@@ -1,0 +1,16 @@
+add_library(carto_project STATIC
+    src/project.cpp
+)
+
+target_include_directories(carto_project
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+)
+
+target_link_libraries(carto_project PUBLIC carto_core carto_scene carto_geometry)
+carto_target(carto_project)
+
+install(TARGETS carto_project EXPORT CartographerTargets)
+install(DIRECTORY include/ DESTINATION include)
+
