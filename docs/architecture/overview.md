@@ -22,9 +22,16 @@ tool input
 | `carto_core` | diagnostics, revisions, precision math | scene or UI policy |
 | `carto_scene` | stable object identity, local transforms, parent links | renderer resources |
 | `carto_geometry` | editable mesh topology and derived compilation | UI state or GPU handles |
+| `carto_assets` | content-addressed immutable blob bytes and digest verification | authoring ownership or import policy |
 | `carto_project` | versioned authoring persistence and asset references | render caches |
+| `carto_journal` | bounded revision-bound recovery records and hash-chain verification | explicit save state or editor history ownership |
+| `carto_providers` | capability descriptors and explicit provider lifecycle | dynamic code loading or permissions |
+| `carto_plugin_protocol` | bounded extension manifests and framed proposals | process isolation, project mutation, or network authority |
 | `carto_editor` | commands and undo/redo history | direct panel-owned mutations |
 | `carto_render` | compiled render snapshots | editable topology |
+| `carto_render_graph` | backend-neutral resource/pass validation and compiled hazards | GPU submission or authoring truth |
+| `carto_gpu` | typed session-local resource handles and public descriptors | Vulkan handles, device ownership, or project serialization |
+| `carto_sdk` | bounded opaque C ABI over application actions/snapshots | C++ layout, mutable model pointers, or native GPU handles |
 | `carto_io` | format adapters and loss reports | project model ownership |
 | `carto_application` | front-end actions, workspace state, immutable snapshots | direct panel-owned mutations or GPU resources |
 | optional native shell | Win32 windowing, ImGui panels, Vulkan submission | authoritative model state or editable topology |
@@ -38,9 +45,13 @@ invalid project-relative asset paths, and failed atomic writes. It does not
 silently repair or flatten these cases.
 
 Primitive constructors are deterministic input tools rather than a second
-source of truth: they generate ordinary editable mesh authoring data. Vertex
-position edits validate the whole mesh before committing a revision; a failed
-edit restores the prior position and cannot enter command history.
+source of truth: they generate ordinary editable mesh authoring data. Mesh
+authoring now retains stable edge, half-edge, and corner identity records
+across topology reads; face-boundary traversal is deterministic and preserves
+those identities when an adjacent face is added. Vertex position edits use a
+revision-bound atomic `MeshPatch` and validate the whole mesh before
+committing a revision; a failed patch restores the prior position and cannot
+enter command history.
 
 Single-face extrusion removes the source face, creates the side walls and cap,
 then validates the complete mesh. Any failed generated vertex or face restores
@@ -51,6 +62,32 @@ Project-bound editor commands also carry the mesh revision they last applied.
 Undo and redo use a revision-conditional replacement, so an external project
 edit causes a stale-data failure instead of being silently overwritten.
 
+Compiled CPU geometry is cached by the authoring mesh revision and invalidated
+whenever an authoring mutation advances that revision. The cache is derived
+state only: it is not serialized, does not own topology, and does not imply a
+GPU resource cache or asynchronous evaluation system.
+
+The public render foundation adds typed generational GPU handles, deferred
+destruction retirement, a canonical offscreen viewport description, and a
+headless render-graph compiler. It validates resource descriptors,
+read-before-write hazards, write transitions, stage/format compatibility, and
+alias lifetime overlap without executing a backend. GPU handles are ephemeral
+and cannot enter project serialization.
+
+The storage foundation adds a content-addressed SHA-256 blob store and a
+revision-bound append-only journal with tamper/truncation detection. Its
+checkpoint store persists snapshot bytes by digest and records the verified
+journal prefix needed to identify pending entries after restart. These are
+standalone primitives: the v1 text project serializer remains authoritative
+until a real package/database integration is accepted, and journal presence is
+not equivalent to an explicit user save.
+
+Provider resolution is metadata-only at this stage. `carto_providers` keeps
+discovery, inspection, registration, verification, readiness, loading, and
+distinct failure states explicit. `carto_plugin_protocol` validates bounded
+sandbox-default manifests and `carto.plugin.v1` frames; it does not launch a
+process or admit plugin output into the project.
+
 Selection state is an ephemeral editor concern. Object, vertex, and face
 selections are isolated by mode, are never serialized into project truth, and
 must be validated against the current scene or mesh before a tool consumes
@@ -58,8 +95,9 @@ them. Component selections may be bound to one scene object; add/toggle
 operations cannot span objects or silently bind an existing unbound selection
 to a different mesh context. Mesh-bound selections retain the mesh instance and
 source revision they were created against, so replacement or mutation requires
-explicit reselection. Edge mode remains deferred until the topology layer has
-stable edge identity rather than snapshot-only half-edge IDs.
+explicit reselection. Edge mode remains deferred until selection and tool
+operations consume the persistent topology identity rather than only the
+current vertex/face selection API.
 
 Tool actions are registered by stable IDs and return editor commands. The
 registry submits successful commands through `CommandBus`; it does not expose a
@@ -111,6 +149,27 @@ tree with the Win32 and Vulkan backends. There is no dependency download or
 CPU rendering fallback. Missing prerequisites stop configuration or startup
 with an explicit diagnostic; GPU execution and desktop workflow acceptance
 remain separate verification gates.
+
+The headless build also exposes a backend-neutral `carto_gpu` contract for
+typed generational resource handles, deferred destruction keyed by completed
+submission serials, and canonical resource descriptions. `carto_render_graph`
+validates declared resource hazards, produces write barriers, and rejects
+overlapping alias lifetimes. `render::OffscreenViewport` declares canonical
+color/depth/selection/normal attachments and increments a generation when its
+extent or attachment policy changes. These are planning and lifetime
+contracts only; they do not claim Vulkan allocation, command submission, or
+GPU execution.
+
+`carto_assets` provides the first persistent-data boundary: immutable bytes are
+stored beneath a SHA-256 content path, written through a temporary file and
+atomic rename, and re-hashed on reads. `carto_journal` provides the first
+recovery boundary: committed records carry before/after revisions, payload
+digests, a previous-entry hash, and a record hash. The application session
+binds that journal to saved projects, records a baseline plus accepted
+mutations, and rolls back an in-memory action if its durable append fails.
+These foundations are not yet a replacement for the v1 text project file:
+the SQLite WAL package, checkpoint replay, and startup recovery flow remain
+separate work.
 
 Asynchronous jobs and persistent GPU resource ownership are not part of the
 headless/application contract yet. When derived jobs or resources are

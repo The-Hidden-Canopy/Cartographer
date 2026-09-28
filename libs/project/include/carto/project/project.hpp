@@ -71,6 +71,11 @@ public:
     [[nodiscard]] std::string serialize() const;
     [[nodiscard]] core::Result<void> validate() const;
 
+    // Exchanges the complete document state without advancing either
+    // revision. ProjectTransaction uses this after its journal append is
+    // durable, making the in-memory publish step non-throwing.
+    void swap(ProjectDocument& other) noexcept;
+
     [[nodiscard]] const std::string& name() const noexcept { return name_; }
     [[nodiscard]] const scene::Scene& scene() const noexcept { return scene_; }
     [[nodiscard]] const std::map<std::uint64_t, geometry::EditableMesh>& meshes() const noexcept {

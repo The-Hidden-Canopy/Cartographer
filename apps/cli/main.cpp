@@ -1,5 +1,7 @@
 #include <carto/io/obj.hpp>
+#include <carto/io/builtin_provider.hpp>
 #include <carto/geometry/primitives.hpp>
+#include <carto/providers/registry.hpp>
 #include <carto/project/project.hpp>
 
 #include <cstdlib>
@@ -73,6 +75,15 @@ int validate(const std::filesystem::path& path) {
 }
 
 int export_obj(const std::filesystem::path& project_path, const std::filesystem::path& obj_path) {
+    carto::providers::Registry providers;
+    if (auto result = carto::io::register_builtin_obj_providers(providers); !result) {
+        print_error(result.error().with_context("OBJ exporter provider"));
+        return EXIT_FAILURE;
+    }
+    if (auto result = providers.resolve("geometry.export.obj"); !result) {
+        print_error(result.error().with_context("OBJ exporter capability"));
+        return EXIT_FAILURE;
+    }
     auto document = carto::project::ProjectDocument::load(project_path);
     if (!document) {
         print_error(document.error());
@@ -96,6 +107,15 @@ int export_obj(const std::filesystem::path& project_path, const std::filesystem:
 }
 
 int import_obj(const std::filesystem::path& obj_path, const std::filesystem::path& project_path) {
+    carto::providers::Registry providers;
+    if (auto result = carto::io::register_builtin_obj_providers(providers); !result) {
+        print_error(result.error().with_context("OBJ importer provider"));
+        return EXIT_FAILURE;
+    }
+    if (auto result = providers.resolve("geometry.import.obj"); !result) {
+        print_error(result.error().with_context("OBJ importer capability"));
+        return EXIT_FAILURE;
+    }
     auto imported = carto::io::import_obj(obj_path);
     if (!imported) {
         print_error(imported.error());

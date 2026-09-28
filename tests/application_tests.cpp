@@ -1,7 +1,10 @@
 #include <carto/application/application.hpp>
+#include <carto/journal/journal.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -276,6 +279,82 @@ void application_open_failure_preserves_current_project_and_save_is_atomic() {
     REQUIRE(!reopened.snapshot().dirty);
 }
 
+void application_journals_committed_mutations_and_rolls_back_failed_append() {
+    TempDirectory temp;
+    const auto path = temp.path() / "journaled.carto";
+    const auto journal_path = std::filesystem::path(path.string() + ".journal");
+
+    carto::application::ApplicationSession session;
+    REQUIRE(session.dispatch(carto::application::NewProjectAction{"Journaled"}));
+    REQUIRE(session.dispatch(carto::application::SaveProjectAction{path}));
+
+    carto::journal::Journal journal(journal_path);
+    auto baseline = journal.read_all();
+    REQUIRE(baseline);
+    REQUIRE(baseline.value().size() == 1U);
+    REQUIRE(baseline.value().front().event_type == "cartographer.snapshot");
+
+    REQUIRE(session.dispatch(carto::application::CreateBoxAction{
+        "Box", {1.0, 1.0, 1.0}}));
+    auto after_create = session.snapshot();
+    REQUIRE(after_create.objects.size() == 1U);
+    REQUIRE(after_create.undo_count == 1U);
+
+    auto after_event = journal.read_all();
+    REQUIRE(after_event);
+    REQUIRE(after_event.value().size() == 2U);
+    REQUIRE(after_event.value().back().event_type == "cartographer.application_action");
+    REQUIRE(after_event.value().back().revision_after == after_create.project_revision);
+    const std::string mutation_payload(
+        after_event.value().back().payload.begin(), after_event.value().back().payload.end());
+    REQUIRE(mutation_payload.find("CARTOGRAPHER_APPLICATION_MUTATION_V1") == 0U);
+    REQUIRE(mutation_payload.find("CARTOGRAPHER_PROJECT 1") != std::string::npos);
+    REQUIRE(journal.verify());
+
+    REQUIRE(session.dispatch(carto::application::UndoAction{}));
+    auto after_undo = journal.read_all();
+    REQUIRE(after_undo);
+    REQUIRE(after_undo.value().size() == 3U);
+    REQUIRE(after_undo.value().back().event_type == "cartographer.application_action");
+
+    REQUIRE(session.dispatch(carto::application::RedoAction{}));
+    auto after_redo = journal.read_all();
+    REQUIRE(after_redo);
+    REQUIRE(after_redo.value().size() == 4U);
+
+    const auto before_failed_append = session.snapshot();
+    REQUIRE(std::filesystem::remove(journal_path));
+    REQUIRE(std::filesystem::create_directory(journal_path));
+    REQUIRE(!session.dispatch(carto::application::CreatePlaneAction{
+        "Rejected", 1.0, 1.0}));
+    const auto after_failed_append = session.snapshot();
+    REQUIRE(after_failed_append.project_revision == before_failed_append.project_revision);
+    REQUIRE(after_failed_append.objects.size() == before_failed_append.objects.size());
+    REQUIRE(after_failed_append.undo_count == before_failed_append.undo_count);
+    REQUIRE(std::filesystem::remove_all(journal_path) == 1U);
+}
+
+void application_rejects_journal_revision_drift_before_open() {
+    TempDirectory temp;
+    const auto path = temp.path() / "drifted.carto";
+    carto::application::ApplicationSession source;
+    REQUIRE(source.dispatch(carto::application::NewProjectAction{"Drifted"}));
+    REQUIRE(source.dispatch(carto::application::SaveProjectAction{path}));
+
+    const auto journal_path = std::filesystem::path(path.string() + ".journal");
+    carto::journal::Journal journal(journal_path);
+    const auto current = journal.current_revision();
+    REQUIRE(current);
+    const std::array<std::uint8_t, 1> payload{0x01U};
+    REQUIRE(journal.append(carto::journal::JournalAppend{
+        current.value(), current.value().next(), "test.drift", payload, 1U}));
+
+    carto::application::ApplicationSession target;
+    REQUIRE(!target.dispatch(carto::application::OpenProjectAction{path}));
+    REQUIRE(target.snapshot().project_name != "Drifted");
+    REQUIRE(!target.snapshot().problems.empty());
+}
+
 } // namespace
 
 int main() {
@@ -287,6 +366,8 @@ int main() {
         application_bounds_failure_diagnostics();
         application_validates_workspace_layouts();
         application_open_failure_preserves_current_project_and_save_is_atomic();
+        application_journals_committed_mutations_and_rolls_back_failed_append();
+        application_rejects_journal_revision_drift_before_open();
     } catch (const std::exception& error) {
         return (void(std::cerr << "FAIL " << error.what() << '\n'), 1);
     }

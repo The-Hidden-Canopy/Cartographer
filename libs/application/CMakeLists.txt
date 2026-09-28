@@ -12,6 +12,7 @@ target_link_libraries(carto_application
     PUBLIC
         carto_core
         carto_geometry
+        carto_journal
         carto_project
         carto_editor
         carto_render

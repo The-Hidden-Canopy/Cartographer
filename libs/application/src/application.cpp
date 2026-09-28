@@ -3,6 +3,8 @@
 #include <memory>
 #include <limits>
 #include <set>
+#include <span>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
@@ -15,6 +17,37 @@ core::Diagnostic invalid_state(std::string message) {
 }
 
 constexpr std::size_t kMaxProblems = 128U;
+constexpr std::size_t kMaxJournalPayloadBytes = 64U * 1024U * 1024U;
+constexpr std::string_view kSnapshotEvent = "cartographer.snapshot";
+constexpr std::string_view kActionEvent = "cartographer.application_action";
+
+std::filesystem::path journal_path_for(const std::filesystem::path& project_path) {
+    std::filesystem::path journal_path = project_path;
+    journal_path += ".journal";
+    return journal_path;
+}
+
+std::string document_snapshot_payload(
+    std::string_view header,
+    std::string_view operation,
+    std::string_view serialized_document) {
+    return std::string(header) + "\n" +
+        (operation.empty() ? std::string{} : "operation=" + std::string(operation) + "\n") +
+        "document_bytes=" + std::to_string(serialized_document.size()) + "\n" +
+        std::string(serialized_document);
+}
+
+bool journal_entry_matches_document(
+    const journal::JournalEntry& entry,
+    std::string_view serialized_document) {
+    const std::string payload(entry.payload.begin(), entry.payload.end());
+    const std::string marker =
+        "document_bytes=" + std::to_string(serialized_document.size()) + "\n";
+    const std::size_t marker_offset = payload.find(marker);
+    if (marker_offset == std::string::npos) return false;
+    const std::size_t document_offset = marker_offset + marker.size();
+    return payload.compare(document_offset, std::string::npos, serialized_document) == 0;
+}
 
 } // namespace
 
@@ -50,6 +83,112 @@ core::Result<void> WorkspaceState::validate() const {
 ApplicationSession::ApplicationSession() {
     static_cast<void>(tools_.register_builtin_tools());
     saved_revision_ = document_.revision();
+}
+
+core::Result<ApplicationSession::PreparedJournal> ApplicationSession::prepare_journal(
+    const std::filesystem::path& project_path,
+    const project::ProjectDocument& document) const {
+    if (project_path.empty() || project_path.filename().empty()) {
+        return core::Result<PreparedJournal>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "journal binding requires a project file path"));
+    }
+
+    const auto path = journal_path_for(project_path);
+    std::error_code exists_error;
+    const bool existed = std::filesystem::exists(path, exists_error);
+    if (exists_error) {
+        return core::Result<PreparedJournal>::failure(core::Diagnostic(
+            core::ErrorCode::io_error,
+            "unable to inspect the project journal path"));
+    }
+
+    journal::Journal candidate(path);
+    const auto entries = candidate.read_all();
+    if (!entries) {
+        return core::Result<PreparedJournal>::failure(entries.error().with_context(
+            "project journal verification"));
+    }
+
+    if (!entries.value().empty()) {
+        const core::Revision tail = entries.value().back().revision_after;
+        if (tail != document.revision()) {
+            return core::Result<PreparedJournal>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "project revision does not match the durable journal; recovery is required"));
+        }
+        const std::string serialized = document.serialize();
+        if (!journal_entry_matches_document(entries.value().back(), serialized)) {
+            return core::Result<PreparedJournal>::failure(core::Diagnostic(
+                core::ErrorCode::validation_failed,
+                "project contents do not match the latest durable journal snapshot"));
+        }
+        return core::Result<PreparedJournal>::success(
+            PreparedJournal{std::move(candidate), false});
+    }
+
+    if (document.revision().value() != 0U) {
+        const std::string snapshot = document.serialize();
+        if (snapshot.size() > kMaxJournalPayloadBytes) {
+            return core::Result<PreparedJournal>::failure(core::Diagnostic(
+                core::ErrorCode::validation_failed,
+                "project snapshot exceeds the durable journal payload limit"));
+        }
+        const std::string payload_text = document_snapshot_payload(
+            "CARTOGRAPHER_PROJECT_SNAPSHOT_V1", {}, snapshot);
+        if (payload_text.size() > kMaxJournalPayloadBytes) {
+            return core::Result<PreparedJournal>::failure(core::Diagnostic(
+                core::ErrorCode::validation_failed,
+                "project snapshot journal envelope exceeds the payload limit"));
+        }
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(payload_text.data());
+        const std::span<const std::uint8_t> payload(bytes, payload_text.size());
+        const auto baseline = candidate.append(journal::JournalAppend{
+            core::Revision{},
+            document.revision(),
+            std::string(kSnapshotEvent),
+            payload,
+            std::nullopt,
+        });
+        if (!baseline) {
+            return core::Result<PreparedJournal>::failure(baseline.error().with_context(
+                "project journal baseline"));
+        }
+    }
+
+    return core::Result<PreparedJournal>::success(
+        PreparedJournal{std::move(candidate), !existed});
+}
+
+core::Result<void> ApplicationSession::append_mutation_event(
+    std::string_view action,
+    core::Revision revision_before,
+    core::Revision revision_after) {
+    if (!journal_.has_value() || revision_before == revision_after) {
+        return core::Result<void>::success();
+    }
+    const std::string serialized_document = document_.serialize();
+    const std::string payload_text = document_snapshot_payload(
+        "CARTOGRAPHER_APPLICATION_MUTATION_V1", action, serialized_document);
+    if (payload_text.size() > kMaxJournalPayloadBytes) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::validation_failed,
+            "application mutation snapshot exceeds the durable journal payload limit"));
+    }
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(payload_text.data());
+    const std::span<const std::uint8_t> payload(bytes, payload_text.size());
+    const auto appended = journal_->append(journal::JournalAppend{
+        revision_before,
+        revision_after,
+        std::string(kActionEvent),
+        payload,
+        std::nullopt,
+    });
+    if (!appended) {
+        return core::Result<void>::failure(appended.error().with_context(
+            "durable application journal append"));
+    }
+    return core::Result<void>::success();
 }
 
 core::Result<DispatchReceipt> ApplicationSession::dispatch(const ApplicationAction& action) {
@@ -128,6 +267,7 @@ core::Result<DispatchReceipt> ApplicationSession::new_project(const NewProjectAc
     const core::Revision before = document_.revision();
     document_ = std::move(created.value());
     project_path_.reset();
+    journal_.reset();
     reset_editor_state();
     saved_revision_ = document_.revision();
     if (project_generation_ == std::numeric_limits<std::uint64_t>::max()) {
@@ -146,9 +286,14 @@ core::Result<DispatchReceipt> ApplicationSession::open_project(const OpenProject
     if (!loaded) {
         return failure(loaded.error().with_context("open project"));
     }
+    auto prepared_journal = prepare_journal(action.path, loaded.value());
+    if (!prepared_journal) {
+        return failure(prepared_journal.error().with_context("open project journal"));
+    }
     const core::Revision before = document_.revision();
     document_ = std::move(loaded.value());
     project_path_ = action.path;
+    journal_ = std::move(prepared_journal.value().journal);
     reset_editor_state();
     saved_revision_ = document_.revision();
     if (project_generation_ == std::numeric_limits<std::uint64_t>::max()) {
@@ -181,12 +326,21 @@ core::Result<DispatchReceipt> ApplicationSession::save_project(const SaveProject
     if (!selected) {
         return failure(invalid_state("save requires a project path"));
     }
+    auto prepared_journal = prepare_journal(*selected, document_);
+    if (!prepared_journal) {
+        return failure(prepared_journal.error().with_context("save project journal"));
+    }
     const auto saved = document_.save_atomic(*selected);
     if (!saved) {
+        if (prepared_journal.value().created_file) {
+            std::error_code ignored;
+            std::filesystem::remove(prepared_journal.value().journal.path(), ignored);
+        }
         return failure(saved.error().with_context("save project"));
     }
     const core::Revision before = document_.revision();
     project_path_ = *selected;
+    journal_ = std::move(prepared_journal.value().journal);
     saved_revision_ = document_.revision();
     return accepted("Save Project", before);
 }
@@ -195,10 +349,30 @@ core::Result<DispatchReceipt> ApplicationSession::execute_command(
     std::unique_ptr<editor::EditorCommand> command,
     std::string action) {
     const core::Revision before = document_.revision();
+    project::ProjectDocument before_document = document_;
     if (auto result = history_.execute(std::move(command)); !result) {
         return failure(result.error().with_context(action));
     }
-    return accepted(std::move(action), before);
+    return accept_command_mutation(std::move(action), before, std::move(before_document));
+}
+
+core::Result<DispatchReceipt> ApplicationSession::accept_command_mutation(
+    std::string action,
+    core::Revision revision_before,
+    project::ProjectDocument before_document) {
+    const core::Revision revision_after = document_.revision();
+    if (auto result = append_mutation_event(action, revision_before, revision_after); !result) {
+        const auto rollback = history_.rollback_last_execute();
+        document_ = std::move(before_document);
+        if (!rollback) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "durable journal append failed and command rollback failed: " +
+                    rollback.error().message));
+        }
+        return failure(result.error().with_context("mutation rolled back"));
+    }
+    return accepted(std::move(action), revision_before);
 }
 
 core::Result<DispatchReceipt> ApplicationSession::select_object(const SelectObjectAction& action) {
@@ -253,11 +427,15 @@ core::Result<DispatchReceipt> ApplicationSession::select_face(const SelectFaceAc
 
 core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAction& action) {
     const core::Revision before = document_.revision();
+    project::ProjectDocument before_document = document_;
     editor::ToolContext context(document_, selection_);
     if (auto result = tools_.invoke(action.tool_id, context, action.arguments, history_); !result) {
         return failure(result.error().with_context("tool invocation"));
     }
-    return accepted("Invoke Tool: " + action.tool_id, before);
+    return accept_command_mutation(
+        "Invoke Tool: " + action.tool_id,
+        before,
+        std::move(before_document));
 }
 
 core::Result<DispatchReceipt> ApplicationSession::create_box(const CreateBoxAction& action) {
@@ -284,16 +462,40 @@ core::Result<DispatchReceipt> ApplicationSession::create_plane(const CreatePlane
 
 core::Result<DispatchReceipt> ApplicationSession::undo() {
     const core::Revision before = document_.revision();
+    project::ProjectDocument before_document = document_;
     if (auto result = history_.undo(); !result) {
         return failure(result.error().with_context("undo"));
+    }
+    if (auto result = append_mutation_event("Undo", before, document_.revision()); !result) {
+        const auto rollback = history_.redo();
+        document_ = std::move(before_document);
+        if (!rollback) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "durable journal append failed and undo rollback failed: " +
+                    rollback.error().message));
+        }
+        return failure(result.error().with_context("undo rolled back"));
     }
     return accepted("Undo", before);
 }
 
 core::Result<DispatchReceipt> ApplicationSession::redo() {
     const core::Revision before = document_.revision();
+    project::ProjectDocument before_document = document_;
     if (auto result = history_.redo(); !result) {
         return failure(result.error().with_context("redo"));
+    }
+    if (auto result = append_mutation_event("Redo", before, document_.revision()); !result) {
+        const auto rollback = history_.undo();
+        document_ = std::move(before_document);
+        if (!rollback) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "durable journal append failed and redo rollback failed: " +
+                    rollback.error().message));
+        }
+        return failure(result.error().with_context("redo rolled back"));
     }
     return accepted("Redo", before);
 }

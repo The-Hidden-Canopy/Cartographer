@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.25)
 project(Cartographer
     VERSION 0.1.0
     DESCRIPTION "Standalone open-source spatial authoring system"
-    LANGUAGES CXX
+    LANGUAGES C CXX
 )
 
 option(CARTO_BUILD_TESTS "Build headless unit and invariant tests" ON)
@@ -31,10 +31,17 @@ endfunction()
 add_subdirectory(libs/core)
 add_subdirectory(libs/scene)
 add_subdirectory(libs/geometry/mesh)
+add_subdirectory(libs/assets)
+add_subdirectory(libs/gpu)
+add_subdirectory(libs/journal)
+add_subdirectory(libs/render_graph)
+add_subdirectory(libs/providers)
+add_subdirectory(libs/plugin_protocol)
 add_subdirectory(libs/project)
 add_subdirectory(libs/editor)
 add_subdirectory(libs/render)
 add_subdirectory(libs/application)
+add_subdirectory(libs/sdk)
 add_subdirectory(libs/io)
 
 if(CARTO_ENABLE_VULKAN)

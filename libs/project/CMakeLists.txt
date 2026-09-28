@@ -1,5 +1,7 @@
 add_library(carto_project STATIC
+    src/package.cpp
     src/project.cpp
+    src/transaction.cpp
 )
 
 target_include_directories(carto_project
@@ -8,9 +10,8 @@ target_include_directories(carto_project
         $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(carto_project PUBLIC carto_core carto_scene carto_geometry)
+target_link_libraries(carto_project PUBLIC carto_core carto_scene carto_geometry carto_assets carto_journal)
 carto_target(carto_project)
 
 install(TARGETS carto_project EXPORT CartographerTargets)
 install(DIRECTORY include/ DESTINATION include)
-

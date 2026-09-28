@@ -382,6 +382,14 @@ core::Result<void> ProjectDocument::validate() const {
     return core::Result<void>::success();
 }
 
+void ProjectDocument::swap(ProjectDocument& other) noexcept {
+    name_.swap(other.name_);
+    scene_.swap(other.scene_);
+    meshes_.swap(other.meshes_);
+    std::swap(next_mesh_id_, other.next_mesh_id_);
+    std::swap(revision_, other.revision_);
+}
+
 std::string ProjectDocument::serialize() const {
     std::ostringstream output;
     output << kMagic << ' ' << kSchemaVersion << '\n';

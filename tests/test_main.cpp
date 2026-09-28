@@ -277,6 +277,15 @@ void mesh_compiles_without_mutating_source_and_exposes_boundary_topology() {
     REQUIRE(mesh.revision() == before_revision);
     REQUIRE(mesh.vertex_count() == before_vertices);
     REQUIRE(compiled.value().indices.size() == 3U);
+    const auto compiled_again = mesh.compile();
+    REQUIRE(compiled_again);
+    REQUIRE(compiled_again.value().source_revision == before_revision);
+    const auto moved_vertex = mesh.vertices_sorted().front();
+    REQUIRE(mesh.set_vertex_position(moved_vertex.id, {0.1, 0.0, 0.0}));
+    const auto recompiled = mesh.compile();
+    REQUIRE(recompiled);
+    REQUIRE(recompiled.value().source_revision == mesh.revision());
+    REQUIRE(recompiled.value().source_revision != before_revision);
 
     const auto topology = mesh.topology();
     REQUIRE(topology);
@@ -285,6 +294,101 @@ void mesh_compiles_without_mutating_source_and_exposes_boundary_topology() {
     for (const auto& edge : topology.value().half_edges) {
         REQUIRE(!edge.twin.has_value());
     }
+}
+
+void topology_ids_persist_and_boundary_traversal_is_deterministic() {
+    auto mesh = triangle_mesh();
+    const auto first_face = mesh.faces_sorted().front().id;
+    const auto first_topology = mesh.topology();
+    REQUIRE(first_topology);
+    REQUIRE(first_topology.value().edges.size() == 3U);
+    REQUIRE(first_topology.value().half_edges.size() == 3U);
+    REQUIRE(first_topology.value().corners.size() == 3U);
+    REQUIRE(first_topology.value().boundary_half_edges().size() == 3U);
+    const auto first_boundary = first_topology.value().face_boundary(first_face);
+    REQUIRE(first_boundary);
+    REQUIRE(first_boundary.value().size() == 3U);
+
+    const auto second_topology = mesh.topology();
+    REQUIRE(second_topology);
+    for (std::size_t index = 0U; index < first_topology.value().half_edges.size(); ++index) {
+        REQUIRE(first_topology.value().half_edges[index].id ==
+                second_topology.value().half_edges[index].id);
+        REQUIRE(first_topology.value().half_edges[index].edge ==
+                second_topology.value().half_edges[index].edge);
+        REQUIRE(first_topology.value().half_edges[index].corner ==
+                second_topology.value().half_edges[index].corner);
+    }
+
+    const auto vertices = mesh.vertices_sorted();
+    REQUIRE(vertices.size() == 3U);
+    const auto added_vertex = mesh.add_vertex({1.0, 1.0, 0.0});
+    REQUIRE(added_vertex);
+    REQUIRE(mesh.add_face({vertices[1].id, added_vertex.value(), vertices[2].id}));
+
+    const auto expanded_topology = mesh.topology();
+    REQUIRE(expanded_topology);
+    REQUIRE(expanded_topology.value().edges.size() == 5U);
+    REQUIRE(expanded_topology.value().half_edges.size() == 6U);
+    REQUIRE(expanded_topology.value().corners.size() == 6U);
+    REQUIRE(expanded_topology.value().boundary_half_edges().size() == 4U);
+
+    carto::geometry::EdgeId shared_edge{};
+    for (const auto& edge : first_topology.value().edges) {
+        if ((edge.first == vertices[1].id && edge.second == vertices[2].id) ||
+            (edge.first == vertices[2].id && edge.second == vertices[1].id)) {
+            shared_edge = edge.id;
+        }
+    }
+    REQUIRE(shared_edge);
+    bool shared_edge_survived = false;
+    for (const auto& edge : expanded_topology.value().edges) {
+        if (edge.id == shared_edge) {
+            shared_edge_survived = true;
+            REQUIRE(edge.second_half_edge.has_value());
+        }
+    }
+    REQUIRE(shared_edge_survived);
+    REQUIRE(expanded_topology.value().validate());
+
+    auto malformed = expanded_topology.value();
+    malformed.edges.front().first_half_edge = carto::geometry::HalfEdgeId{999};
+    REQUIRE(!malformed.validate());
+}
+
+void mesh_patches_are_revision_bound_atomic_and_invertible() {
+    auto mesh = triangle_mesh();
+    const auto vertex = mesh.vertices_sorted().front();
+    const carto::core::Vec3d moved{0.25, 0.0, 0.0};
+    const carto::geometry::MeshPatch patch{
+        mesh.revision(),
+        {carto::geometry::VertexChange{vertex.id, vertex.position, moved}},
+    };
+    REQUIRE(patch.validate());
+    REQUIRE(mesh.apply_patch(patch));
+    REQUIRE(mesh.find_vertex(vertex.id)->position.x == moved.x);
+
+    const auto inverse = patch.inverse(mesh.revision());
+    REQUIRE(inverse.validate());
+    REQUIRE(mesh.apply_patch(inverse));
+    REQUIRE(mesh.find_vertex(vertex.id)->position.x == vertex.position.x);
+
+    const auto stale = mesh.apply_patch(patch);
+    REQUIRE(!stale);
+    REQUIRE(stale.error().code == carto::core::ErrorCode::stale_data);
+
+    const auto current = mesh.find_vertex(vertex.id)->position;
+    const carto::core::Vec3d invalid_target{0.5, 0.0, 0.0};
+    const carto::geometry::MeshPatch partially_missing{
+        mesh.revision(),
+        {
+            carto::geometry::VertexChange{vertex.id, current, invalid_target},
+            carto::geometry::VertexChange{
+                carto::geometry::VertexId{999}, current, invalid_target},
+        },
+    };
+    REQUIRE(!mesh.apply_patch(partially_missing));
+    REQUIRE(mesh.find_vertex(vertex.id)->position.x == current.x);
 }
 
 void primitives_are_deterministic_and_dimension_validated() {
@@ -1118,6 +1222,8 @@ int main() {
         {"selection is mode scoped and context validated", selection_is_mode_scoped_and_context_validated},
         {"mesh rejects degenerate and duplicate topology", mesh_rejects_degenerate_and_duplicate_topology},
         {"mesh compiles without mutating source", mesh_compiles_without_mutating_source_and_exposes_boundary_topology},
+        {"topology ids persist and boundary traversal is deterministic", topology_ids_persist_and_boundary_traversal_is_deterministic},
+        {"mesh patches are revision-bound atomic and invertible", mesh_patches_are_revision_bound_atomic_and_invertible},
         {"primitives are deterministic and validated", primitives_are_deterministic_and_dimension_validated},
         {"vector normalization preserves invalid state", vector_normalization_preserves_invalid_state},
         {"stale render result is rejected", stale_render_result_is_rejected},

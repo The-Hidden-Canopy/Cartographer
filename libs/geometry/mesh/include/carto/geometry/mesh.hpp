@@ -23,6 +23,14 @@ struct Face {
     std::vector<VertexId> vertices;
 };
 
+struct EdgeRecord {
+    EdgeId id;
+    VertexId first;
+    VertexId second;
+    HalfEdgeId first_half_edge;
+    std::optional<HalfEdgeId> second_half_edge;
+};
+
 struct HalfEdgeRecord {
     HalfEdgeId id;
     VertexId origin;
@@ -31,12 +39,39 @@ struct HalfEdgeRecord {
     HalfEdgeId next;
     HalfEdgeId previous;
     std::optional<HalfEdgeId> twin;
+    EdgeId edge;
+    CornerId corner;
+};
+
+struct CornerRecord {
+    CornerId id;
+    FaceId face;
+    VertexId vertex;
+    HalfEdgeId half_edge;
+};
+
+struct VertexChange {
+    VertexId id;
+    core::Vec3d before;
+    core::Vec3d after;
+};
+
+struct MeshPatch {
+    core::Revision expected_revision;
+    std::vector<VertexChange> vertex_changes;
+
+    [[nodiscard]] core::Result<void> validate() const;
+    [[nodiscard]] MeshPatch inverse(core::Revision expected_revision) const;
 };
 
 struct TopologySnapshot {
+    std::vector<EdgeRecord> edges;
     std::vector<HalfEdgeRecord> half_edges;
+    std::vector<CornerRecord> corners;
 
     [[nodiscard]] core::Result<void> validate() const;
+    [[nodiscard]] core::Result<std::vector<HalfEdgeId>> face_boundary(FaceId face) const;
+    [[nodiscard]] std::vector<HalfEdgeId> boundary_half_edges() const;
 };
 
 class EditableMesh {
@@ -48,6 +83,7 @@ public:
     [[nodiscard]] core::Result<void> insert_vertex(Vertex vertex);
     [[nodiscard]] core::Result<void> insert_face(Face face);
     [[nodiscard]] core::Result<void> set_vertex_position(VertexId id, core::Vec3d position);
+    [[nodiscard]] core::Result<void> apply_patch(const MeshPatch& patch);
     [[nodiscard]] core::Result<void> extrude_face(FaceId id, double distance);
     [[nodiscard]] core::Result<void> restore_from(const EditableMesh& source);
     [[nodiscard]] core::Result<void> restore_revision(core::Revision revision);
@@ -66,13 +102,27 @@ public:
     [[nodiscard]] std::size_t face_count() const noexcept { return faces_.size(); }
 
 private:
-    void bump_revision() noexcept { revision_ = revision_.next(); }
+    [[nodiscard]] core::Result<void> rebuild_topology();
+    [[nodiscard]] core::Result<void> validate_topology_state() const;
+    [[nodiscard]] TopologySnapshot topology_snapshot() const;
+    void bump_revision() noexcept {
+        compiled_cache_.reset();
+        revision_ = revision_.next();
+    }
 
     std::map<VertexId, Vertex> vertices_;
     std::map<FaceId, Face> faces_;
+    std::map<EdgeId, EdgeRecord> edges_;
+    std::map<HalfEdgeId, HalfEdgeRecord> half_edges_;
+    std::map<CornerId, CornerRecord> corners_;
+    std::map<FaceId, HalfEdgeId> face_boundaries_;
     std::uint64_t next_vertex_id_ = 1;
     std::uint64_t next_face_id_ = 1;
+    std::uint64_t next_edge_id_ = 1;
+    std::uint64_t next_half_edge_id_ = 1;
+    std::uint64_t next_corner_id_ = 1;
     core::Revision revision_{};
+    mutable std::optional<CompiledMesh> compiled_cache_;
 };
 
 } // namespace carto::geometry

@@ -26,6 +26,10 @@ public:
 class CommandBus {
 public:
     [[nodiscard]] core::Result<void> execute(std::unique_ptr<EditorCommand> command);
+    // Removes and reverses the command most recently accepted by execute().
+    // The application layer uses this when a durable side effect fails after
+    // an in-memory command has already been admitted.
+    [[nodiscard]] core::Result<void> rollback_last_execute();
     [[nodiscard]] core::Result<void> undo();
     [[nodiscard]] core::Result<void> redo();
 

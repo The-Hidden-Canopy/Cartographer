@@ -45,8 +45,16 @@ evidence only for the named behavior; it does not promote deferred features.
 | interchange boundary | OBJ export/import test | feature-loss warning retained; oversized face input fails closed |
 | clean standalone build | Debug/Release CMake + CTest | passed locally |
 | optional Vulkan/desktop prerequisites | negative CMake probes | Vulkan configure stops without a discoverable SDK; desktop configure stops unless Vulkan is explicitly enabled |
+| typed GPU handle lifetime | render architecture tests | slot reuse advances generation and stale handles fail; type confusion is rejected at compile time |
+| render-graph hazards | render architecture tests | valid write transitions compile; read-before-write, illegal stage/format use, duplicate use, and overlapping aliases fail |
+| content-addressed blob integrity | storage/journal tests | known SHA-256, bounded storage, read verification, and tamper detection pass |
+| package manifest/layout boundary | storage/journal tests | manifest is human-readable, required package directories are validated, escaped text round-trips, malformed/trailing and future versions fail closed, and no fake database is created |
+| durable journal integrity | storage/journal tests | revision-bound append, staged transaction atomicity, replay, payload/hash chain, malformed checkpoint fail-closed behavior, and truncated-record rejection pass |
+| provider lifecycle boundary | provider/plugin tests | duplicate descriptors, invalid transitions, unavailable provider diagnostics, capability absence, and built-in OBJ importer/exporter readiness fail visibly when violated |
+| plugin protocol boundary | provider/plugin tests | sandbox-default manifest, network/path permission rejection, framed round-trip, malformed nested-object rejection, truncation, and payload-size bounds pass |
 
-Not yet covered: power-loss fault injection, chunk checksums, crash recovery
-journals, a successful Vulkan/desktop build, GPU/Vulkan execution, desktop
+Not yet covered: SQLite WAL package storage, schema migrations, power-loss fault
+injection, checkpoint replay adapters, crash recovery UX, a successful
+Vulkan/desktop build, GPU/Vulkan execution, desktop
 input/DPI and resize behavior, fuzz corpora, cross-platform package
 installation in a clean VM, and downstream Unreal/Unity acceptance.

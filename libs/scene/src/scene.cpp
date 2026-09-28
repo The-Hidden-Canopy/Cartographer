@@ -391,4 +391,12 @@ core::Result<void> Scene::clear() {
     return core::Result<void>::success();
 }
 
+void Scene::swap(Scene& other) noexcept {
+    objects_.swap(other.objects_);
+    children_.swap(other.children_);
+    hierarchy_depths_.swap(other.hierarchy_depths_);
+    std::swap(next_id_, other.next_id_);
+    std::swap(revision_, other.revision_);
+}
+
 } // namespace carto::scene

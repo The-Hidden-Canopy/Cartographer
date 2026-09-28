@@ -38,6 +38,12 @@ records are present. Render meshes, GPU resources, thumbnails, BVHs, and other
 derived caches are
 intentionally absent.
 
+Runtime `EdgeId`, `HalfEdgeId`, and `CornerId` records are maintained by the
+authoring mesh and are intentionally not additional v1 serialized fields yet.
+They preserve identity across topology reads and in-session edits; durable
+topology-ID persistence requires a future schema migration rather than being
+silently implied by the current text format.
+
 ## Save contract
 
 `ProjectDocument::save_atomic` validates the in-memory document, serializes it,

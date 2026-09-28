@@ -11,9 +11,9 @@ target_link_libraries(cartographer_cli
         carto_editor
         carto_render
         carto_io
+        carto_providers
 )
 
 carto_target(cartographer_cli)
 
 install(TARGETS cartographer_cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-

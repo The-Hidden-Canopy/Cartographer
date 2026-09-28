@@ -17,6 +17,24 @@ core::Result<void> CommandBus::execute(std::unique_ptr<EditorCommand> command) {
     return core::Result<void>::success();
 }
 
+core::Result<void> CommandBus::rollback_last_execute() {
+    if (undo_stack_.empty()) {
+        return core::Result<void>::failure(
+            core::Diagnostic(core::ErrorCode::invalid_state,
+                             "command history has no accepted command to roll back"));
+    }
+    auto command = std::move(undo_stack_.back());
+    undo_stack_.pop_back();
+    if (auto result = command->undo(); !result) {
+        undo_stack_.push_back(std::move(command));
+        return result;
+    }
+    // The failed admission consumed the redo branch when execute() accepted
+    // the command. It must not become visible as a successful history state.
+    redo_stack_.clear();
+    return core::Result<void>::success();
+}
+
 core::Result<void> CommandBus::undo() {
     if (undo_stack_.empty()) {
         return core::Result<void>::failure(
@@ -120,7 +138,15 @@ core::Result<void> SetVertexPositionCommand::apply(core::Vec3d position) {
         return core::Result<void>::failure(
             core::Diagnostic(core::ErrorCode::invalid_state, "vertex command has no mesh"));
     }
-    return mesh_->set_vertex_position(vertex_, position);
+    const auto* current = mesh_->find_vertex(vertex_);
+    if (!current) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::not_found, "vertex command references a missing mesh vertex"));
+    }
+    return mesh_->apply_patch(geometry::MeshPatch{
+        mesh_->revision(),
+        {geometry::VertexChange{vertex_, current->position, position}},
+    });
 }
 
 SetProjectSelectedVertexPositionCommand::SetProjectSelectedVertexPositionCommand(

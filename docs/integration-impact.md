@@ -2,7 +2,8 @@
 
 Cartographer is intentionally standalone. The following is the impact of this
 repository on the four named Hidden Canopy systems; it is not a claim that any
-integration exists.
+integration exists. The render, blob, and journal foundations remain local and
+dependency-free.
 
 ## Direct impact
 
@@ -19,10 +20,10 @@ is produced.
 ## Shared contract touched
 
 Only the general engineering boundary is shared: standalone builds, explicit
-provenance, failure-visible diagnostics, and separation of authoritative data
-from derived output. Cartographer does not adopt RegOS state transitions,
-permissions, audit ledgers, or domain-event schemas because it has no governed
-organizational mutation surface.
+provenance, failure-visible diagnostics, hash-checked lineage, and separation
+of authoritative data from derived output. Cartographer does not adopt RegOS
+state transitions, permissions, audit ledgers, or domain-event schemas because
+it has no governed organizational mutation surface.
 
 ## API/schema, dataset/eval, and deployment risk
 

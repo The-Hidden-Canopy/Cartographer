@@ -9,6 +9,8 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] CMake target graph and headless build
 - [x] double-precision scene objects and cycle-safe hierarchy
 - [x] editable polygon mesh with stable IDs and topology validation
+- [x] persistent EdgeId/HalfEdgeId/CornerId records with deterministic face-boundary traversal
+- [x] revision-bound atomic vertex MeshPatch with inverse generation
 - [x] deterministic compiled mesh, normals, bounds, and source revisions
 - [x] reversible transform command and history boundary
 - [x] versioned project format with atomic save/load
@@ -23,14 +25,31 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] headless application/session boundary for the first authoring vertical slice
 - [x] validated ephemeral workspace/pane state with a required viewport
 - [x] stable compiled vertex/face identity mapping for future viewport picking
+- [x] backend-neutral generational GPU handles, deferred submission retirement, render-graph validation, and offscreen viewport planning
+- [x] SHA-256 content-addressed blob store with atomic publication and integrity verification
+- [x] append-only revision-bound journal with hash chain, verification, replay callback, content-addressed checkpoints, and staged transaction publication
 - [ ] desktop shell and workspace registry (source scaffold present; native acceptance pending)
 - [ ] Vulkan resource backend and viewport (optional source path present; SDK/GPU acceptance pending)
-- [ ] interactive selection UI, stable edge mode, and broader modeling tool interaction (headless dispatch exists; input acceptance pending)
+- [x] directory project package layout and human-readable manifest boundary (SQLite database and migrations remain pending)
+- [ ] SQLite WAL authoring database, migrations, integrity scanner, and cache separation
+- [ ] startup recovery, replay inspection, and recovery-versus-explicit-save workflow (application mutation journaling and rollback are present; checkpoint replay/UI integration pending)
+- [x] bounded opaque C ABI smoke surface with a C compiler/linker fixture
+- [ ] ABI negotiation, shared-library packaging, and C++/Python/C# bindings
+- [x] capability provider lifecycle/resolve foundation
+- [x] sandbox-default bounded plugin envelope foundation
+- [ ] built-in provider migration beyond the OBJ CLI gate, process isolation, resource budgets, and neutral-result admission
+- [ ] persistent topology edit patches, loop/ring traversal, interactive selection UI, stable edge mode, and broader modeling tool interaction (identity/traversal and vertex patches exist; topology operators and input acceptance pending)
 
 The optional native source path is intentionally not marked complete by the
 presence of a window class or renderer type. It requires a caller-supplied
 Vulkan SDK and pinned Dear ImGui checkout, then a real build, launch, input,
 resize/DPI, and GPU evidence pass.
+
+The cross-repository tranche is also intentionally split. A valid hash chain or
+content-addressed blob is not a recovered project, SQLite package, or promotion
+receipt until the owning checkpoint replay, database, and user-visible recovery
+workflows are independently tested. The staged transaction boundary closes the
+document-to-journal publication risk but does not implement those later flows.
 
 ## 0.2 - non-destructive DCC maturity
 

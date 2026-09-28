@@ -54,6 +54,10 @@ public:
     [[nodiscard]] std::size_t size() const noexcept { return objects_.size(); }
     [[nodiscard]] core::Result<void> clear();
 
+    // Used by higher-level atomic document transactions. All scene state is
+    // exchanged without changing either scene's revision.
+    void swap(Scene& other) noexcept;
+
 private:
     [[nodiscard]] bool would_create_cycle(ObjectId child, ObjectId parent) const;
     [[nodiscard]] core::Result<core::Transform> resolve_world(

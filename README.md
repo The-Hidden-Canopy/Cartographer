@@ -55,6 +55,23 @@ have implemented all sixty specification subsystems.
 - `carto_render` accepts compiled mesh snapshots only. It is a backend-neutral
   render-scene seam with stable source vertex/face identity mapping; it is
   still not a Vulkan renderer.
+- `carto_gpu` provides typed generational resource handles, deferred lifetime
+  retirement, and backend-neutral descriptors; `carto_render_graph` validates
+  and compiles headless resource hazards without submitting GPU work.
+- `carto_assets` provides bounded content-addressed SHA-256 blobs, and
+  `carto_journal` provides revision-bound append-only records with a verified
+  hash chain. These are foundations, not a replacement for the v1 project
+  serializer or a crash-recovery claim.
+- `ProjectPackage` creates and validates the proposed human-readable package
+  manifest/layout and owns the blob root. It intentionally does not create a
+  fake `document.db`; SQLite WAL storage remains a separately accepted layer.
+- `carto_sdk` exposes a bounded opaque C ABI over the headless application
+  session, with explicit version/status/error ownership. It is not yet a full
+  multi-language SDK or shared-library distribution.
+- `carto_providers` resolves bounded capability descriptors through explicit
+  lifecycle states, and `carto_plugin_protocol` defines a sandbox-default,
+  length-bounded host envelope. Neither target loads third-party code or grants
+  arbitrary project authority yet.
 - The optional `carto_vulkan` runtime probe and Win32/Dear ImGui desktop shell
   are source-wired behind explicit CMake options. They remain runtime-
   unaccepted until built against a pinned Vulkan SDK/ImGui checkout and
@@ -129,9 +146,17 @@ user/tool
     -> carto_application action/snapshot boundary
         -> carto_editor command/transaction boundary
             -> carto_project / carto_scene authoring truth
-                -> carto_geometry validation and compilation
-                    -> carto_render compiled snapshot seam
-                    -> optional Vulkan/platform backend
+                    -> carto_geometry validation and compilation
+                        -> carto_render compiled snapshot seam
+                            -> carto_render_graph / carto_gpu render planning
+                            -> optional Vulkan/platform backend
+
+Recovery and asset lineage remain parallel to rendering:
+
+```text
+authoring revision -> carto_journal (append/replay/verify)
+immutable bytes    -> carto_assets (SHA-256 blob)
+```
 ```
 
 `carto_application` owns the boundary consumed by panels and native shells:

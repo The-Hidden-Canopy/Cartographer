@@ -7,6 +7,7 @@
 #include <carto/editor/selection.hpp>
 #include <carto/editor/tools.hpp>
 #include <carto/geometry/primitives.hpp>
+#include <carto/journal/journal.hpp>
 #include <carto/project/project.hpp>
 #include <carto/render/render_scene.hpp>
 
@@ -16,6 +17,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -182,6 +184,10 @@ private:
     [[nodiscard]] core::Result<DispatchReceipt> execute_command(
         std::unique_ptr<editor::EditorCommand> command,
         std::string action);
+    [[nodiscard]] core::Result<DispatchReceipt> accept_command_mutation(
+        std::string action,
+        core::Revision revision_before,
+        project::ProjectDocument before_document);
     [[nodiscard]] core::Result<DispatchReceipt> select_object(const SelectObjectAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> select_vertex(const SelectVertexAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> select_face(const SelectFaceAction& action);
@@ -190,6 +196,17 @@ private:
     [[nodiscard]] core::Result<DispatchReceipt> create_plane(const CreatePlaneAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> undo();
     [[nodiscard]] core::Result<DispatchReceipt> redo();
+    [[nodiscard]] core::Result<void> append_mutation_event(
+        std::string_view action,
+        core::Revision revision_before,
+        core::Revision revision_after);
+    struct PreparedJournal {
+        journal::Journal journal;
+        bool created_file = false;
+    };
+    [[nodiscard]] core::Result<PreparedJournal> prepare_journal(
+        const std::filesystem::path& project_path,
+        const project::ProjectDocument& document) const;
     [[nodiscard]] core::Result<void> require_discard_confirmation(bool discard_dirty) const;
 
     [[nodiscard]] core::Result<DispatchReceipt> accepted(
@@ -205,6 +222,7 @@ private:
     editor::SelectionState selection_;
     editor::CommandBus history_;
     editor::ToolRegistry tools_;
+    std::optional<journal::Journal> journal_;
     WorkspaceState workspace_;
     std::vector<core::Diagnostic> problems_;
 };
