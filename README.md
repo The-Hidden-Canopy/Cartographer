@@ -153,7 +153,6 @@ See [provenance and IP boundary](docs/provenance.md),
 The concrete 0.1 evidence is recorded in the
 [acceptance matrix](docs/verification/acceptance-matrix.md).
 
-The code license is intentionally not guessed. A permissive license, CLA/DCO
-policy, and trademark policy require the business/counsel decision described in
-the specification; until that decision is recorded, this checkout must not be
-represented as licensed for redistribution.
+The code is released under the Apache License, Version 2.0; see
+[LICENSE](LICENSE). The project follows the
+[Open Canopy Contract](OPEN_CANOPY_CONTRACT.md).
