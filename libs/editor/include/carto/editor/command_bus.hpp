@@ -38,6 +38,9 @@ private:
     std::vector<std::unique_ptr<EditorCommand>> redo_stack_;
 };
 
+// Standalone mesh/scene commands are intentionally lower-level. Application
+// authoring must use the ProjectDocument-bound command variants below so
+// project revision and asset identity guards cannot be bypassed.
 class SetObjectTransformCommand final : public EditorCommand {
 public:
     SetObjectTransformCommand(
@@ -59,6 +62,31 @@ private:
     core::Transform after_;
 };
 
+class SetProjectObjectTransformCommand final : public EditorCommand {
+public:
+    SetProjectObjectTransformCommand(
+        project::ProjectDocument& document,
+        scene::ObjectId object,
+        core::Transform before,
+        core::Transform after);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override {
+        return "Set Project Object Transform";
+    }
+
+private:
+    [[nodiscard]] core::Result<void> apply(core::Transform transform);
+
+    project::ProjectDocument* document_;
+    scene::ObjectId object_;
+    core::Transform before_;
+    core::Transform after_;
+    core::Revision expected_project_revision_;
+    std::optional<core::Revision> current_project_revision_;
+};
+
 class SetVertexPositionCommand final : public EditorCommand {
 public:
     SetVertexPositionCommand(
@@ -78,6 +106,29 @@ private:
     geometry::VertexId vertex_;
     core::Vec3d before_;
     core::Vec3d after_;
+};
+
+class SetProjectSelectedVertexPositionCommand final : public EditorCommand {
+public:
+    SetProjectSelectedVertexPositionCommand(
+        project::ProjectDocument& document,
+        const SelectionState& selection,
+        core::Vec3d position);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override {
+        return "Set Project Selected Vertex Position";
+    }
+
+private:
+    project::ProjectDocument* document_;
+    const SelectionState* selection_;
+    core::Vec3d position_;
+    std::optional<std::uint64_t> mesh_asset_;
+    std::optional<geometry::EditableMesh> before_;
+    std::optional<geometry::EditableMesh> after_;
+    std::optional<core::Revision> current_mesh_revision_;
 };
 
 class ExtrudeFaceCommand final : public EditorCommand {
@@ -112,6 +163,29 @@ private:
     geometry::EditableMesh* mesh_;
     double distance_;
     std::unique_ptr<ExtrudeFaceCommand> delegate_;
+};
+
+class ExtrudeProjectSelectedFaceCommand final : public EditorCommand {
+public:
+    ExtrudeProjectSelectedFaceCommand(
+        project::ProjectDocument& document,
+        const SelectionState& selection,
+        double distance);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override {
+        return "Extrude Project Selected Face";
+    }
+
+private:
+    project::ProjectDocument* document_;
+    const SelectionState* selection_;
+    double distance_;
+    std::optional<std::uint64_t> mesh_asset_;
+    std::optional<geometry::EditableMesh> before_;
+    std::optional<geometry::EditableMesh> after_;
+    std::optional<core::Revision> current_mesh_revision_;
 };
 
 class CreateMeshObjectCommand final : public EditorCommand {

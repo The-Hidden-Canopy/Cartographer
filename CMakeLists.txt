@@ -8,8 +8,9 @@ project(Cartographer
 
 option(CARTO_BUILD_TESTS "Build headless unit and invariant tests" ON)
 option(CARTO_BUILD_CLI "Build the headless Cartographer CLI" ON)
-option(CARTO_ENABLE_VULKAN "Enable the Vulkan backend (not implemented in 0.1)" OFF)
-option(CARTO_BUILD_DESKTOP "Build the native desktop shell (not implemented in 0.1)" OFF)
+option(CARTO_ENABLE_VULKAN "Enable the optional Vulkan render backend" OFF)
+option(CARTO_BUILD_DESKTOP "Build the optional Dear ImGui/Vulkan desktop shell" OFF)
+set(CARTO_IMGUI_ROOT "" CACHE PATH "Path to a pinned Dear ImGui source tree")
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     add_compile_options(-Wall -Wextra -Wpedantic -Wconversion -Wshadow)
@@ -22,18 +23,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-if(CARTO_ENABLE_VULKAN)
-    find_package(Vulkan QUIET)
-    if(NOT Vulkan_FOUND)
-        message(FATAL_ERROR "CARTO_ENABLE_VULKAN=ON requires a discoverable Vulkan SDK")
-    endif()
-    message(FATAL_ERROR "The Vulkan backend is intentionally fail-closed until its 0.1 contract is implemented")
-endif()
-
-if(CARTO_BUILD_DESKTOP)
-    message(FATAL_ERROR "The desktop shell is not implemented in the 0.1 foundation")
-endif()
-
 function(carto_target target)
     target_compile_features(${target} PUBLIC cxx_std_23)
     target_compile_definitions(${target} PUBLIC CARTOGRAPHER_VERSION="${PROJECT_VERSION}")
@@ -45,7 +34,32 @@ add_subdirectory(libs/geometry/mesh)
 add_subdirectory(libs/project)
 add_subdirectory(libs/editor)
 add_subdirectory(libs/render)
+add_subdirectory(libs/application)
 add_subdirectory(libs/io)
+
+if(CARTO_ENABLE_VULKAN)
+    find_package(Vulkan QUIET)
+    if(NOT Vulkan_FOUND)
+        message(FATAL_ERROR "CARTO_ENABLE_VULKAN=ON requires a discoverable Vulkan SDK")
+    endif()
+    add_subdirectory(libs/vulkan)
+endif()
+
+if(CARTO_BUILD_DESKTOP)
+    if(NOT WIN32)
+        message(FATAL_ERROR "CARTO_BUILD_DESKTOP=ON requires the Windows platform")
+    endif()
+    if(NOT CARTO_ENABLE_VULKAN)
+        message(FATAL_ERROR "CARTO_BUILD_DESKTOP=ON requires CARTO_ENABLE_VULKAN=ON")
+    endif()
+    if(NOT EXISTS "${CARTO_IMGUI_ROOT}/imgui.h" OR
+       NOT EXISTS "${CARTO_IMGUI_ROOT}/backends/imgui_impl_win32.cpp" OR
+       NOT EXISTS "${CARTO_IMGUI_ROOT}/backends/imgui_impl_vulkan.cpp")
+        message(FATAL_ERROR
+            "CARTO_BUILD_DESKTOP=ON requires CARTO_IMGUI_ROOT pointing to a pinned Dear ImGui source tree")
+    endif()
+    add_subdirectory(apps/desktop)
+endif()
 
 if(CARTO_BUILD_CLI)
     add_subdirectory(apps/cli)
@@ -83,4 +97,3 @@ install(FILES
 )
 
 install(DIRECTORY docs/ DESTINATION ${CMAKE_INSTALL_DOCDIR})
-

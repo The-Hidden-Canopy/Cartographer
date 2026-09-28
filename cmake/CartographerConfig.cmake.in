@@ -1,5 +1,9 @@
 @PACKAGE_INIT@
 
+if(@CARTO_ENABLE_VULKAN@)
+    include(CMakeFindDependencyMacro)
+    find_dependency(Vulkan)
+endif()
+
 include("${CMAKE_CURRENT_LIST_DIR}/CartographerTargets.cmake")
 check_required_components(Cartographer)
-

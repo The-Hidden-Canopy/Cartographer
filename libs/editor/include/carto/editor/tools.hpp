@@ -1,5 +1,6 @@
 #pragma once
 
+#include <carto/core/math.hpp>
 #include <carto/core/result.hpp>
 #include <carto/editor/command_bus.hpp>
 
@@ -17,19 +18,22 @@ struct ToolDescriptor {
 };
 
 struct ToolContext {
-    ToolContext(const SelectionState& selection, geometry::EditableMesh& mesh);
+    ToolContext(project::ProjectDocument& document, const SelectionState& selection);
 
     [[nodiscard]] const SelectionState& selection() const noexcept { return selection_; }
     [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
     make_extrude_selected_face_command(double distance) const;
+    [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
+    make_set_selected_vertex_position_command(core::Vec3d position) const;
 
 private:
+    project::ProjectDocument& document_;
     const SelectionState& selection_;
-    geometry::EditableMesh& mesh_;
 };
 
 struct ToolArguments {
     double distance = 0.0;
+    core::Vec3d position{};
 };
 
 using ToolFactory = std::function<core::Result<std::unique_ptr<EditorCommand>>(

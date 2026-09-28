@@ -16,12 +16,13 @@ struct Vec3d {
     }
 
     [[nodiscard]] double length_squared() const noexcept { return x * x + y * y + z * z; }
-    [[nodiscard]] double length() const noexcept { return std::sqrt(length_squared()); }
+    [[nodiscard]] double length() const noexcept { return std::hypot(std::hypot(x, y), z); }
 
     [[nodiscard]] Vec3d normalized(double epsilon = 1e-12) const noexcept {
         const double magnitude = length();
         if (!std::isfinite(magnitude) || magnitude <= epsilon) {
-            return {};
+            const double invalid = std::numeric_limits<double>::quiet_NaN();
+            return {invalid, invalid, invalid};
         }
         return {x / magnitude, y / magnitude, z / magnitude};
     }
@@ -71,10 +72,16 @@ struct Quaternion {
         return std::isfinite(x) && std::isfinite(y) && std::isfinite(z) && std::isfinite(w);
     }
 
+    [[nodiscard]] bool normalizable(double epsilon = 1e-12) const noexcept {
+        const double magnitude = std::hypot(std::hypot(x, y), std::hypot(z, w));
+        return finite() && std::isfinite(magnitude) && magnitude > epsilon;
+    }
+
     [[nodiscard]] Quaternion normalized(double epsilon = 1e-12) const noexcept {
-        const double magnitude = std::sqrt(x * x + y * y + z * z + w * w);
-        if (!std::isfinite(magnitude) || magnitude <= epsilon) {
-            return identity();
+        const double magnitude = std::hypot(std::hypot(x, y), std::hypot(z, w));
+        if (!normalizable(epsilon)) {
+            const double invalid = std::numeric_limits<double>::quiet_NaN();
+            return {invalid, invalid, invalid, invalid};
         }
         return {x / magnitude, y / magnitude, z / magnitude, w / magnitude};
     }
@@ -104,13 +111,15 @@ struct Transform {
     [[nodiscard]] static constexpr Transform identity() noexcept { return {}; }
 
     [[nodiscard]] bool finite() const noexcept {
-        return translation.finite() && rotation.finite() && scale.finite();
+        return translation.finite() && rotation.normalizable() && scale.finite();
     }
 
     [[nodiscard]] Transform combine(const Transform& child) const noexcept {
+        const Quaternion parent_rotation = rotation.normalized();
+        const Quaternion child_rotation = child.rotation.normalized();
         return {
-            translation + rotation.rotate(componentwise_multiply(scale, child.translation)),
-            (rotation * child.rotation).normalized(),
+            translation + parent_rotation.rotate(componentwise_multiply(scale, child.translation)),
+            (parent_rotation * child_rotation).normalized(),
             componentwise_multiply(scale, child.scale),
         };
     }

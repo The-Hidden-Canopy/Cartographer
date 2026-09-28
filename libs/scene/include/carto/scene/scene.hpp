@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -51,7 +52,7 @@ public:
 
     [[nodiscard]] core::Revision revision() const noexcept { return revision_; }
     [[nodiscard]] std::size_t size() const noexcept { return objects_.size(); }
-    void clear() noexcept;
+    [[nodiscard]] core::Result<void> clear();
 
 private:
     [[nodiscard]] bool would_create_cycle(ObjectId child, ObjectId parent) const;
@@ -61,9 +62,10 @@ private:
     void bump_revision() noexcept { revision_ = revision_.next(); }
 
     std::map<ObjectId, SceneObject> objects_;
+    std::map<ObjectId, std::set<ObjectId>> children_;
+    std::map<ObjectId, std::size_t> hierarchy_depths_;
     std::uint64_t next_id_ = 1;
     core::Revision revision_{};
 };
 
 } // namespace carto::scene
-

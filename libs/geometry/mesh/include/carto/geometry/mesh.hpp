@@ -1,6 +1,7 @@
 #pragma once
 
 #include <carto/geometry/compiled_mesh.hpp>
+#include <carto/geometry/ids.hpp>
 
 #include <carto/core/result.hpp>
 
@@ -12,20 +13,6 @@
 
 namespace carto::geometry {
 
-struct VertexId {
-    std::uint64_t value = 0;
-
-    [[nodiscard]] constexpr explicit operator bool() const noexcept { return value != 0; }
-    [[nodiscard]] constexpr auto operator<=>(const VertexId&) const noexcept = default;
-};
-
-struct FaceId {
-    std::uint64_t value = 0;
-
-    [[nodiscard]] constexpr explicit operator bool() const noexcept { return value != 0; }
-    [[nodiscard]] constexpr auto operator<=>(const FaceId&) const noexcept = default;
-};
-
 struct Vertex {
     VertexId id;
     core::Vec3d position;
@@ -34,13 +21,6 @@ struct Vertex {
 struct Face {
     FaceId id;
     std::vector<VertexId> vertices;
-};
-
-struct HalfEdgeId {
-    std::uint64_t value = 0;
-
-    [[nodiscard]] constexpr explicit operator bool() const noexcept { return value != 0; }
-    [[nodiscard]] constexpr auto operator<=>(const HalfEdgeId&) const noexcept = default;
 };
 
 struct HalfEdgeRecord {
@@ -70,7 +50,7 @@ public:
     [[nodiscard]] core::Result<void> set_vertex_position(VertexId id, core::Vec3d position);
     [[nodiscard]] core::Result<void> extrude_face(FaceId id, double distance);
     [[nodiscard]] core::Result<void> restore_from(const EditableMesh& source);
-    void restore_revision(core::Revision revision) noexcept { revision_ = revision; }
+    [[nodiscard]] core::Result<void> restore_revision(core::Revision revision);
 
     [[nodiscard]] const Vertex* find_vertex(VertexId id) const noexcept;
     [[nodiscard]] const Face* find_face(FaceId id) const noexcept;

@@ -23,6 +23,10 @@ Diagnostic validation(std::string message) {
     return Diagnostic(ErrorCode::validation_failed, std::move(message));
 }
 
+Diagnostic exhausted_revision() {
+    return Diagnostic(ErrorCode::invalid_state, "mesh revision space is exhausted");
+}
+
 struct EdgeKey {
     VertexId first;
     VertexId second;
@@ -41,6 +45,9 @@ double triangle_area_squared(core::Vec3d a, core::Vec3d b, core::Vec3d c) {
 } // namespace
 
 core::Result<VertexId> EditableMesh::add_vertex(core::Vec3d position) {
+    if (revision_.exhausted()) {
+        return core::Result<VertexId>::failure(exhausted_revision());
+    }
     if (!position.finite()) {
         return core::Result<VertexId>::failure(invalid("mesh vertex position must be finite"));
     }
@@ -55,6 +62,9 @@ core::Result<VertexId> EditableMesh::add_vertex(core::Vec3d position) {
 }
 
 core::Result<void> EditableMesh::insert_vertex(Vertex vertex) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
     if (!vertex.id || !vertex.position.finite()) {
         return core::Result<void>::failure(
             invalid("inserted mesh vertex requires a non-zero id and finite position"));
@@ -73,6 +83,9 @@ core::Result<void> EditableMesh::insert_vertex(Vertex vertex) {
 }
 
 core::Result<void> EditableMesh::set_vertex_position(VertexId id, core::Vec3d position) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
     if (!position.finite()) {
         return core::Result<void>::failure(invalid("mesh vertex position must be finite"));
     }
@@ -92,6 +105,9 @@ core::Result<void> EditableMesh::set_vertex_position(VertexId id, core::Vec3d po
 }
 
 core::Result<void> EditableMesh::extrude_face(FaceId id, double distance) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
     if (!std::isfinite(distance) || distance <= 0.0) {
         return core::Result<void>::failure(
             invalid("face extrusion distance must be finite and strictly positive"));
@@ -110,7 +126,7 @@ core::Result<void> EditableMesh::extrude_face(FaceId id, double distance) {
     const core::Vec3d second = vertices_.at(original.vertices[1]).position;
     const core::Vec3d third = vertices_.at(original.vertices[2]).position;
     const core::Vec3d normal = core::cross(second - first, third - first).normalized();
-    if (normal.length_squared() <= 1e-24) {
+    if (!normal.finite() || normal.length_squared() <= 1e-24) {
         return core::Result<void>::failure(validation("cannot extrude a zero-area face"));
     }
 
@@ -154,6 +170,9 @@ core::Result<void> EditableMesh::extrude_face(FaceId id, double distance) {
 }
 
 core::Result<void> EditableMesh::restore_from(const EditableMesh& source) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
     if (auto result = source.validate(); !result) {
         return result;
     }
@@ -165,7 +184,18 @@ core::Result<void> EditableMesh::restore_from(const EditableMesh& source) {
     return core::Result<void>::success();
 }
 
+core::Result<void> EditableMesh::restore_revision(core::Revision revision) {
+    if (revision.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    revision_ = revision;
+    return core::Result<void>::success();
+}
+
 core::Result<FaceId> EditableMesh::add_face(std::vector<VertexId> vertices) {
+    if (revision_.exhausted()) {
+        return core::Result<FaceId>::failure(exhausted_revision());
+    }
     if (vertices.size() < 3U) {
         return core::Result<FaceId>::failure(
             invalid("mesh face requires at least three vertices"));
@@ -198,6 +228,9 @@ core::Result<FaceId> EditableMesh::add_face(std::vector<VertexId> vertices) {
 }
 
 core::Result<void> EditableMesh::insert_face(Face face) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
     if (!face.id || face.vertices.size() < 3U) {
         return core::Result<void>::failure(
             invalid("inserted mesh face requires a non-zero id and at least three vertices"));
@@ -385,16 +418,17 @@ core::Result<CompiledMesh> EditableMesh::compile() const {
         indices.emplace(id, static_cast<std::uint32_t>(compiled.positions.size()));
         compiled.positions.push_back(vertex.position);
         compiled.normals.push_back({});
+        compiled.vertex_ids.push_back(id);
         compiled.bounds.include(vertex.position);
     }
 
     for (const auto& [face_id, face] : faces_) {
-        static_cast<void>(face_id);
         const std::uint32_t first = indices.at(face.vertices.front());
         for (std::size_t index = 1U; index + 1U < face.vertices.size(); ++index) {
             const std::uint32_t second = indices.at(face.vertices[index]);
             const std::uint32_t third = indices.at(face.vertices[index + 1U]);
             compiled.indices.insert(compiled.indices.end(), {first, second, third});
+            compiled.triangle_faces.push_back(face_id);
             const core::Vec3d normal = core::cross(
                 compiled.positions[second] - compiled.positions[first],
                 compiled.positions[third] - compiled.positions[first]);

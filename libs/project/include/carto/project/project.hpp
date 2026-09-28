@@ -1,5 +1,6 @@
 #pragma once
 
+#include <carto/core/revision.hpp>
 #include <carto/core/result.hpp>
 #include <carto/geometry/mesh.hpp>
 #include <carto/scene/scene.hpp>
@@ -45,10 +46,26 @@ public:
     [[nodiscard]] core::Result<void> insert_mesh(
         std::uint64_t mesh_asset,
         geometry::EditableMesh mesh);
+    // Replaces a validated asset and advances its source revision.
+    [[nodiscard]] core::Result<void> replace_mesh(
+        std::uint64_t mesh_asset,
+        geometry::EditableMesh mesh);
+    // Replaces only when the caller still owns the expected source revision.
+    [[nodiscard]] core::Result<core::Revision> replace_mesh_if_revision(
+        std::uint64_t mesh_asset,
+        core::Revision expected_revision,
+        geometry::EditableMesh mesh);
     [[nodiscard]] core::Result<void> remove_mesh(std::uint64_t mesh_asset);
     [[nodiscard]] core::Result<void> attach_mesh(
         scene::ObjectId object,
         std::uint64_t mesh_asset);
+    [[nodiscard]] core::Result<void> set_object_transform(
+        scene::ObjectId object,
+        core::Transform transform);
+    [[nodiscard]] core::Result<core::Revision> set_object_transform_if_revision(
+        scene::ObjectId object,
+        core::Revision expected_revision,
+        core::Transform transform);
 
     [[nodiscard]] core::Result<SaveReceipt> save_atomic(const std::filesystem::path& path) const;
     [[nodiscard]] std::string serialize() const;

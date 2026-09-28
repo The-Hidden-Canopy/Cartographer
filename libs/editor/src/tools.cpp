@@ -15,13 +15,27 @@ Diagnostic invalid(std::string message) {
 
 } // namespace
 
-ToolContext::ToolContext(const SelectionState& selection, geometry::EditableMesh& mesh)
-    : selection_(selection), mesh_(mesh) {}
+ToolContext::ToolContext(
+    project::ProjectDocument& document,
+    const SelectionState& selection)
+    : document_(document), selection_(selection) {}
 
 core::Result<std::unique_ptr<EditorCommand>>
 ToolContext::make_extrude_selected_face_command(double distance) const {
     return core::Result<std::unique_ptr<EditorCommand>>::success(
-        std::make_unique<ExtrudeSelectedFaceCommand>(selection_, mesh_, distance));
+        std::make_unique<ExtrudeProjectSelectedFaceCommand>(
+            document_,
+            selection_,
+            distance));
+}
+
+core::Result<std::unique_ptr<EditorCommand>>
+ToolContext::make_set_selected_vertex_position_command(core::Vec3d position) const {
+    return core::Result<std::unique_ptr<EditorCommand>>::success(
+        std::make_unique<SetProjectSelectedVertexPositionCommand>(
+            document_,
+            selection_,
+            position));
 }
 
 core::Result<void> ToolRegistry::register_tool(
@@ -44,11 +58,20 @@ core::Result<void> ToolRegistry::register_tool(
 }
 
 core::Result<void> ToolRegistry::register_builtin_tools() {
-    return register_tool(
+    if (auto result = register_tool(
         {"mesh.extrude-face", "Extrude selected face"},
         [](const ToolContext& context, const ToolArguments& arguments)
             -> core::Result<std::unique_ptr<EditorCommand>> {
             return context.make_extrude_selected_face_command(arguments.distance);
+        });
+        !result) {
+        return result;
+    }
+    return register_tool(
+        {"mesh.set-vertex-position", "Set selected vertex position"},
+        [](const ToolContext& context, const ToolArguments& arguments)
+            -> core::Result<std::unique_ptr<EditorCommand>> {
+            return context.make_set_selected_vertex_position_command(arguments.position);
         });
 }
 

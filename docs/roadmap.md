@@ -18,9 +18,19 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] ephemeral object/vertex/face selection with context validation
 - [x] validated single-face selection-to-tool adapter
 - [x] explicit tool registry dispatching commands through editor history
-- [ ] desktop shell and workspace registry
-- [ ] Vulkan resource backend and viewport
-- [ ] interactive selection UI, stable edge mode, and broader modeling tool interaction
+- [x] project-bound tool context routing selected components to the owning mesh asset
+- [x] project-bound selected-vertex position editing with topology-safe rollback
+- [x] headless application/session boundary for the first authoring vertical slice
+- [x] validated ephemeral workspace/pane state with a required viewport
+- [x] stable compiled vertex/face identity mapping for future viewport picking
+- [ ] desktop shell and workspace registry (source scaffold present; native acceptance pending)
+- [ ] Vulkan resource backend and viewport (optional source path present; SDK/GPU acceptance pending)
+- [ ] interactive selection UI, stable edge mode, and broader modeling tool interaction (headless dispatch exists; input acceptance pending)
+
+The optional native source path is intentionally not marked complete by the
+presence of a window class or renderer type. It requires a caller-supplied
+Vulkan SDK and pinned Dear ImGui checkout, then a real build, launch, input,
+resize/DPI, and GPU evidence pass.
 
 ## 0.2 - non-destructive DCC maturity
 

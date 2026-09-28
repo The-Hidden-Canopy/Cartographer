@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <vector>
 
 namespace carto::render {
 
@@ -23,6 +24,7 @@ public:
     [[nodiscard]] core::Result<void> remove(scene::ObjectId object);
     [[nodiscard]] const RenderInstance* find(scene::ObjectId object) const noexcept;
     [[nodiscard]] std::size_t size() const noexcept { return instances_.size(); }
+    [[nodiscard]] std::vector<RenderInstance> instances() const;
 
 private:
     std::map<scene::ObjectId, RenderInstance> instances_;

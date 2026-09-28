@@ -31,13 +31,13 @@ organizational mutation surface.
 - Dataset/eval risk: no training or evaluation data is generated. A rendered
   image or mesh export must not be promoted to model or capability evidence
   without a separate provenance decision.
-- Deployment risk: the current CLI is offline and headless. It does not prove
-  desktop packaging, GPU availability, runtime DLL delivery, or cloud
-  deployment.
+- Deployment risk: the default CLI and tests are offline and headless. The
+  optional native source path does not prove desktop packaging, GPU
+  availability, runtime DLL delivery, or cloud deployment until its SDK,
+  pinned ImGui dependency, and Windows runtime are independently accepted.
 
 ## Required follow-up before integration
 
 Add an adapter-specific contract, fixture provenance, version negotiation,
 round-trip/loss tests, and an independent consumer acceptance run. Do not
 import Cartographer internals into any of the four systems.
-

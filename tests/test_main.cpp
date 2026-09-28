@@ -95,11 +95,58 @@ void scene_resolves_double_precision_world_transform() {
     REQUIRE(world.value().translation.z == 3.75);
 }
 
+void scene_rejects_nonfinite_world_transform_and_deep_hierarchies() {
+    carto::scene::Scene scene;
+    carto::core::Transform large_root;
+    large_root.translation = {1.0e308, 0.0, 0.0};
+    const auto root = scene.create_object("Large Root", large_root);
+    carto::core::Transform large_child;
+    large_child.translation = {1.0e308, 0.0, 0.0};
+    const auto child = scene.create_object("Large Child", large_child);
+    REQUIRE(root && child);
+    const auto nonfinite_composition = large_root.combine(large_child);
+    REQUIRE(!nonfinite_composition.finite());
+    REQUIRE(scene.set_parent(child.value(), root.value()));
+    const auto nonfinite = scene.world_transform(child.value());
+    REQUIRE(!nonfinite);
+    REQUIRE(nonfinite.error().code == carto::core::ErrorCode::validation_failed);
+
+    carto::core::Transform zero_rotation;
+    zero_rotation.rotation = {0.0, 0.0, 0.0, 0.0};
+    REQUIRE(!scene.create_object("Zero rotation", zero_rotation));
+    REQUIRE(!zero_rotation.combine(carto::core::Transform::identity()).finite());
+
+    constexpr std::size_t depth = 4097U;
+    std::string serialized =
+        "CARTOGRAPHER_PROJECT 1\n"
+        "NAME \"Deep hierarchy\"\n"
+        "REVISION 0\n";
+    serialized += "OBJECTS " + std::to_string(depth) + "\n";
+    for (std::size_t index = 1U; index <= depth; ++index) {
+        const std::size_t parent = index == depth ? 0U : index + 1U;
+        serialized += "OBJECT " + std::to_string(index) + " " + std::to_string(parent) +
+            " \"Object" + std::to_string(index) + "\" 0 0 0 0 0 0 1 1 1 1 0 0 0\n";
+    }
+    serialized += "MESHES 0\nEND\n";
+    const auto deep = carto::project::ProjectDocument::deserialize(serialized);
+    REQUIRE(!deep);
+    REQUIRE(deep.error().code == carto::core::ErrorCode::invalid_state);
+}
+
 void selection_is_mode_scoped_and_context_validated() {
     carto::scene::Scene scene;
     const auto first_object = scene.create_object("First");
     const auto second_object = scene.create_object("Second");
     REQUIRE(first_object && second_object);
+
+    carto::editor::SelectionState invalid_state;
+    REQUIRE(!invalid_state.set_mode(static_cast<carto::editor::SelectionMode>(99)));
+    REQUIRE(invalid_state.mode() == carto::editor::SelectionMode::object);
+    REQUIRE(!invalid_state.select_object(
+        scene,
+        first_object.value(),
+        static_cast<carto::editor::SelectionOperation>(99)));
+    REQUIRE(invalid_state.empty());
 
     auto mesh = triangle_mesh();
     const auto vertex = mesh.vertices_sorted().front().id;
@@ -143,10 +190,52 @@ void selection_is_mode_scoped_and_context_validated() {
     REQUIRE(!stale_selection);
     REQUIRE(stale_selection.error().code == carto::core::ErrorCode::stale_data);
 
-    REQUIRE(scene.remove_object(second_object.value()));
-    carto::editor::SelectionState stale_object_selection;
-    REQUIRE(stale_object_selection.select_object(scene, first_object.value()));
+    carto::editor::SelectionState bound_selection;
+    REQUIRE(bound_selection.select_face(
+        scene, first_object.value(), box.value(), box_face));
+    REQUIRE(bound_selection.component_object().has_value());
+    REQUIRE(*bound_selection.component_object() == first_object.value());
+    REQUIRE(bound_selection.validate(scene, &box.value()));
+    const auto cross_object = bound_selection.select_face(
+        scene,
+        second_object.value(),
+        box.value(),
+        box_face,
+        carto::editor::SelectionOperation::add);
+    REQUIRE(!cross_object);
+    REQUIRE(cross_object.error().code == carto::core::ErrorCode::invalid_state);
+    REQUIRE(bound_selection.active_count() == 1U);
+    REQUIRE(*bound_selection.component_object() == first_object.value());
+
+    carto::editor::SelectionState unbound_binding;
+    REQUIRE(unbound_binding.select_face(box.value(), box_face));
+    const auto bind_without_replace = unbound_binding.select_face(
+        scene,
+        first_object.value(),
+        box.value(),
+        box_face,
+        carto::editor::SelectionOperation::add);
+    REQUIRE(!bind_without_replace);
+    REQUIRE(bind_without_replace.error().code == carto::core::ErrorCode::invalid_state);
+    REQUIRE(unbound_binding.active_count() == 1U);
+    REQUIRE(!unbound_binding.component_object().has_value());
+
+    const auto bound_vertex = box.value().vertices_sorted().front();
+    auto changed_position = bound_vertex.position;
+    changed_position.x += 0.125;
+    REQUIRE(box.value().set_vertex_position(bound_vertex.id, changed_position));
+    const auto stale_revision = bound_selection.validate(scene, &box.value());
+    REQUIRE(!stale_revision);
+    REQUIRE(stale_revision.error().code == carto::core::ErrorCode::stale_data);
+
     REQUIRE(scene.remove_object(first_object.value()));
+    const auto stale_component = bound_selection.validate(scene, &box.value());
+    REQUIRE(!stale_component);
+    REQUIRE(stale_component.error().code == carto::core::ErrorCode::stale_data);
+
+    carto::editor::SelectionState stale_object_selection;
+    REQUIRE(stale_object_selection.select_object(scene, second_object.value()));
+    REQUIRE(scene.remove_object(second_object.value()));
     const auto stale_object = stale_object_selection.validate(scene);
     REQUIRE(!stale_object);
     REQUIRE(stale_object.error().code == carto::core::ErrorCode::stale_data);
@@ -239,6 +328,16 @@ void primitives_are_deterministic_and_dimension_validated() {
     const auto invalid_plane = carto::geometry::make_plane(
         std::numeric_limits<double>::quiet_NaN(), 2.0);
     REQUIRE(!invalid_plane);
+}
+
+void vector_normalization_preserves_invalid_state() {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const carto::core::Vec3d zero{};
+    const carto::core::Vec3d nonfinite{nan, 0.0, 0.0};
+    const carto::core::Vec3d huge{1.0e308, 0.0, 0.0};
+    REQUIRE(!zero.normalized().finite());
+    REQUIRE(!nonfinite.normalized().finite());
+    REQUIRE(huge.normalized().x == 1.0);
 }
 
 void vertex_edit_command_is_reversible_and_topology_atomic() {
@@ -374,28 +473,48 @@ void selected_face_tool_adapter_validates_before_delegating() {
 }
 
 void tool_registry_dispatches_registered_commands_through_history() {
-    auto primitive = carto::geometry::make_box({2.0, 2.0, 2.0});
-    REQUIRE(primitive);
-    auto mesh = std::move(primitive.value());
+    auto document = carto::project::ProjectDocument::create("Tool registry workflow");
+    REQUIRE(document);
+    const auto first_object = document.value().create_object("First");
+    const auto second_object = document.value().create_object("Second");
+    REQUIRE(first_object && second_object);
+    auto first_primitive = carto::geometry::make_box({2.0, 2.0, 2.0});
+    auto second_primitive = carto::geometry::make_box({1.0, 1.0, 1.0});
+    REQUIRE(first_primitive && second_primitive);
+    const auto first_mesh = document.value().add_mesh(std::move(first_primitive.value()));
+    const auto second_mesh = document.value().add_mesh(std::move(second_primitive.value()));
+    REQUIRE(first_mesh && second_mesh);
+    REQUIRE(document.value().attach_mesh(first_object.value(), first_mesh.value()));
+    REQUIRE(document.value().attach_mesh(second_object.value(), second_mesh.value()));
     carto::editor::SelectionState selection;
-    REQUIRE(selection.select_face(mesh, mesh.faces_sorted().front().id));
-    carto::editor::ToolContext context(selection, mesh);
+    const auto selected_face = document.value().meshes().at(second_mesh.value()).faces_sorted().front().id;
+    REQUIRE(selection.select_face(
+        document.value().scene(),
+        second_object.value(),
+        document.value().meshes().at(second_mesh.value()),
+        selected_face));
+    carto::editor::ToolContext context(document.value(), selection);
     carto::editor::ToolArguments arguments{0.5};
     carto::editor::CommandBus history;
     carto::editor::ToolRegistry registry;
     REQUIRE(registry.register_builtin_tools());
     const auto descriptors = registry.descriptors();
-    REQUIRE(descriptors.size() == 1U);
+    REQUIRE(descriptors.size() == 2U);
     REQUIRE(descriptors.front().id == "mesh.extrude-face");
+    REQUIRE(descriptors.back().id == "mesh.set-vertex-position");
     REQUIRE(!registry.register_builtin_tools());
 
     REQUIRE(registry.invoke("mesh.extrude-face", context, arguments, history));
     REQUIRE(history.undo_count() == 1U);
-    REQUIRE(mesh.vertex_count() == 12U);
+    REQUIRE(document.value().meshes().at(first_mesh.value()).vertex_count() == 8U);
+    REQUIRE(document.value().meshes().at(second_mesh.value()).vertex_count() == 12U);
     REQUIRE(history.undo());
-    REQUIRE(mesh.vertex_count() == 8U);
+    REQUIRE(document.value().meshes().at(first_mesh.value()).vertex_count() == 8U);
+    REQUIRE(document.value().meshes().at(second_mesh.value()).vertex_count() == 8U);
     REQUIRE(history.redo());
-    REQUIRE(mesh.vertex_count() == 12U);
+    REQUIRE(document.value().meshes().at(first_mesh.value()).vertex_count() == 8U);
+    REQUIRE(document.value().meshes().at(second_mesh.value()).vertex_count() == 12U);
+    REQUIRE(document.value().validate());
 
     const auto missing = registry.invoke("missing-tool", context, arguments, history);
     REQUIRE(!missing);
@@ -422,6 +541,161 @@ void tool_registry_dispatches_registered_commands_through_history() {
     REQUIRE(!null_command);
     REQUIRE(null_command.error().code == carto::core::ErrorCode::invalid_argument);
     REQUIRE(history.undo_count() == 1U);
+}
+
+void project_vertex_tool_routes_through_history_and_rejects_bad_context() {
+    auto document = carto::project::ProjectDocument::create("Project vertex workflow");
+    REQUIRE(document);
+    const auto first_object = document.value().create_object("First");
+    const auto second_object = document.value().create_object("Second");
+    const auto unbound_object = document.value().create_object("No mesh");
+    REQUIRE(first_object && second_object && unbound_object);
+    auto first_primitive = carto::geometry::make_box({2.0, 2.0, 2.0});
+    auto second_primitive = carto::geometry::make_box({1.0, 1.0, 1.0});
+    REQUIRE(first_primitive && second_primitive);
+    const auto first_mesh = document.value().add_mesh(std::move(first_primitive.value()));
+    const auto second_mesh = document.value().add_mesh(std::move(second_primitive.value()));
+    REQUIRE(first_mesh && second_mesh);
+    REQUIRE(document.value().attach_mesh(first_object.value(), first_mesh.value()));
+    REQUIRE(document.value().attach_mesh(second_object.value(), second_mesh.value()));
+
+    const auto second_vertex = document.value().meshes().at(second_mesh.value()).vertices_sorted().front();
+    const auto first_position = document.value().meshes().at(first_mesh.value()).vertices_sorted().front().position;
+    const auto original_position = second_vertex.position;
+    auto target_position = original_position;
+    target_position.x += 0.25;
+
+    carto::editor::SelectionState selection;
+    REQUIRE(selection.select_vertex(
+        document.value().scene(),
+        second_object.value(),
+        document.value().meshes().at(second_mesh.value()),
+        second_vertex.id));
+    carto::editor::ToolContext context(document.value(), selection);
+    carto::editor::ToolArguments arguments;
+    arguments.position = target_position;
+    carto::editor::CommandBus history;
+    carto::editor::ToolRegistry registry;
+    REQUIRE(registry.register_builtin_tools());
+    const auto descriptors = registry.descriptors();
+    REQUIRE(descriptors.size() == 2U);
+    REQUIRE(descriptors[0].id == "mesh.extrude-face");
+    REQUIRE(descriptors[1].id == "mesh.set-vertex-position");
+    REQUIRE(!registry.register_builtin_tools());
+
+    carto::editor::SelectionState rebound_selection;
+    REQUIRE(rebound_selection.select_vertex(
+        document.value().scene(),
+        second_object.value(),
+        document.value().meshes().at(second_mesh.value()),
+        second_vertex.id));
+    REQUIRE(document.value().attach_mesh(second_object.value(), first_mesh.value()));
+    carto::editor::ToolContext rebound_context(document.value(), rebound_selection);
+    carto::editor::CommandBus rebound_history;
+    const auto rebound_result = registry.invoke(
+        "mesh.set-vertex-position", rebound_context, arguments, rebound_history);
+    REQUIRE(!rebound_result);
+    REQUIRE(rebound_result.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(rebound_history.undo_count() == 0U);
+    REQUIRE(document.value().attach_mesh(second_object.value(), second_mesh.value()));
+
+    REQUIRE(registry.invoke("mesh.set-vertex-position", context, arguments, history));
+    REQUIRE(history.undo_count() == 1U);
+    REQUIRE(document.value().meshes().at(first_mesh.value()).vertices_sorted().front().position.x ==
+            first_position.x);
+    REQUIRE(document.value().meshes().at(second_mesh.value()).find_vertex(second_vertex.id)->position.x ==
+            target_position.x);
+    REQUIRE(document.value().validate());
+    REQUIRE(history.undo());
+    REQUIRE(document.value().meshes().at(second_mesh.value()).find_vertex(second_vertex.id)->position.x ==
+            original_position.x);
+    REQUIRE(history.redo());
+    REQUIRE(document.value().meshes().at(second_mesh.value()).find_vertex(second_vertex.id)->position.x ==
+            target_position.x);
+
+    carto::editor::SelectionState replacement_selection;
+    REQUIRE(replacement_selection.select_vertex(
+        document.value().scene(),
+        second_object.value(),
+        document.value().meshes().at(second_mesh.value()),
+        second_vertex.id));
+    const auto replacement_revision = document.value().meshes().at(second_mesh.value()).revision();
+    auto same_revision_mesh = document.value().meshes().at(second_mesh.value());
+    REQUIRE(document.value().replace_mesh(second_mesh.value(), std::move(same_revision_mesh)));
+    REQUIRE(document.value().meshes().at(second_mesh.value()).revision() > replacement_revision);
+    const auto stale_replacement = replacement_selection.validate(
+        document.value().scene(), &document.value().meshes().at(second_mesh.value()));
+    REQUIRE(!stale_replacement);
+    REQUIRE(stale_replacement.error().code == carto::core::ErrorCode::stale_data);
+    const auto conflicted_undo = history.undo();
+    REQUIRE(!conflicted_undo);
+    REQUIRE(conflicted_undo.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(history.undo_count() == 1U);
+
+    carto::editor::SelectionState wrong_mode;
+    const auto second_face = document.value().meshes().at(second_mesh.value()).faces_sorted().front().id;
+    REQUIRE(wrong_mode.select_face(
+        document.value().scene(),
+        second_object.value(),
+        document.value().meshes().at(second_mesh.value()),
+        second_face));
+    carto::editor::ToolContext wrong_context(document.value(), wrong_mode);
+    carto::editor::CommandBus wrong_history;
+    REQUIRE(!registry.invoke("mesh.set-vertex-position", wrong_context, arguments, wrong_history));
+    REQUIRE(wrong_history.undo_count() == 0U);
+
+    carto::editor::SelectionState multiple_selection;
+    const auto second_vertices = document.value().meshes().at(second_mesh.value()).vertices_sorted();
+    REQUIRE(multiple_selection.select_vertex(
+        document.value().scene(),
+        second_object.value(),
+        document.value().meshes().at(second_mesh.value()),
+        second_vertices[0].id));
+    REQUIRE(multiple_selection.select_vertex(
+        document.value().scene(),
+        second_object.value(),
+        document.value().meshes().at(second_mesh.value()),
+        second_vertices[1].id,
+        carto::editor::SelectionOperation::add));
+    carto::editor::ToolContext multiple_context(document.value(), multiple_selection);
+    carto::editor::CommandBus multiple_history;
+    REQUIRE(!registry.invoke("mesh.set-vertex-position", multiple_context, arguments, multiple_history));
+    REQUIRE(multiple_history.undo_count() == 0U);
+
+    carto::editor::SelectionState no_mesh_selection;
+    REQUIRE(no_mesh_selection.select_vertex(
+        document.value().scene(),
+        unbound_object.value(),
+        document.value().meshes().at(second_mesh.value()),
+        second_vertex.id));
+    carto::editor::ToolContext no_mesh_context(document.value(), no_mesh_selection);
+    carto::editor::CommandBus no_mesh_history;
+    REQUIRE(!registry.invoke("mesh.set-vertex-position", no_mesh_context, arguments, no_mesh_history));
+    REQUIRE(no_mesh_history.undo_count() == 0U);
+
+    carto::editor::SelectionState invalid_selection;
+    REQUIRE(invalid_selection.select_vertex(
+        document.value().scene(),
+        second_object.value(),
+        document.value().meshes().at(second_mesh.value()),
+        second_vertex.id));
+    carto::editor::ToolContext invalid_context(document.value(), invalid_selection);
+    const auto invalid_target = document.value().meshes().at(second_mesh.value()).vertices_sorted().at(1).position;
+    arguments.position = invalid_target;
+    carto::editor::CommandBus invalid_history;
+    const auto invalid_result = registry.invoke(
+        "mesh.set-vertex-position", invalid_context, arguments, invalid_history);
+    REQUIRE(!invalid_result);
+    REQUIRE(invalid_result.error().code == carto::core::ErrorCode::validation_failed);
+    REQUIRE(invalid_history.undo_count() == 0U);
+    REQUIRE(document.value().meshes().at(second_mesh.value()).find_vertex(second_vertex.id)->position.x ==
+            target_position.x);
+
+    REQUIRE(document.value().remove_object(second_object.value()));
+    carto::editor::CommandBus stale_history;
+    arguments.position = target_position;
+    REQUIRE(!registry.invoke("mesh.set-vertex-position", context, arguments, stale_history));
+    REQUIRE(stale_history.undo_count() == 0U);
 }
 
 void create_mesh_object_command_preserves_ids_across_undo_redo() {
@@ -458,12 +732,24 @@ void create_mesh_object_command_preserves_ids_across_undo_redo() {
     REQUIRE(invalid_document);
     auto second_primitive = carto::geometry::make_plane(1.0, 1.0);
     REQUIRE(second_primitive);
+    const auto before_revision = invalid_document.value().revision();
+    const auto before_serialized = invalid_document.value().serialize();
     carto::editor::CommandBus invalid_bus;
     REQUIRE(!invalid_bus.execute(std::make_unique<carto::editor::CreateMeshObjectCommand>(
         invalid_document.value(), "", std::move(second_primitive.value()))));
     REQUIRE(invalid_bus.undo_count() == 0U);
     REQUIRE(invalid_document.value().scene().size() == 0U);
     REQUIRE(invalid_document.value().meshes().empty());
+    REQUIRE(invalid_document.value().revision() == before_revision);
+    REQUIRE(invalid_document.value().serialize() == before_serialized);
+
+    auto recovered_primitive = carto::geometry::make_plane(1.0, 1.0);
+    REQUIRE(recovered_primitive);
+    REQUIRE(invalid_bus.execute(std::make_unique<carto::editor::CreateMeshObjectCommand>(
+        invalid_document.value(), "Recovered", std::move(recovered_primitive.value()))));
+    REQUIRE(invalid_document.value().scene().objects_sorted().front().id ==
+            carto::scene::ObjectId{1});
+    REQUIRE(*invalid_document.value().scene().objects_sorted().front().mesh_asset == 1U);
 }
 
 void stale_render_result_is_rejected() {
@@ -482,6 +768,28 @@ void stale_render_result_is_rejected() {
     });
     REQUIRE(!stale);
     REQUIRE(stale.error().code == carto::core::ErrorCode::stale_data);
+
+    auto malformed = compiled.value();
+    malformed.indices.front() = static_cast<std::uint32_t>(malformed.positions.size());
+    REQUIRE(!malformed.valid());
+    REQUIRE(!render.upsert({
+        object,
+        std::make_shared<carto::geometry::CompiledMesh>(std::move(malformed)),
+        carto::core::Transform::identity(),
+        compiled.value().source_revision,
+    }));
+
+    carto::core::Transform overflowing;
+    overflowing.translation = {1.0e308, 0.0, 0.0};
+    overflowing.scale = {1.0e308, 1.0, 1.0};
+    const auto nonfinite_world = render.upsert({
+        object,
+        compiled_ptr,
+        overflowing,
+        compiled.value().source_revision,
+    });
+    REQUIRE(!nonfinite_world);
+    REQUIRE(nonfinite_world.error().code == carto::core::ErrorCode::validation_failed);
 }
 
 void command_bus_is_reversible_and_rejects_failed_commands() {
@@ -517,6 +825,53 @@ void command_bus_is_reversible_and_rejects_failed_commands() {
     REQUIRE(!bus.redo());
 }
 
+void project_transform_command_rejects_stale_undo() {
+    auto document = carto::project::ProjectDocument::create("Transform guard");
+    REQUIRE(document);
+    const auto object = document.value().create_object("Object");
+    REQUIRE(object);
+    const auto before = document.value().scene().find(object.value())->local_transform;
+    auto after = before;
+    after.translation.x = 4.0;
+
+    carto::editor::CommandBus bus;
+    REQUIRE(bus.execute(std::make_unique<carto::editor::SetProjectObjectTransformCommand>(
+        document.value(), object.value(), before, after)));
+    auto external = after;
+    external.translation.y = 9.0;
+    REQUIRE(document.value().set_object_transform(object.value(), external));
+
+    REQUIRE(!bus.undo());
+    REQUIRE(bus.undo_count() == 1U);
+    const auto* current = document.value().scene().find(object.value());
+    REQUIRE(current != nullptr);
+    REQUIRE(current->local_transform.translation.x == 4.0);
+    REQUIRE(current->local_transform.translation.y == 9.0);
+
+    auto deferred_document = carto::project::ProjectDocument::create("Deferred transform guard");
+    REQUIRE(deferred_document);
+    const auto deferred_object = deferred_document.value().create_object("Object");
+    REQUIRE(deferred_object);
+    const auto deferred_before =
+        deferred_document.value().scene().find(deferred_object.value())->local_transform;
+    auto deferred_after = deferred_before;
+    deferred_after.translation.x = 12.0;
+    auto deferred_command = std::make_unique<carto::editor::SetProjectObjectTransformCommand>(
+        deferred_document.value(), deferred_object.value(), deferred_before, deferred_after);
+    auto external_transform = deferred_before;
+    external_transform.translation.y = 6.0;
+    REQUIRE(deferred_document.value().set_object_transform(
+        deferred_object.value(), external_transform));
+    carto::editor::CommandBus deferred_bus;
+    REQUIRE(!deferred_bus.execute(std::move(deferred_command)));
+    REQUIRE(deferred_bus.undo_count() == 0U);
+    const auto* deferred_current =
+        deferred_document.value().scene().find(deferred_object.value());
+    REQUIRE(deferred_current != nullptr);
+    REQUIRE(deferred_current->local_transform.translation.x == 0.0);
+    REQUIRE(deferred_current->local_transform.translation.y == 6.0);
+}
+
 void project_round_trips_authoritative_state_and_rejects_future_versions() {
     TempDirectory temp;
     const auto path = temp.path() / "scene.carto";
@@ -544,6 +899,116 @@ void project_round_trips_authoritative_state_and_rejects_future_versions() {
     const auto rejected = carto::project::ProjectDocument::deserialize(future);
     REQUIRE(!rejected);
     REQUIRE(rejected.error().code == carto::core::ErrorCode::version_mismatch);
+
+    REQUIRE(carto::core::Revision(carto::core::Revision::max_value()).next() ==
+            carto::core::Revision(carto::core::Revision::max_value()));
+    auto exhausted_mesh = triangle_mesh();
+    REQUIRE(!exhausted_mesh.restore_revision(
+        carto::core::Revision(carto::core::Revision::max_value())));
+    std::string exhausted_project = serialized_before;
+    const auto revision_position = exhausted_project.find("REVISION ");
+    REQUIRE(revision_position != std::string::npos);
+    const auto revision_end = exhausted_project.find('\n', revision_position);
+    exhausted_project.replace(
+        revision_position,
+        revision_end - revision_position,
+        "REVISION " + std::to_string(carto::core::Revision::max_value()));
+    const auto exhausted_project_rejected =
+        carto::project::ProjectDocument::deserialize(exhausted_project);
+    REQUIRE(!exhausted_project_rejected);
+    REQUIRE(exhausted_project_rejected.error().code ==
+            carto::core::ErrorCode::validation_failed);
+
+    std::string exhausted_mesh_revision = serialized_before;
+    const auto serialized_mesh_start = exhausted_mesh_revision.find(
+        "MESH ", exhausted_mesh_revision.find("MESHES "));
+    REQUIRE(serialized_mesh_start != std::string::npos);
+    const auto mesh_id_end = exhausted_mesh_revision.find(' ', serialized_mesh_start + 5U);
+    const auto mesh_revision_end = exhausted_mesh_revision.find('\n', mesh_id_end + 1U);
+    REQUIRE(mesh_id_end != std::string::npos && mesh_revision_end != std::string::npos);
+    exhausted_mesh_revision.replace(
+        mesh_id_end + 1U,
+        mesh_revision_end - mesh_id_end - 1U,
+        std::to_string(carto::core::Revision::max_value()));
+    const auto exhausted_mesh_rejected =
+        carto::project::ProjectDocument::deserialize(exhausted_mesh_revision);
+    REQUIRE(!exhausted_mesh_rejected);
+    REQUIRE(exhausted_mesh_rejected.error().code ==
+            carto::core::ErrorCode::validation_failed);
+
+    const auto mesh_start = serialized_before.find(
+        "MESH ", serialized_before.find("MESHES "));
+    const auto end_marker = serialized_before.rfind("END\n");
+    REQUIRE(mesh_start != std::string::npos && end_marker != std::string::npos);
+    const std::string mesh_block = serialized_before.substr(mesh_start, end_marker - mesh_start);
+    std::string duplicate_mesh = serialized_before;
+    const auto mesh_count = duplicate_mesh.find("MESHES 1");
+    REQUIRE(mesh_count != std::string::npos);
+    duplicate_mesh.replace(mesh_count, std::string("MESHES 1").size(), "MESHES 2");
+    duplicate_mesh.insert(duplicate_mesh.rfind("END\n"), mesh_block);
+    const auto duplicate_rejected = carto::project::ProjectDocument::deserialize(duplicate_mesh);
+    REQUIRE(!duplicate_rejected);
+    REQUIRE(duplicate_rejected.error().code == carto::core::ErrorCode::validation_failed);
+
+    const auto trailing_rejected = carto::project::ProjectDocument::deserialize(
+        serialized_before + "TRAILING\n");
+    REQUIRE(!trailing_rejected);
+    REQUIRE(trailing_rejected.error().code == carto::core::ErrorCode::validation_failed);
+
+    const auto expect_oversized_count = [&](std::string marker, std::string replacement) {
+        std::string oversized = serialized_before;
+        const auto count_position = oversized.find(marker);
+        REQUIRE(count_position != std::string::npos);
+        oversized.replace(count_position, marker.size(), replacement);
+        const auto rejected_count = carto::project::ProjectDocument::deserialize(oversized);
+        REQUIRE(!rejected_count);
+        REQUIRE(rejected_count.error().code == carto::core::ErrorCode::validation_failed);
+    };
+    expect_oversized_count("OBJECTS 1", "OBJECTS 1000001");
+    expect_oversized_count("MESHES 1", "MESHES 1000001");
+    expect_oversized_count("VERTICES 3", "VERTICES 1000001");
+    expect_oversized_count("FACES 1", "FACES 1000001");
+
+    std::string oversized_face = serialized_before;
+    const auto face_position = oversized_face.find("FACE ");
+    REQUIRE(face_position != std::string::npos);
+    const auto face_id_end = oversized_face.find(' ', face_position + 5U);
+    REQUIRE(face_id_end != std::string::npos);
+    const auto face_count_end = oversized_face.find(' ', face_id_end + 1U);
+    REQUIRE(face_count_end != std::string::npos);
+    oversized_face.replace(
+        face_id_end + 1U,
+        face_count_end - face_id_end - 1U,
+        "1000001");
+    const auto oversized_face_rejected =
+        carto::project::ProjectDocument::deserialize(oversized_face);
+    REQUIRE(!oversized_face_rejected);
+    REQUIRE(oversized_face_rejected.error().code == carto::core::ErrorCode::validation_failed);
+
+    const auto higher_id_parent = carto::project::ProjectDocument::deserialize(
+        "CARTOGRAPHER_PROJECT 1\n"
+        "NAME \"Hierarchy\"\n"
+        "REVISION 0\n"
+        "OBJECTS 2\n"
+        "OBJECT 1 2 \"Child\" 0 0 0 0 0 0 1 1 1 1 0 0 0\n"
+        "OBJECT 2 0 \"Parent\" 0 0 0 0 0 0 1 1 1 1 0 0 0\n"
+        "MESHES 0\n"
+        "END\n");
+    REQUIRE(higher_id_parent);
+    REQUIRE(higher_id_parent.value().scene().find(carto::scene::ObjectId{1})->parent.has_value());
+    REQUIRE(*higher_id_parent.value().scene().find(carto::scene::ObjectId{1})->parent ==
+            carto::scene::ObjectId{2});
+
+    const auto negative_id = carto::project::ProjectDocument::deserialize(
+        "CARTOGRAPHER_PROJECT 1\n"
+        "NAME \"Negative ID\"\n"
+        "REVISION 0\n"
+        "OBJECTS 1\n"
+        "OBJECT -1 0 \"Object\" 0 0 0 0 0 0 1 1 1 1 0 0 0\n"
+        "MESHES 0\n"
+        "END\n");
+    REQUIRE(!negative_id);
+    REQUIRE(negative_id.error().code == carto::core::ErrorCode::validation_failed);
 }
 
 void project_save_failure_does_not_replace_existing_file_and_paths_are_bounded() {
@@ -559,6 +1024,15 @@ void project_save_failure_does_not_replace_existing_file_and_paths_are_bounded()
     std::ifstream after(path, std::ios::binary);
     const std::string unchanged((std::istreambuf_iterator<char>(after)), std::istreambuf_iterator<char>());
     REQUIRE(original == unchanged);
+
+    const auto blocked_temporary = temp.path() / "valid.carto.carto.tmp";
+    REQUIRE(std::filesystem::create_directory(blocked_temporary));
+    const auto blocked_save = document.value().save_atomic(path);
+    REQUIRE(!blocked_save);
+    std::ifstream blocked_after(path, std::ios::binary);
+    const std::string blocked_unchanged(
+        (std::istreambuf_iterator<char>(blocked_after)), std::istreambuf_iterator<char>());
+    REQUIRE(blocked_unchanged == original);
 
     carto::project::AssetReference safe{"assets/mesh.obj"};
     REQUIRE(safe.validate());
@@ -588,6 +1062,40 @@ void obj_interchange_reports_feature_loss_and_round_trips_geometry() {
     REQUIRE(imported.value().mesh.vertex_count() == 3U);
     REQUIRE(imported.value().mesh.face_count() == 1U);
     REQUIRE(imported.value().report.triangles == 1U);
+
+    const auto oversized_face_path = temp.path() / "oversized-face.obj";
+    std::ofstream oversized_face(oversized_face_path, std::ios::binary | std::ios::trunc);
+    oversized_face << "v 0 0 0\nv 1 0 0\nv 0 1 0\nf";
+    for (std::size_t index = 0; index < 1'000'001U; ++index) {
+        oversized_face << " 1";
+    }
+    oversized_face << '\n';
+    oversized_face.close();
+    const auto rejected_oversized_face = carto::io::import_obj(oversized_face_path);
+    REQUIRE(!rejected_oversized_face);
+    REQUIRE(rejected_oversized_face.error().code == carto::core::ErrorCode::validation_failed);
+
+    const auto malformed_index_path = temp.path() / "malformed-index.obj";
+    std::ofstream malformed_index(malformed_index_path, std::ios::binary | std::ios::trunc);
+    malformed_index << "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1x 2 3\n";
+    malformed_index.close();
+    const auto rejected_malformed_index = carto::io::import_obj(malformed_index_path);
+    REQUIRE(!rejected_malformed_index);
+    REQUIRE(rejected_malformed_index.error().code == carto::core::ErrorCode::validation_failed);
+
+    const auto atomic_path = temp.path() / "atomic.obj";
+    REQUIRE(carto::io::export_obj(mesh, atomic_path));
+    std::ifstream atomic_before(atomic_path, std::ios::binary);
+    const std::string atomic_original(
+        (std::istreambuf_iterator<char>(atomic_before)), std::istreambuf_iterator<char>());
+    const auto blocked_temporary = temp.path() / "atomic.obj.carto.tmp";
+    REQUIRE(std::filesystem::create_directory(blocked_temporary));
+    const auto blocked_export = carto::io::export_obj(mesh, atomic_path);
+    REQUIRE(!blocked_export);
+    std::ifstream atomic_after(atomic_path, std::ios::binary);
+    const std::string atomic_unchanged(
+        (std::istreambuf_iterator<char>(atomic_after)), std::istreambuf_iterator<char>());
+    REQUIRE(atomic_unchanged == atomic_original);
 }
 
 void render_boundary_does_not_include_editable_mesh_api() {
@@ -606,16 +1114,20 @@ int main() {
     const std::vector<std::pair<std::string_view, std::function<void()>>> tests = {
         {"scene rejects dangling parent and cycles", scene_rejects_dangling_parent_and_cycles},
         {"scene resolves double precision world transform", scene_resolves_double_precision_world_transform},
+        {"scene rejects nonfinite and deep hierarchy state", scene_rejects_nonfinite_world_transform_and_deep_hierarchies},
         {"selection is mode scoped and context validated", selection_is_mode_scoped_and_context_validated},
         {"mesh rejects degenerate and duplicate topology", mesh_rejects_degenerate_and_duplicate_topology},
         {"mesh compiles without mutating source", mesh_compiles_without_mutating_source_and_exposes_boundary_topology},
         {"primitives are deterministic and validated", primitives_are_deterministic_and_dimension_validated},
+        {"vector normalization preserves invalid state", vector_normalization_preserves_invalid_state},
         {"stale render result is rejected", stale_render_result_is_rejected},
         {"command bus is reversible", command_bus_is_reversible_and_rejects_failed_commands},
+        {"project transform command rejects stale undo", project_transform_command_rejects_stale_undo},
         {"vertex edit command is reversible and atomic", vertex_edit_command_is_reversible_and_topology_atomic},
         {"face extrude command is reversible", face_extrude_command_is_reversible_and_validated},
         {"selected face tool adapter validates", selected_face_tool_adapter_validates_before_delegating},
         {"tool registry dispatches through history", tool_registry_dispatches_registered_commands_through_history},
+        {"project vertex tool routes through history", project_vertex_tool_routes_through_history_and_rejects_bad_context},
         {"create mesh object command preserves ids", create_mesh_object_command_preserves_ids_across_undo_redo},
         {"project round trip and future version rejection", project_round_trips_authoritative_state_and_rejects_future_versions},
         {"project save failure and path bounds", project_save_failure_does_not_replace_existing_file_and_paths_are_bounded},

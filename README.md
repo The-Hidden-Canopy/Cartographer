@@ -32,25 +32,41 @@ have implemented all sixty specification subsystems.
 - `ToolRegistry` exposes explicit tool IDs and command factories; successful
   actions are submitted through `CommandBus`, while unknown, duplicate, or
   null-command registrations fail closed. Tool factories receive no mutable
-  mesh accessor; the built-in context exposes only approved command builders.
+  mesh accessor; the built-in project-bound context resolves the selected scene
+  object to its mesh asset and exposes only approved command builders.
 - `carto_editor` routes supported transforms, vertex edits, and mesh-object
   creation through reversible commands, preserving stable IDs across
   undo/redo and keeping failed commands out of history.
+- The built-in project tool context also routes a single selected vertex to a
+  validated position-edit command; invalid geometry, stale owners, and wrong
+  selection modes fail without changing history or sibling assets. Project
+  undo/redo uses mesh-revision preconditions and refuses to overwrite an
+  intervening external edit.
+- `carto_application` provides the headless front-end boundary: new/open/save,
+  outliner-style object views, validated workspace/pane actions, selection
+  actions, tool dispatch, undo/redo, diagnostics, and immutable viewport
+  snapshots. Panels and native shells dispatch actions through this boundary
+  rather than mutating the project directly.
 - `carto_project` persists authoring state in a versioned, deterministic text
   format with pre-commit validation and atomic replacement. Render caches are
   not serialized as project truth.
 - `carto_io` provides a deliberately narrow OBJ importer/exporter. Unsupported
   features are reported as loss rather than silently presented as preserved.
 - `carto_render` accepts compiled mesh snapshots only. It is a backend-neutral
-  render-scene seam; it is not yet a Vulkan renderer.
+  render-scene seam with stable source vertex/face identity mapping; it is
+  still not a Vulkan renderer.
+- The optional `carto_vulkan` runtime probe and Win32/Dear ImGui desktop shell
+  are source-wired behind explicit CMake options. They remain runtime-
+  unaccepted until built against a pinned Vulkan SDK/ImGui checkout and
+  exercised on a compatible GPU.
 - `cartographer_cli` can create/validate a sample project and import/export
   OBJ geometry without a login or network connection.
 
-## Explicitly not implemented yet
+## Not yet runtime-accepted
 
-The following are contracts and roadmap items, not shipped capability in this
-checkout: the native desktop shell, Vulkan resource backend, workspace/pane
-system, selection UI, stable edge mode, inset/bevel/edge tools,
+The following are contracts and roadmap items, not runtime-accepted capability
+in this checkout: native desktop launch on a real Vulkan SDK/GPU, the complete
+Vulkan resource lifecycle, workspace/pane persistence, stable edge mode, inset/bevel/edge tools,
 modifiers, UVs, materials, textures, node graphs, curves/NURBS, sculpting, CAD
 sketches/constraints, B-Rep/booleans, BIM objects, animation, rigging, physics,
 plugins, Python bindings, glTF/STEP/IFC interchange, and large-scene streaming.
@@ -77,6 +93,22 @@ cmake --build --preset default
 ctest --preset default
 ```
 
+The optional native front end does not fetch dependencies. A local Vulkan SDK
+and a pinned Dear ImGui source tree are required:
+
+```powershell
+cmake -S . -B build/vulkan -G Ninja -DCMAKE_BUILD_TYPE=Debug `
+  -DCARTO_ENABLE_VULKAN=ON
+cmake -S . -B build/desktop -G Ninja -DCMAKE_BUILD_TYPE=Debug `
+  -DCARTO_ENABLE_VULKAN=ON -DCARTO_BUILD_DESKTOP=ON `
+  -DCARTO_IMGUI_ROOT=C:/path/to/pinned/imgui
+cmake --build build/desktop --parallel
+```
+
+Configuration fails closed when the SDK or the required ImGui Win32/Vulkan
+backends are absent. A successful configure/build still does not establish
+GPU, DPI, input, or desktop workflow acceptance.
+
 ## CLI smoke workflow
 
 ```powershell
@@ -94,17 +126,21 @@ successful CLI smoke run as Vulkan, desktop, CAD, or release acceptance.
 
 ```text
 user/tool
-    -> carto_editor command/transaction boundary
-        -> carto_project / carto_scene authoring truth
-            -> carto_geometry validation and compilation
-                -> carto_render compiled snapshot seam
-                    -> future Vulkan/platform backend
+    -> carto_application action/snapshot boundary
+        -> carto_editor command/transaction boundary
+            -> carto_project / carto_scene authoring truth
+                -> carto_geometry validation and compilation
+                    -> carto_render compiled snapshot seam
+                    -> optional Vulkan/platform backend
 ```
 
-`carto_render` cannot include editable topology internals. Authoring objects
-remain the source of truth; compiled geometry and render state are disposable,
-revision-tagged outputs. See [architecture overview](docs/architecture/overview.md)
-and the [target map](docs/architecture/target-map.md).
+`carto_application` owns the boundary consumed by panels and native shells:
+actions are validated before entering editor history, and snapshots expose
+compiled geometry rather than editable topology. `carto_render` cannot include
+editable topology internals. Authoring objects remain the source of truth;
+compiled geometry and render state are disposable, revision-tagged outputs.
+See [architecture overview](docs/architecture/overview.md) and the [target
+map](docs/architecture/target-map.md).
 
 ## Governance and provenance
 
