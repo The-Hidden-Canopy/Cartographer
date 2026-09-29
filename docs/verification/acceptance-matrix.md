@@ -27,6 +27,12 @@ evidence only for the named behavior; it does not promote deferred features.
 | external project edit during tool history | project vertex tool test | revision-conditional undo refuses to overwrite the intervening edit |
 | application action boundary | application tests | new/open/save, selection, primitive creation, transforms, tool dispatch, undo/redo, and failed-action diagnostics stay behind `ApplicationSession` |
 | failed front-end action | application tests | invalid selection/tool actions record a problem and do not add history |
+| UI authority boundary | UI tests | `UiController` routes authoring through `ApplicationSession`; successful project receipts are projected into a bounded operation rail and failed actions do not create UI operations |
+| UI shell invariants | UI tests | theme/density/operator/workspace state is bounded; the viewport cannot be hidden; application workspace state remains validated |
+| edge selection boundary | editor/application/UI tests | stable EdgeId values survive compiled identity mapping; replace/toggle selection is mesh/revision-bound, cross-object/stale/missing edges fail closed, and selection changes do not change project revision |
+| unsupported UI capability | UI tests | edge authoring remains explicit as deferred; AI-First discloses unavailable tools and does not create a mutation path |
+| UI preference integrity | UI tests plus native source audit | atomic local preference save/load works; malformed or oversized preferences are rejected, reset through the validated workspace path, surfaced as UI diagnostics, and native read/write failures use an explicit warning surface |
+| bounded command palette and shortcut errors | UI tests | query size is bounded; failed undo/redo/save shortcuts return diagnostics without error-path crashes |
 | failed project open preserves active state | application tests | malformed/unavailable open leaves the current project and selection context intact |
 | workspace layout boundary | application tests | empty, unknown, duplicate, or viewport-less layouts fail closed; valid compact layouts update without changing document revision |
 | dirty replacement/close boundary | application tests | new/open/close require explicit discard confirmation and preserve the current project before confirmation |
@@ -48,13 +54,13 @@ evidence only for the named behavior; it does not promote deferred features.
 | typed GPU handle lifetime | render architecture tests | slot reuse advances generation and stale handles fail; type confusion is rejected at compile time |
 | render-graph hazards | render architecture tests | valid write transitions compile; read-before-write, illegal stage/format use, duplicate use, and overlapping aliases fail |
 | content-addressed blob integrity | storage/journal tests | known SHA-256, bounded storage, read verification, and tamper detection pass |
-| package manifest/layout boundary | storage/journal tests | manifest is human-readable, required package directories are validated, escaped text round-trips, malformed/trailing and future versions fail closed, and no fake database is created |
-| durable journal integrity | storage/journal tests | revision-bound append, staged transaction atomicity, replay, payload/hash chain, malformed checkpoint fail-closed behavior, and truncated-record rejection pass |
+| package manifest/layout boundary | storage/journal tests | manifest is human-readable, required package directories are validated, top-level JSON fields cannot be supplied by nested lookalikes, escaped text round-trips, malformed/trailing and future versions fail closed, and no fake database is created |
+| durable journal integrity | storage/journal tests | revision-bound and in-process concurrent append serialization, cross-process sidecar-lock contention, staged transaction atomicity, snapshot-envelope recovery, exact application envelope binding, payload/hash chain, checkpoint filename/content binding, malformed checkpoint fail-closed behavior, and truncated-record rejection pass |
 | provider lifecycle boundary | provider/plugin tests | duplicate descriptors, invalid transitions, unavailable provider diagnostics, capability absence, and built-in OBJ importer/exporter readiness fail visibly when violated |
 | plugin protocol boundary | provider/plugin tests | sandbox-default manifest, network/path permission rejection, framed round-trip, malformed nested-object rejection, truncation, and payload-size bounds pass |
 
 Not yet covered: SQLite WAL package storage, schema migrations, power-loss fault
-injection, checkpoint replay adapters, crash recovery UX, a successful
+injection, patch-specific delta replay, crash recovery UX, a successful
 Vulkan/desktop build, GPU/Vulkan execution, desktop
-input/DPI and resize behavior, fuzz corpora, cross-platform package
+input/DPI and resize behavior, native UI visual acceptance, fuzz corpora, cross-platform package
 installation in a clean VM, and downstream Unreal/Unity acceptance.

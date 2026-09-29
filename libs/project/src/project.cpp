@@ -1,15 +1,20 @@
 #include <carto/project/project.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <charconv>
 #include <cmath>
+#include <chrono>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <system_error>
+#include <thread>
 #include <utility>
 
 #ifdef _WIN32
@@ -42,6 +47,8 @@ constexpr std::uint64_t kMaxSerializedVertices = 1'000'000U;
 constexpr std::uint64_t kMaxSerializedFaces = 1'000'000U;
 constexpr std::uint64_t kMaxSerializedFaceVertices = 1'000'000U;
 constexpr std::uintmax_t kMaxSerializedProjectBytes = 128ULL * 1024ULL * 1024ULL;
+std::mutex g_project_save_mutex;
+std::atomic<std::uint64_t> g_project_temp_counter{0U};
 
 core::Result<void> validate_serialized_count(
     std::uint64_t count,
@@ -80,7 +87,13 @@ core::Result<std::uint64_t> read_uint(std::istream& input, std::string_view fiel
 }
 
 std::filesystem::path temporary_path(const std::filesystem::path& target) {
-    return target.parent_path() / (target.filename().string() + ".carto.tmp");
+    const auto ticks = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto thread = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    const auto counter = g_project_temp_counter.fetch_add(1U, std::memory_order_relaxed);
+    return target.parent_path() / (target.filename().string() + ".carto.tmp-" +
+        std::to_string(static_cast<unsigned long long>(ticks)) + "-" +
+        std::to_string(static_cast<unsigned long long>(thread)) + "-" +
+        std::to_string(static_cast<unsigned long long>(counter)));
 }
 
 core::Result<void> atomic_replace(
@@ -677,7 +690,11 @@ core::Result<ProjectDocument> ProjectDocument::load(const std::filesystem::path&
     }
     std::error_code size_error;
     const auto file_size = std::filesystem::file_size(path, size_error);
-    if (!size_error && file_size > kMaxSerializedProjectBytes) {
+    if (size_error) {
+        return core::Result<ProjectDocument>::failure(
+            Diagnostic(ErrorCode::io_error, "unable to inspect project file size"));
+    }
+    if (file_size > kMaxSerializedProjectBytes) {
         return core::Result<ProjectDocument>::failure(parse_error(
             "project file exceeds the Cartographer v1 size limit of 128 MiB"));
     }
@@ -691,6 +708,16 @@ core::Result<ProjectDocument> ProjectDocument::load(const std::filesystem::path&
 }
 
 core::Result<SaveReceipt> ProjectDocument::save_atomic(const std::filesystem::path& path) const {
+    FileLock file_lock(path);
+    if (auto result = file_lock.acquire(); !result) {
+        return core::Result<SaveReceipt>::failure(result.error());
+    }
+    return save_atomic_unlocked(path);
+}
+
+core::Result<SaveReceipt> ProjectDocument::save_atomic_unlocked(
+    const std::filesystem::path& path) const {
+    std::lock_guard lock(g_project_save_mutex);
     if (path.empty() || path.filename().empty()) {
         return core::Result<SaveReceipt>::failure(invalid("project save path must name a file"));
     }
@@ -698,9 +725,17 @@ core::Result<SaveReceipt> ProjectDocument::save_atomic(const std::filesystem::pa
         return core::Result<SaveReceipt>::failure(result.error());
     }
     const auto parent = path.parent_path();
-    if (!parent.empty() && !std::filesystem::exists(parent)) {
-        return core::Result<SaveReceipt>::failure(
-            Diagnostic(ErrorCode::io_error, "project save parent directory does not exist"));
+    if (!parent.empty()) {
+        std::error_code parent_error;
+        const bool parent_exists = std::filesystem::exists(parent, parent_error);
+        if (parent_error) {
+            return core::Result<SaveReceipt>::failure(
+                Diagnostic(ErrorCode::io_error, "unable to inspect project save parent directory"));
+        }
+        if (!parent_exists || !std::filesystem::is_directory(parent, parent_error) || parent_error) {
+            return core::Result<SaveReceipt>::failure(
+                Diagnostic(ErrorCode::io_error, "project save parent directory does not exist"));
+        }
     }
 
     const std::string serialized = serialize();

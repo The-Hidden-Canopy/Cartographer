@@ -28,6 +28,10 @@ add_executable(cartographer_provider_plugin_tests
     provider_plugin_tests.cpp
 )
 
+add_executable(cartographer_ui_tests
+    ui_tests.cpp
+)
+
 target_link_libraries(cartographer_tests
     PRIVATE
         carto_core
@@ -98,3 +102,12 @@ target_link_libraries(cartographer_provider_plugin_tests
 
 carto_target(cartographer_provider_plugin_tests)
 add_test(NAME cartographer_provider_plugin_tests COMMAND cartographer_provider_plugin_tests)
+
+target_link_libraries(cartographer_ui_tests
+    PRIVATE
+        carto_application
+        carto_ui
+)
+
+carto_target(cartographer_ui_tests)
+add_test(NAME cartographer_ui_tests COMMAND cartographer_ui_tests)

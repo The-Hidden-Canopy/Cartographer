@@ -53,6 +53,7 @@ struct SelectionView {
     editor::SelectionMode mode = editor::SelectionMode::object;
     std::vector<scene::ObjectId> objects;
     std::vector<geometry::VertexId> vertices;
+    std::vector<geometry::EdgeId> edges;
     std::vector<geometry::FaceId> faces;
     std::optional<scene::ObjectId> component_object;
     std::optional<core::Revision> component_mesh_revision;
@@ -126,6 +127,12 @@ struct SelectFaceAction {
     editor::SelectionOperation operation = editor::SelectionOperation::replace;
 };
 
+struct SelectEdgeAction {
+    scene::ObjectId object;
+    geometry::EdgeId edge;
+    editor::SelectionOperation operation = editor::SelectionOperation::replace;
+};
+
 struct SetObjectTransformAction {
     scene::ObjectId object;
     core::Transform transform;
@@ -147,6 +154,11 @@ struct CreatePlaneAction {
     double depth = 1.0;
 };
 
+struct CreateMeshObjectAction {
+    std::string object_name;
+    geometry::EditableMesh mesh;
+};
+
 struct UndoAction {};
 struct RedoAction {};
 
@@ -159,10 +171,12 @@ using ApplicationAction = std::variant<
     SelectObjectAction,
     SelectVertexAction,
     SelectFaceAction,
+    SelectEdgeAction,
     SetObjectTransformAction,
     InvokeToolAction,
     CreateBoxAction,
     CreatePlaneAction,
+    CreateMeshObjectAction,
     UndoAction,
     RedoAction>;
 
@@ -191,9 +205,12 @@ private:
     [[nodiscard]] core::Result<DispatchReceipt> select_object(const SelectObjectAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> select_vertex(const SelectVertexAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> select_face(const SelectFaceAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> select_edge(const SelectEdgeAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> invoke_tool(const InvokeToolAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_box(const CreateBoxAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_plane(const CreatePlaneAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> create_mesh_object(
+        const CreateMeshObjectAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> undo();
     [[nodiscard]] core::Result<DispatchReceipt> redo();
     [[nodiscard]] core::Result<void> append_mutation_event(
@@ -203,6 +220,8 @@ private:
     struct PreparedJournal {
         journal::Journal journal;
         bool created_file = false;
+        bool appended_baseline = false;
+        std::uintmax_t original_bytes = 0U;
     };
     [[nodiscard]] core::Result<PreparedJournal> prepare_journal(
         const std::filesystem::path& project_path,

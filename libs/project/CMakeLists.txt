@@ -1,6 +1,8 @@
 add_library(carto_project STATIC
+    src/file_lock.cpp
     src/package.cpp
     src/project.cpp
+    src/recovery.cpp
     src/transaction.cpp
 )
 

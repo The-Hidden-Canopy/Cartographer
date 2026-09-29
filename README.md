@@ -22,9 +22,10 @@ have implemented all sixty specification subsystems.
 - `carto_geometry` provides deterministic box and plane primitive constructors;
   validated vertex-position edits are reversible through `carto_editor`.
 - A single face can be extruded into side faces and a cap through a validated,
-  reversible command. The operation is topology-safe; interactive selection and
-  tool UI are not yet shipped.
-- `carto_editor` provides ephemeral object, vertex, and face selection with
+  reversible command. The operation is topology-safe; the headless UI contract
+  and optional source shell now route supported selection/tool actions through
+  the application boundary, while native visual acceptance remains pending.
+- `carto_editor` provides ephemeral object, vertex, edge, and face selection with
   replace/add/toggle operations and stale-context validation. Selection is not
   serialized as authoring truth.
 - The selected-face extrusion adapter validates selection mode, cardinality,
@@ -47,6 +48,11 @@ have implemented all sixty specification subsystems.
   actions, tool dispatch, undo/redo, diagnostics, and immutable viewport
   snapshots. Panels and native shells dispatch actions through this boundary
   rather than mutating the project directly.
+- `carto_ui` provides the headless VANTA-family presentation/controller layer:
+  centralized tokens, density/theme/operator/workspace state, bounded local
+  preferences, command-palette/shortcut routing, operation/problem views, and
+  explicit unavailable states for edge authoring and AI tools. It does not own
+  project truth or provide a direct mutation path.
 - `carto_project` persists authoring state in a versioned, deterministic text
   format with pre-commit validation and atomic replacement. Render caches are
   not serialized as project truth.
@@ -83,7 +89,7 @@ have implemented all sixty specification subsystems.
 
 The following are contracts and roadmap items, not runtime-accepted capability
 in this checkout: native desktop launch on a real Vulkan SDK/GPU, the complete
-Vulkan resource lifecycle, workspace/pane persistence, stable edge mode, inset/bevel/edge tools,
+Vulkan resource lifecycle, native workspace restore/docking, edge-edit tools, inset/bevel tools,
 modifiers, UVs, materials, textures, node graphs, curves/NURBS, sculpting, CAD
 sketches/constraints, B-Rep/booleans, BIM objects, animation, rigging, physics,
 plugins, Python bindings, glTF/STEP/IFC interchange, and large-scene streaming.
@@ -151,6 +157,8 @@ user/tool
                             -> carto_render_graph / carto_gpu render planning
                             -> optional Vulkan/platform backend
 
+optional native shell -> carto_ui presentation/controller -> carto_application
+
 Recovery and asset lineage remain parallel to rendering:
 
 ```text
@@ -159,7 +167,8 @@ immutable bytes    -> carto_assets (SHA-256 blob)
 ```
 ```
 
-`carto_application` owns the boundary consumed by panels and native shells:
+`carto_ui` owns the presentation boundary consumed by the optional native
+shell; it delegates authoring actions to `carto_application`. The application
 actions are validated before entering editor history, and snapshots expose
 compiled geometry rather than editable topology. `carto_render` cannot include
 editable topology internals. Authoring objects remain the source of truth;

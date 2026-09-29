@@ -34,6 +34,7 @@ tool input
 | `carto_sdk` | bounded opaque C ABI over application actions/snapshots | C++ layout, mutable model pointers, or native GPU handles |
 | `carto_io` | format adapters and loss reports | project model ownership |
 | `carto_application` | front-end actions, workspace state, immutable snapshots | direct panel-owned mutations or GPU resources |
+| `carto_ui` | authority-preserving presentation state, VANTA tokens, bounded UI preferences, operation/problem projections | project truth, editor history ownership, direct mutation, AI authority |
 | optional native shell | Win32 windowing, ImGui panels, Vulkan submission | authoritative model state or editable topology |
 
 ## Failure posture
@@ -88,16 +89,15 @@ distinct failure states explicit. `carto_plugin_protocol` validates bounded
 sandbox-default manifests and `carto.plugin.v1` frames; it does not launch a
 process or admit plugin output into the project.
 
-Selection state is an ephemeral editor concern. Object, vertex, and face
+Selection state is an ephemeral editor concern. Object, vertex, edge, and face
 selections are isolated by mode, are never serialized into project truth, and
 must be validated against the current scene or mesh before a tool consumes
 them. Component selections may be bound to one scene object; add/toggle
 operations cannot span objects or silently bind an existing unbound selection
 to a different mesh context. Mesh-bound selections retain the mesh instance and
 source revision they were created against, so replacement or mutation requires
-explicit reselection. Edge mode remains deferred until selection and tool
-operations consume the persistent topology identity rather than only the
-current vertex/face selection API.
+explicit reselection. Edge selection consumes persistent topology identity, but
+edge authoring, traversal, and topology-edit tools remain deferred.
 
 Tool actions are registered by stable IDs and return editor commands. The
 registry submits successful commands through `CommandBus`; it does not expose a
@@ -132,13 +132,21 @@ and passes the render boundary; a failed candidate yields an unavailable
 viewport instead of a partial or invented fallback. Diagnostics are bounded to
 the latest 128 entries. Project identity generations reset transient inspector
 state after replacement. Compiled vertices and triangles retain stable source
-IDs so a future viewport can map a hit back to editor selection without
-exposing editable topology.
+IDs so a viewport can map object, vertex, edge, and face hits back to editor
+selection without exposing editable topology.
 
 The optional desktop shell consumes only this action/snapshot interface. Its
 outliner, inspector, and viewport are therefore presentation code; transform,
-vertex, face, extrusion, creation, and history actions still pass through the
-same session and command preconditions.
+vertex, edge, face, extrusion, creation, and history actions still pass through
+the same session and command preconditions.
+
+`carto_ui` adds the testable presentation contract above the application
+session. Its operation rail is a bounded view of successful application
+receipts, not a second history or audit ledger. Theme/density/workspace state
+and local preferences remain outside project truth; corrupt preferences reset
+through the same validated workspace action path. The controller exposes the
+AI-First shell only as an unavailable/manual state until a bounded planner and
+proposal transaction adapter exist.
 
 ## Native backend boundary
 

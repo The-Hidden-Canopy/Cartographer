@@ -15,6 +15,7 @@ namespace carto::editor {
 enum class SelectionMode {
     object,
     vertex,
+    edge,
     face,
 };
 
@@ -60,6 +61,16 @@ public:
         const geometry::EditableMesh& mesh,
         geometry::FaceId face,
         SelectionOperation operation = SelectionOperation::replace);
+    [[nodiscard]] core::Result<void> select_edge(
+        const geometry::EditableMesh& mesh,
+        geometry::EdgeId edge,
+        SelectionOperation operation = SelectionOperation::replace);
+    [[nodiscard]] core::Result<void> select_edge(
+        const scene::Scene& scene,
+        scene::ObjectId object,
+        const geometry::EditableMesh& mesh,
+        geometry::EdgeId edge,
+        SelectionOperation operation = SelectionOperation::replace);
 
     [[nodiscard]] core::Result<void> validate(
         const scene::Scene& scene,
@@ -74,6 +85,7 @@ public:
 
     [[nodiscard]] std::vector<scene::ObjectId> selected_objects() const;
     [[nodiscard]] std::vector<geometry::VertexId> selected_vertices() const;
+    [[nodiscard]] std::vector<geometry::EdgeId> selected_edges() const;
     [[nodiscard]] std::vector<geometry::FaceId> selected_faces() const;
 
 private:
@@ -87,6 +99,7 @@ private:
     SelectionMode mode_ = SelectionMode::object;
     std::set<scene::ObjectId> objects_;
     std::set<geometry::VertexId> vertices_;
+    std::set<geometry::EdgeId> edges_;
     std::set<geometry::FaceId> faces_;
     std::optional<scene::ObjectId> component_object_;
     const geometry::EditableMesh* component_mesh_ = nullptr;

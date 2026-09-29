@@ -1,4 +1,5 @@
 #include <carto/plugin_protocol/protocol.hpp>
+#include <carto/core/json.hpp>
 
 #include <algorithm>
 #include <cstring>
@@ -33,49 +34,7 @@ bool safe_request_id(std::string_view value) {
 }
 
 bool valid_json_object(std::string_view text) {
-    if (text.empty() || text.front() != '{') return false;
-    std::size_t object_depth = 0U;
-    std::size_t array_depth = 0U;
-    bool in_string = false;
-    bool escaped = false;
-    bool root_closed = false;
-    for (const char byte : text) {
-        if (in_string) {
-            if (escaped) {
-                if (byte != '\\' && byte != '"' && byte != '/' && byte != 'b' &&
-                    byte != 'f' && byte != 'n' && byte != 'r' && byte != 't' && byte != 'u') {
-                    return false;
-                }
-                escaped = false;
-            } else if (byte == '\\') {
-                escaped = true;
-            } else if (byte == '"') {
-                in_string = false;
-            } else if (static_cast<unsigned char>(byte) < 0x20U) {
-                return false;
-            }
-            continue;
-        }
-        if (root_closed) {
-            if (byte != ' ' && byte != '\n' && byte != '\r' && byte != '\t') return false;
-            continue;
-        }
-        if (byte == '"') {
-            in_string = true;
-        } else if (byte == '{') {
-            ++object_depth;
-        } else if (byte == '}') {
-            if (object_depth == 0U) return false;
-            --object_depth;
-            if (object_depth == 0U && array_depth == 0U) root_closed = true;
-        } else if (byte == '[') {
-            ++array_depth;
-        } else if (byte == ']') {
-            if (array_depth == 0U) return false;
-            --array_depth;
-        }
-    }
-    return root_closed && !in_string && !escaped && object_depth == 0U && array_depth == 0U;
+    return carto::core::json::is_object(text);
 }
 
 bool valid_json_payload(std::string_view value) {
@@ -101,37 +60,34 @@ std::string make_json(const Envelope& envelope) {
 }
 
 core::Result<std::string> json_string(std::string_view text, std::string_view name) {
-    const std::string marker = "\"" + std::string(name) + "\":\"";
-    const std::size_t start = text.find(marker);
-    if (start == std::string_view::npos) {
+    const auto object = carto::core::json::parse_object(text);
+    if (!object) {
+        return core::Result<std::string>::failure(object.error());
+    }
+    const auto* member = carto::core::json::find_member(object.value(), name);
+    if (member == nullptr) {
         return core::Result<std::string>::failure(validation("plugin envelope field is missing"));
     }
-    const std::size_t value_start = start + marker.size();
-    std::size_t cursor = value_start;
-    std::string value;
-    while (cursor < text.size()) {
-        const char byte = text[cursor++];
-        if (byte == '"') return core::Result<std::string>::success(std::move(value));
-        if (byte == '\\' || static_cast<unsigned char>(byte) < 0x20U) {
-            return core::Result<std::string>::failure(validation("plugin envelope string is malformed"));
-        }
-        value.push_back(byte);
+    const auto value = carto::core::json::decode_string(member->raw_value);
+    if (!value) {
+        return core::Result<std::string>::failure(value.error());
     }
-    return core::Result<std::string>::failure(validation("plugin envelope string is unterminated"));
+    return value;
 }
 
 core::Result<std::string> json_payload(std::string_view text) {
-    const std::string marker = "\"payload\":";
-    const std::size_t start = text.find(marker);
-    if (start == std::string_view::npos) {
+    const auto object = carto::core::json::parse_object(text);
+    if (!object) {
+        return core::Result<std::string>::failure(object.error());
+    }
+    const auto* member = carto::core::json::find_member(object.value(), "payload");
+    if (member == nullptr) {
         return core::Result<std::string>::failure(validation("plugin envelope payload is missing"));
     }
-    const std::size_t value_start = start + marker.size();
-    if (value_start >= text.size() || text[value_start] != '{' || text.back() != '}') {
+    if (!carto::core::json::is_object(member->raw_value)) {
         return core::Result<std::string>::failure(validation("plugin envelope payload is not an object"));
     }
-    return core::Result<std::string>::success(
-        std::string(text.substr(value_start, text.size() - value_start - 1U)));
+    return core::Result<std::string>::success(std::string(member->raw_value));
 }
 
 } // namespace
@@ -143,6 +99,10 @@ core::Result<void> Protocol::validate_manifest(const PluginManifest& manifest) {
     if (manifest.trust == providers::TrustClass::remote_service || manifest.permissions.network) {
         return core::Result<void>::failure(validation(
             "plugin manifests cannot request implicit remote or network authority"));
+    }
+    if (manifest.permissions.project_write_new_assets) {
+        return core::Result<void>::failure(validation(
+            "plugin project-write permission is unsupported until host admission exists"));
     }
     if (manifest.capabilities.empty() || manifest.capabilities.size() > kMaxCapabilities) {
         return core::Result<void>::failure(invalid("plugin manifest capabilities are invalid"));
@@ -159,6 +119,20 @@ core::Result<void> Protocol::validate_manifest(const PluginManifest& manifest) {
         if (!safe_token(path) || path.find("..") != std::string::npos) {
             return core::Result<void>::failure(invalid("plugin filesystem permission is invalid"));
         }
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> Protocol::validate_admission(
+    const PluginManifest& manifest,
+    const Envelope& envelope) {
+    if (auto result = validate_manifest(manifest); !result) return result;
+    if (auto result = validate_envelope(envelope); !result) return result;
+    if (std::find(
+            manifest.capabilities.begin(), manifest.capabilities.end(), envelope.capability) ==
+        manifest.capabilities.end()) {
+        return core::Result<void>::failure(validation(
+            "plugin envelope capability was not granted by the manifest"));
     }
     return core::Result<void>::success();
 }
@@ -205,14 +179,20 @@ core::Result<Envelope> Protocol::decode(std::span<const std::uint8_t> frame) {
         return core::Result<Envelope>::failure(validation("plugin frame length is invalid"));
     }
     const std::string_view json(reinterpret_cast<const char*>(frame.data() + 4U), size);
-    const std::string protocol_marker = "\"protocol\":\"" + std::string(kProtocolName) + "\"";
-    if (json.find(protocol_marker) == std::string_view::npos || !valid_json_object(json)) {
+    if (!valid_json_object(json)) {
         return core::Result<Envelope>::failure(validation("plugin frame protocol is invalid"));
     }
+    const auto protocol = json_string(json, "protocol");
     const auto request_id = json_string(json, "request_id");
     const auto capability = json_string(json, "capability");
     const auto method = json_string(json, "method");
     const auto payload = json_payload(json);
+    if (!protocol) {
+        return core::Result<Envelope>::failure(protocol.error());
+    }
+    if (protocol.value() != kProtocolName) {
+        return core::Result<Envelope>::failure(validation("plugin frame protocol is invalid"));
+    }
     if (!request_id || !capability || !method || !payload) {
         const auto& diagnostic = !request_id ? request_id.error() : !capability ? capability.error() :
             !method ? method.error() : payload.error();

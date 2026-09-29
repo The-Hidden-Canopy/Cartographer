@@ -90,6 +90,7 @@ public:
 
     [[nodiscard]] const Vertex* find_vertex(VertexId id) const noexcept;
     [[nodiscard]] const Face* find_face(FaceId id) const noexcept;
+    [[nodiscard]] const EdgeRecord* find_edge(EdgeId id) const noexcept;
     [[nodiscard]] std::vector<Vertex> vertices_sorted() const;
     [[nodiscard]] std::vector<Face> faces_sorted() const;
 

@@ -1,6 +1,7 @@
 #include <cartographer/carto.h>
 
 #include <carto/application/application.hpp>
+#include <carto/core/json.hpp>
 
 #include <cctype>
 #include <cstdint>
@@ -76,49 +77,7 @@ carto_status invalid(const char* message, carto_error* error) noexcept {
 }
 
 bool valid_json_object(std::string_view text) noexcept {
-    if (text.empty() || text.front() != '{') return false;
-    std::size_t object_depth = 0U;
-    std::size_t array_depth = 0U;
-    bool in_string = false;
-    bool escaped = false;
-    bool root_closed = false;
-    for (const char byte : text) {
-        if (in_string) {
-            if (escaped) {
-                if (byte != '\\' && byte != '"' && byte != '/' && byte != 'b' &&
-                    byte != 'f' && byte != 'n' && byte != 'r' && byte != 't' && byte != 'u') {
-                    return false;
-                }
-                escaped = false;
-            } else if (byte == '\\') {
-                escaped = true;
-            } else if (byte == '"') {
-                in_string = false;
-            } else if (static_cast<unsigned char>(byte) < 0x20U) {
-                return false;
-            }
-            continue;
-        }
-        if (root_closed) {
-            if (byte != ' ' && byte != '\n' && byte != '\r' && byte != '\t') return false;
-            continue;
-        }
-        if (byte == '"') {
-            in_string = true;
-        } else if (byte == '{') {
-            ++object_depth;
-        } else if (byte == '}') {
-            if (object_depth == 0U) return false;
-            --object_depth;
-            if (object_depth == 0U && array_depth == 0U) root_closed = true;
-        } else if (byte == '[') {
-            ++array_depth;
-        } else if (byte == ']') {
-            if (array_depth == 0U) return false;
-            --array_depth;
-        }
-    }
-    return root_closed && !in_string && !escaped && object_depth == 0U && array_depth == 0U;
+    return carto::core::json::is_object(text);
 }
 
 bool bounded_json(const char* request) noexcept {
@@ -163,51 +122,38 @@ std::optional<std::filesystem::path> authorized_path(
 }
 
 std::optional<std::string> json_string_field(std::string_view request, std::string_view name) {
-    const std::string needle = "\"" + std::string(name) + "\"";
-    const std::size_t key = request.find(needle);
-    if (key == std::string_view::npos) return std::nullopt;
-    std::size_t cursor = request.find(':', key + needle.size());
-    if (cursor == std::string_view::npos) return std::nullopt;
-    ++cursor;
-    while (cursor < request.size() && std::isspace(static_cast<unsigned char>(request[cursor])) != 0) ++cursor;
-    if (cursor >= request.size() || request[cursor] != '"') return std::nullopt;
-    ++cursor;
-    std::string result;
-    while (cursor < request.size()) {
-        const char value = request[cursor++];
-        if (value == '"') return result;
-        if (value == '\\') {
-            if (cursor >= request.size()) return std::nullopt;
-            const char escaped = request[cursor++];
-            switch (escaped) {
-            case '"': result.push_back('"'); break;
-            case '\\': result.push_back('\\'); break;
-            case '/': result.push_back('/'); break;
-            case 'n': result.push_back('\n'); break;
-            case 'r': result.push_back('\r'); break;
-            case 't': result.push_back('\t'); break;
-            default: return std::nullopt;
-            }
-        } else {
-            if (static_cast<unsigned char>(value) < 0x20U) return std::nullopt;
-            result.push_back(value);
-        }
-        if (result.size() > kMaxJsonBytes) return std::nullopt;
-    }
-    return std::nullopt;
+    const auto object = carto::core::json::parse_object(request);
+    if (!object) return std::nullopt;
+    const auto* member = carto::core::json::find_member(object.value(), name);
+    if (member == nullptr) return std::nullopt;
+    const auto value = carto::core::json::decode_string(member->raw_value);
+    if (!value || value.value().size() > kMaxJsonBytes) return std::nullopt;
+    return value.value();
 }
 
 std::string json_escape(std::string_view value) {
+    static constexpr char hex[] = "0123456789abcdef";
     std::string escaped;
     escaped.reserve(value.size() + 2U);
-    for (const char character : value) {
+    for (const char raw_character : value) {
+        const auto character = static_cast<unsigned char>(raw_character);
         switch (character) {
         case '"': escaped += "\\\""; break;
         case '\\': escaped += "\\\\"; break;
         case '\n': escaped += "\\n"; break;
         case '\r': escaped += "\\r"; break;
         case '\t': escaped += "\\t"; break;
-        default: escaped.push_back(character); break;
+        case '\b': escaped += "\\b"; break;
+        case '\f': escaped += "\\f"; break;
+        default:
+            if (character < 0x20U) {
+                escaped += "\\u00";
+                escaped.push_back(hex[character >> 4U]);
+                escaped.push_back(hex[character & 0x0fU]);
+            } else {
+                escaped.push_back(static_cast<char>(character));
+            }
+            break;
         }
     }
     return escaped;

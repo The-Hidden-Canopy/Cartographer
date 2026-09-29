@@ -1,4 +1,5 @@
 #include <carto/application/application.hpp>
+#include <carto/geometry/primitives.hpp>
 #include <carto/journal/journal.hpp>
 
 #include <algorithm>
@@ -6,7 +7,9 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 
@@ -93,6 +96,34 @@ void application_routes_authoring_through_snapshot_and_history() {
     REQUIRE(session.snapshot().redo_count == 0U);
 }
 
+void application_routes_imported_mesh_through_the_durable_command_boundary() {
+    TempDirectory temp;
+    auto mesh = carto::geometry::make_plane(2.0, 3.0);
+    REQUIRE(mesh);
+
+    const auto path = temp.path() / "imported.carto";
+    carto::application::ApplicationSession session;
+    REQUIRE(session.dispatch(carto::application::NewProjectAction{"Imported"}));
+    REQUIRE(session.dispatch(carto::application::SaveProjectAction{path}));
+    REQUIRE(session.dispatch(carto::application::CreateMeshObjectAction{
+        "Imported mesh", std::move(mesh.value())}));
+    REQUIRE(session.dispatch(carto::application::SaveProjectAction{std::nullopt}));
+
+    const auto snapshot = session.snapshot();
+    REQUIRE(snapshot.objects.size() == 1U);
+    REQUIRE(snapshot.viewport.error == std::nullopt);
+
+    carto::journal::Journal journal(std::filesystem::path(path.string() + ".journal"));
+    const auto entries = journal.read_all();
+    REQUIRE(entries);
+    REQUIRE(entries.value().size() == 2U);
+    REQUIRE(entries.value().back().event_type == "cartographer.application_action");
+    const std::string payload(
+        entries.value().back().payload.begin(), entries.value().back().payload.end());
+    REQUIRE(payload.find("operation=Create Mesh Object") != std::string::npos);
+    REQUIRE(journal.verify());
+}
+
 void application_routes_vertex_edit_and_rejects_stale_reselection() {
     carto::application::ApplicationSession session;
     REQUIRE(session.dispatch(carto::application::CreateBoxAction{
@@ -139,6 +170,38 @@ void application_routes_vertex_edit_and_rejects_stale_reselection() {
     REQUIRE(session.snapshot().redo_count == 1U);
     REQUIRE(session.dispatch(carto::application::RedoAction{}));
     REQUIRE(session.snapshot().redo_count == 0U);
+}
+
+void application_routes_persistent_edge_selection_without_mutation() {
+    carto::application::ApplicationSession session;
+    REQUIRE(session.dispatch(carto::application::CreateBoxAction{
+        "Edge selection", {2.0, 2.0, 2.0}}));
+    auto snapshot = session.snapshot();
+    REQUIRE(snapshot.objects.size() == 1U);
+    const auto object = snapshot.objects.front().object.id;
+    const auto instances = snapshot.viewport.scene.instances();
+    REQUIRE(instances.size() == 1U);
+    REQUIRE(instances.front().mesh->triangle_edges.size() ==
+            instances.front().mesh->triangle_faces.size());
+    REQUIRE(instances.front().mesh->triangle_edges.front().front().has_value());
+    const auto edge = *instances.front().mesh->triangle_edges.front().front();
+    const auto revision = snapshot.project_revision;
+
+    REQUIRE(session.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::edge}));
+    REQUIRE(session.dispatch(carto::application::SelectEdgeAction{object, edge}));
+    snapshot = session.snapshot();
+    REQUIRE(snapshot.project_revision == revision);
+    REQUIRE(snapshot.selection.mode == carto::editor::SelectionMode::edge);
+    REQUIRE(snapshot.selection.edges.size() == 1U);
+    REQUIRE(snapshot.selection.edges.front() == edge);
+
+    REQUIRE(!session.dispatch(carto::application::SelectEdgeAction{
+        object, carto::geometry::EdgeId{999}}));
+    const auto after_failure = session.snapshot();
+    REQUIRE(after_failure.project_revision == revision);
+    REQUIRE(after_failure.selection.edges.size() == 1U);
+    REQUIRE(after_failure.selection.edges.front() == edge);
 }
 
 void application_rejects_bad_selection_without_mutating_history() {
@@ -355,12 +418,83 @@ void application_rejects_journal_revision_drift_before_open() {
     REQUIRE(!target.snapshot().problems.empty());
 }
 
+void application_rolls_back_preexisting_journal_baseline_on_save_failure() {
+    TempDirectory temp;
+    const auto path = temp.path() / "blocked.carto";
+    const auto journal_path = std::filesystem::path(path.string() + ".journal");
+    const std::string header = "CARTOGRAPHER_JOURNAL_V1\n";
+    {
+        std::ofstream seed(journal_path, std::ios::binary | std::ios::trunc);
+        seed << header;
+    }
+    REQUIRE(std::filesystem::create_directory(path));
+
+    carto::application::ApplicationSession session;
+    REQUIRE(session.dispatch(carto::application::NewProjectAction{"Save rollback"}));
+    REQUIRE(!session.dispatch(carto::application::SaveProjectAction{path}));
+
+    std::ifstream restored(journal_path, std::ios::binary);
+    const std::string contents(
+        std::istreambuf_iterator<char>{restored}, std::istreambuf_iterator<char>{});
+    REQUIRE(contents == header);
+    carto::journal::Journal journal(journal_path);
+    const auto entries = journal.read_all();
+    REQUIRE(entries);
+    REQUIRE(entries.value().empty());
+}
+
+void application_rejects_semantically_wrong_journal_tail() {
+    TempDirectory temp;
+    const auto path = temp.path() / "semantic-drift.carto";
+    carto::application::ApplicationSession source;
+    REQUIRE(source.dispatch(carto::application::NewProjectAction{"Semantic drift"}));
+    REQUIRE(source.dispatch(carto::application::SaveProjectAction{path}));
+
+    const auto journal_path = std::filesystem::path(path.string() + ".journal");
+    carto::journal::Journal journal(journal_path);
+    const auto baseline = journal.read_all();
+    REQUIRE(baseline);
+    REQUIRE(baseline.value().size() == 1U);
+    const std::string baseline_payload(
+        baseline.value().front().payload.begin(), baseline.value().front().payload.end());
+    const std::size_t marker = baseline_payload.find("document_bytes=");
+    REQUIRE(marker != std::string::npos);
+    const std::size_t document_start = baseline_payload.find('\n', marker);
+    REQUIRE(document_start != std::string::npos);
+    std::string revision_two = baseline_payload.substr(document_start + 1U);
+    const std::string revision_marker = "REVISION 1\n";
+    const std::size_t revision = revision_two.find(revision_marker);
+    REQUIRE(revision != std::string::npos);
+    revision_two.replace(revision, revision_marker.size(), "REVISION 2\n");
+
+    const std::string fake_payload =
+        "CARTOGRAPHER_PROJECT_SNAPSHOT_V1\n" +
+        std::string("document_bytes=") + std::to_string(revision_two.size()) + "\n" +
+        revision_two;
+    REQUIRE(journal.append(carto::journal::JournalAppend{
+        carto::core::Revision{1U}, carto::core::Revision{2U}, "test.fake_snapshot",
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(fake_payload.data()), fake_payload.size()),
+        2U}));
+    std::ofstream replace(path, std::ios::binary | std::ios::trunc);
+    replace << revision_two;
+    replace.close();
+    REQUIRE(replace);
+
+    carto::application::ApplicationSession target;
+    const auto opened = target.dispatch(carto::application::OpenProjectAction{path});
+    REQUIRE(!opened);
+    REQUIRE(opened.error().code == carto::core::ErrorCode::validation_failed);
+}
+
 } // namespace
 
 int main() {
     try {
         application_routes_authoring_through_snapshot_and_history();
+        application_routes_imported_mesh_through_the_durable_command_boundary();
         application_routes_vertex_edit_and_rejects_stale_reselection();
+        application_routes_persistent_edge_selection_without_mutation();
         application_rejects_bad_selection_without_mutating_history();
         application_requires_explicit_discard_for_project_replacement();
         application_bounds_failure_diagnostics();
@@ -368,6 +502,8 @@ int main() {
         application_open_failure_preserves_current_project_and_save_is_atomic();
         application_journals_committed_mutations_and_rolls_back_failed_append();
         application_rejects_journal_revision_drift_before_open();
+        application_rolls_back_preexisting_journal_baseline_on_save_failure();
+        application_rejects_semantically_wrong_journal_tail();
     } catch (const std::exception& error) {
         return (void(std::cerr << "FAIL " << error.what() << '\n'), 1);
     }

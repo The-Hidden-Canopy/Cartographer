@@ -72,6 +72,7 @@ public:
 
 private:
     [[nodiscard]] core::Result<JournalEntry> parse_record(std::string_view line) const;
+    [[nodiscard]] core::Result<std::vector<JournalEntry>> read_all_unlocked() const;
     [[nodiscard]] std::string serialize_record(const JournalEntry& entry) const;
     [[nodiscard]] static assets::Sha256Digest entry_digest(const JournalEntry& entry);
 

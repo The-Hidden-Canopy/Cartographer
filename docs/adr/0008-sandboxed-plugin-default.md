@@ -13,3 +13,7 @@ neutral data; the host validates and commits through an authoring transaction.
 No plugin protocol message is an authoring mutation by itself. Network access,
 arbitrary paths, credentials, mutable project pointers, GPU handles, and
 implicit process authority are outside the manifest and envelope contract.
+The currently declared project-write permission is rejected until a host-side
+admission and `ProjectTransaction` path exists. A valid frame must also use a
+capability explicitly granted by its manifest; syntax validation is not
+authorization.

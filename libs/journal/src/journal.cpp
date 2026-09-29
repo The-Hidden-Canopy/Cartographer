@@ -3,11 +3,23 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cerrno>
 #include <fstream>
+#include <mutex>
 #include <random>
 #include <set>
 #include <sstream>
+#include <system_error>
 #include <utility>
+
+#ifdef _WIN32
+#    define NOMINMAX
+#    include <windows.h>
+#else
+#    include <fcntl.h>
+#    include <sys/file.h>
+#    include <unistd.h>
+#endif
 
 namespace carto::journal {
 
@@ -113,6 +125,92 @@ std::uint64_t now_ms() {
         std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
+// Journal append is a read/validate/write transaction. Keep that transaction
+// serialized for every Journal instance in this process and across cooperating
+// Cartographer processes.
+// The lock file is deliberately separate from the append-only journal so
+// acquiring a lock cannot make a missing journal look like a malformed one.
+std::mutex g_journal_mutex;
+
+class JournalFileLock final {
+public:
+    JournalFileLock() = default;
+    JournalFileLock(const JournalFileLock&) = delete;
+    JournalFileLock& operator=(const JournalFileLock&) = delete;
+
+    ~JournalFileLock() { release(); }
+
+    core::Result<void> acquire(const std::filesystem::path& journal_path, bool exclusive) {
+        const std::filesystem::path lock_path = journal_path.string() + ".lock";
+        const auto parent = lock_path.parent_path();
+        if (!parent.empty()) {
+            std::error_code error;
+            std::filesystem::create_directories(parent, error);
+            if (error) return core::Result<void>::failure(io_error(
+                "unable to create journal lock directory"));
+        }
+#ifdef _WIN32
+        handle_ = CreateFileW(
+            lock_path.wstring().c_str(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) {
+            return core::Result<void>::failure(io_error("unable to open journal lock"));
+        }
+        OVERLAPPED overlapped{};
+        const DWORD flags = exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0U;
+        if (!LockFileEx(handle_, flags, 0U, MAXDWORD, MAXDWORD, &overlapped)) {
+            CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+            return core::Result<void>::failure(io_error("unable to acquire journal lock"));
+        }
+        locked_ = true;
+#else
+        fd_ = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0666);
+        if (fd_ < 0) {
+            return core::Result<void>::failure(io_error("unable to open journal lock"));
+        }
+        if (::flock(fd_, exclusive ? LOCK_EX : LOCK_SH) != 0) {
+            ::close(fd_);
+            fd_ = -1;
+            return core::Result<void>::failure(io_error("unable to acquire journal lock"));
+        }
+        locked_ = true;
+#endif
+        return core::Result<void>::success();
+    }
+
+private:
+    void release() noexcept {
+#ifdef _WIN32
+        if (handle_ == INVALID_HANDLE_VALUE) return;
+        if (locked_) {
+            OVERLAPPED overlapped{};
+            static_cast<void>(UnlockFileEx(handle_, 0U, MAXDWORD, MAXDWORD, &overlapped));
+        }
+        CloseHandle(handle_);
+        handle_ = INVALID_HANDLE_VALUE;
+#else
+        if (fd_ < 0) return;
+        if (locked_) static_cast<void>(::flock(fd_, LOCK_UN));
+        static_cast<void>(::close(fd_));
+        fd_ = -1;
+#endif
+        locked_ = false;
+    }
+
+#ifdef _WIN32
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    int fd_ = -1;
+#endif
+    bool locked_ = false;
+};
+
 } // namespace
 
 bool Uuid::is_zero() const noexcept {
@@ -215,6 +313,30 @@ core::Result<JournalEntry> Journal::parse_record(std::string_view line) const {
 }
 
 core::Result<std::vector<JournalEntry>> Journal::read_all() const {
+    std::lock_guard lock(g_journal_mutex);
+    std::error_code error;
+    const bool journal_exists = std::filesystem::exists(path_, error);
+    if (error) {
+        return core::Result<std::vector<JournalEntry>>::failure(
+            io_error("unable to inspect journal path"));
+    }
+    const std::filesystem::path lock_path = path_.string() + ".lock";
+    const bool lock_exists = std::filesystem::exists(lock_path, error);
+    if (error) {
+        return core::Result<std::vector<JournalEntry>>::failure(
+            io_error("unable to inspect journal lock path"));
+    }
+    if (!journal_exists && !lock_exists) {
+        return read_all_unlocked();
+    }
+    JournalFileLock file_lock;
+    if (auto result = file_lock.acquire(path_, false); !result) {
+        return core::Result<std::vector<JournalEntry>>::failure(result.error());
+    }
+    return read_all_unlocked();
+}
+
+core::Result<std::vector<JournalEntry>> Journal::read_all_unlocked() const {
     std::error_code error;
     if (!std::filesystem::exists(path_, error)) {
         if (error) {
@@ -223,7 +345,11 @@ core::Result<std::vector<JournalEntry>> Journal::read_all() const {
         return core::Result<std::vector<JournalEntry>>::success({});
     }
     const auto file_size = std::filesystem::file_size(path_, error);
-    if (error || file_size > limits_.max_file_bytes) {
+    if (error) {
+        return core::Result<std::vector<JournalEntry>>::failure(
+            io_error("unable to inspect journal size"));
+    }
+    if (file_size > limits_.max_file_bytes) {
         return core::Result<std::vector<JournalEntry>>::failure(
             validation("journal file exceeds the configured limit"));
     }
@@ -279,7 +405,12 @@ core::Result<JournalEntry> Journal::append(const JournalAppend& request) {
     if (request.payload.size() > limits_.max_payload_bytes) {
         return core::Result<JournalEntry>::failure(invalid("journal payload exceeds the configured limit"));
     }
-    const auto existing = read_all();
+    std::lock_guard lock(g_journal_mutex);
+    JournalFileLock file_lock;
+    if (auto result = file_lock.acquire(path_, true); !result) {
+        return core::Result<JournalEntry>::failure(result.error());
+    }
+    const auto existing = read_all_unlocked();
     if (!existing) {
         return core::Result<JournalEntry>::failure(existing.error());
     }
@@ -333,6 +464,10 @@ core::Result<JournalEntry> Journal::append(const JournalAppend& request) {
         }
         needs_header = size == 0U;
     }
+    const auto original_size = exists ? std::filesystem::file_size(path_, error) : 0U;
+    if (error) {
+        return core::Result<JournalEntry>::failure(io_error("unable to record journal append boundary"));
+    }
     std::ofstream stream(path_, std::ios::binary | std::ios::app);
     if (!stream) {
         return core::Result<JournalEntry>::failure(io_error("unable to open journal for append"));
@@ -343,6 +478,13 @@ core::Result<JournalEntry> Journal::append(const JournalAppend& request) {
     stream << record << '\n';
     stream.flush();
     if (!stream) {
+        stream.close();
+        std::error_code rollback_error;
+        std::filesystem::resize_file(path_, original_size, rollback_error);
+        if (rollback_error) {
+            return core::Result<JournalEntry>::failure(
+                io_error("journal append failed and partial-record rollback failed"));
+        }
         return core::Result<JournalEntry>::failure(io_error("unable to append journal record"));
     }
     return core::Result<JournalEntry>::success(std::move(entry));

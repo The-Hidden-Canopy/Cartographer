@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <sstream>
+#include <thread>
 #include <utility>
 
 namespace carto::assets {
@@ -31,6 +34,8 @@ constexpr std::array<std::uint32_t, 64> kRoundConstants{
     0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U,
     0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U,
 };
+
+std::atomic<std::uint64_t> g_blob_temp_counter{0U};
 
 constexpr std::uint32_t rotate_right(std::uint32_t value, unsigned amount) noexcept {
     return (value >> amount) | (value << (32U - amount));
@@ -243,7 +248,12 @@ core::Result<BlobRef> BlobStore::put(
         }
     } else {
         const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-        const std::filesystem::path temporary = destination.string() + ".tmp-" + std::to_string(stamp);
+        const auto thread = std::hash<std::thread::id>{}(std::this_thread::get_id());
+        const auto counter = g_blob_temp_counter.fetch_add(1U, std::memory_order_relaxed);
+        const std::filesystem::path temporary = destination.string() + ".tmp-" +
+            std::to_string(static_cast<unsigned long long>(stamp)) + "-" +
+            std::to_string(static_cast<unsigned long long>(thread)) + "-" +
+            std::to_string(static_cast<unsigned long long>(counter));
         std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
         if (!stream) {
             return core::Result<BlobRef>::failure(io_error("unable to create temporary blob"));
@@ -265,18 +275,32 @@ core::Result<BlobRef> BlobStore::put(
             }
         }
     }
-    return core::Result<BlobRef>::success(BlobRef{digest, bytes.size(), std::move(media_type)});
+    const auto verified = read(digest);
+    if (!verified) {
+        return core::Result<BlobRef>::failure(verified.error().with_context(
+            "published blob verification"));
+    }
+    return core::Result<BlobRef>::success(BlobRef{digest, verified.value().size(), std::move(media_type)});
 }
 
 core::Result<std::vector<std::uint8_t>> BlobStore::read(const Sha256Digest& digest) const {
     const std::filesystem::path path = path_for(digest);
     std::error_code error;
-    if (!std::filesystem::is_regular_file(path, error)) {
+    const bool regular_file = std::filesystem::is_regular_file(path, error);
+    if (error) {
+        return core::Result<std::vector<std::uint8_t>>::failure(
+            io_error("unable to inspect blob path"));
+    }
+    if (!regular_file) {
         return core::Result<std::vector<std::uint8_t>>::failure(
             core::Diagnostic(core::ErrorCode::not_found, "blob does not exist"));
     }
     const auto size = std::filesystem::file_size(path, error);
-    if (error || size > limits_.max_blob_bytes || size > std::numeric_limits<std::size_t>::max()) {
+    if (error) {
+        return core::Result<std::vector<std::uint8_t>>::failure(
+            io_error("unable to inspect blob size"));
+    }
+    if (size > limits_.max_blob_bytes || size > std::numeric_limits<std::size_t>::max()) {
         return core::Result<std::vector<std::uint8_t>>::failure(
             validation("blob size is invalid or exceeds the configured limit"));
     }

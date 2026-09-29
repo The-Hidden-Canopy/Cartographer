@@ -28,17 +28,20 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] backend-neutral generational GPU handles, deferred submission retirement, render-graph validation, and offscreen viewport planning
 - [x] SHA-256 content-addressed blob store with atomic publication and integrity verification
 - [x] append-only revision-bound journal with hash chain, verification, replay callback, content-addressed checkpoints, and staged transaction publication
-- [ ] desktop shell and workspace registry (source scaffold present; native acceptance pending)
+- [x] authority-preserving `carto_ui` foundation with VANTA tokens, density/theme/operator/workspace state, operation/problems projections, shortcut routing, and bounded local preferences
+- [ ] desktop shell and workspace registry (source consumes `carto_ui`; native acceptance pending)
 - [ ] Vulkan resource backend and viewport (optional source path present; SDK/GPU acceptance pending)
 - [x] directory project package layout and human-readable manifest boundary (SQLite database and migrations remain pending)
 - [ ] SQLite WAL authoring database, migrations, integrity scanner, and cache separation
-- [ ] startup recovery, replay inspection, and recovery-versus-explicit-save workflow (application mutation journaling and rollback are present; checkpoint replay/UI integration pending)
+- [ ] startup recovery, replay inspection, and recovery-versus-explicit-save workflow (snapshot-envelope replay is present; recovery UI and explicit-save decision flow remain pending)
 - [x] bounded opaque C ABI smoke surface with a C compiler/linker fixture
 - [ ] ABI negotiation, shared-library packaging, and C++/Python/C# bindings
 - [x] capability provider lifecycle/resolve foundation
-- [x] sandbox-default bounded plugin envelope foundation
+- [x] sandbox-default bounded plugin envelope foundation with fail-closed
+  permission and manifest-capability admission
 - [ ] built-in provider migration beyond the OBJ CLI gate, process isolation, resource budgets, and neutral-result admission
-- [ ] persistent topology edit patches, loop/ring traversal, interactive selection UI, stable edge mode, and broader modeling tool interaction (identity/traversal and vertex patches exist; topology operators and input acceptance pending)
+- [x] stable object/vertex/edge/face selection identity through the editor, application snapshot, headless UI, and source-wired viewport picker (native acceptance pending)
+- [ ] persistent topology edit patches, loop/ring traversal, edge-edit tools, and broader modeling tool interaction (identity/traversal and vertex patches exist; topology operators and native input acceptance pending)
 
 The optional native source path is intentionally not marked complete by the
 presence of a window class or renderer type. It requires a caller-supplied

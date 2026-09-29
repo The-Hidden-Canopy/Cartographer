@@ -574,6 +574,11 @@ const Face* EditableMesh::find_face(FaceId id) const noexcept {
     return iterator == faces_.end() ? nullptr : &iterator->second;
 }
 
+const EdgeRecord* EditableMesh::find_edge(EdgeId id) const noexcept {
+    const auto iterator = edges_.find(id);
+    return iterator == edges_.end() ? nullptr : &iterator->second;
+}
+
 std::vector<Vertex> EditableMesh::vertices_sorted() const {
     std::vector<Vertex> result;
     result.reserve(vertices_.size());
@@ -824,6 +829,15 @@ core::Result<CompiledMesh> EditableMesh::compile() const {
     CompiledMesh compiled;
     compiled.source_revision = revision_;
     std::map<VertexId, std::uint32_t> indices;
+    std::map<EdgeKey, EdgeId> edge_ids;
+    for (const auto& [id, edge] : edges_) {
+        edge_ids.emplace(undirected(edge.first, edge.second), id);
+    }
+    const auto find_edge = [&edge_ids](VertexId first, VertexId second) {
+        const auto found = edge_ids.find(undirected(first, second));
+        if (found == edge_ids.end()) return std::optional<EdgeId>{};
+        return std::optional<EdgeId>{found->second};
+    };
     for (const auto& [id, vertex] : vertices_) {
         indices.emplace(id, static_cast<std::uint32_t>(compiled.positions.size()));
         compiled.positions.push_back(vertex.position);
@@ -839,6 +853,11 @@ core::Result<CompiledMesh> EditableMesh::compile() const {
             const std::uint32_t third = indices.at(face.vertices[index + 1U]);
             compiled.indices.insert(compiled.indices.end(), {first, second, third});
             compiled.triangle_faces.push_back(face_id);
+            compiled.triangle_edges.push_back({
+                find_edge(face.vertices.front(), face.vertices[index]),
+                find_edge(face.vertices[index], face.vertices[index + 1U]),
+                find_edge(face.vertices[index + 1U], face.vertices.front()),
+            });
             const core::Vec3d normal = core::cross(
                 compiled.positions[second] - compiled.positions[first],
                 compiled.positions[third] - compiled.positions[first]);

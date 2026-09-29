@@ -1,5 +1,6 @@
 #include <carto/application/application.hpp>
 
+#include <charconv>
 #include <memory>
 #include <limits>
 #include <set>
@@ -41,12 +42,46 @@ bool journal_entry_matches_document(
     const journal::JournalEntry& entry,
     std::string_view serialized_document) {
     const std::string payload(entry.payload.begin(), entry.payload.end());
-    const std::string marker =
-        "document_bytes=" + std::to_string(serialized_document.size()) + "\n";
-    const std::size_t marker_offset = payload.find(marker);
-    if (marker_offset == std::string::npos) return false;
-    const std::size_t document_offset = marker_offset + marker.size();
-    return payload.compare(document_offset, std::string::npos, serialized_document) == 0;
+    const bool is_snapshot = entry.event_type == kSnapshotEvent;
+    const bool is_mutation = entry.event_type == kActionEvent;
+    if (!is_snapshot && !is_mutation) return false;
+
+    std::size_t cursor = 0U;
+    const auto next_line = [&payload, &cursor]() -> std::optional<std::string_view> {
+        const std::size_t end = payload.find('\n', cursor);
+        if (end == std::string::npos) return std::nullopt;
+        const std::string_view line(payload.data() + cursor, end - cursor);
+        cursor = end + 1U;
+        return line;
+    };
+    const auto header = next_line();
+    if (!header.has_value() || *header !=
+            (is_snapshot ? "CARTOGRAPHER_PROJECT_SNAPSHOT_V1"
+                         : "CARTOGRAPHER_APPLICATION_MUTATION_V1")) {
+        return false;
+    }
+    if (is_mutation) {
+        const auto operation = next_line();
+        if (!operation.has_value() || !operation->starts_with("operation=") ||
+            operation->size() == std::string_view("operation=").size() ||
+            operation->find_first_of("\r\n") != std::string_view::npos) {
+            return false;
+        }
+    }
+    const auto document_bytes = next_line();
+    constexpr std::string_view kDocumentBytes = "document_bytes=";
+    if (!document_bytes.has_value() || !document_bytes->starts_with(kDocumentBytes)) {
+        return false;
+    }
+    const std::string_view value = document_bytes->substr(kDocumentBytes.size());
+    if (value.empty()) return false;
+    std::uint64_t declared_bytes = 0U;
+    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), declared_bytes);
+    if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+        declared_bytes != serialized_document.size()) {
+        return false;
+    }
+    return std::string_view(payload).substr(cursor) == serialized_document;
 }
 
 } // namespace
@@ -102,6 +137,16 @@ core::Result<ApplicationSession::PreparedJournal> ApplicationSession::prepare_jo
             core::ErrorCode::io_error,
             "unable to inspect the project journal path"));
     }
+    std::uintmax_t original_bytes = 0U;
+    if (existed) {
+        std::error_code size_error;
+        original_bytes = std::filesystem::file_size(path, size_error);
+        if (size_error) {
+            return core::Result<PreparedJournal>::failure(core::Diagnostic(
+                core::ErrorCode::io_error,
+                "unable to inspect the project journal size"));
+        }
+    }
 
     journal::Journal candidate(path);
     const auto entries = candidate.read_all();
@@ -124,7 +169,7 @@ core::Result<ApplicationSession::PreparedJournal> ApplicationSession::prepare_jo
                 "project contents do not match the latest durable journal snapshot"));
         }
         return core::Result<PreparedJournal>::success(
-            PreparedJournal{std::move(candidate), false});
+            PreparedJournal{std::move(candidate), false, false, original_bytes});
     }
 
     if (document.revision().value() != 0U) {
@@ -154,10 +199,12 @@ core::Result<ApplicationSession::PreparedJournal> ApplicationSession::prepare_jo
             return core::Result<PreparedJournal>::failure(baseline.error().with_context(
                 "project journal baseline"));
         }
+        return core::Result<PreparedJournal>::success(
+            PreparedJournal{std::move(candidate), !existed, true, original_bytes});
     }
 
     return core::Result<PreparedJournal>::success(
-        PreparedJournal{std::move(candidate), !existed});
+        PreparedJournal{std::move(candidate), !existed, false, original_bytes});
 }
 
 core::Result<void> ApplicationSession::append_mutation_event(
@@ -219,6 +266,8 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(const ApplicationActi
                 return select_vertex(value);
             } else if constexpr (std::is_same_v<Action, SelectFaceAction>) {
                 return select_face(value);
+            } else if constexpr (std::is_same_v<Action, SelectEdgeAction>) {
+                return select_edge(value);
             } else if constexpr (std::is_same_v<Action, SetObjectTransformAction>) {
                 const auto* object = document_.scene().find(value.object);
                 if (!object) {
@@ -239,6 +288,8 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(const ApplicationActi
                 return create_box(value);
             } else if constexpr (std::is_same_v<Action, CreatePlaneAction>) {
                 return create_plane(value);
+            } else if constexpr (std::is_same_v<Action, CreateMeshObjectAction>) {
+                return create_mesh_object(value);
             } else if constexpr (std::is_same_v<Action, UndoAction>) {
                 return undo();
             } else {
@@ -281,6 +332,10 @@ core::Result<DispatchReceipt> ApplicationSession::new_project(const NewProjectAc
 core::Result<DispatchReceipt> ApplicationSession::open_project(const OpenProjectAction& action) {
     if (auto result = require_discard_confirmation(action.discard_dirty); !result) {
         return failure(result.error());
+    }
+    project::FileLock project_lock(action.path);
+    if (auto result = project_lock.acquire(); !result) {
+        return failure(result.error().with_context("project read lock"));
     }
     auto loaded = project::ProjectDocument::load(action.path);
     if (!loaded) {
@@ -326,15 +381,30 @@ core::Result<DispatchReceipt> ApplicationSession::save_project(const SaveProject
     if (!selected) {
         return failure(invalid_state("save requires a project path"));
     }
+    project::FileLock project_lock(*selected);
+    if (auto result = project_lock.acquire(); !result) {
+        return failure(result.error().with_context("project write lock"));
+    }
     auto prepared_journal = prepare_journal(*selected, document_);
     if (!prepared_journal) {
         return failure(prepared_journal.error().with_context("save project journal"));
     }
-    const auto saved = document_.save_atomic(*selected);
+    const auto saved = document_.save_atomic_unlocked(*selected);
     if (!saved) {
+        std::error_code cleanup_error;
         if (prepared_journal.value().created_file) {
-            std::error_code ignored;
-            std::filesystem::remove(prepared_journal.value().journal.path(), ignored);
+            std::filesystem::remove(prepared_journal.value().journal.path(), cleanup_error);
+        } else if (prepared_journal.value().appended_baseline) {
+            std::filesystem::resize_file(
+                prepared_journal.value().journal.path(),
+                prepared_journal.value().original_bytes,
+                cleanup_error);
+        }
+        if (cleanup_error) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "project save failed and durable journal rollback failed: " +
+                    cleanup_error.message()));
         }
         return failure(saved.error().with_context("save project"));
     }
@@ -425,6 +495,27 @@ core::Result<DispatchReceipt> ApplicationSession::select_face(const SelectFaceAc
     return accepted("Select Face", before);
 }
 
+core::Result<DispatchReceipt> ApplicationSession::select_edge(const SelectEdgeAction& action) {
+    const auto* object = document_.scene().find(action.object);
+    if (!object) {
+        return failure(core::Diagnostic(core::ErrorCode::not_found, "cannot select on a missing object"));
+    }
+    if (!object->mesh_asset.has_value()) {
+        return failure(invalid_state("cannot select an edge on an object without a mesh"));
+    }
+    const auto mesh = document_.meshes().find(*object->mesh_asset);
+    if (mesh == document_.meshes().end()) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data, "object references a missing mesh"));
+    }
+    const core::Revision before = document_.revision();
+    if (auto result = selection_.select_edge(
+            document_.scene(), action.object, mesh->second, action.edge, action.operation);
+        !result) {
+        return failure(result.error().with_context("edge selection"));
+    }
+    return accepted("Select Edge", before);
+}
+
 core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAction& action) {
     const core::Revision before = document_.revision();
     project::ProjectDocument before_document = document_;
@@ -458,6 +549,14 @@ core::Result<DispatchReceipt> ApplicationSession::create_plane(const CreatePlane
         std::make_unique<editor::CreateMeshObjectCommand>(
             document_, action.object_name, std::move(mesh.value())),
         "Create Plane");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::create_mesh_object(
+    const CreateMeshObjectAction& action) {
+    return execute_command(
+        std::make_unique<editor::CreateMeshObjectCommand>(
+            document_, action.object_name, action.mesh),
+        "Create Mesh Object");
 }
 
 core::Result<DispatchReceipt> ApplicationSession::undo() {
@@ -553,6 +652,7 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
     result.selection.mode = selection_.mode();
     result.selection.objects = selection_.selected_objects();
     result.selection.vertices = selection_.selected_vertices();
+    result.selection.edges = selection_.selected_edges();
     result.selection.faces = selection_.selected_faces();
     result.selection.component_object = selection_.component_object();
     result.selection.component_mesh_revision = selection_.component_mesh_revision();

@@ -2,10 +2,12 @@
 #include <carto/plugin_protocol/protocol.hpp>
 #include <carto/providers/registry.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -70,10 +72,17 @@ void plugin_protocol_is_bounded_and_defaults_to_non_network_sandboxing() {
     auto traversal = manifest;
     traversal.permissions.filesystem_inputs = {".."};
     REQUIRE(!carto::plugin_protocol::Protocol::validate_manifest(traversal));
+    auto write = manifest;
+    write.permissions.project_write_new_assets = true;
+    REQUIRE(!carto::plugin_protocol::Protocol::validate_manifest(write));
 
     const carto::plugin_protocol::Envelope envelope{
         "request-1", "geometry.import.obj", "import", "{\"source\":\"input.obj\"}",
     };
+    REQUIRE(carto::plugin_protocol::Protocol::validate_admission(manifest, envelope));
+    auto ungranted = envelope;
+    ungranted.capability = "geometry.export.obj";
+    REQUIRE(!carto::plugin_protocol::Protocol::validate_admission(manifest, ungranted));
     const auto frame = carto::plugin_protocol::Protocol::encode(envelope);
     REQUIRE(frame);
     const auto decoded = carto::plugin_protocol::Protocol::decode(frame.value());
@@ -89,6 +98,19 @@ void plugin_protocol_is_bounded_and_defaults_to_non_network_sandboxing() {
         "request-2", "geometry.import.obj", "import", "{" + oversized + "}"}));
     REQUIRE(!carto::plugin_protocol::Protocol::encode({
         "request-3", "geometry.import.obj", "import", "{\"source\": {"}));
+
+    const std::string nested_request_id =
+        "{\"protocol\":\"carto.plugin.v1\","
+        "\"capability\":\"geometry.import.obj\",\"method\":\"import\","
+        "\"payload\":{\"nested\":{\"request_id\":\"request-1\"}}}";
+    std::vector<std::uint8_t> nested_frame(nested_request_id.size() + 4U);
+    const auto nested_size = static_cast<std::uint32_t>(nested_request_id.size());
+    nested_frame[0] = static_cast<std::uint8_t>(nested_size);
+    nested_frame[1] = static_cast<std::uint8_t>(nested_size >> 8U);
+    nested_frame[2] = static_cast<std::uint8_t>(nested_size >> 16U);
+    nested_frame[3] = static_cast<std::uint8_t>(nested_size >> 24U);
+    std::copy(nested_request_id.begin(), nested_request_id.end(), nested_frame.begin() + 4U);
+    REQUIRE(!carto::plugin_protocol::Protocol::decode(nested_frame));
 }
 
 } // namespace

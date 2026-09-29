@@ -39,7 +39,7 @@ public:
     [[nodiscard]] const std::filesystem::path& root() const noexcept { return root_; }
     [[nodiscard]] std::filesystem::path manifest_path() const { return root_ / "manifest.json"; }
     [[nodiscard]] std::filesystem::path document_database_path() const { return root_ / "document.db"; }
-    [[nodiscard]] bool has_document_database() const;
+    [[nodiscard]] core::Result<bool> has_document_database() const;
 
 private:
     ProjectPackage(std::filesystem::path root, PackageManifest manifest)

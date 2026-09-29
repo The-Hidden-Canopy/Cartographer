@@ -40,6 +40,9 @@ public:
     static constexpr std::uint32_t kMaxFrameBytes = 4U * 1024U * 1024U;
 
     [[nodiscard]] static core::Result<void> validate_manifest(const PluginManifest& manifest);
+    [[nodiscard]] static core::Result<void> validate_admission(
+        const PluginManifest& manifest,
+        const Envelope& envelope);
     [[nodiscard]] static core::Result<void> validate_envelope(const Envelope& envelope);
     [[nodiscard]] static core::Result<std::vector<std::uint8_t>> encode(
         const Envelope& envelope);

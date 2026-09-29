@@ -1,5 +1,6 @@
 #include <carto/io/obj.hpp>
 #include <carto/io/builtin_provider.hpp>
+#include <carto/application/application.hpp>
 #include <carto/geometry/primitives.hpp>
 #include <carto/providers/registry.hpp>
 #include <carto/project/project.hpp>
@@ -24,39 +25,33 @@ void print_error(const carto::core::Diagnostic& diagnostic) {
 }
 
 int demo(const std::filesystem::path& path) {
-    auto document = carto::project::ProjectDocument::create("Cartographer 0.1 sample");
-    if (!document) {
-        print_error(document.error());
+    carto::application::ApplicationSession session;
+    auto created_project = session.dispatch(
+        carto::application::NewProjectAction{"Cartographer 0.1 sample"});
+    if (!created_project) {
+        print_error(created_project.error());
         return EXIT_FAILURE;
     }
-    auto object = document.value().create_object("Cube");
-    if (!object) {
-        print_error(object.error());
+    auto baseline = session.dispatch(carto::application::SaveProjectAction{path});
+    if (!baseline) {
+        print_error(baseline.error());
         return EXIT_FAILURE;
     }
-    auto primitive = carto::geometry::make_box({2.0, 2.0, 2.0});
-    if (!primitive) {
-        print_error(primitive.error());
+    auto created_object = session.dispatch(carto::application::CreateBoxAction{
+        "Cube", {2.0, 2.0, 2.0}});
+    if (!created_object) {
+        print_error(created_object.error());
         return EXIT_FAILURE;
     }
-    auto mesh = document.value().add_mesh(std::move(primitive.value()));
-    if (!mesh) {
-        print_error(mesh.error());
-        return EXIT_FAILURE;
-    }
-    auto attach = document.value().attach_mesh(object.value(), mesh.value());
-    if (!attach) {
-        print_error(attach.error());
-        return EXIT_FAILURE;
-    }
-    auto receipt = document.value().save_atomic(path);
+    auto receipt = session.dispatch(carto::application::SaveProjectAction{std::nullopt});
     if (!receipt) {
         print_error(receipt.error());
         return EXIT_FAILURE;
     }
+    const auto snapshot = session.snapshot();
     std::cout << "created " << path << "\n"
-              << "objects=" << document.value().scene().size() << " meshes="
-              << document.value().meshes().size() << " bytes=" << receipt.value().bytes_written
+              << "objects=" << snapshot.objects.size() << " revision="
+              << snapshot.project_revision.value() << " journaled=true"
               << "\n";
     return EXIT_SUCCESS;
 }
@@ -121,33 +116,32 @@ int import_obj(const std::filesystem::path& obj_path, const std::filesystem::pat
         print_error(imported.error());
         return EXIT_FAILURE;
     }
-    auto document = carto::project::ProjectDocument::create(obj_path.stem().string());
-    if (!document) {
-        print_error(document.error());
+    carto::application::ApplicationSession session;
+    auto created_project = session.dispatch(carto::application::NewProjectAction{
+        obj_path.stem().string()});
+    if (!created_project) {
+        print_error(created_project.error());
         return EXIT_FAILURE;
     }
-    auto object = document.value().create_object(obj_path.stem().string());
-    if (!object) {
-        print_error(object.error());
+    auto baseline = session.dispatch(carto::application::SaveProjectAction{project_path});
+    if (!baseline) {
+        print_error(baseline.error());
         return EXIT_FAILURE;
     }
-    auto mesh = document.value().add_mesh(std::move(imported.value().mesh));
-    if (!mesh) {
-        print_error(mesh.error());
+    auto created_object = session.dispatch(carto::application::CreateMeshObjectAction{
+        obj_path.stem().string(), std::move(imported.value().mesh)});
+    if (!created_object) {
+        print_error(created_object.error());
         return EXIT_FAILURE;
     }
-    if (auto attach = document.value().attach_mesh(object.value(), mesh.value()); !attach) {
-        print_error(attach.error());
-        return EXIT_FAILURE;
-    }
-    auto receipt = document.value().save_atomic(project_path);
+    auto receipt = session.dispatch(carto::application::SaveProjectAction{std::nullopt});
     if (!receipt) {
         print_error(receipt.error());
         return EXIT_FAILURE;
     }
     std::cout << "imported " << obj_path << " -> " << project_path << " vertices="
               << imported.value().report.vertices << " faces=" << imported.value().report.faces
-              << '\n';
+              << " journaled=true\n";
     for (const auto& warning : imported.value().report.warnings) {
         std::cout << "warning: " << warning << '\n';
     }

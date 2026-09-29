@@ -179,16 +179,45 @@ void selection_is_mode_scoped_and_context_validated() {
     REQUIRE(selection.empty());
     REQUIRE(selection.validate(scene, &mesh));
 
+    const auto mesh_topology = mesh.topology();
+    REQUIRE(mesh_topology);
+    const auto edge = mesh_topology.value().edges.front().id;
+    REQUIRE(selection.select_edge(mesh, edge));
+    REQUIRE(selection.mode() == carto::editor::SelectionMode::edge);
+    REQUIRE(selection.active_count() == 1U);
+    REQUIRE(selection.selected_edges().front() == edge);
+    REQUIRE(selection.validate(scene, &mesh));
+    REQUIRE(!selection.select_edge(mesh, carto::geometry::EdgeId{999}));
+    REQUIRE(selection.active_count() == 1U);
+    REQUIRE(selection.select_edge(mesh, edge, carto::editor::SelectionOperation::toggle));
+    REQUIRE(selection.empty());
+    REQUIRE(selection.validate(scene, &mesh));
+
     auto box = carto::geometry::make_box({2.0, 2.0, 2.0});
     auto plane = carto::geometry::make_plane(2.0, 2.0);
     REQUIRE(box && plane);
     const auto box_face = box.value().faces_sorted().back().id;
+    const auto box_edge = box.value().topology().value().edges.front().id;
     REQUIRE(selection.select_face(box.value(), box_face));
     REQUIRE(selection.mode() == carto::editor::SelectionMode::face);
     REQUIRE(selection.validate(scene, &box.value()));
     const auto stale_selection = selection.validate(scene, &plane.value());
     REQUIRE(!stale_selection);
     REQUIRE(stale_selection.error().code == carto::core::ErrorCode::stale_data);
+
+    carto::editor::SelectionState bound_edge;
+    REQUIRE(bound_edge.select_edge(scene, first_object.value(), box.value(), box_edge));
+    REQUIRE(bound_edge.validate(scene, &box.value()));
+    const auto cross_edge = bound_edge.select_edge(
+        scene,
+        second_object.value(),
+        box.value(),
+        box_edge,
+        carto::editor::SelectionOperation::add);
+    REQUIRE(!cross_edge);
+    REQUIRE(cross_edge.error().code == carto::core::ErrorCode::invalid_state);
+    REQUIRE(bound_edge.active_count() == 1U);
+    REQUIRE(bound_edge.selected_edges().front() == box_edge);
 
     carto::editor::SelectionState bound_selection;
     REQUIRE(bound_selection.select_face(
@@ -224,6 +253,9 @@ void selection_is_mode_scoped_and_context_validated() {
     auto changed_position = bound_vertex.position;
     changed_position.x += 0.125;
     REQUIRE(box.value().set_vertex_position(bound_vertex.id, changed_position));
+    const auto stale_edge_revision = bound_edge.validate(scene, &box.value());
+    REQUIRE(!stale_edge_revision);
+    REQUIRE(stale_edge_revision.error().code == carto::core::ErrorCode::stale_data);
     const auto stale_revision = bound_selection.validate(scene, &box.value());
     REQUIRE(!stale_revision);
     REQUIRE(stale_revision.error().code == carto::core::ErrorCode::stale_data);
@@ -277,6 +309,8 @@ void mesh_compiles_without_mutating_source_and_exposes_boundary_topology() {
     REQUIRE(mesh.revision() == before_revision);
     REQUIRE(mesh.vertex_count() == before_vertices);
     REQUIRE(compiled.value().indices.size() == 3U);
+    REQUIRE(compiled.value().triangle_edges.size() == 1U);
+    for (const auto& edge : compiled.value().triangle_edges.front()) REQUIRE(edge.has_value());
     const auto compiled_again = mesh.compile();
     REQUIRE(compiled_again);
     REQUIRE(compiled_again.value().source_revision == before_revision);
@@ -1129,14 +1163,11 @@ void project_save_failure_does_not_replace_existing_file_and_paths_are_bounded()
     const std::string unchanged((std::istreambuf_iterator<char>(after)), std::istreambuf_iterator<char>());
     REQUIRE(original == unchanged);
 
-    const auto blocked_temporary = temp.path() / "valid.carto.carto.tmp";
-    REQUIRE(std::filesystem::create_directory(blocked_temporary));
-    const auto blocked_save = document.value().save_atomic(path);
+    const auto blocked_destination = temp.path() / "blocked.carto";
+    REQUIRE(std::filesystem::create_directory(blocked_destination));
+    const auto blocked_save = document.value().save_atomic(blocked_destination);
     REQUIRE(!blocked_save);
-    std::ifstream blocked_after(path, std::ios::binary);
-    const std::string blocked_unchanged(
-        (std::istreambuf_iterator<char>(blocked_after)), std::istreambuf_iterator<char>());
-    REQUIRE(blocked_unchanged == original);
+    REQUIRE(std::filesystem::is_directory(blocked_destination));
 
     carto::project::AssetReference safe{"assets/mesh.obj"};
     REQUIRE(safe.validate());
@@ -1192,10 +1223,11 @@ void obj_interchange_reports_feature_loss_and_round_trips_geometry() {
     std::ifstream atomic_before(atomic_path, std::ios::binary);
     const std::string atomic_original(
         (std::istreambuf_iterator<char>(atomic_before)), std::istreambuf_iterator<char>());
-    const auto blocked_temporary = temp.path() / "atomic.obj.carto.tmp";
-    REQUIRE(std::filesystem::create_directory(blocked_temporary));
-    const auto blocked_export = carto::io::export_obj(mesh, atomic_path);
+    const auto blocked_destination = temp.path() / "blocked.obj";
+    REQUIRE(std::filesystem::create_directory(blocked_destination));
+    const auto blocked_export = carto::io::export_obj(mesh, blocked_destination);
     REQUIRE(!blocked_export);
+    REQUIRE(std::filesystem::is_directory(blocked_destination));
     std::ifstream atomic_after(atomic_path, std::ios::binary);
     const std::string atomic_unchanged(
         (std::istreambuf_iterator<char>(atomic_after)), std::istreambuf_iterator<char>());

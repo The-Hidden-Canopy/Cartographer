@@ -21,6 +21,7 @@ add_executable(cartographer_desktop WIN32
 target_link_libraries(cartographer_desktop
     PRIVATE
         carto_application
+        carto_ui
         carto_vulkan
         carto_imgui
         Vulkan::Vulkan

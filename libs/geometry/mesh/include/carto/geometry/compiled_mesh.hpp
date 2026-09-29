@@ -6,6 +6,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
+#include <optional>
 #include <vector>
 
 namespace carto::geometry {
@@ -18,12 +20,14 @@ struct CompiledMesh {
     // to authoring IDs.  They are never an alternate source of topology.
     std::vector<VertexId> vertex_ids;
     std::vector<FaceId> triangle_faces;
+    std::vector<std::array<std::optional<EdgeId>, 3>> triangle_edges;
     core::Bounds3d bounds;
     core::Revision source_revision;
 
     [[nodiscard]] bool valid() const noexcept {
         if (positions.size() != normals.size() || positions.size() != vertex_ids.size() ||
             indices.size() % 3U != 0U || triangle_faces.size() != indices.size() / 3U ||
+            triangle_edges.size() != triangle_faces.size() ||
             !bounds.valid()) {
             return false;
         }
@@ -40,6 +44,11 @@ struct CompiledMesh {
         for (const FaceId face : triangle_faces) {
             if (!face) {
                 return false;
+            }
+        }
+        for (const auto& triangle : triangle_edges) {
+            for (const auto& edge : triangle) {
+                if (edge.has_value() && !*edge) return false;
             }
         }
         return true;

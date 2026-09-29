@@ -1,12 +1,16 @@
 #include <carto/project/package.hpp>
+#include <carto/core/json.hpp>
+#include <carto/project/file_lock.hpp>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
-#include <charconv>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 namespace carto::project {
@@ -16,6 +20,7 @@ namespace {
 constexpr std::size_t kMaxManifestBytes = 64U * 1024U;
 constexpr std::size_t kMaxProjectIdBytes = 128U;
 constexpr std::size_t kMaxNameBytes = 4096U;
+std::atomic<std::uint64_t> g_package_temp_counter{0U};
 
 core::Diagnostic invalid(std::string message) {
     return core::Diagnostic(core::ErrorCode::invalid_argument, std::move(message));
@@ -58,140 +63,6 @@ std::string json_escape(std::string_view value) {
         escaped.push_back(byte);
     }
     return escaped;
-}
-
-std::size_t skip_space(std::string_view text, std::size_t offset) {
-    while (offset < text.size() &&
-           (text[offset] == ' ' || text[offset] == '\n' || text[offset] == '\r' || text[offset] == '\t')) {
-        ++offset;
-    }
-    return offset;
-}
-
-bool valid_json_object(std::string_view text) {
-    const std::size_t first = skip_space(text, 0U);
-    if (first >= text.size() || text[first] != '{') return false;
-
-    std::size_t object_depth = 0U;
-    std::size_t array_depth = 0U;
-    bool in_string = false;
-    bool escaped = false;
-    bool root_closed = false;
-    for (std::size_t offset = first; offset < text.size(); ++offset) {
-        const char byte = text[offset];
-        if (in_string) {
-            if (escaped) {
-                if (byte != '\\' && byte != '"') return false;
-                escaped = false;
-            } else if (byte == '\\') {
-                escaped = true;
-            } else if (byte == '"') {
-                in_string = false;
-            } else if (static_cast<unsigned char>(byte) < 0x20U) {
-                return false;
-            }
-            continue;
-        }
-
-        if (root_closed) {
-            if (byte != ' ' && byte != '\n' && byte != '\r' && byte != '\t') return false;
-            continue;
-        }
-        if (byte == '"') {
-            in_string = true;
-        } else if (byte == '{') {
-            ++object_depth;
-        } else if (byte == '}') {
-            if (object_depth == 0U) return false;
-            --object_depth;
-            if (object_depth == 0U && array_depth == 0U) root_closed = true;
-        } else if (byte == '[') {
-            ++array_depth;
-        } else if (byte == ']') {
-            if (array_depth == 0U) return false;
-            --array_depth;
-        }
-    }
-    return root_closed && !in_string && !escaped && object_depth == 0U && array_depth == 0U;
-}
-
-std::size_t key_count(std::string_view text, std::string_view key) {
-    const std::string marker = "\"" + std::string(key) + "\"";
-    std::size_t count = 0U;
-    std::size_t offset = 0U;
-    while (true) {
-        offset = text.find(marker, offset);
-        if (offset == std::string_view::npos) return count;
-        const std::size_t after = skip_space(text, offset + marker.size());
-        if (after < text.size() && text[after] == ':') {
-            ++count;
-        }
-        offset += marker.size();
-    }
-}
-
-core::Result<std::string> json_string_field(std::string_view text, std::string_view key) {
-    const std::string marker = "\"" + std::string(key) + "\"";
-    const std::size_t marker_offset = text.find(marker);
-    if (marker_offset == std::string_view::npos) {
-        return core::Result<std::string>::failure(invalid("manifest field is missing: " + std::string(key)));
-    }
-    const std::size_t colon = text.find(':', marker_offset + marker.size());
-    if (colon == std::string_view::npos) {
-        return core::Result<std::string>::failure(invalid("manifest field has no value: " + std::string(key)));
-    }
-    std::size_t offset = skip_space(text, colon + 1U);
-    if (offset >= text.size() || text[offset] != '"') {
-        return core::Result<std::string>::failure(invalid("manifest field is not a string: " + std::string(key)));
-    }
-    ++offset;
-    std::string value;
-    while (offset < text.size()) {
-        const char byte = text[offset++];
-        if (byte == '"') {
-            return core::Result<std::string>::success(std::move(value));
-        }
-        if (byte == '\\') {
-            if (offset >= text.size() || (text[offset] != '\\' && text[offset] != '"')) {
-                return core::Result<std::string>::failure(
-                    invalid("manifest string uses unsupported escaping: " + std::string(key)));
-            }
-            value.push_back(text[offset++]);
-            continue;
-        }
-        if (static_cast<unsigned char>(byte) < 0x20U) {
-            return core::Result<std::string>::failure(
-                invalid("manifest string contains a control byte: " + std::string(key)));
-        }
-        value.push_back(byte);
-    }
-    return core::Result<std::string>::failure(invalid("manifest string is unterminated: " + std::string(key)));
-}
-
-core::Result<std::uint32_t> json_uint_field(std::string_view text, std::string_view key) {
-    const std::string marker = "\"" + std::string(key) + "\"";
-    const std::size_t marker_offset = text.find(marker);
-    if (marker_offset == std::string_view::npos) {
-        return core::Result<std::uint32_t>::failure(invalid("manifest field is missing: " + std::string(key)));
-    }
-    const std::size_t colon = text.find(':', marker_offset + marker.size());
-    if (colon == std::string_view::npos) {
-        return core::Result<std::uint32_t>::failure(invalid("manifest field has no value: " + std::string(key)));
-    }
-    const std::size_t start = skip_space(text, colon + 1U);
-    std::size_t end = start;
-    while (end < text.size() && text[end] >= '0' && text[end] <= '9') {
-        ++end;
-    }
-    if (start == end) {
-        return core::Result<std::uint32_t>::failure(invalid("manifest version is not an integer"));
-    }
-    std::uint32_t value = 0U;
-    const auto result = std::from_chars(text.data() + start, text.data() + end, value);
-    if (result.ec != std::errc{} || result.ptr != text.data() + end) {
-        return core::Result<std::uint32_t>::failure(invalid("manifest version is invalid"));
-    }
-    return core::Result<std::uint32_t>::success(value);
 }
 
 } // namespace
@@ -238,8 +109,13 @@ core::Result<void> ProjectPackage::write_manifest() const {
         "  \"document_database\": \"document.db\",\n"
         "  \"blob_root\": \"blobs/sha256\"\n"
         "}\n";
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto thread = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    const auto counter = g_package_temp_counter.fetch_add(1U, std::memory_order_relaxed);
     const auto temporary = manifest_path().string() + ".tmp-" +
-        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        std::to_string(static_cast<unsigned long long>(stamp)) + "-" +
+        std::to_string(static_cast<unsigned long long>(thread)) + "-" +
+        std::to_string(static_cast<unsigned long long>(counter));
     std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
     if (!stream) {
         return core::Result<void>::failure(io_error("unable to create package manifest"));
@@ -267,12 +143,37 @@ core::Result<ProjectPackage> ProjectPackage::create(
     if (auto result = validate_manifest(manifest); !result) {
         return core::Result<ProjectPackage>::failure(result.error());
     }
+    if (root.empty() || root.filename().empty()) {
+        return core::Result<ProjectPackage>::failure(
+            invalid("package root must name a directory"));
+    }
+    const auto parent = root.parent_path();
+    if (!parent.empty()) {
+        std::error_code parent_error;
+        std::filesystem::create_directories(parent, parent_error);
+        if (parent_error) {
+            return core::Result<ProjectPackage>::failure(
+                io_error("unable to create package parent directory"));
+        }
+    }
+    FileLock file_lock(root);
+    if (auto result = file_lock.acquire(); !result) {
+        return core::Result<ProjectPackage>::failure(result.error());
+    }
     std::error_code error;
-    if (std::filesystem::exists(root, error)) {
-        if (error || !std::filesystem::is_directory(root, error)) {
+    const bool root_exists = std::filesystem::exists(root, error);
+    if (error) {
+        return core::Result<ProjectPackage>::failure(io_error("unable to inspect package root"));
+    }
+    if (root_exists) {
+        if (!std::filesystem::is_directory(root, error) || error) {
             return core::Result<ProjectPackage>::failure(io_error("package root is not a directory"));
         }
-        if (!std::filesystem::is_empty(root, error) || error) {
+        const bool root_is_empty = std::filesystem::is_empty(root, error);
+        if (error) {
+            return core::Result<ProjectPackage>::failure(io_error("unable to inspect package root contents"));
+        }
+        if (!root_is_empty) {
             return core::Result<ProjectPackage>::failure(
                 invalid("refusing to create a package in a non-empty directory"));
         }
@@ -289,12 +190,21 @@ core::Result<ProjectPackage> ProjectPackage::create(
 
 core::Result<PackageManifest> ProjectPackage::read_manifest(const std::filesystem::path& path) {
     std::error_code error;
-    if (!std::filesystem::is_regular_file(path, error)) {
+    const bool regular_file = std::filesystem::is_regular_file(path, error);
+    if (error) {
+        return core::Result<PackageManifest>::failure(
+            io_error("unable to inspect package manifest"));
+    }
+    if (!regular_file) {
         return core::Result<PackageManifest>::failure(
             core::Diagnostic(core::ErrorCode::not_found, "package manifest does not exist"));
     }
     const auto size = std::filesystem::file_size(path, error);
-    if (error || size > kMaxManifestBytes || size > std::numeric_limits<std::size_t>::max()) {
+    if (error) {
+        return core::Result<PackageManifest>::failure(
+            io_error("unable to inspect package manifest size"));
+    }
+    if (size > kMaxManifestBytes || size > std::numeric_limits<std::size_t>::max()) {
         return core::Result<PackageManifest>::failure(validation("package manifest is too large"));
     }
     std::string text(static_cast<std::size_t>(size), '\0');
@@ -306,32 +216,45 @@ core::Result<PackageManifest> ProjectPackage::read_manifest(const std::filesyste
     if (!stream && !stream.eof()) {
         return core::Result<PackageManifest>::failure(io_error("unable to read package manifest"));
     }
-    const std::size_t first = skip_space(text, 0U);
-    std::size_t last = text.size();
-    while (last > first &&
-           (text[last - 1U] == ' ' || text[last - 1U] == '\n' || text[last - 1U] == '\r' ||
-            text[last - 1U] == '\t')) {
-        --last;
+    const auto object = core::json::parse_object(text);
+    if (!object) {
+        return core::Result<PackageManifest>::failure(
+            object.error().with_context("package manifest JSON"));
     }
-    if (first >= last || text[first] != '{' || text[last - 1U] != '}' ||
-        !valid_json_object(text.substr(first, last - first))) {
-        return core::Result<PackageManifest>::failure(validation("package manifest is not one JSON object"));
-    }
-    for (const auto key : {"format", "format_version", "project_id", "name", "units", "up_axis",
-                           "document_database", "blob_root"}) {
-        if (key_count(text, key) != 1U) {
-            return core::Result<PackageManifest>::failure(
-                validation("package manifest has a missing or duplicate field"));
+    const auto string_field = [&object](std::string_view key) {
+        const auto* member = core::json::find_member(object.value(), key);
+        if (member == nullptr) {
+            return core::Result<std::string>::failure(
+                validation("package manifest field is missing: " + std::string(key)));
         }
-    }
-    const auto format = json_string_field(text, "format");
-    const auto version = json_uint_field(text, "format_version");
-    const auto project_id = json_string_field(text, "project_id");
-    const auto name = json_string_field(text, "name");
-    const auto units = json_string_field(text, "units");
-    const auto up_axis = json_string_field(text, "up_axis");
-    const auto database = json_string_field(text, "document_database");
-    const auto blobs = json_string_field(text, "blob_root");
+        const auto value = core::json::decode_string(member->raw_value);
+        if (!value) {
+            return core::Result<std::string>::failure(
+                value.error().with_context("package manifest field: " + std::string(key)));
+        }
+        return value;
+    };
+    const auto integer_field = [&object](std::string_view key) {
+        const auto* member = core::json::find_member(object.value(), key);
+        if (member == nullptr) {
+            return core::Result<std::uint64_t>::failure(
+                validation("package manifest field is missing: " + std::string(key)));
+        }
+        const auto value = core::json::parse_uint(member->raw_value);
+        if (!value) {
+            return core::Result<std::uint64_t>::failure(
+                value.error().with_context("package manifest field: " + std::string(key)));
+        }
+        return value;
+    };
+    const auto format = string_field("format");
+    const auto version = integer_field("format_version");
+    const auto project_id = string_field("project_id");
+    const auto name = string_field("name");
+    const auto units = string_field("units");
+    const auto up_axis = string_field("up_axis");
+    const auto database = string_field("document_database");
+    const auto blobs = string_field("blob_root");
     if (!format || !version || !project_id || !name || !units || !up_axis || !database || !blobs) {
         const auto& diagnostic = !format ? format.error() : !version ? version.error() :
             !project_id ? project_id.error() : !name ? name.error() : !units ? units.error() :
@@ -362,7 +285,11 @@ core::Result<PackageManifest> ProjectPackage::read_manifest(const std::filesyste
 
 core::Result<ProjectPackage> ProjectPackage::open(const std::filesystem::path& root) {
     std::error_code error;
-    if (!std::filesystem::is_directory(root, error)) {
+    const bool root_is_directory = std::filesystem::is_directory(root, error);
+    if (error) {
+        return core::Result<ProjectPackage>::failure(io_error("unable to inspect package root"));
+    }
+    if (!root_is_directory) {
         return core::Result<ProjectPackage>::failure(
             core::Diagnostic(core::ErrorCode::not_found, "package root does not exist"));
     }
@@ -419,9 +346,26 @@ assets::BlobStore ProjectPackage::blob_store() const {
     return assets::BlobStore(root_ / "blobs");
 }
 
-bool ProjectPackage::has_document_database() const {
+core::Result<bool> ProjectPackage::has_document_database() const {
     std::error_code error;
-    return std::filesystem::exists(document_database_path(), error) && !error;
+    const bool exists = std::filesystem::exists(document_database_path(), error);
+    if (error) {
+        return core::Result<bool>::failure(io_error(
+            "unable to inspect package document database"));
+    }
+    if (exists && !std::filesystem::is_regular_file(document_database_path(), error)) {
+        if (error) {
+            return core::Result<bool>::failure(io_error(
+                "unable to inspect package document database"));
+        }
+        return core::Result<bool>::failure(validation(
+            "package document database path is not a regular file"));
+    }
+    if (error) {
+        return core::Result<bool>::failure(io_error(
+            "unable to inspect package document database"));
+    }
+    return core::Result<bool>::success(exists);
 }
 
 } // namespace carto::project

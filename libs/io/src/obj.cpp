@@ -1,11 +1,16 @@
 #include <carto/io/obj.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 #include <system_error>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 #ifdef _WIN32
@@ -29,9 +34,17 @@ constexpr std::size_t kMaxObjVertices = 1'000'000U;
 constexpr std::size_t kMaxObjFaces = 1'000'000U;
 constexpr std::size_t kMaxObjFaceVertices = 1'000'000U;
 constexpr std::size_t kMaxObjWarnings = 10'000U;
+std::mutex g_obj_export_mutex;
+std::atomic<std::uint64_t> g_obj_temp_counter{0U};
 
 std::filesystem::path temporary_path(const std::filesystem::path& target) {
-    return target.parent_path() / (target.filename().string() + ".carto.tmp");
+    const auto ticks = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto thread = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    const auto counter = g_obj_temp_counter.fetch_add(1U, std::memory_order_relaxed);
+    return target.parent_path() / (target.filename().string() + ".carto.tmp-" +
+        std::to_string(static_cast<unsigned long long>(ticks)) + "-" +
+        std::to_string(static_cast<unsigned long long>(thread)) + "-" +
+        std::to_string(static_cast<unsigned long long>(counter)));
 }
 
 core::Result<void> atomic_replace(
@@ -94,6 +107,21 @@ core::Result<std::size_t> parse_index(std::string_view token, std::size_t count)
 core::Result<IoReport> export_obj(
     const geometry::EditableMesh& mesh,
     const std::filesystem::path& path) {
+    std::lock_guard lock(g_obj_export_mutex);
+    if (path.empty() || path.filename().empty()) {
+        return core::Result<IoReport>::failure(
+            Diagnostic(ErrorCode::invalid_argument, "OBJ export path must name a file"));
+    }
+    const auto parent = path.parent_path();
+    if (!parent.empty()) {
+        std::error_code parent_error;
+        const bool parent_exists = std::filesystem::exists(parent, parent_error);
+        if (parent_error || !parent_exists ||
+            !std::filesystem::is_directory(parent, parent_error) || parent_error) {
+            return core::Result<IoReport>::failure(
+                Diagnostic(ErrorCode::io_error, "OBJ export parent directory is unavailable"));
+        }
+    }
     auto compiled = mesh.compile();
     if (!compiled) {
         return core::Result<IoReport>::failure(compiled.error());
@@ -151,7 +179,11 @@ core::Result<ImportResult> import_obj(const std::filesystem::path& path) {
     }
     std::error_code size_error;
     const auto file_size = std::filesystem::file_size(path, size_error);
-    if (!size_error && file_size > kMaxObjBytes) {
+    if (size_error) {
+        return core::Result<ImportResult>::failure(
+            Diagnostic(ErrorCode::io_error, "unable to inspect OBJ input size"));
+    }
+    if (file_size > kMaxObjBytes) {
         return core::Result<ImportResult>::failure(
             validation("OBJ input exceeds the Cartographer import limit of 128 MiB"));
     }

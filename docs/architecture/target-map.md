@@ -19,6 +19,7 @@ carto_core
   |-- carto_editor        (scene + core)
   |-- carto_io            (geometry + core)
   |-- carto_application   (project + editor + render snapshot composition)
+  |-- carto_ui            (presentation state + validated application routing)
   `-- cartographer_cli    (headless application composition)
 ```
 
@@ -27,6 +28,7 @@ with its external prerequisites, the optional extension is:
 
 ```text
 carto_application       (headless authoring composition)
+carto_ui                 (headless VANTA-family presentation/controller)
 carto_vulkan             (optional Vulkan runtime probe/backend seam)
 cartographer_desktop     (optional application + Vulkan + Dear ImGui shell)
 ```

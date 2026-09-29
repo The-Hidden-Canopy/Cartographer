@@ -41,6 +41,7 @@ add_subdirectory(libs/project)
 add_subdirectory(libs/editor)
 add_subdirectory(libs/render)
 add_subdirectory(libs/application)
+add_subdirectory(libs/ui)
 add_subdirectory(libs/sdk)
 add_subdirectory(libs/io)
 

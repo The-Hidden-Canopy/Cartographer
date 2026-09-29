@@ -24,7 +24,7 @@ Diagnostic invalid(std::string message) {
 
 bool valid_mode(SelectionMode mode) noexcept {
     return mode == SelectionMode::object || mode == SelectionMode::vertex ||
-        mode == SelectionMode::face;
+        mode == SelectionMode::edge || mode == SelectionMode::face;
 }
 
 bool valid_operation(SelectionOperation operation) noexcept {
@@ -40,6 +40,8 @@ std::size_t SelectionState::active_count() const noexcept {
         return objects_.size();
     case SelectionMode::vertex:
         return vertices_.size();
+    case SelectionMode::edge:
+        return edges_.size();
     case SelectionMode::face:
         return faces_.size();
     }
@@ -167,6 +169,62 @@ core::Result<void> SelectionState::select_face(
     return core::Result<void>::success();
 }
 
+core::Result<void> SelectionState::select_edge(
+    const geometry::EditableMesh& mesh,
+    geometry::EdgeId edge,
+    SelectionOperation operation) {
+    if (!valid_operation(operation)) {
+        return core::Result<void>::failure(invalid("selection operation is invalid"));
+    }
+    if (!mesh.find_edge(edge)) {
+        return core::Result<void>::failure(missing("cannot select a missing mesh edge"));
+    }
+    if (auto result = prepare_component_selection(
+            SelectionMode::edge, std::nullopt, mesh, operation);
+        !result) {
+        return result;
+    }
+    if (operation == SelectionOperation::replace) {
+        edges_.clear();
+    }
+    if (operation == SelectionOperation::toggle && edges_.contains(edge)) {
+        edges_.erase(edge);
+    } else {
+        edges_.insert(edge);
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> SelectionState::select_edge(
+    const scene::Scene& scene,
+    scene::ObjectId object,
+    const geometry::EditableMesh& mesh,
+    geometry::EdgeId edge,
+    SelectionOperation operation) {
+    if (!valid_operation(operation)) {
+        return core::Result<void>::failure(invalid("selection operation is invalid"));
+    }
+    if (!scene.find(object)) {
+        return core::Result<void>::failure(missing("cannot select an edge on a missing object"));
+    }
+    if (!mesh.find_edge(edge)) {
+        return core::Result<void>::failure(missing("cannot select a missing mesh edge"));
+    }
+    if (auto result = prepare_component_selection(SelectionMode::edge, object, mesh, operation);
+        !result) {
+        return result;
+    }
+    if (operation == SelectionOperation::replace) {
+        edges_.clear();
+    }
+    if (operation == SelectionOperation::toggle && edges_.contains(edge)) {
+        edges_.erase(edge);
+    } else {
+        edges_.insert(edge);
+    }
+    return core::Result<void>::success();
+}
+
 core::Result<void> SelectionState::select_face(
     const scene::Scene& scene,
     scene::ObjectId object,
@@ -219,6 +277,16 @@ core::Result<void> SelectionState::validate(
                 stale("selection owner object is no longer present in the scene"));
         }
         return validate(*mesh);
+    case SelectionMode::edge:
+        if (!mesh) {
+            return core::Result<void>::failure(
+                invalid("edge selection validation requires a mesh context"));
+        }
+        if (component_object_.has_value() && !scene.find(*component_object_)) {
+            return core::Result<void>::failure(
+                stale("selection owner object is no longer present in the scene"));
+        }
+        return validate(*mesh);
     case SelectionMode::face:
         if (!mesh) {
             return core::Result<void>::failure(
@@ -254,6 +322,23 @@ core::Result<void> SelectionState::validate(const geometry::EditableMesh& mesh) 
             }
         }
         return core::Result<void>::success();
+    case SelectionMode::edge:
+        if (component_mesh_ && component_mesh_ != &mesh) {
+            return core::Result<void>::failure(
+                stale("selection belongs to a different mesh context"));
+        }
+        if (component_mesh_revision_.has_value() &&
+            *component_mesh_revision_ != mesh.revision()) {
+            return core::Result<void>::failure(
+                stale("selection was created against an older mesh revision"));
+        }
+        for (const geometry::EdgeId edge : edges_) {
+            if (!mesh.find_edge(edge)) {
+                return core::Result<void>::failure(
+                    stale("selection contains an edge no longer present in the mesh"));
+            }
+        }
+        return core::Result<void>::success();
     case SelectionMode::face:
         if (component_mesh_ && component_mesh_ != &mesh) {
             return core::Result<void>::failure(
@@ -283,6 +368,10 @@ std::vector<geometry::VertexId> SelectionState::selected_vertices() const {
     return {vertices_.begin(), vertices_.end()};
 }
 
+std::vector<geometry::EdgeId> SelectionState::selected_edges() const {
+    return {edges_.begin(), edges_.end()};
+}
+
 std::vector<geometry::FaceId> SelectionState::selected_faces() const {
     return {faces_.begin(), faces_.end()};
 }
@@ -290,6 +379,7 @@ std::vector<geometry::FaceId> SelectionState::selected_faces() const {
 void SelectionState::clear_all() noexcept {
     objects_.clear();
     vertices_.clear();
+    edges_.clear();
     faces_.clear();
     component_object_.reset();
     component_mesh_ = nullptr;

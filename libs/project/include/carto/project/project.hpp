@@ -3,6 +3,7 @@
 #include <carto/core/revision.hpp>
 #include <carto/core/result.hpp>
 #include <carto/geometry/mesh.hpp>
+#include <carto/project/file_lock.hpp>
 #include <carto/scene/scene.hpp>
 
 #include <cstdint>
@@ -10,6 +11,10 @@
 #include <map>
 #include <string>
 #include <string_view>
+
+namespace carto::application {
+class ApplicationSession;
+}
 
 namespace carto::project {
 
@@ -85,7 +90,11 @@ public:
     [[nodiscard]] std::uint32_t schema_version() const noexcept { return kSchemaVersion; }
 
 private:
+    friend class ::carto::application::ApplicationSession;
+
     [[nodiscard]] core::Result<void> set_name(std::string name);
+    [[nodiscard]] core::Result<SaveReceipt> save_atomic_unlocked(
+        const std::filesystem::path& path) const;
     void bump_revision() noexcept { revision_ = revision_.next(); }
 
     std::string name_ = "Untitled";

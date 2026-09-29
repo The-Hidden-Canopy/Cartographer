@@ -12,6 +12,7 @@
 #include <imgui.h>
 
 #include <carto/application/application.hpp>
+#include <carto/ui/ui.hpp>
 #include <carto/vulkan/runtime.hpp>
 
 #include <algorithm>
@@ -24,6 +25,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -31,6 +33,7 @@ namespace {
 
 using carto::application::ApplicationSession;
 using carto::application::ApplicationSnapshot;
+using carto::application::SelectEdgeAction;
 using carto::application::SelectFaceAction;
 using carto::application::SelectObjectAction;
 using carto::application::SelectVertexAction;
@@ -39,6 +42,7 @@ using carto::application::SetSelectionModeAction;
 using carto::application::UndoAction;
 using carto::application::RedoAction;
 using carto::core::Vec3d;
+using carto::ui::UiSnapshot;
 
 [[nodiscard]] std::wstring wide(const std::string& value) {
     return std::wstring(value.begin(), value.end());
@@ -484,6 +488,21 @@ DesktopState* g_state = nullptr;
            (ab <= 0.0F && bc <= 0.0F && ca <= 0.0F);
 }
 
+[[nodiscard]] float point_segment_distance_squared(ImVec2 point, ImVec2 a, ImVec2 b) {
+    const ImVec2 delta = b - a;
+    const float length_squared = delta.x * delta.x + delta.y * delta.y;
+    if (length_squared <= 1e-6F) {
+        const ImVec2 offset = point - a;
+        return offset.x * offset.x + offset.y * offset.y;
+    }
+    const ImVec2 offset = point - a;
+    const float projection = std::clamp(
+        (offset.x * delta.x + offset.y * delta.y) / length_squared, 0.0F, 1.0F);
+    const ImVec2 closest = a + delta * projection;
+    const ImVec2 distance = point - closest;
+    return distance.x * distance.x + distance.y * distance.y;
+}
+
 [[nodiscard]] Vec3d world_point(const carto::core::Transform& transform, Vec3d point) {
     return transform.translation +
            transform.rotation.rotate(carto::core::componentwise_multiply(transform.scale, point));
@@ -503,8 +522,24 @@ DesktopState* g_state = nullptr;
     return std::filesystem::path(path);
 }
 
+[[nodiscard]] std::optional<std::filesystem::path> user_preference_path(bool create_parent) {
+    std::array<wchar_t, 32768> local_app_data{};
+    const DWORD length = GetEnvironmentVariableW(
+        L"LOCALAPPDATA", local_app_data.data(), static_cast<DWORD>(local_app_data.size()));
+    if (length == 0U || length >= local_app_data.size()) return std::nullopt;
+    std::filesystem::path directory(std::wstring(local_app_data.data(), length));
+    directory /= L"Cartographer";
+    if (create_parent) {
+        std::error_code error;
+        std::filesystem::create_directories(directory, error);
+        if (error) return std::nullopt;
+    }
+    return directory / L"workspace.prefs";
+}
+
 struct DesktopState {
     ApplicationSession session;
+    carto::ui::UiController ui;
     VulkanShell renderer;
     HWND window = nullptr;
     carto::scene::ObjectId inspector_object{};
@@ -517,9 +552,38 @@ struct DesktopState {
     bool pending_exit = false;
     bool discard_prompt_pending = false;
     bool close_requested = false;
+    std::string ai_intent;
+
+    DesktopState() : ui(session) {}
+
+    void load_preferences() {
+        const auto path = user_preference_path(false);
+        if (!path.has_value()) return;
+        const auto result = ui.load_preferences(*path);
+        if (!result && result.error().code != carto::core::ErrorCode::not_found) {
+            // Malformed preference files are recorded by UiController. Other
+            // read failures remain visible through the native error surface.
+            MessageBoxW(window, wide(result.error().message).c_str(),
+                        L"Cartographer preferences unavailable", MB_OK | MB_ICONWARNING);
+        }
+    }
+
+    void save_preferences() {
+        const auto path = user_preference_path(true);
+        if (!path.has_value()) {
+            MessageBoxW(window, L"Cartographer could not prepare its local preference directory.",
+                        L"Cartographer preferences unavailable", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        const auto result = ui.save_preferences(*path);
+        if (!result) {
+            MessageBoxW(window, wide(result.error().message).c_str(),
+                        L"Cartographer preferences unavailable", MB_OK | MB_ICONWARNING);
+        }
+    }
 
     bool dispatch(const carto::application::ApplicationAction& action) {
-        return static_cast<bool>(session.dispatch(action));
+        return static_cast<bool>(ui.dispatch(action));
     }
 
     void request_discard(carto::application::ApplicationAction action) {
@@ -537,7 +601,7 @@ struct DesktopState {
     void process_close_request() {
         if (!close_requested) return;
         close_requested = false;
-        if (session.can_close()) {
+        if (ui.can_close()) {
             approve_close();
             return;
         }
@@ -586,20 +650,131 @@ struct DesktopState {
             pane) != snapshot.workspace.visible_panes.end();
     }
 
-    void toggle_pane(const ApplicationSnapshot& snapshot, carto::application::Pane pane) {
-        if (pane == carto::application::Pane::viewport) return;
-        auto workspace = snapshot.workspace;
-        const auto found = std::find(
-            workspace.visible_panes.begin(), workspace.visible_panes.end(), pane);
-        if (found == workspace.visible_panes.end()) {
-            workspace.visible_panes.push_back(pane);
-        } else {
-            workspace.visible_panes.erase(found);
+    [[nodiscard]] static std::optional<carto::ui::Panel> ui_panel(
+        carto::application::Pane pane) noexcept {
+        switch (pane) {
+        case carto::application::Pane::outliner: return carto::ui::Panel::scene;
+        case carto::application::Pane::viewport: return carto::ui::Panel::viewport;
+        case carto::application::Pane::inspector: return carto::ui::Panel::inspector;
+        case carto::application::Pane::problems: return carto::ui::Panel::problems;
+        case carto::application::Pane::history: return carto::ui::Panel::operations;
         }
-        dispatch(carto::application::SetWorkspaceAction{std::move(workspace)});
+        return std::nullopt;
     }
 
-    void draw_menu(const ApplicationSnapshot& snapshot) {
+    void toggle_pane(const UiSnapshot& snapshot, carto::application::Pane pane) {
+        if (pane == carto::application::Pane::viewport) return;
+        const auto panel = ui_panel(pane);
+        if (!panel.has_value()) return;
+        const bool visible = std::find(
+            snapshot.visible_panels.begin(), snapshot.visible_panels.end(), *panel) !=
+            snapshot.visible_panels.end();
+        static_cast<void>(ui.set_panel_visible(*panel, !visible));
+    }
+
+    [[nodiscard]] static ImVec4 color(carto::ui::UiColor value) noexcept {
+        return ImVec4(value.red, value.green, value.blue, value.alpha);
+    }
+
+    [[nodiscard]] static bool workspace_available(carto::ui::Workspace workspace) noexcept {
+        return workspace == carto::ui::Workspace::model || workspace == carto::ui::Workspace::ai;
+    }
+
+    void apply_theme(const UiSnapshot& snapshot) {
+        ImGuiStyle& style = ImGui::GetStyle();
+        style.Colors[ImGuiCol_WindowBg] = color(snapshot.colors.canvas_0);
+        style.Colors[ImGuiCol_ChildBg] = color(snapshot.colors.panel_0);
+        style.Colors[ImGuiCol_PopupBg] = color(snapshot.colors.panel_1);
+        style.Colors[ImGuiCol_Border] = color(snapshot.colors.border_soft);
+        style.Colors[ImGuiCol_BorderShadow] = ImVec4(0, 0, 0, 0);
+        style.Colors[ImGuiCol_FrameBg] = color(snapshot.colors.panel_1);
+        style.Colors[ImGuiCol_FrameBgHovered] = color(snapshot.colors.panel_hover);
+        style.Colors[ImGuiCol_FrameBgActive] = color(snapshot.colors.panel_selected);
+        style.Colors[ImGuiCol_Button] = color(snapshot.colors.panel_1);
+        style.Colors[ImGuiCol_ButtonHovered] = color(snapshot.colors.panel_hover);
+        style.Colors[ImGuiCol_ButtonActive] = color(snapshot.colors.panel_selected);
+        style.Colors[ImGuiCol_Header] = color(snapshot.colors.panel_1);
+        style.Colors[ImGuiCol_HeaderHovered] = color(snapshot.colors.panel_hover);
+        style.Colors[ImGuiCol_HeaderActive] = color(snapshot.colors.panel_selected);
+        style.Colors[ImGuiCol_Text] = color(snapshot.colors.text_primary);
+        style.Colors[ImGuiCol_TextDisabled] = color(snapshot.colors.text_disabled);
+        style.Colors[ImGuiCol_CheckMark] = color(snapshot.colors.accent_primary);
+        style.Colors[ImGuiCol_SliderGrab] = color(snapshot.colors.accent_primary);
+        style.Colors[ImGuiCol_SliderGrabActive] = color(snapshot.colors.accent_secondary);
+        style.Colors[ImGuiCol_Tab] = color(snapshot.colors.panel_0);
+        style.Colors[ImGuiCol_TabHovered] = color(snapshot.colors.panel_hover);
+        style.Colors[ImGuiCol_TabActive] = color(snapshot.colors.panel_selected);
+        style.WindowPadding = snapshot.density == carto::ui::Density::compact
+            ? ImVec2(6, 5) : snapshot.density == carto::ui::Density::touch
+            ? ImVec2(12, 10) : ImVec2(8, 7);
+        style.FramePadding = snapshot.density == carto::ui::Density::compact
+            ? ImVec2(5, 3) : snapshot.density == carto::ui::Density::touch
+            ? ImVec2(9, 7) : ImVec2(7, 5);
+    }
+
+    void route_shortcuts() {
+        const ImGuiIO& io = ImGui::GetIO();
+        if (io.WantTextInput) return;
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) {
+            static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::save));
+        } else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z)) {
+            static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::undo));
+        } else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y)) {
+            static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::redo));
+        } else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_K)) {
+            static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::toggle_command_palette));
+        } else if (ImGui::IsKeyPressed(ImGuiKey_1)) {
+            static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::object_mode));
+        } else if (ImGui::IsKeyPressed(ImGuiKey_2)) {
+            static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::vertex_mode));
+        } else if (ImGui::IsKeyPressed(ImGuiKey_3)) {
+            static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::edge_mode));
+        } else if (ImGui::IsKeyPressed(ImGuiKey_4)) {
+            static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::face_mode));
+        } else if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::close_overlay));
+        }
+    }
+
+    void draw_workspace_bar(const UiSnapshot& snapshot) {
+        ImGui::BeginChild("WorkspaceBar", ImVec2(0, 36), true);
+        static constexpr std::array<std::pair<carto::ui::Workspace, const char*>, 8> workspaces{{
+            {carto::ui::Workspace::model, "MODEL"},
+            {carto::ui::Workspace::sculpt, "SCULPT"},
+            {carto::ui::Workspace::cad, "CAD"},
+            {carto::ui::Workspace::build, "BUILD"},
+            {carto::ui::Workspace::material, "MATERIAL"},
+            {carto::ui::Workspace::animate, "ANIMATE"},
+            {carto::ui::Workspace::review, "REVIEW"},
+            {carto::ui::Workspace::ai, "AI"},
+        }};
+        for (const auto& [workspace, label] : workspaces) {
+            const bool available = workspace_available(workspace);
+            if (available && workspace == snapshot.workspace_kind) {
+                ImGui::PushStyleColor(ImGuiCol_Button, color(snapshot.colors.panel_selected));
+            }
+            if (available) {
+                if (ImGui::Button(label)) static_cast<void>(ui.set_workspace(workspace));
+            } else {
+                ImGui::TextDisabled("%s (future)", label);
+            }
+            if (available && workspace == snapshot.workspace_kind) ImGui::PopStyleColor();
+            ImGui::SameLine();
+        }
+        ImGui::TextDisabled("Operator:");
+        ImGui::SameLine();
+        if (ImGui::Button(snapshot.operator_mode == carto::ui::OperatorMode::person_first
+                              ? "PERSON-FIRST"
+                              : "AI-FIRST")) {
+            static_cast<void>(ui.set_operator_mode(
+                snapshot.operator_mode == carto::ui::OperatorMode::person_first
+                    ? carto::ui::OperatorMode::ai_first
+                    : carto::ui::OperatorMode::person_first));
+        }
+        ImGui::EndChild();
+    }
+
+    void draw_menu(const UiSnapshot& snapshot) {
         if (!ImGui::BeginMainMenuBar()) return;
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("New")) {
@@ -621,7 +796,6 @@ struct DesktopState {
                 }
             }
             if (ImGui::MenuItem("Save")) {
-                auto snapshot = session.snapshot();
                 if (snapshot.project_path.has_value()) {
                     dispatch(carto::application::SaveProjectAction{std::nullopt});
                 } else if (const auto path = choose_file(true); path.has_value()) {
@@ -652,10 +826,36 @@ struct DesktopState {
             ImGui::TextDisabled("Viewport is required");
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Window")) {
+            if (ImGui::MenuItem("Compact Density", nullptr,
+                               snapshot.density == carto::ui::Density::compact)) {
+                static_cast<void>(ui.set_density(carto::ui::Density::compact));
+            }
+            if (ImGui::MenuItem("Standard Density", nullptr,
+                               snapshot.density == carto::ui::Density::standard)) {
+                static_cast<void>(ui.set_density(carto::ui::Density::standard));
+            }
+            if (ImGui::MenuItem("Touch Density", nullptr,
+                               snapshot.density == carto::ui::Density::touch)) {
+                static_cast<void>(ui.set_density(carto::ui::Density::touch));
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Dark Theme", nullptr, snapshot.theme == carto::ui::Theme::dark)) {
+                static_cast<void>(ui.set_theme(carto::ui::Theme::dark));
+            }
+            if (ImGui::MenuItem("Light Theme", nullptr, snapshot.theme == carto::ui::Theme::light)) {
+                static_cast<void>(ui.set_theme(carto::ui::Theme::light));
+            }
+            if (ImGui::MenuItem("High Contrast", nullptr,
+                               snapshot.theme == carto::ui::Theme::high_contrast)) {
+                static_cast<void>(ui.set_theme(carto::ui::Theme::high_contrast));
+            }
+            ImGui::EndMenu();
+        }
         ImGui::EndMainMenuBar();
     }
 
-    void draw_toolbar(const ApplicationSnapshot& snapshot) {
+    void draw_toolbar(const UiSnapshot& snapshot) {
         ImGui::BeginChild("Toolbar", ImVec2(0, 42), true);
         if (ImGui::Button("New Box")) dispatch(carto::application::CreateBoxAction{"Box", {2.0, 2.0, 2.0}});
         ImGui::SameLine();
@@ -665,18 +865,69 @@ struct DesktopState {
         ImGui::SameLine();
         if (ImGui::Button("Redo")) dispatch(carto::application::RedoAction{});
         ImGui::SameLine();
-        int mode = static_cast<int>(snapshot.selection.mode);
-        const char* modes[] = {"Object", "Vertex", "Face"};
-        if (ImGui::Combo("Mode", &mode, modes, 3)) {
-            dispatch(SetSelectionModeAction{static_cast<carto::editor::SelectionMode>(mode)});
+        int mode = snapshot.selection.mode == carto::editor::SelectionMode::object ? 0
+            : snapshot.selection.mode == carto::editor::SelectionMode::vertex ? 1
+            : snapshot.selection.mode == carto::editor::SelectionMode::edge ? 2 : 3;
+        const char* modes[] = {"Object", "Vertex", "Edge", "Face"};
+        if (ImGui::Combo("Mode", &mode, modes, 4)) {
+            if (mode == 0) static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::object_mode));
+            else if (mode == 1) static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::vertex_mode));
+            else if (mode == 2) static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::edge_mode));
+            else static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::face_mode));
         }
         ImGui::SameLine();
-        ImGui::TextUnformatted(snapshot.dirty ? "DIRTY" : "SAVED");
+        ImGui::TextUnformatted(snapshot.project_status_text.c_str());
         if (snapshot.viewport.error.has_value()) {
             ImGui::SameLine();
-            ImGui::TextColored(ImVec4(1.0F, 0.45F, 0.35F, 1.0F), "RENDER UNAVAILABLE");
+            ImGui::TextColored(color(snapshot.colors.semantic_error), "RENDER UNAVAILABLE");
         }
         ImGui::EndChild();
+    }
+
+    void draw_command_palette(const UiSnapshot& snapshot) {
+        if (!snapshot.command_palette_open) return;
+        bool open = true;
+        if (!ImGui::Begin("Command Palette", &open, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::End();
+            return;
+        }
+        std::array<char, 1025> query{};
+        const std::size_t copy_bytes = std::min(snapshot.command_palette_query.size(), query.size() - 1U);
+        std::copy_n(snapshot.command_palette_query.data(), copy_bytes, query.data());
+        if (ImGui::InputText("Search", query.data(), query.size())) {
+            static_cast<void>(ui.set_command_palette_query(std::string(query.data())));
+        }
+        for (const auto& command : snapshot.commands) {
+            if (!snapshot.command_palette_query.empty() &&
+                command.label.find(snapshot.command_palette_query) == std::string::npos &&
+                command.id.find(snapshot.command_palette_query) == std::string::npos) {
+                continue;
+            }
+            if (!command.supported) {
+                ImGui::TextDisabled("%s — unavailable: %s", command.label.c_str(),
+                                   command.unavailable_reason.c_str());
+                continue;
+            }
+            if (ImGui::Selectable((command.label +
+                                  (command.shortcut.empty() ? "" : "    " + command.shortcut)).c_str())) {
+                if (command.id == "project.save") static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::save));
+                else if (command.id == "edit.undo") static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::undo));
+                else if (command.id == "edit.redo") static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::redo));
+                else if (command.id == "mode.object") static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::object_mode));
+                else if (command.id == "mode.vertex") static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::vertex_mode));
+                else if (command.id == "mode.edge") static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::edge_mode));
+                else if (command.id == "mode.face") static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::face_mode));
+                else if (command.id == "operator.person") static_cast<void>(ui.set_operator_mode(carto::ui::OperatorMode::person_first));
+                else if (command.id == "operator.ai") static_cast<void>(ui.set_operator_mode(carto::ui::OperatorMode::ai_first));
+                else if (command.id == "workspace.reset") static_cast<void>(ui.reset_preferences());
+                else if (command.id == "create.box") dispatch(carto::application::CreateBoxAction{"Box", {2.0, 2.0, 2.0}});
+                else if (command.id == "create.plane") dispatch(carto::application::CreatePlaneAction{"Plane", 2.0, 2.0});
+                static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::close_overlay));
+                break;
+            }
+        }
+        if (!open) static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::close_overlay));
+        ImGui::End();
     }
 
     void draw_outliner(const ApplicationSnapshot& snapshot) {
@@ -697,13 +948,13 @@ struct DesktopState {
         ImGui::EndChild();
     }
 
-    void draw_viewport(const ApplicationSnapshot& snapshot) {
+    void draw_viewport(const UiSnapshot& snapshot) {
         ImGui::BeginChild("Viewport", ImVec2(0, 0), true, ImGuiWindowFlags_NoScrollbar);
         ImGui::TextUnformatted("VIEWPORT / COMPILED SNAPSHOT");
         ImGui::Separator();
         if (snapshot.viewport.error.has_value()) {
             ImGui::TextColored(
-                ImVec4(1.0F, 0.45F, 0.35F, 1.0F),
+                color(snapshot.colors.semantic_error),
                 "Render unavailable: %s",
                 snapshot.viewport.error->message.c_str());
             ImGui::EndChild();
@@ -712,7 +963,11 @@ struct DesktopState {
         const ImVec2 origin = ImGui::GetCursorScreenPos();
         const ImVec2 extent = ImGui::GetContentRegionAvail();
         ImDrawList* draw = ImGui::GetWindowDrawList();
-        draw->AddRectFilled(origin, origin + extent, IM_COL32(14, 18, 24, 255));
+        const auto rgba = [](carto::ui::UiColor token, float alpha) {
+            token.alpha *= alpha;
+            return ImGui::ColorConvertFloat4ToU32(color(token));
+        };
+        draw->AddRectFilled(origin, origin + extent, rgba(snapshot.colors.canvas_0, 1.0F));
         const auto instances = snapshot.viewport.scene.instances();
         Vec3d minimum{std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
                       std::numeric_limits<double>::infinity()};
@@ -741,8 +996,15 @@ struct DesktopState {
 
         struct FaceHit { carto::scene::ObjectId object; carto::geometry::FaceId face; std::array<ImVec2, 3> points; };
         struct VertexHit { carto::scene::ObjectId object; carto::geometry::VertexId vertex; ImVec2 point; };
+        struct EdgeHit {
+            carto::scene::ObjectId object;
+            carto::geometry::EdgeId edge;
+            ImVec2 first;
+            ImVec2 second;
+        };
         std::vector<FaceHit> faces;
         std::vector<VertexHit> vertices;
+        std::vector<EdgeHit> edges;
         std::vector<std::pair<carto::scene::ObjectId, ImRect>> objects;
         for (const auto& instance : instances) {
             const bool highlighted = std::find(
@@ -769,19 +1031,46 @@ struct DesktopState {
                 const bool face_selected = snapshot.selection.mode == carto::editor::SelectionMode::face &&
                     std::find(snapshot.selection.faces.begin(), snapshot.selection.faces.end(),
                               instance.mesh->triangle_faces[index / 3U]) != snapshot.selection.faces.end();
-                const ImU32 fill = face_selected ? IM_COL32(210, 170, 70, 130)
-                                                  : (highlighted ? IM_COL32(100, 170, 220, 80)
-                                                                 : IM_COL32(80, 100, 130, 45));
+                const ImU32 fill = face_selected ? rgba(snapshot.colors.semantic_warning, 0.52F)
+                                                  : (highlighted ? rgba(snapshot.colors.accent_primary, 0.30F)
+                                                                 : rgba(snapshot.colors.panel_hover, 0.18F));
                 draw->AddTriangleFilled(a, b, c, fill);
-                draw->AddTriangle(a, b, c, IM_COL32(150, 180, 210, 210), 1.0F);
+                draw->AddTriangle(a, b, c, rgba(snapshot.colors.border_soft, 0.82F), 1.0F);
                 faces.push_back({instance.object, instance.mesh->triangle_faces[index / 3U], {a, b, c}});
+                const std::array<ImVec2, 3> points{a, b, c};
+                const auto& triangle_edges = instance.mesh->triangle_edges.at(index / 3U);
+                for (std::size_t edge_index = 0U; edge_index < triangle_edges.size(); ++edge_index) {
+                    if (!triangle_edges[edge_index].has_value()) continue;
+                    const ImVec2 first = points[edge_index];
+                    const ImVec2 second = points[(edge_index + 1U) % points.size()];
+                    const bool selected = snapshot.selection.mode == carto::editor::SelectionMode::edge &&
+                        std::find(snapshot.selection.edges.begin(), snapshot.selection.edges.end(),
+                                  *triangle_edges[edge_index]) != snapshot.selection.edges.end();
+                    draw->AddLine(first, second,
+                                  selected ? rgba(snapshot.colors.semantic_warning, 1.0F)
+                                           : rgba(snapshot.colors.text_secondary, 0.88F),
+                                  selected ? 3.0F : 1.0F);
+                    edges.push_back({instance.object, *triangle_edges[edge_index], first, second});
+                }
             }
         }
         if (instances.empty()) ImGui::TextDisabled("No compiled geometry");
 
         if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             const ImVec2 mouse = ImGui::GetMousePos();
-            if (snapshot.selection.mode == carto::editor::SelectionMode::face) {
+            if (snapshot.selection.mode == carto::editor::SelectionMode::edge) {
+                float best = 12.0F * 12.0F;
+                std::optional<EdgeHit> hit;
+                for (const auto& candidate : edges) {
+                    const float distance = point_segment_distance_squared(
+                        mouse, candidate.first, candidate.second);
+                    if (distance < best) {
+                        best = distance;
+                        hit = candidate;
+                    }
+                }
+                if (hit.has_value()) dispatch(SelectEdgeAction{hit->object, hit->edge});
+            } else if (snapshot.selection.mode == carto::editor::SelectionMode::face) {
                 for (auto iterator = faces.rbegin(); iterator != faces.rend(); ++iterator) {
                     if (point_in_triangle(mouse, iterator->points[0], iterator->points[1], iterator->points[2])) {
                         dispatch(SelectFaceAction{iterator->object, iterator->face});
@@ -868,6 +1157,12 @@ struct DesktopState {
                 }
             }
         }
+        if (snapshot.selection.mode == carto::editor::SelectionMode::edge &&
+            !snapshot.selection.edges.empty()) {
+            ImGui::Separator();
+            ImGui::Text("Edge %llu", static_cast<unsigned long long>(snapshot.selection.edges.front().value));
+            ImGui::TextDisabled("Edge authoring tools are not available yet.");
+        }
         if (snapshot.selection.mode == carto::editor::SelectionMode::face && !snapshot.selection.faces.empty()) {
             ImGui::Separator();
             ImGui::Text("Face %llu", static_cast<unsigned long long>(snapshot.selection.faces.front().value));
@@ -881,32 +1176,92 @@ struct DesktopState {
         ImGui::EndChild();
     }
 
-    void draw_bottom(const ApplicationSnapshot& snapshot) {
+    void draw_ai_context(const UiSnapshot& snapshot) {
+        ImGui::BeginChild("AI Context", ImVec2(260, 0), true);
+        ImGui::TextUnformatted("AI-FIRST");
+        ImGui::Separator();
+        ImGui::TextDisabled("Intent");
+        std::array<char, 8193> intent{};
+        const std::size_t copy_bytes = std::min(ai_intent.size(), intent.size() - 1U);
+        std::copy_n(ai_intent.data(), copy_bytes, intent.data());
+        if (ImGui::InputTextMultiline("##intent", intent.data(), intent.size(), ImVec2(-1, 100))) {
+            ai_intent.assign(intent.data());
+        }
+        ImGui::TextDisabled("Constraints");
+        ImGui::BulletText("No planner connected");
+        ImGui::BulletText("No proposal is authoritative");
+        ImGui::Separator();
+        ImGui::TextWrapped("%s", snapshot.ai_status.c_str());
+        ImGui::TextDisabled("AI proposals require a future bounded planner and transaction adapter.");
+        ImGui::EndChild();
+    }
+
+    void draw_bottom(const UiSnapshot& snapshot) {
         ImGui::BeginChild("Bottom", ImVec2(0, 130), true);
-        ImGui::Text("PROBLEMS: %llu  |  UNDO: %llu  |  REDO: %llu",
+        static constexpr std::array<std::pair<carto::ui::BottomPanel, const char*>, 6> tabs{{
+            {carto::ui::BottomPanel::operations, "OPERATIONS"},
+            {carto::ui::BottomPanel::graph, "GRAPH"},
+            {carto::ui::BottomPanel::assets, "ASSETS"},
+            {carto::ui::BottomPanel::timeline, "TIMELINE"},
+            {carto::ui::BottomPanel::problems, "PROBLEMS"},
+            {carto::ui::BottomPanel::console, "CONSOLE"},
+        }};
+        for (const auto& [panel, label] : tabs) {
+            if (panel == snapshot.bottom_panel) ImGui::PushStyleColor(ImGuiCol_Button, color(snapshot.colors.panel_selected));
+            if (ImGui::Button(label)) static_cast<void>(ui.set_bottom_panel(panel));
+            if (panel == snapshot.bottom_panel) ImGui::PopStyleColor();
+            ImGui::SameLine();
+        }
+        ImGui::Separator();
+        if (snapshot.bottom_panel == carto::ui::BottomPanel::operations) {
+            ImGui::Text("OPERATIONS: %llu  |  PROBLEMS: %llu  |  UNDO: %llu  |  REDO: %llu",
+                    static_cast<unsigned long long>(snapshot.operations.size()),
                     static_cast<unsigned long long>(snapshot.problems.size()),
                     static_cast<unsigned long long>(snapshot.undo_count),
                     static_cast<unsigned long long>(snapshot.redo_count));
-        for (const auto& problem : snapshot.problems) {
-            ImGui::TextColored(ImVec4(1.0F, 0.5F, 0.4F, 1.0F), "%s: %s",
-                               carto::core::error_code_name(problem.code), problem.message.c_str());
+            std::size_t displayed_operations = 0U;
+            for (auto iterator = snapshot.operations.rbegin();
+                 iterator != snapshot.operations.rend() && displayed_operations < 6U;
+                 ++iterator, ++displayed_operations) {
+                ImGui::Text("#%llu %s  rev %llu -> %llu",
+                            static_cast<unsigned long long>(iterator->operation_id),
+                            iterator->action.c_str(),
+                            static_cast<unsigned long long>(iterator->revision_before.value()),
+                            static_cast<unsigned long long>(iterator->revision_after.value()));
+            }
+        } else if (snapshot.bottom_panel == carto::ui::BottomPanel::problems) {
+            for (const auto& problem : snapshot.problems) {
+                ImGui::TextColored(color(snapshot.colors.semantic_error), "%s: %s",
+                                   carto::core::error_code_name(problem.code), problem.message.c_str());
+            }
+            for (const auto& problem : snapshot.ui_problems) {
+                ImGui::TextColored(color(snapshot.colors.semantic_warning), "UI: %s", problem.message.c_str());
+            }
+        } else {
+            ImGui::TextDisabled("%s panel is reserved for the corresponding future subsystem.",
+                               tabs.at(static_cast<std::size_t>(snapshot.bottom_panel)).second);
         }
         ImGui::EndChild();
     }
 
     void draw() {
         process_close_request();
+        route_shortcuts();
+        const auto snapshot = ui.snapshot();
+        apply_theme(snapshot);
         draw_discard_prompt();
-        const auto snapshot = session.snapshot();
         draw_menu(snapshot);
         draw_toolbar(snapshot);
+        draw_workspace_bar(snapshot);
+        draw_command_palette(snapshot);
         ImGui::Begin("Cartographer Workspace", nullptr, ImGuiWindowFlags_NoCollapse);
         const bool show_outliner = has_pane(snapshot, carto::application::Pane::outliner);
         const bool show_inspector = has_pane(snapshot, carto::application::Pane::inspector);
         const bool show_bottom = has_pane(snapshot, carto::application::Pane::problems) ||
             has_pane(snapshot, carto::application::Pane::history);
         if (show_outliner) {
-            draw_outliner(snapshot);
+            if (snapshot.operator_mode == carto::ui::OperatorMode::ai_first) draw_ai_context(snapshot);
+            else draw_outliner(snapshot);
             ImGui::SameLine();
         }
         ImGui::BeginGroup();
@@ -950,6 +1305,7 @@ HWND create_window(HINSTANCE instance) {
 
 int run(HINSTANCE instance) {
     DesktopState state;
+    state.load_preferences();
     g_state = &state;
     state.window = create_window(instance);
     ImGui::CreateContext();
@@ -974,6 +1330,7 @@ int run(HINSTANCE instance) {
         state.renderer.render(ImGui::GetDrawData());
     }
 
+    state.save_preferences();
     state.renderer.shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

@@ -1,5 +1,7 @@
 #include <cartographer/carto.h>
 
+#include <carto/core/json.hpp>
+
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -68,7 +70,7 @@ void sdk_exposes_bounded_versioned_query_and_execute_surface() {
     const auto path = temp.path() / "scene.carto";
     {
         std::ofstream stream(path, std::ios::binary | std::ios::trunc);
-        stream << "CARTOGRAPHER_PROJECT 1\nNAME \"SDK\"\nREVISION 0\nOBJECTS 0\nMESHES 0\nEND\n";
+        stream << "CARTOGRAPHER_PROJECT 1\nNAME \"SDK\tName\"\nREVISION 0\nOBJECTS 0\nMESHES 0\nEND\n";
     }
     carto_document* document = nullptr;
     require_ok(carto_document_open(context, path.string().c_str(), &document, &error), error);
@@ -83,6 +85,12 @@ void sdk_exposes_bounded_versioned_query_and_execute_surface() {
     char* response = nullptr;
     require_ok(carto_document_query_json(document, "{\"op\":\"capabilities\"}", &response, &error), error);
     REQUIRE(std::string(response).find("create_box") != std::string::npos);
+    carto_free(response);
+    response = nullptr;
+
+    require_ok(carto_document_query_json(document, "{\"op\":\"snapshot\"}", &response, &error), error);
+    REQUIRE(carto::core::json::is_object(response));
+    REQUIRE(std::string(response).find("SDK\\tName") != std::string::npos);
     carto_free(response);
     response = nullptr;
 
@@ -128,6 +136,22 @@ void sdk_rejects_oversized_and_unknown_requests() {
     char* response = nullptr;
     REQUIRE(carto_document_query_json(document, "{\"op\":\"unknown\"}", &response, &error) ==
             CARTO_INVALID_ARGUMENT);
+    REQUIRE(response == nullptr);
+    REQUIRE(error.message != nullptr);
+    carto_free(error.message);
+    error = {};
+
+    REQUIRE(carto_document_query_json(
+                document, "{\"nested\":{\"op\":\"snapshot\"}}", &response, &error) ==
+            CARTO_INVALID_ARGUMENT);
+    REQUIRE(response == nullptr);
+    REQUIRE(error.message != nullptr);
+    carto_free(error.message);
+    error = {};
+
+    REQUIRE(carto_document_query_json(
+                document, "{\"op\":\"snapshot\",\"op\":\"capabilities\"}",
+                &response, &error) == CARTO_INVALID_ARGUMENT);
     REQUIRE(response == nullptr);
     REQUIRE(error.message != nullptr);
     carto_free(error.message);

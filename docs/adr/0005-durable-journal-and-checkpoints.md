@@ -21,9 +21,16 @@ journal remains distinct from editor undo/redo and explicit save state.
 - a failed replay callback does not get converted into a successful recovery.
 - a malformed checkpoint file matching the checkpoint naming contract fails
   recovery instead of being silently skipped.
+- a checkpoint filename must canonically encode the revision in its metadata;
+- application and transaction snapshot envelopes are parsed by exact header,
+  metadata, byte-count, and document-revision rules;
+- partial journal append failures attempt to restore the pre-append byte
+  boundary.
 
 ## Deferred
 
-Checkpoint snapshots and a project transaction adapter are implemented as
-verified foundations, but startup recovery UX, patch-specific replay, and
-SQLite transaction coordination require the project-package tranche.
+Checkpoint snapshots, a project transaction adapter, bounded snapshot-envelope
+recovery, and per-journal sidecar locking are implemented as verified
+foundations. Startup recovery UX, patch-specific delta replay, SQLite
+transaction coordination across multiple files, and power-loss/fsync fault
+injection require later acceptance.

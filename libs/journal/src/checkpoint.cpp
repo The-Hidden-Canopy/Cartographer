@@ -1,10 +1,15 @@
 #include <carto/journal/checkpoint.hpp>
 
+#include <atomic>
 #include <charconv>
+#include <chrono>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace carto::journal {
@@ -28,6 +33,8 @@ core::Diagnostic stale(std::string message) {
 }
 
 constexpr std::uintmax_t kMaxCheckpointBytes = 64U * 1024U;
+std::mutex g_checkpoint_mutex;
+std::atomic<std::uint64_t> g_checkpoint_temp_counter{0U};
 
 core::Result<std::uint64_t> parse_uint64(std::string_view value) {
     if (value.empty()) {
@@ -86,7 +93,11 @@ core::Result<CheckpointRecord> CheckpointStore::parse(
     const std::filesystem::path& path) const {
     std::error_code error;
     const auto size = std::filesystem::file_size(path, error);
-    if (error || size > kMaxCheckpointBytes || size > std::numeric_limits<std::size_t>::max()) {
+    if (error) {
+        return core::Result<CheckpointRecord>::failure(
+            io_error("unable to inspect checkpoint metadata size"));
+    }
+    if (size > kMaxCheckpointBytes || size > std::numeric_limits<std::size_t>::max()) {
         return core::Result<CheckpointRecord>::failure(
             validation("checkpoint metadata is missing or too large"));
     }
@@ -181,6 +192,7 @@ core::Result<CheckpointRecord> CheckpointStore::save(
     core::Revision project_revision,
     std::span<const std::uint8_t> snapshot,
     assets::Sha256Digest asset_manifest_digest) {
+    std::lock_guard lock(g_checkpoint_mutex);
     const auto entries = journal.read_all();
     if (!entries) return core::Result<CheckpointRecord>::failure(entries.error());
     const core::Revision current = entries.value().empty()
@@ -213,7 +225,13 @@ core::Result<CheckpointRecord> CheckpointStore::save(
         return core::Result<CheckpointRecord>::failure(
             core::Diagnostic(core::ErrorCode::invalid_state, "checkpoint revision already exists"));
     }
-    const std::filesystem::path temporary = destination.string() + ".tmp";
+    const auto ticks = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto thread = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    const auto counter = g_checkpoint_temp_counter.fetch_add(1U, std::memory_order_relaxed);
+    const std::filesystem::path temporary = destination.string() + ".tmp-" +
+        std::to_string(static_cast<unsigned long long>(ticks)) + "-" +
+        std::to_string(static_cast<unsigned long long>(thread)) + "-" +
+        std::to_string(static_cast<unsigned long long>(counter));
     std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
     if (!stream) return core::Result<CheckpointRecord>::failure(io_error("unable to create checkpoint temporary file"));
     stream << serialize(record);
@@ -232,23 +250,50 @@ core::Result<CheckpointRecord> CheckpointStore::save(
 }
 
 core::Result<RecoveryCandidate> CheckpointStore::recover(const Journal& journal) const {
+    std::lock_guard lock(g_checkpoint_mutex);
     const auto entries = journal.read_all();
     if (!entries) return core::Result<RecoveryCandidate>::failure(entries.error());
     std::error_code error;
-    if (!std::filesystem::is_directory(root_, error)) {
+    const bool root_is_directory = std::filesystem::is_directory(root_, error);
+    if (error) {
+        return core::Result<RecoveryCandidate>::failure(
+            io_error("unable to inspect checkpoint directory"));
+    }
+    if (!root_is_directory) {
         return core::Result<RecoveryCandidate>::failure(
             core::Diagnostic(core::ErrorCode::not_found, "checkpoint directory does not exist"));
     }
     std::optional<CheckpointRecord> selected;
     for (const auto& item : std::filesystem::directory_iterator(root_, error)) {
         if (error) break;
-        if (!item.is_regular_file(error)) continue;
+        const bool regular_file = item.is_regular_file(error);
+        if (error) {
+            return core::Result<RecoveryCandidate>::failure(
+                io_error("unable to inspect checkpoint directory entry"));
+        }
+        if (!regular_file) continue;
         const std::string filename = item.path().filename().string();
         if (!filename.starts_with("checkpoint-") || !filename.ends_with(".meta")) continue;
+        const std::string filename_revision = filename.substr(
+            std::string("checkpoint-").size(),
+            filename.size() - std::string("checkpoint-").size() - std::string(".meta").size());
+        const auto parsed_filename_revision = parse_uint64(filename_revision);
+        if (!parsed_filename_revision) {
+            return core::Result<RecoveryCandidate>::failure(
+                validation("checkpoint filename revision is invalid"));
+        }
+        if (filename_revision != std::to_string(parsed_filename_revision.value())) {
+            return core::Result<RecoveryCandidate>::failure(
+                validation("checkpoint filename revision is not canonical"));
+        }
         const auto parsed = parse(item.path());
         if (!parsed) {
             return core::Result<RecoveryCandidate>::failure(
                 parsed.error().with_context("checkpoint metadata: " + item.path().string()));
+        }
+        if (parsed.value().project_revision.value() != parsed_filename_revision.value()) {
+            return core::Result<RecoveryCandidate>::failure(
+                validation("checkpoint filename revision does not match its metadata"));
         }
         if (!selected.has_value() || parsed.value().project_revision > selected->project_revision) {
             selected = parsed.value();
