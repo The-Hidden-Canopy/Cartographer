@@ -1,3 +1,5 @@
+#include "project_document_access.hpp"
+
 #include <carto/assets/blob_store.hpp>
 #include <carto/journal/checkpoint.hpp>
 #include <carto/project/package.hpp>
@@ -465,7 +467,7 @@ void project_transaction_publishes_only_after_journal_append() {
     auto blocked = carto::project::ProjectTransaction::begin(document, journal, "editor-2");
     REQUIRE(blocked);
     REQUIRE(blocked.value().create_object("blocked-object"));
-    REQUIRE(document.create_object("concurrent-object"));
+    REQUIRE(carto::project::testing::access(document).create_object("concurrent-object"));
     const auto stale_commit = blocked.value().commit("scene.concurrent");
     REQUIRE(!stale_commit);
     REQUIRE(stale_commit.error().code == carto::core::ErrorCode::stale_data);

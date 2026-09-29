@@ -31,6 +31,14 @@ successful project-affecting application receipts with before/after revisions;
 it is not a second history, audit ledger, or durable project record. Application
 diagnostics remain distinct from UI-local preference/interaction diagnostics.
 
+Persistence status is derived from the application snapshot rather than from
+the absence of an error. A project without a bound path is `Not saved`, even
+when it is clean; a path-bound clean project is `Saved`, and a dirty bound
+project is `Modified`. Failed saves never convert an unbound project into the
+saved state. AI-labelled operation dispatch is fail-closed until an explicit
+planner/admission boundary exists; selecting the AI category cannot mutate the
+document or operation rail.
+
 ## VANTA-family primitives currently implemented
 
 - centralized dark, light, and high-contrast color tokens;
@@ -62,24 +70,46 @@ The optional `apps/desktop` source now constructs `UiController`, consumes
 `UiSnapshot`, maps the centralized tokens into its ImGui style, loads and saves
 bounded local preferences under the Windows user profile, and routes toolbar,
 menu, shortcut, palette, workspace, and inspector actions through the
-controller/application boundary. Preference read/write failures are surfaced
-rather than silently discarded. The source remains behind the existing Vulkan
-SDK and pinned Dear ImGui prerequisites. This checkout does not claim a native
-build, launch, GPU execution, input, DPI, resize, or desktop workflow result
-until those prerequisites are present and exercised.
+controller/application boundary. The native shell now presents a product-shaped
+surface around that contract: persistent navigation for Workspace, Project,
+Diagnostics, and Settings; explicit project/revision/persistence state; truthful
+native-shell and viewport capability cards; and a settings surface for the
+bounded UI preferences. The Workspace surface is a drafting workbench: the
+viewport is the fixed work surface, the left and right edges are Tool Rack and
+Instrument Bay handles, authoring controls open as movable/resizable instrument
+windows with visible grip spines, and the bottom surface is an Operation
+Ledger. Instruments may be opened, closed, repositioned, resized, and seated
+near the racks; nearby instrument edges magnetically settle into aligned
+adjacent positions, and dropping one onto a rack returns it to storage.
+Instrument visibility, geometry, and Ledger collapse state are validated and
+atomically persisted as local `workbench.prefs` state, separate from project
+truth.
+Ledger receipts are selectable and expose the retained operation id, action,
+revision interval, and document-change flag. Parameter reopening is explicitly
+disabled until the application receipt contract carries an editable parameter
+payload; the shell does not infer or fabricate one.
+Unavailable capabilities remain explicit placeholder instruments. Preference
+read/write failures are surfaced rather than silently discarded. The shell
+remains behind the existing Vulkan SDK and pinned Dear ImGui prerequisites. A
+local Debug build and responsive native-window launch have been exercised
+against those prerequisites; native click-through, pixel, DPI, resize,
+OS-level tear-out, and broad GPU compatibility remain separate acceptance
+gates.
 
 ## Evidence
 
 `tests/ui_tests.cpp` covers preference invariants, required viewport behavior,
-authoritative action routing, operation lineage, edge-selection non-mutation,
-AI-unavailable disclosure, bounded command-palette input,
-preference persistence, corrupt-preference reset, and failed action/shortcut
-diagnostics. These are model and contract tests, not pixel snapshots. Native
-visual acceptance remains a separate gate.
+authoritative action routing, operation lineage, persistence-state truth,
+AI-proposal admission failure, edge-selection non-mutation, AI-unavailable disclosure, bounded command-palette input,
+preference persistence, corrupt-preference reset, validated workbench geometry
+round-trips, atomic workbench writes, and failed action/shortcut diagnostics.
+These are model and contract tests, not pixel snapshots. Native visual
+acceptance remains a separate gate.
 
 ## Deliberate non-claims
 
 This layer does not implement the complete UI specification. Persistent edge
 authoring, gizmos, snapping, numeric transform editing, full direct-modeling
 interaction, CAD/BUILD/material/animation subsystems, AI planning/proposals,
-workspace docking, and native Vulkan/ImGui acceptance remain roadmap work.
+full docking/tab stacks, OS-level tear-out, native pixel/input acceptance,
+and broad GPU compatibility remain roadmap work.

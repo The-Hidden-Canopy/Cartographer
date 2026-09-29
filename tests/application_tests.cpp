@@ -315,7 +315,11 @@ void application_validates_workspace_layouts() {
         carto::application::Pane::viewport,
         carto::application::Pane::inspector,
     };
-    REQUIRE(session.dispatch(carto::application::SetWorkspaceAction{compact}));
+    const auto compact_receipt = session.dispatch(
+        carto::application::SetWorkspaceAction{compact});
+    REQUIRE(compact_receipt);
+    REQUIRE(compact_receipt.value().action == "Set Workspace");
+    REQUIRE(!compact_receipt.value().document_changed);
     REQUIRE(session.snapshot().workspace.visible_panes == compact.visible_panes);
     REQUIRE(session.snapshot().problems.size() == 4U);
 }

@@ -16,7 +16,16 @@ namespace carto::application {
 class ApplicationSession;
 }
 
+namespace carto::editor {
+class CreateMeshObjectCommand;
+class ExtrudeProjectSelectedFaceCommand;
+class SetProjectObjectTransformCommand;
+class SetProjectSelectedVertexPositionCommand;
+}
+
 namespace carto::project {
+
+class ProjectTransaction;
 
 struct AssetReference {
     std::string relative_path;
@@ -37,10 +46,35 @@ public:
     static constexpr std::string_view kMagic = "CARTOGRAPHER_PROJECT";
 
     ProjectDocument() = default;
+    ProjectDocument(const ProjectDocument&) = default;
+    ProjectDocument(ProjectDocument&&) = default;
 
     [[nodiscard]] static core::Result<ProjectDocument> create(std::string name);
     [[nodiscard]] static core::Result<ProjectDocument> load(const std::filesystem::path& path);
     [[nodiscard]] static core::Result<ProjectDocument> deserialize(std::string_view text);
+
+    [[nodiscard]] core::Result<SaveReceipt> save_atomic(const std::filesystem::path& path) const;
+    [[nodiscard]] std::string serialize() const;
+    [[nodiscard]] core::Result<void> validate() const;
+
+    [[nodiscard]] const std::string& name() const noexcept { return name_; }
+    [[nodiscard]] const scene::Scene& scene() const noexcept { return scene_; }
+    [[nodiscard]] const std::map<std::uint64_t, geometry::EditableMesh>& meshes() const noexcept {
+        return meshes_;
+    }
+    [[nodiscard]] core::Revision revision() const noexcept { return revision_; }
+    [[nodiscard]] std::uint32_t schema_version() const noexcept { return kSchemaVersion; }
+
+private:
+    friend class ::carto::application::ApplicationSession;
+    friend class ::carto::editor::CreateMeshObjectCommand;
+    friend class ::carto::editor::ExtrudeProjectSelectedFaceCommand;
+    friend class ::carto::editor::SetProjectObjectTransformCommand;
+    friend class ::carto::editor::SetProjectSelectedVertexPositionCommand;
+    friend class ::carto::project::ProjectTransaction;
+
+    ProjectDocument& operator=(const ProjectDocument&) = default;
+    ProjectDocument& operator=(ProjectDocument&&) = default;
 
     [[nodiscard]] core::Result<scene::ObjectId> create_object(
         std::string name,
@@ -72,25 +106,10 @@ public:
         core::Revision expected_revision,
         core::Transform transform);
 
-    [[nodiscard]] core::Result<SaveReceipt> save_atomic(const std::filesystem::path& path) const;
-    [[nodiscard]] std::string serialize() const;
-    [[nodiscard]] core::Result<void> validate() const;
-
     // Exchanges the complete document state without advancing either
-    // revision. ProjectTransaction uses this after its journal append is
+    // revision. ProjectTransaction uses this only after its journal append is
     // durable, making the in-memory publish step non-throwing.
     void swap(ProjectDocument& other) noexcept;
-
-    [[nodiscard]] const std::string& name() const noexcept { return name_; }
-    [[nodiscard]] const scene::Scene& scene() const noexcept { return scene_; }
-    [[nodiscard]] const std::map<std::uint64_t, geometry::EditableMesh>& meshes() const noexcept {
-        return meshes_;
-    }
-    [[nodiscard]] core::Revision revision() const noexcept { return revision_; }
-    [[nodiscard]] std::uint32_t schema_version() const noexcept { return kSchemaVersion; }
-
-private:
-    friend class ::carto::application::ApplicationSession;
 
     [[nodiscard]] core::Result<void> set_name(std::string name);
     [[nodiscard]] core::Result<SaveReceipt> save_atomic_unlocked(

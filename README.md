@@ -79,9 +79,15 @@ have implemented all sixty specification subsystems.
   length-bounded host envelope. Neither target loads third-party code or grants
   arbitrary project authority yet.
 - The optional `carto_vulkan` runtime probe and Win32/Dear ImGui desktop shell
-  are source-wired behind explicit CMake options. They remain runtime-
-  unaccepted until built against a pinned Vulkan SDK/ImGui checkout and
-  exercised on a compatible GPU.
+  are source-wired behind explicit CMake options. The desktop shell now has a
+  product-shaped drafting workbench with a fixed work surface, Tool Rack,
+  Instrument Bay, movable/resizable instruments, an Operation Ledger,
+  project/revision state, diagnostics, settings, explicit unavailable-state
+  language, and validated local persistence for rack visibility and instrument
+  geometry. A local Debug build and responsive native-window launch have been
+  exercised against pinned Vulkan SDK/ImGui prerequisites; native click-through,
+  pixel, DPI, resize, OS-level tear-out, and broad GPU compatibility remain
+  separate acceptance gates.
 - `cartographer_cli` can create/validate a sample project and import/export
   OBJ geometry without a login or network connection.
 
@@ -89,7 +95,7 @@ have implemented all sixty specification subsystems.
 
 The following are contracts and roadmap items, not runtime-accepted capability
 in this checkout: native desktop launch on a real Vulkan SDK/GPU, the complete
-Vulkan resource lifecycle, native workspace restore/docking, edge-edit tools, inset/bevel tools,
+Vulkan resource lifecycle, native workspace docking/tab stacks, edge-edit tools, inset/bevel tools,
 modifiers, UVs, materials, textures, node graphs, curves/NURBS, sculpting, CAD
 sketches/constraints, B-Rep/booleans, BIM objects, animation, rigging, physics,
 plugins, Python bindings, glTF/STEP/IFC interchange, and large-scene streaming.

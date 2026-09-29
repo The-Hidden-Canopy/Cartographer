@@ -14,6 +14,17 @@
 
 namespace carto::editor {
 
+// A project-bound command may mutate a ProjectDocument only when it carries
+// this admission token. ApplicationSession creates the token for an
+// application-dispatched command; low-level callers cannot manufacture one.
+class ProjectCommandAdmission final {
+private:
+    ProjectCommandAdmission() = default;
+
+    friend class ::carto::application::ApplicationSession;
+    friend struct ToolContext;
+};
+
 class EditorCommand {
 public:
     virtual ~EditorCommand() = default;
@@ -69,6 +80,7 @@ private:
 class SetProjectObjectTransformCommand final : public EditorCommand {
 public:
     SetProjectObjectTransformCommand(
+        ProjectCommandAdmission admission,
         project::ProjectDocument& document,
         scene::ObjectId object,
         core::Transform before,
@@ -81,6 +93,9 @@ public:
     }
 
 private:
+    friend class ::carto::application::ApplicationSession;
+    friend struct ToolContext;
+
     [[nodiscard]] core::Result<void> apply(core::Transform transform);
 
     project::ProjectDocument* document_;
@@ -115,6 +130,7 @@ private:
 class SetProjectSelectedVertexPositionCommand final : public EditorCommand {
 public:
     SetProjectSelectedVertexPositionCommand(
+        ProjectCommandAdmission admission,
         project::ProjectDocument& document,
         const SelectionState& selection,
         core::Vec3d position);
@@ -126,6 +142,9 @@ public:
     }
 
 private:
+    friend class ::carto::application::ApplicationSession;
+    friend struct ToolContext;
+
     project::ProjectDocument* document_;
     const SelectionState* selection_;
     core::Vec3d position_;
@@ -172,6 +191,7 @@ private:
 class ExtrudeProjectSelectedFaceCommand final : public EditorCommand {
 public:
     ExtrudeProjectSelectedFaceCommand(
+        ProjectCommandAdmission admission,
         project::ProjectDocument& document,
         const SelectionState& selection,
         double distance);
@@ -183,6 +203,9 @@ public:
     }
 
 private:
+    friend class ::carto::application::ApplicationSession;
+    friend struct ToolContext;
+
     project::ProjectDocument* document_;
     const SelectionState* selection_;
     double distance_;
@@ -195,6 +218,7 @@ private:
 class CreateMeshObjectCommand final : public EditorCommand {
 public:
     CreateMeshObjectCommand(
+        ProjectCommandAdmission admission,
         project::ProjectDocument& document,
         std::string object_name,
         geometry::EditableMesh mesh);
@@ -204,6 +228,11 @@ public:
     [[nodiscard]] std::string label() const override { return "Create Mesh Object"; }
 
 private:
+    friend class ::carto::application::ApplicationSession;
+    friend struct ToolContext;
+    friend class ::carto::project::testing::ProjectDocumentAccess;
+    friend class ::carto::project::testing::EditorProjectAccess;
+
     [[nodiscard]] core::Result<void> create_first_instance();
     [[nodiscard]] core::Result<void> restore_instance();
     [[nodiscard]] core::Result<void> remove_instance();

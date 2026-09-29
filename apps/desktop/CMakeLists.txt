@@ -12,7 +12,7 @@ target_include_directories(carto_imgui PUBLIC
     ${CARTO_IMGUI_ROOT}
     ${CARTO_IMGUI_ROOT}/backends
 )
-target_link_libraries(carto_imgui PUBLIC Vulkan::Vulkan user32 gdi32 shell32)
+target_link_libraries(carto_imgui PUBLIC Vulkan::Vulkan user32 gdi32 shell32 dwmapi)
 
 add_executable(cartographer_desktop WIN32
     main.cpp
@@ -28,6 +28,7 @@ target_link_libraries(cartographer_desktop
         user32
         gdi32
         shell32
+        dwmapi
 )
 
 target_include_directories(cartographer_desktop PRIVATE

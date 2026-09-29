@@ -22,7 +22,34 @@
 #include <variant>
 #include <vector>
 
+namespace carto::ui {
+class UiController;
+}
+
+namespace carto::sdk {
+class ApplicationAccess;
+}
+
+namespace carto::cli {
+class ApplicationAccess;
+}
+
 namespace carto::application {
+
+class ApplicationSession;
+
+// Authoring actions require an admission object from a named front-end
+// boundary. This prevents future proposal/AI code from treating the generic
+// ApplicationAction variant as an implicit mutation authority.
+class HumanActionAdmission final {
+private:
+    HumanActionAdmission() = default;
+
+    friend class ApplicationSession;
+    friend class ::carto::ui::UiController;
+    friend class ::carto::sdk::ApplicationAccess;
+    friend class ::carto::cli::ApplicationAccess;
+};
 
 enum class Pane {
     outliner,
@@ -184,14 +211,16 @@ class ApplicationSession {
 public:
     ApplicationSession();
 
-    [[nodiscard]] core::Result<DispatchReceipt> dispatch(const ApplicationAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> dispatch(
+        HumanActionAdmission admission,
+        const ApplicationAction& action);
     [[nodiscard]] ApplicationSnapshot snapshot() const;
 
     [[nodiscard]] const WorkspaceState& workspace() const noexcept { return workspace_; }
-    [[nodiscard]] core::Result<void> set_workspace(WorkspaceState workspace);
     [[nodiscard]] core::Result<void> can_close(bool discard_dirty = false) const;
 
 private:
+    [[nodiscard]] core::Result<void> set_workspace(WorkspaceState workspace);
     [[nodiscard]] core::Result<DispatchReceipt> new_project(const NewProjectAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> open_project(const OpenProjectAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> save_project(const SaveProjectAction& action);

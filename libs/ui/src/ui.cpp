@@ -28,6 +28,7 @@ constexpr std::size_t kMaxOperations = 256U;
 constexpr std::size_t kMaxUiProblems = 64U;
 constexpr std::size_t kMaxPreferenceBytes = 16U * 1024U;
 constexpr std::size_t kMaxPreferenceLineBytes = 1024U;
+constexpr std::size_t kWorkbenchPreferenceFieldCount = 2U + kWorkbenchInstrumentCount;
 std::mutex g_preferences_mutex;
 std::atomic<std::uint64_t> g_preference_temp_counter{0U};
 
@@ -280,6 +281,163 @@ std::filesystem::path preference_temporary_path(const std::filesystem::path& pat
         "-" + std::to_string(static_cast<unsigned long long>(counter)));
 }
 
+constexpr std::array<WorkbenchInstrument, kWorkbenchInstrumentCount>
+    all_workbench_instruments() noexcept {
+    return {
+        WorkbenchInstrument::scene,
+        WorkbenchInstrument::assets,
+        WorkbenchInstrument::layers,
+        WorkbenchInstrument::tools,
+        WorkbenchInstrument::references,
+        WorkbenchInstrument::draft,
+        WorkbenchInstrument::inspector,
+        WorkbenchInstrument::material,
+        WorkbenchInstrument::constraint,
+        WorkbenchInstrument::modify,
+        WorkbenchInstrument::measure,
+        WorkbenchInstrument::transform,
+        WorkbenchInstrument::extrude,
+    };
+}
+
+bool parse_integer(std::string_view text, std::int32_t& value) noexcept {
+    if (text.empty()) return false;
+    std::int64_t parsed = 0;
+    const auto result = std::from_chars(text.data(), text.data() + text.size(), parsed);
+    if (result.ec != std::errc{} || result.ptr != text.data() + text.size() ||
+        parsed < std::numeric_limits<std::int32_t>::min() ||
+        parsed > std::numeric_limits<std::int32_t>::max()) {
+        return false;
+    }
+    value = static_cast<std::int32_t>(parsed);
+    return true;
+}
+
+bool parse_flag(std::string_view text, bool& value) noexcept {
+    if (text == "0") {
+        value = false;
+        return true;
+    }
+    if (text == "1") {
+        value = true;
+        return true;
+    }
+    return false;
+}
+
+core::Result<WorkbenchInstrumentLayout> parse_workbench_layout(std::string_view text) {
+    std::array<std::string_view, 6U> fields{};
+    std::size_t field_index = 0U;
+    std::size_t cursor = 0U;
+    while (field_index < fields.size()) {
+        const std::size_t separator = text.find(',', cursor);
+        const std::size_t end = separator == std::string_view::npos ? text.size() : separator;
+        fields[field_index] = text.substr(cursor, end - cursor);
+        if (fields[field_index].empty()) {
+            return core::Result<WorkbenchInstrumentLayout>::failure(
+                validation("workbench instrument layout contains an empty field"));
+        }
+        ++field_index;
+        if (separator == std::string_view::npos) break;
+        cursor = separator + 1U;
+    }
+    if (field_index != fields.size() || text.find(',', cursor) != std::string_view::npos) {
+        return core::Result<WorkbenchInstrumentLayout>::failure(
+            validation("workbench instrument layout must contain six fields"));
+    }
+
+    WorkbenchInstrumentLayout result;
+    if (!parse_flag(fields[0], result.visible) || !parse_flag(fields[1], result.positioned) ||
+        !parse_integer(fields[2], result.x) || !parse_integer(fields[3], result.y) ||
+        !parse_integer(fields[4], result.width) || !parse_integer(fields[5], result.height)) {
+        return core::Result<WorkbenchInstrumentLayout>::failure(
+            validation("workbench instrument layout contains an invalid value"));
+    }
+    return core::Result<WorkbenchInstrumentLayout>::success(result);
+}
+
+core::Result<WorkbenchPreferences> parse_workbench_preferences(std::string_view text) {
+    if (text.size() > kMaxPreferenceBytes) {
+        return core::Result<WorkbenchPreferences>::failure(
+            validation("workbench preferences are too large"));
+    }
+    std::map<std::string, std::string> fields;
+    std::size_t cursor = 0U;
+    while (cursor < text.size()) {
+        const std::size_t end = text.find('\n', cursor);
+        const std::size_t line_end = end == std::string_view::npos ? text.size() : end;
+        std::string_view line = text.substr(cursor, line_end - cursor);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1U);
+        if (line.size() > kMaxPreferenceLineBytes) {
+            return core::Result<WorkbenchPreferences>::failure(
+                validation("workbench preference line is too long"));
+        }
+        if (!line.empty()) {
+            const std::size_t separator = line.find('=');
+            if (separator == std::string_view::npos || separator == 0U ||
+                !fields.emplace(std::string(line.substr(0U, separator)),
+                                std::string(line.substr(separator + 1U))).second) {
+                return core::Result<WorkbenchPreferences>::failure(
+                    validation("workbench preference field is malformed"));
+            }
+        }
+        if (end == std::string_view::npos) break;
+        cursor = end + 1U;
+    }
+
+    const auto header = fields.find("header");
+    if (header == fields.end() || header->second != "CARTOGRAPHER_WORKBENCH_PREFS_V1") {
+        return core::Result<WorkbenchPreferences>::failure(
+            validation("workbench preference header is invalid"));
+    }
+    if (fields.size() != kWorkbenchPreferenceFieldCount) {
+        return core::Result<WorkbenchPreferences>::failure(
+            validation("workbench preference field set is invalid"));
+    }
+
+    const auto ledger = fields.find("ledger_collapsed");
+    if (ledger == fields.end()) {
+        return core::Result<WorkbenchPreferences>::failure(
+            validation("workbench preference field is missing: ledger_collapsed"));
+    }
+    WorkbenchPreferences result;
+    if (!parse_flag(ledger->second, result.ledger_collapsed)) {
+        return core::Result<WorkbenchPreferences>::failure(
+            validation("workbench preference ledger flag is invalid"));
+    }
+    for (std::size_t index = 0U; index < kWorkbenchInstrumentCount; ++index) {
+        const auto instrument = all_workbench_instruments()[index];
+        const auto field = fields.find(workbench_instrument_name(instrument));
+        if (field == fields.end()) {
+            return core::Result<WorkbenchPreferences>::failure(validation(
+                "workbench preference field is missing: " +
+                std::string(workbench_instrument_name(instrument))));
+        }
+        const auto parsed = parse_workbench_layout(field->second);
+        if (!parsed) return core::Result<WorkbenchPreferences>::failure(parsed.error());
+        result.instruments[index] = parsed.value();
+    }
+    if (auto valid_result = result.validate(); !valid_result) {
+        return core::Result<WorkbenchPreferences>::failure(valid_result.error());
+    }
+    return core::Result<WorkbenchPreferences>::success(std::move(result));
+}
+
+std::string serialize_workbench_preferences(const WorkbenchPreferences& preferences) {
+    std::string result = "header=CARTOGRAPHER_WORKBENCH_PREFS_V1\n";
+    result += std::string("ledger_collapsed=") + (preferences.ledger_collapsed ? "1\n" : "0\n");
+    for (std::size_t index = 0U; index < kWorkbenchInstrumentCount; ++index) {
+        const auto& layout = preferences.instruments[index];
+        result += workbench_instrument_name(all_workbench_instruments()[index]);
+        result += "=";
+        result += layout.visible ? "1," : "0,";
+        result += layout.positioned ? "1," : "0,";
+        result += std::to_string(layout.x) + "," + std::to_string(layout.y) + "," +
+            std::to_string(layout.width) + "," + std::to_string(layout.height) + "\n";
+    }
+    return result;
+}
+
 } // namespace
 
 core::Result<void> UiPreferences::validate() const {
@@ -295,6 +453,25 @@ core::Result<void> UiPreferences::validate() const {
     }
     if (!unique.contains(Panel::viewport)) {
         return core::Result<void>::failure(invalid_state("workspace preferences must keep the viewport visible"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> WorkbenchPreferences::validate() const {
+    for (const auto& layout : instruments) {
+        if (!layout.positioned) {
+            if (layout.x != 0 || layout.y != 0 || layout.width != 0 || layout.height != 0) {
+                return core::Result<void>::failure(
+                    invalid("unpositioned workbench instruments cannot have geometry"));
+            }
+            continue;
+        }
+        if (layout.width < 120 || layout.width > 4096 || layout.height < 80 ||
+            layout.height > 4096 || layout.x < -65536 || layout.x > 65536 ||
+            layout.y < -65536 || layout.y > 65536) {
+            return core::Result<void>::failure(
+                invalid("workbench instrument layout is outside safe bounds"));
+        }
     }
     return core::Result<void>::success();
 }
@@ -409,13 +586,111 @@ const char* bottom_panel_name(BottomPanel panel) noexcept {
     return "unknown";
 }
 
+const char* workbench_instrument_name(WorkbenchInstrument instrument) noexcept {
+    switch (instrument) {
+    case WorkbenchInstrument::scene: return "scene";
+    case WorkbenchInstrument::assets: return "assets";
+    case WorkbenchInstrument::layers: return "layers";
+    case WorkbenchInstrument::tools: return "tools";
+    case WorkbenchInstrument::references: return "references";
+    case WorkbenchInstrument::draft: return "draft";
+    case WorkbenchInstrument::inspector: return "inspector";
+    case WorkbenchInstrument::material: return "material";
+    case WorkbenchInstrument::constraint: return "constraint";
+    case WorkbenchInstrument::modify: return "modify";
+    case WorkbenchInstrument::measure: return "measure";
+    case WorkbenchInstrument::transform: return "transform";
+    case WorkbenchInstrument::extrude: return "extrude";
+    }
+    return "unknown";
+}
+
+core::Result<void> save_workbench_preferences(
+    const std::filesystem::path& path,
+    const WorkbenchPreferences& preferences) {
+    std::lock_guard lock(g_preferences_mutex);
+    if (path.empty() || path.filename().empty()) {
+        return core::Result<void>::failure(invalid("workbench preference path must name a file"));
+    }
+    if (auto result = preferences.validate(); !result) return result;
+    std::error_code error;
+    if (!path.parent_path().empty()) {
+        std::filesystem::create_directories(path.parent_path(), error);
+        if (error) return core::Result<void>::failure(io_error(
+            "workbench preference parent is unavailable: " + error.message()));
+    }
+    const auto temporary = preference_temporary_path(path);
+    {
+        std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
+        if (!stream) return core::Result<void>::failure(
+            io_error("unable to create workbench preferences"));
+        stream << serialize_workbench_preferences(preferences);
+        stream.flush();
+        if (!stream) {
+            std::error_code cleanup_error;
+            std::filesystem::remove(temporary, cleanup_error);
+            return core::Result<void>::failure(
+                io_error("unable to write workbench preferences"));
+        }
+    }
+    const auto replaced = atomic_replace(temporary, path);
+    if (!replaced) {
+        std::error_code cleanup_error;
+        std::filesystem::remove(temporary, cleanup_error);
+    }
+    return replaced;
+}
+
+core::Result<WorkbenchPreferences> load_workbench_preferences(
+    const std::filesystem::path& path) {
+    std::lock_guard lock(g_preferences_mutex);
+    if (path.empty() || path.filename().empty()) {
+        return core::Result<WorkbenchPreferences>::failure(
+            invalid("workbench preference path must name a file"));
+    }
+    std::error_code error;
+    if (!std::filesystem::exists(path, error)) {
+        if (error) return core::Result<WorkbenchPreferences>::failure(
+            io_error("unable to inspect workbench preferences: " + error.message()));
+        return core::Result<WorkbenchPreferences>::failure(
+            core::Diagnostic(core::ErrorCode::not_found, "workbench preferences do not exist"));
+    }
+    const auto size = std::filesystem::file_size(path, error);
+    if (error) return core::Result<WorkbenchPreferences>::failure(
+        io_error("unable to inspect workbench preference size: " + error.message()));
+    if (size > kMaxPreferenceBytes) return core::Result<WorkbenchPreferences>::failure(
+        validation("workbench preferences are too large"));
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) return core::Result<WorkbenchPreferences>::failure(
+        io_error("unable to open workbench preferences"));
+    std::string text(static_cast<std::size_t>(size), '\0');
+    stream.read(text.data(), static_cast<std::streamsize>(text.size()));
+    if (!stream && !stream.eof()) return core::Result<WorkbenchPreferences>::failure(
+        io_error("unable to read workbench preferences"));
+    return parse_workbench_preferences(text);
+}
+
 UiController::UiController(application::ApplicationSession& session)
     : session_(session) {}
 
 core::Result<application::DispatchReceipt> UiController::dispatch(
+    const application::ApplicationAction& action) {
+    return dispatch_with_category(action, OperationCategory::committed_command);
+}
+
+core::Result<application::DispatchReceipt> UiController::submit_ai_proposal(
+    const application::ApplicationAction& action) {
+    static_cast<void>(action);
+    const auto diagnostic = invalid_state(
+        "AI proposals require explicit admission; no planner is connected");
+    record_ui_problem(diagnostic);
+    return core::Result<application::DispatchReceipt>::failure(diagnostic);
+}
+
+core::Result<application::DispatchReceipt> UiController::dispatch_with_category(
     const application::ApplicationAction& action,
     OperationCategory category) {
-    const auto result = session_.dispatch(action);
+    const auto result = session_.dispatch(application::HumanActionAdmission{}, action);
     if (!result) return result;
     if (is_operation_action(action)) record_operation(result.value(), category);
     return result;
@@ -472,15 +747,18 @@ core::Result<void> UiController::reset_preferences() {
 core::Result<void> UiController::handle_shortcut(Shortcut shortcut) {
     switch (shortcut) {
     case Shortcut::save: {
-        const auto result = dispatch(application::SaveProjectAction{std::nullopt}, OperationCategory::project);
+        const auto result = dispatch_with_category(
+            application::SaveProjectAction{std::nullopt}, OperationCategory::project);
         return result ? core::Result<void>::success() : core::Result<void>::failure(result.error());
     }
     case Shortcut::undo: {
-        const auto result = dispatch(application::UndoAction{}, OperationCategory::undo);
+        const auto result = dispatch_with_category(
+            application::UndoAction{}, OperationCategory::undo);
         return result ? core::Result<void>::success() : core::Result<void>::failure(result.error());
     }
     case Shortcut::redo: {
-        const auto result = dispatch(application::RedoAction{}, OperationCategory::redo);
+        const auto result = dispatch_with_category(
+            application::RedoAction{}, OperationCategory::redo);
         return result ? core::Result<void>::success() : core::Result<void>::failure(result.error());
     }
     case Shortcut::object_mode: {
@@ -539,8 +817,9 @@ core::Result<void> UiController::apply_preferences(const UiPreferences& preferen
 core::Result<void> UiController::sync_application_workspace(
     const std::vector<Panel>& panels) {
     if (panels.empty()) return core::Result<void>::failure(invalid("panel set is empty"));
-    const auto result = dispatch(application::SetWorkspaceAction{
-        application::WorkspaceState{application_panes(panels)}}, OperationCategory::project);
+    const auto result = dispatch_with_category(
+        application::SetWorkspaceAction{application::WorkspaceState{application_panes(panels)}},
+        OperationCategory::project);
     if (!result) return core::Result<void>::failure(result.error());
     return core::Result<void>::success();
 }
@@ -688,6 +967,9 @@ UiSnapshot UiController::snapshot() const {
     } else if (result.viewport.error.has_value()) {
         result.project_status = ProjectStatus::render_error;
         result.project_status_text = "Render unavailable";
+    } else if (!result.project_path.has_value()) {
+        result.project_status = ProjectStatus::unsaved;
+        result.project_status_text = "Not saved";
     } else if (result.dirty) {
         result.project_status = ProjectStatus::modified;
         result.project_status_text = "Modified";

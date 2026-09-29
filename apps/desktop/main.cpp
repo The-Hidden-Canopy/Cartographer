@@ -5,11 +5,21 @@
 
 #include <windows.h>
 #include <commdlg.h>
+#include <dwmapi.h>
 #include <vulkan/vulkan.h>
 
 #include <backends/imgui_impl_vulkan.h>
 #include <backends/imgui_impl_win32.h>
 #include <imgui.h>
+#include <imgui_internal.h>
+
+// Dear ImGui intentionally keeps the Win32 message handler declaration behind
+// a disabled block in its public backend header to avoid pulling in windows.h.
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
+    HWND window,
+    UINT message,
+    WPARAM w_param,
+    LPARAM l_param);
 
 #include <carto/application/application.hpp>
 #include <carto/ui/ui.hpp>
@@ -480,6 +490,56 @@ private:
 struct DesktopState;
 DesktopState* g_state = nullptr;
 
+enum class ShellSurface {
+    workspace,
+    project,
+    diagnostics,
+    settings,
+};
+
+struct WorkbenchState {
+    bool scene = true;
+    bool assets = false;
+    bool layers = false;
+    bool tools = true;
+    bool references = false;
+    bool draft = false;
+    bool inspector = true;
+    bool material = false;
+    bool constraint = false;
+    bool modify = false;
+    bool measure = false;
+    bool transform = true;
+    bool extrude = false;
+    bool ledger_collapsed = false;
+    carto::ui::WorkbenchPreferences persisted;
+    std::array<bool, carto::ui::kWorkbenchInstrumentCount> seeded{};
+};
+
+[[nodiscard]] std::size_t workbench_index(carto::ui::WorkbenchInstrument instrument) noexcept {
+    return static_cast<std::size_t>(instrument);
+}
+
+[[nodiscard]] bool& workbench_visible(
+    WorkbenchState& state, carto::ui::WorkbenchInstrument instrument) noexcept {
+    switch (instrument) {
+    case carto::ui::WorkbenchInstrument::scene: return state.scene;
+    case carto::ui::WorkbenchInstrument::assets: return state.assets;
+    case carto::ui::WorkbenchInstrument::layers: return state.layers;
+    case carto::ui::WorkbenchInstrument::tools: return state.tools;
+    case carto::ui::WorkbenchInstrument::references: return state.references;
+    case carto::ui::WorkbenchInstrument::draft: return state.draft;
+    case carto::ui::WorkbenchInstrument::inspector: return state.inspector;
+    case carto::ui::WorkbenchInstrument::material: return state.material;
+    case carto::ui::WorkbenchInstrument::constraint: return state.constraint;
+    case carto::ui::WorkbenchInstrument::modify: return state.modify;
+    case carto::ui::WorkbenchInstrument::measure: return state.measure;
+    case carto::ui::WorkbenchInstrument::transform: return state.transform;
+    case carto::ui::WorkbenchInstrument::extrude: return state.extrude;
+    }
+    return state.scene;
+}
+
 [[nodiscard]] bool point_in_triangle(ImVec2 point, ImVec2 a, ImVec2 b, ImVec2 c) {
     const float ab = (point.x - b.x) * (a.y - b.y) - (point.y - b.y) * (a.x - b.x);
     const float bc = (point.x - c.x) * (b.y - c.y) - (point.y - c.y) * (b.x - c.x);
@@ -537,11 +597,26 @@ DesktopState* g_state = nullptr;
     return directory / L"workspace.prefs";
 }
 
+[[nodiscard]] std::optional<std::filesystem::path> workbench_preference_path(bool create_parent) {
+    const auto workspace_path = user_preference_path(create_parent);
+    if (!workspace_path.has_value()) return std::nullopt;
+    auto path = *workspace_path;
+    path.replace_filename(L"workbench.prefs");
+    return path;
+}
+
 struct DesktopState {
     ApplicationSession session;
     carto::ui::UiController ui;
     VulkanShell renderer;
     HWND window = nullptr;
+    ShellSurface surface = ShellSurface::workspace;
+    WorkbenchState workbench;
+    bool renderer_ready = false;
+    std::optional<carto::ui::Theme> applied_window_theme;
+    ImVec2 workbench_origin{};
+    ImVec2 workbench_extent{};
+    bool workbench_bounds_valid = false;
     carto::scene::ObjectId inspector_object{};
     carto::core::Transform inspector_transform = carto::core::Transform::identity();
     carto::geometry::VertexId inspector_vertex{};
@@ -553,6 +628,7 @@ struct DesktopState {
     bool discard_prompt_pending = false;
     bool close_requested = false;
     std::string ai_intent;
+    std::optional<std::uint64_t> selected_operation_id;
 
     DesktopState() : ui(session) {}
 
@@ -580,6 +656,47 @@ struct DesktopState {
             MessageBoxW(window, wide(result.error().message).c_str(),
                         L"Cartographer preferences unavailable", MB_OK | MB_ICONWARNING);
         }
+    }
+
+    void load_workbench_preferences() {
+        const auto path = workbench_preference_path(false);
+        if (!path.has_value()) return;
+        const auto result = carto::ui::load_workbench_preferences(*path);
+        if (!result) {
+            if (result.error().code == carto::core::ErrorCode::not_found) return;
+            MessageBoxW(window, wide(result.error().message).c_str(),
+                        L"Cartographer workbench layout unavailable", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        workbench.persisted = result.value();
+        workbench.ledger_collapsed = result.value().ledger_collapsed;
+        for (std::size_t index = 0U; index < carto::ui::kWorkbenchInstrumentCount; ++index) {
+            const auto instrument = static_cast<carto::ui::WorkbenchInstrument>(index);
+            workbench_visible(workbench, instrument) = workbench.persisted.instruments[index].visible;
+        }
+    }
+
+    void save_workbench_preferences() {
+        const auto path = workbench_preference_path(true);
+        if (!path.has_value()) {
+            MessageBoxW(window, L"Cartographer could not prepare its local workbench layout directory.",
+                        L"Cartographer workbench layout unavailable", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        workbench.persisted.ledger_collapsed = workbench.ledger_collapsed;
+        for (std::size_t index = 0U; index < carto::ui::kWorkbenchInstrumentCount; ++index) {
+            const auto instrument = static_cast<carto::ui::WorkbenchInstrument>(index);
+            workbench.persisted.instruments[index].visible = workbench_visible(workbench, instrument);
+        }
+        const auto result = carto::ui::save_workbench_preferences(*path, workbench.persisted);
+        if (!result) {
+            MessageBoxW(window, wide(result.error().message).c_str(),
+                        L"Cartographer workbench layout unavailable", MB_OK | MB_ICONWARNING);
+        }
+    }
+
+    void reset_workbench() {
+        workbench = WorkbenchState{};
     }
 
     bool dispatch(const carto::application::ApplicationAction& action) {
@@ -685,8 +802,15 @@ struct DesktopState {
         style.Colors[ImGuiCol_WindowBg] = color(snapshot.colors.canvas_0);
         style.Colors[ImGuiCol_ChildBg] = color(snapshot.colors.panel_0);
         style.Colors[ImGuiCol_PopupBg] = color(snapshot.colors.panel_1);
+        style.Colors[ImGuiCol_MenuBarBg] = color(snapshot.colors.panel_0);
+        style.Colors[ImGuiCol_TitleBg] = color(snapshot.colors.canvas_0);
+        style.Colors[ImGuiCol_TitleBgActive] = color(snapshot.colors.panel_0);
+        style.Colors[ImGuiCol_TitleBgCollapsed] = color(snapshot.colors.canvas_0);
         style.Colors[ImGuiCol_Border] = color(snapshot.colors.border_soft);
         style.Colors[ImGuiCol_BorderShadow] = ImVec4(0, 0, 0, 0);
+        style.Colors[ImGuiCol_Separator] = color(snapshot.colors.border_soft);
+        style.Colors[ImGuiCol_SeparatorHovered] = color(snapshot.colors.border_focus);
+        style.Colors[ImGuiCol_SeparatorActive] = color(snapshot.colors.accent_primary);
         style.Colors[ImGuiCol_FrameBg] = color(snapshot.colors.panel_1);
         style.Colors[ImGuiCol_FrameBgHovered] = color(snapshot.colors.panel_hover);
         style.Colors[ImGuiCol_FrameBgActive] = color(snapshot.colors.panel_selected);
@@ -698,18 +822,400 @@ struct DesktopState {
         style.Colors[ImGuiCol_HeaderActive] = color(snapshot.colors.panel_selected);
         style.Colors[ImGuiCol_Text] = color(snapshot.colors.text_primary);
         style.Colors[ImGuiCol_TextDisabled] = color(snapshot.colors.text_disabled);
+        style.Colors[ImGuiCol_TextSelectedBg] = color(snapshot.colors.panel_selected);
         style.Colors[ImGuiCol_CheckMark] = color(snapshot.colors.accent_primary);
         style.Colors[ImGuiCol_SliderGrab] = color(snapshot.colors.accent_primary);
         style.Colors[ImGuiCol_SliderGrabActive] = color(snapshot.colors.accent_secondary);
+        style.Colors[ImGuiCol_ScrollbarBg] = color(snapshot.colors.canvas_0);
+        style.Colors[ImGuiCol_ScrollbarGrab] = color(snapshot.colors.border_soft);
+        style.Colors[ImGuiCol_ScrollbarGrabHovered] = color(snapshot.colors.border_focus);
+        style.Colors[ImGuiCol_ScrollbarGrabActive] = color(snapshot.colors.accent_primary);
+        style.Colors[ImGuiCol_NavHighlight] = color(snapshot.colors.accent_primary);
         style.Colors[ImGuiCol_Tab] = color(snapshot.colors.panel_0);
         style.Colors[ImGuiCol_TabHovered] = color(snapshot.colors.panel_hover);
         style.Colors[ImGuiCol_TabActive] = color(snapshot.colors.panel_selected);
+        style.WindowRounding = 2.0F;
+        style.ChildRounding = 2.0F;
+        style.FrameRounding = 3.0F;
+        style.PopupRounding = 3.0F;
+        style.ScrollbarRounding = 2.0F;
+        style.WindowBorderSize = 0.0F;
+        style.ChildBorderSize = 1.0F;
+        style.FrameBorderSize = 1.0F;
+        style.ItemSpacing = ImVec2(8.0F, 7.0F);
         style.WindowPadding = snapshot.density == carto::ui::Density::compact
             ? ImVec2(6, 5) : snapshot.density == carto::ui::Density::touch
             ? ImVec2(12, 10) : ImVec2(8, 7);
         style.FramePadding = snapshot.density == carto::ui::Density::compact
             ? ImVec2(5, 3) : snapshot.density == carto::ui::Density::touch
             ? ImVec2(9, 7) : ImVec2(7, 5);
+    }
+
+    void apply_window_chrome(const UiSnapshot& snapshot) {
+        if (window == nullptr || applied_window_theme == snapshot.theme) return;
+        const BOOL dark_mode = snapshot.theme != carto::ui::Theme::light ? TRUE : FALSE;
+        const COLORREF caption = dark_mode == TRUE ? RGB(7, 11, 18) : RGB(244, 246, 249);
+        const COLORREF text = dark_mode == TRUE ? RGB(230, 236, 250) : RGB(20, 26, 36);
+        // These attributes are supported by current Windows 10/11 builds. The
+        // calls are intentionally best-effort so older systems keep the native
+        // title bar instead of making startup fail.
+        static_cast<void>(DwmSetWindowAttribute(
+            window, static_cast<DWMWINDOWATTRIBUTE>(20), &dark_mode, sizeof(dark_mode)));
+        static_cast<void>(DwmSetWindowAttribute(
+            window, static_cast<DWMWINDOWATTRIBUTE>(35), &caption, sizeof(caption)));
+        static_cast<void>(DwmSetWindowAttribute(
+            window, static_cast<DWMWINDOWATTRIBUTE>(36), &text, sizeof(text)));
+        applied_window_theme = snapshot.theme;
+    }
+
+    [[nodiscard]] ImVec4 status_color(const UiSnapshot& snapshot) const noexcept {
+        switch (snapshot.project_status) {
+        case carto::ui::ProjectStatus::unsaved:
+            return color(snapshot.colors.semantic_warning);
+        case carto::ui::ProjectStatus::saved:
+            return color(snapshot.colors.semantic_success);
+        case carto::ui::ProjectStatus::modified:
+            return color(snapshot.colors.modified);
+        case carto::ui::ProjectStatus::render_error:
+            return color(snapshot.colors.semantic_warning);
+        case carto::ui::ProjectStatus::ui_error:
+            return color(snapshot.colors.semantic_error);
+        }
+        return color(snapshot.colors.text_secondary);
+    }
+
+    [[nodiscard]] const char* surface_title() const noexcept {
+        switch (surface) {
+        case ShellSurface::workspace: return "Workspace";
+        case ShellSurface::project: return "Project";
+        case ShellSurface::diagnostics: return "Diagnostics";
+        case ShellSurface::settings: return "Settings";
+        }
+        return "Workspace";
+    }
+
+    [[nodiscard]] std::string project_location(const UiSnapshot& snapshot) const {
+        if (!snapshot.project_path.has_value()) return "Local workspace · not saved to disk";
+        return snapshot.project_path->string();
+    }
+
+    void draw_shell_header(const UiSnapshot& snapshot) {
+        ImGui::BeginChild("ShellHeader", ImVec2(0, 72), true, ImGuiWindowFlags_NoScrollbar);
+        ImGui::BeginGroup();
+        ImGui::TextColored(color(snapshot.colors.accent_primary), "CARTOGRAPHER");
+        ImGui::SameLine();
+        ImGui::TextDisabled("/");
+        ImGui::SameLine();
+        ImGui::TextUnformatted(surface_title());
+        ImGui::Text("%s", snapshot.project_name.c_str());
+        ImGui::TextDisabled("%s", project_location(snapshot).c_str());
+        ImGui::EndGroup();
+
+        ImGui::SameLine(std::max(240.0F, ImGui::GetWindowWidth() - 555.0F));
+        ImGui::BeginGroup();
+        ImGui::TextColored(status_color(snapshot), "%s", snapshot.project_status_text.c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled("THEME");
+        ImGui::SameLine();
+        if (snapshot.theme == carto::ui::Theme::dark) ImGui::PushStyleColor(
+            ImGuiCol_Button, color(snapshot.colors.panel_selected));
+        if (ImGui::SmallButton("Dark##header-theme")) {
+            static_cast<void>(ui.set_theme(carto::ui::Theme::dark));
+        }
+        if (snapshot.theme == carto::ui::Theme::dark) ImGui::PopStyleColor();
+        ImGui::SameLine();
+        if (snapshot.theme == carto::ui::Theme::light) ImGui::PushStyleColor(
+            ImGuiCol_Button, color(snapshot.colors.panel_selected));
+        if (ImGui::SmallButton("Light##header-theme")) {
+            static_cast<void>(ui.set_theme(carto::ui::Theme::light));
+        }
+        if (snapshot.theme == carto::ui::Theme::light) ImGui::PopStyleColor();
+        ImGui::SameLine();
+        if (ImGui::Button("Ctrl+K  Command")) {
+            static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::toggle_command_palette));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Save")) {
+            if (snapshot.project_path.has_value()) {
+                static_cast<void>(dispatch(carto::application::SaveProjectAction{std::nullopt}));
+            } else if (const auto path = choose_file(true); path.has_value()) {
+                static_cast<void>(dispatch(carto::application::SaveProjectAction{*path}));
+            }
+        }
+        ImGui::EndGroup();
+        ImGui::EndChild();
+    }
+
+    void draw_navigation_rail(const UiSnapshot& snapshot) {
+        ImGui::BeginChild("ProductRail", ImVec2(232, 0), true);
+        ImGui::TextColored(color(snapshot.colors.accent_primary), "C");
+        ImGui::SameLine();
+        ImGui::TextUnformatted("SPATIAL AUTHORING");
+        ImGui::TextDisabled("A truthful workspace for geometry, history, and evidence.");
+        ImGui::Separator();
+
+        const auto nav_item = [this, &snapshot](const char* label, const char* detail,
+                                                 ShellSurface target) {
+            const bool selected = surface == target;
+            if (selected) {
+                ImGui::PushStyleColor(ImGuiCol_Header, color(snapshot.colors.panel_selected));
+                ImGui::PushStyleColor(ImGuiCol_Text, color(snapshot.colors.accent_primary));
+            }
+            if (ImGui::Selectable(label, selected, 0, ImVec2(-1, 32))) surface = target;
+            if (selected) ImGui::PopStyleColor(2);
+            ImGui::TextDisabled("  %s", detail);
+        };
+        nav_item("Workspace", "Author geometry", ShellSurface::workspace);
+        nav_item("Project", "Persistence and revision", ShellSurface::project);
+        nav_item("Diagnostics", "Problems and capability", ShellSurface::diagnostics);
+        nav_item("Settings", "Density, theme, operator", ShellSurface::settings);
+
+        ImGui::Spacing();
+        if (ImGui::Button("+  New Project", ImVec2(-1, 34))) {
+            carto::application::NewProjectAction action{"Untitled"};
+            if (snapshot.dirty) {
+                action.discard_dirty = true;
+                request_discard(std::move(action));
+            } else {
+                static_cast<void>(dispatch(action));
+            }
+        }
+        if (ImGui::Button("Open Project", ImVec2(-1, 30))) {
+            if (const auto path = choose_file(false); path.has_value()) {
+                carto::application::OpenProjectAction action{*path};
+                if (snapshot.dirty) {
+                    action.discard_dirty = true;
+                    request_discard(std::move(action));
+                } else {
+                    static_cast<void>(dispatch(action));
+                }
+            }
+        }
+
+        ImGui::Dummy(ImVec2(0, 8));
+        ImGui::Separator();
+        ImGui::TextDisabled("SESSION");
+        ImGui::Text("Revision %llu", static_cast<unsigned long long>(snapshot.project_revision.value()));
+        ImGui::Text("%zu object%s", snapshot.objects.size(), snapshot.objects.size() == 1U ? "" : "s");
+        ImGui::TextColored(status_color(snapshot), "%s", snapshot.project_status_text.c_str());
+        if (snapshot.dirty) ImGui::TextColored(color(snapshot.colors.modified), "Unsaved changes");
+        ImGui::Spacing();
+        ImGui::TextDisabled("NATIVE SHELL");
+        ImGui::TextColored(renderer_ready ? color(snapshot.colors.semantic_success)
+                                          : color(snapshot.colors.semantic_error),
+                          renderer_ready ? "ACTIVE" : "UNAVAILABLE");
+        ImGui::TextDisabled("Mutations remain behind the application session.");
+        ImGui::EndChild();
+    }
+
+    void rack_button(const UiSnapshot& snapshot, const char* label, bool& open) {
+        if (open) {
+            ImGui::PushStyleColor(ImGuiCol_Button, color(snapshot.colors.panel_selected));
+            ImGui::PushStyleColor(ImGuiCol_Text, color(snapshot.colors.accent_primary));
+        }
+        if (ImGui::Button(label, ImVec2(-1, 26))) open = !open;
+        if (open) ImGui::PopStyleColor(2);
+    }
+
+    void draw_tool_rack(const UiSnapshot& snapshot) {
+        ImGui::BeginChild("ToolRack", ImVec2(108, 0), true);
+        ImGui::TextColored(color(snapshot.colors.accent_primary), "TOOL");
+        ImGui::TextUnformatted("RACK");
+        ImGui::Separator();
+        rack_button(snapshot, "SCENE", workbench.scene);
+        rack_button(snapshot, "ASSETS", workbench.assets);
+        rack_button(snapshot, "LAYERS", workbench.layers);
+        rack_button(snapshot, "TOOLS", workbench.tools);
+        rack_button(snapshot, "REFS", workbench.references);
+        rack_button(snapshot, "DRAFT", workbench.draft);
+        ImGui::Spacing();
+        ImGui::TextDisabled("Grab an instrument\nby its title bar.");
+        ImGui::EndChild();
+    }
+
+    void draw_bay_rack(const UiSnapshot& snapshot) {
+        ImGui::BeginChild("InstrumentBay", ImVec2(108, 0), true);
+        ImGui::TextColored(color(snapshot.colors.accent_secondary), "INSTRUMENT");
+        ImGui::TextUnformatted("BAY");
+        ImGui::Separator();
+        rack_button(snapshot, "INSPECT", workbench.inspector);
+        rack_button(snapshot, "TRANSFORM", workbench.transform);
+        rack_button(snapshot, "MATERIAL", workbench.material);
+        rack_button(snapshot, "CONSTRAINT", workbench.constraint);
+        rack_button(snapshot, "MODIFY", workbench.modify);
+        rack_button(snapshot, "MEASURE", workbench.measure);
+        rack_button(snapshot, "EXTRUDE", workbench.extrude);
+        ImGui::Spacing();
+        ImGui::TextDisabled("Stored instruments\nslide out here.");
+        ImGui::EndChild();
+    }
+
+    [[nodiscard]] ImVec2 instrument_origin(ImVec2 offset, ImVec2 size) const noexcept {
+        if (workbench_bounds_valid) {
+            if (offset.x < 0.0F) offset.x = workbench_extent.x + offset.x - size.x;
+            if (offset.y < 0.0F) offset.y = workbench_extent.y + offset.y - size.y;
+            return workbench_origin + offset;
+        }
+        return ImGui::GetMainViewport()->WorkPos + offset;
+    }
+
+    bool begin_instrument(const UiSnapshot& snapshot,
+                          carto::ui::WorkbenchInstrument instrument,
+                          const char* title, bool& open,
+                          ImVec2 offset, ImVec2 size, carto::ui::UiColor accent) {
+        const std::size_t index = workbench_index(instrument);
+        auto& layout = workbench.persisted.instruments.at(index);
+        if (!workbench.seeded.at(index)) {
+            const ImGuiViewport* viewport = ImGui::GetMainViewport();
+            const ImVec2 position = layout.positioned
+                ? viewport->WorkPos + ImVec2(static_cast<float>(layout.x), static_cast<float>(layout.y))
+                : instrument_origin(offset, size);
+            const ImVec2 window_size = layout.positioned
+                ? ImVec2(static_cast<float>(layout.width), static_cast<float>(layout.height))
+                : size;
+            ImGui::SetNextWindowPos(position, ImGuiCond_Always);
+            ImGui::SetNextWindowSize(window_size, ImGuiCond_Always);
+            workbench.seeded.at(index) = true;
+        }
+        ImVec4 title_color = color(accent);
+        title_color.w = 0.22F;
+        ImVec4 active_title = color(accent);
+        active_title.w = 0.32F;
+        ImGui::PushStyleColor(ImGuiCol_TitleBg, title_color);
+        ImGui::PushStyleColor(ImGuiCol_TitleBgActive, active_title);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, color(snapshot.colors.panel_0));
+        const bool visible = ImGui::Begin(title, &open,
+                                          ImGuiWindowFlags_NoCollapse |
+                                          ImGuiWindowFlags_NoSavedSettings);
+        ImGui::PopStyleColor(3);
+        if (!visible) {
+            ImGui::End();
+            return false;
+        }
+
+        ImGui::BeginChild("##instrument_grip", ImVec2(-1, 7), false,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        const ImVec2 grip_origin = ImGui::GetCursorScreenPos();
+        const ImVec2 grip_extent = ImGui::GetContentRegionAvail();
+        ImGui::GetWindowDrawList()->AddRectFilled(
+            grip_origin, grip_origin + ImVec2(grip_extent.x, 7.0F),
+            ImGui::ColorConvertFloat4ToU32(color(accent)));
+        ImGui::EndChild();
+        ImGui::TextDisabled("GRIP  /  MOVE · RESIZE · MAGNET · DROP TO RACK");
+        return true;
+    }
+
+    void draw_instrument_separator(const UiSnapshot& snapshot, const char* label) {
+        ImGui::Separator();
+        ImGui::TextColored(color(snapshot.colors.accent_primary), "%s", label);
+    }
+
+    void capture_instrument_layout(carto::ui::WorkbenchInstrument instrument) {
+        auto& layout = workbench.persisted.instruments.at(workbench_index(instrument));
+        const ImGuiViewport* viewport = ImGui::GetMainViewport();
+        const ImVec2 position = ImGui::GetWindowPos() - viewport->WorkPos;
+        const ImVec2 size = ImGui::GetWindowSize();
+        if (!std::isfinite(position.x) || !std::isfinite(position.y) ||
+            !std::isfinite(size.x) || !std::isfinite(size.y)) return;
+        layout.positioned = true;
+        layout.x = static_cast<std::int32_t>(std::clamp<std::int64_t>(
+            static_cast<std::int64_t>(std::lround(position.x)), -65536, 65536));
+        layout.y = static_cast<std::int32_t>(std::clamp<std::int64_t>(
+            static_cast<std::int64_t>(std::lround(position.y)), -65536, 65536));
+        layout.width = static_cast<std::int32_t>(std::clamp<std::int64_t>(
+            static_cast<std::int64_t>(std::lround(size.x)), 120, 4096));
+        layout.height = static_cast<std::int32_t>(std::clamp<std::int64_t>(
+            static_cast<std::int64_t>(std::lround(size.y)), 80, 4096));
+    }
+
+    void magnetize_instrument(carto::ui::WorkbenchInstrument instrument,
+                              ImVec2 position, ImVec2 size) {
+        constexpr float snap_distance = 24.0F;
+        const float gap = ImGui::GetStyle().ItemSpacing.x;
+        const ImGuiViewport* viewport = ImGui::GetMainViewport();
+        std::optional<ImVec2> best_position;
+        float best_distance = std::numeric_limits<float>::max();
+        const auto consider = [&](ImVec2 candidate) {
+            const float dx = std::abs(position.x - candidate.x);
+            const float dy = std::abs(position.y - candidate.y);
+            if (dx > snap_distance || dy > snap_distance) return;
+            const float distance = dx * dx + dy * dy;
+            if (distance < best_distance) {
+                best_distance = distance;
+                best_position = candidate;
+            }
+        };
+
+        for (std::size_t index = 0U; index < carto::ui::kWorkbenchInstrumentCount; ++index) {
+            const auto other = static_cast<carto::ui::WorkbenchInstrument>(index);
+            if (other == instrument || !workbench_visible(workbench, other)) continue;
+            const auto& layout = workbench.persisted.instruments[index];
+            if (!layout.positioned) continue;
+            const ImVec2 other_position = viewport->WorkPos + ImVec2(
+                static_cast<float>(layout.x), static_cast<float>(layout.y));
+            const ImVec2 other_size(static_cast<float>(layout.width),
+                                    static_cast<float>(layout.height));
+            consider(ImVec2(other_position.x + other_size.x + gap, other_position.y));
+            consider(ImVec2(other_position.x - size.x - gap, other_position.y));
+            consider(ImVec2(other_position.x, other_position.y + other_size.y + gap));
+            consider(ImVec2(other_position.x, other_position.y - size.y - gap));
+        }
+        if (best_position.has_value()) ImGui::SetWindowPos(*best_position);
+    }
+
+    void settle_instrument(carto::ui::WorkbenchInstrument instrument, bool& open) {
+        if (!ImGui::IsMouseReleased(ImGuiMouseButton_Left) ||
+            !ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)) return;
+        const ImVec2 position = ImGui::GetWindowPos();
+        const ImVec2 size = ImGui::GetWindowSize();
+        const ImVec2 rack_gap(ImGui::GetStyle().ItemSpacing.x, ImGui::GetStyle().ItemSpacing.y);
+        const ImRect window_rect(position, position + size);
+        const ImRect left_rack(
+            ImVec2(workbench_origin.x - 108.0F - rack_gap.x, workbench_origin.y),
+            ImVec2(workbench_origin.x - rack_gap.x,
+                   workbench_origin.y + workbench_extent.y));
+        const ImRect right_rack(
+            ImVec2(workbench_origin.x + workbench_extent.x + rack_gap.x, workbench_origin.y),
+            ImVec2(workbench_origin.x + workbench_extent.x + rack_gap.x + 108.0F,
+                   workbench_origin.y + workbench_extent.y));
+        const bool overlaps_rack = workbench_bounds_valid &&
+            (window_rect.Overlaps(left_rack) || window_rect.Overlaps(right_rack));
+        if (overlaps_rack) {
+            open = false;
+            auto& layout = workbench.persisted.instruments.at(workbench_index(instrument));
+            layout.positioned = false;
+            layout.x = 0;
+            layout.y = 0;
+            layout.width = 0;
+            layout.height = 0;
+            workbench.seeded.at(workbench_index(instrument)) = false;
+            return;
+        }
+        magnetize_instrument(instrument, position, size);
+    }
+
+    void end_instrument(carto::ui::WorkbenchInstrument instrument, bool& open) {
+        settle_instrument(instrument, open);
+        if (open) capture_instrument_layout(instrument);
+        ImGui::End();
+    }
+
+    void draw_placeholder_instrument(const UiSnapshot& snapshot,
+                                      carto::ui::WorkbenchInstrument instrument,
+                                      const char* title,
+                                      bool& open, ImVec2 offset, ImVec2 size,
+                                      const char* category, const char* description) {
+        if (!begin_instrument(snapshot, instrument, title, open, offset, size,
+                              snapshot.colors.accent_secondary)) {
+            return;
+        }
+        ImGui::TextDisabled("%s", category);
+        ImGui::Spacing();
+        ImGui::TextWrapped("%s", description);
+        ImGui::Spacing();
+        ImGui::TextColored(color(snapshot.colors.semantic_warning), "STORED / NOT CONNECTED");
+        ImGui::TextDisabled("This instrument is an explicit capability boundary, not fabricated live state.");
+        end_instrument(instrument, open);
     }
 
     void route_shortcuts() {
@@ -811,19 +1317,15 @@ struct DesktopState {
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("View")) {
-            const auto pane_item = [this, &snapshot](
-                                       const char* label,
-                                       carto::application::Pane pane) {
-                if (ImGui::MenuItem(label, nullptr, has_pane(snapshot, pane))) {
-                    toggle_pane(snapshot, pane);
-                }
-            };
-            pane_item("Outliner", carto::application::Pane::outliner);
-            pane_item("Inspector", carto::application::Pane::inspector);
-            pane_item("Problems", carto::application::Pane::problems);
-            pane_item("History", carto::application::Pane::history);
+            if (ImGui::MenuItem("Scene instrument", nullptr, workbench.scene)) workbench.scene = !workbench.scene;
+            if (ImGui::MenuItem("Tools instrument", nullptr, workbench.tools)) workbench.tools = !workbench.tools;
+            if (ImGui::MenuItem("Inspector instrument", nullptr, workbench.inspector)) workbench.inspector = !workbench.inspector;
+            if (ImGui::MenuItem("Transform instrument", nullptr, workbench.transform)) workbench.transform = !workbench.transform;
+            if (ImGui::MenuItem("Operation ledger", nullptr, !workbench.ledger_collapsed)) {
+                workbench.ledger_collapsed = !workbench.ledger_collapsed;
+            }
             ImGui::Separator();
-            ImGui::TextDisabled("Viewport is required");
+            ImGui::TextDisabled("The work surface is fixed; instruments are movable.");
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Window")) {
@@ -857,9 +1359,7 @@ struct DesktopState {
 
     void draw_toolbar(const UiSnapshot& snapshot) {
         ImGui::BeginChild("Toolbar", ImVec2(0, 42), true);
-        if (ImGui::Button("New Box")) dispatch(carto::application::CreateBoxAction{"Box", {2.0, 2.0, 2.0}});
-        ImGui::SameLine();
-        if (ImGui::Button("New Plane")) dispatch(carto::application::CreatePlaneAction{"Plane", 2.0, 2.0});
+        ImGui::TextDisabled("WORK SURFACE");
         ImGui::SameLine();
         if (ImGui::Button("Undo")) dispatch(carto::application::UndoAction{});
         ImGui::SameLine();
@@ -919,7 +1419,10 @@ struct DesktopState {
                 else if (command.id == "mode.face") static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::face_mode));
                 else if (command.id == "operator.person") static_cast<void>(ui.set_operator_mode(carto::ui::OperatorMode::person_first));
                 else if (command.id == "operator.ai") static_cast<void>(ui.set_operator_mode(carto::ui::OperatorMode::ai_first));
-                else if (command.id == "workspace.reset") static_cast<void>(ui.reset_preferences());
+                else if (command.id == "workspace.reset") {
+                    static_cast<void>(ui.reset_preferences());
+                    reset_workbench();
+                }
                 else if (command.id == "create.box") dispatch(carto::application::CreateBoxAction{"Box", {2.0, 2.0, 2.0}});
                 else if (command.id == "create.plane") dispatch(carto::application::CreatePlaneAction{"Plane", 2.0, 2.0});
                 static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::close_overlay));
@@ -931,8 +1434,8 @@ struct DesktopState {
     }
 
     void draw_outliner(const ApplicationSnapshot& snapshot) {
-        ImGui::BeginChild("Outliner", ImVec2(260, 0), true);
-        ImGui::TextUnformatted("OUTLINER");
+        ImGui::TextUnformatted("SCENE");
+        ImGui::TextDisabled("Objects currently on the work surface");
         ImGui::Separator();
         for (const auto& object : snapshot.objects) {
             const bool selected = std::find(
@@ -945,12 +1448,11 @@ struct DesktopState {
             ImGui::TextDisabled("#%llu", static_cast<unsigned long long>(object.object.id.value));
         }
         if (snapshot.objects.empty()) ImGui::TextDisabled("No project objects");
-        ImGui::EndChild();
     }
 
-    void draw_viewport(const UiSnapshot& snapshot) {
-        ImGui::BeginChild("Viewport", ImVec2(0, 0), true, ImGuiWindowFlags_NoScrollbar);
-        ImGui::TextUnformatted("VIEWPORT / COMPILED SNAPSHOT");
+    void draw_viewport(const UiSnapshot& snapshot, ImVec2 size = ImVec2(0, 0)) {
+        ImGui::BeginChild("WorkSurfaceViewport", size, true, ImGuiWindowFlags_NoScrollbar);
+        ImGui::TextUnformatted("WORK SURFACE / COMPILED SNAPSHOT");
         ImGui::Separator();
         if (snapshot.viewport.error.has_value()) {
             ImGui::TextColored(
@@ -1107,12 +1609,11 @@ struct DesktopState {
             inspector_vertex = {};
             inspector_vertex_position = {};
         }
-        ImGui::BeginChild("Inspector", ImVec2(300, 0), true);
         ImGui::TextUnformatted("INSPECTOR");
+        ImGui::TextDisabled("Selected object and mesh-element instruments");
         ImGui::Separator();
         if (!snapshot.selection.component_object.has_value() && snapshot.selection.objects.empty()) {
             ImGui::TextDisabled("Select an object or mesh element");
-            ImGui::EndChild();
             return;
         }
         const auto selected_id = snapshot.selection.component_object.value_or(
@@ -1125,12 +1626,8 @@ struct DesktopState {
                 inspector_transform = object->object.local_transform;
             }
             ImGui::Text("Object: %s", object->object.name.c_str());
-            ImGui::InputDouble("Translate X", &inspector_transform.translation.x);
-            ImGui::InputDouble("Translate Y", &inspector_transform.translation.y);
-            ImGui::InputDouble("Translate Z", &inspector_transform.translation.z);
-            if (ImGui::Button("Apply Transform")) {
-                dispatch(SetObjectTransformAction{selected_id, inspector_transform});
-            }
+            ImGui::TextDisabled("Transform is a detachable instrument.");
+            if (ImGui::Button("Open Transform Instrument")) workbench.transform = true;
         }
         const auto instances = snapshot.viewport.scene.instances();
         const auto instance = std::find_if(instances.begin(), instances.end(),
@@ -1166,13 +1663,371 @@ struct DesktopState {
         if (snapshot.selection.mode == carto::editor::SelectionMode::face && !snapshot.selection.faces.empty()) {
             ImGui::Separator();
             ImGui::Text("Face %llu", static_cast<unsigned long long>(snapshot.selection.faces.front().value));
-            ImGui::InputDouble("Extrude distance", &extrude_distance);
-            if (ImGui::Button("Extrude Selected Face")) {
-                carto::editor::ToolArguments arguments;
-                arguments.distance = extrude_distance;
-                dispatch(carto::application::InvokeToolAction{"mesh.extrude-face", arguments});
+            ImGui::TextDisabled("Face operation available as a movable instrument.");
+            if (ImGui::Button("Open Extrude Instrument")) workbench.extrude = true;
+        }
+    }
+
+    void draw_scene_instrument(const UiSnapshot& snapshot) {
+        if (!begin_instrument(snapshot, carto::ui::WorkbenchInstrument::scene,
+                              "Scene", workbench.scene, ImVec2(118, 48),
+                              ImVec2(286, 330), snapshot.colors.accent_primary)) return;
+        draw_outliner(snapshot);
+        end_instrument(carto::ui::WorkbenchInstrument::scene, workbench.scene);
+    }
+
+    void draw_tools_instrument(const UiSnapshot& snapshot) {
+        if (!begin_instrument(snapshot, carto::ui::WorkbenchInstrument::tools,
+                              "Tools", workbench.tools, ImVec2(118, 390),
+                              ImVec2(286, 265), snapshot.colors.accent_primary)) return;
+        ImGui::TextDisabled("AUTHORING INSTRUMENTS");
+        if (ImGui::Button("New Box", ImVec2(124, 30))) {
+            static_cast<void>(dispatch(carto::application::CreateBoxAction{"Box", {2.0, 2.0, 2.0}}));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("New Plane", ImVec2(124, 30))) {
+            static_cast<void>(dispatch(carto::application::CreatePlaneAction{"Plane", 2.0, 2.0}));
+        }
+        if (ImGui::Button("Transform Instrument", ImVec2(-1, 30))) workbench.transform = true;
+        const bool face_available = snapshot.selection.mode == carto::editor::SelectionMode::face &&
+            !snapshot.selection.faces.empty();
+        if (face_available) {
+            if (ImGui::Button("Extrude Instrument", ImVec2(-1, 30))) workbench.extrude = true;
+        } else {
+            ImGui::BeginDisabled();
+            ImGui::Button("Extrude requires a selected face", ImVec2(-1, 30));
+            ImGui::EndDisabled();
+        }
+        if (ImGui::Button("Drafting Board", ImVec2(-1, 30))) workbench.draft = true;
+        ImGui::Separator();
+        if (ImGui::Button("Undo", ImVec2(124, 30))) static_cast<void>(dispatch(carto::application::UndoAction{}));
+        ImGui::SameLine();
+        if (ImGui::Button("Redo", ImVec2(124, 30))) static_cast<void>(dispatch(carto::application::RedoAction{}));
+        end_instrument(carto::ui::WorkbenchInstrument::tools, workbench.tools);
+    }
+
+    void draw_transform_instrument(const UiSnapshot& snapshot) {
+        if (!begin_instrument(snapshot, carto::ui::WorkbenchInstrument::transform,
+                              "Transform", workbench.transform, ImVec2(420, 50),
+                              ImVec2(270, 210), snapshot.colors.accent_secondary)) return;
+        const auto selected_id = snapshot.selection.component_object.value_or(
+            snapshot.selection.objects.empty() ? carto::scene::ObjectId{} : snapshot.selection.objects.front());
+        const auto object = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
+                                         [selected_id](const auto& value) { return value.object.id == selected_id; });
+        if (object == snapshot.objects.end()) {
+            ImGui::TextDisabled("Select an object to expose transform controls.");
+            end_instrument(carto::ui::WorkbenchInstrument::transform, workbench.transform);
+            return;
+        }
+        if (inspector_object != selected_id) {
+            inspector_object = selected_id;
+            inspector_transform = object->object.local_transform;
+        }
+        ImGui::Text("%s", object->object.name.c_str());
+        ImGui::InputDouble("X", &inspector_transform.translation.x);
+        ImGui::InputDouble("Y", &inspector_transform.translation.y);
+        ImGui::InputDouble("Z", &inspector_transform.translation.z);
+        if (ImGui::Button("Apply", ImVec2(112, 30))) {
+            static_cast<void>(dispatch(SetObjectTransformAction{selected_id, inspector_transform}));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset", ImVec2(112, 30))) {
+            inspector_transform = object->object.local_transform;
+        }
+        end_instrument(carto::ui::WorkbenchInstrument::transform, workbench.transform);
+    }
+
+    void draw_extrude_instrument(const UiSnapshot& snapshot) {
+        if (!begin_instrument(snapshot, carto::ui::WorkbenchInstrument::extrude,
+                              "Extrude", workbench.extrude, ImVec2(370, 280),
+                              ImVec2(250, 190), snapshot.colors.semantic_warning)) return;
+        if (snapshot.selection.mode != carto::editor::SelectionMode::face ||
+            snapshot.selection.faces.empty()) {
+            ImGui::TextDisabled("Select one face to arm this instrument.");
+            end_instrument(carto::ui::WorkbenchInstrument::extrude, workbench.extrude);
+            return;
+        }
+        ImGui::Text("Face %llu", static_cast<unsigned long long>(snapshot.selection.faces.front().value));
+        ImGui::InputDouble("Distance", &extrude_distance);
+        ImGui::TextDisabled("Direction  Normal");
+        ImGui::TextDisabled("Segments   1");
+        if (ImGui::Button("Cancel", ImVec2(108, 30))) workbench.extrude = false;
+        ImGui::SameLine();
+        if (ImGui::Button("Apply", ImVec2(108, 30))) {
+            carto::editor::ToolArguments arguments;
+            arguments.distance = extrude_distance;
+            if (dispatch(carto::application::InvokeToolAction{"mesh.extrude-face", arguments})) {
+                workbench.extrude = false;
             }
         }
+        end_instrument(carto::ui::WorkbenchInstrument::extrude, workbench.extrude);
+    }
+
+    void draw_draft_instrument(const UiSnapshot& snapshot) {
+        if (!begin_instrument(snapshot, carto::ui::WorkbenchInstrument::draft,
+                              "Drafting Board", workbench.draft, ImVec2(180, 150),
+                              ImVec2(320, 260), snapshot.colors.provisional)) return;
+        ImGui::TextDisabled("AI STUDY / NON-AUTHORITATIVE");
+        std::array<char, 4097> intent{};
+        const std::size_t copy_bytes = std::min(ai_intent.size(), intent.size() - 1U);
+        std::copy_n(ai_intent.data(), copy_bytes, intent.data());
+        if (ImGui::InputTextMultiline("##draft-intent", intent.data(), intent.size(), ImVec2(-1, 90))) {
+            ai_intent.assign(intent.data());
+        }
+        ImGui::TextDisabled("CONSTRAINTS");
+        ImGui::BulletText("Existing geometry remains authoritative");
+        ImGui::BulletText("Proposals require explicit review");
+        ImGui::BeginDisabled(!snapshot.ai_available);
+        ImGui::Button("Generate Study", ImVec2(-1, 30));
+        ImGui::EndDisabled();
+        if (!snapshot.ai_available) ImGui::TextColored(
+            color(snapshot.colors.semantic_warning), "Unavailable: no planner connected");
+        end_instrument(carto::ui::WorkbenchInstrument::draft, workbench.draft);
+    }
+
+    void draw_workbench_instruments(const UiSnapshot& snapshot) {
+        if (workbench.scene) draw_scene_instrument(snapshot);
+        if (workbench.tools) draw_tools_instrument(snapshot);
+        if (workbench.inspector) {
+            if (begin_instrument(snapshot, carto::ui::WorkbenchInstrument::inspector,
+                                 "Inspector", workbench.inspector, ImVec2(-8, 48),
+                                 ImVec2(300, 340), snapshot.colors.accent_primary)) {
+                draw_inspector(snapshot);
+                end_instrument(carto::ui::WorkbenchInstrument::inspector, workbench.inspector);
+            }
+        }
+        if (workbench.transform) draw_transform_instrument(snapshot);
+        if (workbench.extrude) draw_extrude_instrument(snapshot);
+        if (workbench.draft) draw_draft_instrument(snapshot);
+        if (workbench.assets) draw_placeholder_instrument(
+            snapshot, carto::ui::WorkbenchInstrument::assets, "Assets", workbench.assets,
+            ImVec2(135, 100), ImVec2(280, 210),
+            "ASSET RACK", "Content-addressed assets will appear here when an asset browser is connected.");
+        if (workbench.layers) draw_placeholder_instrument(
+            snapshot, carto::ui::WorkbenchInstrument::layers, "Layers", workbench.layers,
+            ImVec2(135, 330), ImVec2(280, 190),
+            "LAYER RACK", "Layer visibility and ordering are reserved for a future governed workspace layer.");
+        if (workbench.references) draw_placeholder_instrument(
+            snapshot, carto::ui::WorkbenchInstrument::references, "References", workbench.references,
+            ImVec2(250, 430), ImVec2(300, 185),
+            "REFERENCE RACK", "Reference drawings remain an explicit future input boundary.");
+        if (workbench.material) draw_placeholder_instrument(
+            snapshot, carto::ui::WorkbenchInstrument::material, "Material", workbench.material,
+            ImVec2(-8, 390), ImVec2(285, 190),
+            "MATERIAL BAY", "Material authoring is not connected to the current render snapshot.");
+        if (workbench.constraint) draw_placeholder_instrument(
+            snapshot, carto::ui::WorkbenchInstrument::constraint, "Constraint", workbench.constraint,
+            ImVec2(-8, 210), ImVec2(285, 170),
+            "CONSTRAINT BAY", "Constraint solving is not available in this capability slice.");
+        if (workbench.modify) draw_placeholder_instrument(
+            snapshot, carto::ui::WorkbenchInstrument::modify, "Modify", workbench.modify,
+            ImVec2(-8, 575), ImVec2(285, 170),
+            "MODIFIER BAY", "Modifier evaluation remains a deferred, revision-bound subsystem.");
+        if (workbench.measure) draw_placeholder_instrument(
+            snapshot, carto::ui::WorkbenchInstrument::measure, "Measure", workbench.measure,
+            ImVec2(540, 430), ImVec2(250, 170),
+            "MEASURE BAY", "Measurement tools are not yet connected to a governed geometry query.");
+    }
+
+    void draw_project_surface(const UiSnapshot& snapshot) {
+        ImGui::BeginChild("ProjectSurface", ImVec2(0, 0), false);
+        ImGui::TextColored(color(snapshot.colors.accent_primary), "PROJECT");
+        ImGui::TextDisabled("The durable boundary for this workspace.");
+        ImGui::Separator();
+
+        ImGui::BeginChild("ProjectOverview", ImVec2(0, 122), true);
+        ImGui::TextDisabled("CURRENT PROJECT");
+        ImGui::Text("%s", snapshot.project_name.c_str());
+        ImGui::TextDisabled("%s", project_location(snapshot).c_str());
+        ImGui::SameLine(ImGui::GetWindowWidth() - 275.0F);
+        ImGui::TextColored(status_color(snapshot), "%s", snapshot.project_status_text.c_str());
+        ImGui::Text("Revision %llu", static_cast<unsigned long long>(snapshot.project_revision.value()));
+        ImGui::SameLine();
+        ImGui::TextDisabled("·");
+        ImGui::SameLine();
+        ImGui::Text("%zu object%s", snapshot.objects.size(), snapshot.objects.size() == 1U ? "" : "s");
+        ImGui::EndChild();
+
+        ImGui::BeginChild("ProjectMetrics", ImVec2(0, 112), true);
+        ImGui::TextDisabled("PROJECT SIGNALS");
+        ImGui::Columns(4, "ProjectMetricsColumns", false);
+        ImGui::Text("%llu", static_cast<unsigned long long>(snapshot.project_revision.value()));
+        ImGui::TextDisabled("REVISION");
+        ImGui::NextColumn();
+        ImGui::Text("%zu", snapshot.operations.size());
+        ImGui::TextDisabled("OPERATIONS");
+        ImGui::NextColumn();
+        ImGui::Text("%zu", snapshot.undo_count);
+        ImGui::TextDisabled("UNDO AVAILABLE");
+        ImGui::NextColumn();
+        ImGui::Text("%zu", snapshot.redo_count);
+        ImGui::TextDisabled("REDO AVAILABLE");
+        ImGui::Columns(1);
+        ImGui::EndChild();
+
+        ImGui::BeginChild("ProjectLineage", ImVec2(0, 0), true);
+        ImGui::TextDisabled("LINEAGE AND PERSISTENCE");
+        if (snapshot.project_path.has_value()) {
+            ImGui::TextColored(color(snapshot.colors.semantic_success), "PROJECT PATH BOUND");
+            ImGui::TextWrapped("%s", snapshot.project_path->string().c_str());
+            ImGui::TextDisabled("Authoring changes remain routed through the session and its journal boundary.");
+        } else {
+            ImGui::TextColored(color(snapshot.colors.semantic_warning), "NOT SAVED TO DISK");
+            ImGui::TextDisabled("Save the project to establish a durable project path and recovery journal.");
+        }
+        ImGui::Spacing();
+        if (ImGui::Button("Save Project", ImVec2(128, 32))) {
+            if (snapshot.project_path.has_value()) {
+                static_cast<void>(dispatch(carto::application::SaveProjectAction{std::nullopt}));
+            } else if (const auto path = choose_file(true); path.has_value()) {
+                static_cast<void>(dispatch(carto::application::SaveProjectAction{*path}));
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Open Another", ImVec2(128, 32))) {
+            if (const auto path = choose_file(false); path.has_value()) {
+                carto::application::OpenProjectAction action{*path};
+                if (snapshot.dirty) {
+                    action.discard_dirty = true;
+                    request_discard(std::move(action));
+                } else {
+                    static_cast<void>(dispatch(action));
+                }
+            }
+        }
+        ImGui::EndChild();
+        ImGui::EndChild();
+    }
+
+    void draw_diagnostics_surface(const UiSnapshot& snapshot) {
+        ImGui::BeginChild("DiagnosticsSurface", ImVec2(0, 0), false);
+        ImGui::TextColored(color(snapshot.colors.accent_primary), "DIAGNOSTICS");
+        ImGui::TextDisabled("Evidence about the current shell and application snapshot.");
+        ImGui::Separator();
+
+        ImGui::BeginChild("CapabilityCards", ImVec2(0, 118), true);
+        ImGui::TextDisabled("CAPABILITY STATE");
+        ImGui::Columns(3, "CapabilityColumns", false);
+        ImGui::TextColored(renderer_ready ? color(snapshot.colors.semantic_success)
+                                          : color(snapshot.colors.semantic_error),
+                          renderer_ready ? "ACTIVE" : "UNAVAILABLE");
+        ImGui::TextDisabled("NATIVE SHELL");
+        ImGui::NextColumn();
+        if (snapshot.viewport.error.has_value()) {
+            ImGui::TextColored(color(snapshot.colors.semantic_warning), "UNAVAILABLE");
+            ImGui::TextDisabled("VIEWPORT SNAPSHOT");
+        } else {
+            ImGui::TextColored(color(snapshot.colors.semantic_success), "READY");
+            ImGui::TextDisabled("VIEWPORT SNAPSHOT");
+        }
+        ImGui::NextColumn();
+        ImGui::TextColored(snapshot.project_path.has_value()
+                               ? color(snapshot.colors.semantic_success)
+                               : color(snapshot.colors.semantic_warning),
+                          snapshot.project_path.has_value() ? "BOUND" : "LOCAL ONLY");
+        ImGui::TextDisabled("PERSISTENCE");
+        ImGui::Columns(1);
+        ImGui::EndChild();
+
+        ImGui::BeginChild("DiagnosticDetails", ImVec2(0, 0), true);
+        ImGui::TextDisabled("CURRENT REPORT");
+        if (snapshot.viewport.error.has_value()) {
+            ImGui::TextColored(color(snapshot.colors.semantic_warning), "Viewport: %s",
+                               snapshot.viewport.error->message.c_str());
+        }
+        if (snapshot.problems.empty() && snapshot.ui_problems.empty() &&
+            !snapshot.viewport.error.has_value()) {
+            ImGui::TextColored(color(snapshot.colors.semantic_success), "No active problems reported.");
+        }
+        for (const auto& problem : snapshot.problems) {
+            ImGui::BulletText("%s: %s", carto::core::error_code_name(problem.code),
+                              problem.message.c_str());
+        }
+        for (const auto& problem : snapshot.ui_problems) {
+            ImGui::BulletText("UI: %s", problem.message.c_str());
+        }
+        ImGui::Spacing();
+        ImGui::TextDisabled("This surface reports observed state only. It does not manufacture live renderer, GPU, or AI capability.");
+        ImGui::EndChild();
+        ImGui::EndChild();
+    }
+
+    void draw_settings_surface(const UiSnapshot& snapshot) {
+        ImGui::BeginChild("SettingsSurface", ImVec2(0, 0), false);
+        ImGui::TextColored(color(snapshot.colors.accent_primary), "SETTINGS");
+        ImGui::TextDisabled("Presentation preferences are local UI state; project truth remains in the application session.");
+        ImGui::Separator();
+
+        ImGui::BeginChild("AppearanceSettings", ImVec2(0, 180), true);
+        ImGui::TextDisabled("APPEARANCE");
+        ImGui::Text("Theme: %s", carto::ui::theme_name(snapshot.theme));
+        ImGui::SameLine(150.0F);
+        if (ImGui::Button("Dark")) static_cast<void>(ui.set_theme(carto::ui::Theme::dark));
+        ImGui::SameLine();
+        if (ImGui::Button("Light")) static_cast<void>(ui.set_theme(carto::ui::Theme::light));
+        ImGui::SameLine();
+        if (ImGui::Button("High contrast")) static_cast<void>(ui.set_theme(carto::ui::Theme::high_contrast));
+        ImGui::Text("Density");
+        ImGui::SameLine(150.0F);
+        if (ImGui::Button("Compact")) static_cast<void>(ui.set_density(carto::ui::Density::compact));
+        ImGui::SameLine();
+        if (ImGui::Button("Standard")) static_cast<void>(ui.set_density(carto::ui::Density::standard));
+        ImGui::SameLine();
+        if (ImGui::Button("Touch")) static_cast<void>(ui.set_density(carto::ui::Density::touch));
+        ImGui::EndChild();
+
+        ImGui::BeginChild("OperatorSettings", ImVec2(0, 142), true);
+        ImGui::TextDisabled("OPERATOR BOUNDARY");
+        ImGui::Text("Current mode: %s", carto::ui::operator_mode_name(snapshot.operator_mode));
+        if (ImGui::Button("Person-first", ImVec2(130, 32))) {
+            static_cast<void>(ui.set_operator_mode(carto::ui::OperatorMode::person_first));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("AI-first", ImVec2(130, 32))) {
+            static_cast<void>(ui.set_operator_mode(carto::ui::OperatorMode::ai_first));
+        }
+        ImGui::TextDisabled("AI proposals remain non-authoritative and no planner is connected.");
+        ImGui::EndChild();
+
+        ImGui::BeginChild("PanelSettings", ImVec2(0, 0), true);
+        ImGui::TextDisabled("INSTRUMENT RACK STATE");
+        const auto instrument_toggle = [](const char* label, bool& visible) {
+            static_cast<void>(ImGui::Checkbox(label, &visible));
+        };
+        instrument_toggle("Scene", workbench.scene);
+        instrument_toggle("Tools", workbench.tools);
+        instrument_toggle("Inspector", workbench.inspector);
+        instrument_toggle("Transform", workbench.transform);
+        instrument_toggle("Material", workbench.material);
+        instrument_toggle("Constraint", workbench.constraint);
+        instrument_toggle("Modify", workbench.modify);
+        instrument_toggle("Measure", workbench.measure);
+        ImGui::TextDisabled("The viewport and machine frame remain fixed.\nRack instruments can be reopened at any time.");
+        ImGui::EndChild();
+        ImGui::EndChild();
+    }
+
+    void draw_workspace_surface(const UiSnapshot& snapshot) {
+        draw_workspace_bar(snapshot);
+        draw_toolbar(snapshot);
+        workbench_bounds_valid = false;
+        ImGui::BeginChild("WorkbenchLayout", ImVec2(0, 0), false);
+        const float rack_width = 108.0F;
+        const float bay_gap = ImGui::GetStyle().ItemSpacing.x;
+        const float center_width = std::max(
+            320.0F, ImGui::GetContentRegionAvail().x - rack_width * 2.0F - bay_gap * 2.0F);
+        draw_tool_rack(snapshot);
+        ImGui::SameLine();
+        ImGui::BeginChild("WorkSurfaceFrame", ImVec2(center_width, 0), false);
+        workbench_origin = ImGui::GetWindowPos();
+        workbench_extent = ImGui::GetWindowSize();
+        workbench_bounds_valid = true;
+        const float ledger_height = workbench.ledger_collapsed ? 34.0F : 148.0F;
+        draw_viewport(snapshot, ImVec2(0, -ledger_height - ImGui::GetStyle().ItemSpacing.y));
+        draw_bottom(snapshot, ledger_height);
+        ImGui::EndChild();
+        ImGui::SameLine();
+        draw_bay_rack(snapshot);
         ImGui::EndChild();
     }
 
@@ -1196,8 +2051,73 @@ struct DesktopState {
         ImGui::EndChild();
     }
 
-    void draw_bottom(const UiSnapshot& snapshot) {
-        ImGui::BeginChild("Bottom", ImVec2(0, 130), true);
+    void draw_bottom(const UiSnapshot& snapshot, float height) {
+        ImGui::BeginChild("OperationLedger", ImVec2(0, height), true);
+        ImGui::TextColored(color(snapshot.colors.accent_primary), "OPERATION LEDGER");
+        ImGui::SameLine();
+        ImGui::TextDisabled("revision-bound activity");
+        ImGui::SameLine(ImGui::GetWindowWidth() - 90.0F);
+        if (ImGui::SmallButton(workbench.ledger_collapsed ? "EXPAND" : "COLLAPSE")) {
+            workbench.ledger_collapsed = !workbench.ledger_collapsed;
+        }
+
+        if (selected_operation_id.has_value() && std::none_of(
+                snapshot.operations.begin(), snapshot.operations.end(),
+                [this](const auto& operation) {
+                    return operation.operation_id == *selected_operation_id;
+                })) {
+            selected_operation_id.reset();
+        }
+        if (!selected_operation_id.has_value() && !snapshot.operations.empty()) {
+            selected_operation_id = snapshot.operations.back().operation_id;
+        }
+        const auto selected_operation_iterator = std::find_if(
+            snapshot.operations.begin(), snapshot.operations.end(),
+            [this](const auto& operation) {
+                return selected_operation_id.has_value() &&
+                    operation.operation_id == *selected_operation_id;
+            });
+        const carto::ui::OperationView* selected_operation =
+            selected_operation_iterator == snapshot.operations.end()
+                ? nullptr : &*selected_operation_iterator;
+
+        if (workbench.ledger_collapsed) {
+            if (snapshot.operations.empty()) ImGui::TextDisabled("No committed operations yet");
+            else {
+                const auto& operation = selected_operation != nullptr
+                    ? *selected_operation : snapshot.operations.back();
+                ImGui::Text("%s  ·  rev %llu", operation.action.c_str(),
+                            static_cast<unsigned long long>(operation.revision_after.value()));
+                ImGui::SameLine();
+                if (ImGui::SmallButton("DETAILS")) workbench.ledger_collapsed = false;
+            }
+            ImGui::EndChild();
+            return;
+        }
+        if (snapshot.operations.empty()) {
+            ImGui::TextDisabled("No operations yet. Authoring receipts will settle here.");
+        } else {
+            ImGui::BeginChild("LedgerTimeline", ImVec2(0, 42), false,
+                              ImGuiWindowFlags_HorizontalScrollbar);
+            const std::size_t timeline_start = snapshot.operations.size() > 8U
+                ? snapshot.operations.size() - 8U : 0U;
+            for (std::size_t timeline_index = timeline_start;
+                 timeline_index < snapshot.operations.size(); ++timeline_index) {
+                const auto& operation = snapshot.operations.at(timeline_index);
+                if (timeline_index != timeline_start) ImGui::SameLine();
+                const bool selected = selected_operation_id == operation.operation_id;
+                const std::string label = "● " + operation.action + "##ledger_operation_" +
+                    std::to_string(operation.operation_id);
+                if (ImGui::Selectable(label.c_str(), selected, 0, ImVec2(172, 28))) {
+                    selected_operation_id = operation.operation_id;
+                }
+                if (timeline_index + 1U < snapshot.operations.size()) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("────");
+                }
+            }
+            ImGui::EndChild();
+        }
         static constexpr std::array<std::pair<carto::ui::BottomPanel, const char*>, 6> tabs{{
             {carto::ui::BottomPanel::operations, "OPERATIONS"},
             {carto::ui::BottomPanel::graph, "GRAPH"},
@@ -1219,6 +2139,25 @@ struct DesktopState {
                     static_cast<unsigned long long>(snapshot.problems.size()),
                     static_cast<unsigned long long>(snapshot.undo_count),
                     static_cast<unsigned long long>(snapshot.redo_count));
+            if (selected_operation != nullptr) {
+                ImGui::BeginChild("LedgerReceiptDetail", ImVec2(0, 86), true);
+                ImGui::Text("RECEIPT #%llu  /  %s",
+                            static_cast<unsigned long long>(selected_operation->operation_id),
+                            selected_operation->action.c_str());
+                ImGui::Text("Revision %llu -> %llu  |  document %s",
+                            static_cast<unsigned long long>(selected_operation->revision_before.value()),
+                            static_cast<unsigned long long>(selected_operation->revision_after.value()),
+                            selected_operation->document_changed ? "changed" : "unchanged");
+                ImGui::TextDisabled("This is a session receipt, not a second project history.");
+                ImGui::BeginDisabled();
+                ImGui::SmallButton("REOPEN PARAMETERS");
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                ImGui::TextDisabled("Unavailable: this receipt retains no editable parameter payload.");
+                ImGui::EndChild();
+            } else {
+                ImGui::TextDisabled("Select an operation above to inspect its receipt.");
+            }
             std::size_t displayed_operations = 0U;
             for (auto iterator = snapshot.operations.rbegin();
                  iterator != snapshot.operations.rend() && displayed_operations < 6U;
@@ -1249,30 +2188,41 @@ struct DesktopState {
         route_shortcuts();
         const auto snapshot = ui.snapshot();
         apply_theme(snapshot);
+        apply_window_chrome(snapshot);
         draw_discard_prompt();
         draw_menu(snapshot);
-        draw_toolbar(snapshot);
-        draw_workspace_bar(snapshot);
-        draw_command_palette(snapshot);
-        ImGui::Begin("Cartographer Workspace", nullptr, ImGuiWindowFlags_NoCollapse);
-        const bool show_outliner = has_pane(snapshot, carto::application::Pane::outliner);
-        const bool show_inspector = has_pane(snapshot, carto::application::Pane::inspector);
-        const bool show_bottom = has_pane(snapshot, carto::application::Pane::problems) ||
-            has_pane(snapshot, carto::application::Pane::history);
-        if (show_outliner) {
-            if (snapshot.operator_mode == carto::ui::OperatorMode::ai_first) draw_ai_context(snapshot);
-            else draw_outliner(snapshot);
-            ImGui::SameLine();
+        const ImGuiViewport* viewport = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(viewport->WorkPos);
+        ImGui::SetNextWindowSize(viewport->WorkSize);
+        const ImGuiWindowFlags shell_flags = ImGuiWindowFlags_NoDecoration |
+            ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoBringToFrontOnFocus;
+        ImGui::Begin("Cartographer Shell", nullptr, shell_flags);
+        draw_shell_header(snapshot);
+        ImGui::BeginChild("ShellBody", ImVec2(0, 0), false);
+        draw_navigation_rail(snapshot);
+        ImGui::SameLine();
+        ImGui::BeginChild("SurfaceHost", ImVec2(0, 0), false);
+        switch (surface) {
+        case ShellSurface::workspace:
+            draw_workspace_surface(snapshot);
+            break;
+        case ShellSurface::project:
+            draw_project_surface(snapshot);
+            break;
+        case ShellSurface::diagnostics:
+            draw_diagnostics_surface(snapshot);
+            break;
+        case ShellSurface::settings:
+            draw_settings_surface(snapshot);
+            break;
         }
-        ImGui::BeginGroup();
-        draw_viewport(snapshot);
-        if (show_bottom) draw_bottom(snapshot);
-        ImGui::EndGroup();
-        if (show_inspector) {
-            ImGui::SameLine();
-            draw_inspector(snapshot);
-        }
+        ImGui::EndChild();
+        ImGui::EndChild();
         ImGui::End();
+        if (surface == ShellSurface::workspace) draw_workbench_instruments(snapshot);
+        draw_command_palette(snapshot);
     }
 };
 
@@ -1294,7 +2244,7 @@ HWND create_window(HINSTANCE instance) {
     window_class.hInstance = instance;
     window_class.lpfnWndProc = window_proc;
     window_class.lpszClassName = L"CartographerDesktopWindow";
-    window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    window_class.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
     if (RegisterClassW(&window_class) == 0) throw std::runtime_error("could not register Cartographer window class");
     HWND window = CreateWindowExW(
         0, window_class.lpszClassName, L"Cartographer", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
@@ -1308,10 +2258,15 @@ int run(HINSTANCE instance) {
     state.load_preferences();
     g_state = &state;
     state.window = create_window(instance);
+    state.load_workbench_preferences();
     ImGui::CreateContext();
+    // UI preferences are owned by UiController; do not let Dear ImGui create
+    // an unmanaged imgui.ini beside the executable or in the checkout.
+    ImGui::GetIO().IniFilename = nullptr;
     ImGui::StyleColorsDark();
-    if (!ImGui_ImplWin32_Init(state.window)) throw std::runtime_error("Dear ImGui Win32 initialization failed");
-    state.renderer.initialize(state.window);
+        if (!ImGui_ImplWin32_Init(state.window)) throw std::runtime_error("Dear ImGui Win32 initialization failed");
+        state.renderer.initialize(state.window);
+        state.renderer_ready = true;
 
     MSG message{};
     bool running = true;
@@ -1331,6 +2286,8 @@ int run(HINSTANCE instance) {
     }
 
     state.save_preferences();
+    state.save_workbench_preferences();
+    state.renderer_ready = false;
     state.renderer.shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
@@ -1340,7 +2297,7 @@ int run(HINSTANCE instance) {
 
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     try {
         const auto runtime = carto::vulkan::Runtime::probe();
         if (!runtime) {

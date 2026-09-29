@@ -21,8 +21,8 @@ struct TransactionReceipt {
 };
 
 // Stages document mutations and publishes them only after a matching journal
-// append succeeds. Existing legacy mutators remain available for the v1 text
-// serializer; new durable integrations should use this boundary.
+// append succeeds. ProjectDocument's state-mutating primitives are private to
+// this boundary, the application session, and its trusted editor commands.
 class ProjectTransaction {
 public:
     [[nodiscard]] static core::Result<ProjectTransaction> begin(

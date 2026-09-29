@@ -47,16 +47,17 @@ undo, redo, and CLI batch-import actions with before/after revisions. Project
 open/save holds the project path lock across journal preparation and document
 publication. If an append fails, the in-memory command is reversed and the
 exact pre-action document snapshot is restored. The journal remains owned by
-the application boundary rather than by `ProjectDocument`; direct document
-API calls outside an application session are still not durable events.
+the application boundary rather than by `ProjectDocument`; the public document
+API exposes no unjournaled state mutators. Trusted application commands and
+`ProjectTransaction` are the only production mutation paths.
 
 The `ProjectTransaction` boundary provides the corresponding lower-level
 durable path for integrations that own a `ProjectDocument` directly. It
 requires the document revision and journal tail to match, stages all supported
 document mutations, includes the actor and operation in the journal payload,
-and publishes the staged document only after the append succeeds. Legacy direct
-mutators remain available for the v1 serializer and are not falsely described
-as durable by themselves.
+and publishes the staged document only after the append succeeds. Serialization,
+load, validation, and atomic save remain low-level persistence operations; they
+do not provide a second authoring path.
 
 The `CheckpointStore` persists and verifies snapshot bytes plus the journal
 prefix, can identify pending entries after restart, and fails closed when a

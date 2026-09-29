@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 
@@ -66,8 +67,13 @@ void ui_routes_authoritative_actions_and_operation_lineage() {
     auto snapshot = ui.snapshot();
     REQUIRE(snapshot.objects.size() == 1U);
     REQUIRE(snapshot.dirty);
-    REQUIRE(snapshot.project_status == carto::ui::ProjectStatus::modified);
+    REQUIRE(snapshot.project_status == carto::ui::ProjectStatus::unsaved);
+    REQUIRE(snapshot.project_status_text == "Not saved");
     REQUIRE(snapshot.operations.size() == 1U);
+    REQUIRE(snapshot.operations.back().operation_id == 1U);
+    REQUIRE(snapshot.operations.back().revision_before == carto::core::Revision{});
+    REQUIRE(snapshot.operations.back().revision_after > snapshot.operations.back().revision_before);
+    REQUIRE(snapshot.operations.back().category == carto::ui::OperationCategory::committed_command);
     REQUIRE(snapshot.operations.back().action == "Create Box");
     REQUIRE(snapshot.operations.back().document_changed);
 
@@ -81,6 +87,71 @@ void ui_routes_authoritative_actions_and_operation_lineage() {
     REQUIRE(snapshot.operations.size() == 3U);
     REQUIRE(snapshot.operations[1].category == carto::ui::OperationCategory::undo);
     REQUIRE(snapshot.operations[2].category == carto::ui::OperationCategory::redo);
+}
+
+void ui_distinguishes_unsaved_from_saved_state() {
+    TempDirectory temp;
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+
+    auto snapshot = ui.snapshot();
+    REQUIRE(!snapshot.project_path.has_value());
+    REQUIRE(snapshot.project_status == carto::ui::ProjectStatus::unsaved);
+    REQUIRE(snapshot.project_status_text == "Not saved");
+
+    REQUIRE(ui.dispatch(carto::application::NewProjectAction{"Unsaved"}));
+    snapshot = ui.snapshot();
+    REQUIRE(!snapshot.project_path.has_value());
+    REQUIRE(snapshot.project_status == carto::ui::ProjectStatus::unsaved);
+    REQUIRE(snapshot.project_status_text == "Not saved");
+
+    REQUIRE(!ui.dispatch(carto::application::SaveProjectAction{
+        temp.path() / "missing-parent" / "failed.carto"}));
+    snapshot = ui.snapshot();
+    REQUIRE(!snapshot.project_path.has_value());
+    REQUIRE(snapshot.project_status == carto::ui::ProjectStatus::unsaved);
+    REQUIRE(snapshot.project_status_text == "Not saved");
+
+    const auto path = temp.path() / "saved.carto";
+    REQUIRE(ui.dispatch(carto::application::SaveProjectAction{path}));
+    snapshot = ui.snapshot();
+    REQUIRE(snapshot.project_path.has_value());
+    REQUIRE(snapshot.project_status == carto::ui::ProjectStatus::saved);
+    REQUIRE(snapshot.project_status_text == "Saved");
+
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Modified", {1.0, 1.0, 1.0}}));
+    snapshot = ui.snapshot();
+    REQUIRE(snapshot.project_path.has_value());
+    REQUIRE(snapshot.dirty);
+    REQUIRE(snapshot.project_status == carto::ui::ProjectStatus::modified);
+    REQUIRE(snapshot.project_status_text == "Modified");
+    REQUIRE(!ui.dispatch(carto::application::SaveProjectAction{
+        temp.path() / "missing-parent" / "failed-again.carto"}));
+    snapshot = ui.snapshot();
+    REQUIRE(snapshot.project_path.has_value());
+    REQUIRE(snapshot.dirty);
+    REQUIRE(snapshot.project_status == carto::ui::ProjectStatus::modified);
+    REQUIRE(snapshot.project_status_text == "Modified");
+}
+
+void ui_rejects_unadmitted_ai_proposals() {
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    const auto before = session.snapshot();
+
+    const auto rejected = ui.submit_ai_proposal(
+        carto::application::CreateBoxAction{"AI Box", {1.0, 1.0, 1.0}});
+    REQUIRE(!rejected);
+    REQUIRE(session.snapshot().project_revision == before.project_revision);
+    REQUIRE(session.snapshot().objects.empty());
+    REQUIRE(ui.snapshot().operations.empty());
+    REQUIRE(!ui.snapshot().ui_problems.empty());
+
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Human Box", {1.0, 1.0, 1.0}}));
+    REQUIRE(session.snapshot().objects.size() == 1U);
+    REQUIRE(ui.snapshot().operations.size() == 1U);
 }
 
 void ui_routes_edge_selection_without_authoring_mutation() {
@@ -110,6 +181,15 @@ void ui_preserves_required_viewport_and_supports_mode_theme_density() {
     carto::ui::UiController ui(session);
     REQUIRE(!ui.set_panel_visible(carto::ui::Panel::viewport, false));
     REQUIRE(ui.set_density(carto::ui::Density::compact));
+    REQUIRE(ui.set_theme(carto::ui::Theme::dark));
+    const auto dark_snapshot = ui.snapshot();
+    REQUIRE(dark_snapshot.theme == carto::ui::Theme::dark);
+    REQUIRE(dark_snapshot.colors.canvas_0.red < dark_snapshot.colors.text_primary.red);
+    REQUIRE(ui.set_theme(carto::ui::Theme::light));
+    const auto light_snapshot = ui.snapshot();
+    REQUIRE(light_snapshot.theme == carto::ui::Theme::light);
+    REQUIRE(light_snapshot.colors.canvas_0.red > light_snapshot.colors.text_primary.red);
+    REQUIRE(dark_snapshot.colors.canvas_0.red != light_snapshot.colors.canvas_0.red);
     REQUIRE(ui.set_theme(carto::ui::Theme::high_contrast));
     REQUIRE(ui.set_operator_mode(carto::ui::OperatorMode::ai_first));
     REQUIRE(ui.set_workspace(carto::ui::Workspace::ai));
@@ -172,6 +252,52 @@ void ui_persists_preferences_and_resets_corrupt_state() {
     REQUIRE(!reopened.snapshot().ui_problems.empty());
 }
 
+void workbench_preferences_round_trip_and_fail_closed() {
+    TempDirectory temp;
+    const auto path = temp.path() / "workbench.prefs";
+    carto::ui::WorkbenchPreferences preferences;
+    preferences.ledger_collapsed = true;
+    auto& scene = preferences.instruments.at(static_cast<std::size_t>(
+        carto::ui::WorkbenchInstrument::scene));
+    scene.visible = true;
+    scene.positioned = true;
+    scene.x = 142;
+    scene.y = 156;
+    scene.width = 286;
+    scene.height = 330;
+    REQUIRE(carto::ui::save_workbench_preferences(path, preferences));
+
+    const auto loaded = carto::ui::load_workbench_preferences(path);
+    REQUIRE(loaded);
+    REQUIRE(loaded.value().ledger_collapsed);
+    REQUIRE(loaded.value().instruments.at(static_cast<std::size_t>(
+        carto::ui::WorkbenchInstrument::scene)).visible);
+    REQUIRE(loaded.value().instruments.at(static_cast<std::size_t>(
+        carto::ui::WorkbenchInstrument::scene)).x == 142);
+    REQUIRE(loaded.value().instruments.at(static_cast<std::size_t>(
+        carto::ui::WorkbenchInstrument::scene)).width == 286);
+
+    const std::string before_failed_save = [&path] {
+        std::ifstream stream(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(stream), {});
+    }();
+    auto invalid_preferences = preferences;
+    invalid_preferences.instruments.at(static_cast<std::size_t>(
+        carto::ui::WorkbenchInstrument::scene)).width = 20;
+    REQUIRE(!carto::ui::save_workbench_preferences(path, invalid_preferences));
+    std::ifstream after_failed_save_stream(path, std::ios::binary);
+    const std::string after_failed_save(
+        std::istreambuf_iterator<char>(after_failed_save_stream), {});
+    REQUIRE(after_failed_save == before_failed_save);
+
+    {
+        std::ofstream corrupt(path, std::ios::binary | std::ios::trunc);
+        corrupt << "header=CARTOGRAPHER_WORKBENCH_PREFS_V1\n"
+                   "ledger_collapsed=0\nscene=1,1,142,156,286\n";
+    }
+    REQUIRE(!carto::ui::load_workbench_preferences(path));
+}
+
 void ui_failed_shortcuts_and_actions_remain_bounded() {
     carto::application::ApplicationSession session;
     carto::ui::UiController ui(session);
@@ -210,9 +336,12 @@ int main() {
     try {
         preferences_validate_shell_invariants();
         ui_routes_authoritative_actions_and_operation_lineage();
+        ui_distinguishes_unsaved_from_saved_state();
+        ui_rejects_unadmitted_ai_proposals();
         ui_routes_edge_selection_without_authoring_mutation();
         ui_preserves_required_viewport_and_supports_mode_theme_density();
         ui_persists_preferences_and_resets_corrupt_state();
+        workbench_preferences_round_trip_and_fail_closed();
         ui_failed_shortcuts_and_actions_remain_bounded();
         ui_command_palette_is_bounded_and_explicit_about_deferred_features();
     } catch (const std::exception& error) {

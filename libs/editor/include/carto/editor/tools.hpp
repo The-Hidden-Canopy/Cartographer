@@ -18,7 +18,10 @@ struct ToolDescriptor {
 };
 
 struct ToolContext {
-    ToolContext(project::ProjectDocument& document, const SelectionState& selection);
+    ToolContext(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        const SelectionState& selection);
 
     [[nodiscard]] const SelectionState& selection() const noexcept { return selection_; }
     [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
@@ -27,6 +30,9 @@ struct ToolContext {
     make_set_selected_vertex_position_command(core::Vec3d position) const;
 
 private:
+    friend class ::carto::application::ApplicationSession;
+
+    ProjectCommandAdmission admission_;
     project::ProjectDocument& document_;
     const SelectionState& selection_;
 };

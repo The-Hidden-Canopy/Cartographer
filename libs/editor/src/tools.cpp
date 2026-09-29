@@ -16,14 +16,16 @@ Diagnostic invalid(std::string message) {
 } // namespace
 
 ToolContext::ToolContext(
+    ProjectCommandAdmission admission,
     project::ProjectDocument& document,
     const SelectionState& selection)
-    : document_(document), selection_(selection) {}
+    : admission_(admission), document_(document), selection_(selection) {}
 
 core::Result<std::unique_ptr<EditorCommand>>
 ToolContext::make_extrude_selected_face_command(double distance) const {
     return core::Result<std::unique_ptr<EditorCommand>>::success(
         std::make_unique<ExtrudeProjectSelectedFaceCommand>(
+            admission_,
             document_,
             selection_,
             distance));
@@ -33,6 +35,7 @@ core::Result<std::unique_ptr<EditorCommand>>
 ToolContext::make_set_selected_vertex_position_command(core::Vec3d position) const {
     return core::Result<std::unique_ptr<EditorCommand>>::success(
         std::make_unique<SetProjectSelectedVertexPositionCommand>(
+            admission_,
             document_,
             selection_,
             position));

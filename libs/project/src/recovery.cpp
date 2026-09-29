@@ -2,6 +2,7 @@
 
 #include <charconv>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -127,13 +128,14 @@ core::Result<RecoveryReceipt> recover_from_journal(
         return core::Result<RecoveryReceipt>::failure(checkpoint_document.error().with_context(
             "checkpoint project snapshot"));
     }
-    ProjectDocument document = std::move(checkpoint_document.value());
-    if (document.revision() != candidate.value().checkpoint.project_revision) {
+    std::optional<ProjectDocument> document;
+    document.emplace(std::move(checkpoint_document.value()));
+    if (document->revision() != candidate.value().checkpoint.project_revision) {
         return core::Result<RecoveryReceipt>::failure(
             stale("checkpoint project revision does not match its metadata"));
     }
 
-    core::Revision current_revision = document.revision();
+    core::Revision current_revision = document->revision();
     for (const auto& entry : candidate.value().pending_entries) {
         if (entry.revision_before != current_revision) {
             return core::Result<RecoveryReceipt>::failure(
@@ -153,16 +155,16 @@ core::Result<RecoveryReceipt> recover_from_journal(
             return core::Result<RecoveryReceipt>::failure(
                 stale("pending project snapshot revision does not match its journal entry"));
         }
-        document = std::move(next.value());
-        current_revision = document.revision();
+        document.emplace(std::move(next.value()));
+        current_revision = document->revision();
     }
 
-    if (auto result = document.validate(); !result) {
+    if (auto result = document->validate(); !result) {
         return core::Result<RecoveryReceipt>::failure(result.error().with_context(
             "recovered project"));
     }
     return core::Result<RecoveryReceipt>::success(RecoveryReceipt{
-        std::move(document),
+        std::move(document.value()),
         candidate.value().checkpoint.project_revision,
         current_revision,
         candidate.value().pending_entries.size(),

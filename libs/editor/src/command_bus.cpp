@@ -88,6 +88,7 @@ core::Result<void> SetObjectTransformCommand::apply(core::Transform transform) {
 }
 
 SetProjectObjectTransformCommand::SetProjectObjectTransformCommand(
+    ProjectCommandAdmission,
     project::ProjectDocument& document,
     scene::ObjectId object,
     core::Transform before,
@@ -150,6 +151,7 @@ core::Result<void> SetVertexPositionCommand::apply(core::Vec3d position) {
 }
 
 SetProjectSelectedVertexPositionCommand::SetProjectSelectedVertexPositionCommand(
+    ProjectCommandAdmission,
     project::ProjectDocument& document,
     const SelectionState& selection,
     core::Vec3d position)
@@ -342,6 +344,7 @@ core::Result<void> ExtrudeSelectedFaceCommand::undo() {
 }
 
 ExtrudeProjectSelectedFaceCommand::ExtrudeProjectSelectedFaceCommand(
+    ProjectCommandAdmission,
     project::ProjectDocument& document,
     const SelectionState& selection,
     double distance)
@@ -445,6 +448,7 @@ core::Result<void> ExtrudeProjectSelectedFaceCommand::undo() {
 }
 
 CreateMeshObjectCommand::CreateMeshObjectCommand(
+    ProjectCommandAdmission,
     project::ProjectDocument& document,
     std::string object_name,
     geometry::EditableMesh mesh)

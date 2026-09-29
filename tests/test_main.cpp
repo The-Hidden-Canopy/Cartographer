@@ -1,3 +1,6 @@
+#include "project_document_access.hpp"
+#include "editor_project_access.hpp"
+
 #include <carto/editor/command_bus.hpp>
 #include <carto/editor/selection.hpp>
 #include <carto/editor/tools.hpp>
@@ -613,17 +616,21 @@ void selected_face_tool_adapter_validates_before_delegating() {
 void tool_registry_dispatches_registered_commands_through_history() {
     auto document = carto::project::ProjectDocument::create("Tool registry workflow");
     REQUIRE(document);
-    const auto first_object = document.value().create_object("First");
-    const auto second_object = document.value().create_object("Second");
+    const auto first_object = carto::project::testing::access(document.value()).create_object("First");
+    const auto second_object = carto::project::testing::access(document.value()).create_object("Second");
     REQUIRE(first_object && second_object);
     auto first_primitive = carto::geometry::make_box({2.0, 2.0, 2.0});
     auto second_primitive = carto::geometry::make_box({1.0, 1.0, 1.0});
     REQUIRE(first_primitive && second_primitive);
-    const auto first_mesh = document.value().add_mesh(std::move(first_primitive.value()));
-    const auto second_mesh = document.value().add_mesh(std::move(second_primitive.value()));
+    const auto first_mesh = carto::project::testing::access(document.value()).add_mesh(
+        std::move(first_primitive.value()));
+    const auto second_mesh = carto::project::testing::access(document.value()).add_mesh(
+        std::move(second_primitive.value()));
     REQUIRE(first_mesh && second_mesh);
-    REQUIRE(document.value().attach_mesh(first_object.value(), first_mesh.value()));
-    REQUIRE(document.value().attach_mesh(second_object.value(), second_mesh.value()));
+    REQUIRE(carto::project::testing::access(document.value()).attach_mesh(
+        first_object.value(), first_mesh.value()));
+    REQUIRE(carto::project::testing::access(document.value()).attach_mesh(
+        second_object.value(), second_mesh.value()));
     carto::editor::SelectionState selection;
     const auto selected_face = document.value().meshes().at(second_mesh.value()).faces_sorted().front().id;
     REQUIRE(selection.select_face(
@@ -631,7 +638,7 @@ void tool_registry_dispatches_registered_commands_through_history() {
         second_object.value(),
         document.value().meshes().at(second_mesh.value()),
         selected_face));
-    carto::editor::ToolContext context(document.value(), selection);
+    auto context = carto::project::testing::editor_access(document.value()).tool_context(selection);
     carto::editor::ToolArguments arguments{0.5};
     carto::editor::CommandBus history;
     carto::editor::ToolRegistry registry;
@@ -684,18 +691,22 @@ void tool_registry_dispatches_registered_commands_through_history() {
 void project_vertex_tool_routes_through_history_and_rejects_bad_context() {
     auto document = carto::project::ProjectDocument::create("Project vertex workflow");
     REQUIRE(document);
-    const auto first_object = document.value().create_object("First");
-    const auto second_object = document.value().create_object("Second");
-    const auto unbound_object = document.value().create_object("No mesh");
+    const auto first_object = carto::project::testing::access(document.value()).create_object("First");
+    const auto second_object = carto::project::testing::access(document.value()).create_object("Second");
+    const auto unbound_object = carto::project::testing::access(document.value()).create_object("No mesh");
     REQUIRE(first_object && second_object && unbound_object);
     auto first_primitive = carto::geometry::make_box({2.0, 2.0, 2.0});
     auto second_primitive = carto::geometry::make_box({1.0, 1.0, 1.0});
     REQUIRE(first_primitive && second_primitive);
-    const auto first_mesh = document.value().add_mesh(std::move(first_primitive.value()));
-    const auto second_mesh = document.value().add_mesh(std::move(second_primitive.value()));
+    const auto first_mesh = carto::project::testing::access(document.value()).add_mesh(
+        std::move(first_primitive.value()));
+    const auto second_mesh = carto::project::testing::access(document.value()).add_mesh(
+        std::move(second_primitive.value()));
     REQUIRE(first_mesh && second_mesh);
-    REQUIRE(document.value().attach_mesh(first_object.value(), first_mesh.value()));
-    REQUIRE(document.value().attach_mesh(second_object.value(), second_mesh.value()));
+    REQUIRE(carto::project::testing::access(document.value()).attach_mesh(
+        first_object.value(), first_mesh.value()));
+    REQUIRE(carto::project::testing::access(document.value()).attach_mesh(
+        second_object.value(), second_mesh.value()));
 
     const auto second_vertex = document.value().meshes().at(second_mesh.value()).vertices_sorted().front();
     const auto first_position = document.value().meshes().at(first_mesh.value()).vertices_sorted().front().position;
@@ -709,7 +720,7 @@ void project_vertex_tool_routes_through_history_and_rejects_bad_context() {
         second_object.value(),
         document.value().meshes().at(second_mesh.value()),
         second_vertex.id));
-    carto::editor::ToolContext context(document.value(), selection);
+    auto context = carto::project::testing::editor_access(document.value()).tool_context(selection);
     carto::editor::ToolArguments arguments;
     arguments.position = target_position;
     carto::editor::CommandBus history;
@@ -727,15 +738,18 @@ void project_vertex_tool_routes_through_history_and_rejects_bad_context() {
         second_object.value(),
         document.value().meshes().at(second_mesh.value()),
         second_vertex.id));
-    REQUIRE(document.value().attach_mesh(second_object.value(), first_mesh.value()));
-    carto::editor::ToolContext rebound_context(document.value(), rebound_selection);
+    REQUIRE(carto::project::testing::access(document.value()).attach_mesh(
+        second_object.value(), first_mesh.value()));
+    auto rebound_context = carto::project::testing::editor_access(
+        document.value()).tool_context(rebound_selection);
     carto::editor::CommandBus rebound_history;
     const auto rebound_result = registry.invoke(
         "mesh.set-vertex-position", rebound_context, arguments, rebound_history);
     REQUIRE(!rebound_result);
     REQUIRE(rebound_result.error().code == carto::core::ErrorCode::stale_data);
     REQUIRE(rebound_history.undo_count() == 0U);
-    REQUIRE(document.value().attach_mesh(second_object.value(), second_mesh.value()));
+    REQUIRE(carto::project::testing::access(document.value()).attach_mesh(
+        second_object.value(), second_mesh.value()));
 
     REQUIRE(registry.invoke("mesh.set-vertex-position", context, arguments, history));
     REQUIRE(history.undo_count() == 1U);
@@ -759,7 +773,8 @@ void project_vertex_tool_routes_through_history_and_rejects_bad_context() {
         second_vertex.id));
     const auto replacement_revision = document.value().meshes().at(second_mesh.value()).revision();
     auto same_revision_mesh = document.value().meshes().at(second_mesh.value());
-    REQUIRE(document.value().replace_mesh(second_mesh.value(), std::move(same_revision_mesh)));
+    REQUIRE(carto::project::testing::access(document.value()).replace_mesh(
+        second_mesh.value(), std::move(same_revision_mesh)));
     REQUIRE(document.value().meshes().at(second_mesh.value()).revision() > replacement_revision);
     const auto stale_replacement = replacement_selection.validate(
         document.value().scene(), &document.value().meshes().at(second_mesh.value()));
@@ -777,7 +792,8 @@ void project_vertex_tool_routes_through_history_and_rejects_bad_context() {
         second_object.value(),
         document.value().meshes().at(second_mesh.value()),
         second_face));
-    carto::editor::ToolContext wrong_context(document.value(), wrong_mode);
+    auto wrong_context = carto::project::testing::editor_access(
+        document.value()).tool_context(wrong_mode);
     carto::editor::CommandBus wrong_history;
     REQUIRE(!registry.invoke("mesh.set-vertex-position", wrong_context, arguments, wrong_history));
     REQUIRE(wrong_history.undo_count() == 0U);
@@ -795,7 +811,8 @@ void project_vertex_tool_routes_through_history_and_rejects_bad_context() {
         document.value().meshes().at(second_mesh.value()),
         second_vertices[1].id,
         carto::editor::SelectionOperation::add));
-    carto::editor::ToolContext multiple_context(document.value(), multiple_selection);
+    auto multiple_context = carto::project::testing::editor_access(
+        document.value()).tool_context(multiple_selection);
     carto::editor::CommandBus multiple_history;
     REQUIRE(!registry.invoke("mesh.set-vertex-position", multiple_context, arguments, multiple_history));
     REQUIRE(multiple_history.undo_count() == 0U);
@@ -806,7 +823,8 @@ void project_vertex_tool_routes_through_history_and_rejects_bad_context() {
         unbound_object.value(),
         document.value().meshes().at(second_mesh.value()),
         second_vertex.id));
-    carto::editor::ToolContext no_mesh_context(document.value(), no_mesh_selection);
+    auto no_mesh_context = carto::project::testing::editor_access(
+        document.value()).tool_context(no_mesh_selection);
     carto::editor::CommandBus no_mesh_history;
     REQUIRE(!registry.invoke("mesh.set-vertex-position", no_mesh_context, arguments, no_mesh_history));
     REQUIRE(no_mesh_history.undo_count() == 0U);
@@ -817,7 +835,8 @@ void project_vertex_tool_routes_through_history_and_rejects_bad_context() {
         second_object.value(),
         document.value().meshes().at(second_mesh.value()),
         second_vertex.id));
-    carto::editor::ToolContext invalid_context(document.value(), invalid_selection);
+    auto invalid_context = carto::project::testing::editor_access(
+        document.value()).tool_context(invalid_selection);
     const auto invalid_target = document.value().meshes().at(second_mesh.value()).vertices_sorted().at(1).position;
     arguments.position = invalid_target;
     carto::editor::CommandBus invalid_history;
@@ -829,7 +848,8 @@ void project_vertex_tool_routes_through_history_and_rejects_bad_context() {
     REQUIRE(document.value().meshes().at(second_mesh.value()).find_vertex(second_vertex.id)->position.x ==
             target_position.x);
 
-    REQUIRE(document.value().remove_object(second_object.value()));
+    REQUIRE(carto::project::testing::access(document.value()).remove_object(
+        second_object.value()));
     carto::editor::CommandBus stale_history;
     arguments.position = target_position;
     REQUIRE(!registry.invoke("mesh.set-vertex-position", context, arguments, stale_history));
@@ -843,8 +863,8 @@ void create_mesh_object_command_preserves_ids_across_undo_redo() {
     REQUIRE(primitive);
 
     carto::editor::CommandBus bus;
-    REQUIRE(bus.execute(std::make_unique<carto::editor::CreateMeshObjectCommand>(
-        document.value(), "Box", std::move(primitive.value()))));
+    REQUIRE(bus.execute(carto::project::testing::editor_access(document.value())
+        .create_mesh_object_command("Box", std::move(primitive.value()))));
     REQUIRE(document.value().scene().size() == 1U);
     REQUIRE(document.value().meshes().size() == 1U);
     const auto object = document.value().scene().objects_sorted().front();
@@ -873,8 +893,8 @@ void create_mesh_object_command_preserves_ids_across_undo_redo() {
     const auto before_revision = invalid_document.value().revision();
     const auto before_serialized = invalid_document.value().serialize();
     carto::editor::CommandBus invalid_bus;
-    REQUIRE(!invalid_bus.execute(std::make_unique<carto::editor::CreateMeshObjectCommand>(
-        invalid_document.value(), "", std::move(second_primitive.value()))));
+    REQUIRE(!invalid_bus.execute(carto::project::testing::editor_access(invalid_document.value())
+        .create_mesh_object_command("", std::move(second_primitive.value()))));
     REQUIRE(invalid_bus.undo_count() == 0U);
     REQUIRE(invalid_document.value().scene().size() == 0U);
     REQUIRE(invalid_document.value().meshes().empty());
@@ -883,8 +903,8 @@ void create_mesh_object_command_preserves_ids_across_undo_redo() {
 
     auto recovered_primitive = carto::geometry::make_plane(1.0, 1.0);
     REQUIRE(recovered_primitive);
-    REQUIRE(invalid_bus.execute(std::make_unique<carto::editor::CreateMeshObjectCommand>(
-        invalid_document.value(), "Recovered", std::move(recovered_primitive.value()))));
+    REQUIRE(invalid_bus.execute(carto::project::testing::editor_access(invalid_document.value())
+        .create_mesh_object_command("Recovered", std::move(recovered_primitive.value()))));
     REQUIRE(invalid_document.value().scene().objects_sorted().front().id ==
             carto::scene::ObjectId{1});
     REQUIRE(*invalid_document.value().scene().objects_sorted().front().mesh_asset == 1U);
@@ -966,18 +986,19 @@ void command_bus_is_reversible_and_rejects_failed_commands() {
 void project_transform_command_rejects_stale_undo() {
     auto document = carto::project::ProjectDocument::create("Transform guard");
     REQUIRE(document);
-    const auto object = document.value().create_object("Object");
+    const auto object = carto::project::testing::access(document.value()).create_object("Object");
     REQUIRE(object);
     const auto before = document.value().scene().find(object.value())->local_transform;
     auto after = before;
     after.translation.x = 4.0;
 
     carto::editor::CommandBus bus;
-    REQUIRE(bus.execute(std::make_unique<carto::editor::SetProjectObjectTransformCommand>(
-        document.value(), object.value(), before, after)));
+    REQUIRE(bus.execute(carto::project::testing::editor_access(document.value())
+        .set_project_object_transform_command(object.value(), before, after)));
     auto external = after;
     external.translation.y = 9.0;
-    REQUIRE(document.value().set_object_transform(object.value(), external));
+    REQUIRE(carto::project::testing::access(document.value()).set_object_transform(
+        object.value(), external));
 
     REQUIRE(!bus.undo());
     REQUIRE(bus.undo_count() == 1U);
@@ -988,17 +1009,19 @@ void project_transform_command_rejects_stale_undo() {
 
     auto deferred_document = carto::project::ProjectDocument::create("Deferred transform guard");
     REQUIRE(deferred_document);
-    const auto deferred_object = deferred_document.value().create_object("Object");
+    const auto deferred_object = carto::project::testing::access(
+        deferred_document.value()).create_object("Object");
     REQUIRE(deferred_object);
     const auto deferred_before =
         deferred_document.value().scene().find(deferred_object.value())->local_transform;
     auto deferred_after = deferred_before;
     deferred_after.translation.x = 12.0;
-    auto deferred_command = std::make_unique<carto::editor::SetProjectObjectTransformCommand>(
-        deferred_document.value(), deferred_object.value(), deferred_before, deferred_after);
+    auto deferred_command = carto::project::testing::editor_access(deferred_document.value())
+        .set_project_object_transform_command(
+            deferred_object.value(), deferred_before, deferred_after);
     auto external_transform = deferred_before;
     external_transform.translation.y = 6.0;
-    REQUIRE(deferred_document.value().set_object_transform(
+    REQUIRE(carto::project::testing::access(deferred_document.value()).set_object_transform(
         deferred_object.value(), external_transform));
     carto::editor::CommandBus deferred_bus;
     REQUIRE(!deferred_bus.execute(std::move(deferred_command)));
@@ -1015,12 +1038,14 @@ void project_round_trips_authoritative_state_and_rejects_future_versions() {
     const auto path = temp.path() / "scene.carto";
     auto document = carto::project::ProjectDocument::create("Round Trip");
     REQUIRE(document);
-    const auto object = document.value().create_object("Triangle");
+    const auto object = carto::project::testing::access(document.value()).create_object("Triangle");
     REQUIRE(object);
     auto mesh = triangle_mesh();
-    const auto mesh_id = document.value().add_mesh(std::move(mesh));
+    const auto mesh_id = carto::project::testing::access(document.value()).add_mesh(
+        std::move(mesh));
     REQUIRE(mesh_id);
-    REQUIRE(document.value().attach_mesh(object.value(), mesh_id.value()));
+    REQUIRE(carto::project::testing::access(document.value()).attach_mesh(
+        object.value(), mesh_id.value()));
     const std::string serialized_before = document.value().serialize();
     REQUIRE(document.value().save_atomic(path));
     auto loaded = carto::project::ProjectDocument::load(path);
@@ -1154,7 +1179,7 @@ void project_save_failure_does_not_replace_existing_file_and_paths_are_bounded()
     const auto path = temp.path() / "valid.carto";
     auto document = carto::project::ProjectDocument::create("Stable");
     REQUIRE(document);
-    REQUIRE(document.value().create_object("Object"));
+    REQUIRE(carto::project::testing::access(document.value()).create_object("Object"));
     REQUIRE(document.value().save_atomic(path));
     std::ifstream before(path, std::ios::binary);
     const std::string original((std::istreambuf_iterator<char>(before)), std::istreambuf_iterator<char>());

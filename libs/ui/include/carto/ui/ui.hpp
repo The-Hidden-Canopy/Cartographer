@@ -3,6 +3,7 @@
 #include <carto/application/application.hpp>
 #include <carto/core/result.hpp>
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -92,6 +93,7 @@ enum class BottomPanel {
 };
 
 enum class ProjectStatus {
+    unsaved,
     saved,
     modified,
     render_error,
@@ -105,7 +107,6 @@ enum class OperationCategory {
     project,
     recovery,
     provider,
-    ai_proposal,
 };
 
 enum class Shortcut {
@@ -156,6 +157,43 @@ struct UiPreferences {
     [[nodiscard]] core::Result<void> validate() const;
 };
 
+// Cartographer's physical workbench is local presentation state. It is kept
+// separate from document/project state and is persisted in its own bounded
+// preference file so instrument geometry cannot become project truth.
+enum class WorkbenchInstrument {
+    scene,
+    assets,
+    layers,
+    tools,
+    references,
+    draft,
+    inspector,
+    material,
+    constraint,
+    modify,
+    measure,
+    transform,
+    extrude,
+};
+
+inline constexpr std::size_t kWorkbenchInstrumentCount = 13U;
+
+struct WorkbenchInstrumentLayout {
+    bool visible = false;
+    bool positioned = false;
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    std::int32_t width = 0;
+    std::int32_t height = 0;
+};
+
+struct WorkbenchPreferences {
+    bool ledger_collapsed = false;
+    std::array<WorkbenchInstrumentLayout, kWorkbenchInstrumentCount> instruments{};
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
 // A UI snapshot is a presentation projection. The inherited application
 // snapshot remains the only authoring data source; UI-only state is kept in
 // the additional fields below and is never serialized into a project.
@@ -165,7 +203,7 @@ struct UiSnapshot : application::ApplicationSnapshot {
     Density density = Density::standard;
     Theme theme = Theme::dark;
     BottomPanel bottom_panel = BottomPanel::operations;
-    ProjectStatus project_status = ProjectStatus::saved;
+    ProjectStatus project_status = ProjectStatus::unsaved;
     std::string project_status_text;
     bool command_palette_open = false;
     std::string command_palette_query;
@@ -185,6 +223,13 @@ struct UiSnapshot : application::ApplicationSnapshot {
 [[nodiscard]] const char* workspace_name(Workspace workspace) noexcept;
 [[nodiscard]] const char* panel_name(Panel panel) noexcept;
 [[nodiscard]] const char* bottom_panel_name(BottomPanel panel) noexcept;
+[[nodiscard]] const char* workbench_instrument_name(WorkbenchInstrument instrument) noexcept;
+
+[[nodiscard]] core::Result<void> save_workbench_preferences(
+    const std::filesystem::path& path,
+    const WorkbenchPreferences& preferences);
+[[nodiscard]] core::Result<WorkbenchPreferences> load_workbench_preferences(
+    const std::filesystem::path& path);
 
 class UiController final {
 public:
@@ -194,8 +239,11 @@ public:
     UiController& operator=(const UiController&) = delete;
 
     [[nodiscard]] core::Result<application::DispatchReceipt> dispatch(
-        const application::ApplicationAction& action,
-        OperationCategory category = OperationCategory::committed_command);
+        const application::ApplicationAction& action);
+    // AI proposals have no mutation route until a bounded planner and an
+    // explicit host admission contract are connected.
+    [[nodiscard]] core::Result<application::DispatchReceipt> submit_ai_proposal(
+        const application::ApplicationAction& action);
     [[nodiscard]] core::Result<void> set_operator_mode(OperatorMode mode);
     [[nodiscard]] core::Result<void> set_workspace(Workspace workspace);
     [[nodiscard]] core::Result<void> set_density(Density density);
@@ -215,6 +263,9 @@ public:
     [[nodiscard]] UiSnapshot snapshot() const;
 
 private:
+    [[nodiscard]] core::Result<application::DispatchReceipt> dispatch_with_category(
+        const application::ApplicationAction& action,
+        OperationCategory category);
     [[nodiscard]] core::Result<void> apply_preferences(const UiPreferences& preferences);
     [[nodiscard]] core::Result<void> sync_application_workspace(
         const std::vector<Panel>& panels);

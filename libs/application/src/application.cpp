@@ -238,7 +238,9 @@ core::Result<void> ApplicationSession::append_mutation_event(
     return core::Result<void>::success();
 }
 
-core::Result<DispatchReceipt> ApplicationSession::dispatch(const ApplicationAction& action) {
+core::Result<DispatchReceipt> ApplicationSession::dispatch(
+    HumanActionAdmission,
+    const ApplicationAction& action) {
     return std::visit(
         [this](const auto& value) -> core::Result<DispatchReceipt> {
             using Action = std::decay_t<decltype(value)>;
@@ -278,8 +280,10 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(const ApplicationActi
                 if (object->locked) {
                     return failure(invalid_state("locked scene objects cannot be transformed"));
                 }
+                editor::ProjectCommandAdmission admission;
                 return execute_command(
                     std::make_unique<editor::SetProjectObjectTransformCommand>(
+                        admission,
                         document_, value.object, object->local_transform, value.transform),
                     "Set Object Transform");
             } else if constexpr (std::is_same_v<Action, InvokeToolAction>) {
@@ -519,7 +523,8 @@ core::Result<DispatchReceipt> ApplicationSession::select_edge(const SelectEdgeAc
 core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAction& action) {
     const core::Revision before = document_.revision();
     project::ProjectDocument before_document = document_;
-    editor::ToolContext context(document_, selection_);
+    editor::ProjectCommandAdmission admission;
+    editor::ToolContext context(admission, document_, selection_);
     if (auto result = tools_.invoke(action.tool_id, context, action.arguments, history_); !result) {
         return failure(result.error().with_context("tool invocation"));
     }
@@ -534,8 +539,10 @@ core::Result<DispatchReceipt> ApplicationSession::create_box(const CreateBoxActi
     if (!mesh) {
         return failure(mesh.error().with_context("create box"));
     }
+    editor::ProjectCommandAdmission admission;
     return execute_command(
         std::make_unique<editor::CreateMeshObjectCommand>(
+            admission,
             document_, action.object_name, std::move(mesh.value())),
         "Create Box");
 }
@@ -545,16 +552,20 @@ core::Result<DispatchReceipt> ApplicationSession::create_plane(const CreatePlane
     if (!mesh) {
         return failure(mesh.error().with_context("create plane"));
     }
+    editor::ProjectCommandAdmission admission;
     return execute_command(
         std::make_unique<editor::CreateMeshObjectCommand>(
+            admission,
             document_, action.object_name, std::move(mesh.value())),
         "Create Plane");
 }
 
 core::Result<DispatchReceipt> ApplicationSession::create_mesh_object(
     const CreateMeshObjectAction& action) {
+    editor::ProjectCommandAdmission admission;
     return execute_command(
         std::make_unique<editor::CreateMeshObjectCommand>(
+            admission,
             document_, action.object_name, action.mesh),
         "Create Mesh Object");
 }
