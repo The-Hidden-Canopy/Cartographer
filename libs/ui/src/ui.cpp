@@ -28,7 +28,9 @@ constexpr std::size_t kMaxOperations = 256U;
 constexpr std::size_t kMaxUiProblems = 64U;
 constexpr std::size_t kMaxPreferenceBytes = 16U * 1024U;
 constexpr std::size_t kMaxPreferenceLineBytes = 1024U;
-constexpr std::size_t kWorkbenchPreferenceFieldCount = 2U + kWorkbenchInstrumentCount;
+constexpr std::size_t kWorkbenchPreferenceV1FieldCount = 2U + kWorkbenchInstrumentCount;
+constexpr std::size_t kWorkbenchPreferenceV2FieldCount =
+    kWorkbenchPreferenceV1FieldCount + 2U;
 std::mutex g_preferences_mutex;
 std::atomic<std::uint64_t> g_preference_temp_counter{0U};
 
@@ -313,6 +315,34 @@ bool parse_integer(std::string_view text, std::int32_t& value) noexcept {
     return true;
 }
 
+bool parse_flow_count(std::string_view text, std::uint32_t& value) noexcept {
+    if (text.empty()) return false;
+    std::uint32_t parsed = 0U;
+    const auto result = std::from_chars(text.data(), text.data() + text.size(), parsed);
+    if (result.ec != std::errc{} || result.ptr != text.data() + text.size() ||
+        parsed > kMaxWorkbenchFlowUses) {
+        return false;
+    }
+    value = parsed;
+    return true;
+}
+
+bool parse_flow_counts(
+    std::string_view text,
+    std::array<std::uint32_t, kWorkbenchFlowMemoryCount>& values) noexcept {
+    std::size_t cursor = 0U;
+    for (std::size_t index = 0U; index < values.size(); ++index) {
+        const std::size_t separator = text.find(',', cursor);
+        const std::size_t end = separator == std::string_view::npos ? text.size() : separator;
+        if (!parse_flow_count(text.substr(cursor, end - cursor), values[index])) return false;
+        if (separator == std::string_view::npos) {
+            return index + 1U == values.size();
+        }
+        cursor = separator + 1U;
+    }
+    return false;
+}
+
 bool parse_flag(std::string_view text, bool& value) noexcept {
     if (text == "0") {
         value = false;
@@ -386,11 +416,17 @@ core::Result<WorkbenchPreferences> parse_workbench_preferences(std::string_view 
     }
 
     const auto header = fields.find("header");
-    if (header == fields.end() || header->second != "CARTOGRAPHER_WORKBENCH_PREFS_V1") {
+    const bool legacy_format = header != fields.end() &&
+        header->second == "CARTOGRAPHER_WORKBENCH_PREFS_V1";
+    const bool current_format = header != fields.end() &&
+        header->second == "CARTOGRAPHER_WORKBENCH_PREFS_V2";
+    if (!legacy_format && !current_format) {
         return core::Result<WorkbenchPreferences>::failure(
             validation("workbench preference header is invalid"));
     }
-    if (fields.size() != kWorkbenchPreferenceFieldCount) {
+    const std::size_t expected_field_count = current_format
+        ? kWorkbenchPreferenceV2FieldCount : kWorkbenchPreferenceV1FieldCount;
+    if (fields.size() != expected_field_count) {
         return core::Result<WorkbenchPreferences>::failure(
             validation("workbench preference field set is invalid"));
     }
@@ -404,6 +440,16 @@ core::Result<WorkbenchPreferences> parse_workbench_preferences(std::string_view 
     if (!parse_flag(ledger->second, result.ledger_collapsed)) {
         return core::Result<WorkbenchPreferences>::failure(
             validation("workbench preference ledger flag is invalid"));
+    }
+    if (current_format) {
+        const auto last_flow = fields.find("workflow_last_flow");
+        const auto flow_counts = fields.find("workflow_flow_counts");
+        if (last_flow == fields.end() || flow_counts == fields.end() ||
+            !parse_integer(last_flow->second, result.last_flow_index) ||
+            !parse_flow_counts(flow_counts->second, result.flow_use_counts)) {
+            return core::Result<WorkbenchPreferences>::failure(
+                validation("workbench workflow memory is invalid"));
+        }
     }
     for (std::size_t index = 0U; index < kWorkbenchInstrumentCount; ++index) {
         const auto instrument = all_workbench_instruments()[index];
@@ -424,8 +470,15 @@ core::Result<WorkbenchPreferences> parse_workbench_preferences(std::string_view 
 }
 
 std::string serialize_workbench_preferences(const WorkbenchPreferences& preferences) {
-    std::string result = "header=CARTOGRAPHER_WORKBENCH_PREFS_V1\n";
+    std::string result = "header=CARTOGRAPHER_WORKBENCH_PREFS_V2\n";
     result += std::string("ledger_collapsed=") + (preferences.ledger_collapsed ? "1\n" : "0\n");
+    result += "workflow_last_flow=" + std::to_string(preferences.last_flow_index) + "\n";
+    result += "workflow_flow_counts=";
+    for (std::size_t index = 0U; index < preferences.flow_use_counts.size(); ++index) {
+        if (index != 0U) result.push_back(',');
+        result += std::to_string(preferences.flow_use_counts[index]);
+    }
+    result.push_back('\n');
     for (std::size_t index = 0U; index < kWorkbenchInstrumentCount; ++index) {
         const auto& layout = preferences.instruments[index];
         result += workbench_instrument_name(all_workbench_instruments()[index]);
@@ -458,6 +511,17 @@ core::Result<void> UiPreferences::validate() const {
 }
 
 core::Result<void> WorkbenchPreferences::validate() const {
+    if (last_flow_index < -1 ||
+        last_flow_index >= static_cast<std::int32_t>(kWorkbenchFlowMemoryCount)) {
+        return core::Result<void>::failure(
+            invalid("workbench workflow memory contains an invalid last flow"));
+    }
+    for (const std::uint32_t uses : flow_use_counts) {
+        if (uses > kMaxWorkbenchFlowUses) {
+            return core::Result<void>::failure(
+                invalid("workbench workflow memory exceeds its safe bound"));
+        }
+    }
     for (const auto& layout : instruments) {
         if (!layout.positioned) {
             if (layout.x != 0 || layout.y != 0 || layout.width != 0 || layout.height != 0) {
@@ -479,16 +543,18 @@ core::Result<void> WorkbenchPreferences::validate() const {
 UiColorTokens color_tokens(Theme theme) noexcept {
     if (theme == Theme::light) {
         return {
-            {0.93F, 0.94F, 0.96F, 1.0F}, {0.98F, 0.98F, 0.99F, 1.0F},
-            {0.86F, 0.87F, 0.90F, 1.0F}, {0.91F, 0.92F, 0.94F, 1.0F},
-            {0.82F, 0.86F, 0.92F, 1.0F}, {0.70F, 0.80F, 0.94F, 1.0F},
-            {0.10F, 0.12F, 0.16F, 1.0F}, {0.30F, 0.34F, 0.41F, 1.0F},
-            {0.50F, 0.53F, 0.58F, 1.0F}, {0.68F, 0.70F, 0.75F, 1.0F},
-            {0.15F, 0.34F, 0.70F, 1.0F}, {0.10F, 0.34F, 0.78F, 1.0F},
-            {0.22F, 0.48F, 0.84F, 1.0F}, {0.12F, 0.56F, 0.28F, 1.0F},
-            {0.75F, 0.48F, 0.06F, 1.0F}, {0.72F, 0.16F, 0.14F, 1.0F},
-            {0.10F, 0.36F, 0.72F, 1.0F}, {0.62F, 0.32F, 0.78F, 0.45F},
-            {0.72F, 0.42F, 0.05F, 0.75F}, {0.88F, 0.64F, 0.10F, 1.0F},
+            // HAVEN-derived light surfaces: cool canvas, white cards, and a
+            // restrained blue interaction layer keep the workbench readable.
+            {0.961F, 0.969F, 0.984F, 1.0F}, {0.969F, 0.976F, 0.992F, 1.0F},
+            {1.0F, 1.0F, 1.0F, 1.0F}, {0.941F, 0.953F, 0.973F, 1.0F},
+            {0.145F, 0.388F, 0.922F, 0.10F}, {0.145F, 0.388F, 0.922F, 0.20F},
+            {0.090F, 0.125F, 0.200F, 1.0F}, {0.361F, 0.400F, 0.471F, 1.0F},
+            {0.463F, 0.502F, 0.573F, 1.0F}, {0.847F, 0.875F, 0.918F, 1.0F},
+            {0.145F, 0.388F, 0.922F, 1.0F}, {0.145F, 0.388F, 0.922F, 1.0F},
+            {0.486F, 0.227F, 0.929F, 1.0F}, {0.133F, 0.773F, 0.369F, 1.0F},
+            {0.961F, 0.620F, 0.043F, 1.0F}, {0.937F, 0.267F, 0.267F, 1.0F},
+            {0.008F, 0.518F, 0.780F, 1.0F}, {0.486F, 0.227F, 0.929F, 0.20F},
+            {0.918F, 0.345F, 0.047F, 0.75F}, {0.918F, 0.345F, 0.047F, 1.0F},
         };
     }
     if (theme == Theme::high_contrast) {
@@ -506,16 +572,18 @@ UiColorTokens color_tokens(Theme theme) noexcept {
         };
     }
     return {
-        {0.035F, 0.045F, 0.060F, 1.0F}, {0.055F, 0.065F, 0.085F, 1.0F},
-        {0.075F, 0.085F, 0.110F, 1.0F}, {0.095F, 0.105F, 0.135F, 1.0F},
-        {0.13F, 0.15F, 0.19F, 1.0F}, {0.18F, 0.28F, 0.40F, 1.0F},
-        {0.92F, 0.94F, 0.98F, 1.0F}, {0.62F, 0.68F, 0.77F, 1.0F},
-        {0.40F, 0.45F, 0.53F, 1.0F}, {0.20F, 0.24F, 0.31F, 1.0F},
-        {0.32F, 0.58F, 0.88F, 1.0F}, {0.26F, 0.55F, 0.88F, 1.0F},
-        {0.38F, 0.70F, 1.0F, 1.0F}, {0.30F, 0.78F, 0.48F, 1.0F},
-        {0.92F, 0.68F, 0.24F, 1.0F}, {0.95F, 0.34F, 0.30F, 1.0F},
-        {0.36F, 0.63F, 0.95F, 1.0F}, {0.72F, 0.38F, 0.95F, 0.45F},
-        {0.95F, 0.60F, 0.18F, 0.75F}, {0.98F, 0.75F, 0.18F, 1.0F},
+        // HAVEN-derived dark surfaces: navy depth, blue focus, and violet for
+        // secondary instruments. The high-contrast branch above stays strict.
+        {0.043F, 0.071F, 0.125F, 1.0F}, {0.055F, 0.102F, 0.180F, 1.0F},
+        {0.067F, 0.102F, 0.173F, 1.0F}, {0.090F, 0.133F, 0.220F, 1.0F},
+        {1.0F, 1.0F, 1.0F, 0.133F}, {0.231F, 0.510F, 0.965F, 0.20F},
+        {0.953F, 0.965F, 0.988F, 1.0F}, {0.557F, 0.608F, 0.706F, 1.0F},
+        {0.400F, 0.450F, 0.530F, 1.0F}, {0.153F, 0.208F, 0.310F, 1.0F},
+        {0.231F, 0.510F, 0.965F, 1.0F}, {0.231F, 0.510F, 0.965F, 1.0F},
+        {0.545F, 0.361F, 0.965F, 1.0F}, {0.133F, 0.773F, 0.369F, 1.0F},
+        {0.961F, 0.620F, 0.043F, 1.0F}, {0.937F, 0.267F, 0.267F, 1.0F},
+        {0.008F, 0.518F, 0.780F, 1.0F}, {0.545F, 0.361F, 0.965F, 0.20F},
+        {1.0F, 0.541F, 0.239F, 0.75F}, {0.961F, 0.620F, 0.043F, 1.0F},
     };
 }
 
@@ -678,6 +746,18 @@ core::Result<application::DispatchReceipt> UiController::dispatch(
     return dispatch_with_category(action, OperationCategory::committed_command);
 }
 
+core::Result<editor::AuthoringPreview> UiController::begin_preview(
+    editor::PreviewKind kind) const {
+    return session_.begin_preview(kind);
+}
+
+core::Result<application::DispatchReceipt> UiController::commit_preview(
+    editor::AuthoringPreview& preview) {
+    const auto result = application::HumanApplicationAccess::commit_preview(session_, preview);
+    if (result) record_operation(result.value(), OperationCategory::committed_command);
+    return result;
+}
+
 core::Result<application::DispatchReceipt> UiController::submit_ai_proposal(
     const application::ApplicationAction& action) {
     static_cast<void>(action);
@@ -690,7 +770,7 @@ core::Result<application::DispatchReceipt> UiController::submit_ai_proposal(
 core::Result<application::DispatchReceipt> UiController::dispatch_with_category(
     const application::ApplicationAction& action,
     OperationCategory category) {
-    const auto result = session_.dispatch(application::HumanActionAdmission{}, action);
+    const auto result = application::HumanApplicationAccess::dispatch(session_, action);
     if (!result) return result;
     if (is_operation_action(action)) record_operation(result.value(), category);
     return result;

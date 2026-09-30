@@ -447,6 +447,602 @@ core::Result<void> ExtrudeProjectSelectedFaceCommand::undo() {
     return core::Result<void>::success();
 }
 
+InsetFaceCommand::InsetFaceCommand(
+    geometry::EditableMesh& mesh,
+    geometry::FaceId face,
+    double distance)
+    : mesh_(&mesh), face_(face), distance_(distance) {}
+
+core::Result<void> InsetFaceCommand::execute() {
+    if (!mesh_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state, "inset command has no mesh"));
+    }
+    if (before_.has_value()) {
+        if (!after_.has_value() || !receipt_.has_value()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "inset command has incomplete history state"));
+        }
+        return mesh_->restore_from(*after_);
+    }
+
+    geometry::EditableMesh before = *mesh_;
+    auto inset = mesh_->inset_face(face_, distance_);
+    if (!inset) {
+        return core::Result<void>::failure(inset.error());
+    }
+    before_ = std::move(before);
+    after_ = *mesh_;
+    receipt_ = std::move(inset.value());
+    return core::Result<void>::success();
+}
+
+core::Result<void> InsetFaceCommand::undo() {
+    if (!mesh_ || !before_.has_value() || !after_.has_value() || !receipt_.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "inset command has no completed operation to undo"));
+    }
+    return mesh_->restore_from(*before_);
+}
+
+InsetSelectedFaceCommand::InsetSelectedFaceCommand(
+    const SelectionState& selection,
+    geometry::EditableMesh& mesh,
+    double distance)
+    : selection_(&selection), mesh_(&mesh), distance_(distance) {}
+
+core::Result<void> InsetSelectedFaceCommand::execute() {
+    if (!selection_ || !mesh_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "selected-face inset command has incomplete context"));
+    }
+    if (!delegate_) {
+        if (selection_->mode() != SelectionMode::face) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_argument,
+                "selected-face inset requires face selection mode"));
+        }
+        if (auto result = selection_->validate(*mesh_); !result) {
+            return result;
+        }
+        const auto faces = selection_->selected_faces();
+        if (faces.empty()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "selected-face inset requires one selected face"));
+        }
+        if (faces.size() != 1U) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::unsupported,
+                "multi-face inset is not implemented in this tool boundary"));
+        }
+        delegate_ = std::make_unique<InsetFaceCommand>(*mesh_, faces.front(), distance_);
+        auto result = delegate_->execute();
+        if (!result) {
+            delegate_.reset();
+        }
+        return result;
+    }
+    return delegate_->execute();
+}
+
+core::Result<void> InsetSelectedFaceCommand::undo() {
+    if (!delegate_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "selected-face inset has no completed operation to undo"));
+    }
+    return delegate_->undo();
+}
+
+InsetProjectSelectedFaceCommand::InsetProjectSelectedFaceCommand(
+    ProjectCommandAdmission,
+    project::ProjectDocument& document,
+    const SelectionState& selection,
+    double distance)
+    : document_(&document), selection_(&selection), distance_(distance) {}
+
+core::Result<void> InsetProjectSelectedFaceCommand::execute() {
+    if (!document_ || !selection_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "project face inset command has incomplete context"));
+    }
+    if (before_.has_value()) {
+        if (!mesh_asset_.has_value() || !after_.has_value() || !receipt_.has_value() ||
+            !current_mesh_revision_.has_value()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "project face inset command has incomplete history state"));
+        }
+        auto result = document_->replace_mesh_if_revision(
+            *mesh_asset_, *current_mesh_revision_, *after_);
+        if (!result) {
+            return core::Result<void>::failure(result.error());
+        }
+        current_mesh_revision_ = result.value();
+        return core::Result<void>::success();
+    }
+    if (selection_->mode() != SelectionMode::face) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "project face inset requires face selection mode"));
+    }
+    const auto owner = selection_->component_object();
+    if (!owner.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "project face inset requires an object-bound face selection"));
+    }
+    const auto* object = document_->scene().find(*owner);
+    if (!object) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "selected face owner object is no longer present"));
+    }
+    if (!object->mesh_asset.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "selected face owner has no mesh asset"));
+    }
+    const std::uint64_t mesh_asset = *object->mesh_asset;
+    const auto mesh_iterator = document_->meshes().find(mesh_asset);
+    if (mesh_iterator == document_->meshes().end()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "selected face owner references a missing mesh asset"));
+    }
+    if (auto result = selection_->validate(document_->scene(), &mesh_iterator->second); !result) {
+        return result;
+    }
+    const auto faces = selection_->selected_faces();
+    if (faces.empty()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "project face inset requires one selected face"));
+    }
+    if (faces.size() != 1U) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "multi-face project inset is not implemented"));
+    }
+
+    geometry::EditableMesh before = mesh_iterator->second;
+    geometry::EditableMesh after = before;
+    auto inset = after.inset_face(faces.front(), distance_);
+    if (!inset) {
+        return core::Result<void>::failure(inset.error());
+    }
+    auto replaced = document_->replace_mesh_if_revision(mesh_asset, before.revision(), after);
+    if (!replaced) {
+        return core::Result<void>::failure(replaced.error());
+    }
+    mesh_asset_ = mesh_asset;
+    before_ = std::move(before);
+    after_ = std::move(after);
+    receipt_ = std::move(inset.value());
+    current_mesh_revision_ = replaced.value();
+    return core::Result<void>::success();
+}
+
+core::Result<void> InsetProjectSelectedFaceCommand::undo() {
+    if (!document_ || !mesh_asset_.has_value() || !before_.has_value() ||
+        !after_.has_value() || !receipt_.has_value() || !current_mesh_revision_.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "project face inset command has no completed operation to undo"));
+    }
+    auto result = document_->replace_mesh_if_revision(
+        *mesh_asset_, *current_mesh_revision_, *before_);
+    if (!result) {
+        return core::Result<void>::failure(result.error());
+    }
+    current_mesh_revision_ = result.value();
+    return core::Result<void>::success();
+}
+
+DeleteFaceCommand::DeleteFaceCommand(
+    geometry::EditableMesh& mesh,
+    geometry::FaceId face,
+    bool remove_orphaned_vertices)
+    : mesh_(&mesh), face_(face), remove_orphaned_vertices_(remove_orphaned_vertices) {}
+
+core::Result<void> DeleteFaceCommand::execute() {
+    if (!mesh_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state, "delete face command has no mesh"));
+    }
+    if (before_.has_value()) {
+        if (!after_.has_value() || !receipt_.has_value()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "delete face command has incomplete history state"));
+        }
+        return mesh_->restore_from(*after_);
+    }
+
+    geometry::EditableMesh before = *mesh_;
+    auto deleted = mesh_->delete_face(face_, remove_orphaned_vertices_);
+    if (!deleted) {
+        return core::Result<void>::failure(deleted.error());
+    }
+    before_ = std::move(before);
+    after_ = *mesh_;
+    receipt_ = std::move(deleted.value());
+    return core::Result<void>::success();
+}
+
+core::Result<void> DeleteFaceCommand::undo() {
+    if (!mesh_ || !before_.has_value() || !after_.has_value() || !receipt_.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "delete face command has no completed operation to undo"));
+    }
+    return mesh_->restore_from(*before_);
+}
+
+DeleteSelectedFaceCommand::DeleteSelectedFaceCommand(
+    const SelectionState& selection,
+    geometry::EditableMesh& mesh,
+    bool remove_orphaned_vertices)
+    : selection_(&selection),
+      mesh_(&mesh),
+      remove_orphaned_vertices_(remove_orphaned_vertices) {}
+
+core::Result<void> DeleteSelectedFaceCommand::execute() {
+    if (!selection_ || !mesh_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "selected-face deletion command has incomplete context"));
+    }
+    if (!delegate_) {
+        if (selection_->mode() != SelectionMode::face) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_argument,
+                "selected-face deletion requires face selection mode"));
+        }
+        if (auto result = selection_->validate(*mesh_); !result) {
+            return result;
+        }
+        const auto faces = selection_->selected_faces();
+        if (faces.empty()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "selected-face deletion requires one selected face"));
+        }
+        if (faces.size() != 1U) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::unsupported,
+                "multi-face deletion is not implemented in this tool boundary"));
+        }
+        delegate_ = std::make_unique<DeleteFaceCommand>(
+            *mesh_, faces.front(), remove_orphaned_vertices_);
+        auto result = delegate_->execute();
+        if (!result) {
+            delegate_.reset();
+        }
+        return result;
+    }
+    return delegate_->execute();
+}
+
+core::Result<void> DeleteSelectedFaceCommand::undo() {
+    if (!delegate_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "selected-face deletion has no completed operation to undo"));
+    }
+    return delegate_->undo();
+}
+
+DeleteProjectSelectedFaceCommand::DeleteProjectSelectedFaceCommand(
+    ProjectCommandAdmission,
+    project::ProjectDocument& document,
+    const SelectionState& selection,
+    bool remove_orphaned_vertices)
+    : document_(&document),
+      selection_(&selection),
+      remove_orphaned_vertices_(remove_orphaned_vertices) {}
+
+core::Result<void> DeleteProjectSelectedFaceCommand::execute() {
+    if (!document_ || !selection_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "project face deletion command has incomplete context"));
+    }
+    if (before_.has_value()) {
+        if (!mesh_asset_.has_value() || !after_.has_value() || !receipt_.has_value() ||
+            !current_mesh_revision_.has_value()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "project face deletion command has incomplete history state"));
+        }
+        auto result = document_->replace_mesh_if_revision(
+            *mesh_asset_, *current_mesh_revision_, *after_);
+        if (!result) {
+            return core::Result<void>::failure(result.error());
+        }
+        current_mesh_revision_ = result.value();
+        return core::Result<void>::success();
+    }
+    if (selection_->mode() != SelectionMode::face) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "project face deletion requires face selection mode"));
+    }
+    const auto owner = selection_->component_object();
+    if (!owner.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "project face deletion requires an object-bound face selection"));
+    }
+    const auto* object = document_->scene().find(*owner);
+    if (!object) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "selected face owner object is no longer present"));
+    }
+    if (!object->mesh_asset.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "selected face owner has no mesh asset"));
+    }
+    const std::uint64_t mesh_asset = *object->mesh_asset;
+    const auto mesh_iterator = document_->meshes().find(mesh_asset);
+    if (mesh_iterator == document_->meshes().end()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "selected face owner references a missing mesh asset"));
+    }
+    if (auto result = selection_->validate(document_->scene(), &mesh_iterator->second); !result) {
+        return result;
+    }
+    const auto faces = selection_->selected_faces();
+    if (faces.empty()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "project face deletion requires one selected face"));
+    }
+    if (faces.size() != 1U) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "multi-face project deletion is not implemented"));
+    }
+
+    geometry::EditableMesh before = mesh_iterator->second;
+    geometry::EditableMesh after = before;
+    auto deleted = after.delete_face(faces.front(), remove_orphaned_vertices_);
+    if (!deleted) {
+        return core::Result<void>::failure(deleted.error());
+    }
+    auto replaced = document_->replace_mesh_if_revision(mesh_asset, before.revision(), after);
+    if (!replaced) {
+        return core::Result<void>::failure(replaced.error());
+    }
+    mesh_asset_ = mesh_asset;
+    before_ = std::move(before);
+    after_ = std::move(after);
+    receipt_ = std::move(deleted.value());
+    current_mesh_revision_ = replaced.value();
+    return core::Result<void>::success();
+}
+
+core::Result<void> DeleteProjectSelectedFaceCommand::undo() {
+    if (!document_ || !mesh_asset_.has_value() || !before_.has_value() ||
+        !after_.has_value() || !receipt_.has_value() || !current_mesh_revision_.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "project face deletion command has no completed operation to undo"));
+    }
+    auto result = document_->replace_mesh_if_revision(
+        *mesh_asset_, *current_mesh_revision_, *before_);
+    if (!result) {
+        return core::Result<void>::failure(result.error());
+    }
+    current_mesh_revision_ = result.value();
+    return core::Result<void>::success();
+}
+
+SplitEdgeCommand::SplitEdgeCommand(
+    geometry::EditableMesh& mesh,
+    geometry::EdgeId edge,
+    double factor)
+    : mesh_(&mesh), edge_(edge), factor_(factor) {}
+
+core::Result<void> SplitEdgeCommand::execute() {
+    if (!mesh_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state, "split edge command has no mesh"));
+    }
+    if (before_.has_value()) {
+        if (!after_.has_value() || !receipt_.has_value()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "split edge command has incomplete history state"));
+        }
+        return mesh_->restore_from(*after_);
+    }
+
+    geometry::EditableMesh before = *mesh_;
+    auto split = mesh_->split_edge(edge_, factor_);
+    if (!split) {
+        return core::Result<void>::failure(split.error());
+    }
+    before_ = std::move(before);
+    after_ = *mesh_;
+    receipt_ = std::move(split.value());
+    return core::Result<void>::success();
+}
+
+core::Result<void> SplitEdgeCommand::undo() {
+    if (!mesh_ || !before_.has_value() || !after_.has_value() || !receipt_.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "split edge command has no completed operation to undo"));
+    }
+    return mesh_->restore_from(*before_);
+}
+
+SplitSelectedEdgeCommand::SplitSelectedEdgeCommand(
+    const SelectionState& selection,
+    geometry::EditableMesh& mesh,
+    double factor)
+    : selection_(&selection), mesh_(&mesh), factor_(factor) {}
+
+core::Result<void> SplitSelectedEdgeCommand::execute() {
+    if (!selection_ || !mesh_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "selected-edge split command has incomplete context"));
+    }
+    if (!delegate_) {
+        if (selection_->mode() != SelectionMode::edge) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_argument,
+                "selected-edge splitting requires edge selection mode"));
+        }
+        if (auto result = selection_->validate(*mesh_); !result) {
+            return result;
+        }
+        const auto edges = selection_->selected_edges();
+        if (edges.empty()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "selected-edge splitting requires one selected edge"));
+        }
+        if (edges.size() != 1U) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::unsupported,
+                "multi-edge splitting is not implemented in this tool boundary"));
+        }
+        delegate_ = std::make_unique<SplitEdgeCommand>(*mesh_, edges.front(), factor_);
+        auto result = delegate_->execute();
+        if (!result) {
+            delegate_.reset();
+        }
+        return result;
+    }
+    return delegate_->execute();
+}
+
+core::Result<void> SplitSelectedEdgeCommand::undo() {
+    if (!delegate_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "selected-edge splitting has no completed operation to undo"));
+    }
+    return delegate_->undo();
+}
+
+SplitProjectSelectedEdgeCommand::SplitProjectSelectedEdgeCommand(
+    ProjectCommandAdmission,
+    project::ProjectDocument& document,
+    const SelectionState& selection,
+    double factor)
+    : document_(&document), selection_(&selection), factor_(factor) {}
+
+core::Result<void> SplitProjectSelectedEdgeCommand::execute() {
+    if (!document_ || !selection_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "project edge split command has incomplete context"));
+    }
+    if (before_.has_value()) {
+        if (!mesh_asset_.has_value() || !after_.has_value() || !receipt_.has_value() ||
+            !current_mesh_revision_.has_value()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "project edge split command has incomplete history state"));
+        }
+        auto result = document_->replace_mesh_if_revision(
+            *mesh_asset_, *current_mesh_revision_, *after_);
+        if (!result) {
+            return core::Result<void>::failure(result.error());
+        }
+        current_mesh_revision_ = result.value();
+        return core::Result<void>::success();
+    }
+    if (selection_->mode() != SelectionMode::edge) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "project edge splitting requires edge selection mode"));
+    }
+    const auto owner = selection_->component_object();
+    if (!owner.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "project edge splitting requires an object-bound edge selection"));
+    }
+    const auto* object = document_->scene().find(*owner);
+    if (!object) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "selected edge owner object is no longer present"));
+    }
+    if (!object->mesh_asset.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "selected edge owner has no mesh asset"));
+    }
+    const std::uint64_t mesh_asset = *object->mesh_asset;
+    const auto mesh_iterator = document_->meshes().find(mesh_asset);
+    if (mesh_iterator == document_->meshes().end()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "selected edge owner references a missing mesh asset"));
+    }
+    if (auto result = selection_->validate(document_->scene(), &mesh_iterator->second); !result) {
+        return result;
+    }
+    const auto edges = selection_->selected_edges();
+    if (edges.empty()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "project edge splitting requires one selected edge"));
+    }
+    if (edges.size() != 1U) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "multi-edge project splitting is not implemented"));
+    }
+
+    geometry::EditableMesh before = mesh_iterator->second;
+    geometry::EditableMesh after = before;
+    auto split = after.split_edge(edges.front(), factor_);
+    if (!split) {
+        return core::Result<void>::failure(split.error());
+    }
+    auto replaced = document_->replace_mesh_if_revision(mesh_asset, before.revision(), after);
+    if (!replaced) {
+        return core::Result<void>::failure(replaced.error());
+    }
+    mesh_asset_ = mesh_asset;
+    before_ = std::move(before);
+    after_ = std::move(after);
+    receipt_ = std::move(split.value());
+    current_mesh_revision_ = replaced.value();
+    return core::Result<void>::success();
+}
+
+core::Result<void> SplitProjectSelectedEdgeCommand::undo() {
+    if (!document_ || !mesh_asset_.has_value() || !before_.has_value() ||
+        !after_.has_value() || !receipt_.has_value() || !current_mesh_revision_.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "project edge split command has no completed operation to undo"));
+    }
+    auto result = document_->replace_mesh_if_revision(
+        *mesh_asset_, *current_mesh_revision_, *before_);
+    if (!result) {
+        return core::Result<void>::failure(result.error());
+    }
+    current_mesh_revision_ = result.value();
+    return core::Result<void>::success();
+}
+
 CreateMeshObjectCommand::CreateMeshObjectCommand(
     ProjectCommandAdmission,
     project::ProjectDocument& document,

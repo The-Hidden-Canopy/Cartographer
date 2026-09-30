@@ -16,9 +16,16 @@
 #include <string_view>
 #include <vector>
 
+#if defined(__clang__)
+#    pragma clang diagnostic push
+#    pragma clang diagnostic ignored "-Wkeyword-macro"
+#endif
 #define private public
 #include <carto/editor/tools.hpp>
 #undef private
+#if defined(__clang__)
+#    pragma clang diagnostic pop
+#endif
 
 #include <utility>
 

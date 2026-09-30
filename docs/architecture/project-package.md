@@ -19,12 +19,18 @@ Project.carto/
 ```
 
 The current repository still treats the versioned text `.carto` file as the
-authoritative v1 save format. `carto_project::ProjectPackage` now creates and
+authoritative versioned save format. `carto_project::ProjectPackage` now creates and
 validates the human-readable manifest and package directories, while
 `carto_assets` implements the portable content-addressed blob primitive that
 the package uses. The package layer does not create an empty or fake
 `document.db`, because an empty file is not a SQLite authoring database and
 would make package validity look better than it is.
+
+Derived interchange artifacts belong under `exports/` when a future package
+writer is connected. The current headless CLI writes the same artifact to an
+explicit caller-provided path: `export-vanta project.carto scene.gltf`. That
+glTF is a VANTA-shaped export profile, not authoring truth and not a migration
+of the `.carto` serializer.
 
 SQLite WAL storage, manifest migration execution, database integrity checks,
 and package open/save integration are the next storage tranche. They require a

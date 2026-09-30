@@ -23,9 +23,9 @@ verified merely because it was discovered.
 
 ## Built-ins and future adapters
 
-The in-process OBJ importer and exporter are now registered through this path
-and the CLI requires their capabilities to be ready before invoking them. The
-actual OBJ functions remain statically linked and deterministic; registry
-resolution is a lifecycle/authority gate, not dynamic loading. Vulkan,
-material, CAD, and BIM implementations still require their own adapters and
-runtime evidence.
+The in-process OBJ importer/exporter and the deterministic glTF export profile
+are registered through this path and the CLI requires their capabilities to be
+ready before invoking them. The actual functions remain statically linked and
+deterministic; registry resolution is a lifecycle/authority gate, not dynamic
+loading. Vulkan, material, CAD, and BIM implementations still require their
+own adapters and runtime evidence.

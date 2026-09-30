@@ -2,6 +2,7 @@
 
 #include <carto/geometry/compiled_mesh.hpp>
 #include <carto/geometry/ids.hpp>
+#include <carto/geometry/topology_edit.hpp>
 
 #include <carto/core/result.hpp>
 
@@ -85,6 +86,15 @@ public:
     [[nodiscard]] core::Result<void> set_vertex_position(VertexId id, core::Vec3d position);
     [[nodiscard]] core::Result<void> apply_patch(const MeshPatch& patch);
     [[nodiscard]] core::Result<void> extrude_face(FaceId id, double distance);
+    [[nodiscard]] core::Result<TopologyEditReceipt> delete_face(
+        FaceId id,
+        bool remove_orphaned_vertices = true);
+    [[nodiscard]] core::Result<TopologyEditReceipt> split_edge(
+        EdgeId id,
+        double factor = 0.5);
+    [[nodiscard]] core::Result<TopologyEditReceipt> inset_face(
+        FaceId id,
+        double distance);
     [[nodiscard]] core::Result<void> restore_from(const EditableMesh& source);
     [[nodiscard]] core::Result<void> restore_revision(core::Revision revision);
 

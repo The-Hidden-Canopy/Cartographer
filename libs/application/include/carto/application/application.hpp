@@ -3,7 +3,9 @@
 #include <carto/core/diagnostic.hpp>
 #include <carto/core/math.hpp>
 #include <carto/core/result.hpp>
+#include <carto/editor/authoring_context.hpp>
 #include <carto/editor/command_bus.hpp>
+#include <carto/editor/preview_transaction.hpp>
 #include <carto/editor/selection.hpp>
 #include <carto/editor/tools.hpp>
 #include <carto/geometry/primitives.hpp>
@@ -22,21 +24,10 @@
 #include <variant>
 #include <vector>
 
-namespace carto::ui {
-class UiController;
-}
-
-namespace carto::sdk {
-class ApplicationAccess;
-}
-
-namespace carto::cli {
-class ApplicationAccess;
-}
-
 namespace carto::application {
 
 class ApplicationSession;
+class HumanApplicationAccess;
 
 // Authoring actions require an admission object from a named front-end
 // boundary. This prevents future proposal/AI code from treating the generic
@@ -45,10 +36,7 @@ class HumanActionAdmission final {
 private:
     HumanActionAdmission() = default;
 
-    friend class ApplicationSession;
-    friend class ::carto::ui::UiController;
-    friend class ::carto::sdk::ApplicationAccess;
-    friend class ::carto::cli::ApplicationAccess;
+    friend class HumanApplicationAccess;
 };
 
 enum class Pane {
@@ -108,11 +96,40 @@ struct ApplicationSnapshot {
     ViewportState viewport;
 };
 
+using OperationId = std::uint64_t;
+
+enum class OperationSource {
+    human,
+    ai_proposal,
+    plugin,
+    recovery,
+};
+
+struct AffectedSet {
+    std::vector<scene::ObjectId> objects;
+    std::vector<geometry::VertexId> vertices;
+    std::vector<geometry::EdgeId> edges;
+    std::vector<geometry::FaceId> faces;
+};
+
+struct ParameterPayload {
+    std::optional<core::Transform> transform;
+    std::optional<double> distance;
+    std::optional<core::Vec3d> position;
+    std::optional<bool> remove_orphaned_vertices;
+    std::optional<double> factor;
+};
+
 struct DispatchReceipt {
     std::string action;
     core::Revision revision_before;
     core::Revision revision_after;
     bool document_changed = false;
+    OperationId operation_id = 0U;
+    OperationSource source = OperationSource::human;
+    AffectedSet affected;
+    std::optional<ParameterPayload> parameters;
+    std::vector<core::Diagnostic> warnings;
 };
 
 struct NewProjectAction {
@@ -207,6 +224,19 @@ using ApplicationAction = std::variant<
     UndoAction,
     RedoAction>;
 
+// The explicit human/local front-end adapter is the only production factory
+// for HumanActionAdmission. AI proposals use the separate UI proposal API and
+// cannot reach ApplicationSession::dispatch without this boundary.
+class HumanApplicationAccess final {
+public:
+    [[nodiscard]] static core::Result<DispatchReceipt> dispatch(
+        ApplicationSession& session,
+        const ApplicationAction& action);
+    [[nodiscard]] static core::Result<DispatchReceipt> commit_preview(
+        ApplicationSession& session,
+        editor::AuthoringPreview& preview);
+};
+
 class ApplicationSession {
 public:
     ApplicationSession();
@@ -214,6 +244,12 @@ public:
     [[nodiscard]] core::Result<DispatchReceipt> dispatch(
         HumanActionAdmission admission,
         const ApplicationAction& action);
+    [[nodiscard]] core::Result<editor::AuthoringContext> authoring_context() const;
+    [[nodiscard]] core::Result<editor::AuthoringPreview> begin_preview(
+        editor::PreviewKind kind) const;
+    [[nodiscard]] core::Result<DispatchReceipt> commit_preview(
+        HumanActionAdmission admission,
+        editor::AuthoringPreview& preview);
     [[nodiscard]] ApplicationSnapshot snapshot() const;
 
     [[nodiscard]] const WorkspaceState& workspace() const noexcept { return workspace_; }
@@ -226,11 +262,15 @@ private:
     [[nodiscard]] core::Result<DispatchReceipt> save_project(const SaveProjectAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> execute_command(
         std::unique_ptr<editor::EditorCommand> command,
-        std::string action);
+        std::string action,
+        AffectedSet affected = {},
+        std::optional<ParameterPayload> parameters = std::nullopt);
     [[nodiscard]] core::Result<DispatchReceipt> accept_command_mutation(
         std::string action,
         core::Revision revision_before,
-        project::ProjectDocument before_document);
+        project::ProjectDocument before_document,
+        AffectedSet affected = {},
+        std::optional<ParameterPayload> parameters = std::nullopt);
     [[nodiscard]] core::Result<DispatchReceipt> select_object(const SelectObjectAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> select_vertex(const SelectVertexAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> select_face(const SelectFaceAction& action);
@@ -240,6 +280,8 @@ private:
     [[nodiscard]] core::Result<DispatchReceipt> create_plane(const CreatePlaneAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_mesh_object(
         const CreateMeshObjectAction& action);
+    [[nodiscard]] core::Result<ApplicationAction> preview_action(
+        const editor::AuthoringPreview& preview) const;
     [[nodiscard]] core::Result<DispatchReceipt> undo();
     [[nodiscard]] core::Result<DispatchReceipt> redo();
     [[nodiscard]] core::Result<void> append_mutation_event(
@@ -259,7 +301,9 @@ private:
 
     [[nodiscard]] core::Result<DispatchReceipt> accepted(
         std::string action,
-        core::Revision revision_before) const;
+        core::Revision revision_before,
+        AffectedSet affected = {},
+        std::optional<ParameterPayload> parameters = std::nullopt);
     [[nodiscard]] core::Result<DispatchReceipt> failure(core::Diagnostic diagnostic);
     void reset_editor_state() noexcept;
 
@@ -273,6 +317,7 @@ private:
     std::optional<journal::Journal> journal_;
     WorkspaceState workspace_;
     std::vector<core::Diagnostic> problems_;
+    OperationId next_operation_id_ = 1U;
 };
 
 } // namespace carto::application

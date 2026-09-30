@@ -8,6 +8,7 @@ project(Cartographer
 
 option(CARTO_BUILD_TESTS "Build headless unit and invariant tests" ON)
 option(CARTO_BUILD_CLI "Build the headless Cartographer CLI" ON)
+option(CARTO_BUILD_GMIB_GAME "Build the headless GMIB game slice" ON)
 option(CARTO_ENABLE_VULKAN "Enable the optional Vulkan render backend" OFF)
 option(CARTO_BUILD_DESKTOP "Build the optional Dear ImGui/Vulkan desktop shell" OFF)
 set(CARTO_IMGUI_ROOT "" CACHE PATH "Path to a pinned Dear ImGui source tree")
@@ -30,6 +31,7 @@ endfunction()
 
 add_subdirectory(libs/core)
 add_subdirectory(libs/scene)
+add_subdirectory(libs/simulation)
 add_subdirectory(libs/geometry/mesh)
 add_subdirectory(libs/assets)
 add_subdirectory(libs/gpu)
@@ -73,9 +75,27 @@ if(CARTO_BUILD_CLI)
     add_subdirectory(apps/cli)
 endif()
 
+if(CARTO_BUILD_GMIB_GAME)
+    add_subdirectory(apps/gmib)
+endif()
+
 if(CARTO_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+
+    add_executable(cartographer_simulation_tests
+        libs/simulation/tests/simulation_tests.cpp
+    )
+    target_link_libraries(cartographer_simulation_tests PRIVATE carto_simulation)
+    carto_target(cartographer_simulation_tests)
+    add_test(NAME cartographer_simulation_tests COMMAND cartographer_simulation_tests)
+
+    add_executable(cartographer_gmib_game_tests
+        libs/simulation/tests/game_tests.cpp
+    )
+    target_link_libraries(cartographer_gmib_game_tests PRIVATE carto_simulation)
+    carto_target(cartographer_gmib_game_tests)
+    add_test(NAME cartographer_gmib_game_tests COMMAND cartographer_gmib_game_tests)
 endif()
 
 include(GNUInstallDirs)

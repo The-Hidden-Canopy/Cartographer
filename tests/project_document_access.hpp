@@ -16,9 +16,16 @@
 // header. It exposes the model's private invariant helpers to this test
 // translation unit without placing a test friend or a test macro in the
 // installed production API.
+#if defined(__clang__)
+#    pragma clang diagnostic push
+#    pragma clang diagnostic ignored "-Wkeyword-macro"
+#endif
 #define private public
 #include <carto/project/project.hpp>
 #undef private
+#if defined(__clang__)
+#    pragma clang diagnostic pop
+#endif
 
 #include <utility>
 

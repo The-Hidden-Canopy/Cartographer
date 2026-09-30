@@ -13,9 +13,10 @@ runtime dependency to RegOS, IDA_Training, hidden_canopy_bot, or Ask_IDA.
 ## Indirect impact
 
 Future neutral interchange or project/mesh exports could become input fixtures
-for other systems, but the current repository emits only local `.carto` and
-OBJ artifacts. No dataset, training run, capability score, or promotion status
-is produced.
+for other systems. Cartographer now emits a bounded, derived glTF profile in
+addition to local `.carto` and OBJ artifacts; it does not emit a VANTA project,
+runtime state, or promotion receipt. No dataset, training run, capability
+score, or promotion status is produced.
 
 ## Shared contract touched
 
@@ -27,8 +28,9 @@ it has no governed organizational mutation surface.
 
 ## API/schema, dataset/eval, and deployment risk
 
-- API/schema risk: future consumers must version the `.carto` format and treat
-  OBJ warnings as feature-loss evidence; no consumer contract exists yet.
+- API/schema risk: consumers must version the `.carto` format and the glTF
+  profile separately, and treat the export warnings as feature-loss evidence;
+  no direct VANTA project contract exists.
 - Dataset/eval risk: no training or evaluation data is generated. A rendered
   image or mesh export must not be promoted to model or capability evidence
   without a separate provenance decision.
@@ -39,6 +41,8 @@ it has no governed organizational mutation surface.
 
 ## Required follow-up before integration
 
-Add an adapter-specific contract, fixture provenance, version negotiation,
-round-trip/loss tests, and an independent consumer acceptance run. Do not
-import Cartographer internals into any of the four systems.
+For any direct adapter, add adapter-specific version negotiation, fixture
+provenance, round-trip/loss tests, and an independent consumer acceptance run.
+Do not import Cartographer internals into any of the four systems. The current
+glTF exporter keeps the artifact neutral and source-revision bound, but it does
+not prove VANTA render parity.

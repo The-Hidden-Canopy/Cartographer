@@ -60,6 +60,26 @@ void builtin_obj_providers_use_the_registry_lifecycle() {
     REQUIRE(!carto::io::register_builtin_obj_providers(registry));
 }
 
+void builtin_gltf_export_provider_is_lifecycle_gated() {
+    carto::providers::Registry registry;
+    REQUIRE(carto::io::register_builtin_gltf_providers(registry));
+    const auto exporter = registry.resolve("geometry.export.gltf");
+    REQUIRE(exporter);
+    REQUIRE(exporter.value().id == "cartographer.gltf.export");
+    REQUIRE((exporter.value().version == carto::providers::Version{1U, 0U, 0U}));
+    REQUIRE(!carto::io::register_builtin_gltf_providers(registry));
+}
+
+void builtin_polygon_and_triangle_export_providers_are_lifecycle_gated() {
+    carto::providers::Registry registry;
+    REQUIRE(carto::io::register_builtin_ply_providers(registry));
+    REQUIRE(carto::io::register_builtin_stl_providers(registry));
+    REQUIRE(registry.resolve("geometry.import.ply"));
+    REQUIRE(registry.resolve("geometry.export.ply"));
+    REQUIRE(registry.resolve("geometry.import.stl"));
+    REQUIRE(registry.resolve("geometry.export.stl"));
+}
+
 void plugin_protocol_is_bounded_and_defaults_to_non_network_sandboxing() {
     const carto::plugin_protocol::PluginManifest manifest{
         "org.example.obj", {1U, 2U, 0U}, 1U, {"geometry.import.obj"},
@@ -119,6 +139,8 @@ int main() {
     try {
         provider_registry_preserves_lifecycle_and_capability_failures();
         builtin_obj_providers_use_the_registry_lifecycle();
+    builtin_gltf_export_provider_is_lifecycle_gated();
+    builtin_polygon_and_triangle_export_providers_are_lifecycle_gated();
         plugin_protocol_is_bounded_and_defaults_to_non_network_sandboxing();
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';

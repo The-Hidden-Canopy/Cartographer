@@ -32,6 +32,16 @@ ToolContext::make_extrude_selected_face_command(double distance) const {
 }
 
 core::Result<std::unique_ptr<EditorCommand>>
+ToolContext::make_inset_selected_face_command(double distance) const {
+    return core::Result<std::unique_ptr<EditorCommand>>::success(
+        std::make_unique<InsetProjectSelectedFaceCommand>(
+            admission_,
+            document_,
+            selection_,
+            distance));
+}
+
+core::Result<std::unique_ptr<EditorCommand>>
 ToolContext::make_set_selected_vertex_position_command(core::Vec3d position) const {
     return core::Result<std::unique_ptr<EditorCommand>>::success(
         std::make_unique<SetProjectSelectedVertexPositionCommand>(
@@ -39,6 +49,26 @@ ToolContext::make_set_selected_vertex_position_command(core::Vec3d position) con
             document_,
             selection_,
             position));
+}
+
+core::Result<std::unique_ptr<EditorCommand>>
+ToolContext::make_delete_selected_face_command(bool remove_orphaned_vertices) const {
+    return core::Result<std::unique_ptr<EditorCommand>>::success(
+        std::make_unique<DeleteProjectSelectedFaceCommand>(
+            admission_,
+            document_,
+            selection_,
+            remove_orphaned_vertices));
+}
+
+core::Result<std::unique_ptr<EditorCommand>>
+ToolContext::make_split_selected_edge_command(double factor) const {
+    return core::Result<std::unique_ptr<EditorCommand>>::success(
+        std::make_unique<SplitProjectSelectedEdgeCommand>(
+            admission_,
+            document_,
+            selection_,
+            factor));
 }
 
 core::Result<void> ToolRegistry::register_tool(
@@ -70,11 +100,39 @@ core::Result<void> ToolRegistry::register_builtin_tools() {
         !result) {
         return result;
     }
-    return register_tool(
+    if (auto result = register_tool(
+        {"mesh.inset-face", "Inset selected face"},
+        [](const ToolContext& context, const ToolArguments& arguments)
+            -> core::Result<std::unique_ptr<EditorCommand>> {
+            return context.make_inset_selected_face_command(arguments.distance);
+        });
+        !result) {
+        return result;
+    }
+    if (auto result = register_tool(
+        {"mesh.remove-face", "Delete selected face"},
+        [](const ToolContext& context, const ToolArguments& arguments)
+            -> core::Result<std::unique_ptr<EditorCommand>> {
+            return context.make_delete_selected_face_command(
+                arguments.remove_orphaned_vertices);
+        });
+        !result) {
+        return result;
+    }
+    if (auto result = register_tool(
         {"mesh.set-vertex-position", "Set selected vertex position"},
         [](const ToolContext& context, const ToolArguments& arguments)
             -> core::Result<std::unique_ptr<EditorCommand>> {
             return context.make_set_selected_vertex_position_command(arguments.position);
+        });
+        !result) {
+        return result;
+    }
+    return register_tool(
+        {"mesh.split-edge", "Split selected edge"},
+        [](const ToolContext& context, const ToolArguments& arguments)
+            -> core::Result<std::unique_ptr<EditorCommand>> {
+            return context.make_split_selected_edge_command(arguments.factor);
         });
 }
 

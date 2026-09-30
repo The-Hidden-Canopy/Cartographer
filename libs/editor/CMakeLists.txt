@@ -1,5 +1,7 @@
 add_library(carto_editor STATIC
+    src/authoring_context.cpp
     src/command_bus.cpp
+    src/preview_transaction.cpp
     src/selection.cpp
     src/tools.cpp
 )

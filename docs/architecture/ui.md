@@ -13,6 +13,7 @@ The supported path is:
 ```text
 input / shortcut / panel action
     -> carto_ui::UiController
+    -> carto_application::HumanApplicationAccess
     -> carto_application::ApplicationSession::dispatch
     -> editor command / project validation
     -> immutable ApplicationSnapshot
@@ -35,9 +36,9 @@ Persistence status is derived from the application snapshot rather than from
 the absence of an error. A project without a bound path is `Not saved`, even
 when it is clean; a path-bound clean project is `Saved`, and a dirty bound
 project is `Modified`. Failed saves never convert an unbound project into the
-saved state. AI-labelled operation dispatch is fail-closed until an explicit
-planner/admission boundary exists; selecting the AI category cannot mutate the
-document or operation rail.
+saved state. Human authoring dispatch uses the application admission boundary;
+AI proposal submission is a separate fail-closed API until an explicit planner
+and host admission contract exist.
 
 ## VANTA-family primitives currently implemented
 
@@ -54,15 +55,21 @@ document or operation rail.
 - a required viewport invariant;
 - local, bounded, line-oriented workspace preferences with atomic replacement,
   duplicate/unknown-field rejection, and corrupt-file reset to defaults;
-- explicit edge-authoring and "AI tools unavailable" surfaces.
+- explicit edge-authoring, single-edge split, convex-face inset, and "AI tools
+  unavailable" surfaces.
 
 The current application model supports object, vertex, edge, and face
 selection. Edge selection is identity- and revision-bound, and is available to
 the headless controller and source-wired viewport picker without changing
-project truth. Persistent edge authoring, traversal tools, and edge-edit
-transactions remain deferred. AI-First is a presentation shell only: there is
-no planner, proposal transaction adapter, model service, or direct AI mutation
-path in this repository.
+project truth. A single selected edge can be split through the same
+revision-guarded project command path as the other authoring tools; the
+operation is undoable, reports its factor, and clears the removed edge
+selection. A single selected convex face can likewise be inset through the
+same command boundary with distance metadata and guarded undo/redo. Concave
+inset, broader persistent edge authoring, and traversal tools remain deferred.
+AI-First is a presentation shell only: there is no planner, proposal
+transaction adapter, model service, or direct AI mutation path in this
+repository.
 
 ## Native shell integration
 
@@ -108,8 +115,9 @@ acceptance remains a separate gate.
 
 ## Deliberate non-claims
 
-This layer does not implement the complete UI specification. Persistent edge
-authoring, gizmos, snapping, numeric transform editing, full direct-modeling
-interaction, CAD/BUILD/material/animation subsystems, AI planning/proposals,
-full docking/tab stacks, OS-level tear-out, native pixel/input acceptance,
-and broad GPU compatibility remain roadmap work.
+This layer does not implement the complete UI specification. Concave inset,
+broader persistent edge authoring/traversal, gizmos, snapping, numeric
+transform editing, full direct-modeling interaction, CAD/BUILD/material/
+animation subsystems, AI planning/proposals, full docking/tab stacks,
+OS-level tear-out, native pixel/input acceptance, and broad GPU compatibility
+remain roadmap work.

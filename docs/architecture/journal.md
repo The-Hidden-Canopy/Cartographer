@@ -40,7 +40,9 @@ existing content is rehashed instead of being trusted by filename or size.
 
 ## Application mutation integration
 
-The current v1 authoring serializer remains the explicit save format. The
+The current versioned authoring serializer remains the explicit save format.
+It reads legacy v1 documents and writes v2 documents with an explicit
+authoring/units/coordinate-system envelope. The
 `ApplicationSession` binds a project-local journal beside a saved project,
 records a baseline snapshot at bind time, and appends accepted command, tool,
 undo, redo, and CLI batch-import actions with before/after revisions. Project

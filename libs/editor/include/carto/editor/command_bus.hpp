@@ -215,6 +215,204 @@ private:
     std::optional<core::Revision> current_mesh_revision_;
 };
 
+class InsetFaceCommand final : public EditorCommand {
+public:
+    InsetFaceCommand(
+        geometry::EditableMesh& mesh,
+        geometry::FaceId face,
+        double distance);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Inset Face"; }
+
+private:
+    geometry::EditableMesh* mesh_;
+    geometry::FaceId face_;
+    double distance_;
+    std::optional<geometry::EditableMesh> before_;
+    std::optional<geometry::EditableMesh> after_;
+    std::optional<geometry::TopologyEditReceipt> receipt_;
+};
+
+class InsetSelectedFaceCommand final : public EditorCommand {
+public:
+    InsetSelectedFaceCommand(
+        const SelectionState& selection,
+        geometry::EditableMesh& mesh,
+        double distance);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Inset Selected Face"; }
+
+private:
+    const SelectionState* selection_;
+    geometry::EditableMesh* mesh_;
+    double distance_;
+    std::unique_ptr<InsetFaceCommand> delegate_;
+};
+
+class InsetProjectSelectedFaceCommand final : public EditorCommand {
+public:
+    InsetProjectSelectedFaceCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        const SelectionState& selection,
+        double distance);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override {
+        return "Inset Project Selected Face";
+    }
+
+private:
+    friend class ::carto::application::ApplicationSession;
+    friend struct ToolContext;
+
+    project::ProjectDocument* document_;
+    const SelectionState* selection_;
+    double distance_;
+    std::optional<std::uint64_t> mesh_asset_;
+    std::optional<geometry::EditableMesh> before_;
+    std::optional<geometry::EditableMesh> after_;
+    std::optional<geometry::TopologyEditReceipt> receipt_;
+    std::optional<core::Revision> current_mesh_revision_;
+};
+
+class DeleteFaceCommand final : public EditorCommand {
+public:
+    DeleteFaceCommand(
+        geometry::EditableMesh& mesh,
+        geometry::FaceId face,
+        bool remove_orphaned_vertices);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Delete Face"; }
+
+private:
+    geometry::EditableMesh* mesh_;
+    geometry::FaceId face_;
+    bool remove_orphaned_vertices_;
+    std::optional<geometry::EditableMesh> before_;
+    std::optional<geometry::EditableMesh> after_;
+    std::optional<geometry::TopologyEditReceipt> receipt_;
+};
+
+class DeleteSelectedFaceCommand final : public EditorCommand {
+public:
+    DeleteSelectedFaceCommand(
+        const SelectionState& selection,
+        geometry::EditableMesh& mesh,
+        bool remove_orphaned_vertices);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Delete Selected Face"; }
+
+private:
+    const SelectionState* selection_;
+    geometry::EditableMesh* mesh_;
+    bool remove_orphaned_vertices_;
+    std::unique_ptr<DeleteFaceCommand> delegate_;
+};
+
+class DeleteProjectSelectedFaceCommand final : public EditorCommand {
+public:
+    DeleteProjectSelectedFaceCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        const SelectionState& selection,
+        bool remove_orphaned_vertices);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override {
+        return "Delete Project Selected Face";
+    }
+
+private:
+    friend class ::carto::application::ApplicationSession;
+    friend struct ToolContext;
+
+    project::ProjectDocument* document_;
+    const SelectionState* selection_;
+    bool remove_orphaned_vertices_;
+    std::optional<std::uint64_t> mesh_asset_;
+    std::optional<geometry::EditableMesh> before_;
+    std::optional<geometry::EditableMesh> after_;
+    std::optional<geometry::TopologyEditReceipt> receipt_;
+    std::optional<core::Revision> current_mesh_revision_;
+};
+
+class SplitEdgeCommand final : public EditorCommand {
+public:
+    SplitEdgeCommand(
+        geometry::EditableMesh& mesh,
+        geometry::EdgeId edge,
+        double factor);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Split Edge"; }
+
+private:
+    geometry::EditableMesh* mesh_;
+    geometry::EdgeId edge_;
+    double factor_;
+    std::optional<geometry::EditableMesh> before_;
+    std::optional<geometry::EditableMesh> after_;
+    std::optional<geometry::TopologyEditReceipt> receipt_;
+};
+
+class SplitSelectedEdgeCommand final : public EditorCommand {
+public:
+    SplitSelectedEdgeCommand(
+        const SelectionState& selection,
+        geometry::EditableMesh& mesh,
+        double factor);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Split Selected Edge"; }
+
+private:
+    const SelectionState* selection_;
+    geometry::EditableMesh* mesh_;
+    double factor_;
+    std::unique_ptr<SplitEdgeCommand> delegate_;
+};
+
+class SplitProjectSelectedEdgeCommand final : public EditorCommand {
+public:
+    SplitProjectSelectedEdgeCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        const SelectionState& selection,
+        double factor);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override {
+        return "Split Project Selected Edge";
+    }
+
+private:
+    friend class ::carto::application::ApplicationSession;
+    friend struct ToolContext;
+
+    project::ProjectDocument* document_;
+    const SelectionState* selection_;
+    double factor_;
+    std::optional<std::uint64_t> mesh_asset_;
+    std::optional<geometry::EditableMesh> before_;
+    std::optional<geometry::EditableMesh> after_;
+    std::optional<geometry::TopologyEditReceipt> receipt_;
+    std::optional<core::Revision> current_mesh_revision_;
+};
+
 class CreateMeshObjectCommand final : public EditorCommand {
 public:
     CreateMeshObjectCommand(
@@ -230,8 +428,6 @@ public:
 private:
     friend class ::carto::application::ApplicationSession;
     friend struct ToolContext;
-    friend class ::carto::project::testing::ProjectDocumentAccess;
-    friend class ::carto::project::testing::EditorProjectAccess;
 
     [[nodiscard]] core::Result<void> create_first_instance();
     [[nodiscard]] core::Result<void> restore_instance();

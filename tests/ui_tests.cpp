@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -257,6 +258,8 @@ void workbench_preferences_round_trip_and_fail_closed() {
     const auto path = temp.path() / "workbench.prefs";
     carto::ui::WorkbenchPreferences preferences;
     preferences.ledger_collapsed = true;
+    preferences.flow_use_counts[2] = 7U;
+    preferences.last_flow_index = 2;
     auto& scene = preferences.instruments.at(static_cast<std::size_t>(
         carto::ui::WorkbenchInstrument::scene));
     scene.visible = true;
@@ -270,6 +273,8 @@ void workbench_preferences_round_trip_and_fail_closed() {
     const auto loaded = carto::ui::load_workbench_preferences(path);
     REQUIRE(loaded);
     REQUIRE(loaded.value().ledger_collapsed);
+    REQUIRE(loaded.value().flow_use_counts[2] == 7U);
+    REQUIRE(loaded.value().last_flow_index == 2);
     REQUIRE(loaded.value().instruments.at(static_cast<std::size_t>(
         carto::ui::WorkbenchInstrument::scene)).visible);
     REQUIRE(loaded.value().instruments.at(static_cast<std::size_t>(
@@ -289,6 +294,31 @@ void workbench_preferences_round_trip_and_fail_closed() {
     const std::string after_failed_save(
         std::istreambuf_iterator<char>(after_failed_save_stream), {});
     REQUIRE(after_failed_save == before_failed_save);
+
+    auto invalid_memory = preferences;
+    invalid_memory.last_flow_index = 4;
+    REQUIRE(!carto::ui::save_workbench_preferences(path, invalid_memory));
+    std::ifstream after_invalid_memory_stream(path, std::ios::binary);
+    const std::string after_invalid_memory(
+        std::istreambuf_iterator<char>(after_invalid_memory_stream), {});
+    REQUIRE(after_invalid_memory == before_failed_save);
+
+    {
+        std::ofstream legacy(path, std::ios::binary | std::ios::trunc);
+        legacy << "header=CARTOGRAPHER_WORKBENCH_PREFS_V1\n"
+                  "ledger_collapsed=0\n";
+        for (std::size_t index = 0U; index < carto::ui::kWorkbenchInstrumentCount; ++index) {
+            const auto instrument = static_cast<carto::ui::WorkbenchInstrument>(index);
+            legacy << carto::ui::workbench_instrument_name(instrument)
+                   << "=0,0,0,0,0,0\n";
+        }
+    }
+    const auto legacy_loaded = carto::ui::load_workbench_preferences(path);
+    REQUIRE(legacy_loaded);
+    REQUIRE(legacy_loaded.value().last_flow_index == -1);
+    REQUIRE(std::all_of(legacy_loaded.value().flow_use_counts.begin(),
+                        legacy_loaded.value().flow_use_counts.end(),
+                        [](std::uint32_t uses) { return uses == 0U; }));
 
     {
         std::ofstream corrupt(path, std::ios::binary | std::ios::trunc);

@@ -96,15 +96,21 @@ them. Component selections may be bound to one scene object; add/toggle
 operations cannot span objects or silently bind an existing unbound selection
 to a different mesh context. Mesh-bound selections retain the mesh instance and
 source revision they were created against, so replacement or mutation requires
-explicit reselection. Edge selection consumes persistent topology identity, but
-edge authoring, traversal, and topology-edit tools remain deferred.
+explicit reselection. Edge selection consumes persistent topology identity.
+Single-edge splitting, convex-face inset, and single-face deletion are now
+admitted topology edits: they validate the bound selection, mutate a
+project-owned mesh through a revision-guarded command, emit
+affected-set/parameter receipt metadata, and clear selections whose identities
+are removed. Concave inset, broader edge traversal, and multi-selection
+topology operators remain deferred.
 
 Tool actions are registered by stable IDs and return editor commands. The
 registry submits successful commands through `CommandBus`; it does not expose a
 direct mutation callback or mutable mesh accessor to panels or UI code. The
 current built-in context resolves an object-bound selection through
 `ProjectDocument` to the owning mesh asset and exposes approved command
-builders for selected-face extrusion and single-vertex position editing.
+builders for selected-face extrusion, convex-face inset, single-face deletion,
+single-edge splitting, and single-vertex position editing.
 Additional tool builders must preserve the same boundary and leave context
 routing out of panel code.
 
@@ -122,7 +128,9 @@ contain a viewport and cannot contain duplicate panes; invalid updates become
 diagnostics and leave the previous layout unchanged.
 
 The session dispatches all authoring changes through project-bound editor
-commands. A failed action records its diagnostic and does not create history.
+commands and requires a named front-end admission object; an unadmitted caller
+cannot invoke the public dispatch route. A failed action records its diagnostic
+and does not create history.
 New/open replacement and application close reject dirty state until the caller
 provides an explicit discard decision. Opening a malformed or unavailable
 project is performed into a temporary document, so the current project remains

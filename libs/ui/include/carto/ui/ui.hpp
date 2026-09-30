@@ -177,6 +177,8 @@ enum class WorkbenchInstrument {
 };
 
 inline constexpr std::size_t kWorkbenchInstrumentCount = 13U;
+inline constexpr std::size_t kWorkbenchFlowMemoryCount = 4U;
+inline constexpr std::uint32_t kMaxWorkbenchFlowUses = 10000U;
 
 struct WorkbenchInstrumentLayout {
     bool visible = false;
@@ -189,6 +191,11 @@ struct WorkbenchInstrumentLayout {
 
 struct WorkbenchPreferences {
     bool ledger_collapsed = false;
+    // Bounded local workflow memory. The desktop maps the four preset flow
+    // slots to Focus, Author, Inspect, and Draft without making this state
+    // part of project truth.
+    std::array<std::uint32_t, kWorkbenchFlowMemoryCount> flow_use_counts{};
+    std::int32_t last_flow_index = -1;
     std::array<WorkbenchInstrumentLayout, kWorkbenchInstrumentCount> instruments{};
 
     [[nodiscard]] core::Result<void> validate() const;
@@ -240,6 +247,10 @@ public:
 
     [[nodiscard]] core::Result<application::DispatchReceipt> dispatch(
         const application::ApplicationAction& action);
+    [[nodiscard]] core::Result<editor::AuthoringPreview> begin_preview(
+        editor::PreviewKind kind) const;
+    [[nodiscard]] core::Result<application::DispatchReceipt> commit_preview(
+        editor::AuthoringPreview& preview);
     // AI proposals have no mutation route until a bounded planner and an
     // explicit host admission contract are connected.
     [[nodiscard]] core::Result<application::DispatchReceipt> submit_ai_proposal(

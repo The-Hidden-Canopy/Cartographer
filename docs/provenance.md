@@ -27,8 +27,11 @@ reimplementation and does not link or include those repositories.
 - Future extraction or compatibility work requires a source map, provenance
   review, declassification decision, and fresh-repository build before it can
   be represented as public code.
-- The repository does not claim compatibility with VANTA merely because its
-  generic concepts are similar.
+- The repository does not claim full compatibility with VANTA merely because
+  its generic concepts are similar. It does provide an explicit, bounded glTF
+  export profile shaped to VANTA's documented public mesh-import subset; that
+  profile is an interchange contract, not a claim of VANTA runtime, material,
+  or visual parity.
 
 ## Evidence classes
 
@@ -36,4 +39,3 @@ The implementation distinguishes authoring truth from derived data in types and
 documentation. A successful build or a compiled mesh proves only the tested
 local capability. It is not evidence of Vulkan execution, desktop launch,
 performance at production scale, CAD semantics, or downstream engine parity.
-

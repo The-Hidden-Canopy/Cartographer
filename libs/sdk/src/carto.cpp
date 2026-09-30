@@ -24,19 +24,6 @@ struct carto_document {
     carto::application::ApplicationSession session;
 };
 
-namespace carto::sdk {
-
-class ApplicationAccess final {
-public:
-    [[nodiscard]] static core::Result<application::DispatchReceipt> dispatch(
-        application::ApplicationSession& session,
-        const application::ApplicationAction& action) {
-        return session.dispatch(application::HumanActionAdmission{}, action);
-    }
-};
-
-} // namespace carto::sdk
-
 namespace {
 
 constexpr std::uint32_t kAbiVersion = 1U;
@@ -235,7 +222,8 @@ carto_status dispatch_action(
         return invalid("execute request uses an unsupported op", error);
     }
 
-    const auto result = carto::sdk::ApplicationAccess::dispatch(document.session, action);
+    const auto result = carto::application::HumanApplicationAccess::dispatch(
+        document.session, action);
     if (!result) return fail(result.error(), error);
     return allocate_response(receipt_json(result.value()), output, error);
 }
@@ -309,7 +297,7 @@ carto_status carto_document_open(
         if (!authorized) return invalid(path_error.c_str(), out_error);
         auto* document = new carto_document;
         document->project_root = context->project_root;
-        const auto opened = carto::sdk::ApplicationAccess::dispatch(
+        const auto opened = carto::application::HumanApplicationAccess::dispatch(
             document->session,
             carto::application::OpenProjectAction{authorized.value(), true});
         if (!opened) {

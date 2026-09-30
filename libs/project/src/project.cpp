@@ -406,6 +406,9 @@ void ProjectDocument::swap(ProjectDocument& other) noexcept {
 std::string ProjectDocument::serialize() const {
     std::ostringstream output;
     output << kMagic << ' ' << kSchemaVersion << '\n';
+    output << "AUTHORING " << std::quoted(std::string(kAuthoringFormat)) << ' '
+           << std::quoted(std::string(kAuthoringUnits)) << ' '
+           << std::quoted(std::string(kAuthoringCoordinateSystem)) << '\n';
     output << "NAME " << std::quoted(name_) << '\n';
     output << "REVISION " << revision_.value() << '\n';
 
@@ -469,9 +472,25 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
     if (!version) {
         return core::Result<ProjectDocument>::failure(version.error());
     }
-    if (version.value() != kSchemaVersion) {
+    if (version.value() < kMinimumReadableSchemaVersion || version.value() > kSchemaVersion) {
         return core::Result<ProjectDocument>::failure(
             Diagnostic(ErrorCode::version_mismatch, "unsupported Cartographer project schema version"));
+    }
+
+    if (version.value() >= 2U) {
+        if (auto result = require_line(input, "AUTHORING"); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+        std::string authoring_format;
+        std::string authoring_units;
+        std::string authoring_coordinate_system;
+        if (!(input >> std::quoted(authoring_format) >> std::quoted(authoring_units) >>
+              std::quoted(authoring_coordinate_system)) ||
+            authoring_format != kAuthoringFormat || authoring_units != kAuthoringUnits ||
+            authoring_coordinate_system != kAuthoringCoordinateSystem) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project AUTHORING record does not describe the supported Cartographer coordinate contract"));
+        }
     }
 
     if (auto result = require_line(input, "NAME"); !result) {
@@ -696,7 +715,7 @@ core::Result<ProjectDocument> ProjectDocument::load(const std::filesystem::path&
     }
     if (file_size > kMaxSerializedProjectBytes) {
         return core::Result<ProjectDocument>::failure(parse_error(
-            "project file exceeds the Cartographer v1 size limit of 128 MiB"));
+            "project file exceeds the Cartographer size limit of 128 MiB"));
     }
     std::ostringstream contents;
     contents << input.rdbuf();

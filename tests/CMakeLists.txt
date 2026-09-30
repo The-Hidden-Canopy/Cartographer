@@ -32,6 +32,18 @@ add_executable(cartographer_ui_tests
     ui_tests.cpp
 )
 
+add_executable(cartographer_public_api_tests
+    public_api_tests.cpp
+)
+
+add_executable(cartographer_preview_transaction_tests
+    preview_transaction_tests.cpp
+)
+
+add_executable(cartographer_topology_edit_tests
+    topology_edit_tests.cpp
+)
+
 target_link_libraries(cartographer_tests
     PRIVATE
         carto_core
@@ -111,3 +123,33 @@ target_link_libraries(cartographer_ui_tests
 
 carto_target(cartographer_ui_tests)
 add_test(NAME cartographer_ui_tests COMMAND cartographer_ui_tests)
+
+target_link_libraries(cartographer_public_api_tests
+    PRIVATE
+        carto_application
+        carto_editor
+        carto_project
+)
+
+carto_target(cartographer_public_api_tests)
+add_test(NAME cartographer_public_api_tests COMMAND cartographer_public_api_tests)
+
+target_link_libraries(cartographer_preview_transaction_tests
+    PRIVATE
+        carto_application
+        carto_editor
+        carto_ui
+)
+
+carto_target(cartographer_preview_transaction_tests)
+add_test(NAME cartographer_preview_transaction_tests COMMAND cartographer_preview_transaction_tests)
+
+target_link_libraries(cartographer_topology_edit_tests
+    PRIVATE
+        carto_application
+        carto_editor
+        carto_geometry
+)
+
+carto_target(cartographer_topology_edit_tests)
+add_test(NAME cartographer_topology_edit_tests COMMAND cartographer_topology_edit_tests)

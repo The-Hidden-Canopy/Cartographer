@@ -15,6 +15,7 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] reversible transform command and history boundary
 - [x] versioned project format with atomic save/load
 - [x] OBJ import/export with explicit feature-loss warnings
+- [x] bounded glTF export profile for the VANTA public mesh-import subset with explicit feature-loss warnings
 - [x] deterministic box/plane primitives and reversible primitive/vertex editing commands
 - [x] atomic single-face extrusion with reversible topology history
 - [x] ephemeral object/vertex/face selection with context validation

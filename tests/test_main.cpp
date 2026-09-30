@@ -7,6 +7,9 @@
 #include <carto/geometry/mesh.hpp>
 #include <carto/geometry/primitives.hpp>
 #include <carto/io/obj.hpp>
+#include <carto/io/ply.hpp>
+#include <carto/io/stl.hpp>
+#include <carto/io/vanta_export.hpp>
 #include <carto/project/project.hpp>
 #include <carto/render/render_scene.hpp>
 
@@ -644,9 +647,12 @@ void tool_registry_dispatches_registered_commands_through_history() {
     carto::editor::ToolRegistry registry;
     REQUIRE(registry.register_builtin_tools());
     const auto descriptors = registry.descriptors();
-    REQUIRE(descriptors.size() == 2U);
+    REQUIRE(descriptors.size() == 5U);
     REQUIRE(descriptors.front().id == "mesh.extrude-face");
-    REQUIRE(descriptors.back().id == "mesh.set-vertex-position");
+    REQUIRE(descriptors[1].id == "mesh.inset-face");
+    REQUIRE(descriptors[2].id == "mesh.remove-face");
+    REQUIRE(descriptors[3].id == "mesh.set-vertex-position");
+    REQUIRE(descriptors.back().id == "mesh.split-edge");
     REQUIRE(!registry.register_builtin_tools());
 
     REQUIRE(registry.invoke("mesh.extrude-face", context, arguments, history));
@@ -727,9 +733,12 @@ void project_vertex_tool_routes_through_history_and_rejects_bad_context() {
     carto::editor::ToolRegistry registry;
     REQUIRE(registry.register_builtin_tools());
     const auto descriptors = registry.descriptors();
-    REQUIRE(descriptors.size() == 2U);
+    REQUIRE(descriptors.size() == 5U);
     REQUIRE(descriptors[0].id == "mesh.extrude-face");
-    REQUIRE(descriptors[1].id == "mesh.set-vertex-position");
+    REQUIRE(descriptors[1].id == "mesh.inset-face");
+    REQUIRE(descriptors[2].id == "mesh.remove-face");
+    REQUIRE(descriptors[3].id == "mesh.set-vertex-position");
+    REQUIRE(descriptors[4].id == "mesh.split-edge");
     REQUIRE(!registry.register_builtin_tools());
 
     carto::editor::SelectionState rebound_selection;
@@ -1047,6 +1056,9 @@ void project_round_trips_authoritative_state_and_rejects_future_versions() {
     REQUIRE(carto::project::testing::access(document.value()).attach_mesh(
         object.value(), mesh_id.value()));
     const std::string serialized_before = document.value().serialize();
+    REQUIRE(serialized_before.find(
+                "AUTHORING \"cartographer.authoring\" \"meters\" \"right_handed_y_up\"") !=
+            std::string::npos);
     REQUIRE(document.value().save_atomic(path));
     auto loaded = carto::project::ProjectDocument::load(path);
     REQUIRE(loaded);
@@ -1055,13 +1067,24 @@ void project_round_trips_authoritative_state_and_rejects_future_versions() {
     REQUIRE(loaded.value().meshes().at(mesh_id.value()).vertex_count() == 3U);
 
     std::string future = serialized_before;
-    const std::string version = "CARTOGRAPHER_PROJECT 1";
+    const std::string version = "CARTOGRAPHER_PROJECT 2";
     const auto position = future.find(version);
     REQUIRE(position != std::string::npos);
-    future.replace(position, version.size(), "CARTOGRAPHER_PROJECT 2");
+    future.replace(position, version.size(), "CARTOGRAPHER_PROJECT 3");
     const auto rejected = carto::project::ProjectDocument::deserialize(future);
     REQUIRE(!rejected);
     REQUIRE(rejected.error().code == carto::core::ErrorCode::version_mismatch);
+
+    std::string missing_authoring = serialized_before;
+    const auto authoring_start = missing_authoring.find("AUTHORING ");
+    REQUIRE(authoring_start != std::string::npos);
+    const auto authoring_end = missing_authoring.find('\n', authoring_start);
+    REQUIRE(authoring_end != std::string::npos);
+    missing_authoring.erase(authoring_start, authoring_end - authoring_start + 1U);
+    const auto missing_authoring_rejected =
+        carto::project::ProjectDocument::deserialize(missing_authoring);
+    REQUIRE(!missing_authoring_rejected);
+    REQUIRE(missing_authoring_rejected.error().code == carto::core::ErrorCode::validation_failed);
 
     REQUIRE(carto::core::Revision(carto::core::Revision::max_value()).next() ==
             carto::core::Revision(carto::core::Revision::max_value()));
@@ -1259,6 +1282,41 @@ void obj_interchange_reports_feature_loss_and_round_trips_geometry() {
     REQUIRE(atomic_unchanged == atomic_original);
 }
 
+void ply_and_stl_interchange_round_trip_with_explicit_loss() {
+    TempDirectory temp;
+    auto polygon = carto::geometry::make_plane(2.0, 3.0);
+    REQUIRE(polygon);
+
+    const auto ply_path = temp.path() / "plane.ply";
+    const auto exported_ply = carto::io::export_ply(polygon.value(), ply_path);
+    REQUIRE(exported_ply);
+    REQUIRE(exported_ply.value().vertices == 4U && exported_ply.value().faces == 1U);
+    REQUIRE(exported_ply.value().triangles == 2U && !exported_ply.value().warnings.empty());
+    const auto imported_ply = carto::io::import_ply(ply_path);
+    REQUIRE(imported_ply);
+    REQUIRE(imported_ply.value().mesh.vertex_count() == 4U);
+    REQUIRE(imported_ply.value().mesh.face_count() == 1U);
+    REQUIRE(imported_ply.value().report.triangles == 2U);
+
+    const auto stl_path = temp.path() / "plane.stl";
+    const auto exported_stl = carto::io::export_stl(polygon.value(), stl_path);
+    REQUIRE(exported_stl);
+    REQUIRE(exported_stl.value().triangles == 2U && !exported_stl.value().warnings.empty());
+    const auto imported_stl = carto::io::import_stl(stl_path);
+    REQUIRE(imported_stl);
+    REQUIRE(imported_stl.value().mesh.face_count() == 2U);
+    REQUIRE(imported_stl.value().report.triangles == 2U);
+
+    const auto blocked_ply = temp.path() / "blocked.ply";
+    REQUIRE(std::filesystem::create_directory(blocked_ply));
+    const auto rejected_ply = carto::io::export_ply(polygon.value(), blocked_ply);
+    REQUIRE(!rejected_ply && std::filesystem::is_directory(blocked_ply));
+    const auto blocked_stl = temp.path() / "blocked.stl";
+    REQUIRE(std::filesystem::create_directory(blocked_stl));
+    const auto rejected_stl = carto::io::export_stl(polygon.value(), blocked_stl);
+    REQUIRE(!rejected_stl && std::filesystem::is_directory(blocked_stl));
+}
+
 void render_boundary_does_not_include_editable_mesh_api() {
     // The compile-time boundary is reinforced by render_scene.hpp including
     // only compiled_mesh.hpp. This runtime check confirms the object accepts
@@ -1267,6 +1325,66 @@ void render_boundary_does_not_include_editable_mesh_api() {
     const auto compiled = mesh.compile();
     REQUIRE(compiled);
     REQUIRE(compiled.value().valid());
+}
+
+void vanta_gltf_export_is_deterministic_bounded_and_feature_honest() {
+    TempDirectory temp;
+    auto document = carto::project::ProjectDocument::create("VANTA export \"fixture\"");
+    REQUIRE(document);
+    auto mesh = carto::geometry::make_box({2.0, 2.0, 2.0});
+    REQUIRE(mesh);
+    auto access = carto::project::testing::access(document.value());
+    const auto mesh_id = access.add_mesh(std::move(mesh.value()));
+    REQUIRE(mesh_id);
+    const auto object = access.create_object("Visible box");
+    REQUIRE(object);
+    REQUIRE(access.attach_mesh(object.value(), mesh_id.value()));
+
+    const auto first_path = temp.path() / "first.gltf";
+    const auto second_path = temp.path() / "second.gltf";
+    const auto first = carto::io::export_vanta_gltf(document.value(), first_path);
+    REQUIRE(first);
+    REQUIRE(first.value().objects == 1U && first.value().meshes == 1U);
+    REQUIRE(first.value().vertices == 8U && first.value().triangles == 12U);
+    REQUIRE(first.value().index_bytes == 72U);
+    REQUIRE(!first.value().used_uint32_indices);
+    REQUIRE(first.value().warnings.size() == 2U);
+    REQUIRE(carto::io::export_vanta_gltf(document.value(), second_path));
+
+    std::ifstream first_input(first_path, std::ios::binary);
+    std::ifstream second_input(second_path, std::ios::binary);
+    const std::string first_text(
+        (std::istreambuf_iterator<char>(first_input)), std::istreambuf_iterator<char>());
+    const std::string second_text(
+        (std::istreambuf_iterator<char>(second_input)), std::istreambuf_iterator<char>());
+    REQUIRE(!first_text.empty() && first_text == second_text);
+    REQUIRE(first_text.find("\"version\":\"2.0\"") != std::string::npos);
+    REQUIRE(first_text.find("cartographer-vanta-gltf") != std::string::npos);
+    REQUIRE(first_text.find("\"POSITION\":0") != std::string::npos);
+    REQUIRE(first_text.find("\"NORMAL\":1") != std::string::npos);
+    REQUIRE(first_text.find("\"componentType\":5123") != std::string::npos);
+    REQUIRE(first_text.find("TEXCOORD_0") == std::string::npos);
+    REQUIRE(first_text.find("TANGENT") == std::string::npos);
+
+    const auto blocked_path = temp.path() / "blocked.gltf";
+    REQUIRE(std::filesystem::create_directory(blocked_path));
+    const auto blocked = carto::io::export_vanta_gltf(document.value(), blocked_path);
+    REQUIRE(!blocked && std::filesystem::is_directory(blocked_path));
+
+    auto oversized = carto::project::ProjectDocument::create("float32 boundary");
+    REQUIRE(oversized);
+    carto::geometry::EditableMesh huge;
+    const auto a = huge.add_vertex({1.0e100, 0.0, 0.0});
+    const auto b = huge.add_vertex({1.0e100 + 1.0e90, 0.0, 0.0});
+    const auto c = huge.add_vertex({1.0e100, 1.0, 0.0});
+    REQUIRE(a && b && c);
+    REQUIRE(huge.add_face({a.value(), b.value(), c.value()}));
+    auto oversized_access = carto::project::testing::access(oversized.value());
+    REQUIRE(oversized_access.add_mesh(std::move(huge)));
+    const auto rejected = carto::io::export_vanta_gltf(
+        oversized.value(), temp.path() / "rejected.gltf");
+    REQUIRE(!rejected);
+    REQUIRE(rejected.error().code == carto::core::ErrorCode::validation_failed);
 }
 
 } // namespace
@@ -1295,6 +1413,8 @@ int main() {
         {"project round trip and future version rejection", project_round_trips_authoritative_state_and_rejects_future_versions},
         {"project save failure and path bounds", project_save_failure_does_not_replace_existing_file_and_paths_are_bounded},
         {"OBJ interchange reports feature loss", obj_interchange_reports_feature_loss_and_round_trips_geometry},
+        {"PLY and STL interchange round trips with explicit loss", ply_and_stl_interchange_round_trip_with_explicit_loss},
+        {"VANTA glTF export is deterministic and bounded", vanta_gltf_export_is_deterministic_bounded_and_feature_honest},
         {"render boundary consumes compiled data", render_boundary_does_not_include_editable_mesh_api},
     };
 

@@ -86,6 +86,18 @@ bool journal_entry_matches_document(
 
 } // namespace
 
+core::Result<DispatchReceipt> HumanApplicationAccess::dispatch(
+    ApplicationSession& session,
+    const ApplicationAction& action) {
+    return session.dispatch(HumanActionAdmission{}, action);
+}
+
+core::Result<DispatchReceipt> HumanApplicationAccess::commit_preview(
+    ApplicationSession& session,
+    editor::AuthoringPreview& preview) {
+    return session.commit_preview(HumanActionAdmission{}, preview);
+}
+
 core::Result<void> WorkspaceState::validate() const {
     if (visible_panes.empty()) {
         return core::Result<void>::failure(core::Diagnostic(
@@ -285,7 +297,10 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                     std::make_unique<editor::SetProjectObjectTransformCommand>(
                         admission,
                         document_, value.object, object->local_transform, value.transform),
-                    "Set Object Transform");
+                    "Set Object Transform",
+                    AffectedSet{{value.object}, {}, {}, {}},
+                    ParameterPayload{
+                        value.transform, std::nullopt, std::nullopt, std::nullopt, std::nullopt});
             } else if constexpr (std::is_same_v<Action, InvokeToolAction>) {
                 return invoke_tool(value);
             } else if constexpr (std::is_same_v<Action, CreateBoxAction>) {
@@ -301,6 +316,112 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
             }
         },
         action);
+}
+
+core::Result<editor::AuthoringContext> ApplicationSession::authoring_context() const {
+    auto context = editor::AuthoringContext::from_selection(document_.revision(), selection_);
+    if (!context) {
+        return context;
+    }
+
+    if (selection_.mode() == editor::SelectionMode::object) {
+        if (auto result = selection_.validate(document_.scene(), nullptr); !result) {
+            return core::Result<editor::AuthoringContext>::failure(result.error().with_context(
+                "authoring selection"));
+        }
+        return context;
+    }
+
+    const auto owner = selection_.component_object();
+    if (!owner.has_value()) {
+        return core::Result<editor::AuthoringContext>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "component authoring context has no owning scene object"));
+    }
+    const auto* object = document_.scene().find(*owner);
+    if (!object) {
+        return core::Result<editor::AuthoringContext>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "component authoring context owner object is no longer present"));
+    }
+    if (!object->mesh_asset.has_value()) {
+        return core::Result<editor::AuthoringContext>::failure(invalid_state(
+            "component authoring context owner has no mesh asset"));
+    }
+    const auto mesh = document_.meshes().find(*object->mesh_asset);
+    if (mesh == document_.meshes().end()) {
+        return core::Result<editor::AuthoringContext>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "component authoring context references a missing mesh asset"));
+    }
+    if (auto result = selection_.validate(document_.scene(), &mesh->second); !result) {
+        return core::Result<editor::AuthoringContext>::failure(result.error().with_context(
+            "authoring selection"));
+    }
+    return context;
+}
+
+core::Result<editor::AuthoringPreview> ApplicationSession::begin_preview(
+    editor::PreviewKind kind) const {
+    auto context = authoring_context();
+    if (!context) {
+        return core::Result<editor::AuthoringPreview>::failure(context.error());
+    }
+    return editor::AuthoringPreview::begin(document_.revision(), context.value(), kind);
+}
+
+core::Result<ApplicationAction> ApplicationSession::preview_action(
+    const editor::AuthoringPreview& preview) const {
+    const auto& context = preview.context();
+    const auto& parameters = preview.parameters();
+    if (preview.kind() == editor::PreviewKind::object_transform) {
+        if (!parameters.transform.has_value() || context.objects.size() != 1U) {
+            return core::Result<ApplicationAction>::failure(invalid_state(
+                "object transform preview has no complete action payload"));
+        }
+        return core::Result<ApplicationAction>::success(SetObjectTransformAction{
+            context.objects.front(), *parameters.transform});
+    }
+    if (preview.kind() == editor::PreviewKind::extrude_face) {
+        if (!parameters.distance.has_value()) {
+            return core::Result<ApplicationAction>::failure(invalid_state(
+                "face extrusion preview has no distance"));
+        }
+        return core::Result<ApplicationAction>::success(InvokeToolAction{
+            "mesh.extrude-face", editor::ToolArguments{*parameters.distance, {}}});
+    }
+    if (!parameters.position.has_value()) {
+        return core::Result<ApplicationAction>::failure(invalid_state(
+            "vertex position preview has no position"));
+    }
+    return core::Result<ApplicationAction>::success(InvokeToolAction{
+        "mesh.set-vertex-position", editor::ToolArguments{0.0, *parameters.position}});
+}
+
+core::Result<DispatchReceipt> ApplicationSession::commit_preview(
+    HumanActionAdmission admission,
+    editor::AuthoringPreview& preview) {
+    if (auto result = preview.validate_commit(document_.revision()); !result) {
+        return failure(result.error().with_context("preview commit"));
+    }
+    auto current_context = authoring_context();
+    if (!current_context) {
+        return failure(current_context.error().with_context("preview commit context"));
+    }
+    if (current_context.value() != preview.context()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "authoring preview context no longer matches the current selection"));
+    }
+    auto action = preview_action(preview);
+    if (!action) {
+        return failure(action.error().with_context("preview commit action"));
+    }
+    auto result = dispatch(admission, action.value());
+    if (result) {
+        preview.mark_committed();
+    }
+    return result;
 }
 
 core::Result<void> ApplicationSession::set_workspace(WorkspaceState workspace) {
@@ -421,19 +542,25 @@ core::Result<DispatchReceipt> ApplicationSession::save_project(const SaveProject
 
 core::Result<DispatchReceipt> ApplicationSession::execute_command(
     std::unique_ptr<editor::EditorCommand> command,
-    std::string action) {
+    std::string action,
+    AffectedSet affected,
+    std::optional<ParameterPayload> parameters) {
     const core::Revision before = document_.revision();
     project::ProjectDocument before_document = document_;
     if (auto result = history_.execute(std::move(command)); !result) {
         return failure(result.error().with_context(action));
     }
-    return accept_command_mutation(std::move(action), before, std::move(before_document));
+    return accept_command_mutation(
+        std::move(action), before, std::move(before_document), std::move(affected),
+        std::move(parameters));
 }
 
 core::Result<DispatchReceipt> ApplicationSession::accept_command_mutation(
     std::string action,
     core::Revision revision_before,
-    project::ProjectDocument before_document) {
+    project::ProjectDocument before_document,
+    AffectedSet affected,
+    std::optional<ParameterPayload> parameters) {
     const core::Revision revision_after = document_.revision();
     if (auto result = append_mutation_event(action, revision_before, revision_after); !result) {
         const auto rollback = history_.rollback_last_execute();
@@ -446,7 +573,8 @@ core::Result<DispatchReceipt> ApplicationSession::accept_command_mutation(
         }
         return failure(result.error().with_context("mutation rolled back"));
     }
-    return accepted(std::move(action), revision_before);
+    return accepted(
+        std::move(action), revision_before, std::move(affected), std::move(parameters));
 }
 
 core::Result<DispatchReceipt> ApplicationSession::select_object(const SelectObjectAction& action) {
@@ -525,13 +653,68 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
     project::ProjectDocument before_document = document_;
     editor::ProjectCommandAdmission admission;
     editor::ToolContext context(admission, document_, selection_);
+    AffectedSet affected;
+    std::optional<ParameterPayload> parameters;
+    if (auto authoring = authoring_context(); authoring) {
+        affected.objects = authoring.value().objects;
+        affected.vertices = authoring.value().vertices;
+        affected.edges = authoring.value().edges;
+        affected.faces = authoring.value().faces;
+        if (authoring.value().component_object.has_value()) {
+            affected.objects.push_back(*authoring.value().component_object);
+        }
+        if (action.tool_id == "mesh.extrude-face") {
+            parameters = ParameterPayload{
+                std::nullopt,
+                action.arguments.distance,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt};
+        } else if (action.tool_id == "mesh.inset-face") {
+            parameters = ParameterPayload{
+                std::nullopt,
+                action.arguments.distance,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt};
+        } else if (action.tool_id == "mesh.remove-face") {
+            parameters = ParameterPayload{
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                action.arguments.remove_orphaned_vertices,
+                std::nullopt};
+        } else if (action.tool_id == "mesh.set-vertex-position") {
+            parameters = ParameterPayload{
+                std::nullopt,
+                std::nullopt,
+                action.arguments.position,
+                std::nullopt,
+                std::nullopt};
+        } else if (action.tool_id == "mesh.split-edge") {
+            parameters = ParameterPayload{
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                action.arguments.factor};
+        }
+    }
     if (auto result = tools_.invoke(action.tool_id, context, action.arguments, history_); !result) {
         return failure(result.error().with_context("tool invocation"));
     }
-    return accept_command_mutation(
+    auto result = accept_command_mutation(
         "Invoke Tool: " + action.tool_id,
         before,
-        std::move(before_document));
+        std::move(before_document),
+        std::move(affected),
+        std::move(parameters));
+    if (result && (action.tool_id == "mesh.inset-face" ||
+                   action.tool_id == "mesh.remove-face" ||
+                   action.tool_id == "mesh.split-edge")) {
+        selection_.clear();
+    }
+    return result;
 }
 
 core::Result<DispatchReceipt> ApplicationSession::create_box(const CreateBoxAction& action) {
@@ -612,10 +795,17 @@ core::Result<DispatchReceipt> ApplicationSession::redo() {
 
 core::Result<DispatchReceipt> ApplicationSession::accepted(
     std::string action,
-    core::Revision revision_before) const {
+    core::Revision revision_before,
+    AffectedSet affected,
+    std::optional<ParameterPayload> parameters) {
+    const OperationId operation_id = next_operation_id_;
+    next_operation_id_ = next_operation_id_ == std::numeric_limits<OperationId>::max()
+        ? OperationId{1U}
+        : next_operation_id_ + 1U;
     return core::Result<DispatchReceipt>::success(DispatchReceipt{
         std::move(action), revision_before, document_.revision(),
-        revision_before != document_.revision()});
+        revision_before != document_.revision(), operation_id, OperationSource::human,
+        std::move(affected), std::move(parameters), {}});
 }
 
 core::Result<DispatchReceipt> ApplicationSession::failure(core::Diagnostic diagnostic) {

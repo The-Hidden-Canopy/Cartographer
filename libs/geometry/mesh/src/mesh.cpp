@@ -251,6 +251,384 @@ core::Result<void> EditableMesh::extrude_face(FaceId id, double distance) {
     return core::Result<void>::success();
 }
 
+core::Result<TopologyEditReceipt> EditableMesh::delete_face(
+    FaceId id,
+    bool remove_orphaned_vertices) {
+    if (revision_.exhausted()) {
+        return core::Result<TopologyEditReceipt>::failure(exhausted_revision());
+    }
+    const auto face_iterator = faces_.find(id);
+    if (face_iterator == faces_.end()) {
+        return core::Result<TopologyEditReceipt>::failure(
+            Diagnostic(ErrorCode::not_found, "cannot delete a missing mesh face"));
+    }
+
+    const EditableMesh before = *this;
+    const core::Revision revision_before = revision_;
+    const Face deleted = face_iterator->second;
+    faces_.erase(face_iterator);
+
+    std::vector<VertexId> removed_vertices;
+    if (remove_orphaned_vertices) {
+        std::set<VertexId> used_vertices;
+        for (const auto& [face_id, face] : faces_) {
+            static_cast<void>(face_id);
+            used_vertices.insert(face.vertices.begin(), face.vertices.end());
+        }
+        for (const VertexId vertex : deleted.vertices) {
+            if (!used_vertices.contains(vertex)) {
+                vertices_.erase(vertex);
+                removed_vertices.push_back(vertex);
+            }
+        }
+    }
+
+    if (auto result = rebuild_topology(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    if (auto result = validate(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    bump_revision();
+    return core::Result<TopologyEditReceipt>::success(TopologyEditReceipt{
+        revision_before,
+        revision_,
+        {},
+        {},
+        {},
+        std::move(removed_vertices),
+        {},
+        {id},
+    });
+}
+
+core::Result<TopologyEditReceipt> EditableMesh::split_edge(EdgeId id, double factor) {
+    if (revision_.exhausted()) {
+        return core::Result<TopologyEditReceipt>::failure(exhausted_revision());
+    }
+    if (!std::isfinite(factor) || factor <= 0.0 || factor >= 1.0) {
+        return core::Result<TopologyEditReceipt>::failure(invalid(
+            "edge split factor must be finite and strictly between zero and one"));
+    }
+    if (auto result = validate(); !result) {
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    const auto edge_iterator = edges_.find(id);
+    if (edge_iterator == edges_.end()) {
+        return core::Result<TopologyEditReceipt>::failure(
+            Diagnostic(ErrorCode::not_found, "cannot split a missing mesh edge"));
+    }
+    if (next_vertex_id_ == std::numeric_limits<std::uint64_t>::max()) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::invalid_state, "mesh vertex id space is exhausted"));
+    }
+
+    const EditableMesh before = *this;
+    const TopologySnapshot before_topology = topology_snapshot();
+    const core::Revision revision_before = revision_;
+    const EdgeRecord edge = edge_iterator->second;
+    const auto first = vertices_.find(edge.first);
+    const auto second = vertices_.find(edge.second);
+    if (first == vertices_.end() || second == vertices_.end()) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::stale_data, "mesh edge references a missing endpoint"));
+    }
+
+    const VertexId created_vertex{next_vertex_id_++};
+    vertices_.emplace(
+        created_vertex,
+        Vertex{created_vertex, first->second.position * (1.0 - factor) +
+            second->second.position * factor});
+    std::size_t incident_faces = 0U;
+    for (auto& [face_id, face] : faces_) {
+        static_cast<void>(face_id);
+        std::vector<VertexId> split_vertices;
+        split_vertices.reserve(face.vertices.size() + 1U);
+        bool split = false;
+        for (std::size_t index = 0U; index < face.vertices.size(); ++index) {
+            const VertexId origin = face.vertices[index];
+            const VertexId destination = face.vertices[(index + 1U) % face.vertices.size()];
+            split_vertices.push_back(origin);
+            if ((origin == edge.first && destination == edge.second) ||
+                (origin == edge.second && destination == edge.first)) {
+                if (split) {
+                    *this = before;
+                    return core::Result<TopologyEditReceipt>::failure(validation(
+                        "mesh edge occurs more than once in one face"));
+                }
+                split_vertices.push_back(created_vertex);
+                split = true;
+            }
+        }
+        if (split) {
+            const auto anchor = std::find_if(
+                split_vertices.begin(), split_vertices.end(),
+                [edge, created_vertex](VertexId vertex) {
+                    return vertex != edge.first && vertex != edge.second &&
+                        vertex != created_vertex;
+                });
+            if (anchor == split_vertices.end()) {
+                *this = before;
+                return core::Result<TopologyEditReceipt>::failure(validation(
+                    "mesh edge split has no non-collinear face anchor"));
+            }
+            // The compiled mesh currently uses a fan triangulation. Rotate the
+            // authored boundary so the fan anchor is not one of the collinear
+            // endpoints/midpoint introduced by this edit.
+            std::rotate(split_vertices.begin(), anchor, split_vertices.end());
+            ++incident_faces;
+            face.vertices = std::move(split_vertices);
+        }
+    }
+    if (incident_faces == 0U) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::stale_data, "mesh edge has no authored incident face"));
+    }
+
+    if (auto result = rebuild_topology(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    if (auto result = validate(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    const TopologySnapshot after_topology = topology_snapshot();
+    bump_revision();
+
+    std::set<EdgeId> before_edges;
+    for (const auto& edge_record : before_topology.edges) before_edges.insert(edge_record.id);
+    std::set<EdgeId> after_edges;
+    for (const auto& edge_record : after_topology.edges) after_edges.insert(edge_record.id);
+    std::vector<EdgeId> created_edges;
+    std::vector<EdgeId> removed_edges;
+    for (const EdgeId edge_id : after_edges) {
+        if (!before_edges.contains(edge_id)) created_edges.push_back(edge_id);
+    }
+    for (const EdgeId edge_id : before_edges) {
+        if (!after_edges.contains(edge_id)) removed_edges.push_back(edge_id);
+    }
+    return core::Result<TopologyEditReceipt>::success(TopologyEditReceipt{
+        revision_before,
+        revision_,
+        {created_vertex},
+        std::move(created_edges),
+        {},
+        {},
+        std::move(removed_edges),
+        {},
+    });
+}
+
+core::Result<TopologyEditReceipt> EditableMesh::inset_face(FaceId id, double distance) {
+    if (revision_.exhausted()) {
+        return core::Result<TopologyEditReceipt>::failure(exhausted_revision());
+    }
+    if (!std::isfinite(distance) || distance <= 0.0) {
+        return core::Result<TopologyEditReceipt>::failure(
+            invalid("face inset distance must be finite and strictly positive"));
+    }
+    if (auto result = validate(); !result) {
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    const auto face_iterator = faces_.find(id);
+    if (face_iterator == faces_.end()) {
+        return core::Result<TopologyEditReceipt>::failure(
+            Diagnostic(ErrorCode::not_found, "cannot inset a missing mesh face"));
+    }
+    const Face original = face_iterator->second;
+    const std::size_t vertex_count = original.vertices.size();
+    if (vertex_count < 3U) {
+        return core::Result<TopologyEditReceipt>::failure(
+            validation("face inset requires at least three boundary vertices"));
+    }
+
+    std::vector<core::Vec3d> positions;
+    positions.reserve(vertex_count);
+    for (const VertexId vertex : original.vertices) {
+        positions.push_back(vertices_.at(vertex).position);
+    }
+    const core::Vec3d normal = core::cross(
+        positions[1U] - positions[0U], positions[2U] - positions[0U]).normalized();
+    if (!normal.finite()) {
+        return core::Result<TopologyEditReceipt>::failure(
+            validation("face inset requires a non-degenerate planar face"));
+    }
+
+    double scale = 1.0;
+    for (std::size_t index = 0U; index < vertex_count; ++index) {
+        const core::Vec3d edge = positions[(index + 1U) % vertex_count] - positions[index];
+        scale = std::max(scale, edge.length());
+        const double plane_distance = core::dot(positions[index] - positions[0U], normal);
+        if (!std::isfinite(plane_distance) || std::abs(plane_distance) > 1e-8 * scale) {
+            return core::Result<TopologyEditReceipt>::failure(core::Diagnostic(
+                ErrorCode::unsupported,
+                "face inset currently requires a planar face"));
+        }
+    }
+    const double area_epsilon = 1e-12 * scale * scale;
+    for (std::size_t index = 0U; index < vertex_count; ++index) {
+        const std::size_t next = (index + 1U) % vertex_count;
+        const std::size_t after_next = (index + 2U) % vertex_count;
+        const double turn = core::dot(
+            core::cross(
+                positions[next] - positions[index],
+                positions[after_next] - positions[next]),
+            normal);
+        if (!std::isfinite(turn) || turn <= area_epsilon) {
+            return core::Result<TopologyEditReceipt>::failure(core::Diagnostic(
+                ErrorCode::unsupported,
+                "face inset currently requires a strictly convex face"));
+        }
+    }
+
+    std::vector<core::Vec3d> inward;
+    std::vector<core::Vec3d> offset_starts;
+    inward.reserve(vertex_count);
+    offset_starts.reserve(vertex_count);
+    for (std::size_t index = 0U; index < vertex_count; ++index) {
+        const std::size_t next = (index + 1U) % vertex_count;
+        const core::Vec3d edge = positions[next] - positions[index];
+        const core::Vec3d direction = edge.normalized();
+        const core::Vec3d inside = core::cross(normal, direction).normalized();
+        if (!inside.finite()) {
+            return core::Result<TopologyEditReceipt>::failure(
+                validation("face inset found a degenerate boundary edge"));
+        }
+        inward.push_back(inside);
+        offset_starts.push_back(positions[index] + inside * distance);
+    }
+
+    std::vector<core::Vec3d> inset_positions;
+    inset_positions.reserve(vertex_count);
+    for (std::size_t index = 0U; index < vertex_count; ++index) {
+        const std::size_t previous = (index + vertex_count - 1U) % vertex_count;
+        const core::Vec3d first_direction =
+            positions[index] - positions[previous];
+        const core::Vec3d second_direction =
+            positions[(index + 1U) % vertex_count] - positions[index];
+        const double denominator = core::dot(
+            core::cross(first_direction, second_direction), normal);
+        if (!std::isfinite(denominator) || std::abs(denominator) <= area_epsilon) {
+            return core::Result<TopologyEditReceipt>::failure(core::Diagnostic(
+                ErrorCode::unsupported,
+                "face inset offset boundaries do not intersect uniquely"));
+        }
+        const core::Vec3d offset_delta = offset_starts[index] - offset_starts[previous];
+        const double parameter = core::dot(
+            core::cross(offset_delta, second_direction), normal) / denominator;
+        const core::Vec3d inset = offset_starts[previous] + first_direction * parameter;
+        if (!inset.finite()) {
+            return core::Result<TopologyEditReceipt>::failure(
+                validation("face inset produced a non-finite vertex"));
+        }
+        inset_positions.push_back(inset);
+    }
+
+    const double tolerance = 1e-8 * std::max(scale, distance);
+    for (const auto& inset : inset_positions) {
+        for (std::size_t index = 0U; index < vertex_count; ++index) {
+            if (core::dot(inset - positions[index], inward[index]) < distance - tolerance) {
+                return core::Result<TopologyEditReceipt>::failure(core::Diagnostic(
+                    ErrorCode::invalid_argument,
+                    "face inset distance leaves no valid inner face"));
+            }
+        }
+    }
+    for (std::size_t index = 0U; index < vertex_count; ++index) {
+        const std::size_t next = (index + 1U) % vertex_count;
+        const std::size_t after_next = (index + 2U) % vertex_count;
+        const double turn = core::dot(
+            core::cross(
+                inset_positions[next] - inset_positions[index],
+                inset_positions[after_next] - inset_positions[next]),
+            normal);
+        if (!std::isfinite(turn) || turn <= area_epsilon) {
+            return core::Result<TopologyEditReceipt>::failure(core::Diagnostic(
+                ErrorCode::invalid_argument,
+                "face inset distance collapses or inverts the inner face"));
+        }
+    }
+
+    const std::uint64_t new_vertex_count = static_cast<std::uint64_t>(vertex_count);
+    const std::uint64_t new_face_count = new_vertex_count + 1U;
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    if (next_vertex_id_ > maximum - new_vertex_count) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::invalid_state, "mesh vertex id space is exhausted"));
+    }
+    if (next_face_id_ > maximum - new_face_count) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::invalid_state, "mesh face id space is exhausted"));
+    }
+
+    const EditableMesh before = *this;
+    const TopologySnapshot before_topology = topology_snapshot();
+    const core::Revision revision_before = revision_;
+    faces_.erase(face_iterator);
+
+    std::vector<VertexId> inset_vertices;
+    inset_vertices.reserve(vertex_count);
+    for (const core::Vec3d position : inset_positions) {
+        const VertexId vertex{next_vertex_id_++};
+        vertices_.emplace(vertex, Vertex{vertex, position});
+        inset_vertices.push_back(vertex);
+    }
+
+    std::vector<FaceId> created_faces;
+    created_faces.reserve(static_cast<std::size_t>(new_face_count));
+    for (std::size_t index = 0U; index < vertex_count; ++index) {
+        const std::size_t next = (index + 1U) % vertex_count;
+        const FaceId face{next_face_id_++};
+        faces_.emplace(face, Face{
+            face,
+            {original.vertices[index], original.vertices[next],
+             inset_vertices[next], inset_vertices[index]},
+        });
+        created_faces.push_back(face);
+    }
+    const FaceId inner_face{next_face_id_++};
+    faces_.emplace(inner_face, Face{inner_face, inset_vertices});
+    created_faces.push_back(inner_face);
+
+    if (auto result = rebuild_topology(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    if (auto result = validate(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    const TopologySnapshot after_topology = topology_snapshot();
+    bump_revision();
+
+    std::set<EdgeId> before_edges;
+    for (const auto& edge : before_topology.edges) before_edges.insert(edge.id);
+    std::set<EdgeId> after_edges;
+    for (const auto& edge : after_topology.edges) after_edges.insert(edge.id);
+    std::vector<EdgeId> created_edges;
+    std::vector<EdgeId> removed_edges;
+    for (const EdgeId edge : after_edges) {
+        if (!before_edges.contains(edge)) created_edges.push_back(edge);
+    }
+    for (const EdgeId edge : before_edges) {
+        if (!after_edges.contains(edge)) removed_edges.push_back(edge);
+    }
+    return core::Result<TopologyEditReceipt>::success(TopologyEditReceipt{
+        revision_before,
+        revision_,
+        std::move(inset_vertices),
+        std::move(created_edges),
+        std::move(created_faces),
+        {},
+        std::move(removed_edges),
+        {id},
+    });
+}
+
 core::Result<void> EditableMesh::restore_from(const EditableMesh& source) {
     if (revision_.exhausted()) {
         return core::Result<void>::failure(exhausted_revision());
@@ -371,20 +749,28 @@ core::Result<void> EditableMesh::rebuild_topology() {
     std::map<CornerId, CornerRecord> new_corners;
     std::map<FaceId, HalfEdgeId> new_face_boundaries;
     std::map<std::pair<VertexId, VertexId>, HalfEdgeId> directed;
+    std::map<EdgeKey, EdgeId> allocated_edges;
     std::uint64_t next_edge_id = next_edge_id_;
     std::uint64_t next_half_edge_id = next_half_edge_id_;
     std::uint64_t next_corner_id = next_corner_id_;
 
     const auto allocate_edge_id = [&](const EdgeKey& key) -> core::Result<EdgeId> {
+        const auto allocated = allocated_edges.find(key);
+        if (allocated != allocated_edges.end()) {
+            return core::Result<EdgeId>::success(allocated->second);
+        }
         const auto previous = previous_edges.find(key);
         if (previous != previous_edges.end()) {
+            allocated_edges.emplace(key, previous->second);
             return core::Result<EdgeId>::success(previous->second);
         }
         if (next_edge_id == std::numeric_limits<std::uint64_t>::max()) {
             return core::Result<EdgeId>::failure(Diagnostic(
                 ErrorCode::invalid_state, "mesh edge id space is exhausted"));
         }
-        return core::Result<EdgeId>::success(EdgeId{next_edge_id++});
+        const EdgeId allocated_id{next_edge_id++};
+        allocated_edges.emplace(key, allocated_id);
+        return core::Result<EdgeId>::success(allocated_id);
     };
     const auto allocate_half_edge_id =
         [&](const HalfEdgeKey& key) -> core::Result<HalfEdgeId> {

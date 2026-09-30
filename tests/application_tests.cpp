@@ -1,4 +1,5 @@
-#include <carto/application/application.hpp>
+#include "application_access.hpp"
+
 #include <carto/geometry/primitives.hpp>
 #include <carto/journal/journal.hpp>
 
@@ -49,8 +50,8 @@ private:
 
 void application_routes_authoring_through_snapshot_and_history() {
     carto::application::ApplicationSession session;
-    REQUIRE(session.dispatch(carto::application::NewProjectAction{"Authoring"}));
-    REQUIRE(session.dispatch(carto::application::CreateBoxAction{"Box", {2.0, 2.0, 2.0}}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::NewProjectAction{"Authoring"}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::CreateBoxAction{"Box", {2.0, 2.0, 2.0}}));
 
     auto snapshot = session.snapshot();
     REQUIRE(snapshot.project_name == "Authoring");
@@ -68,31 +69,31 @@ void application_routes_authoring_through_snapshot_and_history() {
     const auto object = snapshot.objects.front().object.id;
     carto::core::Transform moved = snapshot.objects.front().object.local_transform;
     moved.translation = {1.0, 2.0, 3.0};
-    REQUIRE(session.dispatch(carto::application::SetObjectTransformAction{object, moved}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::SetObjectTransformAction{object, moved}));
     REQUIRE(session.snapshot().objects.front().world_transform.translation.x == 1.0);
-    REQUIRE(session.dispatch(carto::application::UndoAction{}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::UndoAction{}));
     REQUIRE(session.snapshot().objects.front().world_transform.translation.x == 0.0);
-    REQUIRE(session.dispatch(carto::application::RedoAction{}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::RedoAction{}));
     REQUIRE(session.snapshot().objects.front().world_transform.translation.x == 1.0);
 
-    REQUIRE(session.dispatch(carto::application::SelectObjectAction{object}));
-    REQUIRE(session.dispatch(carto::application::SetSelectionModeAction{
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::SelectObjectAction{object}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::SetSelectionModeAction{
         carto::editor::SelectionMode::face}));
-    REQUIRE(session.dispatch(carto::application::SelectFaceAction{
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::SelectFaceAction{
         object, carto::geometry::FaceId{1}}));
 
     carto::editor::ToolArguments arguments;
     arguments.distance = 0.25;
-    REQUIRE(session.dispatch(carto::application::InvokeToolAction{
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::InvokeToolAction{
         "mesh.extrude-face", arguments}));
     snapshot = session.snapshot();
     REQUIRE(snapshot.undo_count == 3U);
     REQUIRE(snapshot.objects.size() == 1U);
     REQUIRE(snapshot.viewport.error == std::nullopt);
 
-    REQUIRE(session.dispatch(carto::application::UndoAction{}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::UndoAction{}));
     REQUIRE(session.snapshot().redo_count == 1U);
-    REQUIRE(session.dispatch(carto::application::RedoAction{}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::RedoAction{}));
     REQUIRE(session.snapshot().redo_count == 0U);
 }
 
@@ -103,11 +104,11 @@ void application_routes_imported_mesh_through_the_durable_command_boundary() {
 
     const auto path = temp.path() / "imported.carto";
     carto::application::ApplicationSession session;
-    REQUIRE(session.dispatch(carto::application::NewProjectAction{"Imported"}));
-    REQUIRE(session.dispatch(carto::application::SaveProjectAction{path}));
-    REQUIRE(session.dispatch(carto::application::CreateMeshObjectAction{
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::NewProjectAction{"Imported"}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::SaveProjectAction{path}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::CreateMeshObjectAction{
         "Imported mesh", std::move(mesh.value())}));
-    REQUIRE(session.dispatch(carto::application::SaveProjectAction{std::nullopt}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::SaveProjectAction{std::nullopt}));
 
     const auto snapshot = session.snapshot();
     REQUIRE(snapshot.objects.size() == 1U);
@@ -126,13 +127,13 @@ void application_routes_imported_mesh_through_the_durable_command_boundary() {
 
 void application_routes_vertex_edit_and_rejects_stale_reselection() {
     carto::application::ApplicationSession session;
-    REQUIRE(session.dispatch(carto::application::CreateBoxAction{
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::CreateBoxAction{
         "Box", {2.0, 2.0, 2.0}}));
     auto snapshot = session.snapshot();
     const auto object = snapshot.objects.front().object.id;
-    REQUIRE(session.dispatch(carto::application::SetSelectionModeAction{
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::SetSelectionModeAction{
         carto::editor::SelectionMode::vertex}));
-    REQUIRE(session.dispatch(carto::application::SelectVertexAction{
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::SelectVertexAction{
         object, carto::geometry::VertexId{1}}));
 
     const auto before_instances = session.snapshot().viewport.scene.instances();
@@ -148,7 +149,7 @@ void application_routes_vertex_edit_and_rejects_stale_reselection() {
 
     carto::editor::ToolArguments arguments;
     arguments.position = target;
-    REQUIRE(session.dispatch(carto::application::InvokeToolAction{
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::InvokeToolAction{
         "mesh.set-vertex-position", arguments}));
     snapshot = session.snapshot();
     REQUIRE(snapshot.undo_count == 2U);
@@ -162,19 +163,19 @@ void application_routes_vertex_edit_and_rejects_stale_reselection() {
         after_vertex - after_instances.front().mesh->vertex_ids.begin());
     REQUIRE(after_instances.front().mesh->positions[after_index].x == target.x);
 
-    REQUIRE(!session.dispatch(carto::application::InvokeToolAction{
+    REQUIRE(!carto::application::testing::dispatch(session, carto::application::InvokeToolAction{
         "mesh.set-vertex-position", arguments}));
     REQUIRE(session.snapshot().undo_count == 2U);
     REQUIRE(!session.snapshot().problems.empty());
-    REQUIRE(session.dispatch(carto::application::UndoAction{}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::UndoAction{}));
     REQUIRE(session.snapshot().redo_count == 1U);
-    REQUIRE(session.dispatch(carto::application::RedoAction{}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::RedoAction{}));
     REQUIRE(session.snapshot().redo_count == 0U);
 }
 
 void application_routes_persistent_edge_selection_without_mutation() {
     carto::application::ApplicationSession session;
-    REQUIRE(session.dispatch(carto::application::CreateBoxAction{
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::CreateBoxAction{
         "Edge selection", {2.0, 2.0, 2.0}}));
     auto snapshot = session.snapshot();
     REQUIRE(snapshot.objects.size() == 1U);
@@ -187,16 +188,16 @@ void application_routes_persistent_edge_selection_without_mutation() {
     const auto edge = *instances.front().mesh->triangle_edges.front().front();
     const auto revision = snapshot.project_revision;
 
-    REQUIRE(session.dispatch(carto::application::SetSelectionModeAction{
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::SetSelectionModeAction{
         carto::editor::SelectionMode::edge}));
-    REQUIRE(session.dispatch(carto::application::SelectEdgeAction{object, edge}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::SelectEdgeAction{object, edge}));
     snapshot = session.snapshot();
     REQUIRE(snapshot.project_revision == revision);
     REQUIRE(snapshot.selection.mode == carto::editor::SelectionMode::edge);
     REQUIRE(snapshot.selection.edges.size() == 1U);
     REQUIRE(snapshot.selection.edges.front() == edge);
 
-    REQUIRE(!session.dispatch(carto::application::SelectEdgeAction{
+    REQUIRE(!carto::application::testing::dispatch(session, carto::application::SelectEdgeAction{
         object, carto::geometry::EdgeId{999}}));
     const auto after_failure = session.snapshot();
     REQUIRE(after_failure.project_revision == revision);
@@ -206,25 +207,25 @@ void application_routes_persistent_edge_selection_without_mutation() {
 
 void application_rejects_bad_selection_without_mutating_history() {
     carto::application::ApplicationSession session;
-    REQUIRE(session.dispatch(carto::application::CreateBoxAction{
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::CreateBoxAction{
         "Box", {1.0, 1.0, 1.0}}));
     const auto before = session.snapshot();
-    REQUIRE(!session.dispatch(carto::application::SelectFaceAction{
+    REQUIRE(!carto::application::testing::dispatch(session, carto::application::SelectFaceAction{
         carto::scene::ObjectId{999}, carto::geometry::FaceId{1}}));
     const auto after = session.snapshot();
     REQUIRE(after.undo_count == before.undo_count);
     REQUIRE(after.project_revision == before.project_revision);
     REQUIRE(!after.problems.empty());
 
-    REQUIRE(!session.dispatch(carto::application::InvokeToolAction{
+    REQUIRE(!carto::application::testing::dispatch(session, carto::application::InvokeToolAction{
         "missing.tool", {}}));
     REQUIRE(session.snapshot().undo_count == before.undo_count);
 
     const auto before_mode = session.snapshot().selection.mode;
-    REQUIRE(!session.dispatch(carto::application::SetSelectionModeAction{
+    REQUIRE(!carto::application::testing::dispatch(session, carto::application::SetSelectionModeAction{
         static_cast<carto::editor::SelectionMode>(99)}));
     REQUIRE(session.snapshot().selection.mode == before_mode);
-    REQUIRE(!session.dispatch(carto::application::SelectObjectAction{
+    REQUIRE(!carto::application::testing::dispatch(session, carto::application::SelectObjectAction{
         carto::scene::ObjectId{1},
         static_cast<carto::editor::SelectionOperation>(99)}));
     REQUIRE(session.snapshot().selection.objects.empty());
@@ -233,24 +234,24 @@ void application_rejects_bad_selection_without_mutating_history() {
 void application_requires_explicit_discard_for_project_replacement() {
     TempDirectory temp;
     carto::application::ApplicationSession source;
-    REQUIRE(source.dispatch(carto::application::NewProjectAction{"Saved source"}));
-    REQUIRE(source.dispatch(carto::application::CreatePlaneAction{
+    REQUIRE(carto::application::testing::dispatch(source, carto::application::NewProjectAction{"Saved source"}));
+    REQUIRE(carto::application::testing::dispatch(source, carto::application::CreatePlaneAction{
         "Saved source", 2.0, 2.0}));
     const auto source_path = temp.path() / "source.carto";
-    REQUIRE(source.dispatch(carto::application::SaveProjectAction{source_path}));
+    REQUIRE(carto::application::testing::dispatch(source, carto::application::SaveProjectAction{source_path}));
 
     carto::application::ApplicationSession session;
-    REQUIRE(session.dispatch(carto::application::CreateBoxAction{
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::CreateBoxAction{
         "Unsaved", {1.0, 1.0, 1.0}}));
     const auto before = session.snapshot();
     REQUIRE(before.dirty);
     REQUIRE(!session.can_close());
-    REQUIRE(!session.dispatch(carto::application::NewProjectAction{"Replacement"}));
+    REQUIRE(!carto::application::testing::dispatch(session, carto::application::NewProjectAction{"Replacement"}));
     REQUIRE(session.snapshot().project_name == before.project_name);
     REQUIRE(session.snapshot().objects.size() == before.objects.size());
 
     const auto generation = before.project_generation;
-    REQUIRE(session.dispatch(carto::application::NewProjectAction{"Replacement", true}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::NewProjectAction{"Replacement", true}));
     const auto after = session.snapshot();
     REQUIRE(after.project_name == "Replacement");
     REQUIRE(after.objects.empty());
@@ -258,13 +259,13 @@ void application_requires_explicit_discard_for_project_replacement() {
     REQUIRE(after.project_generation != generation);
     REQUIRE(session.can_close());
 
-    REQUIRE(session.dispatch(carto::application::CreateBoxAction{
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::CreateBoxAction{
         "Dirty before open", {1.0, 1.0, 1.0}}));
     const auto before_open = session.snapshot();
-    REQUIRE(!session.dispatch(carto::application::OpenProjectAction{source_path}));
+    REQUIRE(!carto::application::testing::dispatch(session, carto::application::OpenProjectAction{source_path}));
     REQUIRE(session.snapshot().project_name == before_open.project_name);
     REQUIRE(session.snapshot().objects.size() == before_open.objects.size());
-    REQUIRE(session.dispatch(carto::application::OpenProjectAction{source_path, true}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::OpenProjectAction{source_path, true}));
     REQUIRE(session.snapshot().project_name == "Saved source");
     REQUIRE(!session.snapshot().dirty);
 }
@@ -272,7 +273,7 @@ void application_requires_explicit_discard_for_project_replacement() {
 void application_bounds_failure_diagnostics() {
     carto::application::ApplicationSession session;
     for (std::size_t index = 0U; index < 256U; ++index) {
-        REQUIRE(!session.dispatch(carto::application::InvokeToolAction{
+        REQUIRE(!carto::application::testing::dispatch(session, carto::application::InvokeToolAction{
             "missing.tool", {}}));
     }
     const auto snapshot = session.snapshot();
@@ -289,12 +290,12 @@ void application_validates_workspace_layouts() {
         carto::application::Pane::viewport,
         carto::application::Pane::viewport,
     };
-    REQUIRE(!session.dispatch(carto::application::SetWorkspaceAction{duplicate}));
+    REQUIRE(!carto::application::testing::dispatch(session, carto::application::SetWorkspaceAction{duplicate}));
     REQUIRE(session.snapshot().workspace.visible_panes == before);
 
     carto::application::WorkspaceState empty;
     empty.visible_panes.clear();
-    REQUIRE(!session.dispatch(carto::application::SetWorkspaceAction{empty}));
+    REQUIRE(!carto::application::testing::dispatch(session, carto::application::SetWorkspaceAction{empty}));
     REQUIRE(session.snapshot().workspace.visible_panes == before);
 
     carto::application::WorkspaceState unknown;
@@ -302,12 +303,12 @@ void application_validates_workspace_layouts() {
         carto::application::Pane::viewport,
         static_cast<carto::application::Pane>(99),
     };
-    REQUIRE(!session.dispatch(carto::application::SetWorkspaceAction{unknown}));
+    REQUIRE(!carto::application::testing::dispatch(session, carto::application::SetWorkspaceAction{unknown}));
     REQUIRE(session.snapshot().workspace.visible_panes == before);
 
     carto::application::WorkspaceState no_viewport;
     no_viewport.visible_panes = {carto::application::Pane::outliner};
-    REQUIRE(!session.dispatch(carto::application::SetWorkspaceAction{no_viewport}));
+    REQUIRE(!carto::application::testing::dispatch(session, carto::application::SetWorkspaceAction{no_viewport}));
     REQUIRE(session.snapshot().workspace.visible_panes == before);
 
     carto::application::WorkspaceState compact;
@@ -315,7 +316,7 @@ void application_validates_workspace_layouts() {
         carto::application::Pane::viewport,
         carto::application::Pane::inspector,
     };
-    const auto compact_receipt = session.dispatch(
+    const auto compact_receipt = carto::application::testing::dispatch(session,
         carto::application::SetWorkspaceAction{compact});
     REQUIRE(compact_receipt);
     REQUIRE(compact_receipt.value().action == "Set Workspace");
@@ -327,21 +328,21 @@ void application_validates_workspace_layouts() {
 void application_open_failure_preserves_current_project_and_save_is_atomic() {
     TempDirectory temp;
     carto::application::ApplicationSession session;
-    REQUIRE(session.dispatch(carto::application::CreatePlaneAction{
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::CreatePlaneAction{
         "Plane", 2.0, 3.0}));
     const auto current = session.snapshot();
-    REQUIRE(!session.dispatch(carto::application::OpenProjectAction{
+    REQUIRE(!carto::application::testing::dispatch(session, carto::application::OpenProjectAction{
         temp.path() / "missing.carto"}));
     REQUIRE(session.snapshot().objects.size() == current.objects.size());
     REQUIRE(session.snapshot().project_revision == current.project_revision);
 
     const auto path = temp.path() / "saved.carto";
-    REQUIRE(session.dispatch(carto::application::SaveProjectAction{path}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::SaveProjectAction{path}));
     REQUIRE(!session.snapshot().dirty);
     REQUIRE(std::filesystem::is_regular_file(path));
 
     carto::application::ApplicationSession reopened;
-    REQUIRE(reopened.dispatch(carto::application::OpenProjectAction{path}));
+    REQUIRE(carto::application::testing::dispatch(reopened, carto::application::OpenProjectAction{path}));
     REQUIRE(reopened.snapshot().objects.size() == 1U);
     REQUIRE(!reopened.snapshot().dirty);
 }
@@ -352,8 +353,8 @@ void application_journals_committed_mutations_and_rolls_back_failed_append() {
     const auto journal_path = std::filesystem::path(path.string() + ".journal");
 
     carto::application::ApplicationSession session;
-    REQUIRE(session.dispatch(carto::application::NewProjectAction{"Journaled"}));
-    REQUIRE(session.dispatch(carto::application::SaveProjectAction{path}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::NewProjectAction{"Journaled"}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::SaveProjectAction{path}));
 
     carto::journal::Journal journal(journal_path);
     auto baseline = journal.read_all();
@@ -361,7 +362,7 @@ void application_journals_committed_mutations_and_rolls_back_failed_append() {
     REQUIRE(baseline.value().size() == 1U);
     REQUIRE(baseline.value().front().event_type == "cartographer.snapshot");
 
-    REQUIRE(session.dispatch(carto::application::CreateBoxAction{
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::CreateBoxAction{
         "Box", {1.0, 1.0, 1.0}}));
     auto after_create = session.snapshot();
     REQUIRE(after_create.objects.size() == 1U);
@@ -378,13 +379,13 @@ void application_journals_committed_mutations_and_rolls_back_failed_append() {
     REQUIRE(mutation_payload.find("CARTOGRAPHER_PROJECT 1") != std::string::npos);
     REQUIRE(journal.verify());
 
-    REQUIRE(session.dispatch(carto::application::UndoAction{}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::UndoAction{}));
     auto after_undo = journal.read_all();
     REQUIRE(after_undo);
     REQUIRE(after_undo.value().size() == 3U);
     REQUIRE(after_undo.value().back().event_type == "cartographer.application_action");
 
-    REQUIRE(session.dispatch(carto::application::RedoAction{}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::RedoAction{}));
     auto after_redo = journal.read_all();
     REQUIRE(after_redo);
     REQUIRE(after_redo.value().size() == 4U);
@@ -392,7 +393,7 @@ void application_journals_committed_mutations_and_rolls_back_failed_append() {
     const auto before_failed_append = session.snapshot();
     REQUIRE(std::filesystem::remove(journal_path));
     REQUIRE(std::filesystem::create_directory(journal_path));
-    REQUIRE(!session.dispatch(carto::application::CreatePlaneAction{
+    REQUIRE(!carto::application::testing::dispatch(session, carto::application::CreatePlaneAction{
         "Rejected", 1.0, 1.0}));
     const auto after_failed_append = session.snapshot();
     REQUIRE(after_failed_append.project_revision == before_failed_append.project_revision);
@@ -405,8 +406,8 @@ void application_rejects_journal_revision_drift_before_open() {
     TempDirectory temp;
     const auto path = temp.path() / "drifted.carto";
     carto::application::ApplicationSession source;
-    REQUIRE(source.dispatch(carto::application::NewProjectAction{"Drifted"}));
-    REQUIRE(source.dispatch(carto::application::SaveProjectAction{path}));
+    REQUIRE(carto::application::testing::dispatch(source, carto::application::NewProjectAction{"Drifted"}));
+    REQUIRE(carto::application::testing::dispatch(source, carto::application::SaveProjectAction{path}));
 
     const auto journal_path = std::filesystem::path(path.string() + ".journal");
     carto::journal::Journal journal(journal_path);
@@ -417,7 +418,7 @@ void application_rejects_journal_revision_drift_before_open() {
         current.value(), current.value().next(), "test.drift", payload, 1U}));
 
     carto::application::ApplicationSession target;
-    REQUIRE(!target.dispatch(carto::application::OpenProjectAction{path}));
+    REQUIRE(!carto::application::testing::dispatch(target, carto::application::OpenProjectAction{path}));
     REQUIRE(target.snapshot().project_name != "Drifted");
     REQUIRE(!target.snapshot().problems.empty());
 }
@@ -434,8 +435,8 @@ void application_rolls_back_preexisting_journal_baseline_on_save_failure() {
     REQUIRE(std::filesystem::create_directory(path));
 
     carto::application::ApplicationSession session;
-    REQUIRE(session.dispatch(carto::application::NewProjectAction{"Save rollback"}));
-    REQUIRE(!session.dispatch(carto::application::SaveProjectAction{path}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::NewProjectAction{"Save rollback"}));
+    REQUIRE(!carto::application::testing::dispatch(session, carto::application::SaveProjectAction{path}));
 
     std::ifstream restored(journal_path, std::ios::binary);
     const std::string contents(
@@ -451,8 +452,8 @@ void application_rejects_semantically_wrong_journal_tail() {
     TempDirectory temp;
     const auto path = temp.path() / "semantic-drift.carto";
     carto::application::ApplicationSession source;
-    REQUIRE(source.dispatch(carto::application::NewProjectAction{"Semantic drift"}));
-    REQUIRE(source.dispatch(carto::application::SaveProjectAction{path}));
+    REQUIRE(carto::application::testing::dispatch(source, carto::application::NewProjectAction{"Semantic drift"}));
+    REQUIRE(carto::application::testing::dispatch(source, carto::application::SaveProjectAction{path}));
 
     const auto journal_path = std::filesystem::path(path.string() + ".journal");
     carto::journal::Journal journal(journal_path);
@@ -486,7 +487,7 @@ void application_rejects_semantically_wrong_journal_tail() {
     REQUIRE(replace);
 
     carto::application::ApplicationSession target;
-    const auto opened = target.dispatch(carto::application::OpenProjectAction{path});
+    const auto opened = carto::application::testing::dispatch(target, carto::application::OpenProjectAction{path});
     REQUIRE(!opened);
     REQUIRE(opened.error().code == carto::core::ErrorCode::validation_failed);
 }

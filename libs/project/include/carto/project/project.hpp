@@ -18,9 +18,12 @@ class ApplicationSession;
 
 namespace carto::editor {
 class CreateMeshObjectCommand;
+class DeleteProjectSelectedFaceCommand;
 class ExtrudeProjectSelectedFaceCommand;
+class InsetProjectSelectedFaceCommand;
 class SetProjectObjectTransformCommand;
 class SetProjectSelectedVertexPositionCommand;
+class SplitProjectSelectedEdgeCommand;
 }
 
 namespace carto::project {
@@ -42,8 +45,12 @@ struct SaveReceipt {
 
 class ProjectDocument {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 1;
+    static constexpr std::uint32_t kSchemaVersion = 2;
+    static constexpr std::uint32_t kMinimumReadableSchemaVersion = 1;
     static constexpr std::string_view kMagic = "CARTOGRAPHER_PROJECT";
+    static constexpr std::string_view kAuthoringFormat = "cartographer.authoring";
+    static constexpr std::string_view kAuthoringUnits = "meters";
+    static constexpr std::string_view kAuthoringCoordinateSystem = "right_handed_y_up";
 
     ProjectDocument() = default;
     ProjectDocument(const ProjectDocument&) = default;
@@ -68,9 +75,12 @@ public:
 private:
     friend class ::carto::application::ApplicationSession;
     friend class ::carto::editor::CreateMeshObjectCommand;
+    friend class ::carto::editor::DeleteProjectSelectedFaceCommand;
     friend class ::carto::editor::ExtrudeProjectSelectedFaceCommand;
+    friend class ::carto::editor::InsetProjectSelectedFaceCommand;
     friend class ::carto::editor::SetProjectObjectTransformCommand;
     friend class ::carto::editor::SetProjectSelectedVertexPositionCommand;
+    friend class ::carto::editor::SplitProjectSelectedEdgeCommand;
     friend class ::carto::project::ProjectTransaction;
 
     ProjectDocument& operator=(const ProjectDocument&) = default;

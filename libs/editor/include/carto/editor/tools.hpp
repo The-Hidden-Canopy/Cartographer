@@ -27,7 +27,13 @@ struct ToolContext {
     [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
     make_extrude_selected_face_command(double distance) const;
     [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
+    make_inset_selected_face_command(double distance) const;
+    [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
     make_set_selected_vertex_position_command(core::Vec3d position) const;
+    [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
+    make_delete_selected_face_command(bool remove_orphaned_vertices) const;
+    [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
+    make_split_selected_edge_command(double factor) const;
 
 private:
     friend class ::carto::application::ApplicationSession;
@@ -40,6 +46,8 @@ private:
 struct ToolArguments {
     double distance = 0.0;
     core::Vec3d position{};
+    bool remove_orphaned_vertices = true;
+    double factor = 0.5;
 };
 
 using ToolFactory = std::function<core::Result<std::unique_ptr<EditorCommand>>(
