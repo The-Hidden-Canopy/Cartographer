@@ -1,5 +1,6 @@
 #pragma once
 
+#include <carto/ai/ai.hpp>
 #include <carto/application/application.hpp>
 #include <carto/core/result.hpp>
 
@@ -123,6 +124,55 @@ enum class Shortcut {
     ai_first,
 };
 
+// The native shell translates platform key messages into this small, toolkit-
+// independent contract.  It lets the authoritative UI controller own core
+// shortcuts without depending on Dear ImGui frame state.
+enum class NativeKey {
+    s,
+    z,
+    y,
+    k,
+    digit_1,
+    digit_2,
+    digit_3,
+    digit_4,
+    escape,
+};
+
+inline constexpr std::uint8_t kNativeModifierControl = 1U << 0U;
+inline constexpr std::uint8_t kNativeModifierShift = 1U << 1U;
+inline constexpr std::uint8_t kNativeModifierAlt = 1U << 2U;
+
+struct NativeKeyEvent {
+    NativeKey key = NativeKey::escape;
+    std::uint8_t modifiers = 0U;
+    bool pressed = true;
+    bool repeat = false;
+};
+
+[[nodiscard]] std::optional<Shortcut> shortcut_for_native_key(
+    const NativeKeyEvent& event) noexcept;
+
+// Native pointer coordinates are client-area pixels supplied by the platform
+// shell.  The UI layer only interprets the safe selection modifiers; hit
+// testing and command admission remain owned by the host/controller boundary.
+enum class NativePointerButton {
+    primary,
+    secondary,
+    middle,
+};
+
+struct NativePointerEvent {
+    NativePointerButton button = NativePointerButton::primary;
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    std::uint8_t modifiers = 0U;
+    bool pressed = true;
+};
+
+[[nodiscard]] std::optional<editor::SelectionOperation>
+selection_operation_for_native_pointer(const NativePointerEvent& event) noexcept;
+
 struct OperationView {
     std::uint64_t operation_id = 0U;
     OperationCategory category = OperationCategory::committed_command;
@@ -146,6 +196,7 @@ struct UiPreferences {
     Density density = Density::standard;
     Theme theme = Theme::dark;
     BottomPanel bottom_panel = BottomPanel::operations;
+    bool ai_auto_approve = true;
     std::vector<Panel> visible_panels{
         Panel::scene,
         Panel::viewport,
@@ -220,6 +271,7 @@ struct UiSnapshot : application::ApplicationSnapshot {
     std::vector<core::Diagnostic> ui_problems;
     UiColorTokens colors;
     bool ai_available = false;
+    bool ai_auto_approve = true;
     std::string ai_status;
 };
 
@@ -251,8 +303,17 @@ public:
         editor::PreviewKind kind) const;
     [[nodiscard]] core::Result<application::DispatchReceipt> commit_preview(
         editor::AuthoringPreview& preview);
-    // AI proposals have no mutation route until a bounded planner and an
-    // explicit host admission contract are connected.
+    // Native AI proposals carry their copied context so a stale selection or
+    // project revision cannot be reused. Safe native operations may be
+    // auto-applied by policy; the host still uses the typed preview boundary.
+    [[nodiscard]] core::Result<ai::Proposal> propose_ai(std::string_view intent);
+    [[nodiscard]] core::Result<editor::AuthoringPreview> begin_ai_preview(
+        const ai::Proposal& proposal) const;
+    [[nodiscard]] core::Result<application::DispatchReceipt> apply_ai_intent(
+        std::string_view intent);
+    [[nodiscard]] core::Result<application::DispatchReceipt> commit_ai_preview(
+        editor::AuthoringPreview& preview,
+        const ai::Proposal& proposal);
     [[nodiscard]] core::Result<application::DispatchReceipt> submit_ai_proposal(
         const application::ApplicationAction& action);
     [[nodiscard]] core::Result<void> set_operator_mode(OperatorMode mode);
@@ -260,6 +321,7 @@ public:
     [[nodiscard]] core::Result<void> set_density(Density density);
     [[nodiscard]] core::Result<void> set_theme(Theme theme);
     [[nodiscard]] core::Result<void> set_bottom_panel(BottomPanel panel);
+    [[nodiscard]] core::Result<void> set_ai_auto_approve(bool enabled);
     [[nodiscard]] core::Result<void> set_panel_visible(Panel panel, bool visible);
     [[nodiscard]] core::Result<void> reset_preferences();
     [[nodiscard]] core::Result<void> handle_shortcut(Shortcut shortcut);
@@ -288,6 +350,7 @@ private:
 
     application::ApplicationSession& session_;
     UiPreferences preferences_;
+    ai::NativePlanner native_planner_;
     bool command_palette_open_ = false;
     std::string command_palette_query_;
     std::vector<OperationView> operations_;

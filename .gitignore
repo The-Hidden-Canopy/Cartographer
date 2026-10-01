@@ -1,9 +1,21 @@
 # Build output and local tool state
 /build/
+/build-*/
+/cmake-build-*/
 /out/
 /install/
+/dist/
+/coverage/
+/Testing/
 /.cache/
 /tmp/
+
+# Generated build-system state outside a preset build directory
+*.ninja
+.ninja_deps
+.ninja_log
+.ninja_lock
+CMakeUserPresets.json
 
 # IDE files
 .vs/
@@ -34,3 +46,22 @@ _deps/
 *.carto.tmp
 *.log
 
+# Local credentials and environment (never commit workstation secrets)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# Private hub/API adapters are maintained outside the Cartographer checkout
+/.hub/
+/hub-local/
+
+# Private/uncleared integration material must stay out of the public tree.
+/private/
+/.private/
+/docs/anatomy/
+*.owh.carto
+*.private.*
+.codex-remote-attachments/

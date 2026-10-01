@@ -8,7 +8,7 @@ target_include_directories(carto_ui
         $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(carto_ui PUBLIC carto_application carto_core)
+target_link_libraries(carto_ui PUBLIC carto_ai carto_application carto_core)
 carto_target(carto_ui)
 
 install(TARGETS carto_ui EXPORT CartographerTargets)

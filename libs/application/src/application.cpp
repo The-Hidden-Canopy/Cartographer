@@ -18,9 +18,20 @@ core::Diagnostic invalid_state(std::string message) {
 }
 
 constexpr std::size_t kMaxProblems = 128U;
-constexpr std::size_t kMaxJournalPayloadBytes = 64U * 1024U * 1024U;
+// ProjectDocument bounds serialized projects at 128 MiB. Keep the durable
+// snapshot envelope capable of carrying that governed project state so large
+// imported anatomy meshes do not require an unjournaled mutation path.
+constexpr std::size_t kMaxJournalPayloadBytes = 128U * 1024U * 1024U;
 constexpr std::string_view kSnapshotEvent = "cartographer.snapshot";
 constexpr std::string_view kActionEvent = "cartographer.application_action";
+
+journal::JournalLimits application_journal_limits() {
+    journal::JournalLimits limits;
+    limits.max_payload_bytes = kMaxJournalPayloadBytes;
+    limits.max_record_bytes = 256ULL * 1024ULL * 1024ULL;
+    limits.max_file_bytes = 1024ULL * 1024ULL * 1024ULL;
+    return limits;
+}
 
 std::filesystem::path journal_path_for(const std::filesystem::path& project_path) {
     std::filesystem::path journal_path = project_path;
@@ -98,6 +109,14 @@ core::Result<DispatchReceipt> HumanApplicationAccess::commit_preview(
     return session.commit_preview(HumanActionAdmission{}, preview);
 }
 
+core::Result<DispatchReceipt> HumanApplicationAccess::commit_preview(
+    ApplicationSession& session,
+    editor::AuthoringPreview& preview,
+    OperationSource source,
+    std::string_view provenance_id) {
+    return session.commit_preview(HumanActionAdmission{}, preview, source, provenance_id);
+}
+
 core::Result<void> WorkspaceState::validate() const {
     if (visible_panes.empty()) {
         return core::Result<void>::failure(core::Diagnostic(
@@ -160,7 +179,7 @@ core::Result<ApplicationSession::PreparedJournal> ApplicationSession::prepare_jo
         }
     }
 
-    journal::Journal candidate(path);
+    journal::Journal candidate(path, application_journal_limits());
     const auto entries = candidate.read_all();
     if (!entries) {
         return core::Result<PreparedJournal>::failure(entries.error().with_context(
@@ -252,7 +271,22 @@ core::Result<void> ApplicationSession::append_mutation_event(
 
 core::Result<DispatchReceipt> ApplicationSession::dispatch(
     HumanActionAdmission,
-    const ApplicationAction& action) {
+    const ApplicationAction& action,
+    OperationSource source,
+    std::string_view provenance_id) {
+    const OperationSource previous_source = active_source_;
+    std::string previous_provenance = std::move(active_provenance_id_);
+    active_source_ = source;
+    active_provenance_id_ = std::string(provenance_id);
+    struct SourceRestore final {
+        ApplicationSession* session;
+        OperationSource source;
+        std::string provenance;
+        ~SourceRestore() {
+            session->active_source_ = source;
+            session->active_provenance_id_ = std::move(provenance);
+        }
+    } restore{this, previous_source, std::move(previous_provenance)};
     return std::visit(
         [this](const auto& value) -> core::Result<DispatchReceipt> {
             using Action = std::decay_t<decltype(value)>;
@@ -390,6 +424,14 @@ core::Result<ApplicationAction> ApplicationSession::preview_action(
         return core::Result<ApplicationAction>::success(InvokeToolAction{
             "mesh.extrude-face", editor::ToolArguments{*parameters.distance, {}}});
     }
+    if (preview.kind() == editor::PreviewKind::inset_face) {
+        if (!parameters.distance.has_value()) {
+            return core::Result<ApplicationAction>::failure(invalid_state(
+                "face inset preview has no distance"));
+        }
+        return core::Result<ApplicationAction>::success(InvokeToolAction{
+            "mesh.inset-face", editor::ToolArguments{*parameters.distance, {}}});
+    }
     if (!parameters.position.has_value()) {
         return core::Result<ApplicationAction>::failure(invalid_state(
             "vertex position preview has no position"));
@@ -400,7 +442,9 @@ core::Result<ApplicationAction> ApplicationSession::preview_action(
 
 core::Result<DispatchReceipt> ApplicationSession::commit_preview(
     HumanActionAdmission admission,
-    editor::AuthoringPreview& preview) {
+    editor::AuthoringPreview& preview,
+    OperationSource source,
+    std::string_view provenance_id) {
     if (auto result = preview.validate_commit(document_.revision()); !result) {
         return failure(result.error().with_context("preview commit"));
     }
@@ -417,7 +461,7 @@ core::Result<DispatchReceipt> ApplicationSession::commit_preview(
     if (!action) {
         return failure(action.error().with_context("preview commit action"));
     }
-    auto result = dispatch(admission, action.value());
+    auto result = dispatch(admission, action.value(), source, provenance_id);
     if (result) {
         preview.mark_committed();
     }
@@ -804,7 +848,8 @@ core::Result<DispatchReceipt> ApplicationSession::accepted(
         : next_operation_id_ + 1U;
     return core::Result<DispatchReceipt>::success(DispatchReceipt{
         std::move(action), revision_before, document_.revision(),
-        revision_before != document_.revision(), operation_id, OperationSource::human,
+        revision_before != document_.revision(), operation_id, active_source_,
+        active_provenance_id_,
         std::move(affected), std::move(parameters), {}});
 }
 

@@ -376,7 +376,10 @@ void application_journals_committed_mutations_and_rolls_back_failed_append() {
     const std::string mutation_payload(
         after_event.value().back().payload.begin(), after_event.value().back().payload.end());
     REQUIRE(mutation_payload.find("CARTOGRAPHER_APPLICATION_MUTATION_V1") == 0U);
-    REQUIRE(mutation_payload.find("CARTOGRAPHER_PROJECT 1") != std::string::npos);
+    REQUIRE(mutation_payload.find("CARTOGRAPHER_PROJECT 2") != std::string::npos);
+    REQUIRE(mutation_payload.find(
+                "AUTHORING \"cartographer.authoring\" \"meters\" \"right_handed_y_up\"") !=
+            std::string::npos);
     REQUIRE(journal.verify());
 
     REQUIRE(carto::application::testing::dispatch(session, carto::application::UndoAction{}));

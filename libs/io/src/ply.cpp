@@ -1,6 +1,7 @@
 #include <carto/io/ply.hpp>
 
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -94,17 +95,14 @@ core::Result<void> validate_output_path(const std::filesystem::path& path, std::
 }
 
 core::Result<std::size_t> parse_count(std::string_view text, std::string_view field) {
-    std::size_t consumed = 0;
-    try {
-        const auto value = std::stoull(std::string(text), &consumed);
-        if (consumed != text.size() || value > std::numeric_limits<std::size_t>::max()) {
-            throw std::out_of_range("count");
-        }
-        return core::Result<std::size_t>::success(static_cast<std::size_t>(value));
-    } catch (...) {
+    std::uint64_t value = 0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+        value > std::numeric_limits<std::size_t>::max()) {
         return core::Result<std::size_t>::failure(
             validation("PLY " + std::string(field) + " is not a valid non-negative count"));
     }
+    return core::Result<std::size_t>::success(static_cast<std::size_t>(value));
 }
 
 core::Result<double> parse_real(std::string_view text, std::string_view field) {

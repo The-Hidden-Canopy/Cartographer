@@ -6,6 +6,8 @@
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <limits>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <system_error>
@@ -102,6 +104,71 @@ core::Result<std::size_t> parse_index(std::string_view token, std::size_t count)
     return core::Result<std::size_t>::success(static_cast<std::size_t>(resolved));
 }
 
+core::Result<void> isolate_conflicting_directed_edges(
+    std::vector<geometry::Vertex>& vertices,
+    std::vector<geometry::Face>& faces,
+    IoReport& report) {
+    std::map<geometry::VertexId, core::Vec3d> positions;
+    std::uint64_t next_vertex_id = 1U;
+    for (const auto& vertex : vertices) {
+        positions.emplace(vertex.id, vertex.position);
+        if (vertex.id.value < std::numeric_limits<std::uint64_t>::max()) {
+            next_vertex_id = std::max(next_vertex_id, vertex.id.value + 1U);
+        }
+    }
+
+    std::map<std::pair<geometry::VertexId, geometry::VertexId>, geometry::FaceId> directed_edges;
+    for (auto& face : faces) {
+        bool conflicts = false;
+        for (std::size_t index = 0U; index < face.vertices.size(); ++index) {
+            const auto edge = std::make_pair(
+                face.vertices[index], face.vertices[(index + 1U) % face.vertices.size()]);
+            if (directed_edges.contains(edge)) {
+                conflicts = true;
+                break;
+            }
+        }
+
+        if (conflicts) {
+            if (vertices.size() > kMaxObjVertices - face.vertices.size()) {
+                return core::Result<void>::failure(
+                    validation("OBJ topology repair would exceed the vertex import limit"));
+            }
+            std::vector<geometry::VertexId> isolated_vertices;
+            isolated_vertices.reserve(face.vertices.size());
+            for (const geometry::VertexId original : face.vertices) {
+                const auto position = positions.find(original);
+                if (position == positions.end() || next_vertex_id == std::numeric_limits<std::uint64_t>::max()) {
+                    return core::Result<void>::failure(
+                        validation("OBJ topology repair found an invalid vertex reference"));
+                }
+                const geometry::VertexId isolated{next_vertex_id++};
+                vertices.push_back(geometry::Vertex{isolated, position->second});
+                positions.emplace(isolated, position->second);
+                isolated_vertices.push_back(isolated);
+            }
+            face.vertices = std::move(isolated_vertices);
+            if (report.warnings.size() >= kMaxObjWarnings) {
+                return core::Result<void>::failure(
+                    validation("OBJ topology repair warning limit exceeded"));
+            }
+            report.warnings.push_back(
+                "isolated OBJ face " + std::to_string(face.id.value) +
+                " by duplicating vertices across a conflicting directed edge");
+        }
+
+        for (std::size_t index = 0U; index < face.vertices.size(); ++index) {
+            const auto edge = std::make_pair(
+                face.vertices[index], face.vertices[(index + 1U) % face.vertices.size()]);
+            if (!directed_edges.emplace(edge, face.id).second) {
+                return core::Result<void>::failure(
+                    validation("OBJ topology contains an unrecoverable duplicate directed edge"));
+            }
+        }
+    }
+    return core::Result<void>::success();
+}
+
 } // namespace
 
 core::Result<IoReport> export_obj(
@@ -188,6 +255,8 @@ core::Result<ImportResult> import_obj(const std::filesystem::path& path) {
             validation("OBJ input exceeds the Cartographer import limit of 128 MiB"));
     }
     ImportResult result;
+    std::vector<geometry::Vertex> parsed_vertices;
+    std::vector<geometry::Face> faces;
     std::string line;
     std::size_t line_number = 0;
     std::uintmax_t bytes_read = 0;
@@ -205,7 +274,7 @@ core::Result<ImportResult> import_obj(const std::filesystem::path& path) {
             continue;
         }
         if (tag == "v") {
-            if (result.mesh.vertex_count() >= kMaxObjVertices) {
+            if (parsed_vertices.size() >= kMaxObjVertices) {
                 return core::Result<ImportResult>::failure(
                     validation("OBJ vertex count exceeds the Cartographer import limit"));
             }
@@ -214,9 +283,8 @@ core::Result<ImportResult> import_obj(const std::filesystem::path& path) {
                 return core::Result<ImportResult>::failure(
                     Diagnostic(ErrorCode::validation_failed, "invalid OBJ vertex at line " + std::to_string(line_number)));
             }
-            if (auto vertex = result.mesh.add_vertex(position); !vertex) {
-                return core::Result<ImportResult>::failure(vertex.error().with_context("OBJ line " + std::to_string(line_number)));
-            }
+            const geometry::VertexId id{static_cast<std::uint64_t>(parsed_vertices.size()) + 1U};
+            parsed_vertices.push_back(geometry::Vertex{id, position});
             continue;
         }
         if (tag == "f") {
@@ -224,8 +292,7 @@ core::Result<ImportResult> import_obj(const std::filesystem::path& path) {
                 return core::Result<ImportResult>::failure(
                     validation("OBJ face count exceeds the Cartographer import limit"));
             }
-            const auto existing = result.mesh.vertices_sorted();
-            std::vector<geometry::VertexId> vertices;
+            std::vector<geometry::VertexId> face_vertices;
             std::string token;
             std::size_t token_count = 0;
             while (fields >> token) {
@@ -233,17 +300,16 @@ core::Result<ImportResult> import_obj(const std::filesystem::path& path) {
                     return core::Result<ImportResult>::failure(
                         validation("OBJ face vertex count exceeds the Cartographer import limit"));
                 }
-                auto parsed = parse_index(token, result.mesh.vertex_count());
+                auto parsed = parse_index(token, parsed_vertices.size());
                 if (!parsed) {
                     return core::Result<ImportResult>::failure(parsed.error().with_context("OBJ line " + std::to_string(line_number)));
                 }
-                vertices.push_back(existing.at(parsed.value()).id);
+                face_vertices.push_back(geometry::VertexId{static_cast<std::uint64_t>(parsed.value()) + 1U});
                 ++token_count;
             }
-            auto face = result.mesh.add_face(std::move(vertices));
-            if (!face) {
-                return core::Result<ImportResult>::failure(face.error().with_context("OBJ line " + std::to_string(line_number)));
-            }
+            faces.push_back(geometry::Face{
+                geometry::FaceId{static_cast<std::uint64_t>(faces.size()) + 1U},
+                std::move(face_vertices)});
             continue;
         }
         if (result.report.warnings.size() >= kMaxObjWarnings) {
@@ -255,6 +321,13 @@ core::Result<ImportResult> import_obj(const std::filesystem::path& path) {
     if (!input.eof() && input.fail()) {
         return core::Result<ImportResult>::failure(
             Diagnostic(ErrorCode::io_error, "failed while reading OBJ input"));
+    }
+    if (auto repaired = isolate_conflicting_directed_edges(parsed_vertices, faces, result.report);
+        !repaired) {
+        return core::Result<ImportResult>::failure(repaired.error().with_context("OBJ topology repair"));
+    }
+    if (auto inserted = result.mesh.insert_bulk(std::move(parsed_vertices), std::move(faces)); !inserted) {
+        return core::Result<ImportResult>::failure(inserted.error().with_context("bulk OBJ topology admission"));
     }
     result.report.vertices = result.mesh.vertex_count();
     result.report.faces = result.mesh.face_count();

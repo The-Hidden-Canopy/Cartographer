@@ -28,7 +28,7 @@ with its external prerequisites, the optional extension is:
 
 ```text
 carto_application       (headless authoring composition)
-carto_ui                 (headless VANTA-family presentation/controller)
+carto_ui                 (headless public presentation/controller)
 carto_vulkan             (optional Vulkan runtime probe/backend seam)
 cartographer_desktop     (optional application + Vulkan + Dear ImGui shell)
 ```

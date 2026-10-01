@@ -46,7 +46,7 @@ from claims about broad GPU or desktop compatibility.
 - OS-level tear-out and full docking/tab-stack behavior;
 - DPI, resize, clean-machine packaging, or cross-device compatibility;
 - broad Vulkan/GPU support beyond the local launch environment;
-- implementation of deferred edge authoring, AI planning, or other future
+- implementation of deferred edge authoring, model-backed/autonomous AI, or other future
   workspace capabilities.
 
 The native shell is therefore launch-proven locally, not generally promoted as

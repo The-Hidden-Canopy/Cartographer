@@ -176,13 +176,58 @@ core::Result<void> EditableMesh::apply_patch(const MeshPatch& patch) {
         previous_positions.push_back(vertices_.at(change.id).position);
         vertices_.at(change.id).position = change.after;
     }
-    if (auto result = validate(); !result) {
+    if (auto result = validate_patch_geometry(patch); !result) {
         for (std::size_t index = 0U; index < patch.vertex_changes.size(); ++index) {
             vertices_.at(patch.vertex_changes[index].id).position = previous_positions[index];
         }
         return result;
     }
     bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> EditableMesh::validate_patch_geometry(const MeshPatch& patch) const {
+    // A mesh patch changes positions only. All topology mutation paths rebuild and validate
+    // topology before publishing, so rechecking maps and identity records here would duplicate
+    // the dominant cost without expanding the invariant boundary. Use the maintained incidence
+    // index to visit only faces whose geometry can be invalidated by this patch.
+    std::set<FaceId> affected_faces;
+    for (const auto& change : patch.vertex_changes) {
+        const auto incident = vertex_faces_.find(change.id);
+        if (incident == vertex_faces_.end()) {
+            continue;
+        }
+        affected_faces.insert(incident->second.begin(), incident->second.end());
+    }
+
+    for (const FaceId face_id : affected_faces) {
+        const auto face_iterator = faces_.find(face_id);
+        if (face_iterator == faces_.end()) {
+            return core::Result<void>::failure(
+                validation("vertex-to-face incidence references a missing face"));
+        }
+        const auto& face = face_iterator->second;
+        if (!face_id || face.id != face_id || face.vertices.size() < 3U) {
+            return core::Result<void>::failure(validation("mesh contains an invalid face record"));
+        }
+
+        std::set<VertexId> unique_vertices;
+        for (const VertexId vertex : face.vertices) {
+            if (!vertex || !vertices_.contains(vertex) || !unique_vertices.insert(vertex).second) {
+                return core::Result<void>::failure(
+                    validation("mesh face has a dangling or duplicate vertex"));
+            }
+        }
+
+        const core::Vec3d first_position = vertices_.at(face.vertices.front()).position;
+        for (std::size_t index = 1U; index + 1U < face.vertices.size(); ++index) {
+            const core::Vec3d second_position = vertices_.at(face.vertices[index]).position;
+            const core::Vec3d third_position = vertices_.at(face.vertices[index + 1U]).position;
+            if (triangle_area_squared(first_position, second_position, third_position) <= 1e-24) {
+                return core::Result<void>::failure(validation("mesh face contains a zero-area triangle"));
+            }
+        }
+    }
     return core::Result<void>::success();
 }
 
@@ -212,42 +257,62 @@ core::Result<void> EditableMesh::extrude_face(FaceId id, double distance) {
         return core::Result<void>::failure(validation("cannot extrude a zero-area face"));
     }
 
+    const std::uint64_t new_vertex_count = static_cast<std::uint64_t>(original.vertices.size());
+    const std::uint64_t new_face_count = new_vertex_count + 1U;
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    if (next_vertex_id_ > maximum - new_vertex_count) {
+        return core::Result<void>::failure(
+            Diagnostic(ErrorCode::invalid_state, "mesh vertex id space is exhausted"));
+    }
+    if (next_face_id_ > maximum - new_face_count) {
+        return core::Result<void>::failure(
+            Diagnostic(ErrorCode::invalid_state, "mesh face id space is exhausted"));
+    }
+
+    std::vector<core::Vec3d> extruded_positions;
+    extruded_positions.reserve(original.vertices.size());
+    for (const VertexId vertex : original.vertices) {
+        const core::Vec3d position = vertices_.at(vertex).position + normal * distance;
+        if (!position.finite()) {
+            return core::Result<void>::failure(
+                invalid("extruded vertex position must be finite"));
+        }
+        extruded_positions.push_back(position);
+    }
+
     const EditableMesh before = *this;
     faces_.erase(face_iterator);
 
     std::vector<VertexId> extruded_vertices;
     extruded_vertices.reserve(original.vertices.size());
-    for (const VertexId vertex : original.vertices) {
-        auto added = add_vertex(vertices_.at(vertex).position + normal * distance);
-        if (!added) {
-            *this = before;
-            return core::Result<void>::failure(added.error().with_context("extruded vertex"));
-        }
-        extruded_vertices.push_back(added.value());
+    for (const core::Vec3d position : extruded_positions) {
+        const VertexId vertex{next_vertex_id_++};
+        vertices_.emplace(vertex, Vertex{vertex, position});
+        extruded_vertices.push_back(vertex);
     }
 
     for (std::size_t index = 0U; index < original.vertices.size(); ++index) {
         const std::size_t next = (index + 1U) % original.vertices.size();
-        auto side = add_face({
-            original.vertices[index],
-            original.vertices[next],
-            extruded_vertices[next],
-            extruded_vertices[index],
+        const FaceId face{next_face_id_++};
+        faces_.emplace(face, Face{
+            face,
+            {original.vertices[index], original.vertices[next],
+             extruded_vertices[next], extruded_vertices[index]},
         });
-        if (!side) {
-            *this = before;
-            return core::Result<void>::failure(side.error().with_context("extruded side face"));
-        }
     }
-    auto cap = add_face(extruded_vertices);
-    if (!cap) {
+
+    const FaceId cap{next_face_id_++};
+    faces_.emplace(cap, Face{cap, extruded_vertices});
+
+    if (auto result = rebuild_topology(); !result) {
         *this = before;
-        return core::Result<void>::failure(cap.error().with_context("extruded cap face"));
+        return result;
     }
     if (auto result = validate(); !result) {
         *this = before;
         return result;
     }
+    bump_revision();
     return core::Result<void>::success();
 }
 
@@ -270,13 +335,20 @@ core::Result<TopologyEditReceipt> EditableMesh::delete_face(
 
     std::vector<VertexId> removed_vertices;
     if (remove_orphaned_vertices) {
-        std::set<VertexId> used_vertices;
-        for (const auto& [face_id, face] : faces_) {
-            static_cast<void>(face_id);
-            used_vertices.insert(face.vertices.begin(), face.vertices.end());
-        }
         for (const VertexId vertex : deleted.vertices) {
-            if (!used_vertices.contains(vertex)) {
+            const auto incident = vertex_faces_.find(vertex);
+            const bool used_by_remaining_face = incident == vertex_faces_.end()
+                ? std::any_of(
+                    faces_.begin(), faces_.end(),
+                    [vertex](const auto& entry) {
+                        const auto& face = entry.second;
+                        return std::find(face.vertices.begin(), face.vertices.end(), vertex) !=
+                            face.vertices.end();
+                    })
+                : std::any_of(
+                    incident->second.begin(), incident->second.end(),
+                    [this](const FaceId face_id) { return faces_.contains(face_id); });
+            if (!used_by_remaining_face) {
                 vertices_.erase(vertex);
                 removed_vertices.push_back(vertex);
             }
@@ -312,9 +384,6 @@ core::Result<TopologyEditReceipt> EditableMesh::split_edge(EdgeId id, double fac
         return core::Result<TopologyEditReceipt>::failure(invalid(
             "edge split factor must be finite and strictly between zero and one"));
     }
-    if (auto result = validate(); !result) {
-        return core::Result<TopologyEditReceipt>::failure(result.error());
-    }
     const auto edge_iterator = edges_.find(id);
     if (edge_iterator == edges_.end()) {
         return core::Result<TopologyEditReceipt>::failure(
@@ -326,7 +395,6 @@ core::Result<TopologyEditReceipt> EditableMesh::split_edge(EdgeId id, double fac
     }
 
     const EditableMesh before = *this;
-    const TopologySnapshot before_topology = topology_snapshot();
     const core::Revision revision_before = revision_;
     const EdgeRecord edge = edge_iterator->second;
     const auto first = vertices_.find(edge.first);
@@ -341,9 +409,52 @@ core::Result<TopologyEditReceipt> EditableMesh::split_edge(EdgeId id, double fac
         created_vertex,
         Vertex{created_vertex, first->second.position * (1.0 - factor) +
             second->second.position * factor});
+
+    // The edge record is already the authoritative narrow-phase index for this
+    // edit. Avoid scanning unrelated faces in large authored meshes. Keep the
+    // stale-record checks here so a corrupted index fails closed and still
+    // rolls back through the existing transaction snapshot.
+    std::vector<FaceId> incident_face_ids;
+    incident_face_ids.reserve(2U);
+    const auto collect_incident_face = [&](HalfEdgeId half_edge_id) -> core::Result<void> {
+        const auto half_edge_iterator = half_edges_.find(half_edge_id);
+        if (half_edge_iterator == half_edges_.end() || half_edge_iterator->second.edge != id) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::stale_data, "mesh edge references a missing or mismatched half-edge"));
+        }
+        const FaceId face_id = half_edge_iterator->second.face;
+        if (!faces_.contains(face_id)) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::stale_data, "mesh edge references a missing incident face"));
+        }
+        if (std::find(incident_face_ids.begin(), incident_face_ids.end(), face_id) !=
+            incident_face_ids.end()) {
+            return core::Result<void>::failure(validation(
+                "mesh edge occurs more than once in one face"));
+        }
+        incident_face_ids.push_back(face_id);
+        return core::Result<void>::success();
+    };
+    if (auto result = collect_incident_face(edge.first_half_edge); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    if (edge.second_half_edge.has_value()) {
+        if (auto result = collect_incident_face(*edge.second_half_edge); !result) {
+            *this = before;
+            return core::Result<TopologyEditReceipt>::failure(result.error());
+        }
+    }
+
     std::size_t incident_faces = 0U;
-    for (auto& [face_id, face] : faces_) {
-        static_cast<void>(face_id);
+    for (const FaceId face_id : incident_face_ids) {
+        auto face_iterator = faces_.find(face_id);
+        if (face_iterator == faces_.end()) {
+            *this = before;
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::stale_data, "mesh edge incident face disappeared during split"));
+        }
+        auto& face = face_iterator->second;
         std::vector<VertexId> split_vertices;
         split_vertices.reserve(face.vertices.size() + 1U);
         bool split = false;
@@ -396,20 +507,13 @@ core::Result<TopologyEditReceipt> EditableMesh::split_edge(EdgeId id, double fac
         *this = before;
         return core::Result<TopologyEditReceipt>::failure(result.error());
     }
-    const TopologySnapshot after_topology = topology_snapshot();
     bump_revision();
 
-    std::set<EdgeId> before_edges;
-    for (const auto& edge_record : before_topology.edges) before_edges.insert(edge_record.id);
-    std::set<EdgeId> after_edges;
-    for (const auto& edge_record : after_topology.edges) after_edges.insert(edge_record.id);
     std::vector<EdgeId> created_edges;
-    std::vector<EdgeId> removed_edges;
-    for (const EdgeId edge_id : after_edges) {
-        if (!before_edges.contains(edge_id)) created_edges.push_back(edge_id);
-    }
-    for (const EdgeId edge_id : before_edges) {
-        if (!after_edges.contains(edge_id)) removed_edges.push_back(edge_id);
+    for (const auto& [edge_id, edge_record] : edges_) {
+        if (edge_record.first == created_vertex || edge_record.second == created_vertex) {
+            created_edges.push_back(edge_id);
+        }
     }
     return core::Result<TopologyEditReceipt>::success(TopologyEditReceipt{
         revision_before,
@@ -418,7 +522,7 @@ core::Result<TopologyEditReceipt> EditableMesh::split_edge(EdgeId id, double fac
         std::move(created_edges),
         {},
         {},
-        std::move(removed_edges),
+        {id},
         {},
     });
 }
@@ -430,9 +534,6 @@ core::Result<TopologyEditReceipt> EditableMesh::inset_face(FaceId id, double dis
     if (!std::isfinite(distance) || distance <= 0.0) {
         return core::Result<TopologyEditReceipt>::failure(
             invalid("face inset distance must be finite and strictly positive"));
-    }
-    if (auto result = validate(); !result) {
-        return core::Result<TopologyEditReceipt>::failure(result.error());
     }
     const auto face_iterator = faces_.find(id);
     if (face_iterator == faces_.end()) {
@@ -566,7 +667,6 @@ core::Result<TopologyEditReceipt> EditableMesh::inset_face(FaceId id, double dis
     }
 
     const EditableMesh before = *this;
-    const TopologySnapshot before_topology = topology_snapshot();
     const core::Revision revision_before = revision_;
     faces_.erase(face_iterator);
 
@@ -602,20 +702,15 @@ core::Result<TopologyEditReceipt> EditableMesh::inset_face(FaceId id, double dis
         *this = before;
         return core::Result<TopologyEditReceipt>::failure(result.error());
     }
-    const TopologySnapshot after_topology = topology_snapshot();
     bump_revision();
 
-    std::set<EdgeId> before_edges;
-    for (const auto& edge : before_topology.edges) before_edges.insert(edge.id);
-    std::set<EdgeId> after_edges;
-    for (const auto& edge : after_topology.edges) after_edges.insert(edge.id);
     std::vector<EdgeId> created_edges;
-    std::vector<EdgeId> removed_edges;
-    for (const EdgeId edge : after_edges) {
-        if (!before_edges.contains(edge)) created_edges.push_back(edge);
-    }
-    for (const EdgeId edge : before_edges) {
-        if (!after_edges.contains(edge)) removed_edges.push_back(edge);
+    const std::set<VertexId> inset_vertex_set(inset_vertices.begin(), inset_vertices.end());
+    for (const auto& [edge_id, edge_record] : edges_) {
+        if (inset_vertex_set.contains(edge_record.first) ||
+            inset_vertex_set.contains(edge_record.second)) {
+            created_edges.push_back(edge_id);
+        }
     }
     return core::Result<TopologyEditReceipt>::success(TopologyEditReceipt{
         revision_before,
@@ -624,7 +719,7 @@ core::Result<TopologyEditReceipt> EditableMesh::inset_face(FaceId id, double dis
         std::move(created_edges),
         std::move(created_faces),
         {},
-        std::move(removed_edges),
+        {},
         {id},
     });
 }
@@ -642,6 +737,7 @@ core::Result<void> EditableMesh::restore_from(const EditableMesh& source) {
     half_edges_ = source.half_edges_;
     corners_ = source.corners_;
     face_boundaries_ = source.face_boundaries_;
+    vertex_faces_ = source.vertex_faces_;
     next_vertex_id_ = source.next_vertex_id_;
     next_face_id_ = source.next_face_id_;
     next_edge_id_ = source.next_edge_id_;
@@ -729,6 +825,81 @@ core::Result<void> EditableMesh::insert_face(Face face) {
     return core::Result<void>::success();
 }
 
+core::Result<void> EditableMesh::insert_bulk(
+    std::vector<Vertex> vertices,
+    std::vector<Face> faces) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+
+    std::map<VertexId, Vertex> new_vertices;
+    std::uint64_t next_vertex_id = 1U;
+    for (Vertex& vertex : vertices) {
+        if (!vertex.id || !vertex.position.finite()) {
+            return core::Result<void>::failure(
+                invalid("bulk mesh vertex requires a non-zero id and finite position"));
+        }
+        if (!new_vertices.emplace(vertex.id, std::move(vertex)).second) {
+            return core::Result<void>::failure(
+                Diagnostic(ErrorCode::invalid_state, "bulk mesh contains a duplicate vertex id"));
+        }
+        if (new_vertices.rbegin()->first.value < std::numeric_limits<std::uint64_t>::max()) {
+            next_vertex_id = std::max(next_vertex_id, new_vertices.rbegin()->first.value + 1U);
+        }
+    }
+
+    std::map<FaceId, Face> new_faces;
+    std::uint64_t next_face_id = 1U;
+    for (Face& face : faces) {
+        if (!face.id || face.vertices.size() < 3U) {
+            return core::Result<void>::failure(
+                invalid("bulk mesh face requires a non-zero id and at least three vertices"));
+        }
+        std::set<VertexId> unique_vertices;
+        for (const VertexId vertex : face.vertices) {
+            if (!vertex || !new_vertices.contains(vertex)) {
+                return core::Result<void>::failure(
+                    Diagnostic(ErrorCode::not_found, "bulk mesh face references a missing vertex"));
+            }
+            if (!unique_vertices.insert(vertex).second) {
+                return core::Result<void>::failure(
+                    validation("bulk mesh face contains a duplicate vertex"));
+            }
+        }
+        if (!new_faces.emplace(face.id, std::move(face)).second) {
+            return core::Result<void>::failure(
+                Diagnostic(ErrorCode::invalid_state, "bulk mesh contains a duplicate face id"));
+        }
+        if (new_faces.rbegin()->first.value < std::numeric_limits<std::uint64_t>::max()) {
+            next_face_id = std::max(next_face_id, new_faces.rbegin()->first.value + 1U);
+        }
+    }
+
+    const EditableMesh before = *this;
+    vertices_ = std::move(new_vertices);
+    faces_ = std::move(new_faces);
+    edges_.clear();
+    half_edges_.clear();
+    corners_.clear();
+    face_boundaries_.clear();
+    vertex_faces_.clear();
+    next_vertex_id_ = next_vertex_id;
+    next_face_id_ = next_face_id;
+    next_edge_id_ = 1U;
+    next_half_edge_id_ = 1U;
+    next_corner_id_ = 1U;
+    if (auto result = rebuild_topology(); !result) {
+        *this = before;
+        return result;
+    }
+    if (auto result = validate(); !result) {
+        *this = before;
+        return result;
+    }
+    bump_revision();
+    return core::Result<void>::success();
+}
+
 core::Result<void> EditableMesh::rebuild_topology() {
     std::map<EdgeKey, EdgeId> previous_edges;
     for (const auto& [id, edge] : edges_) {
@@ -748,6 +919,7 @@ core::Result<void> EditableMesh::rebuild_topology() {
     std::map<HalfEdgeId, HalfEdgeRecord> new_half_edges;
     std::map<CornerId, CornerRecord> new_corners;
     std::map<FaceId, HalfEdgeId> new_face_boundaries;
+    std::map<VertexId, std::vector<FaceId>> new_vertex_faces;
     std::map<std::pair<VertexId, VertexId>, HalfEdgeId> directed;
     std::map<EdgeKey, EdgeId> allocated_edges;
     std::uint64_t next_edge_id = next_edge_id_;
@@ -799,6 +971,9 @@ core::Result<void> EditableMesh::rebuild_topology() {
     for (const auto& [face_id, face] : faces_) {
         if (!face_id || face.id != face_id || face.vertices.size() < 3U) {
             return core::Result<void>::failure(validation("mesh contains an invalid face record"));
+        }
+        for (const VertexId vertex : face.vertices) {
+            new_vertex_faces[vertex].push_back(face_id);
         }
         std::vector<HalfEdgeId> boundary;
         boundary.reserve(face.vertices.size());
@@ -870,10 +1045,17 @@ core::Result<void> EditableMesh::rebuild_topology() {
         static_cast<void>(id);
     }
 
+    for (auto& [vertex, faces] : new_vertex_faces) {
+        static_cast<void>(vertex);
+        std::sort(faces.begin(), faces.end());
+        faces.erase(std::unique(faces.begin(), faces.end()), faces.end());
+    }
+
     edges_ = std::move(new_edges);
     half_edges_ = std::move(new_half_edges);
     corners_ = std::move(new_corners);
     face_boundaries_ = std::move(new_face_boundaries);
+    vertex_faces_ = std::move(new_vertex_faces);
     next_edge_id_ = next_edge_id;
     next_half_edge_id_ = next_half_edge_id;
     next_corner_id_ = next_corner_id;
@@ -985,6 +1167,41 @@ std::vector<Face> EditableMesh::faces_sorted() const {
     return result;
 }
 
+core::Result<void> EditableMesh::validate_vertex_face_index() const {
+    for (const auto& [vertex_id, face_ids] : vertex_faces_) {
+        if (!vertex_id || !vertices_.contains(vertex_id)) {
+            return core::Result<void>::failure(
+                validation("vertex-to-face incidence references a missing vertex"));
+        }
+        if (!std::is_sorted(face_ids.begin(), face_ids.end()) ||
+            std::adjacent_find(face_ids.begin(), face_ids.end()) != face_ids.end()) {
+            return core::Result<void>::failure(
+                validation("vertex-to-face incidence is not sorted and unique"));
+        }
+        for (const FaceId face_id : face_ids) {
+            const auto face = faces_.find(face_id);
+            if (face == faces_.end() ||
+                std::find(face->second.vertices.begin(), face->second.vertices.end(), vertex_id) ==
+                    face->second.vertices.end()) {
+                return core::Result<void>::failure(
+                    validation("vertex-to-face incidence disagrees with authored faces"));
+            }
+        }
+    }
+
+    for (const auto& [face_id, face] : faces_) {
+        for (const VertexId vertex_id : face.vertices) {
+            const auto incident = vertex_faces_.find(vertex_id);
+            if (incident == vertex_faces_.end() ||
+                !std::binary_search(incident->second.begin(), incident->second.end(), face_id)) {
+                return core::Result<void>::failure(
+                    validation("authored face is missing from vertex-to-face incidence"));
+            }
+        }
+    }
+    return core::Result<void>::success();
+}
+
 core::Result<void> EditableMesh::validate() const {
     std::map<EdgeKey, std::size_t> edge_use;
     std::map<std::pair<VertexId, VertexId>, FaceId> directed_edges;
@@ -1030,6 +1247,9 @@ core::Result<void> EditableMesh::validate() const {
         if (!id || vertex.id != id || !vertex.position.finite()) {
             return core::Result<void>::failure(validation("mesh contains an invalid vertex record"));
         }
+    }
+    if (auto result = validate_vertex_face_index(); !result) {
+        return result;
     }
     return validate_topology_state();
 }

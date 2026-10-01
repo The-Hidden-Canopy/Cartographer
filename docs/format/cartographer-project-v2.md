@@ -24,7 +24,7 @@ The authoring envelope is intentionally small and explicit:
 - `cartographer.authoring` identifies the owning document contract;
 - `meters` is the unit contract for positions and translations;
 - `right_handed_y_up` is the coordinate contract used by the native authoring
-  and private VANTA adapter paths.
+  and private consumer adapter paths.
 
 All geometry and transforms remain double precision in the `.carto` source.
 Derived formats may narrow or triangulate only at their own validated adapter
@@ -37,6 +37,6 @@ versions, missing or mismatched v2 envelope fields, duplicate records,
 trailing data, malformed topology, non-finite values, path traversal, and
 resource-limit violations fail closed.
 
-The private VANTA adapter consumes this contract on the VANTA side. It does
-not make Cartographer link against VANTA or move VANTA runtime state into the
+Private consumers may adapt this contract on their side. That does not make
+Cartographer link against a consumer runtime or move runtime state into the
 authoring document.

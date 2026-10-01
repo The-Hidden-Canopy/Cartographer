@@ -1,4 +1,4 @@
-#include <carto/io/vanta_export.hpp>
+#include <carto/io/gltf_export.hpp>
 
 #include <carto/project/project.hpp>
 
@@ -44,8 +44,8 @@ constexpr std::uint32_t kGlTriangles = 4U;
 constexpr std::size_t kMaxExportBufferBytes = 256ULL * 1024ULL * 1024ULL;
 constexpr std::size_t kMaxExportJsonBytes = 512ULL * 1024ULL * 1024ULL;
 
-std::mutex g_vanta_export_mutex;
-std::atomic<std::uint64_t> g_vanta_export_temp_counter{0U};
+std::mutex g_gltf_export_mutex;
+std::atomic<std::uint64_t> g_gltf_export_temp_counter{0U};
 
 Diagnostic invalid(std::string message) {
     return Diagnostic(ErrorCode::invalid_argument, std::move(message));
@@ -62,7 +62,7 @@ Diagnostic io_error(std::string message) {
 std::filesystem::path temporary_path(const std::filesystem::path& target) {
     const auto ticks = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto thread = std::hash<std::thread::id>{}(std::this_thread::get_id());
-    const auto counter = g_vanta_export_temp_counter.fetch_add(1U, std::memory_order_relaxed);
+    const auto counter = g_gltf_export_temp_counter.fetch_add(1U, std::memory_order_relaxed);
     return target.parent_path() / (target.filename().string() + ".carto.tmp-" +
         std::to_string(static_cast<unsigned long long>(ticks)) + "-" +
         std::to_string(static_cast<unsigned long long>(thread)) + "-" +
@@ -192,7 +192,7 @@ core::Result<float> finite_float(double value, std::string_view field) {
     const float narrowed = static_cast<float>(value);
     if (!std::isfinite(narrowed)) {
         return core::Result<float>::failure(validation(
-            "VANTA glTF export cannot represent " + std::string(field) + " as float32"));
+            "glTF export cannot represent " + std::string(field) + " as float32"));
     }
     return core::Result<float>::success(narrowed);
 }
@@ -244,13 +244,13 @@ void append_float_array(
 
 } // namespace
 
-core::Result<VantaExportReport> export_vanta_gltf(
+core::Result<GltfExportReport> export_gltf(
     const project::ProjectDocument& document,
     const std::filesystem::path& path) {
-    std::lock_guard lock(g_vanta_export_mutex);
+    std::lock_guard lock(g_gltf_export_mutex);
     if (path.empty() || path.filename().empty()) {
-        return core::Result<VantaExportReport>::failure(
-            invalid("VANTA glTF export path must name a file"));
+        return core::Result<GltfExportReport>::failure(
+            invalid("glTF export path must name a file"));
     }
     const auto parent = path.parent_path();
     if (!parent.empty()) {
@@ -258,17 +258,17 @@ core::Result<VantaExportReport> export_vanta_gltf(
         const bool parent_exists = std::filesystem::exists(parent, parent_error);
         if (parent_error || !parent_exists ||
             !std::filesystem::is_directory(parent, parent_error) || parent_error) {
-            return core::Result<VantaExportReport>::failure(
-                io_error("VANTA glTF export parent directory is unavailable"));
+            return core::Result<GltfExportReport>::failure(
+                io_error("glTF export parent directory is unavailable"));
         }
     }
     if (auto valid = document.validate(); !valid) {
-        return core::Result<VantaExportReport>::failure(
-            valid.error().with_context("VANTA glTF export source project"));
+        return core::Result<GltfExportReport>::failure(
+            valid.error().with_context("glTF export source project"));
     }
     if (document.meshes().empty()) {
-        return core::Result<VantaExportReport>::failure(
-            validation("VANTA glTF export requires at least one mesh asset"));
+        return core::Result<GltfExportReport>::failure(
+            validation("glTF export requires at least one mesh asset"));
     }
 
     std::vector<std::uint8_t> buffer;
@@ -276,27 +276,27 @@ core::Result<VantaExportReport> export_vanta_gltf(
     std::vector<Accessor> accessors;
     std::vector<MeshRecord> meshes;
     meshes.reserve(document.meshes().size());
-    VantaExportReport report;
+    GltfExportReport report;
     report.path = path;
     report.source_revision = document.revision();
     report.objects = document.scene().size();
     report.meshes = document.meshes().size();
     report.warnings = {
         "Cartographer authoring currently has no UV, tangent, or material channels; "
-        "the VANTA consumer must use its default material path",
+        "consumers must use their default material path",
         "float64 authoring positions and normals are narrowed to glTF float32",
     };
 
     for (const auto& [mesh_id, mesh] : document.meshes()) {
         auto compiled = mesh.compile();
         if (!compiled) {
-            return core::Result<VantaExportReport>::failure(
+            return core::Result<GltfExportReport>::failure(
                 compiled.error().with_context("mesh asset " + std::to_string(mesh_id)));
         }
         const auto& source = compiled.value();
         if (source.positions.empty() || source.indices.empty() || source.indices.size() % 3U != 0U) {
-            return core::Result<VantaExportReport>::failure(
-                validation("VANTA glTF export requires non-empty triangle meshes"));
+            return core::Result<GltfExportReport>::failure(
+                validation("glTF export requires non-empty triangle meshes"));
         }
 
         std::vector<std::array<float, 3>> positions;
@@ -315,7 +315,7 @@ core::Result<VantaExportReport> export_vanta_gltf(
         };
         for (const auto position : source.positions) {
             const auto narrowed = finite_vec3(position, "mesh position");
-            if (!narrowed) return core::Result<VantaExportReport>::failure(narrowed.error());
+            if (!narrowed) return core::Result<GltfExportReport>::failure(narrowed.error());
             positions.push_back(narrowed.value());
             for (std::size_t axis = 0U; axis < 3U; ++axis) {
                 minimum[axis] = std::min(minimum[axis], narrowed.value()[axis]);
@@ -324,14 +324,14 @@ core::Result<VantaExportReport> export_vanta_gltf(
         }
         for (const auto normal : source.normals) {
             const auto narrowed = finite_vec3(normal, "mesh normal");
-            if (!narrowed) return core::Result<VantaExportReport>::failure(narrowed.error());
+            if (!narrowed) return core::Result<GltfExportReport>::failure(narrowed.error());
             const float magnitude = std::sqrt(
                 narrowed.value()[0] * narrowed.value()[0] +
                 narrowed.value()[1] * narrowed.value()[1] +
                 narrowed.value()[2] * narrowed.value()[2]);
             if (!(magnitude > 1.0e-6F) || !std::isfinite(magnitude)) {
-                return core::Result<VantaExportReport>::failure(
-                    validation("VANTA glTF export produced a zero-length mesh normal"));
+                return core::Result<GltfExportReport>::failure(
+                    validation("glTF export produced a zero-length mesh normal"));
             }
             normals.push_back({
                 narrowed.value()[0] / magnitude,
@@ -347,8 +347,8 @@ core::Result<VantaExportReport> export_vanta_gltf(
             indices_16.reserve(source.indices.size());
             for (const std::uint32_t index : source.indices) {
                 if (index > std::numeric_limits<std::uint16_t>::max()) {
-                    return core::Result<VantaExportReport>::failure(
-                        validation("VANTA glTF 16-bit index selection was unsafe"));
+                    return core::Result<GltfExportReport>::failure(
+                        validation("glTF 16-bit index selection was unsafe"));
                 }
                 indices_16.push_back(static_cast<std::uint16_t>(index));
             }
@@ -396,8 +396,8 @@ core::Result<VantaExportReport> export_vanta_gltf(
         const std::size_t index_accessor = accessors.size() - 1U;
 
         if (buffer.size() > kMaxExportBufferBytes) {
-            return core::Result<VantaExportReport>::failure(
-                validation("VANTA glTF export exceeds the 256 MiB derived-buffer limit"));
+            return core::Result<GltfExportReport>::failure(
+                validation("glTF export exceeds the 256 MiB derived-buffer limit"));
         }
         meshes.push_back({
             "cartographer-mesh-" + std::to_string(mesh_id),
@@ -423,7 +423,7 @@ core::Result<VantaExportReport> export_vanta_gltf(
                 [&object](const auto& entry) { return entry.first == *object.mesh_asset; })
             : document.meshes().end();
         if (object.mesh_asset.has_value() && mesh == document.meshes().end()) {
-            return core::Result<VantaExportReport>::failure(
+            return core::Result<GltfExportReport>::failure(
                 validation("scene object references a mesh missing from the export"));
         }
         std::optional<std::size_t> mesh_index;
@@ -447,7 +447,7 @@ core::Result<VantaExportReport> export_vanta_gltf(
         if (objects[index].parent.has_value()) {
             const auto node_parent = node_indices.find(*objects[index].parent);
             if (node_parent == node_indices.end()) {
-                return core::Result<VantaExportReport>::failure(
+                return core::Result<GltfExportReport>::failure(
                     validation("scene object parent is missing from the export"));
             }
             nodes[index].parent = node_parent->second;
@@ -474,7 +474,7 @@ core::Result<VantaExportReport> export_vanta_gltf(
         if (node.mesh.has_value()) json << ",\"mesh\":" << *node.mesh;
         json << ',';
         if (auto transform = append_transform_json(json, node.transform); !transform) {
-            return core::Result<VantaExportReport>::failure(transform.error());
+            return core::Result<GltfExportReport>::failure(transform.error());
         }
         json << ",\"extras\":{\"cartographer_object_id\":" << node.id.value
              << ",\"visible\":" << (node.visible ? "true" : "false")
@@ -526,23 +526,23 @@ core::Result<VantaExportReport> export_vanta_gltf(
     json << "  ],\n  \"buffers\":[{\"byteLength\":" << buffer.size()
          << ",\"uri\":\"data:application/octet-stream;base64,"
          << base64(buffer) << "\"}],\n"
-         << "  \"extras\":{\"cartographer\":{\"profile\":\"cartographer-vanta-gltf\","
-         << "\"profile_version\":" << VantaExportReport::kProfileVersion
+         << "  \"extras\":{\"cartographer\":{\"profile\":\"cartographer-gltf\","
+         << "\"profile_version\":" << GltfExportReport::kProfileVersion
          << ",\"project_schema\":" << document.schema_version()
          << ",\"project_revision\":" << document.revision().value()
          << ",\"project_name\":\"" << json_escape(document.name()) << "\"}}\n"
          << "}\n";
     const std::string text = json.str();
     if (text.size() > kMaxExportJsonBytes) {
-        return core::Result<VantaExportReport>::failure(
-            validation("VANTA glTF export exceeds the 512 MiB JSON limit"));
+        return core::Result<GltfExportReport>::failure(
+            validation("glTF export exceeds the 512 MiB JSON limit"));
     }
 
     const auto temporary = temporary_path(path);
     std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
     if (!output) {
-        return core::Result<VantaExportReport>::failure(
-            io_error("unable to open VANTA glTF temporary output"));
+        return core::Result<GltfExportReport>::failure(
+            io_error("unable to open glTF temporary output"));
     }
     output.write(text.data(), static_cast<std::streamsize>(text.size()));
     output.flush();
@@ -550,23 +550,23 @@ core::Result<VantaExportReport> export_vanta_gltf(
         output.close();
         std::error_code ignored;
         std::filesystem::remove(temporary, ignored);
-        return core::Result<VantaExportReport>::failure(
-            io_error("failed while writing VANTA glTF temporary output"));
+        return core::Result<GltfExportReport>::failure(
+            io_error("failed while writing glTF temporary output"));
     }
     output.close();
     if (!output) {
         std::error_code ignored;
         std::filesystem::remove(temporary, ignored);
-        return core::Result<VantaExportReport>::failure(
-            io_error("failed while closing VANTA glTF temporary output"));
+        return core::Result<GltfExportReport>::failure(
+            io_error("failed while closing glTF temporary output"));
     }
     auto replacement = atomic_replace(temporary, path);
     if (!replacement) {
         std::error_code ignored;
         std::filesystem::remove(temporary, ignored);
-        return core::Result<VantaExportReport>::failure(replacement.error());
+        return core::Result<GltfExportReport>::failure(replacement.error());
     }
-    return core::Result<VantaExportReport>::success(std::move(report));
+    return core::Result<GltfExportReport>::success(std::move(report));
 }
 
 } // namespace carto::io

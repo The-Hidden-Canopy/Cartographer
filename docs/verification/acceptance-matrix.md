@@ -29,11 +29,11 @@ evidence only for the named behavior; it does not promote deferred features.
 | failed front-end action | application tests | invalid selection/tool actions record a problem and do not add history |
 | UI authority boundary | UI tests | `UiController` routes authoring through `ApplicationSession`; successful project receipts are projected into a bounded operation rail and failed actions do not create UI operations |
 | UI shell invariants | UI tests | theme/density/operator/workspace state is bounded; the viewport cannot be hidden; application workspace state remains validated |
-| persistence truth and AI admission boundary | UI tests | fresh/new projects report `Not saved`; successful save reports `Saved`; failed save does not claim `Saved`; the separate AI proposal API is rejected without revision/history mutation and a normal human action still succeeds |
+| persistence truth and AI admission boundary | UI/AI tests | fresh/new projects report `Not saved`; successful save reports `Saved`; failed save does not claim `Saved`; raw AI application actions are rejected while typed native proposals remain revision-bound until policy-authorized safe auto-apply or explicit preview/apply, with stale and wrong-scope paths failing without mutation |
 | edge selection boundary | editor/application/UI tests | stable EdgeId values survive compiled identity mapping; replace/toggle selection is mesh/revision-bound, cross-object/stale/missing edges fail closed, and selection changes do not change project revision |
 | single-edge topology authoring | topology/application tests | a finite interior factor splits one selected edge atomically, repairs derived topology, reports affected/parameter metadata, clears the removed selection, and survives undo/redo; endpoint, NaN, wrong-mode, and multi-edge inputs fail closed |
 | convex-face inset | topology/application tests | a finite positive distance replaces one planar convex face with a validated ring and inner face, reports affected/distance metadata, clears the removed selection, and survives undo/redo; zero, NaN, collapsing, non-planar, and concave inputs fail closed |
-| unsupported UI capability | UI tests | concave inset, broader edge traversal/multi-selection authoring, and AI-First tooling remain explicit as deferred; no unsupported path creates a mutation |
+| unsupported UI capability | UI/AI tests | concave inset, broader edge traversal/multi-selection authoring, and model-backed/autonomous AI remain explicit as deferred; unsupported paths and raw AI actions create no mutation |
 | UI preference integrity | UI tests plus native source audit | atomic local preference save/load works; malformed or oversized preferences are rejected, reset through the validated workspace path, surfaced as UI diagnostics, and native read/write failures use an explicit warning surface |
 | bounded command palette and shortcut errors | UI tests | query size is bounded; failed undo/redo/save shortcuts return diagnostics without error-path crashes |
 | failed project open preserves active state | application tests | malformed/unavailable open leaves the current project and selection context intact |
@@ -53,7 +53,7 @@ evidence only for the named behavior; it does not promote deferred features.
 | external asset traversal | asset reference test | rejected |
 | interchange boundary | OBJ export/import test | feature-loss warning retained; oversized face input fails closed |
 | clean standalone build | Debug/Release CMake + CTest | passed locally |
-| optional Vulkan/desktop prerequisites | negative CMake probes plus local native build/launch evidence | Vulkan configure stops without a discoverable SDK; desktop configure stops unless Vulkan is explicitly enabled; the current checkout also builds and launches a responsive native window against pinned prerequisites |
+| optional Vulkan/desktop prerequisites | explicit-SDK Vulkan configure/build plus headless runtime acceptance; negative CMake probes | Vulkan configure fails closed without an SDK or `glslc`; with the local SDK the Vulkan 1.1 headless test selects by physical-device UUID, accepts a caller-provided revision-bound `CompiledMesh`, uploads its vertex/index streams, creates RGBA16F/D32 targets, compiles aligned acceptance shaders, submits an indexed mesh, checks bounded readback, and separately passes an opt-in 8192x8192 run; desktop configure still requires Vulkan and pinned ImGui, while production PBR/render-graph/presentation remain separate gates |
 | typed GPU handle lifetime | render architecture tests | slot reuse advances generation and stale handles fail; type confusion is rejected at compile time |
 | render-graph hazards | render architecture tests | valid write transitions compile; read-before-write, illegal stage/format use, duplicate use, and overlapping aliases fail |
 | content-addressed blob integrity | storage/journal tests | known SHA-256, bounded storage, read verification, and tamper detection pass |
@@ -64,7 +64,8 @@ evidence only for the named behavior; it does not promote deferred features.
 | plugin protocol boundary | provider/plugin tests | sandbox-default manifest, network/path permission rejection, framed round-trip, malformed nested-object rejection, truncation, and payload-size bounds pass |
 
 Not yet covered: SQLite WAL package storage, schema migrations, power-loss fault
-injection, patch-specific delta replay, crash recovery UX, GPU/Vulkan execution
-beyond the exercised local launch, desktop input/DPI and resize behavior,
+injection, patch-specific delta replay, crash recovery UX, GPU/Vulkan production
+PBR, render-graph, submission-lifetime, and presentation execution beyond the
+headless indexed-draw/readback rung, desktop input/DPI and resize behavior,
 native UI visual acceptance, fuzz corpora, cross-platform package installation
 in a clean VM, and downstream Unreal/Unity acceptance.

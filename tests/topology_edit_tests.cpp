@@ -20,6 +20,42 @@ public:
         if (!(condition)) throw TestFailure(std::string("requirement failed: ") + #condition); \
     } while (false)
 
+void shared_vertex_position_patch_checks_all_incident_faces() {
+    carto::geometry::EditableMesh mesh;
+    const std::vector<carto::core::Vec3d> positions = {
+        {0.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        {1.0, 1.0, 0.0},
+        {0.0, 1.0, 0.0},
+        {2.0, 0.0, 0.0},
+        {2.0, 1.0, 0.0},
+    };
+    std::vector<carto::geometry::VertexId> vertices;
+    for (const auto position : positions) {
+        const auto added = mesh.add_vertex(position);
+        REQUIRE(added);
+        vertices.push_back(added.value());
+    }
+    REQUIRE(mesh.add_face({vertices[0], vertices[1], vertices[2], vertices[3]}));
+    REQUIRE(mesh.add_face({vertices[1], vertices[4], vertices[5], vertices[2]}));
+    REQUIRE(mesh.validate());
+
+    const auto before_revision = mesh.revision();
+    REQUIRE(mesh.set_vertex_position(vertices[1], {1.1, 0.1, 0.0}));
+    REQUIRE(mesh.revision() == before_revision.next());
+    REQUIRE(mesh.validate());
+
+    const auto before_rejected_revision = mesh.revision();
+    const auto before_rejected_position = mesh.find_vertex(vertices[1])->position;
+    const auto rejected = mesh.set_vertex_position(vertices[1], {0.0, 0.0, 0.0});
+    REQUIRE(!rejected);
+    REQUIRE(mesh.revision() == before_rejected_revision);
+    REQUIRE(mesh.find_vertex(vertices[1])->position.x == before_rejected_position.x);
+    REQUIRE(mesh.find_vertex(vertices[1])->position.y == before_rejected_position.y);
+    REQUIRE(mesh.find_vertex(vertices[1])->position.z == before_rejected_position.z);
+    REQUIRE(mesh.validate());
+}
+
 void face_delete_is_atomic_and_reports_removed_identity() {
     auto plane = carto::geometry::make_plane(2.0, 2.0);
     REQUIRE(plane);
@@ -52,6 +88,52 @@ void face_delete_can_preserve_orphans_without_invalid_topology() {
     REQUIRE(box.value().face_count() == 5U);
     REQUIRE(box.value().vertex_count() == 8U);
     REQUIRE(box.value().validate());
+}
+
+void face_delete_preserves_shared_vertices_when_removing_orphans() {
+    carto::geometry::EditableMesh mesh;
+    const std::vector<carto::core::Vec3d> positions = {
+        {0.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        {1.0, 1.0, 0.0},
+        {0.0, 1.0, 0.0},
+        {2.0, 0.0, 0.0},
+        {2.0, 1.0, 0.0},
+    };
+    std::vector<carto::geometry::VertexId> vertices;
+    for (const auto position : positions) {
+        const auto added = mesh.add_vertex(position);
+        REQUIRE(added);
+        vertices.push_back(added.value());
+    }
+    const auto first_face = mesh.add_face({vertices[0], vertices[1], vertices[2], vertices[3]});
+    REQUIRE(first_face);
+    REQUIRE(mesh.add_face({vertices[1], vertices[4], vertices[5], vertices[2]}));
+
+    const auto deleted = mesh.delete_face(first_face.value(), true);
+    REQUIRE(deleted);
+    REQUIRE(deleted.value().removed_vertices.size() == 2U);
+    REQUIRE(deleted.value().removed_vertices[0] == vertices[0]);
+    REQUIRE(deleted.value().removed_vertices[1] == vertices[3]);
+    REQUIRE(mesh.find_vertex(vertices[1]) != nullptr);
+    REQUIRE(mesh.find_vertex(vertices[2]) != nullptr);
+    REQUIRE(mesh.face_count() == 1U);
+    REQUIRE(mesh.vertex_count() == 4U);
+    REQUIRE(mesh.validate());
+}
+
+void face_extrude_is_atomic_and_advances_once() {
+    auto plane = carto::geometry::make_plane(2.0, 2.0);
+    REQUIRE(plane);
+    const auto face = plane.value().faces_sorted().front().id;
+    const auto before_revision = plane.value().revision();
+
+    REQUIRE(plane.value().extrude_face(face, 0.25));
+    REQUIRE(plane.value().revision() == before_revision.next());
+    REQUIRE(plane.value().vertex_count() == 8U);
+    REQUIRE(plane.value().face_count() == 5U);
+    REQUIRE(plane.value().find_face(face) == nullptr);
+    REQUIRE(plane.value().validate());
 }
 
 void edge_split_is_atomic_and_reports_topology_delta() {
@@ -368,8 +450,11 @@ void admitted_face_inset_is_undoable_and_clears_removed_selection() {
 
 int main() {
     try {
+        shared_vertex_position_patch_checks_all_incident_faces();
         face_delete_is_atomic_and_reports_removed_identity();
         face_delete_can_preserve_orphans_without_invalid_topology();
+        face_delete_preserves_shared_vertices_when_removing_orphans();
+        face_extrude_is_atomic_and_advances_once();
         edge_split_is_atomic_and_reports_topology_delta();
         edge_split_rejects_invalid_factors_without_mutation();
         admitted_edge_split_rejects_wrong_mode_and_multi_selection();

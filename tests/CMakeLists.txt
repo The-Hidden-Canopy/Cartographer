@@ -36,13 +36,41 @@ add_executable(cartographer_public_api_tests
     public_api_tests.cpp
 )
 
+if(NOT CARTO_BUILD_PRIVATE_INTEGRATIONS)
+    add_executable(cartographer_public_boundary_tests
+        public_boundary_tests.cpp
+    )
+    carto_target(cartographer_public_boundary_tests)
+    add_test(NAME cartographer_public_boundary_tests COMMAND cartographer_public_boundary_tests)
+endif()
+
 add_executable(cartographer_preview_transaction_tests
     preview_transaction_tests.cpp
+)
+
+add_executable(cartographer_ai_tests
+    ai_tests.cpp
 )
 
 add_executable(cartographer_topology_edit_tests
     topology_edit_tests.cpp
 )
+
+if(CARTO_BUILD_PRIVATE_INTEGRATIONS)
+    add_executable(cartographer_owh_model_tests
+        "${CARTO_PRIVATE_SOURCE_ROOT}/libs/owh/tests/model_tests.cpp"
+    )
+    target_link_libraries(cartographer_owh_model_tests PRIVATE carto_owh)
+    carto_target(cartographer_owh_model_tests)
+    add_test(NAME cartographer_owh_model_tests COMMAND cartographer_owh_model_tests)
+
+    add_executable(cartographer_anatomy_catalog_tests
+        "${CARTO_PRIVATE_SOURCE_ROOT}/tests/anatomy_catalog_tests.cpp"
+    )
+    target_link_libraries(cartographer_anatomy_catalog_tests PRIVATE carto_anatomy)
+    carto_target(cartographer_anatomy_catalog_tests)
+    add_test(NAME cartographer_anatomy_catalog_tests COMMAND cartographer_anatomy_catalog_tests)
+endif()
 
 target_link_libraries(cartographer_tests
     PRIVATE
@@ -70,6 +98,7 @@ add_test(NAME cartographer_application_tests COMMAND cartographer_application_te
 target_link_libraries(cartographer_render_architecture_tests
     PRIVATE
         carto_core
+        carto_assets
         carto_gpu
         carto_render
         carto_render_graph
@@ -77,6 +106,15 @@ target_link_libraries(cartographer_render_architecture_tests
 
 carto_target(cartographer_render_architecture_tests)
 add_test(NAME cartographer_render_architecture_tests COMMAND cartographer_render_architecture_tests)
+
+if(CARTO_ENABLE_VULKAN)
+    add_executable(cartographer_vulkan_runtime_tests
+        vulkan_runtime_tests.cpp
+    )
+    target_link_libraries(cartographer_vulkan_runtime_tests PRIVATE carto_vulkan)
+    carto_target(cartographer_vulkan_runtime_tests)
+    add_test(NAME cartographer_vulkan_runtime_tests COMMAND cartographer_vulkan_runtime_tests)
+endif()
 
 target_link_libraries(cartographer_storage_journal_tests
     PRIVATE
@@ -143,6 +181,16 @@ target_link_libraries(cartographer_preview_transaction_tests
 
 carto_target(cartographer_preview_transaction_tests)
 add_test(NAME cartographer_preview_transaction_tests COMMAND cartographer_preview_transaction_tests)
+
+target_link_libraries(cartographer_ai_tests
+    PRIVATE
+        carto_ai
+        carto_ui
+        carto_application
+)
+
+carto_target(cartographer_ai_tests)
+add_test(NAME cartographer_ai_tests COMMAND cartographer_ai_tests)
 
 target_link_libraries(cartographer_topology_edit_tests
     PRIVATE

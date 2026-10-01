@@ -25,10 +25,6 @@ bool is_write(Access access) {
     return access == Access::write || access == Access::read_write;
 }
 
-bool is_depth_format(gpu::Format format) {
-    return format == gpu::Format::depth24_stencil8;
-}
-
 } // namespace
 
 core::Result<void> GraphBuilder::validate_resource(const ResourceDesc& descriptor) const {
@@ -71,14 +67,14 @@ core::Result<void> GraphBuilder::validate_usage(const ResourceUsage& usage) cons
     switch (usage.stage) {
     case PipelineStage::color_output:
         if (resource->second.kind != ResourceKind::texture ||
-            is_depth_format(resource->second.format)) {
+            gpu::is_depth_format(resource->second.format)) {
             return core::Result<void>::failure(
                 validation("color-output usage requires a non-depth texture"));
         }
         break;
     case PipelineStage::depth_stencil:
         if (resource->second.kind != ResourceKind::texture ||
-            !is_depth_format(resource->second.format)) {
+            !gpu::is_depth_format(resource->second.format)) {
             return core::Result<void>::failure(
                 validation("depth-stencil usage requires a depth texture"));
         }

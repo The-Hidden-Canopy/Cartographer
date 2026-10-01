@@ -18,8 +18,8 @@ namespace carto::io {
 // The export is deliberately glTF rather than a second authoring document
 // dialect.  Cartographer remains the source of truth; this profile is a
 // bounded, derived interchange artifact for consumers that implement the
-// documented VANTA MeshAsset glTF subset.
-struct VantaExportReport {
+// supported Cartographer glTF profile.
+struct GltfExportReport {
     static constexpr std::uint32_t kProfileVersion = 1U;
 
     std::filesystem::path path;
@@ -39,7 +39,7 @@ struct VantaExportReport {
 // smallest supported unsigned index width for each mesh.  It does not mutate
 // the project or claim to carry materials, UVs, tangents, or other channels
 // that the current Cartographer authoring model does not own.
-[[nodiscard]] core::Result<VantaExportReport> export_vanta_gltf(
+[[nodiscard]] core::Result<GltfExportReport> export_gltf(
     const project::ProjectDocument& document,
     const std::filesystem::path& path);
 

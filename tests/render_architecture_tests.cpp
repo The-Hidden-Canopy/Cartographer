@@ -1,6 +1,9 @@
+#include <carto/assets/texture.hpp>
 #include <carto/gpu/handles.hpp>
 #include <carto/gpu/lifetime.hpp>
 #include <carto/gpu/rhi.hpp>
+#include <carto/render/material.hpp>
+#include <carto/render/render_request.hpp>
 #include <carto/render/viewport.hpp>
 #include <carto/render_graph/graph.hpp>
 
@@ -76,6 +79,124 @@ void deferred_destruction_waits_for_completed_submission() {
     REQUIRE(queue.pending_count() == 0U);
     REQUIRE(observation.expired());
     REQUIRE(!queue.retire(9U, std::shared_ptr<int>{}));
+}
+
+void exact_rhi_descriptors_reject_ambiguous_intent() {
+    const carto::gpu::BufferDesc vertex_buffer{
+        4096U,
+        carto::gpu::MemoryClass::device_local,
+        carto::gpu::BufferUsage::vertex | carto::gpu::BufferUsage::transfer_destination,
+    };
+    REQUIRE(carto::gpu::validate(vertex_buffer));
+    REQUIRE(!carto::gpu::validate(carto::gpu::BufferDesc{}));
+
+    const carto::gpu::TextureDesc hdr_color{
+        512U,
+        512U,
+        1U,
+        1U,
+        1U,
+        Format::rgba16_float,
+        carto::gpu::TextureDimension::texture_2d,
+        carto::gpu::TextureUsage::sampled |
+            carto::gpu::TextureUsage::color_attachment |
+            carto::gpu::TextureUsage::transfer_source,
+    };
+    REQUIRE(carto::gpu::validate(hdr_color));
+
+    auto invalid_depth = hdr_color;
+    invalid_depth.format = Format::depth32_float;
+    REQUIRE(!carto::gpu::validate(invalid_depth));
+
+    carto::gpu::SamplerDesc sampler;
+    sampler.anisotropy = true;
+    sampler.max_anisotropy = 16.0F;
+    sampler.compare = true;
+    REQUIRE(carto::gpu::validate(sampler));
+    sampler.anisotropy = false;
+    REQUIRE(!carto::gpu::validate(sampler));
+
+    carto::gpu::DeviceCapabilities capabilities;
+    capabilities.graphics_queue = true;
+    capabilities.timestamp_queries = true;
+    capabilities.fp16_color_attachment = true;
+    capabilities.max_texture_dimension_2d = 16384U;
+    capabilities.max_sampler_anisotropy = 16.0F;
+    capabilities.max_color_attachments = 8U;
+    REQUIRE(carto::gpu::validate(capabilities));
+}
+
+void texture_material_and_render_contracts_preserve_fidelity() {
+    carto::assets::TextureAsset base_color{
+        1U,
+        "brick.base-color",
+        1024U,
+        1024U,
+        carto::assets::TextureDimension::texture_2d,
+        carto::assets::TextureSemantic::base_color,
+        carto::assets::ColorSpace::srgb,
+        carto::assets::PixelFormat::rgba8,
+        {{1024U, 1024U, 4096U}, {512U, 512U, 1024U}},
+        std::nullopt,
+    };
+    REQUIRE(base_color.validate());
+    base_color.color_space = carto::assets::ColorSpace::linear;
+    REQUIRE(!base_color.validate());
+
+    carto::render::StandardMaterial material;
+    material.base_color_factor = {1.0, 0.8, 0.6, 1.0};
+    material.metallic = 0.15;
+    material.roughness = 0.25;
+    material.emissive_factor = {0.1, 0.05, 0.0};
+    material.emissive_strength = 0.5;
+    REQUIRE(material.validate());
+
+    const auto evaluation = carto::render::evaluate_pbr_reference(
+        material,
+        carto::render::PbrSurface{
+            {0.0, 0.0, 1.0},
+            {0.0, 0.0, 1.0},
+            {0.2, 0.2, 0.2},
+            {0.4, 0.4, 0.4},
+            {0.5, 0.1},
+        },
+        carto::render::PbrLight{{0.0, 0.0, 1.0}, {20.0, 20.0, 20.0}});
+    REQUIRE(evaluation);
+    REQUIRE(evaluation.value().hdr_color.x > 1.0);
+    const auto mapped = carto::render::tone_map(
+        evaluation.value().hdr_color, carto::render::ToneMapMode::aces_fitted);
+    REQUIRE(mapped);
+    REQUIRE(mapped.value().x >= 0.0 && mapped.value().x <= 1.0);
+    const auto environment_only = carto::render::evaluate_pbr_reference(
+        material,
+        carto::render::PbrSurface{
+            {0.0, 0.0, 1.0},
+            {0.0, 0.0, 1.0},
+            {0.4, 0.4, 0.4},
+            {0.2, 0.2, 0.2},
+            {0.5, 0.1},
+        },
+        carto::render::PbrLight{{0.0, 0.0, -1.0}, {20.0, 20.0, 20.0}});
+    REQUIRE(environment_only);
+    REQUIRE(environment_only.value().direct_diffuse.x == 0.0);
+    REQUIRE(environment_only.value().ibl_diffuse.x > 0.0);
+
+    carto::render::RenderRequest request{
+        carto::core::Revision{12U},
+        carto::scene::ObjectId{7U},
+        {7680U, 4320U},
+        carto::render::RenderQualityProfile::final_high,
+        32U,
+        carto::render::OutputFormat::exr,
+        false,
+        false,
+        {carto::render::CaptureResource::linear_hdr_color},
+    };
+    REQUIRE(request.validate());
+    REQUIRE(request.resolve().value().samples == 32U);
+    request.transparent_background = true;
+    request.output = carto::render::OutputFormat::png;
+    REQUIRE(!request.validate());
 }
 
 ResourceDesc make_buffer(std::string name, std::uint32_t alias_group = 0U) {
@@ -250,6 +371,8 @@ int main() {
     try {
         generational_registries_reject_stale_handles();
         deferred_destruction_waits_for_completed_submission();
+        exact_rhi_descriptors_reject_ambiguous_intent();
+        texture_material_and_render_contracts_preserve_fidelity();
         valid_graph_compiles_with_write_barriers();
         graph_rejects_invalid_descriptors_and_hazards();
         graph_rejects_overlapping_alias_lifetimes();

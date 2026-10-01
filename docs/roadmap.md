@@ -14,8 +14,10 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] deterministic compiled mesh, normals, bounds, and source revisions
 - [x] reversible transform command and history boundary
 - [x] versioned project format with atomic save/load
+- [x] v2 authoring envelope with v1 compatibility and explicit meters/right-handed/Y-up contract
 - [x] OBJ import/export with explicit feature-loss warnings
-- [x] bounded glTF export profile for the VANTA public mesh-import subset with explicit feature-loss warnings
+- [x] bounded ASCII PLY and binary/ASCII STL interchange with explicit feature-loss warnings
+- [x] bounded glTF export profile with explicit feature-loss warnings
 - [x] deterministic box/plane primitives and reversible primitive/vertex editing commands
 - [x] atomic single-face extrusion with reversible topology history
 - [x] ephemeral object/vertex/face selection with context validation
@@ -29,7 +31,7 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] backend-neutral generational GPU handles, deferred submission retirement, render-graph validation, and offscreen viewport planning
 - [x] SHA-256 content-addressed blob store with atomic publication and integrity verification
 - [x] append-only revision-bound journal with hash chain, verification, replay callback, content-addressed checkpoints, and staged transaction publication
-- [x] authority-preserving `carto_ui` foundation with VANTA tokens, density/theme/operator/workspace state, operation/problems projections, shortcut routing, and bounded local preferences
+- [x] authority-preserving `carto_ui` foundation with design tokens, density/theme/operator/workspace state, operation/problems projections, shortcut routing, and bounded local preferences
 - [ ] desktop shell and workspace registry (source consumes `carto_ui`; native acceptance pending)
 - [ ] Vulkan resource backend and viewport (optional source path present; SDK/GPU acceptance pending)
 - [x] directory project package layout and human-readable manifest boundary (SQLite database and migrations remain pending)

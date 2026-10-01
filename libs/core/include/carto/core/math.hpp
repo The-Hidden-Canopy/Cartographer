@@ -6,6 +6,15 @@
 
 namespace carto::core {
 
+struct Vec2d {
+    double x = 0.0;
+    double y = 0.0;
+
+    [[nodiscard]] bool finite() const noexcept {
+        return std::isfinite(x) && std::isfinite(y);
+    }
+};
+
 struct Vec3d {
     double x = 0.0;
     double y = 0.0;
@@ -25,6 +34,18 @@ struct Vec3d {
             return {invalid, invalid, invalid};
         }
         return {x / magnitude, y / magnitude, z / magnitude};
+    }
+};
+
+struct Vec4d {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+    double w = 0.0;
+
+    [[nodiscard]] bool finite() const noexcept {
+        return std::isfinite(x) && std::isfinite(y) && std::isfinite(z) &&
+               std::isfinite(w);
     }
 };
 

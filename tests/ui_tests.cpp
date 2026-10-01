@@ -199,8 +199,9 @@ void ui_preserves_required_viewport_and_supports_mode_theme_density() {
     REQUIRE(snapshot.theme == carto::ui::Theme::high_contrast);
     REQUIRE(snapshot.operator_mode == carto::ui::OperatorMode::ai_first);
     REQUIRE(snapshot.workspace_kind == carto::ui::Workspace::ai);
-    REQUIRE(!snapshot.ai_available);
-    REQUIRE(snapshot.ai_status.find("manual") != std::string::npos);
+    REQUIRE(snapshot.ai_available);
+    REQUIRE(snapshot.ai_auto_approve);
+    REQUIRE(snapshot.ai_status.find("Native planner") != std::string::npos);
     REQUIRE(std::find(snapshot.visible_panels.begin(), snapshot.visible_panels.end(),
                       carto::ui::Panel::viewport) != snapshot.visible_panels.end());
 }
@@ -212,6 +213,7 @@ void ui_persists_preferences_and_resets_corrupt_state() {
     REQUIRE(ui.set_density(carto::ui::Density::touch));
     REQUIRE(ui.set_theme(carto::ui::Theme::light));
     REQUIRE(ui.set_bottom_panel(carto::ui::BottomPanel::problems));
+    REQUIRE(ui.set_ai_auto_approve(false));
     const auto path = temp.path() / "workspace.prefs";
     REQUIRE(ui.save_preferences(path));
 
@@ -221,12 +223,26 @@ void ui_persists_preferences_and_resets_corrupt_state() {
     REQUIRE(reopened.snapshot().density == carto::ui::Density::touch);
     REQUIRE(reopened.snapshot().theme == carto::ui::Theme::light);
     REQUIRE(reopened.snapshot().bottom_panel == carto::ui::BottomPanel::problems);
+    REQUIRE(!reopened.snapshot().ai_auto_approve);
     REQUIRE(reopened.set_panel_visible(carto::ui::Panel::scene, false));
     auto reopened_application_snapshot = reopened_session.snapshot();
     REQUIRE(std::find(reopened_application_snapshot.workspace.visible_panes.begin(),
                       reopened_application_snapshot.workspace.visible_panes.end(),
                       carto::application::Pane::outliner) ==
             reopened_application_snapshot.workspace.visible_panes.end());
+
+    {
+        std::ofstream legacy(path, std::ios::binary | std::ios::trunc);
+        legacy << "header=CARTOGRAPHER_UI_PREFS_V1\n"
+                  "operator_mode=person-first\n"
+                  "workspace=model\n"
+                  "density=standard\n"
+                  "theme=dark\n"
+                  "bottom_panel=operations\n"
+                  "panels=scene,viewport,inspector,operations,problems\n";
+    }
+    REQUIRE(reopened.load_preferences(path));
+    REQUIRE(reopened.snapshot().ai_auto_approve);
 
     {
         std::ofstream corrupt(path, std::ios::binary | std::ios::trunc);
@@ -360,6 +376,56 @@ void ui_command_palette_is_bounded_and_explicit_about_deferred_features() {
     REQUIRE(ui.snapshot().project_revision == carto::core::Revision{});
 }
 
+void native_key_contract_maps_core_control_without_imgui() {
+    using carto::ui::NativeKey;
+    using carto::ui::NativeKeyEvent;
+    using carto::ui::Shortcut;
+
+    const auto save = carto::ui::shortcut_for_native_key({
+        NativeKey::s, carto::ui::kNativeModifierControl, true, false});
+    REQUIRE(save.has_value() && *save == Shortcut::save);
+    const auto undo_repeat = carto::ui::shortcut_for_native_key({
+        NativeKey::z, carto::ui::kNativeModifierControl, true, true});
+    REQUIRE(undo_repeat.has_value() && *undo_repeat == Shortcut::undo);
+    const auto face = carto::ui::shortcut_for_native_key({
+        NativeKey::digit_4, 0U, true, false});
+    REQUIRE(face.has_value() && *face == Shortcut::face_mode);
+    const auto escape = carto::ui::shortcut_for_native_key({
+        NativeKey::escape, 0U, true, false});
+    REQUIRE(escape.has_value() && *escape == Shortcut::close_overlay);
+    REQUIRE(!carto::ui::shortcut_for_native_key({
+        NativeKey::s, 0U, true, false}).has_value());
+    REQUIRE(!carto::ui::shortcut_for_native_key({
+        NativeKey::digit_1, carto::ui::kNativeModifierShift, true, false}).has_value());
+    REQUIRE(!carto::ui::shortcut_for_native_key(
+        NativeKeyEvent{NativeKey::k, carto::ui::kNativeModifierControl, false, false}).has_value());
+
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.handle_shortcut(*face));
+    REQUIRE(ui.snapshot().selection.mode == carto::editor::SelectionMode::face);
+
+    using carto::ui::NativePointerButton;
+    using carto::ui::NativePointerEvent;
+    const auto replace = carto::ui::selection_operation_for_native_pointer({
+        NativePointerButton::primary, 120, 240, 0U, true});
+    REQUIRE(replace.has_value() && *replace == carto::editor::SelectionOperation::replace);
+    const auto add = carto::ui::selection_operation_for_native_pointer({
+        NativePointerButton::primary, 120, 240, carto::ui::kNativeModifierShift, true});
+    REQUIRE(add.has_value() && *add == carto::editor::SelectionOperation::add);
+    const auto toggle = carto::ui::selection_operation_for_native_pointer({
+        NativePointerButton::primary, 120, 240, carto::ui::kNativeModifierControl, true});
+    REQUIRE(toggle.has_value() && *toggle == carto::editor::SelectionOperation::toggle);
+    REQUIRE(!carto::ui::selection_operation_for_native_pointer({
+        NativePointerButton::secondary, 120, 240, 0U, true}).has_value());
+    REQUIRE(!carto::ui::selection_operation_for_native_pointer({
+        NativePointerButton::primary, 120, 240,
+        static_cast<std::uint8_t>(carto::ui::kNativeModifierShift |
+                                   carto::ui::kNativeModifierControl), true}).has_value());
+    REQUIRE(!carto::ui::selection_operation_for_native_pointer(
+        NativePointerEvent{NativePointerButton::primary, 120, 240, 0U, false}).has_value());
+}
+
 } // namespace
 
 int main() {
@@ -374,6 +440,7 @@ int main() {
         workbench_preferences_round_trip_and_fail_closed();
         ui_failed_shortcuts_and_actions_remain_bounded();
         ui_command_palette_is_bounded_and_explicit_about_deferred_features();
+        native_key_contract_maps_core_control_without_imgui();
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         return 1;

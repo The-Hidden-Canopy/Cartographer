@@ -10,9 +10,9 @@ namespace carto::io {
 [[nodiscard]] core::Result<void> register_builtin_obj_providers(
     providers::Registry& registry);
 
-// Registers the deterministic glTF export profile through the same lifecycle
-// gate.  The profile is neutral on the Cartographer side and is shaped for
-// VANTA's bounded public glTF importer contract without linking VANTA.
+// Registers the deterministic public glTF export profile through the same
+// lifecycle gate.  The profile is derived interchange, not authoring truth or
+// a private runtime adapter.
 [[nodiscard]] core::Result<void> register_builtin_gltf_providers(
     providers::Registry& registry);
 

@@ -3,7 +3,7 @@ add_library(carto_io STATIC
     src/obj.cpp
     src/ply.cpp
     src/stl.cpp
-    src/vanta_export.cpp
+    src/gltf_export.cpp
 )
 
 target_include_directories(carto_io

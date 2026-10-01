@@ -34,7 +34,7 @@ tool input
 | `carto_sdk` | bounded opaque C ABI over application actions/snapshots | C++ layout, mutable model pointers, or native GPU handles |
 | `carto_io` | format adapters and loss reports | project model ownership |
 | `carto_application` | front-end actions, workspace state, immutable snapshots | direct panel-owned mutations or GPU resources |
-| `carto_ui` | authority-preserving presentation state, VANTA tokens, bounded UI preferences, operation/problem projections | project truth, editor history ownership, direct mutation, AI authority |
+| `carto_ui` | authority-preserving presentation state, design tokens, bounded UI preferences, operation/problem projections | project truth, editor history ownership, direct mutation, AI authority |
 | optional native shell | Win32 windowing, ImGui panels, Vulkan submission | authoritative model state or editable topology |
 
 ## Failure posture

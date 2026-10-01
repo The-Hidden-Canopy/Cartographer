@@ -617,6 +617,8 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
             !result) {
             return core::Result<ProjectDocument>::failure(result.error());
         }
+        std::vector<geometry::Vertex> mesh_vertices;
+        mesh_vertices.reserve(static_cast<std::size_t>(vertex_count.value()));
         std::map<std::uint64_t, geometry::VertexId> vertex_ids;
         for (std::uint64_t vertex_index = 0; vertex_index < vertex_count.value(); ++vertex_index) {
             if (auto result = require_line(input, "VERTEX"); !result) {
@@ -629,9 +631,7 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
                 return core::Result<ProjectDocument>::failure(parse_error("invalid mesh vertex record"));
             }
             const geometry::VertexId vertex_id{serialized_id.value()};
-            if (auto added = mesh.insert_vertex(geometry::Vertex{vertex_id, position}); !added) {
-                return core::Result<ProjectDocument>::failure(added.error());
-            }
+            mesh_vertices.push_back(geometry::Vertex{vertex_id, position});
             vertex_ids.emplace(serialized_id.value(), vertex_id);
         }
         if (auto result = require_line(input, "FACES"); !result) {
@@ -646,6 +646,8 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
             !result) {
             return core::Result<ProjectDocument>::failure(result.error());
         }
+        std::vector<geometry::Face> mesh_faces;
+        mesh_faces.reserve(static_cast<std::size_t>(face_count.value()));
         for (std::uint64_t face_index = 0; face_index < face_count.value(); ++face_index) {
             if (auto result = require_line(input, "FACE"); !result) {
                 return core::Result<ProjectDocument>::failure(result.error());
@@ -667,11 +669,11 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
                 face_vertices.push_back(vertex_ids.at(serialized_vertex.value()));
             }
             const geometry::FaceId face_id{serialized_face_id.value()};
-            if (auto added = mesh.insert_face(geometry::Face{face_id, std::move(face_vertices)});
-                !added) {
-                return core::Result<ProjectDocument>::failure(
-                    added.error().with_context("serialized face " + std::to_string(serialized_face_id.value())));
-            }
+            mesh_faces.push_back(geometry::Face{face_id, std::move(face_vertices)});
+        }
+        if (auto added = mesh.insert_bulk(std::move(mesh_vertices), std::move(mesh_faces)); !added) {
+            return core::Result<ProjectDocument>::failure(
+                added.error().with_context("bulk serialized mesh admission"));
         }
         if (auto result = mesh.restore_revision(core::Revision(ignored_mesh_revision.value())); !result) {
             return core::Result<ProjectDocument>::failure(result.error());

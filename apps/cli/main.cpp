@@ -2,12 +2,13 @@
 #include <carto/io/builtin_provider.hpp>
 #include <carto/io/ply.hpp>
 #include <carto/io/stl.hpp>
-#include <carto/io/vanta_export.hpp>
+#include <carto/io/gltf_export.hpp>
 #include <carto/application/application.hpp>
 #include <carto/geometry/primitives.hpp>
 #include <carto/providers/registry.hpp>
 #include <carto/project/project.hpp>
 
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -260,7 +261,7 @@ int import_stl(const std::filesystem::path& stl_path, const std::filesystem::pat
                                   imported.value().report);
 }
 
-int export_vanta(const std::filesystem::path& project_path, const std::filesystem::path& gltf_path) {
+int export_gltf(const std::filesystem::path& project_path, const std::filesystem::path& gltf_path) {
     carto::providers::Registry providers;
     if (auto result = carto::io::register_builtin_gltf_providers(providers); !result) {
         print_error(result.error().with_context("glTF exporter provider"));
@@ -279,12 +280,12 @@ int export_vanta(const std::filesystem::path& project_path, const std::filesyste
         std::cerr << "error: project has no mesh assets\n";
         return EXIT_FAILURE;
     }
-    auto report = carto::io::export_vanta_gltf(document.value(), gltf_path);
+    auto report = carto::io::export_gltf(document.value(), gltf_path);
     if (!report) {
         print_error(report.error());
         return EXIT_FAILURE;
     }
-    std::cout << "exported " << gltf_path << " profile=cartographer-vanta-gltf-v1"
+    std::cout << "exported " << gltf_path << " profile=cartographer-gltf-v1"
               << " objects=" << report.value().objects
               << " meshes=" << report.value().meshes
               << " vertices=" << report.value().vertices
@@ -306,7 +307,7 @@ void usage(std::ostream& output) {
            << "  cartographer_cli export-obj <project.carto> <mesh.obj>\n"
            << "  cartographer_cli export-ply <project.carto> <mesh.ply>\n"
            << "  cartographer_cli export-stl <project.carto> <mesh.stl>\n"
-           << "  cartographer_cli export-vanta <project.carto> <scene.gltf>\n"
+           << "  cartographer_cli export-gltf <project.carto> <scene.gltf>\n"
            << "  cartographer_cli import-obj <mesh.obj> <project.carto>\n"
            << "  cartographer_cli import-ply <mesh.ply> <project.carto>\n"
            << "  cartographer_cli import-stl <mesh.stl> <project.carto>\n";
@@ -343,8 +344,8 @@ int main(int argc, char** argv) {
     if (command == "export-stl" && argc == 4) {
         return export_stl(argv[2], argv[3]);
     }
-    if (command == "export-vanta" && argc == 4) {
-        return export_vanta(argv[2], argv[3]);
+    if (command == "export-gltf" && argc == 4) {
+        return export_gltf(argv[2], argv[3]);
     }
     if (command == "import-obj" && argc == 4) {
         return import_obj(argv[2], argv[3]);

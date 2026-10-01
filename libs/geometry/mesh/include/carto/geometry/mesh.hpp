@@ -85,6 +85,12 @@ public:
     [[nodiscard]] core::Result<void> insert_face(Face face);
     [[nodiscard]] core::Result<void> set_vertex_position(VertexId id, core::Vec3d position);
     [[nodiscard]] core::Result<void> apply_patch(const MeshPatch& patch);
+    // Inserts a complete interchange topology and rebuilds adjacency once.
+    // Bounded importers use this instead of repeatedly rebuilding after every
+    // face admission.
+    [[nodiscard]] core::Result<void> insert_bulk(
+        std::vector<Vertex> vertices,
+        std::vector<Face> faces);
     [[nodiscard]] core::Result<void> extrude_face(FaceId id, double distance);
     [[nodiscard]] core::Result<TopologyEditReceipt> delete_face(
         FaceId id,
@@ -114,6 +120,8 @@ public:
 
 private:
     [[nodiscard]] core::Result<void> rebuild_topology();
+    [[nodiscard]] core::Result<void> validate_patch_geometry(const MeshPatch& patch) const;
+    [[nodiscard]] core::Result<void> validate_vertex_face_index() const;
     [[nodiscard]] core::Result<void> validate_topology_state() const;
     [[nodiscard]] TopologySnapshot topology_snapshot() const;
     void bump_revision() noexcept {
@@ -127,6 +135,7 @@ private:
     std::map<HalfEdgeId, HalfEdgeRecord> half_edges_;
     std::map<CornerId, CornerRecord> corners_;
     std::map<FaceId, HalfEdgeId> face_boundaries_;
+    std::map<VertexId, std::vector<FaceId>> vertex_faces_;
     std::uint64_t next_vertex_id_ = 1;
     std::uint64_t next_face_id_ = 1;
     std::uint64_t next_edge_id_ = 1;

@@ -12,8 +12,9 @@ core::Diagnostic invalid(std::string message) {
 }
 
 bool is_color_format(gpu::Format format) {
-    return format == gpu::Format::rgba8_unorm || format == gpu::Format::bgra8_unorm ||
-           format == gpu::Format::rgba16_float;
+    return format == gpu::Format::rgba8_unorm || format == gpu::Format::rgba8_srgb ||
+           format == gpu::Format::bgra8_unorm || format == gpu::Format::bgra8_srgb ||
+           format == gpu::Format::rgba16_float || format == gpu::Format::rgba32_float;
 }
 
 } // namespace
@@ -25,9 +26,10 @@ core::Result<void> ViewportDescription::validate() const {
     if (!is_color_format(color_format)) {
         return core::Result<void>::failure(invalid("offscreen viewport color format is not renderable"));
     }
-    if (depth_format != gpu::Format::depth24_stencil8) {
+    if (depth_format != gpu::Format::depth24_stencil8 &&
+        depth_format != gpu::Format::depth32_float) {
         return core::Result<void>::failure(
-            invalid("offscreen viewport requires the canonical depth-stencil format"));
+            invalid("offscreen viewport requires a supported depth format"));
     }
     return core::Result<void>::success();
 }

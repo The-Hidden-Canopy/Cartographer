@@ -24,6 +24,10 @@
 #include <variant>
 #include <vector>
 
+namespace carto::ui {
+class UiController;
+}
+
 namespace carto::application {
 
 class ApplicationSession;
@@ -127,6 +131,7 @@ struct DispatchReceipt {
     bool document_changed = false;
     OperationId operation_id = 0U;
     OperationSource source = OperationSource::human;
+    std::string provenance_id;
     AffectedSet affected;
     std::optional<ParameterPayload> parameters;
     std::vector<core::Diagnostic> warnings;
@@ -225,8 +230,9 @@ using ApplicationAction = std::variant<
     RedoAction>;
 
 // The explicit human/local front-end adapter is the only production factory
-// for HumanActionAdmission. AI proposals use the separate UI proposal API and
-// cannot reach ApplicationSession::dispatch without this boundary.
+// for HumanActionAdmission. AI proposals use the separate UI proposal API;
+// the source/provenance overload is private to that host boundary and cannot
+// be used as a public raw AI mutation route.
 class HumanApplicationAccess final {
 public:
     [[nodiscard]] static core::Result<DispatchReceipt> dispatch(
@@ -235,6 +241,15 @@ public:
     [[nodiscard]] static core::Result<DispatchReceipt> commit_preview(
         ApplicationSession& session,
         editor::AuthoringPreview& preview);
+
+private:
+    friend class ::carto::ui::UiController;
+
+    [[nodiscard]] static core::Result<DispatchReceipt> commit_preview(
+        ApplicationSession& session,
+        editor::AuthoringPreview& preview,
+        OperationSource source,
+        std::string_view provenance_id);
 };
 
 class ApplicationSession {
@@ -243,13 +258,17 @@ public:
 
     [[nodiscard]] core::Result<DispatchReceipt> dispatch(
         HumanActionAdmission admission,
-        const ApplicationAction& action);
+        const ApplicationAction& action,
+        OperationSource source = OperationSource::human,
+        std::string_view provenance_id = {});
     [[nodiscard]] core::Result<editor::AuthoringContext> authoring_context() const;
     [[nodiscard]] core::Result<editor::AuthoringPreview> begin_preview(
         editor::PreviewKind kind) const;
     [[nodiscard]] core::Result<DispatchReceipt> commit_preview(
         HumanActionAdmission admission,
-        editor::AuthoringPreview& preview);
+        editor::AuthoringPreview& preview,
+        OperationSource source = OperationSource::human,
+        std::string_view provenance_id = {});
     [[nodiscard]] ApplicationSnapshot snapshot() const;
 
     [[nodiscard]] const WorkspaceState& workspace() const noexcept { return workspace_; }
@@ -318,6 +337,8 @@ private:
     WorkspaceState workspace_;
     std::vector<core::Diagnostic> problems_;
     OperationId next_operation_id_ = 1U;
+    OperationSource active_source_ = OperationSource::human;
+    std::string active_provenance_id_;
 };
 
 } // namespace carto::application

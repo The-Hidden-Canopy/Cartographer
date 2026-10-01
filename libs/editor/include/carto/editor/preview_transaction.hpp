@@ -16,6 +16,7 @@ namespace carto::editor {
 enum class PreviewKind {
     object_transform,
     extrude_face,
+    inset_face,
     set_vertex_position,
 };
 

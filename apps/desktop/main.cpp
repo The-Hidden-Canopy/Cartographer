@@ -23,7 +23,10 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 
 #include <carto/application/application.hpp>
 #include <carto/io/builtin_provider.hpp>
-#include <carto/io/vanta_export.hpp>
+#include <carto/io/gltf_export.hpp>
+#include <carto/io/obj.hpp>
+#include <carto/io/ply.hpp>
+#include <carto/io/stl.hpp>
 #include <carto/providers/registry.hpp>
 #include <carto/ui/ui.hpp>
 #include <carto/vulkan/runtime.hpp>
@@ -646,22 +649,98 @@ struct WorkbenchState {
     return distance.x * distance.x + distance.y * distance.y;
 }
 
+struct ViewportFaceHit {
+    carto::scene::ObjectId object;
+    carto::geometry::FaceId face;
+    std::array<ImVec2, 3> points;
+};
+
+struct ViewportVertexHit {
+    carto::scene::ObjectId object;
+    carto::geometry::VertexId vertex;
+    ImVec2 point;
+};
+
+struct ViewportEdgeHit {
+    carto::scene::ObjectId object;
+    carto::geometry::EdgeId edge;
+    ImVec2 first;
+    ImVec2 second;
+};
+
+struct NativeViewportHitCache {
+    carto::core::Revision project_revision;
+    ImVec2 screen_origin{};
+    ImVec2 extent{};
+    bool valid = false;
+    bool interactive = false;
+    std::vector<ViewportFaceHit> faces;
+    std::vector<ViewportVertexHit> vertices;
+    std::vector<ViewportEdgeHit> edges;
+    std::vector<std::pair<carto::scene::ObjectId, ImRect>> objects;
+
+    void reset() {
+        project_revision = {};
+        screen_origin = {};
+        extent = {};
+        valid = false;
+        interactive = false;
+        faces.clear();
+        vertices.clear();
+        edges.clear();
+        objects.clear();
+    }
+};
+
 [[nodiscard]] Vec3d world_point(const carto::core::Transform& transform, Vec3d point) {
     return transform.translation +
            transform.rotation.rotate(carto::core::componentwise_multiply(transform.scale, point));
 }
 
-[[nodiscard]] std::optional<std::filesystem::path> choose_file(bool save, bool gltf = false) {
+enum class FileDialogKind {
+    project,
+    gltf,
+    obj,
+    ply,
+    stl,
+};
+
+enum class StandardMeshExport {
+    obj,
+    ply,
+    stl,
+};
+
+[[nodiscard]] std::optional<std::filesystem::path> choose_file(
+    bool save, FileDialogKind kind = FileDialogKind::project) {
     wchar_t path[MAX_PATH]{};
     OPENFILENAMEW dialog{};
     dialog.lStructSize = sizeof(dialog);
     dialog.lpstrFile = path;
     dialog.nMaxFile = MAX_PATH;
-    dialog.lpstrFilter = gltf
-        ? L"VANTA glTF export (*.gltf)\0*.gltf\0All Files\0*.*\0"
-        : L"Cartographer Project (*.carto)\0*.carto\0All Files\0*.*\0";
+    switch (kind) {
+    case FileDialogKind::gltf:
+        dialog.lpstrFilter = L"glTF export (*.gltf)\0*.gltf\0All Files\0*.*\0";
+        dialog.lpstrDefExt = L"gltf";
+        break;
+    case FileDialogKind::obj:
+        dialog.lpstrFilter = L"Wavefront OBJ (*.obj)\0*.obj\0All Files\0*.*\0";
+        dialog.lpstrDefExt = L"obj";
+        break;
+    case FileDialogKind::ply:
+        dialog.lpstrFilter = L"ASCII PLY (*.ply)\0*.ply\0All Files\0*.*\0";
+        dialog.lpstrDefExt = L"ply";
+        break;
+    case FileDialogKind::stl:
+        dialog.lpstrFilter = L"Binary STL (*.stl)\0*.stl\0All Files\0*.*\0";
+        dialog.lpstrDefExt = L"stl";
+        break;
+    case FileDialogKind::project:
+        dialog.lpstrFilter = L"Cartographer Project (*.carto)\0*.carto\0All Files\0*.*\0";
+        dialog.lpstrDefExt = L"carto";
+        break;
+    }
     dialog.nFilterIndex = 1;
-    dialog.lpstrDefExt = gltf ? L"gltf" : L"carto";
     dialog.Flags = OFN_PATHMUSTEXIST | (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
     const BOOL selected = save ? GetSaveFileNameW(&dialog) : GetOpenFileNameW(&dialog);
     if (!selected) return std::nullopt;
@@ -707,6 +786,7 @@ struct DesktopState {
     ImVec2 workbench_origin{};
     ImVec2 workbench_extent{};
     bool workbench_bounds_valid = false;
+    NativeViewportHitCache native_viewport_hits;
     carto::scene::ObjectId inspector_object{};
     carto::core::Transform inspector_transform = carto::core::Transform::identity();
     carto::geometry::VertexId inspector_vertex{};
@@ -720,6 +800,9 @@ struct DesktopState {
     bool discard_prompt_pending = false;
     bool close_requested = false;
     std::string ai_intent;
+    std::optional<carto::ai::Proposal> ai_proposal;
+    std::optional<carto::editor::AuthoringPreview> ai_preview;
+    std::string ai_feedback;
     std::optional<std::uint64_t> selected_operation_id;
 
     static constexpr float kWorkbenchRackWidth = 128.0F;
@@ -936,9 +1019,97 @@ struct DesktopState {
         return static_cast<bool>(ui.dispatch(action));
     }
 
-    void export_vanta_gltf(const UiSnapshot& snapshot) {
+    bool route_native_key(const carto::ui::NativeKeyEvent& event) {
+        if (ImGui::GetCurrentContext() != nullptr && ImGui::GetIO().WantTextInput) {
+            return false;
+        }
+        const auto shortcut = carto::ui::shortcut_for_native_key(event);
+        if (!shortcut.has_value()) return false;
+        if (!event.repeat) static_cast<void>(ui.handle_shortcut(*shortcut));
+        return true;
+    }
+
+    bool route_native_pointer(const carto::ui::NativePointerEvent& event) {
+        const auto selection_operation =
+            carto::ui::selection_operation_for_native_pointer(event);
+        if (!selection_operation.has_value() || surface != ShellSurface::workspace ||
+            !native_viewport_hits.valid || !native_viewport_hits.interactive) {
+            return false;
+        }
+        const auto snapshot = ui.snapshot();
+        if (snapshot.project_revision != native_viewport_hits.project_revision) return false;
+
+        POINT client_point{
+            static_cast<LONG>(event.x),
+            static_cast<LONG>(event.y),
+        };
+        if (window == nullptr || ClientToScreen(window, &client_point) == FALSE) return false;
+        const ImVec2 point{
+            static_cast<float>(client_point.x),
+            static_cast<float>(client_point.y),
+        };
+        const ImRect viewport(
+            native_viewport_hits.screen_origin,
+            native_viewport_hits.screen_origin + native_viewport_hits.extent);
+        if (!viewport.Contains(point)) return false;
+
+        if (snapshot.selection.mode == carto::editor::SelectionMode::edge) {
+            float best = 12.0F * 12.0F;
+            const ViewportEdgeHit* hit = nullptr;
+            for (const auto& candidate : native_viewport_hits.edges) {
+                const float distance = point_segment_distance_squared(
+                    point, candidate.first, candidate.second);
+                if (distance < best) {
+                    best = distance;
+                    hit = &candidate;
+                }
+            }
+            if (hit != nullptr) {
+                static_cast<void>(dispatch(SelectEdgeAction{
+                    hit->object, hit->edge, *selection_operation}));
+            }
+        } else if (snapshot.selection.mode == carto::editor::SelectionMode::face) {
+            for (auto iterator = native_viewport_hits.faces.rbegin();
+                 iterator != native_viewport_hits.faces.rend(); ++iterator) {
+                if (point_in_triangle(
+                        point, iterator->points[0], iterator->points[1], iterator->points[2])) {
+                    static_cast<void>(dispatch(SelectFaceAction{
+                        iterator->object, iterator->face, *selection_operation}));
+                    return true;
+                }
+            }
+        } else if (snapshot.selection.mode == carto::editor::SelectionMode::vertex) {
+            float best = 12.0F * 12.0F;
+            const ViewportVertexHit* hit = nullptr;
+            for (const auto& candidate : native_viewport_hits.vertices) {
+                const float dx = candidate.point.x - point.x;
+                const float dy = candidate.point.y - point.y;
+                const float distance = dx * dx + dy * dy;
+                if (distance < best) {
+                    best = distance;
+                    hit = &candidate;
+                }
+            }
+            if (hit != nullptr) {
+                static_cast<void>(dispatch(SelectVertexAction{
+                    hit->object, hit->vertex, *selection_operation}));
+            }
+        } else {
+            for (auto iterator = native_viewport_hits.objects.rbegin();
+                 iterator != native_viewport_hits.objects.rend(); ++iterator) {
+                if (iterator->second.Contains(point)) {
+                    static_cast<void>(dispatch(SelectObjectAction{
+                        iterator->first, *selection_operation}));
+                    return true;
+                }
+            }
+        }
+        return true;
+    }
+
+    void export_gltf(const UiSnapshot& snapshot) {
         if (!snapshot.project_path.has_value()) {
-            MessageBoxW(window, L"Save the .carto project before exporting a VANTA glTF asset.",
+            MessageBoxW(window, L"Save the .carto project before exporting a glTF asset.",
                         L"Cartographer export unavailable", MB_OK | MB_ICONWARNING);
             return;
         }
@@ -947,7 +1118,7 @@ struct DesktopState {
                         L"Cartographer export unavailable", MB_OK | MB_ICONWARNING);
             return;
         }
-        const auto path = choose_file(true, true);
+        const auto path = choose_file(true, FileDialogKind::gltf);
         if (!path.has_value()) return;
         carto::providers::Registry providers;
         if (auto result = carto::io::register_builtin_gltf_providers(providers); !result) {
@@ -966,7 +1137,7 @@ struct DesktopState {
                         L"Cartographer export failed", MB_OK | MB_ICONERROR);
             return;
         }
-        const auto report = carto::io::export_vanta_gltf(document.value(), *path);
+        const auto report = carto::io::export_gltf(document.value(), *path);
         if (!report) {
             MessageBoxW(window, wide(report.error().message).c_str(),
                         L"Cartographer export failed", MB_OK | MB_ICONERROR);
@@ -976,7 +1147,73 @@ struct DesktopState {
             std::to_string(report.value().meshes) + " mesh(es), " +
             std::to_string(report.value().triangles) + " triangle(s).";
         MessageBoxW(window, wide(message).c_str(),
-                    L"Cartographer VANTA glTF export", MB_OK | MB_ICONINFORMATION);
+                    L"Cartographer glTF export", MB_OK | MB_ICONINFORMATION);
+    }
+
+    void export_standard_mesh(const UiSnapshot& snapshot, StandardMeshExport format) {
+        if (!snapshot.project_path.has_value()) {
+            MessageBoxW(window, L"Save the .carto project before exporting a mesh asset.",
+                        L"Cartographer export unavailable", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        if (snapshot.dirty) {
+            MessageBoxW(window, L"Save the project before exporting so the derived asset has a durable source revision.",
+                        L"Cartographer export unavailable", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        const FileDialogKind dialog_kind = format == StandardMeshExport::obj
+            ? FileDialogKind::obj
+            : format == StandardMeshExport::ply ? FileDialogKind::ply : FileDialogKind::stl;
+        const auto path = choose_file(true, dialog_kind);
+        if (!path.has_value()) return;
+
+        carto::providers::Registry providers;
+        const auto register_provider = [&]() -> carto::core::Result<void> {
+            if (format == StandardMeshExport::obj) return carto::io::register_builtin_obj_providers(providers);
+            if (format == StandardMeshExport::ply) return carto::io::register_builtin_ply_providers(providers);
+            return carto::io::register_builtin_stl_providers(providers);
+        };
+        const char* capability = format == StandardMeshExport::obj
+            ? "geometry.export.obj"
+            : format == StandardMeshExport::ply ? "geometry.export.ply" : "geometry.export.stl";
+        if (auto result = register_provider(); !result) {
+            MessageBoxW(window, wide(result.error().message).c_str(),
+                        L"Cartographer exporter unavailable", MB_OK | MB_ICONERROR);
+            return;
+        }
+        if (auto result = providers.resolve(capability); !result) {
+            MessageBoxW(window, wide(result.error().message).c_str(),
+                        L"Cartographer exporter unavailable", MB_OK | MB_ICONERROR);
+            return;
+        }
+        const auto document = carto::project::ProjectDocument::load(*snapshot.project_path);
+        if (!document) {
+            MessageBoxW(window, wide(document.error().message).c_str(),
+                        L"Cartographer export failed", MB_OK | MB_ICONERROR);
+            return;
+        }
+        if (document.value().meshes().empty()) {
+            MessageBoxW(window, L"The project has no mesh assets to export.",
+                        L"Cartographer export unavailable", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        const auto export_mesh = [&]() -> carto::core::Result<carto::io::IoReport> {
+            const auto& mesh = document.value().meshes().begin()->second;
+            if (format == StandardMeshExport::obj) return carto::io::export_obj(mesh, *path);
+            if (format == StandardMeshExport::ply) return carto::io::export_ply(mesh, *path);
+            return carto::io::export_stl(mesh, *path);
+        };
+        const auto report = export_mesh();
+        if (!report) {
+            MessageBoxW(window, wide(report.error().message).c_str(),
+                        L"Cartographer export failed", MB_OK | MB_ICONERROR);
+            return;
+        }
+        const std::string message = "Exported " + path->string() + "\n" +
+            std::to_string(report.value().vertices) + " vertex/vertices, " +
+            std::to_string(report.value().triangles) + " triangle(s).";
+        MessageBoxW(window, wide(message).c_str(),
+                    L"Cartographer mesh export", MB_OK | MB_ICONINFORMATION);
     }
 
     void request_discard(carto::application::ApplicationAction action) {
@@ -1613,26 +1850,14 @@ struct DesktopState {
         } else if (io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_T)) {
             workbench.transform = !workbench.transform;
             mark_custom_workbench();
+        } else if (io.KeyCtrl && io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_O)) {
+            export_standard_mesh(ui.snapshot(), StandardMeshExport::obj);
+        } else if (io.KeyCtrl && io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_P)) {
+            export_standard_mesh(ui.snapshot(), StandardMeshExport::ply);
+        } else if (io.KeyCtrl && io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_S)) {
+            export_standard_mesh(ui.snapshot(), StandardMeshExport::stl);
         } else if (io.KeyCtrl && io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_E)) {
-            export_vanta_gltf(ui.snapshot());
-        } else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) {
-            static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::save));
-        } else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z)) {
-            static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::undo));
-        } else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y)) {
-            static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::redo));
-        } else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_K)) {
-            static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::toggle_command_palette));
-        } else if (ImGui::IsKeyPressed(ImGuiKey_1)) {
-            static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::object_mode));
-        } else if (ImGui::IsKeyPressed(ImGuiKey_2)) {
-            static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::vertex_mode));
-        } else if (ImGui::IsKeyPressed(ImGuiKey_3)) {
-            static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::edge_mode));
-        } else if (ImGui::IsKeyPressed(ImGuiKey_4)) {
-            static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::face_mode));
-        } else if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-            static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::close_overlay));
+            export_gltf(ui.snapshot());
         }
     }
 
@@ -1703,8 +1928,17 @@ struct DesktopState {
                 }
             }
             const bool can_export = snapshot.project_path.has_value() && !snapshot.dirty;
-            if (ImGui::MenuItem("Export VANTA glTF", "Ctrl+Alt+E", false, can_export)) {
-                export_vanta_gltf(snapshot);
+            if (ImGui::MenuItem("Export glTF", "Ctrl+Alt+E", false, can_export)) {
+                export_gltf(snapshot);
+            }
+            if (ImGui::MenuItem("Export OBJ", "Ctrl+Alt+O", false, can_export)) {
+                export_standard_mesh(snapshot, StandardMeshExport::obj);
+            }
+            if (ImGui::MenuItem("Export PLY", "Ctrl+Alt+P", false, can_export)) {
+                export_standard_mesh(snapshot, StandardMeshExport::ply);
+            }
+            if (ImGui::MenuItem("Export STL", "Ctrl+Alt+S", false, can_export)) {
+                export_standard_mesh(snapshot, StandardMeshExport::stl);
             }
             if (!can_export) {
                 ImGui::TextDisabled("Export requires a saved, unmodified .carto source");
@@ -1865,6 +2099,7 @@ struct DesktopState {
     }
 
     void draw_viewport(const UiSnapshot& snapshot, ImVec2 size = ImVec2(0, 0)) {
+        native_viewport_hits.reset();
         ImGui::BeginChild("WorkSurfaceViewport", size, true, ImGuiWindowFlags_NoScrollbar);
         heading_text("Work surface · compiled snapshot");
         ImGui::Dummy(ImVec2(0, 4));
@@ -1878,6 +2113,11 @@ struct DesktopState {
         }
         const ImVec2 origin = ImGui::GetCursorScreenPos();
         const ImVec2 extent = ImGui::GetContentRegionAvail();
+        native_viewport_hits.project_revision = snapshot.project_revision;
+        native_viewport_hits.screen_origin = origin;
+        native_viewport_hits.extent = extent;
+        native_viewport_hits.valid = extent.x > 0.0F && extent.y > 0.0F;
+        native_viewport_hits.interactive = ImGui::IsWindowHovered();
         ImDrawList* draw = ImGui::GetWindowDrawList();
         const auto rgba = [](carto::ui::UiColor token, float alpha) {
             token.alpha *= alpha;
@@ -1885,11 +2125,16 @@ struct DesktopState {
         };
         draw->AddRectFilled(origin, origin + extent, rgba(snapshot.colors.canvas_0, 1.0F));
         const auto instances = snapshot.viewport.scene.instances();
+        bool invalid_render_snapshot = false;
         Vec3d minimum{std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
                       std::numeric_limits<double>::infinity()};
         Vec3d maximum{-std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(),
                       -std::numeric_limits<double>::infinity()};
         for (const auto& instance : instances) {
+            if (instance.mesh == nullptr || !instance.mesh->valid()) {
+                invalid_render_snapshot = true;
+                continue;
+            }
             for (const auto point : instance.mesh->positions) {
                 const auto world = world_point(instance.world_transform, point);
                 minimum.x = std::min(minimum.x, world.x);
@@ -1910,19 +2155,15 @@ struct DesktopState {
                 origin.y + static_cast<float>((maximum.z - world.z) / scale * std::max(1.0F, extent.y - 24.0F)) + 12.0F);
         };
 
-        struct FaceHit { carto::scene::ObjectId object; carto::geometry::FaceId face; std::array<ImVec2, 3> points; };
-        struct VertexHit { carto::scene::ObjectId object; carto::geometry::VertexId vertex; ImVec2 point; };
-        struct EdgeHit {
-            carto::scene::ObjectId object;
-            carto::geometry::EdgeId edge;
-            ImVec2 first;
-            ImVec2 second;
-        };
-        std::vector<FaceHit> faces;
-        std::vector<VertexHit> vertices;
-        std::vector<EdgeHit> edges;
-        std::vector<std::pair<carto::scene::ObjectId, ImRect>> objects;
+        auto& faces = native_viewport_hits.faces;
+        auto& vertices = native_viewport_hits.vertices;
+        auto& edges = native_viewport_hits.edges;
+        auto& objects = native_viewport_hits.objects;
         for (const auto& instance : instances) {
+            if (instance.mesh == nullptr || !instance.mesh->valid()) {
+                invalid_render_snapshot = true;
+                continue;
+            }
             const bool highlighted = std::find(
                 snapshot.selection.objects.begin(), snapshot.selection.objects.end(), instance.object) !=
                 snapshot.selection.objects.end();
@@ -1941,9 +2182,9 @@ struct DesktopState {
             }
             objects.emplace_back(instance.object, ImRect(object_min - ImVec2(8, 8), object_max + ImVec2(8, 8)));
             for (std::size_t index = 0; index + 2U < instance.mesh->indices.size(); index += 3U) {
-                const auto a = projected.at(instance.mesh->indices[index]);
-                const auto b = projected.at(instance.mesh->indices[index + 1U]);
-                const auto c = projected.at(instance.mesh->indices[index + 2U]);
+                const auto a = projected[instance.mesh->indices[index]];
+                const auto b = projected[instance.mesh->indices[index + 1U]];
+                const auto c = projected[instance.mesh->indices[index + 2U]];
                 const bool face_selected = snapshot.selection.mode == carto::editor::SelectionMode::face &&
                     std::find(snapshot.selection.faces.begin(), snapshot.selection.faces.end(),
                               instance.mesh->triangle_faces[index / 3U]) != snapshot.selection.faces.end();
@@ -1954,7 +2195,7 @@ struct DesktopState {
                 draw->AddTriangle(a, b, c, rgba(snapshot.colors.border_soft, 0.82F), 1.0F);
                 faces.push_back({instance.object, instance.mesh->triangle_faces[index / 3U], {a, b, c}});
                 const std::array<ImVec2, 3> points{a, b, c};
-                const auto& triangle_edges = instance.mesh->triangle_edges.at(index / 3U);
+                const auto& triangle_edges = instance.mesh->triangle_edges[index / 3U];
                 for (std::size_t edge_index = 0U; edge_index < triangle_edges.size(); ++edge_index) {
                     if (!triangle_edges[edge_index].has_value()) continue;
                     const ImVec2 first = points[edge_index];
@@ -1970,13 +2211,28 @@ struct DesktopState {
                 }
             }
         }
+        if (invalid_render_snapshot) {
+            ImGui::TextColored(
+                color(snapshot.colors.semantic_warning),
+                "Render snapshot contains invalid geometry; selection disabled.");
+        }
         if (instances.empty()) ImGui::TextDisabled("No compiled geometry");
 
         if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             const ImVec2 mouse = ImGui::GetMousePos();
-            if (snapshot.selection.mode == carto::editor::SelectionMode::edge) {
+            std::uint8_t modifiers = 0U;
+            const ImGuiIO& io = ImGui::GetIO();
+            if (io.KeyCtrl) modifiers |= carto::ui::kNativeModifierControl;
+            if (io.KeyShift) modifiers |= carto::ui::kNativeModifierShift;
+            if (io.KeyAlt) modifiers |= carto::ui::kNativeModifierAlt;
+            const auto selection_operation =
+                carto::ui::selection_operation_for_native_pointer({
+                    carto::ui::NativePointerButton::primary,
+                    0, 0, modifiers, true});
+            if (selection_operation.has_value() &&
+                snapshot.selection.mode == carto::editor::SelectionMode::edge) {
                 float best = 12.0F * 12.0F;
-                std::optional<EdgeHit> hit;
+                std::optional<ViewportEdgeHit> hit;
                 for (const auto& candidate : edges) {
                     const float distance = point_segment_distance_squared(
                         mouse, candidate.first, candidate.second);
@@ -1985,28 +2241,33 @@ struct DesktopState {
                         hit = candidate;
                     }
                 }
-                if (hit.has_value()) dispatch(SelectEdgeAction{hit->object, hit->edge});
-            } else if (snapshot.selection.mode == carto::editor::SelectionMode::face) {
+                if (hit.has_value()) dispatch(SelectEdgeAction{
+                    hit->object, hit->edge, *selection_operation});
+            } else if (selection_operation.has_value() &&
+                       snapshot.selection.mode == carto::editor::SelectionMode::face) {
                 for (auto iterator = faces.rbegin(); iterator != faces.rend(); ++iterator) {
                     if (point_in_triangle(mouse, iterator->points[0], iterator->points[1], iterator->points[2])) {
-                        dispatch(SelectFaceAction{iterator->object, iterator->face});
+                        dispatch(SelectFaceAction{
+                            iterator->object, iterator->face, *selection_operation});
                         break;
                     }
                 }
-            } else if (snapshot.selection.mode == carto::editor::SelectionMode::vertex) {
+            } else if (selection_operation.has_value() &&
+                       snapshot.selection.mode == carto::editor::SelectionMode::vertex) {
                 float best = 12.0F * 12.0F;
-                std::optional<VertexHit> hit;
+                std::optional<ViewportVertexHit> hit;
                 for (const auto& candidate : vertices) {
                     const float dx = candidate.point.x - mouse.x;
                     const float dy = candidate.point.y - mouse.y;
                     const float distance = dx * dx + dy * dy;
                     if (distance < best) { best = distance; hit = candidate; }
                 }
-                if (hit.has_value()) dispatch(SelectVertexAction{hit->object, hit->vertex});
-            } else {
+                if (hit.has_value()) dispatch(SelectVertexAction{
+                    hit->object, hit->vertex, *selection_operation});
+            } else if (selection_operation.has_value()) {
                 for (auto iterator = objects.rbegin(); iterator != objects.rend(); ++iterator) {
                     if (iterator->second.Contains(mouse)) {
-                        dispatch(SelectObjectAction{iterator->first});
+                        dispatch(SelectObjectAction{iterator->first, *selection_operation});
                         break;
                     }
                 }
@@ -2231,12 +2492,66 @@ struct DesktopState {
         }
         ImGui::TextDisabled("Constraints");
         ImGui::BulletText("Existing geometry remains authoritative");
-        ImGui::BulletText("Proposals require explicit review");
-        ImGui::BeginDisabled(!snapshot.ai_available);
-        ImGui::Button("Generate Study", ImVec2(-1, 30));
-        ImGui::EndDisabled();
-        if (!snapshot.ai_available) ImGui::TextColored(
-            color(snapshot.colors.semantic_warning), "Unavailable: no planner connected");
+        if (snapshot.ai_auto_approve) {
+            ImGui::BulletText("Safe native studies auto-apply");
+        } else {
+            ImGui::BulletText("Proposals require explicit review");
+        }
+        if (!ai_preview.has_value()) {
+            ImGui::BeginDisabled(!snapshot.ai_available || ai_intent.empty());
+            const char* generate_label = snapshot.ai_auto_approve
+                ? "Generate & Apply Study" : "Generate Study";
+            if (ImGui::Button(generate_label, ImVec2(-1, 30))) {
+                if (snapshot.ai_auto_approve) {
+                    const auto committed = ui.apply_ai_intent(ai_intent);
+                    if (committed) {
+                        ai_feedback = "Auto-approved and applied through the native command boundary.";
+                    } else {
+                        ai_feedback = committed.error().message;
+                    }
+                } else {
+                    const auto proposal = ui.propose_ai(ai_intent);
+                    if (!proposal) {
+                        ai_feedback = proposal.error().message;
+                        ai_proposal.reset();
+                        ai_preview.reset();
+                    } else {
+                        const auto preview = ui.begin_ai_preview(proposal.value());
+                        if (!preview) {
+                            ai_feedback = preview.error().message;
+                            ai_proposal.reset();
+                            ai_preview.reset();
+                        } else {
+                            ai_proposal = proposal.value();
+                            ai_preview = std::move(preview.value());
+                            ai_feedback = "Preview ready; the scene is unchanged.";
+                        }
+                    }
+                }
+            }
+            ImGui::EndDisabled();
+        } else {
+            ImGui::Text("Proposal: %s", ai_proposal->tool_id.c_str());
+            ImGui::TextWrapped("%s", ai_proposal->rationale.c_str());
+            if (ImGui::Button("Apply Approved Study", ImVec2(-1, 30))) {
+                const auto committed = ui.commit_ai_preview(*ai_preview, *ai_proposal);
+                if (committed) {
+                    ai_feedback = "Applied through the native command boundary.";
+                    ai_proposal.reset();
+                    ai_preview.reset();
+                } else {
+                    ai_feedback = committed.error().message;
+                }
+            }
+            if (ImGui::Button("Discard Study", ImVec2(-1, 30))) {
+                ai_proposal.reset();
+                ai_preview.reset();
+                ai_feedback = "Proposal discarded; the scene is unchanged.";
+            }
+        }
+        if (!ai_feedback.empty()) {
+            ImGui::TextWrapped("%s", ai_feedback.c_str());
+        }
         end_instrument(carto::ui::WorkbenchInstrument::draft, workbench.draft);
     }
 
@@ -2442,7 +2757,7 @@ struct DesktopState {
         if (ImGui::Button("Touch")) static_cast<void>(ui.set_density(carto::ui::Density::touch));
         ImGui::EndChild();
 
-        ImGui::BeginChild("OperatorSettings", ImVec2(0, 142), true);
+        ImGui::BeginChild("OperatorSettings", ImVec2(0, 190), true);
         ImGui::TextDisabled("Operator boundary");
         ImGui::Text("Current mode: %s", carto::ui::operator_mode_name(snapshot.operator_mode));
         if (ImGui::Button("Person-first", ImVec2(130, 32))) {
@@ -2452,7 +2767,11 @@ struct DesktopState {
         if (ImGui::Button("AI-first", ImVec2(130, 32))) {
             static_cast<void>(ui.set_operator_mode(carto::ui::OperatorMode::ai_first));
         }
-        ImGui::TextDisabled("AI proposals remain non-authoritative and no planner is connected.");
+        bool auto_approve = snapshot.ai_auto_approve;
+        if (ImGui::Checkbox("Auto-approve safe native studies", &auto_approve)) {
+            static_cast<void>(ui.set_ai_auto_approve(auto_approve));
+        }
+        ImGui::TextDisabled("Default on. The AI can invoke the same typed Apply boundary.");
         ImGui::EndChild();
 
         ImGui::BeginChild("PanelSettings", ImVec2(0, 0), true);
@@ -2509,11 +2828,15 @@ struct DesktopState {
             ai_intent.assign(intent.data());
         }
         ImGui::TextDisabled("Constraints");
-        ImGui::BulletText("No planner connected");
+        ImGui::BulletText("Native proposal planner");
         ImGui::BulletText("No proposal is authoritative");
         ImGui::Separator();
         ImGui::TextWrapped("%s", snapshot.ai_status.c_str());
-        ImGui::TextDisabled("AI proposals require a future bounded planner and transaction adapter.");
+        if (ai_proposal.has_value()) {
+            ImGui::Text("Pending: %s", ai_proposal->tool_id.c_str());
+            ImGui::TextDisabled("Revision %llu", static_cast<unsigned long long>(
+                ai_proposal->base_revision.value()));
+        }
         ImGui::EndChild();
     }
 
@@ -2643,13 +2966,16 @@ struct DesktopState {
                 ImGui::TextColored(color(snapshot.colors.semantic_warning), "UI: %s", problem.message.c_str());
             }
         } else {
+            const std::size_t bottom_index = static_cast<std::size_t>(snapshot.bottom_panel);
+            const char* bottom_label = bottom_index < tabs.size() ? tabs[bottom_index].second : "Unknown";
             ImGui::TextDisabled("%s panel is reserved for the corresponding future subsystem.",
-                               tabs.at(static_cast<std::size_t>(snapshot.bottom_panel)).second);
+                               bottom_label);
         }
         ImGui::EndChild();
     }
 
     void draw() {
+        if (surface != ShellSurface::workspace) native_viewport_hits.reset();
         process_close_request();
         route_shortcuts();
         const auto snapshot = ui.snapshot();
@@ -2698,6 +3024,53 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
         limits->ptMinTrackSize.x = 1120;
         limits->ptMinTrackSize.y = 720;
         return 0;
+    }
+    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && g_state != nullptr) {
+        const auto native_key = [&]() -> std::optional<carto::ui::NativeKey> {
+            switch (w_param) {
+            case 'S': return carto::ui::NativeKey::s;
+            case 'Z': return carto::ui::NativeKey::z;
+            case 'Y': return carto::ui::NativeKey::y;
+            case 'K': return carto::ui::NativeKey::k;
+            case '1': return carto::ui::NativeKey::digit_1;
+            case '2': return carto::ui::NativeKey::digit_2;
+            case '3': return carto::ui::NativeKey::digit_3;
+            case '4': return carto::ui::NativeKey::digit_4;
+            case VK_ESCAPE: return carto::ui::NativeKey::escape;
+            default: return std::nullopt;
+            }
+        }();
+        if (native_key.has_value()) {
+            std::uint8_t modifiers = 0U;
+            if ((GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+                modifiers |= carto::ui::kNativeModifierControl;
+            }
+            if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) {
+                modifiers |= carto::ui::kNativeModifierShift;
+            }
+            if ((GetKeyState(VK_MENU) & 0x8000) != 0) {
+                modifiers |= carto::ui::kNativeModifierAlt;
+            }
+            const bool repeat =
+                (static_cast<std::uint64_t>(l_param) & (1ULL << 30U)) != 0U;
+            if (g_state->route_native_key(
+                    carto::ui::NativeKeyEvent{*native_key, modifiers, true, repeat})) {
+                return 0;
+            }
+        }
+    }
+    if (message == WM_LBUTTONDOWN && g_state != nullptr) {
+        std::uint8_t modifiers = 0U;
+        if ((w_param & MK_CONTROL) != 0U) modifiers |= carto::ui::kNativeModifierControl;
+        if ((w_param & MK_SHIFT) != 0U) modifiers |= carto::ui::kNativeModifierShift;
+        if ((GetKeyState(VK_MENU) & 0x8000) != 0) modifiers |= carto::ui::kNativeModifierAlt;
+        const carto::ui::NativePointerEvent event{
+            carto::ui::NativePointerButton::primary,
+            static_cast<std::int32_t>(static_cast<SHORT>(LOWORD(l_param))),
+            static_cast<std::int32_t>(static_cast<SHORT>(HIWORD(l_param))),
+            modifiers,
+            true};
+        if (g_state->route_native_pointer(event)) return 0;
     }
     if (ImGui_ImplWin32_WndProcHandler(window, message, w_param, l_param)) return 1;
     if (message == WM_SIZE && g_state != nullptr && w_param != SIZE_MINIMIZED) {

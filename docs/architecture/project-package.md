@@ -28,9 +28,9 @@ would make package validity look better than it is.
 
 Derived interchange artifacts belong under `exports/` when a future package
 writer is connected. The current headless CLI writes the same artifact to an
-explicit caller-provided path: `export-vanta project.carto scene.gltf`. That
-glTF is a VANTA-shaped export profile, not authoring truth and not a migration
-of the `.carto` serializer.
+explicit caller-provided path: `export-gltf project.carto scene.gltf`. That
+glTF is a bounded derived interchange profile, not authoring truth and not a
+migration of the `.carto` serializer.
 
 SQLite WAL storage, manifest migration execution, database integrity checks,
 and package open/save integration are the next storage tranche. They require a

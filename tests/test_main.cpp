@@ -9,7 +9,7 @@
 #include <carto/io/obj.hpp>
 #include <carto/io/ply.hpp>
 #include <carto/io/stl.hpp>
-#include <carto/io/vanta_export.hpp>
+#include <carto/io/gltf_export.hpp>
 #include <carto/project/project.hpp>
 #include <carto/render/render_scene.hpp>
 
@@ -429,6 +429,21 @@ void mesh_patches_are_revision_bound_atomic_and_invertible() {
     };
     REQUIRE(!mesh.apply_patch(partially_missing));
     REQUIRE(mesh.find_vertex(vertex.id)->position.x == current.x);
+
+    const auto third_vertex = mesh.vertices_sorted().at(2);
+    const auto before_degenerate_revision = mesh.revision();
+    const carto::geometry::MeshPatch degenerate_patch{
+        before_degenerate_revision,
+        {carto::geometry::VertexChange{
+            third_vertex.id, third_vertex.position, carto::core::Vec3d{0.5, 0.0, 0.0}}},
+    };
+    const auto degenerate = mesh.apply_patch(degenerate_patch);
+    REQUIRE(!degenerate);
+    REQUIRE(degenerate.error().code == carto::core::ErrorCode::validation_failed);
+    REQUIRE(mesh.revision() == before_degenerate_revision);
+    REQUIRE(mesh.find_vertex(third_vertex.id)->position.x == third_vertex.position.x);
+    REQUIRE(mesh.find_vertex(third_vertex.id)->position.y == third_vertex.position.y);
+    REQUIRE(mesh.validate());
 }
 
 void primitives_are_deterministic_and_dimension_validated() {
@@ -1246,6 +1261,20 @@ void obj_interchange_reports_feature_loss_and_round_trips_geometry() {
     REQUIRE(imported.value().mesh.face_count() == 1U);
     REQUIRE(imported.value().report.triangles == 1U);
 
+    const auto conflicting_path = temp.path() / "conflicting-directed-edge.obj";
+    std::ofstream conflicting(conflicting_path, std::ios::binary | std::ios::trunc);
+    conflicting << "v 0 0 0\nv 1 0 0\nv 0 1 0\n"
+                   "f 1 2 3\n"
+                   "f 1 2 3\n";
+    conflicting.close();
+    const auto repaired = carto::io::import_obj(conflicting_path);
+    REQUIRE(repaired);
+    REQUIRE(repaired.value().mesh.vertex_count() == 6U &&
+            repaired.value().mesh.face_count() == 2U &&
+            repaired.value().report.triangles == 2U &&
+            repaired.value().report.warnings.size() == 1U &&
+            repaired.value().report.warnings.front().find("isolated OBJ face") != std::string::npos);
+
     const auto oversized_face_path = temp.path() / "oversized-face.obj";
     std::ofstream oversized_face(oversized_face_path, std::ios::binary | std::ios::trunc);
     oversized_face << "v 0 0 0\nv 1 0 0\nv 0 1 0\nf";
@@ -1327,9 +1356,9 @@ void render_boundary_does_not_include_editable_mesh_api() {
     REQUIRE(compiled.value().valid());
 }
 
-void vanta_gltf_export_is_deterministic_bounded_and_feature_honest() {
+void gltf_export_is_deterministic_bounded_and_feature_honest() {
     TempDirectory temp;
-    auto document = carto::project::ProjectDocument::create("VANTA export \"fixture\"");
+    auto document = carto::project::ProjectDocument::create("glTF export \"fixture\"");
     REQUIRE(document);
     auto mesh = carto::geometry::make_box({2.0, 2.0, 2.0});
     REQUIRE(mesh);
@@ -1342,14 +1371,14 @@ void vanta_gltf_export_is_deterministic_bounded_and_feature_honest() {
 
     const auto first_path = temp.path() / "first.gltf";
     const auto second_path = temp.path() / "second.gltf";
-    const auto first = carto::io::export_vanta_gltf(document.value(), first_path);
+    const auto first = carto::io::export_gltf(document.value(), first_path);
     REQUIRE(first);
     REQUIRE(first.value().objects == 1U && first.value().meshes == 1U);
     REQUIRE(first.value().vertices == 8U && first.value().triangles == 12U);
     REQUIRE(first.value().index_bytes == 72U);
     REQUIRE(!first.value().used_uint32_indices);
     REQUIRE(first.value().warnings.size() == 2U);
-    REQUIRE(carto::io::export_vanta_gltf(document.value(), second_path));
+    REQUIRE(carto::io::export_gltf(document.value(), second_path));
 
     std::ifstream first_input(first_path, std::ios::binary);
     std::ifstream second_input(second_path, std::ios::binary);
@@ -1359,7 +1388,7 @@ void vanta_gltf_export_is_deterministic_bounded_and_feature_honest() {
         (std::istreambuf_iterator<char>(second_input)), std::istreambuf_iterator<char>());
     REQUIRE(!first_text.empty() && first_text == second_text);
     REQUIRE(first_text.find("\"version\":\"2.0\"") != std::string::npos);
-    REQUIRE(first_text.find("cartographer-vanta-gltf") != std::string::npos);
+    REQUIRE(first_text.find("cartographer-gltf") != std::string::npos);
     REQUIRE(first_text.find("\"POSITION\":0") != std::string::npos);
     REQUIRE(first_text.find("\"NORMAL\":1") != std::string::npos);
     REQUIRE(first_text.find("\"componentType\":5123") != std::string::npos);
@@ -1368,7 +1397,7 @@ void vanta_gltf_export_is_deterministic_bounded_and_feature_honest() {
 
     const auto blocked_path = temp.path() / "blocked.gltf";
     REQUIRE(std::filesystem::create_directory(blocked_path));
-    const auto blocked = carto::io::export_vanta_gltf(document.value(), blocked_path);
+    const auto blocked = carto::io::export_gltf(document.value(), blocked_path);
     REQUIRE(!blocked && std::filesystem::is_directory(blocked_path));
 
     auto oversized = carto::project::ProjectDocument::create("float32 boundary");
@@ -1381,7 +1410,7 @@ void vanta_gltf_export_is_deterministic_bounded_and_feature_honest() {
     REQUIRE(huge.add_face({a.value(), b.value(), c.value()}));
     auto oversized_access = carto::project::testing::access(oversized.value());
     REQUIRE(oversized_access.add_mesh(std::move(huge)));
-    const auto rejected = carto::io::export_vanta_gltf(
+    const auto rejected = carto::io::export_gltf(
         oversized.value(), temp.path() / "rejected.gltf");
     REQUIRE(!rejected);
     REQUIRE(rejected.error().code == carto::core::ErrorCode::validation_failed);
@@ -1414,7 +1443,7 @@ int main() {
         {"project save failure and path bounds", project_save_failure_does_not_replace_existing_file_and_paths_are_bounded},
         {"OBJ interchange reports feature loss", obj_interchange_reports_feature_loss_and_round_trips_geometry},
         {"PLY and STL interchange round trips with explicit loss", ply_and_stl_interchange_round_trip_with_explicit_loss},
-        {"VANTA glTF export is deterministic and bounded", vanta_gltf_export_is_deterministic_bounded_and_feature_honest},
+        {"glTF export is deterministic and bounded", gltf_export_is_deterministic_bounded_and_feature_honest},
         {"render boundary consumes compiled data", render_boundary_does_not_include_editable_mesh_api},
     };
 

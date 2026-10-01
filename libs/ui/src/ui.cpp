@@ -42,6 +42,10 @@ core::Diagnostic invalid_state(std::string message) {
     return core::Diagnostic(core::ErrorCode::invalid_state, std::move(message));
 }
 
+core::Diagnostic stale(std::string message) {
+    return core::Diagnostic(core::ErrorCode::stale_data, std::move(message));
+}
+
 core::Diagnostic io_error(std::string message) {
     return core::Diagnostic(core::ErrorCode::io_error, std::move(message));
 }
@@ -119,6 +123,36 @@ bool is_operation_action(const application::ApplicationAction& action) {
     }, action);
 }
 
+ai::Context make_ai_context(
+    const application::ApplicationSnapshot& snapshot,
+    const editor::AuthoringContext& authoring) {
+    return ai::Context{
+        snapshot.project_revision,
+        authoring,
+        ai::build_operation_ontology(snapshot.tools)};
+}
+
+bool same_ai_preview(
+    const ai::Proposal& proposal,
+    const editor::AuthoringPreview& preview) {
+    if (proposal.base_revision != preview.base_revision() ||
+        proposal.context != preview.context() ||
+        proposal.preview_kind != preview.kind()) {
+        return false;
+    }
+    const auto& expected = proposal.parameters;
+    const auto& actual = preview.parameters();
+    if (expected.distance != actual.distance) return false;
+    if (expected.position.has_value() != actual.position.has_value()) return false;
+    if (expected.position.has_value()) {
+        const auto& left = *expected.position;
+        const auto& right = *actual.position;
+        if (left.x != right.x || left.y != right.y || left.z != right.z) return false;
+    }
+    if (expected.transform.has_value() != actual.transform.has_value()) return false;
+    return !expected.transform.has_value();
+}
+
 std::string serialize_panels(const std::vector<Panel>& panels) {
     std::string result;
     for (std::size_t index = 0U; index < panels.size(); ++index) {
@@ -171,10 +205,14 @@ core::Result<UiPreferences> parse_preferences(std::string_view text) {
         cursor = end + 1U;
     }
     const auto header = fields.find("header");
-    if (header == fields.end() || header->second != "CARTOGRAPHER_UI_PREFS_V1") {
+    const bool legacy_format = header != fields.end() &&
+        header->second == "CARTOGRAPHER_UI_PREFS_V1";
+    const bool current_format = header != fields.end() &&
+        header->second == "CARTOGRAPHER_UI_PREFS_V2";
+    if (!legacy_format && !current_format) {
         return core::Result<UiPreferences>::failure(validation("workspace preference header is invalid"));
     }
-    if (fields.size() != 7U) {
+    if (fields.size() != (current_format ? 8U : 7U)) {
         return core::Result<UiPreferences>::failure(validation("workspace preference field set is invalid"));
     }
     const auto get = [&fields](std::string_view key) -> core::Result<std::string> {
@@ -191,10 +229,19 @@ core::Result<UiPreferences> parse_preferences(std::string_view text) {
     const auto theme = get("theme");
     const auto bottom = get("bottom_panel");
     const auto panels = get("panels");
-    if (!mode || !workspace || !density || !theme || !bottom || !panels) {
+    const auto auto_approve = [&]() -> core::Result<bool> {
+        if (!current_format) return core::Result<bool>::success(true);
+        const auto value = get("ai_auto_approve");
+        if (!value) return core::Result<bool>::failure(value.error());
+        if (value.value() == "1") return core::Result<bool>::success(true);
+        if (value.value() == "0") return core::Result<bool>::success(false);
+        return core::Result<bool>::failure(
+            validation("workspace preference AI auto-approve flag is invalid"));
+    }();
+    if (!mode || !workspace || !density || !theme || !bottom || !panels || !auto_approve) {
         const auto& diagnostic = !mode ? mode.error() : !workspace ? workspace.error() :
             !density ? density.error() : !theme ? theme.error() :
-            !bottom ? bottom.error() : panels.error();
+            !bottom ? bottom.error() : !panels ? panels.error() : auto_approve.error();
         return core::Result<UiPreferences>::failure(diagnostic);
     }
     const auto parsed_mode = parse_enum<OperatorMode>(mode.value(), {
@@ -224,6 +271,7 @@ core::Result<UiPreferences> parse_preferences(std::string_view text) {
     result.density = parsed_density.value();
     result.theme = parsed_theme.value();
     result.bottom_panel = parsed_bottom.value();
+    result.ai_auto_approve = auto_approve.value();
     result.visible_panels.clear();
     std::size_t panel_cursor = 0U;
     while (panel_cursor <= panels.value().size()) {
@@ -246,12 +294,13 @@ core::Result<UiPreferences> parse_preferences(std::string_view text) {
 }
 
 std::string serialize_preferences(const UiPreferences& preferences) {
-    return std::string("header=CARTOGRAPHER_UI_PREFS_V1\n") +
+    return std::string("header=CARTOGRAPHER_UI_PREFS_V2\n") +
         "operator_mode=" + operator_mode_name(preferences.operator_mode) + "\n" +
         "workspace=" + workspace_name(preferences.workspace) + "\n" +
         "density=" + density_name(preferences.density) + "\n" +
         "theme=" + theme_name(preferences.theme) + "\n" +
         "bottom_panel=" + bottom_panel_name(preferences.bottom_panel) + "\n" +
+        "ai_auto_approve=" + std::string(preferences.ai_auto_approve ? "1\n" : "0\n") +
         "panels=" + serialize_panels(preferences.visible_panels) + "\n";
 }
 
@@ -673,6 +722,61 @@ const char* workbench_instrument_name(WorkbenchInstrument instrument) noexcept {
     return "unknown";
 }
 
+std::optional<Shortcut> shortcut_for_native_key(const NativeKeyEvent& event) noexcept {
+    if (!event.pressed) return std::nullopt;
+
+    const bool control = (event.modifiers & kNativeModifierControl) != 0U;
+    const bool shift = (event.modifiers & kNativeModifierShift) != 0U;
+    const bool alt = (event.modifiers & kNativeModifierAlt) != 0U;
+    const std::uint8_t known_modifiers =
+        kNativeModifierControl | kNativeModifierShift | kNativeModifierAlt;
+    if ((event.modifiers & static_cast<std::uint8_t>(~known_modifiers)) != 0U) {
+        return std::nullopt;
+    }
+
+    if (control && !shift && !alt) {
+        switch (event.key) {
+        case NativeKey::s: return Shortcut::save;
+        case NativeKey::z: return Shortcut::undo;
+        case NativeKey::y: return Shortcut::redo;
+        case NativeKey::k: return Shortcut::toggle_command_palette;
+        default: break;
+        }
+    }
+
+    if (!control && !shift && !alt) {
+        switch (event.key) {
+        case NativeKey::digit_1: return Shortcut::object_mode;
+        case NativeKey::digit_2: return Shortcut::vertex_mode;
+        case NativeKey::digit_3: return Shortcut::edge_mode;
+        case NativeKey::digit_4: return Shortcut::face_mode;
+        case NativeKey::escape: return Shortcut::close_overlay;
+        default: break;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<editor::SelectionOperation> selection_operation_for_native_pointer(
+    const NativePointerEvent& event) noexcept {
+    if (!event.pressed || event.button != NativePointerButton::primary) {
+        return std::nullopt;
+    }
+
+    const std::uint8_t known_modifiers =
+        kNativeModifierControl | kNativeModifierShift | kNativeModifierAlt;
+    if ((event.modifiers & static_cast<std::uint8_t>(~known_modifiers)) != 0U) {
+        return std::nullopt;
+    }
+    const bool control = (event.modifiers & kNativeModifierControl) != 0U;
+    const bool shift = (event.modifiers & kNativeModifierShift) != 0U;
+    const bool alt = (event.modifiers & kNativeModifierAlt) != 0U;
+    if (alt || (control && shift)) return std::nullopt;
+    if (control) return editor::SelectionOperation::toggle;
+    if (shift) return editor::SelectionOperation::add;
+    return editor::SelectionOperation::replace;
+}
+
 core::Result<void> save_workbench_preferences(
     const std::filesystem::path& path,
     const WorkbenchPreferences& preferences) {
@@ -758,11 +862,89 @@ core::Result<application::DispatchReceipt> UiController::commit_preview(
     return result;
 }
 
+core::Result<ai::Proposal> UiController::propose_ai(std::string_view intent) {
+    const auto authoring = session_.authoring_context();
+    if (!authoring) {
+        record_ui_problem(authoring.error().with_context("native AI context"));
+        return core::Result<ai::Proposal>::failure(authoring.error());
+    }
+    const auto context = make_ai_context(session_.snapshot(), authoring.value());
+    if (auto result = context.validate(); !result) {
+        record_ui_problem(result.error().with_context("native AI context"));
+        return core::Result<ai::Proposal>::failure(result.error());
+    }
+    auto proposal = native_planner_.propose(intent, context);
+    if (!proposal) record_ui_problem(proposal.error().with_context("native AI proposal"));
+    return proposal;
+}
+
+core::Result<editor::AuthoringPreview> UiController::begin_ai_preview(
+    const ai::Proposal& proposal) const {
+    const auto authoring = session_.authoring_context();
+    if (!authoring) return core::Result<editor::AuthoringPreview>::failure(authoring.error());
+    const auto context = make_ai_context(session_.snapshot(), authoring.value());
+    if (auto result = proposal.validate(context); !result) {
+        return core::Result<editor::AuthoringPreview>::failure(result.error());
+    }
+    auto preview = session_.begin_preview(proposal.preview_kind);
+    if (!preview) return preview;
+    auto updated = preview.value().update(proposal.parameters);
+    if (!updated) {
+        return core::Result<editor::AuthoringPreview>::failure(updated.error());
+    }
+    return preview;
+}
+
+core::Result<application::DispatchReceipt> UiController::apply_ai_intent(
+    std::string_view intent) {
+    const auto proposal = propose_ai(intent);
+    if (!proposal) {
+        return core::Result<application::DispatchReceipt>::failure(proposal.error());
+    }
+    const auto authoring = session_.authoring_context();
+    if (!authoring) {
+        record_ui_problem(authoring.error().with_context("native AI auto-approval context"));
+        return core::Result<application::DispatchReceipt>::failure(authoring.error());
+    }
+    const auto context = make_ai_context(session_.snapshot(), authoring.value());
+    if (auto result = proposal.value().validate_auto_approval(context); !result) {
+        record_ui_problem(result.error().with_context("native AI auto-approval"));
+        return core::Result<application::DispatchReceipt>::failure(result.error());
+    }
+    auto preview = begin_ai_preview(proposal.value());
+    if (!preview) {
+        record_ui_problem(preview.error().with_context("native AI auto-approval preview"));
+        return core::Result<application::DispatchReceipt>::failure(preview.error());
+    }
+    return commit_ai_preview(preview.value(), proposal.value());
+}
+
+core::Result<application::DispatchReceipt> UiController::commit_ai_preview(
+    editor::AuthoringPreview& preview,
+    const ai::Proposal& proposal) {
+    const auto authoring = session_.authoring_context();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(authoring.error());
+    const auto context = make_ai_context(session_.snapshot(), authoring.value());
+    if (auto result = proposal.validate(context); !result) {
+        record_ui_problem(result.error().with_context("native AI commit"));
+        return core::Result<application::DispatchReceipt>::failure(result.error());
+    }
+    if (!same_ai_preview(proposal, preview)) {
+        const auto diagnostic = stale("native AI preview no longer matches its proposal");
+        record_ui_problem(diagnostic);
+        return core::Result<application::DispatchReceipt>::failure(diagnostic);
+    }
+    const auto result = application::HumanApplicationAccess::commit_preview(
+        session_, preview, application::OperationSource::ai_proposal, proposal.request_id);
+    if (result) record_operation(result.value(), OperationCategory::provider);
+    return result;
+}
+
 core::Result<application::DispatchReceipt> UiController::submit_ai_proposal(
     const application::ApplicationAction& action) {
     static_cast<void>(action);
     const auto diagnostic = invalid_state(
-        "AI proposals require explicit admission; no planner is connected");
+        "raw AI application actions are rejected; submit a typed proposal and preview it first");
     record_ui_problem(diagnostic);
     return core::Result<application::DispatchReceipt>::failure(diagnostic);
 }
@@ -804,6 +986,11 @@ core::Result<void> UiController::set_theme(Theme theme) {
 core::Result<void> UiController::set_bottom_panel(BottomPanel panel) {
     if (!valid(panel)) return core::Result<void>::failure(invalid("bottom panel is invalid"));
     preferences_.bottom_panel = panel;
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::set_ai_auto_approve(bool enabled) {
+    preferences_.ai_auto_approve = enabled;
     return core::Result<void>::success();
 }
 
@@ -1039,8 +1226,11 @@ UiSnapshot UiController::snapshot() const {
     result.commands = command_views();
     result.ui_problems = ui_problems_;
     result.colors = color_tokens(preferences_.theme);
-    result.ai_available = false;
-    result.ai_status = "AI tools unavailable; manual Cartographer remains fully functional.";
+    result.ai_available = true;
+    result.ai_auto_approve = preferences_.ai_auto_approve;
+    result.ai_status = preferences_.ai_auto_approve
+        ? "Native planner ready. Safe proposals auto-apply through the revision-bound command path."
+        : "Native planner ready. Proposals require explicit Apply through the revision-bound command path.";
     if (!result.ui_problems.empty()) {
         result.project_status = ProjectStatus::ui_error;
         result.project_status_text = "UI attention required";

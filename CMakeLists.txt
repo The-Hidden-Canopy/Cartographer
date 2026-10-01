@@ -2,16 +2,63 @@ cmake_minimum_required(VERSION 3.25)
 
 project(Cartographer
     VERSION 0.1.0
-    DESCRIPTION "Standalone open-source spatial authoring system"
+    DESCRIPTION "Standalone spatial authoring system"
     LANGUAGES C CXX
 )
 
 option(CARTO_BUILD_TESTS "Build headless unit and invariant tests" ON)
+option(CARTO_BUILD_BENCHMARKS "Build native geometry kernel benchmarks" OFF)
 option(CARTO_BUILD_CLI "Build the headless Cartographer CLI" ON)
-option(CARTO_BUILD_GMIB_GAME "Build the headless GMIB game slice" ON)
+option(CARTO_BUILD_PRIVATE_INTEGRATIONS
+    "Build out-of-tree private/uncleared integration surfaces" OFF)
+set(CARTO_PRIVATE_SOURCE_ROOT "" CACHE PATH
+    "Out-of-tree Cartographer-private source root")
 option(CARTO_ENABLE_VULKAN "Enable the optional Vulkan render backend" OFF)
 option(CARTO_BUILD_DESKTOP "Build the optional Dear ImGui/Vulkan desktop shell" OFF)
 set(CARTO_IMGUI_ROOT "" CACHE PATH "Path to a pinned Dear ImGui source tree")
+option(CARTO_BUILD_GMIB_GRAPHICS "Build the optional GMIB presentation consumer" OFF)
+set(CARTO_GMIB_ROOT "" CACHE PATH "Standalone GMIB source root for the optional graphics consumer")
+option(CARTO_BUILD_GMIB_GAME "Build the Cartographer-hosted GMIB game surface" OFF)
+if(CARTO_BUILD_PRIVATE_INTEGRATIONS)
+    set(_carto_private_required_paths
+        "${CARTO_PRIVATE_SOURCE_ROOT}/libs/anatomy/CMakeLists.txt"
+        "${CARTO_PRIVATE_SOURCE_ROOT}/libs/owh/CMakeLists.txt"
+        "${CARTO_PRIVATE_SOURCE_ROOT}/libs/simulation/CMakeLists.txt"
+        "${CARTO_PRIVATE_SOURCE_ROOT}/tests/anatomy_catalog_tests.cpp")
+    foreach(_carto_private_path IN LISTS _carto_private_required_paths)
+        if(NOT EXISTS "${_carto_private_path}")
+            message(FATAL_ERROR
+                "CARTO_BUILD_PRIVATE_INTEGRATIONS=ON requires a complete CARTO_PRIVATE_SOURCE_ROOT: missing ${_carto_private_path}")
+        endif()
+    endforeach()
+endif()
+if((CARTO_BUILD_GMIB_GRAPHICS OR CARTO_BUILD_GMIB_GAME) AND
+   NOT CARTO_BUILD_PRIVATE_INTEGRATIONS)
+    message(FATAL_ERROR
+        "GMIB surfaces are private integrations; enable CARTO_BUILD_PRIVATE_INTEGRATIONS and provide CARTO_PRIVATE_SOURCE_ROOT")
+endif()
+if(CARTO_BUILD_GMIB_GRAPHICS AND
+   NOT EXISTS "${CARTO_PRIVATE_SOURCE_ROOT}/libs/gmib/CMakeLists.txt")
+    message(FATAL_ERROR
+        "CARTO_BUILD_GMIB_GRAPHICS=ON requires the private GMIB adapter in CARTO_PRIVATE_SOURCE_ROOT")
+endif()
+if(CARTO_BUILD_GMIB_GRAPHICS AND
+   NOT EXISTS "${CARTO_GMIB_ROOT}/include/gmib/game/presentation.hpp")
+    message(FATAL_ERROR "CARTO_BUILD_GMIB_GRAPHICS=ON requires CARTO_GMIB_ROOT pointing at god-mode-is-a-bug")
+endif()
+if(CARTO_BUILD_GMIB_GAME AND NOT CARTO_BUILD_GMIB_GRAPHICS)
+    message(FATAL_ERROR "CARTO_BUILD_GMIB_GAME=ON requires CARTO_BUILD_GMIB_GRAPHICS=ON")
+endif()
+if(CARTO_BUILD_GMIB_GAME AND
+   (NOT EXISTS "${CARTO_PRIVATE_SOURCE_ROOT}/apps/gmib-game/main.cpp" OR
+    NOT EXISTS "${CARTO_PRIVATE_SOURCE_ROOT}/apps/gmib-game/bake.cpp"))
+    message(FATAL_ERROR
+        "CARTO_BUILD_GMIB_GAME=ON requires the private GMIB host sources in CARTO_PRIVATE_SOURCE_ROOT")
+endif()
+if(CARTO_BUILD_GMIB_GAME AND
+   NOT EXISTS "${CARTO_GMIB_ROOT}/include/gmib/game/game.hpp")
+    message(FATAL_ERROR "CARTO_BUILD_GMIB_GAME=ON requires CARTO_GMIB_ROOT pointing at god-mode-is-a-bug")
+endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     add_compile_options(-Wall -Wextra -Wpedantic -Wconversion -Wshadow)
@@ -31,7 +78,17 @@ endfunction()
 
 add_subdirectory(libs/core)
 add_subdirectory(libs/scene)
-add_subdirectory(libs/simulation)
+if(CARTO_BUILD_PRIVATE_INTEGRATIONS)
+    add_subdirectory(
+        "${CARTO_PRIVATE_SOURCE_ROOT}/libs/anatomy"
+        "${CMAKE_CURRENT_BINARY_DIR}/private/anatomy")
+    add_subdirectory(
+        "${CARTO_PRIVATE_SOURCE_ROOT}/libs/owh"
+        "${CMAKE_CURRENT_BINARY_DIR}/private/owh")
+    add_subdirectory(
+        "${CARTO_PRIVATE_SOURCE_ROOT}/libs/simulation"
+        "${CMAKE_CURRENT_BINARY_DIR}/private/simulation")
+endif()
 add_subdirectory(libs/geometry/mesh)
 add_subdirectory(libs/assets)
 add_subdirectory(libs/gpu)
@@ -41,11 +98,54 @@ add_subdirectory(libs/providers)
 add_subdirectory(libs/plugin_protocol)
 add_subdirectory(libs/project)
 add_subdirectory(libs/editor)
+add_subdirectory(libs/ai)
 add_subdirectory(libs/render)
+if(CARTO_BUILD_GMIB_GRAPHICS)
+    add_subdirectory(
+        "${CARTO_PRIVATE_SOURCE_ROOT}/libs/gmib"
+        "${CMAKE_CURRENT_BINARY_DIR}/private/gmib")
+endif()
+
+if(CARTO_BUILD_GMIB_GAME)
+    # Build GMIB from source inside the Cartographer host configuration. The
+    # standalone checkout remains independently buildable, while this target
+    # no longer relies on a separately configured GMIB binary directory.
+    set(_carto_gmib_tests_was_defined FALSE)
+    if(DEFINED GMIB_BUILD_TESTS)
+        set(_carto_gmib_tests_was_defined TRUE)
+        set(_carto_gmib_tests_previous "${GMIB_BUILD_TESTS}")
+    endif()
+    set(GMIB_BUILD_TESTS OFF CACHE BOOL "Build GMIB tests when embedded by an engine" FORCE)
+    add_subdirectory("${CARTO_GMIB_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/gmib" EXCLUDE_FROM_ALL)
+    if(_carto_gmib_tests_was_defined)
+        set(GMIB_BUILD_TESTS "${_carto_gmib_tests_previous}" CACHE BOOL
+            "Build GMIB tests when embedded by an engine" FORCE)
+    else()
+        unset(GMIB_BUILD_TESTS CACHE)
+    endif()
+    if(NOT TARGET gmib_game)
+        message(FATAL_ERROR "embedded GMIB source did not define the gmib_game target")
+    endif()
+
+    add_executable(
+        cartographer_gmib_game
+        "${CARTO_PRIVATE_SOURCE_ROOT}/apps/gmib-game/main.cpp")
+    target_link_libraries(cartographer_gmib_game PRIVATE carto_gmib_graphics gmib_game)
+    carto_target(cartographer_gmib_game)
+endif()
 add_subdirectory(libs/application)
 add_subdirectory(libs/ui)
 add_subdirectory(libs/sdk)
 add_subdirectory(libs/io)
+
+if(CARTO_BUILD_GMIB_GAME)
+    target_link_libraries(cartographer_gmib_game PRIVATE carto_project)
+    add_executable(
+        cartographer_gmib_bake
+        "${CARTO_PRIVATE_SOURCE_ROOT}/apps/gmib-game/bake.cpp")
+    target_link_libraries(cartographer_gmib_bake PRIVATE carto_project carto_assets carto_gmib_graphics gmib_game)
+    carto_target(cartographer_gmib_bake)
+endif()
 
 if(CARTO_ENABLE_VULKAN)
     find_package(Vulkan QUIET)
@@ -75,27 +175,40 @@ if(CARTO_BUILD_CLI)
     add_subdirectory(apps/cli)
 endif()
 
-if(CARTO_BUILD_GMIB_GAME)
-    add_subdirectory(apps/gmib)
+if(CARTO_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
 endif()
 
 if(CARTO_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 
-    add_executable(cartographer_simulation_tests
-        libs/simulation/tests/simulation_tests.cpp
-    )
-    target_link_libraries(cartographer_simulation_tests PRIVATE carto_simulation)
-    carto_target(cartographer_simulation_tests)
-    add_test(NAME cartographer_simulation_tests COMMAND cartographer_simulation_tests)
+    if(CARTO_BUILD_PRIVATE_INTEGRATIONS)
+        add_executable(cartographer_simulation_tests
+            "${CARTO_PRIVATE_SOURCE_ROOT}/libs/simulation/tests/simulation_tests.cpp")
+        target_link_libraries(cartographer_simulation_tests PRIVATE carto_simulation)
+        carto_target(cartographer_simulation_tests)
+        add_test(NAME cartographer_simulation_tests COMMAND cartographer_simulation_tests)
+    endif()
 
-    add_executable(cartographer_gmib_game_tests
-        libs/simulation/tests/game_tests.cpp
-    )
-    target_link_libraries(cartographer_gmib_game_tests PRIVATE carto_simulation)
-    carto_target(cartographer_gmib_game_tests)
-    add_test(NAME cartographer_gmib_game_tests COMMAND cartographer_gmib_game_tests)
+    if(CARTO_BUILD_GMIB_GRAPHICS)
+        add_executable(cartographer_gmib_graphics_tests
+            "${CARTO_PRIVATE_SOURCE_ROOT}/libs/gmib/tests/graphics_tests.cpp"
+        )
+        target_link_libraries(cartographer_gmib_graphics_tests PRIVATE carto_gmib_graphics)
+        carto_target(cartographer_gmib_graphics_tests)
+        add_test(NAME cartographer_gmib_graphics_tests COMMAND cartographer_gmib_graphics_tests)
+    endif()
+
+    if(CARTO_BUILD_GMIB_GAME)
+        add_executable(cartographer_gmib_game_tests
+            "${CARTO_PRIVATE_SOURCE_ROOT}/libs/gmib/tests/game_host_tests.cpp"
+        )
+        target_link_libraries(cartographer_gmib_game_tests PRIVATE carto_gmib_graphics gmib_game)
+        carto_target(cartographer_gmib_game_tests)
+        add_test(NAME cartographer_gmib_game_tests COMMAND cartographer_gmib_game_tests)
+    endif()
+
 endif()
 
 include(GNUInstallDirs)

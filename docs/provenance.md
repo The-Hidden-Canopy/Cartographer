@@ -1,41 +1,68 @@
-# Provenance and open-source boundary
+# Public provenance and release boundary
 
-## Source specification
+Cartographer is the public, standalone authoring foundation. The public
+checkout must build and test without login, network access, a model runtime,
+private repositories, or hosted services.
 
-The repository was created from the user-provided 143-page
-`Cartographer_Engineering_Specification.pdf`, preserved at
-`docs/spec/Cartographer_Engineering_Specification.pdf`.
+## Public source boundary
 
-Recorded source digest:
+The public repository contains generic authoring and interchange behavior:
+
+- versioned `.carto` authoring data and validation;
+- scene, geometry, topology, revision, undo/redo, and local receipts;
+- OBJ, PLY, STL, and bounded glTF interchange;
+- backend-neutral render-graph and GPU contracts;
+- optional generic Vulkan and native-shell acceptance seams; and
+- provider-neutral, revision-bound proposal contracts.
+
+These surfaces do not contain account authority, credentials, model weights,
+provider routing, private telemetry, runtime entity handles, or hosted project
+state.
+
+## Private boundary
+
+Private integrations are maintained outside this checkout. They may consume a
+versioned public artifact or proposal, but they must not become a dependency of
+the public authoring graph. A private integration may add an adapter, provider,
+optimization pass, catalog, workflow service, or runtime projection only from
+the private side of the boundary.
+
+The public build rejects private integration options unless an explicit
+out-of-tree private source root is supplied:
 
 ```text
-SHA-256 008C7F5144E7A6E14EAB3D975521D3387563A7E49AAA910A580F981F242A0E8D
+CARTO_BUILD_PRIVATE_INTEGRATIONS=OFF       public default
+CARTO_PRIVATE_SOURCE_ROOT=<private tree>  private development only
 ```
 
-The specification describes inspected capabilities in private VANTA,
-Open-World-Model-Harness, ForgeOfFate, and related repositories. Those
-references are treated as architecture evidence and downstream validation
-context only. This 0.1 implementation was written as a standalone
-reimplementation and does not link or include those repositories.
+This is a build boundary, not a license grant. The presence of a generic
+interchange profile does not imply compatibility, endorsement, or access to a
+private runtime.
 
-## Public boundary rules
+## Proposal boundary
 
-- No `vanta_*` namespace, private target, private header, model runtime, trace
-  pipeline, defense/governance service, or credential is part of the public
-  target graph.
-- Public code keeps its own `carto_*` namespaces and tests generic behavior.
-- Future extraction or compatibility work requires a source map, provenance
-  review, declassification decision, and fresh-repository build before it can
-  be represented as public code.
-- The repository does not claim full compatibility with VANTA merely because
-  its generic concepts are similar. It does provide an explicit, bounded glTF
-  export profile shaped to VANTA's documented public mesh-import subset; that
-  profile is an interchange contract, not a claim of VANTA runtime, material,
-  or visual parity.
+The supported Hub shape is:
 
-## Evidence classes
+```text
+local revision-bound context
+    -> optional Hub request
+    -> typed proposal / study / export
+    -> local revision and policy validation
+    -> local preview
+    -> local governed apply
+```
 
-The implementation distinguishes authoring truth from derived data in types and
-documentation. A successful build or a compiled mesh proves only the tested
-local capability. It is not evidence of Vulkan execution, desktop launch,
-performance at production scale, CAD semantics, or downstream engine parity.
+The Hub never receives a mutable mesh pointer and never silently changes a
+Cartographer document. Project files remain local authoring truth. Private
+service state belongs in a private service record or sidecar; it must not place
+credentials, prompts, model handles, telemetry payloads, or runtime entity IDs
+inside ordinary `.carto` files.
+
+## Release rule
+
+Internal automation contracts, uncleared source specifications, private
+integration adapters, generated catalogs, private benchmark data, and workflow
+telemetry are not public release material. They must be cleared, relocated, or
+kept in the private companion tree before publication. `.gitignore` is not a
+history-remediation mechanism for material that was already tracked or
+published.

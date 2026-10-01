@@ -22,7 +22,7 @@ core::Diagnostic stale(std::string message) {
 
 bool valid_kind(PreviewKind kind) noexcept {
     return kind == PreviewKind::object_transform || kind == PreviewKind::extrude_face ||
-        kind == PreviewKind::set_vertex_position;
+        kind == PreviewKind::inset_face || kind == PreviewKind::set_vertex_position;
 }
 
 } // namespace
@@ -42,14 +42,14 @@ core::Result<void> PreviewParameters::validate(PreviewKind kind) const {
         }
         return core::Result<void>::success();
     }
-    if (kind == PreviewKind::extrude_face) {
+    if (kind == PreviewKind::extrude_face || kind == PreviewKind::inset_face) {
         if (!distance.has_value() || transform.has_value() || position.has_value()) {
-            return core::Result<void>::failure(
-                invalid("face extrusion preview requires only a distance"));
+            return core::Result<void>::failure(invalid(
+                "face operation preview requires only a distance"));
         }
         if (!std::isfinite(*distance) || *distance <= 0.0) {
             return core::Result<void>::failure(
-                invalid("face extrusion preview distance must be finite and strictly positive"));
+                invalid("face operation preview distance must be finite and strictly positive"));
         }
         return core::Result<void>::success();
     }
@@ -80,11 +80,11 @@ core::Result<AuthoringPreview> AuthoringPreview::begin(
         return core::Result<AuthoringPreview>::failure(invalid(
             "object transform preview requires exactly one selected object"));
     }
-    if (kind == PreviewKind::extrude_face &&
+    if ((kind == PreviewKind::extrude_face || kind == PreviewKind::inset_face) &&
         (context.selection_mode != SelectionMode::face || context.faces.size() != 1U ||
          !context.component_object.has_value())) {
-        return core::Result<AuthoringPreview>::failure(invalid(
-            "face extrusion preview requires exactly one object-bound selected face"));
+            return core::Result<AuthoringPreview>::failure(invalid(
+            "face operation preview requires exactly one object-bound selected face"));
     }
     if (kind == PreviewKind::set_vertex_position &&
         (context.selection_mode != SelectionMode::vertex || context.vertices.size() != 1U ||
