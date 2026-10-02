@@ -85,6 +85,17 @@ core::Result<void> validate(const TextureDesc& descriptor) {
         return core::Result<void>::failure(
             validation("depth attachments require an explicit depth format"));
     }
+    for (const float value : descriptor.clear_color) {
+        if (!std::isfinite(value)) {
+            return core::Result<void>::failure(
+                invalid("texture clear colors must contain finite values"));
+        }
+    }
+    if (!std::isfinite(descriptor.clear_depth) ||
+        descriptor.clear_depth < 0.0F || descriptor.clear_depth > 1.0F) {
+        return core::Result<void>::failure(
+            invalid("texture clear depth must be finite and within [0, 1]"));
+    }
     return core::Result<void>::success();
 }
 
@@ -143,6 +154,10 @@ core::Result<void> validate(const PipelineDesc& descriptor) {
             return core::Result<void>::failure(
                 validation("pipeline descriptor bindings must be unique and staged"));
         }
+    }
+    if (descriptor.sampled_texture_count > descriptor.descriptor_bindings.size()) {
+        return core::Result<void>::failure(invalid(
+            "sampled texture binding count exceeds the declared descriptor bindings"));
     }
     if (descriptor.push_constant_bytes > 256U) {
         return core::Result<void>::failure(

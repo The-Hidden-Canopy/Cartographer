@@ -2,6 +2,7 @@
 
 #include <carto/assets/blob_store.hpp>
 #include <carto/eval/graph.hpp>
+#include <carto/geometry/primitives.hpp>
 #include <carto/journal/checkpoint.hpp>
 #include <carto/project/package.hpp>
 #include <carto/project/file_lock.hpp>
@@ -626,13 +627,66 @@ void project_transaction_journals_evaluation_graph_reference_with_document_state
         checkpoint_text.substr(0, checkpoint_text.find("EVALUATION_GRAPH_DIGEST")) +
         "EVALUATION_GRAPH_DIGEST 0000000000000000000000000000000000000000000000000000000000000000\nEND\n"));
     std::string legacy_graph = checkpoint_text;
-    const auto current_header = legacy_graph.find("CARTOGRAPHER_PROJECT 3");
+    const auto current_header = legacy_graph.find("CARTOGRAPHER_PROJECT 4");
     REQUIRE(current_header != std::string::npos);
-    legacy_graph.replace(current_header, std::string("CARTOGRAPHER_PROJECT 3").size(),
+    legacy_graph.replace(current_header, std::string("CARTOGRAPHER_PROJECT 4").size(),
                          "CARTOGRAPHER_PROJECT 2");
     const auto rejected_legacy_graph = carto::project::ProjectDocument::deserialize(legacy_graph);
     REQUIRE(!rejected_legacy_graph);
     REQUIRE(rejected_legacy_graph.error().code == carto::core::ErrorCode::version_mismatch);
+}
+
+void project_transaction_persists_topology_receipts_through_recovery() {
+    TempDirectory temp;
+    carto::project::ProjectDocument document;
+    carto::journal::Journal journal(temp.path() / "recovery" / "journal.log");
+    carto::journal::CheckpointStore checkpoints(temp.path() / "recovery" / "checkpoints");
+    const std::string baseline = document.serialize();
+    const auto asset_manifest = carto::assets::sha256(std::span<const std::uint8_t>{
+        reinterpret_cast<const std::uint8_t*>("assets"), 6U});
+    REQUIRE(checkpoints.save(
+        journal, carto::core::Revision{},
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(baseline.data()), baseline.size()),
+        asset_manifest));
+
+    auto transaction = carto::project::ProjectTransaction::begin(
+        document, journal, "topology-editor");
+    REQUIRE(transaction);
+    auto box = carto::geometry::make_box({1.0, 1.0, 1.0});
+    REQUIRE(box);
+    const auto mesh_asset = transaction.value().add_mesh(std::move(box.value()));
+    REQUIRE(mesh_asset);
+    const auto before = transaction.value().staged_document().meshes().at(mesh_asset.value());
+    auto after = before;
+    const auto face = after.faces_sorted().front().id;
+    const auto inset = after.inset_face(face, 0.1);
+    REQUIRE(inset);
+    auto forged_after = before;
+    auto forged_receipt = inset.value();
+    forged_receipt.revision_before = forged_receipt.revision_before.next();
+    forged_receipt.revision_after = forged_receipt.revision_after.next();
+    const auto staged_revision_before_rejection = transaction.value().staged_revision();
+    const auto forged = transaction.value().replace_mesh(
+        mesh_asset.value(), std::move(forged_after), forged_receipt);
+    REQUIRE(!forged);
+    REQUIRE(forged.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(transaction.value().staged_revision() == staged_revision_before_rejection);
+    REQUIRE(transaction.value().replace_mesh(mesh_asset.value(), std::move(after), inset.value()));
+    REQUIRE(transaction.value().commit("mesh.inset"));
+
+    REQUIRE(document.topology_receipts().size() == 1U);
+    const auto entries = journal.read_all();
+    REQUIRE(entries);
+    REQUIRE(entries.value().size() == 1U);
+    const std::string payload(entries.value().front().payload.begin(), entries.value().front().payload.end());
+    REQUIRE(payload.find("TOPOLOGY_RECEIPTS 1") != std::string::npos);
+
+    const auto recovered = carto::project::recover_from_journal(checkpoints, journal);
+    REQUIRE(recovered);
+    REQUIRE(recovered.value().document.serialize() == document.serialize());
+    REQUIRE(recovered.value().document.topology_receipts().size() == 1U);
+    REQUIRE(recovered.value().document.topology_receipts().front().mesh_asset == mesh_asset.value());
 }
 
 void project_recovery_replays_only_verified_snapshot_envelopes() {
@@ -733,6 +787,7 @@ int main(int argc, char** argv) {
         package_concurrent_graph_writers_fail_closed_on_stale_manifests();
         project_transaction_publishes_only_after_journal_append();
         project_transaction_journals_evaluation_graph_reference_with_document_state();
+        project_transaction_persists_topology_receipts_through_recovery();
         project_recovery_replays_only_verified_snapshot_envelopes();
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';

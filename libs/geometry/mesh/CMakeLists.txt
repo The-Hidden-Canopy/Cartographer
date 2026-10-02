@@ -1,6 +1,7 @@
 add_library(carto_geometry STATIC
     src/mesh.cpp
     src/primitives.cpp
+    src/topology_edit.cpp
 )
 
 target_include_directories(carto_geometry

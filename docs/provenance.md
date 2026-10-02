@@ -10,12 +10,45 @@ The public repository contains generic authoring and interchange behavior:
 
 - versioned `.carto` authoring data and validation;
 - scene, geometry, topology, revision, undo/redo, and local receipts;
+- v4 `.carto` persistence for project-bound topology receipt lineage;
 - OBJ, PLY, STL, and bounded glTF interchange;
 - backend-neutral render-graph and GPU contracts;
 - local precision-role and kernel execution receipts with explicit artifact
   identity and no outbound telemetry;
 - optional generic Vulkan and native-shell acceptance seams; and
 - provider-neutral, revision-bound proposal contracts.
+
+The public C++ export surface for polygon-kernel lineage is intentionally
+narrow and installable without private integrations:
+
+```cpp
+#include <carto/geometry/mesh.hpp>
+#include <carto/geometry/topology_edit.hpp>
+#include <carto/mesh_attributes/provenance.hpp>
+```
+
+`carto_geometry` owns validated `TopologyEditReceipt` values and deterministic
+edge-loop, edge-ring, boundary-loop, vertex-fan, face-region, linked-component,
+and shortest-path traversal. `carto_mesh_attributes`
+owns the `provenance_from_receipt` adapter. It requires the source revision to
+match `receipt.revision_before` and the destination revision to match
+`receipt.revision_after`; source IDs are resolved within their declared domain,
+and unknown IDs fail closed. The adapter produces source-index provenance for
+`carto_attributes::transfer`, not a second mutation or persistence path.
+
+`ProjectDocument` owns the separate durable `TopologyReceiptRecord` ledger in
+project schema v4. A project-bound extrusion, inset, face deletion, or edge
+split supplies a receipt to the revision-bound mesh replacement, so the mesh
+snapshot and its lineage record publish in one project revision. The same
+receipt-aware replacement contract is available through `ProjectTransaction`,
+so its staged document and journal snapshot preserve the same lineage. Save/load
+round-trips the bounded receipt codec and rejects duplicate, future, dangling,
+or malformed records. The ledger is historical metadata: undo and redo publish
+authoritative snapshots without fabricating inverse receipts. Direct kernel
+calls, other replacement paths, and future modeling operators must opt into
+the API before they can claim durable lineage. Receipt decoding also applies
+bounded byte and aggregate identity/source-element budgets before allocating
+large lineage containers.
 
 These surfaces do not contain account authority, credentials, model weights,
 provider routing, private telemetry, runtime entity handles, or hosted project

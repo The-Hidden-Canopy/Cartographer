@@ -71,6 +71,8 @@ public:
         std::uint64_t bytes) const override;
     [[nodiscard]] core::Result<std::vector<float>> read_texture_rgba32f(
         gpu::TextureHandle handle) const override;
+    [[nodiscard]] core::Result<std::vector<float>> read_texture_depth32f(
+        gpu::TextureHandle handle) const;
 
     // Waits for every queue submission currently owned by this device. This
     // is required before native swapchain resize/replacement, where DXGI
@@ -108,6 +110,11 @@ public:
 
 private:
     struct Impl;
+
+    [[nodiscard]] core::Result<std::vector<float>> read_texture_float32(
+        gpu::TextureHandle handle,
+        gpu::Format expected_format,
+        std::uint32_t channel_count) const;
 
     explicit D3D12Device(std::unique_ptr<Impl> impl);
 

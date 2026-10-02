@@ -19,7 +19,9 @@ Project.carto/
 ```
 
 The current repository still treats the versioned text `.carto` file as the
-authoritative versioned save format. `carto_project::ProjectPackage` now creates and
+authoritative versioned save format. Current saves use project format v4,
+which includes the bounded project-bound topology receipt ledger.
+`carto_project::ProjectPackage` now creates and
 validates the human-readable manifest and package directories, while
 `carto_assets` implements the portable content-addressed blob primitive that
 the package uses. The package layer does not create an empty or fake
@@ -54,7 +56,7 @@ They require a deliberately selected SQLite distribution and
 license/packaging decision; no
 network or private repository is a hidden prerequisite for the headless build.
 
-Until that tranche is accepted, deleting a build cache is safe, but the flat v1
+Until that tranche is accepted, deleting a build cache is safe, but the flat v4
 serializer remains the only supported authoring save format. A package
 manifest/blob layout is inspectable groundwork, not a migration of existing
 projects and not a claim of SQLite integrity.

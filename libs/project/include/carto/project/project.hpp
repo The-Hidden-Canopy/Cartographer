@@ -13,6 +13,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace carto::application {
 class ApplicationSession;
@@ -45,9 +46,20 @@ struct SaveReceipt {
     core::Revision source_revision;
 };
 
+// A durable lineage record for a project-bound topology edit. The receipt is
+// historical metadata: it may describe an earlier mesh revision after
+// undo/redo has advanced the current revision, but it never substitutes for
+// the authoritative mesh snapshot.
+struct TopologyReceiptRecord {
+    std::uint64_t mesh_asset = 0;
+    geometry::TopologyEditReceipt receipt;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
 class ProjectDocument {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 3;
+    static constexpr std::uint32_t kSchemaVersion = 4;
     static constexpr std::uint32_t kMinimumReadableSchemaVersion = 1;
     static constexpr std::string_view kMagic = "CARTOGRAPHER_PROJECT";
     static constexpr std::string_view kAuthoringFormat = "cartographer.authoring";
@@ -73,6 +85,9 @@ public:
     }
     [[nodiscard]] const std::optional<assets::Sha256Digest>& evaluation_graph_digest() const noexcept {
         return evaluation_graph_digest_;
+    }
+    [[nodiscard]] const std::vector<TopologyReceiptRecord>& topology_receipts() const noexcept {
+        return topology_receipts_;
     }
     [[nodiscard]] core::Revision revision() const noexcept { return revision_; }
     [[nodiscard]] std::uint32_t schema_version() const noexcept { return kSchemaVersion; }
@@ -108,7 +123,8 @@ private:
     [[nodiscard]] core::Result<core::Revision> replace_mesh_if_revision(
         std::uint64_t mesh_asset,
         core::Revision expected_revision,
-        geometry::EditableMesh mesh);
+        geometry::EditableMesh mesh,
+        std::optional<geometry::TopologyEditReceipt> receipt = std::nullopt);
     [[nodiscard]] core::Result<void> remove_mesh(std::uint64_t mesh_asset);
     [[nodiscard]] core::Result<void> attach_mesh(
         scene::ObjectId object,
@@ -138,6 +154,7 @@ private:
     std::string name_ = "Untitled";
     scene::Scene scene_;
     std::map<std::uint64_t, geometry::EditableMesh> meshes_;
+    std::vector<TopologyReceiptRecord> topology_receipts_;
     std::optional<assets::Sha256Digest> evaluation_graph_digest_;
     std::uint64_t next_mesh_id_ = 1;
     core::Revision revision_{};

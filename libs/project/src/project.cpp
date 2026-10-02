@@ -12,9 +12,11 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <utility>
 
 #ifdef _WIN32
@@ -46,6 +48,7 @@ constexpr std::uint64_t kMaxSerializedMeshes = 1'000'000U;
 constexpr std::uint64_t kMaxSerializedVertices = 1'000'000U;
 constexpr std::uint64_t kMaxSerializedFaces = 1'000'000U;
 constexpr std::uint64_t kMaxSerializedFaceVertices = 1'000'000U;
+constexpr std::uint64_t kMaxSerializedTopologyReceipts = 1'000'000U;
 constexpr std::uintmax_t kMaxSerializedProjectBytes = 128ULL * 1024ULL * 1024ULL;
 std::mutex g_project_save_mutex;
 std::atomic<std::uint64_t> g_project_temp_counter{0U};
@@ -137,6 +140,14 @@ core::Result<void> AssetReference::validate() const {
         }
     }
     return core::Result<void>::success();
+}
+
+core::Result<void> TopologyReceiptRecord::validate() const {
+    if (mesh_asset == 0U) {
+        return core::Result<void>::failure(invalid(
+            "topology receipt record mesh asset id must be non-zero"));
+    }
+    return receipt.validate();
 }
 
 core::Result<ProjectDocument> ProjectDocument::create(std::string name) {
@@ -266,7 +277,8 @@ core::Result<void> ProjectDocument::replace_mesh(
 core::Result<core::Revision> ProjectDocument::replace_mesh_if_revision(
     std::uint64_t mesh_asset,
     core::Revision expected_revision,
-    geometry::EditableMesh mesh) {
+    geometry::EditableMesh mesh,
+    std::optional<geometry::TopologyEditReceipt> receipt) {
     if (revision_.exhausted()) {
         return core::Result<core::Revision>::failure(exhausted_revision());
     }
@@ -279,6 +291,32 @@ core::Result<core::Revision> ProjectDocument::replace_mesh_if_revision(
         return core::Result<core::Revision>::failure(Diagnostic(
             ErrorCode::stale_data,
             "mesh replacement revision does not match the current asset"));
+    }
+    if (receipt.has_value()) {
+        if (auto result = receipt->validate(); !result) {
+            return core::Result<core::Revision>::failure(
+                result.error().with_context("topology receipt"));
+        }
+        if (receipt->revision_before != expected_revision ||
+            receipt->revision_after != mesh.revision()) {
+            return core::Result<core::Revision>::failure(Diagnostic(
+                ErrorCode::stale_data,
+                "topology receipt does not bind to the replaced mesh revisions"));
+        }
+        if (topology_receipts_.size() >= kMaxSerializedTopologyReceipts) {
+            return core::Result<core::Revision>::failure(Diagnostic(
+                ErrorCode::validation_failed,
+                "project topology receipt ledger is at its bounded capacity"));
+        }
+        for (const auto& record : topology_receipts_) {
+            if (record.mesh_asset == mesh_asset &&
+                record.receipt.revision_before == receipt->revision_before &&
+                record.receipt.revision_after == receipt->revision_after) {
+                return core::Result<core::Revision>::failure(Diagnostic(
+                    ErrorCode::invalid_state,
+                    "project already contains this topology receipt interval"));
+            }
+        }
     }
     if (auto result = mesh.validate(); !result) {
         return core::Result<core::Revision>::failure(result.error());
@@ -296,6 +334,9 @@ core::Result<core::Revision> ProjectDocument::replace_mesh_if_revision(
     }
     const core::Revision applied_revision = mesh.revision();
     iterator->second = std::move(mesh);
+    if (receipt.has_value()) {
+        topology_receipts_.push_back(TopologyReceiptRecord{mesh_asset, std::move(*receipt)});
+    }
     bump_revision();
     return core::Result<core::Revision>::success(applied_revision);
 }
@@ -316,6 +357,13 @@ core::Result<void> ProjectDocument::remove_mesh(std::uint64_t mesh_asset) {
         }
     }
     meshes_.erase(mesh_asset);
+    topology_receipts_.erase(
+        std::remove_if(
+            topology_receipts_.begin(), topology_receipts_.end(),
+            [mesh_asset](const TopologyReceiptRecord& record) {
+                return record.mesh_asset == mesh_asset;
+            }),
+        topology_receipts_.end());
     bump_revision();
     return core::Result<void>::success();
 }
@@ -403,6 +451,33 @@ core::Result<void> ProjectDocument::validate() const {
             return core::Result<void>::failure(parse_error("mesh revision space is exhausted"));
         }
     }
+    if (topology_receipts_.size() > kMaxSerializedTopologyReceipts) {
+        return core::Result<void>::failure(parse_error(
+            "project contains too many topology receipt records"));
+    }
+    std::set<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>> receipt_keys;
+    for (const auto& record : topology_receipts_) {
+        if (auto result = record.validate(); !result) {
+            return core::Result<void>::failure(result.error().with_context(
+                "project topology receipt"));
+        }
+        const auto mesh = meshes_.find(record.mesh_asset);
+        if (mesh == meshes_.end()) {
+            return core::Result<void>::failure(parse_error(
+                "project topology receipt references a missing mesh asset"));
+        }
+        if (record.receipt.revision_after > mesh->second.revision()) {
+            return core::Result<void>::failure(parse_error(
+                "project topology receipt is newer than its mesh asset"));
+        }
+        const auto key = std::make_tuple(
+            record.mesh_asset, record.receipt.revision_before.value(),
+            record.receipt.revision_after.value());
+        if (!receipt_keys.insert(key).second) {
+            return core::Result<void>::failure(parse_error(
+                "project contains a duplicate topology receipt record"));
+        }
+    }
     if (evaluation_graph_digest_.has_value() && evaluation_graph_digest_->is_zero()) {
         return core::Result<void>::failure(parse_error(
             "project evaluation graph digest must not be zero"));
@@ -420,6 +495,7 @@ void ProjectDocument::swap(ProjectDocument& other) noexcept {
     name_.swap(other.name_);
     scene_.swap(other.scene_);
     meshes_.swap(other.meshes_);
+    topology_receipts_.swap(other.topology_receipts_);
     std::swap(evaluation_graph_digest_, other.evaluation_graph_digest_);
     std::swap(next_mesh_id_, other.next_mesh_id_);
     std::swap(revision_, other.revision_);
@@ -474,6 +550,11 @@ std::string ProjectDocument::serialize() const {
             }
             output << '\n';
         }
+    }
+    output << "TOPOLOGY_RECEIPTS " << topology_receipts_.size() << '\n';
+    for (const auto& record : topology_receipts_) {
+        output << "TOPOLOGY_RECEIPT " << record.mesh_asset << ' '
+               << std::quoted(record.receipt.serialize()) << '\n';
     }
     if (evaluation_graph_digest_.has_value()) {
         output << "EVALUATION_GRAPH_DIGEST " << evaluation_graph_digest_->hex() << '\n';
@@ -715,9 +796,72 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
     }
 
     std::string terminal_record;
+    bool topology_receipts_seen = false;
     if (!(input >> terminal_record)) {
         return core::Result<ProjectDocument>::failure(
             parse_error("project is missing its terminal record"));
+    }
+    if (terminal_record == "TOPOLOGY_RECEIPTS") {
+        topology_receipts_seen = true;
+        if (version.value() < 4U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "topology receipt records require project schema version 4"));
+        }
+        auto receipt_count = read_uint(input, "topology receipt count");
+        if (!receipt_count) {
+            return core::Result<ProjectDocument>::failure(receipt_count.error());
+        }
+        if (auto result = validate_serialized_count(
+                receipt_count.value(), kMaxSerializedTopologyReceipts,
+                "project topology receipt count");
+            !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+        std::set<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>> receipt_keys;
+        for (std::uint64_t receipt_index = 0U;
+             receipt_index < receipt_count.value(); ++receipt_index) {
+            if (auto result = require_line(input, "TOPOLOGY_RECEIPT"); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            auto mesh_asset = read_uint(input, "topology receipt mesh asset");
+            std::string encoded_receipt;
+            if (!mesh_asset || mesh_asset.value() == 0U ||
+                !(input >> std::quoted(encoded_receipt))) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "invalid topology receipt record"));
+            }
+            if (!document.meshes_.contains(mesh_asset.value())) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "topology receipt references an unknown mesh asset"));
+            }
+            auto receipt = geometry::TopologyEditReceipt::deserialize(encoded_receipt);
+            if (!receipt) {
+                return core::Result<ProjectDocument>::failure(
+                    receipt.error().with_context("serialized topology receipt"));
+            }
+            const auto key = std::make_tuple(
+                mesh_asset.value(), receipt.value().revision_before.value(),
+                receipt.value().revision_after.value());
+            if (!receipt_keys.insert(key).second) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project contains a duplicate topology receipt record"));
+            }
+            TopologyReceiptRecord record{mesh_asset.value(), std::move(receipt.value())};
+            if (auto result = record.validate(); !result) {
+                return core::Result<ProjectDocument>::failure(result.error().with_context(
+                    "serialized topology receipt"));
+            }
+            document.topology_receipts_.push_back(std::move(record));
+        }
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(
+                parse_error("project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 4U && !topology_receipts_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v4 is missing its topology receipt record"));
     }
     if (terminal_record == "EVALUATION_GRAPH_DIGEST") {
         if (version.value() < 3U) {

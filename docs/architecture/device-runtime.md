@@ -69,16 +69,19 @@ validated render graph and attaches a `KernelContract` to every prepared pass.
 it to native input elements.
 
 The D3D12 target packages forward PBR, depth-shadow, temporal-resolve, and HDR
-tone-map HLSL sources. Those assets remain preparation for the broader render
-graph; they are not evidence of PBR/HDR, shadow, temporal, presentation, or
-8K parity.
+tone-map HLSL sources. A bounded headless acceptance now executes the forward
+PBR source with a sampled material into an HDR RGBA32F color target, runs the
+tone-map source, writes and reads a depth-only shadow target, and resolves
+current color, history, and motion inputs through the temporal compute source.
 
-A bounded headless D3D12 acceptance is now real on the local Quadro P5200:
-runtime DXC compiles the indexed-triangle test shaders, a graphics PSO is
-created, an indexed draw is submitted, and an RGBA32F texture is read back.
-The acceptance also checks native adapter/resource ownership and an empty
-debug-layer receipt. It is graphics-device evidence, not a GPU topology-kernel
-benchmark or a general production-renderer claim.
+The bounded headless D3D12 acceptance is real on the local Quadro P5200:
+runtime DXC produces the native shader binaries, graphics and compute work are
+submitted, indexed/sampled/depth draws and temporal output are read back,
+native adapter/resource ownership and descriptor retirement are exercised, and
+the debug-layer receipt is empty. The acceptance also covers typed hidden-window swapchain
+resize/present, a bounded desktop launch smoke, and 8192x8192 target
+allocation/clear. It is graphics-device evidence, not a GPU topology-kernel
+benchmark, full render-graph parity, or a general production-renderer claim.
 
 ## N6: precision and evidence boundary
 
@@ -109,19 +112,19 @@ or the render graph. The opt-in `carto_d3d12` target owns Windows DXGI/D3D12
 headers, deterministic adapter selection, native queue creation, resource
 mapping, DXGI-to-Cartographer format mapping, state transitions, buffer and
 texture copies, offscreen clears, shader compilation through the runtime DXC
-loader, graphics command encoding, sampled-texture descriptor tables, debug
-receipts, device-loss state, and submission-aware deferred destruction. The
-optional Win32 presentation seam owns DXGI swapchain lifecycle, resize, and
-present operations; a compile-only desktop target exercises that boundary
-without pretending that swapchain back buffers are already imported into the
-device resource registry. The bounded native graphics receipt currently
-covers runtime DXC, graphics PSO creation, indexed draw, RGBA32F readback,
-and empty debug-layer receipts on the Quadro P5200. `CmdDispatch` remains
-fail-closed in the D3D12 submission path, so topology authoring and its
-optimized kernels remain CPU-authoritative. Swapchain/back-buffer import,
-desktop launch, resize/DPI/input, PBR/HDR/shadow/temporal execution, 8K
-allocation, and GPU performance evidence remain unverified. Vulkan remains
-an optional compatibility path until a separately evidenced removal decision.
+loader, graphics and compute command encoding, sampled-texture and
+storage-texture descriptor tables, bounded multi-input compute bindings, debug
+receipts, device-loss state, and submission-aware deferred destruction. The optional Win32 presentation seam
+owns DXGI swapchain lifecycle, typed back-buffer import, resize, and present
+operations. The bounded native receipt covers runtime DXC,
+sampled-material PBR/HDR/tone-map, shadow-depth, and temporal-resolve
+execution/readback, storage dispatch/readback, indexed draw,
+descriptor/resource retirement, typed hidden-window presentation, and empty
+debug-layer receipts on the Quadro P5200. Topology authoring and its optimized
+kernels remain CPU-authoritative. Full IBL/render-graph scheduling parity,
+final output encoding, resize/DPI/input acceptance, GPU performance evidence,
+and 8K frame/readback performance remain unverified. Vulkan remains an optional
+compatibility path until a separately evidenced removal decision.
 
 ## Verification
 

@@ -2,6 +2,7 @@
 
 #include <carto/gpu/handles.hpp>
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -214,6 +215,8 @@ struct TextureDesc {
     Format format = Format::unknown;
     TextureDimension dimension = TextureDimension::texture_2d;
     TextureUsage usage = TextureUsage::none;
+    std::array<float, 4U> clear_color{0.0F, 0.0F, 0.0F, 1.0F};
+    float clear_depth = 1.0F;
 };
 
 struct SamplerDesc {
@@ -250,6 +253,10 @@ struct PipelineDesc {
     std::string debug_name;
     std::vector<ShaderHandle> shaders;
     std::vector<DescriptorBinding> descriptor_bindings;
+    // Compute backends may expose a bounded prefix of sampled texture
+    // bindings before an optional storage-texture binding. Graphics backends
+    // retain the existing single sampled-texture contract when this is zero.
+    std::uint32_t sampled_texture_count = 0U;
     PrimitiveTopology topology = PrimitiveTopology::triangle_list;
     PolygonMode polygon_mode = PolygonMode::fill;
     CullMode cull_mode = CullMode::back;

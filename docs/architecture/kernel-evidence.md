@@ -41,11 +41,17 @@ path derives a compiler-recipe digest from the target profile, entry point,
 optimization, and debug options. That field is not presented as a hash of the
 DXC executable; a stronger compiler binary identity requires backend support.
 
-The native GPU boundary is now partially released for bounded local D3D12
-graphics acceptance. The headless receipt records Quadro P5200 identity,
-runtime DXC shader compilation, graphics PSO creation, indexed draw, RGBA32F
-readback, and empty debug-layer receipts. This does not exercise the geometry
-topology kernels: D3D12 `CmdDispatch` remains unsupported, so the CPU path is
-still authoritative for authoring and kernel benchmarks. No GPU timing,
-throughput, power, 8K, PBR/HDR, presentation, training, promotion, or outbound
-telemetry claim is implied.
+The native GPU boundary now has a bounded local D3D12 acceptance tranche. The
+headless receipt records Quadro P5200 identity, runtime DXC source/binary
+identity, a depth-only shadow draw/readback, a temporal resolve over three
+sampled inputs and one storage output, an offscreen sampled-material PBR draw
+into an HDR RGBA32F target with depth, an HDR-to-display tone-map draw and
+readback, indexed draw/RGBA32F readback, storage-texture compute dispatch and
+readback, descriptor/resource retirement, empty debug-layer receipts, typed
+swapchain resize/present, desktop launch smoke, and an 8192x8192 target clear.
+This does not make GPU geometry
+authoring authoritative: the CPU path remains the authoring and kernel-benchmark
+authority. Full IBL and production render-graph scheduling/parity, final output
+encoding, input/DPI behavior, GPU timing, throughput, power, 8K
+frame/readback performance, training, promotion, and outbound telemetry remain
+unclaimed.

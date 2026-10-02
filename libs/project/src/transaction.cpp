@@ -127,9 +127,23 @@ core::Result<void> ProjectTransaction::insert_mesh(
 
 core::Result<void> ProjectTransaction::replace_mesh(
     std::uint64_t mesh_asset,
-    geometry::EditableMesh mesh) {
+    geometry::EditableMesh mesh,
+    std::optional<geometry::TopologyEditReceipt> receipt) {
     if (auto result = ensure_active(); !result) return result;
-    return staged_.replace_mesh(mesh_asset, std::move(mesh));
+    if (!receipt.has_value()) {
+        return staged_.replace_mesh(mesh_asset, std::move(mesh));
+    }
+    const auto iterator = staged_.meshes().find(mesh_asset);
+    if (iterator == staged_.meshes().end()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::not_found, "cannot replace a missing mesh asset"));
+    }
+    const auto replaced = staged_.replace_mesh_if_revision(
+        mesh_asset, iterator->second.revision(), std::move(mesh), std::move(receipt));
+    if (!replaced) {
+        return core::Result<void>::failure(replaced.error());
+    }
+    return core::Result<void>::success();
 }
 
 core::Result<void> ProjectTransaction::remove_mesh(std::uint64_t mesh_asset) {

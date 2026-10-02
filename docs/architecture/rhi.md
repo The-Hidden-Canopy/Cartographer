@@ -54,8 +54,10 @@ Deferred destruction planning exists, but native resource retirement is still
 a backend concern.
 The GPU preparation tranche adds `carto_render`'s aligned ABI and pass plan,
 plus packaged D3D12 HLSL sources for forward PBR, depth shadows, temporal
-resolve, and HDR tone mapping. These are source and layout preparation only;
-they have not been compiled or executed on the GPU in the current ablation.
+resolve, and HDR tone mapping. The bounded D3D12 receipt now compiles and
+executes those PBR/HDR, shadow-depth, and temporal paths with native readback;
+the CPU path remains the authoring and kernel-benchmark authority, and the
+receipt does not imply IBL or full render-graph parity.
 The D3D12 shader binary boundary also retains SHA-256 source and bytecode
 identity when runtime DXC is available; the compiler field identifies the
 invocation recipe and does not overclaim executable provenance.

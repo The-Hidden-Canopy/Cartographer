@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
@@ -65,6 +66,15 @@ Diagnostic native_failure(const char* operation, HRESULT status) {
             << static_cast<unsigned long>(status);
     return Diagnostic(ErrorCode::invalid_state, message.str());
 }
+
+Diagnostic device_lost_failure() {
+    return Diagnostic(
+        ErrorCode::invalid_state,
+        "D3D12 device is lost; call recover() to create a fresh device");
+}
+
+constexpr std::size_t kMaxHlslSourceBytes = 16U * 1024U * 1024U;
+constexpr std::size_t kMaxDebugMessageBytes = 64U * 1024U;
 
 bool is_device_removed_hresult(HRESULT status) {
     return status == DXGI_ERROR_DEVICE_REMOVED || status == DXGI_ERROR_DEVICE_RESET ||
@@ -313,6 +323,10 @@ core::Result<device::ShaderBinary> compile_hlsl(const ShaderSource& source) {
         return core::Result<device::ShaderBinary>::failure(invalid(
             "HLSL compilation requires a name, entry point, and source"));
     }
+    if (source.source.size() > kMaxHlslSourceBytes) {
+        return core::Result<device::ShaderBinary>::failure(invalid(
+            "HLSL source exceeds the Cartographer compilation limit of 16 MiB"));
+    }
     const auto stage_bits = static_cast<std::uint32_t>(source.stage);
     if (stage_bits != static_cast<std::uint32_t>(gpu::ShaderStage::vertex) &&
         stage_bits != static_cast<std::uint32_t>(gpu::ShaderStage::fragment) &&
@@ -434,6 +448,21 @@ core::Result<device::ShaderBinary> compile_hlsl(const ShaderSource& source) {
 }
 
 struct D3D12Device::Impl {
+    struct DescriptorLease {
+        std::vector<UINT>* free_indices = nullptr;
+        UINT index = 0U;
+
+        DescriptorLease(std::vector<UINT>* free_list, UINT descriptor_index)
+            : free_indices(free_list), index(descriptor_index) {}
+
+        DescriptorLease(const DescriptorLease&) = delete;
+        DescriptorLease& operator=(const DescriptorLease&) = delete;
+
+        ~DescriptorLease() {
+            if (free_indices != nullptr) free_indices->push_back(index);
+        }
+    };
+
     struct BufferResource {
         gpu::BufferDesc descriptor;
         ComPtr<ID3D12Resource> resource;
@@ -446,9 +475,16 @@ struct D3D12Device::Impl {
         D3D12_RESOURCE_STATES native_state = D3D12_RESOURCE_STATE_COMMON;
         D3D12_CPU_DESCRIPTOR_HANDLE srv{};
         D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu{};
+        D3D12_CPU_DESCRIPTOR_HANDLE uav{};
+        D3D12_GPU_DESCRIPTOR_HANDLE uav_gpu{};
         D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
         D3D12_CPU_DESCRIPTOR_HANDLE dsv{};
+        std::shared_ptr<DescriptorLease> srv_lease;
+        std::shared_ptr<DescriptorLease> uav_lease;
+        std::shared_ptr<DescriptorLease> rtv_lease;
+        std::shared_ptr<DescriptorLease> dsv_lease;
         bool has_srv = false;
+        bool has_uav = false;
         bool has_rtv = false;
         bool has_dsv = false;
     };
@@ -464,13 +500,17 @@ struct D3D12Device::Impl {
         ComPtr<ID3D12PipelineState> pipeline_state;
         std::optional<UINT> push_constant_root_index;
         std::optional<UINT> sampled_texture_root_index;
+        std::vector<UINT> sampled_texture_root_indices;
+        std::optional<UINT> storage_texture_root_index;
         std::optional<UINT> sampler_root_index;
+        bool compute = false;
     };
 
     struct SamplerResource {
         gpu::SamplerDesc descriptor;
         D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
         D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
+        std::shared_ptr<DescriptorLease> lease;
         bool has_descriptor = false;
     };
 
@@ -516,6 +556,10 @@ struct D3D12Device::Impl {
     // CBV/SRV/UAV heap has a separate, larger limit. Keep the capacities
     // distinct so device creation does not request an invalid native heap.
     static constexpr UINT sampler_descriptor_capacity = 2048U;
+    std::vector<UINT> free_rtv;
+    std::vector<UINT> free_dsv;
+    std::vector<UINT> free_srv;
+    std::vector<UINT> free_sampler;
     gpu::Registry<gpu::BufferTag, BufferResource> buffers;
     gpu::Registry<gpu::TextureTag, TextureResource> textures;
     gpu::Registry<gpu::SamplerTag, SamplerResource> samplers;
@@ -525,16 +569,40 @@ struct D3D12Device::Impl {
     gpu::SubmissionSerial next_serial = 0U;
     mutable gpu::SubmissionSerial completed = 0U;
     mutable std::map<gpu::SubmissionSerial, gpu::QueueType> pending;
+
     mutable gpu::DeferredDestructionQueue deferred_destruction;
     mutable std::vector<std::string> debug_receipts;
     mutable bool device_lost = false;
 
+    [[nodiscard]] core::Result<std::shared_ptr<DescriptorLease>> acquire_descriptor(
+        std::vector<UINT>& free_indices,
+        UINT& next_index,
+        UINT capacity,
+        const char* label) {
+        UINT index = 0U;
+        if (!free_indices.empty()) {
+            index = free_indices.back();
+            free_indices.pop_back();
+        } else {
+            if (next_index >= capacity) {
+                return core::Result<std::shared_ptr<DescriptorLease>>::failure(invalid(
+                    std::string("D3D12 ") + label + " descriptor heap is exhausted"));
+            }
+            index = next_index++;
+        }
+        return core::Result<std::shared_ptr<DescriptorLease>>::success(
+            std::make_shared<DescriptorLease>(&free_indices, index));
+    }
+
     void capture_debug_messages() const {
         if (!info_queue) return;
         const UINT64 count = info_queue->GetNumStoredMessages();
-        for (UINT64 index = 0U; index < count; ++index) {
+        constexpr UINT64 maximum_receipts = 256U;
+        const UINT64 first_index = count > maximum_receipts ? count - maximum_receipts : 0U;
+        for (UINT64 index = first_index; index < count; ++index) {
             SIZE_T bytes = 0U;
             if (FAILED(info_queue->GetMessage(index, nullptr, &bytes)) || bytes == 0U) continue;
+            if (bytes > kMaxDebugMessageBytes) continue;
             std::vector<std::uint8_t> storage(bytes);
             auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
             if (FAILED(info_queue->GetMessage(index, message, &bytes)) ||
@@ -544,7 +612,6 @@ struct D3D12Device::Impl {
             debug_receipts.emplace_back(message->pDescription);
         }
         if (count != 0U) info_queue->ClearStoredMessages();
-        constexpr std::size_t maximum_receipts = 256U;
         if (debug_receipts.size() > maximum_receipts) {
             debug_receipts.erase(
                 debug_receipts.begin(),
@@ -710,6 +777,10 @@ core::Result<std::unique_ptr<D3D12Device>> D3D12Device::create(D3D12DeviceOption
         return core::Result<std::unique_ptr<D3D12Device>>::failure(
             native_failure("CreateDescriptorHeap(SAMPLER)", status));
     }
+    impl->free_rtv.reserve(Impl::descriptor_capacity);
+    impl->free_dsv.reserve(Impl::descriptor_capacity);
+    impl->free_srv.reserve(Impl::descriptor_capacity);
+    impl->free_sampler.reserve(Impl::sampler_descriptor_capacity);
     impl->rtv_increment = impl->device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     impl->dsv_increment = impl->device->GetDescriptorHandleIncrementSize(
@@ -720,15 +791,39 @@ core::Result<std::unique_ptr<D3D12Device>> D3D12Device::create(D3D12DeviceOption
         D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
 
     impl->identity.backend = device::BackendKind::d3d12;
+    ComPtr<IDXGIAdapter3> adapter3;
+    DXGI_QUERY_VIDEO_MEMORY_INFO memory_info{};
+    if (SUCCEEDED(impl->adapter.As(&adapter3)) &&
+        SUCCEEDED(adapter3->QueryVideoMemoryInfo(
+            0U, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memory_info))) {
+        impl->identity.local_memory_budget = memory_info.Budget;
+    }
     impl->capabilities.graphics_queue = true;
     impl->capabilities.compute_queue = true;
     impl->capabilities.copy_queue = true;
     impl->capabilities.presentation = true;
-    impl->capabilities.max_texture_dimension_2d = 16384U;
-    impl->capabilities.max_sampler_anisotropy = 16.0F;
+    impl->capabilities.anisotropy = true;
+    impl->capabilities.sampler_compare = true;
+    impl->capabilities.max_texture_dimension_2d = D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+    impl->capabilities.max_sampler_anisotropy =
+        static_cast<float>(D3D12_MAX_MAXANISOTROPY);
     impl->capabilities.max_color_attachments = 8U;
-    impl->capabilities.fp16_color_attachment = true;
-    impl->capabilities.fp16_storage = true;
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT fp16_support{};
+    fp16_support.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (SUCCEEDED(impl->device->CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            &fp16_support,
+            sizeof(fp16_support)))) {
+        impl->capabilities.fp16_color_attachment =
+            (static_cast<std::uint32_t>(fp16_support.Support1) &
+             static_cast<std::uint32_t>(D3D12_FORMAT_SUPPORT1_RENDER_TARGET)) != 0U;
+        impl->capabilities.fp16_storage =
+            (static_cast<std::uint32_t>(fp16_support.Support2) &
+             static_cast<std::uint32_t>(D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)) != 0U;
+    }
+    if (auto result = gpu::validate(impl->capabilities); !result) {
+        return core::Result<std::unique_ptr<D3D12Device>>::failure(result.error());
+    }
     return core::Result<std::unique_ptr<D3D12Device>>::success(
         std::unique_ptr<D3D12Device>(new D3D12Device(std::move(impl))));
 }
@@ -750,6 +845,9 @@ const gpu::DeviceCapabilities& D3D12Device::capabilities() const noexcept {
 }
 
 core::Result<gpu::BufferHandle> D3D12Device::create_buffer(const gpu::BufferDesc& descriptor) {
+    if (impl_->device_lost) {
+        return core::Result<gpu::BufferHandle>::failure(device_lost_failure());
+    }
     if (auto result = gpu::validate(descriptor); !result) {
         return core::Result<gpu::BufferHandle>::failure(result.error());
     }
@@ -787,6 +885,9 @@ core::Result<gpu::BufferHandle> D3D12Device::create_buffer(const gpu::BufferDesc
 }
 
 core::Result<gpu::TextureHandle> D3D12Device::create_texture(const gpu::TextureDesc& descriptor) {
+    if (impl_->device_lost) {
+        return core::Result<gpu::TextureHandle>::failure(device_lost_failure());
+    }
     if (auto result = gpu::validate(descriptor); !result) {
         return core::Result<gpu::TextureHandle>::failure(result.error());
     }
@@ -804,12 +905,51 @@ core::Result<gpu::TextureHandle> D3D12Device::create_texture(const gpu::TextureD
         return core::Result<gpu::TextureHandle>::failure(invalid(
             "D3D12 texture format is not mapped"));
     }
+    std::shared_ptr<Impl::DescriptorLease> srv_lease;
+    std::shared_ptr<Impl::DescriptorLease> rtv_lease;
+    std::shared_ptr<Impl::DescriptorLease> dsv_lease;
+    if (gpu::has_usage(descriptor.usage, gpu::TextureUsage::sampled)) {
+        if (gpu::is_depth_format(descriptor.format)) {
+            return core::Result<gpu::TextureHandle>::failure(unsupported(
+                "D3D12 sampled textures currently require a color format"));
+        }
+        auto lease = impl_->acquire_descriptor(
+            impl_->free_srv, impl_->next_srv, Impl::descriptor_capacity, "SRV");
+        if (!lease) return core::Result<gpu::TextureHandle>::failure(lease.error());
+        srv_lease = std::move(lease.value());
+    }
+    std::shared_ptr<Impl::DescriptorLease> uav_lease;
+    if (gpu::has_usage(descriptor.usage, gpu::TextureUsage::storage)) {
+        if (gpu::is_depth_format(descriptor.format)) {
+            return core::Result<gpu::TextureHandle>::failure(unsupported(
+                "D3D12 storage textures currently require a color format"));
+        }
+        auto lease = impl_->acquire_descriptor(
+            impl_->free_srv, impl_->next_srv, Impl::descriptor_capacity, "UAV");
+        if (!lease) return core::Result<gpu::TextureHandle>::failure(lease.error());
+        uav_lease = std::move(lease.value());
+    }
+    if (gpu::has_usage(descriptor.usage, gpu::TextureUsage::color_attachment)) {
+        auto lease = impl_->acquire_descriptor(
+            impl_->free_rtv, impl_->next_rtv, Impl::descriptor_capacity, "RTV");
+        if (!lease) return core::Result<gpu::TextureHandle>::failure(lease.error());
+        rtv_lease = std::move(lease.value());
+    }
+    if (gpu::has_usage(descriptor.usage, gpu::TextureUsage::depth_attachment)) {
+        auto lease = impl_->acquire_descriptor(
+            impl_->free_dsv, impl_->next_dsv, Impl::descriptor_capacity, "DSV");
+        if (!lease) return core::Result<gpu::TextureHandle>::failure(lease.error());
+        dsv_lease = std::move(lease.value());
+    }
     D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE;
     if (gpu::has_usage(descriptor.usage, gpu::TextureUsage::color_attachment)) {
         flags = flags | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     }
     if (gpu::has_usage(descriptor.usage, gpu::TextureUsage::depth_attachment)) {
         flags = flags | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    }
+    if (gpu::has_usage(descriptor.usage, gpu::TextureUsage::storage)) {
+        flags = flags | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     }
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -827,12 +967,24 @@ core::Result<gpu::TextureHandle> D3D12Device::create_texture(const gpu::TextureD
     resource.Flags = flags;
     D3D12_CLEAR_VALUE clear{};
     clear.Format = native_format;
-    if (gpu::is_depth_format(descriptor.format)) clear.DepthStencil.Depth = 1.0F;
-    else clear.Color[3] = 1.0F;
+    if (gpu::is_depth_format(descriptor.format)) {
+        clear.DepthStencil.Depth = descriptor.clear_depth;
+    } else {
+        std::copy(
+            descriptor.clear_color.begin(),
+            descriptor.clear_color.end(),
+            clear.Color);
+    }
     Impl::TextureResource value{};
     value.descriptor = descriptor;
     value.native_state = D3D12_RESOURCE_STATE_COMMON;
-    const bool has_clear_value = flags != D3D12_RESOURCE_FLAG_NONE;
+    value.srv_lease = std::move(srv_lease);
+    value.uav_lease = std::move(uav_lease);
+    value.rtv_lease = std::move(rtv_lease);
+    value.dsv_lease = std::move(dsv_lease);
+    const bool has_clear_value =
+        gpu::has_usage(descriptor.usage, gpu::TextureUsage::color_attachment) ||
+        gpu::has_usage(descriptor.usage, gpu::TextureUsage::depth_attachment);
     const HRESULT status = impl_->device->CreateCommittedResource(
         &heap,
         D3D12_HEAP_FLAG_NONE,
@@ -845,20 +997,12 @@ core::Result<gpu::TextureHandle> D3D12Device::create_texture(const gpu::TextureD
             native_failure("CreateCommittedResource(texture)", status));
     }
     if (gpu::has_usage(descriptor.usage, gpu::TextureUsage::sampled)) {
-        if (gpu::is_depth_format(descriptor.format)) {
-            return core::Result<gpu::TextureHandle>::failure(unsupported(
-                "D3D12 sampled textures currently require a color format"));
-        }
-        if (impl_->next_srv >= Impl::descriptor_capacity) {
-            return core::Result<gpu::TextureHandle>::failure(invalid(
-                "D3D12 SRV descriptor heap is exhausted"));
-        }
         const auto cpu_start = impl_->srv_heap->GetCPUDescriptorHandleForHeapStart();
         const auto gpu_start = impl_->srv_heap->GetGPUDescriptorHandleForHeapStart();
         value.srv.ptr = cpu_start.ptr +
-            static_cast<SIZE_T>(impl_->next_srv) * impl_->srv_increment;
+            static_cast<SIZE_T>(value.srv_lease->index) * impl_->srv_increment;
         value.srv_gpu.ptr = gpu_start.ptr +
-            static_cast<UINT64>(impl_->next_srv) * impl_->srv_increment;
+            static_cast<UINT64>(value.srv_lease->index) * impl_->srv_increment;
         D3D12_SHADER_RESOURCE_VIEW_DESC view{};
         view.Format = native_format;
         view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -867,29 +1011,35 @@ core::Result<gpu::TextureHandle> D3D12Device::create_texture(const gpu::TextureD
         view.Texture2D.MipLevels = descriptor.mip_levels;
         impl_->device->CreateShaderResourceView(value.resource.Get(), &view, value.srv);
         value.has_srv = true;
-        ++impl_->next_srv;
+    }
+    if (gpu::has_usage(descriptor.usage, gpu::TextureUsage::storage)) {
+        const auto cpu_start = impl_->srv_heap->GetCPUDescriptorHandleForHeapStart();
+        const auto gpu_start = impl_->srv_heap->GetGPUDescriptorHandleForHeapStart();
+        value.uav.ptr = cpu_start.ptr +
+            static_cast<SIZE_T>(value.uav_lease->index) * impl_->srv_increment;
+        value.uav_gpu.ptr = gpu_start.ptr +
+            static_cast<UINT64>(value.uav_lease->index) * impl_->srv_increment;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+        view.Format = native_format;
+        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        view.Texture2D.MipSlice = 0U;
+        impl_->device->CreateUnorderedAccessView(
+            value.resource.Get(), nullptr, &view, value.uav);
+        value.has_uav = true;
     }
     if (gpu::has_usage(descriptor.usage, gpu::TextureUsage::color_attachment)) {
-        if (impl_->next_rtv >= 4096U) {
-            return core::Result<gpu::TextureHandle>::failure(invalid(
-                "D3D12 RTV descriptor heap is exhausted"));
-        }
         const auto start = impl_->rtv_heap->GetCPUDescriptorHandleForHeapStart();
-        value.rtv.ptr = start.ptr + static_cast<SIZE_T>(impl_->next_rtv) * impl_->rtv_increment;
+        value.rtv.ptr = start.ptr +
+            static_cast<SIZE_T>(value.rtv_lease->index) * impl_->rtv_increment;
         impl_->device->CreateRenderTargetView(value.resource.Get(), nullptr, value.rtv);
         value.has_rtv = true;
-        ++impl_->next_rtv;
     }
     if (gpu::has_usage(descriptor.usage, gpu::TextureUsage::depth_attachment)) {
-        if (impl_->next_dsv >= 4096U) {
-            return core::Result<gpu::TextureHandle>::failure(invalid(
-                "D3D12 DSV descriptor heap is exhausted"));
-        }
         const auto start = impl_->dsv_heap->GetCPUDescriptorHandleForHeapStart();
-        value.dsv.ptr = start.ptr + static_cast<SIZE_T>(impl_->next_dsv) * impl_->dsv_increment;
+        value.dsv.ptr = start.ptr +
+            static_cast<SIZE_T>(value.dsv_lease->index) * impl_->dsv_increment;
         impl_->device->CreateDepthStencilView(value.resource.Get(), nullptr, value.dsv);
         value.has_dsv = true;
-        ++impl_->next_dsv;
     }
     auto handle = impl_->textures.insert(std::move(value));
     if (handle) impl_->resource_states.emplace(
@@ -900,6 +1050,9 @@ core::Result<gpu::TextureHandle> D3D12Device::create_texture(const gpu::TextureD
 core::Result<gpu::TextureHandle> D3D12Device::import_swapchain_texture(
     void* native_resource,
     const gpu::TextureDesc& descriptor) {
+    if (impl_->device_lost) {
+        return core::Result<gpu::TextureHandle>::failure(device_lost_failure());
+    }
     if (native_resource == nullptr) {
         return core::Result<gpu::TextureHandle>::failure(invalid(
             "D3D12 swapchain texture import requires a native resource"));
@@ -914,10 +1067,6 @@ core::Result<gpu::TextureHandle> D3D12Device::import_swapchain_texture(
         return core::Result<gpu::TextureHandle>::failure(invalid(
             "D3D12 swapchain imports require a single-level 2D color attachment"));
     }
-    if (impl_->next_rtv >= Impl::descriptor_capacity) {
-        return core::Result<gpu::TextureHandle>::failure(invalid(
-            "D3D12 RTV descriptor heap is exhausted"));
-    }
     auto* resource = reinterpret_cast<ID3D12Resource*>(native_resource);
     const D3D12_RESOURCE_DESC native_descriptor = resource->GetDesc();
     if (native_descriptor.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
@@ -929,17 +1078,22 @@ core::Result<gpu::TextureHandle> D3D12Device::import_swapchain_texture(
         return core::Result<gpu::TextureHandle>::failure(validation(
             "D3D12 swapchain resource does not match its Cartographer texture descriptor"));
     }
+    auto rtv_lease = impl_->acquire_descriptor(
+        impl_->free_rtv, impl_->next_rtv, Impl::descriptor_capacity, "RTV");
+    if (!rtv_lease) {
+        return core::Result<gpu::TextureHandle>::failure(rtv_lease.error());
+    }
 
     Impl::TextureResource value{};
     value.descriptor = descriptor;
     value.resource = resource;
     value.native_state = D3D12_RESOURCE_STATE_PRESENT;
+    value.rtv_lease = std::move(rtv_lease.value());
     const auto start = impl_->rtv_heap->GetCPUDescriptorHandleForHeapStart();
     value.rtv.ptr = start.ptr +
-        static_cast<SIZE_T>(impl_->next_rtv) * impl_->rtv_increment;
+        static_cast<SIZE_T>(value.rtv_lease->index) * impl_->rtv_increment;
     impl_->device->CreateRenderTargetView(value.resource.Get(), nullptr, value.rtv);
     value.has_rtv = true;
-    ++impl_->next_rtv;
 
     auto handle = impl_->textures.insert(std::move(value));
     if (handle) {
@@ -951,21 +1105,33 @@ core::Result<gpu::TextureHandle> D3D12Device::import_swapchain_texture(
 
 core::Result<gpu::SamplerHandle> D3D12Device::create_sampler(
     const gpu::SamplerDesc& descriptor) {
+    if (impl_->device_lost) {
+        return core::Result<gpu::SamplerHandle>::failure(device_lost_failure());
+    }
     if (auto result = gpu::validate(descriptor); !result) {
         return core::Result<gpu::SamplerHandle>::failure(result.error());
     }
-    if (impl_->next_sampler >= Impl::sampler_descriptor_capacity) {
+    if (descriptor.anisotropy &&
+        (descriptor.max_anisotropy > impl_->capabilities.max_sampler_anisotropy ||
+         std::floor(descriptor.max_anisotropy) != descriptor.max_anisotropy)) {
         return core::Result<gpu::SamplerHandle>::failure(invalid(
-            "D3D12 sampler descriptor heap is exhausted"));
+            "D3D12 sampler anisotropy must be an integer within the device limit"));
     }
+    auto lease = impl_->acquire_descriptor(
+        impl_->free_sampler,
+        impl_->next_sampler,
+        Impl::sampler_descriptor_capacity,
+        "sampler");
+    if (!lease) return core::Result<gpu::SamplerHandle>::failure(lease.error());
     Impl::SamplerResource resource{};
     resource.descriptor = descriptor;
+    resource.lease = std::move(lease.value());
     const auto cpu_start = impl_->sampler_heap->GetCPUDescriptorHandleForHeapStart();
     const auto gpu_start = impl_->sampler_heap->GetGPUDescriptorHandleForHeapStart();
     resource.cpu.ptr = cpu_start.ptr +
-        static_cast<SIZE_T>(impl_->next_sampler) * impl_->sampler_increment;
+        static_cast<SIZE_T>(resource.lease->index) * impl_->sampler_increment;
     resource.gpu.ptr = gpu_start.ptr +
-        static_cast<UINT64>(impl_->next_sampler) * impl_->sampler_increment;
+        static_cast<UINT64>(resource.lease->index) * impl_->sampler_increment;
     D3D12_SAMPLER_DESC native{};
     native.Filter = native_filter(descriptor);
     native.AddressU = native_address_mode(descriptor.u);
@@ -974,8 +1140,11 @@ core::Result<gpu::SamplerHandle> D3D12Device::create_sampler(
     native.MipLODBias = 0.0F;
     native.MaxAnisotropy = descriptor.anisotropy
         ? static_cast<UINT>(descriptor.max_anisotropy) : 1U;
+    // D3D12 ignores ComparisonFunc for non-comparison filters, but the debug
+    // layer still reports ALWAYS as a likely configuration error. NEVER is
+    // inert for ordinary sampling and keeps the native descriptor truthful.
     native.ComparisonFunc = descriptor.compare ?
-        native_compare(descriptor.compare_op) : D3D12_COMPARISON_FUNC_ALWAYS;
+        native_compare(descriptor.compare_op) : D3D12_COMPARISON_FUNC_NEVER;
     native.BorderColor[0] = 0.0F;
     native.BorderColor[1] = 0.0F;
     native.BorderColor[2] = 0.0F;
@@ -984,12 +1153,14 @@ core::Result<gpu::SamplerHandle> D3D12Device::create_sampler(
     native.MaxLOD = descriptor.max_lod;
     impl_->device->CreateSampler(&native, resource.cpu);
     resource.has_descriptor = true;
-    ++impl_->next_sampler;
     return impl_->samplers.insert(std::move(resource));
 }
 
 core::Result<gpu::ShaderHandle> D3D12Device::create_shader(
     const device::ShaderBinary& binary) {
+    if (impl_->device_lost) {
+        return core::Result<gpu::ShaderHandle>::failure(device_lost_failure());
+    }
     if (auto result = device::validate(binary); !result) {
         return core::Result<gpu::ShaderHandle>::failure(result.error());
     }
@@ -1007,6 +1178,9 @@ core::Result<gpu::ShaderHandle> D3D12Device::create_shader(
 
 core::Result<gpu::PipelineHandle> D3D12Device::create_pipeline(
     const gpu::PipelineDesc& descriptor) {
+    if (impl_->device_lost) {
+        return core::Result<gpu::PipelineHandle>::failure(device_lost_failure());
+    }
     if (auto result = gpu::validate(descriptor); !result) {
         return core::Result<gpu::PipelineHandle>::failure(result.error());
     }
@@ -1014,14 +1188,23 @@ core::Result<gpu::PipelineHandle> D3D12Device::create_pipeline(
         return core::Result<gpu::PipelineHandle>::failure(unsupported(
             "D3D12 reference pipeline creation currently requires one sample"));
     }
-    if (descriptor.descriptor_bindings.size() > 1U ||
-        (!descriptor.descriptor_bindings.empty() &&
-         (descriptor.descriptor_bindings.front().set != 0U ||
-          descriptor.descriptor_bindings.front().binding != 0U ||
-          !gpu::has_stage(descriptor.descriptor_bindings.front().stages,
-                          gpu::ShaderStage::fragment)))) {
+    const bool has_multi_sampled_compute_bindings = descriptor.sampled_texture_count != 0U;
+    if ((!has_multi_sampled_compute_bindings && descriptor.descriptor_bindings.size() > 1U) ||
+        (has_multi_sampled_compute_bindings &&
+         descriptor.descriptor_bindings.size() !=
+             static_cast<std::size_t>(descriptor.sampled_texture_count) + 1U)) {
         return core::Result<gpu::PipelineHandle>::failure(unsupported(
-            "D3D12 supports one sampled texture at set 0 binding 0"));
+            "D3D12 supports one texture binding, or up to three sampled compute bindings plus one storage binding"));
+    }
+    for (std::size_t binding_index = 0U;
+         binding_index < descriptor.descriptor_bindings.size(); ++binding_index) {
+        const auto& binding = descriptor.descriptor_bindings.at(binding_index);
+        if (binding.set != 0U || binding.binding != binding_index ||
+            (!gpu::has_stage(binding.stages, gpu::ShaderStage::fragment) &&
+             !gpu::has_stage(binding.stages, gpu::ShaderStage::compute))) {
+            return core::Result<gpu::PipelineHandle>::failure(unsupported(
+                "D3D12 descriptor bindings must use consecutive set 0 registers"));
+        }
     }
     if (descriptor.push_constant_bytes % sizeof(std::uint32_t) != 0U) {
         return core::Result<gpu::PipelineHandle>::failure(invalid(
@@ -1030,6 +1213,7 @@ core::Result<gpu::PipelineHandle> D3D12Device::create_pipeline(
 
     const Impl::ShaderResource* vertex_shader = nullptr;
     const Impl::ShaderResource* fragment_shader = nullptr;
+    const Impl::ShaderResource* compute_shader = nullptr;
     for (const gpu::ShaderHandle shader_handle : descriptor.shaders) {
         auto shader = impl_->shaders.resolve(shader_handle);
         if (!shader) return core::Result<gpu::PipelineHandle>::failure(shader.error());
@@ -1045,14 +1229,143 @@ core::Result<gpu::PipelineHandle> D3D12Device::create_pipeline(
                     "D3D12 graphics pipelines cannot contain duplicate fragment shaders"));
             }
             fragment_shader = shader.value();
+        } else if (shader.value()->descriptor.stage == gpu::ShaderStage::compute) {
+            if (compute_shader != nullptr) {
+                return core::Result<gpu::PipelineHandle>::failure(validation(
+                    "D3D12 compute pipelines cannot contain duplicate compute shaders"));
+            }
+            compute_shader = shader.value();
         } else {
             return core::Result<gpu::PipelineHandle>::failure(unsupported(
-                "D3D12 graphics pipelines require vertex and fragment DXIL stages"));
+                "D3D12 pipelines require supported DXIL stages"));
         }
     }
+
+    if (compute_shader != nullptr) {
+        if (vertex_shader != nullptr || fragment_shader != nullptr) {
+            return core::Result<gpu::PipelineHandle>::failure(validation(
+                "D3D12 compute pipelines cannot mix graphics shader stages"));
+        }
+        if (!descriptor.descriptor_bindings.empty() &&
+            !gpu::has_stage(descriptor.descriptor_bindings.front().stages,
+                            gpu::ShaderStage::compute)) {
+            return core::Result<gpu::PipelineHandle>::failure(validation(
+                "D3D12 compute resource bindings must be staged for compute"));
+        }
+        if (descriptor.sampled_texture_count > 3U) {
+            return core::Result<gpu::PipelineHandle>::failure(unsupported(
+                "D3D12 compute pipelines support at most three sampled textures"));
+        }
+        for (const auto& binding : descriptor.descriptor_bindings) {
+            if (!gpu::has_stage(binding.stages, gpu::ShaderStage::compute)) {
+                return core::Result<gpu::PipelineHandle>::failure(validation(
+                    "D3D12 compute resource bindings must all be staged for compute"));
+            }
+        }
+
+        Impl::PipelineResource value{};
+        value.descriptor = descriptor;
+        value.compute = true;
+        std::array<D3D12_ROOT_PARAMETER, 5U> root_parameters{};
+        std::array<D3D12_DESCRIPTOR_RANGE, 4U> descriptor_ranges{};
+        UINT root_parameter_count = 0U;
+        D3D12_ROOT_SIGNATURE_DESC root_descriptor{};
+        if (descriptor.push_constant_bytes != 0U) {
+            const UINT root_index = root_parameter_count++;
+            value.push_constant_root_index = root_index;
+            auto& root_parameter = root_parameters.at(root_index);
+            root_parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            root_parameter.Constants.ShaderRegister = 0U;
+            root_parameter.Constants.RegisterSpace = 0U;
+            root_parameter.Constants.Num32BitValues =
+                descriptor.push_constant_bytes / sizeof(std::uint32_t);
+            root_parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        }
+        for (std::uint32_t sampled_index = 0U;
+             sampled_index < descriptor.sampled_texture_count; ++sampled_index) {
+            auto& sampled_range = descriptor_ranges.at(sampled_index);
+            sampled_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            sampled_range.NumDescriptors = 1U;
+            sampled_range.BaseShaderRegister = sampled_index;
+            sampled_range.RegisterSpace = 0U;
+            sampled_range.OffsetInDescriptorsFromTableStart = 0U;
+            const UINT sampled_root_index = root_parameter_count++;
+            value.sampled_texture_root_indices.push_back(sampled_root_index);
+            auto& sampled_parameter = root_parameters.at(sampled_root_index);
+            sampled_parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            sampled_parameter.DescriptorTable.NumDescriptorRanges = 1U;
+            sampled_parameter.DescriptorTable.pDescriptorRanges = &sampled_range;
+            sampled_parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        }
+        if (descriptor.descriptor_bindings.size() > descriptor.sampled_texture_count) {
+            auto& storage_range = descriptor_ranges.at(descriptor.sampled_texture_count);
+            storage_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+            storage_range.NumDescriptors = 1U;
+            storage_range.BaseShaderRegister = 0U;
+            storage_range.RegisterSpace = 0U;
+            storage_range.OffsetInDescriptorsFromTableStart = 0U;
+            const UINT storage_root_index = root_parameter_count++;
+            value.storage_texture_root_index = storage_root_index;
+            auto& storage_parameter = root_parameters.at(storage_root_index);
+            storage_parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            storage_parameter.DescriptorTable.NumDescriptorRanges = 1U;
+            storage_parameter.DescriptorTable.pDescriptorRanges = &storage_range;
+            storage_parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        }
+        root_descriptor.NumParameters = root_parameter_count;
+        root_descriptor.pParameters = root_parameter_count == 0U
+            ? nullptr : root_parameters.data();
+        root_descriptor.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+        Microsoft::WRL::ComPtr<ID3DBlob> serialized_root;
+        Microsoft::WRL::ComPtr<ID3DBlob> root_errors;
+        HRESULT status = D3D12SerializeRootSignature(
+            &root_descriptor,
+            D3D_ROOT_SIGNATURE_VERSION_1,
+            &serialized_root,
+            &root_errors);
+        if (FAILED(status) || !serialized_root) {
+            std::string message = "D3D12 compute root-signature serialization failed";
+            if (root_errors && root_errors->GetBufferPointer() != nullptr) {
+                message += ": ";
+                message.append(
+                    static_cast<const char*>(root_errors->GetBufferPointer()),
+                    root_errors->GetBufferSize());
+            }
+            return core::Result<gpu::PipelineHandle>::failure(
+                Diagnostic(ErrorCode::validation_failed, std::move(message)));
+        }
+        status = impl_->device->CreateRootSignature(
+            0U,
+            serialized_root->GetBufferPointer(),
+            serialized_root->GetBufferSize(),
+            IID_PPV_ARGS(&value.root_signature));
+        if (FAILED(status)) {
+            return core::Result<gpu::PipelineHandle>::failure(
+                native_failure("ID3D12Device::CreateRootSignature(compute)", status));
+        }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline{};
+        pipeline.pRootSignature = value.root_signature.Get();
+        pipeline.CS = {
+            compute_shader->binary.bytes.data(), compute_shader->binary.bytes.size()};
+        pipeline.NodeMask = 0U;
+        pipeline.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+        status = impl_->device->CreateComputePipelineState(
+            &pipeline, IID_PPV_ARGS(&value.pipeline_state));
+        if (FAILED(status)) {
+            impl_->capture_debug_messages();
+            return core::Result<gpu::PipelineHandle>::failure(
+                native_failure("ID3D12Device::CreateComputePipelineState", status));
+        }
+        return impl_->pipelines.insert(std::move(value));
+    }
+
     if (vertex_shader == nullptr || fragment_shader == nullptr) {
         return core::Result<gpu::PipelineHandle>::failure(validation(
             "D3D12 graphics pipelines require one vertex and one fragment shader"));
+    }
+    if (descriptor.sampled_texture_count != 0U) {
+        return core::Result<gpu::PipelineHandle>::failure(unsupported(
+            "D3D12 multi-texture bindings are limited to compute pipelines"));
     }
 
     Impl::PipelineResource value{};
@@ -1336,6 +1649,7 @@ core::Result<void> D3D12Device::write_buffer(
     gpu::BufferHandle handle,
     std::uint64_t offset,
     std::span<const std::uint8_t> bytes) {
+    if (impl_->device_lost) return core::Result<void>::failure(device_lost_failure());
     auto result = impl_->buffers.resolve(handle);
     if (!result) return core::Result<void>::failure(result.error());
     if (result.value()->descriptor.memory != gpu::MemoryClass::upload) {
@@ -1360,6 +1674,9 @@ core::Result<std::vector<std::uint8_t>> D3D12Device::read_buffer(
     gpu::BufferHandle handle,
     std::uint64_t offset,
     std::uint64_t bytes) const {
+    if (impl_->device_lost) {
+        return core::Result<std::vector<std::uint8_t>>::failure(device_lost_failure());
+    }
     auto result = impl_->buffers.resolve(handle);
     if (!result) return core::Result<std::vector<std::uint8_t>>::failure(result.error());
     if (result.value()->descriptor.memory != gpu::MemoryClass::readback) {
@@ -1387,15 +1704,20 @@ core::Result<std::vector<std::uint8_t>> D3D12Device::read_buffer(
     return core::Result<std::vector<std::uint8_t>>::success(std::move(output));
 }
 
-core::Result<std::vector<float>> D3D12Device::read_texture_rgba32f(
-    gpu::TextureHandle handle) const {
+core::Result<std::vector<float>> D3D12Device::read_texture_float32(
+    gpu::TextureHandle handle,
+    gpu::Format expected_format,
+    std::uint32_t channel_count) const {
+    if (impl_->device_lost) {
+        return core::Result<std::vector<float>>::failure(device_lost_failure());
+    }
     auto texture = impl_->textures.resolve(handle);
     if (!texture) {
         return core::Result<std::vector<float>>::failure(texture.error());
     }
-    if (texture.value()->descriptor.format != gpu::Format::rgba32_float) {
+    if (texture.value()->descriptor.format != expected_format) {
         return core::Result<std::vector<float>>::failure(unsupported(
-            "D3D12 RGBA32F readback currently accepts only an RGBA32F source texture"));
+            "D3D12 float readback format does not match the requested source texture"));
     }
     const auto current = impl_->resource_states.find(device_ir::ResourceHandle{handle});
     if (current == impl_->resource_states.end()) {
@@ -1459,7 +1781,7 @@ core::Result<std::vector<float>> D3D12Device::read_texture_rgba32f(
     if (!bytes) return core::Result<std::vector<float>>::failure(bytes.error());
     const std::uint64_t expected_values =
         static_cast<std::uint64_t>(texture.value()->descriptor.width) *
-        static_cast<std::uint64_t>(texture.value()->descriptor.height) * 4U;
+        static_cast<std::uint64_t>(texture.value()->descriptor.height) * channel_count;
     if (expected_values > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
         return core::Result<std::vector<float>>::failure(out_of_memory(
             "D3D12 texture readback result exceeds host addressable memory"));
@@ -1467,7 +1789,8 @@ core::Result<std::vector<float>> D3D12Device::read_texture_rgba32f(
     std::vector<float> output(static_cast<std::size_t>(expected_values), 0.0F);
     const std::size_t row_bytes = static_cast<std::size_t>(row_size);
     const std::size_t destination_row_bytes =
-        static_cast<std::size_t>(texture.value()->descriptor.width) * 4U * sizeof(float);
+        static_cast<std::size_t>(texture.value()->descriptor.width) * channel_count *
+        sizeof(float);
     for (std::uint32_t row = 0U; row < texture.value()->descriptor.height; ++row) {
         const std::size_t source_offset = static_cast<std::size_t>(footprint.Offset) +
             static_cast<std::size_t>(row) * static_cast<std::size_t>(footprint.Footprint.RowPitch);
@@ -1485,6 +1808,16 @@ core::Result<std::vector<float>> D3D12Device::read_texture_rgba32f(
             destination_row_bytes);
     }
     return core::Result<std::vector<float>>::success(std::move(output));
+}
+
+core::Result<std::vector<float>> D3D12Device::read_texture_rgba32f(
+    gpu::TextureHandle handle) const {
+    return read_texture_float32(handle, gpu::Format::rgba32_float, 4U);
+}
+
+core::Result<std::vector<float>> D3D12Device::read_texture_depth32f(
+    gpu::TextureHandle handle) const {
+    return read_texture_float32(handle, gpu::Format::depth32_float, 1U);
 }
 
 core::Result<void> D3D12Device::wait_idle() {
@@ -1597,7 +1930,14 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
         }
         return core::Result<void>::success();
     };
-    auto transition = [this, &queue_resource, &remember_native_state](
+    auto require_compute = [queue]() -> core::Result<void> {
+        if (queue != gpu::QueueType::compute) {
+            return core::Result<void>::failure(unsupported(
+                "D3D12 compute commands require the compute queue"));
+        }
+        return core::Result<void>::success();
+    };
+    auto transition = [this, &queue_resource, &remember_native_state, queue](
         const device_ir::CmdTransitionResource& command) -> core::Result<void> {
         const auto current = impl_->resource_states.find(command.resource);
         if (current == impl_->resource_states.end() || current->second != command.before) {
@@ -1621,8 +1961,9 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
             before = after;
             return core::Result<void>::success();
         };
+        const bool copy_queue = queue == gpu::QueueType::copy;
         const auto result = std::visit(
-            [&record, this, &command](const auto handle) -> core::Result<void> {
+            [&record, this, &command, copy_queue](const auto handle) -> core::Result<void> {
                 using Handle = std::decay_t<decltype(handle)>;
                 if constexpr (std::is_same_v<Handle, gpu::BufferHandle>) {
                     auto resource = impl_->buffers.resolve(handle);
@@ -1653,6 +1994,20 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
                 } else {
                     auto resource = impl_->textures.resolve(handle);
                     if (!resource) return core::Result<void>::failure(resource.error());
+                    if (copy_queue &&
+                        (command.after == device_ir::ResourceState::copy_source ||
+                         command.after == device_ir::ResourceState::copy_destination)) {
+                        // Copy queues use COMMON as the native ownership state and
+                        // rely on D3D12's copy-state promotion/decay. Keep the
+                        // semantic state explicit while leaving the native state
+                        // at COMMON for the copy command list.
+                        if (resource.value()->native_state != D3D12_RESOURCE_STATE_COMMON) {
+                            return core::Result<void>::failure(unsupported(
+                                "D3D12 copy-queue texture use requires native COMMON ownership"));
+                        }
+                        impl_->resource_states[command.resource] = command.after;
+                        return core::Result<void>::success();
+                    }
                     return record(resource.value()->resource.Get(), resource.value()->native_state);
                 }
             },
@@ -1663,13 +2018,14 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
 
     std::optional<gpu::PipelineHandle> bound_pipeline;
     std::optional<device_ir::ResourceBinding> bound_sampled_texture;
+    std::optional<device_ir::ResourceBinding> bound_storage_texture;
     bool vertex_buffer_bound = false;
     bool index_buffer_bound = false;
     for (const auto& command : stream.commands()) {
         const auto result = std::visit(
-            [this, &queue_resource, &require_state, &require_graphics, &transition,
-             &bound_pipeline, &bound_sampled_texture, &vertex_buffer_bound,
-             &index_buffer_bound](
+            [this, &queue_resource, &require_state, &require_graphics, &require_compute,
+             &transition, &bound_pipeline, &bound_sampled_texture,
+             &bound_storage_texture, &vertex_buffer_bound, &index_buffer_bound](
                 const auto& value) -> core::Result<void> {
                 using T = std::decay_t<decltype(value)>;
                 if constexpr (std::is_same_v<T, device_ir::CmdBeginLabel> ||
@@ -1911,9 +2267,18 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
                     queue_resource.command_list->RSSetScissorRects(1U, &rectangle);
                     return core::Result<void>::success();
                 } else if constexpr (std::is_same_v<T, device_ir::CmdBindPipeline>) {
-                    if (auto result = require_graphics(); !result) return result;
                     auto pipeline = impl_->pipelines.resolve(value.pipeline);
                     if (!pipeline) return core::Result<void>::failure(pipeline.error());
+                    if (pipeline.value()->compute) {
+                        if (auto result = require_compute(); !result) return result;
+                        queue_resource.command_list->SetPipelineState(
+                            pipeline.value()->pipeline_state.Get());
+                        queue_resource.command_list->SetComputeRootSignature(
+                            pipeline.value()->root_signature.Get());
+                        bound_pipeline = value.pipeline;
+                        return core::Result<void>::success();
+                    }
+                    if (auto result = require_graphics(); !result) return result;
                     queue_resource.command_list->SetPipelineState(
                         pipeline.value()->pipeline_state.Get());
                     queue_resource.command_list->SetGraphicsRootSignature(
@@ -1987,22 +2352,122 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
                     return core::Result<void>::success();
                 } else if constexpr (std::is_same_v<T, device_ir::CmdBindResources>) {
                     bound_sampled_texture.reset();
+                    bound_storage_texture.reset();
                     if (value.bindings.empty()) return core::Result<void>::success();
-                    if (!bound_pipeline.has_value() || value.bindings.size() != 1U ||
+                    if (!bound_pipeline.has_value() ||
                         !std::holds_alternative<gpu::TextureHandle>(
-                            value.bindings.front().resource)) {
+                        value.bindings.front().resource)) {
                         return core::Result<void>::failure(unsupported(
-                            "D3D12 supports one sampled texture binding after pipeline binding"));
+                            "D3D12 resource bindings require a bound texture pipeline"));
                     }
                     auto pipeline = impl_->pipelines.resolve(*bound_pipeline);
                     if (!pipeline) return core::Result<void>::failure(pipeline.error());
+                    if (pipeline.value()->compute &&
+                        pipeline.value()->descriptor.sampled_texture_count != 0U) {
+                        const std::size_t sampled_count = static_cast<std::size_t>(
+                            pipeline.value()->descriptor.sampled_texture_count);
+                        if (!pipeline.value()->storage_texture_root_index.has_value() ||
+                            value.bindings.size() != sampled_count + 1U) {
+                            return core::Result<void>::failure(validation(
+                                "D3D12 multi-texture compute bindings require sampled textures followed by one storage texture"));
+                        }
+                        if (auto result = require_compute(); !result) return result;
+                        ID3D12DescriptorHeap* heaps[] = {impl_->srv_heap.Get()};
+                        queue_resource.command_list->SetDescriptorHeaps(1U, heaps);
+                        for (std::size_t sampled_index = 0U;
+                             sampled_index < sampled_count; ++sampled_index) {
+                            const auto& binding = value.bindings.at(sampled_index);
+                            if (binding.set != 0U || binding.binding != sampled_index ||
+                                binding.sampler.has_value() ||
+                                !std::holds_alternative<gpu::TextureHandle>(binding.resource)) {
+                                return core::Result<void>::failure(validation(
+                                    "D3D12 sampled compute bindings must be consecutive texture SRVs without samplers"));
+                            }
+                            const auto texture_handle = std::get<gpu::TextureHandle>(
+                                binding.resource);
+                            if (auto result = require_state(
+                                    device_ir::ResourceHandle{texture_handle},
+                                    device_ir::ResourceState::shader_read); !result) {
+                                return result;
+                            }
+                            auto texture = impl_->textures.resolve(texture_handle);
+                            if (!texture) return core::Result<void>::failure(texture.error());
+                            if (!texture.value()->has_srv) {
+                                return core::Result<void>::failure(unsupported(
+                                    "D3D12 sampled compute texture has no SRV descriptor"));
+                            }
+                            queue_resource.command_list->SetComputeRootDescriptorTable(
+                                pipeline.value()->sampled_texture_root_indices.at(sampled_index),
+                                texture.value()->srv_gpu);
+                        }
+                        const auto& storage_binding = value.bindings.at(sampled_count);
+                        if (storage_binding.set != 0U ||
+                            storage_binding.binding != sampled_count ||
+                            storage_binding.sampler.has_value() ||
+                            !std::holds_alternative<gpu::TextureHandle>(storage_binding.resource)) {
+                            return core::Result<void>::failure(validation(
+                                "D3D12 storage compute binding must follow sampled texture bindings"));
+                        }
+                        const auto storage_handle = std::get<gpu::TextureHandle>(
+                            storage_binding.resource);
+                        if (auto result = require_state(
+                                device_ir::ResourceHandle{storage_handle},
+                                device_ir::ResourceState::shader_write); !result) {
+                            return result;
+                        }
+                        auto storage = impl_->textures.resolve(storage_handle);
+                        if (!storage) return core::Result<void>::failure(storage.error());
+                        if (!storage.value()->has_uav) {
+                            return core::Result<void>::failure(unsupported(
+                                "D3D12 compute storage texture has no UAV descriptor"));
+                        }
+                        queue_resource.command_list->SetComputeRootDescriptorTable(
+                            *pipeline.value()->storage_texture_root_index,
+                            storage.value()->uav_gpu);
+                        bound_sampled_texture = value.bindings.front();
+                        bound_storage_texture = storage_binding;
+                        return core::Result<void>::success();
+                    }
+                    if (value.bindings.size() != 1U) {
+                        return core::Result<void>::failure(unsupported(
+                            "D3D12 graphics and single-storage compute pipelines accept one texture binding"));
+                    }
+                    const auto texture_handle = std::get<gpu::TextureHandle>(
+                        value.bindings.front().resource);
+                    if (pipeline.value()->compute) {
+                        if (auto result = require_compute(); !result) return result;
+                        if (!pipeline.value()->storage_texture_root_index.has_value()) {
+                            return core::Result<void>::failure(validation(
+                                "D3D12 compute resource binding is not declared by the bound pipeline"));
+                        }
+                        if (value.bindings.front().sampler.has_value()) {
+                            return core::Result<void>::failure(validation(
+                                "D3D12 compute storage bindings do not accept a sampler"));
+                        }
+                        if (auto result = require_state(
+                                device_ir::ResourceHandle{texture_handle},
+                                device_ir::ResourceState::shader_write); !result) {
+                            return result;
+                        }
+                        auto texture = impl_->textures.resolve(texture_handle);
+                        if (!texture) return core::Result<void>::failure(texture.error());
+                        if (!texture.value()->has_uav) {
+                            return core::Result<void>::failure(unsupported(
+                                "D3D12 compute storage texture has no UAV descriptor"));
+                        }
+                        ID3D12DescriptorHeap* heaps[] = {impl_->srv_heap.Get()};
+                        queue_resource.command_list->SetDescriptorHeaps(1U, heaps);
+                        queue_resource.command_list->SetComputeRootDescriptorTable(
+                            *pipeline.value()->storage_texture_root_index,
+                            texture.value()->uav_gpu);
+                        bound_storage_texture = value.bindings.front();
+                        return core::Result<void>::success();
+                    }
                     if (!pipeline.value()->sampled_texture_root_index.has_value() ||
                         !pipeline.value()->sampler_root_index.has_value()) {
                         return core::Result<void>::failure(validation(
                             "D3D12 resource binding is not declared by the bound pipeline"));
                     }
-                    const auto texture_handle = std::get<gpu::TextureHandle>(
-                        value.bindings.front().resource);
                     if (auto result = require_state(
                             device_ir::ResourceHandle{texture_handle},
                             device_ir::ResourceState::shader_read); !result) {
@@ -2037,13 +2502,17 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
                     bound_sampled_texture = value.bindings.front();
                     return core::Result<void>::success();
                 } else if constexpr (std::is_same_v<T, device_ir::CmdPushConstants>) {
-                    if (auto result = require_graphics(); !result) return result;
                     if (!bound_pipeline.has_value()) {
                         return core::Result<void>::failure(validation(
-                            "D3D12 push constants require a bound graphics pipeline"));
+                            "D3D12 push constants require a bound pipeline"));
                     }
                     auto pipeline = impl_->pipelines.resolve(*bound_pipeline);
                     if (!pipeline) return core::Result<void>::failure(pipeline.error());
+                    if (pipeline.value()->compute) {
+                        if (auto result = require_compute(); !result) return result;
+                    } else {
+                        if (auto result = require_graphics(); !result) return result;
+                    }
                     if (!pipeline.value()->push_constant_root_index.has_value()) {
                         return core::Result<void>::failure(validation(
                             "D3D12 push constants are not declared by the bound pipeline"));
@@ -2054,11 +2523,21 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
                             "D3D12 push constants exceed the bound root-constant range"));
                     }
                     if (!value.bytes.empty()) {
-                        queue_resource.command_list->SetGraphicsRoot32BitConstants(
-                            *pipeline.value()->push_constant_root_index,
-                            static_cast<UINT>(value.bytes.size() / sizeof(std::uint32_t)),
-                            value.bytes.data(),
-                            0U);
+                        const UINT count = static_cast<UINT>(
+                            value.bytes.size() / sizeof(std::uint32_t));
+                        if (pipeline.value()->compute) {
+                            queue_resource.command_list->SetComputeRoot32BitConstants(
+                                *pipeline.value()->push_constant_root_index,
+                                count,
+                                value.bytes.data(),
+                                0U);
+                        } else {
+                            queue_resource.command_list->SetGraphicsRoot32BitConstants(
+                                *pipeline.value()->push_constant_root_index,
+                                count,
+                                value.bytes.data(),
+                                0U);
+                        }
                     }
                     return core::Result<void>::success();
                 } else if constexpr (std::is_same_v<T, device_ir::CmdDraw>) {
@@ -2069,6 +2548,10 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
                     }
                     auto pipeline = impl_->pipelines.resolve(*bound_pipeline);
                     if (!pipeline) return core::Result<void>::failure(pipeline.error());
+                    if (pipeline.value()->compute) {
+                        return core::Result<void>::failure(validation(
+                            "D3D12 draw cannot use a compute pipeline"));
+                    }
                     if (pipeline.value()->sampled_texture_root_index.has_value() &&
                         !bound_sampled_texture.has_value()) {
                         return core::Result<void>::failure(validation(
@@ -2088,6 +2571,10 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
                     }
                     auto pipeline = impl_->pipelines.resolve(*bound_pipeline);
                     if (!pipeline) return core::Result<void>::failure(pipeline.error());
+                    if (pipeline.value()->compute) {
+                        return core::Result<void>::failure(validation(
+                            "D3D12 indexed draw cannot use a compute pipeline"));
+                    }
                     if (pipeline.value()->sampled_texture_root_index.has_value() &&
                         !bound_sampled_texture.has_value()) {
                         return core::Result<void>::failure(validation(
@@ -2100,8 +2587,32 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
                         value.vertex_offset,
                         value.first_instance);
                     return core::Result<void>::success();
+                } else if constexpr (std::is_same_v<T, device_ir::CmdDispatch>) {
+                    if (auto result = require_compute(); !result) return result;
+                    if (!bound_pipeline.has_value()) {
+                        return core::Result<void>::failure(validation(
+                            "D3D12 dispatch requires a bound compute pipeline"));
+                    }
+                    auto pipeline = impl_->pipelines.resolve(*bound_pipeline);
+                    if (!pipeline) return core::Result<void>::failure(pipeline.error());
+                    if (!pipeline.value()->compute) {
+                        return core::Result<void>::failure(validation(
+                            "D3D12 dispatch requires a compute pipeline"));
+                    }
+                    if (pipeline.value()->storage_texture_root_index.has_value() &&
+                        !bound_storage_texture.has_value()) {
+                        return core::Result<void>::failure(validation(
+                            "D3D12 storage dispatch requires a bound texture"));
+                    }
+                    if (pipeline.value()->descriptor.sampled_texture_count != 0U &&
+                        !bound_sampled_texture.has_value()) {
+                        return core::Result<void>::failure(validation(
+                            "D3D12 sampled compute dispatch requires bound textures"));
+                    }
+                    queue_resource.command_list->Dispatch(
+                        value.group_count_x, value.group_count_y, value.group_count_z);
+                    return core::Result<void>::success();
                 } else if constexpr (std::is_same_v<T, device_ir::CmdBlitTexture> ||
-                                     std::is_same_v<T, device_ir::CmdDispatch> ||
                                      std::is_same_v<T, device_ir::CmdWriteTimestamp> ||
                                      std::is_same_v<T, device_ir::CmdResolveTimestamps>) {
                     return core::Result<void>::failure(unsupported(
@@ -2178,6 +2689,7 @@ gpu::SubmissionSerial D3D12Device::completed_serial() const noexcept {
 }
 
 core::Result<void> D3D12Device::wait(gpu::SubmissionSerial serial) {
+    if (impl_->device_lost) return core::Result<void>::failure(device_lost_failure());
     if (serial == 0U || serial > impl_->next_serial) {
         return core::Result<void>::failure(Diagnostic(
             ErrorCode::invalid_state, "D3D12 wait requested an unknown submission serial"));
@@ -2197,7 +2709,11 @@ core::Result<void> D3D12Device::wait(gpu::SubmissionSerial serial) {
             return core::Result<void>::failure(Diagnostic(
                 ErrorCode::invalid_state, "D3D12 wait registration failed"));
         }
-        WaitForSingleObject(queue.event, INFINITE);
+        const DWORD wait_status = WaitForSingleObject(queue.event, INFINITE);
+        if (wait_status != WAIT_OBJECT_0) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::invalid_state, "D3D12 wait event did not signal"));
+        }
     }
     return core::Result<void>::success();
 }

@@ -14,7 +14,7 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] deterministic compiled mesh, normals, bounds, and source revisions
 - [x] reversible transform command and history boundary
 - [x] versioned project format with atomic save/load
-- [x] v3 project format with v1/v2 compatibility, explicit meters/right-handed/Y-up contract, and optional graph reference
+- [x] v4 project format with v1/v2/v3 compatibility, explicit meters/right-handed/Y-up contract, optional graph reference, and bounded project-bound topology receipt lineage
 - [x] OBJ import/export with explicit feature-loss warnings
 - [x] bounded ASCII PLY and binary/ASCII STL interchange with explicit feature-loss warnings
 - [x] bounded glTF export profile with explicit feature-loss warnings
@@ -36,12 +36,13 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] evaluation graph identity/DAG validation, deterministic digest, cache key, and stale-publication gate
 - [x] bounded versioned evaluation-graph serialization with hostile-input rejection
 - [x] domain-specific attribute layers with explicit topology-transfer policy
-- [x] stable-ID topology provenance adapter with explicit created/deleted mappings
+- [x] stable-ID topology provenance adapter with revision-bound receipt mapping and explicit created/deleted mappings
 - [x] workflow benchmark ledger with honest per-domain closure status
 - [x] bounded worker-backed evaluation scheduler with unpublished candidate receipts
-- [x] project-package graph reference binding, journal/checkpoint preservation, and polygon topology-provenance adapter
+- [x] project-package graph reference binding, journal/checkpoint preservation, polygon topology-provenance adapter, and v4 project-bound topology receipt persistence
 - [x] opt-in Windows D3D12 adapter/resource boundary and native identity smoke acceptance
-+ [ ] D3D12 production backend with headless parity against the CPU command semantics (bounded native DXIL, descriptor-table, indexed draw/readback, debug-receipt, and deferred-destruction acceptance passes on the Quadro P5200; compute dispatch, PBR/HDR/temporal parity, swapchain runtime, desktop launch, and 8K remain)
+- [x] bounded D3D12 native acceptance tranche: runtime DXIL suite, offscreen sampled-material PBR into an HDR target, HDR-to-display tone-map execution/readback, shadow-depth execution/readback, temporal resolve over current/history/motion inputs, storage-texture compute dispatch/readback, deferred descriptor/resource lifetime, typed DXGI back-buffer import, resize/present, desktop launch smoke, and 8K render-target clear on the Quadro P5200
+- [ ] D3D12 production backend with full render-graph parity (PBR/HDR/IBL/shadow/temporal execution, final presentation integration, input/DPI workflow, and GPU performance/8K frame evidence remain)
 - [x] SHA-256 content-addressed blob store with atomic publication and integrity verification
 - [x] append-only revision-bound journal with hash chain, verification, replay callback, content-addressed checkpoints, and staged transaction publication
 - [x] authority-preserving `carto_ui` foundation with design tokens, density/theme/operator/workspace state, operation/problems projections, shortcut routing, and bounded local preferences
@@ -58,17 +59,20 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
   permission and manifest-capability admission
 - [ ] built-in provider migration beyond the OBJ CLI gate, process isolation, resource budgets, and neutral-result admission
 - [x] stable object/vertex/edge/face selection identity through the editor, application snapshot, headless UI, and source-wired viewport picker (native acceptance pending)
-- [ ] persistent topology edit patches, loop/ring traversal, edge-edit tools, and broader modeling tool interaction (identity/traversal and vertex patches exist; topology operators and native input acceptance pending)
+- [ ] persistent topology edit patches, loop/ring modeling operators, edge-edit tools, and broader modeling tool interaction (receipt-aware edge-loop/edge-ring/boundary/fan/region/path traversal and vertex patches exist; bevel/merge/loop-cut/knife operators and native input acceptance pending)
 
 The optional native source path is intentionally not marked complete by the
 presence of a window class or renderer type. The CPU device supplies the
 offline semantic acceptance rung, including texture sampling and bounded
-lighting/temporal references. The bounded D3D12 path now has a passing
-PSO/draw/readback receipt on the Quadro P5200, but the production Windows path
-still requires typed swapchain back-buffer import, launch, input, resize/DPI,
-compute coverage, PBR/HDR/temporal parity, and GPU/8K evidence. The existing
-Vulkan path remains compatibility-only until its independent acceptance and
-removal decision are complete.
+lighting/temporal references. The bounded D3D12 path now has passing local
+evidence for runtime DXIL production, sampled-material PBR/HDR/tone-map,
+shadow-depth, and temporal-resolve graphics/compute execution, descriptor/resource retirement, typed swapchain
+import/resize/present, a desktop launch smoke, and an 8192x8192 render-target
+clear on the Quadro P5200. Those receipts do not claim full IBL/render-graph
+scheduling parity, final output encoding, input/DPI behavior, or 8K frame
+throughput.
+The existing Vulkan path remains compatibility-only until its independent
+acceptance and removal decision are complete.
 
 The cross-repository tranche is also intentionally split. A valid hash chain or
 content-addressed blob is not a recovered project, SQLite package, or promotion

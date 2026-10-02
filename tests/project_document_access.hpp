@@ -71,9 +71,10 @@ public:
     [[nodiscard]] core::Result<core::Revision> replace_mesh_if_revision(
         std::uint64_t mesh_asset,
         core::Revision expected_revision,
-        geometry::EditableMesh mesh) {
+        geometry::EditableMesh mesh,
+        std::optional<geometry::TopologyEditReceipt> receipt = std::nullopt) {
         return document_.replace_mesh_if_revision(
-            mesh_asset, expected_revision, std::move(mesh));
+            mesh_asset, expected_revision, std::move(mesh), std::move(receipt));
     }
 
     [[nodiscard]] core::Result<void> remove_mesh(std::uint64_t mesh_asset) {

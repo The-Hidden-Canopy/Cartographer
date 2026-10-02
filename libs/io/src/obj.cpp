@@ -288,7 +288,7 @@ core::Result<ImportResult> import_obj(const std::filesystem::path& path) {
             continue;
         }
         if (tag == "f") {
-            if (result.mesh.face_count() >= kMaxObjFaces) {
+            if (faces.size() >= kMaxObjFaces) {
                 return core::Result<ImportResult>::failure(
                     validation("OBJ face count exceeds the Cartographer import limit"));
             }

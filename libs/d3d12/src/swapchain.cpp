@@ -7,6 +7,7 @@
 #include <wrl/client.h>
 
 #include <carto/d3d12/swapchain.hpp>
+#include <carto/device_ir/command.hpp>
 
 #include <limits>
 #include <sstream>
@@ -41,6 +42,14 @@ void record_device_loss(D3D12Device& device, const char* operation, HRESULT stat
     if (is_device_removed_hresult(status)) {
         device.record_external_device_loss(operation, static_cast<std::uint32_t>(status));
     }
+}
+
+core::Result<void> synchronize_graphics_queue(D3D12Device& device) {
+    if (auto idle = device.wait_idle(); !idle) return idle;
+    device_ir::DeviceCommandStream marker;
+    const auto serial = device.submit(marker, gpu::QueueType::graphics);
+    if (!serial) return core::Result<void>::failure(serial.error());
+    return device.wait(serial.value());
 }
 
 DXGI_FORMAT native_format(gpu::Format format) {
@@ -132,7 +141,7 @@ core::Result<std::unique_ptr<D3D12Swapchain>> D3D12Swapchain::create(
 D3D12Swapchain::D3D12Swapchain(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 D3D12Swapchain::~D3D12Swapchain() {
     if (impl_ != nullptr && impl_->device != nullptr && !impl_->device->device_lost()) {
-        static_cast<void>(impl_->device->wait_idle());
+        static_cast<void>(synchronize_graphics_queue(*impl_->device));
     }
 }
 
@@ -145,7 +154,9 @@ core::Result<void> D3D12Swapchain::resize(std::uint32_t width, std::uint32_t hei
         return core::Result<void>::failure(Diagnostic(
             ErrorCode::invalid_state, "D3D12 swapchain cannot resize a lost device"));
     }
-    if (auto idle = impl_->device->wait_idle(); !idle) return idle;
+    if (auto synchronized = synchronize_graphics_queue(*impl_->device); !synchronized) {
+        return synchronized;
+    }
     const HRESULT status = impl_->swapchain->ResizeBuffers(
         impl_->options.buffer_count,
         width,
@@ -190,6 +201,10 @@ core::Result<gpu::TextureHandle> D3D12Swapchain::acquire_back_buffer() {
 }
 
 core::Result<void> D3D12Swapchain::present(bool vsync) {
+    if (impl_->device->device_lost()) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::invalid_state, "D3D12 swapchain cannot present on a lost device"));
+    }
     const UINT flags = !vsync && impl_->options.allow_tearing
         ? DXGI_PRESENT_ALLOW_TEARING : 0U;
     const HRESULT status = impl_->swapchain->Present(vsync ? 1U : 0U, flags);

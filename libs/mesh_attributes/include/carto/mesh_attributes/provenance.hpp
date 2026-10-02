@@ -19,4 +19,13 @@ stable_topology_snapshot(const geometry::EditableMesh& mesh);
     const geometry::EditableMesh& source,
     const geometry::EditableMesh& destination);
 
+// Adapts a validated geometry-kernel edit receipt into the source-index
+// mappings consumed by the generic attribute transfer layer. The revision
+// binding prevents a receipt from being applied to a different source or
+// destination state, and unknown source identities fail closed.
+[[nodiscard]] core::Result<attributes::TopologyProvenance> provenance_from_receipt(
+    const geometry::EditableMesh& source,
+    const geometry::EditableMesh& destination,
+    const geometry::TopologyEditReceipt& receipt);
+
 } // namespace carto::mesh_attributes

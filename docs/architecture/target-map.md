@@ -7,7 +7,7 @@ layout and link declarations:
 carto_core
   |-- carto_assets      (content-addressed blobs)
   |-- carto_attributes  (typed domain layers and transfer policy)
-  |     `-- carto_mesh_attributes (polygon-kernel stable-ID provenance adapter)
+  |     `-- carto_mesh_attributes (polygon-kernel stable-ID and receipt provenance adapter)
   |-- carto_eval        (revision-bound graph, cache, scheduler, and snapshot format)
   |-- carto_gpu         (backend-neutral handles/lifetime)
   |-- carto_device_ir   (backend-neutral command stream)
@@ -45,16 +45,18 @@ cartographer_desktop     (optional application + Vulkan + Dear ImGui shell)
 Vulkan, D3D12, and desktop configuration are fail-closed when prerequisites
 are missing; they are not silently replaced by CPU rendering or a web shell.
 The D3D12 target implements native queue, resource, transition, copy, clear,
-runtime DXC, graphics-pipeline, draw, texture-readback, debug-receipt,
-device-loss, deferred-destruction, sampled-texture descriptor, and indexed
-draw/readback paths. The optional Win32/DXGI swapchain and desktop shell
-configure and link as a native compile target. Bounded headless acceptance now
-passes on the Quadro P5200 through runtime DXC shader compilation, graphics PSO
-creation, indexed draw, RGBA32F readback, and empty debug-layer receipts.
-D3D12 `CmdDispatch` remains unsupported, so GPU topology-kernel execution and
-performance are not claimed. Swapchain runtime, back-buffer import, desktop
-launch, PBR/HDR/shadow/temporal execution, and 8K hardware acceptance remain
-unverified.
+runtime DXC, graphics/compute pipeline, draw/dispatch, texture-readback,
+debug-receipt, device-loss, deferred-destruction, sampled-texture and
+storage-texture descriptors, bounded multi-input compute bindings, and
+indexed draw/readback paths. The optional Win32/DXGI swapchain and desktop
+shell configure and link as native targets. Bounded headless acceptance now
+passes on the Quadro P5200 through runtime DXIL production, sampled-material
+PBR/HDR/tone-map execution, shadow-depth execution/readback, temporal resolve,
+storage dispatch/readback, typed back-buffer import, resize/present, and empty
+debug-layer receipts. These receipts do not promote GPU topology authoring or
+performance claims; the 8K receipt is target allocation/clear only. Full IBL
+and production render-graph scheduling, output encoding, input/DPI, and 8K
+frame/readback acceptance remain unverified.
 
 The remaining future target graph from the engineering specification is
 recorded in the roadmap. New targets must preserve these constraints:
@@ -67,3 +69,10 @@ recorded in the roadmap. New targets must preserve these constraints:
 - blob and journal primitives verify content and lineage before returning data;
 - platform headers stay out of core and geometry;
 - tests link the narrowest target that proves the behavior.
+
+The public geometry/provenance surface is exported by the `CartographerTargets`
+package. `carto_geometry` installs `carto/geometry/mesh.hpp` and
+`carto/geometry/topology_edit.hpp`; `carto_mesh_attributes` installs
+`carto/mesh_attributes/provenance.hpp`. The receipt adapter is revision-bound
+and remains a local source-index conversion, not a permission to mutate a
+project outside the owning editor/application path.

@@ -54,6 +54,7 @@ evidence only for the named behavior; it does not promote deferred features.
 | interchange boundary | OBJ export/import test | feature-loss warning retained; oversized face input fails closed |
 | clean standalone build | Debug/Release CMake + CTest | passed locally |
 | optional Vulkan/desktop prerequisites | explicit-SDK Vulkan configure/build plus headless runtime acceptance; negative CMake probes | Vulkan configure fails closed without an SDK or `glslc`; with the local SDK the Vulkan 1.1 headless test selects by physical-device UUID, accepts a caller-provided revision-bound `CompiledMesh`, uploads its vertex/index streams, creates RGBA16F/D32 targets, compiles aligned acceptance shaders, submits an indexed mesh, checks bounded readback, and separately passes an opt-in 8192x8192 run; desktop configure still requires Vulkan and pinned ImGui, while production PBR/render-graph/presentation remain separate gates |
+| bounded D3D12 native acceptance | `d3d12-headless-release` CTest plus `d3d12-desktop-compile` build and 3-second desktop launch smoke | 17/17 D3D12-preset tests pass on the Quadro P5200: runtime DXIL production, sampled-material PBR into an HDR target, HDR-to-display tone-map execution/readback, shadow-depth execution/readback, temporal resolve over current/history/motion inputs, graphics PSO/indexed draw/RGBA32F readback, storage-texture compute dispatch/readback, deferred descriptor/resource lifetime, injected device-loss recovery, typed back-buffer import, hidden-window resize/present, empty debug receipts, and 8192x8192 render-target clear; the desktop executable builds and remains alive during the launch smoke |
 | typed GPU handle lifetime | render architecture tests | slot reuse advances generation and stale handles fail; type confusion is rejected at compile time |
 | render-graph hazards | render architecture tests | valid write transitions compile; read-before-write, illegal stage/format use, duplicate use, and overlapping aliases fail |
 | content-addressed blob integrity | storage/journal tests | known SHA-256, bounded storage, read verification, and tamper detection pass |
@@ -64,8 +65,10 @@ evidence only for the named behavior; it does not promote deferred features.
 | plugin protocol boundary | provider/plugin tests | sandbox-default manifest, network/path permission rejection, framed round-trip, malformed nested-object rejection, truncation, and payload-size bounds pass |
 
 Not yet covered: SQLite WAL package storage, schema migrations, power-loss fault
-injection, patch-specific delta replay, crash recovery UX, GPU/Vulkan production
-PBR, render-graph, submission-lifetime, and presentation execution beyond the
-headless indexed-draw/readback rung, desktop input/DPI and resize behavior,
-native UI visual acceptance, fuzz corpora, cross-platform package installation
-in a clean VM, and downstream Unreal/Unity acceptance.
+injection, patch-specific delta replay, crash recovery UX, full GPU/Vulkan
+production PBR/HDR/IBL/shadow/temporal render-graph execution, final output
+encoding, GPU timing/throughput/power, 8K frame/readback performance, desktop
+input/DPI and visual UI acceptance, fuzz corpora, cross-platform package
+installation in a clean VM, and downstream Unreal/Unity acceptance. The D3D12
+8K receipt proves target allocation and clear only; it is not a throughput
+claim.

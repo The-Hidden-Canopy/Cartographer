@@ -64,13 +64,19 @@ that mapping, while preserve/interpolate/duplicate fail closed.
 adapter for kernels that expose stable element IDs. Unchanged IDs map to source
 indices, new IDs become empty mappings, and duplicate or zero IDs are rejected.
 `carto_mesh_attributes` now supplies the polygon-kernel adapter for stable
-vertex, edge, face, and corner IDs. The adapter does not infer provenance for a
-kernel that has not supplied stable identity; curve and B-Rep owners still need
-to wire their operation receipts into this contract.
+vertex, edge, face, and corner IDs plus `provenance_from_receipt`, which binds a
+validated kernel receipt to the source and destination revisions and replaces
+created-element empty mappings with explicit domain-local source indices.
+Unknown identities and stale source/destination revisions fail closed. The
+adapter does not infer provenance for a kernel that has not supplied stable
+identity; curve and B-Rep owners still need to wire their operation receipts
+into this contract.
 
 ## Boundary still open
 
-The next structural rung is atomic package/document graph storage and
-topology-operation receipts that provide provenance for UV, normal, material,
-seam, and crease layers. Modifier, sculpt, animation, and CAD claims remain
-deferred until those adapters have corpus and workflow evidence.
+The next structural rung is atomic package/document graph storage and broader
+topology-operation coverage. Extrude, split-edge, and inset now emit explicit
+lineage for the polygon kernel; delete emits a validated identity delta but has
+no created-element lineage by design. Bevel, merge, dissolve, bridge, loop cut,
+knife, modifiers, sculpt, animation, and CAD claims remain deferred until their
+operators have receipts, attribute-survival tests, and workflow evidence.

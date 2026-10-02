@@ -1082,10 +1082,10 @@ void project_round_trips_authoritative_state_and_rejects_future_versions() {
     REQUIRE(loaded.value().meshes().at(mesh_id.value()).vertex_count() == 3U);
 
     std::string future = serialized_before;
-    const std::string version = "CARTOGRAPHER_PROJECT 3";
+    const std::string version = "CARTOGRAPHER_PROJECT 4";
     const auto position = future.find(version);
     REQUIRE(position != std::string::npos);
-    future.replace(position, version.size(), "CARTOGRAPHER_PROJECT 4");
+    future.replace(position, version.size(), "CARTOGRAPHER_PROJECT 5");
     const auto rejected = carto::project::ProjectDocument::deserialize(future);
     REQUIRE(!rejected);
     REQUIRE(rejected.error().code == carto::core::ErrorCode::version_mismatch);
@@ -1247,6 +1247,107 @@ void project_save_failure_does_not_replace_existing_file_and_paths_are_bounded()
     REQUIRE(!carto::project::ProjectDocument::deserialize(invalid_flag));
 }
 
+void project_persists_topology_receipts_and_rejects_stale_lineage() {
+    auto document = carto::project::ProjectDocument::create("Receipt Ledger");
+    REQUIRE(document);
+    auto box = carto::geometry::make_box({1.0, 1.0, 1.0});
+    REQUIRE(box);
+    auto access = carto::project::testing::access(document.value());
+    const auto mesh_asset = access.add_mesh(std::move(box.value()));
+    REQUIRE(mesh_asset);
+
+    const auto before = document.value().meshes().at(mesh_asset.value());
+    auto after = before;
+    const auto face = after.faces_sorted().front().id;
+    auto inset = after.inset_face(face, 0.1);
+    REQUIRE(inset);
+    const auto receipt = inset.value();
+    REQUIRE(access.replace_mesh_if_revision(
+        mesh_asset.value(), before.revision(), std::move(after), receipt));
+    REQUIRE(document.value().topology_receipts().size() == 1U);
+    REQUIRE(document.value().validate());
+
+    const std::string serialized = document.value().serialize();
+    REQUIRE(serialized.find("CARTOGRAPHER_PROJECT 4") != std::string::npos);
+    REQUIRE(serialized.find("TOPOLOGY_RECEIPTS 1") != std::string::npos);
+
+    auto empty_document = carto::project::ProjectDocument::create("Missing Ledger");
+    REQUIRE(empty_document);
+    std::string missing_receipt_ledger = empty_document.value().serialize();
+    const auto receipt_ledger = missing_receipt_ledger.find("TOPOLOGY_RECEIPTS 0\n");
+    REQUIRE(receipt_ledger != std::string::npos);
+    missing_receipt_ledger.erase(receipt_ledger, std::string("TOPOLOGY_RECEIPTS 0\n").size());
+    const auto missing_receipt_ledger_rejected =
+        carto::project::ProjectDocument::deserialize(missing_receipt_ledger);
+    REQUIRE(!missing_receipt_ledger_rejected);
+    REQUIRE(missing_receipt_ledger_rejected.error().code ==
+            carto::core::ErrorCode::validation_failed);
+
+    const auto reopened = carto::project::ProjectDocument::deserialize(serialized);
+    REQUIRE(reopened);
+    REQUIRE(reopened.value().serialize() == serialized);
+    REQUIRE(reopened.value().topology_receipts().size() == 1U);
+    REQUIRE(reopened.value().topology_receipts().front().mesh_asset == mesh_asset.value());
+    REQUIRE(reopened.value().topology_receipts().front().receipt.serialize() ==
+            receipt.serialize());
+
+    auto stale_after = document.value().meshes().at(mesh_asset.value());
+    auto stale_receipt = receipt;
+    stale_receipt.revision_before = receipt.revision_after;
+    stale_receipt.revision_after = receipt.revision_after.next();
+    const auto project_revision = document.value().revision();
+    const auto rejected = access.replace_mesh_if_revision(
+        mesh_asset.value(), stale_after.revision(), std::move(stale_after), stale_receipt);
+    REQUIRE(!rejected);
+    REQUIRE(rejected.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(document.value().revision() == project_revision);
+    REQUIRE(document.value().topology_receipts().size() == 1U);
+
+    std::string oversized = serialized;
+    const auto count = oversized.find("TOPOLOGY_RECEIPTS 1");
+    REQUIRE(count != std::string::npos);
+    oversized.replace(count, std::string("TOPOLOGY_RECEIPTS 1").size(),
+                      "TOPOLOGY_RECEIPTS 1000001");
+    const auto oversized_rejected = carto::project::ProjectDocument::deserialize(oversized);
+    REQUIRE(!oversized_rejected);
+    REQUIRE(oversized_rejected.error().code == carto::core::ErrorCode::validation_failed);
+
+    const auto record_start = serialized.find("TOPOLOGY_RECEIPT ");
+    const auto record_end = serialized.rfind("\nEND\n");
+    REQUIRE(record_start != std::string::npos && record_end != std::string::npos);
+    const std::string record = serialized.substr(record_start, record_end - record_start + 1U);
+    std::string duplicate = serialized;
+    const auto receipt_count = duplicate.find("TOPOLOGY_RECEIPTS 1");
+    REQUIRE(receipt_count != std::string::npos);
+    duplicate.replace(receipt_count, std::string("TOPOLOGY_RECEIPTS 1").size(),
+                      "TOPOLOGY_RECEIPTS 2");
+    duplicate.insert(duplicate.rfind("\nEND\n"), record);
+    const auto duplicate_rejected = carto::project::ProjectDocument::deserialize(duplicate);
+    REQUIRE(!duplicate_rejected);
+    REQUIRE(duplicate_rejected.error().code == carto::core::ErrorCode::validation_failed);
+
+    std::string dangling = serialized;
+    const auto receipt_marker = dangling.find("TOPOLOGY_RECEIPT 1 ");
+    REQUIRE(receipt_marker != std::string::npos);
+    dangling.replace(receipt_marker, std::string("TOPOLOGY_RECEIPT 1 ").size(),
+                     "TOPOLOGY_RECEIPT 999 ");
+    const auto dangling_rejected = carto::project::ProjectDocument::deserialize(dangling);
+    REQUIRE(!dangling_rejected);
+    REQUIRE(dangling_rejected.error().code == carto::core::ErrorCode::validation_failed);
+
+    std::string future = serialized;
+    const auto after_revision = future.find(
+        "REVISION_AFTER " + std::to_string(receipt.revision_after.value()));
+    REQUIRE(after_revision != std::string::npos);
+    future.replace(
+        after_revision,
+        std::string("REVISION_AFTER " + std::to_string(receipt.revision_after.value())).size(),
+        "REVISION_AFTER 18446744073709551615");
+    const auto future_rejected = carto::project::ProjectDocument::deserialize(future);
+    REQUIRE(!future_rejected);
+    REQUIRE(future_rejected.error().code == carto::core::ErrorCode::validation_failed);
+}
+
 void obj_interchange_reports_feature_loss_and_round_trips_geometry() {
     TempDirectory temp;
     const auto path = temp.path() / "triangle.obj";
@@ -1274,6 +1375,22 @@ void obj_interchange_reports_feature_loss_and_round_trips_geometry() {
             repaired.value().report.triangles == 2U &&
             repaired.value().report.warnings.size() == 1U &&
             repaired.value().report.warnings.front().find("isolated OBJ face") != std::string::npos);
+
+    const auto oversized_faces_path = temp.path() / "oversized-faces.obj";
+    std::ofstream oversized_faces(oversized_faces_path, std::ios::binary | std::ios::trunc);
+    REQUIRE(oversized_faces);
+    oversized_faces << "v 0 0 0\nv 1 0 0\nv 0 1 0\n";
+    for (std::size_t face = 0U; face <= 1'000'000U; ++face) {
+        oversized_faces << "f 1 2 3\n";
+    }
+    oversized_faces.close();
+    REQUIRE(oversized_faces);
+    const auto oversized_faces_rejected = carto::io::import_obj(oversized_faces_path);
+    REQUIRE(!oversized_faces_rejected);
+    REQUIRE(oversized_faces_rejected.error().code ==
+            carto::core::ErrorCode::validation_failed);
+    REQUIRE(oversized_faces_rejected.error().message.find("face count exceeds") !=
+            std::string::npos);
 
     const auto oversized_face_path = temp.path() / "oversized-face.obj";
     std::ofstream oversized_face(oversized_face_path, std::ios::binary | std::ios::trunc);
@@ -1441,6 +1558,7 @@ int main() {
         {"create mesh object command preserves ids", create_mesh_object_command_preserves_ids_across_undo_redo},
         {"project round trip and future version rejection", project_round_trips_authoritative_state_and_rejects_future_versions},
         {"project save failure and path bounds", project_save_failure_does_not_replace_existing_file_and_paths_are_bounded},
+        {"project persists topology receipts and rejects stale lineage", project_persists_topology_receipts_and_rejects_stale_lineage},
         {"OBJ interchange reports feature loss", obj_interchange_reports_feature_loss_and_round_trips_geometry},
         {"PLY and STL interchange round trips with explicit loss", ply_and_stl_interchange_round_trip_with_explicit_loss},
         {"glTF export is deterministic and bounded", gltf_export_is_deterministic_bounded_and_feature_honest},

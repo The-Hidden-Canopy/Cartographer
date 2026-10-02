@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <limits>
 #include <set>
 #include <sstream>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -114,7 +116,198 @@ bool same_position(core::Vec3d left, core::Vec3d right) {
     return left.x == right.x && left.y == right.y && left.z == right.z;
 }
 
+template <typename Id>
+std::vector<Id> ids_not_in(const std::vector<Id>& source, const std::vector<Id>& other) {
+    std::set<Id> other_ids(other.begin(), other.end());
+    std::vector<Id> result;
+    for (const Id id : source) {
+        if (!other_ids.contains(id)) result.push_back(id);
+    }
+    return result;
+}
+
+std::vector<EdgeId> edge_ids(const TopologySnapshot& snapshot) {
+    std::vector<EdgeId> result;
+    result.reserve(snapshot.edges.size());
+    for (const auto& edge : snapshot.edges) result.push_back(edge.id);
+    return result;
+}
+
+std::vector<CornerId> corner_ids(const TopologySnapshot& snapshot) {
+    std::vector<CornerId> result;
+    result.reserve(snapshot.corners.size());
+    for (const auto& corner : snapshot.corners) result.push_back(corner.id);
+    return result;
+}
+
+core::Result<void> populate_identity_delta(
+    const EditableMesh& before,
+    const EditableMesh& after,
+    TopologyEditReceipt& receipt) {
+    const auto before_topology = before.topology();
+    const auto after_topology = after.topology();
+    if (!before_topology) return core::Result<void>::failure(before_topology.error());
+    if (!after_topology) return core::Result<void>::failure(after_topology.error());
+
+    const auto before_vertices = before.vertices_sorted();
+    const auto after_vertices = after.vertices_sorted();
+    std::vector<VertexId> before_vertex_ids;
+    std::vector<VertexId> after_vertex_ids;
+    before_vertex_ids.reserve(before_vertices.size());
+    after_vertex_ids.reserve(after_vertices.size());
+    for (const auto& vertex : before_vertices) before_vertex_ids.push_back(vertex.id);
+    for (const auto& vertex : after_vertices) after_vertex_ids.push_back(vertex.id);
+
+    const auto before_faces = before.faces_sorted();
+    const auto after_faces = after.faces_sorted();
+    std::vector<FaceId> before_face_ids;
+    std::vector<FaceId> after_face_ids;
+    before_face_ids.reserve(before_faces.size());
+    after_face_ids.reserve(after_faces.size());
+    for (const auto& face : before_faces) before_face_ids.push_back(face.id);
+    for (const auto& face : after_faces) after_face_ids.push_back(face.id);
+
+    receipt.created_vertices = ids_not_in(after_vertex_ids, before_vertex_ids);
+    receipt.removed_vertices = ids_not_in(before_vertex_ids, after_vertex_ids);
+    receipt.created_faces = ids_not_in(after_face_ids, before_face_ids);
+    receipt.removed_faces = ids_not_in(before_face_ids, after_face_ids);
+    receipt.created_edges = ids_not_in(
+        edge_ids(after_topology.value()), edge_ids(before_topology.value()));
+    receipt.removed_edges = ids_not_in(
+        edge_ids(before_topology.value()), edge_ids(after_topology.value()));
+    receipt.created_corners = ids_not_in(
+        corner_ids(after_topology.value()), corner_ids(before_topology.value()));
+    receipt.removed_corners = ids_not_in(
+        corner_ids(before_topology.value()), corner_ids(after_topology.value()));
+    return core::Result<void>::success();
+}
+
+template <typename Id>
+void add_origin(
+    std::map<Id, ElementOrigin>& origins,
+    Id id,
+    OriginKind kind,
+    std::initializer_list<std::uint64_t> source_ids) {
+    origins.emplace(id, ElementOrigin{kind, std::vector<std::uint64_t>(
+        source_ids.begin(), source_ids.end())});
+}
+
+template <typename Id>
+void add_origin(
+    std::map<Id, ElementOrigin>& origins,
+    Id id,
+    OriginKind kind,
+    std::vector<std::uint64_t> source_ids) {
+    origins.emplace(id, ElementOrigin{kind, std::move(source_ids)});
+}
+
+bool valid_origin_kind(OriginKind kind) noexcept {
+    switch (kind) {
+    case OriginKind::preserved:
+    case OriginKind::duplicated_from:
+    case OriginKind::interpolated_from:
+    case OriginKind::split_from:
+    case OriginKind::generated_from_vertex:
+    case OriginKind::generated_from_edge:
+    case OriginKind::generated_from_face:
+    case OriginKind::boolean_intersection:
+    case OriginKind::subdivision_child:
+        return true;
+    }
+    return false;
+}
+
 } // namespace
+
+core::Result<void> TopologyEditReceipt::validate() const {
+    if (revision_before.exhausted() || revision_after.exhausted()) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::validation_failed,
+            "topology edit receipt revisions must not be exhausted"));
+    }
+    if (revision_after <= revision_before) {
+        return core::Result<void>::failure(validation(
+            "topology edit receipt must advance the mesh revision"));
+    }
+
+    const auto validate_ids = [](const auto& ids, const char* label) -> core::Result<void> {
+        using Id = typename std::decay_t<decltype(ids)>::value_type;
+        std::set<Id> unique;
+        for (const Id id : ids) {
+            if (!id || !unique.insert(id).second) {
+                return core::Result<void>::failure(validation(
+                    std::string("topology edit receipt contains an invalid or duplicate ") + label));
+            }
+        }
+        if (!std::is_sorted(ids.begin(), ids.end())) {
+            return core::Result<void>::failure(validation(
+                std::string("topology edit receipt contains non-deterministically ordered ") + label +
+                " identities"));
+        }
+        return core::Result<void>::success();
+    };
+    if (auto result = validate_ids(created_vertices, "created vertex"); !result) return result;
+    if (auto result = validate_ids(created_edges, "created edge"); !result) return result;
+    if (auto result = validate_ids(created_faces, "created face"); !result) return result;
+    if (auto result = validate_ids(removed_vertices, "removed vertex"); !result) return result;
+    if (auto result = validate_ids(removed_edges, "removed edge"); !result) return result;
+    if (auto result = validate_ids(removed_faces, "removed face"); !result) return result;
+    if (auto result = validate_ids(created_corners, "created corner"); !result) return result;
+    if (auto result = validate_ids(removed_corners, "removed corner"); !result) return result;
+
+    const auto validate_disjoint = [](const auto& created, const auto& removed,
+                                      const char* label) -> core::Result<void> {
+        std::set<typename std::decay_t<decltype(created)>::value_type> removed_ids(
+            removed.begin(), removed.end());
+        for (const auto id : created) {
+            if (removed_ids.contains(id)) {
+                return core::Result<void>::failure(validation(
+                    std::string("topology edit receipt marks the same ") + label +
+                    " as created and removed"));
+            }
+        }
+        return core::Result<void>::success();
+    };
+    if (auto result = validate_disjoint(created_vertices, removed_vertices, "vertex"); !result) {
+        return result;
+    }
+    if (auto result = validate_disjoint(created_edges, removed_edges, "edge"); !result) {
+        return result;
+    }
+    if (auto result = validate_disjoint(created_faces, removed_faces, "face"); !result) {
+        return result;
+    }
+    if (auto result = validate_disjoint(created_corners, removed_corners, "corner"); !result) {
+        return result;
+    }
+
+    const auto validate_origins = [&]<typename Map, typename IdList>(
+        const Map& origins, const IdList& created, const char* label) -> core::Result<void> {
+        for (const auto& [id, origin] : origins) {
+            if (std::find(created.begin(), created.end(), id) == created.end()) {
+                return core::Result<void>::failure(validation(
+                    std::string("origin map contains a non-created ") + label));
+            }
+            if (!valid_origin_kind(origin.kind) || origin.source_ids.empty()) {
+                return core::Result<void>::failure(validation(
+                    std::string("origin map contains an invalid ") + label + " origin"));
+            }
+            std::set<std::uint64_t> unique_sources(
+                origin.source_ids.begin(), origin.source_ids.end());
+            if (unique_sources.size() != origin.source_ids.size() ||
+                unique_sources.contains(0U)) {
+                return core::Result<void>::failure(validation(
+                    std::string("origin map contains duplicate or zero ") + label + " sources"));
+            }
+        }
+        return core::Result<void>::success();
+    };
+    if (auto result = validate_origins(vertex_origins, created_vertices, "vertex"); !result) return result;
+    if (auto result = validate_origins(edge_origins, created_edges, "edge"); !result) return result;
+    if (auto result = validate_origins(face_origins, created_faces, "face"); !result) return result;
+    if (auto result = validate_origins(corner_origins, created_corners, "corner"); !result) return result;
+    return core::Result<void>::success();
+}
 
 core::Result<void> MeshPatch::validate() const {
     if (expected_revision.exhausted()) {
@@ -369,6 +562,119 @@ core::Result<void> EditableMesh::extrude_face(FaceId id, double distance) {
     return core::Result<void>::success();
 }
 
+core::Result<TopologyEditReceipt> EditableMesh::extrude_face_with_receipt(
+    FaceId id, double distance) {
+    const EditableMesh before = *this;
+    const auto original = before.find_face(id);
+    if (original == nullptr) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::not_found, "cannot create an extrusion receipt for a missing face"));
+    }
+    if (auto result = extrude_face(id, distance); !result) {
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+
+    TopologyEditReceipt receipt;
+    receipt.revision_before = before.revision();
+    receipt.revision_after = revision_;
+    if (auto result = populate_identity_delta(before, *this, receipt); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    std::map<VertexId, VertexId> created_vertex_sources;
+    if (receipt.created_vertices.size() != original->vertices.size()) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(validation(
+            "extrusion receipt does not contain one generated vertex per source vertex"));
+    }
+    for (std::size_t index = 0U; index < receipt.created_vertices.size(); ++index) {
+        const VertexId created = receipt.created_vertices[index];
+        const VertexId source = original->vertices[index];
+        created_vertex_sources.emplace(created, source);
+        add_origin(receipt.vertex_origins, created, OriginKind::duplicated_from, {source.value});
+    }
+    for (const FaceId created : receipt.created_faces) {
+        add_origin(receipt.face_origins, created, OriginKind::generated_from_face, {id.value});
+    }
+
+    const auto before_topology = before.topology();
+    const auto after_topology = topology();
+    if (!before_topology || !after_topology) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(validation(
+            "extrusion receipt topology snapshot failed validation"));
+    }
+    std::map<EdgeKey, EdgeId> source_edges;
+    for (const auto& edge : before_topology.value().edges) {
+        source_edges.emplace(undirected(edge.first, edge.second), edge.id);
+    }
+    const auto source_vertex_ids = [&created_vertex_sources](VertexId vertex) {
+        const auto found = created_vertex_sources.find(vertex);
+        return found == created_vertex_sources.end()
+            ? std::vector<VertexId>{vertex} : std::vector<VertexId>{found->second};
+    };
+    const auto source_edge_for = [&source_edges](
+        const std::vector<VertexId>& first_sources,
+        const std::vector<VertexId>& second_sources) -> std::optional<EdgeId> {
+        for (const VertexId first : first_sources) {
+            for (const VertexId second : second_sources) {
+                if (first == second) continue;
+                const auto source = source_edges.find(undirected(first, second));
+                if (source != source_edges.end()) return source->second;
+            }
+        }
+        for (const auto& [key, source] : source_edges) {
+            const bool first_matches = std::find(
+                first_sources.begin(), first_sources.end(), key.first) != first_sources.end() ||
+                std::find(first_sources.begin(), first_sources.end(), key.second) != first_sources.end();
+            const bool second_matches = std::find(
+                second_sources.begin(), second_sources.end(), key.first) != second_sources.end() ||
+                std::find(second_sources.begin(), second_sources.end(), key.second) != second_sources.end();
+            if (first_matches || second_matches) return source;
+        }
+        return std::nullopt;
+    };
+    for (const auto& edge : after_topology.value().edges) {
+        if (!std::binary_search(receipt.created_edges.begin(), receipt.created_edges.end(), edge.id)) {
+            continue;
+        }
+        const auto source = source_edge_for(
+            source_vertex_ids(edge.first), source_vertex_ids(edge.second));
+        if (source.has_value()) {
+            add_origin(receipt.edge_origins, edge.id, OriginKind::generated_from_edge,
+                {source->value});
+        }
+    }
+
+    std::map<std::pair<FaceId, VertexId>, CornerId> source_corners;
+    for (const auto& corner : before_topology.value().corners) {
+        source_corners.emplace(std::make_pair(corner.face, corner.vertex), corner.id);
+    }
+    for (const auto& corner : after_topology.value().corners) {
+        if (!std::binary_search(receipt.created_corners.begin(), receipt.created_corners.end(), corner.id)) {
+            continue;
+        }
+        const auto face_origin = receipt.face_origins.find(corner.face);
+        if (face_origin == receipt.face_origins.end()) continue;
+        const auto vertices = source_vertex_ids(corner.vertex);
+        std::vector<std::uint64_t> source_ids;
+        for (const VertexId vertex : vertices) {
+            const auto source = source_corners.find(
+                std::make_pair(FaceId{face_origin->second.source_ids.front()}, vertex));
+            if (source != source_corners.end()) source_ids.push_back(source->second.value);
+        }
+        if (source_ids.empty()) continue;
+        add_origin(receipt.corner_origins, corner.id,
+            source_ids.size() == 1U ? OriginKind::duplicated_from : OriginKind::interpolated_from,
+            std::move(source_ids));
+    }
+    if (auto result = receipt.validate(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    return core::Result<TopologyEditReceipt>::success(std::move(receipt));
+}
+
 core::Result<TopologyEditReceipt> EditableMesh::delete_face(
     FaceId id,
     bool remove_orphaned_vertices) {
@@ -386,7 +692,6 @@ core::Result<TopologyEditReceipt> EditableMesh::delete_face(
     const Face deleted = face_iterator->second;
     faces_.erase(face_iterator);
 
-    std::vector<VertexId> removed_vertices;
     if (remove_orphaned_vertices) {
         for (const VertexId vertex : deleted.vertices) {
             const auto incident = vertex_faces_.find(vertex);
@@ -403,7 +708,6 @@ core::Result<TopologyEditReceipt> EditableMesh::delete_face(
                     [this](const FaceId face_id) { return faces_.contains(face_id); });
             if (!used_by_remaining_face) {
                 vertices_.erase(vertex);
-                removed_vertices.push_back(vertex);
             }
         }
     }
@@ -417,16 +721,18 @@ core::Result<TopologyEditReceipt> EditableMesh::delete_face(
         return core::Result<TopologyEditReceipt>::failure(result.error());
     }
     bump_revision();
-    return core::Result<TopologyEditReceipt>::success(TopologyEditReceipt{
-        revision_before,
-        revision_,
-        {},
-        {},
-        {},
-        std::move(removed_vertices),
-        {},
-        {id},
-    });
+    TopologyEditReceipt receipt;
+    receipt.revision_before = revision_before;
+    receipt.revision_after = revision_;
+    if (auto result = populate_identity_delta(before, *this, receipt); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    if (auto result = receipt.validate(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    return core::Result<TopologyEditReceipt>::success(std::move(receipt));
 }
 
 core::Result<TopologyEditReceipt> EditableMesh::split_edge(EdgeId id, double factor) {
@@ -561,23 +867,23 @@ core::Result<TopologyEditReceipt> EditableMesh::split_edge(EdgeId id, double fac
         return core::Result<TopologyEditReceipt>::failure(result.error());
     }
     bump_revision();
-
-    std::vector<EdgeId> created_edges;
-    for (const auto& [edge_id, edge_record] : edges_) {
-        if (edge_record.first == created_vertex || edge_record.second == created_vertex) {
-            created_edges.push_back(edge_id);
-        }
+    TopologyEditReceipt receipt;
+    receipt.revision_before = revision_before;
+    receipt.revision_after = revision_;
+    if (auto result = populate_identity_delta(before, *this, receipt); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
     }
-    return core::Result<TopologyEditReceipt>::success(TopologyEditReceipt{
-        revision_before,
-        revision_,
-        {created_vertex},
-        std::move(created_edges),
-        {},
-        {},
-        {id},
-        {},
-    });
+    add_origin(receipt.vertex_origins, created_vertex, OriginKind::interpolated_from,
+        {edge.first.value, edge.second.value});
+    for (const EdgeId created : receipt.created_edges) {
+        add_origin(receipt.edge_origins, created, OriginKind::split_from, {id.value});
+    }
+    if (auto result = receipt.validate(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    return core::Result<TopologyEditReceipt>::success(std::move(receipt));
 }
 
 core::Result<TopologyEditReceipt> EditableMesh::inset_face(FaceId id, double distance) {
@@ -757,24 +1063,109 @@ core::Result<TopologyEditReceipt> EditableMesh::inset_face(FaceId id, double dis
     }
     bump_revision();
 
-    std::vector<EdgeId> created_edges;
-    const std::set<VertexId> inset_vertex_set(inset_vertices.begin(), inset_vertices.end());
-    for (const auto& [edge_id, edge_record] : edges_) {
-        if (inset_vertex_set.contains(edge_record.first) ||
-            inset_vertex_set.contains(edge_record.second)) {
-            created_edges.push_back(edge_id);
+    TopologyEditReceipt receipt;
+    receipt.revision_before = revision_before;
+    receipt.revision_after = revision_;
+    if (auto result = populate_identity_delta(before, *this, receipt); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+
+    std::map<VertexId, std::vector<VertexId>> source_vertices;
+    for (std::size_t index = 0U; index < inset_vertices.size(); ++index) {
+        const std::size_t previous = (index + vertex_count - 1U) % vertex_count;
+        const std::size_t next = (index + 1U) % vertex_count;
+        source_vertices.emplace(inset_vertices[index], std::vector<VertexId>{
+            original.vertices[previous], original.vertices[index], original.vertices[next]});
+        add_origin(receipt.vertex_origins, inset_vertices[index],
+            OriginKind::interpolated_from,
+            {original.vertices[previous].value, original.vertices[index].value,
+             original.vertices[next].value});
+    }
+    for (const FaceId created : receipt.created_faces) {
+        add_origin(receipt.face_origins, created, OriginKind::generated_from_face, {id.value});
+    }
+
+    const auto before_topology = before.topology();
+    const auto after_topology = topology();
+    if (!before_topology || !after_topology) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(validation(
+            "inset receipt topology snapshot failed validation"));
+    }
+    std::map<EdgeKey, EdgeId> source_edges;
+    for (const auto& edge : before_topology.value().edges) {
+        source_edges.emplace(undirected(edge.first, edge.second), edge.id);
+    }
+    const auto expanded_vertices = [&source_vertices](VertexId vertex) {
+        const auto found = source_vertices.find(vertex);
+        return found == source_vertices.end()
+            ? std::vector<VertexId>{vertex} : found->second;
+    };
+    const auto source_edge_for = [&source_edges](
+        const std::vector<VertexId>& first_sources,
+        const std::vector<VertexId>& second_sources) -> std::optional<EdgeId> {
+        for (const VertexId first : first_sources) {
+            for (const VertexId second : second_sources) {
+                if (first == second) continue;
+                const auto source = source_edges.find(undirected(first, second));
+                if (source != source_edges.end()) return source->second;
+            }
+        }
+        for (const auto& [key, source] : source_edges) {
+            const bool first_matches = std::find(
+                first_sources.begin(), first_sources.end(), key.first) != first_sources.end() ||
+                std::find(first_sources.begin(), first_sources.end(), key.second) != first_sources.end();
+            const bool second_matches = std::find(
+                second_sources.begin(), second_sources.end(), key.first) != second_sources.end() ||
+                std::find(second_sources.begin(), second_sources.end(), key.second) != second_sources.end();
+            if (first_matches || second_matches) return source;
+        }
+        return std::nullopt;
+    };
+    for (const auto& edge : after_topology.value().edges) {
+        if (!std::binary_search(receipt.created_edges.begin(), receipt.created_edges.end(), edge.id)) {
+            continue;
+        }
+        const auto source = source_edge_for(
+            expanded_vertices(edge.first), expanded_vertices(edge.second));
+        if (source.has_value()) {
+            add_origin(receipt.edge_origins, edge.id, OriginKind::generated_from_edge,
+                {source->value});
         }
     }
-    return core::Result<TopologyEditReceipt>::success(TopologyEditReceipt{
-        revision_before,
-        revision_,
-        std::move(inset_vertices),
-        std::move(created_edges),
-        std::move(created_faces),
-        {},
-        {},
-        {id},
-    });
+
+    std::map<std::pair<FaceId, VertexId>, CornerId> source_corners;
+    for (const auto& corner : before_topology.value().corners) {
+        source_corners.emplace(std::make_pair(corner.face, corner.vertex), corner.id);
+    }
+    for (const auto& corner : after_topology.value().corners) {
+        if (!std::binary_search(receipt.created_corners.begin(), receipt.created_corners.end(), corner.id)) {
+            continue;
+        }
+        const auto face_origin = receipt.face_origins.find(corner.face);
+        if (face_origin == receipt.face_origins.end()) continue;
+        const FaceId source_face{face_origin->second.source_ids.front()};
+        const auto vertex_sources = expanded_vertices(corner.vertex);
+        std::vector<std::uint64_t> source_ids;
+        for (const VertexId vertex : vertex_sources) {
+            const auto source = source_corners.find(std::make_pair(source_face, vertex));
+            if (source != source_corners.end()) source_ids.push_back(source->second.value);
+        }
+        if (source_ids.empty()) continue;
+        if (source_ids.size() == 1U) {
+            add_origin(receipt.corner_origins, corner.id, OriginKind::duplicated_from,
+                std::move(source_ids));
+        } else {
+            add_origin(receipt.corner_origins, corner.id, OriginKind::interpolated_from,
+                std::move(source_ids));
+        }
+    }
+    if (auto result = receipt.validate(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    return core::Result<TopologyEditReceipt>::success(std::move(receipt));
 }
 
 core::Result<void> EditableMesh::restore_from(const EditableMesh& source) {
@@ -1490,6 +1881,499 @@ std::vector<HalfEdgeId> TopologySnapshot::boundary_half_edges() const {
         }
     }
     return result;
+}
+
+core::Result<std::vector<EdgeId>> TopologySnapshot::edge_loop(EdgeId edge) const {
+    if (auto result = validate(); !result) {
+        return core::Result<std::vector<EdgeId>>::failure(result.error());
+    }
+    if (!edge) {
+        return core::Result<std::vector<EdgeId>>::failure(
+            Diagnostic(ErrorCode::invalid_argument, "topology edge id must be non-zero"));
+    }
+
+    std::unordered_map<HalfEdgeId, const HalfEdgeRecord*, IdHash<HalfEdgeId>> by_id;
+    by_id.reserve(half_edges.size());
+    for (const auto& half_edge : half_edges) by_id.emplace(half_edge.id, &half_edge);
+    const auto edge_iterator = std::find_if(
+        edges.begin(), edges.end(), [edge](const EdgeRecord& record) { return record.id == edge; });
+    if (edge_iterator == edges.end()) {
+        return core::Result<std::vector<EdgeId>>::failure(
+            Diagnostic(ErrorCode::not_found, "topology edge loop was not found"));
+    }
+
+    const auto walk = [&by_id, this](HalfEdgeId start) -> core::Result<std::vector<EdgeId>> {
+        std::vector<EdgeId> result;
+        std::unordered_set<HalfEdgeId, IdHash<HalfEdgeId>> visited_half_edges;
+        std::unordered_set<EdgeId, IdHash<EdgeId>> visited_edges;
+        visited_half_edges.reserve(half_edges.size());
+        visited_edges.reserve(edges.size());
+        HalfEdgeId current = start;
+        for (std::size_t step = 0U; step <= half_edges.size(); ++step) {
+            if (!visited_half_edges.insert(current).second) {
+                return core::Result<std::vector<EdgeId>>::success(std::move(result));
+            }
+            const auto current_iterator = by_id.find(current);
+            if (current_iterator == by_id.end()) {
+                return core::Result<std::vector<EdgeId>>::failure(
+                    validation("edge loop references a missing half-edge"));
+            }
+            const HalfEdgeRecord& current_record = *current_iterator->second;
+            if (result.empty()) {
+                visited_edges.insert(current_record.edge);
+                result.push_back(current_record.edge);
+            }
+
+            const auto boundary = face_boundary(current_record.face);
+            if (!boundary) {
+                return core::Result<std::vector<EdgeId>>::failure(boundary.error());
+            }
+            if (boundary.value().size() != 4U) {
+                return core::Result<std::vector<EdgeId>>::failure(Diagnostic(
+                    ErrorCode::unsupported,
+                    "edge loop traversal currently requires quadrilateral faces"));
+            }
+            const auto position = std::find(
+                boundary.value().begin(), boundary.value().end(), current_record.id);
+            if (position == boundary.value().end()) {
+                return core::Result<std::vector<EdgeId>>::failure(
+                    validation("edge loop half-edge is absent from its face boundary"));
+            }
+            const std::size_t index = static_cast<std::size_t>(
+                std::distance(boundary.value().begin(), position));
+            const HalfEdgeId opposite_id = boundary.value()[(index + 2U) % 4U];
+            const auto opposite_iterator = by_id.find(opposite_id);
+            if (opposite_iterator == by_id.end()) {
+                return core::Result<std::vector<EdgeId>>::failure(
+                    validation("edge loop opposite half-edge is missing"));
+            }
+            if (!visited_edges.insert(opposite_iterator->second->edge).second) {
+                return core::Result<std::vector<EdgeId>>::success(std::move(result));
+            }
+            result.push_back(opposite_iterator->second->edge);
+            if (!opposite_iterator->second->twin.has_value()) {
+                return core::Result<std::vector<EdgeId>>::success(std::move(result));
+            }
+            current = *opposite_iterator->second->twin;
+        }
+        return core::Result<std::vector<EdgeId>>::failure(
+            validation("edge loop exceeds the available half-edges"));
+    };
+
+    const auto forward = walk(edge_iterator->first_half_edge);
+    if (!forward) return forward;
+    if (!edge_iterator->second_half_edge.has_value()) return forward;
+
+    const auto backward = walk(*edge_iterator->second_half_edge);
+    if (!backward) return backward;
+    std::vector<EdgeId> result;
+    result.reserve(backward.value().size() + forward.value().size());
+    std::unordered_set<EdgeId, IdHash<EdgeId>> appended;
+    appended.reserve(backward.value().size() + forward.value().size());
+    for (auto iterator = backward.value().rbegin(); iterator != backward.value().rend(); ++iterator) {
+        if (*iterator != edge && appended.insert(*iterator).second) result.push_back(*iterator);
+    }
+    for (const EdgeId item : forward.value()) {
+        if (appended.insert(item).second) result.push_back(item);
+    }
+    return core::Result<std::vector<EdgeId>>::success(std::move(result));
+}
+
+core::Result<std::vector<EdgeId>> TopologySnapshot::edge_ring(EdgeId edge) const {
+    if (auto result = validate(); !result) {
+        return core::Result<std::vector<EdgeId>>::failure(result.error());
+    }
+    if (!edge) {
+        return core::Result<std::vector<EdgeId>>::failure(
+            Diagnostic(ErrorCode::invalid_argument, "topology edge id must be non-zero"));
+    }
+
+    std::unordered_map<HalfEdgeId, const HalfEdgeRecord*, IdHash<HalfEdgeId>> by_id;
+    by_id.reserve(half_edges.size());
+    for (const auto& half_edge : half_edges) by_id.emplace(half_edge.id, &half_edge);
+    const auto edge_iterator = std::find_if(
+        edges.begin(), edges.end(), [edge](const EdgeRecord& record) { return record.id == edge; });
+    if (edge_iterator == edges.end()) {
+        return core::Result<std::vector<EdgeId>>::failure(
+            Diagnostic(ErrorCode::not_found, "topology edge ring was not found"));
+    }
+
+    const auto walk = [&by_id, this](HalfEdgeId start) -> core::Result<std::vector<EdgeId>> {
+        std::vector<EdgeId> result;
+        std::unordered_set<HalfEdgeId, IdHash<HalfEdgeId>> visited_half_edges;
+        std::unordered_set<EdgeId, IdHash<EdgeId>> visited_edges;
+        visited_half_edges.reserve(half_edges.size());
+        visited_edges.reserve(edges.size());
+        HalfEdgeId current = start;
+        for (std::size_t step = 0U; step <= half_edges.size(); ++step) {
+            if (!visited_half_edges.insert(current).second) {
+                return core::Result<std::vector<EdgeId>>::success(std::move(result));
+            }
+            const auto current_iterator = by_id.find(current);
+            if (current_iterator == by_id.end()) {
+                return core::Result<std::vector<EdgeId>>::failure(
+                    validation("edge ring references a missing half-edge"));
+            }
+            const HalfEdgeRecord& current_record = *current_iterator->second;
+            if (result.empty()) {
+                visited_edges.insert(current_record.edge);
+                result.push_back(current_record.edge);
+            }
+
+            const auto boundary = face_boundary(current_record.face);
+            if (!boundary) {
+                return core::Result<std::vector<EdgeId>>::failure(boundary.error());
+            }
+            if (boundary.value().size() != 4U) {
+                return core::Result<std::vector<EdgeId>>::failure(Diagnostic(
+                    ErrorCode::unsupported,
+                    "edge ring traversal currently requires quadrilateral faces"));
+            }
+            const auto position = std::find(
+                boundary.value().begin(), boundary.value().end(), current_record.id);
+            if (position == boundary.value().end()) {
+                return core::Result<std::vector<EdgeId>>::failure(
+                    validation("edge ring half-edge is absent from its face boundary"));
+            }
+            const std::size_t index = static_cast<std::size_t>(
+                std::distance(boundary.value().begin(), position));
+            const HalfEdgeId side_id = boundary.value()[(index + 1U) % 4U];
+            const auto side_iterator = by_id.find(side_id);
+            if (side_iterator == by_id.end()) {
+                return core::Result<std::vector<EdgeId>>::failure(
+                    validation("edge ring side half-edge is missing"));
+            }
+            if (!visited_edges.insert(side_iterator->second->edge).second) {
+                return core::Result<std::vector<EdgeId>>::success(std::move(result));
+            }
+            result.push_back(side_iterator->second->edge);
+            if (!side_iterator->second->twin.has_value()) {
+                return core::Result<std::vector<EdgeId>>::success(std::move(result));
+            }
+            current = *side_iterator->second->twin;
+        }
+        return core::Result<std::vector<EdgeId>>::failure(
+            validation("edge ring exceeds the available half-edges"));
+    };
+
+    const auto forward = walk(edge_iterator->first_half_edge);
+    if (!forward) return forward;
+    if (!edge_iterator->second_half_edge.has_value()) return forward;
+    const auto backward = walk(*edge_iterator->second_half_edge);
+    if (!backward) return backward;
+
+    std::vector<EdgeId> result;
+    result.reserve(backward.value().size() + forward.value().size());
+    std::unordered_set<EdgeId, IdHash<EdgeId>> appended;
+    appended.reserve(backward.value().size() + forward.value().size());
+    for (auto iterator = backward.value().rbegin(); iterator != backward.value().rend(); ++iterator) {
+        if (*iterator != edge && appended.insert(*iterator).second) result.push_back(*iterator);
+    }
+    for (const EdgeId item : forward.value()) {
+        if (appended.insert(item).second) result.push_back(item);
+    }
+    return core::Result<std::vector<EdgeId>>::success(std::move(result));
+}
+
+core::Result<std::vector<EdgeId>> TopologySnapshot::boundary_loop(EdgeId edge) const {
+    if (auto result = validate(); !result) {
+        return core::Result<std::vector<EdgeId>>::failure(result.error());
+    }
+    if (!edge) {
+        return core::Result<std::vector<EdgeId>>::failure(
+            Diagnostic(ErrorCode::invalid_argument, "topology edge id must be non-zero"));
+    }
+
+    std::unordered_map<HalfEdgeId, const HalfEdgeRecord*, IdHash<HalfEdgeId>> by_id;
+    by_id.reserve(half_edges.size());
+    for (const auto& half_edge : half_edges) by_id.emplace(half_edge.id, &half_edge);
+    const auto edge_iterator = std::find_if(
+        edges.begin(), edges.end(), [edge](const EdgeRecord& record) { return record.id == edge; });
+    if (edge_iterator == edges.end()) {
+        return core::Result<std::vector<EdgeId>>::failure(
+            Diagnostic(ErrorCode::not_found, "topology boundary loop edge was not found"));
+    }
+    HalfEdgeId start = edge_iterator->first_half_edge;
+    const auto first_iterator = by_id.find(start);
+    if (first_iterator == by_id.end()) {
+        return core::Result<std::vector<EdgeId>>::failure(
+            validation("topology boundary loop edge references a missing half-edge"));
+    }
+    if (first_iterator->second->twin.has_value()) {
+        if (!edge_iterator->second_half_edge.has_value()) {
+            return core::Result<std::vector<EdgeId>>::failure(
+                validation("topology boundary edge has an inconsistent twin record"));
+        }
+        start = *edge_iterator->second_half_edge;
+    }
+    const auto start_iterator = by_id.find(start);
+    if (start_iterator == by_id.end() || start_iterator->second->twin.has_value()) {
+        return core::Result<std::vector<EdgeId>>::failure(Diagnostic(
+            ErrorCode::unsupported, "boundary loop traversal requires a boundary edge"));
+    }
+
+    std::vector<EdgeId> result;
+    std::unordered_set<HalfEdgeId, IdHash<HalfEdgeId>> visited;
+    visited.reserve(half_edges.size());
+    HalfEdgeId current = start;
+    for (std::size_t step = 0U; step <= half_edges.size(); ++step) {
+        if (current == start && !result.empty()) {
+            return core::Result<std::vector<EdgeId>>::success(std::move(result));
+        }
+        if (!visited.insert(current).second) {
+            return core::Result<std::vector<EdgeId>>::failure(
+                validation("boundary loop repeats before closing"));
+        }
+        const auto current_iterator = by_id.find(current);
+        if (current_iterator == by_id.end() || current_iterator->second->twin.has_value()) {
+            return core::Result<std::vector<EdgeId>>::failure(
+                validation("boundary loop crossed an internal half-edge"));
+        }
+        const HalfEdgeRecord& current_record = *current_iterator->second;
+        result.push_back(current_record.edge);
+
+        const auto next_iterator = by_id.find(current_record.next);
+        if (next_iterator == by_id.end()) {
+            return core::Result<std::vector<EdgeId>>::failure(
+                validation("boundary loop references a missing next half-edge"));
+        }
+        const HalfEdgeRecord* candidate = next_iterator->second;
+        std::unordered_set<HalfEdgeId, IdHash<HalfEdgeId>> transition_visited;
+        transition_visited.reserve(half_edges.size());
+        while (candidate->twin.has_value()) {
+            if (!transition_visited.insert(candidate->id).second) {
+                return core::Result<std::vector<EdgeId>>::failure(
+                    validation("boundary loop cannot reach its next boundary half-edge"));
+            }
+            const auto twin_iterator = by_id.find(*candidate->twin);
+            if (twin_iterator == by_id.end()) {
+                return core::Result<std::vector<EdgeId>>::failure(
+                    validation("boundary loop references a missing twin half-edge"));
+            }
+            const auto after_twin_iterator = by_id.find(twin_iterator->second->next);
+            if (after_twin_iterator == by_id.end()) {
+                return core::Result<std::vector<EdgeId>>::failure(
+                    validation("boundary loop references a missing post-twin half-edge"));
+            }
+            candidate = after_twin_iterator->second;
+        }
+        current = candidate->id;
+    }
+    return core::Result<std::vector<EdgeId>>::failure(
+        validation("boundary loop exceeds the available half-edges"));
+}
+
+core::Result<std::vector<FaceId>> TopologySnapshot::vertex_fan(VertexId vertex) const {
+    if (auto result = validate(); !result) {
+        return core::Result<std::vector<FaceId>>::failure(result.error());
+    }
+    if (!vertex) {
+        return core::Result<std::vector<FaceId>>::failure(
+            Diagnostic(ErrorCode::invalid_argument, "topology vertex id must be non-zero"));
+    }
+
+    std::unordered_map<HalfEdgeId, const HalfEdgeRecord*, IdHash<HalfEdgeId>> by_id;
+    by_id.reserve(half_edges.size());
+    std::vector<const HalfEdgeRecord*> outgoing;
+    for (const auto& half_edge : half_edges) {
+        by_id.emplace(half_edge.id, &half_edge);
+        if (half_edge.origin == vertex) outgoing.push_back(&half_edge);
+    }
+    if (outgoing.empty()) {
+        return core::Result<std::vector<FaceId>>::failure(
+            Diagnostic(ErrorCode::not_found, "topology vertex fan was not found"));
+    }
+    std::sort(outgoing.begin(), outgoing.end(), [](const auto* left, const auto* right) {
+        return left->id < right->id;
+    });
+
+    const HalfEdgeRecord* start = outgoing.front();
+    for (const auto* candidate : outgoing) {
+        const auto previous = by_id.find(candidate->previous);
+        if (previous == by_id.end()) {
+            return core::Result<std::vector<FaceId>>::failure(
+                validation("vertex fan references a missing previous half-edge"));
+        }
+        if (!previous->second->twin.has_value()) {
+            start = candidate;
+            break;
+        }
+    }
+
+    std::vector<FaceId> result;
+    std::unordered_set<HalfEdgeId, IdHash<HalfEdgeId>> visited;
+    visited.reserve(outgoing.size());
+    const HalfEdgeRecord* current = start;
+    for (std::size_t step = 0U; step <= outgoing.size(); ++step) {
+        if (!visited.insert(current->id).second) {
+            if (current->id == start->id && visited.size() == outgoing.size()) {
+                return core::Result<std::vector<FaceId>>::success(std::move(result));
+            }
+            return core::Result<std::vector<FaceId>>::failure(
+                Diagnostic(ErrorCode::unsupported, "vertex fan is non-manifold"));
+        }
+        result.push_back(current->face);
+        const auto previous = by_id.find(current->previous);
+        if (previous == by_id.end()) {
+            return core::Result<std::vector<FaceId>>::failure(
+                validation("vertex fan references a missing previous half-edge"));
+        }
+        if (!previous->second->twin.has_value()) {
+            if (visited.size() != outgoing.size()) {
+                return core::Result<std::vector<FaceId>>::failure(
+                    Diagnostic(ErrorCode::unsupported, "vertex fan is non-manifold"));
+            }
+            return core::Result<std::vector<FaceId>>::success(std::move(result));
+        }
+        const auto next = by_id.find(*previous->second->twin);
+        if (next == by_id.end() || next->second->origin != vertex) {
+            return core::Result<std::vector<FaceId>>::failure(
+                validation("vertex fan twin does not originate at the requested vertex"));
+        }
+        current = next->second;
+    }
+    return core::Result<std::vector<FaceId>>::failure(
+        validation("vertex fan exceeds the available incident half-edges"));
+}
+
+core::Result<std::vector<FaceId>> TopologySnapshot::face_region(FaceId face) const {
+    if (auto result = validate(); !result) {
+        return core::Result<std::vector<FaceId>>::failure(result.error());
+    }
+    if (!face) {
+        return core::Result<std::vector<FaceId>>::failure(
+            Diagnostic(ErrorCode::invalid_argument, "topology face id must be non-zero"));
+    }
+
+    std::unordered_map<HalfEdgeId, const HalfEdgeRecord*, IdHash<HalfEdgeId>> by_id;
+    by_id.reserve(half_edges.size());
+    std::map<FaceId, std::vector<FaceId>> adjacency;
+    for (const auto& half_edge : half_edges) {
+        by_id.emplace(half_edge.id, &half_edge);
+        adjacency.try_emplace(half_edge.face);
+    }
+    if (!adjacency.contains(face)) {
+        return core::Result<std::vector<FaceId>>::failure(
+            Diagnostic(ErrorCode::not_found, "topology face region seed was not found"));
+    }
+    for (const auto& half_edge : half_edges) {
+        if (!half_edge.twin.has_value()) continue;
+        const auto twin = by_id.find(*half_edge.twin);
+        if (twin == by_id.end()) {
+            return core::Result<std::vector<FaceId>>::failure(
+                validation("topology face region references a missing twin half-edge"));
+        }
+        if (twin->second->face != half_edge.face) {
+            adjacency[half_edge.face].push_back(twin->second->face);
+        }
+    }
+    for (auto& [ignored, neighbors] : adjacency) {
+        static_cast<void>(ignored);
+        std::sort(neighbors.begin(), neighbors.end());
+        neighbors.erase(std::unique(neighbors.begin(), neighbors.end()), neighbors.end());
+    }
+
+    std::vector<FaceId> result;
+    std::vector<FaceId> pending{face};
+    std::set<FaceId> visited{face};
+    for (std::size_t index = 0U; index < pending.size(); ++index) {
+        const FaceId current = pending[index];
+        result.push_back(current);
+        for (const FaceId neighbor : adjacency.at(current)) {
+            if (visited.insert(neighbor).second) pending.push_back(neighbor);
+        }
+    }
+    return core::Result<std::vector<FaceId>>::success(std::move(result));
+}
+
+core::Result<std::vector<VertexId>> TopologySnapshot::linked_component(VertexId vertex) const {
+    if (auto result = validate(); !result) {
+        return core::Result<std::vector<VertexId>>::failure(result.error());
+    }
+    if (!vertex) {
+        return core::Result<std::vector<VertexId>>::failure(
+            Diagnostic(ErrorCode::invalid_argument, "topology vertex id must be non-zero"));
+    }
+
+    std::map<VertexId, std::vector<VertexId>> adjacency;
+    for (const auto& edge : edges) {
+        adjacency[edge.first].push_back(edge.second);
+        adjacency[edge.second].push_back(edge.first);
+    }
+    if (!adjacency.contains(vertex)) {
+        return core::Result<std::vector<VertexId>>::failure(
+            Diagnostic(ErrorCode::not_found, "topology linked-component seed was not found"));
+    }
+    for (auto& [ignored, neighbors] : adjacency) {
+        static_cast<void>(ignored);
+        std::sort(neighbors.begin(), neighbors.end());
+        neighbors.erase(std::unique(neighbors.begin(), neighbors.end()), neighbors.end());
+    }
+
+    std::vector<VertexId> result;
+    std::vector<VertexId> pending{vertex};
+    std::set<VertexId> visited{vertex};
+    for (std::size_t index = 0U; index < pending.size(); ++index) {
+        const VertexId current = pending[index];
+        result.push_back(current);
+        for (const VertexId neighbor : adjacency.at(current)) {
+            if (visited.insert(neighbor).second) pending.push_back(neighbor);
+        }
+    }
+    return core::Result<std::vector<VertexId>>::success(std::move(result));
+}
+
+core::Result<std::vector<VertexId>> TopologySnapshot::shortest_path(
+    VertexId start, VertexId goal) const {
+    if (auto result = validate(); !result) {
+        return core::Result<std::vector<VertexId>>::failure(result.error());
+    }
+    if (!start || !goal) {
+        return core::Result<std::vector<VertexId>>::failure(
+            Diagnostic(ErrorCode::invalid_argument, "topology path vertex ids must be non-zero"));
+    }
+
+    std::map<VertexId, std::vector<VertexId>> adjacency;
+    for (const auto& edge : edges) {
+        adjacency[edge.first].push_back(edge.second);
+        adjacency[edge.second].push_back(edge.first);
+    }
+    if (!adjacency.contains(start) || !adjacency.contains(goal)) {
+        return core::Result<std::vector<VertexId>>::failure(
+            Diagnostic(ErrorCode::not_found, "topology shortest-path endpoint was not found"));
+    }
+    if (start == goal) {
+        return core::Result<std::vector<VertexId>>::success({start});
+    }
+    for (auto& [ignored, neighbors] : adjacency) {
+        static_cast<void>(ignored);
+        std::sort(neighbors.begin(), neighbors.end());
+        neighbors.erase(std::unique(neighbors.begin(), neighbors.end()), neighbors.end());
+    }
+
+    std::vector<VertexId> pending{start};
+    std::set<VertexId> visited{start};
+    std::map<VertexId, VertexId> predecessor;
+    for (std::size_t index = 0U; index < pending.size(); ++index) {
+        const VertexId current = pending[index];
+        for (const VertexId neighbor : adjacency.at(current)) {
+            if (!visited.insert(neighbor).second) continue;
+            predecessor.emplace(neighbor, current);
+            if (neighbor == goal) {
+                std::vector<VertexId> result{goal};
+                VertexId cursor = goal;
+                while (cursor != start) {
+                    cursor = predecessor.at(cursor);
+                    result.push_back(cursor);
+                }
+                std::reverse(result.begin(), result.end());
+                return core::Result<std::vector<VertexId>>::success(std::move(result));
+            }
+            pending.push_back(neighbor);
+        }
+    }
+    return core::Result<std::vector<VertexId>>::failure(
+        Diagnostic(ErrorCode::not_found, "topology vertices are not linked by a path"));
 }
 
 core::Result<CompiledMesh> EditableMesh::compile() const {

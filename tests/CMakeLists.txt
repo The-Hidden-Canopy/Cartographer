@@ -59,6 +59,13 @@ if(CARTO_ENABLE_D3D12)
             carto_device_ir
             carto_gpu
     )
+    target_compile_definitions(cartographer_d3d12_tests
+        PRIVATE
+            CARTO_D3D12_SHADER_DIR="${CMAKE_SOURCE_DIR}/libs/d3d12/shaders"
+    )
+    if(WIN32)
+        target_link_libraries(cartographer_d3d12_tests PRIVATE user32)
+    endif()
     carto_target(cartographer_d3d12_tests)
     add_test(NAME cartographer_d3d12_tests COMMAND cartographer_d3d12_tests)
 endif()
@@ -220,6 +227,7 @@ target_link_libraries(cartographer_public_api_tests
     PRIVATE
         carto_application
         carto_editor
+        carto_mesh_attributes
         carto_project
 )
 

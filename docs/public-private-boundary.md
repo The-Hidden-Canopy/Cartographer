@@ -62,3 +62,19 @@ checkout. A deleted PDF, archive, model, credential, or source specification
 can remain recoverable from a public remote. If a moat object is found in
 reachable history, stop the release, obtain explicit owner approval for history
 rewriting or remote purge, and verify every public ref after remediation.
+
+## Automated publication check
+
+The repository includes a read-only publication audit:
+
+```text
+python scripts/public_boundary_audit.py --check-ignore-policy
+```
+
+It checks tracked files, non-ignored working-tree files, recognizable
+credential patterns, required quarantine rules, and all reachable Git history.
+It never rewrites history, expires reflogs, deletes files, or contacts a
+remote. Use `--include-reflog` for a local hygiene audit that also inspects
+reflog/unreachable objects. Legacy GMIB, anatomy, OWH, and simulation paths are
+reported for provenance/licensing review; `--fail-on-review` makes those review
+items blocking for an owner-approved release gate.

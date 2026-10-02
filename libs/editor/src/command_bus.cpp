@@ -417,10 +417,12 @@ core::Result<void> ExtrudeProjectSelectedFaceCommand::execute() {
 
     geometry::EditableMesh before = mesh_iterator->second;
     geometry::EditableMesh after = before;
-    if (auto result = after.extrude_face(faces.front(), distance_); !result) {
-        return result;
+    auto extrusion = after.extrude_face_with_receipt(faces.front(), distance_);
+    if (!extrusion) {
+        return core::Result<void>::failure(extrusion.error());
     }
-    auto replaced = document_->replace_mesh_if_revision(mesh_asset, before.revision(), after);
+    auto replaced = document_->replace_mesh_if_revision(
+        mesh_asset, before.revision(), after, extrusion.value());
     if (!replaced) {
         return core::Result<void>::failure(replaced.error());
     }
@@ -616,7 +618,8 @@ core::Result<void> InsetProjectSelectedFaceCommand::execute() {
     if (!inset) {
         return core::Result<void>::failure(inset.error());
     }
-    auto replaced = document_->replace_mesh_if_revision(mesh_asset, before.revision(), after);
+    auto replaced = document_->replace_mesh_if_revision(
+        mesh_asset, before.revision(), after, inset.value());
     if (!replaced) {
         return core::Result<void>::failure(replaced.error());
     }
@@ -818,7 +821,8 @@ core::Result<void> DeleteProjectSelectedFaceCommand::execute() {
     if (!deleted) {
         return core::Result<void>::failure(deleted.error());
     }
-    auto replaced = document_->replace_mesh_if_revision(mesh_asset, before.revision(), after);
+    auto replaced = document_->replace_mesh_if_revision(
+        mesh_asset, before.revision(), after, deleted.value());
     if (!replaced) {
         return core::Result<void>::failure(replaced.error());
     }
@@ -1015,7 +1019,8 @@ core::Result<void> SplitProjectSelectedEdgeCommand::execute() {
     if (!split) {
         return core::Result<void>::failure(split.error());
     }
-    auto replaced = document_->replace_mesh_if_revision(mesh_asset, before.revision(), after);
+    auto replaced = document_->replace_mesh_if_revision(
+        mesh_asset, before.revision(), after, split.value());
     if (!replaced) {
         return core::Result<void>::failure(replaced.error());
     }

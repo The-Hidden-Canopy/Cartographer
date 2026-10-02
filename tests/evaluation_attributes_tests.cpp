@@ -8,10 +8,12 @@
 #include <carto/geometry/primitives.hpp>
 #include <carto/mesh_attributes/provenance.hpp>
 
+#include <algorithm>
 #include <iostream>
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -305,6 +307,96 @@ void mesh_kernel_provenance_uses_stable_ids_and_preserves_created_boundaries() {
     REQUIRE(provenance.value().source_indices.at(attributes::AttributeDomain::face).size() == 1U);
 }
 
+void mesh_receipt_provenance_maps_created_elements_and_rejects_stale_states() {
+    using namespace carto;
+    auto source_result = geometry::make_plane(2.0, 2.0);
+    REQUIRE(source_result);
+    geometry::EditableMesh source = source_result.value();
+    geometry::EditableMesh destination = source;
+    const auto source_face = source.faces_sorted().front().id;
+    const auto receipt = destination.extrude_face_with_receipt(source_face, 0.25);
+    REQUIRE(receipt);
+
+    const auto provenance = mesh_attributes::provenance_from_receipt(
+        source, destination, receipt.value());
+    REQUIRE(provenance);
+    const auto destination_snapshot = mesh_attributes::stable_topology_snapshot(destination);
+    REQUIRE(destination_snapshot);
+    const auto source_topology = source.topology();
+    REQUIRE(source_topology);
+    const auto destination_index = [&destination_snapshot](
+        attributes::AttributeDomain domain, std::uint64_t id) {
+        const auto& ids = destination_snapshot.value().element_ids.at(domain);
+        return static_cast<std::size_t>(std::distance(ids.begin(), std::find(ids.begin(), ids.end(), id)));
+    };
+    for (const auto& [id, ignored] : receipt.value().vertex_origins) {
+        static_cast<void>(ignored);
+        const auto index = destination_index(attributes::AttributeDomain::vertex, id.value);
+        REQUIRE(index < provenance.value().source_indices.at(attributes::AttributeDomain::vertex).size());
+        REQUIRE(!provenance.value().source_indices.at(attributes::AttributeDomain::vertex)[index].empty());
+    }
+    for (const auto& [id, ignored] : receipt.value().face_origins) {
+        static_cast<void>(ignored);
+        const auto index = destination_index(attributes::AttributeDomain::face, id.value);
+        REQUIRE(!provenance.value().source_indices.at(attributes::AttributeDomain::face)[index].empty());
+    }
+
+    attributes::AttributeSet source_attributes({
+        {attributes::AttributeDomain::vertex, source.vertex_count()},
+        {attributes::AttributeDomain::edge, source_topology.value().edges.size()},
+        {attributes::AttributeDomain::face, source.face_count()},
+        {attributes::AttributeDomain::corner, source_topology.value().corners.size()},
+    });
+    REQUIRE(source_attributes.add_layer(attributes::AttributeLayer{
+        {"vertex_position", attributes::AttributeDomain::vertex, attributes::AttributeType::vec3},
+        {core::Vec3d{0.0, 0.0, 0.0}, core::Vec3d{1.0, 0.0, 0.0},
+         core::Vec3d{1.0, 1.0, 0.0}, core::Vec3d{0.0, 1.0, 0.0}},
+    }));
+    REQUIRE(source_attributes.add_layer(attributes::AttributeLayer{
+        {"edge_weight", attributes::AttributeDomain::edge, attributes::AttributeType::float64},
+        {1.0, 2.0, 3.0, 4.0},
+    }));
+    REQUIRE(source_attributes.add_layer(attributes::AttributeLayer{
+        {"face_material", attributes::AttributeDomain::face, attributes::AttributeType::uint32},
+        {std::uint32_t{7U}},
+    }));
+    REQUIRE(source_attributes.add_layer(attributes::AttributeLayer{
+        {"corner_uv", attributes::AttributeDomain::corner, attributes::AttributeType::vec2},
+        {core::Vec2d{0.0, 0.0}, core::Vec2d{1.0, 0.0},
+         core::Vec2d{1.0, 1.0}, core::Vec2d{0.0, 1.0}},
+    }));
+    REQUIRE(source_attributes.validate());
+    attributes::AttributeTransferPolicy policy;
+    policy.per_layer.emplace("vertex_position", attributes::TransferMode::interpolate);
+    policy.per_layer.emplace("edge_weight", attributes::TransferMode::duplicate);
+    policy.per_layer.emplace("face_material", attributes::TransferMode::duplicate);
+    policy.per_layer.emplace("corner_uv", attributes::TransferMode::interpolate);
+    const auto transferred = attributes::transfer(
+        source_attributes, provenance.value(), policy);
+    REQUIRE(transferred);
+    REQUIRE(transferred.value().domain_count(attributes::AttributeDomain::vertex) ==
+            destination.vertex_count());
+    REQUIRE(transferred.value().domain_count(attributes::AttributeDomain::face) ==
+            destination.face_count());
+
+    geometry::EditableMesh stale_destination = destination;
+    const auto first_destination_vertex = stale_destination.vertices_sorted().front();
+    REQUIRE(stale_destination.set_vertex_position(
+        first_destination_vertex.id, first_destination_vertex.position + core::Vec3d{0.01, 0.0, 0.0}));
+    const auto stale = mesh_attributes::provenance_from_receipt(
+        source, stale_destination, receipt.value());
+    REQUIRE(!stale);
+    REQUIRE(stale.error().code == core::ErrorCode::stale_data);
+
+    auto forged = receipt.value();
+    REQUIRE(!forged.vertex_origins.empty());
+    forged.vertex_origins.begin()->second.source_ids.front() = 999999U;
+    const auto rejected_forgery = mesh_attributes::provenance_from_receipt(
+        source, destination, forged);
+    REQUIRE(!rejected_forgery);
+    REQUIRE(rejected_forgery.error().code == core::ErrorCode::validation_failed);
+}
+
 } // namespace
 
 int main() {
@@ -316,6 +408,7 @@ int main() {
         corner_attributes_interpolate_and_discrete_layers_invalidate();
         stable_ids_derive_created_and_deleted_provenance();
         mesh_kernel_provenance_uses_stable_ids_and_preserves_created_boundaries();
+        mesh_receipt_provenance_maps_created_elements_and_rejects_stale_states();
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         return 1;

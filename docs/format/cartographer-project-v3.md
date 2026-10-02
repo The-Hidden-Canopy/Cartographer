@@ -1,4 +1,4 @@
-# Cartographer project format v3
+# Cartographer project format v3 (historical)
 
 Cartographer v3 keeps the deterministic authoring envelope from v2 and adds
 an optional reference to an immutable, content-addressed evaluation-graph
@@ -30,8 +30,9 @@ revision path, so journal envelopes and checkpoint snapshots preserve it.
 that verifies the document and package reference agree and that the blob is
 present and intact.
 
-The v3 parser remains able to read v1 and v2 documents. New saves always write
-v3. Zero, malformed, duplicate, or misplaced graph records fail closed, as do
+The v3 parser remains able to read v1 and v2 documents. Current saves write
+[project format v4](cartographer-project-v4.md), while v3 remains a readable
+legacy representation. Zero, malformed, duplicate, or misplaced graph records fail closed, as do
 unknown/future versions, invalid authoring envelopes, malformed topology,
 trailing data, non-finite values, and resource-limit violations.
 

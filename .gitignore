@@ -20,6 +20,8 @@ CMakeUserPresets.json
 # IDE files
 .vs/
 .vscode/
+__pycache__/
+*.pyc
 *.user
 *.suo
 
@@ -50,9 +52,26 @@ _deps/
 .env
 .env.*
 !.env.example
+*.env
+!*.env.example
 *.pem
 *.key
 *.p12
+*.pfx
+*.crt
+*.der
+*.jks
+*.keystore
+*.secret
+*.credentials
+
+# Private model and weight artifacts are kept behind the moat by default.
+*.gguf
+*.safetensors
+*.onnx
+*.pt
+*.pth
+*.ckpt
 
 # Private hub/API adapters are maintained outside the Cartographer checkout
 /.hub/

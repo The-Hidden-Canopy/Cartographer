@@ -73,6 +73,14 @@ struct TopologySnapshot {
     [[nodiscard]] core::Result<void> validate() const;
     [[nodiscard]] core::Result<std::vector<HalfEdgeId>> face_boundary(FaceId face) const;
     [[nodiscard]] std::vector<HalfEdgeId> boundary_half_edges() const;
+    [[nodiscard]] core::Result<std::vector<EdgeId>> edge_loop(EdgeId edge) const;
+    [[nodiscard]] core::Result<std::vector<EdgeId>> edge_ring(EdgeId edge) const;
+    [[nodiscard]] core::Result<std::vector<EdgeId>> boundary_loop(EdgeId edge) const;
+    [[nodiscard]] core::Result<std::vector<FaceId>> vertex_fan(VertexId vertex) const;
+    [[nodiscard]] core::Result<std::vector<FaceId>> face_region(FaceId face) const;
+    [[nodiscard]] core::Result<std::vector<VertexId>> linked_component(VertexId vertex) const;
+    [[nodiscard]] core::Result<std::vector<VertexId>> shortest_path(
+        VertexId start, VertexId goal) const;
 };
 
 class EditableMesh {
@@ -92,6 +100,8 @@ public:
         std::vector<Vertex> vertices,
         std::vector<Face> faces);
     [[nodiscard]] core::Result<void> extrude_face(FaceId id, double distance);
+    [[nodiscard]] core::Result<TopologyEditReceipt> extrude_face_with_receipt(
+        FaceId id, double distance);
     [[nodiscard]] core::Result<TopologyEditReceipt> delete_face(
         FaceId id,
         bool remove_orphaned_vertices = true);

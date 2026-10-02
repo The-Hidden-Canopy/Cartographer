@@ -202,10 +202,10 @@ core::Result<void> DeviceCommandStream::validate() const {
                             "indexed draw requires a rendering scope and triangle-aligned counts"));
                     }
                 } else if constexpr (std::is_same_v<T, CmdDispatch>) {
-                    if (value.group_count_x == 0U || value.group_count_y == 0U ||
+                    if (rendering || value.group_count_x == 0U || value.group_count_y == 0U ||
                         value.group_count_z == 0U) {
                         return core::Result<void>::failure(
-                            invalid("dispatch group counts must be non-zero"));
+                            validation("dispatch requires a non-rendering scope and non-zero group counts"));
                     }
                 } else if constexpr (std::is_same_v<T, CmdWriteTimestamp>) {
                     static_cast<void>(value);

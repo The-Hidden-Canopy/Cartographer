@@ -2,8 +2,10 @@
 #include <carto/geometry/primitives.hpp>
 #include <carto/geometry/mesh.hpp>
 
+#include <algorithm>
 #include <iostream>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -251,6 +253,213 @@ void convex_face_inset_is_atomic_and_reports_topology_delta() {
     REQUIRE(box.value().compile());
 }
 
+void topology_receipts_preserve_operation_lineage() {
+    auto plane = carto::geometry::make_plane(2.0, 2.0);
+    REQUIRE(plane);
+    const auto face = plane.value().faces_sorted().front().id;
+    const auto extruded = plane.value().extrude_face_with_receipt(face, 0.25);
+    REQUIRE(extruded);
+    REQUIRE(extruded.value().validate());
+    REQUIRE(extruded.value().vertex_origins.size() == 4U);
+    REQUIRE(extruded.value().face_origins.size() == 5U);
+    for (const auto& [created, origin] : extruded.value().vertex_origins) {
+        REQUIRE(std::find(
+            extruded.value().created_vertices.begin(),
+            extruded.value().created_vertices.end(), created) !=
+            extruded.value().created_vertices.end());
+        REQUIRE(origin.kind == carto::geometry::OriginKind::duplicated_from);
+        REQUIRE(origin.source_ids.size() == 1U);
+    }
+    REQUIRE(!extruded.value().edge_origins.empty());
+    REQUIRE(!extruded.value().corner_origins.empty());
+
+    auto split_mesh = carto::geometry::make_box({1.0, 1.0, 1.0});
+    REQUIRE(split_mesh);
+    const auto split_topology = split_mesh.value().topology();
+    REQUIRE(split_topology);
+    const auto split = split_mesh.value().split_edge(split_topology.value().edges.front().id);
+    REQUIRE(split);
+    REQUIRE(split.value().validate());
+    REQUIRE(split.value().vertex_origins.size() == 1U);
+    REQUIRE(split.value().vertex_origins.begin()->second.kind ==
+            carto::geometry::OriginKind::interpolated_from);
+    REQUIRE(split.value().edge_origins.size() == split.value().created_edges.size());
+
+    auto inset_mesh = carto::geometry::make_box({2.0, 2.0, 2.0});
+    REQUIRE(inset_mesh);
+    const auto inset_face = inset_mesh.value().faces_sorted().front().id;
+    const auto inset = inset_mesh.value().inset_face(inset_face, 0.25);
+    REQUIRE(inset);
+    REQUIRE(inset.value().validate());
+    REQUIRE(inset.value().vertex_origins.size() == 4U);
+    REQUIRE(inset.value().face_origins.size() == 5U);
+    REQUIRE(inset.value().edge_origins.size() == inset.value().created_edges.size());
+    REQUIRE(!inset.value().corner_origins.empty());
+}
+
+void topology_traversals_are_validated_and_deterministic() {
+    auto plane = carto::geometry::make_plane(2.0, 2.0);
+    REQUIRE(plane);
+    const auto plane_topology = plane.value().topology();
+    REQUIRE(plane_topology);
+    const auto plane_edge = plane_topology.value().edges.front().id;
+    const auto boundary = plane_topology.value().boundary_loop(plane_edge);
+    REQUIRE(boundary);
+    REQUIRE(boundary.value().size() == 4U);
+    REQUIRE(boundary.value().front() == plane_edge);
+    const auto plane_loop = plane_topology.value().edge_loop(plane_edge);
+    REQUIRE(plane_loop);
+    REQUIRE(plane_loop.value().size() == 2U);
+    REQUIRE(plane_loop.value().front() == plane_edge);
+    const auto plane_ring = plane_topology.value().edge_ring(plane_edge);
+    REQUIRE(plane_ring);
+    REQUIRE(plane_ring.value().size() == 2U);
+    REQUIRE(plane_ring.value().front() == plane_edge);
+    const auto plane_fan = plane_topology.value().vertex_fan(
+        plane.value().vertices_sorted().front().id);
+    REQUIRE(plane_fan);
+    REQUIRE(plane_fan.value().size() == 1U);
+    const auto plane_region = plane_topology.value().face_region(
+        plane.value().faces_sorted().front().id);
+    REQUIRE(plane_region);
+    REQUIRE(plane_region.value().size() == 1U);
+    const auto plane_vertices = plane.value().vertices_sorted();
+    const auto plane_path = plane_topology.value().shortest_path(
+        plane_vertices.front().id, plane_vertices.back().id);
+    REQUIRE(plane_path);
+    REQUIRE(plane_path.value().front() == plane_vertices.front().id);
+    REQUIRE(plane_path.value().back() == plane_vertices.back().id);
+
+    auto box = carto::geometry::make_box({1.0, 1.0, 1.0});
+    REQUIRE(box);
+    const auto box_topology = box.value().topology();
+    REQUIRE(box_topology);
+    const auto box_loop = box_topology.value().edge_loop(box_topology.value().edges.front().id);
+    REQUIRE(box_loop);
+    REQUIRE(!box_loop.value().empty());
+    REQUIRE(std::set<carto::geometry::EdgeId>(
+        box_loop.value().begin(), box_loop.value().end()).size() == box_loop.value().size());
+    const auto box_ring = box_topology.value().edge_ring(box_topology.value().edges.front().id);
+    REQUIRE(box_ring);
+    REQUIRE(!box_ring.value().empty());
+    REQUIRE(std::set<carto::geometry::EdgeId>(
+        box_ring.value().begin(), box_ring.value().end()).size() == box_ring.value().size());
+    const auto box_fan = box_topology.value().vertex_fan(
+        box.value().vertices_sorted().front().id);
+    REQUIRE(box_fan);
+    REQUIRE(box_fan.value().size() == 3U);
+    const auto box_region = box_topology.value().face_region(
+        box.value().faces_sorted().front().id);
+    REQUIRE(box_region);
+    REQUIRE(box_region.value().size() == 6U);
+    const auto box_component = box_topology.value().linked_component(
+        box.value().vertices_sorted().front().id);
+    REQUIRE(box_component);
+    REQUIRE(box_component.value().size() == 8U);
+    const auto box_path = box_topology.value().shortest_path(
+        box.value().vertices_sorted().front().id, box.value().vertices_sorted().back().id);
+    REQUIRE(box_path);
+    REQUIRE(box_path.value().front() == box.value().vertices_sorted().front().id);
+    REQUIRE(box_path.value().back() == box.value().vertices_sorted().back().id);
+    const auto closed_boundary = box_topology.value().boundary_loop(
+        box_topology.value().edges.front().id);
+    REQUIRE(!closed_boundary);
+    REQUIRE(closed_boundary.error().code == carto::core::ErrorCode::unsupported);
+    const auto missing_edge = box_topology.value().edge_loop(carto::geometry::EdgeId{999999U});
+    REQUIRE(!missing_edge);
+    REQUIRE(missing_edge.error().code == carto::core::ErrorCode::not_found);
+
+    carto::geometry::EditableMesh triangle;
+    const auto a = triangle.add_vertex({0.0, 0.0, 0.0});
+    const auto b = triangle.add_vertex({1.0, 0.0, 0.0});
+    const auto c = triangle.add_vertex({0.0, 1.0, 0.0});
+    REQUIRE(a && b && c);
+    REQUIRE(triangle.add_face({a.value(), b.value(), c.value()}));
+    const auto triangle_topology = triangle.topology();
+    REQUIRE(triangle_topology);
+    const auto unsupported_loop = triangle_topology.value().edge_loop(
+        triangle_topology.value().edges.front().id);
+    REQUIRE(!unsupported_loop);
+    REQUIRE(unsupported_loop.error().code == carto::core::ErrorCode::unsupported);
+    const auto unsupported_ring = triangle_topology.value().edge_ring(
+        triangle_topology.value().edges.front().id);
+    REQUIRE(!unsupported_ring);
+    REQUIRE(unsupported_ring.error().code == carto::core::ErrorCode::unsupported);
+}
+
+void invalid_topology_receipts_fail_closed() {
+    carto::geometry::TopologyEditReceipt invalid;
+    invalid.revision_before = carto::core::Revision{1U};
+    invalid.revision_after = carto::core::Revision{2U};
+    invalid.created_vertices = {{1U}, {1U}};
+    const auto rejected = invalid.validate();
+    REQUIRE(!rejected);
+    REQUIRE(rejected.error().code == carto::core::ErrorCode::validation_failed);
+
+    invalid.created_vertices = {{2U}, {1U}};
+    const auto unordered = invalid.validate();
+    REQUIRE(!unordered);
+    REQUIRE(unordered.error().code == carto::core::ErrorCode::validation_failed);
+}
+
+void topology_receipts_round_trip_and_reject_hostile_text() {
+    auto plane = carto::geometry::make_plane(2.0, 2.0);
+    REQUIRE(plane);
+    const auto face = plane.value().faces_sorted().front().id;
+    const auto receipt = plane.value().extrude_face_with_receipt(face, 0.25);
+    REQUIRE(receipt);
+
+    const std::string encoded = receipt.value().serialize();
+    const auto decoded = carto::geometry::TopologyEditReceipt::deserialize(encoded);
+    REQUIRE(decoded);
+    REQUIRE(decoded.value().serialize() == encoded);
+    REQUIRE(decoded.value().revision_before == receipt.value().revision_before);
+    REQUIRE(decoded.value().revision_after == receipt.value().revision_after);
+
+    const auto trailing = carto::geometry::TopologyEditReceipt::deserialize(
+        encoded + "TRAILING\n");
+    REQUIRE(!trailing);
+    REQUIRE(trailing.error().code == carto::core::ErrorCode::validation_failed);
+
+    std::string future = encoded;
+    const auto version = future.find("CARTOGRAPHER_TOPOLOGY_RECEIPT 1");
+    REQUIRE(version != std::string::npos);
+    future.replace(version, std::string("CARTOGRAPHER_TOPOLOGY_RECEIPT 1").size(),
+                   "CARTOGRAPHER_TOPOLOGY_RECEIPT 2");
+    const auto future_rejected = carto::geometry::TopologyEditReceipt::deserialize(future);
+    REQUIRE(!future_rejected);
+    REQUIRE(future_rejected.error().code == carto::core::ErrorCode::version_mismatch);
+
+    std::string oversized = encoded;
+    const auto created_vertices = oversized.find("CREATED_VERTICES 4");
+    REQUIRE(created_vertices != std::string::npos);
+    oversized.replace(created_vertices, std::string("CREATED_VERTICES 4").size(),
+                      "CREATED_VERTICES 1000001");
+    const auto oversized_rejected = carto::geometry::TopologyEditReceipt::deserialize(oversized);
+    REQUIRE(!oversized_rejected);
+    REQUIRE(oversized_rejected.error().code == carto::core::ErrorCode::validation_failed);
+
+    std::string aggregate_oversized =
+        "CARTOGRAPHER_TOPOLOGY_RECEIPT 1\n"
+        "REVISION_BEFORE 1\n"
+        "REVISION_AFTER 2\n"
+        "CREATED_VERTICES 1000000";
+    aggregate_oversized.reserve(16U * 1024U * 1024U);
+    for (std::uint64_t id = 1U; id <= 1'000'000U; ++id) {
+        aggregate_oversized += ' ' + std::to_string(id);
+    }
+    aggregate_oversized += "\nCREATED_EDGES 1000000";
+    for (std::uint64_t id = 1U; id <= 1'000'000U; ++id) {
+        aggregate_oversized += ' ' + std::to_string(id);
+    }
+    aggregate_oversized += "\nCREATED_FACES 1\n";
+    const auto aggregate_rejected =
+        carto::geometry::TopologyEditReceipt::deserialize(aggregate_oversized);
+    REQUIRE(!aggregate_rejected);
+    REQUIRE(aggregate_rejected.error().code == carto::core::ErrorCode::validation_failed);
+    REQUIRE(aggregate_rejected.error().message.find("element budget") != std::string::npos);
+}
+
 void face_inset_rejects_invalid_or_collapsing_distances_without_mutation() {
     auto box = carto::geometry::make_box({2.0, 2.0, 2.0});
     REQUIRE(box);
@@ -459,6 +668,10 @@ int main() {
         edge_split_rejects_invalid_factors_without_mutation();
         admitted_edge_split_rejects_wrong_mode_and_multi_selection();
         convex_face_inset_is_atomic_and_reports_topology_delta();
+        topology_receipts_preserve_operation_lineage();
+        topology_traversals_are_validated_and_deterministic();
+        invalid_topology_receipts_fail_closed();
+        topology_receipts_round_trip_and_reject_hostile_text();
         face_inset_rejects_invalid_or_collapsing_distances_without_mutation();
         face_inset_rejects_concave_and_nonplanar_faces();
         admitted_face_delete_is_undoable_and_clears_removed_selection();

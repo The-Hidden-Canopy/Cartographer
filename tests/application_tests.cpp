@@ -97,6 +97,42 @@ void application_routes_authoring_through_snapshot_and_history() {
     REQUIRE(session.snapshot().redo_count == 0U);
 }
 
+void application_persists_project_topology_receipts_through_save_and_reopen() {
+    TempDirectory temp;
+    const auto path = temp.path() / "receipt-ledger.carto";
+
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::NewProjectAction{"Receipt persistence"}));
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::CreateBoxAction{"Box", {1.0, 1.0, 1.0}}));
+    const auto object = session.snapshot().objects.front().object.id;
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SetSelectionModeAction{carto::editor::SelectionMode::face}));
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SelectFaceAction{object, carto::geometry::FaceId{1U}}));
+    carto::editor::ToolArguments arguments;
+    arguments.distance = 0.2;
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::InvokeToolAction{"mesh.extrude-face", arguments}));
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SaveProjectAction{path}));
+
+    std::ifstream input(path, std::ios::binary);
+    const std::string serialized(
+        (std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    REQUIRE(serialized.find("TOPOLOGY_RECEIPTS 1") != std::string::npos);
+    const auto loaded = carto::project::ProjectDocument::load(path);
+    REQUIRE(loaded);
+    REQUIRE(loaded.value().topology_receipts().size() == 1U);
+    REQUIRE(loaded.value().topology_receipts().front().mesh_asset == 1U);
+
+    carto::application::ApplicationSession reopened;
+    REQUIRE(carto::application::testing::dispatch(
+        reopened, carto::application::OpenProjectAction{path}));
+    REQUIRE(reopened.snapshot().objects.size() == 1U);
+}
+
 void application_routes_imported_mesh_through_the_durable_command_boundary() {
     TempDirectory temp;
     auto mesh = carto::geometry::make_plane(2.0, 3.0);
@@ -376,7 +412,7 @@ void application_journals_committed_mutations_and_rolls_back_failed_append() {
     const std::string mutation_payload(
         after_event.value().back().payload.begin(), after_event.value().back().payload.end());
     REQUIRE(mutation_payload.find("CARTOGRAPHER_APPLICATION_MUTATION_V1") == 0U);
-    REQUIRE(mutation_payload.find("CARTOGRAPHER_PROJECT 3") != std::string::npos);
+    REQUIRE(mutation_payload.find("CARTOGRAPHER_PROJECT 4") != std::string::npos);
     REQUIRE(mutation_payload.find(
                 "AUTHORING \"cartographer.authoring\" \"meters\" \"right_handed_y_up\"") !=
             std::string::npos);
@@ -500,6 +536,7 @@ void application_rejects_semantically_wrong_journal_tail() {
 int main() {
     try {
         application_routes_authoring_through_snapshot_and_history();
+        application_persists_project_topology_receipts_through_save_and_reopen();
         application_routes_imported_mesh_through_the_durable_command_boundary();
         application_routes_vertex_edit_and_rejects_stale_reselection();
         application_routes_persistent_edge_selection_without_mutation();
