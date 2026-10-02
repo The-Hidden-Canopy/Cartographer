@@ -1,5 +1,6 @@
 #include <carto/d3d12/device.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <array>
 #include <cstring>
@@ -25,6 +26,9 @@ void d3d12_device_reports_native_identity_and_owns_resources() {
 
     const auto created = d3d12::D3D12Device::create(d3d12::D3D12DeviceOptions{
         {}, false, true});
+    if (!created) {
+        throw TestFailure("D3D12 create: " + created.error().message);
+    }
     REQUIRE(created);
     auto& device = *created.value();
     REQUIRE(device.backend() == device::BackendKind::d3d12);
@@ -39,6 +43,9 @@ void d3d12_device_reports_native_identity_and_owns_resources() {
         false,
         false,
     });
+    if (!selected) {
+        throw TestFailure("D3D12 explicit adapter selection: " + selected.error().message);
+    }
     REQUIRE(selected);
     REQUIRE(selected.value()->identity().stable_adapter_id ==
             device.identity().stable_adapter_id);
@@ -209,6 +216,18 @@ void d3d12_compiles_dxil_draws_indexed_and_reads_texture() {
     if (!pipeline) {
         std::string message = "D3D12 PSO: " + pipeline.error().message;
         for (const auto& receipt : device.debug_receipts()) message += " | " + receipt;
+        const auto append_prefix = [&message](const char* label, const auto& bytes) {
+            message += " | " + std::string(label) + "=";
+            const std::size_t count = std::min<std::size_t>(16U, bytes.size());
+            for (std::size_t index = 0U; index < count; ++index) {
+                constexpr char digits[] = "0123456789abcdef";
+                const auto byte = bytes[index];
+                message += digits[(byte >> 4U) & 0x0fU];
+                message += digits[byte & 0x0fU];
+            }
+        };
+        append_prefix("vs", vertex_shader.value().bytes);
+        append_prefix("ps", fragment_shader.value().bytes);
         throw TestFailure(message);
     }
 
@@ -279,6 +298,11 @@ void d3d12_compiles_dxil_draws_indexed_and_reads_texture() {
     REQUIRE(pixels.value()[center] > 0.8F);
     REQUIRE(pixels.value()[center + 1U] > 0.1F);
     REQUIRE(pixels.value()[center + 3U] > 0.8F);
+    if (!device.debug_receipts().empty()) {
+        std::string message = "D3D12 debug receipts:";
+        for (const auto& receipt : device.debug_receipts()) message += " | " + receipt;
+        throw TestFailure(message);
+    }
     REQUIRE(device.debug_receipts().empty());
 
     REQUIRE(device.destroy_texture(depth.value()));

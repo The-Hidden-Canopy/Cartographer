@@ -69,9 +69,16 @@ validated render graph and attaches a `KernelContract` to every prepared pass.
 it to native input elements.
 
 The D3D12 target packages forward PBR, depth-shadow, temporal-resolve, and HDR
-tone-map HLSL sources. This is native GPU preparation, not shader compilation,
-pipeline creation, execution, or performance evidence; those operations remain
-paused while the host is used for an ML ablation.
+tone-map HLSL sources. Those assets remain preparation for the broader render
+graph; they are not evidence of PBR/HDR, shadow, temporal, presentation, or
+8K parity.
+
+A bounded headless D3D12 acceptance is now real on the local Quadro P5200:
+runtime DXC compiles the indexed-triangle test shaders, a graphics PSO is
+created, an indexed draw is submitted, and an RGBA32F texture is read back.
+The acceptance also checks native adapter/resource ownership and an empty
+debug-layer receipt. It is graphics-device evidence, not a GPU topology-kernel
+benchmark or a general production-renderer claim.
 
 ## N6: precision and evidence boundary
 
@@ -107,12 +114,14 @@ receipts, device-loss state, and submission-aware deferred destruction. The
 optional Win32 presentation seam owns DXGI swapchain lifecycle, resize, and
 present operations; a compile-only desktop target exercises that boundary
 without pretending that swapchain back buffers are already imported into the
-device resource registry. The first end-to-end native graphics attempt
-currently reaches PSO creation but fails with `E_INVALIDARG`; no GPU
-draw/readback/presentation claim is made until that receipt is repaired and
-re-run. Native execution and 8K allocation are intentionally paused while a
-separate ML ablation uses the machine. Vulkan remains an optional compatibility
-path until a separately evidenced removal decision.
+device resource registry. The bounded native graphics receipt currently
+covers runtime DXC, graphics PSO creation, indexed draw, RGBA32F readback,
+and empty debug-layer receipts on the Quadro P5200. `CmdDispatch` remains
+fail-closed in the D3D12 submission path, so topology authoring and its
+optimized kernels remain CPU-authoritative. Swapchain/back-buffer import,
+desktop launch, resize/DPI/input, PBR/HDR/shadow/temporal execution, 8K
+allocation, and GPU performance evidence remain unverified. Vulkan remains
+an optional compatibility path until a separately evidenced removal decision.
 
 ## Verification
 

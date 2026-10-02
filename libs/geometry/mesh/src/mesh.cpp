@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <map>
 #include <limits>
 #include <set>
 #include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace carto::geometry {
@@ -47,6 +50,56 @@ struct CornerKey {
     VertexId vertex;
 
     [[nodiscard]] constexpr auto operator<=>(const CornerKey&) const noexcept = default;
+};
+
+void hash_combine(std::size_t& seed, std::uint64_t value) noexcept {
+    const auto hashed = std::hash<std::uint64_t>{}(value);
+    seed ^= hashed + static_cast<std::size_t>(0x9e3779b9U) + (seed << 6U) + (seed >> 2U);
+}
+
+struct EdgeKeyHash {
+    [[nodiscard]] std::size_t operator()(const EdgeKey& key) const noexcept {
+        std::size_t seed = 0U;
+        hash_combine(seed, key.first.value);
+        hash_combine(seed, key.second.value);
+        return seed;
+    }
+};
+
+struct HalfEdgeKeyHash {
+    [[nodiscard]] std::size_t operator()(const HalfEdgeKey& key) const noexcept {
+        std::size_t seed = 0U;
+        hash_combine(seed, key.face.value);
+        hash_combine(seed, key.origin.value);
+        hash_combine(seed, key.destination.value);
+        return seed;
+    }
+};
+
+struct CornerKeyHash {
+    [[nodiscard]] std::size_t operator()(const CornerKey& key) const noexcept {
+        std::size_t seed = 0U;
+        hash_combine(seed, key.face.value);
+        hash_combine(seed, key.vertex.value);
+        return seed;
+    }
+};
+
+struct VertexPairHash {
+    [[nodiscard]] std::size_t operator()(
+        const std::pair<VertexId, VertexId>& key) const noexcept {
+        std::size_t seed = 0U;
+        hash_combine(seed, key.first.value);
+        hash_combine(seed, key.second.value);
+        return seed;
+    }
+};
+
+template <typename Id>
+struct IdHash {
+    [[nodiscard]] std::size_t operator()(Id id) const noexcept {
+        return std::hash<std::uint64_t>{}(id.value);
+    }
 };
 
 EdgeKey undirected(VertexId left, VertexId right) {
@@ -901,16 +954,19 @@ core::Result<void> EditableMesh::insert_bulk(
 }
 
 core::Result<void> EditableMesh::rebuild_topology() {
-    std::map<EdgeKey, EdgeId> previous_edges;
+    std::unordered_map<EdgeKey, EdgeId, EdgeKeyHash> previous_edges;
+    previous_edges.reserve(edges_.size());
     for (const auto& [id, edge] : edges_) {
         previous_edges.emplace(undirected(edge.first, edge.second), id);
     }
-    std::map<HalfEdgeKey, HalfEdgeId> previous_half_edges;
+    std::unordered_map<HalfEdgeKey, HalfEdgeId, HalfEdgeKeyHash> previous_half_edges;
+    previous_half_edges.reserve(half_edges_.size());
     for (const auto& [id, edge] : half_edges_) {
         previous_half_edges.emplace(
             HalfEdgeKey{edge.face, edge.origin, edge.destination}, id);
     }
-    std::map<CornerKey, CornerId> previous_corners;
+    std::unordered_map<CornerKey, CornerId, CornerKeyHash> previous_corners;
+    previous_corners.reserve(corners_.size());
     for (const auto& [id, corner] : corners_) {
         previous_corners.emplace(CornerKey{corner.face, corner.vertex}, id);
     }
@@ -920,8 +976,10 @@ core::Result<void> EditableMesh::rebuild_topology() {
     std::map<CornerId, CornerRecord> new_corners;
     std::map<FaceId, HalfEdgeId> new_face_boundaries;
     std::map<VertexId, std::vector<FaceId>> new_vertex_faces;
-    std::map<std::pair<VertexId, VertexId>, HalfEdgeId> directed;
-    std::map<EdgeKey, EdgeId> allocated_edges;
+    std::unordered_map<std::pair<VertexId, VertexId>, HalfEdgeId, VertexPairHash> directed;
+    directed.reserve(half_edges_.size() + faces_.size());
+    std::unordered_map<EdgeKey, EdgeId, EdgeKeyHash> allocated_edges;
+    allocated_edges.reserve(edges_.size() + faces_.size());
     std::uint64_t next_edge_id = next_edge_id_;
     std::uint64_t next_half_edge_id = next_half_edge_id_;
     std::uint64_t next_corner_id = next_corner_id_;
@@ -1092,7 +1150,8 @@ core::Result<void> EditableMesh::validate_topology_state() const {
             validation("mesh topology is missing a face boundary"));
     }
 
-    std::map<HalfEdgeId, const HalfEdgeRecord*> by_id;
+    std::unordered_map<HalfEdgeId, const HalfEdgeRecord*, IdHash<HalfEdgeId>> by_id;
+    by_id.reserve(snapshot.half_edges.size());
     for (const auto& edge : snapshot.half_edges) {
         by_id.emplace(edge.id, &edge);
     }
@@ -1203,8 +1262,10 @@ core::Result<void> EditableMesh::validate_vertex_face_index() const {
 }
 
 core::Result<void> EditableMesh::validate() const {
-    std::map<EdgeKey, std::size_t> edge_use;
-    std::map<std::pair<VertexId, VertexId>, FaceId> directed_edges;
+    std::unordered_map<EdgeKey, std::size_t, EdgeKeyHash> edge_use;
+    edge_use.reserve(edges_.size());
+    std::unordered_map<std::pair<VertexId, VertexId>, FaceId, VertexPairHash> directed_edges;
+    directed_edges.reserve(half_edges_.size());
 
     for (const auto& [face_id, face] : faces_) {
         if (!face_id || face.id != face_id || face.vertices.size() < 3U) {
@@ -1262,11 +1323,16 @@ core::Result<TopologySnapshot> EditableMesh::topology() const {
 }
 
 core::Result<void> TopologySnapshot::validate() const {
-    std::map<EdgeId, const EdgeRecord*> edges_by_id;
-    std::map<HalfEdgeId, const HalfEdgeRecord*> by_id;
-    std::map<CornerId, const CornerRecord*> corners_by_id;
-    std::map<EdgeId, std::size_t> edge_use;
-    std::map<CornerId, std::size_t> corner_use;
+    std::unordered_map<EdgeId, const EdgeRecord*, IdHash<EdgeId>> edges_by_id;
+    edges_by_id.reserve(edges.size());
+    std::unordered_map<HalfEdgeId, const HalfEdgeRecord*, IdHash<HalfEdgeId>> by_id;
+    by_id.reserve(half_edges.size());
+    std::unordered_map<CornerId, const CornerRecord*, IdHash<CornerId>> corners_by_id;
+    corners_by_id.reserve(corners.size());
+    std::unordered_map<EdgeId, std::size_t, IdHash<EdgeId>> edge_use;
+    edge_use.reserve(edges.size());
+    std::unordered_map<CornerId, std::size_t, IdHash<CornerId>> corner_use;
+    corner_use.reserve(corners.size());
     for (const auto& edge : edges) {
         if (!edge.id || !edge.first || !edge.second || edge.first == edge.second ||
             !(edge.first < edge.second) || !edge.first_half_edge) {
@@ -1378,7 +1444,8 @@ core::Result<std::vector<HalfEdgeId>> TopologySnapshot::face_boundary(FaceId fac
         return core::Result<std::vector<HalfEdgeId>>::failure(
             Diagnostic(ErrorCode::invalid_argument, "topology face id must be non-zero"));
     }
-    std::map<HalfEdgeId, const HalfEdgeRecord*> by_id;
+    std::unordered_map<HalfEdgeId, const HalfEdgeRecord*, IdHash<HalfEdgeId>> by_id;
+    by_id.reserve(half_edges.size());
     std::optional<HalfEdgeId> start;
     for (const auto& edge : half_edges) {
         by_id.emplace(edge.id, &edge);
@@ -1392,7 +1459,8 @@ core::Result<std::vector<HalfEdgeId>> TopologySnapshot::face_boundary(FaceId fac
     }
 
     std::vector<HalfEdgeId> boundary;
-    std::set<HalfEdgeId> visited;
+    std::unordered_set<HalfEdgeId, IdHash<HalfEdgeId>> visited;
+    visited.reserve(half_edges.size());
     HalfEdgeId current = *start;
     for (std::size_t count = 0U; count <= half_edges.size(); ++count) {
         if (current == *start && !boundary.empty()) {

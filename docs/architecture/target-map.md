@@ -48,11 +48,13 @@ The D3D12 target implements native queue, resource, transition, copy, clear,
 runtime DXC, graphics-pipeline, draw, texture-readback, debug-receipt,
 device-loss, deferred-destruction, sampled-texture descriptor, and indexed
 draw/readback paths. The optional Win32/DXGI swapchain and desktop shell
-configure and link as a native compile target. Its end-to-end graphics
-acceptance is currently blocked at PSO creation with an `E_INVALIDARG` receipt,
-and native execution is paused while the host is used for an ML ablation.
-Swapchain runtime, back-buffer import, desktop launch, and 8K hardware
-acceptance remain unverified.
+configure and link as a native compile target. Bounded headless acceptance now
+passes on the Quadro P5200 through runtime DXC shader compilation, graphics PSO
+creation, indexed draw, RGBA32F readback, and empty debug-layer receipts.
+D3D12 `CmdDispatch` remains unsupported, so GPU topology-kernel execution and
+performance are not claimed. Swapchain runtime, back-buffer import, desktop
+launch, PBR/HDR/shadow/temporal execution, and 8K hardware acceptance remain
+unverified.
 
 The remaining future target graph from the engineering specification is
 recorded in the roadmap. New targets must preserve these constraints:

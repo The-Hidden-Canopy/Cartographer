@@ -41,7 +41,11 @@ path derives a compiler-recipe digest from the target profile, entry point,
 optimization, and debug options. That field is not presented as a hash of the
 DXC executable; a stronger compiler binary identity requires backend support.
 
-The current GPU ablation boundary remains in force: these contracts and
-identities are prepared and compile-checked only. No D3D12/Vulkan execution,
-GPU timing, 8K allocation, shader compilation receipt, or native performance
-claim is implied until the operator releases that boundary.
+The native GPU boundary is now partially released for bounded local D3D12
+graphics acceptance. The headless receipt records Quadro P5200 identity,
+runtime DXC shader compilation, graphics PSO creation, indexed draw, RGBA32F
+readback, and empty debug-layer receipts. This does not exercise the geometry
+topology kernels: D3D12 `CmdDispatch` remains unsupported, so the CPU path is
+still authoritative for authoring and kernel benchmarks. No GPU timing,
+throughput, power, 8K, PBR/HDR, presentation, training, promotion, or outbound
+telemetry claim is implied.

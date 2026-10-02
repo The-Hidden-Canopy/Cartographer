@@ -497,10 +497,14 @@ core::Result<EvaluationGraph> EvaluationGraph::deserialize(std::string_view text
             return core::Result<EvaluationGraph>::failure(result.error());
         }
         const auto output_node = read_uint(stream, "output node");
-        const auto input_node = read_uint(stream, "input node");
         std::string output_port;
+        if (!output_node || !(stream >> output_port)) {
+            return core::Result<EvaluationGraph>::failure(parse_error(
+                "evaluation graph serialization contains an incomplete connection").error());
+        }
+        const auto input_node = read_uint(stream, "input node");
         std::string input_port;
-        if (!output_node || !input_node || !(stream >> output_port >> input_port)) {
+        if (!input_node || !(stream >> input_port)) {
             return core::Result<EvaluationGraph>::failure(parse_error(
                 "evaluation graph serialization contains an incomplete connection").error());
         }

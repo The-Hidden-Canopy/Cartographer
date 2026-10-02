@@ -244,6 +244,7 @@ std::wstring utf8_to_wide(const std::string& value) {
 
 HMODULE load_dxc_module() {
     std::vector<std::filesystem::path> candidates;
+    std::vector<std::filesystem::path> versioned_candidates;
     const std::wstring configured = environment_value(L"CARTO_DXCOMPILER_PATH");
     if (!configured.empty()) candidates.emplace_back(configured);
     candidates.emplace_back(L"dxcompiler.dll");
@@ -255,7 +256,7 @@ HMODULE load_dxc_module() {
         if (std::filesystem::exists(bin_root, error)) {
             for (const auto& version : std::filesystem::directory_iterator(bin_root, error)) {
                 if (error) break;
-                candidates.push_back(version.path() / L"x64" / L"dxcompiler.dll");
+                versioned_candidates.push_back(version.path() / L"x64" / L"dxcompiler.dll");
             }
         }
     }
@@ -265,10 +266,18 @@ HMODULE load_dxc_module() {
     if (std::filesystem::exists(installed_root, error)) {
         for (const auto& version : std::filesystem::directory_iterator(installed_root, error)) {
             if (error) break;
-            candidates.push_back(version.path() / L"x64" / L"dxcompiler.dll");
+            versioned_candidates.push_back(version.path() / L"x64" / L"dxcompiler.dll");
         }
     }
-for (const auto& candidate : candidates) {
+    // Directory enumeration order is unspecified. Prefer the newest installed
+    // SDK runtime so the produced DXIL matches the current Windows validator;
+    // an explicit CARTO_DXCOMPILER_PATH still wins above this list.
+    std::sort(versioned_candidates.begin(), versioned_candidates.end(),
+              [](const auto& left, const auto& right) {
+                  return left.wstring() > right.wstring();
+              });
+    candidates.insert(candidates.end(), versioned_candidates.begin(), versioned_candidates.end());
+    for (const auto& candidate : candidates) {
         HMODULE module = LoadLibraryW(candidate.c_str());
         if (module != nullptr) return module;
     }
@@ -503,6 +512,10 @@ struct D3D12Device::Impl {
     UINT next_srv = 0U;
     UINT next_sampler = 0U;
     static constexpr UINT descriptor_capacity = 4096U;
+    // D3D12 caps shader-visible sampler heaps at 2048 descriptors, while the
+    // CBV/SRV/UAV heap has a separate, larger limit. Keep the capacities
+    // distinct so device creation does not request an invalid native heap.
+    static constexpr UINT sampler_descriptor_capacity = 2048U;
     gpu::Registry<gpu::BufferTag, BufferResource> buffers;
     gpu::Registry<gpu::TextureTag, TextureResource> textures;
     gpu::Registry<gpu::SamplerTag, SamplerResource> samplers;
@@ -689,7 +702,7 @@ core::Result<std::unique_ptr<D3D12Device>> D3D12Device::create(D3D12DeviceOption
     }
     D3D12_DESCRIPTOR_HEAP_DESC sampler_heap_descriptor{};
     sampler_heap_descriptor.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
-    sampler_heap_descriptor.NumDescriptors = Impl::descriptor_capacity;
+    sampler_heap_descriptor.NumDescriptors = Impl::sampler_descriptor_capacity;
     sampler_heap_descriptor.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     status = impl->device->CreateDescriptorHeap(
         &sampler_heap_descriptor, IID_PPV_ARGS(&impl->sampler_heap));
@@ -941,7 +954,7 @@ core::Result<gpu::SamplerHandle> D3D12Device::create_sampler(
     if (auto result = gpu::validate(descriptor); !result) {
         return core::Result<gpu::SamplerHandle>::failure(result.error());
     }
-    if (impl_->next_sampler >= Impl::descriptor_capacity) {
+    if (impl_->next_sampler >= Impl::sampler_descriptor_capacity) {
         return core::Result<gpu::SamplerHandle>::failure(invalid(
             "D3D12 sampler descriptor heap is exhausted"));
     }
@@ -1368,7 +1381,9 @@ core::Result<std::vector<std::uint8_t>> D3D12Device::read_buffer(
     }
     std::vector<std::uint8_t> output(static_cast<std::size_t>(bytes));
     std::memcpy(output.data(), static_cast<const std::uint8_t*>(mapped) + offset, output.size());
-    result.value()->resource->Unmap(0U, &read_range);
+    // This is a CPU read from a READBACK heap; an empty written range tells
+    // D3D12 that the CPU did not modify the resource while it was mapped.
+    result.value()->resource->Unmap(0U, nullptr);
     return core::Result<std::vector<std::uint8_t>>::success(std::move(output));
 }
 
@@ -1427,7 +1442,10 @@ core::Result<std::vector<float>> D3D12Device::read_texture_rgba32f(
             current->second,
         });
     }
-    const auto serial = mutable_device->submit(stream, gpu::QueueType::copy);
+    // A texture may need to return from copy_source to its prior render-target
+    // state. Record both transitions on the graphics queue; a copy queue cannot
+    // legally own that graphics-state restoration barrier on all D3D12 drivers.
+    const auto serial = mutable_device->submit(stream, gpu::QueueType::graphics);
     if (!serial) {
         static_cast<void>(mutable_device->destroy_buffer(readback.value()));
         return core::Result<std::vector<float>>::failure(serial.error());

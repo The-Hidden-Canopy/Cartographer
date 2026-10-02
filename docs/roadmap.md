@@ -41,7 +41,7 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] bounded worker-backed evaluation scheduler with unpublished candidate receipts
 - [x] project-package graph reference binding, journal/checkpoint preservation, and polygon topology-provenance adapter
 - [x] opt-in Windows D3D12 adapter/resource boundary and native identity smoke acceptance
-- [ ] D3D12 production backend with headless parity against the CPU command semantics (DXIL, descriptor tables, indexed draw/readback, debug receipts, deferred destruction, and a compile-only Win32/DXGI presentation seam exist; current PSO `E_INVALIDARG` receipt is unresolved)
++ [ ] D3D12 production backend with headless parity against the CPU command semantics (bounded native DXIL, descriptor-table, indexed draw/readback, debug-receipt, and deferred-destruction acceptance passes on the Quadro P5200; compute dispatch, PBR/HDR/temporal parity, swapchain runtime, desktop launch, and 8K remain)
 - [x] SHA-256 content-addressed blob store with atomic publication and integrity verification
 - [x] append-only revision-bound journal with hash chain, verification, replay callback, content-addressed checkpoints, and staged transaction publication
 - [x] authority-preserving `carto_ui` foundation with design tokens, density/theme/operator/workspace state, operation/problems projections, shortcut routing, and bounded local preferences
@@ -61,14 +61,14 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [ ] persistent topology edit patches, loop/ring traversal, edge-edit tools, and broader modeling tool interaction (identity/traversal and vertex patches exist; topology operators and native input acceptance pending)
 
 The optional native source path is intentionally not marked complete by the
-presence of a window class or renderer type. The CPU device now supplies the
+presence of a window class or renderer type. The CPU device supplies the
 offline semantic acceptance rung, including texture sampling and bounded
-lighting/temporal references; the production Windows path still requires a
-passing D3D12 PSO/draw/readback receipt, typed swapchain back-buffer import,
-launch, input, resize/DPI, and GPU evidence pass. Native execution is paused
-during the current ML ablation. The existing Vulkan path remains
-compatibility-only until its independent acceptance and removal decision are
-complete.
+lighting/temporal references. The bounded D3D12 path now has a passing
+PSO/draw/readback receipt on the Quadro P5200, but the production Windows path
+still requires typed swapchain back-buffer import, launch, input, resize/DPI,
+compute coverage, PBR/HDR/temporal parity, and GPU/8K evidence. The existing
+Vulkan path remains compatibility-only until its independent acceptance and
+removal decision are complete.
 
 The cross-repository tranche is also intentionally split. A valid hash chain or
 content-addressed blob is not a recovered project, SQLite package, or promotion
