@@ -1,5 +1,6 @@
 #pragma once
 
+#include <carto/assets/blob_store.hpp>
 #include <carto/core/revision.hpp>
 #include <carto/core/result.hpp>
 #include <carto/geometry/mesh.hpp>
@@ -9,6 +10,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -45,7 +47,7 @@ struct SaveReceipt {
 
 class ProjectDocument {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 2;
+    static constexpr std::uint32_t kSchemaVersion = 3;
     static constexpr std::uint32_t kMinimumReadableSchemaVersion = 1;
     static constexpr std::string_view kMagic = "CARTOGRAPHER_PROJECT";
     static constexpr std::string_view kAuthoringFormat = "cartographer.authoring";
@@ -68,6 +70,9 @@ public:
     [[nodiscard]] const scene::Scene& scene() const noexcept { return scene_; }
     [[nodiscard]] const std::map<std::uint64_t, geometry::EditableMesh>& meshes() const noexcept {
         return meshes_;
+    }
+    [[nodiscard]] const std::optional<assets::Sha256Digest>& evaluation_graph_digest() const noexcept {
+        return evaluation_graph_digest_;
     }
     [[nodiscard]] core::Revision revision() const noexcept { return revision_; }
     [[nodiscard]] std::uint32_t schema_version() const noexcept { return kSchemaVersion; }
@@ -108,6 +113,10 @@ private:
     [[nodiscard]] core::Result<void> attach_mesh(
         scene::ObjectId object,
         std::uint64_t mesh_asset);
+    // Binds a content-addressed evaluation graph snapshot to the same
+    // revisioned document state that is journaled and checkpointed.
+    [[nodiscard]] core::Result<void> set_evaluation_graph_digest(
+        std::optional<assets::Sha256Digest> digest);
     [[nodiscard]] core::Result<void> set_object_transform(
         scene::ObjectId object,
         core::Transform transform);
@@ -129,6 +138,7 @@ private:
     std::string name_ = "Untitled";
     scene::Scene scene_;
     std::map<std::uint64_t, geometry::EditableMesh> meshes_;
+    std::optional<assets::Sha256Digest> evaluation_graph_digest_;
     std::uint64_t next_mesh_id_ = 1;
     core::Revision revision_{};
 };

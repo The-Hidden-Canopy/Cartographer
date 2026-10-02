@@ -13,11 +13,17 @@
       "binaryDir": "${sourceDir}/build/default",
       "cacheVariables": {
         "CARTO_BUILD_TESTS": "ON",
+        "CARTO_BUILD_BENCHMARKS": "OFF",
         "CARTO_BUILD_CLI": "ON",
+        "CARTO_BUILD_DEVICE_CPU": "ON",
         "CARTO_BUILD_PRIVATE_INTEGRATIONS": "OFF",
+        "CARTO_PRIVATE_SOURCE_ROOT": "",
         "CARTO_BUILD_GMIB_GRAPHICS": "OFF",
         "CARTO_BUILD_GMIB_GAME": "OFF",
+        "CARTO_GMIB_ROOT": "",
         "CARTO_ENABLE_VULKAN": "OFF",
+        "CARTO_ENABLE_D3D12": "OFF",
+        "CARTO_BUILD_D3D12_DESKTOP": "OFF",
         "CARTO_BUILD_DESKTOP": "OFF"
       }
     },
@@ -47,6 +53,24 @@
       "cacheVariables": {
         "CARTO_ENABLE_VULKAN": "ON"
       }
+    },
+    {
+      "name": "d3d12-headless-release",
+      "displayName": "Cartographer D3D12 headless acceptance",
+      "inherits": "headless-release",
+      "binaryDir": "${sourceDir}/build/d3d12-headless-release",
+      "cacheVariables": {
+        "CARTO_ENABLE_D3D12": "ON"
+      }
+    },
+    {
+      "name": "d3d12-desktop-compile",
+      "displayName": "Cartographer native D3D12 desktop compile",
+      "inherits": "d3d12-headless-release",
+      "binaryDir": "${sourceDir}/build/d3d12-desktop-compile",
+      "cacheVariables": {
+        "CARTO_BUILD_D3D12_DESKTOP": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -65,6 +89,14 @@
     {
       "name": "vulkan-headless-release",
       "configurePreset": "vulkan-headless-release"
+    },
+    {
+      "name": "d3d12-headless-release",
+      "configurePreset": "d3d12-headless-release"
+    },
+    {
+      "name": "d3d12-desktop-compile",
+      "configurePreset": "d3d12-desktop-compile"
     }
   ],
   "testPresets": [
@@ -92,6 +124,13 @@
     {
       "name": "vulkan-headless-release",
       "configurePreset": "vulkan-headless-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "d3d12-headless-release",
+      "configurePreset": "d3d12-headless-release",
       "output": {
         "outputOnFailure": true
       }

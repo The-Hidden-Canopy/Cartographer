@@ -1,6 +1,7 @@
 #include "project_document_access.hpp"
 
 #include <carto/assets/blob_store.hpp>
+#include <carto/eval/graph.hpp>
 #include <carto/journal/checkpoint.hpp>
 #include <carto/project/package.hpp>
 #include <carto/project/file_lock.hpp>
@@ -430,6 +431,111 @@ void package_manifest_is_human_readable_and_does_not_fabricate_database() {
     REQUIRE(rejected.error().code == carto::core::ErrorCode::version_mismatch);
 }
 
+void package_persists_evaluation_graph_as_verified_content_addressed_state() {
+    TempDirectory temp;
+    const auto path = temp.path() / "Graph.carto";
+    auto package = carto::project::ProjectPackage::create(path, {
+        "graph-project", "Graph Project", "meter", "z",
+    });
+    REQUIRE(package);
+
+    carto::eval::EvaluationGraph graph;
+    REQUIRE(graph.register_type(carto::eval::NodeTypeDefinition{
+        carto::eval::NodeTypeId{"source"},
+        {carto::eval::PortDescriptor{
+            carto::eval::PortId{"mesh"},
+            carto::eval::PortDirection::output,
+            carto::eval::ValueKind::editable_mesh}},
+    }));
+    const auto node = graph.create_node(carto::eval::NodeTypeId{"source"}, "source-v1");
+    REQUIRE(node);
+    const auto stored = package.value().store_evaluation_graph(graph);
+    REQUIRE(stored);
+    REQUIRE(package.value().manifest().evaluation_graph_blob.has_value());
+    REQUIRE(package.value().manifest().evaluation_graph_blob.value() == stored.value().digest);
+
+    carto::project::ProjectDocument bound_document;
+    carto::journal::Journal binding_journal(temp.path() / "binding" / "journal.log");
+    auto binding = carto::project::ProjectTransaction::begin(
+        bound_document, binding_journal, "graph-binding");
+    REQUIRE(binding);
+    REQUIRE(binding.value().set_evaluation_graph_digest(stored.value().digest));
+    REQUIRE(binding.value().commit("graph.bind"));
+    REQUIRE(package.value().validate_document_binding(bound_document));
+    REQUIRE(!package.value().validate_document_binding(carto::project::ProjectDocument{}));
+
+    const auto opened = carto::project::ProjectPackage::open(path);
+    REQUIRE(opened);
+    const auto loaded = opened.value().load_evaluation_graph();
+    REQUIRE(loaded);
+    REQUIRE(loaded.value().content_digest() == graph.content_digest());
+
+    const auto graph_blob = opened.value().manifest().evaluation_graph_blob.value();
+    const auto graph_path = opened.value().blob_store().path_for(graph_blob);
+    std::ofstream tampered(graph_path, std::ios::binary | std::ios::trunc);
+    tampered << "tampered";
+    tampered.close();
+    const auto rejected = carto::project::ProjectPackage::open(path);
+    REQUIRE(!rejected);
+    REQUIRE(rejected.error().code == carto::core::ErrorCode::validation_failed);
+}
+
+void package_concurrent_graph_writers_fail_closed_on_stale_manifests() {
+    TempDirectory temp;
+    const auto path = temp.path() / "Concurrent.carto";
+    auto created = carto::project::ProjectPackage::create(path, {
+        "concurrent-project", "Concurrent Project", "meter", "z",
+    });
+    REQUIRE(created);
+    auto first = carto::project::ProjectPackage::open(path);
+    auto second = carto::project::ProjectPackage::open(path);
+    REQUIRE(first && second);
+
+    carto::eval::EvaluationGraph graph_a;
+    REQUIRE(graph_a.register_type(carto::eval::NodeTypeDefinition{
+        carto::eval::NodeTypeId{"source-a"},
+        {carto::eval::PortDescriptor{
+            carto::eval::PortId{"mesh"}, carto::eval::PortDirection::output,
+            carto::eval::ValueKind::editable_mesh}},
+    }));
+    carto::eval::EvaluationGraph graph_b;
+    REQUIRE(graph_b.register_type(carto::eval::NodeTypeDefinition{
+        carto::eval::NodeTypeId{"source-b"},
+        {carto::eval::PortDescriptor{
+            carto::eval::PortId{"mesh"}, carto::eval::PortDirection::output,
+            carto::eval::ValueKind::editable_mesh}},
+    }));
+
+    std::atomic<std::uint32_t> ready{0U};
+    std::atomic<bool> first_succeeded{false};
+    std::atomic<bool> second_succeeded{false};
+    std::thread first_writer([&] {
+        ready.fetch_add(1U, std::memory_order_release);
+        while (ready.load(std::memory_order_acquire) != 2U) std::this_thread::yield();
+        first_succeeded.store(
+            static_cast<bool>(first.value().store_evaluation_graph(graph_a)),
+            std::memory_order_release);
+    });
+    std::thread second_writer([&] {
+        ready.fetch_add(1U, std::memory_order_release);
+        while (ready.load(std::memory_order_acquire) != 2U) std::this_thread::yield();
+        second_succeeded.store(
+            static_cast<bool>(second.value().store_evaluation_graph(graph_b)),
+            std::memory_order_release);
+    });
+    first_writer.join();
+    second_writer.join();
+
+    REQUIRE(first_succeeded.load(std::memory_order_acquire) !=
+            second_succeeded.load(std::memory_order_acquire));
+    const auto reopened = carto::project::ProjectPackage::open(path);
+    REQUIRE(reopened);
+    const auto loaded = reopened.value().load_evaluation_graph();
+    REQUIRE(loaded);
+    REQUIRE(loaded.value().content_digest() == graph_a.content_digest() ||
+            loaded.value().content_digest() == graph_b.content_digest());
+}
+
 void project_transaction_publishes_only_after_journal_append() {
     TempDirectory temp;
     carto::project::ProjectDocument document;
@@ -473,6 +579,60 @@ void project_transaction_publishes_only_after_journal_append() {
     REQUIRE(stale_commit.error().code == carto::core::ErrorCode::stale_data);
     REQUIRE(blocked.value().active());
     REQUIRE(journal.current_revision().value() == carto::core::Revision{1U});
+}
+
+void project_transaction_journals_evaluation_graph_reference_with_document_state() {
+    TempDirectory temp;
+    carto::project::ProjectDocument document;
+    carto::journal::Journal journal(temp.path() / "recovery" / "journal.log");
+    carto::journal::CheckpointStore checkpoints(temp.path() / "recovery" / "checkpoints");
+    const std::string baseline = document.serialize();
+    const auto asset_manifest = carto::assets::sha256(std::span<const std::uint8_t>{
+        reinterpret_cast<const std::uint8_t*>("assets"), 6U});
+    REQUIRE(checkpoints.save(
+        journal, carto::core::Revision{},
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(baseline.data()), baseline.size()),
+        asset_manifest));
+
+    const auto digest = carto::assets::sha256(std::span<const std::uint8_t>{
+        reinterpret_cast<const std::uint8_t*>("graph-snapshot"), 14U});
+    auto transaction = carto::project::ProjectTransaction::begin(document, journal, "graph-editor");
+    REQUIRE(transaction);
+    REQUIRE(transaction.value().create_object("graph-bound"));
+    REQUIRE(transaction.value().set_evaluation_graph_digest(digest));
+    const auto committed = transaction.value().commit("graph.bind");
+    REQUIRE(committed);
+    REQUIRE(document.evaluation_graph_digest().has_value());
+    REQUIRE(document.evaluation_graph_digest().value() == digest);
+
+    const auto entries = journal.read_all();
+    REQUIRE(entries);
+    const std::string payload(entries.value().front().payload.begin(), entries.value().front().payload.end());
+    REQUIRE(payload.find("EVALUATION_GRAPH_DIGEST " + digest.hex()) != std::string::npos);
+
+    const auto checkpoint_text = document.serialize();
+    const auto restored = carto::project::ProjectDocument::deserialize(checkpoint_text);
+    REQUIRE(restored);
+    REQUIRE(restored.value().evaluation_graph_digest().has_value());
+    REQUIRE(restored.value().evaluation_graph_digest().value() == digest);
+
+    const auto recovered = carto::project::recover_from_journal(checkpoints, journal);
+    REQUIRE(recovered);
+    REQUIRE(recovered.value().document.evaluation_graph_digest().has_value());
+    REQUIRE(recovered.value().document.evaluation_graph_digest().value() == digest);
+
+    REQUIRE(!carto::project::ProjectDocument::deserialize(
+        checkpoint_text.substr(0, checkpoint_text.find("EVALUATION_GRAPH_DIGEST")) +
+        "EVALUATION_GRAPH_DIGEST 0000000000000000000000000000000000000000000000000000000000000000\nEND\n"));
+    std::string legacy_graph = checkpoint_text;
+    const auto current_header = legacy_graph.find("CARTOGRAPHER_PROJECT 3");
+    REQUIRE(current_header != std::string::npos);
+    legacy_graph.replace(current_header, std::string("CARTOGRAPHER_PROJECT 3").size(),
+                         "CARTOGRAPHER_PROJECT 2");
+    const auto rejected_legacy_graph = carto::project::ProjectDocument::deserialize(legacy_graph);
+    REQUIRE(!rejected_legacy_graph);
+    REQUIRE(rejected_legacy_graph.error().code == carto::core::ErrorCode::version_mismatch);
 }
 
 void project_recovery_replays_only_verified_snapshot_envelopes() {
@@ -569,7 +729,10 @@ int main(int argc, char** argv) {
             std::filesystem::absolute(std::filesystem::path(argv[0])));
         checkpoint_store_recovers_pending_entries_and_rejects_mismatch();
         package_manifest_is_human_readable_and_does_not_fabricate_database();
+        package_persists_evaluation_graph_as_verified_content_addressed_state();
+        package_concurrent_graph_writers_fail_closed_on_stale_manifests();
         project_transaction_publishes_only_after_journal_append();
+        project_transaction_journals_evaluation_graph_reference_with_document_state();
         project_recovery_replays_only_verified_snapshot_envelopes();
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';

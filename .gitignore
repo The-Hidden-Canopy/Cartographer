@@ -58,10 +58,26 @@ _deps/
 /.hub/
 /hub-local/
 
-# Private/uncleared integration material must stay out of the public tree.
+# Only moat material is permanently private. Keep explicit quarantine paths so
+# models, weights, prompts, telemetry, tuning, and private runtime snapshots
+# cannot be staged accidentally; ordinary public kernels, tests, shaders, and
+# benchmarks remain visible to review.
+/.moat/
+/moat/
+/.private-runtime/
+/private-runtime/
+/models-private/
+/weights-private/
+/prompts-private/
+/telemetry-private/
+/tuning-private/
+
+# Private/uncleared integration material must stay out of the public tree
+# until provenance and licensing are cleared.
 /private/
 /.private/
 /docs/anatomy/
+/docs/spec/
 *.owh.carto
 *.private.*
 .codex-remote-attachments/

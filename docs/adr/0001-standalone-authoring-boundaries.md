@@ -11,16 +11,16 @@ truth lives in scene, project, and geometry layers. Rendering, interchange,
 UI, and future simulation consume validated derived or exported data and do not
 become alternate sources of truth.
 
-The public repository is built without private runtime targets or hosted
-service dependencies. Generic behavior is implemented under Cartographer
-namespaces. Any future compatibility adapter must remain outside the core
-public target graph and carry its own provenance review.
+The public repository is built without moat runtime targets or hosted-service
+dependencies. Generic behavior is implemented under Cartographer namespaces.
+Any not-yet-cleared compatibility adapter may remain outside the core public
+target graph during provenance review; once cleared, an ordinary adapter may
+become public without changing authoring authority.
 
 ## Pressure and rejected alternatives
 
-- Straight-copying a private runtime would shorten the first implementation but
-  would risk private IP leakage and semantic coupling to a non-public revision
-  model.
+- Straight-copying a moat runtime would shorten the first implementation but
+  would risk IP leakage and semantic coupling to a non-public revision model.
 - Making Vulkan or the desktop shell mandatory would prevent headless geometry
   tests and make a missing SDK look like a modeling capability.
 - Storing compiled render data as project truth would make stale cache output

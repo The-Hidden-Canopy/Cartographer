@@ -144,6 +144,12 @@ core::Result<void> ProjectTransaction::attach_mesh(
     return staged_.attach_mesh(object, mesh_asset);
 }
 
+core::Result<void> ProjectTransaction::set_evaluation_graph_digest(
+    std::optional<assets::Sha256Digest> digest) {
+    if (auto result = ensure_active(); !result) return result;
+    return staged_.set_evaluation_graph_digest(digest);
+}
+
 core::Result<void> ProjectTransaction::set_object_transform(
     scene::ObjectId object,
     core::Transform transform) {

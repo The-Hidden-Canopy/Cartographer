@@ -1,8 +1,10 @@
 # Public render hardware boundary
 
-`carto_gpu` is the first public render-resource boundary described by the
+`carto_gpu` is the public render-resource boundary described by the
 cross-repository architecture specification. It is intentionally backend
-neutral and does not include Vulkan headers or expose native API handles.
+neutral and does not include Vulkan or D3D12 headers or expose native API
+handles. `carto_device_ir` and `carto_device` build the submission boundary
+above it; `carto_device_cpu` provides the first executable semantic oracle.
 
 ## Implemented foundation
 
@@ -13,14 +15,24 @@ neutral and does not include Vulkan headers or expose native API handles.
   generation before a slot can be reused.
 - `BufferDesc`, `TextureDesc`, `SamplerDesc`, `ShaderDesc`, `PipelineDesc`,
   and `RenderTargetDesc` describe the public intent without naming a backend.
+- `PipelineDesc` can carry an explicit bounded vertex layout and stride. An
+  empty layout retains the legacy float4 `POSITION` contract; native D3D12
+  maps explicit attributes to DXGI input elements without shader reflection.
 - RHI descriptors now carry explicit format, texture dimension, buffer/texture
   usage, sampler, shader-stage, pipeline-state, and device-capability contracts.
   Descriptor validators reject ambiguous format/usage combinations before a
   backend can create a native resource.
 - `carto_assets` retains source texture identity, mip metadata, semantic, and
   color-space requirements. `carto_render` provides a validated
-  `StandardMaterial`, deterministic CPU PBR/HDR reference math, and immutable
-  render-request quality profiles.
+  `StandardMaterial`, deterministic CPU PBR/HDR/shadow/temporal reference
+  math, immutable render-request quality profiles, aligned GPU frame/material/
+  light/temporal constants, and a canonical shadow/opaque/temporal/tone-map/
+  present graph plan.
+- `carto_device` exposes a local kernel precision/evidence contract. It keeps
+  requested representation separate from actual arithmetic and execution
+  path, requires native source/binary identity, records explicit fallback
+  reasons, and never exports telemetry. See
+  [kernel-evidence.md](kernel-evidence.md).
 - `carto_render_graph` validates resource descriptors, read-before-write
   hazards, write transitions, stage/format compatibility, and alias lifetime
   overlap. Its output is a deterministic compiled description, not a GPU
@@ -31,9 +43,22 @@ GPU handles are session-local derived state. They are never serialized into a
 
 ## Deferred runtime claims
 
-`carto_gpu` does not yet provide a `Device`, queue submission, fences, surface,
-swapchain, shader compiler, or native Vulkan execution. Deferred destruction
-planning exists, but native resource retirement is still a backend concern.
+`carto_gpu` remains a resource-description and lifetime layer. The separate
+`carto_device` target now provides a backend-neutral `Device`, queue
+submission, completion serials, bounded readback, and shader-binary contract;
+`carto_device_ir` provides validated command streams; and
+`carto_device_cpu` executes the bounded reference subset, including explicit
+RGBA32F texture transfer and sampling semantics. None of these layers provides
+a surface, swapchain, or native Vulkan execution.
+Deferred destruction planning exists, but native resource retirement is still
+a backend concern.
+The GPU preparation tranche adds `carto_render`'s aligned ABI and pass plan,
+plus packaged D3D12 HLSL sources for forward PBR, depth shadows, temporal
+resolve, and HDR tone mapping. These are source and layout preparation only;
+they have not been compiled or executed on the GPU in the current ablation.
+The D3D12 shader binary boundary also retains SHA-256 source and bytecode
+identity when runtime DXC is available; the compiler field identifies the
+invocation recipe and does not overclaim executable provenance.
 The optional `carto_vulkan` target remains a separate runtime seam. The current
 headless acceptance validates a caller-provided `geometry::CompiledMesh`,
 creates an RGBA16F color target and D32 depth target, compiles and loads the

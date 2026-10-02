@@ -2,13 +2,17 @@
 
 #include <carto/assets/blob_store.hpp>
 #include <carto/core/result.hpp>
+#include <carto/eval/graph.hpp>
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <utility>
 
 namespace carto::project {
+
+class ProjectDocument;
 
 struct PackageManifest {
     static constexpr std::uint32_t kCurrentFormatVersion = 2U;
@@ -17,6 +21,7 @@ struct PackageManifest {
     std::string name;
     std::string units = "meter";
     std::string up_axis = "z";
+    std::optional<assets::Sha256Digest> evaluation_graph_blob = std::nullopt;
 
     [[nodiscard]] bool operator==(const PackageManifest&) const noexcept = default;
 };
@@ -33,7 +38,15 @@ public:
         const std::filesystem::path& root);
 
     [[nodiscard]] core::Result<void> validate() const;
+    // Validates that the document's optional graph reference agrees with the
+    // package manifest and that the referenced blob is already verified.
+    // This is an explicit cross-file check, not a multi-file commit.
+    [[nodiscard]] core::Result<void> validate_document_binding(
+        const ProjectDocument& document) const;
     [[nodiscard]] assets::BlobStore blob_store() const;
+    [[nodiscard]] core::Result<assets::BlobRef> store_evaluation_graph(
+        const eval::EvaluationGraph& graph);
+    [[nodiscard]] core::Result<eval::EvaluationGraph> load_evaluation_graph() const;
 
     [[nodiscard]] const PackageManifest& manifest() const noexcept { return manifest_; }
     [[nodiscard]] const std::filesystem::path& root() const noexcept { return root_; }

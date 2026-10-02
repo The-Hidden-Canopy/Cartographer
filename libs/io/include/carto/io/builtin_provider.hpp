@@ -12,7 +12,7 @@ namespace carto::io {
 
 // Registers the deterministic public glTF export profile through the same
 // lifecycle gate.  The profile is derived interchange, not authoring truth or
-// a private runtime adapter.
+// a moat runtime adapter.
 [[nodiscard]] core::Result<void> register_builtin_gltf_providers(
     providers::Registry& registry);
 

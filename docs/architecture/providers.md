@@ -27,5 +27,6 @@ The in-process OBJ, PLY, STL, and deterministic glTF interchange functions are
 registered through this path and the CLI requires their capabilities to be
 ready before invoking them. The actual functions remain statically linked and
 deterministic; registry resolution is a lifecycle/authority gate, not dynamic
-loading. Hosted providers and private runtime adapters remain outside the
-public target graph and require their own release decision and evidence.
+loading. Hosted providers and moat runtime adapters remain outside the public
+target graph. Other external providers and adapters require provenance,
+licensing, and release evidence before they move into the public graph.

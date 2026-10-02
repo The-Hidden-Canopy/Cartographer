@@ -1,7 +1,9 @@
-# Cartographer project format v2
+# Cartographer project format v2 (legacy)
 
-Cartographer v2 keeps the deterministic line-oriented authoring model from v1
-but adds an explicit authoring envelope before the document name:
+Cartographer v2 is the legacy deterministic line-oriented authoring model from
+v1 with an explicit authoring envelope before the document name. New saves use
+[project format v3](cartographer-project-v3.md), which adds the optional
+content-addressed evaluation-graph reference:
 
 ```text
 CARTOGRAPHER_PROJECT 2
@@ -31,9 +33,9 @@ Derived formats may narrow or triangulate only at their own validated adapter
 boundary and must report that loss. No compiled render data, GPU handles,
 materials, textures, or AI/runtime state is stored in the authoring file.
 
-The parser continues to accept v1 files. A v1 load is an explicit legacy read;
-the next save writes v2 with the authoring envelope. Unknown or future schema
-versions, missing or mismatched v2 envelope fields, duplicate records,
+The parser continues to accept v1 and v2 files. A legacy load is an explicit
+legacy read; the next save writes v3. Unknown or future schema versions,
+missing or mismatched v2 envelope fields, duplicate records,
 trailing data, malformed topology, non-finite values, path traversal, and
 resource-limit violations fail closed.
 

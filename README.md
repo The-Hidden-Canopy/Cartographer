@@ -6,9 +6,9 @@ interchange workflows.
 
 The implementation is a standalone 0.1 foundation. Its public/private release
 boundary is recorded in [docs/provenance.md](docs/provenance.md) and
-[docs/public-private-boundary.md](docs/public-private-boundary.md). Internal
-source specifications and private integration material are maintained outside
-this public checkout.
+[docs/public-private-boundary.md](docs/public-private-boundary.md). Moat assets
+and not-yet-cleared integration material are maintained outside this public
+checkout.
 
 ## What works today
 
@@ -62,7 +62,7 @@ this public checkout.
   outbound telemetry in this path.
 - `carto_project` persists authoring state in a versioned, deterministic text
   format with pre-commit validation and atomic replacement. New saves use the
-  v2 authoring envelope while v1 projects remain readable. Render caches are
+  v3 authoring envelope and optional graph reference while v1/v2 projects remain readable. Render caches are
   not serialized as project truth.
 - `carto_io` provides OBJ, polygon-preserving ASCII PLY, binary/ASCII STL, and
   a bounded glTF export profile. Unsupported features are reported as loss
@@ -120,10 +120,11 @@ sketches/constraints, B-Rep/booleans, BIM objects, animation, rigging, physics,
 plugins, Python bindings, full glTF/STEP/IFC interchange, and large-scene
 streaming.
 
-No Hub service, account authority, model runtime, private adapter, RegOS
-service, IDA runtime, or cloud dependency is required or linked. Private OWH,
-GMIB, anatomy, and hosted integration surfaces are maintained in the adjacent
-private companion tree and are not part of the public build.
+No Hub service, account authority, model runtime, moat adapter, RegOS service,
+IDA runtime, or cloud dependency is required or linked. OWH, GMIB, anatomy,
+simulation, and other ordinary integration surfaces may be maintained in the
+adjacent companion tree while provenance and licensing are reviewed; they are
+not automatically part of the moat or the public runtime dependency graph.
 
 ## Build and test
 
@@ -229,13 +230,15 @@ boundary](docs/architecture/proposal-boundary.md), and the [target map](docs/arc
 ## Governance and provenance
 
 The public implementation keeps authoring truth and generic interchange
-contracts independent of private runtimes. See [public provenance](docs/provenance.md),
+contracts independent of moat runtimes. See [public provenance](docs/provenance.md),
 [the public/private boundary](docs/public-private-boundary.md),
 [ADR-0001](docs/adr/0001-standalone-authoring-boundaries.md), and the
 [capability matrix](docs/capability-matrix.md).
 The concrete 0.1 evidence is recorded in the
 [acceptance matrix](docs/verification/acceptance-matrix.md).
 
-The tracked [LICENSE](LICENSE) file is not by itself a redistribution decision.
-Confirm the owner-approved public license and review all release material before
-publication. The project follows the [Open Canopy Contract](OPEN_CANOPY_CONTRACT.md).
+Source released in this repository is licensed under the tracked
+[Apache License 2.0](LICENSE). That license does not grant rights to moat
+assets held outside this repository, and third-party provenance still requires
+review before publication. The project follows the
+[Open Canopy Contract](OPEN_CANOPY_CONTRACT.md).

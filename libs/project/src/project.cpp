@@ -336,6 +336,23 @@ core::Result<void> ProjectDocument::attach_mesh(scene::ObjectId object, std::uin
     return core::Result<void>::success();
 }
 
+core::Result<void> ProjectDocument::set_evaluation_graph_digest(
+    std::optional<assets::Sha256Digest> digest) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (digest.has_value() && digest->is_zero()) {
+        return core::Result<void>::failure(
+            invalid("evaluation graph digest must not be zero"));
+    }
+    if (evaluation_graph_digest_ == digest) {
+        return core::Result<void>::success();
+    }
+    evaluation_graph_digest_ = digest;
+    bump_revision();
+    return core::Result<void>::success();
+}
+
 core::Result<void> ProjectDocument::set_object_transform(
     scene::ObjectId object,
     core::Transform transform) {
@@ -386,6 +403,10 @@ core::Result<void> ProjectDocument::validate() const {
             return core::Result<void>::failure(parse_error("mesh revision space is exhausted"));
         }
     }
+    if (evaluation_graph_digest_.has_value() && evaluation_graph_digest_->is_zero()) {
+        return core::Result<void>::failure(parse_error(
+            "project evaluation graph digest must not be zero"));
+    }
     for (const auto& object : scene_.objects_sorted()) {
         if (object.mesh_asset.has_value() && !meshes_.contains(*object.mesh_asset)) {
             return core::Result<void>::failure(
@@ -399,6 +420,7 @@ void ProjectDocument::swap(ProjectDocument& other) noexcept {
     name_.swap(other.name_);
     scene_.swap(other.scene_);
     meshes_.swap(other.meshes_);
+    std::swap(evaluation_graph_digest_, other.evaluation_graph_digest_);
     std::swap(next_mesh_id_, other.next_mesh_id_);
     std::swap(revision_, other.revision_);
 }
@@ -452,6 +474,9 @@ std::string ProjectDocument::serialize() const {
             }
             output << '\n';
         }
+    }
+    if (evaluation_graph_digest_.has_value()) {
+        output << "EVALUATION_GRAPH_DIGEST " << evaluation_graph_digest_->hex() << '\n';
     }
     output << "END\n";
     return output.str();
@@ -689,8 +714,36 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
         }
     }
 
-    if (auto result = require_line(input, "END"); !result) {
-        return core::Result<ProjectDocument>::failure(result.error());
+    std::string terminal_record;
+    if (!(input >> terminal_record)) {
+        return core::Result<ProjectDocument>::failure(
+            parse_error("project is missing its terminal record"));
+    }
+    if (terminal_record == "EVALUATION_GRAPH_DIGEST") {
+        if (version.value() < 3U) {
+            return core::Result<ProjectDocument>::failure(
+                Diagnostic(ErrorCode::version_mismatch,
+                           "evaluation graph references require project schema version 3"));
+        }
+        std::string encoded_digest;
+        if (!(input >> encoded_digest)) {
+            return core::Result<ProjectDocument>::failure(
+                parse_error("project evaluation graph digest is missing"));
+        }
+        const auto digest = assets::Sha256Digest::from_hex(encoded_digest);
+        if (!digest || digest.value().is_zero()) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project evaluation graph digest is invalid"));
+        }
+        document.evaluation_graph_digest_ = digest.value();
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(
+                parse_error("project is missing its terminal record"));
+        }
+    }
+    if (terminal_record != "END") {
+        return core::Result<ProjectDocument>::failure(
+            parse_error("project is missing its END record"));
     }
     std::string trailing_token;
     if (input >> trailing_token) {

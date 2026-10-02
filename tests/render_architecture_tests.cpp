@@ -3,15 +3,21 @@
 #include <carto/gpu/lifetime.hpp>
 #include <carto/gpu/rhi.hpp>
 #include <carto/render/material.hpp>
+#include <carto/render/gpu_plan.hpp>
+#include <carto/render/lighting.hpp>
 #include <carto/render/render_request.hpp>
+#include <carto/render/temporal.hpp>
 #include <carto/render/viewport.hpp>
 #include <carto/render_graph/graph.hpp>
 
+#include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 namespace {
 
@@ -199,6 +205,121 @@ void texture_material_and_render_contracts_preserve_fidelity() {
     REQUIRE(!request.validate());
 }
 
+void shadow_and_temporal_reference_contracts_preserve_boundaries() {
+    const std::vector<float> depth = {0.2F, 0.8F, 0.8F, 0.8F};
+    const auto shadowed = carto::render::evaluate_shadow_reference(
+        depth, 2U, 2U, 0.0F, 0.0F, 0.5F, carto::render::ShadowKernel{0U, 0.0F});
+    REQUIRE(shadowed);
+    REQUIRE(shadowed.value().visibility == 0.0F);
+    REQUIRE(shadowed.value().taps == 1U);
+
+    const auto lit = carto::render::evaluate_shadow_reference(
+        depth, 2U, 2U, 1.0F, 1.0F, 0.5F, carto::render::ShadowKernel{0U, 0.0F});
+    REQUIRE(lit);
+    REQUIRE(lit.value().visibility == 1.0F);
+
+    const auto filtered = carto::render::evaluate_shadow_reference(
+        depth, 2U, 2U, 0.0F, 0.0F, 0.5F, carto::render::ShadowKernel{1U, 0.0F});
+    REQUIRE(filtered);
+    REQUIRE(filtered.value().taps == 9U);
+    REQUIRE(std::abs(filtered.value().visibility - (5.0F / 9.0F)) < 0.001F);
+
+    auto invalid_depth = depth;
+    invalid_depth.front() = std::numeric_limits<float>::quiet_NaN();
+    const auto rejected_shadow = carto::render::evaluate_shadow_reference(
+        invalid_depth, 2U, 2U, 0.5F, 0.5F, 0.5F);
+    REQUIRE(!rejected_shadow);
+    REQUIRE(rejected_shadow.error().code == ErrorCode::validation_failed);
+
+    const std::vector<float> current = {
+        1.0F, 1.0F, 1.0F, 1.0F,
+        0.2F, 0.2F, 0.2F, 1.0F,
+    };
+    const std::vector<float> history = {
+        0.0F, 0.0F, 0.0F, 1.0F,
+        1.0F, 1.0F, 1.0F, 1.0F,
+    };
+    const std::vector<float> motion = {0.0F, 2.0F};
+    const auto temporal = carto::render::resolve_temporal_reference({
+        carto::core::Revision{4U},
+        carto::core::Revision{4U},
+        2U,
+        1U,
+        current,
+        history,
+        motion,
+        true,
+        false,
+        0.5F,
+        2.0F,
+        1.0F,
+    });
+    REQUIRE(temporal);
+    REQUIRE(temporal.value().history_used);
+    REQUIRE(temporal.value().rejected_pixels == 1U);
+    REQUIRE(std::abs(temporal.value().rgba[0] - 0.5F) < 0.001F);
+    REQUIRE(std::abs(temporal.value().rgba[4] - current[4]) < 0.001F);
+
+    const auto stale_temporal = carto::render::resolve_temporal_reference({
+        carto::core::Revision{5U},
+        carto::core::Revision{4U},
+        2U,
+        1U,
+        current,
+        history,
+        {},
+        true,
+        false,
+        0.9F,
+        0.25F,
+        1.0F,
+    });
+    REQUIRE(stale_temporal);
+    REQUIRE(!stale_temporal.value().history_used);
+    REQUIRE(stale_temporal.value().rgba == current);
+
+    const auto invalid_temporal = carto::render::resolve_temporal_reference({
+        carto::core::Revision{4U},
+        carto::core::Revision{4U},
+        2U,
+        1U,
+        current,
+        history,
+        motion,
+        true,
+        false,
+        1.5F,
+        0.25F,
+        1.0F,
+    });
+    REQUIRE(!invalid_temporal);
+    REQUIRE(invalid_temporal.error().code == ErrorCode::invalid_argument);
+}
+
+void gpu_plan_attaches_explicit_kernel_intents_to_each_pass() {
+    const carto::render::RenderRequest request{
+        carto::core::Revision{8U},
+        carto::scene::ObjectId{3U},
+        {1280U, 720U},
+        carto::render::RenderQualityProfile::interactive,
+        0U,
+        carto::render::OutputFormat::png,
+        false,
+        false,
+        {},
+    };
+    const auto plan = carto::render::prepare_gpu_render_plan(request, true, false);
+    REQUIRE(plan);
+    REQUIRE(plan.value().kernels.size() == 5U);
+    REQUIRE(plan.value().kernels.size() == plan.value().graph.pass_order.size());
+    for (const auto& kernel : plan.value().kernels) {
+        REQUIRE(kernel.pass);
+        REQUIRE(carto::device::validate(kernel.contract));
+        REQUIRE(kernel.contract.requested_arithmetic == "fp32");
+        REQUIRE(!kernel.contract.fallback_allowed);
+    }
+}
+
 ResourceDesc make_buffer(std::string name, std::uint32_t alias_group = 0U) {
     ResourceDesc descriptor;
     descriptor.name = std::move(name);
@@ -373,6 +494,8 @@ int main() {
         deferred_destruction_waits_for_completed_submission();
         exact_rhi_descriptors_reject_ambiguous_intent();
         texture_material_and_render_contracts_preserve_fidelity();
+        shadow_and_temporal_reference_contracts_preserve_boundaries();
+        gpu_plan_attaches_explicit_kernel_intents_to_each_pass();
         valid_graph_compiles_with_write_barriers();
         graph_rejects_invalid_descriptors_and_hazards();
         graph_rejects_overlapping_alias_lifetimes();

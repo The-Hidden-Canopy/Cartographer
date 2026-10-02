@@ -9,17 +9,34 @@ project(Cartographer
 option(CARTO_BUILD_TESTS "Build headless unit and invariant tests" ON)
 option(CARTO_BUILD_BENCHMARKS "Build native geometry kernel benchmarks" OFF)
 option(CARTO_BUILD_CLI "Build the headless Cartographer CLI" ON)
+option(CARTO_BUILD_DEVICE_CPU "Build the CPU reference device" ON)
 option(CARTO_BUILD_PRIVATE_INTEGRATIONS
-    "Build out-of-tree private/uncleared integration surfaces" OFF)
+    "Build out-of-tree moat or not-yet-cleared integration surfaces" OFF)
 set(CARTO_PRIVATE_SOURCE_ROOT "" CACHE PATH
     "Out-of-tree Cartographer-private source root")
 option(CARTO_ENABLE_VULKAN "Enable the optional Vulkan render backend" OFF)
+option(CARTO_ENABLE_D3D12 "Enable the optional Windows D3D12 render backend" OFF)
+option(CARTO_BUILD_D3D12_DESKTOP
+    "Build the optional native Win32/D3D12 presentation shell" OFF)
 option(CARTO_BUILD_DESKTOP "Build the optional Dear ImGui/Vulkan desktop shell" OFF)
 set(CARTO_IMGUI_ROOT "" CACHE PATH "Path to a pinned Dear ImGui source tree")
 option(CARTO_BUILD_GMIB_GRAPHICS "Build the optional GMIB presentation consumer" OFF)
 set(CARTO_GMIB_ROOT "" CACHE PATH "Standalone GMIB source root for the optional graphics consumer")
 option(CARTO_BUILD_GMIB_GAME "Build the Cartographer-hosted GMIB game surface" OFF)
+
+get_filename_component(_carto_public_root "${CMAKE_SOURCE_DIR}" REALPATH)
 if(CARTO_BUILD_PRIVATE_INTEGRATIONS)
+    if(CARTO_PRIVATE_SOURCE_ROOT STREQUAL "" OR
+       NOT IS_DIRECTORY "${CARTO_PRIVATE_SOURCE_ROOT}")
+        message(FATAL_ERROR
+            "CARTO_BUILD_PRIVATE_INTEGRATIONS=ON requires an existing out-of-tree CARTO_PRIVATE_SOURCE_ROOT")
+    endif()
+    get_filename_component(_carto_private_root "${CARTO_PRIVATE_SOURCE_ROOT}" REALPATH)
+    cmake_path(IS_PREFIX _carto_public_root "${_carto_private_root}" NORMALIZE _carto_private_inside_public)
+    if(_carto_private_inside_public)
+        message(FATAL_ERROR
+            "CARTO_PRIVATE_SOURCE_ROOT must be outside the public Cartographer checkout")
+    endif()
     set(_carto_private_required_paths
         "${CARTO_PRIVATE_SOURCE_ROOT}/libs/anatomy/CMakeLists.txt"
         "${CARTO_PRIVATE_SOURCE_ROOT}/libs/owh/CMakeLists.txt"
@@ -35,16 +52,24 @@ endif()
 if((CARTO_BUILD_GMIB_GRAPHICS OR CARTO_BUILD_GMIB_GAME) AND
    NOT CARTO_BUILD_PRIVATE_INTEGRATIONS)
     message(FATAL_ERROR
-        "GMIB surfaces are private integrations; enable CARTO_BUILD_PRIVATE_INTEGRATIONS and provide CARTO_PRIVATE_SOURCE_ROOT")
+        "GMIB surfaces are out-of-tree integrations; enable CARTO_BUILD_PRIVATE_INTEGRATIONS and provide CARTO_PRIVATE_SOURCE_ROOT")
 endif()
 if(CARTO_BUILD_GMIB_GRAPHICS AND
    NOT EXISTS "${CARTO_PRIVATE_SOURCE_ROOT}/libs/gmib/CMakeLists.txt")
     message(FATAL_ERROR
-        "CARTO_BUILD_GMIB_GRAPHICS=ON requires the private GMIB adapter in CARTO_PRIVATE_SOURCE_ROOT")
+        "CARTO_BUILD_GMIB_GRAPHICS=ON requires the out-of-tree GMIB adapter in CARTO_PRIVATE_SOURCE_ROOT")
 endif()
 if(CARTO_BUILD_GMIB_GRAPHICS AND
    NOT EXISTS "${CARTO_GMIB_ROOT}/include/gmib/game/presentation.hpp")
     message(FATAL_ERROR "CARTO_BUILD_GMIB_GRAPHICS=ON requires CARTO_GMIB_ROOT pointing at god-mode-is-a-bug")
+endif()
+if(CARTO_BUILD_GMIB_GRAPHICS)
+    get_filename_component(_carto_gmib_root "${CARTO_GMIB_ROOT}" REALPATH)
+    cmake_path(IS_PREFIX _carto_public_root "${_carto_gmib_root}" NORMALIZE _carto_gmib_inside_public)
+    if(_carto_gmib_inside_public)
+        message(FATAL_ERROR
+            "CARTO_GMIB_ROOT must be outside the public Cartographer checkout")
+    endif()
 endif()
 if(CARTO_BUILD_GMIB_GAME AND NOT CARTO_BUILD_GMIB_GRAPHICS)
     message(FATAL_ERROR "CARTO_BUILD_GMIB_GAME=ON requires CARTO_BUILD_GMIB_GRAPHICS=ON")
@@ -53,7 +78,7 @@ if(CARTO_BUILD_GMIB_GAME AND
    (NOT EXISTS "${CARTO_PRIVATE_SOURCE_ROOT}/apps/gmib-game/main.cpp" OR
     NOT EXISTS "${CARTO_PRIVATE_SOURCE_ROOT}/apps/gmib-game/bake.cpp"))
     message(FATAL_ERROR
-        "CARTO_BUILD_GMIB_GAME=ON requires the private GMIB host sources in CARTO_PRIVATE_SOURCE_ROOT")
+        "CARTO_BUILD_GMIB_GAME=ON requires the out-of-tree GMIB host sources in CARTO_PRIVATE_SOURCE_ROOT")
 endif()
 if(CARTO_BUILD_GMIB_GAME AND
    NOT EXISTS "${CARTO_GMIB_ROOT}/include/gmib/game/game.hpp")
@@ -91,9 +116,17 @@ if(CARTO_BUILD_PRIVATE_INTEGRATIONS)
 endif()
 add_subdirectory(libs/geometry/mesh)
 add_subdirectory(libs/assets)
+add_subdirectory(libs/attributes)
+add_subdirectory(libs/mesh_attributes)
+add_subdirectory(libs/eval)
 add_subdirectory(libs/gpu)
 add_subdirectory(libs/journal)
 add_subdirectory(libs/render_graph)
+add_subdirectory(libs/device_ir)
+add_subdirectory(libs/device)
+if(CARTO_BUILD_DEVICE_CPU)
+    add_subdirectory(libs/device_cpu)
+endif()
 add_subdirectory(libs/providers)
 add_subdirectory(libs/plugin_protocol)
 add_subdirectory(libs/project)
@@ -153,6 +186,24 @@ if(CARTO_ENABLE_VULKAN)
         message(FATAL_ERROR "CARTO_ENABLE_VULKAN=ON requires a discoverable Vulkan SDK")
     endif()
     add_subdirectory(libs/vulkan)
+endif()
+
+if(CARTO_ENABLE_D3D12)
+    if(NOT WIN32)
+        message(FATAL_ERROR "CARTO_ENABLE_D3D12=ON requires the Windows platform")
+    endif()
+    add_subdirectory(libs/d3d12)
+endif()
+
+if(CARTO_BUILD_D3D12_DESKTOP)
+    if(NOT WIN32)
+        message(FATAL_ERROR "CARTO_BUILD_D3D12_DESKTOP=ON requires the Windows platform")
+    endif()
+    if(NOT CARTO_ENABLE_D3D12)
+        message(FATAL_ERROR
+            "CARTO_BUILD_D3D12_DESKTOP=ON requires CARTO_ENABLE_D3D12=ON")
+    endif()
+    add_subdirectory(apps/d3d12_desktop)
 endif()
 
 if(CARTO_BUILD_DESKTOP)

@@ -91,3 +91,12 @@ We do not need to take back what we already gave the community.
 Download it. Run it. Study it. Change it. Build with it. Keep your work.
 
 You should not need an ongoing relationship with The Hidden Canopy to keep using software we released for you to own.
+
+These commitments apply to the source and artifacts intentionally released
+under this contract. They do not require publication of unreleased moat
+assets, including private model material, proprietary native kernels and
+optimization recipes, provider credentials, private telemetry or datasets,
+hosted entitlements, or internal automation. A public build must remain useful
+without those assets; if a moat asset is later released as part of the public
+project, it enters the applicable public license and contract boundary at that
+time.

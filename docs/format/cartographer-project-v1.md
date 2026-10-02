@@ -1,8 +1,9 @@
 # Cartographer project format v1
 
 This is the legacy format. Cartographer continues to read it for migration,
-but new saves use [project format v2](cartographer-project-v2.md), which adds
-an explicit authoring/units/coordinate-system envelope.
+but new saves use [project format v3](cartographer-project-v3.md), which adds
+the v2 authoring/units/coordinate-system envelope and the optional graph
+reference.
 
 The 0.1 project format is a deterministic, line-oriented text format intended
 to make failures diagnosable before a binary chunk store exists. It is not

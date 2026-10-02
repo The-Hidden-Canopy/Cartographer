@@ -1,6 +1,7 @@
 #include <carto/project/package.hpp>
 #include <carto/core/json.hpp>
 #include <carto/project/file_lock.hpp>
+#include <carto/project/project.hpp>
 
 #include <algorithm>
 #include <array>
@@ -20,6 +21,8 @@ namespace {
 constexpr std::size_t kMaxManifestBytes = 64U * 1024U;
 constexpr std::size_t kMaxProjectIdBytes = 128U;
 constexpr std::size_t kMaxNameBytes = 4096U;
+constexpr std::string_view kEvaluationGraphMediaType =
+    "application/vnd.cartographer.evaluation-graph+text;v=1";
 std::atomic<std::uint64_t> g_package_temp_counter{0U};
 
 core::Diagnostic invalid(std::string message) {
@@ -75,6 +78,11 @@ core::Result<void> ProjectPackage::validate_manifest(const PackageManifest& mani
         !safe_json_text(manifest.units, 64U) || !safe_json_text(manifest.up_axis, 16U)) {
         return core::Result<void>::failure(invalid("package manifest contains invalid text"));
     }
+    if (manifest.evaluation_graph_blob.has_value() &&
+        manifest.evaluation_graph_blob->is_zero()) {
+        return core::Result<void>::failure(
+            invalid("package evaluation graph blob digest must not be zero"));
+    }
     return core::Result<void>::success();
 }
 
@@ -97,7 +105,7 @@ core::Result<void> ProjectPackage::create_layout() const {
 }
 
 core::Result<void> ProjectPackage::write_manifest() const {
-    const std::string text =
+    std::string text =
         "{\n"
         "  \"format\": \"cartographer-project\",\n"
         "  \"format_version\": " + std::to_string(PackageManifest::kCurrentFormatVersion) + ",\n"
@@ -107,8 +115,12 @@ core::Result<void> ProjectPackage::write_manifest() const {
         "  \"up_axis\": \"" + json_escape(manifest_.up_axis) + "\",\n"
         "  \"coordinate_system\": {\"type\": \"local\", \"origin\": [0.0, 0.0, 0.0]},\n"
         "  \"document_database\": \"document.db\",\n"
-        "  \"blob_root\": \"blobs/sha256\"\n"
-        "}\n";
+        "  \"blob_root\": \"blobs/sha256\"";
+    if (manifest_.evaluation_graph_blob.has_value()) {
+        text += ",\n  \"evaluation_graph_blob\": \"" +
+            manifest_.evaluation_graph_blob->hex() + "\"";
+    }
+    text += "\n}\n";
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto thread = std::hash<std::thread::id>{}(std::this_thread::get_id());
     const auto counter = g_package_temp_counter.fetch_add(1U, std::memory_order_relaxed);
@@ -274,8 +286,23 @@ core::Result<PackageManifest> ProjectPackage::read_manifest(const std::filesyste
     if (database.value() != "document.db" || blobs.value() != "blobs/sha256") {
         return core::Result<PackageManifest>::failure(validation("package manifest paths are invalid"));
     }
+    std::optional<assets::Sha256Digest> evaluation_graph_blob;
+    if (const auto* member = core::json::find_member(object.value(), "evaluation_graph_blob");
+        member != nullptr) {
+        const auto encoded = core::json::decode_string(member->raw_value);
+        if (!encoded) {
+            return core::Result<PackageManifest>::failure(
+                encoded.error().with_context("package evaluation graph blob"));
+        }
+        const auto digest = assets::Sha256Digest::from_hex(encoded.value());
+        if (!digest) {
+            return core::Result<PackageManifest>::failure(
+                digest.error().with_context("package evaluation graph blob"));
+        }
+        evaluation_graph_blob = digest.value();
+    }
     PackageManifest manifest{
-        project_id.value(), name.value(), units.value(), up_axis.value(),
+        project_id.value(), name.value(), units.value(), up_axis.value(), evaluation_graph_blob,
     };
     if (auto result = validate_manifest(manifest); !result) {
         return core::Result<PackageManifest>::failure(result.error());
@@ -328,6 +355,12 @@ core::Result<void> ProjectPackage::validate() const {
                 validation("package layout is incomplete: " + std::string(directory)));
         }
     }
+    if (manifest_.evaluation_graph_blob.has_value()) {
+        if (auto result = blob_store().verify(*manifest_.evaluation_graph_blob); !result) {
+            return core::Result<void>::failure(
+                result.error().with_context("package evaluation graph blob"));
+        }
+    }
     const bool database_exists = std::filesystem::exists(document_database_path(), error);
     if (error) {
         return core::Result<void>::failure(io_error("unable to inspect package document database"));
@@ -342,8 +375,63 @@ core::Result<void> ProjectPackage::validate() const {
     return core::Result<void>::success();
 }
 
+core::Result<void> ProjectPackage::validate_document_binding(
+    const ProjectDocument& document) const {
+    if (auto result = validate(); !result) {
+        return result;
+    }
+    if (document.evaluation_graph_digest() != manifest_.evaluation_graph_blob) {
+        return core::Result<void>::failure(validation(
+            "project document evaluation graph reference does not match package manifest"));
+    }
+    return core::Result<void>::success();
+}
+
 assets::BlobStore ProjectPackage::blob_store() const {
     return assets::BlobStore(root_ / "blobs");
+}
+
+core::Result<assets::BlobRef> ProjectPackage::store_evaluation_graph(
+    const eval::EvaluationGraph& graph) {
+    FileLock file_lock(root_);
+    if (auto result = file_lock.acquire(); !result) {
+        return core::Result<assets::BlobRef>::failure(result.error());
+    }
+    if (auto result = validate(); !result) {
+        return core::Result<assets::BlobRef>::failure(result.error());
+    }
+    const auto serialized = graph.serialize();
+    if (!serialized) {
+        return core::Result<assets::BlobRef>::failure(
+            serialized.error().with_context("evaluation graph snapshot"));
+    }
+    auto blob = blob_store().put(
+        serialized.value(), std::string{kEvaluationGraphMediaType});
+    if (!blob) return blob;
+
+    const auto previous = manifest_.evaluation_graph_blob;
+    manifest_.evaluation_graph_blob = blob.value().digest;
+    if (auto result = write_manifest(); !result) {
+        manifest_.evaluation_graph_blob = previous;
+        return core::Result<assets::BlobRef>::failure(result.error());
+    }
+    return blob;
+}
+
+core::Result<eval::EvaluationGraph> ProjectPackage::load_evaluation_graph() const {
+    if (auto result = validate(); !result) {
+        return core::Result<eval::EvaluationGraph>::failure(result.error());
+    }
+    if (!manifest_.evaluation_graph_blob.has_value()) {
+        return core::Result<eval::EvaluationGraph>::failure(
+            core::Diagnostic(core::ErrorCode::not_found,
+                "package does not contain an evaluation graph snapshot"));
+    }
+    const auto bytes = blob_store().read(*manifest_.evaluation_graph_blob);
+    if (!bytes) return core::Result<eval::EvaluationGraph>::failure(bytes.error());
+    const std::string serialized(
+        reinterpret_cast<const char*>(bytes.value().data()), bytes.value().size());
+    return eval::EvaluationGraph::deserialize(serialized);
 }
 
 core::Result<bool> ProjectPackage::has_document_database() const {
