@@ -46,6 +46,10 @@ struct TopologyEditReceipt {
     std::vector<FaceId> removed_faces;
     std::vector<CornerId> created_corners;
     std::vector<CornerId> removed_corners;
+    // A merge maps each removed source vertex to the surviving target vertex.
+    // This is deliberately separate from origin maps: the target is a
+    // preserved identity, not a newly-created element.
+    std::map<VertexId, VertexId> merged_vertices;
     std::map<VertexId, ElementOrigin> vertex_origins;
     std::map<EdgeId, ElementOrigin> edge_origins;
     std::map<FaceId, ElementOrigin> face_origins;

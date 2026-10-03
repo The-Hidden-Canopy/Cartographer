@@ -1,4 +1,5 @@
 #include <carto/application/application.hpp>
+#include <carto/project/recovery.hpp>
 
 #include <charconv>
 #include <memory>
@@ -146,9 +147,176 @@ core::Result<void> WorkspaceState::validate() const {
     return core::Result<void>::success();
 }
 
+core::Result<void> RecoveryInspection::validate() const {
+    if (project_path.empty() || project_path.filename().empty() ||
+        journal_path.empty() || journal_path.filename().empty()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "recovery inspection paths must name files"));
+    }
+    if (journal_entry_count != journal_entries.size()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "recovery inspection entry count does not match its entries"));
+    }
+    if (journal_entries.empty()) {
+        if (durable_revision != core::Revision{}) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "empty recovery inspection cannot have a durable revision"));
+        }
+    } else if (durable_revision != journal_entries.back().revision_after) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "recovery inspection durable revision does not match its journal tail"));
+    }
+    if (state == RecoveryInspectionState::blocked && !diagnostic.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "blocked recovery inspection requires a diagnostic"));
+    }
+    if (state != RecoveryInspectionState::blocked && diagnostic.has_value() &&
+        state == RecoveryInspectionState::clean) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "clean recovery inspection cannot carry a blocking diagnostic"));
+    }
+    for (const auto& entry : journal_entries) {
+        if (entry.event_type.empty() || entry.revision_after <= entry.revision_before) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "recovery inspection contains an invalid journal summary"));
+        }
+    }
+    return core::Result<void>::success();
+}
+
 ApplicationSession::ApplicationSession() {
     static_cast<void>(tools_.register_builtin_tools());
     saved_revision_ = document_.revision();
+}
+
+core::Result<RecoveryInspection> ApplicationSession::inspect_recovery(
+    const std::filesystem::path& project_path) {
+    if (project_path.empty() || project_path.filename().empty()) {
+        return core::Result<RecoveryInspection>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "recovery inspection requires a project file path"));
+    }
+
+    RecoveryInspection inspection;
+    inspection.project_path = project_path;
+    inspection.journal_path = journal_path_for(project_path);
+
+    std::error_code error;
+    const bool project_exists = std::filesystem::exists(project_path, error);
+    if (error) {
+        return core::Result<RecoveryInspection>::failure(core::Diagnostic(
+            core::ErrorCode::io_error,
+            "unable to inspect the project path"));
+    }
+    const bool journal_exists = std::filesystem::exists(inspection.journal_path, error);
+    if (error) {
+        return core::Result<RecoveryInspection>::failure(core::Diagnostic(
+            core::ErrorCode::io_error,
+            "unable to inspect the project journal path"));
+    }
+
+    // Inspect the project and its journal under the same writer lease used by
+    // save, mutation publication, and recovery. Without this lease a writer
+    // could replace the project between the project load and journal read,
+    // producing a recovery classification for two different revisions.
+    std::optional<project::FileLock> project_lock;
+    if (project_exists || journal_exists) {
+        project_lock.emplace(project_path);
+        if (auto result = project_lock->acquire(); !result) {
+            return core::Result<RecoveryInspection>::failure(result.error().with_context(
+                "recovery inspection lock"));
+        }
+    }
+
+    if (project_exists) {
+        const auto document = project::ProjectDocument::load(project_path);
+        if (!document) {
+            inspection.state = RecoveryInspectionState::blocked;
+            inspection.diagnostic = document.error().with_context(
+                "recovery inspection project load");
+        } else {
+            inspection.project_revision = document.value().revision();
+        }
+    }
+
+    if (!journal_exists) {
+        if (inspection.state != RecoveryInspectionState::blocked) {
+            inspection.state = RecoveryInspectionState::unavailable;
+        }
+        if (auto result = inspection.validate(); !result) {
+            return core::Result<RecoveryInspection>::failure(result.error());
+        }
+        return core::Result<RecoveryInspection>::success(std::move(inspection));
+    }
+
+    journal::Journal journal(inspection.journal_path, application_journal_limits());
+    const auto entries = journal.read_all();
+    if (!entries) {
+        inspection.state = RecoveryInspectionState::blocked;
+        inspection.diagnostic = entries.error().with_context(
+            "recovery inspection journal verification");
+    } else {
+        inspection.journal_entry_count = entries.value().size();
+        inspection.journal_entries.reserve(entries.value().size());
+        for (const auto& entry : entries.value()) {
+            inspection.journal_entries.push_back(RecoveryJournalEntry{
+                entry.revision_before, entry.revision_after, entry.event_type});
+        }
+        if (!entries.value().empty()) {
+            inspection.durable_revision = entries.value().back().revision_after;
+        }
+
+        if (inspection.state != RecoveryInspectionState::blocked) {
+            if (!project_exists) {
+                inspection.state = RecoveryInspectionState::pending;
+                inspection.diagnostic = core::Diagnostic(
+                    core::ErrorCode::not_found,
+                    "durable journal exists but the project file is missing");
+            } else if (entries.value().empty()) {
+                if (inspection.project_revision.value_or(core::Revision{}) == core::Revision{}) {
+                    inspection.state = RecoveryInspectionState::clean;
+                } else {
+                    inspection.state = RecoveryInspectionState::blocked;
+                    inspection.diagnostic = core::Diagnostic(
+                        core::ErrorCode::stale_data,
+                        "project has a revision but its durable journal is empty");
+                }
+            } else if (inspection.project_revision.value() < inspection.durable_revision) {
+                inspection.state = RecoveryInspectionState::pending;
+                inspection.diagnostic = core::Diagnostic(
+                    core::ErrorCode::stale_data,
+                    "durable journal is ahead of the saved project");
+            } else if (inspection.project_revision.value() > inspection.durable_revision) {
+                inspection.state = RecoveryInspectionState::blocked;
+                inspection.diagnostic = core::Diagnostic(
+                    core::ErrorCode::stale_data,
+                    "saved project is ahead of its durable journal");
+            } else {
+                const auto document = project::ProjectDocument::load(project_path);
+                if (!document || !journal_entry_matches_document(
+                        entries.value().back(), document.value().serialize())) {
+                    inspection.state = RecoveryInspectionState::blocked;
+                    inspection.diagnostic = core::Diagnostic(
+                        core::ErrorCode::validation_failed,
+                        "durable journal tail does not match the saved project");
+                } else {
+                    inspection.state = RecoveryInspectionState::clean;
+                }
+            }
+        }
+    }
+
+    if (auto result = inspection.validate(); !result) {
+        return core::Result<RecoveryInspection>::failure(result.error());
+    }
+    return core::Result<RecoveryInspection>::success(std::move(inspection));
 }
 
 core::Result<ApplicationSession::PreparedJournal> ApplicationSession::prepare_journal(
@@ -255,18 +423,29 @@ core::Result<void> ApplicationSession::append_mutation_event(
     }
     const auto* bytes = reinterpret_cast<const std::uint8_t*>(payload_text.data());
     const std::span<const std::uint8_t> payload(bytes, payload_text.size());
-    const auto appended = journal_->append(journal::JournalAppend{
-        revision_before,
-        revision_after,
-        std::string(kActionEvent),
-        payload,
-        std::nullopt,
-    });
-    if (!appended) {
-        return core::Result<void>::failure(appended.error().with_context(
-            "durable application journal append"));
+    const auto append = [&]() -> core::Result<void> {
+        const auto appended = journal_->append(journal::JournalAppend{
+            revision_before,
+            revision_after,
+            std::string(kActionEvent),
+            payload,
+            std::nullopt,
+        });
+        if (!appended) {
+            return core::Result<void>::failure(appended.error().with_context(
+                "durable application journal append"));
+        }
+        return core::Result<void>::success();
+    };
+    if (project_path_.has_value()) {
+        project::FileLock project_lock(*project_path_);
+        if (auto result = project_lock.acquire(); !result) {
+            return core::Result<void>::failure(result.error().with_context(
+                "project mutation lock"));
+        }
+        return append();
     }
-    return core::Result<void>::success();
+    return append();
 }
 
 core::Result<DispatchReceipt> ApplicationSession::dispatch(
@@ -294,6 +473,8 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return new_project(value);
             } else if constexpr (std::is_same_v<Action, OpenProjectAction>) {
                 return open_project(value);
+            } else if constexpr (std::is_same_v<Action, RecoverProjectAction>) {
+                return recover_project(value);
             } else if constexpr (std::is_same_v<Action, SaveProjectAction>) {
                 return save_project(value);
             } else if constexpr (std::is_same_v<Action, SetWorkspaceAction>) {
@@ -308,6 +489,12 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                     return failure(result.error().with_context("selection mode"));
                 }
                 return accepted("Set Selection Mode", before);
+            } else if constexpr (std::is_same_v<Action, ConvertSelectionAction>) {
+                return convert_selection(value);
+            } else if constexpr (std::is_same_v<Action, ExpandSelectionAction>) {
+                return expand_selection(value);
+            } else if constexpr (std::is_same_v<Action, SelectShortestPathAction>) {
+                return select_shortest_path(value);
             } else if constexpr (std::is_same_v<Action, SelectObjectAction>) {
                 return select_object(value);
             } else if constexpr (std::is_same_v<Action, SelectVertexAction>) {
@@ -334,9 +521,14 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                     "Set Object Transform",
                     AffectedSet{{value.object}, {}, {}, {}},
                     ParameterPayload{
-                        value.transform, std::nullopt, std::nullopt, std::nullopt, std::nullopt});
+                        value.transform, std::nullopt, std::nullopt, std::nullopt,
+                        std::nullopt, std::nullopt});
             } else if constexpr (std::is_same_v<Action, InvokeToolAction>) {
                 return invoke_tool(value);
+            } else if constexpr (std::is_same_v<Action, RepeatLastToolAction>) {
+                return repeat_last_tool();
+            } else if constexpr (std::is_same_v<Action, AdjustLastToolAction>) {
+                return adjust_last_tool(value);
             } else if constexpr (std::is_same_v<Action, CreateBoxAction>) {
                 return create_box(value);
             } else if constexpr (std::is_same_v<Action, CreatePlaneAction>) {
@@ -422,7 +614,8 @@ core::Result<ApplicationAction> ApplicationSession::preview_action(
                 "face extrusion preview has no distance"));
         }
         return core::Result<ApplicationAction>::success(InvokeToolAction{
-            "mesh.extrude-face", editor::ToolArguments{*parameters.distance, {}}});
+            "mesh.extrude-face", editor::ToolArguments{
+                *parameters.distance, {}, true, 0.5, std::nullopt}});
     }
     if (preview.kind() == editor::PreviewKind::inset_face) {
         if (!parameters.distance.has_value()) {
@@ -430,14 +623,16 @@ core::Result<ApplicationAction> ApplicationSession::preview_action(
                 "face inset preview has no distance"));
         }
         return core::Result<ApplicationAction>::success(InvokeToolAction{
-            "mesh.inset-face", editor::ToolArguments{*parameters.distance, {}}});
+            "mesh.inset-face", editor::ToolArguments{
+                *parameters.distance, {}, true, 0.5, std::nullopt}});
     }
     if (!parameters.position.has_value()) {
         return core::Result<ApplicationAction>::failure(invalid_state(
             "vertex position preview has no position"));
     }
     return core::Result<ApplicationAction>::success(InvokeToolAction{
-        "mesh.set-vertex-position", editor::ToolArguments{0.0, *parameters.position}});
+        "mesh.set-vertex-position", editor::ToolArguments{
+            0.0, *parameters.position, true, 0.5, std::nullopt}});
 }
 
 core::Result<DispatchReceipt> ApplicationSession::commit_preview(
@@ -526,6 +721,62 @@ core::Result<DispatchReceipt> ApplicationSession::open_project(const OpenProject
         ++project_generation_;
     }
     return accepted("Open Project", before);
+}
+
+core::Result<DispatchReceipt> ApplicationSession::recover_project(
+    const RecoverProjectAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(invalid_state(
+            "journal recovery requires an explicit human application action"));
+    }
+    if (auto result = require_discard_confirmation(action.discard_dirty); !result) {
+        return failure(result.error());
+    }
+    if (action.path.empty() || action.path.filename().empty()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "recovery requires a project file path"));
+    }
+
+    project::FileLock project_lock(action.path);
+    if (auto result = project_lock.acquire(); !result) {
+        return failure(result.error().with_context("project recovery lock"));
+    }
+    journal::Journal journal(journal_path_for(action.path), application_journal_limits());
+    const auto recovered = project::recover_latest_snapshot(journal);
+    if (!recovered) {
+        return failure(recovered.error().with_context("recover project"));
+    }
+    auto prepared_journal = prepare_journal(action.path, recovered.value().document);
+    if (!prepared_journal) {
+        return failure(prepared_journal.error().with_context("recover project journal"));
+    }
+    const auto saved = recovered.value().document.save_atomic_unlocked(action.path);
+    if (!saved) {
+        return failure(saved.error().with_context("recover project save"));
+    }
+
+    const core::Revision before = document_.revision();
+    document_ = recovered.value().document;
+    project_path_ = action.path;
+    journal_ = std::move(prepared_journal.value().journal);
+    reset_editor_state();
+    saved_revision_ = document_.revision();
+    if (project_generation_ == std::numeric_limits<std::uint64_t>::max()) {
+        project_generation_ = 0;
+    } else {
+        ++project_generation_;
+    }
+    const OperationSource previous_source = active_source_;
+    active_source_ = OperationSource::recovery;
+    auto receipt = accepted("Recover Project", before);
+    active_source_ = previous_source;
+    if (receipt) {
+        // Recovery can restore a revision already present in the active
+        // session while still replacing the complete document state.
+        receipt.value().document_changed = true;
+    }
+    return receipt;
 }
 
 core::Result<void> ApplicationSession::can_close(bool discard_dirty) const {
@@ -692,6 +943,99 @@ core::Result<DispatchReceipt> ApplicationSession::select_edge(const SelectEdgeAc
     return accepted("Select Edge", before);
 }
 
+core::Result<DispatchReceipt> ApplicationSession::convert_selection(
+    const ConvertSelectionAction& action) {
+    const auto owner = selection_.component_object();
+    if (!owner.has_value()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "selection conversion requires an object-bound component selection"));
+    }
+    const auto* object = document_.scene().find(*owner);
+    if (!object) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "selection conversion owner object is no longer present"));
+    }
+    if (!object->mesh_asset.has_value()) {
+        return failure(invalid_state(
+            "selection conversion owner has no mesh asset"));
+    }
+    const auto mesh = document_.meshes().find(*object->mesh_asset);
+    if (mesh == document_.meshes().end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "selection conversion owner references a missing mesh"));
+    }
+    const core::Revision before = document_.revision();
+    if (auto result = selection_.convert_mode(action.mode, mesh->second); !result) {
+        return failure(result.error().with_context("selection conversion"));
+    }
+    return accepted("Convert Selection", before);
+}
+
+core::Result<DispatchReceipt> ApplicationSession::expand_selection(
+    const ExpandSelectionAction& action) {
+    const auto owner = selection_.component_object();
+    if (!owner.has_value()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "selection expansion requires an object-bound component selection"));
+    }
+    const auto* object = document_.scene().find(*owner);
+    if (!object) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "selection expansion owner object is no longer present"));
+    }
+    if (!object->mesh_asset.has_value()) {
+        return failure(invalid_state(
+            "selection expansion owner has no mesh asset"));
+    }
+    const auto mesh = document_.meshes().find(*object->mesh_asset);
+    if (mesh == document_.meshes().end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "selection expansion owner references a missing mesh"));
+    }
+    const core::Revision before = document_.revision();
+    if (auto result = selection_.expand(action.expansion, mesh->second); !result) {
+        return failure(result.error().with_context("selection expansion"));
+    }
+    return accepted("Expand Selection", before);
+}
+
+core::Result<DispatchReceipt> ApplicationSession::select_shortest_path(
+    const SelectShortestPathAction& action) {
+    const auto owner = selection_.component_object();
+    if (!owner.has_value()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "shortest-path selection requires an object-bound component selection"));
+    }
+    const auto* object = document_.scene().find(*owner);
+    if (!object) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "shortest-path selection owner object is no longer present"));
+    }
+    if (!object->mesh_asset.has_value()) {
+        return failure(invalid_state(
+            "shortest-path selection owner has no mesh asset"));
+    }
+    const auto mesh = document_.meshes().find(*object->mesh_asset);
+    if (mesh == document_.meshes().end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "shortest-path selection owner references a missing mesh"));
+    }
+    const core::Revision before = document_.revision();
+    if (auto result = selection_.select_shortest_path(action.goal, mesh->second); !result) {
+        return failure(result.error().with_context("shortest-path selection"));
+    }
+    return accepted("Select Shortest Path", before);
+}
+
 core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAction& action) {
     const core::Revision before = document_.revision();
     project::ProjectDocument before_document = document_;
@@ -699,7 +1043,9 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
     editor::ToolContext context(admission, document_, selection_);
     AffectedSet affected;
     std::optional<ParameterPayload> parameters;
+    std::optional<editor::AuthoringContext> invocation_context;
     if (auto authoring = authoring_context(); authoring) {
+        invocation_context = authoring.value();
         affected.objects = authoring.value().objects;
         affected.vertices = authoring.value().vertices;
         affected.edges = authoring.value().edges;
@@ -713,11 +1059,13 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
                 action.arguments.distance,
                 std::nullopt,
                 std::nullopt,
+                std::nullopt,
                 std::nullopt};
         } else if (action.tool_id == "mesh.inset-face") {
             parameters = ParameterPayload{
                 std::nullopt,
                 action.arguments.distance,
+                std::nullopt,
                 std::nullopt,
                 std::nullopt,
                 std::nullopt};
@@ -727,12 +1075,14 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
                 std::nullopt,
                 std::nullopt,
                 action.arguments.remove_orphaned_vertices,
+                std::nullopt,
                 std::nullopt};
         } else if (action.tool_id == "mesh.set-vertex-position") {
             parameters = ParameterPayload{
                 std::nullopt,
                 std::nullopt,
                 action.arguments.position,
+                std::nullopt,
                 std::nullopt,
                 std::nullopt};
         } else if (action.tool_id == "mesh.split-edge") {
@@ -741,7 +1091,19 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
                 std::nullopt,
                 std::nullopt,
                 std::nullopt,
-                action.arguments.factor};
+                action.arguments.factor,
+                std::nullopt};
+        } else if (action.tool_id == "mesh.slide-vertex") {
+            parameters = ParameterPayload{
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                action.arguments.factor,
+                action.arguments.support_edge};
+            if (action.arguments.support_edge.has_value()) {
+                affected.edges.push_back(*action.arguments.support_edge);
+            }
         }
     }
     if (auto result = tools_.invoke(action.tool_id, context, action.arguments, history_); !result) {
@@ -754,9 +1116,146 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
         std::move(affected),
         std::move(parameters));
     if (result && (action.tool_id == "mesh.inset-face" ||
+                   action.tool_id == "mesh.poke-face" ||
                    action.tool_id == "mesh.remove-face" ||
-                   action.tool_id == "mesh.split-edge")) {
+                   action.tool_id == "mesh.split-edge" ||
+                   action.tool_id == "mesh.dissolve-edge" ||
+                   action.tool_id == "mesh.tri-to-quad" ||
+                   action.tool_id == "mesh.merge-vertices")) {
         selection_.clear();
+    }
+    if (result) {
+        last_tool_action_ = action;
+        last_tool_context_ = std::move(invocation_context);
+    }
+    return result;
+}
+
+core::Result<void> ApplicationSession::rebind_last_tool_selection() {
+    if (!last_tool_action_.has_value() || !last_tool_context_.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "repeat-last requires a previously accepted tool invocation"));
+    }
+
+    const auto& saved = *last_tool_context_;
+    if (auto result = saved.validate(); !result) {
+        return core::Result<void>::failure(result.error().with_context(
+            "repeat-last authoring context"));
+    }
+
+    selection_.clear();
+    if (auto result = selection_.set_mode(saved.selection_mode); !result) {
+        return core::Result<void>::failure(result.error().with_context(
+            "repeat-last selection mode"));
+    }
+
+    if (saved.selection_mode == editor::SelectionMode::object) {
+        for (const scene::ObjectId object : saved.objects) {
+                if (auto result = selection_.select_object(
+                    document_.scene(), object,
+                    selection_.empty()
+                        ? editor::SelectionOperation::replace
+                    : editor::SelectionOperation::add);
+                !result) {
+                return core::Result<void>::failure(result.error().with_context(
+                    "repeat-last object selection"));
+            }
+        }
+    } else {
+        if (!saved.component_object.has_value()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "repeat-last component context has no owning scene object"));
+        }
+        const auto* object = document_.scene().find(*saved.component_object);
+        if (!object) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "repeat-last owner object is no longer present"));
+        }
+        if (!object->mesh_asset.has_value()) {
+            return core::Result<void>::failure(invalid_state(
+                "repeat-last owner object has no mesh asset"));
+        }
+        const auto mesh = document_.meshes().find(*object->mesh_asset);
+        if (mesh == document_.meshes().end()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "repeat-last owner object references a missing mesh"));
+        }
+        const auto bind = [&](auto&& ids, auto&& select) -> core::Result<void> {
+            bool first = true;
+            for (const auto id : ids) {
+                if (auto result = select(
+                        id,
+                        first ? editor::SelectionOperation::replace
+                              : editor::SelectionOperation::add);
+                    !result) {
+                    return result;
+                }
+                first = false;
+            }
+            return core::Result<void>::success();
+        };
+        core::Result<void> rebound = core::Result<void>::success();
+        if (saved.selection_mode == editor::SelectionMode::vertex) {
+            rebound = bind(saved.vertices, [&](geometry::VertexId id, editor::SelectionOperation op) {
+                return selection_.select_vertex(document_.scene(), *saved.component_object,
+                                                mesh->second, id, op);
+            });
+        } else if (saved.selection_mode == editor::SelectionMode::edge) {
+            rebound = bind(saved.edges, [&](geometry::EdgeId id, editor::SelectionOperation op) {
+                return selection_.select_edge(document_.scene(), *saved.component_object,
+                                              mesh->second, id, op);
+            });
+        } else {
+            rebound = bind(saved.faces, [&](geometry::FaceId id, editor::SelectionOperation op) {
+                return selection_.select_face(document_.scene(), *saved.component_object,
+                                              mesh->second, id, op);
+            });
+        }
+        if (!rebound) {
+            return core::Result<void>::failure(rebound.error().with_context(
+                "repeat-last selection rebind"));
+        }
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<DispatchReceipt> ApplicationSession::repeat_last_tool() {
+    const editor::SelectionState before_selection = selection_;
+    if (auto result = rebind_last_tool_selection(); !result) {
+        selection_ = before_selection;
+        return failure(result.error());
+    }
+    auto result = invoke_tool(*last_tool_action_);
+    if (!result) selection_ = before_selection;
+    return result;
+}
+
+core::Result<DispatchReceipt> ApplicationSession::adjust_last_tool(
+    const AdjustLastToolAction& action) {
+    if (!last_tool_action_.has_value() || !last_tool_context_.has_value()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "adjust-last requires a previously accepted tool invocation"));
+    }
+    const editor::SelectionState before_selection = selection_;
+    const InvokeToolAction previous_action = *last_tool_action_;
+    const editor::AuthoringContext previous_context = *last_tool_context_;
+    last_tool_action_->arguments = action.arguments;
+    if (auto result = rebind_last_tool_selection(); !result) {
+        last_tool_action_ = previous_action;
+        last_tool_context_ = previous_context;
+        selection_ = before_selection;
+        return failure(result.error().with_context("adjust-last selection"));
+    }
+    auto result = invoke_tool(*last_tool_action_);
+    if (!result) {
+        last_tool_action_ = previous_action;
+        last_tool_context_ = previous_context;
+        selection_ = before_selection;
     }
     return result;
 }
@@ -865,6 +1364,8 @@ void ApplicationSession::reset_editor_state() noexcept {
     selection_.clear();
     history_.clear_history();
     problems_.clear();
+    last_tool_action_.reset();
+    last_tool_context_.reset();
 }
 
 ApplicationSnapshot ApplicationSession::snapshot() const {

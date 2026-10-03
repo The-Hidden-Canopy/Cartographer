@@ -46,6 +46,15 @@
       }
     },
     {
+      "name": "sdk-shared-release",
+      "displayName": "Cartographer public shared SDK",
+      "inherits": "headless-release",
+      "binaryDir": "${sourceDir}/build/sdk-shared-release",
+      "cacheVariables": {
+        "CARTO_BUILD_SDK_SHARED": "ON"
+      }
+    },
+    {
       "name": "vulkan-headless-release",
       "displayName": "Cartographer Vulkan headless acceptance",
       "inherits": "headless-release",
@@ -61,6 +70,15 @@
       "binaryDir": "${sourceDir}/build/d3d12-headless-release",
       "cacheVariables": {
         "CARTO_ENABLE_D3D12": "ON"
+      }
+    },
+    {
+      "name": "d3d12-kernel-bench-release",
+      "displayName": "Cartographer D3D12 kernel benchmark",
+      "inherits": "d3d12-headless-release",
+      "binaryDir": "${sourceDir}/build/d3d12-kernel-bench-release",
+      "cacheVariables": {
+        "CARTO_BUILD_BENCHMARKS": "ON"
       }
     },
     {
@@ -87,12 +105,20 @@
       "configurePreset": "kernel-bench-release"
     },
     {
+      "name": "sdk-shared-release",
+      "configurePreset": "sdk-shared-release"
+    },
+    {
       "name": "vulkan-headless-release",
       "configurePreset": "vulkan-headless-release"
     },
     {
       "name": "d3d12-headless-release",
       "configurePreset": "d3d12-headless-release"
+    },
+    {
+      "name": "d3d12-kernel-bench-release",
+      "configurePreset": "d3d12-kernel-bench-release"
     },
     {
       "name": "d3d12-desktop-compile",

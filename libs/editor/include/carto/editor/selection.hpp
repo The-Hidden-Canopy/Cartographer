@@ -25,6 +25,16 @@ enum class SelectionOperation {
     toggle,
 };
 
+enum class SelectionExpansion {
+    linked,
+    grow,
+    shrink,
+    invert,
+    loop,
+    ring,
+    boundary,
+};
+
 // Selection is editor/session state. It is deliberately not part of the
 // project format or authoring revision and must be validated against context
 // before a tool uses it.
@@ -35,6 +45,15 @@ public:
     [[nodiscard]] bool empty() const noexcept { return active_count() == 0U; }
 
     [[nodiscard]] core::Result<void> set_mode(SelectionMode mode);
+    [[nodiscard]] core::Result<void> convert_mode(
+        SelectionMode mode,
+        const geometry::EditableMesh& mesh);
+    [[nodiscard]] core::Result<void> expand(
+        SelectionExpansion expansion,
+        const geometry::EditableMesh& mesh);
+    [[nodiscard]] core::Result<void> select_shortest_path(
+        geometry::VertexId goal,
+        const geometry::EditableMesh& mesh);
     void clear() noexcept;
 
     [[nodiscard]] core::Result<void> select_object(

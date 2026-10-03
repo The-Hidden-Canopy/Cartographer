@@ -100,6 +100,38 @@ struct ApplicationSnapshot {
     ViewportState viewport;
 };
 
+enum class RecoveryInspectionState {
+    unavailable,
+    clean,
+    pending,
+    blocked,
+};
+
+struct RecoveryJournalEntry {
+    core::Revision revision_before;
+    core::Revision revision_after;
+    std::string event_type;
+};
+
+// Read-only startup evidence. Inspection never mutates the project, journal,
+// command history, or in-memory application state. `pending` means the
+// journal is ahead of the saved project (or the project file is missing), so a
+// future explicit recovery decision may be offered. `blocked` means the
+// durable evidence is malformed or semantically inconsistent and must not be
+// presented as recoverable state.
+struct RecoveryInspection {
+    std::filesystem::path project_path;
+    std::filesystem::path journal_path;
+    RecoveryInspectionState state = RecoveryInspectionState::unavailable;
+    std::optional<core::Revision> project_revision;
+    core::Revision durable_revision;
+    std::size_t journal_entry_count = 0U;
+    std::vector<RecoveryJournalEntry> journal_entries;
+    std::optional<core::Diagnostic> diagnostic;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
 using OperationId = std::uint64_t;
 
 enum class OperationSource {
@@ -122,6 +154,7 @@ struct ParameterPayload {
     std::optional<core::Vec3d> position;
     std::optional<bool> remove_orphaned_vertices;
     std::optional<double> factor;
+    std::optional<geometry::EdgeId> support_edge;
 };
 
 struct DispatchReceipt {
@@ -147,6 +180,11 @@ struct OpenProjectAction {
     bool discard_dirty = false;
 };
 
+struct RecoverProjectAction {
+    std::filesystem::path path;
+    bool discard_dirty = false;
+};
+
 struct SaveProjectAction {
     std::optional<std::filesystem::path> path;
 };
@@ -157,6 +195,18 @@ struct SetWorkspaceAction {
 
 struct SetSelectionModeAction {
     editor::SelectionMode mode;
+};
+
+struct ConvertSelectionAction {
+    editor::SelectionMode mode;
+};
+
+struct ExpandSelectionAction {
+    editor::SelectionExpansion expansion;
+};
+
+struct SelectShortestPathAction {
+    geometry::VertexId goal;
 };
 
 struct SelectObjectAction {
@@ -192,6 +242,14 @@ struct InvokeToolAction {
     editor::ToolArguments arguments;
 };
 
+struct RepeatLastToolAction {};
+
+// Re-evaluates the previous tool with a complete replacement argument set.
+// The tool identity and authoring selection remain revision-bound session state.
+struct AdjustLastToolAction {
+    editor::ToolArguments arguments;
+};
+
 struct CreateBoxAction {
     std::string object_name;
     core::Vec3d size{1.0, 1.0, 1.0};
@@ -214,15 +272,21 @@ struct RedoAction {};
 using ApplicationAction = std::variant<
     NewProjectAction,
     OpenProjectAction,
+    RecoverProjectAction,
     SaveProjectAction,
     SetWorkspaceAction,
     SetSelectionModeAction,
+    ConvertSelectionAction,
+    ExpandSelectionAction,
+    SelectShortestPathAction,
     SelectObjectAction,
     SelectVertexAction,
     SelectFaceAction,
     SelectEdgeAction,
     SetObjectTransformAction,
     InvokeToolAction,
+    RepeatLastToolAction,
+    AdjustLastToolAction,
     CreateBoxAction,
     CreatePlaneAction,
     CreateMeshObjectAction,
@@ -256,6 +320,9 @@ class ApplicationSession {
 public:
     ApplicationSession();
 
+    [[nodiscard]] static core::Result<RecoveryInspection> inspect_recovery(
+        const std::filesystem::path& project_path);
+
     [[nodiscard]] core::Result<DispatchReceipt> dispatch(
         HumanActionAdmission admission,
         const ApplicationAction& action,
@@ -278,6 +345,8 @@ private:
     [[nodiscard]] core::Result<void> set_workspace(WorkspaceState workspace);
     [[nodiscard]] core::Result<DispatchReceipt> new_project(const NewProjectAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> open_project(const OpenProjectAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> recover_project(
+        const RecoverProjectAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> save_project(const SaveProjectAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> execute_command(
         std::unique_ptr<editor::EditorCommand> command,
@@ -294,7 +363,17 @@ private:
     [[nodiscard]] core::Result<DispatchReceipt> select_vertex(const SelectVertexAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> select_face(const SelectFaceAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> select_edge(const SelectEdgeAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> convert_selection(
+        const ConvertSelectionAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> expand_selection(
+        const ExpandSelectionAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> select_shortest_path(
+        const SelectShortestPathAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> invoke_tool(const InvokeToolAction& action);
+    [[nodiscard]] core::Result<void> rebind_last_tool_selection();
+    [[nodiscard]] core::Result<DispatchReceipt> repeat_last_tool();
+    [[nodiscard]] core::Result<DispatchReceipt> adjust_last_tool(
+        const AdjustLastToolAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_box(const CreateBoxAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_plane(const CreatePlaneAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_mesh_object(
@@ -336,6 +415,8 @@ private:
     std::optional<journal::Journal> journal_;
     WorkspaceState workspace_;
     std::vector<core::Diagnostic> problems_;
+    std::optional<InvokeToolAction> last_tool_action_;
+    std::optional<editor::AuthoringContext> last_tool_context_;
     OperationId next_operation_id_ = 1U;
     OperationSource active_source_ = OperationSource::human;
     std::string active_provenance_id_;

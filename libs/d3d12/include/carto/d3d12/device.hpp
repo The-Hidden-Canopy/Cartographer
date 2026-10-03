@@ -93,6 +93,11 @@ public:
     [[nodiscard]] gpu::SubmissionSerial completed_serial() const noexcept override;
     [[nodiscard]] core::Result<void> wait(gpu::SubmissionSerial serial) override;
 
+    // Returns the native timestamp frequency for a queue, or zero when the
+    // adapter does not expose timestamp queries for that queue.
+    [[nodiscard]] std::uint64_t timestamp_frequency(
+        gpu::QueueType queue = gpu::QueueType::graphics) const noexcept;
+
     // Debug-layer and device-removal evidence is retained as bounded textual
     // receipts. Recovery is explicit: it creates a fresh device and does not
     // silently claim that GPU resources survived removal.

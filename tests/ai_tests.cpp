@@ -39,16 +39,44 @@ void ontology_is_derived_from_native_tools() {
         [](const auto& operation) { return operation.id == "mesh.extrude-face"; });
     const auto inset = std::find_if(context.operations.begin(), context.operations.end(),
         [](const auto& operation) { return operation.id == "mesh.inset-face"; });
+    const auto poke = std::find_if(context.operations.begin(), context.operations.end(),
+        [](const auto& operation) { return operation.id == "mesh.poke-face"; });
     const auto delete_face = std::find_if(context.operations.begin(), context.operations.end(),
         [](const auto& operation) { return operation.id == "mesh.remove-face"; });
+    const auto merge_vertices = std::find_if(context.operations.begin(), context.operations.end(),
+        [](const auto& operation) { return operation.id == "mesh.merge-vertices"; });
+    const auto dissolve_edge = std::find_if(context.operations.begin(), context.operations.end(),
+        [](const auto& operation) { return operation.id == "mesh.dissolve-edge"; });
+    const auto tri_to_quad = std::find_if(context.operations.begin(), context.operations.end(),
+        [](const auto& operation) { return operation.id == "mesh.tri-to-quad"; });
+    const auto slide_vertex = std::find_if(context.operations.begin(), context.operations.end(),
+        [](const auto& operation) { return operation.id == "mesh.slide-vertex"; });
     REQUIRE(extrude != context.operations.end() && extrude->preview_supported);
     REQUIRE(inset != context.operations.end() && inset->preview_supported);
+    REQUIRE(poke != context.operations.end() && !poke->preview_supported);
     REQUIRE(delete_face != context.operations.end() && !delete_face->preview_supported);
+    REQUIRE(merge_vertices != context.operations.end() && !merge_vertices->preview_supported);
+    REQUIRE(dissolve_edge != context.operations.end() && !dissolve_edge->preview_supported);
+    REQUIRE(tri_to_quad != context.operations.end() && !tri_to_quad->preview_supported);
+    REQUIRE(slide_vertex != context.operations.end() && !slide_vertex->preview_supported);
     REQUIRE(extrude->kernel_operation == "geometry.EditableMesh.extrude_face");
     REQUIRE(inset->kernel_operation == "geometry.EditableMesh.inset_face");
     REQUIRE(inset->precondition.find("strictly convex") != std::string::npos);
     REQUIRE(inset->precondition.find("planar") != std::string::npos);
     REQUIRE(delete_face->kernel_operation == "geometry.EditableMesh.delete_face");
+    REQUIRE(merge_vertices->kernel_operation == "geometry.EditableMesh.merge_vertices");
+    REQUIRE(merge_vertices->precondition.find("exactly two") != std::string::npos);
+    REQUIRE(dissolve_edge->kernel_operation == "geometry.EditableMesh.dissolve_edge");
+    REQUIRE(dissolve_edge->precondition.find("coplanar") != std::string::npos);
+    REQUIRE(dissolve_edge->precondition.find("future preview") != std::string::npos);
+    REQUIRE(tri_to_quad->kernel_operation == "geometry.EditableMesh.tri_to_quad");
+    REQUIRE(tri_to_quad->precondition.find("exactly two") != std::string::npos);
+    REQUIRE(tri_to_quad->precondition.find("future preview") != std::string::npos);
+    REQUIRE(slide_vertex->kernel_operation == "geometry.EditableMesh.slide_vertex");
+    REQUIRE(slide_vertex->precondition.find("strictly between") != std::string::npos);
+    REQUIRE(poke->kernel_operation == "geometry.EditableMesh.poke_face");
+    REQUIRE(poke->precondition.find("strictly convex") != std::string::npos);
+    REQUIRE(poke->precondition.find("future preview") != std::string::npos);
 }
 
 void ontology_json_preserves_kernel_and_approval_contract() {

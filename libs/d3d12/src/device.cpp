@@ -515,12 +515,24 @@ struct D3D12Device::Impl {
     };
 
     struct QueueResource {
+        struct CommandContext {
+            ComPtr<ID3D12CommandAllocator> allocator;
+            ComPtr<ID3D12GraphicsCommandList> command_list;
+            gpu::SubmissionSerial last_submitted = 0U;
+        };
+
         ComPtr<ID3D12CommandQueue> queue;
+        // The public command stream remains serially ordered, but recording
+        // can advance while an earlier submission is executing. A small ring
+        // avoids turning every submit into a CPU-side fence wait.
+        std::array<CommandContext, 3U> command_contexts;
+        std::size_t next_command_context = 0U;
         ComPtr<ID3D12CommandAllocator> allocator;
         ComPtr<ID3D12GraphicsCommandList> command_list;
         ComPtr<ID3D12Fence> fence;
+        ComPtr<ID3D12QueryHeap> timestamp_queries;
+        std::uint64_t timestamp_frequency = 0U;
         HANDLE event = nullptr;
-        gpu::SubmissionSerial last_submitted = 0U;
 
         QueueResource() = default;
         ~QueueResource() {
@@ -552,6 +564,7 @@ struct D3D12Device::Impl {
     UINT next_srv = 0U;
     UINT next_sampler = 0U;
     static constexpr UINT descriptor_capacity = 4096U;
+    static constexpr UINT timestamp_query_capacity = 4096U;
     // D3D12 caps shader-visible sampler heaps at 2048 descriptors, while the
     // CBV/SRV/UAV heap has a separate, larger limit. Keep the capacities
     // distinct so device creation does not request an invalid native heap.
@@ -710,27 +723,47 @@ core::Result<std::unique_ptr<D3D12Device>> D3D12Device::create(D3D12DeviceOption
                 native_failure("ID3D12Device::CreateCommandQueue", status));
         }
         auto& queue = impl->queues.at(queue_type);
-        status = impl->device->CreateCommandAllocator(
-            native_type, IID_PPV_ARGS(&queue.allocator));
-        if (FAILED(status)) {
-            return core::Result<std::unique_ptr<D3D12Device>>::failure(
-                native_failure("ID3D12Device::CreateCommandAllocator", status));
+        for (auto& context : queue.command_contexts) {
+            status = impl->device->CreateCommandAllocator(
+                native_type, IID_PPV_ARGS(&context.allocator));
+            if (FAILED(status)) {
+                return core::Result<std::unique_ptr<D3D12Device>>::failure(
+                    native_failure("ID3D12Device::CreateCommandAllocator", status));
+            }
+            status = impl->device->CreateCommandList(
+                0U,
+                native_type,
+                context.allocator.Get(),
+                nullptr,
+                IID_PPV_ARGS(&context.command_list));
+            if (FAILED(status) || FAILED(context.command_list->Close())) {
+                return core::Result<std::unique_ptr<D3D12Device>>::failure(
+                    native_failure("ID3D12Device::CreateCommandList", FAILED(status) ? status : E_FAIL));
+            }
         }
-        status = impl->device->CreateCommandList(
-            0U,
-            native_type,
-            queue.allocator.Get(),
-            nullptr,
-            IID_PPV_ARGS(&queue.command_list));
-        if (FAILED(status) || FAILED(queue.command_list->Close())) {
-            return core::Result<std::unique_ptr<D3D12Device>>::failure(
-                native_failure("ID3D12Device::CreateCommandList", FAILED(status) ? status : E_FAIL));
-        }
+        queue.allocator = queue.command_contexts.front().allocator;
+        queue.command_list = queue.command_contexts.front().command_list;
         status = impl->device->CreateFence(
             0U, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&queue.fence));
         if (FAILED(status)) {
             return core::Result<std::unique_ptr<D3D12Device>>::failure(
                 native_failure("ID3D12Device::CreateFence", status));
+        }
+        if (native_type != D3D12_COMMAND_LIST_TYPE_COPY) {
+            D3D12_QUERY_HEAP_DESC query_descriptor{};
+            query_descriptor.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+            query_descriptor.Count = Impl::timestamp_query_capacity;
+            const HRESULT query_status = impl->device->CreateQueryHeap(
+                &query_descriptor, IID_PPV_ARGS(&queue.timestamp_queries));
+            if (SUCCEEDED(query_status)) {
+                const HRESULT frequency_status =
+                    queue.queue->GetTimestampFrequency(&queue.timestamp_frequency);
+                if (FAILED(frequency_status) || queue.timestamp_frequency == 0U) {
+                    queue.timestamp_queries.Reset();
+                    queue.timestamp_frequency = 0U;
+                }
+            }
+            if (!queue.timestamp_queries) queue.timestamp_frequency = 0U;
         }
         queue.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (queue.event == nullptr) {
@@ -804,6 +837,11 @@ core::Result<std::unique_ptr<D3D12Device>> D3D12Device::create(D3D12DeviceOption
     impl->capabilities.presentation = true;
     impl->capabilities.anisotropy = true;
     impl->capabilities.sampler_compare = true;
+    impl->capabilities.timestamp_queries = std::any_of(
+        impl->queues.begin(), impl->queues.end(), [](const auto& entry) {
+            return entry.second.timestamp_queries != nullptr &&
+                entry.second.timestamp_frequency != 0U;
+        });
     impl->capabilities.max_texture_dimension_2d = D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
     impl->capabilities.max_sampler_anisotropy =
         static_cast<float>(D3D12_MAX_MAXANISOTROPY);
@@ -1856,15 +1894,21 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
     }
 
     auto& queue_resource = queue_it->second;
-    if (queue_resource.last_submitted != 0U &&
-        queue_resource.fence->GetCompletedValue() < queue_resource.last_submitted) {
+    auto& command_context = queue_resource.command_contexts[
+        queue_resource.next_command_context];
+    queue_resource.next_command_context =
+        (queue_resource.next_command_context + 1U) % queue_resource.command_contexts.size();
+    if (command_context.last_submitted != 0U &&
+        queue_resource.fence->GetCompletedValue() < command_context.last_submitted) {
         if (FAILED(queue_resource.fence->SetEventOnCompletion(
-                queue_resource.last_submitted, queue_resource.event))) {
+                command_context.last_submitted, queue_resource.event))) {
             return core::Result<gpu::SubmissionSerial>::failure(Diagnostic(
                 ErrorCode::invalid_state, "D3D12 fence wait registration failed"));
         }
         WaitForSingleObject(queue_resource.event, INFINITE);
     }
+    queue_resource.allocator = command_context.allocator;
+    queue_resource.command_list = command_context.command_list;
     if (FAILED(queue_resource.allocator->Reset()) ||
         FAILED(queue_resource.command_list->Reset(queue_resource.allocator.Get(), nullptr))) {
         return core::Result<gpu::SubmissionSerial>::failure(Diagnostic(
@@ -1946,7 +1990,11 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
                 "D3D12 resource transition does not match the semantic state"));
         }
         if (auto result = remember_native_state(command.resource); !result) return result;
-        const D3D12_RESOURCE_STATES after = native_state(command.after);
+        const D3D12_RESOURCE_STATES after =
+            queue == gpu::QueueType::compute &&
+                command.after == device_ir::ResourceState::shader_read
+            ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+            : native_state(command.after);
         const auto record = [&](ID3D12Resource* resource,
                                 D3D12_RESOURCE_STATES& before) -> core::Result<void> {
             if (before != after) {
@@ -2023,7 +2071,7 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
     bool index_buffer_bound = false;
     for (const auto& command : stream.commands()) {
         const auto result = std::visit(
-            [this, &queue_resource, &require_state, &require_graphics, &require_compute,
+            [this, queue, &queue_resource, &require_state, &require_graphics, &require_compute,
              &transition, &bound_pipeline, &bound_sampled_texture,
              &bound_storage_texture, &vertex_buffer_bound, &index_buffer_bound](
                 const auto& value) -> core::Result<void> {
@@ -2612,11 +2660,64 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
                     queue_resource.command_list->Dispatch(
                         value.group_count_x, value.group_count_y, value.group_count_z);
                     return core::Result<void>::success();
-                } else if constexpr (std::is_same_v<T, device_ir::CmdBlitTexture> ||
-                                     std::is_same_v<T, device_ir::CmdWriteTimestamp> ||
-                                     std::is_same_v<T, device_ir::CmdResolveTimestamps>) {
+                } else if constexpr (std::is_same_v<T, device_ir::CmdBlitTexture>) {
                     return core::Result<void>::failure(unsupported(
-                        "D3D12 command is reserved for a later parity tranche"));
+                        "D3D12 texture blit is reserved for a later parity tranche"));
+                } else if constexpr (std::is_same_v<T, device_ir::CmdWriteTimestamp>) {
+                    if (queue == gpu::QueueType::copy ||
+                        !queue_resource.timestamp_queries ||
+                        queue_resource.timestamp_frequency == 0U) {
+                        return core::Result<void>::failure(unsupported(
+                            "D3D12 timestamp queries are unavailable on this queue"));
+                    }
+                    if (value.query >= Impl::timestamp_query_capacity) {
+                        return core::Result<void>::failure(invalid(
+                            "D3D12 timestamp query index exceeds the device query capacity"));
+                    }
+                    queue_resource.command_list->EndQuery(
+                        queue_resource.timestamp_queries.Get(),
+                        D3D12_QUERY_TYPE_TIMESTAMP,
+                        value.query);
+                    return core::Result<void>::success();
+                } else if constexpr (std::is_same_v<T, device_ir::CmdResolveTimestamps>) {
+                    if (queue == gpu::QueueType::copy ||
+                        !queue_resource.timestamp_queries ||
+                        queue_resource.timestamp_frequency == 0U) {
+                        return core::Result<void>::failure(unsupported(
+                            "D3D12 timestamp queries are unavailable on this queue"));
+                    }
+                    if (value.first_query >= Impl::timestamp_query_capacity ||
+                        value.query_count > Impl::timestamp_query_capacity - value.first_query) {
+                        return core::Result<void>::failure(invalid(
+                            "D3D12 timestamp query range exceeds the device query capacity"));
+                    }
+                    if (value.destination_offset % sizeof(std::uint64_t) != 0U) {
+                        return core::Result<void>::failure(invalid(
+                            "D3D12 timestamp resolve destination must be 8-byte aligned"));
+                    }
+                    if (auto result = require_state(
+                            device_ir::ResourceHandle{value.destination},
+                            device_ir::ResourceState::copy_destination); !result) {
+                        return result;
+                    }
+                    auto destination = impl_->buffers.resolve(value.destination);
+                    if (!destination) return core::Result<void>::failure(destination.error());
+                    const auto resolve_bytes = static_cast<std::uint64_t>(value.query_count) *
+                        sizeof(std::uint64_t);
+                    if (value.destination_offset > destination.value()->descriptor.bytes ||
+                        resolve_bytes > destination.value()->descriptor.bytes -
+                            value.destination_offset) {
+                        return core::Result<void>::failure(invalid(
+                            "D3D12 timestamp resolve exceeds the destination buffer"));
+                    }
+                    queue_resource.command_list->ResolveQueryData(
+                        queue_resource.timestamp_queries.Get(),
+                        D3D12_QUERY_TYPE_TIMESTAMP,
+                        value.first_query,
+                        value.query_count,
+                        destination.value()->resource.Get(),
+                        value.destination_offset);
+                    return core::Result<void>::success();
                 } else if constexpr (std::is_same_v<T, device_ir::CmdWaitTimeline>) {
                     if (value.serial > completed_serial()) {
                         return core::Result<void>::failure(Diagnostic(
@@ -2640,6 +2741,7 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
 
     const HRESULT close_status = queue_resource.command_list->Close();
     if (FAILED(close_status)) {
+        impl_->capture_debug_messages();
         rollback_preexecution_state();
         return core::Result<gpu::SubmissionSerial>::failure(
             native_failure("ID3D12GraphicsCommandList::Close", close_status));
@@ -2662,7 +2764,7 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
             native_failure("ID3D12CommandQueue::Signal", signal_status));
     }
     impl_->capture_debug_messages();
-    queue_resource.last_submitted = serial;
+    command_context.last_submitted = serial;
     impl_->pending.emplace(serial, queue);
     return core::Result<gpu::SubmissionSerial>::success(serial);
 }
@@ -2716,6 +2818,11 @@ core::Result<void> D3D12Device::wait(gpu::SubmissionSerial serial) {
         }
     }
     return core::Result<void>::success();
+}
+
+std::uint64_t D3D12Device::timestamp_frequency(gpu::QueueType queue) const noexcept {
+    const auto current = impl_->queues.find(queue);
+    return current == impl_->queues.end() ? 0U : current->second.timestamp_frequency;
 }
 
 const std::vector<std::string>& D3D12Device::debug_receipts() const noexcept {

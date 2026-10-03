@@ -281,6 +281,25 @@ core::Result<void> TopologyEditReceipt::validate() const {
         return result;
     }
 
+    for (const auto& [source, target] : merged_vertices) {
+        if (!source || !target || source == target) {
+            return core::Result<void>::failure(validation(
+                "topology receipt contains an invalid vertex merge mapping"));
+        }
+        if (!std::binary_search(removed_vertices.begin(), removed_vertices.end(), source)) {
+            return core::Result<void>::failure(validation(
+                "topology receipt merge source is not a removed vertex"));
+        }
+        if (std::binary_search(removed_vertices.begin(), removed_vertices.end(), target)) {
+            return core::Result<void>::failure(validation(
+                "topology receipt merge target is also removed"));
+        }
+        if (std::binary_search(created_vertices.begin(), created_vertices.end(), source)) {
+            return core::Result<void>::failure(validation(
+                "topology receipt merge source is also a created vertex"));
+        }
+    }
+
     const auto validate_origins = [&]<typename Map, typename IdList>(
         const Map& origins, const IdList& created, const char* label) -> core::Result<void> {
         for (const auto& [id, origin] : origins) {
@@ -390,6 +409,43 @@ core::Result<void> EditableMesh::set_vertex_position(VertexId id, core::Vec3d po
         revision_,
         {VertexChange{id, vertex->position, position}},
     });
+}
+
+core::Result<void> EditableMesh::slide_vertex(
+    VertexId vertex,
+    EdgeId support_edge,
+    double factor) {
+    if (!std::isfinite(factor) || factor <= 0.0 || factor >= 1.0) {
+        return core::Result<void>::failure(invalid(
+            "vertex slide factor must be finite and strictly between zero and one"));
+    }
+    const auto* source = find_vertex(vertex);
+    if (!source) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::not_found, "cannot slide a missing mesh vertex"));
+    }
+    const auto* edge = find_edge(support_edge);
+    if (!edge) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::not_found, "vertex slide references a missing support edge"));
+    }
+    VertexId destination;
+    if (edge->first == vertex) {
+        destination = edge->second;
+    } else if (edge->second == vertex) {
+        destination = edge->first;
+    } else {
+        return core::Result<void>::failure(invalid(
+            "vertex slide support edge must be incident to the selected vertex"));
+    }
+    const auto* target = find_vertex(destination);
+    if (!target) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::stale_data, "vertex slide support edge references a missing endpoint"));
+    }
+    const core::Vec3d position = source->position +
+        (target->position - source->position) * factor;
+    return set_vertex_position(vertex, position);
 }
 
 core::Result<void> EditableMesh::apply_patch(const MeshPatch& patch) {
@@ -886,6 +942,335 @@ core::Result<TopologyEditReceipt> EditableMesh::split_edge(EdgeId id, double fac
     return core::Result<TopologyEditReceipt>::success(std::move(receipt));
 }
 
+core::Result<TopologyEditReceipt> EditableMesh::dissolve_edge(EdgeId id) {
+    if (revision_.exhausted()) {
+        return core::Result<TopologyEditReceipt>::failure(exhausted_revision());
+    }
+    const auto edge_iterator = edges_.find(id);
+    if (edge_iterator == edges_.end()) {
+        return core::Result<TopologyEditReceipt>::failure(
+            Diagnostic(ErrorCode::not_found, "cannot dissolve a missing mesh edge"));
+    }
+    const EdgeRecord edge = edge_iterator->second;
+    if (!edge.second_half_edge.has_value()) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::unsupported,
+            "edge dissolve currently requires an internal manifold edge"));
+    }
+
+    const auto first_iterator = half_edges_.find(edge.first_half_edge);
+    const auto second_iterator = half_edges_.find(*edge.second_half_edge);
+    if (first_iterator == half_edges_.end() || second_iterator == half_edges_.end() ||
+        first_iterator->second.edge != id || second_iterator->second.edge != id) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::stale_data,
+            "edge dissolve references a missing or mismatched half-edge"));
+    }
+    const HalfEdgeRecord first = first_iterator->second;
+    const HalfEdgeRecord second = second_iterator->second;
+    if (first.face == second.face || first.origin != second.destination ||
+        first.destination != second.origin || !first.twin.has_value() ||
+        !second.twin.has_value() || *first.twin != second.id || *second.twin != first.id) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::validation_failed,
+            "edge dissolve found inconsistent internal edge adjacency"));
+    }
+
+    const auto first_face_iterator = faces_.find(first.face);
+    const auto second_face_iterator = faces_.find(second.face);
+    if (first_face_iterator == faces_.end() || second_face_iterator == faces_.end()) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::stale_data,
+            "edge dissolve references a missing incident face"));
+    }
+
+    // The first half-edge is first.origin -> first.destination. The merged
+    // boundary walks the second face from first.origin to first.destination,
+    // then the first face from first.destination back to first.origin. This
+    // deliberately walks the outer paths and omits the dissolved edge.
+    const auto outer_path = [](const Face& face, VertexId start, VertexId end)
+        -> std::optional<std::vector<VertexId>> {
+        const auto start_iterator = std::find(face.vertices.begin(), face.vertices.end(), start);
+        if (start_iterator == face.vertices.end()) return std::nullopt;
+        const std::size_t start_index = static_cast<std::size_t>(
+            std::distance(face.vertices.begin(), start_iterator));
+        std::vector<VertexId> path;
+        path.reserve(face.vertices.size());
+        for (std::size_t step = 0U; step < face.vertices.size(); ++step) {
+            const VertexId vertex = face.vertices[(start_index + step) % face.vertices.size()];
+            path.push_back(vertex);
+            if (vertex == end) return path;
+        }
+        return std::nullopt;
+    };
+
+    const auto second_path = outer_path(
+        second_face_iterator->second, first.origin, first.destination);
+    const auto first_path = outer_path(
+        first_face_iterator->second, first.destination, first.origin);
+    if (!second_path.has_value() || !first_path.has_value() ||
+        second_path->size() < 2U || first_path->size() < 2U) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::validation_failed,
+            "edge dissolve could not construct both incident face boundary paths"));
+    }
+
+    std::vector<VertexId> merged_vertices = *second_path;
+    merged_vertices.insert(
+        merged_vertices.end(), first_path->begin() + 1, first_path->end() - 1);
+    if (merged_vertices.size() < 3U ||
+        std::set<VertexId>(merged_vertices.begin(), merged_vertices.end()).size() !=
+            merged_vertices.size()) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::unsupported,
+            "edge dissolve would create a non-simple merged boundary"));
+    }
+
+    std::vector<core::Vec3d> positions;
+    positions.reserve(merged_vertices.size());
+    double scale = 1.0;
+    for (std::size_t index = 0U; index < merged_vertices.size(); ++index) {
+        const auto vertex_iterator = vertices_.find(merged_vertices[index]);
+        if (vertex_iterator == vertices_.end()) {
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::stale_data,
+                "edge dissolve merged boundary references a missing vertex"));
+        }
+        positions.push_back(vertex_iterator->second.position);
+        const core::Vec3d edge_vector = vertex_iterator->second.position -
+            vertices_.at(merged_vertices[(index + merged_vertices.size() - 1U) %
+                                         merged_vertices.size()]).position;
+        scale = std::max(scale, edge_vector.length());
+    }
+
+    const core::Vec3d normal = core::cross(
+        positions[1U] - positions[0U], positions[2U] - positions[0U]).normalized();
+    if (!normal.finite()) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::unsupported,
+            "edge dissolve requires non-degenerate incident face geometry"));
+    }
+    const double plane_tolerance = 1e-8 * scale;
+    for (const core::Vec3d position : positions) {
+        const double plane_distance = core::dot(position - positions.front(), normal);
+        if (!std::isfinite(plane_distance) || std::abs(plane_distance) > plane_tolerance) {
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::unsupported,
+                "edge dissolve currently requires coplanar incident faces"));
+        }
+    }
+
+    const double convexity_epsilon = 1e-12 * scale * scale;
+    for (std::size_t index = 0U; index < positions.size(); ++index) {
+        const std::size_t next = (index + 1U) % positions.size();
+        const std::size_t after_next = (index + 2U) % positions.size();
+        const double turn = core::dot(
+            core::cross(
+                positions[next] - positions[index],
+                positions[after_next] - positions[next]),
+            normal);
+        if (!std::isfinite(turn) || turn < -convexity_epsilon) {
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::unsupported,
+                "edge dissolve currently requires a convex merged boundary"));
+        }
+        if (index >= 1U && index + 1U < positions.size() &&
+            triangle_area_squared(
+                positions.front(), positions[index], positions[index + 1U]) <= 1e-24) {
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::unsupported,
+                "edge dissolve would create a zero-area compiled triangle"));
+        }
+    }
+
+    const EditableMesh before = *this;
+    const core::Revision revision_before = revision_;
+    const FaceId survivor = std::min(first.face, second.face);
+    const FaceId removed = std::max(first.face, second.face);
+    const auto before_topology = before.topology();
+    if (!before_topology) {
+        return core::Result<TopologyEditReceipt>::failure(before_topology.error());
+    }
+
+    faces_.erase(first.face);
+    faces_.erase(second.face);
+    faces_.emplace(survivor, Face{survivor, std::move(merged_vertices)});
+
+    if (auto result = rebuild_topology(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    if (auto result = validate(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    bump_revision();
+
+    TopologyEditReceipt receipt;
+    receipt.revision_before = revision_before;
+    receipt.revision_after = revision_;
+    if (auto result = populate_identity_delta(before, *this, receipt); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+
+    // The lower stable face identity survives the join. Newly-created corner
+    // identities on that face can still carry the removed face's corner
+    // lineage without pretending that the existing face identity was newly
+    // generated.
+    const auto after_topology = topology();
+    if (!after_topology) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(after_topology.error());
+    }
+    for (const auto& corner : after_topology.value().corners) {
+        if (!std::binary_search(receipt.created_corners.begin(), receipt.created_corners.end(),
+                                corner.id) || corner.face != survivor) {
+            continue;
+        }
+        const auto source = std::find_if(
+            before_topology.value().corners.begin(), before_topology.value().corners.end(),
+            [removed, &corner](const CornerRecord& candidate) {
+                return candidate.face == removed && candidate.vertex == corner.vertex;
+            });
+        if (source != before_topology.value().corners.end()) {
+            add_origin(receipt.corner_origins, corner.id, OriginKind::duplicated_from,
+                       {source->id.value});
+        }
+    }
+    if (auto result = receipt.validate(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    return core::Result<TopologyEditReceipt>::success(std::move(receipt));
+}
+
+core::Result<TopologyEditReceipt> EditableMesh::tri_to_quad(
+    FaceId first,
+    FaceId second) {
+    if (revision_.exhausted()) {
+        return core::Result<TopologyEditReceipt>::failure(exhausted_revision());
+    }
+    if (!first || !second || first == second) {
+        return core::Result<TopologyEditReceipt>::failure(invalid(
+            "triangle-to-quad conversion requires two distinct face identities"));
+    }
+    const auto first_iterator = faces_.find(first);
+    const auto second_iterator = faces_.find(second);
+    if (first_iterator == faces_.end() || second_iterator == faces_.end()) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::not_found,
+            "triangle-to-quad conversion references a missing face"));
+    }
+    if (first_iterator->second.vertices.size() != 3U ||
+        second_iterator->second.vertices.size() != 3U) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::unsupported,
+            "triangle-to-quad conversion requires exactly two authored triangles"));
+    }
+
+    std::optional<EdgeId> shared_edge;
+    for (const auto& [edge_id, edge] : edges_) {
+        if (!edge.second_half_edge.has_value()) continue;
+        const auto first_half_edge = half_edges_.find(edge.first_half_edge);
+        const auto second_half_edge = half_edges_.find(*edge.second_half_edge);
+        if (first_half_edge == half_edges_.end() || second_half_edge == half_edges_.end()) {
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::stale_data,
+                "triangle-to-quad conversion found a missing edge half-edge"));
+        }
+        const bool matches =
+            (first_half_edge->second.face == first && second_half_edge->second.face == second) ||
+            (first_half_edge->second.face == second && second_half_edge->second.face == first);
+        if (!matches) continue;
+        if (shared_edge.has_value()) {
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::unsupported,
+                "triangle-to-quad conversion requires exactly one shared edge"));
+        }
+        shared_edge = edge_id;
+    }
+    if (!shared_edge.has_value()) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::unsupported,
+            "triangle-to-quad conversion requires one internal shared edge"));
+    }
+    return dissolve_edge(*shared_edge);
+}
+
+core::Result<TopologyEditReceipt> EditableMesh::merge_vertices(
+    VertexId target,
+    VertexId source) {
+    if (revision_.exhausted()) {
+        return core::Result<TopologyEditReceipt>::failure(exhausted_revision());
+    }
+    if (!target || !source || target == source) {
+        return core::Result<TopologyEditReceipt>::failure(invalid(
+            "vertex merge requires two distinct non-zero vertex identities"));
+    }
+    if (!find_vertex(target) || !find_vertex(source)) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::not_found, "vertex merge references a missing mesh vertex"));
+    }
+
+    const EditableMesh before = *this;
+    const core::Revision revision_before = revision_;
+    std::map<FaceId, Face> merged_faces;
+    for (const auto& [face_id, face] : faces_) {
+        std::vector<VertexId> collapsed;
+        collapsed.reserve(face.vertices.size());
+        for (const VertexId vertex : face.vertices) {
+            const VertexId replacement = vertex == source ? target : vertex;
+            if (collapsed.empty() || collapsed.back() != replacement) {
+                collapsed.push_back(replacement);
+            }
+        }
+        if (collapsed.size() > 1U && collapsed.front() == collapsed.back()) {
+            collapsed.pop_back();
+        }
+
+        if (collapsed.size() < 3U) {
+            // Collapsing an edge of a face removes that degenerate face. The
+            // receipt records the deletion so downstream attribute transfer
+            // can invalidate face/corner data instead of guessing.
+            continue;
+        }
+        std::set<VertexId> unique_vertices(collapsed.begin(), collapsed.end());
+        if (unique_vertices.size() != collapsed.size()) {
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::unsupported,
+                "vertex merge would create a non-simple face; no mutation was published"));
+        }
+        merged_faces.emplace(face_id, Face{face_id, std::move(collapsed)});
+    }
+
+    faces_ = std::move(merged_faces);
+    vertices_.erase(source);
+    if (auto result = rebuild_topology(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    if (auto result = validate(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    bump_revision();
+
+    TopologyEditReceipt receipt;
+    receipt.revision_before = revision_before;
+    receipt.revision_after = revision_;
+    if (auto result = populate_identity_delta(before, *this, receipt); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    receipt.merged_vertices.emplace(source, target);
+    if (auto result = receipt.validate(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    return core::Result<TopologyEditReceipt>::success(std::move(receipt));
+}
+
 core::Result<TopologyEditReceipt> EditableMesh::inset_face(FaceId id, double distance) {
     if (revision_.exhausted()) {
         return core::Result<TopologyEditReceipt>::failure(exhausted_revision());
@@ -1159,6 +1544,194 @@ core::Result<TopologyEditReceipt> EditableMesh::inset_face(FaceId id, double dis
         } else {
             add_origin(receipt.corner_origins, corner.id, OriginKind::interpolated_from,
                 std::move(source_ids));
+        }
+    }
+    if (auto result = receipt.validate(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    return core::Result<TopologyEditReceipt>::success(std::move(receipt));
+}
+
+core::Result<TopologyEditReceipt> EditableMesh::poke_face(FaceId id) {
+    if (revision_.exhausted()) {
+        return core::Result<TopologyEditReceipt>::failure(exhausted_revision());
+    }
+    const auto face_iterator = faces_.find(id);
+    if (face_iterator == faces_.end()) {
+        return core::Result<TopologyEditReceipt>::failure(
+            Diagnostic(ErrorCode::not_found, "cannot poke a missing mesh face"));
+    }
+    const Face original = face_iterator->second;
+    const std::size_t vertex_count = original.vertices.size();
+    if (vertex_count < 3U) {
+        return core::Result<TopologyEditReceipt>::failure(
+            validation("face poke requires at least three boundary vertices"));
+    }
+
+    std::vector<core::Vec3d> positions;
+    positions.reserve(vertex_count);
+    double scale = 1.0;
+    for (std::size_t index = 0U; index < vertex_count; ++index) {
+        const auto vertex = vertices_.find(original.vertices[index]);
+        if (vertex == vertices_.end()) {
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::stale_data, "face poke references a missing mesh vertex"));
+        }
+        positions.push_back(vertex->second.position);
+        const auto next_vertex = vertices_.find(original.vertices[(index + 1U) % vertex_count]);
+        if (next_vertex == vertices_.end()) {
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::stale_data, "face poke references a missing boundary vertex"));
+        }
+        const core::Vec3d edge = next_vertex->second.position - vertex->second.position;
+        scale = std::max(scale, edge.length());
+    }
+    const core::Vec3d raw_normal = core::cross(
+        positions[1U] - positions[0U], positions[2U] - positions[0U]);
+    const core::Vec3d normal = raw_normal.normalized();
+    if (!normal.finite()) {
+        return core::Result<TopologyEditReceipt>::failure(
+            validation("face poke requires a non-degenerate planar face"));
+    }
+    const double plane_tolerance = 1e-8 * scale;
+    for (const core::Vec3d position : positions) {
+        const double plane_distance = core::dot(position - positions.front(), normal);
+        if (!std::isfinite(plane_distance) || std::abs(plane_distance) > plane_tolerance) {
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::unsupported,
+                "face poke currently requires a planar face"));
+        }
+    }
+
+    const double area_epsilon = 1e-12 * scale * scale;
+    for (std::size_t index = 0U; index < vertex_count; ++index) {
+        const std::size_t next = (index + 1U) % vertex_count;
+        const std::size_t after_next = (index + 2U) % vertex_count;
+        const double turn = core::dot(
+            core::cross(
+                positions[next] - positions[index],
+                positions[after_next] - positions[next]),
+            normal);
+        if (!std::isfinite(turn) || turn <= area_epsilon) {
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::unsupported,
+                "face poke currently requires a strictly convex face"));
+        }
+    }
+
+    core::Vec3d center{};
+    for (const core::Vec3d position : positions) center = center + position;
+    center = center * (1.0 / static_cast<double>(vertex_count));
+    if (!center.finite()) {
+        return core::Result<TopologyEditReceipt>::failure(
+            validation("face poke produced a non-finite centroid"));
+    }
+    for (std::size_t index = 0U; index < vertex_count; ++index) {
+        const std::size_t next = (index + 1U) % vertex_count;
+        const double inside = core::dot(
+            core::cross(positions[next] - positions[index], center - positions[index]),
+            normal);
+        if (!std::isfinite(inside) || inside <= area_epsilon) {
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::unsupported,
+                "face poke centroid is not strictly inside the face"));
+        }
+    }
+
+    const std::uint64_t new_face_count = static_cast<std::uint64_t>(vertex_count);
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    if (next_vertex_id_ > maximum - 1U) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::invalid_state, "mesh vertex id space is exhausted"));
+    }
+    if (next_face_id_ > maximum - new_face_count) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::invalid_state, "mesh face id space is exhausted"));
+    }
+
+    const EditableMesh before = *this;
+    const core::Revision revision_before = revision_;
+    faces_.erase(face_iterator);
+
+    const VertexId center_vertex{next_vertex_id_++};
+    vertices_.emplace(center_vertex, Vertex{center_vertex, center});
+    for (std::size_t index = 0U; index < vertex_count; ++index) {
+        const std::size_t next = (index + 1U) % vertex_count;
+        const FaceId triangle{next_face_id_++};
+        faces_.emplace(triangle, Face{
+            triangle,
+            {original.vertices[index], original.vertices[next], center_vertex},
+        });
+    }
+
+    if (auto result = rebuild_topology(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    if (auto result = validate(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    bump_revision();
+
+    TopologyEditReceipt receipt;
+    receipt.revision_before = revision_before;
+    receipt.revision_after = revision_;
+    if (auto result = populate_identity_delta(before, *this, receipt); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    add_origin(receipt.vertex_origins, center_vertex, OriginKind::interpolated_from,
+        [&original]() {
+            std::vector<std::uint64_t> sources;
+            sources.reserve(original.vertices.size());
+            for (const VertexId vertex : original.vertices) sources.push_back(vertex.value);
+            return sources;
+        }());
+    for (const FaceId created : receipt.created_faces) {
+        add_origin(receipt.face_origins, created, OriginKind::generated_from_face, {id.value});
+    }
+
+    const auto before_topology = before.topology();
+    const auto after_topology = topology();
+    if (!before_topology || !after_topology) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(validation(
+            "face poke receipt topology snapshot failed validation"));
+    }
+    std::map<std::pair<FaceId, VertexId>, CornerId> source_corners;
+    for (const auto& corner : before_topology.value().corners) {
+        source_corners.emplace(std::make_pair(corner.face, corner.vertex), corner.id);
+    }
+    for (const auto& edge : after_topology.value().edges) {
+        if (!std::binary_search(receipt.created_edges.begin(), receipt.created_edges.end(), edge.id)) {
+            continue;
+        }
+        add_origin(receipt.edge_origins, edge.id, OriginKind::generated_from_face, {id.value});
+    }
+    for (const auto& corner : after_topology.value().corners) {
+        if (!std::binary_search(
+                receipt.created_corners.begin(), receipt.created_corners.end(), corner.id)) {
+            continue;
+        }
+        if (corner.vertex == center_vertex) {
+            std::vector<std::uint64_t> sources;
+            sources.reserve(original.vertices.size());
+            for (const VertexId vertex : original.vertices) {
+                const auto source = source_corners.find(std::make_pair(id, vertex));
+                if (source != source_corners.end()) sources.push_back(source->second.value);
+            }
+            if (!sources.empty()) {
+                add_origin(receipt.corner_origins, corner.id,
+                    OriginKind::interpolated_from, std::move(sources));
+            }
+        } else {
+            const auto source = source_corners.find(std::make_pair(id, corner.vertex));
+            if (source != source_corners.end()) {
+                add_origin(receipt.corner_origins, corner.id,
+                    OriginKind::duplicated_from, {source->second.value});
+            }
         }
     }
     if (auto result = receipt.validate(); !result) {

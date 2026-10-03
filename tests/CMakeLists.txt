@@ -33,6 +33,22 @@ target_link_libraries(cartographer_evaluation_attributes_tests
 carto_target(cartographer_evaluation_attributes_tests)
 add_test(NAME cartographer_evaluation_attributes_tests COMMAND cartographer_evaluation_attributes_tests)
 
+add_executable(cartographer_web_geometry_tests
+    web_geometry_tests.cpp
+)
+target_link_libraries(cartographer_web_geometry_tests
+    PRIVATE
+        carto_web_geometry_compile
+        carto_web_geometry_core
+        carto_web_geometry_evaluation
+        carto_web_geometry_package
+        carto_eval
+        carto_attributes
+        carto_geometry
+)
+carto_target(cartographer_web_geometry_tests)
+add_test(NAME cartographer_web_geometry_tests COMMAND cartographer_web_geometry_tests)
+
 if(CARTO_BUILD_DEVICE_CPU)
     add_executable(cartographer_device_tests
         device_tests.cpp

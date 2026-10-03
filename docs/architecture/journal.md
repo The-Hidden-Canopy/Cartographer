@@ -48,11 +48,14 @@ bounded project-bound topology receipt ledger. The
 records a baseline snapshot at bind time, and appends accepted command, tool,
 undo, redo, and CLI batch-import actions with before/after revisions. Project
 open/save holds the project path lock across journal preparation and document
-publication. If an append fails, the in-memory command is reversed and the
-exact pre-action document snapshot is restored. The journal remains owned by
-the application boundary rather than by `ProjectDocument`; the public document
-API exposes no unjournaled state mutators. Trusted application commands and
-`ProjectTransaction` are the only production mutation paths.
+publication, and accepted mutations hold that same lease while appending their
+durable snapshot. Recovery also holds the lease from verified journal read
+through atomic project publication. If an append fails, the in-memory command
+is reversed and the exact pre-action document snapshot is restored. The
+journal remains owned by the application boundary rather than by
+`ProjectDocument`; the public document API exposes no unjournaled state
+mutators. Trusted application commands and `ProjectTransaction` are the only
+production mutation paths.
 
 The `ProjectTransaction` boundary provides the corresponding lower-level
 durable path for integrations that own a `ProjectDocument` directly. It
@@ -75,6 +78,25 @@ and exact envelope shape, rather than searching for a document marker. A
 journal or checkpoint therefore must not be presented as proof
 that a crash-recovered document is ready for promotion without the remaining
 user-visible recovery workflow.
+
+`ApplicationSession::inspect_recovery` is the non-mutating application-side
+evidence boundary for startup integration. It verifies the project and its
+project-local journal, returns the bounded journal revision/event summary, and
+classifies the result as `unavailable`, `clean`, `pending`, or `blocked`.
+Inspection takes the project writer lease before loading either side of the
+boundary, so it cannot classify a project and journal from different writer
+revisions. It never applies a snapshot, rewrites a journal, truncates a
+record, changes command history, or changes saved state. A `pending` result is
+only a signal for a future explicit recovery decision; it is not a recovered
+project.
+
+`project::recover_latest_snapshot` and the human-only
+`RecoverProjectAction` provide the next bounded step. They select only the
+latest journal entry whose envelope, serialized document, revision, and full
+document validation all succeed, then save that candidate through the normal
+atomic project path and rebind the session. A dirty active session requires an
+explicit discard flag. AI/proposal sources cannot invoke this action, and the
+recovery path does not silently repair or truncate durable evidence.
 
 ## Recovery rule
 

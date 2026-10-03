@@ -14,6 +14,13 @@ does not start a process or grant authority.
 - request envelopes use `carto.plugin.v1` and a four-byte length-prefixed frame;
 - frame size, request ID, capability, method, and object payload boundaries are
   validated before a host can consider dispatching them.
+- neutral results are accepted only when they match the admitted request and
+  capability, fit the bounded object-payload limit, and match an expected
+  source revision when the host supplies one; the result type contains no
+  authoring mutation primitive.
+- manifests carry bounded wall-time, CPU-time, and output-size policy values;
+  the host rejects zero or over-limit declarations and applies the output cap
+  to neutral results. These are admission limits, not OS enforcement.
 
 ## Package inspection and local install foundation
 
@@ -37,7 +44,7 @@ rechecks the installed package digest so stale or tampered receipts do not
 become trusted state.
 
 This wave does not claim process isolation, OS sandboxing, plugin execution,
-geometry admission, Hub/catalog authority, update resolution, network
+host geometry admission, Hub/catalog authority, update resolution, network
 permissions, or VANTA runtime control. Those are later waves and remain
 outside the current host authority boundary. The signing primitive has standard
 RFC8032 vector coverage but is not an external cryptographic-audit claim.
@@ -46,7 +53,7 @@ RFC8032 vector coverage but is not an external cryptographic-audit claim.
 
 ```text
 package -> manifest -> inspect -> capability registry -> bounded frame
-         -> sandbox process -> neutral proposal
+         -> sandbox process -> neutral result admission
          -> host geometry/size validation -> ProjectTransaction
 ```
 
@@ -54,7 +61,8 @@ The plugin never receives a `ProjectDocument*`, mutable mesh pointer, GPU
 handle, credential, or arbitrary filesystem authority. A malformed frame,
 oversized payload, process crash, timeout, or invalid geometry result must stay
 outside authoring truth. Process limits, cancellation, OS sandbox policy, and
-neutral-result validation remain deferred runtime work. Before a host dispatches
+process-result transport, runtime timeout/cancellation, OS resource limits, and host geometry validation
+remain deferred runtime work. Before a host dispatches
 an envelope, it must validate the manifest and require that the envelope
 capability is explicitly listed by that manifest; envelope framing alone is not
 an authority grant.

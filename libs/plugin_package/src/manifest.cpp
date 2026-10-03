@@ -391,6 +391,7 @@ core::Result<plugin_protocol::PluginManifest> to_plugin_manifest(
             manifest.permissions.network,
             manifest.permissions.project_write_new_assets,
             manifest.permissions.filesystem_inputs},
+        plugin_protocol::ExecutionBudget{},
     };
     if (auto valid = plugin_protocol::Protocol::validate_manifest(result); !valid) {
         return core::Result<plugin_protocol::PluginManifest>::failure(valid.error());

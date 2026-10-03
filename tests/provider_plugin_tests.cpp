@@ -84,6 +84,7 @@ void plugin_protocol_is_bounded_and_defaults_to_non_network_sandboxing() {
     const carto::plugin_protocol::PluginManifest manifest{
         "org.example.obj", {1U, 2U, 0U}, 1U, {"geometry.import.obj"},
         carto::providers::TrustClass::sandboxed_process, {},
+        {},
     };
     REQUIRE(carto::plugin_protocol::Protocol::validate_manifest(manifest));
     auto network = manifest;
@@ -95,6 +96,12 @@ void plugin_protocol_is_bounded_and_defaults_to_non_network_sandboxing() {
     auto write = manifest;
     write.permissions.project_write_new_assets = true;
     REQUIRE(!carto::plugin_protocol::Protocol::validate_manifest(write));
+    auto invalid_budget = manifest;
+    invalid_budget.budget.max_wall_time_ms = 0U;
+    REQUIRE(!carto::plugin_protocol::Protocol::validate_manifest(invalid_budget));
+    REQUIRE(!carto::plugin_protocol::Protocol::validate_execution_budget(
+        carto::plugin_protocol::ExecutionBudget{
+            30'000U, 30'000U, carto::plugin_protocol::Protocol::kMaxFrameBytes + 1U}));
 
     const carto::plugin_protocol::Envelope envelope{
         "request-1", "geometry.import.obj", "import", "{\"source\":\"input.obj\"}",
@@ -103,6 +110,21 @@ void plugin_protocol_is_bounded_and_defaults_to_non_network_sandboxing() {
     auto ungranted = envelope;
     ungranted.capability = "geometry.export.obj";
     REQUIRE(!carto::plugin_protocol::Protocol::validate_admission(manifest, ungranted));
+
+    const carto::plugin_protocol::NeutralResult neutral{
+        envelope.request_id, envelope.capability, "{\"vertices\":[]}", 7U};
+    REQUIRE(carto::plugin_protocol::Protocol::validate_neutral_result(
+        manifest, envelope, neutral, 7U));
+    REQUIRE(!carto::plugin_protocol::Protocol::validate_neutral_result(
+        manifest, envelope, neutral, 8U));
+    auto replayed = neutral;
+    replayed.request_id = "other-request";
+    REQUIRE(!carto::plugin_protocol::Protocol::validate_neutral_result(
+        manifest, envelope, replayed));
+    auto non_object = neutral;
+    non_object.payload_json = "[]";
+    REQUIRE(!carto::plugin_protocol::Protocol::validate_neutral_result(
+        manifest, envelope, non_object, 7U));
     const auto frame = carto::plugin_protocol::Protocol::encode(envelope);
     REQUIRE(frame);
     const auto decoded = carto::plugin_protocol::Protocol::decode(frame.value());

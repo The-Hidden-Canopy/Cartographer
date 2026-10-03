@@ -3,6 +3,20 @@
 
 #include <stdint.h>
 
+#if defined(_WIN32)
+#    if defined(CARTO_SDK_BUILDING)
+#        define CARTO_SDK_API __declspec(dllexport)
+#    elif defined(CARTO_SDK_SHARED)
+#        define CARTO_SDK_API __declspec(dllimport)
+#    else
+#        define CARTO_SDK_API
+#    endif
+#elif defined(__GNUC__) || defined(__clang__)
+#    define CARTO_SDK_API __attribute__((visibility("default")))
+#else
+#    define CARTO_SDK_API
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -27,7 +41,14 @@ typedef struct carto_error {
 } carto_error;
 
 /* Returns the ABI version; callers should gate optional operations on it. */
-uint32_t carto_abi_version(void);
+CARTO_SDK_API uint32_t carto_abi_version(void);
+
+/* Selects the current ABI only when it falls within the caller's supported range. */
+CARTO_SDK_API carto_status carto_abi_negotiate(
+    uint32_t minimum_version,
+    uint32_t maximum_version,
+    uint32_t* out_version,
+    carto_error* out_error);
 
 /*
  * config_json may contain {"project_root":"..."}. When omitted, the
@@ -35,33 +56,33 @@ uint32_t carto_abi_version(void);
  * beneath that root; absolute paths outside it and any '..' component are
  * rejected. The context owns the root policy for all documents it opens.
  */
-carto_status carto_context_create(
+CARTO_SDK_API carto_status carto_context_create(
     const char* config_json,
     carto_context** out_context,
     carto_error* out_error);
 
-carto_status carto_document_open(
+CARTO_SDK_API carto_status carto_document_open(
     carto_context* context,
     const char* path_utf8,
     carto_document** out_document,
     carto_error* out_error);
 
-carto_status carto_document_query_json(
+CARTO_SDK_API carto_status carto_document_query_json(
     carto_document* document,
     const char* request_json,
     char** out_response_json,
     carto_error* out_error);
 
-carto_status carto_document_execute_json(
+CARTO_SDK_API carto_status carto_document_execute_json(
     carto_document* document,
     const char* request_json,
     char** out_response_json,
     carto_error* out_error);
 
-void carto_document_close(carto_document* document);
-void carto_context_destroy(carto_context* context);
+CARTO_SDK_API void carto_document_close(carto_document* document);
+CARTO_SDK_API void carto_context_destroy(carto_context* context);
 /* Messages returned through carto_error and response strings are freed here. */
-void carto_free(void* allocation);
+CARTO_SDK_API void carto_free(void* allocation);
 
 #ifdef __cplusplus
 }

@@ -48,6 +48,14 @@ struct SnapSettings {
     [[nodiscard]] constexpr bool operator==(const SnapSettings&) const noexcept = default;
 };
 
+// Applies only grid/increment snapping. Geometry-target kinds require a
+// candidate service with visible target identity and are rejected here rather
+// than silently treated as grid snapping.
+[[nodiscard]] core::Result<double> snap_scalar(double value, const SnapSettings& settings);
+[[nodiscard]] core::Result<core::Vec3d> snap_vector(
+    core::Vec3d value,
+    const SnapSettings& settings);
+
 // AuthoringContext is a value snapshot of the operator's validated intent.
 // It contains no project references and therefore cannot grant mutation
 // authority. The application/session layer is responsible for validating the

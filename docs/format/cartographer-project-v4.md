@@ -25,8 +25,10 @@ END
 ```
 
 The graph record remains optional. The topology receipt record contains a
-versioned `CARTOGRAPHER_TOPOLOGY_RECEIPT 1` value with mesh source/destination
-revisions, created/removed stable IDs, and domain-local origin maps. It never
+versioned `CARTOGRAPHER_TOPOLOGY_RECEIPT 2` value with mesh source/destination
+revisions, created/removed stable IDs, optional source-to-target vertex merge
+mappings, and domain-local origin maps. Receipt version 1 remains readable for
+legacy projects. It never
 contains positions, compiled indices, GPU handles, prompts, credentials,
 telemetry, or runtime entity IDs. The quoted receipt may span physical lines;
 the parser consumes the quoted value as one bounded field with a 32 MiB byte
@@ -39,8 +41,8 @@ and revision interval. Records newer than the current mesh snapshot, dangling
 asset references, oversized counts, unknown origin kinds, duplicate IDs,
 trailing data, and future receipt/project versions fail closed.
 
-Only project-bound extrusion, inset, face deletion, and edge split commands
-currently append receipts. Direct kernel calls and other project replacements
+Only project-bound extrusion, inset, face deletion, edge split, bounded internal-edge dissolve, compatible triangle-to-quad conversion, face poke, and target-weld
+commands currently append receipts. Direct kernel calls and other project replacements
 remain valid but do not claim a receipt unless they provide one through the
 revision-bound replacement API. Undo and redo persist authoritative snapshots
 and do not fabricate inverse topology receipts; existing lineage remains

@@ -10,6 +10,10 @@
 /.cache/
 /tmp/
 
+# GitHub Actions is opt-in for this local/public checkout; do not stage
+# workflow definitions unless CI is intentionally re-enabled.
+/.github/workflows/
+
 # Generated build-system state outside a preset build directory
 *.ninja
 .ninja_deps
@@ -46,6 +50,10 @@ _deps/
 
 # Local project files and test artifacts
 *.carto.tmp
+*.carto.tmp-*
+*.carto.journal
+*.carto.lock
+*.journal.lock
 *.log
 
 # Local credentials and environment (never commit workstation secrets)

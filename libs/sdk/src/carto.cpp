@@ -236,6 +236,27 @@ uint32_t carto_abi_version(void) {
     return kAbiVersion;
 }
 
+carto_status carto_abi_negotiate(
+    uint32_t minimum_version,
+    uint32_t maximum_version,
+    uint32_t* out_version,
+    carto_error* out_error) {
+    clear_error(out_error);
+    if (out_version == nullptr) return invalid("output ABI version pointer is null", out_error);
+    *out_version = 0U;
+    if (minimum_version == 0U || maximum_version == 0U || minimum_version > maximum_version) {
+        return invalid("ABI negotiation range is invalid", out_error);
+    }
+    if (kAbiVersion < minimum_version || kAbiVersion > maximum_version) {
+        return fail(carto::core::Diagnostic(
+                        carto::core::ErrorCode::version_mismatch,
+                        "requested ABI range is not supported"),
+                    out_error);
+    }
+    *out_version = kAbiVersion;
+    return CARTO_OK;
+}
+
 carto_status carto_context_create(
     const char* config_json,
     carto_context** out_context,
@@ -332,7 +353,7 @@ carto_status carto_document_query_json(
         }
         if (*operation == "capabilities") {
             return allocate_response(
-                "{\"abi_version\":1,\"operations\":[\"snapshot\",\"save\",\"create_box\",\"create_plane\",\"undo\",\"redo\"]}",
+                "{\"abi_version\":1,\"abi_min_version\":1,\"abi_max_version\":1,\"operations\":[\"snapshot\",\"save\",\"create_box\",\"create_plane\",\"undo\",\"redo\"]}",
                 out_response_json, out_error);
         }
         return invalid("query request uses an unsupported op", out_error);

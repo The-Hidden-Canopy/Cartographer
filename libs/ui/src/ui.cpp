@@ -85,6 +85,43 @@ bool valid(BottomPanel value) noexcept {
         value == BottomPanel::problems || value == BottomPanel::console;
 }
 
+std::vector<WorkspaceDefinition> make_workspace_registry() {
+    const std::vector<Panel> model_panels{
+        Panel::scene, Panel::viewport, Panel::inspector, Panel::operations, Panel::problems};
+    const std::vector<Panel> graph_panels{
+        Panel::scene, Panel::viewport, Panel::inspector, Panel::graph, Panel::problems};
+    const std::vector<Panel> asset_panels{
+        Panel::scene, Panel::viewport, Panel::assets, Panel::inspector, Panel::problems};
+    const std::vector<Panel> timeline_panels{
+        Panel::scene, Panel::viewport, Panel::inspector, Panel::timeline, Panel::problems};
+    const auto future = [](Workspace workspace,
+                           std::string id,
+                           std::string label,
+                           std::vector<Panel> panels,
+                           BottomPanel bottom,
+                           std::string reason) {
+        return WorkspaceDefinition{
+            workspace, std::move(id), std::move(label), std::move(panels), bottom, false,
+            std::move(reason)};
+    };
+    return {
+        {Workspace::model, "model", "Model", model_panels, BottomPanel::operations, true, {}},
+        future(Workspace::sculpt, "sculpt", "Sculpt", model_panels, BottomPanel::operations,
+               "sculpt authoring tools are not available in this build"),
+        future(Workspace::cad, "cad", "CAD", graph_panels, BottomPanel::graph,
+               "CAD sketch and constraint tools are not available in this build"),
+        future(Workspace::build, "build", "Build", asset_panels, BottomPanel::assets,
+               "build and assembly tools are not available in this build"),
+        future(Workspace::material, "material", "Material", asset_panels, BottomPanel::assets,
+               "material authoring tools are not available in this build"),
+        future(Workspace::animate, "animate", "Animate", timeline_panels, BottomPanel::timeline,
+               "animation tools are not available in this build"),
+        future(Workspace::review, "review", "Review", model_panels, BottomPanel::problems,
+               "review and comparison tools are not available in this build"),
+        {Workspace::ai, "ai", "AI", graph_panels, BottomPanel::graph, true, {}},
+    };
+}
+
 std::vector<application::Pane> application_panes(const std::vector<Panel>& panels) {
     std::vector<application::Pane> result;
     const auto add = [&result](application::Pane pane) {
@@ -116,6 +153,8 @@ bool is_operation_action(const application::ApplicationAction& action) {
             std::is_same_v<Action, application::UndoAction> ||
             std::is_same_v<Action, application::RedoAction> ||
             std::is_same_v<Action, application::InvokeToolAction> ||
+            std::is_same_v<Action, application::RepeatLastToolAction> ||
+            std::is_same_v<Action, application::AdjustLastToolAction> ||
             std::is_same_v<Action, application::CreateBoxAction> ||
             std::is_same_v<Action, application::CreatePlaneAction> ||
             std::is_same_v<Action, application::CreateMeshObjectAction> ||
@@ -542,6 +581,33 @@ std::string serialize_workbench_preferences(const WorkbenchPreferences& preferen
 
 } // namespace
 
+core::Result<void> WorkspaceDefinition::validate() const {
+    if (!valid(workspace) || id.empty() || id.size() > 32U || label.empty() ||
+        label.size() > 64U || !valid(default_bottom_panel) || default_panels.empty()) {
+        return core::Result<void>::failure(invalid("workspace definition identity or defaults are invalid"));
+    }
+    std::set<Panel> panels;
+    for (const Panel panel : default_panels) {
+        if (!valid(panel) || !panels.insert(panel).second) {
+            return core::Result<void>::failure(invalid(
+                "workspace definition contains an invalid or duplicate default panel"));
+        }
+    }
+    if (!panels.contains(Panel::viewport)) {
+        return core::Result<void>::failure(invalid_state(
+            "workspace definition must keep the viewport visible"));
+    }
+    if (available && !unavailable_reason.empty()) {
+        return core::Result<void>::failure(invalid(
+            "available workspace definition cannot have an unavailable reason"));
+    }
+    if (!available && unavailable_reason.empty()) {
+        return core::Result<void>::failure(invalid(
+            "unavailable workspace definition requires a reason"));
+    }
+    return core::Result<void>::success();
+}
+
 core::Result<void> UiPreferences::validate() const {
     if (!valid(operator_mode) || !valid(workspace) || !valid(density) ||
         !valid(theme) || !valid(bottom_panel) || visible_panels.empty()) {
@@ -676,6 +742,26 @@ const char* workspace_name(Workspace workspace) noexcept {
     return "unknown";
 }
 
+const std::vector<WorkspaceDefinition>& workspace_registry() noexcept {
+    static const std::vector<WorkspaceDefinition> definitions = make_workspace_registry();
+    return definitions;
+}
+
+core::Result<WorkspaceDefinition> workspace_definition(Workspace workspace) {
+    const auto found = std::find_if(
+        workspace_registry().begin(), workspace_registry().end(),
+        [workspace](const WorkspaceDefinition& definition) {
+            return definition.workspace == workspace;
+        });
+    if (found == workspace_registry().end()) {
+        return core::Result<WorkspaceDefinition>::failure(invalid("workspace is invalid"));
+    }
+    if (auto result = found->validate(); !result) {
+        return core::Result<WorkspaceDefinition>::failure(result.error());
+    }
+    return core::Result<WorkspaceDefinition>::success(*found);
+}
+
 const char* panel_name(Panel panel) noexcept {
     switch (panel) {
     case Panel::scene: return "scene";
@@ -739,6 +825,7 @@ std::optional<Shortcut> shortcut_for_native_key(const NativeKeyEvent& event) noe
         case NativeKey::s: return Shortcut::save;
         case NativeKey::z: return Shortcut::undo;
         case NativeKey::y: return Shortcut::redo;
+        case NativeKey::r: return Shortcut::repeat_last_tool;
         case NativeKey::k: return Shortcut::toggle_command_palette;
         default: break;
         }
@@ -965,10 +1052,17 @@ core::Result<void> UiController::set_operator_mode(OperatorMode mode) {
 }
 
 core::Result<void> UiController::set_workspace(Workspace workspace) {
-    if (!valid(workspace)) return core::Result<void>::failure(invalid("workspace is invalid"));
-    if (auto result = sync_application_workspace(preferences_.visible_panels); !result) return result;
-    preferences_.workspace = workspace;
-    return core::Result<void>::success();
+    const auto definition = workspace_definition(workspace);
+    if (!definition) return core::Result<void>::failure(definition.error());
+    if (!definition.value().available) {
+        return core::Result<void>::failure(invalid_state(
+            definition.value().unavailable_reason));
+    }
+    UiPreferences next = preferences_;
+    next.workspace = workspace;
+    next.visible_panels = definition.value().default_panels;
+    next.bottom_panel = definition.value().default_bottom_panel;
+    return apply_preferences(next);
 }
 
 core::Result<void> UiController::set_density(Density density) {
@@ -1026,6 +1120,11 @@ core::Result<void> UiController::handle_shortcut(Shortcut shortcut) {
     case Shortcut::redo: {
         const auto result = dispatch_with_category(
             application::RedoAction{}, OperationCategory::redo);
+        return result ? core::Result<void>::success() : core::Result<void>::failure(result.error());
+    }
+    case Shortcut::repeat_last_tool: {
+        const auto result = dispatch_with_category(
+            application::RepeatLastToolAction{}, OperationCategory::committed_command);
         return result ? core::Result<void>::success() : core::Result<void>::failure(result.error());
     }
     case Shortcut::object_mode: {
@@ -1096,6 +1195,7 @@ std::vector<CommandView> UiController::command_views() const {
         {"project.save", "Save Project", "Ctrl+S", true, {}},
         {"edit.undo", "Undo", "Ctrl+Z", true, {}},
         {"edit.redo", "Redo", "Ctrl+Y", true, {}},
+        {"edit.repeat-last", "Repeat Last Tool", "Ctrl+R", true, {}},
         {"mode.object", "Object Mode", "1", true, {}},
         {"mode.vertex", "Vertex Mode", "2", true, {}},
         {"mode.edge", "Edge Mode", "3", true, {}},

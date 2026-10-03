@@ -6,6 +6,7 @@
 
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -22,7 +23,12 @@ enum class ToolKernelKind {
     editable_mesh_inset_face,
     editable_mesh_delete_face,
     editable_mesh_set_vertex_position,
+    editable_mesh_slide_vertex,
     editable_mesh_split_edge,
+    editable_mesh_dissolve_edge,
+    editable_mesh_tri_to_quad,
+    editable_mesh_merge_vertices,
+    editable_mesh_poke_face,
 };
 
 struct ToolDescriptor {
@@ -45,9 +51,21 @@ struct ToolContext {
     [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
     make_set_selected_vertex_position_command(core::Vec3d position) const;
     [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
+    make_slide_selected_vertex_command(
+        std::optional<geometry::EdgeId> support_edge,
+        double factor) const;
+    [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
     make_delete_selected_face_command(bool remove_orphaned_vertices) const;
     [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
     make_split_selected_edge_command(double factor) const;
+    [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
+    make_dissolve_selected_edge_command() const;
+    [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
+    make_tri_to_quad_selected_faces_command() const;
+    [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
+    make_merge_selected_vertices_command() const;
+    [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
+    make_poke_selected_face_command() const;
 
 private:
     friend class ::carto::application::ApplicationSession;
@@ -62,6 +80,7 @@ struct ToolArguments {
     core::Vec3d position{};
     bool remove_orphaned_vertices = true;
     double factor = 0.5;
+    std::optional<geometry::EdgeId> support_edge;
 };
 
 using ToolFactory = std::function<core::Result<std::unique_ptr<EditorCommand>>(

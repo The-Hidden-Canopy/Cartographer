@@ -257,6 +257,118 @@ void d3d12_device_loss_is_fail_closed_and_recoverable() {
     REQUIRE(recovered.value()->destroy_buffer(buffer.value()));
 }
 
+void d3d12_captures_native_timestamp_queries() {
+    using namespace carto;
+
+    const auto created = d3d12::D3D12Device::create(d3d12::D3D12DeviceOptions{
+        {}, false, true});
+    REQUIRE(created);
+    auto& device = *created.value();
+    REQUIRE(device.capabilities().timestamp_queries);
+    REQUIRE(device.timestamp_frequency(gpu::QueueType::graphics) != 0U);
+    REQUIRE(device.timestamp_frequency(gpu::QueueType::compute) != 0U);
+
+    const auto readback = device.create_buffer(gpu::BufferDesc{
+        2U * sizeof(std::uint64_t),
+        gpu::MemoryClass::readback,
+        gpu::BufferUsage::transfer_destination,
+    });
+    REQUIRE(readback);
+
+    const auto capture = [&device, readback](gpu::QueueType queue, bool initialize) {
+        device_ir::DeviceCommandStream stream;
+        if (initialize) {
+            stream.append(device_ir::CmdTransitionResource{
+                device_ir::ResourceHandle{readback.value()},
+                device_ir::ResourceState::undefined,
+                device_ir::ResourceState::copy_destination,
+            });
+        }
+        stream.append(device_ir::CmdWriteTimestamp{0U});
+        stream.append(device_ir::CmdWriteTimestamp{1U});
+        stream.append(device_ir::CmdResolveTimestamps{
+            readback.value(), 0U, 2U, 0U});
+        const auto serial = device.submit(stream, queue);
+        REQUIRE(serial);
+        REQUIRE(device.wait(serial.value()));
+        const auto bytes = device.read_buffer(
+            readback.value(), 0U, 2U * sizeof(std::uint64_t));
+        REQUIRE(bytes);
+        std::uint64_t timestamps[2U]{};
+        std::memcpy(timestamps, bytes.value().data(), sizeof(timestamps));
+        REQUIRE(timestamps[1U] >= timestamps[0U]);
+    };
+    capture(gpu::QueueType::graphics, true);
+    capture(gpu::QueueType::compute, false);
+    REQUIRE(device.destroy_buffer(readback.value()));
+    REQUIRE(device.debug_receipts().empty());
+}
+
+void d3d12_uses_compute_queue_shader_states() {
+    using namespace carto;
+
+    const auto created = d3d12::D3D12Device::create(d3d12::D3D12DeviceOptions{
+        {}, false, true});
+    REQUIRE(created);
+    auto& device = *created.value();
+    const auto sampled = device.create_texture(gpu::TextureDesc{
+        8U,
+        8U,
+        1U,
+        1U,
+        1U,
+        gpu::Format::rgba32_float,
+        gpu::TextureDimension::texture_2d,
+        gpu::TextureUsage::sampled,
+    });
+    const auto storage = device.create_texture(gpu::TextureDesc{
+        8U,
+        8U,
+        1U,
+        1U,
+        1U,
+        gpu::Format::rgba32_float,
+        gpu::TextureDimension::texture_2d,
+        gpu::TextureUsage::storage,
+    });
+    REQUIRE(sampled && storage);
+    device_ir::DeviceCommandStream stream;
+    stream.append(device_ir::CmdTransitionResource{
+        device_ir::ResourceHandle{sampled.value()},
+        device_ir::ResourceState::undefined,
+        device_ir::ResourceState::shader_read,
+    });
+    stream.append(device_ir::CmdTransitionResource{
+        device_ir::ResourceHandle{storage.value()},
+        device_ir::ResourceState::undefined,
+        device_ir::ResourceState::shader_write,
+    });
+    const auto serial = device.submit(stream, gpu::QueueType::compute);
+    REQUIRE(serial);
+    REQUIRE(device.wait(serial.value()));
+    REQUIRE(device.debug_receipts().empty());
+    REQUIRE(device.destroy_texture(storage.value()));
+    REQUIRE(device.destroy_texture(sampled.value()));
+}
+
+void d3d12_reuses_multiple_in_flight_command_contexts() {
+    using namespace carto;
+
+    const auto created = d3d12::D3D12Device::create(d3d12::D3D12DeviceOptions{
+        {}, false, true});
+    REQUIRE(created);
+    auto& device = *created.value();
+    device_ir::DeviceCommandStream stream;
+    std::array<gpu::SubmissionSerial, 8U> serials{};
+    for (auto& serial : serials) {
+        const auto submitted = device.submit(stream, gpu::QueueType::graphics);
+        REQUIRE(submitted);
+        serial = submitted.value();
+    }
+    for (const auto serial : serials) REQUIRE(device.wait(serial));
+    REQUIRE(device.debug_receipts().empty());
+}
+
 template <typename T>
 std::vector<std::uint8_t> bytes_of(const T& value) {
     const auto* begin = reinterpret_cast<const std::uint8_t*>(&value);
@@ -1217,6 +1329,12 @@ int main() {
         std::cout << "PASS D3D12 descriptor reuse and deferred destruction\n";
         d3d12_device_loss_is_fail_closed_and_recoverable();
         std::cout << "PASS D3D12 device-loss recovery boundary\n";
+        d3d12_captures_native_timestamp_queries();
+        std::cout << "PASS D3D12 native timestamp queries\n";
+        d3d12_uses_compute_queue_shader_states();
+        std::cout << "PASS D3D12 compute queue shader states\n";
+        d3d12_reuses_multiple_in_flight_command_contexts();
+        std::cout << "PASS D3D12 in-flight command contexts\n";
         d3d12_compiles_dxil_draws_indexed_and_reads_texture();
         std::cout << "PASS D3D12 DXIL indexed draw and texture readback\n";
         d3d12_executes_builtin_shader_suite_and_dispatches_compute();

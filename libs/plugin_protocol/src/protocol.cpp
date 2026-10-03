@@ -12,6 +12,8 @@ namespace {
 constexpr std::size_t kMaxTokenBytes = 128U;
 constexpr std::size_t kMaxCapabilities = 64U;
 constexpr std::size_t kMaxFilesystemInputs = 32U;
+constexpr std::uint32_t kMaxWallTimeMs = 5U * 60U * 1000U;
+constexpr std::uint32_t kMaxCpuTimeMs = 5U * 60U * 1000U;
 
 core::Diagnostic invalid(std::string message) {
     return core::Diagnostic(core::ErrorCode::invalid_argument, std::move(message));
@@ -120,6 +122,19 @@ core::Result<void> Protocol::validate_manifest(const PluginManifest& manifest) {
             return core::Result<void>::failure(invalid("plugin filesystem permission is invalid"));
         }
     }
+    if (auto result = validate_execution_budget(manifest.budget); !result) {
+        return result;
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> Protocol::validate_execution_budget(const ExecutionBudget& budget) {
+    if (budget.max_wall_time_ms == 0U || budget.max_wall_time_ms > kMaxWallTimeMs ||
+        budget.max_cpu_time_ms == 0U || budget.max_cpu_time_ms > kMaxCpuTimeMs ||
+        budget.max_output_bytes == 0U || budget.max_output_bytes > kMaxFrameBytes) {
+        return core::Result<void>::failure(invalid(
+            "plugin execution budget is zero or exceeds the host bound"));
+    }
     return core::Result<void>::success();
 }
 
@@ -133,6 +148,38 @@ core::Result<void> Protocol::validate_admission(
         manifest.capabilities.end()) {
         return core::Result<void>::failure(validation(
             "plugin envelope capability was not granted by the manifest"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> Protocol::validate_neutral_result(
+    const PluginManifest& manifest,
+    const Envelope& request,
+    const NeutralResult& result,
+    std::optional<std::uint64_t> expected_source_revision) {
+    if (auto admission = validate_admission(manifest, request); !admission) {
+        return admission;
+    }
+    if (!safe_request_id(result.request_id) || !safe_token(result.capability) ||
+        result.request_id != request.request_id || result.capability != request.capability) {
+        return core::Result<void>::failure(validation(
+            "plugin neutral result is not bound to its admitted request"));
+    }
+    if (!valid_json_payload(result.payload_json)) {
+        return core::Result<void>::failure(invalid(
+            "plugin neutral result payload is not a bounded JSON object"));
+    }
+    if (result.payload_json.size() > manifest.budget.max_output_bytes ||
+        result.payload_json.size() + 256U > kMaxFrameBytes) {
+        return core::Result<void>::failure(invalid(
+            "plugin neutral result exceeds the frame limit"));
+    }
+    if (expected_source_revision.has_value() != result.source_revision.has_value() ||
+        (expected_source_revision.has_value() &&
+         expected_source_revision.value() != result.source_revision.value())) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "plugin neutral result source revision is stale or missing"));
     }
     return core::Result<void>::success();
 }

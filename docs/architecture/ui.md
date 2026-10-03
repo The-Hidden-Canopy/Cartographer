@@ -60,7 +60,7 @@ submits through the same application admission boundary.
 - Scene, Viewport, Inspector, Operations, Graph, Assets, Timeline, Problems,
   and Console panel vocabulary;
 - bounded command-palette state and keyboard routing for save, undo, redo,
-  object/vertex/edge/face modes, operator mode, and overlay close;
+  repeat-last, object/vertex/edge/face modes, operator mode, and overlay close;
 - native Win32 key routing plus revision-bound primary viewport pointer
   routing for object, vertex, edge, and face selection;
 - a required viewport invariant;
@@ -69,6 +69,11 @@ submits through the same application admission boundary.
 - explicit edge-authoring and unsupported-operation surfaces;
 - a native Drafting Board that exposes proposal, preview, apply, and discard
   states without presenting a proposal as authoritative geometry.
+- revision-bound repeat-last and adjust-last tool actions that rebind saved
+  component identities against the current document before re-evaluation and
+  restore the prior selection when a stale identity blocks the replay.
+- a bounded editor numeric-entry substrate for finite unit-aware absolute and
+  relative scalar values; it is not yet a modal text-input or gizmo service.
 
 The current application model supports object, vertex, edge, and face
 selection. Edge selection is identity- and revision-bound, and is available to
@@ -79,6 +84,10 @@ operation is undoable, reports its factor, and clears the removed edge
 selection. A single selected convex face can likewise be inset through the
 same command boundary with distance metadata and guarded undo/redo. Concave
 inset, broader persistent edge authoring, and traversal tools remain deferred.
+An object-bound selected vertex can slide along a deterministic incident support
+edge (or an explicitly supplied support edge) with a bounded factor; the
+topology remains unchanged and invalid support/factor/geometry inputs fail
+closed.
 AI-First uses the native `carto_ai` planner for a deliberately narrow first
 workflow. It produces typed proposals for selected-face extrusion/inset and
 selected-vertex position changes. The proposal is revalidated against the
@@ -86,6 +95,12 @@ current revision and selection before preview and again before commit; raw AI
 application actions remain rejected. Default auto-approval is limited to the
 native preview-safe operation set. No model service or unrestricted direct AI
 mutation path exists.
+
+Repeat and adjust-last retain only the last accepted tool identity, complete
+arguments, and value-level authoring context in session state; they are not a
+second journal and are not serialized into `.carto`. Replaying after undo or a
+document replacement rebinds stable object/component IDs to the current mesh.
+Missing, stale, or removed identities fail closed without document mutation.
 
 ## Native shell integration
 
@@ -107,6 +122,11 @@ adjacent positions, and dropping one onto a rack returns it to storage.
 Instrument visibility, geometry, and Ledger collapse state are validated and
 atomically persisted as local `workbench.prefs` state, separate from project
 truth.
+Workspace availability and default layouts are supplied by the validated
+`workspace_registry`; the shell does not maintain a second hardcoded list.
+Available Model and AI workspaces apply their registry defaults through the
+validated preference boundary. Future workspaces retain explicit reasons and
+fail closed when selected rather than silently presenting an incomplete mode.
 Ledger receipts are selectable and expose the retained operation id, action,
 revision interval, and document-change flag. Parameter reopening is explicitly
 disabled until the application receipt contract carries an editable parameter
@@ -127,6 +147,7 @@ authoritative action routing, operation lineage, persistence-state truth,
 AI-proposal admission failure, native proposal/preview/apply lineage,
 edge-selection non-mutation, unsupported-operation disclosure, bounded command-palette input,
 native key and pointer modifier contracts,
+workspace registry identity, default-layout application, and unavailable-workspace rejection,
 preference persistence, corrupt-preference reset, validated workbench geometry
 round-trips, atomic workbench writes, and failed action/shortcut diagnostics.
 These are model and contract tests, not pixel snapshots. Native visual
@@ -135,8 +156,8 @@ acceptance remains a separate gate.
 ## Deliberate non-claims
 
 This layer does not implement the complete UI specification. Concave inset,
-broader persistent edge authoring/traversal, gizmos, snapping, numeric
-transform editing, full direct-modeling interaction, CAD/BUILD/material/
+visual target markers, viewport projection, broad surface/normal snapping, broader persistent edge authoring/traversal, gizmos, numeric
+transform editing, full modal numeric confirmation/axis locks, full direct-modeling interaction, CAD/BUILD/material/
 animation subsystems, model-backed AI planning, full docking/tab stacks,
 OS-level tear-out, native visual/click-through/DPI acceptance, and broad GPU compatibility
 remain roadmap work.

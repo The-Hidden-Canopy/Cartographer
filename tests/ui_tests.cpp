@@ -9,6 +9,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -88,6 +89,18 @@ void ui_routes_authoritative_actions_and_operation_lineage() {
     REQUIRE(snapshot.operations.size() == 3U);
     REQUIRE(snapshot.operations[1].category == carto::ui::OperationCategory::undo);
     REQUIRE(snapshot.operations[2].category == carto::ui::OperationCategory::redo);
+
+    const auto object = snapshot.objects.front().object.id;
+    REQUIRE(ui.handle_shortcut(carto::ui::Shortcut::vertex_mode));
+    REQUIRE(ui.dispatch(carto::application::SelectVertexAction{
+        object, carto::geometry::VertexId{1U}}));
+    carto::editor::ToolArguments arguments;
+    arguments.position = {-1.25, -1.0, -1.0};
+    REQUIRE(ui.dispatch(carto::application::InvokeToolAction{
+        "mesh.set-vertex-position", arguments}));
+    REQUIRE(ui.handle_shortcut(carto::ui::Shortcut::undo));
+    REQUIRE(ui.handle_shortcut(carto::ui::Shortcut::repeat_last_tool));
+    REQUIRE(ui.snapshot().operations.back().action == "Invoke Tool: mesh.set-vertex-position");
 }
 
 void ui_distinguishes_unsaved_from_saved_state() {
@@ -371,6 +384,11 @@ void ui_command_palette_is_bounded_and_explicit_about_deferred_features() {
         [](const auto& command) { return command.id == "mode.edge"; });
     REQUIRE(edge != ui.snapshot().commands.end());
     REQUIRE(edge->supported);
+    const auto repeat = std::find_if(
+        ui.snapshot().commands.begin(), ui.snapshot().commands.end(),
+        [](const auto& command) { return command.id == "edit.repeat-last"; });
+    REQUIRE(repeat != ui.snapshot().commands.end());
+    REQUIRE(repeat->shortcut == "Ctrl+R");
     REQUIRE(ui.handle_shortcut(carto::ui::Shortcut::edge_mode));
     REQUIRE(ui.snapshot().selection.mode == carto::editor::SelectionMode::edge);
     REQUIRE(ui.snapshot().project_revision == carto::core::Revision{});
@@ -387,6 +405,9 @@ void native_key_contract_maps_core_control_without_imgui() {
     const auto undo_repeat = carto::ui::shortcut_for_native_key({
         NativeKey::z, carto::ui::kNativeModifierControl, true, true});
     REQUIRE(undo_repeat.has_value() && *undo_repeat == Shortcut::undo);
+    const auto repeat_last = carto::ui::shortcut_for_native_key({
+        NativeKey::r, carto::ui::kNativeModifierControl, true, false});
+    REQUIRE(repeat_last.has_value() && *repeat_last == Shortcut::repeat_last_tool);
     const auto face = carto::ui::shortcut_for_native_key({
         NativeKey::digit_4, 0U, true, false});
     REQUIRE(face.has_value() && *face == Shortcut::face_mode);
@@ -426,6 +447,48 @@ void native_key_contract_maps_core_control_without_imgui() {
         NativePointerEvent{NativePointerButton::primary, 120, 240, 0U, false}).has_value());
 }
 
+void workspace_registry_is_canonical_and_fail_closed() {
+    const auto& registry = carto::ui::workspace_registry();
+    REQUIRE(registry.size() == 8U);
+    std::vector<carto::ui::Workspace> seen;
+    for (const auto& definition : registry) {
+        REQUIRE(definition.validate());
+        REQUIRE(std::find(seen.begin(), seen.end(), definition.workspace) == seen.end());
+        seen.push_back(definition.workspace);
+        const auto resolved = carto::ui::workspace_definition(definition.workspace);
+        REQUIRE(resolved);
+        REQUIRE(resolved.value().id == definition.id);
+        REQUIRE(resolved.value().label == definition.label);
+    }
+    REQUIRE(seen.size() == registry.size());
+
+    const auto model = carto::ui::workspace_definition(carto::ui::Workspace::model);
+    REQUIRE(model && model.value().available);
+    const auto ai = carto::ui::workspace_definition(carto::ui::Workspace::ai);
+    REQUIRE(ai && ai.value().available);
+    const auto future = carto::ui::workspace_definition(carto::ui::Workspace::cad);
+    REQUIRE(future && !future.value().available);
+    REQUIRE(!future.value().unavailable_reason.empty());
+    REQUIRE(!carto::ui::workspace_definition(static_cast<carto::ui::Workspace>(99)));
+
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.set_panel_visible(carto::ui::Panel::assets, true));
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::ai));
+    const auto ai_snapshot = ui.snapshot();
+    REQUIRE(ai_snapshot.workspace_kind == carto::ui::Workspace::ai);
+    REQUIRE(ai_snapshot.bottom_panel == carto::ui::BottomPanel::graph);
+    REQUIRE(std::find(ai_snapshot.visible_panels.begin(), ai_snapshot.visible_panels.end(),
+                      carto::ui::Panel::graph) != ai_snapshot.visible_panels.end());
+    REQUIRE(std::find(ai_snapshot.visible_panels.begin(), ai_snapshot.visible_panels.end(),
+                      carto::ui::Panel::assets) == ai_snapshot.visible_panels.end());
+
+    const auto unavailable = ui.set_workspace(carto::ui::Workspace::cad);
+    REQUIRE(!unavailable);
+    REQUIRE(unavailable.error().code == carto::core::ErrorCode::invalid_state);
+    REQUIRE(ui.snapshot().workspace_kind == carto::ui::Workspace::ai);
+}
+
 } // namespace
 
 int main() {
@@ -441,6 +504,7 @@ int main() {
         ui_failed_shortcuts_and_actions_remain_bounded();
         ui_command_palette_is_bounded_and_explicit_about_deferred_features();
         native_key_contract_maps_core_control_without_imgui();
+        workspace_registry_is_canonical_and_fail_closed();
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         return 1;

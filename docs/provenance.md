@@ -121,4 +121,8 @@ Before a public push, inspect every reachable ref and object, not only the
 working tree. Deleting a moat asset from `HEAD` does not remove its historical
 blob from a public remote. A reachable moat asset requires owner-approved
 history remediation and remote verification before the repository can be
-described as publication-safe.
+described as publication-safe. Automatic hosted CI is currently disabled to
+avoid CI spend; the local release command remains blocking for unclassified
+legacy integration paths and must be used before publication. If CI is
+re-enabled, it must run that same blocking command. The audit does not rewrite
+history or infer a license classification from file ownership.

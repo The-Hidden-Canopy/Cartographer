@@ -92,6 +92,13 @@ public:
     [[nodiscard]] core::Result<void> insert_vertex(Vertex vertex);
     [[nodiscard]] core::Result<void> insert_face(Face face);
     [[nodiscard]] core::Result<void> set_vertex_position(VertexId id, core::Vec3d position);
+    // Moves one vertex along an incident support edge without changing
+    // topology. The factor is strictly inside (0, 1); invalid or
+    // geometry-collapsing slides are rejected atomically.
+    [[nodiscard]] core::Result<void> slide_vertex(
+        VertexId vertex,
+        EdgeId support_edge,
+        double factor);
     [[nodiscard]] core::Result<void> apply_patch(const MeshPatch& patch);
     // Inserts a complete interchange topology and rebuilds adjacency once.
     // Bounded importers use this instead of repeatedly rebuilding after every
@@ -108,9 +115,27 @@ public:
     [[nodiscard]] core::Result<TopologyEditReceipt> split_edge(
         EdgeId id,
         double factor = 0.5);
+    // Dissolves one internal manifold edge by joining its two convex,
+    // coplanar incident faces. Boundary, non-planar, and ambiguous
+    // joins are rejected atomically until broader dissolve semantics exist.
+    [[nodiscard]] core::Result<TopologyEditReceipt> dissolve_edge(EdgeId id);
+    // Converts exactly two triangles sharing one internal edge into one
+    // validated convex quad by reusing the bounded dissolve contract.
+    [[nodiscard]] core::Result<TopologyEditReceipt> tri_to_quad(
+        FaceId first,
+        FaceId second);
+    // Target-welds source onto target. The target identity and position are
+    // preserved; degenerate faces created by the collapse are removed and
+    // recorded in the topology receipt.
+    [[nodiscard]] core::Result<TopologyEditReceipt> merge_vertices(
+        VertexId target,
+        VertexId source);
     [[nodiscard]] core::Result<TopologyEditReceipt> inset_face(
         FaceId id,
         double distance);
+    // Replaces a strictly convex planar face with a fan of triangles around
+    // a new centroid vertex. Unsupported geometry is rejected atomically.
+    [[nodiscard]] core::Result<TopologyEditReceipt> poke_face(FaceId id);
     [[nodiscard]] core::Result<void> restore_from(const EditableMesh& source);
     [[nodiscard]] core::Result<void> restore_revision(core::Revision revision);
 

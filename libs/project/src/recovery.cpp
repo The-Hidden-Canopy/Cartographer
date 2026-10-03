@@ -171,4 +171,40 @@ core::Result<RecoveryReceipt> recover_from_journal(
     });
 }
 
+core::Result<SnapshotRecoveryReceipt> recover_latest_snapshot(
+    const journal::Journal& journal) {
+    const auto entries = journal.read_all();
+    if (!entries) {
+        return core::Result<SnapshotRecoveryReceipt>::failure(entries.error().with_context(
+            "latest snapshot recovery journal verification"));
+    }
+    if (entries.value().empty()) {
+        return core::Result<SnapshotRecoveryReceipt>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "journal contains no snapshot-bearing recovery entry"));
+    }
+
+    const journal::JournalEntry& entry = entries.value().back();
+    const auto snapshot = snapshot_from_entry(entry);
+    if (!snapshot) {
+        return core::Result<SnapshotRecoveryReceipt>::failure(snapshot.error().with_context(
+            "latest snapshot recovery entry"));
+    }
+    auto document = ProjectDocument::deserialize(snapshot.value());
+    if (!document) {
+        return core::Result<SnapshotRecoveryReceipt>::failure(document.error().with_context(
+            "latest snapshot recovery document"));
+    }
+    if (document.value().revision() != entry.revision_after) {
+        return core::Result<SnapshotRecoveryReceipt>::failure(stale(
+            "latest snapshot recovery revision does not match its journal entry"));
+    }
+    if (auto result = document.value().validate(); !result) {
+        return core::Result<SnapshotRecoveryReceipt>::failure(result.error().with_context(
+            "latest snapshot recovery validation"));
+    }
+    return core::Result<SnapshotRecoveryReceipt>::success(SnapshotRecoveryReceipt{
+        std::move(document.value()), entry.revision_after, entries.value().size()});
+}
+
 } // namespace carto::project

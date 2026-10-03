@@ -79,6 +79,19 @@ class PublicBoundaryAuditTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("weights.safetensors", result.stdout)
 
+    def test_tracked_ignored_path_fails(self) -> None:
+        with self.make_repo() as temporary:
+            repo = Path(temporary)
+            (repo / ".gitignore").write_text("private.txt\n", encoding="utf-8")
+            git(repo, "add", ".gitignore")
+            git(repo, "commit", "-q", "-m", "ignore private fixture")
+            (repo / "private.txt").write_text("private fixture\n", encoding="utf-8")
+            git(repo, "add", "-f", "private.txt")
+            git(repo, "commit", "-q", "-m", "tracked ignored fixture")
+            result = audit(repo)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("tracked path private.txt: file is ignored by current policy", result.stdout)
+
     def test_dot_prefixed_quarantine_path_fails(self) -> None:
         with self.make_repo() as temporary:
             repo = Path(temporary)

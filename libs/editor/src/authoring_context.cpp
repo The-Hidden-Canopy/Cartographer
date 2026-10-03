@@ -67,6 +67,42 @@ core::Result<void> SnapSettings::validate() const {
     return core::Result<void>::success();
 }
 
+core::Result<double> snap_scalar(double value, const SnapSettings& settings) {
+    if (!std::isfinite(value)) {
+        return core::Result<double>::failure(invalid(
+            "snap input must be finite"));
+    }
+    if (auto result = settings.validate(); !result) {
+        return core::Result<double>::failure(result.error());
+    }
+    if (!settings.enabled) return core::Result<double>::success(value);
+    if (settings.kind != SnapKind::grid && settings.kind != SnapKind::increment) {
+        return core::Result<double>::failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "geometry-target snapping requires a candidate service"));
+    }
+    const double units = value / settings.increment;
+    const double rounded = std::round(units);
+    const double snapped = rounded * settings.increment;
+    if (!std::isfinite(units) || !std::isfinite(rounded) || !std::isfinite(snapped)) {
+        return core::Result<double>::failure(invalid(
+            "snap result is non-finite"));
+    }
+    return core::Result<double>::success(snapped);
+}
+
+core::Result<core::Vec3d> snap_vector(
+    core::Vec3d value,
+    const SnapSettings& settings) {
+    const auto x = snap_scalar(value.x, settings);
+    if (!x) return core::Result<core::Vec3d>::failure(x.error());
+    const auto y = snap_scalar(value.y, settings);
+    if (!y) return core::Result<core::Vec3d>::failure(y.error());
+    const auto z = snap_scalar(value.z, settings);
+    if (!z) return core::Result<core::Vec3d>::failure(z.error());
+    return core::Result<core::Vec3d>::success({x.value(), y.value(), z.value()});
+}
+
 core::Result<AuthoringContext> AuthoringContext::from_selection(
     core::Revision project_revision,
     const SelectionState& selection) {

@@ -39,27 +39,42 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] stable-ID topology provenance adapter with revision-bound receipt mapping and explicit created/deleted mappings
 - [x] workflow benchmark ledger with honest per-domain closure status
 - [x] bounded worker-backed evaluation scheduler with unpublished candidate receipts
+- [x] vendor-neutral web geometry C1-C5 slice: deterministic leaf clustering, root hierarchy, revision-bound FaceId provenance, bounded runtime-page payloads, package reader/writer, and structural corruption tests
+- [x] web geometry evaluation-graph publication and downstream-closed incremental invalidation with cluster/page dirty identities
+- [x] web geometry read-only cluster diagnostics snapshots with explicit grouping-only warnings and package-bound conservative error receipts for editor/problem consumers
+- [x] web geometry backend-neutral cluster-overlay projection math with explicit matrix conventions, clipping, viewport bounds, and fail-closed non-finite handling
+- [x] web geometry deterministic package-bound page-interest planning from visible overlay identities without residency mutation
+- [ ] web geometry renderable parent simplification, VANTA import admission, native overlay rendering/pointer integration, and native runtime admission
 - [x] project-package graph reference binding, journal/checkpoint preservation, polygon topology-provenance adapter, and v4 project-bound topology receipt persistence
 - [x] opt-in Windows D3D12 adapter/resource boundary and native identity smoke acceptance
 - [x] bounded D3D12 native acceptance tranche: runtime DXIL suite, offscreen sampled-material PBR into an HDR target, HDR-to-display tone-map execution/readback, shadow-depth execution/readback, temporal resolve over current/history/motion inputs, storage-texture compute dispatch/readback, deferred descriptor/resource lifetime, typed DXGI back-buffer import, resize/present, desktop launch smoke, and 8K render-target clear on the Quadro P5200
+- [x] D3D12 native timestamp capture, queue-aware compute shader states, in-flight command-context reuse, and a warmed temporal-kernel stress benchmark with separate GPU/host timing receipts
 - [ ] D3D12 production backend with full render-graph parity (PBR/HDR/IBL/shadow/temporal execution, final presentation integration, input/DPI workflow, and GPU performance/8K frame evidence remain)
 - [x] SHA-256 content-addressed blob store with atomic publication and integrity verification
 - [x] append-only revision-bound journal with hash chain, verification, replay callback, content-addressed checkpoints, and staged transaction publication
 - [x] authority-preserving `carto_ui` foundation with design tokens, density/theme/operator/workspace state, operation/problems projections, shortcut routing, and bounded local preferences
-- [ ] desktop shell and workspace registry (source consumes `carto_ui`; native acceptance pending)
+- [x] canonical workspace registry with validated availability, future-workspace reasons, and workspace-specific default layouts
+- [ ] desktop shell native visual/click-through/DPI/resize acceptance, full docking, OS-level tear-out, clean-machine packaging, and workspace registry integration evidence
 - [ ] Vulkan resource backend and viewport (optional source path present; SDK/GPU acceptance pending)
 - [x] directory project package layout, human-readable manifest boundary, and optional document-bound graph snapshot reference (SQLite database and migrations remain pending)
 - [x] content-addressed evaluation-graph snapshot reference in the package manifest
 - [ ] SQLite WAL authoring database, migrations, integrity scanner, and cache separation
-- [ ] startup recovery, replay inspection, and recovery-versus-explicit-save workflow (snapshot-envelope replay is present; recovery UI and explicit-save decision flow remain pending)
+- [x] read-only startup recovery inspection plus explicit human recovery of the latest verified snapshot-bearing journal entry
+- [ ] startup recovery UI, recovery-versus-explicit-save decision surface, and crash-injection acceptance (snapshot-envelope replay is present)
 - [x] bounded opaque C ABI smoke surface with a C compiler/linker fixture
-- [ ] ABI negotiation, shared-library packaging, and C++/Python/C# bindings
+- [x] opt-in shared-library packaging for the bounded C ABI with explicit platform symbol visibility
+- [x] bounded ABI range negotiation; C++/Python/C# bindings remain deferred
 - [x] capability provider lifecycle/resolve foundation
 - [x] sandbox-default bounded plugin envelope foundation with fail-closed
   permission and manifest-capability admission
-- [ ] built-in provider migration beyond the OBJ CLI gate, process isolation, resource budgets, and neutral-result admission
+- [x] host-side neutral plugin result admission bound to request identity,
+  bounded object payloads, and optional source revisions
+- [x] host-side plugin execution-budget contract with bounded wall/CPU/output
+  declarations and result-size enforcement
+- [ ] built-in provider migration beyond the OBJ CLI gate, process isolation,
+  runtime budget enforcement, and host geometry admission
 - [x] stable object/vertex/edge/face selection identity through the editor, application snapshot, headless UI, and source-wired viewport picker (native acceptance pending)
-- [ ] persistent topology edit patches, loop/ring modeling operators, edge-edit tools, and broader modeling tool interaction (receipt-aware edge-loop/edge-ring/boundary/fan/region/path traversal and vertex patches exist; bevel/merge/loop-cut/knife operators and native input acceptance pending)
+- [ ] persistent topology edit patches, loop/ring modeling operators, edge-edit tools, and broader modeling tool interaction (receipt-aware edge-loop/edge-ring/boundary/fan/region/path traversal, deterministic vertex/edge/face conversion, one-start shortest-path selection, session-local repeat/adjust-last replay, bounded incident-edge vertex slide, vertex patches, two-vertex target-weld, bounded coplanar internal-edge dissolve, compatible triangle-to-quad conversion, convex-face poke operators, bounded numeric/grid-snapping substrates, and revision-bound vertex/edge-midpoint/face-center candidate discovery exist; bevel/center-or-last merge modes/attribute-aware weld/arbitrary dissolve/broader triangle pairing/multi-object selection/loop-cut/knife operators, viewport projection/markers, modal numeric entry, and native input acceptance remain pending)
 
 The optional native source path is intentionally not marked complete by the
 presence of a window class or renderer type. The CPU device supplies the

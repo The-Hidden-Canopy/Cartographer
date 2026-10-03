@@ -84,6 +84,15 @@ void write_origins(
     }
 }
 
+void write_merged_vertices(
+    std::ostream& output,
+    const std::map<VertexId, VertexId>& merged_vertices) {
+    output << "MERGED_VERTICES " << merged_vertices.size() << '\n';
+    for (const auto& [source, target] : merged_vertices) {
+        output << "MERGE " << source.value << ' ' << target.value << '\n';
+    }
+}
+
 bool valid_origin_kind_value(std::uint64_t value) noexcept {
     return value <= static_cast<std::uint64_t>(OriginKind::subdivision_child);
 }
@@ -92,7 +101,7 @@ bool valid_origin_kind_value(std::uint64_t value) noexcept {
 
 std::string TopologyEditReceipt::serialize() const {
     std::ostringstream output;
-    output << "CARTOGRAPHER_TOPOLOGY_RECEIPT 1\n";
+    output << "CARTOGRAPHER_TOPOLOGY_RECEIPT 2\n";
     output << "REVISION_BEFORE " << revision_before.value() << '\n';
     output << "REVISION_AFTER " << revision_after.value() << '\n';
     write_ids(output, "CREATED_VERTICES", created_vertices);
@@ -103,6 +112,7 @@ std::string TopologyEditReceipt::serialize() const {
     write_ids(output, "REMOVED_FACES", removed_faces);
     write_ids(output, "CREATED_CORNERS", created_corners);
     write_ids(output, "REMOVED_CORNERS", removed_corners);
+    write_merged_vertices(output, merged_vertices);
     write_origins(output, "VERTEX_ORIGINS", vertex_origins);
     write_origins(output, "EDGE_ORIGINS", edge_origins);
     write_origins(output, "FACE_ORIGINS", face_origins);
@@ -122,7 +132,7 @@ core::Result<TopologyEditReceipt> TopologyEditReceipt::deserialize(std::string_v
     }
     auto version = read_uint(input, "schema version");
     if (!version) return core::Result<TopologyEditReceipt>::failure(version.error());
-    if (version.value() != 1U) {
+    if (version.value() != 1U && version.value() != 2U) {
         return core::Result<TopologyEditReceipt>::failure(core::Diagnostic(
             core::ErrorCode::version_mismatch,
             "unsupported topology receipt schema version"));
@@ -197,8 +207,56 @@ core::Result<TopologyEditReceipt> TopologyEditReceipt::deserialize(std::string_v
         return core::Result<TopologyEditReceipt>::failure(result.error());
     }
 
-    const auto read_origins = [&](std::string_view tag, auto& destination) -> core::Result<void> {
-        if (auto result = require_token(input, tag); !result) return result;
+    std::string next_section;
+    if (!(input >> next_section)) {
+        return core::Result<TopologyEditReceipt>::failure(validation(
+            "topology receipt is missing the expected VERTEX_ORIGINS record"));
+    }
+    if (version.value() >= 2U) {
+        if (next_section != "MERGED_VERTICES") {
+            return core::Result<TopologyEditReceipt>::failure(validation(
+                "topology receipt v2 is missing the expected MERGED_VERTICES record"));
+        }
+        auto count = read_bounded_count(input, "MERGED_VERTICES count");
+        if (!count) return core::Result<TopologyEditReceipt>::failure(count.error());
+        if (auto result = consume_element_budget(
+                count.value() * 2U, "MERGED_VERTICES source/target IDs"); !result) {
+            return core::Result<TopologyEditReceipt>::failure(result.error());
+        }
+        for (std::uint64_t index = 0U; index < count.value(); ++index) {
+            if (auto result = require_token(input, "MERGE"); !result) {
+                return core::Result<TopologyEditReceipt>::failure(result.error());
+            }
+            auto source = read_uint(input, "merged source vertex");
+            auto target = read_uint(input, "merged target vertex");
+            if (!source || !target) {
+                return core::Result<TopologyEditReceipt>::failure(
+                    !source ? source.error() : target.error());
+            }
+            const auto [iterator, inserted] = receipt.merged_vertices.emplace(
+                VertexId{source.value()}, VertexId{target.value()});
+            static_cast<void>(iterator);
+            if (!inserted) {
+                return core::Result<TopologyEditReceipt>::failure(validation(
+                    "topology receipt contains a duplicate merged source vertex"));
+            }
+        }
+        if (!(input >> next_section)) {
+            return core::Result<TopologyEditReceipt>::failure(validation(
+                "topology receipt is missing the expected VERTEX_ORIGINS record"));
+        }
+    } else if (next_section != "VERTEX_ORIGINS") {
+        return core::Result<TopologyEditReceipt>::failure(validation(
+            "topology receipt is missing the expected VERTEX_ORIGINS record"));
+    }
+
+    const auto read_origins = [&](
+        std::string_view tag,
+        auto& destination,
+        bool tag_already_consumed = false) -> core::Result<void> {
+        if (!tag_already_consumed) {
+            if (auto result = require_token(input, tag); !result) return result;
+        }
         auto count = read_bounded_count(input, std::string(tag) + " count");
         if (!count) return core::Result<void>::failure(count.error());
         if (auto result = consume_element_budget(count.value(), tag); !result) {
@@ -242,8 +300,7 @@ core::Result<TopologyEditReceipt> TopologyEditReceipt::deserialize(std::string_v
         }
         return core::Result<void>::success();
     };
-
-    if (auto result = read_origins("VERTEX_ORIGINS", receipt.vertex_origins); !result) {
+    if (auto result = read_origins("VERTEX_ORIGINS", receipt.vertex_origins, true); !result) {
         return core::Result<TopologyEditReceipt>::failure(result.error());
     }
     if (auto result = read_origins("EDGE_ORIGINS", receipt.edge_origins); !result) {

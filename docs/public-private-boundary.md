@@ -78,6 +78,11 @@ source root or GMIB root located inside the public checkout, so an ignored
 public configuration. Those paths are deliberately not part of the public
 presets, release instructions, or runtime dependency graph.
 
+Project recovery sidecars are local state rather than source: `.carto.journal`,
+`.carto.lock`, `.journal.lock`, and temporary `.carto.tmp-*` publication files
+are quarantined by the repository ignore policy and are not part of a public
+commit.
+
 ## History rule
 
 The publication check covers reachable Git history as well as the current
@@ -94,10 +99,17 @@ The repository includes a read-only publication audit:
 python scripts/public_boundary_audit.py --check-ignore-policy
 ```
 
-It checks tracked files, non-ignored working-tree files, recognizable
-credential patterns, required quarantine rules, and all reachable Git history.
-It never rewrites history, expires reflogs, deletes files, or contacts a
-remote. Use `--include-reflog` for a local hygiene audit that also inspects
-reflog/unreachable objects. Legacy GMIB, anatomy, OWH, and simulation paths are
-reported for provenance/licensing review; `--fail-on-review` makes those review
-items blocking for an owner-approved release gate.
+It checks tracked files, tracked-but-ignored files, non-ignored working-tree
+files, recognizable credential patterns, required quarantine rules, and all
+reachable Git history. The tracked-but-ignored check is explicit because
+`.gitignore` is not retroactive. It never rewrites history, expires reflogs,
+deletes files, or contacts a remote. Use `--include-reflog` for a local hygiene
+audit that also inspects reflog/unreachable objects. Legacy GMIB, anatomy, OWH,
+and simulation paths are reported for provenance/licensing review;
+`--fail-on-review` makes those review items blocking for an owner-approved
+release gate. Automatic hosted CI is currently disabled to avoid CI spend; if
+CI is re-enabled, it must invoke the same blocking mode so an unclassified
+legacy path cannot pass the public build merely because it is absent from the
+current checkout. Clearing the gate requires provenance/licensing
+classification or owner-approved history remediation; this repository does not
+rewrite history automatically.

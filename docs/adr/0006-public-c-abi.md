@@ -1,7 +1,7 @@
 # ADR-0006: Public C ABI
 
-Status: initial C surface accepted; language bindings and shared-library
-packaging deferred.
+Status: initial C surface accepted; opt-in shared-library packaging and bounded
+ABI-range negotiation accepted; language bindings deferred.
 
 ## Decision
 

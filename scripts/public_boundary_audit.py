@@ -79,6 +79,9 @@ REQUIRED_IGNORE_PROBES = (
     "private-runtime/snapshot.db",
     "docs/spec/source.pdf",
     "sample.owh.carto",
+    "sample.carto.journal",
+    "sample.carto.lock",
+    "sample.journal.lock",
 )
 
 SECRET_PATTERNS = (
@@ -172,6 +175,24 @@ def current_paths(root: Path) -> tuple[list[str], list[str]]:
     return tracked, untracked
 
 
+def tracked_ignored_paths(root: Path) -> list[str]:
+    """Return tracked files hidden by the current ignore policy.
+
+    `.gitignore` is not retroactive. A private file can remain tracked after a
+    rule is added, so the publication audit must inspect the index separately
+    from the ordinary non-ignored working-tree scan.
+    """
+    return nul_paths(
+        run_git(root, "ls-files", "--cached", "--ignored", "--exclude-standard", "-z")
+    )
+
+
+def deleted_worktree_paths(root: Path) -> set[str]:
+    """Return tracked paths explicitly deleted in the working tree."""
+    result = run_git(root, "diff", "--name-only", "--diff-filter=D", "-z")
+    return {normalize_path(path) for path in nul_paths(result)}
+
+
 def history_paths(root: Path, include_reflog: bool) -> tuple[list[str], list[str]]:
     arguments = ["rev-list", "--objects", "--all"]
     if include_reflog:
@@ -248,7 +269,14 @@ def main() -> int:
     findings: list[str] = []
     reviews: list[str] = []
     tracked, untracked = current_paths(root)
+    tracked_ignored = tracked_ignored_paths(root)
+    deleted_paths = deleted_worktree_paths(root)
     historical, commits = history_paths(root, arguments.include_reflog)
+
+    for path in tracked_ignored:
+        if normalize_path(path) in deleted_paths:
+            continue
+        findings.append(f"tracked path {path}: file is ignored by current policy")
 
     for source, paths in (("tracked", tracked), ("untracked", untracked)):
         for path in paths:

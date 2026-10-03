@@ -93,6 +93,21 @@ enum class BottomPanel {
     console,
 };
 
+// A workspace definition is UI configuration, not project truth. The
+// registry gives native shells and headless consumers one authoritative list
+// of available/future workspaces and their bounded default layout.
+struct WorkspaceDefinition {
+    Workspace workspace = Workspace::model;
+    std::string id;
+    std::string label;
+    std::vector<Panel> default_panels;
+    BottomPanel default_bottom_panel = BottomPanel::operations;
+    bool available = false;
+    std::string unavailable_reason;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
 enum class ProjectStatus {
     unsaved,
     saved,
@@ -114,6 +129,7 @@ enum class Shortcut {
     save,
     undo,
     redo,
+    repeat_last_tool,
     object_mode,
     vertex_mode,
     edge_mode,
@@ -131,6 +147,7 @@ enum class NativeKey {
     s,
     z,
     y,
+    r,
     k,
     digit_1,
     digit_2,
@@ -280,6 +297,8 @@ struct UiSnapshot : application::ApplicationSnapshot {
 [[nodiscard]] const char* density_name(Density density) noexcept;
 [[nodiscard]] const char* operator_mode_name(OperatorMode mode) noexcept;
 [[nodiscard]] const char* workspace_name(Workspace workspace) noexcept;
+[[nodiscard]] const std::vector<WorkspaceDefinition>& workspace_registry() noexcept;
+[[nodiscard]] core::Result<WorkspaceDefinition> workspace_definition(Workspace workspace);
 [[nodiscard]] const char* panel_name(Panel panel) noexcept;
 [[nodiscard]] const char* bottom_panel_name(BottomPanel panel) noexcept;
 [[nodiscard]] const char* workbench_instrument_name(WorkbenchInstrument instrument) noexcept;

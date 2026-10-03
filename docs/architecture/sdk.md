@@ -7,6 +7,9 @@ explicit ABI version, status codes, and caller-visible ownership rules.
 ## Implemented surface
 
 - `carto_abi_version()` reports the ABI version.
+- `carto_abi_negotiate()` selects the current ABI only when it falls within a
+  caller-provided non-zero version range; unsupported ranges leave the output
+  version at zero and return `CARTO_UNSUPPORTED_VERSION`.
 - context creation is bounded to 64 KiB of optional configuration text;
 - context configuration may set a `project_root`; open and save paths are
   resolved beneath that root, reject `..` traversal and outside-root paths,
@@ -31,8 +34,7 @@ callbacks.
 ## Deferred bindings and compatibility
 
 The current ABI is a smoke-tested C surface, not a complete SDK. C++ wrapper,
-Python binding, C# binding, version negotiation beyond the integer version,
-threading rules, shared-library packaging, and downstream language acceptance
-remain deferred. ABI changes require an explicit version decision and a C smoke
-fixture; adding an operation without updating the capability response is a
-contract error.
+Python binding, C# binding, threading rules, and downstream language
+acceptance remain deferred. ABI changes require an explicit version decision
+and a C smoke fixture; adding an operation without updating the capability
+response is a contract error.

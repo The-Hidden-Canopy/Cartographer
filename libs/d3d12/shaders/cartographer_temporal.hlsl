@@ -35,10 +35,11 @@ void CSMain(uint3 dispatch_id : SV_DISPATCHTHREADID)
     const int2 history_pixel = clamp(
         pixel - int2(round(motion)), int2(0, 0), int2(width - 1, height - 1));
     const float4 history = history_color.Load(int3(history_pixel, 0));
-    const float3 lower = min(current.rgb, history.rgb);
-    const float3 upper = max(current.rgb, history.rgb);
-    const float3 clamped_history = clamp(history.rgb, lower, upper);
+    // The prior form clamped history between min(current, history) and
+    // max(current, history), which is an identity operation for every
+    // component. Keep the current contract while removing the redundant
+    // min/max/clamp instruction chain from the resolve kernel.
     const float feedback = saturate(feedback_and_clamp.x);
     resolved_color[pixel] = float4(
-        lerp(current.rgb, clamped_history, feedback), current.a);
+        lerp(current.rgb, history.rgb, feedback), current.a);
 }

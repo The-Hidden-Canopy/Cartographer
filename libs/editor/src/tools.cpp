@@ -46,9 +46,22 @@ ToolContext::make_set_selected_vertex_position_command(core::Vec3d position) con
     return core::Result<std::unique_ptr<EditorCommand>>::success(
         std::make_unique<SetProjectSelectedVertexPositionCommand>(
             admission_,
+        document_,
+        selection_,
+        position));
+}
+
+core::Result<std::unique_ptr<EditorCommand>>
+ToolContext::make_slide_selected_vertex_command(
+    std::optional<geometry::EdgeId> support_edge,
+    double factor) const {
+    return core::Result<std::unique_ptr<EditorCommand>>::success(
+        std::make_unique<SlideProjectSelectedVertexCommand>(
+            admission_,
             document_,
             selection_,
-            position));
+            support_edge,
+            factor));
 }
 
 core::Result<std::unique_ptr<EditorCommand>>
@@ -69,6 +82,42 @@ ToolContext::make_split_selected_edge_command(double factor) const {
             document_,
             selection_,
             factor));
+}
+
+core::Result<std::unique_ptr<EditorCommand>>
+ToolContext::make_dissolve_selected_edge_command() const {
+    return core::Result<std::unique_ptr<EditorCommand>>::success(
+        std::make_unique<DissolveProjectSelectedEdgeCommand>(
+            admission_,
+            document_,
+            selection_));
+}
+
+core::Result<std::unique_ptr<EditorCommand>>
+ToolContext::make_tri_to_quad_selected_faces_command() const {
+    return core::Result<std::unique_ptr<EditorCommand>>::success(
+        std::make_unique<TriToQuadProjectSelectedFacesCommand>(
+            admission_,
+            document_,
+            selection_));
+}
+
+core::Result<std::unique_ptr<EditorCommand>>
+ToolContext::make_merge_selected_vertices_command() const {
+    return core::Result<std::unique_ptr<EditorCommand>>::success(
+        std::make_unique<MergeProjectSelectedVerticesCommand>(
+            admission_,
+            document_,
+            selection_));
+}
+
+core::Result<std::unique_ptr<EditorCommand>>
+ToolContext::make_poke_selected_face_command() const {
+    return core::Result<std::unique_ptr<EditorCommand>>::success(
+        std::make_unique<PokeProjectSelectedFaceCommand>(
+            admission_,
+            document_,
+            selection_));
 }
 
 core::Result<void> ToolRegistry::register_tool(
@@ -112,6 +161,16 @@ core::Result<void> ToolRegistry::register_builtin_tools() {
         return result;
     }
     if (auto result = register_tool(
+        {"mesh.poke-face", "Poke selected face",
+         ToolKernelKind::editable_mesh_poke_face},
+        [](const ToolContext& context, const ToolArguments&)
+            -> core::Result<std::unique_ptr<EditorCommand>> {
+            return context.make_poke_selected_face_command();
+        });
+        !result) {
+        return result;
+    }
+    if (auto result = register_tool(
         {"mesh.remove-face", "Delete selected face",
          ToolKernelKind::editable_mesh_delete_face},
         [](const ToolContext& context, const ToolArguments& arguments)
@@ -132,12 +191,53 @@ core::Result<void> ToolRegistry::register_builtin_tools() {
         !result) {
         return result;
     }
-    return register_tool(
+    if (auto result = register_tool(
+        {"mesh.slide-vertex", "Slide selected vertex",
+         ToolKernelKind::editable_mesh_slide_vertex},
+        [](const ToolContext& context, const ToolArguments& arguments)
+            -> core::Result<std::unique_ptr<EditorCommand>> {
+            return context.make_slide_selected_vertex_command(
+                arguments.support_edge, arguments.factor);
+        });
+        !result) {
+        return result;
+    }
+    if (auto result = register_tool(
         {"mesh.split-edge", "Split selected edge",
          ToolKernelKind::editable_mesh_split_edge},
         [](const ToolContext& context, const ToolArguments& arguments)
             -> core::Result<std::unique_ptr<EditorCommand>> {
             return context.make_split_selected_edge_command(arguments.factor);
+        });
+        !result) {
+        return result;
+    }
+    if (auto result = register_tool(
+        {"mesh.dissolve-edge", "Dissolve selected edge",
+         ToolKernelKind::editable_mesh_dissolve_edge},
+        [](const ToolContext& context, const ToolArguments&)
+            -> core::Result<std::unique_ptr<EditorCommand>> {
+            return context.make_dissolve_selected_edge_command();
+        });
+        !result) {
+        return result;
+    }
+    if (auto result = register_tool(
+        {"mesh.tri-to-quad", "Convert selected triangles to quad",
+         ToolKernelKind::editable_mesh_tri_to_quad},
+        [](const ToolContext& context, const ToolArguments&)
+            -> core::Result<std::unique_ptr<EditorCommand>> {
+            return context.make_tri_to_quad_selected_faces_command();
+        });
+        !result) {
+        return result;
+    }
+    return register_tool(
+        {"mesh.merge-vertices", "Merge selected vertices",
+         ToolKernelKind::editable_mesh_merge_vertices},
+        [](const ToolContext& context, const ToolArguments&)
+            -> core::Result<std::unique_ptr<EditorCommand>> {
+            return context.make_merge_selected_vertices_command();
         });
 }
 

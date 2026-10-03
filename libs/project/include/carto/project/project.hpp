@@ -22,11 +22,16 @@ class ApplicationSession;
 namespace carto::editor {
 class CreateMeshObjectCommand;
 class DeleteProjectSelectedFaceCommand;
+class DissolveProjectSelectedEdgeCommand;
 class ExtrudeProjectSelectedFaceCommand;
 class InsetProjectSelectedFaceCommand;
+class MergeProjectSelectedVerticesCommand;
+class PokeProjectSelectedFaceCommand;
 class SetProjectObjectTransformCommand;
 class SetProjectSelectedVertexPositionCommand;
+class SlideProjectSelectedVertexCommand;
 class SplitProjectSelectedEdgeCommand;
+class TriToQuadProjectSelectedFacesCommand;
 }
 
 namespace carto::project {
@@ -96,11 +101,16 @@ private:
     friend class ::carto::application::ApplicationSession;
     friend class ::carto::editor::CreateMeshObjectCommand;
     friend class ::carto::editor::DeleteProjectSelectedFaceCommand;
+    friend class ::carto::editor::DissolveProjectSelectedEdgeCommand;
     friend class ::carto::editor::ExtrudeProjectSelectedFaceCommand;
     friend class ::carto::editor::InsetProjectSelectedFaceCommand;
+    friend class ::carto::editor::MergeProjectSelectedVerticesCommand;
+    friend class ::carto::editor::PokeProjectSelectedFaceCommand;
     friend class ::carto::editor::SetProjectObjectTransformCommand;
     friend class ::carto::editor::SetProjectSelectedVertexPositionCommand;
+    friend class ::carto::editor::SlideProjectSelectedVertexCommand;
     friend class ::carto::editor::SplitProjectSelectedEdgeCommand;
+    friend class ::carto::editor::TriToQuadProjectSelectedFacesCommand;
     friend class ::carto::project::ProjectTransaction;
 
     ProjectDocument& operator=(const ProjectDocument&) = default;

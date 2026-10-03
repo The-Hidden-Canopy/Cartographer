@@ -22,6 +22,7 @@ tool input
 | `carto_core` | diagnostics, revisions, precision math | scene or UI policy |
 | `carto_scene` | stable object identity, local transforms, parent links | renderer resources |
 | `carto_geometry` | editable mesh topology and derived compilation | UI state or GPU handles |
+| `carto_web_geometry_*` | deterministic derived clusters, provenance, runtime pages, and portable package bytes | authoring mutation, runtime residency, renderer scheduling, or VANTA scene authority |
 | `carto_assets` | content-addressed immutable blob bytes and digest verification | authoring ownership or import policy |
 | `carto_project` | versioned authoring persistence and asset references | render caches |
 | `carto_journal` | bounded revision-bound recovery records and hash-chain verification | explicit save state or editor history ownership |
@@ -98,12 +99,24 @@ operations cannot span objects or silently bind an existing unbound selection
 to a different mesh context. Mesh-bound selections retain the mesh instance and
 source revision they were created against, so replacement or mutation requires
 explicit reselection. Edge selection consumes persistent topology identity.
-Single-edge splitting, convex-face inset, and single-face deletion are now
+Single-edge splitting, bounded coplanar internal-edge dissolve, compatible triangle-to-quad conversion, convex-face inset, convex-face poke, and single-face deletion are now
 admitted topology edits: they validate the bound selection, mutate a
 project-owned mesh through a revision-guarded command, emit
 affected-set/parameter receipt metadata, and clear selections whose identities
-are removed. Concave inset, broader edge traversal, and multi-selection
-topology operators remain deferred.
+are removed. Component selection can be converted and expanded deterministically
+across vertex, edge, and face modes without changing the document revision;
+linked, grow, shrink, invert, and one-start shortest-path selection are
+available on one validated mesh. The
+two-vertex target-weld path preserves the lower stable vertex
+ID, removes only unambiguous degenerate faces, and records source-to-target
+merge lineage. Non-convex poke/inset, broader edge traversal, merge modes beyond
+target-first, arbitrary/non-convex dissolve, broader triangle pairing, and multi-selection topology operators remain deferred.
+
+The application also retains a session-local repeat/adjust-last record for the
+last accepted registered tool. Replays carry complete arguments plus a
+value-level authoring context, rebind stable IDs against the current document,
+and fail closed without mutation when an owner or component disappeared. This
+record is intentionally separate from the durable journal and `.carto` format.
 
 Tool actions are registered by stable IDs and return editor commands. The
 registry submits successful commands through `CommandBus`; it does not expose a
@@ -111,7 +124,9 @@ direct mutation callback or mutable mesh accessor to panels or UI code. The
 current built-in context resolves an object-bound selection through
 `ProjectDocument` to the owning mesh asset and exposes approved command
 builders for selected-face extrusion, convex-face inset, single-face deletion,
-single-edge splitting, and single-vertex position editing.
+single-edge splitting, bounded internal-edge dissolve, compatible triangle-to-quad
+conversion, convex-face poke, bounded incident-edge vertex sliding, two-vertex
+target welding, and single-vertex position editing.
 Additional tool builders must preserve the same boundary and leave context
 routing out of panel code.
 
@@ -120,7 +135,7 @@ routing out of panel code.
 `carto_application::ApplicationSession` is the first front-end integration
 layer. It owns the active project document, project path and saved revision,
 ephemeral selection, command history, tool registry, validated workspace pane
-state, and user-visible problems. Its action variant covers the 0.1 vertical
+state, the canonical UI workspace registry, and user-visible problems. Its action variant covers the 0.1 vertical
 slice: new/open/save, workspace layout, selection, object transforms, primitive
 creation, registered tool invocation, undo, and redo.
 
@@ -154,8 +169,8 @@ session. Its operation rail is a bounded view of successful application
 receipts, not a second history or audit ledger. Theme/density/workspace state
 and local preferences remain outside project truth; corrupt preferences reset
 through the same validated workspace action path. The controller exposes the
-AI-First shell only as an unavailable/manual state until a bounded planner and
-proposal transaction adapter exist.
+AI-First shell through the bounded native planner and proposal transaction
+adapter; unavailable future workspaces remain explicitly gated by the registry.
 
 ## Native backend boundary
 
@@ -185,8 +200,11 @@ digests, a previous-entry hash, and a record hash. The application session
 binds that journal to saved projects, records a baseline plus accepted
 mutations, and rolls back an in-memory action if its durable append fails.
 These foundations are not yet a replacement for the v1 text project file:
-the SQLite WAL package, checkpoint replay, and startup recovery flow remain
-separate work.
+the SQLite WAL package and startup recovery UI remain separate work. The
+application exposes a read-only recovery inspection boundary and a separate
+human-only explicit recovery action that materializes the latest verified
+snapshot through the normal atomic save path, without treating a journal as a
+user save or allowing AI to invoke recovery.
 
 Asynchronous jobs and persistent GPU resource ownership are not part of the
 headless/application contract yet. When derived jobs or resources are

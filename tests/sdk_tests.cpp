@@ -42,6 +42,22 @@ void require_ok(carto_status status, carto_error& error) {
 
 void sdk_exposes_bounded_versioned_query_and_execute_surface() {
     REQUIRE(carto_abi_version() == 1U);
+    carto_error negotiation_error{};
+    uint32_t negotiated_version = 0U;
+    require_ok(carto_abi_negotiate(1U, 1U, &negotiated_version, &negotiation_error),
+               negotiation_error);
+    REQUIRE(negotiated_version == 1U);
+    REQUIRE(carto_abi_negotiate(2U, 3U, &negotiated_version, &negotiation_error) ==
+            CARTO_UNSUPPORTED_VERSION);
+    REQUIRE(negotiated_version == 0U);
+    REQUIRE(negotiation_error.message != nullptr);
+    carto_free(negotiation_error.message);
+    negotiation_error = {};
+    REQUIRE(carto_abi_negotiate(0U, 1U, &negotiated_version, &negotiation_error) ==
+            CARTO_INVALID_ARGUMENT);
+    REQUIRE(negotiated_version == 0U);
+    REQUIRE(negotiation_error.message != nullptr);
+    carto_free(negotiation_error.message);
     TempDirectory temp;
     carto_context* context = nullptr;
     carto_error error{};
@@ -84,6 +100,7 @@ void sdk_exposes_bounded_versioned_query_and_execute_surface() {
 
     char* response = nullptr;
     require_ok(carto_document_query_json(document, "{\"op\":\"capabilities\"}", &response, &error), error);
+    REQUIRE(std::string(response).find("abi_min_version") != std::string::npos);
     REQUIRE(std::string(response).find("create_box") != std::string::npos);
     carto_free(response);
     response = nullptr;
@@ -175,6 +192,10 @@ void sdk_rejects_oversized_and_unknown_requests() {
 void sdk_bounds_context_lifetime_and_null_outputs() {
     carto_context* context = nullptr;
     carto_error error{};
+    REQUIRE(carto_abi_negotiate(1U, 1U, nullptr, &error) == CARTO_INVALID_ARGUMENT);
+    REQUIRE(error.message != nullptr);
+    carto_free(error.message);
+    error = {};
     const std::string oversized(65U * 1024U, 'x');
     REQUIRE(carto_context_create(oversized.c_str(), &context, &error) == CARTO_INVALID_ARGUMENT);
     REQUIRE(context == nullptr);

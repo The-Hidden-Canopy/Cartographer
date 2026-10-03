@@ -27,6 +27,7 @@ constexpr std::size_t kWarmupIterations = 7U;
 constexpr double kExtrudeDistance = 0.05;
 constexpr double kInsetDistance = 0.05;
 constexpr double kSplitFactor = 0.5;
+constexpr double kSlideFactor = 0.25;
 
 struct SizeCase {
     std::size_t rows;
@@ -39,6 +40,8 @@ struct Fixture {
     FaceId face;
     VertexId vertex;
     EdgeId edge;
+    EdgeId support_edge;
+    bool has_interior_edge = false;
 };
 
 struct TimingSummary {
@@ -52,6 +55,7 @@ struct TimingSummary {
 struct KernelSpec {
     std::string_view name;
     bool (*run)(EditableMesh&, const Fixture&);
+    bool requires_interior_edge = false;
 };
 
 [[nodiscard]] EditableMesh make_grid(std::size_t rows, std::size_t columns) {
@@ -83,7 +87,7 @@ struct KernelSpec {
 }
 
 [[nodiscard]] Fixture make_fixture(const SizeCase& size) {
-    Fixture fixture{make_grid(size.rows, size.columns), {}, {}, {}};
+    Fixture fixture{make_grid(size.rows, size.columns), {}, {}, {}, {}, false};
     const auto faces = fixture.mesh.faces_sorted();
     const auto vertices = fixture.mesh.vertices_sorted();
     const auto topology = fixture.mesh.topology();
@@ -93,12 +97,22 @@ struct KernelSpec {
 
     fixture.face = faces.front().id;
     fixture.vertex = vertices.front().id;
+    const auto support = std::find_if(
+        topology.value().edges.begin(), topology.value().edges.end(),
+        [vertex = fixture.vertex](const auto& edge) {
+            return edge.first == vertex || edge.second == vertex;
+        });
+    if (support == topology.value().edges.end()) {
+        throw std::runtime_error("benchmark fixture has no vertex support edge");
+    }
+    fixture.support_edge = support->id;
     const auto interior = std::find_if(
         topology.value().edges.begin(), topology.value().edges.end(),
         [](const auto& edge) { return edge.second_half_edge.has_value(); });
     fixture.edge = interior == topology.value().edges.end()
         ? topology.value().edges.front().id
         : interior->id;
+    fixture.has_interior_edge = interior != topology.value().edges.end();
     if (auto result = fixture.mesh.validate(); !result) {
         throw std::runtime_error(result.error().message);
     }
@@ -118,12 +132,22 @@ bool run_vertex_position(EditableMesh& mesh, const Fixture& fixture) {
         fixture.vertex, Vec3d{0.001, 0.002, 0.003}));
 }
 
+bool run_vertex_slide(EditableMesh& mesh, const Fixture& fixture) {
+    return static_cast<bool>(mesh.slide_vertex(
+        fixture.vertex, fixture.support_edge, kSlideFactor));
+}
+
 bool run_delete(EditableMesh& mesh, const Fixture& fixture) {
     return static_cast<bool>(mesh.delete_face(fixture.face, false));
 }
 
 bool run_split(EditableMesh& mesh, const Fixture& fixture) {
     return static_cast<bool>(mesh.split_edge(fixture.edge, kSplitFactor));
+}
+
+bool run_dissolve(EditableMesh& mesh, const Fixture& fixture) {
+    if (!fixture.has_interior_edge) return false;
+    return static_cast<bool>(mesh.dissolve_edge(fixture.edge));
 }
 
 [[nodiscard]] TimingSummary benchmark(
@@ -185,12 +209,14 @@ int main() {
             SizeCase{8U, 8U, 250U},
             SizeCase{16U, 16U, 50U},
         };
-        constexpr std::array<KernelSpec, 5U> kernels = {
+        constexpr std::array<KernelSpec, 7U> kernels = {
             KernelSpec{"geometry.EditableMesh.extrude_face", run_extrude},
             KernelSpec{"geometry.EditableMesh.inset_face", run_inset},
             KernelSpec{"geometry.EditableMesh.set_vertex_position", run_vertex_position},
+            KernelSpec{"geometry.EditableMesh.slide_vertex", run_vertex_slide},
             KernelSpec{"geometry.EditableMesh.delete_face", run_delete},
             KernelSpec{"geometry.EditableMesh.split_edge", run_split},
+            KernelSpec{"geometry.EditableMesh.dissolve_edge", run_dissolve, true},
         };
 
         std::cout << "kernel,rows,columns,vertices,faces,iterations,min_us,median_us,p95_us,mean_us,checksum\n";
@@ -198,6 +224,7 @@ int main() {
         for (const auto& size : sizes) {
             const Fixture fixture = make_fixture(size);
             for (const auto& kernel : kernels) {
+                if (kernel.requires_interior_edge && !fixture.has_interior_edge) continue;
                 const auto summary = benchmark(fixture, kernel, size.iterations);
                 std::cout << kernel.name << ',' << size.rows << ',' << size.columns << ','
                     << fixture.mesh.vertex_count() << ',' << fixture.mesh.face_count() << ','

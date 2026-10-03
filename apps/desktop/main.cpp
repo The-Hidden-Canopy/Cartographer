@@ -1216,6 +1216,43 @@ struct DesktopState {
                     L"Cartographer mesh export", MB_OK | MB_ICONINFORMATION);
     }
 
+    void recover_latest_snapshot(const UiSnapshot& snapshot) {
+        std::optional<std::filesystem::path> path = snapshot.project_path;
+        if (!path.has_value()) path = choose_file(false, FileDialogKind::project);
+        if (!path.has_value()) return;
+
+        const auto inspection = ApplicationSession::inspect_recovery(*path);
+        if (!inspection) {
+            MessageBoxW(window, wide(inspection.error().message).c_str(),
+                        L"Cartographer recovery unavailable", MB_OK | MB_ICONERROR);
+            return;
+        }
+        if (inspection.value().state ==
+            carto::application::RecoveryInspectionState::blocked) {
+            const std::string message = inspection.value().diagnostic.has_value()
+                ? inspection.value().diagnostic->message
+                : "durable recovery evidence is blocked";
+            MessageBoxW(window, wide(message).c_str(),
+                        L"Cartographer recovery blocked", MB_OK | MB_ICONERROR);
+            return;
+        }
+        if (inspection.value().state !=
+            carto::application::RecoveryInspectionState::pending) {
+            MessageBoxW(window,
+                        L"No pending journal snapshot is available for this project.",
+                        L"Cartographer recovery", MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+
+        carto::application::RecoverProjectAction action{*path};
+        if (snapshot.dirty) {
+            action.discard_dirty = true;
+            request_discard(std::move(action));
+        } else {
+            static_cast<void>(dispatch(action));
+        }
+    }
+
     void request_discard(carto::application::ApplicationAction action) {
         pending_discard_action = std::move(action);
         pending_exit = false;
@@ -1304,10 +1341,6 @@ struct DesktopState {
 
     [[nodiscard]] static ImVec4 color(carto::ui::UiColor value) noexcept {
         return ImVec4(value.red, value.green, value.blue, value.alpha);
-    }
-
-    [[nodiscard]] static bool workspace_available(carto::ui::Workspace workspace) noexcept {
-        return workspace == carto::ui::Workspace::model || workspace == carto::ui::Workspace::ai;
     }
 
     void apply_theme(const UiSnapshot& snapshot) {
@@ -1863,18 +1896,10 @@ struct DesktopState {
 
     void draw_workspace_bar(const UiSnapshot& snapshot) {
         ImGui::BeginChild("WorkspaceBar", ImVec2(0, 52), true);
-        static constexpr std::array<std::pair<carto::ui::Workspace, const char*>, 8> workspaces{{
-            {carto::ui::Workspace::model, "Model"},
-            {carto::ui::Workspace::sculpt, "Sculpt"},
-            {carto::ui::Workspace::cad, "CAD"},
-            {carto::ui::Workspace::build, "Build"},
-            {carto::ui::Workspace::material, "Material"},
-            {carto::ui::Workspace::animate, "Animate"},
-            {carto::ui::Workspace::review, "Review"},
-            {carto::ui::Workspace::ai, "AI"},
-        }};
-        for (const auto& [workspace, label] : workspaces) {
-            const bool available = workspace_available(workspace);
+        for (const auto& definition : carto::ui::workspace_registry()) {
+            const auto workspace = definition.workspace;
+            const char* label = definition.label.c_str();
+            const bool available = definition.available;
             if (available && workspace == snapshot.workspace_kind) {
                 ImGui::PushStyleColor(ImGuiCol_Button, color(snapshot.colors.panel_selected));
             }
@@ -1926,6 +1951,9 @@ struct DesktopState {
                 } else if (const auto path = choose_file(true); path.has_value()) {
                     dispatch(carto::application::SaveProjectAction{*path});
                 }
+            }
+            if (ImGui::MenuItem("Recover latest journal snapshot")) {
+                recover_latest_snapshot(snapshot);
             }
             const bool can_export = snapshot.project_path.has_value() && !snapshot.dirty;
             if (ImGui::MenuItem("Export glTF", "Ctrl+Alt+E", false, can_export)) {
@@ -2061,6 +2089,7 @@ struct DesktopState {
                 if (command.id == "project.save") static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::save));
                 else if (command.id == "edit.undo") static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::undo));
                 else if (command.id == "edit.redo") static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::redo));
+                else if (command.id == "edit.repeat-last") static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::repeat_last_tool));
                 else if (command.id == "mode.object") static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::object_mode));
                 else if (command.id == "mode.vertex") static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::vertex_mode));
                 else if (command.id == "mode.edge") static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::edge_mode));
@@ -3031,6 +3060,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             case 'S': return carto::ui::NativeKey::s;
             case 'Z': return carto::ui::NativeKey::z;
             case 'Y': return carto::ui::NativeKey::y;
+            case 'R': return carto::ui::NativeKey::r;
             case 'K': return carto::ui::NativeKey::k;
             case '1': return carto::ui::NativeKey::digit_1;
             case '2': return carto::ui::NativeKey::digit_2;

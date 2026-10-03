@@ -767,6 +767,33 @@ void project_recovery_replays_only_verified_snapshot_envelopes() {
     REQUIRE(rejected_metadata.error().code == carto::core::ErrorCode::validation_failed);
 }
 
+void project_recovery_can_materialize_latest_snapshot_without_checkpoint() {
+    TempDirectory temp;
+    carto::project::ProjectDocument document;
+    carto::journal::Journal journal(temp.path() / "latest" / "journal.log");
+
+    auto first = carto::project::ProjectTransaction::begin(document, journal, "latest-test");
+    REQUIRE(first);
+    REQUIRE(first.value().create_object("latest"));
+    REQUIRE(first.value().commit("scene.create"));
+
+    auto second = carto::project::ProjectTransaction::begin(document, journal, "latest-test");
+    REQUIRE(second);
+    REQUIRE(second.value().create_object("newer"));
+    REQUIRE(second.value().commit("scene.create"));
+
+    const auto recovered = carto::project::recover_latest_snapshot(journal);
+    REQUIRE(recovered);
+    REQUIRE(recovered.value().recovered_revision == carto::core::Revision{2U});
+    REQUIRE(recovered.value().source_entries == 2U);
+    REQUIRE(recovered.value().document.scene().size() == 2U);
+
+    const auto empty = carto::project::recover_latest_snapshot(
+        carto::journal::Journal(temp.path() / "missing" / "journal.log"));
+    REQUIRE(!empty);
+    REQUIRE(empty.error().code == carto::core::ErrorCode::not_found);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -789,6 +816,7 @@ int main(int argc, char** argv) {
         project_transaction_journals_evaluation_graph_reference_with_document_state();
         project_transaction_persists_topology_receipts_through_recovery();
         project_recovery_replays_only_verified_snapshot_envelopes();
+        project_recovery_can_materialize_latest_snapshot_without_checkpoint();
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         return 1;

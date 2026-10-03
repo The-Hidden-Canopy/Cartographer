@@ -279,6 +279,10 @@ std::vector<OperationDescriptor> build_operation_ontology(
             descriptor.preview_supported = true;
             descriptor.auto_approvable = true;
             descriptor.preview_kind = editor::PreviewKind::inset_face;
+        } else if (matches("mesh.poke-face", editor::ToolKernelKind::editable_mesh_poke_face)) {
+            descriptor.kernel_operation = "geometry.EditableMesh.poke_face";
+            descriptor.precondition =
+                "exactly one object-bound face selected; face is finite, planar, strictly convex, and has a centroid strictly inside; operation requires a future preview contract";
         } else if (matches(
                        "mesh.set-vertex-position",
                        editor::ToolKernelKind::editable_mesh_set_vertex_position)) {
@@ -289,6 +293,13 @@ std::vector<OperationDescriptor> build_operation_ontology(
             descriptor.preview_supported = true;
             descriptor.auto_approvable = true;
             descriptor.preview_kind = editor::PreviewKind::set_vertex_position;
+        } else if (matches(
+                       "mesh.slide-vertex",
+                       editor::ToolKernelKind::editable_mesh_slide_vertex)) {
+            descriptor.kernel_operation = "geometry.EditableMesh.slide_vertex";
+            descriptor.parameters = {"factor", "support_edge"};
+            descriptor.precondition =
+                "exactly one object-bound vertex selected; support edge must be incident or omitted for deterministic lowest-edge selection; finite factor strictly between zero and one; resulting mesh remains valid; operation requires a future preview contract";
         } else if (matches("mesh.remove-face", editor::ToolKernelKind::editable_mesh_delete_face)) {
             descriptor.kernel_operation = "geometry.EditableMesh.delete_face";
             descriptor.parameters = {"remove_orphaned_vertices"};
@@ -299,11 +310,34 @@ std::vector<OperationDescriptor> build_operation_ontology(
             descriptor.parameters = {"factor"};
             descriptor.precondition =
                 "exactly one object-bound edge selected; finite factor strictly between zero and one; operation requires a future preview contract";
+        } else if (matches(
+                       "mesh.dissolve-edge",
+                       editor::ToolKernelKind::editable_mesh_dissolve_edge)) {
+            descriptor.kernel_operation = "geometry.EditableMesh.dissolve_edge";
+            descriptor.precondition =
+                "exactly one object-bound internal manifold edge selected; its incident faces must be coplanar, convex, and form a simple boundary; boundary, non-planar, and multi-edge dissolves are rejected; operation requires a future preview contract";
+        } else if (matches(
+                       "mesh.tri-to-quad",
+                       editor::ToolKernelKind::editable_mesh_tri_to_quad)) {
+            descriptor.kernel_operation = "geometry.EditableMesh.tri_to_quad";
+            descriptor.precondition =
+                "exactly two object-bound authored triangles selected; they must share exactly one internal edge and form a coplanar convex quad; incompatible topology is rejected; operation requires a future preview contract";
+        } else if (matches(
+                       "mesh.merge-vertices",
+                       editor::ToolKernelKind::editable_mesh_merge_vertices)) {
+            descriptor.kernel_operation = "geometry.EditableMesh.merge_vertices";
+            descriptor.precondition =
+                "exactly two object-bound vertices selected; the lower stable ID is preserved as the target; the resulting mesh must remain simple and valid; operation requires a future preview contract";
         } else {
             descriptor.kernel_operation = "unclassified";
             const bool known_id = tool.id == "mesh.extrude-face" ||
-                tool.id == "mesh.inset-face" || tool.id == "mesh.set-vertex-position" ||
-                tool.id == "mesh.remove-face" || tool.id == "mesh.split-edge";
+                tool.id == "mesh.inset-face" || tool.id == "mesh.poke-face" ||
+                tool.id == "mesh.set-vertex-position" ||
+                tool.id == "mesh.slide-vertex" ||
+                tool.id == "mesh.remove-face" || tool.id == "mesh.split-edge" ||
+                tool.id == "mesh.dissolve-edge" ||
+                tool.id == "mesh.tri-to-quad" ||
+                tool.id == "mesh.merge-vertices";
             descriptor.precondition = known_id
                 ? "registered tool ID and native kernel contract do not match; preview disabled"
                 : "native tool-specific validation required";

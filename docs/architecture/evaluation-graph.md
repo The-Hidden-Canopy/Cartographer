@@ -44,6 +44,25 @@ This is not yet a full evaluator. It intentionally does not invent mesh,
 curve, material, or B-Rep result payloads. Those typed result domains can be
 added behind the same graph contract once their owning kernels exist.
 
+The bounded `carto_web_geometry_evaluation` adapter now publishes the
+validated C1-C5 package as typed graph intent through the chain
+`CompileMeshNode -> SurfaceMetadataNode -> LeafClusterNode -> HierarchyNode ->
+PagePackNode -> PackageNode`. Each stage carries a content digest derived from
+the source revision, compiler options, cluster provenance, hierarchy, page
+table/payload identities, or final package identity as appropriate. A
+publication receipt also retains per-cluster and per-page identities.
+
+`compute_invalidation` compares two publication receipts and returns a
+downstream-closed dirty stage set plus changed cluster and page identities.
+This closes the graph-publication and incremental-invalidation contract without
+pretending that a package is an evaluated mesh cache: no worker, cache write,
+GPU residency, project mutation, or VANTA admission happens in this adapter.
+The diagnostics boundary now also exposes package-bound, non-renderable
+grouping error receipts, and the web-geometry core exposes a backend-neutral
+cluster-overlay projection snapshot with explicit clipping and viewport-bound
+validation. Renderable parent simplification, native overlay rendering and
+pointer integration, and runtime admission remain separate acceptance gates.
+
 ## Attribute domains
 
 `carto_attributes` keeps attribute cardinality per domain rather than using a
@@ -75,8 +94,14 @@ into this contract.
 ## Boundary still open
 
 The next structural rung is atomic package/document graph storage and broader
-topology-operation coverage. Extrude, split-edge, and inset now emit explicit
-lineage for the polygon kernel; delete emits a validated identity delta but has
-no created-element lineage by design. Bevel, merge, dissolve, bridge, loop cut,
+topology-operation coverage. Extrude, split-edge, inset, poke, target weld,
+bounded coplanar edge dissolve, and compatible triangle-to-quad conversion now
+emit explicit lineage for the polygon kernel;
+delete emits a validated identity delta but has no created-element lineage by
+design. The target-weld receipt
+records source-to-target mappings separately from created-element origins so a
+preserved target is not misrepresented as newly generated. Poke records the
+centroid vertex and fan faces as interpolated/generated lineage. Bevel, center/last
+merge modes, attribute-aware weld, arbitrary/non-convex dissolve, bridge, loop cut,
 knife, modifiers, sculpt, animation, and CAD claims remain deferred until their
 operators have receipts, attribute-survival tests, and workflow evidence.

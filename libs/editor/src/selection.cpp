@@ -1,6 +1,9 @@
 #include <carto/editor/selection.hpp>
 
+#include <algorithm>
+#include <map>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 namespace carto::editor {
@@ -32,6 +35,16 @@ bool valid_operation(SelectionOperation operation) noexcept {
         operation == SelectionOperation::add || operation == SelectionOperation::toggle;
 }
 
+bool valid_expansion(SelectionExpansion expansion) noexcept {
+    return expansion == SelectionExpansion::linked ||
+        expansion == SelectionExpansion::grow ||
+        expansion == SelectionExpansion::shrink ||
+        expansion == SelectionExpansion::invert ||
+        expansion == SelectionExpansion::loop ||
+        expansion == SelectionExpansion::ring ||
+        expansion == SelectionExpansion::boundary;
+}
+
 } // namespace
 
 std::size_t SelectionState::active_count() const noexcept {
@@ -57,6 +70,349 @@ core::Result<void> SelectionState::set_mode(SelectionMode mode) {
     }
     clear_all();
     mode_ = mode;
+    return core::Result<void>::success();
+}
+
+core::Result<void> SelectionState::convert_mode(
+    SelectionMode mode,
+    const geometry::EditableMesh& mesh) {
+    if (!valid_mode(mode) || mode == SelectionMode::object) {
+        return core::Result<void>::failure(invalid(
+            "component selection conversion requires a vertex, edge, or face mode"));
+    }
+    if (mode_ == SelectionMode::object) {
+        return core::Result<void>::failure(invalid(
+            "object selection cannot be converted without a component selection"));
+    }
+    if (auto result = validate(mesh); !result) {
+        return result;
+    }
+    if (mode_ == mode) {
+        return core::Result<void>::success();
+    }
+
+    const auto topology = mesh.topology();
+    if (!topology) {
+        return core::Result<void>::failure(topology.error().with_context(
+            "selection conversion topology"));
+    }
+    using EdgeKey = std::pair<geometry::VertexId, geometry::VertexId>;
+    const auto edge_key = [](geometry::VertexId first, geometry::VertexId second) {
+        return first < second ? EdgeKey{first, second} : EdgeKey{second, first};
+    };
+    std::map<EdgeKey, geometry::EdgeId> edge_by_vertices;
+    for (const auto& edge : topology.value().edges) {
+        const auto [iterator, inserted] = edge_by_vertices.emplace(
+            edge_key(edge.first, edge.second), edge.id);
+        static_cast<void>(iterator);
+        if (!inserted) {
+            return core::Result<void>::failure(stale(
+                "selection conversion found duplicate edge endpoints"));
+        }
+    }
+
+    std::set<geometry::VertexId> converted_vertices;
+    std::set<geometry::EdgeId> converted_edges;
+    std::set<geometry::FaceId> converted_faces;
+    const auto face_edges = [&](const geometry::Face& face)
+        -> core::Result<std::vector<geometry::EdgeId>> {
+        std::vector<geometry::EdgeId> result;
+        result.reserve(face.vertices.size());
+        for (std::size_t index = 0U; index < face.vertices.size(); ++index) {
+            const auto iterator = edge_by_vertices.find(edge_key(
+                face.vertices[index], face.vertices[(index + 1U) % face.vertices.size()]));
+            if (iterator == edge_by_vertices.end()) {
+                return core::Result<std::vector<geometry::EdgeId>>::failure(stale(
+                    "selection conversion found a face edge missing from topology"));
+            }
+            result.push_back(iterator->second);
+        }
+        return core::Result<std::vector<geometry::EdgeId>>::success(std::move(result));
+    };
+
+    if (mode_ == SelectionMode::vertex && mode == SelectionMode::edge) {
+        for (const auto& edge : topology.value().edges) {
+            if (vertices_.contains(edge.first) && vertices_.contains(edge.second)) {
+                converted_edges.insert(edge.id);
+            }
+        }
+    } else if (mode_ == SelectionMode::vertex && mode == SelectionMode::face) {
+        for (const auto& face : mesh.faces_sorted()) {
+            if (std::all_of(
+                    face.vertices.begin(), face.vertices.end(),
+                    [this](geometry::VertexId vertex) { return vertices_.contains(vertex); })) {
+                converted_faces.insert(face.id);
+            }
+        }
+    } else if (mode_ == SelectionMode::edge && mode == SelectionMode::vertex) {
+        for (const auto& edge : topology.value().edges) {
+            if (edges_.contains(edge.id)) {
+                converted_vertices.insert(edge.first);
+                converted_vertices.insert(edge.second);
+            }
+        }
+    } else if (mode_ == SelectionMode::edge && mode == SelectionMode::face) {
+        for (const auto& face : mesh.faces_sorted()) {
+            auto boundaries = face_edges(face);
+            if (!boundaries) {
+                return core::Result<void>::failure(boundaries.error());
+            }
+            if (std::all_of(
+                    boundaries.value().begin(), boundaries.value().end(),
+                    [this](geometry::EdgeId edge) { return edges_.contains(edge); })) {
+                converted_faces.insert(face.id);
+            }
+        }
+    } else if (mode_ == SelectionMode::face && mode == SelectionMode::vertex) {
+        for (const auto& face : mesh.faces_sorted()) {
+            if (faces_.contains(face.id)) {
+                converted_vertices.insert(face.vertices.begin(), face.vertices.end());
+            }
+        }
+    } else if (mode_ == SelectionMode::face && mode == SelectionMode::edge) {
+        for (const auto& face : mesh.faces_sorted()) {
+            if (!faces_.contains(face.id)) continue;
+            auto boundaries = face_edges(face);
+            if (!boundaries) {
+                return core::Result<void>::failure(boundaries.error());
+            }
+            converted_edges.insert(boundaries.value().begin(), boundaries.value().end());
+        }
+    } else {
+        return core::Result<void>::failure(invalid(
+            "selection conversion does not support the requested mode pair"));
+    }
+
+    const auto owner = component_object_;
+    const auto* component_mesh = component_mesh_;
+    const auto component_revision = component_mesh_revision_;
+    vertices_.clear();
+    edges_.clear();
+    faces_.clear();
+    mode_ = mode;
+    component_object_ = owner;
+    component_mesh_ = component_mesh;
+    component_mesh_revision_ = component_revision;
+    vertices_ = std::move(converted_vertices);
+    edges_ = std::move(converted_edges);
+    faces_ = std::move(converted_faces);
+    return core::Result<void>::success();
+}
+
+core::Result<void> SelectionState::expand(
+    SelectionExpansion expansion,
+    const geometry::EditableMesh& mesh) {
+    if (!valid_expansion(expansion)) {
+        return core::Result<void>::failure(invalid("selection expansion is invalid"));
+    }
+    if (mode_ == SelectionMode::object) {
+        return core::Result<void>::failure(invalid(
+            "object selection cannot use component expansion"));
+    }
+    if ((expansion == SelectionExpansion::loop ||
+         expansion == SelectionExpansion::ring ||
+         expansion == SelectionExpansion::boundary) && mode_ != SelectionMode::edge) {
+        return core::Result<void>::failure(invalid(
+            "loop, ring, and boundary expansion require edge selection mode"));
+    }
+    if (auto result = validate(mesh); !result) {
+        return result;
+    }
+
+    const auto topology = mesh.topology();
+    if (!topology) {
+        return core::Result<void>::failure(topology.error().with_context(
+            "selection expansion topology"));
+    }
+
+    std::map<geometry::VertexId, std::set<geometry::VertexId>> vertex_neighbors;
+    std::map<geometry::VertexId, std::set<geometry::EdgeId>> incident_edges;
+    for (const auto& edge : topology.value().edges) {
+        vertex_neighbors[edge.first].insert(edge.second);
+        vertex_neighbors[edge.second].insert(edge.first);
+        incident_edges[edge.first].insert(edge.id);
+        incident_edges[edge.second].insert(edge.id);
+    }
+
+    std::map<geometry::EdgeId, std::set<geometry::EdgeId>> edge_neighbors;
+    for (const auto& [vertex, edges] : incident_edges) {
+        static_cast<void>(vertex);
+        for (const geometry::EdgeId edge : edges) {
+            auto& neighbors = edge_neighbors[edge];
+            neighbors.insert(edges.begin(), edges.end());
+            neighbors.erase(edge);
+        }
+    }
+
+    std::map<geometry::EdgeId, std::set<geometry::FaceId>> faces_by_edge;
+    for (const auto& half_edge : topology.value().half_edges) {
+        faces_by_edge[half_edge.edge].insert(half_edge.face);
+    }
+    std::map<geometry::FaceId, std::set<geometry::FaceId>> face_neighbors;
+    for (const auto& [edge, faces] : faces_by_edge) {
+        static_cast<void>(edge);
+        for (const geometry::FaceId face : faces) {
+            auto& neighbors = face_neighbors[face];
+            neighbors.insert(faces.begin(), faces.end());
+            neighbors.erase(face);
+        }
+    }
+
+    const auto linked_vertices = [this, &topology]() -> core::Result<std::set<geometry::VertexId>> {
+        std::set<geometry::VertexId> result;
+        for (const geometry::VertexId seed : vertices_) {
+            auto component = topology.value().linked_component(seed);
+            if (!component) {
+                return core::Result<std::set<geometry::VertexId>>::failure(component.error());
+            }
+            result.insert(component.value().begin(), component.value().end());
+        }
+        return core::Result<std::set<geometry::VertexId>>::success(std::move(result));
+    };
+    const auto linked_from_graph = [](const auto& selected, const auto& graph) {
+        using Id = typename std::decay_t<decltype(selected)>::value_type;
+        std::set<Id> result;
+        std::vector<Id> pending;
+        for (const Id seed : selected) {
+            if (result.insert(seed).second) pending.push_back(seed);
+        }
+        for (std::size_t index = 0U; index < pending.size(); ++index) {
+            const auto neighbors = graph.find(pending[index]);
+            if (neighbors == graph.end()) continue;
+            for (const Id neighbor : neighbors->second) {
+                if (result.insert(neighbor).second) pending.push_back(neighbor);
+            }
+        }
+        return result;
+    };
+
+    const auto grow_from_graph = [](const auto& selected, const auto& graph) {
+        using Id = typename std::decay_t<decltype(selected)>::value_type;
+        std::set<Id> result = selected;
+        for (const Id seed : selected) {
+            const auto neighbors = graph.find(seed);
+            if (neighbors == graph.end()) continue;
+            result.insert(neighbors->second.begin(), neighbors->second.end());
+        }
+        return result;
+    };
+    const auto shrink_from_graph = [](const auto& selected, const auto& graph) {
+        using Id = typename std::decay_t<decltype(selected)>::value_type;
+        std::set<Id> result;
+        for (const Id candidate : selected) {
+            const auto neighbors = graph.find(candidate);
+            if (neighbors == graph.end() || neighbors->second.empty() ||
+                std::all_of(
+                    neighbors->second.begin(), neighbors->second.end(),
+                    [&selected](Id neighbor) { return selected.contains(neighbor); })) {
+                result.insert(candidate);
+            }
+        }
+        return result;
+    };
+
+    std::set<geometry::VertexId> next_vertices;
+    std::set<geometry::EdgeId> next_edges;
+    std::set<geometry::FaceId> next_faces;
+    if (mode_ == SelectionMode::vertex) {
+        if (expansion == SelectionExpansion::linked) {
+            auto result = linked_vertices();
+            if (!result) return core::Result<void>::failure(result.error());
+            next_vertices = std::move(result.value());
+        } else if (expansion == SelectionExpansion::grow) {
+            next_vertices = grow_from_graph(vertices_, vertex_neighbors);
+        } else if (expansion == SelectionExpansion::shrink) {
+            next_vertices = shrink_from_graph(vertices_, vertex_neighbors);
+        } else {
+            for (const auto& vertex : mesh.vertices_sorted()) {
+                if (!vertices_.contains(vertex.id)) next_vertices.insert(vertex.id);
+            }
+        }
+    } else if (mode_ == SelectionMode::edge) {
+        if (expansion == SelectionExpansion::loop ||
+            expansion == SelectionExpansion::ring ||
+            expansion == SelectionExpansion::boundary) {
+            for (const geometry::EdgeId seed : edges_) {
+                core::Result<std::vector<geometry::EdgeId>> traversal =
+                    expansion == SelectionExpansion::loop
+                    ? topology.value().edge_loop(seed)
+                    : expansion == SelectionExpansion::ring
+                    ? topology.value().edge_ring(seed)
+                    : topology.value().boundary_loop(seed);
+                if (!traversal) return core::Result<void>::failure(traversal.error());
+                next_edges.insert(traversal.value().begin(), traversal.value().end());
+            }
+        } else if (expansion == SelectionExpansion::linked) {
+            next_edges = linked_from_graph(edges_, edge_neighbors);
+        } else if (expansion == SelectionExpansion::grow) {
+            next_edges = grow_from_graph(edges_, edge_neighbors);
+        } else if (expansion == SelectionExpansion::shrink) {
+            next_edges = shrink_from_graph(edges_, edge_neighbors);
+        } else {
+            for (const auto& edge : topology.value().edges) {
+                if (!edges_.contains(edge.id)) next_edges.insert(edge.id);
+            }
+        }
+    } else {
+        if (expansion == SelectionExpansion::linked) {
+            next_faces = linked_from_graph(faces_, face_neighbors);
+        } else if (expansion == SelectionExpansion::grow) {
+            next_faces = grow_from_graph(faces_, face_neighbors);
+        } else if (expansion == SelectionExpansion::shrink) {
+            next_faces = shrink_from_graph(faces_, face_neighbors);
+        } else {
+            for (const auto& face : mesh.faces_sorted()) {
+                if (!faces_.contains(face.id)) next_faces.insert(face.id);
+            }
+        }
+    }
+
+    if (mode_ == SelectionMode::vertex) {
+        vertices_ = std::move(next_vertices);
+        edges_.clear();
+        faces_.clear();
+    } else if (mode_ == SelectionMode::edge) {
+        vertices_.clear();
+        edges_ = std::move(next_edges);
+        faces_.clear();
+    } else {
+        vertices_.clear();
+        edges_.clear();
+        faces_ = std::move(next_faces);
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> SelectionState::select_shortest_path(
+    geometry::VertexId goal,
+    const geometry::EditableMesh& mesh) {
+    if (mode_ != SelectionMode::vertex) {
+        return core::Result<void>::failure(invalid(
+            "shortest-path selection requires vertex selection mode"));
+    }
+    if (auto result = validate(mesh); !result) {
+        return result;
+    }
+    if (vertices_.empty()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "shortest-path selection requires one selected start vertex"));
+    }
+    if (vertices_.size() != 1U) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "shortest-path selection requires exactly one selected start vertex"));
+    }
+    const auto topology = mesh.topology();
+    if (!topology) {
+        return core::Result<void>::failure(topology.error().with_context(
+            "shortest-path selection topology"));
+    }
+    const auto path = topology.value().shortest_path(*vertices_.begin(), goal);
+    if (!path) {
+        return core::Result<void>::failure(path.error());
+    }
+    vertices_ = std::set<geometry::VertexId>(path.value().begin(), path.value().end());
     return core::Result<void>::success();
 }
 
