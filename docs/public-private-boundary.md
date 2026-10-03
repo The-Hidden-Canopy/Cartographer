@@ -24,6 +24,29 @@ The public side may expose a typed context and a typed proposal contract. It may
 not expose raw mutable authoring pointers or permit a remote service to bypass
 local validation.
 
+## Plugin-package rule
+
+The local `.cartoplug` foundation is public: the manifest schema, bounded
+archive reader, canonical digests, signature verification contract, install
+receipt shape, and adversarial fixtures are reviewable source. Those surfaces
+identify and constrain a package; they do not grant project, network, or
+runtime authority.
+
+The following remain private and must stay outside the public checkout and
+public package fixtures:
+
+- Ed25519 signing private keys and publisher key-management material;
+- Hub credentials, private catalog endpoints, entitlement state, and update
+  policy;
+- private plugin binaries, proprietary kernels, optimization recipes, and
+  unreleased execution telemetry; and
+- private sandbox policy, VANTA runtime payloads, or replay evidence that has
+  not cleared its release boundary.
+
+Public packages may contain only public verification keys or test-only key
+material. A verified signature establishes package identity; capability
+admission and any future sandbox or transaction boundary remain separate.
+
 ## Project-file rule
 
 The core `.carto` document remains public and versioned. Optional public

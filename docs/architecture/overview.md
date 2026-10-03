@@ -27,6 +27,7 @@ tool input
 | `carto_journal` | bounded revision-bound recovery records and hash-chain verification | explicit save state or editor history ownership |
 | `carto_providers` | capability descriptors and explicit provider lifecycle | dynamic code loading or permissions |
 | `carto_plugin_protocol` | bounded extension manifests and framed proposals | process isolation, project mutation, or network authority |
+| `carto_plugin_package` | bounded `.cartoplug` inspection, signature verification, local install receipts | plugin execution, sandboxing, Hub authority, or project mutation |
 | `carto_editor` | commands and undo/redo history | direct panel-owned mutations |
 | `carto_render` | compiled render snapshots | editable topology |
 | `carto_render_graph` | backend-neutral resource/pass validation and compiled hazards | GPU submission or authoring truth |

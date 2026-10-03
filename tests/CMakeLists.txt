@@ -88,6 +88,21 @@ add_executable(cartographer_provider_plugin_tests
     provider_plugin_tests.cpp
 )
 
+add_executable(cartographer_plugin_package_tests
+    plugin_package_tests.cpp
+)
+
+target_link_libraries(cartographer_plugin_package_tests
+    PRIVATE
+        carto_plugin_package
+)
+target_include_directories(cartographer_plugin_package_tests
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/libs/plugin_package/src
+)
+carto_target(cartographer_plugin_package_tests)
+add_test(NAME cartographer_plugin_package_tests COMMAND cartographer_plugin_package_tests)
+
 add_executable(cartographer_ui_tests
     ui_tests.cpp
 )
