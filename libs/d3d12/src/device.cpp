@@ -1,6 +1,9 @@
 #include <carto/d3d12/device.hpp>
 #include <carto/assets/blob_store.hpp>
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
