@@ -67,7 +67,7 @@ struct TopologyReceiptRecord {
 
 class ProjectDocument {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 5;
+    static constexpr std::uint32_t kSchemaVersion = 6;
     static constexpr std::uint32_t kMinimumReadableSchemaVersion = 1;
     static constexpr std::string_view kMagic = "CARTOGRAPHER_PROJECT";
     static constexpr std::string_view kAuthoringFormat = "cartographer.authoring";

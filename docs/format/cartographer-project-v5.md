@@ -1,4 +1,9 @@
-# Cartographer project format v5
+# Cartographer project format v5 (legacy)
+
+Current saves use [project format v6](cartographer-project-v6.md). Version 5
+remains readable for migration, but it has no persisted mesh attribute or UV
+records; a v5 mesh therefore loads with an empty attribute payload and is
+upgraded to v6 on its next save.
 
 Cartographer v5 keeps the v4 authoring envelope, topology lineage ledger, and
 optional evaluation-graph reference, then adds a bounded generic scientific
@@ -40,7 +45,9 @@ developmental programs and traces with optional tissue assignments and
 parameter-value evidence,
 lineage/mutation/recombination receipts (the nested lineage codec is v3 and
 preserves v1/v2 readability plus optional external source identifiers), and bounded morphometric observations, signatures,
-comparisons, and non-persisted bilateral landmark and signature-comparison
+comparisons, non-persisted bilateral landmark and signature-comparison previews,
+and derived CPU-only landmark measurement previews for distance, segment-length,
+angle, branch-angle, ratio, centroid, bounding dimensions, and derived principal-axis
 previews, plus sequence-genome contigs and variants, anatomy/tissue ontology-part
 mappings with ontology version/source-release metadata, typed tissue-region records
 with optional structure/region bindings,
@@ -53,6 +60,14 @@ duplicate IDs, finite numeric values, bounded collections, explicit
 UTC provenance timestamps, and non-zero content digests.
 A field or result set can reference a study and a region without claiming that
 a solver ran.
+
+The scientific model also exposes a derived revision-bound Cartesian parameter
+sweep preview. It canonicalizes study parameter and axis ordering, carries
+authored baseline values for non-swept parameters, enforces authored numeric
+bounds, expands cases deterministically, and rejects duplicate/non-finite or
+out-of-study values plus bounded axis/case/assignment growth. The preview is
+planning data only; it is not a solver/provider execution receipt and is not
+persisted as a new scientific schema record.
 
 Functional-genome diffs remain derived inspection data: they report added,
 removed, and changed genes, group-derived modules, and changed neural values.
@@ -93,11 +108,28 @@ genome, turn a result into source truth, or grant MENAGERIE/VANTA runtime
 authority. Provider execution, genome interpretation, morphology compilation,
 and runtime admission remain separate contracts.
 
+Landmark measurement previews are derived from explicitly owned landmarks in a
+single admitted coordinate frame. They are not persisted scientific results and
+do not infer curve, surface, thickness, curvature, or provider geometry. The
+supported metric contracts are distance/segment-length in model units,
+angle/branch-angle in radians, ratio as ordered-segment A divided by B,
+centroid/bounding dimensions in model units, and principal axes as a
+right-handed orthonormal frame with ordered variances. Ratio rejects a zero
+denominator and principal axes reject ambiguous spectra. Invalid ownership,
+mixed frames, cardinality, units, non-finite values, or forged axes fail closed.
+
+Bilateral landmark previews may use a bounded explicit reference-to-candidate
+correspondence map when names are not stable across specimens. The legacy
+name-bound path remains available for compatibility, while the explicit path
+rejects duplicate endpoints, out-of-structure landmarks, mixed frames, and
+underconstrained aligned transforms before producing derived deltas.
+
 The nested scientific serializer has its own version and a 16 MiB bound. Its
 version 12 optional morphology (nested morphology schema v2; v1 morphology
 records remain readable), functional-genome, developmental-program,
-developmental-trace (nested developmental-trace schema v2; v1 trace records
-remain readable), lineage (nested lineage schema v3; v1/v2 lineage records
+developmental-trace (nested developmental-trace schema v3; v1/v2 trace records
+remain readable, with optional program/genome digests and per-step seed/result
+evidence), lineage (nested lineage schema v3; v1/v2 lineage records
 remain readable), morphometric, sequence-genome, anatomy (nested
 anatomy schema v3; v1/v2 anatomy records remain readable), and field-
 visualization, import-ledger, phenotype-capability, gene-regulatory-network,
@@ -137,8 +169,21 @@ joins one authored instruction to its planned and observed structure changes;
 both keep planned changes separate from observed changes and are inspection
 data, not execution evidence.
 Paired landmark preview requires explicit named correspondence and a shared
-coordinate frame; it computes only deterministic displacement and RMS distance
-and does not infer an alignment transform or provider-generated morphospace.
+coordinate frame. The default shared-frame mode computes deterministic
+displacement and RMS distance; opt-in rigid and scale-normalized modes derive a
+candidate-to-reference transform from centroids and the first deterministic
+non-collinear named landmark triple. Principal-axis mode derives ordered
+covariance axes, rejects coincident or near-degenerate eigenvalue spectra, and
+uses named correspondences to resolve the remaining axis-sign ambiguity. All
+modes then compute aligned displacement and RMS. The transform is derived
+preview metadata, not a persisted registration or provider-generated
+morphospace. An explicit lineage-to-signature binding can also produce a
+bounded CPU evolutionary-morphospace preview over the leading 2D or 3D
+components, with raw or unit-box normalization and parent trajectories. That
+projection is read-only derived inspection data; it does not fit a statistical
+embedding, infer morphology, persist projected coordinates, or claim provider
+execution. Surface registration and provider-generated morphospace remain
+outside this boundary.
 Signature comparison requires matching descriptor, coordinate frame,
 normalization, component labels, and component count; its CPU reference
 metric is Euclidean distance with similarity `1 / (1 + distance)`. These

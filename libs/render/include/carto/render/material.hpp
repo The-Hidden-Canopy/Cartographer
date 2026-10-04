@@ -3,18 +3,94 @@
 #include <carto/assets/texture.hpp>
 #include <carto/core/math.hpp>
 #include <carto/core/result.hpp>
+#include <carto/core/revision.hpp>
 
 #include <array>
 #include <cstdint>
+#include <string>
 
 namespace carto::render {
 
+using UvSetId = std::uint64_t;
+using SamplerId = std::uint64_t;
+inline constexpr UvSetId kUv0 = 1U;
+
+enum class TextureChannel {
+    red,
+    green,
+    blue,
+    alpha,
+    one_minus_red,
+    one_minus_green,
+    one_minus_blue,
+    one_minus_alpha,
+    constant_zero,
+    constant_one,
+};
+
+struct ChannelMapping {
+    std::array<TextureChannel, 4U> rgba{
+        TextureChannel::red,
+        TextureChannel::green,
+        TextureChannel::blue,
+        TextureChannel::alpha,
+    };
+
+    [[nodiscard]] core::Result<void> validate() const;
+    [[nodiscard]] constexpr bool operator==(const ChannelMapping& other) const noexcept {
+        return rgba == other.rgba;
+    }
+};
+
+enum class TextureInterpretation {
+    asset,
+    linear,
+    srgb,
+};
+
+enum class NormalConvention {
+    directx_y_minus,
+    opengl_y_plus,
+};
+
+struct TextureTransform {
+    core::Vec2d offset{};
+    core::Vec2d scale{1.0, 1.0};
+    double rotation = 0.0;
+    core::Vec2d pivot{0.5, 0.5};
+
+    [[nodiscard]] core::Result<void> validate() const;
+    [[nodiscard]] constexpr bool operator==(const TextureTransform& other) const noexcept {
+        return offset.x == other.offset.x && offset.y == other.offset.y &&
+            scale.x == other.scale.x && scale.y == other.scale.y &&
+            rotation == other.rotation && pivot.x == other.pivot.x && pivot.y == other.pivot.y;
+    }
+};
+
 struct TextureRef {
     assets::TextureAssetId asset = 0U;
+    // UV0 is a stable authored identity, not an instruction to pick the first
+    // attribute layer. Projects may bind any non-zero UvSetId explicitly.
+    UvSetId uv_set = kUv0;
+    SamplerId sampler = 0U;
+    TextureTransform transform{};
+    ChannelMapping channels{};
+    TextureInterpretation interpretation = TextureInterpretation::asset;
+    NormalConvention normal_convention = NormalConvention::directx_y_minus;
 
     [[nodiscard]] constexpr explicit operator bool() const noexcept { return asset != 0U; }
-    [[nodiscard]] constexpr auto operator<=>(const TextureRef&) const noexcept = default;
+    [[nodiscard]] core::Result<void> validate() const;
+    [[nodiscard]] constexpr bool operator==(const TextureRef& other) const noexcept {
+        return asset == other.asset && uv_set == other.uv_set && sampler == other.sampler &&
+            transform == other.transform && channels == other.channels &&
+            interpretation == other.interpretation && normal_convention == other.normal_convention;
+    }
 };
+
+// The authored binding is intentionally the same value payload as the legacy
+// TextureRef name. This keeps existing material fields source-compatible while
+// giving new callers the terminology used by the project format.
+using TextureBinding = TextureRef;
 
 enum class AlphaMode {
     opaque,
@@ -37,6 +113,17 @@ struct StandardMaterial {
     TextureRef normal;
     TextureRef occlusion;
     TextureRef emissive;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+using MaterialId = std::uint64_t;
+
+struct MaterialAsset {
+    MaterialId id = 0U;
+    std::string name;
+    StandardMaterial definition;
+    core::Revision revision{};
 
     [[nodiscard]] core::Result<void> validate() const;
 };

@@ -988,6 +988,12 @@ core::Result<application::DispatchReceipt> UiController::apply_ai_intent(
     if (!proposal) {
         return core::Result<application::DispatchReceipt>::failure(proposal.error());
     }
+    if (!preferences_.ai_auto_approve) {
+        const auto diagnostic = invalid_state(
+            "native AI auto-approval is disabled; review the preview before committing");
+        record_ui_problem(diagnostic);
+        return core::Result<application::DispatchReceipt>::failure(diagnostic);
+    }
     const auto authoring = session_.authoring_context();
     if (!authoring) {
         record_ui_problem(authoring.error().with_context("native AI auto-approval context"));

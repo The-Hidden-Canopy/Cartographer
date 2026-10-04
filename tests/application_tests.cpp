@@ -124,6 +124,47 @@ void application_routes_authoring_through_snapshot_and_history() {
     REQUIRE(session.snapshot().redo_count == 0U);
 }
 
+void application_reuses_revision_keyed_viewport_meshes_without_cross_project_staleness() {
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::CreateBoxAction{"Cache", {2.0, 2.0, 2.0}}));
+
+    const auto first = session.snapshot();
+    const auto first_mesh = first.viewport.scene.instances().front().mesh;
+    const auto second = session.snapshot();
+    REQUIRE(second.viewport.scene.instances().front().mesh.get() == first_mesh.get());
+
+    const auto object = first.objects.front().object.id;
+    carto::core::Transform moved = first.objects.front().object.local_transform;
+    moved.translation.x = 3.0;
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SetObjectTransformAction{object, moved}));
+    const auto transformed = session.snapshot();
+    REQUIRE(transformed.viewport.scene.instances().front().mesh.get() == first_mesh.get());
+
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SetSelectionModeAction{
+            carto::editor::SelectionMode::face}));
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SelectFaceAction{object, carto::geometry::FaceId{1U}}));
+    carto::editor::ToolArguments arguments;
+    arguments.distance = 0.25;
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::InvokeToolAction{"mesh.extrude-face", arguments}));
+    const auto edited = session.snapshot();
+    REQUIRE(edited.viewport.scene.instances().front().mesh.get() != first_mesh.get());
+    REQUIRE(edited.viewport.scene.instances().front().mesh->vertex_ids.size() >
+            first_mesh->vertex_ids.size());
+
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::NewProjectAction{"Replacement", true}));
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::CreateBoxAction{"Replacement box", {1.0, 1.0, 1.0}}));
+    const auto replacement = session.snapshot();
+    REQUIRE(replacement.viewport.scene.instances().front().mesh.get() != first_mesh.get());
+    REQUIRE(replacement.viewport.scene.instances().front().mesh.get() != edited.viewport.scene.instances().front().mesh.get());
+}
+
 void application_persists_project_topology_receipts_through_save_and_reopen() {
     TempDirectory temp;
     const auto path = temp.path() / "receipt-ledger.carto";
@@ -856,7 +897,7 @@ void application_journals_committed_mutations_and_rolls_back_failed_append() {
     const std::string mutation_payload(
         after_event.value().back().payload.begin(), after_event.value().back().payload.end());
     REQUIRE(mutation_payload.find("CARTOGRAPHER_APPLICATION_MUTATION_V1") == 0U);
-    REQUIRE(mutation_payload.find("CARTOGRAPHER_PROJECT 5") != std::string::npos);
+    REQUIRE(mutation_payload.find("CARTOGRAPHER_PROJECT 6") != std::string::npos);
     REQUIRE(mutation_payload.find(
                 "AUTHORING \"cartographer.authoring\" \"meters\" \"right_handed_y_up\"") !=
             std::string::npos);
@@ -1265,6 +1306,7 @@ void application_mutation_serializes_with_project_recovery_writer_lease() {
 int main() {
     try {
         application_routes_authoring_through_snapshot_and_history();
+        application_reuses_revision_keyed_viewport_meshes_without_cross_project_staleness();
         application_persists_project_topology_receipts_through_save_and_reopen();
         application_persists_vertex_merge_lineage_through_save_and_reopen();
         application_routes_face_poke_through_history_and_persists_lineage();

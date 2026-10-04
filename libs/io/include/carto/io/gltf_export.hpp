@@ -35,10 +35,13 @@ struct GltfExportReport {
 
 // Emits a deterministic, single-file glTF 2.0 artifact.  The artifact keeps
 // Cartographer scene hierarchy and source revision in glTF extras, emits
-// float32 POSITION/NORMAL attributes and triangle-list indices, and uses the
-// smallest supported unsigned index width for each mesh.  It does not mutate
-// the project or claim to carry materials, UVs, tangents, or other channels
-// that the current Cartographer authoring model does not own.
+// float32 POSITION/NORMAL attributes, active corner-domain UV0 payloads and
+// derived tangent frames when present, and triangle-list indices, and uses the
+// smallest supported unsigned index width for each mesh. Corner-domain UV seams
+// are expanded in the derived render stream without mutating the project.
+// The CONDITION face-domain `condition.material_region` layer is preserved in
+// mesh extras as stable face/region identity; final material realization remains
+// consumer-owned and is reported explicitly.
 [[nodiscard]] core::Result<GltfExportReport> export_gltf(
     const project::ProjectDocument& document,
     const std::filesystem::path& path);

@@ -1,6 +1,7 @@
 #include <carto/io/gltf_export.hpp>
 
 #include <carto/project/project.hpp>
+#include <carto/render/tangent.hpp>
 
 #include <algorithm>
 #include <array>
@@ -15,6 +16,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <span>
 #include <string_view>
@@ -169,13 +171,17 @@ struct Accessor {
 };
 
 struct MeshRecord {
+    std::uint64_t source_id = 0U;
     std::string name;
     std::size_t position_accessor = 0U;
     std::size_t normal_accessor = 0U;
+    std::optional<std::size_t> uv_accessor;
+    std::optional<std::size_t> tangent_accessor;
     std::size_t index_accessor = 0U;
     std::size_t vertices = 0U;
     std::size_t triangles = 0U;
     std::size_t index_bytes = 0U;
+    std::optional<std::vector<std::pair<std::uint64_t, std::uint32_t>>> material_regions;
 };
 
 struct NodeRecord {
@@ -208,6 +214,95 @@ core::Result<std::array<float, 3>> finite_vec3(
             (!x ? x.error() : !y ? y.error() : z.error()));
     }
     return core::Result<std::array<float, 3>>::success({x.value(), y.value(), z.value()});
+}
+
+core::Result<std::array<float, 2>> finite_vec2(
+    core::Vec2d value,
+    std::string_view field) {
+    const auto x = finite_float(value.x, field);
+    const auto y = finite_float(value.y, field);
+    if (!x || !y) {
+        return core::Result<std::array<float, 2>>::failure(!x ? x.error() : y.error());
+    }
+    return core::Result<std::array<float, 2>>::success({x.value(), y.value()});
+}
+
+struct UvCornerPayload {
+    std::map<std::pair<std::uint64_t, std::uint64_t>, core::Vec2d> values;
+};
+
+using MaterialRegionPayload = std::vector<std::pair<std::uint64_t, std::uint32_t>>;
+
+core::Result<std::optional<MaterialRegionPayload>> condition_material_regions(
+    const geometry::EditableMesh& mesh) {
+    constexpr std::string_view kLayerId = "condition.material_region";
+    const auto* layer = mesh.attributes().find(kLayerId);
+    if (layer == nullptr) {
+        return core::Result<std::optional<MaterialRegionPayload>>::success(std::nullopt);
+    }
+    if (layer->descriptor.domain != attributes::AttributeDomain::face ||
+        layer->descriptor.type != attributes::AttributeType::uint32) {
+        return core::Result<std::optional<MaterialRegionPayload>>::failure(validation(
+            "condition.material_region must be a face-domain uint32 layer"));
+    }
+    const auto faces = mesh.faces_sorted();
+    const auto face_count = mesh.attributes().domain_count(attributes::AttributeDomain::face);
+    if (!face_count.has_value() || *face_count != faces.size() ||
+        layer->values.size() != faces.size()) {
+        return core::Result<std::optional<MaterialRegionPayload>>::failure(validation(
+            "condition.material_region cardinality does not match mesh faces"));
+    }
+
+    MaterialRegionPayload payload;
+    payload.reserve(faces.size());
+    for (std::size_t index = 0U; index < faces.size(); ++index) {
+        const auto* value = std::get_if<std::uint32_t>(&layer->values[index]);
+        if (value == nullptr || *value == 0U) {
+            return core::Result<std::optional<MaterialRegionPayload>>::failure(validation(
+                "condition.material_region values must be non-zero uint32 region IDs"));
+        }
+        payload.emplace_back(faces[index].id.value, *value);
+    }
+    return core::Result<std::optional<MaterialRegionPayload>>::success(std::move(payload));
+}
+
+core::Result<std::optional<UvCornerPayload>> active_render_uv(
+    const geometry::EditableMesh& mesh) {
+    const auto* active = mesh.uv_sets().active_for_render();
+    if (active == nullptr) {
+        return core::Result<std::optional<UvCornerPayload>>::success(std::nullopt);
+    }
+    const auto* layer = mesh.attributes().find(active->layer_id);
+    if (layer == nullptr || layer->descriptor.domain != attributes::AttributeDomain::corner ||
+        layer->descriptor.type != attributes::AttributeType::vec2) {
+        return core::Result<std::optional<UvCornerPayload>>::failure(validation(
+            "active render UV set does not reference a corner-domain vec2 layer"));
+    }
+    const auto topology = mesh.topology();
+    if (!topology) {
+        return core::Result<std::optional<UvCornerPayload>>::failure(topology.error());
+    }
+    if (layer->values.size() != topology.value().corners.size()) {
+        return core::Result<std::optional<UvCornerPayload>>::failure(validation(
+            "active render UV layer cardinality does not match mesh corners"));
+    }
+
+    UvCornerPayload payload;
+    for (std::size_t index = 0U; index < topology.value().corners.size(); ++index) {
+        const auto* value = std::get_if<core::Vec2d>(&layer->values[index]);
+        if (value == nullptr || !value->finite()) {
+            return core::Result<std::optional<UvCornerPayload>>::failure(validation(
+                "active render UV layer contains a non-finite or non-vec2 value"));
+        }
+        const auto key = std::make_pair(
+            topology.value().corners[index].face.value,
+            topology.value().corners[index].vertex.value);
+        if (!payload.values.emplace(key, *value).second) {
+            return core::Result<std::optional<UvCornerPayload>>::failure(validation(
+                "active render UV layer contains duplicate face-corner identity"));
+        }
+    }
+    return core::Result<std::optional<UvCornerPayload>>::success(std::move(payload));
 }
 
 core::Result<void> append_transform_json(
@@ -281,11 +376,10 @@ core::Result<GltfExportReport> export_gltf(
     report.source_revision = document.revision();
     report.objects = document.scene().size();
     report.meshes = document.meshes().size();
-    report.warnings = {
-        "Cartographer authoring currently has no UV, tangent, or material channels; "
-        "consumers must use their default material path",
-        "float64 authoring positions and normals are narrowed to glTF float32",
-    };
+    bool any_active_uv = false;
+    bool any_missing_uv = false;
+    bool any_missing_tangent = false;
+    bool any_material_regions = false;
 
     for (const auto& [mesh_id, mesh] : document.meshes()) {
         auto compiled = mesh.compile();
@@ -299,10 +393,118 @@ core::Result<GltfExportReport> export_gltf(
                 validation("glTF export requires non-empty triangle meshes"));
         }
 
+        const auto active_uv = active_render_uv(mesh);
+        if (!active_uv) {
+            return core::Result<GltfExportReport>::failure(
+                active_uv.error().with_context("mesh asset " + std::to_string(mesh_id)));
+        }
+        const auto material_regions = condition_material_regions(mesh);
+        if (!material_regions) {
+            return core::Result<GltfExportReport>::failure(
+                material_regions.error().with_context("mesh asset " + std::to_string(mesh_id)));
+        }
+        const bool has_uv = active_uv.value().has_value();
+        any_active_uv = any_active_uv || has_uv;
+        any_missing_uv = any_missing_uv || !has_uv;
+        any_material_regions = any_material_regions || material_regions.value().has_value();
+
+        std::vector<core::Vec3d> render_positions = source.positions;
+        std::vector<core::Vec3d> render_normals = source.normals;
+        std::vector<std::uint32_t> render_indices = source.indices;
+        std::vector<std::array<float, 2>> texcoords;
+        std::vector<std::array<float, 4>> tangents;
+        if (has_uv) {
+            const auto& uv_payload = *active_uv.value();
+            render_positions.clear();
+            render_normals.clear();
+            render_indices.clear();
+            texcoords.clear();
+            render_positions.reserve(source.indices.size());
+            render_normals.reserve(source.indices.size());
+            texcoords.reserve(source.indices.size());
+            render_indices.reserve(source.indices.size());
+
+            std::map<std::uint64_t, std::uint32_t> compiled_indices;
+            for (std::size_t index = 0U; index < source.vertex_ids.size(); ++index) {
+                compiled_indices.emplace(source.vertex_ids[index].value,
+                    static_cast<std::uint32_t>(index));
+            }
+            const auto append_corner = [&](std::uint64_t face_id,
+                                           geometry::VertexId vertex_id) -> core::Result<void> {
+                const auto compiled_index = compiled_indices.find(vertex_id.value);
+                if (compiled_index == compiled_indices.end()) {
+                    return core::Result<void>::failure(validation(
+                        "active render UV references a vertex missing from compiled geometry"));
+                }
+                const auto uv = uv_payload.values.find(std::make_pair(face_id, vertex_id.value));
+                if (uv == uv_payload.values.end()) {
+                    return core::Result<void>::failure(validation(
+                        "active render UV is missing a face-corner value"));
+                }
+                const auto narrowed_uv = finite_vec2(uv->second, "mesh UV");
+                if (!narrowed_uv) return core::Result<void>::failure(narrowed_uv.error());
+                const std::uint32_t source_index = compiled_index->second;
+                render_positions.push_back(source.positions[source_index]);
+                render_normals.push_back(source.normals[source_index]);
+                texcoords.push_back(narrowed_uv.value());
+                render_indices.push_back(static_cast<std::uint32_t>(render_indices.size()));
+                return core::Result<void>::success();
+            };
+
+            for (const auto& face : mesh.faces_sorted()) {
+                for (std::size_t index = 1U; index + 1U < face.vertices.size(); ++index) {
+                    if (auto result = append_corner(face.id.value, face.vertices.front()); !result) {
+                        return core::Result<GltfExportReport>::failure(result.error());
+                    }
+                    if (auto result = append_corner(face.id.value, face.vertices[index]); !result) {
+                        return core::Result<GltfExportReport>::failure(result.error());
+                    }
+                    if (auto result = append_corner(face.id.value, face.vertices[index + 1U]); !result) {
+                        return core::Result<GltfExportReport>::failure(result.error());
+                    }
+                }
+            }
+            if (render_indices.size() != source.indices.size() ||
+                texcoords.size() != render_positions.size()) {
+                return core::Result<GltfExportReport>::failure(validation(
+                    "corner-domain UV expansion changed the source triangle count"));
+            }
+
+            std::vector<render::TangentVertex> tangent_input;
+            tangent_input.reserve(render_positions.size());
+            for (std::size_t index = 0U; index < render_positions.size(); ++index) {
+                tangent_input.push_back({
+                    render_positions[index],
+                    render_normals[index],
+                    {static_cast<double>(texcoords[index][0]),
+                     static_cast<double>(texcoords[index][1])},
+                });
+            }
+            const auto generated_tangents = render::generate_tangents(
+                tangent_input, render_indices);
+            if (!generated_tangents) {
+                any_missing_tangent = true;
+            } else {
+                tangents.reserve(generated_tangents.value().size());
+                for (const auto tangent : generated_tangents.value()) {
+                    const auto x = finite_float(tangent.x, "mesh tangent");
+                    const auto y = finite_float(tangent.y, "mesh tangent");
+                    const auto z = finite_float(tangent.z, "mesh tangent");
+                    const auto w = finite_float(tangent.w, "mesh tangent handedness");
+                    if (!x || !y || !z || !w) {
+                        any_missing_tangent = true;
+                        tangents.clear();
+                        break;
+                    }
+                    tangents.push_back({x.value(), y.value(), z.value(), w.value()});
+                }
+            }
+        }
+
         std::vector<std::array<float, 3>> positions;
         std::vector<std::array<float, 3>> normals;
-        positions.reserve(source.positions.size());
-        normals.reserve(source.normals.size());
+        positions.reserve(render_positions.size());
+        normals.reserve(render_normals.size());
         std::array<float, 3> minimum{
             std::numeric_limits<float>::infinity(),
             std::numeric_limits<float>::infinity(),
@@ -313,7 +515,7 @@ core::Result<GltfExportReport> export_gltf(
             -std::numeric_limits<float>::infinity(),
             -std::numeric_limits<float>::infinity(),
         };
-        for (const auto position : source.positions) {
+        for (const auto position : render_positions) {
             const auto narrowed = finite_vec3(position, "mesh position");
             if (!narrowed) return core::Result<GltfExportReport>::failure(narrowed.error());
             positions.push_back(narrowed.value());
@@ -322,7 +524,7 @@ core::Result<GltfExportReport> export_gltf(
                 maximum[axis] = std::max(maximum[axis], narrowed.value()[axis]);
             }
         }
-        for (const auto normal : source.normals) {
+        for (const auto normal : render_normals) {
             const auto narrowed = finite_vec3(normal, "mesh normal");
             if (!narrowed) return core::Result<GltfExportReport>::failure(narrowed.error());
             const float magnitude = std::sqrt(
@@ -340,12 +542,12 @@ core::Result<GltfExportReport> export_gltf(
             });
         }
 
-        const bool use_uint16 = source.positions.size() <= 65'535U;
+        const bool use_uint16 = render_positions.size() <= 65'535U;
         std::vector<std::uint16_t> indices_16;
         std::vector<std::uint32_t> indices_32;
         if (use_uint16) {
-            indices_16.reserve(source.indices.size());
-            for (const std::uint32_t index : source.indices) {
+            indices_16.reserve(render_indices.size());
+            for (const std::uint32_t index : render_indices) {
                 if (index > std::numeric_limits<std::uint16_t>::max()) {
                     return core::Result<GltfExportReport>::failure(
                         validation("glTF 16-bit index selection was unsafe"));
@@ -353,7 +555,7 @@ core::Result<GltfExportReport> export_gltf(
                 indices_16.push_back(static_cast<std::uint16_t>(index));
             }
         } else {
-            indices_32 = source.indices;
+            indices_32 = render_indices;
             report.used_uint32_indices = true;
         }
 
@@ -377,17 +579,44 @@ core::Result<GltfExportReport> export_gltf(
         });
         const std::size_t normal_accessor = accessors.size() - 1U;
 
+        std::optional<std::size_t> uv_accessor;
+        if (!texcoords.empty()) {
+            align_four(buffer);
+            const std::size_t uv_offset = buffer.size();
+            append_vector(buffer, texcoords);
+            views.push_back({uv_offset, texcoords.size() * sizeof(texcoords.front()), kGlArrayBuffer});
+            const std::size_t uv_view = views.size() - 1U;
+            accessors.push_back({
+                uv_view, kGlFloat, texcoords.size(), "VEC2", {}, {}, false,
+            });
+            uv_accessor = accessors.size() - 1U;
+        }
+
+        std::optional<std::size_t> tangent_accessor;
+        if (!tangents.empty()) {
+            align_four(buffer);
+            const std::size_t tangent_offset = buffer.size();
+            append_vector(buffer, tangents);
+            views.push_back({tangent_offset,
+                tangents.size() * sizeof(tangents.front()), kGlArrayBuffer});
+            const std::size_t tangent_view = views.size() - 1U;
+            accessors.push_back({
+                tangent_view, kGlFloat, tangents.size(), "VEC4", {}, {}, false,
+            });
+            tangent_accessor = accessors.size() - 1U;
+        }
+
         align_four(buffer);
         const std::size_t index_offset = buffer.size();
         if (use_uint16) append_vector(buffer, indices_16);
         else append_vector(buffer, indices_32);
         const std::size_t index_bytes = use_uint16 ? sizeof(std::uint16_t) : sizeof(std::uint32_t);
-        views.push_back({index_offset, source.indices.size() * index_bytes, kGlElementArrayBuffer});
+        views.push_back({index_offset, render_indices.size() * index_bytes, kGlElementArrayBuffer});
         const std::size_t index_view = views.size() - 1U;
         accessors.push_back({
             index_view,
             use_uint16 ? kGlUnsignedShort : kGlUnsignedInt,
-            source.indices.size(),
+            render_indices.size(),
             "SCALAR",
             {},
             {},
@@ -400,18 +629,44 @@ core::Result<GltfExportReport> export_gltf(
                 validation("glTF export exceeds the 256 MiB derived-buffer limit"));
         }
         meshes.push_back({
+            mesh_id,
             "cartographer-mesh-" + std::to_string(mesh_id),
             position_accessor,
             normal_accessor,
+            uv_accessor,
+            tangent_accessor,
             index_accessor,
-            source.positions.size(),
-            source.indices.size() / 3U,
+            render_positions.size(),
+            render_indices.size() / 3U,
             index_bytes,
+            material_regions.value(),
         });
-        report.vertices += source.positions.size();
-        report.triangles += source.indices.size() / 3U;
-        report.index_bytes += source.indices.size() * index_bytes;
+        report.vertices += render_positions.size();
+        report.triangles += render_indices.size() / 3U;
+        report.index_bytes += render_indices.size() * index_bytes;
     }
+
+    if (any_missing_uv) {
+        if (any_active_uv) {
+            report.warnings.push_back(
+                "Some Cartographer meshes have no active render UV set; those meshes use the default material path");
+        } else {
+            report.warnings.push_back(
+                "Cartographer authoring has no UV, tangent, or material channels; consumers must use their default material path");
+        }
+    }
+    if (any_active_uv && any_missing_tangent) {
+        report.warnings.push_back(
+            "Some UV-bearing Cartographer meshes do not produce a valid tangent frame; those meshes use the default tangent path");
+    }
+    if (any_material_regions) {
+        report.warnings.push_back(
+            "Cartographer glTF export preserves condition.material_region face identity in mesh extras; visual material realization remains consumer-owned");
+    } else if (any_active_uv) {
+        report.warnings.push_back(
+            "Cartographer glTF export does not include material channels; consumers must use their default material path");
+    }
+    report.warnings.push_back("float64 authoring positions and normals are narrowed to glTF float32");
 
     std::map<scene::ObjectId, std::size_t> node_indices;
     std::vector<NodeRecord> nodes;
@@ -498,9 +753,28 @@ core::Result<GltfExportReport> export_gltf(
         const auto& mesh = meshes[index];
         json << "    {\"name\":\"" << json_escape(mesh.name) << "\",\"primitives\":[{"
              << "\"attributes\":{\"POSITION\":" << mesh.position_accessor
-             << ",\"NORMAL\":" << mesh.normal_accessor << "},\"indices\":"
-             << mesh.index_accessor << ",\"mode\":" << kGlTriangles << "}]}"
-             << (index + 1U == meshes.size() ? "\n" : ",\n");
+             << ",\"NORMAL\":" << mesh.normal_accessor;
+        if (mesh.uv_accessor.has_value()) {
+            json << ",\"TEXCOORD_0\":" << *mesh.uv_accessor;
+        }
+        if (mesh.tangent_accessor.has_value()) {
+            json << ",\"TANGENT\":" << *mesh.tangent_accessor;
+        }
+        json << "},\"indices\":" << mesh.index_accessor << ",\"mode\":"
+             << kGlTriangles << ",\"extras\":{\"cartographer_mesh_id\":"
+             << mesh.source_id;
+        if (mesh.material_regions.has_value()) {
+            json << ",\"condition_material_region\":{\"layer\":\"condition.material_region\","
+                    "\"domain\":\"face\",\"faces\":[";
+            for (std::size_t region_index = 0U;
+                 region_index < mesh.material_regions->size(); ++region_index) {
+                if (region_index != 0U) json << ',';
+                const auto [face_id, region_id] = (*mesh.material_regions)[region_index];
+                json << "{\"id\":" << face_id << ",\"region\":" << region_id << '}';
+            }
+            json << "]}";
+        }
+        json << "}}]}" << (index + 1U == meshes.size() ? "\n" : ",\n");
     }
     json << "  ],\n  \"accessors\":[\n";
     for (std::size_t index = 0U; index < accessors.size(); ++index) {

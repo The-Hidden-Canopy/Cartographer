@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <numbers>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -215,6 +216,145 @@ void scientific_model_round_trips_deterministically() {
     REQUIRE(restored.value().serialize() == first);
 }
 
+void artificial_organism_authoring_chain_round_trips_with_previews() {
+    using namespace carto::scientific;
+    const auto provenance = fixture_provenance();
+    auto model = make_model();
+
+    DevelopmentalProgram program;
+    program.schema = "cartographer.developmental-program.v1";
+    program.reference = "program://fixture-development";
+    program.description = "artificial organism development acceptance chain";
+    const auto program_digest = carto::assets::Sha256Digest::from_hex(
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    const auto result_digest_a = carto::assets::Sha256Digest::from_hex(
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+    const auto result_digest_b = carto::assets::Sha256Digest::from_hex(
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd");
+    const auto genome_digest = carto::assets::Sha256Digest::from_hex(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    REQUIRE(program_digest && result_digest_a && result_digest_b && genome_digest);
+    program.source_digest = program_digest.value();
+    REQUIRE(program.insert_stage(DevelopmentStage{
+        StageId{1U}, 0U, "seed", "always", provenance}));
+    REQUIRE(program.insert_stage(DevelopmentStage{
+        StageId{2U}, 1U, "grown", "always", provenance}));
+    REQUIRE(program.insert_instruction(DevelopmentInstruction{
+        InstructionId{1U}, StageId{1U}, "differentiate", "morphogenesis", "always",
+        {ParameterId{1U}}, {StructureId{2U}}, {}, provenance}));
+    REQUIRE(program.insert_instruction(DevelopmentInstruction{
+        InstructionId{2U}, StageId{2U}, "grow", "morphogenesis", "always",
+        {ParameterId{1U}}, {}, {StructureId{2U}}, provenance}));
+    REQUIRE(model.set_developmental_program(std::move(program)));
+
+    DevelopmentalTrace trace;
+    trace.program_reference = "program://fixture-development";
+    trace.genome_reference = "program://fixture-development";
+    trace.program_digest = program_digest.value();
+    trace.genome_digest = genome_digest.value();
+    REQUIRE(trace.insert_entry(DevelopmentTraceEntry{
+        TraceId{1U}, StageId{1U}, InstructionId{1U}, {StructureId{2U}}, {},
+        "provider receipt: differentiation admitted", provenance, std::nullopt, {0.25},
+        std::uint64_t{101U}, result_digest_a.value()}));
+    REQUIRE(trace.insert_entry(DevelopmentTraceEntry{
+        TraceId{2U}, StageId{2U}, InstructionId{2U}, {}, {StructureId{2U}},
+        "provider receipt: growth admitted", provenance, std::nullopt, {0.75},
+        std::uint64_t{102U}, result_digest_b.value()}));
+    REQUIRE(model.set_developmental_trace(std::move(trace)));
+
+    PhenotypeCapabilityModel capabilities;
+    capabilities.schema = "cartographer.phenotype-capabilities.v1";
+    capabilities.compilation_reference = "provider://menagerie/phenotype-preview";
+    capabilities.status = "provider_receipt";
+    capabilities.provenance = provenance;
+    REQUIRE(capabilities.insert_capability(PhenotypeCapability{
+        CapabilityId{1U}, "growth capacity", "structural", "present", 0.75, "normalized",
+        {StructureId{2U}}, {GeneId{1U}}, {InstructionId{1U}, InstructionId{2U}},
+        {TraceId{1U}, TraceId{2U}},
+        "gene 1 -> development instructions -> structure 2", provenance}));
+    REQUIRE(model.set_phenotype_capabilities(std::move(capabilities)));
+
+    GeneRegulatoryNetwork network;
+    network.schema = "cartographer.gene-regulatory.v1";
+    network.reference = "provider://fixture-regulatory-network";
+    network.status = "provider_receipt";
+    network.provenance = provenance;
+    REQUIRE(network.insert_element(RegulatoryElement{
+        RegulatoryElementId{1U}, GeneId{1U}, "growth enhancer", "enhancer",
+        "source://fixture/enhancer-1", provenance}));
+    REQUIRE(network.insert_edge(RegulatoryEdge{
+        RegulatoryEdgeId{1U}, GeneId{1U}, GeneId{2U}, RegulatoryElementId{1U},
+        "activation", "growth-rate > 0", StageId{1U}, provenance}));
+    REQUIRE(network.insert_expression(SpatialExpression{
+        ExpressionId{1U}, GeneId{2U}, StructureId{2U}, std::nullopt, std::nullopt,
+        StageId{2U}, "structure_scalar", 0.75, "", "ratio", provenance}));
+    REQUIRE(model.set_gene_regulatory_network(std::move(network)));
+
+    FieldVisualizationModel visualizations;
+    visualizations.schema = "cartographer.field-visualizations.v1";
+    REQUIRE(visualizations.insert_visualization(FieldVisualization{
+        VisualizationId{1U}, FieldId{1U}, RegionId{2U}, "scalar", "viridis", 0.0, 1.0,
+        "stage:2", true, provenance}));
+    REQUIRE(model.set_field_visualizations(std::move(visualizations)));
+    REQUIRE(model.validate());
+
+    const auto timeline = model.build_developmental_timeline();
+    REQUIRE(timeline);
+    REQUIRE(timeline.value().size() == 2U);
+    REQUIRE(timeline.value().at(0U).planned_creates == std::vector<StructureId>{StructureId{2U}});
+    REQUIRE(timeline.value().at(1U).observed_modifies == std::vector<StructureId>{StructureId{2U}});
+    const auto impact = model.build_developmental_instruction_impact(InstructionId{2U});
+    REQUIRE(impact);
+    REQUIRE(impact.value().trace_entries == std::vector<TraceId>{TraceId{2U}});
+
+    const auto capability_trace = model.phenotype_capabilities()->trace(CapabilityId{1U});
+    REQUIRE(capability_trace);
+    REQUIRE(capability_trace.value().contributing_instructions.size() == 2U);
+    const auto reverse_trace = model.phenotype_capabilities()->capabilities_for_structure(
+        StructureId{2U});
+    REQUIRE(reverse_trace);
+    REQUIRE(reverse_trace.value() == std::vector<CapabilityId>{CapabilityId{1U}});
+    const auto field_preview = model.field_visualizations()->visualizations().at(
+        VisualizationId{1U}).preview_samples(std::vector<double>{0.0, 0.75, 1.0});
+    REQUIRE(field_preview);
+    REQUIRE(field_preview.value().samples.at(1U).normalized_value == 0.75);
+
+    const auto encoded = model.serialize();
+    const auto restored = ScientificModel::deserialize(encoded);
+    REQUIRE(restored);
+    REQUIRE(restored.value().validate());
+    REQUIRE(restored.value().serialize() == encoded);
+    REQUIRE(restored.value().developmental_program()->instructions().size() == 2U);
+    REQUIRE(restored.value().developmental_trace()->entries().size() == 2U);
+    REQUIRE(restored.value().developmental_trace()->program_digest == program_digest.value());
+    REQUIRE(restored.value().developmental_trace()->genome_digest == genome_digest.value());
+    REQUIRE(restored.value().developmental_trace()->entries().at(TraceId{1U}).seed ==
+            std::uint64_t{101U});
+    REQUIRE(restored.value().developmental_trace()->entries().at(TraceId{1U}).result_digest ==
+            result_digest_a.value());
+    REQUIRE(restored.value().phenotype_capabilities()->capabilities().size() == 1U);
+    REQUIRE(restored.value().gene_regulatory_network()->expressions().size() == 1U);
+    REQUIRE(restored.value().field_visualizations()->visualizations().size() == 1U);
+
+    auto stale_program_evidence = model;
+    auto stale_program_trace = *stale_program_evidence.developmental_trace();
+    stale_program_trace.program_digest = result_digest_a.value();
+    REQUIRE(stale_program_evidence.set_developmental_trace(std::move(stale_program_trace)));
+    REQUIRE(!stale_program_evidence.validate());
+
+    auto stale_genome_evidence = model;
+    auto stale_genome_trace = *stale_genome_evidence.developmental_trace();
+    stale_genome_trace.genome_digest = result_digest_b.value();
+    REQUIRE(stale_genome_evidence.set_developmental_trace(std::move(stale_genome_trace)));
+    REQUIRE(!stale_genome_evidence.validate());
+
+    auto zero_result_trace = *model.developmental_trace();
+    auto zero_result_entry = zero_result_trace.entries().at(TraceId{1U});
+    zero_result_entry.id = TraceId{3U};
+    zero_result_entry.result_digest = carto::assets::Sha256Digest{};
+    REQUIRE(!zero_result_trace.insert_entry(std::move(zero_result_entry)));
+}
+
 void morphology_cross_domain_archetypes_round_trip() {
     using namespace carto::scientific;
     const auto provenance = fixture_provenance();
@@ -285,6 +425,201 @@ void morphology_cross_domain_archetypes_round_trip() {
         StructureId{2U}, "child", StructureId{1U}, "", "stage:0", {}, "local", {},
         "authored", provenance}));
     REQUIRE(!cyclic.validate());
+}
+
+void evolutionary_morphospace_preview_is_deterministic_and_fail_closed() {
+    using namespace carto::scientific;
+    const auto provenance = fixture_provenance();
+    auto model = make_model();
+
+    MorphometricModel morphometrics;
+    const std::vector<std::array<double, 3>> signature_components{
+        {0.0, 0.0, 0.0},
+        {1.0, 2.0, 1.0},
+        {2.0, 4.0, 2.0},
+        {3.0, 6.0, 3.0},
+    };
+    for (std::size_t index = 0U; index < signature_components.size(); ++index) {
+        REQUIRE(morphometrics.insert_signature(MorphologySignature{
+            SignatureId{static_cast<std::uint64_t>(index + 1U)}, StructureId{2U},
+            "shape-components", "organ-local", "authored",
+            {signature_components[index][0U], signature_components[index][1U],
+             signature_components[index][2U]},
+            {"length", "width", "depth"}, provenance}));
+    }
+    REQUIRE(model.set_morphometrics(std::move(morphometrics)));
+
+    LineageGraph lineage;
+    REQUIRE(lineage.insert_node(LineageNode{
+        LineageId{1U}, std::nullopt, std::nullopt, 0U, std::nullopt, std::nullopt,
+        provenance, "founder-a"}));
+    REQUIRE(lineage.insert_node(LineageNode{
+        LineageId{2U}, std::nullopt, std::nullopt, 0U, std::nullopt, std::nullopt,
+        provenance, "founder-b"}));
+    REQUIRE(lineage.insert_node(LineageNode{
+        LineageId{3U}, LineageId{1U}, std::nullopt, 1U, std::nullopt, std::nullopt,
+        provenance, "child-a"}));
+    REQUIRE(lineage.insert_node(LineageNode{
+        LineageId{4U}, LineageId{2U}, LineageId{3U}, 2U, std::nullopt, std::nullopt,
+        provenance, "recombined"}));
+    REQUIRE(model.set_lineage_graph(std::move(lineage)));
+    REQUIRE(model.validate());
+
+    const std::vector<EvolutionaryMorphospaceBinding> bindings{
+        {LineageId{4U}, SignatureId{4U}},
+        {LineageId{2U}, SignatureId{2U}},
+        {LineageId{1U}, SignatureId{1U}},
+        {LineageId{3U}, SignatureId{3U}},
+    };
+    const auto preview = model.preview_evolutionary_morphospace(bindings, 2U, "unit-box");
+    REQUIRE(preview);
+    REQUIRE(preview.value().projection == "leading-components");
+    REQUIRE(preview.value().normalization == "unit-box");
+    REQUIRE(preview.value().dimensions == 2U);
+    const std::vector<std::string> expected_labels{"length", "width"};
+    REQUIRE(preview.value().component_labels == expected_labels);
+    REQUIRE(preview.value().points.size() == 4U);
+    REQUIRE(preview.value().points.at(0U).lineage == LineageId{1U});
+    REQUIRE(preview.value().points.at(1U).position.x == 1.0 / 3.0);
+    REQUIRE(preview.value().points.at(2U).position.y == 2.0 / 3.0);
+    REQUIRE(preview.value().points.at(3U).position.x == 1.0);
+    REQUIRE(preview.value().points.at(3U).position.z == 0.0);
+    REQUIRE(preview.value().trajectories.size() == 3U);
+    REQUIRE(preview.value().trajectories.at(0U).parent == LineageId{1U});
+    REQUIRE(preview.value().trajectories.at(0U).child == LineageId{3U});
+    REQUIRE(preview.value().trajectories.at(1U).parent == LineageId{2U});
+    REQUIRE(preview.value().trajectories.at(1U).child == LineageId{4U});
+    REQUIRE(preview.value().trajectories.at(2U).parent == LineageId{3U});
+    REQUIRE(preview.value().trajectories.at(2U).child == LineageId{4U});
+    REQUIRE(preview.value().validate());
+
+    const auto repeated = model.preview_evolutionary_morphospace(bindings, 2U, "unit-box");
+    REQUIRE(repeated);
+    REQUIRE(repeated.value().points.size() == preview.value().points.size());
+    REQUIRE(repeated.value().trajectories.size() == preview.value().trajectories.size());
+    for (std::size_t index = 0U; index < preview.value().points.size(); ++index) {
+        REQUIRE(repeated.value().points.at(index).lineage == preview.value().points.at(index).lineage);
+        REQUIRE(repeated.value().points.at(index).position.x == preview.value().points.at(index).position.x);
+        REQUIRE(repeated.value().points.at(index).position.y == preview.value().points.at(index).position.y);
+        REQUIRE(repeated.value().points.at(index).position.z == preview.value().points.at(index).position.z);
+    }
+
+    const auto encoded = model.serialize();
+    const auto reopened = ScientificModel::deserialize(encoded);
+    REQUIRE(reopened);
+    const auto reopened_preview = reopened.value().preview_evolutionary_morphospace(
+        bindings, 2U, "unit-box");
+    REQUIRE(reopened_preview);
+    REQUIRE(reopened_preview.value().points.at(3U).position.x == preview.value().points.at(3U).position.x);
+    REQUIRE(reopened_preview.value().points.at(3U).position.y == preview.value().points.at(3U).position.y);
+    REQUIRE(reopened_preview.value().points.at(3U).position.z == preview.value().points.at(3U).position.z);
+    REQUIRE(reopened_preview.value().trajectories.size() == preview.value().trajectories.size());
+
+    auto forged = preview.value();
+    forged.trajectories.at(0U).distance += 1.0;
+    REQUIRE(!forged.validate());
+    forged = preview.value();
+    forged.points.at(0U).position.z = 0.25;
+    REQUIRE(!forged.validate());
+    forged = preview.value();
+    forged.component_labels = {"length"};
+    REQUIRE(!forged.validate());
+
+    const std::vector<EvolutionaryMorphospaceBinding> unknown_lineage{
+        {LineageId{999U}, SignatureId{1U}}};
+    REQUIRE(!model.preview_evolutionary_morphospace(unknown_lineage));
+    const std::vector<EvolutionaryMorphospaceBinding> duplicate_lineage{
+        {LineageId{1U}, SignatureId{1U}}, {LineageId{1U}, SignatureId{2U}}};
+    REQUIRE(!model.preview_evolutionary_morphospace(duplicate_lineage));
+    REQUIRE(!model.preview_evolutionary_morphospace(bindings, 4U, "unit-box"));
+    REQUIRE(!model.preview_evolutionary_morphospace(bindings, 2U, "z-score"));
+
+    auto mismatch = *model.morphometrics();
+    REQUIRE(mismatch.insert_signature(MorphologySignature{
+        SignatureId{5U}, StructureId{2U}, "shape-components", "organ-local", "different-normalization",
+        {4.0, 8.0, 4.0}, {"length", "width", "depth"}, provenance}));
+    REQUIRE(model.set_morphometrics(std::move(mismatch)));
+    const std::vector<EvolutionaryMorphospaceBinding> mismatched_bindings{
+        {LineageId{1U}, SignatureId{1U}},
+        {LineageId{2U}, SignatureId{2U}},
+        {LineageId{3U}, SignatureId{3U}},
+        {LineageId{4U}, SignatureId{5U}},
+    };
+    REQUIRE(!model.preview_evolutionary_morphospace(mismatched_bindings));
+}
+
+void parameter_sweep_preview_is_deterministic_bounded_and_fail_closed() {
+    using namespace carto::scientific;
+    const auto provenance = fixture_provenance();
+    ScientificModel model;
+    REQUIRE(model.insert_parameter(Parameter{
+        ParameterId{1U}, "growth-rate", "1/s", 0.25, 0.0, 1.0, provenance}));
+    REQUIRE(model.insert_parameter(Parameter{
+        ParameterId{2U}, "expression-strength", "ratio", 0.5, 0.0, 1.0, provenance}));
+    REQUIRE(model.insert_parameter(Parameter{
+        ParameterId{3U}, "temperature", "K", 300.0, 0.0, 1000.0, provenance}));
+    REQUIRE(model.insert_study(Study{
+        StudyId{7U}, carto::core::Revision{11U}, {}, {}, {}, {}, {},
+        {ParameterId{3U}, ParameterId{1U}, ParameterId{2U}},
+        "deterministic-reference", "reference-provider", {}, "acceptance=parameter-sweep",
+        std::nullopt, provenance}));
+    REQUIRE(model.validate());
+
+    const auto preview = model.preview_parameter_sweep(
+        StudyId{7U},
+        {ParameterSweepAxis{ParameterId{2U}, {0.75, 0.25}},
+         ParameterSweepAxis{ParameterId{1U}, {1.0, 0.5, 0.0}}});
+    REQUIRE(preview);
+    REQUIRE(preview.value().validate());
+    REQUIRE(preview.value().study == StudyId{7U});
+    REQUIRE(preview.value().source_model_revision == carto::core::Revision{11U});
+    REQUIRE(preview.value().strategy == "cartesian");
+    REQUIRE(preview.value().base_assignments.size() == 3U);
+    REQUIRE(preview.value().base_assignments.at(0U).parameter == ParameterId{1U});
+    REQUIRE(preview.value().base_assignments.at(1U).parameter == ParameterId{2U});
+    REQUIRE(preview.value().base_assignments.at(2U).parameter == ParameterId{3U});
+    REQUIRE(preview.value().axes.at(0U).parameter == ParameterId{1U});
+    REQUIRE((preview.value().axes.at(0U).values == std::vector<double>{0.0, 0.5, 1.0}));
+    REQUIRE(preview.value().axes.at(1U).parameter == ParameterId{2U});
+    REQUIRE((preview.value().axes.at(1U).values == std::vector<double>{0.25, 0.75}));
+    REQUIRE(preview.value().cases.size() == 6U);
+    REQUIRE(preview.value().cases.at(0U).at(0U).value == 0.0);
+    REQUIRE(preview.value().cases.at(0U).at(1U).value == 0.25);
+    REQUIRE(preview.value().cases.at(0U).at(2U).value == 300.0);
+    REQUIRE(preview.value().cases.at(5U).at(0U).value == 1.0);
+    REQUIRE(preview.value().cases.at(5U).at(1U).value == 0.75);
+    REQUIRE(preview.value().cases.at(5U).at(2U).value == 300.0);
+
+    const auto repeat = model.preview_parameter_sweep(
+        StudyId{7U},
+        {ParameterSweepAxis{ParameterId{1U}, {0.0, 0.5, 1.0}},
+         ParameterSweepAxis{ParameterId{2U}, {0.25, 0.75}}});
+    REQUIRE(repeat);
+    REQUIRE(repeat.value().cases == preview.value().cases);
+
+    auto forged = preview.value();
+    forged.cases.at(0U).at(0U).value = 0.1;
+    REQUIRE(!forged.validate());
+    REQUIRE(!model.preview_parameter_sweep(
+        StudyId{7U}, {ParameterSweepAxis{ParameterId{1U}, {-0.1, 0.5}}}));
+    REQUIRE(!model.preview_parameter_sweep(
+        StudyId{7U}, {ParameterSweepAxis{ParameterId{99U}, {0.0, 1.0}}}));
+    REQUIRE(!model.preview_parameter_sweep(StudyId{7U}, {}));
+    REQUIRE(!model.preview_parameter_sweep(
+        StudyId{7U}, {ParameterSweepAxis{ParameterId{1U},
+                                          {std::numeric_limits<double>::quiet_NaN()}}}));
+    REQUIRE(!model.preview_parameter_sweep(
+        StudyId{7U}, {ParameterSweepAxis{ParameterId{1U}, {0.0, 1.0}},
+                      ParameterSweepAxis{ParameterId{1U}, {0.25, 0.75}}}));
+
+    std::vector<double> dense_values;
+    dense_values.reserve(128U);
+    for (std::size_t index = 0U; index < 128U; ++index) {
+        dense_values.push_back(static_cast<double>(index) / 127.0);
+    }
+    REQUIRE(!model.preview_parameter_sweep(
+        StudyId{7U}, {ParameterSweepAxis{ParameterId{1U}, dense_values},
+                      ParameterSweepAxis{ParameterId{2U}, dense_values}}));
 }
 
 void functional_genome_provenance_codec_preserves_v1_and_rejects_future() {
@@ -451,10 +786,12 @@ void developmental_program_and_lineage_round_trip_with_boundaries() {
     trace.genome_reference = "program://fixture-development";
     REQUIRE(trace.insert_entry(DevelopmentTraceEntry{
         TraceId{1U}, StageId{1U}, InstructionId{1U}, {StructureId{1U}}, {},
-        "receipt://development/1", provenance, TissueRegionId{1U}, {0.25}}));
+        "receipt://development/1", provenance, TissueRegionId{1U}, {0.25},
+        std::nullopt, std::nullopt}));
     REQUIRE(trace.insert_entry(DevelopmentTraceEntry{
         TraceId{2U}, StageId{2U}, InstructionId{2U}, {}, {StructureId{2U}},
-        "receipt://development/2", provenance, std::nullopt, {0.75}}));
+        "receipt://development/2", provenance, std::nullopt, {0.75},
+        std::nullopt, std::nullopt}));
     REQUIRE(model.set_developmental_trace(std::move(trace)));
 
     LineageGraph lineage;
@@ -520,7 +857,7 @@ void developmental_program_and_lineage_round_trip_with_boundaries() {
 
     const auto encoded = model.serialize();
     REQUIRE(encoded.find("DEVELOPMENTAL_PROGRAM 1") != std::string::npos);
-    REQUIRE(encoded.find("DEVELOPMENTAL_TRACE 2") != std::string::npos);
+    REQUIRE(encoded.find("DEVELOPMENTAL_TRACE 3") != std::string::npos);
     REQUIRE(encoded.find("LINEAGE_GRAPH 1") != std::string::npos);
     const auto restored = ScientificModel::deserialize(encoded);
     REQUIRE(restored);
@@ -543,17 +880,24 @@ void developmental_program_and_lineage_round_trip_with_boundaries() {
     legacy_trace.genome_reference = "program://fixture-development";
     REQUIRE(legacy_trace.insert_entry(DevelopmentTraceEntry{
         TraceId{1U}, StageId{1U}, InstructionId{1U}, {StructureId{1U}}, {},
-        "receipt://development/legacy", provenance, std::nullopt, {}}));
+        "receipt://development/legacy", provenance, std::nullopt, {},
+        std::nullopt, std::nullopt}));
     std::string legacy_trace_text = legacy_trace.serialize();
     const auto legacy_trace_header = legacy_trace_text.find(
-        "CARTOGRAPHER_DEVELOPMENTAL_TRACE 2");
+        "CARTOGRAPHER_DEVELOPMENTAL_TRACE 3");
     REQUIRE(legacy_trace_header != std::string::npos);
     legacy_trace_text.replace(
-        legacy_trace_header, std::string("CARTOGRAPHER_DEVELOPMENTAL_TRACE 2").size(),
+        legacy_trace_header, std::string("CARTOGRAPHER_DEVELOPMENTAL_TRACE 3").size(),
         "CARTOGRAPHER_DEVELOPMENTAL_TRACE 1");
-    const auto legacy_trace_metadata = legacy_trace_text.find(" 0 0\n");
+    const auto legacy_trace_source_start = legacy_trace_text.find('\n') + 1U;
+    const auto legacy_trace_source_end = legacy_trace_text.find('\n', legacy_trace_source_start);
+    REQUIRE(legacy_trace_source_start != 0U && legacy_trace_source_end != std::string::npos);
+    legacy_trace_text.replace(
+        legacy_trace_source_start, legacy_trace_source_end - legacy_trace_source_start,
+        "\"program://fixture-development\" \"program://fixture-development\"");
+    const auto legacy_trace_metadata = legacy_trace_text.rfind(" 0 0 0 0\n");
     REQUIRE(legacy_trace_metadata != std::string::npos);
-    legacy_trace_text.erase(legacy_trace_metadata, std::string(" 0 0").size());
+    legacy_trace_text.erase(legacy_trace_metadata, std::string(" 0 0 0 0").size());
     const auto legacy_trace_restored = DevelopmentalTrace::deserialize(legacy_trace_text);
     REQUIRE(legacy_trace_restored);
     REQUIRE(legacy_trace_restored.value().entries().at(TraceId{1U}).parameter_values.empty());
@@ -565,7 +909,7 @@ void developmental_program_and_lineage_round_trip_with_boundaries() {
     REQUIRE(invalid_parameter_trace.insert_entry(DevelopmentTraceEntry{
         TraceId{1U}, StageId{1U}, InstructionId{1U}, {StructureId{1U}}, {},
         "receipt://development/invalid-parameter-count", provenance, TissueRegionId{1U},
-        {0.25, 0.5}}));
+        {0.25, 0.5}, std::nullopt, std::nullopt}));
     REQUIRE(invalid_parameter_trace_model.set_developmental_trace(
         std::move(invalid_parameter_trace)));
     REQUIRE(!invalid_parameter_trace_model.validate());
@@ -576,7 +920,8 @@ void developmental_program_and_lineage_round_trip_with_boundaries() {
     invalid_tissue_trace.genome_reference = "program://fixture-development";
     REQUIRE(invalid_tissue_trace.insert_entry(DevelopmentTraceEntry{
         TraceId{1U}, StageId{1U}, InstructionId{1U}, {StructureId{1U}}, {},
-        "receipt://development/invalid-tissue", provenance, TissueRegionId{999U}, {0.25}}));
+        "receipt://development/invalid-tissue", provenance, TissueRegionId{999U}, {0.25},
+        std::nullopt, std::nullopt}));
     REQUIRE(invalid_tissue_trace_model.set_developmental_trace(
         std::move(invalid_tissue_trace)));
     REQUIRE(!invalid_tissue_trace_model.validate());
@@ -610,6 +955,61 @@ void developmental_program_and_lineage_round_trip_with_boundaries() {
     REQUIRE(!invalid_lineage.insert_node(LineageNode{
         LineageId{2U}, std::nullopt, std::nullopt, 1U, std::nullopt, std::nullopt,
         provenance, {}}));
+}
+
+void developmental_program_diff_is_structural_and_deterministic() {
+    using namespace carto::scientific;
+    const auto provenance = fixture_provenance();
+
+    DevelopmentalProgram parent;
+    parent.schema = "cartographer.developmental-program.v1";
+    parent.reference = "program://diff-parent";
+    REQUIRE(parent.insert_stage(DevelopmentStage{
+        StageId{1U}, 0U, "specification", "always", provenance}));
+    REQUIRE(parent.insert_stage(DevelopmentStage{
+        StageId{2U}, 1U, "growth", "rate > 0", provenance}));
+    REQUIRE(parent.insert_instruction(DevelopmentInstruction{
+        InstructionId{1U}, StageId{1U}, "instantiate", "morphogenesis", "always",
+        {ParameterId{1U}}, {StructureId{1U}}, {}, provenance}));
+    REQUIRE(parent.insert_instruction(DevelopmentInstruction{
+        InstructionId{2U}, StageId{2U}, "branch", "branching", "rate > 0",
+        {ParameterId{2U}}, {}, {StructureId{1U}}, provenance}));
+    REQUIRE(parent.validate());
+
+    DevelopmentalProgram child;
+    child.schema = parent.schema;
+    child.reference = "program://diff-child";
+    child.source_digest = carto::assets::Sha256Digest::from_hex(
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").value();
+    REQUIRE(child.insert_stage(DevelopmentStage{
+        StageId{1U}, 0U, "specification-updated", "always", provenance}));
+    REQUIRE(child.insert_stage(DevelopmentStage{
+        StageId{3U}, 2U, "remodel", "remodeling > 0", provenance}));
+    REQUIRE(child.insert_instruction(DevelopmentInstruction{
+        InstructionId{1U}, StageId{1U}, "instantiate-updated", "growth", "always",
+        {ParameterId{1U}, ParameterId{3U}}, {StructureId{1U}}, {StructureId{2U}}, provenance}));
+    REQUIRE(child.insert_instruction(DevelopmentInstruction{
+        InstructionId{3U}, StageId{3U}, "differentiate", "sensory", "always",
+        {ParameterId{3U}}, {}, {StructureId{1U}}, provenance}));
+    REQUIRE(child.validate());
+
+    const auto child_serialized = child.serialize();
+    const auto diff = child.diff_against(parent);
+    REQUIRE(diff.added_stages == std::vector<StageId>{StageId{3U}});
+    REQUIRE(diff.removed_stages == std::vector<StageId>{StageId{2U}});
+    REQUIRE(diff.changed_stages == std::vector<StageId>{StageId{1U}});
+    REQUIRE(diff.added_instructions == std::vector<InstructionId>{InstructionId{3U}});
+    REQUIRE(diff.removed_instructions == std::vector<InstructionId>{InstructionId{2U}});
+    REQUIRE(diff.changed_instructions == std::vector<InstructionId>{InstructionId{1U}});
+    const std::vector<std::string> added_modules{"growth", "sensory"};
+    const std::vector<std::string> removed_modules{"branching", "morphogenesis"};
+    const std::vector<std::string> changed_modules{"growth", "morphogenesis"};
+    REQUIRE(diff.added_modules == added_modules);
+    REQUIRE(diff.removed_modules == removed_modules);
+    REQUIRE(diff.changed_modules == changed_modules);
+    REQUIRE(diff.source_identity_changed);
+    REQUIRE(child.diff_against(parent).changed_instructions == diff.changed_instructions);
+    REQUIRE(child.serialize() == child_serialized);
 }
 
 void developmental_and_lineage_deserialization_rejects_hostile_records() {
@@ -879,9 +1279,425 @@ void bilateral_morphology_landmark_preview_is_deterministic_and_fail_closed() {
     REQUIRE(repeat.value().landmark_deltas.at(1U).displacement.y ==
             preview.value().landmark_deltas.at(1U).displacement.y);
     REQUIRE(!morphology.preview_bilateral_landmarks(StructureId{1U}, StructureId{1U}));
+    REQUIRE(!morphology.preview_bilateral_landmarks(
+        StructureId{1U}, StructureId{2U}, "rigid"));
+    REQUIRE(!morphology.preview_bilateral_landmarks(
+        StructureId{1U}, StructureId{2U}, "principal-axis"));
     auto forged = preview.value();
     forged.landmark_deltas.at(0U).distance = 999.0;
     REQUIRE(!forged.validate());
+    forged = preview.value();
+    forged.alignment_translation.x = 1.0;
+    REQUIRE(!forged.validate());
+    forged = preview.value();
+    forged.alignment_mode = "rigid";
+    forged.alignment_rotation.w = 2.0;
+    REQUIRE(!forged.validate());
+    forged = preview.value();
+    forged.landmark_deltas.at(0U).displacement.x = 2.0;
+    forged.landmark_deltas.at(0U).distance = 2.0;
+    REQUIRE(!forged.validate());
+
+    MorphologyModel aligned;
+    aligned.organism_identity = "aligned-fixture";
+    aligned.body_plan = "bilateral";
+    aligned.axes = {"x", "y", "z"};
+    aligned.symmetry = "bilateral";
+    REQUIRE(aligned.insert_structure(MorphologyStructure{
+        StructureId{10U}, "reference", std::nullopt, "left", "stage:0", GeometryBinding{},
+        "paired-local", {LandmarkId{101U}, LandmarkId{102U}, LandmarkId{103U}, LandmarkId{104U}, LandmarkId{105U}},
+        "measured", provenance}));
+    REQUIRE(aligned.insert_structure(MorphologyStructure{
+        StructureId{20U}, "candidate", std::nullopt, "right", "stage:0", GeometryBinding{},
+        "paired-local", {LandmarkId{201U}, LandmarkId{202U}, LandmarkId{203U}, LandmarkId{204U}, LandmarkId{205U}},
+        "measured", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{101U}, "a", StructureId{10U}, {0.0, 0.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{102U}, "b", StructureId{10U}, {1.0, 0.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{103U}, "c", StructureId{10U}, {0.0, 1.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{104U}, "d", StructureId{10U}, {0.0, 2.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{105U}, "e", StructureId{10U}, {0.0, 1.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{201U}, "a", StructureId{20U}, {3.0, 4.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{202U}, "b", StructureId{20U}, {3.0, 5.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{203U}, "c", StructureId{20U}, {2.0, 4.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{204U}, "d", StructureId{20U}, {1.0, 4.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{205U}, "e", StructureId{20U}, {2.0, 4.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.validate());
+    const std::vector<MorphologySurfaceSample> surface_samples{
+        {LandmarkId{101U}, LandmarkId{201U}, {0.0, 1.0, 0.0}, {0.0, 1.0, 0.0},
+         1.0, 1.5, 2.0, 2.25},
+        {LandmarkId{102U}, LandmarkId{202U}, {1.0, 0.0, 0.0}, {0.0, 1.0, 0.0},
+         2.0, 1.75, 1.0, 0.5}};
+    const auto surface_delta = aligned.preview_surface_delta(
+        StructureId{10U}, StructureId{20U}, surface_samples);
+    REQUIRE(surface_delta);
+    REQUIRE(surface_delta.value().coordinate_frame == "paired-local");
+    REQUIRE(surface_delta.value().deltas.size() == 2U);
+    REQUIRE(surface_delta.value().deltas.at(0U).distance == 5.0);
+    REQUIRE(surface_delta.value().deltas.at(0U).normal_displacement == 4.0);
+    REQUIRE(surface_delta.value().deltas.at(0U).curvature_delta == 0.5);
+    REQUIRE(surface_delta.value().deltas.at(0U).thickness_delta == 0.25);
+    REQUIRE(surface_delta.value().deltas.at(1U).normal_angle == std::numbers::pi / 2.0);
+    REQUIRE(std::abs(surface_delta.value().rms_displacement - std::sqrt(27.0)) < 1.0e-12);
+    REQUIRE(surface_delta.value().validate());
+    const auto surface_delta_repeat = aligned.preview_surface_delta(
+        StructureId{10U}, StructureId{20U}, surface_samples);
+    REQUIRE(surface_delta_repeat);
+    REQUIRE(surface_delta_repeat.value().deltas.at(1U).normal_angle ==
+            surface_delta.value().deltas.at(1U).normal_angle);
+    REQUIRE(surface_delta_repeat.value().rms_displacement ==
+            surface_delta.value().rms_displacement);
+    auto forged_surface_delta = surface_delta.value();
+    forged_surface_delta.deltas.at(0U).normal_angle = std::numbers::pi + 1.0;
+    REQUIRE(!forged_surface_delta.validate());
+    forged_surface_delta = surface_delta.value();
+    forged_surface_delta.deltas.at(0U).normal_displacement =
+        std::numeric_limits<double>::quiet_NaN();
+    REQUIRE(!forged_surface_delta.validate());
+    REQUIRE(!aligned.preview_surface_delta(
+        StructureId{10U}, StructureId{20U},
+        std::vector<MorphologySurfaceSample>{surface_samples.front(), surface_samples.front()}));
+    auto invalid_surface_sample = surface_samples.front();
+    invalid_surface_sample.reference_normal = {0.0, 0.0, 0.0};
+    REQUIRE(!aligned.preview_surface_delta(
+        StructureId{10U}, StructureId{20U},
+        std::vector<MorphologySurfaceSample>{invalid_surface_sample}));
+    invalid_surface_sample = surface_samples.front();
+    invalid_surface_sample.candidate_thickness = -1.0;
+    REQUIRE(!aligned.preview_surface_delta(
+        StructureId{10U}, StructureId{20U},
+        std::vector<MorphologySurfaceSample>{invalid_surface_sample}));
+    const std::vector<MorphologyLandmarkCorrespondence> explicit_correspondences{
+        {LandmarkId{103U}, LandmarkId{203U}},
+        {LandmarkId{101U}, LandmarkId{201U}},
+        {LandmarkId{105U}, LandmarkId{205U}},
+        {LandmarkId{104U}, LandmarkId{204U}},
+        {LandmarkId{102U}, LandmarkId{202U}}};
+    const auto explicit_rigid = aligned.preview_bilateral_landmarks(
+        StructureId{10U}, StructureId{20U}, explicit_correspondences, "rigid");
+    REQUIRE(explicit_rigid);
+    REQUIRE(explicit_rigid.value().alignment_mode == "rigid");
+    REQUIRE(explicit_rigid.value().rms_distance < 1.0e-12);
+    REQUIRE(explicit_rigid.value().landmark_deltas.front().reference_landmark == LandmarkId{103U});
+    REQUIRE(explicit_rigid.value().landmark_deltas.front().candidate_landmark == LandmarkId{203U});
+    REQUIRE(!aligned.preview_bilateral_landmarks(
+        StructureId{10U}, StructureId{20U},
+        std::vector<MorphologyLandmarkCorrespondence>{
+            {LandmarkId{101U}, LandmarkId{201U}},
+            {LandmarkId{101U}, LandmarkId{202U}}},
+        "landmark"));
+    REQUIRE(!aligned.preview_bilateral_landmarks(
+        StructureId{10U}, StructureId{20U},
+        std::vector<MorphologyLandmarkCorrespondence>{{LandmarkId{201U}, LandmarkId{202U}}},
+        "landmark"));
+    REQUIRE(!aligned.preview_bilateral_landmarks(
+        StructureId{10U}, StructureId{20U},
+        std::vector<MorphologyLandmarkCorrespondence>{
+            {LandmarkId{101U}, LandmarkId{201U}}},
+        "rigid"));
+    const std::vector<LandmarkId> distance_landmarks{LandmarkId{101U}, LandmarkId{102U}};
+    const auto distance = aligned.preview_measurement(
+        StructureId{10U}, "distance", distance_landmarks);
+    REQUIRE(distance);
+    REQUIRE(distance.value().units == "model");
+    REQUIRE(distance.value().values.size() == 1U);
+    REQUIRE(distance.value().values.front() == 1.0);
+    const std::vector<LandmarkId> arc_landmarks{
+        LandmarkId{101U}, LandmarkId{102U}, LandmarkId{104U}};
+    const auto arc = aligned.preview_measurement(
+        StructureId{10U}, "arc-length", arc_landmarks);
+    REQUIRE(arc);
+    REQUIRE(arc.value().units == "model");
+    REQUIRE(std::abs(arc.value().values.front() - (1.0 + std::sqrt(5.0))) < 1.0e-12);
+    const std::vector<LandmarkId> angle_landmarks{
+        LandmarkId{102U}, LandmarkId{101U}, LandmarkId{103U}};
+    const auto angle = aligned.preview_measurement(
+        StructureId{10U}, "angle", angle_landmarks);
+    REQUIRE(angle);
+    REQUIRE(angle.value().units == "radians");
+    REQUIRE(std::abs(angle.value().values.front() - (std::numbers::pi / 2.0)) < 1.0e-12);
+    const auto branch_angle = aligned.preview_measurement(
+        StructureId{10U}, "branch-angle", angle_landmarks);
+    REQUIRE(branch_angle);
+    REQUIRE(branch_angle.value().units == "radians");
+    REQUIRE(std::abs(branch_angle.value().values.front() - (std::numbers::pi / 2.0)) < 1.0e-12);
+    const std::vector<LandmarkId> triangle_landmarks{
+        LandmarkId{101U}, LandmarkId{102U}, LandmarkId{103U}};
+    const auto centroid = aligned.preview_measurement(
+        StructureId{10U}, "centroid", triangle_landmarks);
+    REQUIRE(centroid);
+    REQUIRE(std::abs(centroid.value().values.at(0U) - (1.0 / 3.0)) < 1.0e-12);
+    REQUIRE(std::abs(centroid.value().values.at(1U) - (1.0 / 3.0)) < 1.0e-12);
+    const auto area = aligned.preview_measurement(
+        StructureId{10U}, "area", triangle_landmarks);
+    REQUIRE(area);
+    REQUIRE(area.value().units == "model^2");
+    REQUIRE(std::abs(area.value().values.front() - 0.5) < 1.0e-12);
+    const auto principal_axes = aligned.preview_principal_axes(
+        StructureId{10U}, triangle_landmarks);
+    REQUIRE(principal_axes);
+    REQUIRE(principal_axes.value().coordinate_frame == "paired-local");
+    REQUIRE(std::abs(principal_axes.value().centroid.x - (1.0 / 3.0)) < 1.0e-12);
+    REQUIRE(std::abs(principal_axes.value().centroid.y - (1.0 / 3.0)) < 1.0e-12);
+    REQUIRE(principal_axes.value().variances.at(0U) > principal_axes.value().variances.at(1U));
+    REQUIRE(principal_axes.value().variances.at(1U) > principal_axes.value().variances.at(2U));
+    REQUIRE(std::abs(principal_axes.value().axes.at(0U).length() - 1.0) < 1.0e-12);
+    REQUIRE(std::abs(principal_axes.value().axes.at(1U).length() - 1.0) < 1.0e-12);
+    REQUIRE(std::abs(principal_axes.value().axes.at(2U).length() - 1.0) < 1.0e-12);
+    REQUIRE(std::abs(carto::core::dot(principal_axes.value().axes.at(0U),
+                                      principal_axes.value().axes.at(1U))) < 1.0e-12);
+    REQUIRE(carto::core::dot(carto::core::cross(principal_axes.value().axes.at(0U),
+                                                principal_axes.value().axes.at(1U)),
+                             principal_axes.value().axes.at(2U)) > 0.999999999);
+    const auto principal_axes_repeat = aligned.preview_principal_axes(
+        StructureId{10U}, triangle_landmarks);
+    REQUIRE(principal_axes_repeat);
+    for (std::size_t axis = 0U; axis < 3U; ++axis) {
+        REQUIRE(principal_axes_repeat.value().axes.at(axis).x ==
+                principal_axes.value().axes.at(axis).x);
+        REQUIRE(principal_axes_repeat.value().axes.at(axis).y ==
+                principal_axes.value().axes.at(axis).y);
+        REQUIRE(principal_axes_repeat.value().axes.at(axis).z ==
+                principal_axes.value().axes.at(axis).z);
+    }
+    auto forged_principal_axes = principal_axes.value();
+    forged_principal_axes.axes.at(0U).x = 2.0;
+    REQUIRE(!forged_principal_axes.validate());
+    REQUIRE(!aligned.preview_principal_axes(
+        StructureId{10U}, std::vector<LandmarkId>{
+            LandmarkId{101U}, LandmarkId{103U}, LandmarkId{104U}}));
+    const auto dimensions = aligned.preview_measurement(
+        StructureId{10U}, "bounding-dimensions", triangle_landmarks);
+    REQUIRE(dimensions);
+    REQUIRE((dimensions.value().values == std::vector<double>{1.0, 1.0, 0.0}));
+    const std::vector<LandmarkId> ratio_landmarks{
+        LandmarkId{101U}, LandmarkId{102U}, LandmarkId{103U}, LandmarkId{104U}};
+    const auto ratio = aligned.preview_measurement(
+        StructureId{10U}, "ratio", ratio_landmarks);
+    REQUIRE(ratio);
+    REQUIRE(ratio.value().units == "ratio");
+    REQUIRE(ratio.value().values.front() == 1.0);
+
+    MorphologyModel tetrahedron;
+    tetrahedron.organism_identity = "tetrahedron-fixture";
+    tetrahedron.body_plan = "explicit-landmark-volume";
+    REQUIRE(tetrahedron.insert_structure(MorphologyStructure{
+        StructureId{30U}, "tetrahedron", std::nullopt, "none", "stage:0", GeometryBinding{},
+        "tetra-local", {LandmarkId{301U}, LandmarkId{302U}, LandmarkId{303U}, LandmarkId{304U}},
+        "measured", provenance}));
+    REQUIRE(tetrahedron.insert_landmark(MorphologyLandmark{
+        LandmarkId{301U}, "origin", StructureId{30U}, {0.0, 0.0, 0.0},
+        "tetra-local", provenance}));
+    REQUIRE(tetrahedron.insert_landmark(MorphologyLandmark{
+        LandmarkId{302U}, "x", StructureId{30U}, {1.0, 0.0, 0.0},
+        "tetra-local", provenance}));
+    REQUIRE(tetrahedron.insert_landmark(MorphologyLandmark{
+        LandmarkId{303U}, "y", StructureId{30U}, {0.0, 1.0, 0.0},
+        "tetra-local", provenance}));
+    REQUIRE(tetrahedron.insert_landmark(MorphologyLandmark{
+        LandmarkId{304U}, "z", StructureId{30U}, {0.0, 0.0, 1.0},
+        "tetra-local", provenance}));
+    REQUIRE(tetrahedron.validate());
+    const auto volume_landmarks = std::vector<LandmarkId>{
+        LandmarkId{301U}, LandmarkId{302U}, LandmarkId{303U}, LandmarkId{304U}};
+    const auto volume = tetrahedron.preview_measurement(
+        StructureId{30U}, "volume", volume_landmarks);
+    REQUIRE(volume);
+    REQUIRE(volume.value().units == "model^3");
+    REQUIRE(std::abs(volume.value().values.front() - (1.0 / 6.0)) < 1.0e-12);
+    REQUIRE(!tetrahedron.preview_measurement(
+        StructureId{30U}, "volume", std::vector<LandmarkId>{
+            LandmarkId{301U}, LandmarkId{302U}, LandmarkId{303U}}));
+
+    MorphologyModel degenerate_tetrahedron;
+    degenerate_tetrahedron.organism_identity = "degenerate-tetrahedron-fixture";
+    degenerate_tetrahedron.body_plan = "explicit-landmark-volume";
+    REQUIRE(degenerate_tetrahedron.insert_structure(MorphologyStructure{
+        StructureId{31U}, "coplanar-tetrahedron", std::nullopt, "none", "stage:0",
+        GeometryBinding{}, "tetra-local",
+        {LandmarkId{311U}, LandmarkId{312U}, LandmarkId{313U}, LandmarkId{314U}},
+        "measured", provenance}));
+    REQUIRE(degenerate_tetrahedron.insert_landmark(MorphologyLandmark{
+        LandmarkId{311U}, "origin", StructureId{31U}, {0.0, 0.0, 0.0},
+        "tetra-local", provenance}));
+    REQUIRE(degenerate_tetrahedron.insert_landmark(MorphologyLandmark{
+        LandmarkId{312U}, "x", StructureId{31U}, {1.0, 0.0, 0.0},
+        "tetra-local", provenance}));
+    REQUIRE(degenerate_tetrahedron.insert_landmark(MorphologyLandmark{
+        LandmarkId{313U}, "y", StructureId{31U}, {0.0, 1.0, 0.0},
+        "tetra-local", provenance}));
+    REQUIRE(degenerate_tetrahedron.insert_landmark(MorphologyLandmark{
+        LandmarkId{314U}, "xy", StructureId{31U}, {1.0, 1.0, 0.0},
+        "tetra-local", provenance}));
+    REQUIRE(degenerate_tetrahedron.validate());
+    REQUIRE(!degenerate_tetrahedron.preview_measurement(
+        StructureId{31U}, "volume", std::vector<LandmarkId>{
+            LandmarkId{311U}, LandmarkId{312U}, LandmarkId{313U}, LandmarkId{314U}}));
+
+    MorphologyModel nonplanar;
+    nonplanar.organism_identity = "nonplanar-fixture";
+    nonplanar.body_plan = "explicit-landmark-area";
+    REQUIRE(nonplanar.insert_structure(MorphologyStructure{
+        StructureId{40U}, "polygon", std::nullopt, "none", "stage:0", GeometryBinding{},
+        "polygon-local", {LandmarkId{401U}, LandmarkId{402U}, LandmarkId{403U}, LandmarkId{404U}},
+        "measured", provenance}));
+    REQUIRE(nonplanar.insert_landmark(MorphologyLandmark{
+        LandmarkId{401U}, "a", StructureId{40U}, {0.0, 0.0, 0.0},
+        "polygon-local", provenance}));
+    REQUIRE(nonplanar.insert_landmark(MorphologyLandmark{
+        LandmarkId{402U}, "b", StructureId{40U}, {1.0, 0.0, 0.0},
+        "polygon-local", provenance}));
+    REQUIRE(nonplanar.insert_landmark(MorphologyLandmark{
+        LandmarkId{403U}, "c", StructureId{40U}, {1.0, 1.0, 0.0},
+        "polygon-local", provenance}));
+    REQUIRE(nonplanar.insert_landmark(MorphologyLandmark{
+        LandmarkId{404U}, "d", StructureId{40U}, {0.0, 1.0, 1.0},
+        "polygon-local", provenance}));
+    REQUIRE(nonplanar.insert_structure(MorphologyStructure{
+        StructureId{41U}, "bowtie", std::nullopt, "none", "stage:0", GeometryBinding{},
+        "polygon-local", {LandmarkId{411U}, LandmarkId{412U}, LandmarkId{413U}, LandmarkId{414U}},
+        "measured", provenance}));
+    REQUIRE(nonplanar.insert_landmark(MorphologyLandmark{
+        LandmarkId{411U}, "a", StructureId{41U}, {0.0, 0.0, 0.0},
+        "polygon-local", provenance}));
+    REQUIRE(nonplanar.insert_landmark(MorphologyLandmark{
+        LandmarkId{412U}, "b", StructureId{41U}, {1.0, 1.0, 0.0},
+        "polygon-local", provenance}));
+    REQUIRE(nonplanar.insert_landmark(MorphologyLandmark{
+        LandmarkId{413U}, "c", StructureId{41U}, {0.0, 1.0, 0.0},
+        "polygon-local", provenance}));
+    REQUIRE(nonplanar.insert_landmark(MorphologyLandmark{
+        LandmarkId{414U}, "d", StructureId{41U}, {1.0, 0.0, 0.0},
+        "polygon-local", provenance}));
+    REQUIRE(nonplanar.validate());
+    REQUIRE(!nonplanar.preview_measurement(
+        StructureId{40U}, "area", std::vector<LandmarkId>{
+            LandmarkId{401U}, LandmarkId{402U}, LandmarkId{403U}, LandmarkId{404U}}));
+    REQUIRE(!nonplanar.preview_measurement(
+        StructureId{41U}, "area", std::vector<LandmarkId>{
+            LandmarkId{411U}, LandmarkId{412U}, LandmarkId{413U}, LandmarkId{414U}}));
+    auto forged_measurement = centroid.value();
+    forged_measurement.values.at(0U) = std::numeric_limits<double>::quiet_NaN();
+    REQUIRE(!forged_measurement.validate());
+    REQUIRE(!aligned.preview_measurement(
+        StructureId{10U}, "distance", std::vector<LandmarkId>{LandmarkId{101U}}));
+    REQUIRE(!aligned.preview_measurement(
+        StructureId{10U}, "arc-length", std::vector<LandmarkId>{LandmarkId{101U}}));
+    REQUIRE(!aligned.preview_measurement(
+        StructureId{10U}, "area", std::vector<LandmarkId>{
+            LandmarkId{101U}, LandmarkId{102U}}));
+    REQUIRE(!aligned.preview_measurement(
+        StructureId{10U}, "distance", std::vector<LandmarkId>{LandmarkId{101U}, LandmarkId{201U}}));
+    REQUIRE(!aligned.preview_measurement(
+        StructureId{10U}, "unsupported", distance_landmarks));
+    REQUIRE(!aligned.preview_measurement(
+        StructureId{10U}, "ratio", std::vector<LandmarkId>{
+            LandmarkId{101U}, LandmarkId{102U}, LandmarkId{103U}}));
+    REQUIRE(!aligned.preview_measurement(
+        StructureId{10U}, "ratio", std::vector<LandmarkId>{
+            LandmarkId{101U}, LandmarkId{102U}, LandmarkId{103U}, LandmarkId{105U}}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{106U}, "unlisted", StructureId{10U}, {2.0, 2.0, 0.0},
+        "paired-local", provenance}));
+    REQUIRE(aligned.validate());
+    REQUIRE(!aligned.preview_measurement(
+        StructureId{10U}, "distance", std::vector<LandmarkId>{
+            LandmarkId{101U}, LandmarkId{106U}}));
+    const auto rigid = aligned.preview_bilateral_landmarks(
+        StructureId{10U}, StructureId{20U}, "rigid");
+    REQUIRE(rigid);
+    REQUIRE(rigid.value().alignment_mode == "rigid");
+    REQUIRE(rigid.value().alignment_scale == 1.0);
+    REQUIRE(rigid.value().rms_distance < 1.0e-12);
+    REQUIRE(rigid.value().alignment_rotation.normalizable());
+    REQUIRE(rigid.value().alignment_translation.finite());
+    const auto principal = aligned.preview_bilateral_landmarks(
+        StructureId{10U}, StructureId{20U}, "principal-axis");
+    REQUIRE(principal);
+    REQUIRE(principal.value().alignment_mode == "principal-axis");
+    REQUIRE(principal.value().alignment_scale == 1.0);
+    REQUIRE(principal.value().rms_distance < 1.0e-10);
+    const auto principal_repeat = aligned.preview_bilateral_landmarks(
+        StructureId{10U}, StructureId{20U}, "principal-axis");
+    REQUIRE(principal_repeat);
+    REQUIRE(principal_repeat.value().alignment_rotation.x ==
+            principal.value().alignment_rotation.x);
+    REQUIRE(principal_repeat.value().alignment_rotation.y ==
+            principal.value().alignment_rotation.y);
+    REQUIRE(principal_repeat.value().alignment_rotation.z ==
+            principal.value().alignment_rotation.z);
+    REQUIRE(principal_repeat.value().alignment_rotation.w ==
+            principal.value().alignment_rotation.w);
+
+    REQUIRE(aligned.insert_structure(MorphologyStructure{
+        StructureId{30U}, "reference-scaled", std::nullopt, "left", "stage:0", GeometryBinding{},
+        "paired-local", {LandmarkId{301U}, LandmarkId{302U}, LandmarkId{303U}},
+        "measured", provenance}));
+    REQUIRE(aligned.insert_structure(MorphologyStructure{
+        StructureId{40U}, "candidate-scaled", std::nullopt, "right", "stage:0", GeometryBinding{},
+        "paired-local", {LandmarkId{401U}, LandmarkId{402U}, LandmarkId{403U}},
+        "measured", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{301U}, "a", StructureId{30U}, {0.0, 0.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{302U}, "b", StructureId{30U}, {1.0, 0.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{303U}, "c", StructureId{30U}, {0.0, 1.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{401U}, "a", StructureId{40U}, {5.0, 6.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{402U}, "b", StructureId{40U}, {5.0, 8.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{403U}, "c", StructureId{40U}, {3.0, 6.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.validate());
+    const auto scale_normalized = aligned.preview_bilateral_landmarks(
+        StructureId{30U}, StructureId{40U}, "scale-normalized");
+    REQUIRE(scale_normalized);
+    REQUIRE(scale_normalized.value().alignment_mode == "scale-normalized");
+    REQUIRE(std::abs(scale_normalized.value().alignment_scale - 0.5) < 1.0e-12);
+    REQUIRE(scale_normalized.value().rms_distance < 1.0e-12);
+
+    // Equal principal moments are intentionally rejected because their axes
+    // are not identifiable without a provider-owned tie-break.
+    REQUIRE(aligned.insert_structure(MorphologyStructure{
+        StructureId{50U}, "reference-symmetric", std::nullopt, "left", "stage:0", GeometryBinding{},
+        "paired-local", {LandmarkId{501U}, LandmarkId{502U}, LandmarkId{503U}, LandmarkId{504U}},
+        "measured", provenance}));
+    REQUIRE(aligned.insert_structure(MorphologyStructure{
+        StructureId{60U}, "candidate-symmetric", std::nullopt, "right", "stage:0", GeometryBinding{},
+        "paired-local", {LandmarkId{601U}, LandmarkId{602U}, LandmarkId{603U}, LandmarkId{604U}},
+        "measured", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{501U}, "a", StructureId{50U}, {-1.0, -1.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{502U}, "b", StructureId{50U}, {1.0, -1.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{503U}, "c", StructureId{50U}, {1.0, 1.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{504U}, "d", StructureId{50U}, {-1.0, 1.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{601U}, "a", StructureId{60U}, {-1.0, -1.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{602U}, "b", StructureId{60U}, {1.0, -1.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{603U}, "c", StructureId{60U}, {1.0, 1.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.insert_landmark(MorphologyLandmark{
+        LandmarkId{604U}, "d", StructureId{60U}, {-1.0, 1.0, 0.0}, "paired-local", provenance}));
+    REQUIRE(aligned.validate());
+    REQUIRE(!aligned.preview_bilateral_landmarks(
+        StructureId{50U}, StructureId{60U}, "principal-axis"));
+    REQUIRE(!aligned.preview_principal_axes(
+        StructureId{50U}, std::vector<LandmarkId>{
+            LandmarkId{501U}, LandmarkId{502U}, LandmarkId{503U}, LandmarkId{504U}}));
 
     // Rebuild the small hostile fixture because the model exposes only
     // read-only collections after admission.
@@ -2344,7 +3160,8 @@ void phenotype_capability_trace_round_trip_and_rejection() {
     trace.genome_reference = "program://fixture-development";
     REQUIRE(trace.insert_entry(DevelopmentTraceEntry{
         TraceId{1U}, StageId{1U}, InstructionId{1U}, {StructureId{2U}}, {},
-        "receipt://development/sensor", provenance, std::nullopt, {}}));
+        "receipt://development/sensor", provenance, std::nullopt, {},
+        std::nullopt, std::nullopt}));
     REQUIRE(model.set_developmental_trace(std::move(trace)));
 
     PhenotypeCapabilityModel phenotype;
@@ -2848,7 +3665,7 @@ void scientific_model_mutation_is_journaled_and_reopens() {
     REQUIRE(entries);
     REQUIRE(entries.value().size() == 1U);
     const std::string payload(entries.value().front().payload.begin(), entries.value().front().payload.end());
-    REQUIRE(payload.find("CARTOGRAPHER_PROJECT 5") != std::string::npos);
+    REQUIRE(payload.find("CARTOGRAPHER_PROJECT 6") != std::string::npos);
     REQUIRE(payload.find("SCIENTIFIC_MODEL") != std::string::npos);
 
     const auto path = temp.path() / "scientific.carto";
@@ -2869,9 +3686,9 @@ void scientific_model_mutation_is_journaled_and_reopens() {
     REQUIRE(!carto::project::ProjectDocument::deserialize(missing_scientific));
 
     std::string legacy_v4 = missing_scientific;
-    const auto current_header = legacy_v4.find("CARTOGRAPHER_PROJECT 5");
+    const auto current_header = legacy_v4.find("CARTOGRAPHER_PROJECT 6");
     REQUIRE(current_header != std::string::npos);
-    legacy_v4.replace(current_header, std::string("CARTOGRAPHER_PROJECT 5").size(),
+    legacy_v4.replace(current_header, std::string("CARTOGRAPHER_PROJECT 6").size(),
                       "CARTOGRAPHER_PROJECT 4");
     const auto loaded_v4 = carto::project::ProjectDocument::deserialize(legacy_v4);
     REQUIRE(loaded_v4);
@@ -2883,10 +3700,14 @@ void scientific_model_mutation_is_journaled_and_reopens() {
 int main() {
     const std::vector<std::pair<std::string_view, void (*)()>> tests = {
         {"scientific model round trips deterministically", scientific_model_round_trips_deterministically},
+        {"artificial organism authoring chain round trips with previews", artificial_organism_authoring_chain_round_trips_with_previews},
         {"morphology cross-domain archetypes round trip", morphology_cross_domain_archetypes_round_trip},
+        {"evolutionary morphospace preview is deterministic and fail closed", evolutionary_morphospace_preview_is_deterministic_and_fail_closed},
+        {"parameter sweep preview is deterministic, bounded, and fail closed", parameter_sweep_preview_is_deterministic_bounded_and_fail_closed},
         {"functional genome provenance codec preserves v1 and rejects future", functional_genome_provenance_codec_preserves_v1_and_rejects_future},
         {"functional genome exchange preserves semantics and rejects tampering", functional_genome_exchange_preserves_semantics_and_rejects_tampering},
         {"developmental program and lineage round trip with boundaries", developmental_program_and_lineage_round_trip_with_boundaries},
+        {"developmental program diff is structural and deterministic", developmental_program_diff_is_structural_and_deterministic},
         {"developmental and lineage hostile records are rejected", developmental_and_lineage_deserialization_rejects_hostile_records},
         {"lineage Newick exchange preserves identity and fails closed", lineage_newick_exchange_preserves_identity_and_fails_closed},
         {"morphometrics round trip and reference checks", morphometrics_round_trip_and_reference_checks},

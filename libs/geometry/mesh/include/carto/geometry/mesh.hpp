@@ -1,5 +1,7 @@
 #pragma once
 
+#include <carto/attributes/set.hpp>
+#include <carto/attributes/uv.hpp>
 #include <carto/geometry/compiled_mesh.hpp>
 #include <carto/geometry/ids.hpp>
 #include <carto/geometry/topology_edit.hpp>
@@ -157,6 +159,25 @@ public:
     [[nodiscard]] core::Result<void> restore_from(const EditableMesh& source);
     [[nodiscard]] core::Result<void> restore_revision(core::Revision revision);
 
+    // UVs and other attributes are authored against the current topology. A
+    // payload can be attached only after its domain cardinalities and UV-set
+    // bindings validate against this mesh. Topology edits are then rejected
+    // until an explicit transfer result is attached.
+    [[nodiscard]] core::Result<void> set_attribute_payload(
+        attributes::AttributeSet attributes,
+        attributes::UvSetTable uv_sets);
+    [[nodiscard]] core::Result<void> clear_attribute_payload();
+    [[nodiscard]] const attributes::AttributeSet& attributes() const noexcept {
+        return attributes_;
+    }
+    [[nodiscard]] const attributes::UvSetTable& uv_sets() const noexcept {
+        return uv_sets_;
+    }
+    [[nodiscard]] bool has_attribute_payload() const noexcept {
+        return !attributes_.domain_counts().empty() || attributes_.layer_count() != 0U ||
+            !uv_sets_.descriptors().empty();
+    }
+
     [[nodiscard]] const Vertex* find_vertex(VertexId id) const noexcept;
     [[nodiscard]] const Face* find_face(FaceId id) const noexcept;
     [[nodiscard]] const EdgeRecord* find_edge(EdgeId id) const noexcept;
@@ -173,6 +194,8 @@ public:
 
 private:
     [[nodiscard]] core::Result<void> rebuild_topology();
+    [[nodiscard]] core::Result<void> reject_topology_edit_with_attributes() const;
+    [[nodiscard]] core::Result<void> validate_attribute_payload() const;
     [[nodiscard]] core::Result<void> validate_patch_geometry(const MeshPatch& patch) const;
     [[nodiscard]] core::Result<void> validate_vertex_face_index() const;
     [[nodiscard]] core::Result<void> validate_topology_state() const;
@@ -194,6 +217,8 @@ private:
     std::uint64_t next_edge_id_ = 1;
     std::uint64_t next_half_edge_id_ = 1;
     std::uint64_t next_corner_id_ = 1;
+    attributes::AttributeSet attributes_;
+    attributes::UvSetTable uv_sets_;
     core::Revision revision_{};
     mutable std::optional<CompiledMesh> compiled_cache_;
 };

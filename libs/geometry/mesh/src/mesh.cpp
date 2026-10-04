@@ -104,6 +104,59 @@ struct IdHash {
     }
 };
 
+template <typename Id>
+bool has_duplicate_ids(const std::vector<Id>& ids) {
+    constexpr std::size_t kLinearScanLimit = 32U;
+    if (ids.size() <= kLinearScanLimit) {
+        for (std::size_t index = 0U; index < ids.size(); ++index) {
+            if (std::find(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(index), ids[index]) !=
+                ids.begin() + static_cast<std::ptrdiff_t>(index)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::unordered_set<Id, IdHash<Id>> unique;
+    unique.reserve(ids.size());
+    for (const Id id : ids) {
+        if (!unique.insert(id).second) return true;
+    }
+    return false;
+}
+
+core::Result<void> validate_attribute_payload_for_topology(
+    const attributes::AttributeSet& attributes,
+    const attributes::UvSetTable& uv_sets,
+    std::size_t vertex_count,
+    std::size_t edge_count,
+    std::size_t face_count,
+    std::size_t corner_count) {
+    if (auto result = attributes.validate(); !result) return result;
+
+    const auto check_count = [&](attributes::AttributeDomain domain, std::size_t expected) {
+        const auto count = attributes.domain_count(domain);
+        if (count.has_value() && *count != expected) {
+            return core::Result<void>::failure(validation(
+                "attribute domain count does not match the mesh topology"));
+        }
+        return core::Result<void>::success();
+    };
+    if (auto result = check_count(attributes::AttributeDomain::vertex, vertex_count); !result) {
+        return result;
+    }
+    if (auto result = check_count(attributes::AttributeDomain::edge, edge_count); !result) {
+        return result;
+    }
+    if (auto result = check_count(attributes::AttributeDomain::face, face_count); !result) {
+        return result;
+    }
+    if (auto result = check_count(attributes::AttributeDomain::corner, corner_count); !result) {
+        return result;
+    }
+    return uv_sets.validate(attributes);
+}
+
 EdgeKey undirected(VertexId left, VertexId right) {
     return left < right ? EdgeKey{left, right} : EdgeKey{right, left};
 }
@@ -361,7 +414,50 @@ MeshPatch MeshPatch::inverse(core::Revision target_revision) const {
     return result;
 }
 
+core::Result<void> EditableMesh::reject_topology_edit_with_attributes() const {
+    if (!has_attribute_payload()) return core::Result<void>::success();
+    return core::Result<void>::failure(Diagnostic(
+        ErrorCode::invalid_state,
+        "topology edits require explicit attribute transfer before UV payload is attached"));
+}
+
+core::Result<void> EditableMesh::validate_attribute_payload() const {
+    return validate_attribute_payload_for_topology(
+        attributes_, uv_sets_, vertices_.size(), edges_.size(), faces_.size(), corners_.size());
+}
+
+core::Result<void> EditableMesh::set_attribute_payload(
+    attributes::AttributeSet attributes,
+    attributes::UvSetTable uv_sets) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (auto result = validate_attribute_payload_for_topology(
+            attributes, uv_sets, vertices_.size(), edges_.size(), faces_.size(), corners_.size());
+        !result) {
+        return result;
+    }
+    attributes_ = std::move(attributes);
+    uv_sets_ = std::move(uv_sets);
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> EditableMesh::clear_attribute_payload() {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (!has_attribute_payload()) return core::Result<void>::success();
+    attributes_ = attributes::AttributeSet{};
+    uv_sets_ = attributes::UvSetTable{};
+    bump_revision();
+    return core::Result<void>::success();
+}
+
 core::Result<VertexId> EditableMesh::add_vertex(core::Vec3d position) {
+    if (auto result = reject_topology_edit_with_attributes(); !result) {
+        return core::Result<VertexId>::failure(result.error());
+    }
     if (revision_.exhausted()) {
         return core::Result<VertexId>::failure(exhausted_revision());
     }
@@ -379,6 +475,7 @@ core::Result<VertexId> EditableMesh::add_vertex(core::Vec3d position) {
 }
 
 core::Result<void> EditableMesh::insert_vertex(Vertex vertex) {
+    if (auto result = reject_topology_edit_with_attributes(); !result) return result;
     if (revision_.exhausted()) {
         return core::Result<void>::failure(exhausted_revision());
     }
@@ -493,14 +590,20 @@ core::Result<void> EditableMesh::validate_patch_geometry(const MeshPatch& patch)
     // topology before publishing, so rechecking maps and identity records here would duplicate
     // the dominant cost without expanding the invariant boundary. Use the maintained incidence
     // index to visit only faces whose geometry can be invalidated by this patch.
-    std::set<FaceId> affected_faces;
+    std::vector<FaceId> affected_faces;
     for (const auto& change : patch.vertex_changes) {
         const auto incident = vertex_faces_.find(change.id);
         if (incident == vertex_faces_.end()) {
             continue;
         }
-        affected_faces.insert(incident->second.begin(), incident->second.end());
+        for (const FaceId face_id : incident->second) {
+            if (std::find(affected_faces.begin(), affected_faces.end(), face_id) ==
+                affected_faces.end()) {
+                affected_faces.push_back(face_id);
+            }
+        }
     }
+    std::sort(affected_faces.begin(), affected_faces.end());
 
     for (const FaceId face_id : affected_faces) {
         const auto face_iterator = faces_.find(face_id);
@@ -513,12 +616,15 @@ core::Result<void> EditableMesh::validate_patch_geometry(const MeshPatch& patch)
             return core::Result<void>::failure(validation("mesh contains an invalid face record"));
         }
 
-        std::set<VertexId> unique_vertices;
         for (const VertexId vertex : face.vertices) {
-            if (!vertex || !vertices_.contains(vertex) || !unique_vertices.insert(vertex).second) {
+            if (!vertex || !vertices_.contains(vertex)) {
                 return core::Result<void>::failure(
                     validation("mesh face has a dangling or duplicate vertex"));
             }
+        }
+        if (has_duplicate_ids(face.vertices)) {
+            return core::Result<void>::failure(
+                validation("mesh face has a dangling or duplicate vertex"));
         }
 
         const core::Vec3d first_position = vertices_.at(face.vertices.front()).position;
@@ -534,6 +640,7 @@ core::Result<void> EditableMesh::validate_patch_geometry(const MeshPatch& patch)
 }
 
 core::Result<void> EditableMesh::extrude_face(FaceId id, double distance) {
+    if (auto result = reject_topology_edit_with_attributes(); !result) return result;
     if (revision_.exhausted()) {
         return core::Result<void>::failure(exhausted_revision());
     }
@@ -734,6 +841,9 @@ core::Result<TopologyEditReceipt> EditableMesh::extrude_face_with_receipt(
 core::Result<TopologyEditReceipt> EditableMesh::delete_face(
     FaceId id,
     bool remove_orphaned_vertices) {
+    if (auto result = reject_topology_edit_with_attributes(); !result) {
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
     if (revision_.exhausted()) {
         return core::Result<TopologyEditReceipt>::failure(exhausted_revision());
     }
@@ -792,6 +902,9 @@ core::Result<TopologyEditReceipt> EditableMesh::delete_face(
 }
 
 core::Result<TopologyEditReceipt> EditableMesh::split_edge(EdgeId id, double factor) {
+    if (auto result = reject_topology_edit_with_attributes(); !result) {
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
     if (revision_.exhausted()) {
         return core::Result<TopologyEditReceipt>::failure(exhausted_revision());
     }
@@ -946,6 +1059,9 @@ core::Result<TopologyEditReceipt> EditableMesh::bevel_vertex(
     VertexId id,
     double width,
     std::uint32_t segments) {
+    if (auto result = reject_topology_edit_with_attributes(); !result) {
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
     if (revision_.exhausted()) {
         return core::Result<TopologyEditReceipt>::failure(exhausted_revision());
     }
@@ -1270,6 +1386,9 @@ core::Result<TopologyEditReceipt> EditableMesh::bevel_edge(
     EdgeId id,
     double width,
     std::uint32_t segments) {
+    if (auto result = reject_topology_edit_with_attributes(); !result) {
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
     if (revision_.exhausted()) {
         return core::Result<TopologyEditReceipt>::failure(exhausted_revision());
     }
@@ -1572,6 +1691,9 @@ core::Result<TopologyEditReceipt> EditableMesh::bevel_edge(
 }
 
 core::Result<TopologyEditReceipt> EditableMesh::dissolve_edge(EdgeId id) {
+    if (auto result = reject_topology_edit_with_attributes(); !result) {
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
     if (revision_.exhausted()) {
         return core::Result<TopologyEditReceipt>::failure(exhausted_revision());
     }
@@ -1777,6 +1899,9 @@ core::Result<TopologyEditReceipt> EditableMesh::dissolve_edge(EdgeId id) {
 core::Result<TopologyEditReceipt> EditableMesh::tri_to_quad(
     FaceId first,
     FaceId second) {
+    if (auto result = reject_topology_edit_with_attributes(); !result) {
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
     if (revision_.exhausted()) {
         return core::Result<TopologyEditReceipt>::failure(exhausted_revision());
     }
@@ -1830,6 +1955,9 @@ core::Result<TopologyEditReceipt> EditableMesh::tri_to_quad(
 core::Result<TopologyEditReceipt> EditableMesh::merge_vertices(
     VertexId target,
     VertexId source) {
+    if (auto result = reject_topology_edit_with_attributes(); !result) {
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
     if (revision_.exhausted()) {
         return core::Result<TopologyEditReceipt>::failure(exhausted_revision());
     }
@@ -1901,6 +2029,9 @@ core::Result<TopologyEditReceipt> EditableMesh::merge_vertices(
 }
 
 core::Result<TopologyEditReceipt> EditableMesh::inset_face(FaceId id, double distance) {
+    if (auto result = reject_topology_edit_with_attributes(); !result) {
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
     if (revision_.exhausted()) {
         return core::Result<TopologyEditReceipt>::failure(exhausted_revision());
     }
@@ -2183,6 +2314,9 @@ core::Result<TopologyEditReceipt> EditableMesh::inset_face(FaceId id, double dis
 }
 
 core::Result<TopologyEditReceipt> EditableMesh::poke_face(FaceId id) {
+    if (auto result = reject_topology_edit_with_attributes(); !result) {
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
     if (revision_.exhausted()) {
         return core::Result<TopologyEditReceipt>::failure(exhausted_revision());
     }
@@ -2389,6 +2523,8 @@ core::Result<void> EditableMesh::restore_from(const EditableMesh& source) {
     next_edge_id_ = source.next_edge_id_;
     next_half_edge_id_ = source.next_half_edge_id_;
     next_corner_id_ = source.next_corner_id_;
+    attributes_ = source.attributes_;
+    uv_sets_ = source.uv_sets_;
     bump_revision();
     return core::Result<void>::success();
 }
@@ -2403,6 +2539,9 @@ core::Result<void> EditableMesh::restore_revision(core::Revision revision) {
 }
 
 core::Result<FaceId> EditableMesh::add_face(std::vector<VertexId> vertices) {
+    if (auto result = reject_topology_edit_with_attributes(); !result) {
+        return core::Result<FaceId>::failure(result.error());
+    }
     if (revision_.exhausted()) {
         return core::Result<FaceId>::failure(exhausted_revision());
     }
@@ -2442,6 +2581,7 @@ core::Result<FaceId> EditableMesh::add_face(std::vector<VertexId> vertices) {
 }
 
 core::Result<void> EditableMesh::insert_face(Face face) {
+    if (auto result = reject_topology_edit_with_attributes(); !result) return result;
     if (revision_.exhausted()) {
         return core::Result<void>::failure(exhausted_revision());
     }
@@ -2474,6 +2614,7 @@ core::Result<void> EditableMesh::insert_face(Face face) {
 core::Result<void> EditableMesh::insert_bulk(
     std::vector<Vertex> vertices,
     std::vector<Face> faces) {
+    if (auto result = reject_topology_edit_with_attributes(); !result) return result;
     if (revision_.exhausted()) {
         return core::Result<void>::failure(exhausted_revision());
     }
@@ -2864,12 +3005,15 @@ core::Result<void> EditableMesh::validate() const {
         if (!face_id || face.id != face_id || face.vertices.size() < 3U) {
             return core::Result<void>::failure(validation("mesh contains an invalid face record"));
         }
-        std::set<VertexId> unique_vertices;
         for (VertexId vertex : face.vertices) {
-            if (!vertex || !vertices_.contains(vertex) || !unique_vertices.insert(vertex).second) {
+            if (!vertex || !vertices_.contains(vertex)) {
                 return core::Result<void>::failure(
                     validation("mesh face has a dangling or duplicate vertex"));
             }
+        }
+        if (has_duplicate_ids(face.vertices)) {
+            return core::Result<void>::failure(
+                validation("mesh face has a dangling or duplicate vertex"));
         }
 
         const VertexId first = face.vertices.front();
@@ -2905,7 +3049,10 @@ core::Result<void> EditableMesh::validate() const {
     if (auto result = validate_vertex_face_index(); !result) {
         return result;
     }
-    return validate_topology_state();
+    if (auto result = validate_topology_state(); !result) {
+        return result;
+    }
+    return validate_attribute_payload();
 }
 
 core::Result<TopologySnapshot> EditableMesh::topology() const {

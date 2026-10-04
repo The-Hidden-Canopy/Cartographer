@@ -48,7 +48,8 @@ sampled inputs and one storage output, an offscreen sampled-material PBR draw
 into an HDR RGBA32F target with depth, an HDR-to-display tone-map draw and
 readback, indexed draw/RGBA32F readback, storage-texture compute dispatch and
 readback, descriptor/resource retirement, empty debug-layer receipts, typed
-swapchain resize/present, desktop launch smoke, and an 8192x8192 target clear.
+swapchain resize/present, desktop launch smoke, and an 8192x8192 temporal
+dispatch with RGBA16F/RG16F inputs plus bounded RGBA32F probe readback.
 This does not make GPU geometry
 authoring authoritative: the CPU path remains the authoring and kernel-benchmark
 authority. Full IBL and production render-graph scheduling/parity, final output

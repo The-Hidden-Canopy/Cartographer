@@ -49,6 +49,10 @@ constexpr std::uint64_t kMaxSerializedVertices = 1'000'000U;
 constexpr std::uint64_t kMaxSerializedFaces = 1'000'000U;
 constexpr std::uint64_t kMaxSerializedFaceVertices = 1'000'000U;
 constexpr std::uint64_t kMaxSerializedTopologyReceipts = 1'000'000U;
+constexpr std::uint64_t kMaxSerializedAttributeDomains = 64U;
+constexpr std::uint64_t kMaxSerializedAttributeLayers = 1'000'000U;
+constexpr std::uint64_t kMaxSerializedAttributeValues = 1'000'000U;
+constexpr std::uint64_t kMaxSerializedUvSets = 1'000'000U;
 constexpr std::uintmax_t kMaxSerializedProjectBytes = 128ULL * 1024ULL * 1024ULL;
 std::mutex g_project_save_mutex;
 std::atomic<std::uint64_t> g_project_temp_counter{0U};
@@ -87,6 +91,156 @@ core::Result<std::uint64_t> read_uint(std::istream& input, std::string_view fiel
             parse_error("project field is not a valid unsigned integer: " + std::string(field)));
     }
     return core::Result<std::uint64_t>::success(value);
+}
+
+core::Result<std::int64_t> read_int(std::istream& input, std::string_view field) {
+    std::string token;
+    if (!(input >> token)) {
+        return core::Result<std::int64_t>::failure(
+            parse_error("project field is not a valid signed integer: " + std::string(field)));
+    }
+    std::int64_t value = 0;
+    const auto parsed = std::from_chars(token.data(), token.data() + token.size(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size()) {
+        return core::Result<std::int64_t>::failure(
+            parse_error("project field is not a valid signed integer: " + std::string(field)));
+    }
+    return core::Result<std::int64_t>::success(value);
+}
+
+template <typename T>
+core::Result<T> read_scalar(std::istream& input, std::string_view field) {
+    T value{};
+    if (!(input >> value)) {
+        return core::Result<T>::failure(
+            parse_error("project field is not a valid scalar: " + std::string(field)));
+    }
+    return core::Result<T>::success(value);
+}
+
+void write_attribute_value(
+    std::ostream& output,
+    attributes::AttributeType type,
+    const attributes::AttributeValue& value) {
+    switch (type) {
+    case attributes::AttributeType::boolean:
+        output << (std::get<bool>(value) ? 1 : 0);
+        return;
+    case attributes::AttributeType::int32:
+        output << std::get<std::int32_t>(value);
+        return;
+    case attributes::AttributeType::uint32:
+        output << std::get<std::uint32_t>(value);
+        return;
+    case attributes::AttributeType::float32:
+        output << std::get<float>(value);
+        return;
+    case attributes::AttributeType::float64:
+        output << std::get<double>(value);
+        return;
+    case attributes::AttributeType::vec2: {
+        const auto& candidate = std::get<core::Vec2d>(value);
+        output << candidate.x << ' ' << candidate.y;
+        return;
+    }
+    case attributes::AttributeType::vec3: {
+        const auto& candidate = std::get<core::Vec3d>(value);
+        output << candidate.x << ' ' << candidate.y << ' ' << candidate.z;
+        return;
+    }
+    case attributes::AttributeType::vec4:
+    case attributes::AttributeType::color4: {
+        const auto& candidate = std::get<core::Vec4d>(value);
+        output << candidate.x << ' ' << candidate.y << ' '
+               << candidate.z << ' ' << candidate.w;
+        return;
+    }
+    case attributes::AttributeType::string_id:
+    case attributes::AttributeType::object_id:
+    case attributes::AttributeType::vertex_id:
+        output << std::get<std::uint64_t>(value);
+        return;
+    }
+}
+
+core::Result<attributes::AttributeValue> read_attribute_value(
+    std::istream& input,
+    attributes::AttributeType type) {
+    switch (type) {
+    case attributes::AttributeType::boolean: {
+        auto encoded = read_uint(input, "boolean attribute value");
+        if (!encoded || encoded.value() > 1U) {
+            return core::Result<attributes::AttributeValue>::failure(parse_error(
+                "boolean attribute value must be 0 or 1"));
+        }
+        return core::Result<attributes::AttributeValue>::success(encoded.value() != 0U);
+    }
+    case attributes::AttributeType::int32: {
+        auto encoded = read_int(input, "int32 attribute value");
+        if (!encoded || encoded.value() < std::numeric_limits<std::int32_t>::min() ||
+            encoded.value() > std::numeric_limits<std::int32_t>::max()) {
+            return core::Result<attributes::AttributeValue>::failure(parse_error(
+                "int32 attribute value is out of range"));
+        }
+        return core::Result<attributes::AttributeValue>::success(
+            static_cast<std::int32_t>(encoded.value()));
+    }
+    case attributes::AttributeType::uint32: {
+        auto encoded = read_uint(input, "uint32 attribute value");
+        if (!encoded || encoded.value() > std::numeric_limits<std::uint32_t>::max()) {
+            return core::Result<attributes::AttributeValue>::failure(parse_error(
+                "uint32 attribute value is out of range"));
+        }
+        return core::Result<attributes::AttributeValue>::success(
+            static_cast<std::uint32_t>(encoded.value()));
+    }
+    case attributes::AttributeType::float32: {
+        auto encoded = read_scalar<float>(input, "float32 attribute value");
+        if (!encoded) return core::Result<attributes::AttributeValue>::failure(encoded.error());
+        return core::Result<attributes::AttributeValue>::success(encoded.value());
+    }
+    case attributes::AttributeType::float64: {
+        auto encoded = read_scalar<double>(input, "float64 attribute value");
+        if (!encoded) return core::Result<attributes::AttributeValue>::failure(encoded.error());
+        return core::Result<attributes::AttributeValue>::success(encoded.value());
+    }
+    case attributes::AttributeType::vec2: {
+        auto x = read_scalar<double>(input, "vec2 x attribute value");
+        auto y = read_scalar<double>(input, "vec2 y attribute value");
+        if (!x || !y) return core::Result<attributes::AttributeValue>::failure(parse_error(
+            "vec2 attribute value is invalid"));
+        return core::Result<attributes::AttributeValue>::success(core::Vec2d{x.value(), y.value()});
+    }
+    case attributes::AttributeType::vec3: {
+        auto x = read_scalar<double>(input, "vec3 x attribute value");
+        auto y = read_scalar<double>(input, "vec3 y attribute value");
+        auto z = read_scalar<double>(input, "vec3 z attribute value");
+        if (!x || !y || !z) return core::Result<attributes::AttributeValue>::failure(parse_error(
+            "vec3 attribute value is invalid"));
+        return core::Result<attributes::AttributeValue>::success(
+            core::Vec3d{x.value(), y.value(), z.value()});
+    }
+    case attributes::AttributeType::vec4:
+    case attributes::AttributeType::color4: {
+        auto x = read_scalar<double>(input, "vec4 x attribute value");
+        auto y = read_scalar<double>(input, "vec4 y attribute value");
+        auto z = read_scalar<double>(input, "vec4 z attribute value");
+        auto w = read_scalar<double>(input, "vec4 w attribute value");
+        if (!x || !y || !z || !w) return core::Result<attributes::AttributeValue>::failure(
+            parse_error("vec4 attribute value is invalid"));
+        return core::Result<attributes::AttributeValue>::success(
+            core::Vec4d{x.value(), y.value(), z.value(), w.value()});
+    }
+    case attributes::AttributeType::string_id:
+    case attributes::AttributeType::object_id:
+    case attributes::AttributeType::vertex_id: {
+        auto encoded = read_uint(input, "uint64 attribute value");
+        if (!encoded) return core::Result<attributes::AttributeValue>::failure(encoded.error());
+        return core::Result<attributes::AttributeValue>::success(encoded.value());
+    }
+    }
+    return core::Result<attributes::AttributeValue>::failure(parse_error(
+        "attribute type is invalid"));
 }
 
 std::filesystem::path temporary_path(const std::filesystem::path& target) {
@@ -568,6 +722,33 @@ std::string ProjectDocument::serialize() const {
             }
             output << '\n';
         }
+        output << "ATTRIBUTES\n";
+        output << "DOMAIN_COUNTS " << mesh.attributes().domain_counts().size() << '\n';
+        for (const auto& [domain, count] : mesh.attributes().domain_counts()) {
+            output << "DOMAIN_COUNT " << static_cast<std::uint64_t>(domain) << ' '
+                   << count << '\n';
+        }
+        output << "LAYERS " << mesh.attributes().layer_count() << '\n';
+        for (const auto& [layer_id, layer] : mesh.attributes().layers()) {
+            output << "LAYER " << std::quoted(layer_id) << ' '
+                   << static_cast<std::uint64_t>(layer.descriptor.domain) << ' '
+                   << static_cast<std::uint64_t>(layer.descriptor.type) << ' '
+                   << layer.values.size() << '\n';
+            for (const auto& value : layer.values) {
+                output << "ATTRIBUTE_VALUE ";
+                write_attribute_value(output, layer.descriptor.type, value);
+                output << '\n';
+            }
+        }
+        output << "UV_SETS " << mesh.uv_sets().descriptors().size() << '\n';
+        for (const auto& [uv_id, descriptor] : mesh.uv_sets().descriptors()) {
+            output << "UV_SET " << uv_id << ' ' << std::quoted(descriptor.name) << ' '
+                   << std::quoted(descriptor.layer_id) << ' '
+                   << (descriptor.active_for_editing ? 1 : 0) << ' '
+                   << (descriptor.active_for_render ? 1 : 0) << ' '
+                   << (descriptor.lightmap_candidate ? 1 : 0) << ' '
+                   << descriptor.tile_policy_version << '\n';
+        }
     }
     output << "TOPOLOGY_RECEIPTS " << topology_receipts_.size() << '\n';
     for (const auto& record : topology_receipts_) {
@@ -796,9 +977,167 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
             const geometry::FaceId face_id{serialized_face_id.value()};
             mesh_faces.push_back(geometry::Face{face_id, std::move(face_vertices)});
         }
+        attributes::AttributeSet mesh_attributes;
+        attributes::UvSetTable mesh_uv_sets;
+        if (version.value() >= 6U) {
+            if (auto result = require_line(input, "ATTRIBUTES"); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            if (auto result = require_line(input, "DOMAIN_COUNTS"); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            auto domain_count = read_uint(input, "attribute domain count");
+            if (!domain_count) {
+                return core::Result<ProjectDocument>::failure(domain_count.error());
+            }
+            if (auto result = validate_serialized_count(
+                    domain_count.value(), kMaxSerializedAttributeDomains,
+                    "mesh attribute domain count");
+                !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            std::set<attributes::AttributeDomain> seen_domains;
+            for (std::uint64_t domain_index = 0U;
+                 domain_index < domain_count.value(); ++domain_index) {
+                if (auto result = require_line(input, "DOMAIN_COUNT"); !result) {
+                    return core::Result<ProjectDocument>::failure(result.error());
+                }
+                auto encoded_domain = read_uint(input, "attribute domain");
+                auto encoded_count = read_uint(input, "attribute domain element count");
+                if (!encoded_domain || !encoded_count ||
+                    encoded_count.value() > std::numeric_limits<std::size_t>::max()) {
+                    return core::Result<ProjectDocument>::failure(parse_error(
+                        "invalid mesh attribute domain record"));
+                }
+                const auto domain = static_cast<attributes::AttributeDomain>(
+                    encoded_domain.value());
+                if (!attributes::valid_domain(domain) || !seen_domains.insert(domain).second) {
+                    return core::Result<ProjectDocument>::failure(parse_error(
+                        "mesh attribute domain is invalid or duplicated"));
+                }
+                if (auto result = mesh_attributes.set_domain_count(
+                        domain, static_cast<std::size_t>(encoded_count.value()));
+                    !result) {
+                    return core::Result<ProjectDocument>::failure(result.error());
+                }
+            }
+
+            if (auto result = require_line(input, "LAYERS"); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            auto layer_count = read_uint(input, "attribute layer count");
+            if (!layer_count) {
+                return core::Result<ProjectDocument>::failure(layer_count.error());
+            }
+            if (auto result = validate_serialized_count(
+                    layer_count.value(), kMaxSerializedAttributeLayers,
+                    "mesh attribute layer count");
+                !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            for (std::uint64_t layer_index = 0U;
+                 layer_index < layer_count.value(); ++layer_index) {
+                if (auto result = require_line(input, "LAYER"); !result) {
+                    return core::Result<ProjectDocument>::failure(result.error());
+                }
+                std::string layer_id;
+                if (!(input >> std::quoted(layer_id)) || layer_id.empty()) {
+                    return core::Result<ProjectDocument>::failure(parse_error(
+                        "invalid mesh attribute layer record"));
+                }
+                auto encoded_domain = read_uint(input, "attribute layer domain");
+                auto encoded_type = read_uint(input, "attribute layer type");
+                auto value_count = read_uint(input, "attribute layer value count");
+                if (!encoded_domain || !encoded_type || !value_count) {
+                    return core::Result<ProjectDocument>::failure(parse_error(
+                        "invalid mesh attribute layer record"));
+                }
+                if (auto result = validate_serialized_count(
+                        value_count.value(), kMaxSerializedAttributeValues,
+                        "mesh attribute value count");
+                    !result) {
+                    return core::Result<ProjectDocument>::failure(result.error());
+                }
+                const auto domain = static_cast<attributes::AttributeDomain>(
+                    encoded_domain.value());
+                const auto type = static_cast<attributes::AttributeType>(encoded_type.value());
+                if (!attributes::valid_domain(domain) || !attributes::valid_type(type)) {
+                    return core::Result<ProjectDocument>::failure(parse_error(
+                        "mesh attribute layer has an unknown domain or type"));
+                }
+                std::vector<attributes::AttributeValue> values;
+                values.reserve(static_cast<std::size_t>(value_count.value()));
+                for (std::uint64_t value_index = 0U;
+                     value_index < value_count.value(); ++value_index) {
+                    if (auto result = require_line(input, "ATTRIBUTE_VALUE"); !result) {
+                        return core::Result<ProjectDocument>::failure(result.error());
+                    }
+                    auto value = read_attribute_value(input, type);
+                    if (!value) {
+                        return core::Result<ProjectDocument>::failure(value.error());
+                    }
+                    values.push_back(std::move(value.value()));
+                }
+                if (auto result = mesh_attributes.add_layer(attributes::AttributeLayer{
+                        {std::move(layer_id), domain, type}, std::move(values)});
+                    !result) {
+                    return core::Result<ProjectDocument>::failure(result.error());
+                }
+            }
+
+            if (auto result = require_line(input, "UV_SETS"); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            auto uv_set_count = read_uint(input, "UV set count");
+            if (!uv_set_count) {
+                return core::Result<ProjectDocument>::failure(uv_set_count.error());
+            }
+            if (auto result = validate_serialized_count(
+                    uv_set_count.value(), kMaxSerializedUvSets, "mesh UV set count");
+                !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            for (std::uint64_t uv_index = 0U;
+                 uv_index < uv_set_count.value(); ++uv_index) {
+                if (auto result = require_line(input, "UV_SET"); !result) {
+                    return core::Result<ProjectDocument>::failure(result.error());
+                }
+                attributes::UvSetDescriptor descriptor;
+                auto encoded_id = read_uint(input, "UV set id");
+                int active_for_editing = 0;
+                int active_for_render = 0;
+                int lightmap_candidate = 0;
+                if (!encoded_id ||
+                    !(input >> std::quoted(descriptor.name) >> std::quoted(descriptor.layer_id) >>
+                      active_for_editing >> active_for_render >> lightmap_candidate >>
+                      descriptor.tile_policy_version) ||
+                    encoded_id.value() == 0U ||
+                    (active_for_editing != 0 && active_for_editing != 1) ||
+                    (active_for_render != 0 && active_for_render != 1) ||
+                    (lightmap_candidate != 0 && lightmap_candidate != 1)) {
+                    return core::Result<ProjectDocument>::failure(parse_error(
+                        "invalid mesh UV set record"));
+                }
+                descriptor.id = encoded_id.value();
+                descriptor.active_for_editing = active_for_editing != 0;
+                descriptor.active_for_render = active_for_render != 0;
+                descriptor.lightmap_candidate = lightmap_candidate != 0;
+                if (auto result = mesh_uv_sets.add(std::move(descriptor)); !result) {
+                    return core::Result<ProjectDocument>::failure(result.error());
+                }
+            }
+        }
         if (auto added = mesh.insert_bulk(std::move(mesh_vertices), std::move(mesh_faces)); !added) {
             return core::Result<ProjectDocument>::failure(
                 added.error().with_context("bulk serialized mesh admission"));
+        }
+        if (version.value() >= 6U) {
+            if (auto result = mesh.set_attribute_payload(
+                    std::move(mesh_attributes), std::move(mesh_uv_sets));
+                !result) {
+                return core::Result<ProjectDocument>::failure(
+                    result.error().with_context("serialized mesh attribute admission"));
+            }
         }
         if (auto result = mesh.restore_revision(core::Revision(ignored_mesh_revision.value())); !result) {
             return core::Result<ProjectDocument>::failure(result.error());

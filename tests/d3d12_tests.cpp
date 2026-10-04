@@ -616,15 +616,21 @@ void d3d12_executes_builtin_shader_suite_and_dispatches_compute() {
     pbr_descriptor.debug_name = "cartographer_builtin_pbr";
     pbr_descriptor.shaders = {pbr_vertex, pbr_fragment};
     pbr_descriptor.descriptor_bindings = {
-        gpu::DescriptorBinding{0U, 0U, gpu::ShaderStage::fragment}};
+        gpu::DescriptorBinding{0U, 0U, gpu::ShaderStage::fragment},
+        gpu::DescriptorBinding{0U, 1U, gpu::ShaderStage::fragment},
+        gpu::DescriptorBinding{0U, 2U, gpu::ShaderStage::fragment},
+        gpu::DescriptorBinding{0U, 3U, gpu::ShaderStage::fragment},
+        gpu::DescriptorBinding{0U, 4U, gpu::ShaderStage::fragment}};
+    pbr_descriptor.sampled_texture_count = 5U;
     pbr_descriptor.cull_mode = gpu::CullMode::none;
     pbr_descriptor.color_format = gpu::Format::rgba32_float;
-    pbr_descriptor.push_constant_bytes = 240U;
-    pbr_descriptor.vertex_stride_bytes = 36U;
+    pbr_descriptor.push_constant_bytes = 224U;
+    pbr_descriptor.vertex_stride_bytes = 52U;
     pbr_descriptor.vertex_attributes = {
         gpu::VertexAttribute{"POSITION", 0U, gpu::VertexFormat::float4, 0U, 0U},
         gpu::VertexAttribute{"NORMAL", 0U, gpu::VertexFormat::float3, 16U, 0U},
         gpu::VertexAttribute{"TEXCOORD", 0U, gpu::VertexFormat::float2, 28U, 0U},
+        gpu::VertexAttribute{"TANGENT", 0U, gpu::VertexFormat::float4, 36U, 0U},
     };
     const auto pbr_pipeline = device.create_pipeline(pbr_descriptor);
     if (!pbr_pipeline) {
@@ -753,56 +759,75 @@ void d3d12_executes_builtin_shader_suite_and_dispatches_compute() {
     const auto sampler = device.create_sampler(sampler_descriptor);
     REQUIRE(sampler);
 
-    std::array<std::uint8_t, 256U> base_color_bytes{};
-    base_color_bytes[0U] = 255U;
-    base_color_bytes[1U] = 128U;
-    base_color_bytes[2U] = 64U;
-    base_color_bytes[3U] = 255U;
-    const auto base_upload = device.create_buffer(gpu::BufferDesc{
-        base_color_bytes.size(),
-        gpu::MemoryClass::upload,
-        gpu::BufferUsage::transfer_source,
-    });
-    const auto base_texture = device.create_texture(gpu::TextureDesc{
-        1U,
-        1U,
-        1U,
-        1U,
-        1U,
+    const std::array<std::array<std::uint8_t, 4U>, 5U> material_texels = {{
+        {{255U, 128U, 64U, 255U}},   // base color, sRGB
+        {{0U, 128U, 255U, 255U}},    // metallic/roughness: B metallic, G roughness
+        {{255U, 0U, 255U, 255U}},    // tangent normal, DirectX Y-
+        {{32U, 255U, 255U, 255U}},   // occlusion in R
+        {{255U, 64U, 0U, 255U}},      // emissive, sRGB
+    }};
+    const std::array<gpu::Format, 5U> material_formats = {{
+        gpu::Format::rgba8_srgb,
         gpu::Format::rgba8_unorm,
-        gpu::TextureDimension::texture_2d,
-        gpu::TextureUsage::sampled | gpu::TextureUsage::transfer_destination,
-    });
-    REQUIRE(base_upload && base_texture);
-    REQUIRE(device.write_buffer(base_upload.value(), 0U, base_color_bytes));
+        gpu::Format::rgba8_unorm,
+        gpu::Format::rgba8_unorm,
+        gpu::Format::rgba8_srgb,
+    }};
+    std::array<gpu::BufferHandle, 5U> material_uploads{};
+    std::array<gpu::TextureHandle, 5U> material_textures{};
+    for (std::size_t index = 0U; index < material_texels.size(); ++index) {
+        const auto upload = device.create_buffer(gpu::BufferDesc{
+            256U,
+            gpu::MemoryClass::upload,
+            gpu::BufferUsage::transfer_source,
+        });
+        const auto texture = device.create_texture(gpu::TextureDesc{
+            1U,
+            1U,
+            1U,
+            1U,
+            1U,
+            material_formats.at(index),
+            gpu::TextureDimension::texture_2d,
+            gpu::TextureUsage::sampled | gpu::TextureUsage::transfer_destination,
+        });
+        REQUIRE(upload && texture);
+        material_uploads.at(index) = upload.value();
+        material_textures.at(index) = texture.value();
+        REQUIRE(device.write_buffer(
+            material_uploads.at(index), 0U, material_texels.at(index)));
+    }
     device_ir::DeviceCommandStream upload_stream;
-    upload_stream.append(device_ir::CmdTransitionResource{
-        device_ir::ResourceHandle{base_upload.value()},
-        device_ir::ResourceState::undefined,
-        device_ir::ResourceState::copy_source,
-    });
-    upload_stream.append(device_ir::CmdTransitionResource{
-        device_ir::ResourceHandle{base_texture.value()},
-        device_ir::ResourceState::undefined,
-        device_ir::ResourceState::copy_destination,
-    });
-    upload_stream.append(device_ir::CmdCopyBufferToTexture{
-        base_upload.value(), base_texture.value(), 0U});
+    for (std::size_t index = 0U; index < material_texels.size(); ++index) {
+        upload_stream.append(device_ir::CmdTransitionResource{
+            device_ir::ResourceHandle{material_uploads.at(index)},
+            device_ir::ResourceState::undefined,
+            device_ir::ResourceState::copy_source,
+        });
+        upload_stream.append(device_ir::CmdTransitionResource{
+            device_ir::ResourceHandle{material_textures.at(index)},
+            device_ir::ResourceState::undefined,
+            device_ir::ResourceState::copy_destination,
+        });
+        upload_stream.append(device_ir::CmdCopyBufferToTexture{
+            material_uploads.at(index), material_textures.at(index), 0U});
+    }
     const auto upload_serial = device.submit(upload_stream, gpu::QueueType::copy);
     REQUIRE(upload_serial);
     REQUIRE(device.wait(upload_serial.value()));
-    REQUIRE(device.destroy_buffer(base_upload.value()));
+    for (const auto upload : material_uploads) REQUIRE(device.destroy_buffer(upload));
 
     struct PbrVertex {
         float position[4];
         float normal[3];
         float uv[2];
+        float tangent[4];
     };
-    static_assert(sizeof(PbrVertex) == 36U);
+    static_assert(sizeof(PbrVertex) == 52U);
     const std::array<PbrVertex, 3U> vertices = {{
-        PbrVertex{{-0.75F, -0.75F, 0.0F, 1.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F}},
-        PbrVertex{{0.75F, -0.75F, 0.0F, 1.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 1.0F}},
-        PbrVertex{{0.0F, 0.75F, 0.0F, 1.0F}, {0.0F, 0.0F, 1.0F}, {0.5F, 0.0F}},
+        PbrVertex{{-0.75F, -0.75F, 0.0F, 1.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+        PbrVertex{{0.75F, -0.75F, 0.0F, 1.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 1.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+        PbrVertex{{0.0F, 0.75F, 0.0F, 1.0F}, {0.0F, 0.0F, 1.0F}, {0.5F, 0.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
     }};
     const std::array<std::uint32_t, 3U> indices = {0U, 1U, 2U};
     const auto vertex_buffer = device.create_buffer(gpu::BufferDesc{
@@ -850,7 +875,7 @@ void d3d12_executes_builtin_shader_suite_and_dispatches_compute() {
     REQUIRE(device.write_buffer(vertex_buffer.value(), 0U, bytes_of(vertices)));
     REQUIRE(device.write_buffer(index_buffer.value(), 0U, bytes_of(indices)));
 
-    std::array<float, 60U> pbr_constants{};
+    std::array<float, 56U> pbr_constants{};
     for (std::size_t matrix = 0U; matrix < 2U; ++matrix) {
         for (std::size_t diagonal = 0U; diagonal < 4U; ++diagonal) {
             pbr_constants[matrix * 16U + diagonal * 5U] = 1.0F;
@@ -862,7 +887,13 @@ void d3d12_executes_builtin_shader_suite_and_dispatches_compute() {
     pbr_constants[37U] = 1.0F;
     pbr_constants[38U] = 1.0F;
     pbr_constants[39U] = 1.0F;
-    pbr_constants[45U] = 0.5F;
+    pbr_constants[40U] = 0.2F;
+    pbr_constants[41U] = 0.1F;
+    pbr_constants[43U] = 1.0F;
+    pbr_constants[44U] = 1.0F;
+    pbr_constants[45U] = 1.0F;
+    pbr_constants[46U] = 1.0F;
+    pbr_constants[47U] = 1.0F;
     pbr_constants[48U] = 0.0F;
     pbr_constants[49U] = 0.0F;
     pbr_constants[50U] = 1.0F;
@@ -870,16 +901,17 @@ void d3d12_executes_builtin_shader_suite_and_dispatches_compute() {
     pbr_constants[52U] = 4.0F;
     pbr_constants[53U] = 4.0F;
     pbr_constants[54U] = 4.0F;
-    pbr_constants[55U] = 100.0F;
-    pbr_constants[59U] = 1.0F;
+    pbr_constants[55U] = 1.0F;
     const std::array<float, 4U> tone_constants = {0.0F, 0.0F, 0.0F, 0.0F};
 
     device_ir::DeviceCommandStream render_stream;
-    render_stream.append(device_ir::CmdTransitionResource{
-        device_ir::ResourceHandle{base_texture.value()},
-        device_ir::ResourceState::copy_destination,
-        device_ir::ResourceState::shader_read,
-    });
+    for (const auto texture : material_textures) {
+        render_stream.append(device_ir::CmdTransitionResource{
+            device_ir::ResourceHandle{texture},
+            device_ir::ResourceState::copy_destination,
+            device_ir::ResourceState::shader_read,
+        });
+    }
     render_stream.append(device_ir::CmdTransitionResource{
         device_ir::ResourceHandle{vertex_buffer.value()},
         device_ir::ResourceState::undefined,
@@ -911,11 +943,21 @@ void d3d12_executes_builtin_shader_suite_and_dispatches_compute() {
     render_stream.append(device_ir::CmdSetViewport{0.0F, 0.0F, 32.0F, 32.0F, 0.0F, 1.0F});
     render_stream.append(device_ir::CmdSetScissor{0, 0, 32U, 32U});
     render_stream.append(device_ir::CmdBindPipeline{pbr_pipeline.value()});
-    render_stream.append(device_ir::CmdBindVertexBuffer{vertex_buffer.value(), 0U, 36U});
+    render_stream.append(device_ir::CmdBindVertexBuffer{vertex_buffer.value(), 0U, 52U});
     render_stream.append(device_ir::CmdBindIndexBuffer{
         index_buffer.value(), 0U, device_ir::IndexFormat::uint32});
-    render_stream.append(device_ir::CmdBindResources{{device_ir::ResourceBinding{
-        0U, 0U, device_ir::ResourceHandle{base_texture.value()}, sampler.value()}}});
+    render_stream.append(device_ir::CmdBindResources{{
+        device_ir::ResourceBinding{
+            0U, 0U, device_ir::ResourceHandle{material_textures.at(0U)}, sampler.value()},
+        device_ir::ResourceBinding{
+            0U, 1U, device_ir::ResourceHandle{material_textures.at(1U)}, std::nullopt},
+        device_ir::ResourceBinding{
+            0U, 2U, device_ir::ResourceHandle{material_textures.at(2U)}, std::nullopt},
+        device_ir::ResourceBinding{
+            0U, 3U, device_ir::ResourceHandle{material_textures.at(3U)}, std::nullopt},
+        device_ir::ResourceBinding{
+            0U, 4U, device_ir::ResourceHandle{material_textures.at(4U)}, std::nullopt},
+    }});
     render_stream.append(device_ir::CmdPushConstants{bytes_of(pbr_constants)});
     render_stream.append(device_ir::CmdDrawIndexed{3U, 1U, 0U, 0, 0U});
     render_stream.append(device_ir::CmdEndRendering{});
@@ -929,7 +971,7 @@ void d3d12_executes_builtin_shader_suite_and_dispatches_compute() {
     render_stream.append(device_ir::CmdSetViewport{0.0F, 0.0F, 32.0F, 32.0F, 0.0F, 1.0F});
     render_stream.append(device_ir::CmdSetScissor{0, 0, 32U, 32U});
     render_stream.append(device_ir::CmdBindPipeline{tone_pipeline.value()});
-    render_stream.append(device_ir::CmdBindVertexBuffer{vertex_buffer.value(), 0U, 36U});
+    render_stream.append(device_ir::CmdBindVertexBuffer{vertex_buffer.value(), 0U, 52U});
     render_stream.append(device_ir::CmdBindResources{{device_ir::ResourceBinding{
         0U, 0U, device_ir::ResourceHandle{pbr_target.value()}, sampler.value()}}});
     render_stream.append(device_ir::CmdPushConstants{bytes_of(tone_constants)});
@@ -1166,7 +1208,7 @@ void d3d12_executes_builtin_shader_suite_and_dispatches_compute() {
     REQUIRE(device.destroy_texture(tone_target.value()));
     REQUIRE(device.destroy_texture(depth_target.value()));
     REQUIRE(device.destroy_texture(pbr_target.value()));
-    REQUIRE(device.destroy_texture(base_texture.value()));
+    for (const auto texture : material_textures) REQUIRE(device.destroy_texture(texture));
     REQUIRE(device.destroy_buffer(index_buffer.value()));
     REQUIRE(device.destroy_buffer(vertex_buffer.value()));
     REQUIRE(device.destroy_sampler(sampler.value()));
@@ -1191,7 +1233,7 @@ void d3d12_executes_builtin_shader_suite_and_dispatches_compute() {
     }
 }
 
-void d3d12_accepts_8k_render_target_clear() {
+void d3d12_accepts_8k_temporal_resolve() {
     using namespace carto;
 
     const auto created = d3d12::D3D12Device::create(d3d12::D3D12DeviceOptions{
@@ -1199,34 +1241,233 @@ void d3d12_accepts_8k_render_target_clear() {
     REQUIRE(created);
     auto& device = *created.value();
     REQUIRE(device.capabilities().max_texture_dimension_2d >= 8192U);
-    const auto target = device.create_texture(gpu::TextureDesc{
+    const auto temporal_source = d3d12::compile_hlsl(d3d12::ShaderSource{
+        "cartographer_8k_temporal",
+        gpu::ShaderStage::compute,
+        "CSMain",
+        "cartographer_temporal.hlsl",
+        read_d3d12_shader("cartographer_temporal.hlsl"),
+        true,
+        false,
+    });
+    REQUIRE(temporal_source);
+    const auto temporal_shader = device.create_shader(temporal_source.value());
+    REQUIRE(temporal_shader);
+    gpu::PipelineDesc temporal_descriptor;
+    temporal_descriptor.debug_name = "cartographer_8k_temporal";
+    temporal_descriptor.shaders = {temporal_shader.value()};
+    temporal_descriptor.descriptor_bindings = {
+        gpu::DescriptorBinding{0U, 0U, gpu::ShaderStage::compute},
+        gpu::DescriptorBinding{0U, 1U, gpu::ShaderStage::compute},
+        gpu::DescriptorBinding{0U, 2U, gpu::ShaderStage::compute},
+        gpu::DescriptorBinding{0U, 3U, gpu::ShaderStage::compute},
+    };
+    temporal_descriptor.sampled_texture_count = 3U;
+    temporal_descriptor.depth_test = false;
+    temporal_descriptor.push_constant_bytes = 48U;
+    const auto temporal_pipeline = device.create_pipeline(temporal_descriptor);
+    REQUIRE(temporal_pipeline);
+
+    const auto probe_source = d3d12::compile_hlsl(d3d12::ShaderSource{
+        "cartographer_8k_probe",
+        gpu::ShaderStage::compute,
+        "CSMain",
+        "cartographer_8k_probe.hlsl",
+        R"(
+            Texture2D<float4> source_color : register(t0);
+            RWTexture2D<float4> probe_color : register(u0);
+
+            [numthreads(1, 1, 1)]
+            void CSMain(uint3 dispatch_id : SV_DISPATCHTHREADID) {
+                uint width;
+                uint height;
+                source_color.GetDimensions(width, height);
+                probe_color[uint2(0, 0)] =
+                    source_color.Load(int3(width / 2, height / 2, 0));
+            }
+        )",
+        true,
+        false,
+    });
+    REQUIRE(probe_source);
+    const auto probe_shader = device.create_shader(probe_source.value());
+    REQUIRE(probe_shader);
+    gpu::PipelineDesc probe_descriptor;
+    probe_descriptor.debug_name = "cartographer_8k_probe";
+    probe_descriptor.shaders = {probe_shader.value()};
+    probe_descriptor.descriptor_bindings = {
+        gpu::DescriptorBinding{0U, 0U, gpu::ShaderStage::compute},
+        gpu::DescriptorBinding{0U, 1U, gpu::ShaderStage::compute},
+    };
+    probe_descriptor.sampled_texture_count = 1U;
+    probe_descriptor.depth_test = false;
+    const auto probe_pipeline = device.create_pipeline(probe_descriptor);
+    REQUIRE(probe_pipeline);
+
+    const auto temporal_current = device.create_texture(gpu::TextureDesc{
         8192U,
         8192U,
         1U,
         1U,
         1U,
-        gpu::Format::rgba8_unorm,
+        gpu::Format::rgba16_float,
         gpu::TextureDimension::texture_2d,
-        gpu::TextureUsage::color_attachment,
-        {0.05F, 0.1F, 0.2F, 1.0F},
+        gpu::TextureUsage::sampled | gpu::TextureUsage::color_attachment,
+        {0.2F, 0.4F, 0.6F, 1.0F},
         1.0F,
     });
-    REQUIRE(target);
-    device_ir::DeviceCommandStream stream;
-    stream.append(device_ir::CmdTransitionResource{
-        device_ir::ResourceHandle{target.value()},
-        device_ir::ResourceState::undefined,
-        device_ir::ResourceState::render_target,
+    const auto temporal_history = device.create_texture(gpu::TextureDesc{
+        8192U,
+        8192U,
+        1U,
+        1U,
+        1U,
+        gpu::Format::rgba16_float,
+        gpu::TextureDimension::texture_2d,
+        gpu::TextureUsage::sampled | gpu::TextureUsage::color_attachment,
+        {0.8F, 0.6F, 0.4F, 1.0F},
+        1.0F,
     });
-    stream.append(device_ir::CmdBeginRendering{target.value(), std::nullopt});
-    stream.append(device_ir::CmdClearColor{target.value(), {0.05F, 0.1F, 0.2F, 1.0F}});
-    stream.append(device_ir::CmdEndRendering{});
-    const auto serial = device.submit(stream, gpu::QueueType::graphics);
-    REQUIRE(serial);
-    REQUIRE(device.wait(serial.value()));
-    REQUIRE(device.destroy_texture(target.value()));
+    const auto temporal_motion = device.create_texture(gpu::TextureDesc{
+        8192U,
+        8192U,
+        1U,
+        1U,
+        1U,
+        gpu::Format::rg16_float,
+        gpu::TextureDimension::texture_2d,
+        gpu::TextureUsage::sampled | gpu::TextureUsage::color_attachment,
+        {0.0F, 0.0F, 0.0F, 0.0F},
+        1.0F,
+    });
+    const auto temporal_resolved = device.create_texture(gpu::TextureDesc{
+        8192U,
+        8192U,
+        1U,
+        1U,
+        1U,
+        gpu::Format::rgba16_float,
+        gpu::TextureDimension::texture_2d,
+        gpu::TextureUsage::sampled | gpu::TextureUsage::storage,
+        {0.0F, 0.0F, 0.0F, 1.0F},
+        1.0F,
+    });
+    const auto probe = device.create_texture(gpu::TextureDesc{
+        1U,
+        1U,
+        1U,
+        1U,
+        1U,
+        gpu::Format::rgba32_float,
+        gpu::TextureDimension::texture_2d,
+        gpu::TextureUsage::storage | gpu::TextureUsage::transfer_source,
+    });
+    REQUIRE(temporal_current && temporal_history && temporal_motion && temporal_resolved && probe);
+
+    device_ir::DeviceCommandStream setup;
+    const auto clear_input = [&setup](gpu::TextureHandle texture, std::array<float, 4U> color) {
+        setup.append(device_ir::CmdTransitionResource{
+            device_ir::ResourceHandle{texture},
+            device_ir::ResourceState::undefined,
+            device_ir::ResourceState::render_target,
+        });
+        setup.append(device_ir::CmdBeginRendering{texture, std::nullopt});
+        setup.append(device_ir::CmdClearColor{texture, color});
+        setup.append(device_ir::CmdEndRendering{});
+        setup.append(device_ir::CmdTransitionResource{
+            device_ir::ResourceHandle{texture},
+            device_ir::ResourceState::render_target,
+            device_ir::ResourceState::shader_read,
+        });
+    };
+    clear_input(temporal_current.value(), {0.2F, 0.4F, 0.6F, 1.0F});
+    clear_input(temporal_history.value(), {0.8F, 0.6F, 0.4F, 1.0F});
+    clear_input(temporal_motion.value(), {0.0F, 0.0F, 0.0F, 0.0F});
+    setup.append(device_ir::CmdTransitionResource{
+        device_ir::ResourceHandle{temporal_resolved.value()},
+        device_ir::ResourceState::undefined,
+        device_ir::ResourceState::shader_write,
+    });
+    setup.append(device_ir::CmdTransitionResource{
+        device_ir::ResourceHandle{probe.value()},
+        device_ir::ResourceState::undefined,
+        device_ir::ResourceState::shader_write,
+    });
+    const auto setup_serial = device.submit(setup, gpu::QueueType::graphics);
+    REQUIRE(setup_serial);
+    REQUIRE(device.wait(setup_serial.value()));
+
+    const std::array<float, 8U> temporal_float_constants = {
+        0.5F, 0.0F, 0.0F, 0.0F,
+        0.0F, 0.0F, 1.0F / 8192.0F, 1.0F / 8192.0F,
+    };
+    const std::array<std::uint32_t, 4U> temporal_flags = {1U, 0U, 0U, 0U};
+    std::array<std::uint8_t, 48U> temporal_constants{};
+    std::memcpy(temporal_constants.data(), temporal_float_constants.data(),
+                sizeof(temporal_float_constants));
+    std::memcpy(temporal_constants.data() + sizeof(temporal_float_constants),
+                temporal_flags.data(), sizeof(temporal_flags));
+    device_ir::DeviceCommandStream temporal_stream;
+    temporal_stream.append(device_ir::CmdBindPipeline{temporal_pipeline.value()});
+    temporal_stream.append(device_ir::CmdBindResources{{
+        device_ir::ResourceBinding{
+            0U, 0U, device_ir::ResourceHandle{temporal_current.value()}, std::nullopt},
+        device_ir::ResourceBinding{
+            0U, 1U, device_ir::ResourceHandle{temporal_history.value()}, std::nullopt},
+        device_ir::ResourceBinding{
+            0U, 2U, device_ir::ResourceHandle{temporal_motion.value()}, std::nullopt},
+        device_ir::ResourceBinding{
+            0U, 3U, device_ir::ResourceHandle{temporal_resolved.value()}, std::nullopt},
+    }});
+    temporal_stream.append(device_ir::CmdPushConstants{bytes_of(temporal_constants)});
+    temporal_stream.append(device_ir::CmdDispatch{1024U, 1024U, 1U});
+    temporal_stream.append(device_ir::CmdUavBarrier{
+        device_ir::ResourceHandle{temporal_resolved.value()}});
+    temporal_stream.append(device_ir::CmdTransitionResource{
+        device_ir::ResourceHandle{temporal_resolved.value()},
+        device_ir::ResourceState::shader_write,
+        device_ir::ResourceState::shader_read,
+    });
+    const auto temporal_serial = device.submit(temporal_stream, gpu::QueueType::compute);
+    REQUIRE(temporal_serial);
+    REQUIRE(device.wait(temporal_serial.value()));
+
+    device_ir::DeviceCommandStream probe_stream;
+    probe_stream.append(device_ir::CmdBindPipeline{probe_pipeline.value()});
+    probe_stream.append(device_ir::CmdBindResources{{
+        device_ir::ResourceBinding{
+            0U, 0U, device_ir::ResourceHandle{temporal_resolved.value()}, std::nullopt},
+        device_ir::ResourceBinding{
+            0U, 1U, device_ir::ResourceHandle{probe.value()}, std::nullopt},
+    }});
+    probe_stream.append(device_ir::CmdDispatch{1U, 1U, 1U});
+    probe_stream.append(device_ir::CmdUavBarrier{
+        device_ir::ResourceHandle{probe.value()}});
+    const auto probe_serial = device.submit(probe_stream, gpu::QueueType::compute);
+    if (!probe_serial) {
+        throw TestFailure("D3D12 8K probe submit: " + probe_serial.error().message);
+    }
+    REQUIRE(probe_serial);
+    REQUIRE(device.wait(probe_serial.value()));
+    const auto probe_pixels = device.read_texture_rgba32f(probe.value());
+    REQUIRE(probe_pixels);
+    REQUIRE(probe_pixels.value().size() == 4U);
+    REQUIRE(probe_pixels.value().at(0U) > 0.48F && probe_pixels.value().at(0U) < 0.52F);
+    REQUIRE(probe_pixels.value().at(1U) > 0.48F && probe_pixels.value().at(1U) < 0.52F);
+    REQUIRE(probe_pixels.value().at(2U) > 0.48F && probe_pixels.value().at(2U) < 0.52F);
+    REQUIRE(probe_pixels.value().at(3U) > 0.99F);
+
+    REQUIRE(device.destroy_texture(probe.value()));
+    REQUIRE(device.destroy_texture(temporal_resolved.value()));
+    REQUIRE(device.destroy_texture(temporal_motion.value()));
+    REQUIRE(device.destroy_texture(temporal_history.value()));
+    REQUIRE(device.destroy_texture(temporal_current.value()));
+    REQUIRE(device.destroy_pipeline(probe_pipeline.value()));
+    REQUIRE(device.destroy_shader(probe_shader.value()));
+    REQUIRE(device.destroy_pipeline(temporal_pipeline.value()));
+    REQUIRE(device.destroy_shader(temporal_shader.value()));
     if (!device.debug_receipts().empty()) {
-        std::string message = "D3D12 8K debug receipts:";
+        std::string message = "D3D12 8K temporal debug receipts:";
         for (const auto& receipt : device.debug_receipts()) message += " | " + receipt;
         throw TestFailure(message);
     }
@@ -1339,8 +1580,8 @@ int main() {
         std::cout << "PASS D3D12 DXIL indexed draw and texture readback\n";
         d3d12_executes_builtin_shader_suite_and_dispatches_compute();
         std::cout << "PASS D3D12 built-in PBR/tone-map/shadow/temporal and compute dispatch\n";
-        d3d12_accepts_8k_render_target_clear();
-        std::cout << "PASS D3D12 8K render-target acceptance\n";
+        d3d12_accepts_8k_temporal_resolve();
+        std::cout << "PASS D3D12 8K temporal resolve acceptance\n";
         d3d12_exercises_hidden_swapchain_resize_and_present();
         std::cout << "PASS D3D12 hidden swapchain resize and present\n";
         return 0;

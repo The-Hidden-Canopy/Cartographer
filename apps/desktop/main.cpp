@@ -35,12 +35,14 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -142,22 +144,32 @@ public:
         }
         if (client_width() == 0 || client_height() == 0) return;
 
-        check_vk(vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+        FrameContext& frame = frame_contexts_.at(current_frame_);
+        check_vk(vkWaitForFences(device_, 1, &frame.fence, VK_TRUE, UINT64_MAX),
+                 "vkWaitForFences frame context");
 
         std::uint32_t image_index = 0;
         const VkResult acquired = vkAcquireNextImageKHR(
-            device_, swapchain_, UINT64_MAX, image_available_, VK_NULL_HANDLE, &image_index);
-        if (acquired == VK_ERROR_OUT_OF_DATE_KHR || acquired == VK_SUBOPTIMAL_KHR) {
+            device_, swapchain_, UINT64_MAX, frame.image_available, VK_NULL_HANDLE, &image_index);
+        if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
             resize_pending_ = true;
             return;
         }
+        if (acquired == VK_SUBOPTIMAL_KHR) resize_pending_ = true;
         check_vk(acquired, "vkAcquireNextImageKHR");
-        check_vk(vkResetFences(device_, 1, &fence_), "vkResetFences");
+        if (image_fences_.at(image_index) != VK_NULL_HANDLE &&
+            image_fences_.at(image_index) != frame.fence) {
+            check_vk(vkWaitForFences(
+                         device_, 1, &image_fences_.at(image_index), VK_TRUE, UINT64_MAX),
+                     "vkWaitForFences swapchain image");
+        }
+        image_fences_.at(image_index) = frame.fence;
+        check_vk(vkResetFences(device_, 1, &frame.fence), "vkResetFences");
 
-        check_vk(vkResetCommandBuffer(command_buffer_, 0), "vkResetCommandBuffer");
+        check_vk(vkResetCommandBuffer(frame.command_buffer, 0), "vkResetCommandBuffer");
         VkCommandBufferBeginInfo begin{};
         begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        check_vk(vkBeginCommandBuffer(command_buffer_, &begin), "vkBeginCommandBuffer");
+        check_vk(vkBeginCommandBuffer(frame.command_buffer, &begin), "vkBeginCommandBuffer");
 
         VkClearValue clear_value{};
         clear_value.color.float32[0] = 0.035F;
@@ -173,39 +185,84 @@ public:
         pass.renderArea.extent = {swapchain_width_, swapchain_height_};
         pass.clearValueCount = static_cast<std::uint32_t>(clear.size());
         pass.pClearValues = clear.data();
-        vkCmdBeginRenderPass(command_buffer_, &pass, VK_SUBPASS_CONTENTS_INLINE);
-        ImGui_ImplVulkan_RenderDrawData(draw_data, command_buffer_);
-        vkCmdEndRenderPass(command_buffer_);
-        check_vk(vkEndCommandBuffer(command_buffer_), "vkEndCommandBuffer");
+        vkCmdBeginRenderPass(frame.command_buffer, &pass, VK_SUBPASS_CONTENTS_INLINE);
+        ImGui_ImplVulkan_RenderDrawData(draw_data, frame.command_buffer);
+        vkCmdEndRenderPass(frame.command_buffer);
+        check_vk(vkEndCommandBuffer(frame.command_buffer), "vkEndCommandBuffer");
 
         const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo submit{};
         submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submit.waitSemaphoreCount = 1;
-        submit.pWaitSemaphores = &image_available_;
+        submit.pWaitSemaphores = &frame.image_available;
         submit.pWaitDstStageMask = &wait_stage;
         submit.commandBufferCount = 1;
-        submit.pCommandBuffers = &command_buffer_;
+        submit.pCommandBuffers = &frame.command_buffer;
         submit.signalSemaphoreCount = 1;
-        submit.pSignalSemaphores = &render_finished_;
-        check_vk(vkQueueSubmit(queue_, 1, &submit, fence_), "vkQueueSubmit");
+        submit.pSignalSemaphores = &frame.render_finished;
+        check_vk(vkQueueSubmit(queue_, 1, &submit, frame.fence), "vkQueueSubmit");
 
         VkPresentInfoKHR present{};
         present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         present.waitSemaphoreCount = 1;
-        present.pWaitSemaphores = &render_finished_;
+        present.pWaitSemaphores = &frame.render_finished;
         present.swapchainCount = 1;
         present.pSwapchains = &swapchain_;
         present.pImageIndices = &image_index;
         const VkResult presented = vkQueuePresentKHR(queue_, &present);
         if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) {
             resize_pending_ = true;
-            return;
+        } else {
+            check_vk(presented, "vkQueuePresentKHR");
         }
-        check_vk(presented, "vkQueuePresentKHR");
+        frame.frame_id = next_frame_id_++;
+        current_frame_ = (current_frame_ + 1U) % frame_contexts_.size();
     }
 
 private:
+    struct FrameContext {
+        VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        VkSemaphore image_available = VK_NULL_HANDLE;
+        VkSemaphore render_finished = VK_NULL_HANDLE;
+        std::uint64_t frame_id = 0U;
+    };
+
+    static constexpr std::size_t kFrameContextCount = 3U;
+
+    enum class PresentPolicy {
+        performance,
+        vsync,
+        immediate,
+    };
+
+    [[nodiscard]] static PresentPolicy present_policy_from_environment() noexcept {
+        const char* requested = std::getenv("CARTO_PRESENT_MODE");
+        if (requested == nullptr) return PresentPolicy::performance;
+        const std::string_view value(requested);
+        if (value == "fifo" || value == "vsync") return PresentPolicy::vsync;
+        if (value == "immediate" || value == "debug") return PresentPolicy::immediate;
+        return PresentPolicy::performance;
+    }
+
+    [[nodiscard]] VkPresentModeKHR select_present_mode(
+        const std::vector<VkPresentModeKHR>& supported) const {
+        const auto has = [&supported](VkPresentModeKHR mode) {
+            return std::find(supported.begin(), supported.end(), mode) != supported.end();
+        };
+        switch (present_policy_) {
+        case PresentPolicy::performance:
+            if (has(VK_PRESENT_MODE_MAILBOX_KHR)) return VK_PRESENT_MODE_MAILBOX_KHR;
+            return VK_PRESENT_MODE_FIFO_KHR;
+        case PresentPolicy::vsync:
+            return VK_PRESENT_MODE_FIFO_KHR;
+        case PresentPolicy::immediate:
+            if (has(VK_PRESENT_MODE_IMMEDIATE_KHR)) return VK_PRESENT_MODE_IMMEDIATE_KHR;
+            return VK_PRESENT_MODE_FIFO_KHR;
+        }
+        return VK_PRESENT_MODE_FIFO_KHR;
+    }
+
     [[nodiscard]] VkWin32SurfaceCreateInfoKHR surface_info() const noexcept {
         VkWin32SurfaceCreateInfoKHR info{};
         info.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
@@ -331,17 +388,27 @@ private:
         allocate.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         allocate.commandPool = command_pool_;
         allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocate.commandBufferCount = 1;
-        check_vk(vkAllocateCommandBuffers(device_, &allocate, &command_buffer_), "vkAllocateCommandBuffers");
+        allocate.commandBufferCount = static_cast<std::uint32_t>(kFrameContextCount);
+        std::array<VkCommandBuffer, kFrameContextCount> command_buffers{};
+        check_vk(vkAllocateCommandBuffers(device_, &allocate, command_buffers.data()),
+                 "vkAllocateCommandBuffers");
 
         VkSemaphoreCreateInfo semaphore{};
         semaphore.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-        check_vk(vkCreateSemaphore(device_, &semaphore, nullptr, &image_available_), "vkCreateSemaphore");
-        check_vk(vkCreateSemaphore(device_, &semaphore, nullptr, &render_finished_), "vkCreateSemaphore");
         VkFenceCreateInfo fence{};
         fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-        check_vk(vkCreateFence(device_, &fence, nullptr, &fence_), "vkCreateFence");
+        frame_contexts_.resize(kFrameContextCount);
+        for (std::size_t index = 0U; index < frame_contexts_.size(); ++index) {
+            auto& frame = frame_contexts_[index];
+            frame.command_buffer = command_buffers[index];
+            check_vk(vkCreateSemaphore(device_, &semaphore, nullptr, &frame.image_available),
+                     "vkCreateSemaphore image_available");
+            check_vk(vkCreateSemaphore(device_, &semaphore, nullptr, &frame.render_finished),
+                     "vkCreateSemaphore render_finished");
+            check_vk(vkCreateFence(device_, &fence, nullptr, &frame.fence),
+                     "vkCreateFence frame context");
+        }
     }
 
     void create_descriptor_pool() {
@@ -378,6 +445,15 @@ private:
         check_vk(vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device_, surface_, &format_count, formats.data()),
                  "vkGetPhysicalDeviceSurfaceFormatsKHR");
         if (formats.empty()) throw std::runtime_error("Vulkan surface reported no swapchain formats");
+        std::uint32_t present_mode_count = 0U;
+        check_vk(vkGetPhysicalDeviceSurfacePresentModesKHR(
+                     physical_device_, surface_, &present_mode_count, nullptr),
+                 "vkGetPhysicalDeviceSurfacePresentModesKHR");
+        std::vector<VkPresentModeKHR> present_modes(present_mode_count);
+        check_vk(vkGetPhysicalDeviceSurfacePresentModesKHR(
+                     physical_device_, surface_, &present_mode_count, present_modes.data()),
+                 "vkGetPhysicalDeviceSurfacePresentModesKHR");
+        const VkPresentModeKHR present_mode = select_present_mode(present_modes);
         VkSurfaceFormatKHR selected_format{};
         bool found_preferred_format = false;
         for (const auto& format : formats) {
@@ -417,7 +493,7 @@ private:
         info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         info.preTransform = capabilities.currentTransform;
         info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-        info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        info.presentMode = present_mode;
         info.clipped = VK_TRUE;
         check_vk(vkCreateSwapchainKHR(device_, &info, nullptr, &swapchain_), "vkCreateSwapchainKHR");
 
@@ -427,6 +503,7 @@ private:
         check_vk(vkGetSwapchainImagesKHR(device_, swapchain_, &actual_count, images_.data()), "vkGetSwapchainImagesKHR");
         image_views_.resize(images_.size());
         framebuffers_.resize(images_.size());
+        image_fences_.assign(images_.size(), VK_NULL_HANDLE);
         for (std::size_t index = 0; index < images_.size(); ++index) {
             VkImageViewCreateInfo view{};
             view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -478,9 +555,15 @@ public:
             for (VkImageView view : image_views_) vkDestroyImageView(device_, view, nullptr);
             if (swapchain_ != VK_NULL_HANDLE) vkDestroySwapchainKHR(device_, swapchain_, nullptr);
             if (descriptor_pool_ != VK_NULL_HANDLE) vkDestroyDescriptorPool(device_, descriptor_pool_, nullptr);
-            if (fence_ != VK_NULL_HANDLE) vkDestroyFence(device_, fence_, nullptr);
-            if (image_available_ != VK_NULL_HANDLE) vkDestroySemaphore(device_, image_available_, nullptr);
-            if (render_finished_ != VK_NULL_HANDLE) vkDestroySemaphore(device_, render_finished_, nullptr);
+            for (auto& frame : frame_contexts_) {
+                if (frame.fence != VK_NULL_HANDLE) vkDestroyFence(device_, frame.fence, nullptr);
+                if (frame.image_available != VK_NULL_HANDLE) {
+                    vkDestroySemaphore(device_, frame.image_available, nullptr);
+                }
+                if (frame.render_finished != VK_NULL_HANDLE) {
+                    vkDestroySemaphore(device_, frame.render_finished, nullptr);
+                }
+            }
             if (command_pool_ != VK_NULL_HANDLE) vkDestroyCommandPool(device_, command_pool_, nullptr);
             if (render_pass_ != VK_NULL_HANDLE) vkDestroyRenderPass(device_, render_pass_, nullptr);
             vkDestroyDevice(device_, nullptr);
@@ -492,6 +575,8 @@ public:
         }
         if (instance_ != VK_NULL_HANDLE) vkDestroyInstance(instance_, nullptr);
         instance_ = VK_NULL_HANDLE;
+        frame_contexts_.clear();
+        image_fences_.clear();
     }
 
 private:
@@ -512,11 +597,12 @@ private:
     std::vector<VkFramebuffer> framebuffers_;
     VkRenderPass render_pass_ = VK_NULL_HANDLE;
     VkCommandPool command_pool_ = VK_NULL_HANDLE;
-    VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
-    VkSemaphore image_available_ = VK_NULL_HANDLE;
-    VkSemaphore render_finished_ = VK_NULL_HANDLE;
-    VkFence fence_ = VK_NULL_HANDLE;
+    std::vector<FrameContext> frame_contexts_;
+    std::vector<VkFence> image_fences_;
+    std::size_t current_frame_ = 0U;
+    std::uint64_t next_frame_id_ = 0U;
+    PresentPolicy present_policy_ = present_policy_from_environment();
     bool imgui_initialized_ = false;
     bool resize_pending_ = false;
 };

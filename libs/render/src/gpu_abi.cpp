@@ -99,7 +99,11 @@ core::Result<void> validate(const GpuMaterialConstants& constants) {
         constants.surface_factors[3] < 0.0F ||
         constants.surface_factors[3] > 1.0F ||
         constants.alpha_factors[0] < 0.0F ||
-        constants.alpha_factors[0] > 1.0F) {
+        constants.alpha_factors[0] > 1.0F ||
+        constants.alpha_factors[1] < 0.0F ||
+        constants.alpha_factors[1] > 2.0F ||
+        constants.alpha_factors[2] < 0.0F ||
+        constants.alpha_factors[2] > 1.0F) {
         return core::Result<void>::failure(validation(
             "GPU material constants contain out-of-range surface factors"));
     }
@@ -171,7 +175,12 @@ core::Result<GpuMaterialConstants> pack_material_for_gpu(
         emissive_x.value(), emissive_y.value(), emissive_z.value(), emissive_strength.value()};
     result.surface_factors = {
         metallic.value(), roughness.value(), normal_scale.value(), occlusion.value()};
-    result.alpha_factors = {alpha_cutoff.value(), 0.0F, 0.0F, 0.0F};
+    result.alpha_factors = {
+        alpha_cutoff.value(),
+        static_cast<float>(material.alpha_mode),
+        material.normal.normal_convention == NormalConvention::opengl_y_plus ? 1.0F : 0.0F,
+        0.0F,
+    };
     const auto split_asset_id = [](assets::TextureAssetId value) {
         return std::array<std::uint32_t, 2U>{
             static_cast<std::uint32_t>(value & 0xffffffffULL),
@@ -191,7 +200,6 @@ core::Result<GpuMaterialConstants> pack_material_for_gpu(
         emissive_id[0], emissive_id[1],
         0U, 0U,
     };
-    result.alpha_factors[1] = static_cast<float>(material.alpha_mode);
     if (auto validation_result = validate(result); !validation_result) {
         return core::Result<GpuMaterialConstants>::failure(validation_result.error());
     }

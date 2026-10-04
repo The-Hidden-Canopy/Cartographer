@@ -7,7 +7,7 @@ project(Cartographer
 )
 
 option(CARTO_BUILD_TESTS "Build headless unit and invariant tests" ON)
-option(CARTO_BUILD_BENCHMARKS "Build native geometry kernel benchmarks" OFF)
+option(CARTO_BUILD_BENCHMARKS "Build native CPU geometry and scientific kernel benchmarks" OFF)
 option(CARTO_BUILD_CLI "Build the headless Cartographer CLI" ON)
 option(CARTO_BUILD_DEVICE_CPU "Build the CPU reference device" ON)
 option(CARTO_BUILD_SDK_SHARED "Build the public C ABI as an opt-in shared library" OFF)
@@ -107,6 +107,7 @@ endfunction()
 
 add_subdirectory(libs/core)
 add_subdirectory(libs/scene)
+add_subdirectory(libs/attributes)
 if(CARTO_BUILD_PRIVATE_INTEGRATIONS)
     add_subdirectory(
         "${CARTO_PRIVATE_SOURCE_ROOT}/libs/anatomy"
@@ -121,7 +122,6 @@ endif()
 add_subdirectory(libs/geometry/mesh)
 add_subdirectory(libs/assets)
 add_subdirectory(libs/scientific)
-add_subdirectory(libs/attributes)
 add_subdirectory(libs/mesh_attributes)
 add_subdirectory(libs/web_geometry/core)
 add_subdirectory(libs/web_geometry/compile)

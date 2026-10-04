@@ -5,6 +5,7 @@ add_library(carto_render STATIC
     src/material.cpp
     src/render_request.cpp
     src/render_scene.cpp
+    src/tangent.cpp
     src/temporal.cpp
     src/viewport.cpp
 )

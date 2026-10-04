@@ -220,6 +220,40 @@ void native_ai_can_press_auto_apply_through_typed_boundary() {
     REQUIRE(ui.snapshot().operations.back().category == carto::ui::OperationCategory::provider);
 }
 
+void disabled_native_ai_auto_apply_requires_explicit_review() {
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.set_ai_auto_approve(false));
+    REQUIRE(!ui.snapshot().ai_auto_approve);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{"Box", {1.0, 1.0, 1.0}}));
+    const auto object = session.snapshot().objects.front().object.id;
+    const auto face = session.snapshot().viewport.scene.instances().front().mesh->triangle_faces.front();
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{object, face}));
+
+    const auto before = session.snapshot();
+    const auto before_ui = ui.snapshot();
+    const auto blocked = ui.apply_ai_intent("inset face 0.10");
+    REQUIRE(!blocked);
+    REQUIRE(blocked.error().code == carto::core::ErrorCode::invalid_state);
+    const auto after = session.snapshot();
+    REQUIRE(after.project_revision == before.project_revision);
+    REQUIRE(after.objects.size() == before.objects.size());
+    REQUIRE(after.viewport.scene.instances().front().mesh->vertex_ids.size() ==
+            before.viewport.scene.instances().front().mesh->vertex_ids.size());
+    REQUIRE(ui.snapshot().operations.size() == before_ui.operations.size());
+
+    const auto proposal = ui.propose_ai("inset face 0.10");
+    REQUIRE(proposal);
+    auto preview = ui.begin_ai_preview(proposal.value());
+    REQUIRE(preview);
+    const auto committed = ui.commit_ai_preview(preview.value(), proposal.value());
+    REQUIRE(committed);
+    REQUIRE(committed.value().source == carto::application::OperationSource::ai_proposal);
+    REQUIRE(session.snapshot().project_revision > before.project_revision);
+}
+
 void stale_ai_preview_is_rejected_without_mutation() {
     carto::application::ApplicationSession session;
     carto::ui::UiController ui(session);
@@ -292,6 +326,7 @@ int main() {
         native_planner_rejects_ambiguous_or_wrong_scope_intents();
         ui_ai_flow_is_preview_only_until_explicit_commit();
         native_ai_can_press_auto_apply_through_typed_boundary();
+        disabled_native_ai_auto_apply_requires_explicit_review();
         stale_ai_preview_is_rejected_without_mutation();
         auto_apply_delegates_invalid_geometry_to_the_kernel_without_mutation();
     } catch (const std::exception& error) {

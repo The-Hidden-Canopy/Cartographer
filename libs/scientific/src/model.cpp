@@ -1,11 +1,13 @@
 #include <carto/scientific/model.hpp>
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <iomanip>
 #include <iterator>
 #include <limits>
+#include <numbers>
 #include <set>
 #include <sstream>
 #include <utility>
@@ -22,6 +24,165 @@ constexpr std::size_t kMaxVolumeRaySamples = 2'000'000U;
 constexpr std::size_t kMaxTags = 128U;
 constexpr std::size_t kMaxReferenceBytes = 16U * 1024U;
 constexpr std::size_t kMaxTextBytes = 64U * 1024U;
+constexpr std::size_t kMaxParameterSweepAxes = 32U;
+constexpr std::size_t kMaxParameterSweepValues = 128U;
+constexpr std::size_t kMaxParameterSweepCases = 4'096U;
+constexpr std::size_t kMaxParameterSweepParameters = 256U;
+constexpr std::size_t kMaxMorphospacePoints = 4'096U;
+
+struct PrincipalAxesAnalysis {
+    std::array<core::Vec3d, 3> axes{};
+    std::array<double, 3> variances{};
+};
+
+// Shared CPU reference implementation for morphology principal axes. The
+// caller owns the semantic boundary; this helper only receives finite point
+// positions and refuses ambiguous spectra rather than inventing a tie-break.
+std::optional<PrincipalAxesAnalysis> compute_principal_axes(
+    std::span<const core::Vec3d> positions) {
+    if (positions.size() < 3U) return std::nullopt;
+
+    core::Vec3d centroid{};
+    for (const auto position : positions) {
+        centroid = centroid + position;
+        if (!centroid.finite()) return std::nullopt;
+    }
+    centroid = centroid * (1.0 / static_cast<double>(positions.size()));
+    if (!centroid.finite()) return std::nullopt;
+
+    using Matrix3 = std::array<std::array<double, 3>, 3>;
+    Matrix3 covariance{};
+    for (const auto position : positions) {
+        const auto centered = position - centroid;
+        if (!centered.finite()) return std::nullopt;
+        const std::array<double, 3> values{centered.x, centered.y, centered.z};
+        for (std::size_t row = 0U; row < 3U; ++row) {
+            for (std::size_t column = row; column < 3U; ++column) {
+                covariance[row][column] += values[row] * values[column];
+                if (!std::isfinite(covariance[row][column])) return std::nullopt;
+                covariance[column][row] = covariance[row][column];
+            }
+        }
+    }
+    const double count = static_cast<double>(positions.size());
+    double covariance_scale = 0.0;
+    for (auto& row : covariance) {
+        for (double& value : row) {
+            value /= count;
+            covariance_scale = std::max(covariance_scale, std::abs(value));
+        }
+    }
+    if (!std::isfinite(covariance_scale) ||
+        covariance_scale <= std::numeric_limits<double>::min()) {
+        return std::nullopt;
+    }
+
+    Matrix3 eigenvectors{{
+        {{1.0, 0.0, 0.0}},
+        {{0.0, 1.0, 0.0}},
+        {{0.0, 0.0, 1.0}},
+    }};
+    bool converged = false;
+    for (std::size_t iteration = 0U; iteration < 64U; ++iteration) {
+        std::size_t p = 0U;
+        std::size_t q = 1U;
+        double largest = std::abs(covariance[0][1]);
+        if (std::abs(covariance[0][2]) > largest) {
+            p = 0U;
+            q = 2U;
+            largest = std::abs(covariance[0][2]);
+        }
+        if (std::abs(covariance[1][2]) > largest) {
+            p = 1U;
+            q = 2U;
+            largest = std::abs(covariance[1][2]);
+        }
+        if (!std::isfinite(largest)) return std::nullopt;
+        if (largest <= 1.0e-14 * covariance_scale) {
+            converged = true;
+            break;
+        }
+
+        const double app = covariance[p][p];
+        const double aqq = covariance[q][q];
+        const double apq = covariance[p][q];
+        const double angle = 0.5 * std::atan2(2.0 * apq, aqq - app);
+        const double cosine = std::cos(angle);
+        const double sine = std::sin(angle);
+        if (!std::isfinite(cosine) || !std::isfinite(sine)) return std::nullopt;
+        for (std::size_t index = 0U; index < 3U; ++index) {
+            if (index == p || index == q) continue;
+            const double index_p = covariance[index][p];
+            const double index_q = covariance[index][q];
+            covariance[index][p] = covariance[p][index] =
+                cosine * index_p - sine * index_q;
+            covariance[index][q] = covariance[q][index] =
+                sine * index_p + cosine * index_q;
+        }
+        covariance[p][p] = cosine * cosine * app -
+            2.0 * sine * cosine * apq + sine * sine * aqq;
+        covariance[q][q] = sine * sine * app +
+            2.0 * sine * cosine * apq + cosine * cosine * aqq;
+        covariance[p][q] = covariance[q][p] = 0.0;
+        for (std::size_t row = 0U; row < 3U; ++row) {
+            const double row_p = eigenvectors[row][p];
+            const double row_q = eigenvectors[row][q];
+            eigenvectors[row][p] = cosine * row_p - sine * row_q;
+            eigenvectors[row][q] = sine * row_p + cosine * row_q;
+        }
+    }
+    if (!converged) return std::nullopt;
+
+    std::array<double, 3> eigenvalues{};
+    for (std::size_t index = 0U; index < 3U; ++index) {
+        eigenvalues[index] = covariance[index][index];
+        const double eigenvalue_tolerance = 1.0e-12 * covariance_scale;
+        if (!std::isfinite(eigenvalues[index]) ||
+            eigenvalues[index] < -eigenvalue_tolerance) {
+            return std::nullopt;
+        }
+        eigenvalues[index] = std::max(0.0, eigenvalues[index]);
+    }
+    std::array<std::size_t, 3> order{0U, 1U, 2U};
+    std::sort(order.begin(), order.end(), [&eigenvalues](std::size_t left,
+                                                          std::size_t right) {
+        if (eigenvalues[left] != eigenvalues[right]) {
+            return eigenvalues[left] > eigenvalues[right];
+        }
+        return left < right;
+    });
+    const double eigenvalue_scale = std::max({
+        std::abs(eigenvalues[order[0]]),
+        std::abs(eigenvalues[order[1]]),
+        std::abs(eigenvalues[order[2]])});
+    if (!std::isfinite(eigenvalue_scale) ||
+        eigenvalue_scale <= std::numeric_limits<double>::min()) {
+        return std::nullopt;
+    }
+    for (std::size_t index = 0U; index < 2U; ++index) {
+        const double gap = eigenvalues[order[index]] - eigenvalues[order[index + 1U]];
+        if (!std::isfinite(gap) || gap <= 1.0e-10 * eigenvalue_scale) {
+            return std::nullopt;
+        }
+    }
+
+    std::array<core::Vec3d, 3> axes{};
+    for (std::size_t axis = 0U; axis < 3U; ++axis) {
+        axes[axis] = core::Vec3d{
+            eigenvectors[0][order[axis]],
+            eigenvectors[1][order[axis]],
+            eigenvectors[2][order[axis]],
+        }.normalized();
+        if (!axes[axis].finite()) return std::nullopt;
+    }
+    const double handedness = core::dot(axes[0], core::cross(axes[1], axes[2]));
+    if (!std::isfinite(handedness) || std::abs(handedness) <= 1.0e-8) {
+        return std::nullopt;
+    }
+    if (handedness < 0.0) axes[2] = axes[2] * -1.0;
+    return PrincipalAxesAnalysis{
+        axes, {eigenvalues[order[0]], eigenvalues[order[1]], eigenvalues[order[2]]}};
+}
 
 Diagnostic invalid(std::string message) {
     return Diagnostic(ErrorCode::invalid_argument, std::move(message));
@@ -501,6 +662,147 @@ core::Result<void> Parameter::validate() const {
     return provenance.validate();
 }
 
+core::Result<void> ParameterAssignment::validate() const {
+    if (auto result = validate_id(parameter.value, "parameter assignment parameter"); !result) {
+        return result;
+    }
+    if (!std::isfinite(value)) {
+        return core::Result<void>::failure(validation(
+            "parameter assignment value is not finite"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> ParameterSweepAxis::validate() const {
+    if (auto result = validate_id(parameter.value, "parameter sweep axis parameter"); !result) {
+        return result;
+    }
+    if (values.empty() || values.size() > kMaxParameterSweepValues) {
+        return core::Result<void>::failure(validation(
+            "parameter sweep axis has an invalid value count"));
+    }
+    for (const double value : values) {
+        if (!std::isfinite(value)) {
+            return core::Result<void>::failure(validation(
+                "parameter sweep axis contains a non-finite value"));
+        }
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> ParameterSweepPreview::validate() const {
+    if (auto result = validate_id(study.value, "parameter sweep study"); !result) return result;
+    if (source_model_revision.exhausted()) {
+        return core::Result<void>::failure(validation(
+            "parameter sweep source revision is exhausted"));
+    }
+    if (auto result = validate_text(strategy, "parameter sweep strategy", 64U, true); !result) {
+        return result;
+    }
+    if (strategy != "cartesian") {
+        return core::Result<void>::failure(validation(
+            "parameter sweep strategy is unsupported"));
+    }
+    if (base_assignments.empty() || base_assignments.size() > kMaxParameterSweepParameters ||
+        axes.empty() || axes.size() > kMaxParameterSweepAxes ||
+        cases.empty() || cases.size() > kMaxParameterSweepCases) {
+        return core::Result<void>::failure(validation(
+            "parameter sweep preview has an invalid bounded collection"));
+    }
+
+    std::set<ParameterId> base_ids;
+    for (std::size_t index = 0U; index < base_assignments.size(); ++index) {
+        if (auto result = base_assignments[index].validate(); !result) return result;
+        if (!base_ids.insert(base_assignments[index].parameter).second) {
+            return core::Result<void>::failure(validation(
+                "parameter sweep base assignments contain a duplicate parameter"));
+        }
+        if (index > 0U && !(base_assignments[index - 1U].parameter <
+                            base_assignments[index].parameter)) {
+            return core::Result<void>::failure(validation(
+                "parameter sweep base assignments are not in canonical order"));
+        }
+    }
+
+    std::set<ParameterId> axis_ids;
+    for (std::size_t index = 0U; index < axes.size(); ++index) {
+        if (auto result = axes[index].validate(); !result) return result;
+        if (!base_ids.contains(axes[index].parameter)) {
+            return core::Result<void>::failure(validation(
+                "parameter sweep axis references a parameter outside the study"));
+        }
+        if (!axis_ids.insert(axes[index].parameter).second) {
+            return core::Result<void>::failure(validation(
+                "parameter sweep contains a duplicate axis"));
+        }
+        if (index > 0U && !(axes[index - 1U].parameter < axes[index].parameter)) {
+            return core::Result<void>::failure(validation(
+                "parameter sweep axes are not in canonical order"));
+        }
+        for (std::size_t value_index = 1U; value_index < axes[index].values.size(); ++value_index) {
+            if (!(axes[index].values[value_index - 1U] < axes[index].values[value_index])) {
+                return core::Result<void>::failure(validation(
+                    "parameter sweep axis values are not strictly increasing"));
+            }
+        }
+    }
+
+    std::size_t expected_case_count = 1U;
+    for (const auto& axis : axes) {
+        if (expected_case_count > kMaxParameterSweepCases / axis.values.size()) {
+            return core::Result<void>::failure(validation(
+                "parameter sweep case count exceeds the safety limit"));
+        }
+        expected_case_count *= axis.values.size();
+    }
+    if (cases.size() != expected_case_count) {
+        return core::Result<void>::failure(validation(
+            "parameter sweep case count does not match its axes"));
+    }
+
+    std::vector<std::vector<ParameterAssignment>> expected_cases;
+    expected_cases.push_back(base_assignments);
+    for (const auto& axis : axes) {
+        std::vector<std::vector<ParameterAssignment>> expanded;
+        expanded.reserve(expected_cases.size() * axis.values.size());
+        for (const auto& current : expected_cases) {
+            for (const double value : axis.values) {
+                auto next = current;
+                const auto assignment = std::find_if(
+                    next.begin(), next.end(), [&axis](const ParameterAssignment& candidate) {
+                        return candidate.parameter == axis.parameter;
+                    });
+                if (assignment == next.end()) {
+                    return core::Result<void>::failure(validation(
+                        "parameter sweep expansion lost an axis parameter"));
+                }
+                assignment->value = value;
+                expanded.push_back(std::move(next));
+            }
+        }
+        expected_cases = std::move(expanded);
+    }
+    for (std::size_t case_index = 0U; case_index < cases.size(); ++case_index) {
+        if (cases[case_index].size() != base_assignments.size()) {
+            return core::Result<void>::failure(validation(
+                "parameter sweep case assignment count is invalid"));
+        }
+        for (std::size_t assignment_index = 0U;
+             assignment_index < cases[case_index].size(); ++assignment_index) {
+            if (auto result = cases[case_index][assignment_index].validate(); !result) {
+                return result;
+            }
+            const auto& actual = cases[case_index][assignment_index];
+            const auto& expected = expected_cases[case_index][assignment_index];
+            if (actual.parameter != expected.parameter || actual.value != expected.value) {
+                return core::Result<void>::failure(validation(
+                    "parameter sweep case does not match its canonical expansion"));
+            }
+        }
+    }
+    return core::Result<void>::success();
+}
+
 core::Result<void> Field::validate() const {
     if (auto result = validate_id(id.value, "field id"); !result) return result;
     if (static_cast<unsigned>(kind) > static_cast<unsigned>(FieldKind::categorical)) {
@@ -635,6 +937,290 @@ core::Result<void> MorphologyGrowthDomain::validate() const {
     return provenance.validate();
 }
 
+core::Result<void> MorphologyMeasurementPreview::validate() const {
+    if (auto result = validate_id(structure.value, "morphology measurement structure"); !result) {
+        return result;
+    }
+    if (auto result = validate_text(metric, "morphology measurement metric", 64U, true); !result) {
+        return result;
+    }
+    if (auto result = validate_text(units, "morphology measurement units", 64U, true); !result) {
+        return result;
+    }
+    if (auto result = validate_text(coordinate_frame,
+                                    "morphology measurement coordinate frame", 256U, true);
+        !result) {
+        return result;
+    }
+    if (landmarks.empty() || landmarks.size() > kMaxCollectionEntries ||
+        values.empty() || values.size() > 3U) {
+        return core::Result<void>::failure(validation(
+            "morphology measurement has an invalid bounded collection"));
+    }
+    std::set<LandmarkId> unique_landmarks;
+    for (const auto landmark : landmarks) {
+        if (auto result = validate_id(landmark.value, "morphology measurement landmark"); !result) {
+            return result;
+        }
+        if (!unique_landmarks.insert(landmark).second) {
+            return core::Result<void>::failure(validation(
+                "morphology measurement contains a duplicate landmark"));
+        }
+    }
+    for (const double value : values) {
+        if (!std::isfinite(value)) {
+            return core::Result<void>::failure(validation(
+                "morphology measurement contains a non-finite value"));
+        }
+    }
+
+    if (metric == "distance" || metric == "segment-length") {
+        if (landmarks.size() != 2U || values.size() != 1U || units != "model" ||
+            values.front() < 0.0) {
+            return core::Result<void>::failure(validation(
+                "morphology distance measurement has an invalid shape"));
+        }
+    } else if (metric == "arc-length") {
+        if (landmarks.size() < 2U || values.size() != 1U || units != "model" ||
+            values.front() < 0.0) {
+            return core::Result<void>::failure(validation(
+                "morphology arc-length measurement has an invalid shape"));
+        }
+    } else if (metric == "angle" || metric == "branch-angle") {
+        if (landmarks.size() != 3U || values.size() != 1U || units != "radians" ||
+            values.front() < 0.0 || values.front() > std::numbers::pi) {
+            return core::Result<void>::failure(validation(
+                "morphology angle measurement has an invalid shape"));
+        }
+    } else if (metric == "ratio") {
+        if (landmarks.size() != 4U || values.size() != 1U || units != "ratio" ||
+            values.front() < 0.0) {
+            return core::Result<void>::failure(validation(
+                "morphology ratio measurement has an invalid shape"));
+        }
+    } else if (metric == "area") {
+        if (landmarks.size() < 3U || values.size() != 1U || units != "model^2" ||
+            values.front() <= 0.0) {
+            return core::Result<void>::failure(validation(
+                "morphology area measurement has an invalid shape"));
+        }
+    } else if (metric == "volume") {
+        if (landmarks.size() != 4U || values.size() != 1U || units != "model^3" ||
+            values.front() <= 0.0) {
+            return core::Result<void>::failure(validation(
+                "morphology volume measurement has an invalid shape"));
+        }
+    } else if (metric == "centroid") {
+        if (values.size() != 3U || units != "model") {
+            return core::Result<void>::failure(validation(
+                "morphology centroid measurement has an invalid shape"));
+        }
+    } else if (metric == "bounding-dimensions") {
+        if (values.size() != 3U || units != "model" ||
+            std::any_of(values.begin(), values.end(), [](double value) { return value < 0.0; })) {
+            return core::Result<void>::failure(validation(
+                "morphology bounding-dimensions measurement has an invalid shape"));
+        }
+    } else {
+        return core::Result<void>::failure(validation(
+            "morphology measurement metric is unsupported"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> MorphologyLandmarkCorrespondence::validate() const {
+    if (auto result = validate_id(reference_landmark.value,
+                                  "morphology landmark correspondence reference landmark");
+        !result) {
+        return result;
+    }
+    if (auto result = validate_id(candidate_landmark.value,
+                                  "morphology landmark correspondence candidate landmark");
+        !result) {
+        return result;
+    }
+    if (reference_landmark == candidate_landmark) {
+        return core::Result<void>::failure(validation(
+            "morphology landmark correspondence endpoints must be distinct"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> MorphologySurfaceSample::validate() const {
+    if (auto result = validate_id(reference_landmark.value,
+                                  "morphology surface sample reference landmark"); !result) {
+        return result;
+    }
+    if (auto result = validate_id(candidate_landmark.value,
+                                  "morphology surface sample candidate landmark"); !result) {
+        return result;
+    }
+    if (reference_landmark == candidate_landmark) {
+        return core::Result<void>::failure(validation(
+            "morphology surface sample endpoints must be distinct"));
+    }
+    const auto valid_normal = [](const core::Vec3d& normal) {
+        return normal.finite() && std::isfinite(normal.length()) &&
+            normal.length() > 1.0e-12;
+    };
+    if (!valid_normal(reference_normal) || !valid_normal(candidate_normal)) {
+        return core::Result<void>::failure(validation(
+            "morphology surface sample normals must be finite and non-zero"));
+    }
+    if (!std::isfinite(reference_curvature) || !std::isfinite(candidate_curvature) ||
+        !std::isfinite(reference_thickness) || !std::isfinite(candidate_thickness) ||
+        reference_thickness < 0.0 || candidate_thickness < 0.0) {
+        return core::Result<void>::failure(validation(
+            "morphology surface sample metadata is invalid"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> MorphologySurfaceDelta::validate() const {
+    if (auto result = validate_id(reference_landmark.value,
+                                  "morphology surface delta reference landmark"); !result) {
+        return result;
+    }
+    if (auto result = validate_id(candidate_landmark.value,
+                                  "morphology surface delta candidate landmark"); !result) {
+        return result;
+    }
+    if (reference_landmark == candidate_landmark) {
+        return core::Result<void>::failure(validation(
+            "morphology surface delta endpoints must be distinct"));
+    }
+    if (!displacement.finite() || !std::isfinite(distance) || distance < 0.0 ||
+        !std::isfinite(normal_displacement) || !std::isfinite(curvature_delta) ||
+        !std::isfinite(thickness_delta) || !std::isfinite(normal_angle) ||
+        normal_angle < 0.0 || normal_angle > std::numbers::pi) {
+        return core::Result<void>::failure(validation(
+            "morphology surface delta contains invalid values"));
+    }
+    const double measured = displacement.length();
+    const double tolerance = 1.0e-12 * std::max(1.0, measured);
+    if (!std::isfinite(measured) || std::abs(measured - distance) > tolerance) {
+        return core::Result<void>::failure(validation(
+            "morphology surface delta distance disagrees with displacement"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> MorphologySurfaceDeltaPreview::validate() const {
+    if (auto result = validate_id(reference_structure.value,
+                                  "morphology surface delta preview reference structure"); !result) {
+        return result;
+    }
+    if (auto result = validate_id(candidate_structure.value,
+                                  "morphology surface delta preview candidate structure"); !result) {
+        return result;
+    }
+    if (reference_structure == candidate_structure) {
+        return core::Result<void>::failure(validation(
+            "morphology surface delta preview structures must be distinct"));
+    }
+    if (auto result = validate_text(coordinate_frame,
+                                    "morphology surface delta preview coordinate frame",
+                                    256U, true); !result) {
+        return result;
+    }
+    if (deltas.empty() || deltas.size() > kMaxCollectionEntries) {
+        return core::Result<void>::failure(validation(
+            "morphology surface delta preview must contain bounded samples"));
+    }
+    std::set<LandmarkId> reference_ids;
+    std::set<LandmarkId> candidate_ids;
+    double squared_sum = 0.0;
+    for (const auto& delta : deltas) {
+        if (auto result = delta.validate(); !result) return result;
+        if (!reference_ids.insert(delta.reference_landmark).second ||
+            !candidate_ids.insert(delta.candidate_landmark).second) {
+            return core::Result<void>::failure(validation(
+                "morphology surface delta preview contains duplicate correspondence"));
+        }
+        squared_sum += delta.distance * delta.distance;
+        if (!std::isfinite(squared_sum)) {
+            return core::Result<void>::failure(validation(
+                "morphology surface delta preview RMS is not finite"));
+        }
+    }
+    if (!std::isfinite(rms_displacement) || rms_displacement < 0.0) {
+        return core::Result<void>::failure(validation(
+            "morphology surface delta preview RMS is invalid"));
+    }
+    const double expected = std::sqrt(squared_sum / static_cast<double>(deltas.size()));
+    const double tolerance = 1.0e-12 * std::max(1.0, expected);
+    if (!std::isfinite(expected) || std::abs(expected - rms_displacement) > tolerance) {
+        return core::Result<void>::failure(validation(
+            "morphology surface delta preview RMS disagrees with samples"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> MorphologyPrincipalAxesPreview::validate() const {
+    if (auto result = validate_id(structure.value, "morphology principal-axes structure");
+        !result) {
+        return result;
+    }
+    if (auto result = validate_text(coordinate_frame,
+                                    "morphology principal-axes coordinate frame",
+                                    256U, true);
+        !result) {
+        return result;
+    }
+    if (landmarks.size() < 3U || landmarks.size() > kMaxCollectionEntries) {
+        return core::Result<void>::failure(validation(
+            "morphology principal-axes preview has an invalid landmark count"));
+    }
+    std::set<LandmarkId> unique_landmarks;
+    for (const auto landmark : landmarks) {
+        if (auto result = validate_id(landmark.value,
+                                     "morphology principal-axes landmark"); !result) {
+            return result;
+        }
+        if (!unique_landmarks.insert(landmark).second) {
+            return core::Result<void>::failure(validation(
+                "morphology principal-axes preview contains duplicate landmarks"));
+        }
+    }
+    if (!centroid.finite()) {
+        return core::Result<void>::failure(validation(
+            "morphology principal-axes centroid is not finite"));
+    }
+    for (std::size_t index = 0U; index < axes.size(); ++index) {
+        if (!axes[index].finite() ||
+            std::abs(axes[index].length() - 1.0) > 1.0e-10 ||
+            !std::isfinite(variances[index]) || variances[index] < 0.0) {
+            return core::Result<void>::failure(validation(
+                "morphology principal-axes preview contains an invalid axis"));
+        }
+        if (index > 0U && variances[index - 1U] < variances[index]) {
+            return core::Result<void>::failure(validation(
+                "morphology principal-axes variances are not ordered"));
+        }
+    }
+    const double spectral_tolerance = 1.0e-10 *
+        std::max(variances[0], std::numeric_limits<double>::min());
+    if (variances[0] - variances[1] <= spectral_tolerance ||
+        variances[1] - variances[2] <= spectral_tolerance) {
+        return core::Result<void>::failure(validation(
+            "morphology principal-axes spectrum is ambiguous"));
+    }
+    for (std::size_t left = 0U; left < axes.size(); ++left) {
+        for (std::size_t right = left + 1U; right < axes.size(); ++right) {
+            if (std::abs(core::dot(axes[left], axes[right])) > 1.0e-10) {
+                return core::Result<void>::failure(validation(
+                    "morphology principal-axes are not orthogonal"));
+            }
+        }
+    }
+    const double handedness = core::dot(core::cross(axes[0], axes[1]), axes[2]);
+    if (!std::isfinite(handedness) || handedness < 1.0 - 1.0e-10) {
+        return core::Result<void>::failure(validation(
+            "morphology principal-axes are not right-handed"));
+    }
+    return core::Result<void>::success();
+}
+
 core::Result<void> BilateralMorphologyPreview::validate() const {
     if (auto result = validate_id(reference_structure.value,
                                   "bilateral morphology preview reference structure"); !result) {
@@ -653,11 +1239,15 @@ core::Result<void> BilateralMorphologyPreview::validate() const {
         return result;
     }
     if (alignment_mode != "landmark" && alignment_mode != "rigid" &&
-        alignment_mode != "scale-normalized") {
+        alignment_mode != "scale-normalized" && alignment_mode != "principal-axis") {
         return core::Result<void>::failure(validation(
             "bilateral morphology preview has an unsupported alignment mode"));
     }
+    const double rotation_magnitude = std::hypot(
+        std::hypot(alignment_rotation.x, alignment_rotation.y),
+        std::hypot(alignment_rotation.z, alignment_rotation.w));
     if (!alignment_translation.finite() || !alignment_rotation.normalizable() ||
+        !std::isfinite(rotation_magnitude) || std::abs(rotation_magnitude - 1.0) > 1.0e-12 ||
         !std::isfinite(alignment_scale) || alignment_scale <= 0.0) {
         return core::Result<void>::failure(validation(
             "bilateral morphology preview alignment transform is invalid"));
@@ -704,6 +1294,21 @@ core::Result<void> BilateralMorphologyPreview::validate() const {
     if (!std::isfinite(rms_distance) || rms_distance < 0.0) {
         return core::Result<void>::failure(validation(
             "bilateral morphology preview RMS distance is invalid"));
+    }
+    double squared_sum = 0.0;
+    for (const auto& delta : landmark_deltas) {
+        squared_sum += delta.distance * delta.distance;
+        if (!std::isfinite(squared_sum)) {
+            return core::Result<void>::failure(validation(
+                "bilateral morphology preview RMS distance is not finite"));
+        }
+    }
+    const double expected_rms = std::sqrt(
+        squared_sum / static_cast<double>(landmark_deltas.size()));
+    const double rms_tolerance = 1.0e-12 * std::max(1.0, expected_rms);
+    if (!std::isfinite(expected_rms) || std::abs(expected_rms - rms_distance) > rms_tolerance) {
+        return core::Result<void>::failure(validation(
+            "bilateral morphology preview RMS distance disagrees with landmark distances"));
     }
     return core::Result<void>::success();
 }
@@ -759,6 +1364,569 @@ core::Result<void> MorphologyModel::insert_growth_domain(MorphologyGrowthDomain 
     return insert_unique(growth_domains_, std::move(value), "morphology growth domain");
 }
 
+core::Result<MorphologyMeasurementPreview> MorphologyModel::preview_measurement(
+    StructureId structure,
+    std::string_view metric,
+    std::span<const LandmarkId> landmarks) const {
+    if (auto result = validate(); !result) {
+        return core::Result<MorphologyMeasurementPreview>::failure(
+            result.error().with_context("morphology measurement preview"));
+    }
+    if (auto result = validate_reference(structures_, structure,
+                                         "morphology measurement structure"); !result) {
+        return core::Result<MorphologyMeasurementPreview>::failure(result.error());
+    }
+    if (auto result = validate_text(metric, "morphology measurement metric", 64U, true); !result) {
+        return core::Result<MorphologyMeasurementPreview>::failure(result.error());
+    }
+    if (metric != "distance" && metric != "segment-length" && metric != "arc-length" &&
+        metric != "angle" && metric != "branch-angle" && metric != "ratio" &&
+        metric != "area" && metric != "volume" && metric != "centroid" &&
+        metric != "bounding-dimensions") {
+        return core::Result<MorphologyMeasurementPreview>::failure(validation(
+            "morphology measurement metric is unsupported"));
+    }
+    if (landmarks.empty() || landmarks.size() > kMaxCollectionEntries) {
+        return core::Result<MorphologyMeasurementPreview>::failure(validation(
+            "morphology measurement requires a bounded non-empty landmark set"));
+    }
+    if ((metric == "distance" || metric == "segment-length") && landmarks.size() != 2U) {
+        return core::Result<MorphologyMeasurementPreview>::failure(validation(
+            "morphology distance measurement requires two landmarks"));
+    }
+    if (metric == "angle" && landmarks.size() != 3U) {
+        return core::Result<MorphologyMeasurementPreview>::failure(validation(
+            "morphology angle measurement requires three landmarks"));
+    }
+    if (metric == "branch-angle" && landmarks.size() != 3U) {
+        return core::Result<MorphologyMeasurementPreview>::failure(validation(
+            "morphology branch-angle measurement requires three landmarks"));
+    }
+    if (metric == "ratio" && landmarks.size() != 4U) {
+        return core::Result<MorphologyMeasurementPreview>::failure(validation(
+            "morphology ratio measurement requires four landmarks"));
+    }
+    if (metric == "arc-length" && landmarks.size() < 2U) {
+        return core::Result<MorphologyMeasurementPreview>::failure(validation(
+            "morphology arc-length measurement requires at least two ordered landmarks"));
+    }
+    if (metric == "area" && landmarks.size() < 3U) {
+        return core::Result<MorphologyMeasurementPreview>::failure(validation(
+            "morphology area measurement requires at least three ordered landmarks"));
+    }
+    if (metric == "volume" && landmarks.size() != 4U) {
+        return core::Result<MorphologyMeasurementPreview>::failure(validation(
+            "morphology volume measurement requires four tetrahedron landmarks"));
+    }
+
+    std::vector<core::Vec3d> positions;
+    positions.reserve(landmarks.size());
+    std::string coordinate_frame;
+    std::set<LandmarkId> unique_landmarks;
+    for (const auto landmark_id : landmarks) {
+        if (auto result = validate_id(landmark_id.value, "morphology measurement landmark");
+            !result) {
+            return core::Result<MorphologyMeasurementPreview>::failure(result.error());
+        }
+        if (!unique_landmarks.insert(landmark_id).second) {
+            return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                "morphology measurement contains a duplicate landmark"));
+        }
+        const auto landmark_iterator = landmarks_.find(landmark_id);
+        if (landmark_iterator == landmarks_.end()) {
+            return core::Result<MorphologyMeasurementPreview>::failure(invalid(
+                "morphology measurement references an unknown landmark"));
+        }
+        const auto& landmark = landmark_iterator->second;
+        if (!landmark.structure.has_value() || *landmark.structure != structure) {
+            return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                "morphology measurement requires explicit landmark ownership"));
+        }
+        const auto& structure_record = structures_.at(structure);
+        if (std::find(structure_record.landmarks.begin(), structure_record.landmarks.end(),
+                      landmark_id) == structure_record.landmarks.end()) {
+            return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                "morphology measurement landmark is not listed by its structure"));
+        }
+        if (coordinate_frame.empty()) {
+            coordinate_frame = landmark.coordinate_frame;
+        } else if (coordinate_frame != landmark.coordinate_frame) {
+            return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                "morphology measurement requires a shared coordinate frame"));
+        }
+        positions.push_back(landmark.position);
+    }
+
+    MorphologyMeasurementPreview preview;
+    preview.structure = structure;
+    preview.metric = std::string(metric);
+    preview.units = metric == "angle" || metric == "branch-angle" ? "radians" :
+                    metric == "ratio" ? "ratio" :
+                    metric == "area" ? "model^2" :
+                    metric == "volume" ? "model^3" : "model";
+    preview.coordinate_frame = std::move(coordinate_frame);
+    preview.landmarks.assign(landmarks.begin(), landmarks.end());
+    if (metric == "distance" || metric == "segment-length") {
+        const double distance = (positions[1U] - positions[0U]).length();
+        if (!std::isfinite(distance)) {
+            return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                "morphology distance measurement is not finite"));
+        }
+        preview.values.push_back(distance);
+    } else if (metric == "arc-length") {
+        double length = 0.0;
+        for (std::size_t index = 1U; index < positions.size(); ++index) {
+            const double segment = (positions[index] - positions[index - 1U]).length();
+            if (!std::isfinite(segment) || !std::isfinite(length + segment)) {
+                return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                    "morphology arc-length measurement is not finite"));
+            }
+            length += segment;
+        }
+        preview.values.push_back(length);
+    } else if (metric == "angle" || metric == "branch-angle") {
+        const auto first = (positions[0U] - positions[1U]).normalized();
+        const auto second = (positions[2U] - positions[1U]).normalized();
+        if (!first.finite() || !second.finite()) {
+            return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                "morphology angle measurement has a degenerate arm"));
+        }
+        const double cosine = std::clamp(core::dot(first, second), -1.0, 1.0);
+        const double angle = std::acos(cosine);
+        if (!std::isfinite(angle)) {
+            return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                "morphology angle measurement is not finite"));
+        }
+        preview.values.push_back(angle);
+    } else if (metric == "ratio") {
+        const double numerator = (positions[1U] - positions[0U]).length();
+        const double denominator = (positions[3U] - positions[2U]).length();
+        if (!std::isfinite(numerator) || !std::isfinite(denominator) || denominator <= 0.0) {
+            return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                "morphology ratio measurement has an invalid segment"));
+        }
+        const double ratio = numerator / denominator;
+        if (!std::isfinite(ratio) || ratio < 0.0) {
+            return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                "morphology ratio measurement is not finite"));
+        }
+        preview.values.push_back(ratio);
+    } else if (metric == "area") {
+        double scale = 1.0;
+        for (const auto position : positions) {
+            const double distance = (position - positions.front()).length();
+            if (!std::isfinite(distance)) {
+                return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                    "morphology area measurement has a non-finite extent"));
+            }
+            scale = std::max(scale, distance);
+        }
+        core::Vec3d normal{};
+        bool found_normal = false;
+        for (std::size_t first = 1U; first < positions.size() && !found_normal; ++first) {
+            for (std::size_t second = first + 1U;
+                 second < positions.size(); ++second) {
+                const auto candidate = core::cross(
+                    positions[first] - positions.front(),
+                    positions[second] - positions.front());
+                const double candidate_length = candidate.length();
+                if (std::isfinite(candidate_length) &&
+                    candidate_length > 1.0e-12 * scale * scale) {
+                    normal = candidate * (1.0 / candidate_length);
+                    found_normal = true;
+                    break;
+                }
+            }
+        }
+        if (!found_normal || !normal.finite()) {
+            return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                "morphology area measurement requires a non-degenerate polygon"));
+        }
+        const double planarity_tolerance = 1.0e-10 * scale;
+        for (const auto position : positions) {
+            const double distance_from_plane = core::dot(
+                position - positions.front(), normal);
+            if (!std::isfinite(distance_from_plane) ||
+                std::abs(distance_from_plane) > planarity_tolerance) {
+                return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                    "morphology area measurement requires a planar polygon"));
+            }
+        }
+        const auto first_edge = positions[1U] - positions.front();
+        const double first_edge_length = first_edge.length();
+        if (!std::isfinite(first_edge_length) || first_edge_length <= 1.0e-12 * scale) {
+            return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                "morphology area measurement contains a degenerate first edge"));
+        }
+        const auto basis_u = first_edge * (1.0 / first_edge_length);
+        const auto basis_v = core::cross(normal, basis_u).normalized();
+        if (!basis_u.finite() || !basis_v.finite()) {
+            return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                "morphology area measurement has an invalid planar basis"));
+        }
+        struct Point2 {
+            double x = 0.0;
+            double y = 0.0;
+        };
+        std::vector<Point2> projected;
+        projected.reserve(positions.size());
+        for (const auto position : positions) {
+            const auto offset = position - positions.front();
+            projected.push_back({core::dot(offset, basis_u), core::dot(offset, basis_v)});
+        }
+        const auto orientation = [](const Point2& first_point,
+                                    const Point2& second_point,
+                                    const Point2& third_point) {
+            return (second_point.x - first_point.x) * (third_point.y - first_point.y) -
+                   (second_point.y - first_point.y) * (third_point.x - first_point.x);
+        };
+        const double intersection_tolerance = 1.0e-12 * scale * scale;
+        const auto on_segment = [intersection_tolerance](
+                                    const Point2& first_point,
+                                    const Point2& second_point,
+                                    const Point2& candidate) {
+            return candidate.x >= std::min(first_point.x, second_point.x) - intersection_tolerance &&
+                   candidate.x <= std::max(first_point.x, second_point.x) + intersection_tolerance &&
+                   candidate.y >= std::min(first_point.y, second_point.y) - intersection_tolerance &&
+                   candidate.y <= std::max(first_point.y, second_point.y) + intersection_tolerance;
+        };
+        const auto segments_intersect = [intersection_tolerance, &orientation, &on_segment](
+                                            const Point2& first_start,
+                                            const Point2& first_end,
+                                            const Point2& second_start,
+                                            const Point2& second_end) {
+            const double first_orientation = orientation(first_start, first_end, second_start);
+            const double second_orientation = orientation(first_start, first_end, second_end);
+            const double third_orientation = orientation(second_start, second_end, first_start);
+            const double fourth_orientation = orientation(second_start, second_end, first_end);
+            const bool proper =
+                ((first_orientation > intersection_tolerance && second_orientation < -intersection_tolerance) ||
+                 (first_orientation < -intersection_tolerance && second_orientation > intersection_tolerance)) &&
+                ((third_orientation > intersection_tolerance && fourth_orientation < -intersection_tolerance) ||
+                 (third_orientation < -intersection_tolerance && fourth_orientation > intersection_tolerance));
+            return proper ||
+                   (std::abs(first_orientation) <= intersection_tolerance &&
+                    on_segment(first_start, first_end, second_start)) ||
+                   (std::abs(second_orientation) <= intersection_tolerance &&
+                    on_segment(first_start, first_end, second_end)) ||
+                   (std::abs(third_orientation) <= intersection_tolerance &&
+                    on_segment(second_start, second_end, first_start)) ||
+                   (std::abs(fourth_orientation) <= intersection_tolerance &&
+                    on_segment(second_start, second_end, first_end));
+        };
+        for (std::size_t left = 0U; left < projected.size(); ++left) {
+            const std::size_t left_next = (left + 1U) % projected.size();
+            for (std::size_t right = left + 1U; right < projected.size(); ++right) {
+                const std::size_t right_next = (right + 1U) % projected.size();
+                if (left_next == right || right_next == left) {
+                    continue;
+                }
+                if (segments_intersect(
+                        projected[left], projected[left_next],
+                        projected[right], projected[right_next])) {
+                    return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                        "morphology area measurement requires a simple polygon"));
+                }
+            }
+        }
+        double area = 0.0;
+        for (std::size_t index = 0U; index < positions.size(); ++index) {
+            const auto& current = positions[index];
+            const auto& next = positions[(index + 1U) % positions.size()];
+            const double edge_length = (next - current).length();
+            if (!std::isfinite(edge_length) || edge_length <= 1.0e-12 * scale) {
+                return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                    "morphology area measurement contains a degenerate edge"));
+            }
+            area += core::dot(core::cross(
+                current - positions.front(), next - positions.front()), normal);
+            if (!std::isfinite(area)) {
+                return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                    "morphology area measurement is not finite"));
+            }
+        }
+        area = std::abs(area) * 0.5;
+        if (!std::isfinite(area) || area <= 1.0e-12 * scale * scale) {
+            return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                "morphology area measurement is degenerate"));
+        }
+        preview.values.push_back(area);
+    } else if (metric == "volume") {
+        const auto first = positions[1U] - positions[0U];
+        const auto second = positions[2U] - positions[0U];
+        const auto third = positions[3U] - positions[0U];
+        const double volume = std::abs(core::dot(first, core::cross(second, third))) / 6.0;
+        const double scale = std::max({1.0, first.length(), second.length(), third.length()});
+        if (!std::isfinite(volume) || volume <= 1.0e-15 * scale * scale * scale) {
+            return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                "morphology volume measurement requires a non-degenerate tetrahedron"));
+        }
+        preview.values.push_back(volume);
+    } else if (metric == "centroid") {
+        core::Vec3d sum{};
+        for (const auto position : positions) {
+            sum = sum + position;
+            if (!sum.finite()) {
+                return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                    "morphology centroid measurement is not finite"));
+            }
+        }
+        const auto centroid = sum * (1.0 / static_cast<double>(positions.size()));
+        if (!centroid.finite()) {
+            return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                "morphology centroid measurement is not finite"));
+        }
+        preview.values = {centroid.x, centroid.y, centroid.z};
+    } else {
+        core::Vec3d minimum = positions.front();
+        core::Vec3d maximum = positions.front();
+        for (const auto position : positions) {
+            minimum.x = std::min(minimum.x, position.x);
+            minimum.y = std::min(minimum.y, position.y);
+            minimum.z = std::min(minimum.z, position.z);
+            maximum.x = std::max(maximum.x, position.x);
+            maximum.y = std::max(maximum.y, position.y);
+            maximum.z = std::max(maximum.z, position.z);
+        }
+        preview.values = {
+            maximum.x - minimum.x,
+            maximum.y - minimum.y,
+            maximum.z - minimum.z,
+        };
+        if (!std::all_of(preview.values.begin(), preview.values.end(),
+                         [](double value) { return std::isfinite(value) && value >= 0.0; })) {
+            return core::Result<MorphologyMeasurementPreview>::failure(validation(
+                "morphology bounding-dimensions measurement is invalid"));
+        }
+    }
+    if (auto result = preview.validate(); !result) {
+        return core::Result<MorphologyMeasurementPreview>::failure(result.error());
+    }
+    return core::Result<MorphologyMeasurementPreview>::success(std::move(preview));
+}
+
+core::Result<MorphologyPrincipalAxesPreview> MorphologyModel::preview_principal_axes(
+    StructureId structure,
+    std::span<const LandmarkId> landmarks) const {
+    if (auto result = validate(); !result) {
+        return core::Result<MorphologyPrincipalAxesPreview>::failure(
+            result.error().with_context("morphology principal-axes preview"));
+    }
+    if (auto result = validate_reference(structures_, structure,
+                                         "morphology principal-axes structure"); !result) {
+        return core::Result<MorphologyPrincipalAxesPreview>::failure(result.error());
+    }
+    if (landmarks.size() < 3U || landmarks.size() > kMaxCollectionEntries) {
+        return core::Result<MorphologyPrincipalAxesPreview>::failure(validation(
+            "morphology principal-axes preview requires at least three bounded landmarks"));
+    }
+
+    const auto& structure_record = structures_.at(structure);
+    std::vector<core::Vec3d> positions;
+    positions.reserve(landmarks.size());
+    std::string coordinate_frame;
+    std::set<LandmarkId> unique_landmarks;
+    for (const auto landmark_id : landmarks) {
+        if (auto result = validate_id(landmark_id.value,
+                                     "morphology principal-axes landmark"); !result) {
+            return core::Result<MorphologyPrincipalAxesPreview>::failure(result.error());
+        }
+        if (!unique_landmarks.insert(landmark_id).second) {
+            return core::Result<MorphologyPrincipalAxesPreview>::failure(validation(
+                "morphology principal-axes preview contains duplicate landmarks"));
+        }
+        if (std::find(structure_record.landmarks.begin(), structure_record.landmarks.end(),
+                      landmark_id) == structure_record.landmarks.end()) {
+            return core::Result<MorphologyPrincipalAxesPreview>::failure(validation(
+                "morphology principal-axes landmark is not listed by its structure"));
+        }
+        const auto landmark_iterator = landmarks_.find(landmark_id);
+        if (landmark_iterator == landmarks_.end()) {
+            return core::Result<MorphologyPrincipalAxesPreview>::failure(invalid(
+                "morphology principal-axes preview references an unknown landmark"));
+        }
+        const auto& landmark = landmark_iterator->second;
+        if (!landmark.structure.has_value() || *landmark.structure != structure) {
+            return core::Result<MorphologyPrincipalAxesPreview>::failure(validation(
+                "morphology principal-axes preview requires explicit landmark ownership"));
+        }
+        if (coordinate_frame.empty()) {
+            coordinate_frame = landmark.coordinate_frame;
+        } else if (coordinate_frame != landmark.coordinate_frame) {
+            return core::Result<MorphologyPrincipalAxesPreview>::failure(validation(
+                "morphology principal-axes preview requires a shared coordinate frame"));
+        }
+        positions.push_back(landmark.position);
+    }
+
+    core::Vec3d centroid{};
+    for (const auto position : positions) {
+        centroid = centroid + position;
+        if (!centroid.finite()) {
+            return core::Result<MorphologyPrincipalAxesPreview>::failure(validation(
+                "morphology principal-axes centroid is not finite"));
+        }
+    }
+    centroid = centroid * (1.0 / static_cast<double>(positions.size()));
+    if (!centroid.finite()) {
+        return core::Result<MorphologyPrincipalAxesPreview>::failure(validation(
+            "morphology principal-axes centroid is not finite"));
+    }
+
+    const auto analysis = compute_principal_axes(positions);
+    if (!analysis.has_value()) {
+        return core::Result<MorphologyPrincipalAxesPreview>::failure(validation(
+            "morphology principal-axes spread is degenerate or ambiguous"));
+    }
+
+    const auto canonical_axis = [](core::Vec3d axis) {
+        const auto component_at = [&axis](std::size_t index) {
+            return index == 0U ? axis.x : index == 1U ? axis.y : axis.z;
+        };
+        std::size_t dominant = 0U;
+        if (std::abs(axis.y) > std::abs(axis.x)) dominant = 1U;
+        if (std::abs(axis.z) > std::abs(component_at(dominant))) dominant = 2U;
+        const double component = component_at(dominant);
+        if (component < 0.0) axis = axis * -1.0;
+        return axis;
+    };
+    const auto& raw_axes = analysis->axes;
+    MorphologyPrincipalAxesPreview preview;
+    preview.structure = structure;
+    preview.coordinate_frame = std::move(coordinate_frame);
+    preview.landmarks.assign(landmarks.begin(), landmarks.end());
+    preview.centroid = centroid;
+    preview.axes[0] = canonical_axis(raw_axes[0]);
+    preview.axes[1] = canonical_axis(raw_axes[1]);
+    preview.axes[2] = core::cross(preview.axes[0], preview.axes[1]).normalized();
+    if (!preview.axes[2].finite() ||
+        std::abs(core::dot(preview.axes[2], raw_axes[2])) < 1.0e-8) {
+        return core::Result<MorphologyPrincipalAxesPreview>::failure(validation(
+            "morphology principal-axes orientation is ambiguous"));
+    }
+    preview.variances = analysis->variances;
+    if (auto result = preview.validate(); !result) {
+        return core::Result<MorphologyPrincipalAxesPreview>::failure(result.error());
+    }
+    return core::Result<MorphologyPrincipalAxesPreview>::success(std::move(preview));
+}
+
+core::Result<MorphologySurfaceDeltaPreview> MorphologyModel::preview_surface_delta(
+    StructureId reference_structure,
+    StructureId candidate_structure,
+    std::span<const MorphologySurfaceSample> samples) const {
+    if (auto result = validate(); !result) {
+        return core::Result<MorphologySurfaceDeltaPreview>::failure(
+            result.error().with_context("morphology surface delta preview"));
+    }
+    if (auto result = validate_reference(
+            structures_, reference_structure,
+            "morphology surface delta preview reference structure"); !result) {
+        return core::Result<MorphologySurfaceDeltaPreview>::failure(result.error());
+    }
+    if (auto result = validate_reference(
+            structures_, candidate_structure,
+            "morphology surface delta preview candidate structure"); !result) {
+        return core::Result<MorphologySurfaceDeltaPreview>::failure(result.error());
+    }
+    if (reference_structure == candidate_structure) {
+        return core::Result<MorphologySurfaceDeltaPreview>::failure(validation(
+            "morphology surface delta preview structures must be distinct"));
+    }
+    if (samples.empty() || samples.size() > kMaxCollectionEntries) {
+        return core::Result<MorphologySurfaceDeltaPreview>::failure(validation(
+            "morphology surface delta preview requires bounded samples"));
+    }
+
+    const auto& reference = structures_.at(reference_structure);
+    const auto& candidate = structures_.at(candidate_structure);
+    std::set<LandmarkId> reference_ids;
+    std::set<LandmarkId> candidate_ids;
+    std::string coordinate_frame;
+    MorphologySurfaceDeltaPreview preview;
+    preview.reference_structure = reference_structure;
+    preview.candidate_structure = candidate_structure;
+    preview.deltas.reserve(samples.size());
+    double squared_sum = 0.0;
+
+    for (const auto& sample : samples) {
+        if (auto result = sample.validate(); !result) {
+            return core::Result<MorphologySurfaceDeltaPreview>::failure(result.error());
+        }
+        if (!reference_ids.insert(sample.reference_landmark).second ||
+            !candidate_ids.insert(sample.candidate_landmark).second) {
+            return core::Result<MorphologySurfaceDeltaPreview>::failure(validation(
+                "morphology surface delta preview contains duplicate correspondence"));
+        }
+        const auto reference_landmark = landmarks_.find(sample.reference_landmark);
+        const auto candidate_landmark = landmarks_.find(sample.candidate_landmark);
+        if (reference_landmark == landmarks_.end() || candidate_landmark == landmarks_.end()) {
+            return core::Result<MorphologySurfaceDeltaPreview>::failure(invalid(
+                "morphology surface delta preview references an unknown landmark"));
+        }
+        if (!reference_landmark->second.structure.has_value() ||
+            *reference_landmark->second.structure != reference_structure ||
+            !candidate_landmark->second.structure.has_value() ||
+            *candidate_landmark->second.structure != candidate_structure) {
+            return core::Result<MorphologySurfaceDeltaPreview>::failure(validation(
+                "morphology surface delta preview requires explicit landmark ownership"));
+        }
+        if (std::find(reference.landmarks.begin(), reference.landmarks.end(),
+                      sample.reference_landmark) == reference.landmarks.end() ||
+            std::find(candidate.landmarks.begin(), candidate.landmarks.end(),
+                      sample.candidate_landmark) == candidate.landmarks.end()) {
+            return core::Result<MorphologySurfaceDeltaPreview>::failure(validation(
+                "morphology surface delta preview landmark is not listed by its structure"));
+        }
+        const auto& reference_record = reference_landmark->second;
+        const auto& candidate_record = candidate_landmark->second;
+        if (reference_record.coordinate_frame != candidate_record.coordinate_frame) {
+            return core::Result<MorphologySurfaceDeltaPreview>::failure(validation(
+                "morphology surface delta preview requires a shared coordinate frame"));
+        }
+        if (coordinate_frame.empty()) {
+            coordinate_frame = reference_record.coordinate_frame;
+        } else if (coordinate_frame != reference_record.coordinate_frame) {
+            return core::Result<MorphologySurfaceDeltaPreview>::failure(validation(
+                "morphology surface delta preview samples must share a coordinate frame"));
+        }
+
+        const auto displacement = candidate_record.position - reference_record.position;
+        const auto reference_normal = sample.reference_normal.normalized();
+        const auto candidate_normal = sample.candidate_normal.normalized();
+        const double distance = displacement.length();
+        const double normal_dot = std::clamp(
+            core::dot(reference_normal, candidate_normal), -1.0, 1.0);
+        const double normal_angle = std::acos(normal_dot);
+        const double normal_displacement = core::dot(displacement, reference_normal);
+        const MorphologySurfaceDelta delta{
+            sample.reference_landmark,
+            sample.candidate_landmark,
+            displacement,
+            distance,
+            normal_displacement,
+            sample.candidate_curvature - sample.reference_curvature,
+            sample.candidate_thickness - sample.reference_thickness,
+            normal_angle};
+        if (auto result = delta.validate(); !result) {
+            return core::Result<MorphologySurfaceDeltaPreview>::failure(result.error());
+        }
+        preview.deltas.push_back(delta);
+        squared_sum += distance * distance;
+        if (!std::isfinite(squared_sum)) {
+            return core::Result<MorphologySurfaceDeltaPreview>::failure(validation(
+                "morphology surface delta preview RMS is not finite"));
+        }
+    }
+    preview.coordinate_frame = std::move(coordinate_frame);
+    preview.rms_displacement = std::sqrt(
+        squared_sum / static_cast<double>(preview.deltas.size()));
+    if (auto result = preview.validate(); !result) {
+        return core::Result<MorphologySurfaceDeltaPreview>::failure(result.error());
+    }
+    return core::Result<MorphologySurfaceDeltaPreview>::success(std::move(preview));
+}
+
 core::Result<BilateralMorphologyPreview> MorphologyModel::preview_bilateral_landmarks(
     StructureId reference_structure,
     StructureId candidate_structure) const {
@@ -768,6 +1936,16 @@ core::Result<BilateralMorphologyPreview> MorphologyModel::preview_bilateral_land
 core::Result<BilateralMorphologyPreview> MorphologyModel::preview_bilateral_landmarks(
     StructureId reference_structure,
     StructureId candidate_structure,
+    std::string_view alignment_mode) const {
+    return preview_bilateral_landmarks(
+        reference_structure, candidate_structure,
+        std::span<const MorphologyLandmarkCorrespondence>{}, alignment_mode);
+}
+
+core::Result<BilateralMorphologyPreview> MorphologyModel::preview_bilateral_landmarks(
+    StructureId reference_structure,
+    StructureId candidate_structure,
+    std::span<const MorphologyLandmarkCorrespondence> requested_correspondences,
     std::string_view alignment_mode) const {
     if (auto result = validate(); !result) {
         return core::Result<BilateralMorphologyPreview>::failure(
@@ -786,47 +1964,15 @@ core::Result<BilateralMorphologyPreview> MorphologyModel::preview_bilateral_land
             "bilateral morphology preview structures must be distinct"));
     }
     if (alignment_mode != "landmark" && alignment_mode != "rigid" &&
-        alignment_mode != "scale-normalized") {
+        alignment_mode != "scale-normalized" && alignment_mode != "principal-axis") {
         return core::Result<BilateralMorphologyPreview>::failure(validation(
             "bilateral morphology preview alignment mode is unsupported"));
     }
     const auto& reference = structures_.at(reference_structure);
     const auto& candidate = structures_.at(candidate_structure);
-    if (reference.landmarks.empty() || candidate.landmarks.empty() ||
-        reference.landmarks.size() != candidate.landmarks.size()) {
+    if (reference.landmarks.empty() || candidate.landmarks.empty()) {
         return core::Result<BilateralMorphologyPreview>::failure(validation(
-            "bilateral morphology preview requires equal non-empty landmark sets"));
-    }
-
-    const auto named_landmarks = [&](const MorphologyStructure& structure,
-                                     std::string_view side)
-        -> core::Result<std::map<std::string, LandmarkId>> {
-        std::map<std::string, LandmarkId> result;
-        for (const auto landmark_id : structure.landmarks) {
-            const auto& landmark = landmarks_.at(landmark_id);
-            if (!landmark.structure.has_value() || *landmark.structure != structure.id) {
-                return core::Result<std::map<std::string, LandmarkId>>::failure(validation(
-                    "bilateral morphology preview requires explicit landmark ownership on " +
-                    std::string(side) + " structure"));
-            }
-            if (!result.emplace(landmark.name, landmark.id).second) {
-                return core::Result<std::map<std::string, LandmarkId>>::failure(validation(
-                    "bilateral morphology preview requires unique landmark names per structure"));
-            }
-        }
-        return core::Result<std::map<std::string, LandmarkId>>::success(std::move(result));
-    };
-    const auto reference_landmarks = named_landmarks(reference, "reference");
-    if (!reference_landmarks) {
-        return core::Result<BilateralMorphologyPreview>::failure(reference_landmarks.error());
-    }
-    const auto candidate_landmarks = named_landmarks(candidate, "candidate");
-    if (!candidate_landmarks) {
-        return core::Result<BilateralMorphologyPreview>::failure(candidate_landmarks.error());
-    }
-    if (reference_landmarks.value().size() != candidate_landmarks.value().size()) {
-        return core::Result<BilateralMorphologyPreview>::failure(validation(
-            "bilateral morphology preview landmark names do not correspond"));
+            "bilateral morphology preview requires non-empty landmark sets"));
     }
 
     struct Correspondence {
@@ -836,22 +1982,111 @@ core::Result<BilateralMorphologyPreview> MorphologyModel::preview_bilateral_land
         core::Vec3d candidate_position;
     };
     std::vector<Correspondence> correspondences;
-    correspondences.reserve(reference_landmarks.value().size());
-    for (const auto& [name, reference_id] : reference_landmarks.value()) {
-        const auto candidate_iterator = candidate_landmarks.value().find(name);
-        if (candidate_iterator == candidate_landmarks.value().end()) {
-            return core::Result<BilateralMorphologyPreview>::failure(validation(
-                "bilateral morphology preview landmark names do not correspond"));
+
+    const auto append_correspondence = [&](LandmarkId reference_id,
+                                            LandmarkId candidate_id)
+        -> core::Result<void> {
+        const auto reference_iterator = landmarks_.find(reference_id);
+        const auto candidate_iterator = landmarks_.find(candidate_id);
+        if (reference_iterator == landmarks_.end() || candidate_iterator == landmarks_.end()) {
+            return core::Result<void>::failure(invalid(
+                "bilateral morphology preview correspondence references an unknown landmark"));
         }
-        const auto& reference_landmark = landmarks_.at(reference_id);
-        const auto& candidate_landmark = landmarks_.at(candidate_iterator->second);
+        const auto& reference_landmark = reference_iterator->second;
+        const auto& candidate_landmark = candidate_iterator->second;
+        if (!reference_landmark.structure.has_value() ||
+            *reference_landmark.structure != reference_structure ||
+            !candidate_landmark.structure.has_value() ||
+            *candidate_landmark.structure != candidate_structure) {
+            return core::Result<void>::failure(validation(
+                "bilateral morphology preview correspondence has invalid structure ownership"));
+        }
         if (reference_landmark.coordinate_frame != candidate_landmark.coordinate_frame) {
-            return core::Result<BilateralMorphologyPreview>::failure(validation(
+            return core::Result<void>::failure(validation(
                 "bilateral morphology preview requires a shared landmark coordinate frame"));
         }
         correspondences.push_back(Correspondence{
-            reference_id, candidate_iterator->second,
+            reference_id, candidate_id,
             reference_landmark.position, candidate_landmark.position});
+        return core::Result<void>::success();
+    };
+
+    if (!requested_correspondences.empty()) {
+        if (requested_correspondences.size() > kMaxCollectionEntries) {
+            return core::Result<BilateralMorphologyPreview>::failure(validation(
+                "bilateral morphology preview correspondence set exceeds the safety limit"));
+        }
+        std::set<LandmarkId> reference_ids;
+        std::set<LandmarkId> candidate_ids;
+        correspondences.reserve(requested_correspondences.size());
+        for (const auto& requested : requested_correspondences) {
+            if (auto result = requested.validate(); !result) {
+                return core::Result<BilateralMorphologyPreview>::failure(result.error());
+            }
+            if (!reference_ids.insert(requested.reference_landmark).second ||
+                !candidate_ids.insert(requested.candidate_landmark).second) {
+                return core::Result<BilateralMorphologyPreview>::failure(validation(
+                    "bilateral morphology preview correspondence set contains duplicates"));
+            }
+            if (std::find(reference.landmarks.begin(), reference.landmarks.end(),
+                          requested.reference_landmark) == reference.landmarks.end() ||
+                std::find(candidate.landmarks.begin(), candidate.landmarks.end(),
+                          requested.candidate_landmark) == candidate.landmarks.end()) {
+                return core::Result<BilateralMorphologyPreview>::failure(validation(
+                    "bilateral morphology preview correspondence is not owned by its structure"));
+            }
+            if (auto result = append_correspondence(
+                    requested.reference_landmark, requested.candidate_landmark); !result) {
+                return core::Result<BilateralMorphologyPreview>::failure(result.error());
+            }
+        }
+    } else {
+        if (reference.landmarks.size() != candidate.landmarks.size()) {
+            return core::Result<BilateralMorphologyPreview>::failure(validation(
+                "bilateral morphology preview requires equal landmark sets without an explicit map"));
+        }
+        const auto named_landmarks = [&](const MorphologyStructure& structure,
+                                         std::string_view side)
+            -> core::Result<std::map<std::string, LandmarkId>> {
+            std::map<std::string, LandmarkId> result;
+            for (const auto landmark_id : structure.landmarks) {
+                const auto& landmark = landmarks_.at(landmark_id);
+                if (!landmark.structure.has_value() || *landmark.structure != structure.id) {
+                    return core::Result<std::map<std::string, LandmarkId>>::failure(validation(
+                        "bilateral morphology preview requires explicit landmark ownership on " +
+                        std::string(side) + " structure"));
+                }
+                if (!result.emplace(landmark.name, landmark.id).second) {
+                    return core::Result<std::map<std::string, LandmarkId>>::failure(validation(
+                        "bilateral morphology preview requires unique landmark names per structure"));
+                }
+            }
+            return core::Result<std::map<std::string, LandmarkId>>::success(std::move(result));
+        };
+        const auto reference_landmarks = named_landmarks(reference, "reference");
+        if (!reference_landmarks) {
+            return core::Result<BilateralMorphologyPreview>::failure(reference_landmarks.error());
+        }
+        const auto candidate_landmarks = named_landmarks(candidate, "candidate");
+        if (!candidate_landmarks) {
+            return core::Result<BilateralMorphologyPreview>::failure(candidate_landmarks.error());
+        }
+        if (reference_landmarks.value().size() != candidate_landmarks.value().size()) {
+            return core::Result<BilateralMorphologyPreview>::failure(validation(
+                "bilateral morphology preview landmark names do not correspond"));
+        }
+        correspondences.reserve(reference_landmarks.value().size());
+        for (const auto& [name, reference_id] : reference_landmarks.value()) {
+            const auto candidate_iterator = candidate_landmarks.value().find(name);
+            if (candidate_iterator == candidate_landmarks.value().end()) {
+                return core::Result<BilateralMorphologyPreview>::failure(validation(
+                    "bilateral morphology preview landmark names do not correspond"));
+            }
+            if (auto result = append_correspondence(reference_id, candidate_iterator->second);
+                !result) {
+                return core::Result<BilateralMorphologyPreview>::failure(result.error());
+            }
+        }
     }
 
     BilateralMorphologyPreview preview;
@@ -880,21 +2115,6 @@ core::Result<BilateralMorphologyPreview> MorphologyModel::preview_bilateral_land
                 "aligned bilateral morphology preview centroid is not finite"));
         }
 
-        std::size_t first_distinct = correspondences.size();
-        for (std::size_t index = 1U; index < correspondences.size(); ++index) {
-            if ((correspondences[index].reference_position -
-                 correspondences[0].reference_position).length() > 1.0e-12 &&
-                (correspondences[index].candidate_position -
-                 correspondences[0].candidate_position).length() > 1.0e-12) {
-                first_distinct = index;
-                break;
-            }
-        }
-        if (first_distinct == correspondences.size()) {
-            return core::Result<BilateralMorphologyPreview>::failure(validation(
-                "aligned bilateral morphology preview landmarks are coincident"));
-        }
-
         struct Basis {
             core::Vec3d first;
             core::Vec3d second;
@@ -915,41 +2135,6 @@ core::Result<BilateralMorphologyPreview> MorphologyModel::preview_bilateral_land
             }
             return Basis{first_axis, second_axis, third_axis.normalized()};
         };
-
-        std::size_t third_point = correspondences.size();
-        for (std::size_t index = first_distinct + 1U; index < correspondences.size(); ++index) {
-            const auto reference_cross = core::cross(
-                correspondences[first_distinct].reference_position -
-                    correspondences[0].reference_position,
-                correspondences[index].reference_position -
-                    correspondences[0].reference_position);
-            const auto candidate_cross = core::cross(
-                correspondences[first_distinct].candidate_position -
-                    correspondences[0].candidate_position,
-                correspondences[index].candidate_position -
-                    correspondences[0].candidate_position);
-            if (reference_cross.finite() && candidate_cross.finite() &&
-                reference_cross.length() > 1.0e-12 && candidate_cross.length() > 1.0e-12) {
-                third_point = index;
-                break;
-            }
-        }
-        if (third_point == correspondences.size()) {
-            return core::Result<BilateralMorphologyPreview>::failure(validation(
-                "aligned bilateral morphology preview requires non-collinear landmarks"));
-        }
-        const auto reference_basis = make_basis(
-            correspondences[0].reference_position,
-            correspondences[first_distinct].reference_position,
-            correspondences[third_point].reference_position);
-        const auto candidate_basis = make_basis(
-            correspondences[0].candidate_position,
-            correspondences[first_distinct].candidate_position,
-            correspondences[third_point].candidate_position);
-        if (!reference_basis.has_value() || !candidate_basis.has_value()) {
-            return core::Result<BilateralMorphologyPreview>::failure(validation(
-                "aligned bilateral morphology preview basis is degenerate"));
-        }
 
         double reference_variance = 0.0;
         double candidate_variance = 0.0;
@@ -972,86 +2157,190 @@ core::Result<BilateralMorphologyPreview> MorphologyModel::preview_bilateral_land
             }
         }
 
-        const std::array<core::Vec3d, 3> reference_axes{
-            reference_basis->first, reference_basis->second, reference_basis->third};
-        const std::array<core::Vec3d, 3> candidate_axes{
-            candidate_basis->first, candidate_basis->second, candidate_basis->third};
+        const auto principal_axes = [&](bool reference_side)
+            -> std::optional<std::array<core::Vec3d, 3>> {
+            std::vector<core::Vec3d> positions;
+            positions.reserve(correspondences.size());
+            for (const auto& correspondence : correspondences) {
+                positions.push_back(reference_side
+                    ? correspondence.reference_position
+                    : correspondence.candidate_position);
+            }
+            const auto analysis = compute_principal_axes(positions);
+            if (!analysis.has_value()) return std::nullopt;
+            return analysis->axes;
+        };
+
+        std::array<core::Vec3d, 3> reference_axes{};
+        std::array<core::Vec3d, 3> candidate_axes{};
+        if (alignment_mode == "principal-axis") {
+            const auto reference_principal_axes = principal_axes(true);
+            const auto candidate_principal_axes = principal_axes(false);
+            if (!reference_principal_axes.has_value() ||
+                !candidate_principal_axes.has_value()) {
+                return core::Result<BilateralMorphologyPreview>::failure(validation(
+                    "principal-axis morphology alignment is underconstrained or ambiguous"));
+            }
+            reference_axes = reference_principal_axes.value();
+            candidate_axes = candidate_principal_axes.value();
+        } else {
+            std::size_t first_distinct = correspondences.size();
+            for (std::size_t index = 1U; index < correspondences.size(); ++index) {
+                if ((correspondences[index].reference_position -
+                     correspondences[0].reference_position).length() > 1.0e-12 &&
+                    (correspondences[index].candidate_position -
+                     correspondences[0].candidate_position).length() > 1.0e-12) {
+                    first_distinct = index;
+                    break;
+                }
+            }
+            if (first_distinct == correspondences.size()) {
+                return core::Result<BilateralMorphologyPreview>::failure(validation(
+                    "aligned bilateral morphology preview landmarks are coincident"));
+            }
+
+            std::size_t third_point = correspondences.size();
+            for (std::size_t index = first_distinct + 1U; index < correspondences.size(); ++index) {
+                const auto reference_cross = core::cross(
+                    correspondences[first_distinct].reference_position -
+                        correspondences[0].reference_position,
+                    correspondences[index].reference_position -
+                        correspondences[0].reference_position);
+                const auto candidate_cross = core::cross(
+                    correspondences[first_distinct].candidate_position -
+                        correspondences[0].candidate_position,
+                    correspondences[index].candidate_position -
+                        correspondences[0].candidate_position);
+                if (reference_cross.finite() && candidate_cross.finite() &&
+                    reference_cross.length() > 1.0e-12 && candidate_cross.length() > 1.0e-12) {
+                    third_point = index;
+                    break;
+                }
+            }
+            if (third_point == correspondences.size()) {
+                return core::Result<BilateralMorphologyPreview>::failure(validation(
+                    "aligned bilateral morphology preview requires non-collinear landmarks"));
+            }
+            const auto reference_basis = make_basis(
+                correspondences[0].reference_position,
+                correspondences[first_distinct].reference_position,
+                correspondences[third_point].reference_position);
+            const auto candidate_basis = make_basis(
+                correspondences[0].candidate_position,
+                correspondences[first_distinct].candidate_position,
+                correspondences[third_point].candidate_position);
+            if (!reference_basis.has_value() || !candidate_basis.has_value()) {
+                return core::Result<BilateralMorphologyPreview>::failure(validation(
+                    "aligned bilateral morphology preview basis is degenerate"));
+            }
+            reference_axes = {reference_basis->first, reference_basis->second, reference_basis->third};
+            candidate_axes = {candidate_basis->first, candidate_basis->second, candidate_basis->third};
+        }
+
         const auto component = [](core::Vec3d value, std::size_t index) {
             return index == 0U ? value.x : index == 1U ? value.y : value.z;
         };
-        std::array<std::array<double, 3>, 3> rotation_matrix{};
-        for (std::size_t row = 0U; row < 3U; ++row) {
-            for (std::size_t column = 0U; column < 3U; ++column) {
+        const auto make_rotation = [&](const std::array<core::Vec3d, 3>& reference,
+                                       const std::array<core::Vec3d, 3>& candidate)
+            -> std::optional<core::Quaternion> {
+            std::array<std::array<double, 3>, 3> rotation_matrix{};
+            for (std::size_t row = 0U; row < 3U; ++row) {
+                for (std::size_t column = 0U; column < 3U; ++column) {
+                    for (std::size_t axis = 0U; axis < 3U; ++axis) {
+                        rotation_matrix[row][column] +=
+                            component(reference[axis], row) *
+                            component(candidate[axis], column);
+                    }
+                    if (!std::isfinite(rotation_matrix[row][column])) return std::nullopt;
+                }
+            }
+            const double trace = rotation_matrix[0][0] + rotation_matrix[1][1] +
+                rotation_matrix[2][2];
+            core::Quaternion rotation{};
+            if (trace > 0.0) {
+                const double root = std::sqrt(trace + 1.0) * 2.0;
+                if (!std::isfinite(root) || root <= 0.0) return std::nullopt;
+                rotation.w = 0.25 * root;
+                rotation.x = (rotation_matrix[2][1] - rotation_matrix[1][2]) / root;
+                rotation.y = (rotation_matrix[0][2] - rotation_matrix[2][0]) / root;
+                rotation.z = (rotation_matrix[1][0] - rotation_matrix[0][1]) / root;
+            } else if (rotation_matrix[0][0] > rotation_matrix[1][1] &&
+                       rotation_matrix[0][0] > rotation_matrix[2][2]) {
+                const double root = std::sqrt(std::max(
+                    0.0, 1.0 + rotation_matrix[0][0] - rotation_matrix[1][1] -
+                        rotation_matrix[2][2])) * 2.0;
+                if (!std::isfinite(root) || root <= 0.0) return std::nullopt;
+                rotation.w = (rotation_matrix[2][1] - rotation_matrix[1][2]) / root;
+                rotation.x = 0.25 * root;
+                rotation.y = (rotation_matrix[0][1] + rotation_matrix[1][0]) / root;
+                rotation.z = (rotation_matrix[0][2] + rotation_matrix[2][0]) / root;
+            } else if (rotation_matrix[1][1] > rotation_matrix[2][2]) {
+                const double root = std::sqrt(std::max(
+                    0.0, 1.0 + rotation_matrix[1][1] - rotation_matrix[0][0] -
+                        rotation_matrix[2][2])) * 2.0;
+                if (!std::isfinite(root) || root <= 0.0) return std::nullopt;
+                rotation.w = (rotation_matrix[0][2] - rotation_matrix[2][0]) / root;
+                rotation.x = (rotation_matrix[0][1] + rotation_matrix[1][0]) / root;
+                rotation.y = 0.25 * root;
+                rotation.z = (rotation_matrix[1][2] + rotation_matrix[2][1]) / root;
+            } else {
+                const double root = std::sqrt(std::max(
+                    0.0, 1.0 + rotation_matrix[2][2] - rotation_matrix[0][0] -
+                        rotation_matrix[1][1])) * 2.0;
+                if (!std::isfinite(root) || root <= 0.0) return std::nullopt;
+                rotation.w = (rotation_matrix[1][0] - rotation_matrix[0][1]) / root;
+                rotation.x = (rotation_matrix[0][2] + rotation_matrix[2][0]) / root;
+                rotation.y = (rotation_matrix[1][2] + rotation_matrix[2][1]) / root;
+                rotation.z = 0.25 * root;
+            }
+            if (!rotation.normalizable()) return std::nullopt;
+            return rotation.normalized();
+        };
+
+        std::optional<core::Quaternion> selected_rotation;
+        core::Vec3d selected_translation{};
+        double selected_error = std::numeric_limits<double>::infinity();
+        for (const int first_sign : {-1, 1}) {
+            for (const int second_sign : {-1, 1}) {
+                const std::array<int, 3> signs{
+                    first_sign, second_sign, first_sign * second_sign};
+                std::array<core::Vec3d, 3> signed_candidate_axes{};
                 for (std::size_t axis = 0U; axis < 3U; ++axis) {
-                    rotation_matrix[row][column] +=
-                        component(reference_axes[axis], row) *
-                        component(candidate_axes[axis], column);
+                    signed_candidate_axes[axis] = candidate_axes[axis] *
+                        static_cast<double>(signs[axis]);
+                }
+                const auto rotation = make_rotation(reference_axes, signed_candidate_axes);
+                if (!rotation.has_value()) continue;
+                const auto translation = reference_centroid -
+                    rotation->rotate(candidate_centroid * preview.alignment_scale);
+                if (!translation.finite()) continue;
+                double error = 0.0;
+                bool valid_error = true;
+                for (const auto& correspondence : correspondences) {
+                    const auto transformed = rotation->rotate(
+                        correspondence.candidate_position * preview.alignment_scale) + translation;
+                    const auto displacement = transformed - correspondence.reference_position;
+                    const double distance = displacement.length();
+                    if (!std::isfinite(distance) ||
+                        !std::isfinite(error + distance * distance)) {
+                        valid_error = false;
+                        break;
+                    }
+                    error += distance * distance;
+                }
+                if (valid_error && error < selected_error) {
+                    selected_rotation = rotation;
+                    selected_translation = translation;
+                    selected_error = error;
                 }
             }
         }
-        const double trace = rotation_matrix[0][0] + rotation_matrix[1][1] +
-            rotation_matrix[2][2];
-        core::Quaternion rotation{};
-        if (trace > 0.0) {
-            const double root = std::sqrt(trace + 1.0);
-            if (!std::isfinite(root) || root <= 0.0) {
-                return core::Result<BilateralMorphologyPreview>::failure(validation(
-                    "aligned bilateral morphology preview rotation is invalid"));
-            }
-            rotation.w = 0.25 * root;
-            const double divisor = root * 2.0;
-            rotation.x = (rotation_matrix[2][1] - rotation_matrix[1][2]) / divisor;
-            rotation.y = (rotation_matrix[0][2] - rotation_matrix[2][0]) / divisor;
-            rotation.z = (rotation_matrix[1][0] - rotation_matrix[0][1]) / divisor;
-        } else if (rotation_matrix[0][0] > rotation_matrix[1][1] &&
-                   rotation_matrix[0][0] > rotation_matrix[2][2]) {
-            const double root = std::sqrt(std::max(
-                0.0, 1.0 + rotation_matrix[0][0] - rotation_matrix[1][1] -
-                    rotation_matrix[2][2])) * 2.0;
-            if (!std::isfinite(root) || root <= 0.0) {
-                return core::Result<BilateralMorphologyPreview>::failure(validation(
-                    "aligned bilateral morphology preview rotation is invalid"));
-            }
-            rotation.w = (rotation_matrix[2][1] - rotation_matrix[1][2]) / root;
-            rotation.x = 0.25 * root;
-            rotation.y = (rotation_matrix[0][1] + rotation_matrix[1][0]) / root;
-            rotation.z = (rotation_matrix[0][2] + rotation_matrix[2][0]) / root;
-        } else if (rotation_matrix[1][1] > rotation_matrix[2][2]) {
-            const double root = std::sqrt(std::max(
-                0.0, 1.0 + rotation_matrix[1][1] - rotation_matrix[0][0] -
-                    rotation_matrix[2][2])) * 2.0;
-            if (!std::isfinite(root) || root <= 0.0) {
-                return core::Result<BilateralMorphologyPreview>::failure(validation(
-                    "aligned bilateral morphology preview rotation is invalid"));
-            }
-            rotation.w = (rotation_matrix[0][2] - rotation_matrix[2][0]) / root;
-            rotation.x = (rotation_matrix[0][1] + rotation_matrix[1][0]) / root;
-            rotation.y = 0.25 * root;
-            rotation.z = (rotation_matrix[1][2] + rotation_matrix[2][1]) / root;
-        } else {
-            const double root = std::sqrt(std::max(
-                0.0, 1.0 + rotation_matrix[2][2] - rotation_matrix[0][0] -
-                    rotation_matrix[1][1])) * 2.0;
-            if (!std::isfinite(root) || root <= 0.0) {
-                return core::Result<BilateralMorphologyPreview>::failure(validation(
-                    "aligned bilateral morphology preview rotation is invalid"));
-            }
-            rotation.w = (rotation_matrix[1][0] - rotation_matrix[0][1]) / root;
-            rotation.x = (rotation_matrix[0][2] + rotation_matrix[2][0]) / root;
-            rotation.y = (rotation_matrix[1][2] + rotation_matrix[2][1]) / root;
-            rotation.z = 0.25 * root;
-        }
-        if (!rotation.normalizable()) {
+        if (!selected_rotation.has_value()) {
             return core::Result<BilateralMorphologyPreview>::failure(validation(
-                "aligned bilateral morphology preview rotation is not normalizable"));
+                "aligned bilateral morphology preview rotation is invalid"));
         }
-        preview.alignment_rotation = rotation.normalized();
-        preview.alignment_translation = reference_centroid -
-            preview.alignment_rotation.rotate(candidate_centroid * preview.alignment_scale);
-        if (!preview.alignment_translation.finite()) {
-            return core::Result<BilateralMorphologyPreview>::failure(validation(
-                "aligned bilateral morphology preview translation is not finite"));
-        }
+        preview.alignment_rotation = selected_rotation.value();
+        preview.alignment_translation = selected_translation;
     }
 
     double squared_sum = 0.0;
@@ -1478,6 +2767,154 @@ core::Result<void> MorphologySignatureComparisonPreview::validate() const {
             1.0e-12 * std::max({1.0, std::abs(similarity), std::abs(expected_similarity)})) {
         return core::Result<void>::failure(validation(
             "morphology signature preview similarity does not match its distance"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> EvolutionaryMorphospaceBinding::validate() const {
+    if (auto result = validate_id(lineage.value, "morphospace binding lineage"); !result) {
+        return result;
+    }
+    if (auto result = validate_id(signature.value, "morphospace binding signature"); !result) {
+        return result;
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> EvolutionaryMorphospacePoint::validate() const {
+    if (auto result = validate_id(lineage.value, "morphospace point lineage"); !result) {
+        return result;
+    }
+    if (auto result = validate_id(signature.value, "morphospace point signature"); !result) {
+        return result;
+    }
+    if (!position.finite()) {
+        return core::Result<void>::failure(validation(
+            "morphospace point position must be finite"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> EvolutionaryMorphospaceEdge::validate() const {
+    if (auto result = validate_id(parent.value, "morphospace edge parent"); !result) {
+        return result;
+    }
+    if (auto result = validate_id(child.value, "morphospace edge child"); !result) {
+        return result;
+    }
+    if (parent == child) {
+        return core::Result<void>::failure(validation(
+            "morphospace edge parent and child must be distinct"));
+    }
+    if (!displacement.finite()) {
+        return core::Result<void>::failure(validation(
+            "morphospace edge displacement must be finite"));
+    }
+    if (!std::isfinite(distance) || distance < 0.0) {
+        return core::Result<void>::failure(validation(
+            "morphospace edge distance must be finite and non-negative"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> EvolutionaryMorphospacePreview::validate() const {
+    if (auto result = validate_text(projection, "morphospace projection", 64U, true);
+        !result) {
+        return result;
+    }
+    if (projection != "leading-components") {
+        return core::Result<void>::failure(validation(
+            "morphospace projection is unsupported"));
+    }
+    if (auto result = validate_text(normalization, "morphospace normalization", 64U, true);
+        !result) {
+        return result;
+    }
+    if (normalization != "raw" && normalization != "unit-box") {
+        return core::Result<void>::failure(validation(
+            "morphospace normalization is unsupported"));
+    }
+    if (dimensions != 2U && dimensions != 3U) {
+        return core::Result<void>::failure(validation(
+            "morphospace dimensions must be 2 or 3"));
+    }
+    if (auto result = validate_text(descriptor, "morphospace descriptor", 256U, true);
+        !result) {
+        return result;
+    }
+    if (auto result = validate_text(coordinate_frame, "morphospace coordinate frame", 256U, true);
+        !result) {
+        return result;
+    }
+    if (auto result = validate_text(signature_normalization,
+                                    "morphospace signature normalization", 256U, true);
+        !result) {
+        return result;
+    }
+    if (!component_labels.empty() && component_labels.size() != dimensions) {
+        return core::Result<void>::failure(validation(
+            "morphospace component labels must match the projected dimensions"));
+    }
+    for (const auto& label : component_labels) {
+        if (auto result = validate_text(label, "morphospace component label", 256U, true);
+            !result) {
+            return result;
+        }
+    }
+    if (points.empty() || points.size() > kMaxMorphospacePoints) {
+        return core::Result<void>::failure(validation(
+            "morphospace points are empty or exceed the safety limit"));
+    }
+
+    std::map<LineageId, core::Vec3d> positions;
+    std::set<SignatureId> signatures;
+    for (const auto& point : points) {
+        if (auto result = point.validate(); !result) return result;
+        if (!positions.emplace(point.lineage, point.position).second) {
+            return core::Result<void>::failure(validation(
+                "morphospace points contain a duplicate lineage"));
+        }
+        if (!signatures.insert(point.signature).second) {
+            return core::Result<void>::failure(validation(
+                "morphospace points contain a duplicate signature"));
+        }
+        if (dimensions == 2U && std::abs(point.position.z) > 1.0e-12) {
+            return core::Result<void>::failure(validation(
+                "2D morphospace points must have zero depth"));
+        }
+        if (normalization == "unit-box" &&
+            (point.position.x < 0.0 || point.position.x > 1.0 ||
+             point.position.y < 0.0 || point.position.y > 1.0 ||
+             (dimensions == 3U &&
+              (point.position.z < 0.0 || point.position.z > 1.0)))) {
+            return core::Result<void>::failure(validation(
+                "unit-box morphospace points must lie in the [0,1] range"));
+        }
+    }
+
+    std::set<std::pair<LineageId, LineageId>> edge_keys;
+    for (const auto& edge : trajectories) {
+        if (auto result = edge.validate(); !result) return result;
+        if (!positions.contains(edge.parent) || !positions.contains(edge.child)) {
+            return core::Result<void>::failure(validation(
+                "morphospace trajectory references a point outside the preview"));
+        }
+        if (!edge_keys.emplace(edge.parent, edge.child).second) {
+            return core::Result<void>::failure(validation(
+                "morphospace trajectories contain a duplicate edge"));
+        }
+        const auto expected = positions.at(edge.child) - positions.at(edge.parent);
+        const double expected_distance = std::hypot(
+            std::hypot(expected.x, expected.y), expected.z);
+        const double scale = std::max({1.0, std::abs(edge.distance), expected_distance});
+        if (!expected.finite() || !std::isfinite(expected_distance) ||
+            std::abs(edge.displacement.x - expected.x) > 1.0e-12 * scale ||
+            std::abs(edge.displacement.y - expected.y) > 1.0e-12 * scale ||
+            std::abs(edge.displacement.z - expected.z) > 1.0e-12 * scale ||
+            std::abs(edge.distance - expected_distance) > 1.0e-12 * scale) {
+            return core::Result<void>::failure(validation(
+                "morphospace trajectory does not match its endpoint positions"));
+        }
     }
     return core::Result<void>::success();
 }
@@ -9478,6 +10915,82 @@ core::Result<GeneRegulatoryNetwork> GeneRegulatoryNetwork::deserialize(std::stri
     return core::Result<GeneRegulatoryNetwork>::success(std::move(network));
 }
 
+namespace {
+
+std::string developmental_stage_fingerprint(const DevelopmentStage& stage) {
+    std::ostringstream output;
+    output << stage.ordinal << ' ' << std::quoted(stage.name) << ' '
+           << std::quoted(stage.condition) << ' ';
+    write_provenance(output, stage.provenance);
+    return output.str();
+}
+
+std::string developmental_instruction_fingerprint(
+    const DevelopmentInstruction& instruction) {
+    std::ostringstream output;
+    output << instruction.stage.value << ' ' << std::quoted(instruction.opcode) << ' '
+           << std::quoted(instruction.module) << ' ' << std::quoted(instruction.condition) << ' ';
+    write_id_list(output, instruction.parameters);
+    output << ' ';
+    write_id_list(output, instruction.creates);
+    output << ' ';
+    write_id_list(output, instruction.modifies);
+    output << ' ';
+    write_provenance(output, instruction.provenance);
+    return output.str();
+}
+
+} // namespace
+
+DevelopmentalProgramDiff DevelopmentalProgram::diff_against(
+    const DevelopmentalProgram& parent) const {
+    DevelopmentalProgramDiff diff;
+    diff.source_identity_changed = schema != parent.schema || reference != parent.reference ||
+        source_digest != parent.source_digest;
+
+    std::set<std::string> current_modules;
+    std::set<std::string> parent_modules;
+    std::set<std::string> changed_modules;
+    for (const auto& [id, stage] : stages_) {
+        const auto previous = parent.stages_.find(id);
+        if (previous == parent.stages_.end()) {
+            diff.added_stages.push_back(id);
+        } else if (developmental_stage_fingerprint(stage) !=
+                   developmental_stage_fingerprint(previous->second)) {
+            diff.changed_stages.push_back(id);
+        }
+    }
+    for (const auto& [id, stage] : parent.stages_) {
+        static_cast<void>(stage);
+        if (!stages_.contains(id)) diff.removed_stages.push_back(id);
+    }
+
+    for (const auto& [id, instruction] : instructions_) {
+        current_modules.insert(instruction.module);
+        const auto previous = parent.instructions_.find(id);
+        if (previous == parent.instructions_.end()) {
+            diff.added_instructions.push_back(id);
+        } else if (developmental_instruction_fingerprint(instruction) !=
+                   developmental_instruction_fingerprint(previous->second)) {
+            diff.changed_instructions.push_back(id);
+            changed_modules.insert(instruction.module);
+            changed_modules.insert(previous->second.module);
+        }
+    }
+    for (const auto& [id, instruction] : parent.instructions_) {
+        parent_modules.insert(instruction.module);
+        if (!instructions_.contains(id)) diff.removed_instructions.push_back(id);
+    }
+    std::set_difference(current_modules.begin(), current_modules.end(),
+                        parent_modules.begin(), parent_modules.end(),
+                        std::back_inserter(diff.added_modules));
+    std::set_difference(parent_modules.begin(), parent_modules.end(),
+                        current_modules.begin(), current_modules.end(),
+                        std::back_inserter(diff.removed_modules));
+    diff.changed_modules.assign(changed_modules.begin(), changed_modules.end());
+    return diff;
+}
+
 core::Result<void> DevelopmentStage::validate() const {
     if (auto result = validate_id(id.value, "development stage id"); !result) return result;
     if (auto result = validate_text(name, "development stage name", 256U, true); !result) return result;
@@ -9721,6 +11234,10 @@ core::Result<void> DevelopmentTraceEntry::validate() const {
                 "development trace parameter value is not finite"));
         }
     }
+    if (auto result = validate_digest(result_digest, "development trace result digest");
+        !result) {
+        return result;
+    }
     if (auto result = validate_text(evidence, "development trace evidence", kMaxTextBytes, true);
         !result) return result;
     return provenance.validate();
@@ -9735,6 +11252,14 @@ core::Result<void> DevelopmentalTrace::validate() const {
                                     kMaxReferenceBytes, true); !result) return result;
     if (auto result = validate_text(genome_reference, "development trace genome reference",
                                     kMaxReferenceBytes); !result) return result;
+    if (auto result = validate_digest(program_digest, "development trace program digest");
+        !result) {
+        return result;
+    }
+    if (auto result = validate_digest(genome_digest, "development trace genome digest");
+        !result) {
+        return result;
+    }
     if (entries_.size() > kMaxCollectionEntries) {
         return core::Result<void>::failure(validation(
             "development trace collection exceeds the safety limit"));
@@ -9751,7 +11276,10 @@ core::Result<void> DevelopmentalTrace::validate() const {
 std::string DevelopmentalTrace::serialize() const {
     std::ostringstream output;
     output << "CARTOGRAPHER_DEVELOPMENTAL_TRACE " << kSchemaVersion << '\n';
-    output << std::quoted(program_reference) << ' ' << std::quoted(genome_reference) << '\n';
+    output << std::quoted(program_reference) << ' ' << std::quoted(genome_reference);
+    write_optional_digest(output, program_digest);
+    write_optional_digest(output, genome_digest);
+    output << '\n';
     output << "ENTRIES " << entries_.size() << '\n';
     for (const auto& [id, entry] : entries_) {
         output << "TRACE " << id.value << ' ' << entry.stage.value << ' '
@@ -9763,6 +11291,9 @@ std::string DevelopmentalTrace::serialize() const {
         write_provenance(output, entry.provenance);
         output << ' ' << optional_id(entry.tissue_region) << ' ';
         write_double_list(output, entry.parameter_values);
+        output << ' ' << (entry.seed.has_value() ? 1U : 0U);
+        if (entry.seed.has_value()) output << ' ' << *entry.seed;
+        write_optional_digest(output, entry.result_digest);
         output << '\n';
     }
     output << "END\n";
@@ -9779,7 +11310,8 @@ core::Result<DevelopmentalTrace> DevelopmentalTrace::deserialize(std::string_vie
         return core::Result<DevelopmentalTrace>::failure(result.error());
     }
     const auto version = read_uint(input, "development trace schema version");
-    if (!version || (version.value() != 1U && version.value() != kSchemaVersion)) {
+    if (!version || (version.value() != 1U && version.value() != 2U &&
+                     version.value() != kSchemaVersion)) {
         return core::Result<DevelopmentalTrace>::failure(
             Diagnostic(ErrorCode::version_mismatch, "unsupported developmental trace schema version"));
     }
@@ -9792,6 +11324,16 @@ core::Result<DevelopmentalTrace> DevelopmentalTrace::deserialize(std::string_vie
     DevelopmentalTrace trace;
     trace.program_reference = program.value();
     trace.genome_reference = genome.value();
+    if (version.value() >= 3U) {
+        const auto program_digest = read_optional_digest(input, "development trace program");
+        const auto genome_digest = read_optional_digest(input, "development trace genome");
+        if (!program_digest || !genome_digest) {
+            return core::Result<DevelopmentalTrace>::failure(parse_error(
+                "invalid developmental trace source digest metadata"));
+        }
+        trace.program_digest = program_digest.value();
+        trace.genome_digest = genome_digest.value();
+    }
     if (auto result = require_record(input, "ENTRIES"); !result) {
         return core::Result<DevelopmentalTrace>::failure(result.error());
     }
@@ -9813,6 +11355,8 @@ core::Result<DevelopmentalTrace> DevelopmentalTrace::deserialize(std::string_vie
         const auto provenance = read_provenance(input);
         std::optional<TissueRegionId> tissue_region;
         std::vector<double> parameter_values;
+        std::optional<std::uint64_t> seed;
+        std::optional<assets::Sha256Digest> result_digest;
         if (version.value() >= 2U) {
             const auto parsed_tissue_region = read_optional_id<TissueRegionId>(
                 input, "development trace tissue region");
@@ -9825,6 +11369,26 @@ core::Result<DevelopmentalTrace> DevelopmentalTrace::deserialize(std::string_vie
             tissue_region = parsed_tissue_region.value();
             parameter_values = parsed_parameter_values.value();
         }
+        if (version.value() >= 3U) {
+            const auto seed_present = read_uint(input, "development trace seed presence");
+            if (!seed_present || seed_present.value() > 1U) {
+                return core::Result<DevelopmentalTrace>::failure(parse_error(
+                    "invalid development trace seed presence"));
+            }
+            if (seed_present.value() != 0U) {
+                const auto parsed_seed = read_uint(input, "development trace seed");
+                if (!parsed_seed) {
+                    return core::Result<DevelopmentalTrace>::failure(parsed_seed.error());
+                }
+                seed = parsed_seed.value();
+            }
+            const auto parsed_result_digest = read_optional_digest(
+                input, "development trace result");
+            if (!parsed_result_digest) {
+                return core::Result<DevelopmentalTrace>::failure(parsed_result_digest.error());
+            }
+            result_digest = parsed_result_digest.value();
+        }
         if (!id || !stage || !instruction || !created || !modified || !evidence || !provenance) {
             return core::Result<DevelopmentalTrace>::failure(parse_error(
                 "invalid development trace entry"));
@@ -9832,7 +11396,7 @@ core::Result<DevelopmentalTrace> DevelopmentalTrace::deserialize(std::string_vie
         const auto inserted = trace.insert_entry(DevelopmentTraceEntry{
             TraceId{id.value()}, StageId{stage.value()}, InstructionId{instruction.value()},
             created.value(), modified.value(), evidence.value(), provenance.value(), tissue_region,
-            std::move(parameter_values)});
+            std::move(parameter_values), seed, result_digest});
         if (!inserted) return core::Result<DevelopmentalTrace>::failure(inserted.error());
     }
     if (auto result = require_record(input, "END"); !result) {
@@ -10818,6 +12382,120 @@ core::Result<void> ScientificModel::insert_result_set(ResultSet value) {
     return insert_unique(result_sets_, std::move(value), "result set");
 }
 
+core::Result<ParameterSweepPreview> ScientificModel::preview_parameter_sweep(
+    StudyId study,
+    std::vector<ParameterSweepAxis> axes) const {
+    if (auto result = validate(); !result) {
+        return core::Result<ParameterSweepPreview>::failure(
+            result.error().with_context("parameter sweep preview"));
+    }
+    const auto study_iterator = studies_.find(study);
+    if (study_iterator == studies_.end()) {
+        return core::Result<ParameterSweepPreview>::failure(invalid(
+            "parameter sweep references an unknown study"));
+    }
+    if (axes.empty() || axes.size() > kMaxParameterSweepAxes) {
+        return core::Result<ParameterSweepPreview>::failure(validation(
+            "parameter sweep requires a bounded non-empty axis set"));
+    }
+    const auto& study_record = study_iterator->second;
+    if (study_record.parameters.empty()) {
+        return core::Result<ParameterSweepPreview>::failure(validation(
+            "parameter sweep study has no parameters"));
+    }
+
+    std::vector<ParameterId> parameter_order = study_record.parameters;
+    std::sort(parameter_order.begin(), parameter_order.end());
+    if (std::adjacent_find(parameter_order.begin(), parameter_order.end()) !=
+        parameter_order.end()) {
+        return core::Result<ParameterSweepPreview>::failure(validation(
+            "parameter sweep study contains a duplicate parameter"));
+    }
+    if (parameter_order.size() > kMaxParameterSweepParameters) {
+        return core::Result<ParameterSweepPreview>::failure(validation(
+            "parameter sweep study has too many parameters"));
+    }
+
+    ParameterSweepPreview preview;
+    preview.study = study;
+    preview.source_model_revision = study_record.source_model_revision;
+    preview.strategy = "cartesian";
+    preview.base_assignments.reserve(parameter_order.size());
+    for (const auto parameter_id : parameter_order) {
+        const auto& parameter = parameters_.at(parameter_id);
+        preview.base_assignments.push_back(ParameterAssignment{
+            parameter_id, parameter.value});
+    }
+
+    std::sort(axes.begin(), axes.end(), [](const ParameterSweepAxis& left,
+                                           const ParameterSweepAxis& right) {
+        return left.parameter < right.parameter;
+    });
+    const std::set<ParameterId> study_parameters(
+        study_record.parameters.begin(), study_record.parameters.end());
+    std::set<ParameterId> seen_axes;
+    for (auto& axis : axes) {
+        if (auto result = axis.validate(); !result) {
+            return core::Result<ParameterSweepPreview>::failure(result.error());
+        }
+        if (!study_parameters.contains(axis.parameter)) {
+            return core::Result<ParameterSweepPreview>::failure(validation(
+                "parameter sweep axis references a parameter outside the study"));
+        }
+        if (!seen_axes.insert(axis.parameter).second) {
+            return core::Result<ParameterSweepPreview>::failure(validation(
+                "parameter sweep contains a duplicate axis"));
+        }
+        std::sort(axis.values.begin(), axis.values.end());
+        if (std::adjacent_find(axis.values.begin(), axis.values.end()) != axis.values.end()) {
+            return core::Result<ParameterSweepPreview>::failure(validation(
+                "parameter sweep axis contains duplicate values"));
+        }
+        const auto& parameter = parameters_.at(axis.parameter);
+        for (const double value : axis.values) {
+            if (parameter.lower_bound.has_value() && value < *parameter.lower_bound) {
+                return core::Result<ParameterSweepPreview>::failure(validation(
+                    "parameter sweep value is below its authored bound"));
+            }
+            if (parameter.upper_bound.has_value() && value > *parameter.upper_bound) {
+                return core::Result<ParameterSweepPreview>::failure(validation(
+                    "parameter sweep value is above its authored bound"));
+            }
+        }
+        preview.axes.push_back(std::move(axis));
+    }
+
+    preview.cases.push_back(preview.base_assignments);
+    for (const auto& axis : preview.axes) {
+        if (preview.cases.size() > kMaxParameterSweepCases / axis.values.size()) {
+            return core::Result<ParameterSweepPreview>::failure(validation(
+                "parameter sweep case count exceeds the safety limit"));
+        }
+        std::vector<std::vector<ParameterAssignment>> expanded;
+        expanded.reserve(preview.cases.size() * axis.values.size());
+        for (const auto& current : preview.cases) {
+            for (const double value : axis.values) {
+                auto next = current;
+                const auto assignment = std::find_if(
+                    next.begin(), next.end(), [&axis](const ParameterAssignment& candidate) {
+                        return candidate.parameter == axis.parameter;
+                    });
+                if (assignment == next.end()) {
+                    return core::Result<ParameterSweepPreview>::failure(validation(
+                        "parameter sweep expansion lost an axis parameter"));
+                }
+                assignment->value = value;
+                expanded.push_back(std::move(next));
+            }
+        }
+        preview.cases = std::move(expanded);
+    }
+    if (auto result = preview.validate(); !result) {
+        return core::Result<ParameterSweepPreview>::failure(result.error());
+    }
+    return core::Result<ParameterSweepPreview>::success(std::move(preview));
+}
+
 core::Result<void> ScientificModel::set_morphology(MorphologyModel value) {
     if (auto result = value.validate(); !result) {
         return core::Result<void>::failure(result.error().with_context("morphology admission"));
@@ -11076,6 +12754,185 @@ ScientificModel::build_developmental_instruction_impact(InstructionId instructio
     return core::Result<DevelopmentalInstructionImpact>::success(std::move(impact));
 }
 
+core::Result<EvolutionaryMorphospacePreview>
+ScientificModel::preview_evolutionary_morphospace(
+    std::span<const EvolutionaryMorphospaceBinding> bindings,
+    std::uint32_t dimensions,
+    std::string_view normalization) const {
+    if (!morphometrics_.has_value() || !lineage_graph_.has_value()) {
+        return core::Result<EvolutionaryMorphospacePreview>::failure(validation(
+            "evolutionary morphospace requires admitted morphometrics and lineage graph"));
+    }
+    if (auto result = validate(); !result) {
+        return core::Result<EvolutionaryMorphospacePreview>::failure(
+            result.error().with_context("evolutionary morphospace preview"));
+    }
+    if (bindings.empty() || bindings.size() > kMaxMorphospacePoints) {
+        return core::Result<EvolutionaryMorphospacePreview>::failure(validation(
+            "evolutionary morphospace requires a bounded non-empty binding set"));
+    }
+    if (dimensions != 2U && dimensions != 3U) {
+        return core::Result<EvolutionaryMorphospacePreview>::failure(validation(
+            "evolutionary morphospace dimensions must be 2 or 3"));
+    }
+    if (normalization != "raw" && normalization != "unit-box") {
+        return core::Result<EvolutionaryMorphospacePreview>::failure(validation(
+            "evolutionary morphospace normalization is unsupported"));
+    }
+
+    std::vector<EvolutionaryMorphospaceBinding> ordered(bindings.begin(), bindings.end());
+    std::sort(ordered.begin(), ordered.end(), [](const auto& left, const auto& right) {
+        if (left.lineage != right.lineage) return left.lineage < right.lineage;
+        return left.signature < right.signature;
+    });
+
+    EvolutionaryMorphospacePreview preview;
+    preview.projection = "leading-components";
+    preview.normalization = std::string(normalization);
+    preview.dimensions = dimensions;
+
+    std::set<LineageId> seen_lineages;
+    std::set<SignatureId> seen_signatures;
+    std::array<double, 3> lower{
+        std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::infinity(),
+    };
+    std::array<double, 3> upper{
+        -std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity(),
+    };
+    std::vector<std::array<double, 3>> raw_positions;
+    raw_positions.reserve(ordered.size());
+
+    for (const auto& binding : ordered) {
+        if (auto result = binding.validate(); !result) {
+            return core::Result<EvolutionaryMorphospacePreview>::failure(result.error());
+        }
+        if (!seen_lineages.insert(binding.lineage).second) {
+            return core::Result<EvolutionaryMorphospacePreview>::failure(validation(
+                "evolutionary morphospace binds more than one signature to a lineage"));
+        }
+        if (!seen_signatures.insert(binding.signature).second) {
+            return core::Result<EvolutionaryMorphospacePreview>::failure(validation(
+                "evolutionary morphospace reuses a signature for multiple lineages"));
+        }
+        const auto lineage_iterator = lineage_graph_->nodes().find(binding.lineage);
+        if (lineage_iterator == lineage_graph_->nodes().end()) {
+            return core::Result<EvolutionaryMorphospacePreview>::failure(validation(
+                "evolutionary morphospace references an unknown lineage"));
+        }
+        const auto signature_iterator = morphometrics_->signatures().find(binding.signature);
+        if (signature_iterator == morphometrics_->signatures().end()) {
+            return core::Result<EvolutionaryMorphospacePreview>::failure(validation(
+                "evolutionary morphospace references an unknown signature"));
+        }
+        const auto& signature = signature_iterator->second;
+        if (signature.components.size() < dimensions) {
+            return core::Result<EvolutionaryMorphospacePreview>::failure(validation(
+                "evolutionary morphospace signature has too few components"));
+        }
+        if (preview.points.empty()) {
+            preview.descriptor = signature.descriptor;
+            preview.coordinate_frame = signature.coordinate_frame;
+            preview.signature_normalization = signature.normalization;
+            if (!signature.component_labels.empty()) {
+                preview.component_labels.assign(
+                    signature.component_labels.begin(),
+                    signature.component_labels.begin() + static_cast<std::ptrdiff_t>(dimensions));
+            }
+        } else if (signature.descriptor != preview.descriptor ||
+                   signature.coordinate_frame != preview.coordinate_frame ||
+                   signature.normalization != preview.signature_normalization ||
+                   (signature.component_labels.empty() != preview.component_labels.empty()) ||
+                   (!signature.component_labels.empty() &&
+                    !std::equal(preview.component_labels.begin(), preview.component_labels.end(),
+                                signature.component_labels.begin()))) {
+            return core::Result<EvolutionaryMorphospacePreview>::failure(validation(
+                "evolutionary morphospace requires matching signature descriptor, frame, and labels"));
+        }
+
+        std::array<double, 3> raw{
+            signature.components[0U],
+            signature.components[1U],
+            dimensions == 3U ? signature.components[2U] : 0.0,
+        };
+        for (std::size_t axis = 0U; axis < dimensions; ++axis) {
+            if (!std::isfinite(raw[axis])) {
+                return core::Result<EvolutionaryMorphospacePreview>::failure(validation(
+                    "evolutionary morphospace component is not finite"));
+            }
+            lower[axis] = std::min(lower[axis], raw[axis]);
+            upper[axis] = std::max(upper[axis], raw[axis]);
+        }
+        raw_positions.push_back(raw);
+        preview.points.push_back(EvolutionaryMorphospacePoint{
+            binding.lineage,
+            binding.signature,
+            lineage_iterator->second.generation,
+            core::Vec3d{raw[0U], raw[1U], raw[2U]},
+        });
+    }
+
+    if (normalization == "unit-box") {
+        for (std::size_t point_index = 0U; point_index < preview.points.size(); ++point_index) {
+            auto& point = preview.points[point_index];
+            auto& raw = raw_positions[point_index];
+            std::array<double, 3> normalized{0.0, 0.0, 0.0};
+            for (std::size_t axis = 0U; axis < dimensions; ++axis) {
+                const double span = upper[axis] - lower[axis];
+                if (!std::isfinite(span)) {
+                    return core::Result<EvolutionaryMorphospacePreview>::failure(validation(
+                        "evolutionary morphospace component range is not finite"));
+                }
+                normalized[axis] = span == 0.0 ? 0.0 : (raw[axis] - lower[axis]) / span;
+                if (!std::isfinite(normalized[axis])) {
+                    return core::Result<EvolutionaryMorphospacePreview>::failure(validation(
+                        "evolutionary morphospace normalization is not finite"));
+                }
+            }
+            point.position = core::Vec3d{normalized[0U], normalized[1U], normalized[2U]};
+        }
+    }
+
+    std::map<LineageId, std::size_t> point_indices;
+    for (std::size_t index = 0U; index < preview.points.size(); ++index) {
+        point_indices.emplace(preview.points[index].lineage, index);
+    }
+    const auto append_parent_edge = [&preview, &point_indices](
+                                        LineageId parent,
+                                        LineageId child) {
+        const auto parent_iterator = point_indices.find(parent);
+        const auto child_iterator = point_indices.find(child);
+        if (parent_iterator == point_indices.end() || child_iterator == point_indices.end()) {
+            return;
+        }
+        const auto& parent_position = preview.points[parent_iterator->second].position;
+        const auto& child_position = preview.points[child_iterator->second].position;
+        const auto displacement = child_position - parent_position;
+        const double distance = std::hypot(
+            std::hypot(displacement.x, displacement.y), displacement.z);
+        preview.trajectories.push_back(EvolutionaryMorphospaceEdge{
+            parent, child, displacement, distance});
+    };
+    for (const auto& point : preview.points) {
+        const auto& node = lineage_graph_->nodes().at(point.lineage);
+        if (node.parent_a.has_value()) append_parent_edge(*node.parent_a, point.lineage);
+        if (node.parent_b.has_value()) append_parent_edge(*node.parent_b, point.lineage);
+    }
+    std::sort(preview.trajectories.begin(), preview.trajectories.end(),
+              [](const auto& left, const auto& right) {
+                  if (left.child != right.child) return left.child < right.child;
+                  return left.parent < right.parent;
+              });
+
+    if (auto result = preview.validate(); !result) {
+        return core::Result<EvolutionaryMorphospacePreview>::failure(result.error());
+    }
+    return core::Result<EvolutionaryMorphospacePreview>::success(std::move(preview));
+}
+
 core::Result<void> ScientificModel::validate() const {
     if (regions_.size() > kMaxCollectionEntries || boundaries_.size() > kMaxCollectionEntries ||
         interfaces_.size() > kMaxCollectionEntries || sources_.size() > kMaxCollectionEntries ||
@@ -11245,11 +13102,24 @@ core::Result<void> ScientificModel::validate() const {
             return core::Result<void>::failure(validation(
                 "developmental trace references a different developmental program"));
         }
+        if (developmental_trace_->program_digest.has_value() &&
+            (!developmental_program_->source_digest.has_value() ||
+             *developmental_trace_->program_digest != *developmental_program_->source_digest)) {
+            return core::Result<void>::failure(validation(
+                "developmental trace program digest does not match the admitted program source"));
+        }
         if (functional_genome_.has_value() &&
             !developmental_trace_->genome_reference.empty() &&
             developmental_trace_->genome_reference != functional_genome_->developmental_program_reference) {
             return core::Result<void>::failure(validation(
                 "developmental trace genome reference does not match the admitted genome program reference"));
+        }
+        if (developmental_trace_->genome_digest.has_value() &&
+            (!functional_genome_.has_value() ||
+             !functional_genome_->source_digest.has_value() ||
+             *developmental_trace_->genome_digest != *functional_genome_->source_digest)) {
+            return core::Result<void>::failure(validation(
+                "developmental trace genome digest does not match the admitted functional genome source"));
         }
         for (const auto& [id, entry] : developmental_trace_->entries()) {
             static_cast<void>(id);

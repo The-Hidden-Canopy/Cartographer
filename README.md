@@ -76,9 +76,17 @@ checkout.
   developmental-program/trace records with optional tissue assignment and
   parameter-value evidence, plus lineage/mutation/recombination records, field-linked
   morphology growth-domain records, deterministic
-  timeline/instruction-impact projections, and explicit
+  timeline/instruction-impact projections, deterministic source-level
+  developmental-program diffs for stage/instruction/module changes, and explicit
   morphometric observations/signatures/comparisons plus deterministic
-  bilateral landmark and CPU signature-comparison previews and sequence-genome
+  bilateral landmark (shared-frame, rigid, scale-normalized, and principal-axis)
+  with explicit correspondence maps or a name-bound compatibility path,
+  CPU landmark measurements (distance, segment-length, angle, branch-angle,
+  ratio, centroid, bounding-dimensions, and deterministic principal axes), and
+  signature-comparison previews plus shared-frame explicit surface metadata
+  deltas for displacement, normal displacement, curvature, thickness, and
+  normal angle
+  and sequence-genome
   contigs/variants, bounded anatomy/partonomy mappings with ontology release
   metadata and typed tissue-region records with structure/region bindings,
   stage metadata, and geometry,
@@ -86,6 +94,8 @@ checkout.
   descriptors with CPU-only scalar sample-to-color, vector glyph, bounded slice-plane,
   marching-squares contour, bounded marching-tetrahedra isosurface, bounded front-to-back
   volume projection, single-probe readout, and bounded 2D streamline previews,
+  plus revision-bound Cartesian parameter-sweep previews that expand authored
+  study parameters without solver/provider execution,
   provider-import lineage receipts with explicit preservation
   dispositions, and phenotype-capability
   derivations with typed source tracing and derived forward/reverse capability

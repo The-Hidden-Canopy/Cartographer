@@ -68,8 +68,11 @@ public semantic payload, source receipt, and canonical digest only; they do not
 carry MENAGERIE interpretation logic, private provider handles, or runtime
 admission state. The derived development timeline is read-only
 inspection data and is not a second public source of truth. The bilateral
-landmark preview is likewise a deterministic local delta projection; it does
-not contain private morphospace models, alignment weights, or provider output.
+landmark, measurement, and evolutionary-morphospace previews are likewise
+deterministic local projections; the morphospace surface contains only
+explicit lineage/signature bindings and derived coordinates. It does not
+contain private morphospace models, alignment weights, genome interpretation
+logic, or provider output.
 sequence/adaptation payload is not implicitly a functional genome.
 
 The anatomy provider candidate envelope is likewise provider-neutral. It carries

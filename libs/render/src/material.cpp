@@ -51,6 +51,72 @@ bool finite(Vec3d value) {
 
 } // namespace
 
+core::Result<void> ChannelMapping::validate() const {
+    const auto valid_channel = [](TextureChannel channel) {
+        switch (channel) {
+        case TextureChannel::red:
+        case TextureChannel::green:
+        case TextureChannel::blue:
+        case TextureChannel::alpha:
+        case TextureChannel::one_minus_red:
+        case TextureChannel::one_minus_green:
+        case TextureChannel::one_minus_blue:
+        case TextureChannel::one_minus_alpha:
+        case TextureChannel::constant_zero:
+        case TextureChannel::constant_one:
+            return true;
+        }
+        return false;
+    };
+    for (const TextureChannel channel : rgba) {
+        if (!valid_channel(channel)) {
+            return core::Result<void>::failure(invalid(
+                "texture channel mapping contains an unknown channel"));
+        }
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> TextureTransform::validate() const {
+    if (!offset.finite() || !scale.finite() || !pivot.finite() ||
+        !std::isfinite(rotation)) {
+        return core::Result<void>::failure(invalid(
+            "texture transform must contain finite values"));
+    }
+    if (std::abs(scale.x) <= 1e-12 || std::abs(scale.y) <= 1e-12) {
+        return core::Result<void>::failure(validation(
+            "texture transform scale must be non-zero"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> TextureRef::validate() const {
+    if (!asset) return core::Result<void>::success();
+    if (uv_set == 0U) {
+        return core::Result<void>::failure(validation(
+            "texture bindings require an explicit non-zero UV set identity"));
+    }
+    switch (interpretation) {
+    case TextureInterpretation::asset:
+    case TextureInterpretation::linear:
+    case TextureInterpretation::srgb:
+        break;
+    default:
+        return core::Result<void>::failure(invalid(
+            "texture binding contains an unknown color interpretation"));
+    }
+    switch (normal_convention) {
+    case NormalConvention::directx_y_minus:
+    case NormalConvention::opengl_y_plus:
+        break;
+    default:
+        return core::Result<void>::failure(invalid(
+            "texture binding contains an unknown normal convention"));
+    }
+    if (auto result = transform.validate(); !result) return result;
+    return channels.validate();
+}
+
 core::Result<void> StandardMaterial::validate() const {
     if (!base_color_factor.finite() || !emissive_factor.finite()) {
         return core::Result<void>::failure(
@@ -75,7 +141,19 @@ core::Result<void> StandardMaterial::validate() const {
         return core::Result<void>::failure(
             validation("material emissive factors must be non-negative"));
     }
+    for (const TextureRef* binding : {
+             &base_color, &metallic_roughness, &normal, &occlusion, &emissive}) {
+        if (auto result = binding->validate(); !result) return result;
+    }
     return core::Result<void>::success();
+}
+
+core::Result<void> MaterialAsset::validate() const {
+    if (id == 0U || name.empty()) {
+        return core::Result<void>::failure(invalid(
+            "material asset identity and display name are required"));
+    }
+    return definition.validate();
 }
 
 core::Result<PbrEvaluation> evaluate_pbr_reference(

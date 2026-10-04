@@ -1,4 +1,5 @@
 #include <carto/d3d12/device.hpp>
+#include <carto/device/kernel_evidence.hpp>
 
 #include <algorithm>
 #include <array>
@@ -116,15 +117,14 @@ std::array<std::uint64_t, 2U> read_timestamps(
     return timestamps;
 }
 
-void append_temporal_dispatch(
+void append_temporal_bindings(
     carto::device_ir::DeviceCommandStream& stream,
     carto::gpu::PipelineHandle pipeline,
     TextureHandle current,
     TextureHandle history,
     TextureHandle motion,
     TextureHandle resolved,
-    const std::vector<std::uint8_t>& constants,
-    std::uint32_t groups) {
+    const std::vector<std::uint8_t>& constants) {
     stream.append(carto::device_ir::CmdBindPipeline{pipeline});
     stream.append(carto::device_ir::CmdBindResources{{
         carto::device_ir::ResourceBinding{
@@ -137,7 +137,13 @@ void append_temporal_dispatch(
             0U, 3U, carto::device_ir::ResourceHandle{resolved}, std::nullopt},
     }});
     stream.append(carto::device_ir::CmdPushConstants{constants});
-    stream.append(carto::device_ir::CmdDispatch{groups, groups, 1U});
+}
+
+void append_temporal_dispatch(
+    carto::device_ir::DeviceCommandStream& stream,
+    std::uint32_t groups_x,
+    std::uint32_t groups_y) {
+    stream.append(carto::device_ir::CmdDispatch{groups_x, groups_y, 1U});
 }
 
 Timing run_temporal_batch(
@@ -149,9 +155,11 @@ Timing run_temporal_batch(
     TextureHandle resolved,
     BufferHandle timestamp_readback,
     const std::vector<std::uint8_t>& constants,
-    std::uint32_t groups,
+    std::uint32_t groups_x,
+    std::uint32_t groups_y,
     std::size_t iterations,
-    bool initialize_states) {
+    bool initialize_states,
+    bool bind_each_dispatch) {
     carto::device_ir::DeviceCommandStream stream;
     if (initialize_states) {
         stream.append(carto::device_ir::CmdTransitionResource{
@@ -180,10 +188,17 @@ Timing run_temporal_batch(
             carto::device_ir::ResourceState::copy_destination,
         });
     }
+    if (!bind_each_dispatch) {
+        append_temporal_bindings(
+            stream, pipeline, current, history, motion, resolved, constants);
+    }
     stream.append(carto::device_ir::CmdWriteTimestamp{0U});
     for (std::size_t iteration = 0U; iteration < iterations; ++iteration) {
-        append_temporal_dispatch(
-            stream, pipeline, current, history, motion, resolved, constants, groups);
+        if (bind_each_dispatch) {
+            append_temporal_bindings(
+                stream, pipeline, current, history, motion, resolved, constants);
+        }
+        append_temporal_dispatch(stream, groups_x, groups_y);
         stream.append(carto::device_ir::CmdUavBarrier{
             carto::device_ir::ResourceHandle{resolved}});
     }
@@ -289,19 +304,19 @@ int main(int argc, char** argv) {
             }), "create temporal texture");
         };
         const auto current = make_texture(
-            carto::gpu::Format::rgba32_float,
+            carto::gpu::Format::rgba16_float,
             carto::gpu::TextureUsage::sampled,
             {0.15F, 0.25F, 0.35F, 1.0F});
         const auto history = make_texture(
-            carto::gpu::Format::rgba32_float,
+            carto::gpu::Format::rgba16_float,
             carto::gpu::TextureUsage::sampled,
             {0.35F, 0.25F, 0.15F, 1.0F});
         const auto motion = make_texture(
-            carto::gpu::Format::rg32_float,
+            carto::gpu::Format::rg16_float,
             carto::gpu::TextureUsage::sampled,
             {0.0F, 0.0F, 0.0F, 0.0F});
         const auto resolved = make_texture(
-            carto::gpu::Format::rgba32_float,
+            carto::gpu::Format::rgba16_float,
             carto::gpu::TextureUsage::storage,
             {0.0F, 0.0F, 0.0F, 1.0F});
         const auto timestamp_readback = expect(device->create_buffer(carto::gpu::BufferDesc{
@@ -318,6 +333,19 @@ int main(int argc, char** argv) {
             std::array<std::uint32_t, 4U> history_flags{1U, 0U, 0U, 0U};
         };
         const auto constants = bytes_of(TemporalConstants{});
+        const carto::device::KernelContract temporal_contract{
+            "cartographer.render.temporal_resolve",
+            "history resolve",
+            carto::device::PrecisionRole::compressed_operand,
+            carto::device::KernelDirection::compute,
+            "rgba16f_history",
+            "fp32",
+            carto::device::BackendKind::d3d12,
+            false,
+        };
+        expect_void(
+            carto::device::validate(temporal_contract),
+            "validate temporal kernel ontology contract");
         const std::uint32_t groups = options.extent / 8U;
 
         // Warm the shader, allocator, descriptor heaps, and driver state before
@@ -328,18 +356,24 @@ int main(int argc, char** argv) {
             16U, std::min(options.iterations, std::size_t{32U}));
         static_cast<void>(run_temporal_batch(
             *device, pipeline, current, history, motion, resolved, timestamp_readback,
-            constants, groups, warmup_iterations, true));
-
-        const Timing batched = run_temporal_batch(
+            constants, groups, groups, warmup_iterations, true, true));
+        static_cast<void>(run_temporal_batch(
             *device, pipeline, current, history, motion, resolved, timestamp_readback,
-            constants, groups, options.iterations, false);
+            constants, groups, groups, warmup_iterations, false, false));
+
+        const Timing legacy_batched = run_temporal_batch(
+            *device, pipeline, current, history, motion, resolved, timestamp_readback,
+            constants, groups, groups, options.iterations, false, true);
+        const Timing optimized_batched = run_temporal_batch(
+            *device, pipeline, current, history, motion, resolved, timestamp_readback,
+            constants, groups, groups, options.iterations, false, false);
 
         double per_submit_cpu = 0.0;
         double per_submit_gpu = 0.0;
         for (std::size_t iteration = 0U; iteration < options.iterations; ++iteration) {
             const Timing sample = run_temporal_batch(
                 *device, pipeline, current, history, motion, resolved, timestamp_readback,
-                constants, groups, 1U, false);
+                constants, groups, groups, 1U, false, false);
             per_submit_cpu += sample.cpu_microseconds;
             per_submit_gpu += sample.gpu_microseconds;
         }
@@ -347,25 +381,38 @@ int main(int argc, char** argv) {
         const double pixels = static_cast<double>(options.extent) *
             static_cast<double>(options.extent) * static_cast<double>(options.iterations);
         std::cout << std::fixed << std::setprecision(3)
-                  << "kernel,extent,iterations,warmup_dispatches,submissions,pixels,cpu_total_us,"
+                  << "kernel_id,variant,threadgroup_x,threadgroup_y,extent,iterations,warmup_dispatches,submissions,pixels,cpu_total_us,"
                      "cpu_us_per_dispatch,gpu_total_us,gpu_us_per_dispatch,gpu_mpix_per_s,"
-                     "timestamp_frequency\n"
-                  << "temporal_batched," << options.extent << ',' << options.iterations << ','
+                     "timestamp_frequency,color_format,motion_format\n"
+                  << temporal_contract.kernel_id << ",legacy,8,8," << options.extent << ','
+                  << options.iterations << ','
                   << warmup_iterations << ",1,"
-                  << pixels << ',' << batched.cpu_microseconds << ','
-                  << batched.cpu_microseconds / static_cast<double>(options.iterations) << ','
-                  << batched.gpu_microseconds << ','
-                  << batched.gpu_microseconds / static_cast<double>(options.iterations) << ','
-                  << pixels / batched.gpu_microseconds << ','
-                  << device->timestamp_frequency(carto::gpu::QueueType::compute) << '\n'
-                  << "temporal_per_submit," << options.extent << ',' << options.iterations << ','
+                  << pixels << ',' << legacy_batched.cpu_microseconds << ','
+                  << legacy_batched.cpu_microseconds / static_cast<double>(options.iterations) << ','
+                  << legacy_batched.gpu_microseconds << ','
+                  << legacy_batched.gpu_microseconds / static_cast<double>(options.iterations) << ','
+                  << pixels / legacy_batched.gpu_microseconds << ','
+                  << device->timestamp_frequency(carto::gpu::QueueType::compute)
+                  << ",rgba16_float,rg16_float\n"
+                  << temporal_contract.kernel_id << ",optimized,8,8," << options.extent << ','
+                  << options.iterations << ',' << warmup_iterations << ",1,"
+                  << pixels << ',' << optimized_batched.cpu_microseconds << ','
+                  << optimized_batched.cpu_microseconds / static_cast<double>(options.iterations) << ','
+                  << optimized_batched.gpu_microseconds << ','
+                  << optimized_batched.gpu_microseconds / static_cast<double>(options.iterations) << ','
+                  << pixels / optimized_batched.gpu_microseconds << ','
+                  << device->timestamp_frequency(carto::gpu::QueueType::compute)
+                  << ",rgba16_float,rg16_float\n"
+                  << temporal_contract.kernel_id << ",optimized_per_submit,8,8," << options.extent << ','
+                  << options.iterations << ','
                   << warmup_iterations << ',' << options.iterations << ',' << pixels << ','
                   << per_submit_cpu << ','
                   << per_submit_cpu / static_cast<double>(options.iterations) << ','
                   << per_submit_gpu << ','
                   << per_submit_gpu / static_cast<double>(options.iterations) << ','
                   << pixels / per_submit_gpu << ','
-                  << device->timestamp_frequency(carto::gpu::QueueType::compute) << '\n';
+                  << device->timestamp_frequency(carto::gpu::QueueType::compute)
+                  << ",rgba16_float,rg16_float\n";
 
         if (!device->debug_receipts().empty()) {
             std::ostringstream message;

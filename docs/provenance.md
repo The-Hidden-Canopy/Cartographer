@@ -55,8 +55,9 @@ large lineage containers.
 nested scientific schema v12. It contains typed regions, boundaries, interfaces,
 fields, studies, parameters, probes, result sets, morphology with field-linked
 growth domains, functional and
-sequence-genome authoring records, developmental traces with optional tissue
-assignments and parameter-value evidence, lineage/mutation/recombination
+sequence-genome authoring records, developmental traces with optional
+program/genome source digests, per-step seed/result evidence, tissue
+assignments, and parameter-value evidence, lineage/mutation/recombination
 receipts, deterministic development timeline/instruction-impact projections,
 morphometrics with derived landmark/signature comparison previews,
 anatomy/partonomy mappings with ontology version/source-release metadata,

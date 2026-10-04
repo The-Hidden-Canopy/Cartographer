@@ -355,12 +355,14 @@ carto::core::Result<carto::scientific::ScientificModel> build_scientific_demo_mo
     trace.genome_reference = "program://scientific-demo";
     if (auto result = trace.insert_entry(DevelopmentTraceEntry{
             TraceId{1U}, StageId{1U}, InstructionId{1U}, {StructureId{1U}}, {},
-            "receipt://scientific-demo/formation", provenance, TissueRegionId{1U}, {0.5}}); !result) {
+            "receipt://scientific-demo/formation", provenance, TissueRegionId{1U}, {0.5},
+            std::nullopt, std::nullopt}); !result) {
         return carto::core::Result<ScientificModel>::failure(result.error());
     }
     if (auto result = trace.insert_entry(DevelopmentTraceEntry{
             TraceId{2U}, StageId{2U}, InstructionId{2U}, {}, {StructureId{2U}},
-            "receipt://scientific-demo/differentiation", provenance, TissueRegionId{1U}, {0.75}}); !result) {
+            "receipt://scientific-demo/differentiation", provenance, TissueRegionId{1U}, {0.75},
+            std::nullopt, std::nullopt}); !result) {
         return carto::core::Result<ScientificModel>::failure(result.error());
     }
     if (auto result = model.set_developmental_trace(std::move(trace)); !result) {

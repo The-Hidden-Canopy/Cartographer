@@ -627,9 +627,9 @@ void project_transaction_journals_evaluation_graph_reference_with_document_state
         checkpoint_text.substr(0, checkpoint_text.find("EVALUATION_GRAPH_DIGEST")) +
         "EVALUATION_GRAPH_DIGEST 0000000000000000000000000000000000000000000000000000000000000000\nEND\n"));
     std::string legacy_graph = checkpoint_text;
-    const auto current_header = legacy_graph.find("CARTOGRAPHER_PROJECT 5");
+    const auto current_header = legacy_graph.find("CARTOGRAPHER_PROJECT 6");
     REQUIRE(current_header != std::string::npos);
-    legacy_graph.replace(current_header, std::string("CARTOGRAPHER_PROJECT 5").size(),
+    legacy_graph.replace(current_header, std::string("CARTOGRAPHER_PROJECT 6").size(),
                          "CARTOGRAPHER_PROJECT 2");
     const auto rejected_legacy_graph = carto::project::ProjectDocument::deserialize(legacy_graph);
     REQUIRE(!rejected_legacy_graph);

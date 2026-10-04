@@ -78,10 +78,11 @@ The bounded headless D3D12 acceptance is real on the local Quadro P5200:
 runtime DXC produces the native shader binaries, graphics and compute work are
 submitted, indexed/sampled/depth draws and temporal output are read back,
 native adapter/resource ownership and descriptor retirement are exercised, and
-the debug-layer receipt is empty. The acceptance also covers typed hidden-window swapchain
-resize/present, a bounded desktop launch smoke, and 8192x8192 target
-allocation/clear. It is graphics-device evidence, not a GPU topology-kernel
-benchmark, full render-graph parity, or a general production-renderer claim.
+the debug-layer receipt is empty. The acceptance also covers typed hidden-window
+swapchain resize/present, a bounded desktop launch smoke, and an 8192x8192
+temporal dispatch followed by bounded RGBA32F probe readback. It is
+graphics-device evidence, not a GPU topology-kernel benchmark, full render-graph
+parity, or a general production-renderer claim.
 
 ## N6: precision and evidence boundary
 

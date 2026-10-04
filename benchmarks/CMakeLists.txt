@@ -22,6 +22,18 @@ target_link_libraries(cartographer_web_geometry_bench
 
 carto_target(cartographer_web_geometry_bench)
 
+add_executable(cartographer_scientific_bench
+    scientific_kernels.cpp
+)
+
+target_link_libraries(cartographer_scientific_bench
+    PRIVATE
+        carto_device
+        carto_scientific
+)
+
+carto_target(cartographer_scientific_bench)
+
 if(CARTO_ENABLE_D3D12)
     add_executable(cartographer_d3d12_kernel_bench
         d3d12_kernels.cpp

@@ -10,7 +10,7 @@ target_include_directories(carto_geometry
         $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(carto_geometry PUBLIC carto_core)
+target_link_libraries(carto_geometry PUBLIC carto_core carto_attributes)
 carto_target(carto_geometry)
 
 install(TARGETS carto_geometry EXPORT CartographerTargets)

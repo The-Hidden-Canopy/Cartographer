@@ -54,9 +54,10 @@ passes on the Quadro P5200 through runtime DXIL production, sampled-material
 PBR/HDR/tone-map execution, shadow-depth execution/readback, temporal resolve,
 storage dispatch/readback, typed back-buffer import, resize/present, and empty
 debug-layer receipts. These receipts do not promote GPU topology authoring or
-performance claims; the 8K receipt is target allocation/clear only. Full IBL
-and production render-graph scheduling, output encoding, input/DPI, and 8K
-frame/readback acceptance remain unverified.
+performance claims; the 8K receipt now executes temporal resolve over cleared
+RGBA16F/RG16F inputs and validates a bounded RGBA32F probe readback. Full IBL
+and production render-graph scheduling, output encoding, input/DPI, and full
+presented-frame 8K acceptance remain unverified.
 
 The remaining future target graph from the engineering specification is
 recorded in the roadmap. New targets must preserve these constraints:

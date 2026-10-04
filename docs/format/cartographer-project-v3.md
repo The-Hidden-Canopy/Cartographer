@@ -31,7 +31,7 @@ that verifies the document and package reference agree and that the blob is
 present and intact.
 
 The v3 parser remains able to read v1 and v2 documents. Current saves write
-[project format v5](cartographer-project-v5.md), while v3 remains a readable
+[project format v6](cartographer-project-v6.md), while v3 remains a readable
 legacy representation. Zero, malformed, duplicate, or misplaced graph records fail closed, as do
 unknown/future versions, invalid authoring envelopes, malformed topology,
 trailing data, non-finite values, and resource-limit violations.

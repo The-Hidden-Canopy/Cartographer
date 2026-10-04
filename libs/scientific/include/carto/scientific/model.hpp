@@ -215,6 +215,35 @@ struct Parameter {
     [[nodiscard]] core::Result<void> validate() const;
 };
 
+// Derived parameter assignment data for a bounded study sweep. These records
+// are planning inputs/results only; they do not execute a provider or solver.
+struct ParameterAssignment {
+    ParameterId parameter;
+    double value = 0.0;
+
+    friend constexpr bool operator==(const ParameterAssignment&, const ParameterAssignment&) = default;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+struct ParameterSweepAxis {
+    ParameterId parameter;
+    std::vector<double> values;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+struct ParameterSweepPreview {
+    StudyId study;
+    core::Revision source_model_revision;
+    std::string strategy;
+    std::vector<ParameterAssignment> base_assignments;
+    std::vector<ParameterSweepAxis> axes;
+    std::vector<std::vector<ParameterAssignment>> cases;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
 struct Field {
     FieldId id;
     FieldKind kind = FieldKind::scalar;
@@ -327,6 +356,33 @@ struct MorphologyGrowthDomain {
     [[nodiscard]] core::Result<void> validate() const;
 };
 
+// Derived, read-only landmark measurement data. Coordinates are interpreted
+// only in the admitted landmark frame; this does not infer surface geometry.
+struct MorphologyMeasurementPreview {
+    StructureId structure;
+    std::string metric;
+    std::string units;
+    std::string coordinate_frame;
+    std::vector<LandmarkId> landmarks;
+    std::vector<double> values;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+// Derived, read-only principal-axis data over an explicitly owned landmark
+// cloud. Ambiguous eigenvalue spectra are rejected instead of receiving an
+// invented tie-break.
+struct MorphologyPrincipalAxesPreview {
+    StructureId structure;
+    std::string coordinate_frame;
+    std::vector<LandmarkId> landmarks;
+    core::Vec3d centroid;
+    std::array<core::Vec3d, 3> axes{};
+    std::array<double, 3> variances{};
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
 // Derived, read-only landmark correspondence data for a paired morphology
 // preview. This is intentionally not persisted as provider or solver output.
 struct MorphologyLandmarkDelta {
@@ -334,6 +390,57 @@ struct MorphologyLandmarkDelta {
     LandmarkId candidate_landmark;
     core::Vec3d displacement;
     double distance = 0.0;
+};
+
+// Explicit, derived landmark correspondence input for paired morphology
+// previews. It is not persisted as provider or solver output.
+struct MorphologyLandmarkCorrespondence {
+    LandmarkId reference_landmark;
+    LandmarkId candidate_landmark;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+// Explicit surface sample metadata for a paired morphology preview. The
+// positions remain bound to admitted landmarks; normals, curvature, and
+// thickness are caller-supplied measurements and are never inferred here.
+struct MorphologySurfaceSample {
+    LandmarkId reference_landmark;
+    LandmarkId candidate_landmark;
+    core::Vec3d reference_normal{0.0, 0.0, 1.0};
+    core::Vec3d candidate_normal{0.0, 0.0, 1.0};
+    double reference_curvature = 0.0;
+    double candidate_curvature = 0.0;
+    double reference_thickness = 0.0;
+    double candidate_thickness = 0.0;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+struct MorphologySurfaceDelta {
+    LandmarkId reference_landmark;
+    LandmarkId candidate_landmark;
+    core::Vec3d displacement;
+    double distance = 0.0;
+    double normal_displacement = 0.0;
+    double curvature_delta = 0.0;
+    double thickness_delta = 0.0;
+    double normal_angle = 0.0;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+// Derived, read-only paired surface metadata. This is a shared-frame CPU
+// reference projection over explicit samples; it is not a registered surface,
+// provider result, rendered heatmap, or persisted geometry.
+struct MorphologySurfaceDeltaPreview {
+    StructureId reference_structure;
+    StructureId candidate_structure;
+    std::string coordinate_frame;
+    std::vector<MorphologySurfaceDelta> deltas;
+    double rms_displacement = 0.0;
+
+    [[nodiscard]] core::Result<void> validate() const;
 };
 
 struct BilateralMorphologyPreview {
@@ -390,13 +497,48 @@ public:
     [[nodiscard]] const std::map<GrowthDomainId, MorphologyGrowthDomain>& growth_domains() const noexcept {
         return growth_domains_;
     }
+    // CPU-only measurements over explicitly owned landmarks. Supported
+    // metrics are "distance", "segment-length", "arc-length", "angle",
+    // "branch-angle", "ratio", "area", "volume", "centroid", and
+    // "bounding-dimensions". Arc length uses the caller's ordered polyline;
+    // area uses an ordered planar polygon; volume uses exactly four landmarks
+    // as an explicit tetrahedron. A ratio uses four landmarks as two ordered
+    // segments and returns segment A / segment B. These previews do not infer
+    // curves, surfaces, or provider geometry.
+    [[nodiscard]] core::Result<MorphologyMeasurementPreview> preview_measurement(
+        StructureId structure,
+        std::string_view metric,
+        std::span<const LandmarkId> landmarks) const;
+    [[nodiscard]] core::Result<MorphologyPrincipalAxesPreview> preview_principal_axes(
+        StructureId structure,
+        std::span<const LandmarkId> landmarks) const;
+    // CPU-only shared-frame landmark correspondence. This preserves the
+    // original identity-transform behavior.
     [[nodiscard]] core::Result<BilateralMorphologyPreview> preview_bilateral_landmarks(
         StructureId reference_structure,
         StructureId candidate_structure) const;
+    // CPU-only aligned correspondence. Supported modes are "landmark",
+    // "rigid", "scale-normalized", and "principal-axis"; principal-axis
+    // rejects ambiguous eigenvalue spectra and remains a CPU reference preview,
+    // not statistical morphospace execution.
     [[nodiscard]] core::Result<BilateralMorphologyPreview> preview_bilateral_landmarks(
         StructureId reference_structure,
         StructureId candidate_structure,
         std::string_view alignment_mode) const;
+    // Explicit correspondence avoids relying on cross-specimen landmark
+    // names. An empty map retains the name-based compatibility behavior.
+    [[nodiscard]] core::Result<BilateralMorphologyPreview> preview_bilateral_landmarks(
+        StructureId reference_structure,
+        StructureId candidate_structure,
+        std::span<const MorphologyLandmarkCorrespondence> correspondences,
+        std::string_view alignment_mode) const;
+    // CPU-only shared-frame surface metadata projection. Positions come from
+    // explicitly owned landmarks; normals, curvature, and thickness are
+    // caller-supplied and remain derived inspection data.
+    [[nodiscard]] core::Result<MorphologySurfaceDeltaPreview> preview_surface_delta(
+        StructureId reference_structure,
+        StructureId candidate_structure,
+        std::span<const MorphologySurfaceSample> samples) const;
     [[nodiscard]] core::Result<MorphologyLandmarkSetExport> export_landmark_set() const;
     [[nodiscard]] static core::Result<MorphologyModel> import_landmark_set(
         std::string_view text,
@@ -463,6 +605,54 @@ struct MorphologySignatureComparisonPreview {
     std::vector<double> component_deltas;
     double distance = 0.0;
     double similarity = 0.0;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+// Explicit source bindings for the derived evolutionary morphospace preview.
+// A lineage does not implicitly own a morphology signature: callers must
+// provide the mapping so that the preview cannot silently join unrelated
+// specimens or provider labels.
+struct EvolutionaryMorphospaceBinding {
+    LineageId lineage;
+    SignatureId signature;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+struct EvolutionaryMorphospacePoint {
+    LineageId lineage;
+    SignatureId signature;
+    std::uint64_t generation = 0U;
+    core::Vec3d position;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+struct EvolutionaryMorphospaceEdge {
+    LineageId parent;
+    LineageId child;
+    core::Vec3d displacement;
+    double distance = 0.0;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+// Derived, read-only CPU reference projection of authored morphology
+// signatures onto a bounded 2D or 3D component space. The preview may draw
+// lineage trajectories, including both parents of a recombination node, but
+// it never infers morphology, executes a provider, or persists the projected
+// coordinates as source truth.
+struct EvolutionaryMorphospacePreview {
+    std::string projection;
+    std::string normalization;
+    std::uint32_t dimensions = 0U;
+    std::string descriptor;
+    std::string coordinate_frame;
+    std::string signature_normalization;
+    std::vector<std::string> component_labels;
+    std::vector<EvolutionaryMorphospacePoint> points;
+    std::vector<EvolutionaryMorphospaceEdge> trajectories;
 
     [[nodiscard]] core::Result<void> validate() const;
 };
@@ -1454,6 +1644,22 @@ struct DevelopmentInstruction {
     [[nodiscard]] core::Result<void> validate() const;
 };
 
+// Derived, read-only source comparison for developmental programs. It exposes
+// authored stage/instruction/module changes without executing MENAGERIE or
+// treating a source diff as provider evidence.
+struct DevelopmentalProgramDiff {
+    std::vector<StageId> added_stages;
+    std::vector<StageId> removed_stages;
+    std::vector<StageId> changed_stages;
+    std::vector<InstructionId> added_instructions;
+    std::vector<InstructionId> removed_instructions;
+    std::vector<InstructionId> changed_instructions;
+    std::vector<std::string> added_modules;
+    std::vector<std::string> removed_modules;
+    std::vector<std::string> changed_modules;
+    bool source_identity_changed = false;
+};
+
 class DevelopmentalProgram {
 public:
     static constexpr std::uint32_t kSchemaVersion = 1U;
@@ -1471,6 +1677,8 @@ public:
     [[nodiscard]] const std::map<InstructionId, DevelopmentInstruction>& instructions() const noexcept {
         return instructions_;
     }
+    [[nodiscard]] DevelopmentalProgramDiff diff_against(
+        const DevelopmentalProgram& parent) const;
     [[nodiscard]] core::Result<void> validate() const;
     [[nodiscard]] std::string serialize() const;
     [[nodiscard]] static core::Result<DevelopmentalProgram> deserialize(std::string_view text);
@@ -1493,16 +1701,25 @@ struct DevelopmentTraceEntry {
     // callers and are serialized by developmental-trace schema v2.
     std::optional<TissueRegionId> tissue_region;
     std::vector<double> parameter_values;
+    // Optional evidence identity for the provider step. These fields are
+    // source/result metadata only; they do not claim that Cartographer ran
+    // the provider or solver.
+    std::optional<std::uint64_t> seed;
+    std::optional<assets::Sha256Digest> result_digest;
 
     [[nodiscard]] core::Result<void> validate() const;
 };
 
 class DevelopmentalTrace {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 2U;
+    static constexpr std::uint32_t kSchemaVersion = 3U;
 
     std::string program_reference;
     std::string genome_reference;
+    // When present, these bind the evidence trace to the exact authored
+    // program/genome source records admitted in the enclosing model.
+    std::optional<assets::Sha256Digest> program_digest;
+    std::optional<assets::Sha256Digest> genome_digest;
 
     [[nodiscard]] core::Result<void> insert_entry(DevelopmentTraceEntry value);
     [[nodiscard]] const std::map<TraceId, DevelopmentTraceEntry>& entries() const noexcept {
@@ -1646,6 +1863,11 @@ public:
     [[nodiscard]] core::Result<void> insert_probe(Probe value);
     [[nodiscard]] core::Result<void> insert_study(Study value);
     [[nodiscard]] core::Result<void> insert_result_set(ResultSet value);
+    // Builds a deterministic, revision-bound Cartesian sweep plan from the
+    // authored study parameters. This is a planning preview, not execution.
+    [[nodiscard]] core::Result<ParameterSweepPreview> preview_parameter_sweep(
+        StudyId study,
+        std::vector<ParameterSweepAxis> axes) const;
     [[nodiscard]] core::Result<void> set_morphology(MorphologyModel value);
     [[nodiscard]] core::Result<void> set_functional_genome(FunctionalGenome value);
     [[nodiscard]] core::Result<void> set_developmental_program(DevelopmentalProgram value);
@@ -1730,6 +1952,16 @@ public:
     build_developmental_timeline() const;
     [[nodiscard]] core::Result<DevelopmentalInstructionImpact>
     build_developmental_instruction_impact(InstructionId instruction) const;
+    // Builds a deterministic, derived morphospace from explicit
+    // lineage-to-signature bindings. Supported normalization is "raw" or
+    // "unit-box"; the latter independently scales the leading components to
+    // [0,1]. This is a CPU authoring preview, not provider execution or a
+    // persisted statistical model.
+    [[nodiscard]] core::Result<EvolutionaryMorphospacePreview>
+    preview_evolutionary_morphospace(
+        std::span<const EvolutionaryMorphospaceBinding> bindings,
+        std::uint32_t dimensions = 2U,
+        std::string_view normalization = "unit-box") const;
     [[nodiscard]] std::string serialize() const;
     [[nodiscard]] static core::Result<ScientificModel> deserialize(std::string_view text);
 

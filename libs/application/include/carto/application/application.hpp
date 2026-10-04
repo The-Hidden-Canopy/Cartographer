@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -406,10 +407,21 @@ private:
     [[nodiscard]] core::Result<DispatchReceipt> failure(core::Diagnostic diagnostic);
     void reset_editor_state() noexcept;
 
+    struct ViewportMeshCacheEntry {
+        std::uint64_t project_generation = 0U;
+        const geometry::EditableMesh* source = nullptr;
+        core::Revision source_revision;
+        std::shared_ptr<const geometry::CompiledMesh> mesh;
+    };
+
     project::ProjectDocument document_;
     std::optional<std::filesystem::path> project_path_;
     core::Revision saved_revision_;
     std::uint64_t project_generation_ = 0;
+    // snapshot() is a UI-thread read boundary. The cache is mutable so a
+    // read-only snapshot can retain derived geometry without changing the
+    // authoritative project document.
+    mutable std::map<std::uint64_t, ViewportMeshCacheEntry> viewport_mesh_cache_;
     editor::SelectionState selection_;
     editor::CommandBus history_;
     editor::ToolRegistry tools_;

@@ -1,6 +1,7 @@
 add_library(carto_attributes STATIC
     src/attributes.cpp
     src/provenance.cpp
+    src/uv.cpp
 )
 
 target_include_directories(carto_attributes

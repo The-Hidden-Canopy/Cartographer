@@ -681,6 +681,7 @@ core::Result<DispatchReceipt> ApplicationSession::new_project(const NewProjectAc
     }
     const core::Revision before = document_.revision();
     document_ = std::move(created.value());
+    viewport_mesh_cache_.clear();
     project_path_.reset();
     journal_.reset();
     reset_editor_state();
@@ -711,6 +712,7 @@ core::Result<DispatchReceipt> ApplicationSession::open_project(const OpenProject
     }
     const core::Revision before = document_.revision();
     document_ = std::move(loaded.value());
+    viewport_mesh_cache_.clear();
     project_path_ = action.path;
     journal_ = std::move(prepared_journal.value().journal);
     reset_editor_state();
@@ -758,6 +760,7 @@ core::Result<DispatchReceipt> ApplicationSession::recover_project(
 
     const core::Revision before = document_.revision();
     document_ = recovered.value().document;
+    viewport_mesh_cache_.clear();
     project_path_ = action.path;
     journal_ = std::move(prepared_journal.value().journal);
     reset_editor_state();
@@ -860,6 +863,7 @@ core::Result<DispatchReceipt> ApplicationSession::accept_command_mutation(
     if (auto result = append_mutation_event(action, revision_before, revision_after); !result) {
         const auto rollback = history_.rollback_last_execute();
         document_ = std::move(before_document);
+        viewport_mesh_cache_.clear();
         if (!rollback) {
             return failure(core::Diagnostic(
                 core::ErrorCode::invalid_state,
@@ -1331,6 +1335,7 @@ core::Result<DispatchReceipt> ApplicationSession::undo() {
     if (auto result = append_mutation_event("Undo", before, document_.revision()); !result) {
         const auto rollback = history_.redo();
         document_ = std::move(before_document);
+        viewport_mesh_cache_.clear();
         if (!rollback) {
             return failure(core::Diagnostic(
                 core::ErrorCode::invalid_state,
@@ -1351,6 +1356,7 @@ core::Result<DispatchReceipt> ApplicationSession::redo() {
     if (auto result = append_mutation_event("Redo", before, document_.revision()); !result) {
         const auto rollback = history_.undo();
         document_ = std::move(before_document);
+        viewport_mesh_cache_.clear();
         if (!rollback) {
             return failure(core::Diagnostic(
                 core::ErrorCode::invalid_state,
@@ -1413,10 +1419,13 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
         result.problems.push_back(std::move(diagnostic));
     };
 
-    for (const auto& object : document_.scene().objects_sorted()) {
+    const auto scene_objects = document_.scene().objects_sorted();
+    result.objects.reserve(scene_objects.size());
+    for (const auto& object : scene_objects) {
         auto world = document_.scene().world_transform(object.id);
         if (!world) {
             append_problem(world.error().with_context("scene snapshot"));
+            result.viewport.error = world.error().with_context("viewport transform");
             continue;
         }
         result.objects.push_back(ObjectView{object, world.value()});
@@ -1432,7 +1441,15 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
     result.viewport.project_revision = document_.revision();
 
     render::RenderScene viewport_scene;
-    for (const auto& object : document_.scene().objects_sorted()) {
+    for (auto cache = viewport_mesh_cache_.begin(); cache != viewport_mesh_cache_.end();) {
+        if (!document_.meshes().contains(cache->first)) {
+            cache = viewport_mesh_cache_.erase(cache);
+        } else {
+            ++cache;
+        }
+    }
+    for (const auto& object_view : result.objects) {
+        const auto& object = object_view.object;
         if (!object.visible || !object.mesh_asset.has_value()) {
             continue;
         }
@@ -1443,19 +1460,29 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
                 "scene object references a missing mesh asset");
             break;
         }
-        auto compiled = mesh->second.compile();
-        if (!compiled) {
-            result.viewport.error = compiled.error().with_context("viewport compilation");
-            break;
+        const auto source_revision = mesh->second.revision();
+        const auto cached = viewport_mesh_cache_.find(*object.mesh_asset);
+        std::shared_ptr<const geometry::CompiledMesh> compiled_mesh;
+        if (cached != viewport_mesh_cache_.end() &&
+            cached->second.project_generation == project_generation_ &&
+            cached->second.source == &mesh->second &&
+            cached->second.source_revision == source_revision &&
+            cached->second.mesh != nullptr) {
+            compiled_mesh = cached->second.mesh;
+        } else {
+            auto compiled = mesh->second.compile();
+            if (!compiled) {
+                result.viewport.error = compiled.error().with_context("viewport compilation");
+                break;
+            }
+            auto owned_mesh = std::make_shared<geometry::CompiledMesh>(std::move(compiled.value()));
+            compiled_mesh = owned_mesh;
+            viewport_mesh_cache_[*object.mesh_asset] = ViewportMeshCacheEntry{
+                project_generation_, &mesh->second, source_revision, std::move(owned_mesh)};
         }
-        auto world = document_.scene().world_transform(object.id);
-        if (!world) {
-            result.viewport.error = world.error().with_context("viewport transform");
-            break;
-        }
-        auto compiled_mesh = std::make_shared<geometry::CompiledMesh>(std::move(compiled.value()));
         if (auto inserted = viewport_scene.upsert({
-                object.id, compiled_mesh, world.value(), compiled_mesh->source_revision});
+                object.id, compiled_mesh, object_view.world_transform,
+                compiled_mesh->source_revision});
             !inserted) {
             result.viewport.error = inserted.error().with_context("viewport snapshot");
             break;

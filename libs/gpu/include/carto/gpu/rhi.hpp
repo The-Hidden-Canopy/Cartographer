@@ -253,9 +253,11 @@ struct PipelineDesc {
     std::string debug_name;
     std::vector<ShaderHandle> shaders;
     std::vector<DescriptorBinding> descriptor_bindings;
-    // Compute backends may expose a bounded prefix of sampled texture
-    // bindings before an optional storage-texture binding. Graphics backends
-    // retain the existing single sampled-texture contract when this is zero.
+    // A non-zero value declares a consecutive prefix of sampled texture
+    // bindings. Graphics pipelines use exactly this many SRVs plus one
+    // sampler; compute pipelines may append one storage-texture binding.
+    // Zero preserves the single-sampled-texture compatibility contract when
+    // descriptor_bindings is non-empty.
     std::uint32_t sampled_texture_count = 0U;
     PrimitiveTopology topology = PrimitiveTopology::triangle_list;
     PolygonMode polygon_mode = PolygonMode::fill;

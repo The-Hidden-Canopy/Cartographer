@@ -14,7 +14,7 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] deterministic compiled mesh, normals, bounds, and source revisions
 - [x] reversible transform command and history boundary
 - [x] versioned project format with atomic save/load
-- [x] v5 project format with v1/v2/v3/v4 compatibility, explicit meters/right-handed/Y-up contract, optional graph reference, bounded project-bound topology receipt lineage, and a generic scientific model record
+- [x] v6 project format with v1/v2/v3/v4/v5 compatibility, explicit meters/right-handed/Y-up contract, optional graph reference, bounded project-bound topology receipt lineage, generic scientific model records, and validated per-mesh attribute/UV persistence
 - [x] OBJ import/export with explicit feature-loss warnings
 - [x] bounded ASCII PLY and binary/ASCII STL interchange with explicit feature-loss warnings
 - [x] bounded glTF export profile with explicit feature-loss warnings
@@ -53,8 +53,8 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [ ] web geometry renderable parent simplification, VANTA import admission, native overlay rendering/pointer integration, and native runtime admission
 - [x] project-package graph reference binding, journal/checkpoint preservation, polygon topology-provenance adapter, v5 scientific-model and v5 project-bound topology receipt persistence
 - [x] opt-in Windows D3D12 adapter/resource boundary and native identity smoke acceptance
-- [x] bounded D3D12 native acceptance tranche: runtime DXIL suite, offscreen sampled-material PBR into an HDR target, HDR-to-display tone-map execution/readback, shadow-depth execution/readback, temporal resolve over current/history/motion inputs, storage-texture compute dispatch/readback, deferred descriptor/resource lifetime, typed DXGI back-buffer import, resize/present, desktop launch smoke, and 8K render-target clear on the Quadro P5200
-- [x] D3D12 native timestamp capture, queue-aware compute shader states, in-flight command-context reuse, and a warmed temporal-kernel stress benchmark with separate GPU/host timing receipts
+- [x] bounded D3D12 native acceptance tranche: runtime DXIL suite, offscreen sampled-material PBR into an HDR target, HDR-to-display tone-map execution/readback, shadow-depth execution/readback, temporal resolve over current/history/motion inputs, storage-texture compute dispatch/readback, deferred descriptor/resource lifetime, typed DXGI back-buffer import, resize/present, desktop launch smoke, and an 8K temporal dispatch with bounded probe readback on the Quadro P5200
+- [x] D3D12 native timestamp capture, queue-aware compute shader states, in-flight command-context reuse, and a warmed ontology-identified temporal-kernel stress benchmark with separate GPU/host timing receipts; invariant temporal bindings are hoisted out of batched dispatch loops after same-adapter A/B measurement
 - [ ] D3D12 production backend with full render-graph parity (PBR/HDR/IBL/shadow/temporal execution, final presentation integration, input/DPI workflow, and GPU performance/8K frame evidence remain)
 - [x] SHA-256 content-addressed blob store with atomic publication and integrity verification
 - [x] append-only revision-bound journal with hash chain, verification, replay callback, content-addressed checkpoints, and staged transaction publication
@@ -93,11 +93,27 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
   optional tissue assignment and parameter-value evidence, and generation-checked
   lineage/mutation/recombination receipts with cross-reference
   validation, including a 100-generation mutation-lineage acceptance fixture, plus
-  deterministic planned-vs-observed timeline and instruction-impact projections
+  deterministic planned-vs-observed timeline, instruction-impact projections,
+  and source-level developmental-program diffs for stage/instruction/module changes
 - [x] bounded morphometric observations, shape signatures, and explicit
   structure-to-structure comparisons with finite/range/reference validation,
-  plus deterministic fail-closed bilateral landmark and signature-comparison
-  previews
+  plus deterministic fail-closed bilateral landmark, explicit correspondence,
+  rigid/scale-normalized/principal-axis alignment, signature-comparison previews,
+  and CPU-only landmark measurement previews for distance, segment length, arc
+  length, angle, branch angle, ratio, planar polygon area, explicit tetrahedron
+  volume, centroid, bounding dimensions, and deterministic principal axes with
+  explicit ownership/frame/cardinality validation, planarity/non-degeneracy
+  rejection, eigenvalue-gap rejection, and zero-denominator rejection; explicit
+  shared-frame surface metadata deltas report displacement, normal displacement,
+  curvature, thickness, and normal-angle differences without inferring surfaces;
+  explicit lineage-to-signature bindings now produce a deterministic bounded
+  CPU evolutionary-morphospace projection with raw/unit-box normalization and
+  parent trajectories, including recombination parents, without statistical
+  fitting or provider execution
+- [x] bounded revision-bound Cartesian parameter-sweep previews with canonical
+  axis ordering, authored-bound enforcement, fixed-parameter carry-through,
+  deterministic case expansion, and case-count safety caps; sweep planning
+  remains separate from provider/solver execution
 - [x] bounded sequence-genome contigs and explicit variants with uppercase IUPAC,
   coordinate/reference matching, digest, and provenance validation
 - [x] bounded provider-neutral FASTA, VCF, GFF3, BED6, GTF 2.2, and rooted
@@ -152,10 +168,10 @@ offline semantic acceptance rung, including texture sampling and bounded
 lighting/temporal references. The bounded D3D12 path now has passing local
 evidence for runtime DXIL production, sampled-material PBR/HDR/tone-map,
 shadow-depth, and temporal-resolve graphics/compute execution, descriptor/resource retirement, typed swapchain
-import/resize/present, a desktop launch smoke, and an 8192x8192 render-target
-clear on the Quadro P5200. Those receipts do not claim full IBL/render-graph
-scheduling parity, final output encoding, input/DPI behavior, or 8K frame
-throughput.
+import/resize/present, a desktop launch smoke, and an 8192x8192 temporal
+dispatch with bounded RGBA32F probe readback on the Quadro P5200. Those receipts
+do not claim full IBL/render-graph scheduling parity, final output encoding,
+input/DPI behavior, or full 8K presented-frame throughput.
 The existing Vulkan path remains compatibility-only until its independent
 acceptance and removal decision are complete.
 

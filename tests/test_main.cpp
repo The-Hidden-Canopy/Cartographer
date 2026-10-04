@@ -1212,10 +1212,10 @@ void project_round_trips_authoritative_state_and_rejects_future_versions() {
     REQUIRE(loaded.value().meshes().at(mesh_id.value()).vertex_count() == 3U);
 
     std::string future = serialized_before;
-    const std::string version = "CARTOGRAPHER_PROJECT 5";
+    const std::string version = "CARTOGRAPHER_PROJECT 6";
     const auto position = future.find(version);
     REQUIRE(position != std::string::npos);
-    future.replace(position, version.size(), "CARTOGRAPHER_PROJECT 6");
+    future.replace(position, version.size(), "CARTOGRAPHER_PROJECT 7");
     const auto rejected = carto::project::ProjectDocument::deserialize(future);
     REQUIRE(!rejected);
     REQUIRE(rejected.error().code == carto::core::ErrorCode::version_mismatch);
@@ -1398,7 +1398,7 @@ void project_persists_topology_receipts_and_rejects_stale_lineage() {
     REQUIRE(document.value().validate());
 
     const std::string serialized = document.value().serialize();
-    REQUIRE(serialized.find("CARTOGRAPHER_PROJECT 5") != std::string::npos);
+    REQUIRE(serialized.find("CARTOGRAPHER_PROJECT 6") != std::string::npos);
     REQUIRE(serialized.find("TOPOLOGY_RECEIPTS 1") != std::string::npos);
 
     auto empty_document = carto::project::ProjectDocument::create("Missing Ledger");

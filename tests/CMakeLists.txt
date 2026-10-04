@@ -212,6 +212,20 @@ target_link_libraries(cartographer_render_architecture_tests
 carto_target(cartographer_render_architecture_tests)
 add_test(NAME cartographer_render_architecture_tests COMMAND cartographer_render_architecture_tests)
 
+add_executable(cartographer_uv_material_contract_tests
+    uv_material_contract_tests.cpp
+)
+target_link_libraries(cartographer_uv_material_contract_tests
+    PRIVATE
+        carto_attributes
+        carto_geometry
+        carto_io
+        carto_project
+        carto_render
+)
+carto_target(cartographer_uv_material_contract_tests)
+add_test(NAME cartographer_uv_material_contract_tests COMMAND cartographer_uv_material_contract_tests)
+
 if(CARTO_ENABLE_VULKAN)
     add_executable(cartographer_vulkan_runtime_tests
         vulkan_runtime_tests.cpp
