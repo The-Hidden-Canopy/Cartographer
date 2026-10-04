@@ -22,12 +22,18 @@ struct TemporalResolveInput {
     float feedback = 0.9F;
     float neighborhood_clamp = 0.25F;
     float motion_rejection = 1.0F;
+    // Optional exact continuity tokens. When supplied for a valid history,
+    // mismatched pixels reject history even when revision and motion checks
+    // pass. The spans contain one uint64 token per pixel.
+    std::span<const std::uint64_t> current_surface_identity;
+    std::span<const std::uint64_t> history_surface_identity;
 };
 
 struct TemporalResolveResult {
     std::vector<float> rgba;
     bool history_used = false;
     std::uint32_t rejected_pixels = 0U;
+    std::uint32_t identity_rejected_pixels = 0U;
 };
 
 // Deterministic CPU reference for a bounded temporal resolve. A revision or

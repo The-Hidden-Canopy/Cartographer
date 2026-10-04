@@ -201,11 +201,12 @@ digests, a previous-entry hash, and a record hash. The application session
 binds that journal to saved projects, records a baseline plus accepted
 mutations, and rolls back an in-memory action if its durable append fails.
 These foundations are not yet a replacement for the v1 text project file:
-the SQLite WAL package and startup recovery UI remain separate work. The
-application exposes a read-only recovery inspection boundary and a separate
-human-only explicit recovery action that materializes the latest verified
-snapshot through the normal atomic save path, without treating a journal as a
-user save or allowing AI to invoke recovery.
+the SQLite WAL package and automatic startup recovery remain separate work.
+The desktop shell exposes a read-only recovery inspection boundary and a
+separate human-only explicit recovery action, including a dirty-session
+discard decision, that materializes the latest verified snapshot through the
+normal atomic save path. A journal is never treated as a user save and AI
+cannot invoke recovery.
 
 Asynchronous jobs and persistent GPU resource ownership are not part of the
 headless/application contract yet. When derived jobs or resources are

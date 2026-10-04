@@ -51,6 +51,7 @@ enum class Format {
     rgba32_float,
     rg16_float,
     rg32_float,
+    rg32_uint,
     r16_float,
     r32_float,
     r32_uint,

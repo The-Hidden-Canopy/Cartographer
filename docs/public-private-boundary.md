@@ -136,11 +136,15 @@ reachable Git history. The tracked-but-ignored check is explicit because
 `.gitignore` is not retroactive. It never rewrites history, expires reflogs,
 deletes files, or contacts a remote. Use `--include-reflog` for a local hygiene
 audit that also inspects reflog/unreachable objects. Legacy GMIB, anatomy, OWH,
-and simulation paths are reported for provenance/licensing review;
-`--fail-on-review` makes those review items blocking for an owner-approved
-release gate. Automatic hosted CI is currently disabled to avoid CI spend; if
-CI is re-enabled, it must invoke the same blocking mode so an unclassified
-legacy path cannot pass the public build merely because it is absent from the
-current checkout. Clearing the gate requires provenance/licensing
-classification or owner-approved history remediation; this repository does not
-rewrite history automatically.
+and simulation paths are reported for provenance/licensing review unless an
+exact root is covered by the owner-reviewed
+`docs/verification/public-history-provenance.json` manifest. The manifest is
+machine-checked and cannot classify a forbidden path or an entry without
+explicit owner review, disposition, license basis, and commit identities.
+`--fail-on-review` makes any unclassified review item blocking for an
+owner-approved release gate. Automatic hosted CI is currently disabled to
+avoid CI spend; if CI is re-enabled, it must invoke the same blocking mode so
+an unclassified legacy path cannot pass the public build merely because it is
+absent from the current checkout. Clearing the gate requires provenance/
+licensing classification or owner-approved history remediation; this
+repository does not rewrite history automatically.

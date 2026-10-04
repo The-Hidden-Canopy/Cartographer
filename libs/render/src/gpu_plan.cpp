@@ -125,6 +125,24 @@ core::Result<GpuRenderPlan> prepare_gpu_render_plan(
         if (!resource) return core::Result<GpuRenderPlan>::failure(resource.error());
         object_id = resource.value();
     }
+    std::optional<render_graph::ResourceId> surface_identity;
+    std::optional<render_graph::ResourceId> history_surface_identity;
+    if (history_available || contains(request, CaptureResource::surface_identity)) {
+        const auto resource = graph.create_resource(texture(
+            "surface_identity", request.extent.width, request.extent.height,
+            gpu::Format::rg32_uint));
+        if (!resource) return core::Result<GpuRenderPlan>::failure(resource.error());
+        surface_identity = resource.value();
+        if (history_available) {
+            const auto history_identity = graph.create_resource(texture(
+                "history_surface_identity", request.extent.width, request.extent.height,
+                gpu::Format::rg32_uint, true));
+            if (!history_identity) {
+                return core::Result<GpuRenderPlan>::failure(history_identity.error());
+            }
+            history_surface_identity = history_identity.value();
+        }
+    }
 
     std::vector<GpuKernelPlan> kernels;
     auto add_pass = [&graph, &kernels](
@@ -167,6 +185,10 @@ core::Result<GpuRenderPlan> prepare_gpu_render_plan(
         opaque.push_back({*object_id, render_graph::Access::write,
                           render_graph::PipelineStage::color_output});
     }
+    if (surface_identity.has_value()) {
+        opaque.push_back({*surface_identity, render_graph::Access::write,
+                          render_graph::PipelineStage::color_output});
+    }
     if (auto pass = add_pass(
             "opaque_pbr",
             std::move(opaque),
@@ -192,6 +214,16 @@ core::Result<GpuRenderPlan> prepare_gpu_render_plan(
             render_graph::ResourceUsage{
                 history.value(), render_graph::Access::read,
                 render_graph::PipelineStage::fragment});
+    }
+    if (surface_identity.has_value()) {
+        temporal_usages.push_back({
+            *surface_identity, render_graph::Access::read,
+            render_graph::PipelineStage::fragment});
+    }
+    if (history_surface_identity.has_value()) {
+        temporal_usages.push_back({
+            *history_surface_identity, render_graph::Access::read,
+            render_graph::PipelineStage::fragment});
     }
     if (auto pass = add_pass(
             "temporal_resolve",
@@ -248,6 +280,8 @@ core::Result<GpuRenderPlan> prepare_gpu_render_plan(
                           : std::nullopt,
         normal,
         object_id,
+        surface_identity,
+        history_surface_identity,
         imported_present_target,
     });
 }

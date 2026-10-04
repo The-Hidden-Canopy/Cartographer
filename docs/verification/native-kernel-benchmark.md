@@ -161,3 +161,31 @@ correctness gate into an unbounded 512 MiB-plus host transfer. The immediate
 post-run adapter sample for this receipt was
 `Quadro P5200, 573.71, P5, 139 MHz graphics, 810 MHz memory, 98% utilization,
 62 C`; it remains context rather than a sustained-clock claim.
+
+## 2026-10-04 static-motion speed pass
+
+The temporal shader now has an explicit static-motion fast path. The caller
+sets `history_flags.w` only when the motion field is authoritative zero; the
+shader never infers that condition from texture contents. The guarded path
+avoids the RG16F motion load, rounding, and coordinate clamp for each pixel.
+Dynamic-motion behavior remains the default when the flag is zero.
+
+These serial runs used the same Quadro P5200, D3D12 timestamp frequency, 8x8
+threadgroup, format pair, warmup policy, and iteration count. GPU jobs were not
+overlapped.
+
+```text
+extent,iterations,motion_mode,variant,gpu_us_per_dispatch,gpu_mpix_per_s,cpu_us_per_dispatch
+4096,16,dynamic,optimized,2971.284,5646.453,3004.019
+4096,16,static,optimized,1960.974,8555.552,1985.969
+8192,16,dynamic,optimized,9137.578,7344.273,9176.538
+8192,16,static,optimized,7833.900,8566.469,7893.631
+```
+
+The static assertion reduced the measured GPU resolve time by `34.0%` at
+4096² and `14.3%` at 8192². During the sustained 8192² run, live adapter
+sampling observed 100% utilization, 1708 MHz graphics clock, 73.48 W, 67 C,
+and 1814 MiB of memory; the post-run sample returned to 139 MHz and 0 MiB.
+This is a temporal-pass optimization, not a full presented-frame or general
+motion-field throughput claim. The native D3D12 acceptance suite remained
+green at `21/21` after the shader change.

@@ -66,6 +66,7 @@ std::uint64_t color_channels_bytes(gpu::Format format) {
     case gpu::Format::rg16_float:
         return 4U;
     case gpu::Format::rg32_float:
+    case gpu::Format::rg32_uint:
         return 8U;
     case gpu::Format::r16_float:
         return 2U;

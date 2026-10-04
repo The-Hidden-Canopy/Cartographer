@@ -32,6 +32,11 @@ struct GpuRenderPlan {
     std::optional<render_graph::ResourceId> history;
     std::optional<render_graph::ResourceId> normal;
     std::optional<render_graph::ResourceId> object_id;
+    // A two-channel uint32 continuity token. This is distinct from object_id:
+    // picking identity may change while a surface remains a valid temporal
+    // descendant. Native shader binding is a separate acceptance layer.
+    std::optional<render_graph::ResourceId> surface_identity;
+    std::optional<render_graph::ResourceId> history_surface_identity;
     bool presents = false;
 };
 

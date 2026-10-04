@@ -1,6 +1,9 @@
 #include <carto/d3d12/device.hpp>
 #include <carto/assets/blob_store.hpp>
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -128,6 +131,7 @@ DXGI_FORMAT format(gpu::Format value) {
     case gpu::Format::rgba32_float: return DXGI_FORMAT_R32G32B32A32_FLOAT;
     case gpu::Format::rg16_float: return DXGI_FORMAT_R16G16_FLOAT;
     case gpu::Format::rg32_float: return DXGI_FORMAT_R32G32_FLOAT;
+    case gpu::Format::rg32_uint: return DXGI_FORMAT_R32G32_UINT;
     case gpu::Format::r16_float: return DXGI_FORMAT_R16_FLOAT;
     case gpu::Format::r32_float: return DXGI_FORMAT_R32_FLOAT;
     case gpu::Format::r32_uint: return DXGI_FORMAT_R32_UINT;

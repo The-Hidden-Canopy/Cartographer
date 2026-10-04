@@ -37,8 +37,8 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] backend-neutral generational GPU handles, deferred submission retirement, render-graph validation, and offscreen viewport planning
 - [x] backend-neutral device contract, semantic command IR, CPU reference execution/raster acceptance, and RGBA32F texture sampling
 - [x] deterministic CPU PBR/HDR, shadow-PCF, and temporal-history reference contracts
-- [x] GPU preparation ABI, explicit vertex layouts, canonical render pass plan, and packaged native shader sources (execution pending)
-- [x] precision-role kernel contracts, local evidence receipts, artifact identity, and explicit fallback boundaries (execution pending)
+- [x] GPU preparation ABI, explicit vertex layouts, canonical render pass plan, packaged native shader sources, and bounded D3D12 execution evidence
+- [x] precision-role kernel contracts, local evidence receipts, artifact identity, explicit fallback boundaries, and bounded native receipt validation
 - [x] evaluation graph identity/DAG validation, deterministic digest, cache key, and stale-publication gate
 - [x] bounded versioned evaluation-graph serialization with hostile-input rejection
 - [x] domain-specific attribute layers with explicit topology-transfer policy
@@ -51,7 +51,8 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] web geometry backend-neutral cluster-overlay projection math with explicit matrix conventions, clipping, viewport bounds, and fail-closed non-finite handling
 - [x] web geometry deterministic package-bound page-interest planning from visible overlay identities without residency mutation
 - [ ] private algorithmic representation and continuity work remains outside the public build boundary and requires separate release review
-- [ ] next-level polygon representation inheritance, backend-neutral identity-buffer planning, temporal-history consumers, view/material/constraint/fracture policy execution, and VANTA/runtime admission
+- [ ] next-level polygon representation inheritance, view/material/constraint/fracture policy execution, and VANTA/runtime admission
+- [x] backend-neutral surface-identity buffer planning and revision-bound CPU temporal-history rejection; native shader binding and GPU acceptance remain deferred
 - [ ] web geometry VANTA import admission, native overlay rendering/pointer integration, and native runtime admission
 - [x] project-package graph reference binding, journal/checkpoint preservation, polygon topology-provenance adapter, v5 scientific-model and v5 project-bound topology receipt persistence
 - [x] opt-in Windows D3D12 adapter/resource boundary and native identity smoke acceptance
@@ -68,7 +69,8 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] content-addressed evaluation-graph snapshot reference in the package manifest
 - [ ] SQLite WAL authoring database, migrations, integrity scanner, and cache separation
 - [x] read-only startup recovery inspection plus explicit human recovery of the latest verified snapshot-bearing journal entry
-- [ ] startup recovery UI, recovery-versus-explicit-save decision surface, and crash-injection acceptance (snapshot-envelope replay is present)
+- [x] explicit desktop recovery action with dirty-session discard decision over the verified snapshot-envelope replay path
+- [ ] automatic startup recovery and crash-injection acceptance
 - [x] bounded opaque C ABI smoke surface with a C compiler/linker fixture
 - [x] opt-in shared-library packaging for the bounded C ABI with explicit platform symbol visibility
 - [x] bounded ABI range negotiation; C++/Python/C# bindings remain deferred

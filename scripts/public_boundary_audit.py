@@ -9,6 +9,7 @@ does not rewrite history, expire reflogs, delete files, or contact a remote.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -72,6 +73,9 @@ REVIEW_PREFIXES = (
     "libs/simulation",
     "docs/architecture/gmib-integration.md",
 )
+
+HISTORY_PROVENANCE_MANIFEST = "docs/verification/public-history-provenance.json"
+HISTORY_PROVENANCE_SCHEMA = 1
 
 REQUIRED_IGNORE_PROBES = (
     ".env",
@@ -175,6 +179,91 @@ def review_root(path: str) -> str | None:
         if normalized == prefix or normalized.startswith(prefix + "/"):
             return prefix
     return None
+
+
+def load_classified_history_roots(
+    root: Path,
+    candidates: set[str],
+    findings: list[str],
+    strict: bool,
+    history_commits: set[str],
+) -> set[str]:
+    """Load explicit owner classifications for historical review roots.
+
+    The manifest is deliberately narrow. It can classify only a known review
+    root, and every entry must carry an owner-review marker, a disposition,
+    and a repository-license basis. Missing or malformed metadata fails closed
+    when the blocking release mode is requested.
+    """
+    if not candidates:
+        return set()
+    manifest_path = root / HISTORY_PROVENANCE_MANIFEST
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        if strict:
+            findings.append(
+                f"history provenance manifest {HISTORY_PROVENANCE_MANIFEST}: unavailable"
+            )
+        return set()
+    except (OSError, json.JSONDecodeError) as error:
+        findings.append(
+            f"history provenance manifest {HISTORY_PROVENANCE_MANIFEST}: unavailable or invalid ({error})"
+        )
+        return set()
+    if not isinstance(payload, dict) or payload.get("schema") != HISTORY_PROVENANCE_SCHEMA:
+        findings.append(
+            f"history provenance manifest {HISTORY_PROVENANCE_MANIFEST}: unsupported schema"
+        )
+        return set()
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        findings.append(
+            f"history provenance manifest {HISTORY_PROVENANCE_MANIFEST}: entries must be a list"
+        )
+        return set()
+
+    classified: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            findings.append(
+                f"history provenance manifest {HISTORY_PROVENANCE_MANIFEST}: entry is not an object"
+            )
+            continue
+        candidate_root = entry.get("root")
+        normalized_root = normalize_path(candidate_root) if isinstance(candidate_root, str) else ""
+        if normalized_root not in REVIEW_PREFIXES:
+            findings.append(
+                f"history provenance manifest {HISTORY_PROVENANCE_MANIFEST}: unknown review root {candidate_root!r}"
+            )
+            continue
+        if normalized_root not in candidates:
+            continue
+        commits = entry.get("commits")
+        if (
+            entry.get("owner_reviewed") is not True
+            or entry.get("disposition") != "first_party_removed_from_current_public_tree"
+            or entry.get("license_basis") != "repository_apache_2_0"
+            or not isinstance(commits, list)
+            or not commits
+            or any(
+                not isinstance(commit, str)
+                or re.fullmatch(r"[0-9a-f]{40}", commit) is None
+                for commit in commits
+            )
+            or any(commit not in history_commits for commit in commits)
+        ):
+            findings.append(
+                f"history provenance manifest {HISTORY_PROVENANCE_MANIFEST}: incomplete classification for {normalized_root}"
+            )
+            continue
+        if normalized_root in classified:
+            findings.append(
+                f"history provenance manifest {HISTORY_PROVENANCE_MANIFEST}: duplicate classification for {normalized_root}"
+            )
+            continue
+        classified.add(normalized_root)
+    return classified
 
 
 def nul_paths(result: subprocess.CompletedProcess[str]) -> list[str]:
@@ -281,7 +370,7 @@ def main() -> int:
         return 2
 
     findings: list[str] = []
-    reviews: list[str] = []
+    review_candidates: list[tuple[str, str]] = []
     tracked, untracked = current_paths(root)
     tracked_ignored = tracked_ignored_paths(root)
     deleted_paths = deleted_worktree_paths(root)
@@ -301,9 +390,7 @@ def main() -> int:
                 findings.append(f"{source} path {path}: {reason}")
             review = review_root(path)
             if review is not None:
-                reviews.append(
-                    f"{source} root {review}: legacy integration path requires provenance/licensing review"
-                )
+                review_candidates.append((f"{source} root", review))
 
     for path in historical:
         reason = path_reason(path)
@@ -312,9 +399,7 @@ def main() -> int:
             findings.append(f"{scope} path {path}: {reason}")
         review = review_root(path)
         if review is not None:
-            reviews.append(
-                f"history root {review}: legacy integration path requires provenance/licensing review"
-            )
+            review_candidates.append(("history root", review))
 
     for path in sorted(set(tracked + untracked)):
         text = read_current_text(root, path)
@@ -330,7 +415,15 @@ def main() -> int:
     if arguments.check_ignore_policy:
         check_ignore_policy(root, findings)
 
-    reviews = sorted(set(reviews))
+    candidate_roots = {review for _, review in review_candidates}
+    classified_roots = load_classified_history_roots(
+        root, candidate_roots, findings, arguments.fail_on_review, set(commits)
+    )
+    reviews = sorted({
+        f"{scope} {review}: legacy integration path requires provenance/licensing review"
+        for scope, review in review_candidates
+        if review not in classified_roots
+    })
     findings = sorted(set(findings))
     print(f"Cartographer public boundary audit: {root}")
     if reviews:

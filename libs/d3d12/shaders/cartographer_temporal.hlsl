@@ -31,10 +31,15 @@ void CSMain(uint3 dispatch_id : SV_DISPATCHTHREADID)
         return;
     }
 
-    const float2 motion = motion_vectors.Load(int3(pixel, 0));
-    const int2 history_pixel = clamp(
-        pixel - int2(round(motion)), int2(0, 0), int2(width - 1, height - 1));
-    const float4 history = history_color.Load(int3(history_pixel, 0));
+    // history_flags.w is an explicit caller assertion that the motion field is
+    // zero for this resolve. It is never inferred from texture contents. The
+    // static-camera path avoids one RG16F load plus coordinate arithmetic per
+    // pixel, which matters at 8K where the pass is bandwidth-bound.
+    const float4 history = history_flags.w != 0
+        ? history_color.Load(int3(pixel, 0))
+        : history_color.Load(int3(clamp(
+            pixel - int2(round(motion_vectors.Load(int3(pixel, 0)))),
+            int2(0, 0), int2(width - 1, height - 1)), 0));
     // The prior form clamped history between min(current, history) and
     // max(current, history), which is an identity operation for every
     // component. Keep the current contract while removing the redundant

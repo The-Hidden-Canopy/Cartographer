@@ -29,6 +29,7 @@ using carto::gpu::TextureHandle;
 struct Options {
     std::uint32_t extent = 1024U;
     std::size_t iterations = 32U;
+    bool static_motion = false;
 };
 
 struct Timing {
@@ -86,9 +87,11 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--iterations") {
             options.iterations = static_cast<std::size_t>(
                 std::stoull(std::string(next_value(argument))));
+        } else if (argument == "--static-motion") {
+            options.static_motion = true;
         } else if (argument == "--help") {
             std::cout << "usage: cartographer_d3d12_kernel_bench"
-                         " [--extent pixels] [--iterations count]\n";
+                         " [--extent pixels] [--iterations count] [--static-motion]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("unknown option: " + std::string(argument));
@@ -330,7 +333,10 @@ int main(int argc, char** argv) {
             std::array<float, 4U> jitter_and_inverse_extent{
                 0.0F, 0.0F, 1.0F / static_cast<float>(options.extent),
                 1.0F / static_cast<float>(options.extent)};
-            std::array<std::uint32_t, 4U> history_flags{1U, 0U, 0U, 0U};
+            // w is an explicit zero-motion assertion; the shader never infers
+            // it from the texture contents.
+            std::array<std::uint32_t, 4U> history_flags{
+                1U, 0U, 0U, options.static_motion ? 1U : 0U};
         };
         const auto constants = bytes_of(TemporalConstants{});
         const carto::device::KernelContract temporal_contract{
