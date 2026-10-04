@@ -880,6 +880,9 @@ struct DesktopState {
     double extrude_distance = 0.25;
     double inset_distance = 0.15;
     double edge_split_factor = 0.5;
+    int surface_target_triangles = 6;
+    carto::surface::RepresentationMode surface_mode =
+        carto::surface::RepresentationMode::fidelity_closure;
     std::optional<carto::application::ApplicationAction> pending_discard_action;
     std::uint64_t inspector_generation = std::numeric_limits<std::uint64_t>::max();
     bool pending_exit = false;
@@ -1063,11 +1066,13 @@ struct DesktopState {
         const bool inspector = flow == WorkbenchFlow::author ||
             flow == WorkbenchFlow::inspect || flow == WorkbenchFlow::draft;
         const bool transform = flow == WorkbenchFlow::inspect;
+        const bool measure = flow == WorkbenchFlow::inspect;
         const bool draft = flow == WorkbenchFlow::draft;
         workbench.scene = scene;
         workbench.tools = tools;
         workbench.inspector = inspector;
         workbench.transform = transform;
+        workbench.measure = measure;
         workbench.draft = draft;
         workbench.assets = false;
         workbench.layers = false;
@@ -1726,7 +1731,7 @@ struct DesktopState {
         rack_button(snapshot, "Material", workbench.material);
         rack_button(snapshot, "Constraint", workbench.constraint);
         rack_button(snapshot, "Modify", workbench.modify);
-        rack_button(snapshot, "Measure", workbench.measure);
+        rack_button(snapshot, "Fidelity", workbench.measure);
         rack_button(snapshot, "Extrude", workbench.extrude);
         ImGui::Spacing();
         ImGui::TextDisabled("Stored instruments\nlive here.");
@@ -2082,6 +2087,10 @@ struct DesktopState {
                 workbench.transform = !workbench.transform;
                 mark_custom_workbench();
             }
+            if (ImGui::MenuItem("Fidelity instrument", nullptr, workbench.measure)) {
+                workbench.measure = !workbench.measure;
+                mark_custom_workbench();
+            }
             if (ImGui::MenuItem("Operation ledger", nullptr, !workbench.ledger_collapsed)) {
                 workbench.ledger_collapsed = !workbench.ledger_collapsed;
                 mark_custom_workbench();
@@ -2326,6 +2335,56 @@ struct DesktopState {
                 }
             }
         }
+        const auto& fidelity = snapshot.surface_fidelity;
+        if ((fidelity.status == carto::ui::SurfaceFidelityStatus::ready ||
+             fidelity.status == carto::ui::SurfaceFidelityStatus::rejected) &&
+            fidelity.object.has_value() && fidelity.compiled != nullptr) {
+            const auto source_instance = std::find_if(
+                instances.begin(), instances.end(),
+                [&fidelity](const auto& instance) {
+                    return instance.object == *fidelity.object &&
+                        instance.mesh != nullptr &&
+                        instance.source_revision == fidelity.source_revision;
+                });
+            const auto& geometry = fidelity.compiled->geometry;
+            const bool valid_preview = !geometry.positions.empty() &&
+                geometry.normals.size() == geometry.positions.size() &&
+                geometry.indices.size() % 3U == 0U;
+            if (source_instance != instances.end() && valid_preview) {
+                const ImU32 fill = fidelity.status == carto::ui::SurfaceFidelityStatus::ready
+                    ? rgba(snapshot.colors.provisional, 0.24F)
+                    : rgba(snapshot.colors.semantic_warning, 0.24F);
+                const ImU32 outline = fidelity.status == carto::ui::SurfaceFidelityStatus::ready
+                    ? rgba(snapshot.colors.provisional, 0.94F)
+                    : rgba(snapshot.colors.semantic_warning, 0.94F);
+                bool preview_indices_valid = true;
+                for (const std::uint32_t index : geometry.indices) {
+                    if (index >= geometry.positions.size()) {
+                        preview_indices_valid = false;
+                        break;
+                    }
+                }
+                if (preview_indices_valid) {
+                    for (std::size_t index = 0U; index + 2U < geometry.indices.size(); index += 3U) {
+                        const ImVec2 a = project(world_point(
+                            source_instance->world_transform, geometry.positions[geometry.indices[index]]));
+                        const ImVec2 b = project(world_point(
+                            source_instance->world_transform, geometry.positions[geometry.indices[index + 1U]]));
+                        const ImVec2 c = project(world_point(
+                            source_instance->world_transform, geometry.positions[geometry.indices[index + 2U]]));
+                        draw->AddTriangleFilled(a, b, c, fill);
+                        draw->AddTriangle(a, b, c, outline, 2.0F);
+                    }
+                    ImGui::TextColored(
+                        fidelity.status == carto::ui::SurfaceFidelityStatus::ready
+                            ? color(snapshot.colors.provisional)
+                            : color(snapshot.colors.semantic_warning),
+                        "%s overlay · %u triangles",
+                        carto::ui::surface_fidelity_mode_name(fidelity.mode),
+                        fidelity.target_triangles);
+                }
+            }
+        }
         if (invalid_render_snapshot) {
             ImGui::TextColored(
                 color(snapshot.colors.semantic_warning),
@@ -2418,6 +2477,8 @@ struct DesktopState {
             ImGui::Text("Object: %s", object->object.name.c_str());
             ImGui::TextDisabled("Transform is a detachable instrument.");
             if (ImGui::Button("Open Transform Instrument")) workbench.transform = true;
+            ImGui::SameLine();
+            if (ImGui::Button("Open Fidelity")) workbench.measure = true;
         }
         const auto instances = snapshot.viewport.scene.instances();
         const auto instance = std::find_if(instances.begin(), instances.end(),
@@ -2530,6 +2591,7 @@ struct DesktopState {
             ImGui::EndDisabled();
         }
         if (ImGui::Button("Drafting Board", ImVec2(-1, 30))) workbench.draft = true;
+        if (ImGui::Button("Fidelity Instrument", ImVec2(-1, 30))) workbench.measure = true;
         ImGui::Separator();
         if (ImGui::Button("Undo", ImVec2(124, 30))) static_cast<void>(dispatch(carto::application::UndoAction{}));
         ImGui::SameLine();
@@ -2592,6 +2654,95 @@ struct DesktopState {
             }
         }
         end_instrument(carto::ui::WorkbenchInstrument::extrude, workbench.extrude);
+    }
+
+    void draw_surface_fidelity_instrument(const UiSnapshot& snapshot) {
+        if (!begin_instrument(snapshot, carto::ui::WorkbenchInstrument::measure,
+                              "Surface Fidelity", workbench.measure, ImVec2(520, 110),
+                              ImVec2(340, 430), snapshot.colors.accent_secondary)) return;
+
+        ImGui::TextDisabled("Revision-bound, read-only compiler preview");
+        ImGui::TextWrapped(
+            "Compile a representation for the selected object. The result is evidence only; "
+            "authoring and renderer state remain unchanged.");
+        ImGui::Spacing();
+
+        surface_target_triangles = std::clamp(
+            surface_target_triangles, 1,
+            static_cast<int>(carto::ui::kMaxSurfacePreviewTriangles));
+        ImGui::InputInt("Target triangles", &surface_target_triangles);
+        surface_target_triangles = std::clamp(
+            surface_target_triangles, 1,
+            static_cast<int>(carto::ui::kMaxSurfacePreviewTriangles));
+        ImGui::TextDisabled("CPU preview budget: %u source triangles",
+                            carto::ui::kMaxSurfacePreviewTriangles);
+        int mode = surface_mode == carto::surface::RepresentationMode::fidelity_closure ? 1 : 0;
+        if (ImGui::RadioButton("Fidelity closure", mode == 1)) mode = 1;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Geometry only", mode == 0)) mode = 0;
+        surface_mode = mode == 1
+            ? carto::surface::RepresentationMode::fidelity_closure
+            : carto::surface::RepresentationMode::geometry_only;
+
+        bool refresh_fidelity = false;
+        if (ImGui::Button("Compile preview", ImVec2(160, 30))) {
+            static_cast<void>(ui.compile_surface_preview(
+                static_cast<std::uint32_t>(surface_target_triangles), surface_mode));
+            refresh_fidelity = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clear", ImVec2(80, 30))) {
+            static_cast<void>(ui.clear_surface_preview());
+            refresh_fidelity = true;
+        }
+
+        auto fidelity = snapshot.surface_fidelity;
+        if (refresh_fidelity) fidelity = ui.snapshot().surface_fidelity;
+        ImGui::Separator();
+        const auto status_color_for = [&snapshot](carto::ui::SurfaceFidelityStatus status) {
+            switch (status) {
+            case carto::ui::SurfaceFidelityStatus::ready:
+                return color(snapshot.colors.semantic_success);
+            case carto::ui::SurfaceFidelityStatus::rejected:
+                return color(snapshot.colors.semantic_warning);
+            case carto::ui::SurfaceFidelityStatus::stale:
+                return color(snapshot.colors.stale);
+            case carto::ui::SurfaceFidelityStatus::unavailable:
+                return color(snapshot.colors.semantic_error);
+            case carto::ui::SurfaceFidelityStatus::idle:
+                return color(snapshot.colors.text_secondary);
+            }
+            return color(snapshot.colors.text_secondary);
+        };
+        ImGui::TextColored(status_color_for(fidelity.status), "%s · %s",
+                           carto::ui::surface_fidelity_status_name(fidelity.status),
+                           carto::ui::surface_fidelity_mode_name(fidelity.mode));
+        if (!fidelity.status_text.empty()) {
+            ImGui::TextWrapped("%s", fidelity.status_text.c_str());
+        }
+        if (fidelity.object.has_value()) {
+            ImGui::Text("Object %llu  ·  rev %llu",
+                        static_cast<unsigned long long>(fidelity.object->value),
+                        static_cast<unsigned long long>(fidelity.source_revision.value()));
+            ImGui::Text("Triangles  %u source  ->  %u target",
+                        fidelity.source_triangles, fidelity.target_triangles);
+            ImGui::Text("RMS radiance  %.6f", fidelity.error.rms_radiance_error);
+            ImGui::Text("Max radiance  %.6f", fidelity.error.max_radiance_error);
+            ImGui::Text("Specular  %.6f  ·  Visibility  %.6f",
+                        fidelity.error.specular_error, fidelity.error.visibility_error);
+            ImGui::Text("Silhouette  %.6f  ·  Energy  %.6f",
+                        fidelity.error.max_silhouette_error, fidelity.error.energy_error);
+            ImGui::TextColored(
+                fidelity.admitted ? color(snapshot.colors.semantic_success)
+                                  : color(snapshot.colors.semantic_warning),
+                fidelity.admitted ? "Appearance policy: admitted"
+                                  : "Appearance policy: not admitted");
+        }
+        if (fidelity.diagnostic.has_value()) {
+            ImGui::TextColored(color(snapshot.colors.semantic_warning), "%s",
+                               fidelity.diagnostic->message.c_str());
+        }
+        end_instrument(carto::ui::WorkbenchInstrument::measure, workbench.measure);
     }
 
     void draw_draft_instrument(const UiSnapshot& snapshot) {
@@ -2708,10 +2859,7 @@ struct DesktopState {
             snapshot, carto::ui::WorkbenchInstrument::modify, "Modify", workbench.modify,
             ImVec2(-8, 575), ImVec2(285, 170),
             "Modifier bay", "Modifier evaluation remains a deferred, revision-bound subsystem.");
-        if (workbench.measure) draw_placeholder_instrument(
-            snapshot, carto::ui::WorkbenchInstrument::measure, "Measure", workbench.measure,
-            ImVec2(540, 430), ImVec2(250, 170),
-            "Measure bay", "Measurement tools are not yet connected to a governed geometry query.");
+        if (workbench.measure) draw_surface_fidelity_instrument(snapshot);
     }
 
     void draw_project_surface(const UiSnapshot& snapshot) {
@@ -2820,8 +2968,25 @@ struct DesktopState {
             ImGui::TextColored(color(snapshot.colors.semantic_warning), "Viewport: %s",
                                snapshot.viewport.error->message.c_str());
         }
+        if (snapshot.surface_fidelity.status != carto::ui::SurfaceFidelityStatus::idle) {
+            ImGui::Text("Surface fidelity: %s · %s",
+                        carto::ui::surface_fidelity_status_name(snapshot.surface_fidelity.status),
+                        carto::ui::surface_fidelity_mode_name(snapshot.surface_fidelity.mode));
+            if (snapshot.surface_fidelity.object.has_value()) {
+                ImGui::TextDisabled("Object %llu · %u -> %u triangles · %s",
+                                    static_cast<unsigned long long>(
+                                        snapshot.surface_fidelity.object->value),
+                                    snapshot.surface_fidelity.source_triangles,
+                                    snapshot.surface_fidelity.target_triangles,
+                                    snapshot.surface_fidelity.admitted ? "admitted" : "not admitted");
+            }
+            if (!snapshot.surface_fidelity.status_text.empty()) {
+                ImGui::TextWrapped("%s", snapshot.surface_fidelity.status_text.c_str());
+            }
+        }
         if (snapshot.problems.empty() && snapshot.ui_problems.empty() &&
-            !snapshot.viewport.error.has_value()) {
+            !snapshot.viewport.error.has_value() &&
+            snapshot.surface_fidelity.status == carto::ui::SurfaceFidelityStatus::idle) {
             ImGui::TextColored(color(snapshot.colors.semantic_success), "No active problems reported.");
         }
         for (const auto& problem : snapshot.problems) {
@@ -2901,7 +3066,7 @@ struct DesktopState {
         instrument_toggle("Material", workbench.material);
         instrument_toggle("Constraint", workbench.constraint);
         instrument_toggle("Modify", workbench.modify);
-        instrument_toggle("Measure", workbench.measure);
+        instrument_toggle("Fidelity", workbench.measure);
         ImGui::TextDisabled("The viewport and machine frame remain fixed.\nRack instruments can be reopened at any time.");
         ImGui::EndChild();
         ImGui::EndChild();

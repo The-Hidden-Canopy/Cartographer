@@ -123,6 +123,16 @@ adjacent positions, and dropping one onto a rack returns it to storage.
 Instrument visibility, geometry, and Ledger collapse state are validated and
 atomically persisted as local `workbench.prefs` state, separate from project
 truth.
+The Measure bay is connected to the public surface-fidelity compiler as a
+Surface Fidelity instrument: it compiles an explicit triangle-budget preview
+from the selected viewport instance, displays the appearance-conservation
+receipt, and projects an admitted or rejected ghost representation over the
+work surface. The preview is read-only, carries source revision and project
+generation provenance, and is removed from the viewport when selection or
+authored state becomes stale. Because this compiler currently runs on the
+native UI path, the boundary rejects source or target meshes above the
+explicit 4,096-triangle CPU preview budget instead of allowing an unbounded
+interaction stall; larger workloads remain an offline/renderer-owned concern.
 Workspace availability and default layouts are supplied by the validated
 `workspace_registry`; the shell does not maintain a second hardcoded list.
 Available Model and AI workspaces apply their registry defaults through the
@@ -138,7 +148,7 @@ remains behind the existing Vulkan SDK and pinned Dear ImGui prerequisites. A
 local Debug build and responsive native-window launch have been exercised
 against those prerequisites; native message routing is source- and contract-
 verified, while click-through, pixel, DPI, resize,
-OS-level tear-out, and broad GPU compatibility remain separate acceptance
+OS-level tear-out, broad GPU compatibility, and VANTA runtime admission remain separate acceptance
 gates.
 
 ## Evidence
@@ -151,13 +161,17 @@ native key and pointer modifier contracts,
 workspace registry identity, default-layout application, and unavailable-workspace rejection,
 preference persistence, corrupt-preference reset, validated workbench geometry
 round-trips, atomic workbench writes, and failed action/shortcut diagnostics.
+It also covers explicit surface selection, closure preview admission, compiled
+preview identity, no-authoring-mutation behavior, and stale-preview
+invalidation.
 These are model and contract tests, not pixel snapshots. Native visual
 acceptance remains a separate gate.
 
 ## Deliberate non-claims
 
 This layer does not implement the complete UI specification. Concave inset,
-visual target markers, viewport projection, broad surface/normal snapping, broader persistent edge authoring/traversal, gizmos, numeric
+general-purpose viewport projection, visual target markers beyond the
+revision-bound fidelity overlay, broad surface/normal snapping, broader persistent edge authoring/traversal, gizmos, numeric
 transform editing, full modal numeric confirmation/axis locks, full direct-modeling interaction, CAD/BUILD/material/
 animation subsystems, model-backed AI planning, full docking/tab stacks,
 OS-level tear-out, native visual/click-through/DPI acceptance, and broad GPU compatibility

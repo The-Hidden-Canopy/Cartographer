@@ -54,6 +54,19 @@ core::Diagnostic validation(std::string message) {
     return core::Diagnostic(core::ErrorCode::validation_failed, std::move(message));
 }
 
+core::Diagnostic unsupported(std::string message) {
+    return core::Diagnostic(core::ErrorCode::unsupported, std::move(message));
+}
+
+std::optional<scene::ObjectId> selected_surface_object(
+    const application::ApplicationSnapshot& snapshot) {
+    if (snapshot.selection.component_object.has_value()) {
+        return snapshot.selection.component_object;
+    }
+    if (!snapshot.selection.objects.empty()) return snapshot.selection.objects.front();
+    return std::nullopt;
+}
+
 bool valid(Theme value) noexcept {
     return value == Theme::dark || value == Theme::light || value == Theme::high_contrast;
 }
@@ -655,6 +668,28 @@ core::Result<void> WorkbenchPreferences::validate() const {
     return core::Result<void>::success();
 }
 
+core::Result<void> SurfaceFidelityView::validate() const {
+    if (status_text.size() > 4096U ||
+        (object.has_value() && !*object) ||
+        ((status == SurfaceFidelityStatus::ready ||
+          status == SurfaceFidelityStatus::rejected) &&
+            (!object.has_value() || source_triangles == 0U || target_triangles == 0U ||
+             source_triangles > kMaxSurfacePreviewTriangles ||
+             target_triangles > kMaxSurfacePreviewTriangles ||
+             target_triangles > source_triangles || compiled == nullptr))) {
+        return core::Result<void>::failure(invalid("surface fidelity view is invalid"));
+    }
+    if (status == SurfaceFidelityStatus::ready ||
+        status == SurfaceFidelityStatus::rejected) {
+        if (auto result = error.validate(); !result) return result;
+    }
+    if (admitted && status != SurfaceFidelityStatus::ready) {
+        return core::Result<void>::failure(
+            invalid("admitted surface fidelity view is not ready"));
+    }
+    return core::Result<void>::success();
+}
+
 UiColorTokens color_tokens(Theme theme) noexcept {
     if (theme == Theme::light) {
         return {
@@ -804,6 +839,25 @@ const char* workbench_instrument_name(WorkbenchInstrument instrument) noexcept {
     case WorkbenchInstrument::measure: return "measure";
     case WorkbenchInstrument::transform: return "transform";
     case WorkbenchInstrument::extrude: return "extrude";
+    }
+    return "unknown";
+}
+
+const char* surface_fidelity_status_name(SurfaceFidelityStatus status) noexcept {
+    switch (status) {
+    case SurfaceFidelityStatus::idle: return "idle";
+    case SurfaceFidelityStatus::ready: return "ready";
+    case SurfaceFidelityStatus::stale: return "stale";
+    case SurfaceFidelityStatus::unavailable: return "unavailable";
+    case SurfaceFidelityStatus::rejected: return "rejected";
+    }
+    return "unknown";
+}
+
+const char* surface_fidelity_mode_name(surface::RepresentationMode mode) noexcept {
+    switch (mode) {
+    case surface::RepresentationMode::geometry_only: return "geometry-only";
+    case surface::RepresentationMode::fidelity_closure: return "fidelity closure";
     }
     return "unknown";
 }
@@ -1171,6 +1225,107 @@ core::Result<void> UiController::set_command_palette_query(std::string query) {
     return core::Result<void>::success();
 }
 
+core::Result<void> UiController::compile_surface_preview(
+    std::uint32_t target_triangles,
+    surface::RepresentationMode mode) {
+    const auto current = session_.snapshot();
+    SurfaceFidelityView view;
+    view.project_generation = current.project_generation;
+    view.project_revision = current.project_revision;
+    view.target_triangles = target_triangles;
+    view.mode = mode;
+
+    const auto fail = [this, &view](
+                           core::Diagnostic diagnostic,
+                           SurfaceFidelityStatus status = SurfaceFidelityStatus::unavailable)
+        -> core::Result<void> {
+        view.status = status;
+        view.status_text = diagnostic.message;
+        view.diagnostic = diagnostic;
+        surface_fidelity_ = view;
+        return core::Result<void>::failure(std::move(diagnostic));
+    };
+
+    if (target_triangles == 0U) {
+        return fail(invalid("surface fidelity preview requires at least one target triangle"));
+    }
+    if (target_triangles > kMaxSurfacePreviewTriangles) {
+        return fail(unsupported(
+            "surface fidelity preview exceeds the bounded native UI triangle budget"));
+    }
+    if (mode != surface::RepresentationMode::geometry_only &&
+        mode != surface::RepresentationMode::fidelity_closure) {
+        return fail(invalid("surface fidelity preview mode is invalid"));
+    }
+
+    const auto selected = selected_surface_object(current);
+    if (!selected.has_value()) {
+        return fail(invalid_state(
+            "surface fidelity preview requires a selected object or mesh component"));
+    }
+    view.object = selected;
+    const auto* instance = current.viewport.scene.find(*selected);
+    if (instance == nullptr || instance->mesh == nullptr || !instance->mesh->valid()) {
+        return fail(stale("selected object has no valid compiled viewport geometry"));
+    }
+
+    const auto source_triangles = instance->mesh->indices.size() / 3U;
+    if (source_triangles == 0U || source_triangles > std::numeric_limits<std::uint32_t>::max()) {
+        return fail(validation("selected object has no bounded source triangle set"));
+    }
+    if (source_triangles > kMaxSurfacePreviewTriangles) {
+        return fail(unsupported(
+            "selected object exceeds the bounded native UI source triangle budget"));
+    }
+    view.source_revision = instance->source_revision;
+    view.source_triangles = static_cast<std::uint32_t>(source_triangles);
+    if (target_triangles > view.source_triangles) {
+        return fail(invalid(
+            "surface fidelity target cannot exceed the selected source triangle count"));
+    }
+
+    const auto domain = surface::build_surface_domain(
+        *instance->mesh,
+        surface::SurfaceDomainId{selected->value},
+        "scene-object",
+        "unassigned");
+    if (!domain) return fail(domain.error().with_context("surface fidelity domain"));
+
+    surface::SurfaceClosureCompileOptions options;
+    options.analysis.max_source_triangles = kMaxSurfacePreviewTriangles;
+    options.target_triangles = target_triangles;
+    const auto candidate = surface::compile_surface_representation(
+        *instance->mesh, domain.value(), options, mode);
+    if (!candidate) return fail(candidate.error().with_context("surface fidelity compile"));
+
+    view.error = candidate.value().error;
+    view.compiled = std::make_shared<const surface::SurfaceClosurePolygon>(candidate.value());
+    view.domain_digest = domain.value().digest;
+    view.representation_digest = candidate.value().digest;
+    view.target_triangles = static_cast<std::uint32_t>(candidate.value().geometry.triangle_count());
+
+    const auto admission = surface::admit_surface_representation(
+        *instance->mesh, domain.value(), candidate.value());
+    view.admitted = static_cast<bool>(admission);
+    if (admission) {
+        view.status = SurfaceFidelityStatus::ready;
+        view.status_text = "Preview compiled and admitted by the appearance policy.";
+        view.diagnostic.reset();
+    } else {
+        view.status = SurfaceFidelityStatus::rejected;
+        view.status_text = "Preview compiled but was rejected by the appearance policy.";
+        view.diagnostic = admission.error();
+    }
+    if (auto result = view.validate(); !result) return fail(result.error());
+    surface_fidelity_ = std::move(view);
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::clear_surface_preview() {
+    surface_fidelity_.reset();
+    return core::Result<void>::success();
+}
+
 core::Result<void> UiController::can_close(bool discard_dirty) const {
     return session_.can_close(discard_dirty);
 }
@@ -1337,6 +1492,28 @@ UiSnapshot UiController::snapshot() const {
     result.ai_status = preferences_.ai_auto_approve
         ? "Native planner ready. Safe proposals auto-apply through the revision-bound command path."
         : "Native planner ready. Proposals require explicit Apply through the revision-bound command path.";
+    if (surface_fidelity_.has_value()) {
+        result.surface_fidelity = *surface_fidelity_;
+        const auto& preview = *surface_fidelity_;
+        if (preview.status == SurfaceFidelityStatus::ready ||
+            preview.status == SurfaceFidelityStatus::rejected) {
+            const auto selected = selected_surface_object(result);
+            const auto* instance = selected.has_value()
+                ? result.viewport.scene.find(*selected) : nullptr;
+            const bool stale_preview = !selected.has_value() ||
+                !preview.object.has_value() || *selected != *preview.object ||
+                preview.project_generation != result.project_generation ||
+                preview.project_revision != result.project_revision ||
+                instance == nullptr || instance->mesh == nullptr ||
+                instance->source_revision != preview.source_revision;
+            if (stale_preview) {
+                result.surface_fidelity.status = SurfaceFidelityStatus::stale;
+                result.surface_fidelity.status_text =
+                    "Preview is stale; selection or authored geometry changed.";
+                result.surface_fidelity.admitted = false;
+            }
+        }
+    }
     if (!result.ui_problems.empty()) {
         result.project_status = ProjectStatus::ui_error;
         result.project_status_text = "UI attention required";

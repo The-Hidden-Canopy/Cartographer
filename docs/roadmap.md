@@ -50,6 +50,9 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] web geometry read-only cluster diagnostics snapshots with explicit grouping-only warnings and package-bound conservative error receipts for editor/problem consumers
 - [x] web geometry backend-neutral cluster-overlay projection math with explicit matrix conventions, clipping, viewport bounds, and fail-closed non-finite handling
 - [x] web geometry deterministic package-bound page-interest planning from visible overlay identities without residency mutation
+- [x] public surface-fidelity first milestone: revision-bound SurfaceDomain, bounded differential/frequency analysis, geometry-only baseline, geometry-derived NDF, directional visibility closure, CPU radiometric envelopes, appearance admission, representation tree, and derived VANTA fidelity package
+- [x] native Surface Fidelity workbench instrument: explicit triangle-budget preview, appearance admission readout, revision-bound ghost overlay, and stale-preview invalidation without authoring mutation
+- [x] public surface process contracts: explicit migration receipts, material stratigraphy/depth exposure, deterministic weathering state, manufacturing history, contact graph, semantic edge profiles, and material-derived geometry intent without authored-topology mutation
 - [ ] private algorithmic representation and continuity work remains outside the public build boundary and requires separate release review
 - [ ] next-level polygon representation inheritance, view/material/constraint/fracture policy execution, and VANTA/runtime admission
 - [x] backend-neutral surface-identity buffer planning and revision-bound CPU temporal-history rejection; native shader binding and GPU acceptance remain deferred

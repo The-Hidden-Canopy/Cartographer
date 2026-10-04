@@ -357,6 +357,58 @@ void workbench_preferences_round_trip_and_fail_closed() {
     REQUIRE(!carto::ui::load_workbench_preferences(path));
 }
 
+void ui_connects_surface_fidelity_preview_without_authoring_mutation() {
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+
+    REQUIRE(!ui.compile_surface_preview(6U));
+    REQUIRE(ui.snapshot().surface_fidelity.status ==
+            carto::ui::SurfaceFidelityStatus::unavailable);
+
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{"Surface box", {2.0, 2.0, 2.0}}));
+    const auto before = ui.snapshot();
+    REQUIRE(before.objects.size() == 1U);
+    const auto object = before.objects.front().object.id;
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{object}));
+    const auto selected = ui.snapshot();
+    const auto revision = selected.project_revision;
+    const auto bounded = ui.compile_surface_preview(
+        carto::ui::kMaxSurfacePreviewTriangles + 1U,
+        carto::surface::RepresentationMode::fidelity_closure);
+    REQUIRE(!bounded);
+    REQUIRE(bounded.error().code == carto::core::ErrorCode::unsupported);
+    REQUIRE(ui.snapshot().surface_fidelity.status ==
+            carto::ui::SurfaceFidelityStatus::unavailable);
+    REQUIRE(ui.snapshot().operations.size() == 1U);
+    REQUIRE(ui.compile_surface_preview(
+        6U, carto::surface::RepresentationMode::fidelity_closure));
+
+    auto preview = ui.snapshot().surface_fidelity;
+    REQUIRE(preview.status == carto::ui::SurfaceFidelityStatus::ready);
+    REQUIRE(preview.admitted);
+    REQUIRE(preview.object.has_value() && *preview.object == object);
+    REQUIRE(preview.source_triangles == 12U);
+    REQUIRE(preview.target_triangles == 6U);
+    REQUIRE(preview.mode == carto::surface::RepresentationMode::fidelity_closure);
+    REQUIRE(preview.compiled != nullptr);
+    REQUIRE(preview.compiled->geometry.triangle_count() == 6U);
+    REQUIRE(!preview.domain_digest.empty());
+    REQUIRE(!preview.representation_digest.empty());
+    REQUIRE(preview.validate());
+    REQUIRE(ui.snapshot().project_revision == revision);
+    REQUIRE(ui.snapshot().operations.size() == 1U);
+
+    REQUIRE(ui.dispatch(carto::application::SetObjectTransformAction{
+        object, carto::core::Transform{{1.0, 0.0, 0.0}, carto::core::Quaternion::identity(),
+                                       {1.0, 1.0, 1.0}}}));
+    preview = ui.snapshot().surface_fidelity;
+    REQUIRE(preview.status == carto::ui::SurfaceFidelityStatus::stale);
+    REQUIRE(!preview.admitted);
+
+    REQUIRE(ui.clear_surface_preview());
+    REQUIRE(ui.snapshot().surface_fidelity.status == carto::ui::SurfaceFidelityStatus::idle);
+}
+
 void ui_failed_shortcuts_and_actions_remain_bounded() {
     carto::application::ApplicationSession session;
     carto::ui::UiController ui(session);
@@ -501,6 +553,7 @@ int main() {
         ui_preserves_required_viewport_and_supports_mode_theme_density();
         ui_persists_preferences_and_resets_corrupt_state();
         workbench_preferences_round_trip_and_fail_closed();
+        ui_connects_surface_fidelity_preview_without_authoring_mutation();
         ui_failed_shortcuts_and_actions_remain_bounded();
         ui_command_palette_is_bounded_and_explicit_about_deferred_features();
         native_key_contract_maps_core_control_without_imgui();

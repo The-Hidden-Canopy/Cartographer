@@ -22,6 +22,18 @@ target_link_libraries(cartographer_web_geometry_bench
 
 carto_target(cartographer_web_geometry_bench)
 
+add_executable(cartographer_surface_closure_bench
+    surface_closure.cpp
+)
+
+target_link_libraries(cartographer_surface_closure_bench
+    PRIVATE
+        carto_surface_core
+        carto_geometry
+)
+
+carto_target(cartographer_surface_closure_bench)
+
 add_executable(cartographer_scientific_bench
     scientific_kernels.cpp
 )

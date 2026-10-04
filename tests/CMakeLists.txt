@@ -49,6 +49,17 @@ target_link_libraries(cartographer_web_geometry_tests
 carto_target(cartographer_web_geometry_tests)
 add_test(NAME cartographer_web_geometry_tests COMMAND cartographer_web_geometry_tests)
 
+add_executable(cartographer_surface_closure_tests
+    surface_closure_tests.cpp
+)
+target_link_libraries(cartographer_surface_closure_tests
+    PRIVATE
+        carto_surface_core
+        carto_geometry
+)
+carto_target(cartographer_surface_closure_tests)
+add_test(NAME cartographer_surface_closure_tests COMMAND cartographer_surface_closure_tests)
+
 if(CARTO_BUILD_DEVICE_CPU)
     add_executable(cartographer_device_tests
         device_tests.cpp
