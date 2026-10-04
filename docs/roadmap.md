@@ -14,10 +14,16 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] deterministic compiled mesh, normals, bounds, and source revisions
 - [x] reversible transform command and history boundary
 - [x] versioned project format with atomic save/load
-- [x] v4 project format with v1/v2/v3 compatibility, explicit meters/right-handed/Y-up contract, optional graph reference, and bounded project-bound topology receipt lineage
+- [x] v5 project format with v1/v2/v3/v4 compatibility, explicit meters/right-handed/Y-up contract, optional graph reference, bounded project-bound topology receipt lineage, and a generic scientific model record
 - [x] OBJ import/export with explicit feature-loss warnings
 - [x] bounded ASCII PLY and binary/ASCII STL interchange with explicit feature-loss warnings
 - [x] bounded glTF export profile with explicit feature-loss warnings
+- [x] bounded uppercase-IUPAC FASTA sequence-genome exchange with explicit metadata/variant loss reporting and journaled CLI import
+- [x] bounded VCF variant exchange with reference-digest, assembly, sample, one-based-coordinate, and provenance gates plus journaled CLI import
+- [x] bounded GFF3 sequence-annotation exchange with reference-digest, explicit coordinate conversion, stable feature identity, escaped attributes, and journaled CLI import
+- [x] bounded BED6 sequence-annotation exchange with reference-digest, native interval preservation, stable name identity, explicit score conversion, and journaled CLI import
+- [x] bounded GTF 2.2 sequence-annotation exchange with reference-digest, quoted-attribute validation, explicit coordinate conversion, stable feature identity, and journaled CLI import
+- [x] bounded morphology landmark-set exchange with structure-graph digest binding, stable ownership/coordinate frames, provenance gates, and journaled CLI import
 - [x] deterministic box/plane primitives and reversible primitive/vertex editing commands
 - [x] atomic single-face extrusion with reversible topology history
 - [x] ephemeral object/vertex/face selection with context validation
@@ -45,7 +51,7 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] web geometry backend-neutral cluster-overlay projection math with explicit matrix conventions, clipping, viewport bounds, and fail-closed non-finite handling
 - [x] web geometry deterministic package-bound page-interest planning from visible overlay identities without residency mutation
 - [ ] web geometry renderable parent simplification, VANTA import admission, native overlay rendering/pointer integration, and native runtime admission
-- [x] project-package graph reference binding, journal/checkpoint preservation, polygon topology-provenance adapter, and v4 project-bound topology receipt persistence
+- [x] project-package graph reference binding, journal/checkpoint preservation, polygon topology-provenance adapter, v5 scientific-model and v5 project-bound topology receipt persistence
 - [x] opt-in Windows D3D12 adapter/resource boundary and native identity smoke acceptance
 - [x] bounded D3D12 native acceptance tranche: runtime DXIL suite, offscreen sampled-material PBR into an HDR target, HDR-to-display tone-map execution/readback, shadow-depth execution/readback, temporal resolve over current/history/motion inputs, storage-texture compute dispatch/readback, deferred descriptor/resource lifetime, typed DXGI back-buffer import, resize/present, desktop launch smoke, and 8K render-target clear on the Quadro P5200
 - [x] D3D12 native timestamp capture, queue-aware compute shader states, in-flight command-context reuse, and a warmed temporal-kernel stress benchmark with separate GPU/host timing receipts
@@ -73,8 +79,72 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
   declarations and result-size enforcement
 - [ ] built-in provider migration beyond the OBJ CLI gate, process isolation,
   runtime budget enforcement, and host geometry admission
+- [x] generic scientific substrate with typed entity IDs, regions, boundaries,
+  interfaces, fields, studies, results, parameters, probes, provenance,
+  deterministic serialization, and journaled `.carto` admission
+- [x] bounded morphology structure/attachment/landmark/growth-domain graph, with
+  field-linked direction/rate/anisotropy/stage bounds, and semantic
+  functional-genome records with deterministic gene/module/neural-value and
+  source/lineage/program-identity diff, optional source-digest/lineage identity,
+  and persistence; cross-domain acceptance fixtures cover human-organ,
+  plant-root, insect-limb, and vascular-tree archetypes without domain-specific
+  runtime semantics
+- [x] bounded developmental stages/instructions, evidence-bearing traces with
+  optional tissue assignment and parameter-value evidence, and generation-checked
+  lineage/mutation/recombination receipts with cross-reference
+  validation, including a 100-generation mutation-lineage acceptance fixture, plus
+  deterministic planned-vs-observed timeline and instruction-impact projections
+- [x] bounded morphometric observations, shape signatures, and explicit
+  structure-to-structure comparisons with finite/range/reference validation,
+  plus deterministic fail-closed bilateral landmark and signature-comparison
+  previews
+- [x] bounded sequence-genome contigs and explicit variants with uppercase IUPAC,
+  coordinate/reference matching, digest, and provenance validation
+- [x] bounded provider-neutral FASTA, VCF, GFF3, BED6, GTF 2.2, and rooted
+  single-parent Newick exchange surfaces with explicit coordinate/identity
+  envelopes, preservation dispositions, strict fail-closed parsing, and
+  journaled CLI admission; Newick rejects reticulation and does not replace
+  native lineage identity
+- [x] bounded anatomy ontology-table exchange preserving namespace/accession,
+  term hierarchy, labels, categories, definitions, ontology version, and source
+  release with strict schema/provenance gates and journaled CLI admission;
+  ontology terms remain semantic authoring data
+- [x] bounded anatomy terms, tissue/organ categories, structure-bound parts,
+  ontology version/source-release metadata, typed tissue regions with
+  stage/developmental/physical metadata and geometry bindings, partonomy, and
+  typed relations with cycle/reference validation
+- [x] bounded anatomy-provider publication bindings with semantic IDs,
+  laterality, source project revision, geometry/license lineage, local edits,
+  typed part/structure validation, and an explicit source/digest-bound
+  authoring candidate gate plus a deterministic provider-neutral candidate
+  envelope and CLI export/inspect path
+- [x] bounded scientific replay capsules with source revision, provider/solver,
+  seeds, parameter references, external dataset digests, expected output
+  digests, and explicit provenance
+- [x] bounded field-visualization descriptors with finite display bounds,
+  palette/stage intent, field/region reference validation, and derived
+  CPU-only scalar sample-to-color, vector glyph, slice-plane,
+  marching-squares contour, bounded marching-tetrahedra isosurface,
+  bounded front-to-back volume projection, single-probe readout, and bounded
+  2D streamline previews
+- [x] bounded provider-import lineage receipts with source/provider identity,
+  admitted/considered counts, warnings, feature-loss notes, explicit
+  preserved/converted/ignored/unsupported/ambiguous/repaired dispositions,
+  v1-compatible nested decoding, and provenance
+- [x] provider-neutral functional-genome exchange envelope binding one source
+  preservation receipt to a canonical semantic digest, with fail-closed
+  tamper and sequence-genome substitution checks, plus stable-ID guarded gene
+  replacement/removal for re-exported authoring edits and journaled CLI
+  import/inspect/edit/export workflow
+- [x] bounded phenotype-capability derivations with forward/reverse typed links
+  to morphology, genome, developmental instructions, and development traces,
+  plus derived forward/reverse trace queries
+- [x] bounded gene-regulatory edges and spatial-expression records with typed
+  gene, stage, structure, region, and field targets
+- [ ] provider execution, rendered field visualization, and MENAGERIE / VANTA
+  execution handoff
 - [x] stable object/vertex/edge/face selection identity through the editor, application snapshot, headless UI, and source-wired viewport picker (native acceptance pending)
-- [ ] persistent topology edit patches, loop/ring modeling operators, edge-edit tools, and broader modeling tool interaction (receipt-aware edge-loop/edge-ring/boundary/fan/region/path traversal, deterministic vertex/edge/face conversion, one-start shortest-path selection, session-local repeat/adjust-last replay, bounded incident-edge vertex slide, vertex patches, two-vertex target-weld, bounded coplanar internal-edge dissolve, compatible triangle-to-quad conversion, convex-face poke operators, bounded numeric/grid-snapping substrates, and revision-bound vertex/edge-midpoint/face-center candidate discovery exist; bevel/center-or-last merge modes/attribute-aware weld/arbitrary dissolve/broader triangle pairing/multi-object selection/loop-cut/knife operators, viewport projection/markers, modal numeric entry, and native input acceptance remain pending)
+- [ ] persistent topology edit patches, loop/ring modeling operators, edge-edit tools, and broader modeling tool interaction (receipt-aware edge-loop/edge-ring/boundary/fan/region/path traversal, deterministic vertex/edge/face conversion, one-start shortest-path selection, session-local repeat/adjust-last replay, bounded incident-edge vertex slide, vertex patches, two-vertex target-weld, bounded coplanar internal-edge dissolve, bounded single-segment internal-edge and valence-three vertex bevels, compatible triangle-to-quad conversion, bounded arithmetic numeric/grid-snapping substrates, and revision-bound vertex/edge-midpoint/face-center candidate discovery exist; multi-segment/full bevel policy, center-or-last merge modes/attribute-aware weld/arbitrary dissolve/broader triangle pairing/multi-object selection/loop-cut/knife operators, viewport projection/markers, axis locks, modal numeric confirmation, and native input acceptance remain pending)
 
 The optional native source path is intentionally not marked complete by the
 presence of a window class or renderer type. The CPU device supplies the

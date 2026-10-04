@@ -99,7 +99,7 @@ operations cannot span objects or silently bind an existing unbound selection
 to a different mesh context. Mesh-bound selections retain the mesh instance and
 source revision they were created against, so replacement or mutation requires
 explicit reselection. Edge selection consumes persistent topology identity.
-Single-edge splitting, bounded coplanar internal-edge dissolve, compatible triangle-to-quad conversion, convex-face inset, convex-face poke, and single-face deletion are now
+Single-edge splitting, bounded coplanar internal-edge dissolve, bounded valence-three vertex bevel, compatible triangle-to-quad conversion, convex-face inset, convex-face poke, and single-face deletion are now
 admitted topology edits: they validate the bound selection, mutate a
 project-owned mesh through a revision-guarded command, emit
 affected-set/parameter receipt metadata, and clear selections whose identities
@@ -109,7 +109,7 @@ linked, grow, shrink, invert, and one-start shortest-path selection are
 available on one validated mesh. The
 two-vertex target-weld path preserves the lower stable vertex
 ID, removes only unambiguous degenerate faces, and records source-to-target
-merge lineage. Non-convex poke/inset, broader edge traversal, merge modes beyond
+merge lineage. Broader vertex-bevel fans, non-convex poke/inset, broader edge traversal, merge modes beyond
 target-first, arbitrary/non-convex dissolve, broader triangle pairing, and multi-selection topology operators remain deferred.
 
 The application also retains a session-local repeat/adjust-last record for the
@@ -125,8 +125,9 @@ current built-in context resolves an object-bound selection through
 `ProjectDocument` to the owning mesh asset and exposes approved command
 builders for selected-face extrusion, convex-face inset, single-face deletion,
 single-edge splitting, bounded internal-edge dissolve, compatible triangle-to-quad
-conversion, convex-face poke, bounded incident-edge vertex sliding, two-vertex
-target welding, and single-vertex position editing.
+conversion, convex-face poke, bounded incident-edge vertex sliding, bounded
+valence-three vertex bevel, two-vertex target welding, and single-vertex
+position editing.
 Additional tool builders must preserve the same boundary and leave context
 routing out of panel code.
 

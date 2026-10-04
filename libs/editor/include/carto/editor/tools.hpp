@@ -5,6 +5,7 @@
 #include <carto/editor/command_bus.hpp>
 
 #include <functional>
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <string>
@@ -25,6 +26,8 @@ enum class ToolKernelKind {
     editable_mesh_set_vertex_position,
     editable_mesh_slide_vertex,
     editable_mesh_split_edge,
+    editable_mesh_bevel_edge,
+    editable_mesh_bevel_vertex,
     editable_mesh_dissolve_edge,
     editable_mesh_tri_to_quad,
     editable_mesh_merge_vertices,
@@ -59,6 +62,10 @@ struct ToolContext {
     [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
     make_split_selected_edge_command(double factor) const;
     [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
+    make_bevel_selected_edge_command(double width, std::uint32_t segments) const;
+    [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
+    make_bevel_selected_vertex_command(double width, std::uint32_t segments) const;
+    [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
     make_dissolve_selected_edge_command() const;
     [[nodiscard]] core::Result<std::unique_ptr<EditorCommand>>
     make_tri_to_quad_selected_faces_command() const;
@@ -81,6 +88,7 @@ struct ToolArguments {
     bool remove_orphaned_vertices = true;
     double factor = 0.5;
     std::optional<geometry::EdgeId> support_edge;
+    std::uint32_t segments = 1U;
 };
 
 using ToolFactory = std::function<core::Result<std::unique_ptr<EditorCommand>>(

@@ -36,7 +36,7 @@ if(CARTO_ENABLE_D3D12)
     )
     target_compile_definitions(cartographer_d3d12_kernel_bench
         PRIVATE
-            CARTO_D3D12_SHADER_DIR="${CMAKE_SOURCE_DIR}/libs/d3d12/shaders"
+            CARTO_D3D12_SHADER_DIR="${CMAKE_CURRENT_LIST_DIR}/../libs/d3d12/shaders"
     )
     carto_target(cartographer_d3d12_kernel_bench)
 endif()

@@ -1390,6 +1390,390 @@ core::Result<void> SplitProjectSelectedEdgeCommand::undo() {
     return core::Result<void>::success();
 }
 
+BevelEdgeCommand::BevelEdgeCommand(
+    geometry::EditableMesh& mesh,
+    geometry::EdgeId edge,
+    double width,
+    std::uint32_t segments)
+    : mesh_(&mesh), edge_(edge), width_(width), segments_(segments) {}
+
+core::Result<void> BevelEdgeCommand::execute() {
+    if (!mesh_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state, "bevel edge command has no mesh"));
+    }
+    if (before_.has_value()) {
+        if (!after_.has_value() || !receipt_.has_value()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "bevel edge command has incomplete history state"));
+        }
+        return mesh_->restore_from(*after_);
+    }
+
+    geometry::EditableMesh before = *mesh_;
+    auto beveled = mesh_->bevel_edge(edge_, width_, segments_);
+    if (!beveled) {
+        return core::Result<void>::failure(beveled.error());
+    }
+    before_ = std::move(before);
+    after_ = *mesh_;
+    receipt_ = std::move(beveled.value());
+    return core::Result<void>::success();
+}
+
+core::Result<void> BevelEdgeCommand::undo() {
+    if (!mesh_ || !before_.has_value() || !after_.has_value() || !receipt_.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "bevel edge command has no completed operation to undo"));
+    }
+    return mesh_->restore_from(*before_);
+}
+
+BevelSelectedEdgeCommand::BevelSelectedEdgeCommand(
+    const SelectionState& selection,
+    geometry::EditableMesh& mesh,
+    double width,
+    std::uint32_t segments)
+    : selection_(&selection), mesh_(&mesh), width_(width), segments_(segments) {}
+
+core::Result<void> BevelSelectedEdgeCommand::execute() {
+    if (!selection_ || !mesh_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "selected-edge bevel command has incomplete context"));
+    }
+    if (!delegate_) {
+        if (selection_->mode() != SelectionMode::edge) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_argument,
+                "selected-edge bevel requires edge selection mode"));
+        }
+        if (auto result = selection_->validate(*mesh_); !result) {
+            return result;
+        }
+        const auto edges = selection_->selected_edges();
+        if (edges.empty()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "selected-edge bevel requires one selected edge"));
+        }
+        if (edges.size() != 1U) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::unsupported,
+                "multi-edge bevel is not implemented in this tool boundary"));
+        }
+        delegate_ = std::make_unique<BevelEdgeCommand>(
+            *mesh_, edges.front(), width_, segments_);
+        auto result = delegate_->execute();
+        if (!result) delegate_.reset();
+        return result;
+    }
+    return delegate_->execute();
+}
+
+core::Result<void> BevelSelectedEdgeCommand::undo() {
+    if (!delegate_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "selected-edge bevel has no completed operation to undo"));
+    }
+    return delegate_->undo();
+}
+
+BevelProjectSelectedEdgeCommand::BevelProjectSelectedEdgeCommand(
+    ProjectCommandAdmission,
+    project::ProjectDocument& document,
+    const SelectionState& selection,
+    double width,
+    std::uint32_t segments)
+    : document_(&document), selection_(&selection), width_(width), segments_(segments) {}
+
+core::Result<void> BevelProjectSelectedEdgeCommand::execute() {
+    if (!document_ || !selection_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "project edge bevel command has incomplete context"));
+    }
+    if (before_.has_value()) {
+        if (!mesh_asset_.has_value() || !after_.has_value() || !receipt_.has_value() ||
+            !current_mesh_revision_.has_value()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "project edge bevel command has incomplete history state"));
+        }
+        auto result = document_->replace_mesh_if_revision(
+            *mesh_asset_, *current_mesh_revision_, *after_);
+        if (!result) return core::Result<void>::failure(result.error());
+        current_mesh_revision_ = result.value();
+        return core::Result<void>::success();
+    }
+    if (selection_->mode() != SelectionMode::edge) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "project edge bevel requires edge selection mode"));
+    }
+    const auto owner = selection_->component_object();
+    if (!owner.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "project edge bevel requires an object-bound edge selection"));
+    }
+    const auto* object = document_->scene().find(*owner);
+    if (!object) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "selected edge owner object is no longer present"));
+    }
+    if (!object->mesh_asset.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "selected edge owner has no mesh asset"));
+    }
+    const std::uint64_t mesh_asset = *object->mesh_asset;
+    const auto mesh_iterator = document_->meshes().find(mesh_asset);
+    if (mesh_iterator == document_->meshes().end()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "selected edge owner references a missing mesh asset"));
+    }
+    if (auto result = selection_->validate(document_->scene(), &mesh_iterator->second); !result) {
+        return result;
+    }
+    const auto edges = selection_->selected_edges();
+    if (edges.empty()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "project edge bevel requires one selected edge"));
+    }
+    if (edges.size() != 1U) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "multi-edge project bevel is not implemented"));
+    }
+
+    geometry::EditableMesh before = mesh_iterator->second;
+    geometry::EditableMesh after = before;
+    auto beveled = after.bevel_edge(edges.front(), width_, segments_);
+    if (!beveled) return core::Result<void>::failure(beveled.error());
+    auto replaced = document_->replace_mesh_if_revision(
+        mesh_asset, before.revision(), after, beveled.value());
+    if (!replaced) return core::Result<void>::failure(replaced.error());
+    mesh_asset_ = mesh_asset;
+    before_ = std::move(before);
+    after_ = std::move(after);
+    receipt_ = std::move(beveled.value());
+    current_mesh_revision_ = replaced.value();
+    return core::Result<void>::success();
+}
+
+core::Result<void> BevelProjectSelectedEdgeCommand::undo() {
+    if (!document_ || !mesh_asset_.has_value() || !before_.has_value() ||
+        !after_.has_value() || !receipt_.has_value() || !current_mesh_revision_.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "project edge bevel command has no completed operation to undo"));
+    }
+    auto result = document_->replace_mesh_if_revision(
+        *mesh_asset_, *current_mesh_revision_, *before_);
+    if (!result) return core::Result<void>::failure(result.error());
+    current_mesh_revision_ = result.value();
+    return core::Result<void>::success();
+}
+
+BevelVertexCommand::BevelVertexCommand(
+    geometry::EditableMesh& mesh,
+    geometry::VertexId vertex,
+    double width,
+    std::uint32_t segments)
+    : mesh_(&mesh), vertex_(vertex), width_(width), segments_(segments) {}
+
+core::Result<void> BevelVertexCommand::execute() {
+    if (!mesh_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state, "bevel vertex command has no mesh"));
+    }
+    if (before_.has_value()) {
+        if (!after_.has_value() || !receipt_.has_value()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "bevel vertex command has incomplete history state"));
+        }
+        return mesh_->restore_from(*after_);
+    }
+
+    geometry::EditableMesh before = *mesh_;
+    auto beveled = mesh_->bevel_vertex(vertex_, width_, segments_);
+    if (!beveled) {
+        return core::Result<void>::failure(beveled.error());
+    }
+    before_ = std::move(before);
+    after_ = *mesh_;
+    receipt_ = std::move(beveled.value());
+    return core::Result<void>::success();
+}
+
+core::Result<void> BevelVertexCommand::undo() {
+    if (!mesh_ || !before_.has_value() || !after_.has_value() || !receipt_.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "bevel vertex command has no completed operation to undo"));
+    }
+    return mesh_->restore_from(*before_);
+}
+
+BevelSelectedVertexCommand::BevelSelectedVertexCommand(
+    const SelectionState& selection,
+    geometry::EditableMesh& mesh,
+    double width,
+    std::uint32_t segments)
+    : selection_(&selection), mesh_(&mesh), width_(width), segments_(segments) {}
+
+core::Result<void> BevelSelectedVertexCommand::execute() {
+    if (!selection_ || !mesh_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "selected-vertex bevel command has incomplete context"));
+    }
+    if (!delegate_) {
+        if (selection_->mode() != SelectionMode::vertex) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_argument,
+                "selected-vertex bevel requires vertex selection mode"));
+        }
+        if (auto result = selection_->validate(*mesh_); !result) {
+            return result;
+        }
+        const auto vertices = selection_->selected_vertices();
+        if (vertices.empty()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "selected-vertex bevel requires one selected vertex"));
+        }
+        if (vertices.size() != 1U) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::unsupported,
+                "multi-vertex bevel is not implemented in this tool boundary"));
+        }
+        delegate_ = std::make_unique<BevelVertexCommand>(
+            *mesh_, vertices.front(), width_, segments_);
+        auto result = delegate_->execute();
+        if (!result) delegate_.reset();
+        return result;
+    }
+    return delegate_->execute();
+}
+
+core::Result<void> BevelSelectedVertexCommand::undo() {
+    if (!delegate_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "selected-vertex bevel has no completed operation to undo"));
+    }
+    return delegate_->undo();
+}
+
+BevelProjectSelectedVertexCommand::BevelProjectSelectedVertexCommand(
+    ProjectCommandAdmission,
+    project::ProjectDocument& document,
+    const SelectionState& selection,
+    double width,
+    std::uint32_t segments)
+    : document_(&document), selection_(&selection), width_(width), segments_(segments) {}
+
+core::Result<void> BevelProjectSelectedVertexCommand::execute() {
+    if (!document_ || !selection_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "project vertex bevel command has incomplete context"));
+    }
+    if (before_.has_value()) {
+        if (!mesh_asset_.has_value() || !after_.has_value() || !receipt_.has_value() ||
+            !current_mesh_revision_.has_value()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "project vertex bevel command has incomplete history state"));
+        }
+        auto result = document_->replace_mesh_if_revision(
+            *mesh_asset_, *current_mesh_revision_, *after_);
+        if (!result) return core::Result<void>::failure(result.error());
+        current_mesh_revision_ = result.value();
+        return core::Result<void>::success();
+    }
+    if (selection_->mode() != SelectionMode::vertex) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "project vertex bevel requires vertex selection mode"));
+    }
+    const auto owner = selection_->component_object();
+    if (!owner.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "project vertex bevel requires an object-bound vertex selection"));
+    }
+    const auto* object = document_->scene().find(*owner);
+    if (!object) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "selected vertex owner object is no longer present"));
+    }
+    if (!object->mesh_asset.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "selected vertex owner has no mesh asset"));
+    }
+    const std::uint64_t mesh_asset = *object->mesh_asset;
+    const auto mesh_iterator = document_->meshes().find(mesh_asset);
+    if (mesh_iterator == document_->meshes().end()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "selected vertex owner references a missing mesh asset"));
+    }
+    if (auto result = selection_->validate(document_->scene(), &mesh_iterator->second); !result) {
+        return result;
+    }
+    const auto vertices = selection_->selected_vertices();
+    if (vertices.empty()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "project vertex bevel requires one selected vertex"));
+    }
+    if (vertices.size() != 1U) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "multi-vertex project bevel is not implemented"));
+    }
+
+    geometry::EditableMesh before = mesh_iterator->second;
+    geometry::EditableMesh after = before;
+    auto beveled = after.bevel_vertex(vertices.front(), width_, segments_);
+    if (!beveled) return core::Result<void>::failure(beveled.error());
+    auto replaced = document_->replace_mesh_if_revision(
+        mesh_asset, before.revision(), after, beveled.value());
+    if (!replaced) return core::Result<void>::failure(replaced.error());
+    mesh_asset_ = mesh_asset;
+    before_ = std::move(before);
+    after_ = std::move(after);
+    receipt_ = std::move(beveled.value());
+    current_mesh_revision_ = replaced.value();
+    return core::Result<void>::success();
+}
+
+core::Result<void> BevelProjectSelectedVertexCommand::undo() {
+    if (!document_ || !mesh_asset_.has_value() || !before_.has_value() ||
+        !after_.has_value() || !receipt_.has_value() || !current_mesh_revision_.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "project vertex bevel command has no completed operation to undo"));
+    }
+    auto result = document_->replace_mesh_if_revision(
+        *mesh_asset_, *current_mesh_revision_, *before_);
+    if (!result) return core::Result<void>::failure(result.error());
+    current_mesh_revision_ = result.value();
+    return core::Result<void>::success();
+}
+
 DissolveEdgeCommand::DissolveEdgeCommand(
     geometry::EditableMesh& mesh,
     geometry::EdgeId edge)

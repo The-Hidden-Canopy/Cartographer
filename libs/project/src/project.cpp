@@ -401,6 +401,23 @@ core::Result<void> ProjectDocument::set_evaluation_graph_digest(
     return core::Result<void>::success();
 }
 
+core::Result<void> ProjectDocument::set_scientific_model(
+    scientific::ScientificModel model) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (auto result = model.validate(); !result) {
+        return core::Result<void>::failure(result.error().with_context(
+            "scientific model admission"));
+    }
+    if (scientific_model_.serialize() == model.serialize()) {
+        return core::Result<void>::success();
+    }
+    scientific_model_ = std::move(model);
+    bump_revision();
+    return core::Result<void>::success();
+}
+
 core::Result<void> ProjectDocument::set_object_transform(
     scene::ObjectId object,
     core::Transform transform) {
@@ -496,6 +513,7 @@ void ProjectDocument::swap(ProjectDocument& other) noexcept {
     scene_.swap(other.scene_);
     meshes_.swap(other.meshes_);
     topology_receipts_.swap(other.topology_receipts_);
+    std::swap(scientific_model_, other.scientific_model_);
     std::swap(evaluation_graph_digest_, other.evaluation_graph_digest_);
     std::swap(next_mesh_id_, other.next_mesh_id_);
     std::swap(revision_, other.revision_);
@@ -559,6 +577,7 @@ std::string ProjectDocument::serialize() const {
     if (evaluation_graph_digest_.has_value()) {
         output << "EVALUATION_GRAPH_DIGEST " << evaluation_graph_digest_->hex() << '\n';
     }
+    output << "SCIENTIFIC_MODEL " << std::quoted(scientific_model_.serialize()) << '\n';
     output << "END\n";
     return output.str();
 }
@@ -884,6 +903,39 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
             return core::Result<ProjectDocument>::failure(
                 parse_error("project is missing its terminal record"));
         }
+    }
+    bool scientific_model_seen = false;
+    if (terminal_record == "SCIENTIFIC_MODEL") {
+        if (version.value() < 5U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "scientific model records require project schema version 5"));
+        }
+        std::string encoded_scientific_model;
+        if (!(input >> std::quoted(encoded_scientific_model))) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project scientific model record is invalid"));
+        }
+        if (encoded_scientific_model.size() > scientific::ScientificModel::kMaxSerializedBytes) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project scientific model record exceeds its size limit"));
+        }
+        const auto scientific_model = scientific::ScientificModel::deserialize(
+            encoded_scientific_model);
+        if (!scientific_model) {
+            return core::Result<ProjectDocument>::failure(
+                scientific_model.error().with_context("serialized scientific model"));
+        }
+        document.scientific_model_ = scientific_model.value();
+        scientific_model_seen = true;
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(
+                parse_error("project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 5U && !scientific_model_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v5 is missing its scientific model record"));
     }
     if (terminal_record != "END") {
         return core::Result<ProjectDocument>::failure(

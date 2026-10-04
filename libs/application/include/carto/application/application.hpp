@@ -155,6 +155,7 @@ struct ParameterPayload {
     std::optional<bool> remove_orphaned_vertices;
     std::optional<double> factor;
     std::optional<geometry::EdgeId> support_edge;
+    std::optional<std::uint32_t> segments;
 };
 
 struct DispatchReceipt {

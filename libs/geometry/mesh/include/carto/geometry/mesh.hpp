@@ -115,6 +115,24 @@ public:
     [[nodiscard]] core::Result<TopologyEditReceipt> split_edge(
         EdgeId id,
         double factor = 0.5);
+    // Replaces one internal manifold edge with a bounded single-segment
+    // chamfer. The incident faces must be strictly convex and planar; the
+    // operation rejects boundary edges, non-manifold topology, collapsing
+    // widths, and segment counts other than one until the multi-segment
+    // contract is implemented.
+    [[nodiscard]] core::Result<TopologyEditReceipt> bevel_edge(
+        EdgeId id,
+        double width,
+        std::uint32_t segments = 1U);
+    // Replaces one closed valence-three triangular vertex fan with three
+    // chamfered quads and a bounded triangular cap. Boundary vertices,
+    // non-triangular fans, non-manifold edges, collapsing widths, and segment
+    // counts other than one are rejected until broader vertex-bevel policy is
+    // implemented.
+    [[nodiscard]] core::Result<TopologyEditReceipt> bevel_vertex(
+        VertexId id,
+        double width,
+        std::uint32_t segments = 1U);
     // Dissolves one internal manifold edge by joining its two convex,
     // coplanar incident faces. Boundary, non-planar, and ambiguous
     // joins are rejected atomically until broader dissolve semantics exist.

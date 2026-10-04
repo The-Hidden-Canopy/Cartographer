@@ -164,6 +164,12 @@ core::Result<void> ProjectTransaction::set_evaluation_graph_digest(
     return staged_.set_evaluation_graph_digest(digest);
 }
 
+core::Result<void> ProjectTransaction::set_scientific_model(
+    scientific::ScientificModel model) {
+    if (auto result = ensure_active(); !result) return result;
+    return staged_.set_scientific_model(std::move(model));
+}
+
 core::Result<void> ProjectTransaction::set_object_transform(
     scene::ObjectId object,
     core::Transform transform) {

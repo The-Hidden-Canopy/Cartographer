@@ -1,7 +1,7 @@
 # Cartographer project format v1
 
 This is the legacy format. Cartographer continues to read it for migration,
-but new saves use [project format v4](cartographer-project-v4.md), which adds
+but new saves use [project format v5](cartographer-project-v5.md), which adds
 the v2 authoring/units/coordinate-system envelope, the optional graph
 reference, and the bounded topology receipt ledger.
 

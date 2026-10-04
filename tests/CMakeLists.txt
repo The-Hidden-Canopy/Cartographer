@@ -77,7 +77,7 @@ if(CARTO_ENABLE_D3D12)
     )
     target_compile_definitions(cartographer_d3d12_tests
         PRIVATE
-            CARTO_D3D12_SHADER_DIR="${CMAKE_SOURCE_DIR}/libs/d3d12/shaders"
+            CARTO_D3D12_SHADER_DIR="${CMAKE_CURRENT_LIST_DIR}/../libs/d3d12/shaders"
     )
     if(WIN32)
         target_link_libraries(cartographer_d3d12_tests PRIVATE user32)
@@ -114,7 +114,7 @@ target_link_libraries(cartographer_plugin_package_tests
 )
 target_include_directories(cartographer_plugin_package_tests
     PRIVATE
-        ${CMAKE_SOURCE_DIR}/libs/plugin_package/src
+        ${CMAKE_CURRENT_LIST_DIR}/../libs/plugin_package/src
 )
 carto_target(cartographer_plugin_package_tests)
 add_test(NAME cartographer_plugin_package_tests COMMAND cartographer_plugin_package_tests)
@@ -146,6 +146,20 @@ add_executable(cartographer_ai_tests
 add_executable(cartographer_topology_edit_tests
     topology_edit_tests.cpp
 )
+
+add_executable(cartographer_scientific_tests
+    scientific_model_tests.cpp
+)
+
+target_link_libraries(cartographer_scientific_tests
+    PRIVATE
+        carto_scientific
+        carto_project
+        carto_journal
+)
+
+carto_target(cartographer_scientific_tests)
+add_test(NAME cartographer_scientific_tests COMMAND cartographer_scientific_tests)
 
 if(CARTO_BUILD_PRIVATE_INTEGRATIONS)
     add_executable(cartographer_owh_model_tests

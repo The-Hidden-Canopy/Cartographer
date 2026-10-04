@@ -311,6 +311,20 @@ std::vector<OperationDescriptor> build_operation_ontology(
             descriptor.precondition =
                 "exactly one object-bound edge selected; finite factor strictly between zero and one; operation requires a future preview contract";
         } else if (matches(
+                       "mesh.bevel-edge",
+                       editor::ToolKernelKind::editable_mesh_bevel_edge)) {
+            descriptor.kernel_operation = "geometry.EditableMesh.bevel_edge";
+            descriptor.parameters = {"distance", "segments"};
+            descriptor.precondition =
+                "exactly one object-bound internal manifold edge selected; finite positive width; strictly convex planar incident faces; segments must equal one; operation requires a future preview contract";
+        } else if (matches(
+                       "mesh.bevel-vertex",
+                       editor::ToolKernelKind::editable_mesh_bevel_vertex)) {
+            descriptor.kernel_operation = "geometry.EditableMesh.bevel_vertex";
+            descriptor.parameters = {"distance", "segments"};
+            descriptor.precondition =
+                "exactly one object-bound valence-three vertex selected; all three incident faces must be triangles and all three edges internal manifold; finite positive width below half the shortest incident edge; segments must equal one; operation requires a future preview contract";
+        } else if (matches(
                        "mesh.dissolve-edge",
                        editor::ToolKernelKind::editable_mesh_dissolve_edge)) {
             descriptor.kernel_operation = "geometry.EditableMesh.dissolve_edge";
@@ -335,6 +349,8 @@ std::vector<OperationDescriptor> build_operation_ontology(
                 tool.id == "mesh.set-vertex-position" ||
                 tool.id == "mesh.slide-vertex" ||
                 tool.id == "mesh.remove-face" || tool.id == "mesh.split-edge" ||
+                tool.id == "mesh.bevel-edge" ||
+                tool.id == "mesh.bevel-vertex" ||
                 tool.id == "mesh.dissolve-edge" ||
                 tool.id == "mesh.tri-to-quad" ||
                 tool.id == "mesh.merge-vertices";

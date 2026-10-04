@@ -942,6 +942,635 @@ core::Result<TopologyEditReceipt> EditableMesh::split_edge(EdgeId id, double fac
     return core::Result<TopologyEditReceipt>::success(std::move(receipt));
 }
 
+core::Result<TopologyEditReceipt> EditableMesh::bevel_vertex(
+    VertexId id,
+    double width,
+    std::uint32_t segments) {
+    if (revision_.exhausted()) {
+        return core::Result<TopologyEditReceipt>::failure(exhausted_revision());
+    }
+    if (!std::isfinite(width) || width <= 0.0) {
+        return core::Result<TopologyEditReceipt>::failure(invalid(
+            "vertex bevel width must be finite and strictly positive"));
+    }
+    if (segments != 1U) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::unsupported,
+            "vertex bevel currently supports exactly one segment"));
+    }
+    const auto vertex_iterator = vertices_.find(id);
+    if (vertex_iterator == vertices_.end()) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::not_found, "cannot bevel a missing mesh vertex"));
+    }
+
+    const auto incident_faces_iterator = vertex_faces_.find(id);
+    if (incident_faces_iterator == vertex_faces_.end()) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::stale_data, "vertex bevel has no indexed incident faces"));
+    }
+    const auto& incident_face_ids = incident_faces_iterator->second;
+    if (incident_face_ids.size() != 3U) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::unsupported,
+            "vertex bevel currently requires exactly three incident faces"));
+    }
+
+    std::vector<EdgeRecord> incident_edges;
+    incident_edges.reserve(3U);
+    for (const auto& [edge_id, edge] : edges_) {
+        static_cast<void>(edge_id);
+        if (edge.first == id || edge.second == id) {
+            incident_edges.push_back(edge);
+        }
+    }
+    if (incident_edges.size() != 3U) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::unsupported,
+            "vertex bevel currently requires a valence-three vertex"));
+    }
+
+    const auto incident_face = [&incident_face_ids](FaceId face) {
+        return std::find(incident_face_ids.begin(), incident_face_ids.end(), face) !=
+            incident_face_ids.end();
+    };
+    const auto find_incident_edge = [&incident_edges](VertexId first, VertexId second)
+        -> const EdgeRecord* {
+        for (const auto& edge : incident_edges) {
+            if ((edge.first == first && edge.second == second) ||
+                (edge.first == second && edge.second == first)) {
+                return &edge;
+            }
+        }
+        return nullptr;
+    };
+
+    struct EdgeCut {
+        EdgeId edge;
+        VertexId other;
+        core::Vec3d position{};
+        VertexId created;
+    };
+    std::vector<EdgeCut> cuts;
+    cuts.reserve(incident_edges.size());
+    double minimum_length = std::numeric_limits<double>::infinity();
+    for (const auto& edge : incident_edges) {
+        if (!edge.second_half_edge.has_value()) {
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::unsupported,
+                "vertex bevel currently requires a closed internal manifold fan"));
+        }
+        const VertexId other = edge.first == id ? edge.second : edge.first;
+        const auto other_iterator = vertices_.find(other);
+        if (other_iterator == vertices_.end()) {
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::stale_data,
+                "vertex bevel references a missing incident edge endpoint"));
+        }
+        const double length =
+            (other_iterator->second.position - vertex_iterator->second.position).length();
+        if (!std::isfinite(length) || length <= 1e-12) {
+            return core::Result<TopologyEditReceipt>::failure(validation(
+                "vertex bevel requires non-degenerate incident edges"));
+        }
+        minimum_length = std::min(minimum_length, length);
+
+        const auto first_half_edge = half_edges_.find(edge.first_half_edge);
+        const auto second_half_edge = half_edges_.find(*edge.second_half_edge);
+        if (first_half_edge == half_edges_.end() || second_half_edge == half_edges_.end() ||
+            !incident_face(first_half_edge->second.face) ||
+            !incident_face(second_half_edge->second.face) ||
+            first_half_edge->second.edge != edge.id ||
+            second_half_edge->second.edge != edge.id) {
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::stale_data,
+                "vertex bevel references an inconsistent incident edge"));
+        }
+
+        const core::Vec3d cut_position = vertex_iterator->second.position +
+            (other_iterator->second.position - vertex_iterator->second.position) *
+                (width / length);
+        if (!cut_position.finite()) {
+            return core::Result<TopologyEditReceipt>::failure(validation(
+                "vertex bevel produced a non-finite edge cut"));
+        }
+        cuts.push_back(EdgeCut{
+            edge.id,
+            other,
+            cut_position,
+            {}});
+    }
+    if (!std::isfinite(minimum_length) || width >= 0.5 * minimum_length) {
+        return core::Result<TopologyEditReceipt>::failure(invalid(
+            "vertex bevel width would collapse an incident face"));
+    }
+
+    for (const FaceId face_id : incident_face_ids) {
+        const auto face_iterator = faces_.find(face_id);
+        if (face_iterator == faces_.end()) {
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::stale_data, "vertex bevel references a missing incident face"));
+        }
+        const auto& face = face_iterator->second;
+        if (face.vertices.size() != 3U) {
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::unsupported,
+                "vertex bevel currently requires three incident triangular faces"));
+        }
+        const auto vertex_positions = std::count(face.vertices.begin(), face.vertices.end(), id);
+        if (vertex_positions != 1) {
+            return core::Result<TopologyEditReceipt>::failure(validation(
+                "vertex bevel found an invalid repeated vertex in an incident face"));
+        }
+        const auto vertex_index = static_cast<std::size_t>(std::distance(
+            face.vertices.begin(), std::find(face.vertices.begin(), face.vertices.end(), id)));
+        const VertexId previous = face.vertices[(vertex_index + 2U) % 3U];
+        const VertexId next = face.vertices[(vertex_index + 1U) % 3U];
+        const EdgeRecord* previous_edge = find_incident_edge(id, previous);
+        const EdgeRecord* next_edge = find_incident_edge(id, next);
+        if (!previous_edge || !next_edge || previous_edge->id == next_edge->id) {
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::stale_data,
+                "vertex bevel incident face does not match the indexed fan"));
+        }
+        const auto cut_for = [&cuts](EdgeId edge_id) -> const EdgeCut* {
+            for (const auto& cut : cuts) {
+                if (cut.edge == edge_id) return &cut;
+            }
+            return nullptr;
+        };
+        const EdgeCut* previous_cut = cut_for(previous_edge->id);
+        const EdgeCut* next_cut = cut_for(next_edge->id);
+        if (!previous_cut || !next_cut) {
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::stale_data, "vertex bevel could not resolve an incident edge cut"));
+        }
+    }
+
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    if (next_vertex_id_ > maximum - 3U || next_face_id_ == maximum) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::invalid_state, "vertex bevel identity space is exhausted"));
+    }
+
+    // The cut points are keyed by the original edge. The temporary endpoint
+    // values above let us validate the fan before allocating any IDs.
+    const EditableMesh before = *this;
+    const core::Revision revision_before = revision_;
+    for (auto& cut : cuts) {
+        cut.created = VertexId{next_vertex_id_++};
+        vertices_.emplace(cut.created, Vertex{cut.created, cut.position});
+    }
+
+    const auto created_for_edge = [&cuts](EdgeId edge_id) -> std::optional<VertexId> {
+        for (const auto& cut : cuts) {
+            if (cut.edge == edge_id) return cut.created;
+        }
+        return std::nullopt;
+    };
+    std::map<FaceId, std::pair<VertexId, VertexId>> face_cut_ids;
+    for (const FaceId face_id : incident_face_ids) {
+        auto face_iterator = faces_.find(face_id);
+        if (face_iterator == faces_.end()) {
+            *this = before;
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::stale_data, "vertex bevel face disappeared during mutation"));
+        }
+        auto& face = face_iterator->second;
+        const auto vertex_position = std::find(face.vertices.begin(), face.vertices.end(), id);
+        if (vertex_position == face.vertices.end()) {
+            *this = before;
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::stale_data, "vertex bevel face lost its selected vertex"));
+        }
+        const std::size_t vertex_index = static_cast<std::size_t>(
+            std::distance(face.vertices.begin(), vertex_position));
+        const VertexId previous = face.vertices[(vertex_index + 2U) % 3U];
+        const VertexId next = face.vertices[(vertex_index + 1U) % 3U];
+        const EdgeRecord* previous_edge = find_incident_edge(id, previous);
+        const EdgeRecord* next_edge = find_incident_edge(id, next);
+        if (!previous_edge || !next_edge) {
+            *this = before;
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::stale_data, "vertex bevel lost an incident edge during mutation"));
+        }
+        const auto cut_previous = created_for_edge(previous_edge->id);
+        const auto cut_next = created_for_edge(next_edge->id);
+        if (!cut_previous.has_value() || !cut_next.has_value()) {
+            *this = before;
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::stale_data, "vertex bevel lost an edge cut during mutation"));
+        }
+        std::vector<VertexId> replaced;
+        replaced.reserve(4U);
+        for (const VertexId vertex : face.vertices) {
+            if (vertex == id) {
+                replaced.push_back(*cut_next);
+                continue;
+            }
+            replaced.push_back(vertex);
+            if (vertex == previous) replaced.push_back(*cut_previous);
+        }
+        if (replaced.size() != 4U) {
+            *this = before;
+            return core::Result<TopologyEditReceipt>::failure(validation(
+                "vertex bevel did not produce a four-sided incident face"));
+        }
+        face_cut_ids.emplace(face_id, std::make_pair(*cut_previous, *cut_next));
+        face.vertices = std::move(replaced);
+    }
+    vertices_.erase(id);
+
+    // Each incident face closes across the chamfer loop from cut_previous to
+    // cut_next. The new cap must use the opposite direction on every shared
+    // edge, so build a directed cycle from cut_next back to cut_previous.
+    std::map<VertexId, VertexId> cap_next;
+    for (const auto& [face_id, pair] : face_cut_ids) {
+        static_cast<void>(face_id);
+        const auto [iterator, inserted] = cap_next.emplace(pair.second, pair.first);
+        if (!inserted && iterator->second != pair.first) {
+            *this = before;
+            return core::Result<TopologyEditReceipt>::failure(validation(
+                "vertex bevel chamfer loop has conflicting face directions"));
+        }
+    }
+    if (cap_next.size() != 3U) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(validation(
+            "vertex bevel did not produce a three-edge chamfer loop"));
+    }
+    std::vector<VertexId> cap_vertices;
+    cap_vertices.reserve(3U);
+    const VertexId start = cap_next.begin()->first;
+    VertexId current = start;
+    for (std::size_t count = 0U; count < cap_next.size(); ++count) {
+        if (std::find(cap_vertices.begin(), cap_vertices.end(), current) != cap_vertices.end()) {
+            *this = before;
+            return core::Result<TopologyEditReceipt>::failure(validation(
+                "vertex bevel chamfer loop repeats a cut vertex"));
+        }
+        cap_vertices.push_back(current);
+        const auto next = cap_next.find(current);
+        if (next == cap_next.end()) {
+            *this = before;
+            return core::Result<TopologyEditReceipt>::failure(validation(
+                "vertex bevel chamfer loop lost a cut vertex"));
+        }
+        current = next->second;
+    }
+    if (current != start || cap_vertices.size() != 3U) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(validation(
+            "vertex bevel chamfer loop does not close"));
+    }
+    const core::Vec3d cap_normal = core::cross(
+        vertices_.at(cap_vertices[1U]).position - vertices_.at(cap_vertices[0U]).position,
+        vertices_.at(cap_vertices[2U]).position - vertices_.at(cap_vertices[0U]).position);
+    if (!cap_normal.normalized().finite()) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(validation(
+            "vertex bevel produced a degenerate chamfer cap"));
+    }
+
+    const FaceId bevel_face{next_face_id_++};
+    faces_.emplace(bevel_face, Face{bevel_face, std::move(cap_vertices)});
+    if (auto result = rebuild_topology(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    if (auto result = validate(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    bump_revision();
+
+    TopologyEditReceipt receipt;
+    receipt.revision_before = revision_before;
+    receipt.revision_after = revision_;
+    if (auto result = populate_identity_delta(before, *this, receipt); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    for (const auto& cut : cuts) {
+        add_origin(receipt.vertex_origins, cut.created, OriginKind::interpolated_from,
+            {id.value, cut.other.value});
+    }
+    add_origin(receipt.face_origins, bevel_face, OriginKind::generated_from_vertex, {id.value});
+    for (const EdgeId created : receipt.created_edges) {
+        add_origin(receipt.edge_origins, created, OriginKind::generated_from_vertex, {id.value});
+    }
+    if (auto result = receipt.validate(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    return core::Result<TopologyEditReceipt>::success(std::move(receipt));
+}
+
+core::Result<TopologyEditReceipt> EditableMesh::bevel_edge(
+    EdgeId id,
+    double width,
+    std::uint32_t segments) {
+    if (revision_.exhausted()) {
+        return core::Result<TopologyEditReceipt>::failure(exhausted_revision());
+    }
+    if (!std::isfinite(width) || width <= 0.0) {
+        return core::Result<TopologyEditReceipt>::failure(invalid(
+            "edge bevel width must be finite and strictly positive"));
+    }
+    if (segments != 1U) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::unsupported,
+            "edge bevel currently supports exactly one segment"));
+    }
+    const auto edge_iterator = edges_.find(id);
+    if (edge_iterator == edges_.end()) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::not_found, "cannot bevel a missing mesh edge"));
+    }
+    const EdgeRecord edge = edge_iterator->second;
+    if (!edge.second_half_edge.has_value()) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::unsupported,
+            "edge bevel currently requires an internal manifold edge"));
+    }
+
+    struct FaceCut {
+        FaceId face;
+        VertexId origin;
+        VertexId destination;
+        VertexId previous;
+        VertexId next;
+        std::size_t edge_index = 0U;
+        core::Vec3d cut_origin_position{};
+        core::Vec3d cut_destination_position{};
+        VertexId cut_origin;
+        VertexId cut_destination;
+    };
+
+    const auto validate_face_geometry = [this](const Face& face) -> core::Result<void> {
+        if (face.vertices.size() < 3U) {
+            return core::Result<void>::failure(validation(
+                "edge bevel requires incident faces with at least three vertices"));
+        }
+        std::vector<core::Vec3d> positions;
+        positions.reserve(face.vertices.size());
+        for (const VertexId vertex : face.vertices) {
+            const auto found = vertices_.find(vertex);
+            if (found == vertices_.end()) {
+                return core::Result<void>::failure(Diagnostic(
+                    ErrorCode::stale_data,
+                    "edge bevel incident face references a missing vertex"));
+            }
+            positions.push_back(found->second.position);
+        }
+        const core::Vec3d normal = core::cross(
+            positions[1U] - positions[0U], positions[2U] - positions[0U]).normalized();
+        if (!normal.finite()) {
+            return core::Result<void>::failure(validation(
+                "edge bevel requires non-degenerate planar incident faces"));
+        }
+        double scale = 1.0;
+        for (std::size_t index = 0U; index < positions.size(); ++index) {
+            scale = std::max(
+                scale,
+                (positions[(index + 1U) % positions.size()] - positions[index]).length());
+            const double plane_distance = core::dot(positions[index] - positions[0U], normal);
+            if (!std::isfinite(plane_distance) || std::abs(plane_distance) > 1e-8 * scale) {
+                return core::Result<void>::failure(Diagnostic(
+                    ErrorCode::unsupported,
+                    "edge bevel currently requires planar incident faces"));
+            }
+        }
+        const double area_epsilon = 1e-12 * scale * scale;
+        for (std::size_t index = 0U; index < positions.size(); ++index) {
+            const std::size_t next = (index + 1U) % positions.size();
+            const std::size_t after_next = (index + 2U) % positions.size();
+            const double turn = core::dot(
+                core::cross(
+                    positions[next] - positions[index],
+                    positions[after_next] - positions[next]),
+                normal);
+            if (!std::isfinite(turn) || turn <= area_epsilon) {
+                return core::Result<void>::failure(Diagnostic(
+                    ErrorCode::unsupported,
+                    "edge bevel currently requires strictly convex incident faces"));
+            }
+        }
+        return core::Result<void>::success();
+    };
+
+    const auto build_face_cut = [this, &edge, width, validate_face_geometry](
+        HalfEdgeId half_edge_id) -> core::Result<FaceCut> {
+        const auto half_edge_iterator = half_edges_.find(half_edge_id);
+        if (half_edge_iterator == half_edges_.end() || half_edge_iterator->second.edge != edge.id) {
+            return core::Result<FaceCut>::failure(Diagnostic(
+                ErrorCode::stale_data,
+                "edge bevel references a missing or mismatched incident half-edge"));
+        }
+        const HalfEdgeRecord half_edge = half_edge_iterator->second;
+        const auto face_iterator = faces_.find(half_edge.face);
+        if (face_iterator == faces_.end()) {
+            return core::Result<FaceCut>::failure(Diagnostic(
+                ErrorCode::stale_data,
+                "edge bevel references a missing incident face"));
+        }
+        if (auto result = validate_face_geometry(face_iterator->second); !result) {
+            return core::Result<FaceCut>::failure(result.error());
+        }
+
+        const auto& vertices = face_iterator->second.vertices;
+        std::optional<std::size_t> found_index;
+        for (std::size_t index = 0U; index < vertices.size(); ++index) {
+            const VertexId origin = vertices[index];
+            const VertexId destination = vertices[(index + 1U) % vertices.size()];
+            if (origin == half_edge.origin && destination == half_edge.destination) {
+                if (found_index.has_value()) {
+                    return core::Result<FaceCut>::failure(validation(
+                        "edge bevel found the same directed edge more than once in a face"));
+                }
+                found_index = index;
+            }
+        }
+        if (!found_index.has_value()) {
+            return core::Result<FaceCut>::failure(Diagnostic(
+                ErrorCode::stale_data,
+                "edge bevel half-edge is not present in its authored face"));
+        }
+
+        const std::size_t index = *found_index;
+        const VertexId origin = vertices[index];
+        const VertexId destination = vertices[(index + 1U) % vertices.size()];
+        const VertexId previous = vertices[(index + vertices.size() - 1U) % vertices.size()];
+        const VertexId next = vertices[(index + 2U) % vertices.size()];
+        const auto origin_iterator = vertices_.find(origin);
+        const auto destination_iterator = vertices_.find(destination);
+        const auto previous_iterator = vertices_.find(previous);
+        const auto next_iterator = vertices_.find(next);
+        if (origin_iterator == vertices_.end() || destination_iterator == vertices_.end() ||
+            previous_iterator == vertices_.end() || next_iterator == vertices_.end()) {
+            return core::Result<FaceCut>::failure(Diagnostic(
+                ErrorCode::stale_data,
+                "edge bevel incident face references a missing edge-neighbor vertex"));
+        }
+
+        const core::Vec3d origin_position = origin_iterator->second.position;
+        const core::Vec3d destination_position = destination_iterator->second.position;
+        const core::Vec3d previous_position = previous_iterator->second.position;
+        const core::Vec3d next_position = next_iterator->second.position;
+        const double edge_length = (destination_position - origin_position).length();
+        const double origin_adjacent_length = (previous_position - origin_position).length();
+        const double destination_adjacent_length = (next_position - destination_position).length();
+        const double minimum_length = std::min({edge_length, origin_adjacent_length,
+                                                destination_adjacent_length});
+        if (!std::isfinite(minimum_length) || minimum_length <= 1e-12 ||
+            width >= 0.5 * minimum_length) {
+            return core::Result<FaceCut>::failure(Diagnostic(
+                ErrorCode::invalid_argument,
+                "edge bevel width would collapse an incident face"));
+        }
+
+        const double origin_factor = width / origin_adjacent_length;
+        const double destination_factor = width / destination_adjacent_length;
+        FaceCut result{
+            half_edge.face,
+            origin,
+            destination,
+            previous,
+            next,
+            index,
+            origin_position + (previous_position - origin_position) * origin_factor,
+            destination_position + (next_position - destination_position) * destination_factor,
+            {},
+            {}};
+        if (!result.cut_origin_position.finite() || !result.cut_destination_position.finite() ||
+            (result.cut_destination_position - result.cut_origin_position).length() <= 1e-12) {
+            return core::Result<FaceCut>::failure(validation(
+                "edge bevel produced a degenerate chamfer edge"));
+        }
+        return core::Result<FaceCut>::success(result);
+    };
+
+    auto first_cut = build_face_cut(edge.first_half_edge);
+    auto second_cut = build_face_cut(*edge.second_half_edge);
+    if (!first_cut) return core::Result<TopologyEditReceipt>::failure(first_cut.error());
+    if (!second_cut) return core::Result<TopologyEditReceipt>::failure(second_cut.error());
+    if (first_cut.value().face == second_cut.value().face ||
+        first_cut.value().origin != second_cut.value().destination ||
+        first_cut.value().destination != second_cut.value().origin) {
+        return core::Result<TopologyEditReceipt>::failure(validation(
+            "edge bevel requires two oppositely oriented incident faces"));
+    }
+
+    const core::Vec3d bevel_a = first_cut.value().cut_origin_position;
+    const core::Vec3d bevel_b = first_cut.value().cut_destination_position;
+    const core::Vec3d bevel_c = second_cut.value().cut_destination_position;
+    const core::Vec3d bevel_d = second_cut.value().cut_origin_position;
+    const core::Vec3d bevel_normal = core::cross(bevel_a - bevel_b, bevel_c - bevel_b).normalized();
+    if (!bevel_normal.finite()) {
+        return core::Result<TopologyEditReceipt>::failure(validation(
+            "edge bevel produced a degenerate chamfer face"));
+    }
+    const double bevel_scale = std::max({1.0, (bevel_b - bevel_a).length(),
+                                         (bevel_c - bevel_a).length(),
+                                         (bevel_d - bevel_a).length()});
+    if (std::abs(core::dot(bevel_d - bevel_a, bevel_normal)) > 1e-8 * bevel_scale) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::unsupported,
+            "edge bevel currently requires a planar chamfer result"));
+    }
+
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    if (next_vertex_id_ > maximum - 4U || next_face_id_ == maximum) {
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::invalid_state, "edge bevel identity space is exhausted"));
+    }
+
+    const EditableMesh before = *this;
+    const core::Revision revision_before = revision_;
+    FaceCut first = first_cut.value();
+    FaceCut second = second_cut.value();
+    first.cut_origin = VertexId{next_vertex_id_++};
+    first.cut_destination = VertexId{next_vertex_id_++};
+    second.cut_origin = VertexId{next_vertex_id_++};
+    second.cut_destination = VertexId{next_vertex_id_++};
+    vertices_.emplace(first.cut_origin, Vertex{first.cut_origin, first.cut_origin_position});
+    vertices_.emplace(
+        first.cut_destination,
+        Vertex{first.cut_destination, first.cut_destination_position});
+    vertices_.emplace(second.cut_origin, Vertex{second.cut_origin, second.cut_origin_position});
+    vertices_.emplace(
+        second.cut_destination,
+        Vertex{second.cut_destination, second.cut_destination_position});
+
+    const auto replace_edge_in_face = [](Face& face, const FaceCut& cut) -> bool {
+        std::vector<VertexId> replaced;
+        replaced.reserve(face.vertices.size());
+        bool found = false;
+        for (std::size_t index = 0U; index < face.vertices.size(); ++index) {
+            if (index == cut.edge_index) {
+                replaced.push_back(cut.cut_origin);
+                replaced.push_back(cut.cut_destination);
+                found = true;
+                continue;
+            }
+            if (index == (cut.edge_index + 1U) % face.vertices.size()) continue;
+            replaced.push_back(face.vertices[index]);
+        }
+        if (found) face.vertices = std::move(replaced);
+        return found;
+    };
+    auto first_face = faces_.find(first.face);
+    auto second_face = faces_.find(second.face);
+    if (first_face == faces_.end() || second_face == faces_.end() ||
+        !replace_edge_in_face(first_face->second, first) ||
+        !replace_edge_in_face(second_face->second, second)) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+            ErrorCode::stale_data, "edge bevel face disappeared during mutation"));
+    }
+
+    const FaceId bevel_face{next_face_id_++};
+    faces_.emplace(bevel_face, Face{
+        bevel_face,
+        {first.cut_destination, first.cut_origin,
+         second.cut_destination, second.cut_origin}});
+
+    if (auto result = rebuild_topology(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    if (auto result = validate(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    bump_revision();
+
+    TopologyEditReceipt receipt;
+    receipt.revision_before = revision_before;
+    receipt.revision_after = revision_;
+    if (auto result = populate_identity_delta(before, *this, receipt); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    add_origin(receipt.vertex_origins, first.cut_origin, OriginKind::interpolated_from,
+        {first.origin.value, first.previous.value});
+    add_origin(receipt.vertex_origins, first.cut_destination, OriginKind::interpolated_from,
+        {first.destination.value, first.next.value});
+    add_origin(receipt.vertex_origins, second.cut_origin, OriginKind::interpolated_from,
+        {second.origin.value, second.previous.value});
+    add_origin(receipt.vertex_origins, second.cut_destination, OriginKind::interpolated_from,
+        {second.destination.value, second.next.value});
+    add_origin(receipt.face_origins, bevel_face, OriginKind::generated_from_edge, {id.value});
+    for (const EdgeId created : receipt.created_edges) {
+        add_origin(receipt.edge_origins, created, OriginKind::generated_from_edge, {id.value});
+    }
+    if (auto result = receipt.validate(); !result) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(result.error());
+    }
+    return core::Result<TopologyEditReceipt>::success(std::move(receipt));
+}
+
 core::Result<TopologyEditReceipt> EditableMesh::dissolve_edge(EdgeId id) {
     if (revision_.exhausted()) {
         return core::Result<TopologyEditReceipt>::failure(exhausted_revision());

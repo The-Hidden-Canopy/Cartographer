@@ -95,13 +95,13 @@ into this contract.
 
 The next structural rung is atomic package/document graph storage and broader
 topology-operation coverage. Extrude, split-edge, inset, poke, target weld,
-bounded coplanar edge dissolve, and compatible triangle-to-quad conversion now
+bounded coplanar edge dissolve, bounded valence-three vertex bevel, and compatible triangle-to-quad conversion now
 emit explicit lineage for the polygon kernel;
 delete emits a validated identity delta but has no created-element lineage by
 design. The target-weld receipt
 records source-to-target mappings separately from created-element origins so a
 preserved target is not misrepresented as newly generated. Poke records the
-centroid vertex and fan faces as interpolated/generated lineage. Bevel, center/last
+centroid vertex and fan faces as interpolated/generated lineage. Multi-segment/full bevel, broader vertex-bevel fans, center/last
 merge modes, attribute-aware weld, arbitrary/non-convex dissolve, bridge, loop cut,
 knife, modifiers, sculpt, animation, and CAD claims remain deferred until their
 operators have receipts, attribute-survival tests, and workflow evidence.

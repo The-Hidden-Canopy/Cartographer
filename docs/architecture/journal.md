@@ -41,9 +41,10 @@ existing content is rehashed instead of being trusted by filename or size.
 ## Application mutation integration
 
 The current versioned authoring serializer remains the explicit save format.
-It reads legacy v1/v2/v3 documents and writes v4 documents with an explicit
-authoring/units/coordinate-system envelope, optional graph reference, and a
-bounded project-bound topology receipt ledger. The
+It reads legacy v1/v2/v3/v4 documents and writes v5 documents with an explicit
+authoring/units/coordinate-system envelope, optional graph reference, a
+bounded project-bound topology receipt ledger, and a validated scientific
+model record. The
 `ApplicationSession` binds a project-local journal beside a saved project,
 records a baseline snapshot at bind time, and appends accepted command, tool,
 undo, redo, and CLI batch-import actions with before/after revisions. Project

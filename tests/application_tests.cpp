@@ -51,6 +51,30 @@ private:
     std::filesystem::path path_;
 };
 
+carto::core::Result<carto::geometry::EditableMesh> make_application_tetrahedron() {
+    carto::geometry::EditableMesh mesh;
+    const auto v0 = mesh.add_vertex({0.0, 0.0, 0.0});
+    const auto v1 = mesh.add_vertex({2.0, 0.0, 0.0});
+    const auto v2 = mesh.add_vertex({0.0, 2.0, 0.0});
+    const auto v3 = mesh.add_vertex({0.0, 0.0, 2.0});
+    if (!v0) return carto::core::Result<carto::geometry::EditableMesh>::failure(v0.error());
+    if (!v1) return carto::core::Result<carto::geometry::EditableMesh>::failure(v1.error());
+    if (!v2) return carto::core::Result<carto::geometry::EditableMesh>::failure(v2.error());
+    if (!v3) return carto::core::Result<carto::geometry::EditableMesh>::failure(v3.error());
+    const auto first = mesh.add_face({v0.value(), v2.value(), v1.value()});
+    const auto second = mesh.add_face({v0.value(), v1.value(), v3.value()});
+    const auto third = mesh.add_face({v0.value(), v3.value(), v2.value()});
+    const auto fourth = mesh.add_face({v1.value(), v2.value(), v3.value()});
+    if (!first) return carto::core::Result<carto::geometry::EditableMesh>::failure(first.error());
+    if (!second) return carto::core::Result<carto::geometry::EditableMesh>::failure(second.error());
+    if (!third) return carto::core::Result<carto::geometry::EditableMesh>::failure(third.error());
+    if (!fourth) return carto::core::Result<carto::geometry::EditableMesh>::failure(fourth.error());
+    if (auto result = mesh.validate(); !result) {
+        return carto::core::Result<carto::geometry::EditableMesh>::failure(result.error());
+    }
+    return carto::core::Result<carto::geometry::EditableMesh>::success(std::move(mesh));
+}
+
 void application_routes_authoring_through_snapshot_and_history() {
     carto::application::ApplicationSession session;
     REQUIRE(carto::application::testing::dispatch(session, carto::application::NewProjectAction{"Authoring"}));
@@ -214,6 +238,207 @@ void application_routes_face_poke_through_history_and_persists_lineage() {
     REQUIRE(session.snapshot().viewport.scene.instances().front().mesh->vertex_ids.size() == 4U);
     REQUIRE(carto::application::testing::dispatch(session, carto::application::RedoAction{}));
     REQUIRE(session.snapshot().viewport.scene.instances().front().mesh->vertex_ids.size() == 5U);
+}
+
+void application_routes_edge_bevel_through_history_and_persistence() {
+    TempDirectory temp;
+    const auto path = temp.path() / "bevel-receipt.carto";
+
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::CreateBoxAction{"Bevel", {1.0, 1.0, 1.0}}));
+    const auto object = session.snapshot().objects.front().object.id;
+    const auto selected_edge = session.snapshot().viewport.scene.instances().front()
+        .mesh->triangle_edges.front()[0];
+    REQUIRE(selected_edge.has_value());
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SetSelectionModeAction{
+            carto::editor::SelectionMode::edge}));
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SelectEdgeAction{object, *selected_edge}));
+
+    carto::editor::ToolArguments arguments;
+    arguments.distance = 0.1;
+    arguments.segments = 1U;
+    const auto beveled = carto::application::testing::dispatch(
+        session, carto::application::InvokeToolAction{"mesh.bevel-edge", arguments});
+    REQUIRE(beveled);
+    REQUIRE(beveled.value().parameters.has_value());
+    REQUIRE(beveled.value().parameters->distance.has_value());
+    REQUIRE(*beveled.value().parameters->distance == 0.1);
+    REQUIRE(beveled.value().parameters->segments.has_value());
+    REQUIRE(*beveled.value().parameters->segments == 1U);
+    REQUIRE(session.snapshot().selection.edges.empty());
+    REQUIRE(session.snapshot().viewport.scene.instances().front().mesh->vertex_ids.size() == 12U);
+
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::UndoAction{}));
+    REQUIRE(session.snapshot().viewport.scene.instances().front().mesh->vertex_ids.size() == 8U);
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::RedoAction{}));
+    REQUIRE(session.snapshot().viewport.scene.instances().front().mesh->vertex_ids.size() == 12U);
+
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SaveProjectAction{path}));
+    const auto loaded = carto::project::ProjectDocument::load(path);
+    REQUIRE(loaded);
+    REQUIRE(loaded.value().topology_receipts().size() == 1U);
+    REQUIRE(loaded.value().topology_receipts().front().receipt.created_vertices.size() == 4U);
+
+    carto::application::ApplicationSession reopened;
+    REQUIRE(carto::application::testing::dispatch(
+        reopened, carto::application::OpenProjectAction{path}));
+    REQUIRE(reopened.snapshot().viewport.scene.instances().front().mesh->vertex_ids.size() == 12U);
+}
+
+void application_rejects_edge_bevel_wrong_mode_and_multi_selection() {
+    carto::application::ApplicationSession wrong_mode;
+    REQUIRE(carto::application::testing::dispatch(
+        wrong_mode, carto::application::CreateBoxAction{"Wrong mode", {1.0, 1.0, 1.0}}));
+    const auto wrong_object = wrong_mode.snapshot().objects.front().object.id;
+    const auto wrong_before = wrong_mode.snapshot();
+    REQUIRE(carto::application::testing::dispatch(
+        wrong_mode, carto::application::SetSelectionModeAction{
+            carto::editor::SelectionMode::face}));
+    REQUIRE(carto::application::testing::dispatch(
+        wrong_mode, carto::application::SelectFaceAction{
+            wrong_object, carto::geometry::FaceId{1U}}));
+    carto::editor::ToolArguments wrong_arguments;
+    wrong_arguments.distance = 0.1;
+    const auto wrong_result = carto::application::testing::dispatch(
+        wrong_mode, carto::application::InvokeToolAction{
+            "mesh.bevel-edge", wrong_arguments});
+    REQUIRE(!wrong_result);
+    REQUIRE(wrong_mode.snapshot().project_revision == wrong_before.project_revision);
+    REQUIRE(wrong_mode.snapshot().viewport.scene.instances().front().mesh->vertex_ids.size() == 8U);
+
+    carto::application::ApplicationSession multiple;
+    REQUIRE(carto::application::testing::dispatch(
+        multiple, carto::application::CreateBoxAction{"Multiple", {1.0, 1.0, 1.0}}));
+    const auto multiple_snapshot = multiple.snapshot();
+    const auto multiple_object = multiple_snapshot.objects.front().object.id;
+    const auto triangle_edges = multiple_snapshot.viewport.scene.instances().front()
+        .mesh->triangle_edges.front();
+    REQUIRE(triangle_edges[0].has_value());
+    REQUIRE(triangle_edges[1].has_value());
+    REQUIRE(*triangle_edges[0] != *triangle_edges[1]);
+    REQUIRE(carto::application::testing::dispatch(
+        multiple, carto::application::SetSelectionModeAction{
+            carto::editor::SelectionMode::edge}));
+    REQUIRE(carto::application::testing::dispatch(
+        multiple, carto::application::SelectEdgeAction{
+            multiple_object, *triangle_edges[0]}));
+    REQUIRE(carto::application::testing::dispatch(
+        multiple, carto::application::SelectEdgeAction{
+            multiple_object, *triangle_edges[1], carto::editor::SelectionOperation::add}));
+    const auto multiple_before = multiple.snapshot();
+    carto::editor::ToolArguments multiple_arguments;
+    multiple_arguments.distance = 0.1;
+    const auto multiple_result = carto::application::testing::dispatch(
+        multiple, carto::application::InvokeToolAction{
+            "mesh.bevel-edge", multiple_arguments});
+    REQUIRE(!multiple_result);
+    REQUIRE(multiple.snapshot().project_revision == multiple_before.project_revision);
+    REQUIRE(multiple.snapshot().viewport.scene.instances().front().mesh->vertex_ids.size() == 8U);
+}
+
+void application_routes_vertex_bevel_through_history_and_persistence() {
+    TempDirectory temp;
+    const auto path = temp.path() / "vertex-bevel-receipt.carto";
+    auto tetrahedron = make_application_tetrahedron();
+    REQUIRE(tetrahedron);
+
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::CreateMeshObjectAction{
+            "Vertex bevel", std::move(tetrahedron.value())}));
+    const auto object = session.snapshot().objects.front().object.id;
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SetSelectionModeAction{
+            carto::editor::SelectionMode::vertex}));
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SelectVertexAction{object, carto::geometry::VertexId{1U}}));
+
+    carto::editor::ToolArguments arguments;
+    arguments.distance = 0.25;
+    arguments.segments = 1U;
+    const auto beveled = carto::application::testing::dispatch(
+        session, carto::application::InvokeToolAction{"mesh.bevel-vertex", arguments});
+    REQUIRE(beveled);
+    REQUIRE(beveled.value().parameters.has_value());
+    REQUIRE(beveled.value().parameters->distance.has_value());
+    REQUIRE(*beveled.value().parameters->distance == 0.25);
+    REQUIRE(beveled.value().parameters->segments.has_value());
+    REQUIRE(*beveled.value().parameters->segments == 1U);
+    REQUIRE(session.snapshot().selection.vertices.empty());
+    REQUIRE(session.snapshot().viewport.scene.instances().front().mesh->vertex_ids.size() == 6U);
+
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::UndoAction{}));
+    REQUIRE(session.snapshot().viewport.scene.instances().front().mesh->vertex_ids.size() == 4U);
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::RedoAction{}));
+    REQUIRE(session.snapshot().viewport.scene.instances().front().mesh->vertex_ids.size() == 6U);
+
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SaveProjectAction{path}));
+    const auto loaded = carto::project::ProjectDocument::load(path);
+    REQUIRE(loaded);
+    REQUIRE(loaded.value().topology_receipts().size() == 1U);
+    REQUIRE(loaded.value().topology_receipts().front().receipt.created_vertices.size() == 3U);
+    REQUIRE(loaded.value().topology_receipts().front().receipt.created_faces.size() == 1U);
+    REQUIRE(loaded.value().topology_receipts().front().receipt.removed_vertices.size() == 1U);
+
+    carto::application::ApplicationSession reopened;
+    REQUIRE(carto::application::testing::dispatch(
+        reopened, carto::application::OpenProjectAction{path}));
+    REQUIRE(reopened.snapshot().viewport.scene.instances().front().mesh->vertex_ids.size() == 6U);
+}
+
+void application_rejects_vertex_bevel_wrong_mode_and_multi_selection() {
+    auto tetrahedron = make_application_tetrahedron();
+    REQUIRE(tetrahedron);
+    carto::application::ApplicationSession wrong_mode;
+    REQUIRE(carto::application::testing::dispatch(
+        wrong_mode, carto::application::CreateMeshObjectAction{
+            "Wrong vertex bevel mode", std::move(tetrahedron.value())}));
+    const auto wrong_object = wrong_mode.snapshot().objects.front().object.id;
+    const auto wrong_before = wrong_mode.snapshot();
+    REQUIRE(carto::application::testing::dispatch(
+        wrong_mode, carto::application::SetSelectionModeAction{
+            carto::editor::SelectionMode::face}));
+    REQUIRE(carto::application::testing::dispatch(
+        wrong_mode, carto::application::SelectFaceAction{
+            wrong_object, carto::geometry::FaceId{1U}}));
+    carto::editor::ToolArguments arguments;
+    arguments.distance = 0.25;
+    const auto wrong_result = carto::application::testing::dispatch(
+        wrong_mode, carto::application::InvokeToolAction{
+            "mesh.bevel-vertex", arguments});
+    REQUIRE(!wrong_result);
+    REQUIRE(wrong_mode.snapshot().project_revision == wrong_before.project_revision);
+    REQUIRE(wrong_mode.snapshot().viewport.scene.instances().front().mesh->vertex_ids.size() == 4U);
+
+    auto multiple_tetrahedron = make_application_tetrahedron();
+    REQUIRE(multiple_tetrahedron);
+    carto::application::ApplicationSession multiple;
+    REQUIRE(carto::application::testing::dispatch(
+        multiple, carto::application::CreateMeshObjectAction{
+            "Multiple vertex bevel", std::move(multiple_tetrahedron.value())}));
+    const auto multiple_object = multiple.snapshot().objects.front().object.id;
+    REQUIRE(carto::application::testing::dispatch(
+        multiple, carto::application::SetSelectionModeAction{
+            carto::editor::SelectionMode::vertex}));
+    REQUIRE(carto::application::testing::dispatch(
+        multiple, carto::application::SelectVertexAction{
+            multiple_object, carto::geometry::VertexId{1U}}));
+    REQUIRE(carto::application::testing::dispatch(
+        multiple, carto::application::SelectVertexAction{
+            multiple_object, carto::geometry::VertexId{2U},
+            carto::editor::SelectionOperation::add}));
+    const auto multiple_before = multiple.snapshot();
+    const auto multiple_result = carto::application::testing::dispatch(
+        multiple, carto::application::InvokeToolAction{
+            "mesh.bevel-vertex", arguments});
+    REQUIRE(!multiple_result);
+    REQUIRE(multiple.snapshot().project_revision == multiple_before.project_revision);
+    REQUIRE(multiple.snapshot().viewport.scene.instances().front().mesh->vertex_ids.size() == 4U);
 }
 
 void application_routes_imported_mesh_through_the_durable_command_boundary() {
@@ -631,7 +856,7 @@ void application_journals_committed_mutations_and_rolls_back_failed_append() {
     const std::string mutation_payload(
         after_event.value().back().payload.begin(), after_event.value().back().payload.end());
     REQUIRE(mutation_payload.find("CARTOGRAPHER_APPLICATION_MUTATION_V1") == 0U);
-    REQUIRE(mutation_payload.find("CARTOGRAPHER_PROJECT 4") != std::string::npos);
+    REQUIRE(mutation_payload.find("CARTOGRAPHER_PROJECT 5") != std::string::npos);
     REQUIRE(mutation_payload.find(
                 "AUTHORING \"cartographer.authoring\" \"meters\" \"right_handed_y_up\"") !=
             std::string::npos);
@@ -1043,6 +1268,10 @@ int main() {
         application_persists_project_topology_receipts_through_save_and_reopen();
         application_persists_vertex_merge_lineage_through_save_and_reopen();
         application_routes_face_poke_through_history_and_persists_lineage();
+        application_routes_edge_bevel_through_history_and_persistence();
+        application_rejects_edge_bevel_wrong_mode_and_multi_selection();
+        application_routes_vertex_bevel_through_history_and_persistence();
+        application_rejects_vertex_bevel_wrong_mode_and_multi_selection();
         application_routes_imported_mesh_through_the_durable_command_boundary();
         application_routes_vertex_edit_and_rejects_stale_reselection();
         application_repeats_last_tool_against_current_document();

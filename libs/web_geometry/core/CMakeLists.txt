@@ -8,7 +8,7 @@ add_library(carto_web_geometry_core STATIC
 target_include_directories(carto_web_geometry_core
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/libs/geometry/mesh/include>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../geometry/mesh/include>
         $<INSTALL_INTERFACE:include>
 )
 

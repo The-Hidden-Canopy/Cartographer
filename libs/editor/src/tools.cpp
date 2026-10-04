@@ -85,6 +85,32 @@ ToolContext::make_split_selected_edge_command(double factor) const {
 }
 
 core::Result<std::unique_ptr<EditorCommand>>
+ToolContext::make_bevel_selected_edge_command(
+    double width,
+    std::uint32_t segments) const {
+    return core::Result<std::unique_ptr<EditorCommand>>::success(
+        std::make_unique<BevelProjectSelectedEdgeCommand>(
+            admission_,
+            document_,
+            selection_,
+            width,
+            segments));
+}
+
+core::Result<std::unique_ptr<EditorCommand>>
+ToolContext::make_bevel_selected_vertex_command(
+    double width,
+    std::uint32_t segments) const {
+    return core::Result<std::unique_ptr<EditorCommand>>::success(
+        std::make_unique<BevelProjectSelectedVertexCommand>(
+            admission_,
+            document_,
+            selection_,
+            width,
+            segments));
+}
+
+core::Result<std::unique_ptr<EditorCommand>>
 ToolContext::make_dissolve_selected_edge_command() const {
     return core::Result<std::unique_ptr<EditorCommand>>::success(
         std::make_unique<DissolveProjectSelectedEdgeCommand>(
@@ -208,6 +234,28 @@ core::Result<void> ToolRegistry::register_builtin_tools() {
         [](const ToolContext& context, const ToolArguments& arguments)
             -> core::Result<std::unique_ptr<EditorCommand>> {
             return context.make_split_selected_edge_command(arguments.factor);
+        });
+        !result) {
+        return result;
+    }
+    if (auto result = register_tool(
+        {"mesh.bevel-edge", "Bevel selected edge",
+         ToolKernelKind::editable_mesh_bevel_edge},
+        [](const ToolContext& context, const ToolArguments& arguments)
+            -> core::Result<std::unique_ptr<EditorCommand>> {
+            return context.make_bevel_selected_edge_command(
+                arguments.distance, arguments.segments);
+        });
+        !result) {
+        return result;
+    }
+    if (auto result = register_tool(
+        {"mesh.bevel-vertex", "Bevel selected vertex",
+         ToolKernelKind::editable_mesh_bevel_vertex},
+        [](const ToolContext& context, const ToolArguments& arguments)
+            -> core::Result<std::unique_ptr<EditorCommand>> {
+            return context.make_bevel_selected_vertex_command(
+                arguments.distance, arguments.segments);
         });
         !result) {
         return result;

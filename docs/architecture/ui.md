@@ -73,7 +73,8 @@ submits through the same application admission boundary.
   component identities against the current document before re-evaluation and
   restore the prior selection when a stale identity blocks the replay.
 - a bounded editor numeric-entry substrate for finite unit-aware absolute and
-  relative scalar values; it is not yet a modal text-input or gizmo service.
+  relative scalar values, including bounded arithmetic and grouping; it is not
+  yet a modal text-input or gizmo service.
 
 The current application model supports object, vertex, edge, and face
 selection. Edge selection is identity- and revision-bound, and is available to

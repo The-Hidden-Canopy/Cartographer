@@ -5,6 +5,7 @@
 #include <carto/core/result.hpp>
 #include <carto/geometry/mesh.hpp>
 #include <carto/project/file_lock.hpp>
+#include <carto/scientific/model.hpp>
 #include <carto/scene/scene.hpp>
 
 #include <cstdint>
@@ -30,6 +31,8 @@ class PokeProjectSelectedFaceCommand;
 class SetProjectObjectTransformCommand;
 class SetProjectSelectedVertexPositionCommand;
 class SlideProjectSelectedVertexCommand;
+class BevelProjectSelectedEdgeCommand;
+class BevelProjectSelectedVertexCommand;
 class SplitProjectSelectedEdgeCommand;
 class TriToQuadProjectSelectedFacesCommand;
 }
@@ -64,7 +67,7 @@ struct TopologyReceiptRecord {
 
 class ProjectDocument {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 4;
+    static constexpr std::uint32_t kSchemaVersion = 5;
     static constexpr std::uint32_t kMinimumReadableSchemaVersion = 1;
     static constexpr std::string_view kMagic = "CARTOGRAPHER_PROJECT";
     static constexpr std::string_view kAuthoringFormat = "cartographer.authoring";
@@ -94,6 +97,9 @@ public:
     [[nodiscard]] const std::vector<TopologyReceiptRecord>& topology_receipts() const noexcept {
         return topology_receipts_;
     }
+    [[nodiscard]] const scientific::ScientificModel& scientific_model() const noexcept {
+        return scientific_model_;
+    }
     [[nodiscard]] core::Revision revision() const noexcept { return revision_; }
     [[nodiscard]] std::uint32_t schema_version() const noexcept { return kSchemaVersion; }
 
@@ -109,6 +115,8 @@ private:
     friend class ::carto::editor::SetProjectObjectTransformCommand;
     friend class ::carto::editor::SetProjectSelectedVertexPositionCommand;
     friend class ::carto::editor::SlideProjectSelectedVertexCommand;
+    friend class ::carto::editor::BevelProjectSelectedEdgeCommand;
+    friend class ::carto::editor::BevelProjectSelectedVertexCommand;
     friend class ::carto::editor::SplitProjectSelectedEdgeCommand;
     friend class ::carto::editor::TriToQuadProjectSelectedFacesCommand;
     friend class ::carto::project::ProjectTransaction;
@@ -143,6 +151,8 @@ private:
     // revisioned document state that is journaled and checkpointed.
     [[nodiscard]] core::Result<void> set_evaluation_graph_digest(
         std::optional<assets::Sha256Digest> digest);
+    [[nodiscard]] core::Result<void> set_scientific_model(
+        scientific::ScientificModel model);
     [[nodiscard]] core::Result<void> set_object_transform(
         scene::ObjectId object,
         core::Transform transform);
@@ -165,6 +175,7 @@ private:
     scene::Scene scene_;
     std::map<std::uint64_t, geometry::EditableMesh> meshes_;
     std::vector<TopologyReceiptRecord> topology_receipts_;
+    scientific::ScientificModel scientific_model_;
     std::optional<assets::Sha256Digest> evaluation_graph_digest_;
     std::uint64_t next_mesh_id_ = 1;
     core::Revision revision_{};

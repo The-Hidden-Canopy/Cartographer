@@ -25,7 +25,10 @@ option(CARTO_BUILD_GMIB_GRAPHICS "Build the optional GMIB presentation consumer"
 set(CARTO_GMIB_ROOT "" CACHE PATH "Standalone GMIB source root for the optional graphics consumer")
 option(CARTO_BUILD_GMIB_GAME "Build the Cartographer-hosted GMIB game surface" OFF)
 
-get_filename_component(_carto_public_root "${CMAKE_SOURCE_DIR}" REALPATH)
+# Cartographer can be built standalone or added as a public subdirectory of a
+# consumer such as CONDITION. Resolve the public boundary from this checkout,
+# not from whichever project owns the outer CMake configure.
+get_filename_component(_carto_public_root "${CMAKE_CURRENT_SOURCE_DIR}" REALPATH)
 if(CARTO_BUILD_PRIVATE_INTEGRATIONS)
     if(CARTO_PRIVATE_SOURCE_ROOT STREQUAL "" OR
        NOT IS_DIRECTORY "${CARTO_PRIVATE_SOURCE_ROOT}")
@@ -117,6 +120,7 @@ if(CARTO_BUILD_PRIVATE_INTEGRATIONS)
 endif()
 add_subdirectory(libs/geometry/mesh)
 add_subdirectory(libs/assets)
+add_subdirectory(libs/scientific)
 add_subdirectory(libs/attributes)
 add_subdirectory(libs/mesh_attributes)
 add_subdirectory(libs/web_geometry/core)

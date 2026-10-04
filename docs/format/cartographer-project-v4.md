@@ -1,9 +1,12 @@
-# Cartographer project format v4
+# Cartographer project format v4 (historical)
+
+Current saves use [project format v5](cartographer-project-v5.md). This page
+documents the v4 topology-lineage format that remains readable for migration.
 
 Cartographer v4 keeps the v3 authoring envelope and adds a bounded, durable
-lineage ledger for project-bound topology edits. New saves write v4. The
-parser continues to read v1, v2, and v3 documents; a legacy document has an
-empty receipt ledger until a project-bound topology edit is accepted.
+lineage ledger for project-bound topology edits. The parser continues to read
+v1, v2, and v3 documents; a legacy document has an empty receipt ledger until
+a project-bound topology edit is accepted.
 
 ```text
 CARTOGRAPHER_PROJECT 4
@@ -41,7 +44,7 @@ and revision interval. Records newer than the current mesh snapshot, dangling
 asset references, oversized counts, unknown origin kinds, duplicate IDs,
 trailing data, and future receipt/project versions fail closed.
 
-Only project-bound extrusion, inset, face deletion, edge split, bounded internal-edge dissolve, compatible triangle-to-quad conversion, face poke, and target-weld
+Only project-bound extrusion, inset, face deletion, edge split, bounded internal-edge dissolve, bounded valence-three vertex bevel, compatible triangle-to-quad conversion, face poke, and target-weld
 commands currently append receipts. Direct kernel calls and other project replacements
 remain valid but do not claim a receipt unless they provide one through the
 revision-bound replacement API. Undo and redo persist authoritative snapshots

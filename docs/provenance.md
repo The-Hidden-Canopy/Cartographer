@@ -10,7 +10,8 @@ The public repository contains generic authoring and interchange behavior:
 
 - versioned `.carto` authoring data and validation;
 - scene, geometry, topology, revision, undo/redo, and local receipts;
-- v4 `.carto` persistence for project-bound topology receipt lineage;
+- v5 `.carto` persistence for generic scientific entities plus project-bound
+  topology receipt lineage;
 - OBJ, PLY, STL, and bounded glTF interchange;
 - backend-neutral render-graph and GPU contracts;
 - local precision-role and kernel execution receipts with explicit artifact
@@ -37,7 +38,7 @@ and unknown IDs fail closed. The adapter produces source-index provenance for
 `carto_attributes::transfer`, not a second mutation or persistence path.
 
 `ProjectDocument` owns the separate durable `TopologyReceiptRecord` ledger in
-project schema v4. A project-bound extrusion, inset, face deletion, or edge
+project schema v5. A project-bound extrusion, inset, face deletion, or edge
 split supplies a receipt to the revision-bound mesh replacement, so the mesh
 snapshot and its lineage record publish in one project revision. The same
 receipt-aware replacement contract is available through `ProjectTransaction`,
@@ -49,6 +50,45 @@ calls, other replacement paths, and future modeling operators must opt into
 the API before they can claim durable lineage. Receipt decoding also applies
 bounded byte and aggregate identity/source-element budgets before allocating
 large lineage containers.
+
+`ProjectDocument` also owns a provider-neutral `ScientificModel` record in
+nested scientific schema v12. It contains typed regions, boundaries, interfaces,
+fields, studies, parameters, probes, result sets, morphology with field-linked
+growth domains, functional and
+sequence-genome authoring records, developmental traces with optional tissue
+assignments and parameter-value evidence, lineage/mutation/recombination
+receipts, deterministic development timeline/instruction-impact projections,
+morphometrics with derived landmark/signature comparison previews,
+anatomy/partonomy mappings with ontology version/source-release metadata,
+typed tissue-region records with optional structure/region bindings and geometry,
+field-visualization
+descriptors with derived CPU scalar/color and vector/glyph previews,
+provider-import lineage receipts with explicit preservation
+dispositions, phenotype-capability derivations with forward/reverse trace queries,
+gene-regulatory networks, spatial-expression records, anatomy-provider
+publication bindings with optional source project revision, scientific replay
+capsules, and explicit provenance. Functional-genome source digests and
+lineage references identify authored inputs and ancestry; they are not
+execution receipts.
+
+Functional-genome exchange envelopes bind one such source receipt to the
+canonical functional-genome payload with a semantic digest. The envelope is a
+provider-neutral handoff artifact; it does not contain provider credentials,
+runtime handles, or external execution/admission evidence.
+
+Anatomy provider candidate envelopes bind a validated provider manifest to the
+source project revision and canonical manifest digest. They preserve semantic
+IDs, laterality, geometry digests, tissue/material metadata, and local edits
+for an explicit provider handoff proposal. They are publication artifacts, not
+VANTA validation receipts or runtime admission records.
+`ProjectTransaction` is the only
+production mutation path for replacing that model; the journal payload
+therefore carries the same validated scientific state as the committed
+document. Scientific fields/results, sequences, comparisons, and visualization
+descriptors are not solver/runtime receipts and are not promoted to authored
+source truth without a separate provider admission contract. No credentials,
+model weights, private telemetry, MENAGERIE/VANTA runtime handles, or private
+integration state is introduced by this public substrate.
 
 These surfaces do not contain account authority, credentials, model weights,
 provider routing, private telemetry, runtime entity handles, or hosted project

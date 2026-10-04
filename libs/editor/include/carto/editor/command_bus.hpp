@@ -522,6 +522,150 @@ private:
     std::optional<core::Revision> current_mesh_revision_;
 };
 
+class BevelEdgeCommand final : public EditorCommand {
+public:
+    BevelEdgeCommand(
+        geometry::EditableMesh& mesh,
+        geometry::EdgeId edge,
+        double width,
+        std::uint32_t segments);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Bevel Edge"; }
+
+private:
+    geometry::EditableMesh* mesh_;
+    geometry::EdgeId edge_;
+    double width_;
+    std::uint32_t segments_;
+    std::optional<geometry::EditableMesh> before_;
+    std::optional<geometry::EditableMesh> after_;
+    std::optional<geometry::TopologyEditReceipt> receipt_;
+};
+
+class BevelSelectedEdgeCommand final : public EditorCommand {
+public:
+    BevelSelectedEdgeCommand(
+        const SelectionState& selection,
+        geometry::EditableMesh& mesh,
+        double width,
+        std::uint32_t segments);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Bevel Selected Edge"; }
+
+private:
+    const SelectionState* selection_;
+    geometry::EditableMesh* mesh_;
+    double width_;
+    std::uint32_t segments_;
+    std::unique_ptr<BevelEdgeCommand> delegate_;
+};
+
+class BevelProjectSelectedEdgeCommand final : public EditorCommand {
+public:
+    BevelProjectSelectedEdgeCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        const SelectionState& selection,
+        double width,
+        std::uint32_t segments);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override {
+        return "Bevel Project Selected Edge";
+    }
+
+private:
+    friend class ::carto::application::ApplicationSession;
+    friend struct ToolContext;
+
+    project::ProjectDocument* document_;
+    const SelectionState* selection_;
+    double width_;
+    std::uint32_t segments_;
+    std::optional<std::uint64_t> mesh_asset_;
+    std::optional<geometry::EditableMesh> before_;
+    std::optional<geometry::EditableMesh> after_;
+    std::optional<geometry::TopologyEditReceipt> receipt_;
+    std::optional<core::Revision> current_mesh_revision_;
+};
+
+class BevelVertexCommand final : public EditorCommand {
+public:
+    BevelVertexCommand(
+        geometry::EditableMesh& mesh,
+        geometry::VertexId vertex,
+        double width,
+        std::uint32_t segments);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Bevel Vertex"; }
+
+private:
+    geometry::EditableMesh* mesh_;
+    geometry::VertexId vertex_;
+    double width_;
+    std::uint32_t segments_;
+    std::optional<geometry::EditableMesh> before_;
+    std::optional<geometry::EditableMesh> after_;
+    std::optional<geometry::TopologyEditReceipt> receipt_;
+};
+
+class BevelSelectedVertexCommand final : public EditorCommand {
+public:
+    BevelSelectedVertexCommand(
+        const SelectionState& selection,
+        geometry::EditableMesh& mesh,
+        double width,
+        std::uint32_t segments);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Bevel Selected Vertex"; }
+
+private:
+    const SelectionState* selection_;
+    geometry::EditableMesh* mesh_;
+    double width_;
+    std::uint32_t segments_;
+    std::unique_ptr<BevelVertexCommand> delegate_;
+};
+
+class BevelProjectSelectedVertexCommand final : public EditorCommand {
+public:
+    BevelProjectSelectedVertexCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        const SelectionState& selection,
+        double width,
+        std::uint32_t segments);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override {
+        return "Bevel Project Selected Vertex";
+    }
+
+private:
+    friend class ::carto::application::ApplicationSession;
+    friend struct ToolContext;
+
+    project::ProjectDocument* document_;
+    const SelectionState* selection_;
+    double width_;
+    std::uint32_t segments_;
+    std::optional<std::uint64_t> mesh_asset_;
+    std::optional<geometry::EditableMesh> before_;
+    std::optional<geometry::EditableMesh> after_;
+    std::optional<geometry::TopologyEditReceipt> receipt_;
+    std::optional<core::Revision> current_mesh_revision_;
+};
+
 class DissolveEdgeCommand final : public EditorCommand {
 public:
     DissolveEdgeCommand(

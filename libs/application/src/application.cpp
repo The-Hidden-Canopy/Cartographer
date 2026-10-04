@@ -522,7 +522,7 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                     AffectedSet{{value.object}, {}, {}, {}},
                     ParameterPayload{
                         value.transform, std::nullopt, std::nullopt, std::nullopt,
-                        std::nullopt, std::nullopt});
+                        std::nullopt, std::nullopt, std::nullopt});
             } else if constexpr (std::is_same_v<Action, InvokeToolAction>) {
                 return invoke_tool(value);
             } else if constexpr (std::is_same_v<Action, RepeatLastToolAction>) {
@@ -1060,6 +1060,7 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
                 std::nullopt,
                 std::nullopt,
                 std::nullopt,
+                std::nullopt,
                 std::nullopt};
         } else if (action.tool_id == "mesh.inset-face") {
             parameters = ParameterPayload{
@@ -1068,7 +1069,26 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
                 std::nullopt,
                 std::nullopt,
                 std::nullopt,
+                std::nullopt,
                 std::nullopt};
+        } else if (action.tool_id == "mesh.bevel-edge") {
+            parameters = ParameterPayload{
+                std::nullopt,
+                action.arguments.distance,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                action.arguments.segments};
+        } else if (action.tool_id == "mesh.bevel-vertex") {
+            parameters = ParameterPayload{
+                std::nullopt,
+                action.arguments.distance,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                action.arguments.segments};
         } else if (action.tool_id == "mesh.remove-face") {
             parameters = ParameterPayload{
                 std::nullopt,
@@ -1076,12 +1096,14 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
                 std::nullopt,
                 action.arguments.remove_orphaned_vertices,
                 std::nullopt,
+                std::nullopt,
                 std::nullopt};
         } else if (action.tool_id == "mesh.set-vertex-position") {
             parameters = ParameterPayload{
                 std::nullopt,
                 std::nullopt,
                 action.arguments.position,
+                std::nullopt,
                 std::nullopt,
                 std::nullopt,
                 std::nullopt};
@@ -1092,6 +1114,7 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
                 std::nullopt,
                 std::nullopt,
                 action.arguments.factor,
+                std::nullopt,
                 std::nullopt};
         } else if (action.tool_id == "mesh.slide-vertex") {
             parameters = ParameterPayload{
@@ -1100,7 +1123,8 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
                 std::nullopt,
                 std::nullopt,
                 action.arguments.factor,
-                action.arguments.support_edge};
+                action.arguments.support_edge,
+                std::nullopt};
             if (action.arguments.support_edge.has_value()) {
                 affected.edges.push_back(*action.arguments.support_edge);
             }
@@ -1119,6 +1143,8 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
                    action.tool_id == "mesh.poke-face" ||
                    action.tool_id == "mesh.remove-face" ||
                    action.tool_id == "mesh.split-edge" ||
+                   action.tool_id == "mesh.bevel-edge" ||
+                   action.tool_id == "mesh.bevel-vertex" ||
                    action.tool_id == "mesh.dissolve-edge" ||
                    action.tool_id == "mesh.tri-to-quad" ||
                    action.tool_id == "mesh.merge-vertices")) {

@@ -51,6 +51,10 @@ void ontology_is_derived_from_native_tools() {
         [](const auto& operation) { return operation.id == "mesh.tri-to-quad"; });
     const auto slide_vertex = std::find_if(context.operations.begin(), context.operations.end(),
         [](const auto& operation) { return operation.id == "mesh.slide-vertex"; });
+    const auto bevel_edge = std::find_if(context.operations.begin(), context.operations.end(),
+        [](const auto& operation) { return operation.id == "mesh.bevel-edge"; });
+    const auto bevel_vertex = std::find_if(context.operations.begin(), context.operations.end(),
+        [](const auto& operation) { return operation.id == "mesh.bevel-vertex"; });
     REQUIRE(extrude != context.operations.end() && extrude->preview_supported);
     REQUIRE(inset != context.operations.end() && inset->preview_supported);
     REQUIRE(poke != context.operations.end() && !poke->preview_supported);
@@ -59,6 +63,8 @@ void ontology_is_derived_from_native_tools() {
     REQUIRE(dissolve_edge != context.operations.end() && !dissolve_edge->preview_supported);
     REQUIRE(tri_to_quad != context.operations.end() && !tri_to_quad->preview_supported);
     REQUIRE(slide_vertex != context.operations.end() && !slide_vertex->preview_supported);
+    REQUIRE(bevel_edge != context.operations.end() && !bevel_edge->preview_supported);
+    REQUIRE(bevel_vertex != context.operations.end() && !bevel_vertex->preview_supported);
     REQUIRE(extrude->kernel_operation == "geometry.EditableMesh.extrude_face");
     REQUIRE(inset->kernel_operation == "geometry.EditableMesh.inset_face");
     REQUIRE(inset->precondition.find("strictly convex") != std::string::npos);
@@ -77,6 +83,14 @@ void ontology_is_derived_from_native_tools() {
     REQUIRE(poke->kernel_operation == "geometry.EditableMesh.poke_face");
     REQUIRE(poke->precondition.find("strictly convex") != std::string::npos);
     REQUIRE(poke->precondition.find("future preview") != std::string::npos);
+    REQUIRE(bevel_edge->kernel_operation == "geometry.EditableMesh.bevel_edge");
+    REQUIRE(bevel_edge->precondition.find("segments must equal one") != std::string::npos);
+    REQUIRE(!bevel_edge->auto_approvable);
+    REQUIRE(bevel_vertex->kernel_operation == "geometry.EditableMesh.bevel_vertex");
+    REQUIRE(bevel_vertex->precondition.find("valence-three") != std::string::npos);
+    REQUIRE(bevel_vertex->precondition.find("triangles") != std::string::npos);
+    REQUIRE(bevel_vertex->precondition.find("segments must equal one") != std::string::npos);
+    REQUIRE(!bevel_vertex->auto_approvable);
 }
 
 void ontology_json_preserves_kernel_and_approval_contract() {

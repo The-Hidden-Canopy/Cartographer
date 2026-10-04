@@ -62,8 +62,46 @@ checkout.
   outbound telemetry in this path.
 - `carto_project` persists authoring state in a versioned, deterministic text
   format with pre-commit validation and atomic replacement. New saves use the
-  v3 authoring envelope and optional graph reference while v1/v2 projects remain readable. Render caches are
-  not serialized as project truth.
+  v5 authoring envelope with optional graph reference, topology lineage, and a
+  generic scientific model; v1/v2/v3/v4 projects remain readable. Render
+  caches are not serialized as project truth.
+- `carto_scientific` provides typed, provider-neutral regions, fields, studies,
+  results, probes, parameters, provenance, a bounded morphology structure graph,
+  semantic functional-genome records with deterministic gene/module and
+  source/lineage/program-identity diff, explicit neural-value changes, optional
+  source-digest/lineage identity, and bounded
+  provider-neutral functional-genome exchange envelopes that bind a source
+  preservation receipt to a canonical semantic digest, plus stable-ID guarded
+  gene replacement/removal for journaled authoring edits,
+  developmental-program/trace records with optional tissue assignment and
+  parameter-value evidence, plus lineage/mutation/recombination records, field-linked
+  morphology growth-domain records, deterministic
+  timeline/instruction-impact projections, and explicit
+  morphometric observations/signatures/comparisons plus deterministic
+  bilateral landmark and CPU signature-comparison previews and sequence-genome
+  contigs/variants, bounded anatomy/partonomy mappings with ontology release
+  metadata and typed tissue-region records with structure/region bindings,
+  stage metadata, and geometry,
+  field-visualization
+  descriptors with CPU-only scalar sample-to-color, vector glyph, bounded slice-plane,
+  marching-squares contour, bounded marching-tetrahedra isosurface, bounded front-to-back
+  volume projection, single-probe readout, and bounded 2D streamline previews,
+  provider-import lineage receipts with explicit preservation
+  dispositions, and phenotype-capability
+  derivations with typed source tracing and derived forward/reverse capability
+  queries, plus gene-regulatory and spatial-expression records. It is an authoring substrate, not a solver, sequence-genome
+  interpreter, anatomy behavior catalog, runtime, or renderer. Anatomy-provider
+  publication bindings retain semantic IDs, laterality, source project revision,
+  geometry/license lineage, and local edits without importing VANTA runtime
+  authority. A separate authoring-side candidate gate requires matching source
+  revision and geometry digests before a provider handoff can be proposed.
+  A derived read-only development timeline projection orders stages and exposes
+  planned versus observed instruction/structure changes without persisting a
+  second source of truth.
+  Scientific replay capsules record source revision, provider/solver identity,
+  seeds, parameter references, dataset digests, and expected outputs without
+  claiming execution. The library is not a MENAGERIE runtime, VANTA runtime,
+  or telemetry service.
 - `carto_io` provides OBJ, polygon-preserving ASCII PLY, binary/ASCII STL, and
   a bounded glTF export profile. Unsupported features are reported as loss
   rather than silently presented as preserved.
@@ -182,6 +220,31 @@ render-graph, submission-lifetime, presentation, or multi-adapter acceptance.
 ```powershell
 build\default\apps\cli\cartographer_cli.exe demo sample.carto
 build\default\apps\cli\cartographer_cli.exe validate sample.carto
+build\default\apps\cli\cartographer_cli.exe scientific-demo scientific-demo.carto
+build\default\apps\cli\cartographer_cli.exe scientific-reference-demo reference-morphology.carto
+build\default\apps\cli\cartographer_cli.exe inspect-scientific scientific-demo.carto
+build\default\apps\cli\cartographer_cli.exe export-sequence-fasta scientific-demo.carto scientific-sequence.fasta
+build\default\apps\cli\cartographer_cli.exe import-sequence-fasta scientific-sequence.fasta fixture-assembly sample://fixture imported-sequence.carto
+build\default\apps\cli\cartographer_cli.exe export-sequence-vcf scientific-demo.carto scientific-variants.vcf
+build\default\apps\cli\cartographer_cli.exe import-sequence-vcf scientific-variants.vcf reference-sequence.carto imported-variants.carto
+build\default\apps\cli\cartographer_cli.exe export-sequence-gff3 scientific-demo.carto scientific-annotations.gff3
+build\default\apps\cli\cartographer_cli.exe import-sequence-gff3 scientific-annotations.gff3 reference-sequence.carto imported-annotations.carto
+build\default\apps\cli\cartographer_cli.exe export-sequence-bed6 scientific-demo.carto scientific-annotations.bed
+build\default\apps\cli\cartographer_cli.exe import-sequence-bed6 scientific-annotations.bed reference-sequence.carto imported-bed6.carto
+build\default\apps\cli\cartographer_cli.exe export-sequence-gtf scientific-demo.carto scientific-annotations.gtf
+build\default\apps\cli\cartographer_cli.exe import-sequence-gtf scientific-annotations.gtf reference-sequence.carto imported-gtf.carto
+build\default\apps\cli\cartographer_cli.exe export-lineage-newick scientific-demo.carto lineage.newick
+build\default\apps\cli\cartographer_cli.exe import-lineage-newick lineage.newick scientific-demo.carto imported-lineage.carto
+build\default\apps\cli\cartographer_cli.exe export-anatomy-ontology-table scientific-demo.carto anatomy-ontology.tsv
+build\default\apps\cli\cartographer_cli.exe import-anatomy-ontology-table anatomy-ontology.tsv empty-anatomy.carto imported-anatomy.carto
+build\default\apps\cli\cartographer_cli.exe export-landmark-set scientific-demo.carto scientific-landmarks.carto-landmarks
+build\default\apps\cli\cartographer_cli.exe import-landmark-set scientific-landmarks.carto-landmarks reference-morphology.carto imported-landmarks.carto
+build\default\apps\cli\cartographer_cli.exe export-functional-genome-exchange scientific-demo.carto scientific-genome.carto-genome
+build\default\apps\cli\cartographer_cli.exe inspect-functional-genome-exchange scientific-genome.carto-genome
+build\default\apps\cli\cartographer_cli.exe edit-functional-genome-exchange scientific-genome.carto-genome 1 0.35 edited-genome.carto-genome
+build\default\apps\cli\cartographer_cli.exe import-functional-genome-exchange scientific-genome.carto-genome imported-genome.carto
+build\default\apps\cli\cartographer_cli.exe export-anatomy-provider-candidate scientific-demo.carto anatomy-candidate.carto-anatomy
+build\default\apps\cli\cartographer_cli.exe inspect-anatomy-provider-candidate anatomy-candidate.carto-anatomy
 build\default\apps\cli\cartographer_cli.exe export-obj sample.carto sample.obj
 build\default\apps\cli\cartographer_cli.exe import-obj sample.obj roundtrip.carto
 build\default\apps\cli\cartographer_cli.exe export-ply sample.carto sample.ply
@@ -189,9 +252,107 @@ build\default\apps\cli\cartographer_cli.exe export-stl sample.carto sample.stl
 build\default\apps\cli\cartographer_cli.exe export-gltf sample.carto scene.gltf
 ```
 
-The generated project and mesh files are local artifacts and are ignored only
-when they are placed under ignored build/temp directories. Do not interpret a
-successful CLI smoke run as Vulkan, desktop, CAD, or release acceptance.
+`scientific-demo` creates a populated, deterministic authoring fixture covering
+morphology, field-linked growth domains, functional and sequence genome records, development, lineage,
+morphometrics, anatomy/tissue regions, field visualization descriptors, import dispositions,
+regulation, replay capsules, phenotype trace links, and an authoring-side anatomy
+candidate gate. It is a local preview: it does not execute MENAGERIE/VANTA, run a
+provider, compile a phenotype, or claim live scientific results. The generated
+project and mesh files are local artifacts and are ignored only when they are
+placed under ignored build/temp directories. Do not interpret a successful CLI
+smoke run as Vulkan, desktop, CAD, provider, or release acceptance.
+
+`scientific-reference-demo` creates the corresponding structure-only morphology
+fixture for testing reference-bound landmark imports; it intentionally contains
+zero landmark records.
+
+The functional-genome exchange commands provide a bounded provider-neutral
+workflow for source-receipt-bound import, inspection, stable-ID value edits,
+journaled `.carto` admission, and deterministic re-export. Export refuses projects without
+exactly one source receipt and a source digest; these commands do not execute
+MENAGERIE or admit VANTA runtime state. CLI edits add local gene-level
+authoring provenance rather than overwriting the original source receipt.
+
+The anatomy candidate commands publish a bounded provider-neutral envelope
+containing the candidate manifest, source project revision, semantic bindings,
+geometry digests, and canonical manifest digest. They require the authoring
+candidate gate to pass and do not claim VANTA validation or runtime admission.
+
+The sequence FASTA commands implement a bounded provider-neutral contig
+exchange. Export reports that FASTA omits Cartographer metadata and explicit
+variants; import requires caller-supplied assembly/sample identity, records the
+source digest and per-contig preservation report, and admits the result through
+the normal journaled `.carto` transaction before save/reopen verification.
+
+The sequence VCF commands implement a separate bounded variant exchange. VCF
+export requires a reference-genome digest, assembly, sample identity, and
+reference provenance, emits explicit one-based coordinate metadata, and reports
+that full sequence bytes and per-record provenance are not carried. VCF import
+requires a matching reference project with sequence bytes and no pre-existing
+variants; unsupported sample columns, INFO fields, allele alphabets, stale
+reference alleles, and identity mismatches fail closed. The CLI records a
+source-digest preservation receipt and commits the result through the normal
+journaled transaction before save/reopen verification.
+
+The sequence GFF3 commands implement a separate bounded annotation exchange.
+GFF3 export requires a source-genome digest and sequence-backed contigs, emits
+an explicit one-based-inclusive envelope while Cartographer stores intervals as
+zero-based half-open values, and carries stable feature IDs, source/type,
+score, strand, phase, and escaped attributes. Import requires a matching
+reference project with no pre-existing features; unsupported directives,
+stale contigs, malformed intervals/attributes, duplicate identities, and
+non-finite scores fail closed. GFF3 annotations remain annotations: they do
+not become functional genes, developmental programs, phenotype capabilities,
+or runtime behavior. The CLI records a source-digest preservation receipt and
+commits through the normal journaled transaction before save/reopen
+verification.
+
+The sequence BED6 commands provide a separate bounded interval exchange.
+Cartographer emits stable identity in the BED name, preserves the native
+zero-based half-open interval and strand, converts scores to BED's integer
+0..1000 scale, and records the source-genome digest, assembly, sample, and
+provenance envelope in comments. Import requires a matching reference project
+with no pre-existing features. BED6 type/source/phase/attributes are not
+invented on import, and BED6 annotations do not become functional genes,
+developmental programs, phenotype capabilities, or runtime behavior.
+
+The sequence GTF commands provide a bounded GTF 2.2 exchange over the same
+reference-bound feature layer. They preserve the supported nine-column fields,
+quoted attributes, stable Cartographer identity, native interval conversion,
+and provenance envelope. Imports reject unsupported directives, malformed
+quoted attributes or escapes, stale references, duplicate identities, and
+pre-existing features. GTF annotations remain annotations and are never
+promoted to functional-genome, phenotype, or runtime authority.
+
+The lineage Newick commands provide a bounded rooted-tree exchange. Export
+requires exactly one connected single-parent root and emits stable Cartographer
+lineage IDs, generation, and optional source identifiers in controlled labels;
+reticulation and second-parent graphs fail closed because Newick cannot carry
+them. Import requires the explicit Cartographer envelope and caller provenance,
+derives deterministic path-based IDs only for generic external labels, rejects
+branch lengths/comments/duplicate identities, and journals the admitted graph
+through save/reopen verification. Newick omits native genome/morphology
+bindings, mutation/recombination receipts, and per-node provenance; it never
+becomes phenotype, development, solver, or runtime authority.
+
+The anatomy ontology-table commands provide a bounded semantic-term exchange.
+They preserve namespace/accession identity, term hierarchy, labels, categories,
+definitions, ontology version, and source release through a strict hex-delimited
+table. Import requires caller provenance and either an empty anatomy shell (which
+adopts the declared schema) or a matching schema with no pre-existing terms;
+duplicate IDs/accessions, cycles, malformed rows, and unsupported headers fail
+closed. Parts, tissue regions, relations, geometry, and per-term provenance are
+not silently invented, and ontology labels do not become tissue, phenotype, or
+VANTA runtime authority.
+
+The landmark-set commands implement a bounded morphology exchange for typed
+landmarks. Export binds the set to a digest of the structure graph and carries
+stable landmark IDs, optional structure ownership, coordinates, and explicit
+coordinate frames. Import requires a matching morphology reference model with
+no pre-existing landmark bindings, rejects unsupported metadata, stale
+structures, duplicate IDs, non-finite positions, and frame mismatches, then
+attaches admitted landmarks through the validated morphology API and records a
+source preservation receipt through the normal journaled transaction.
 
 ## Architecture
 

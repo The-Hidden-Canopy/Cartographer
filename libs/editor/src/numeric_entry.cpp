@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <cctype>
 #include <string>
 #include <utility>
 
@@ -27,6 +28,154 @@ double unit_scale(std::string_view suffix) {
     if (suffix == "ft") return 0.3048;
     return 0.0;
 }
+
+class ExpressionParser final {
+public:
+    explicit ExpressionParser(std::string_view text) : text_(text) {}
+
+    [[nodiscard]] core::Result<double> parse() {
+        const auto value = parse_add_subtract(0U);
+        if (!value) return value;
+        skip_spaces();
+        if (position_ != text_.size()) {
+            return core::Result<double>::failure(invalid(
+                "numeric entry contains an unexpected token"));
+        }
+        return value;
+    }
+
+private:
+    static constexpr std::size_t kMaxDepth = 32U;
+    static constexpr std::size_t kMaxOperations = 128U;
+
+    void skip_spaces() noexcept {
+        while (position_ < text_.size() &&
+               (text_[position_] == ' ' || text_[position_] == '\t')) {
+            ++position_;
+        }
+    }
+
+    [[nodiscard]] core::Result<double> parse_add_subtract(std::size_t depth) {
+        if (depth > kMaxDepth) {
+            return core::Result<double>::failure(invalid(
+                "numeric entry expression nesting is too deep"));
+        }
+        auto left = parse_multiply_divide(depth + 1U);
+        if (!left) return left;
+        for (;;) {
+            skip_spaces();
+            if (position_ >= text_.size() ||
+                (text_[position_] != '+' && text_[position_] != '-')) {
+                return left;
+            }
+            if (++operation_count_ > kMaxOperations) {
+                return core::Result<double>::failure(invalid(
+                    "numeric entry expression has too many operations"));
+            }
+            const char operation = text_[position_++];
+            auto right = parse_multiply_divide(depth + 1U);
+            if (!right) return right;
+            const double value = operation == '+'
+                ? left.value() + right.value()
+                : left.value() - right.value();
+            if (!std::isfinite(value)) {
+                return core::Result<double>::failure(invalid(
+                    "numeric entry expression is non-finite"));
+            }
+            left = core::Result<double>::success(value);
+        }
+    }
+
+    [[nodiscard]] core::Result<double> parse_multiply_divide(std::size_t depth) {
+        if (depth > kMaxDepth) {
+            return core::Result<double>::failure(invalid(
+                "numeric entry expression nesting is too deep"));
+        }
+        auto left = parse_primary(depth + 1U);
+        if (!left) return left;
+        for (;;) {
+            skip_spaces();
+            if (position_ >= text_.size() ||
+                (text_[position_] != '*' && text_[position_] != '/')) {
+                return left;
+            }
+            if (++operation_count_ > kMaxOperations) {
+                return core::Result<double>::failure(invalid(
+                    "numeric entry expression has too many operations"));
+            }
+            const char operation = text_[position_++];
+            auto right = parse_primary(depth + 1U);
+            if (!right) return right;
+            if (operation == '/' && right.value() == 0.0) {
+                return core::Result<double>::failure(invalid(
+                    "numeric entry expression divides by zero"));
+            }
+            const double value = operation == '*'
+                ? left.value() * right.value()
+                : left.value() / right.value();
+            if (!std::isfinite(value)) {
+                return core::Result<double>::failure(invalid(
+                    "numeric entry expression is non-finite"));
+            }
+            left = core::Result<double>::success(value);
+        }
+    }
+
+    [[nodiscard]] core::Result<double> parse_primary(std::size_t depth) {
+        if (depth > kMaxDepth) {
+            return core::Result<double>::failure(invalid(
+                "numeric entry expression nesting is too deep"));
+        }
+        skip_spaces();
+        if (position_ >= text_.size()) {
+            return core::Result<double>::failure(invalid(
+                "numeric entry expression is missing a value"));
+        }
+        if (text_[position_] == '(') {
+            ++position_;
+            auto value = parse_add_subtract(depth + 1U);
+            if (!value) return value;
+            skip_spaces();
+            if (position_ >= text_.size() || text_[position_] != ')') {
+                return core::Result<double>::failure(invalid(
+                    "numeric entry expression is missing a closing parenthesis"));
+            }
+            ++position_;
+            return value;
+        }
+
+        const std::string token(text_.substr(position_));
+        char* end = nullptr;
+        const double parsed = std::strtod(token.c_str(), &end);
+        if (end == token.c_str() || !std::isfinite(parsed)) {
+            return core::Result<double>::failure(invalid(
+                "numeric entry expression contains a non-finite or invalid scalar"));
+        }
+        const std::size_t consumed = static_cast<std::size_t>(end - token.c_str());
+        position_ += consumed;
+        const std::size_t suffix_start = position_;
+        while (position_ < text_.size() &&
+               std::isalpha(static_cast<unsigned char>(text_[position_]))) {
+            ++position_;
+        }
+        const std::string_view suffix = text_.substr(suffix_start, position_ - suffix_start);
+        const double scale = unit_scale(suffix);
+        if (scale == 0.0) {
+            return core::Result<double>::failure(invalid(
+                "numeric entry uses an unsupported unit suffix"));
+        }
+        const double value = parsed * scale;
+        if (!std::isfinite(value)) {
+            return core::Result<double>::failure(invalid(
+                "numeric entry conversion is non-finite"));
+        }
+        return core::Result<double>::success(value);
+    }
+
+    std::string_view text_;
+    std::size_t position_ = 0U;
+    std::size_t operation_count_ = 0U;
+};
 
 } // namespace
 
@@ -54,21 +203,11 @@ core::Result<NumericValue> parse_numeric_value(std::string_view text) {
             "numeric entry has no scalar after its relative prefix"));
     }
 
-    const std::string token(text);
-    char* end = nullptr;
-    const double parsed = std::strtod(token.c_str(), &end);
-    if (end == token.c_str() || !std::isfinite(parsed)) {
-        return core::Result<NumericValue>::failure(invalid(
-            "numeric entry is not a finite scalar"));
+    const auto expression = ExpressionParser{text}.parse();
+    if (!expression) {
+        return core::Result<NumericValue>::failure(expression.error());
     }
-    const std::size_t suffix_offset = static_cast<std::size_t>(end - token.c_str());
-    const std::string_view suffix = std::string_view(token).substr(suffix_offset);
-    const double scale = unit_scale(suffix);
-    if (scale == 0.0) {
-        return core::Result<NumericValue>::failure(invalid(
-            "numeric entry uses an unsupported unit suffix"));
-    }
-    const double value = sign * parsed * scale;
+    const double value = sign * expression.value();
     if (!std::isfinite(value)) {
         return core::Result<NumericValue>::failure(invalid(
             "numeric entry conversion is non-finite"));

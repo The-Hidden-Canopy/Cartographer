@@ -27,6 +27,7 @@ The benchmark directly invokes these native methods:
 - `EditableMesh::slide_vertex`
 - `EditableMesh::delete_face`
 - `EditableMesh::split_edge`
+- `EditableMesh::bevel_edge` (bounded single-segment internal-edge chamfer)
 - `EditableMesh::dissolve_edge`
 
 It uses valid quad grids of 1x1, 4x4, 8x8, and 16x16 faces. The internal-edge

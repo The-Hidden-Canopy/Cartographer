@@ -13,6 +13,7 @@ permanently proprietary.
 | Public / open-by-default Canopy | Private moat |
 | --- | --- |
 | `.carto` authoring format and validation | model weights, private prompts, provider credentials, and routing policy |
+| provider-neutral scientific entities, fields, studies, results, and provenance | private genome interpretation, solver binaries, anatomy catalogs, and unpublished scientific datasets |
 | geometry, topology, evaluation, and mesh-attribute kernels | proprietary native kernels, optimization recipes, and tuning data |
 | scene, project, revision, undo/redo, and receipts | private telemetry, workflow-learning stores, and unreleased datasets |
 | OBJ, PLY, STL, glTF, and other reviewed interchange | private schemas, catalogs, and hosted-service state |
@@ -53,6 +54,27 @@ The core `.carto` document remains public and versioned. Optional public
 extensions must be namespaced and versioned independently. Hub-specific state
 belongs outside the ordinary project file or is represented only by an opaque
 reference that has no authority by itself.
+
+The v5 scientific record is intentionally generic: typed IDs and provenance
+can be shared publicly, but it does not carry private telemetry, credentials,
+provider runtime handles, model weights, or execution authority. Anatomy-provider
+publication manifests carry only reviewed semantic IDs, source geometry/license
+lineage, and opaque candidate references; they do not admit VANTA assets or
+runtime components. A result field is not source truth, and a
+provider-import preservation report carries only bounded source keys,
+disposition labels, targets, and notes—not imported payloads, credentials, or
+provider execution state. Functional-genome exchange envelopes carry the
+public semantic payload, source receipt, and canonical digest only; they do not
+carry MENAGERIE interpretation logic, private provider handles, or runtime
+admission state. The derived development timeline is read-only
+inspection data and is not a second public source of truth. The bilateral
+landmark preview is likewise a deterministic local delta projection; it does
+not contain private morphospace models, alignment weights, or provider output.
+sequence/adaptation payload is not implicitly a functional genome.
+
+The anatomy provider candidate envelope is likewise provider-neutral. It carries
+source revision and geometry/manifest digests, but no provider credentials,
+runtime entity handles, private catalog payloads, or VANTA admission state.
 
 The following do not belong in public project files:
 

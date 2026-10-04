@@ -8,6 +8,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -21,6 +22,30 @@ public:
     do {                                                                                      \
         if (!(condition)) throw TestFailure(std::string("requirement failed: ") + #condition); \
     } while (false)
+
+carto::core::Result<carto::geometry::EditableMesh> make_tetrahedron() {
+    carto::geometry::EditableMesh mesh;
+    const auto v0 = mesh.add_vertex({0.0, 0.0, 0.0});
+    const auto v1 = mesh.add_vertex({2.0, 0.0, 0.0});
+    const auto v2 = mesh.add_vertex({0.0, 2.0, 0.0});
+    const auto v3 = mesh.add_vertex({0.0, 0.0, 2.0});
+    if (!v0) return carto::core::Result<carto::geometry::EditableMesh>::failure(v0.error());
+    if (!v1) return carto::core::Result<carto::geometry::EditableMesh>::failure(v1.error());
+    if (!v2) return carto::core::Result<carto::geometry::EditableMesh>::failure(v2.error());
+    if (!v3) return carto::core::Result<carto::geometry::EditableMesh>::failure(v3.error());
+    const auto first = mesh.add_face({v0.value(), v2.value(), v1.value()});
+    const auto second = mesh.add_face({v0.value(), v1.value(), v3.value()});
+    const auto third = mesh.add_face({v0.value(), v3.value(), v2.value()});
+    const auto fourth = mesh.add_face({v1.value(), v2.value(), v3.value()});
+    if (!first) return carto::core::Result<carto::geometry::EditableMesh>::failure(first.error());
+    if (!second) return carto::core::Result<carto::geometry::EditableMesh>::failure(second.error());
+    if (!third) return carto::core::Result<carto::geometry::EditableMesh>::failure(third.error());
+    if (!fourth) return carto::core::Result<carto::geometry::EditableMesh>::failure(fourth.error());
+    if (auto result = mesh.validate(); !result) {
+        return carto::core::Result<carto::geometry::EditableMesh>::failure(result.error());
+    }
+    return carto::core::Result<carto::geometry::EditableMesh>::success(std::move(mesh));
+}
 
 void shared_vertex_position_patch_checks_all_incident_faces() {
     carto::geometry::EditableMesh mesh;
@@ -183,6 +208,214 @@ void edge_split_rejects_invalid_factors_without_mutation() {
         REQUIRE(box.value().vertex_count() == before_vertices);
         REQUIRE(box.value().find_edge(edge) != nullptr);
     }
+}
+
+void edge_bevel_is_bounded_atomic_and_reports_lineage() {
+    auto box = carto::geometry::make_box({1.0, 1.0, 1.0});
+    REQUIRE(box);
+    const auto topology = box.value().topology();
+    REQUIRE(topology);
+    REQUIRE(!topology.value().edges.empty());
+    const auto edge = topology.value().edges.front().id;
+    const auto before_revision = box.value().revision();
+
+    const auto beveled = box.value().bevel_edge(edge, 0.1);
+    REQUIRE(beveled);
+    REQUIRE(beveled.value().revision_before == before_revision);
+    REQUIRE(beveled.value().revision_after == before_revision.next());
+    REQUIRE(beveled.value().created_vertices.size() == 4U);
+    REQUIRE(beveled.value().created_faces.size() == 1U);
+    REQUIRE(beveled.value().removed_edges.size() == 1U);
+    REQUIRE(beveled.value().removed_edges.front() == edge);
+    REQUIRE(beveled.value().vertex_origins.size() == 4U);
+    REQUIRE(beveled.value().face_origins.at(beveled.value().created_faces.front()).kind ==
+            carto::geometry::OriginKind::generated_from_edge);
+    REQUIRE(beveled.value().validate());
+    REQUIRE(box.value().vertex_count() == 12U);
+    REQUIRE(box.value().face_count() == 7U);
+    REQUIRE(box.value().find_edge(edge) == nullptr);
+    REQUIRE(box.value().validate());
+}
+
+void edge_bevel_rejects_boundary_large_and_multisegment_inputs_without_mutation() {
+    auto plane = carto::geometry::make_plane(2.0, 2.0);
+    REQUIRE(plane);
+    const auto plane_topology = plane.value().topology();
+    REQUIRE(plane_topology);
+    const auto boundary_edge = plane_topology.value().edges.front().id;
+    const auto plane_revision = plane.value().revision();
+    const auto boundary = plane.value().bevel_edge(boundary_edge, 0.1);
+    REQUIRE(!boundary);
+    REQUIRE(boundary.error().code == carto::core::ErrorCode::unsupported);
+    REQUIRE(plane.value().revision() == plane_revision);
+    REQUIRE(plane.value().vertex_count() == 4U);
+    REQUIRE(plane.value().face_count() == 1U);
+
+    auto box = carto::geometry::make_box({1.0, 1.0, 1.0});
+    REQUIRE(box);
+    const auto topology = box.value().topology();
+    REQUIRE(topology);
+    const auto edge = topology.value().edges.front().id;
+    const auto before_revision = box.value().revision();
+    const auto before_vertices = box.value().vertex_count();
+    for (const double width : {
+             0.0,
+             -0.1,
+             std::numeric_limits<double>::quiet_NaN(),
+             std::numeric_limits<double>::infinity(),
+         }) {
+        const auto invalid_width = box.value().bevel_edge(edge, width);
+        REQUIRE(!invalid_width);
+        REQUIRE(invalid_width.error().code == carto::core::ErrorCode::invalid_argument);
+        REQUIRE(box.value().revision() == before_revision);
+        REQUIRE(box.value().vertex_count() == before_vertices);
+    }
+    const auto missing = box.value().bevel_edge(carto::geometry::EdgeId{999999U}, 0.1);
+    REQUIRE(!missing);
+    REQUIRE(missing.error().code == carto::core::ErrorCode::not_found);
+    REQUIRE(box.value().revision() == before_revision);
+    const auto too_wide = box.value().bevel_edge(edge, 0.5);
+    REQUIRE(!too_wide);
+    REQUIRE(too_wide.error().code == carto::core::ErrorCode::invalid_argument);
+    REQUIRE(box.value().revision() == before_revision);
+    REQUIRE(box.value().vertex_count() == before_vertices);
+
+    const auto multisegment = box.value().bevel_edge(edge, 0.1, 2U);
+    REQUIRE(!multisegment);
+    REQUIRE(multisegment.error().code == carto::core::ErrorCode::unsupported);
+    REQUIRE(box.value().revision() == before_revision);
+    REQUIRE(box.value().vertex_count() == before_vertices);
+    REQUIRE(box.value().validate());
+}
+
+void edge_bevel_rejects_nonconvex_and_nonplanar_faces_without_mutation() {
+    carto::geometry::EditableMesh concave;
+    const auto a = concave.add_vertex({0.0, 0.0, 0.0});
+    const auto b = concave.add_vertex({2.0, 0.0, 0.0});
+    const auto c = concave.add_vertex({2.0, 2.0, 0.0});
+    const auto d = concave.add_vertex({1.0, 0.75, 0.0});
+    const auto e = concave.add_vertex({0.0, 2.0, 0.0});
+    const auto f = concave.add_vertex({1.0, -1.0, 0.0});
+    REQUIRE(a && b && c && d && e && f);
+    REQUIRE(concave.add_face({a.value(), b.value(), c.value(), d.value(), e.value()}));
+    REQUIRE(concave.add_face({b.value(), a.value(), f.value()}));
+    REQUIRE(concave.validate());
+    const auto concave_topology = concave.topology();
+    REQUIRE(concave_topology);
+    const auto concave_edge = std::find_if(
+        concave_topology.value().edges.begin(), concave_topology.value().edges.end(),
+        [a, b](const auto& edge) {
+            return edge.first == std::min(a.value(), b.value()) &&
+                edge.second == std::max(a.value(), b.value());
+        });
+    REQUIRE(concave_edge != concave_topology.value().edges.end());
+    const auto concave_revision = concave.revision();
+    const auto rejected_concave = concave.bevel_edge(concave_edge->id, 0.1);
+    REQUIRE(!rejected_concave);
+    REQUIRE(rejected_concave.error().code == carto::core::ErrorCode::unsupported);
+    REQUIRE(concave.revision() == concave_revision);
+    REQUIRE(concave.validate());
+
+    carto::geometry::EditableMesh nonplanar;
+    const auto na = nonplanar.add_vertex({0.0, 0.0, 0.0});
+    const auto nb = nonplanar.add_vertex({2.0, 0.0, 0.0});
+    const auto nc = nonplanar.add_vertex({2.0, 2.0, 0.0});
+    const auto nd = nonplanar.add_vertex({0.0, 2.0, 0.25});
+    const auto ne = nonplanar.add_vertex({1.0, -1.0, 0.0});
+    REQUIRE(na && nb && nc && nd && ne);
+    REQUIRE(nonplanar.add_face({na.value(), nb.value(), nc.value(), nd.value()}));
+    REQUIRE(nonplanar.add_face({nb.value(), na.value(), ne.value()}));
+    REQUIRE(nonplanar.validate());
+    const auto nonplanar_topology = nonplanar.topology();
+    REQUIRE(nonplanar_topology);
+    const auto nonplanar_edge = std::find_if(
+        nonplanar_topology.value().edges.begin(), nonplanar_topology.value().edges.end(),
+        [na, nb](const auto& edge) {
+            return edge.first == std::min(na.value(), nb.value()) &&
+                edge.second == std::max(na.value(), nb.value());
+        });
+    REQUIRE(nonplanar_edge != nonplanar_topology.value().edges.end());
+    const auto nonplanar_revision = nonplanar.revision();
+    const auto rejected_nonplanar = nonplanar.bevel_edge(nonplanar_edge->id, 0.1);
+    REQUIRE(!rejected_nonplanar);
+    REQUIRE(rejected_nonplanar.error().code == carto::core::ErrorCode::unsupported);
+    REQUIRE(nonplanar.revision() == nonplanar_revision);
+    REQUIRE(nonplanar.validate());
+}
+
+void vertex_bevel_is_bounded_atomic_and_reports_lineage() {
+    auto tetrahedron = make_tetrahedron();
+    REQUIRE(tetrahedron);
+    auto mesh = std::move(tetrahedron.value());
+    const carto::geometry::VertexId vertex{1U};
+    const auto before_revision = mesh.revision();
+    const auto before_faces = mesh.face_count();
+
+    const auto beveled = mesh.bevel_vertex(vertex, 0.25);
+    REQUIRE(beveled);
+    REQUIRE(beveled.value().revision_before == before_revision);
+    REQUIRE(beveled.value().revision_after == before_revision.next());
+    REQUIRE(beveled.value().created_vertices.size() == 3U);
+    REQUIRE(beveled.value().created_faces.size() == 1U);
+    REQUIRE(beveled.value().removed_vertices.size() == 1U);
+    REQUIRE(beveled.value().removed_vertices.front() == vertex);
+    REQUIRE(beveled.value().vertex_origins.size() == 3U);
+    REQUIRE(beveled.value().face_origins.size() == 1U);
+    REQUIRE(mesh.find_vertex(vertex) == nullptr);
+    REQUIRE(mesh.vertex_count() == 6U);
+    REQUIRE(mesh.face_count() == before_faces + 1U);
+    REQUIRE(mesh.validate());
+    REQUIRE(beveled.value().validate());
+    const auto compiled = mesh.compile();
+    REQUIRE(compiled);
+    REQUIRE(compiled.value().source_revision == mesh.revision());
+}
+
+void vertex_bevel_rejects_boundary_shape_and_numeric_inputs_without_mutation() {
+    auto plane = carto::geometry::make_plane(2.0, 2.0);
+    REQUIRE(plane);
+    const auto plane_vertex = plane.value().vertices_sorted().front().id;
+    const auto plane_revision = plane.value().revision();
+    const auto boundary = plane.value().bevel_vertex(plane_vertex, 0.1);
+    REQUIRE(!boundary);
+    REQUIRE(boundary.error().code == carto::core::ErrorCode::unsupported);
+    REQUIRE(plane.value().revision() == plane_revision);
+    REQUIRE(plane.value().find_vertex(plane_vertex) != nullptr);
+    REQUIRE(plane.value().validate());
+
+    auto tetrahedron = make_tetrahedron();
+    REQUIRE(tetrahedron);
+    auto mesh = std::move(tetrahedron.value());
+    const auto before_revision = mesh.revision();
+    const auto before_vertices = mesh.vertex_count();
+    for (const auto [width, segments] : {
+             std::pair{0.0, 1U},
+             std::pair{std::numeric_limits<double>::quiet_NaN(), 1U},
+             std::pair{std::numeric_limits<double>::infinity(), 1U},
+             std::pair{1.0, 1U},
+             std::pair{0.1, 2U},
+         }) {
+        const auto rejected = mesh.bevel_vertex(carto::geometry::VertexId{1U}, width, segments);
+        REQUIRE(!rejected);
+        REQUIRE(mesh.revision() == before_revision);
+        REQUIRE(mesh.vertex_count() == before_vertices);
+        REQUIRE(mesh.find_vertex(carto::geometry::VertexId{1U}) != nullptr);
+        REQUIRE(mesh.validate());
+    }
+    const auto missing = mesh.bevel_vertex(carto::geometry::VertexId{999999U}, 0.1);
+    REQUIRE(!missing);
+    REQUIRE(missing.error().code == carto::core::ErrorCode::not_found);
+    REQUIRE(mesh.revision() == before_revision);
+
+    auto box = carto::geometry::make_box({1.0, 1.0, 1.0});
+    REQUIRE(box);
+    const auto box_vertex = box.value().vertices_sorted().front().id;
+    const auto box_revision = box.value().revision();
+    const auto non_triangular = box.value().bevel_vertex(box_vertex, 0.1);
+    REQUIRE(!non_triangular);
+    REQUIRE(non_triangular.error().code == carto::core::ErrorCode::unsupported);
+    REQUIRE(box.value().revision() == box_revision);
+    REQUIRE(box.value().validate());
 }
 
 void coplanar_internal_edge_dissolve_is_atomic_and_reports_lineage() {
@@ -1366,6 +1599,11 @@ int main() {
         face_extrude_is_atomic_and_advances_once();
         edge_split_is_atomic_and_reports_topology_delta();
         edge_split_rejects_invalid_factors_without_mutation();
+        edge_bevel_is_bounded_atomic_and_reports_lineage();
+        edge_bevel_rejects_boundary_large_and_multisegment_inputs_without_mutation();
+        edge_bevel_rejects_nonconvex_and_nonplanar_faces_without_mutation();
+        vertex_bevel_is_bounded_atomic_and_reports_lineage();
+        vertex_bevel_rejects_boundary_shape_and_numeric_inputs_without_mutation();
         coplanar_internal_edge_dissolve_is_atomic_and_reports_lineage();
         edge_dissolve_rejects_boundary_and_nonplanar_joins_without_mutation();
         triangle_to_quad_requires_two_compatible_triangles();

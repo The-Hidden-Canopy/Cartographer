@@ -16,7 +16,9 @@ struct NumericValue {
 // Parses the bounded scalar syntax shared by future modal authoring tools.
 // Values are expressed in meters; supported suffixes are m, cm, mm, in, and
 // ft. A leading += or -= marks a relative delta, while an unsuffixed value is
-// absolute. Expressions and axis locks are intentionally not accepted here.
+// absolute. Bounded +, -, *, /, and parenthesized expressions are accepted;
+// all intermediate values remain finite. Axis locks are intentionally not
+// accepted here.
 [[nodiscard]] core::Result<NumericValue> parse_numeric_value(std::string_view text);
 
 // Resolves an absolute value or relative delta against a finite base value.

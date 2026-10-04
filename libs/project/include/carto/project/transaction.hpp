@@ -54,6 +54,8 @@ public:
         std::uint64_t mesh_asset);
     [[nodiscard]] core::Result<void> set_evaluation_graph_digest(
         std::optional<assets::Sha256Digest> digest);
+    [[nodiscard]] core::Result<void> set_scientific_model(
+        scientific::ScientificModel model);
     [[nodiscard]] core::Result<void> set_object_transform(
         scene::ObjectId object,
         core::Transform transform);

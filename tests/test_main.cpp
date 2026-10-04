@@ -54,9 +54,22 @@ void numeric_entry_is_unit_aware_and_fail_closed() {
     REQUIRE(negative_relative && negative_relative.value() == 0.9746);
     const auto feet = carto::editor::parse_numeric_value("2ft");
     REQUIRE(feet && feet.value().value == 0.6096);
+    const auto scaled = carto::editor::parse_numeric_value("2*12.5mm");
+    REQUIRE(scaled && scaled.value().value == 0.025);
+    const auto mixed = carto::editor::resolve_numeric_value("1m + 25cm", 0.0);
+    REQUIRE(mixed && mixed.value() == 1.25);
+    const auto grouped = carto::editor::parse_numeric_value("(1m + 25cm) / 2");
+    REQUIRE(grouped && grouped.value().value == 0.625);
+    const auto relative_expression = carto::editor::resolve_numeric_value(
+        "+=2*12.5mm", 1.0);
+    REQUIRE(relative_expression && relative_expression.value() == 1.025);
     REQUIRE(!carto::editor::parse_numeric_value("nan"));
     REQUIRE(!carto::editor::parse_numeric_value("1yd"));
     REQUIRE(!carto::editor::parse_numeric_value("+="));
+    REQUIRE(!carto::editor::parse_numeric_value("1/0"));
+    REQUIRE(!carto::editor::parse_numeric_value("(1m + 2cm"));
+    REQUIRE(!carto::editor::parse_numeric_value("1m +"));
+    REQUIRE(!carto::editor::parse_numeric_value("1m + 2yd"));
     REQUIRE(!carto::editor::resolve_numeric_value(
         "1m", std::numeric_limits<double>::infinity()));
 }
@@ -765,17 +778,19 @@ void tool_registry_dispatches_registered_commands_through_history() {
     carto::editor::ToolRegistry registry;
     REQUIRE(registry.register_builtin_tools());
     const auto descriptors = registry.descriptors();
-    REQUIRE(descriptors.size() == 10U);
-    REQUIRE(descriptors.front().id == "mesh.dissolve-edge");
-    REQUIRE(descriptors[1].id == "mesh.extrude-face");
-    REQUIRE(descriptors[2].id == "mesh.inset-face");
-    REQUIRE(descriptors[3].id == "mesh.merge-vertices");
-    REQUIRE(descriptors[4].id == "mesh.poke-face");
-    REQUIRE(descriptors[5].id == "mesh.remove-face");
-    REQUIRE(descriptors[6].id == "mesh.set-vertex-position");
-    REQUIRE(descriptors[7].id == "mesh.slide-vertex");
-    REQUIRE(descriptors[8].id == "mesh.split-edge");
-    REQUIRE(descriptors[9].id == "mesh.tri-to-quad");
+    REQUIRE(descriptors.size() == 12U);
+    REQUIRE(descriptors.front().id == "mesh.bevel-edge");
+    REQUIRE(descriptors[1].id == "mesh.bevel-vertex");
+    REQUIRE(descriptors[2].id == "mesh.dissolve-edge");
+    REQUIRE(descriptors[3].id == "mesh.extrude-face");
+    REQUIRE(descriptors[4].id == "mesh.inset-face");
+    REQUIRE(descriptors[5].id == "mesh.merge-vertices");
+    REQUIRE(descriptors[6].id == "mesh.poke-face");
+    REQUIRE(descriptors[7].id == "mesh.remove-face");
+    REQUIRE(descriptors[8].id == "mesh.set-vertex-position");
+    REQUIRE(descriptors[9].id == "mesh.slide-vertex");
+    REQUIRE(descriptors[10].id == "mesh.split-edge");
+    REQUIRE(descriptors[11].id == "mesh.tri-to-quad");
     REQUIRE(!registry.register_builtin_tools());
 
     REQUIRE(registry.invoke("mesh.extrude-face", context, arguments, history));
@@ -856,17 +871,19 @@ void project_vertex_tool_routes_through_history_and_rejects_bad_context() {
     carto::editor::ToolRegistry registry;
     REQUIRE(registry.register_builtin_tools());
     const auto descriptors = registry.descriptors();
-    REQUIRE(descriptors.size() == 10U);
-    REQUIRE(descriptors[0].id == "mesh.dissolve-edge");
-    REQUIRE(descriptors[1].id == "mesh.extrude-face");
-    REQUIRE(descriptors[2].id == "mesh.inset-face");
-    REQUIRE(descriptors[3].id == "mesh.merge-vertices");
-    REQUIRE(descriptors[4].id == "mesh.poke-face");
-    REQUIRE(descriptors[5].id == "mesh.remove-face");
-    REQUIRE(descriptors[6].id == "mesh.set-vertex-position");
-    REQUIRE(descriptors[7].id == "mesh.slide-vertex");
-    REQUIRE(descriptors[8].id == "mesh.split-edge");
-    REQUIRE(descriptors[9].id == "mesh.tri-to-quad");
+    REQUIRE(descriptors.size() == 12U);
+    REQUIRE(descriptors[0].id == "mesh.bevel-edge");
+    REQUIRE(descriptors[1].id == "mesh.bevel-vertex");
+    REQUIRE(descriptors[2].id == "mesh.dissolve-edge");
+    REQUIRE(descriptors[3].id == "mesh.extrude-face");
+    REQUIRE(descriptors[4].id == "mesh.inset-face");
+    REQUIRE(descriptors[5].id == "mesh.merge-vertices");
+    REQUIRE(descriptors[6].id == "mesh.poke-face");
+    REQUIRE(descriptors[7].id == "mesh.remove-face");
+    REQUIRE(descriptors[8].id == "mesh.set-vertex-position");
+    REQUIRE(descriptors[9].id == "mesh.slide-vertex");
+    REQUIRE(descriptors[10].id == "mesh.split-edge");
+    REQUIRE(descriptors[11].id == "mesh.tri-to-quad");
     REQUIRE(!registry.register_builtin_tools());
 
     carto::editor::SelectionState rebound_selection;
@@ -1195,10 +1212,10 @@ void project_round_trips_authoritative_state_and_rejects_future_versions() {
     REQUIRE(loaded.value().meshes().at(mesh_id.value()).vertex_count() == 3U);
 
     std::string future = serialized_before;
-    const std::string version = "CARTOGRAPHER_PROJECT 4";
+    const std::string version = "CARTOGRAPHER_PROJECT 5";
     const auto position = future.find(version);
     REQUIRE(position != std::string::npos);
-    future.replace(position, version.size(), "CARTOGRAPHER_PROJECT 5");
+    future.replace(position, version.size(), "CARTOGRAPHER_PROJECT 6");
     const auto rejected = carto::project::ProjectDocument::deserialize(future);
     REQUIRE(!rejected);
     REQUIRE(rejected.error().code == carto::core::ErrorCode::version_mismatch);
@@ -1381,7 +1398,7 @@ void project_persists_topology_receipts_and_rejects_stale_lineage() {
     REQUIRE(document.value().validate());
 
     const std::string serialized = document.value().serialize();
-    REQUIRE(serialized.find("CARTOGRAPHER_PROJECT 4") != std::string::npos);
+    REQUIRE(serialized.find("CARTOGRAPHER_PROJECT 5") != std::string::npos);
     REQUIRE(serialized.find("TOPOLOGY_RECEIPTS 1") != std::string::npos);
 
     auto empty_document = carto::project::ProjectDocument::create("Missing Ledger");

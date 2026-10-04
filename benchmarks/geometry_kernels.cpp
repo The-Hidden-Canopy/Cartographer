@@ -28,6 +28,7 @@ constexpr double kExtrudeDistance = 0.05;
 constexpr double kInsetDistance = 0.05;
 constexpr double kSplitFactor = 0.5;
 constexpr double kSlideFactor = 0.25;
+constexpr double kBevelWidth = 0.05;
 
 struct SizeCase {
     std::size_t rows;
@@ -145,6 +146,11 @@ bool run_split(EditableMesh& mesh, const Fixture& fixture) {
     return static_cast<bool>(mesh.split_edge(fixture.edge, kSplitFactor));
 }
 
+bool run_bevel(EditableMesh& mesh, const Fixture& fixture) {
+    if (!fixture.has_interior_edge) return false;
+    return static_cast<bool>(mesh.bevel_edge(fixture.edge, kBevelWidth, 1U));
+}
+
 bool run_dissolve(EditableMesh& mesh, const Fixture& fixture) {
     if (!fixture.has_interior_edge) return false;
     return static_cast<bool>(mesh.dissolve_edge(fixture.edge));
@@ -209,13 +215,14 @@ int main() {
             SizeCase{8U, 8U, 250U},
             SizeCase{16U, 16U, 50U},
         };
-        constexpr std::array<KernelSpec, 7U> kernels = {
+        constexpr std::array<KernelSpec, 8U> kernels = {
             KernelSpec{"geometry.EditableMesh.extrude_face", run_extrude},
             KernelSpec{"geometry.EditableMesh.inset_face", run_inset},
             KernelSpec{"geometry.EditableMesh.set_vertex_position", run_vertex_position},
             KernelSpec{"geometry.EditableMesh.slide_vertex", run_vertex_slide},
             KernelSpec{"geometry.EditableMesh.delete_face", run_delete},
             KernelSpec{"geometry.EditableMesh.split_edge", run_split},
+            KernelSpec{"geometry.EditableMesh.bevel_edge", run_bevel, true},
             KernelSpec{"geometry.EditableMesh.dissolve_edge", run_dissolve, true},
         };
 
