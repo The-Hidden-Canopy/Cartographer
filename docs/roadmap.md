@@ -50,7 +50,9 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] web geometry read-only cluster diagnostics snapshots with explicit grouping-only warnings and package-bound conservative error receipts for editor/problem consumers
 - [x] web geometry backend-neutral cluster-overlay projection math with explicit matrix conventions, clipping, viewport bounds, and fail-closed non-finite handling
 - [x] web geometry deterministic package-bound page-interest planning from visible overlay identities without residency mutation
-- [ ] web geometry renderable parent simplification, VANTA import admission, native overlay rendering/pointer integration, and native runtime admission
+- [ ] private algorithmic representation and continuity work remains outside the public build boundary and requires separate release review
+- [ ] next-level polygon representation inheritance, backend-neutral identity-buffer planning, temporal-history consumers, view/material/constraint/fracture policy execution, and VANTA/runtime admission
+- [ ] web geometry VANTA import admission, native overlay rendering/pointer integration, and native runtime admission
 - [x] project-package graph reference binding, journal/checkpoint preservation, polygon topology-provenance adapter, v5 scientific-model and v5 project-bound topology receipt persistence
 - [x] opt-in Windows D3D12 adapter/resource boundary and native identity smoke acceptance
 - [x] bounded D3D12 native acceptance tranche: runtime DXIL suite, offscreen sampled-material PBR into an HDR target, HDR-to-display tone-map execution/readback, shadow-depth execution/readback, temporal resolve over current/history/motion inputs, storage-texture compute dispatch/readback, deferred descriptor/resource lifetime, typed DXGI back-buffer import, resize/present, desktop launch smoke, and an 8K temporal dispatch with bounded probe readback on the Quadro P5200

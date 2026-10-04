@@ -14,7 +14,7 @@ permanently proprietary.
 | --- | --- |
 | `.carto` authoring format and validation | model weights, private prompts, provider credentials, and routing policy |
 | provider-neutral scientific entities, fields, studies, results, and provenance | private genome interpretation, solver binaries, anatomy catalogs, and unpublished scientific datasets |
-| geometry, topology, evaluation, and mesh-attribute kernels | proprietary native kernels, optimization recipes, and tuning data |
+| geometry, topology, evaluation, and mesh-attribute kernels | proprietary native kernels, protected adaptive-representation and continuity algorithms, optimization recipes, and tuning data |
 | scene, project, revision, undo/redo, and receipts | private telemetry, workflow-learning stores, and unreleased datasets |
 | OBJ, PLY, STL, glTF, and other reviewed interchange | private schemas, catalogs, and hosted-service state |
 | render-graph, RHI, CPU reference, and clean-room GPU contracts | proprietary GPU passes, performance recipes, and entitlements |
@@ -24,6 +24,12 @@ permanently proprietary.
 The public side may expose a typed context and a typed proposal contract. It may
 not expose raw mutable authoring pointers or permit a remote service to bypass
 local validation.
+
+Protected algorithm surfaces include adaptive representation/certification
+policy, persistent topological continuity identity, field-growth or other
+private geometry-generation previews, and their benchmarks and specifications.
+They live in the adjacent private companion tree. The public checkout has no
+target, header, test, benchmark, or documentation path for those surfaces.
 
 ## Plugin-package rule
 

@@ -76,4 +76,6 @@ package. `carto_geometry` installs `carto/geometry/mesh.hpp` and
 `carto/geometry/topology_edit.hpp`; `carto_mesh_attributes` installs
 `carto/mesh_attributes/provenance.hpp`. The receipt adapter is revision-bound
 and remains a local source-index conversion, not a permission to mutate a
-project outside the owning editor/application path.
+project outside the owning editor/application path. Protected adaptive
+representation and continuity algorithms are maintained outside this public
+target graph.

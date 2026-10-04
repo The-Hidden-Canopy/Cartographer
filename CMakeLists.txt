@@ -29,6 +29,24 @@ option(CARTO_BUILD_GMIB_GAME "Build the Cartographer-hosted GMIB game surface" O
 # consumer such as CONDITION. Resolve the public boundary from this checkout,
 # not from whichever project owns the outer CMake configure.
 get_filename_component(_carto_public_root "${CMAKE_CURRENT_SOURCE_DIR}" REALPATH)
+set(_carto_protected_public_paths
+    "${_carto_public_root}/libs/web_geometry/certified"
+    "${_carto_public_root}/libs/polygon"
+    "${_carto_public_root}/tests/certified_geometry_tests.cpp"
+    "${_carto_public_root}/tests/polygon_tests.cpp"
+    "${_carto_public_root}/benchmarks/certified_geometry.cpp"
+    "${_carto_public_root}/benchmarks/polygon.cpp"
+    "${_carto_public_root}/docs/architecture/consequence-certified-adaptive-geometry.md"
+    "${_carto_public_root}/docs/verification/consequence-certified-adaptive-geometry.md"
+    "${_carto_public_root}/docs/architecture/persistent-polygons.md"
+    "${_carto_public_root}/docs/verification/persistent-polygons.md"
+)
+foreach(_carto_protected_path IN LISTS _carto_protected_public_paths)
+    if(EXISTS "${_carto_protected_path}")
+        message(FATAL_ERROR
+            "protected Cartographer algorithm surface must remain outside the public checkout: ${_carto_protected_path}")
+    endif()
+endforeach()
 if(CARTO_BUILD_PRIVATE_INTEGRATIONS)
     if(CARTO_PRIVATE_SOURCE_ROOT STREQUAL "" OR
        NOT IS_DIRECTORY "${CARTO_PRIVATE_SOURCE_ROOT}")
@@ -45,13 +63,17 @@ if(CARTO_BUILD_PRIVATE_INTEGRATIONS)
         "${CARTO_PRIVATE_SOURCE_ROOT}/libs/anatomy/CMakeLists.txt"
         "${CARTO_PRIVATE_SOURCE_ROOT}/libs/owh/CMakeLists.txt"
         "${CARTO_PRIVATE_SOURCE_ROOT}/libs/simulation/CMakeLists.txt"
-        "${CARTO_PRIVATE_SOURCE_ROOT}/tests/anatomy_catalog_tests.cpp")
+        "${CARTO_PRIVATE_SOURCE_ROOT}/tests/anatomy_catalog_tests.cpp"
+        "${CARTO_PRIVATE_SOURCE_ROOT}/cmake/private_extensions.cmake")
     foreach(_carto_private_path IN LISTS _carto_private_required_paths)
         if(NOT EXISTS "${_carto_private_path}")
             message(FATAL_ERROR
                 "CARTO_BUILD_PRIVATE_INTEGRATIONS=ON requires a complete CARTO_PRIVATE_SOURCE_ROOT: missing ${_carto_private_path}")
         endif()
     endforeach()
+endif()
+if(CARTO_BUILD_PRIVATE_INTEGRATIONS)
+    include("${CARTO_PRIVATE_SOURCE_ROOT}/cmake/private_extensions.cmake")
 endif()
 if((CARTO_BUILD_GMIB_GRAPHICS OR CARTO_BUILD_GMIB_GAME) AND
    NOT CARTO_BUILD_PRIVATE_INTEGRATIONS)
@@ -181,6 +203,10 @@ add_subdirectory(libs/ui)
 add_subdirectory(libs/sdk)
 add_subdirectory(libs/io)
 
+if(CARTO_BUILD_PRIVATE_INTEGRATIONS)
+    carto_private_add_geometry_extensions()
+endif()
+
 if(CARTO_BUILD_GMIB_GAME)
     target_link_libraries(cartographer_gmib_game PRIVATE carto_project)
     add_executable(
@@ -238,6 +264,9 @@ endif()
 
 if(CARTO_BUILD_BENCHMARKS)
     add_subdirectory(benchmarks)
+    if(CARTO_BUILD_PRIVATE_INTEGRATIONS)
+        carto_private_add_benchmark_extensions()
+    endif()
 endif()
 
 if(CARTO_BUILD_TESTS)
@@ -245,6 +274,8 @@ if(CARTO_BUILD_TESTS)
     add_subdirectory(tests)
 
     if(CARTO_BUILD_PRIVATE_INTEGRATIONS)
+        carto_private_add_test_extensions()
+
         add_executable(cartographer_simulation_tests
             "${CARTO_PRIVATE_SOURCE_ROOT}/libs/simulation/tests/simulation_tests.cpp")
         target_link_libraries(cartographer_simulation_tests PRIVATE carto_simulation)

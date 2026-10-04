@@ -71,6 +71,18 @@ class PublicBoundaryAuditTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("docs/spec/source.pdf", result.stdout)
 
+    def test_protected_algorithm_history_path_fails(self) -> None:
+        with self.make_repo() as temporary:
+            repo = Path(temporary)
+            path = repo / "libs" / "polygon" / "src" / "polygon.cpp"
+            path.parent.mkdir(parents=True)
+            path.write_text("protected fixture\n", encoding="utf-8")
+            git(repo, "add", ".")
+            git(repo, "commit", "-q", "-m", "protected algorithm fixture")
+            result = audit(repo)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("libs/polygon/src/polygon.cpp", result.stdout)
+
     def test_untracked_model_artifact_fails(self) -> None:
         with self.make_repo() as temporary:
             repo = Path(temporary)
@@ -130,8 +142,16 @@ class PublicBoundaryAuditTests(unittest.TestCase):
             blocking = audit(repo, "--fail-on-review")
             self.assertEqual(blocking.returncode, 1)
 
-    def test_checkout_ignore_policy_passes(self) -> None:
-        result = audit(ROOT, "--check-ignore-policy")
+    def test_ignore_policy_passes_before_history_is_considered(self) -> None:
+        with self.make_repo() as temporary:
+            repo = Path(temporary)
+            (repo / ".gitignore").write_text(
+                (ROOT / ".gitignore").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            git(repo, "add", ".gitignore")
+            git(repo, "commit", "-q", "-m", "ignore policy")
+            result = audit(repo, "--check-ignore-policy")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 

@@ -26,6 +26,7 @@ narrow and installable without private integrations:
 #include <carto/geometry/mesh.hpp>
 #include <carto/geometry/topology_edit.hpp>
 #include <carto/mesh_attributes/provenance.hpp>
+#include <carto/polygon/polygon.hpp>
 ```
 
 `carto_geometry` owns validated `TopologyEditReceipt` values and deterministic

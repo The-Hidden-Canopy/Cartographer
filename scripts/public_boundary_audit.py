@@ -31,6 +31,18 @@ FORBIDDEN_PREFIXES = (
     ".private/",
     "docs/anatomy/",
     "docs/spec/",
+    # Protected invention-bearing algorithm surfaces are out-of-tree even
+    # when their names do not look like credentials or private integrations.
+    "libs/web_geometry/certified/",
+    "libs/polygon/",
+    "tests/certified_geometry_tests.cpp",
+    "tests/polygon_tests.cpp",
+    "benchmarks/certified_geometry.cpp",
+    "benchmarks/polygon.cpp",
+    "docs/architecture/consequence-certified-adaptive-geometry.md",
+    "docs/verification/consequence-certified-adaptive-geometry.md",
+    "docs/architecture/persistent-polygons.md",
+    "docs/verification/persistent-polygons.md",
 )
 
 FORBIDDEN_SUFFIXES = (
@@ -78,6 +90,8 @@ REQUIRED_IGNORE_PROBES = (
     "models-private/model.bin",
     "private-runtime/snapshot.db",
     "docs/spec/source.pdf",
+    "libs/polygon/src/polygon.cpp",
+    "libs/web_geometry/certified/src/certified.cpp",
     "sample.owh.carto",
     "sample.carto.journal",
     "sample.carto.lock",
@@ -280,6 +294,8 @@ def main() -> int:
 
     for source, paths in (("tracked", tracked), ("untracked", untracked)):
         for path in paths:
+            if source == "tracked" and normalize_path(path) in deleted_paths:
+                continue
             reason = path_reason(path)
             if reason is not None:
                 findings.append(f"{source} path {path}: {reason}")

@@ -108,3 +108,15 @@ _deps/
 *.owh.carto
 *.private.*
 .codex-remote-attachments/
+
+# Protected invention-bearing algorithm surfaces stay outside the public tree.
+/libs/web_geometry/certified/
+/libs/polygon/
+/tests/certified_geometry_tests.cpp
+/tests/polygon_tests.cpp
+/benchmarks/certified_geometry.cpp
+/benchmarks/polygon.cpp
+/docs/architecture/consequence-certified-adaptive-geometry.md
+/docs/verification/consequence-certified-adaptive-geometry.md
+/docs/architecture/persistent-polygons.md
+/docs/verification/persistent-polygons.md
