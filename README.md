@@ -36,9 +36,10 @@ checkout.
   null-command registrations fail closed. Tool factories receive no mutable
   mesh accessor; the built-in project-bound context resolves the selected scene
   object to its mesh asset and exposes only approved command builders.
-- `carto_editor` routes supported transforms, vertex edits, and mesh-object
-  creation through reversible commands, preserving stable IDs across
-  undo/redo and keeping failed commands out of history.
+- `carto_editor` routes supported transforms, vertex edits, mesh-object
+  creation, and bounded root-level mesh-instance duplication through reversible
+  commands. Instances share the source mesh asset rather than copying geometry;
+  stable IDs survive undo/redo and failed commands stay out of history.
 - The built-in project tool context also routes a single selected vertex to a
   validated position-edit command; invalid geometry, stale owners, and wrong
   selection modes fail without changing history or sibling assets. Project

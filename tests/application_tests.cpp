@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -508,6 +509,97 @@ void application_routes_imported_mesh_through_the_durable_command_boundary() {
         entries.value().back().payload.begin(), entries.value().back().payload.end());
     REQUIRE(payload.find("operation=Create Mesh Object") != std::string::npos);
     REQUIRE(journal.verify());
+}
+
+void application_duplicates_mesh_instances_through_durable_history() {
+    TempDirectory temp;
+    const auto path = temp.path() / "instanced-module.carto";
+
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::NewProjectAction{"Instanced module"}));
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SaveProjectAction{path}));
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::CreateBoxAction{"Module", {2.0, 2.0, 2.0}}));
+
+    const auto source = session.snapshot().objects.front().object;
+    REQUIRE(source.mesh_asset.has_value());
+    const auto before_rejections = session.snapshot();
+    REQUIRE(!carto::application::testing::dispatch(
+        session,
+        carto::application::DuplicateMeshInstanceAction{
+            carto::scene::ObjectId{999U}, "Missing", {1.0, 0.0, 0.0}}));
+    REQUIRE(!carto::application::testing::dispatch(
+        session,
+        carto::application::DuplicateMeshInstanceAction{
+            source.id,
+            "Non-finite",
+            {std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0}}));
+    REQUIRE(session.snapshot().project_revision == before_rejections.project_revision);
+    REQUIRE(session.snapshot().undo_count == before_rejections.undo_count);
+    REQUIRE(session.snapshot().objects.size() == before_rejections.objects.size());
+
+    const auto duplicated = carto::application::testing::dispatch(
+        session,
+        carto::application::DuplicateMeshInstanceAction{
+            source.id, "Module east", {4.0, 0.0, -1.0}});
+    REQUIRE(duplicated);
+    REQUIRE(duplicated.value().action == "Duplicate Mesh Instance");
+    REQUIRE(duplicated.value().document_changed);
+    REQUIRE(duplicated.value().affected.objects.size() == 1U);
+    REQUIRE(duplicated.value().affected.objects.front() == source.id);
+    REQUIRE(duplicated.value().parameters.has_value());
+    REQUIRE(duplicated.value().parameters->position.has_value());
+    REQUIRE(duplicated.value().parameters->position->x == 4.0);
+    REQUIRE(duplicated.value().parameters->position->y == 0.0);
+    REQUIRE(duplicated.value().parameters->position->z == -1.0);
+
+    auto snapshot = session.snapshot();
+    REQUIRE(snapshot.objects.size() == 2U);
+    REQUIRE(snapshot.viewport.scene.size() == 2U);
+    const auto duplicate_iterator = std::find_if(
+        snapshot.objects.begin(), snapshot.objects.end(), [](const auto& view) {
+            return view.object.name == "Module east";
+        });
+    REQUIRE(duplicate_iterator != snapshot.objects.end());
+    const auto duplicate_id = duplicate_iterator->object.id;
+    REQUIRE(duplicate_iterator->object.mesh_asset == source.mesh_asset);
+    REQUIRE(duplicate_iterator->object.local_transform.translation.x == 4.0);
+    REQUIRE(duplicate_iterator->object.local_transform.translation.y == 0.0);
+    REQUIRE(duplicate_iterator->object.local_transform.translation.z == -1.0);
+
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SaveProjectAction{std::nullopt}));
+    const auto loaded = carto::project::ProjectDocument::load(path);
+    REQUIRE(loaded);
+    REQUIRE(loaded.value().scene().size() == 2U);
+    REQUIRE(loaded.value().meshes().size() == 1U);
+    REQUIRE(loaded.value().scene().find(source.id));
+    REQUIRE(loaded.value().scene().find(duplicate_id));
+    REQUIRE(loaded.value().scene().find(duplicate_id)->mesh_asset == source.mesh_asset);
+
+    carto::journal::Journal journal(std::filesystem::path(path.string() + ".journal"));
+    const auto entries = journal.read_all();
+    REQUIRE(entries);
+    REQUIRE(entries.value().size() == 3U);
+    const std::string payload(
+        entries.value().back().payload.begin(), entries.value().back().payload.end());
+    REQUIRE(payload.find("operation=Duplicate Mesh Instance") != std::string::npos);
+    REQUIRE(journal.verify());
+
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::UndoAction{}));
+    REQUIRE(session.snapshot().objects.size() == 1U);
+    REQUIRE(session.snapshot().viewport.scene.size() == 1U);
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::RedoAction{}));
+    snapshot = session.snapshot();
+    REQUIRE(snapshot.objects.size() == 2U);
+    const auto restored = std::find_if(
+        snapshot.objects.begin(), snapshot.objects.end(), [duplicate_id](const auto& view) {
+            return view.object.id == duplicate_id;
+        });
+    REQUIRE(restored != snapshot.objects.end());
+    REQUIRE(restored->object.mesh_asset == source.mesh_asset);
 }
 
 void application_routes_vertex_edit_and_rejects_stale_reselection() {
@@ -1315,6 +1407,7 @@ int main() {
         application_routes_vertex_bevel_through_history_and_persistence();
         application_rejects_vertex_bevel_wrong_mode_and_multi_selection();
         application_routes_imported_mesh_through_the_durable_command_boundary();
+        application_duplicates_mesh_instances_through_durable_history();
         application_routes_vertex_edit_and_rejects_stale_reselection();
         application_repeats_last_tool_against_current_document();
         application_rejects_repeat_without_prior_tool();

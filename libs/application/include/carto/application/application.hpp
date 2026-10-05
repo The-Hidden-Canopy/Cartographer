@@ -268,6 +268,14 @@ struct CreateMeshObjectAction {
     geometry::EditableMesh mesh;
 };
 
+// Duplicates only an authored mesh instance. The new root object retains the
+// source mesh asset identity; it does not copy geometry or hierarchy state.
+struct DuplicateMeshInstanceAction {
+    scene::ObjectId source;
+    std::string object_name;
+    core::Vec3d local_translation_offset{};
+};
+
 struct UndoAction {};
 struct RedoAction {};
 
@@ -292,6 +300,7 @@ using ApplicationAction = std::variant<
     CreateBoxAction,
     CreatePlaneAction,
     CreateMeshObjectAction,
+    DuplicateMeshInstanceAction,
     UndoAction,
     RedoAction>;
 
@@ -380,6 +389,8 @@ private:
     [[nodiscard]] core::Result<DispatchReceipt> create_plane(const CreatePlaneAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_mesh_object(
         const CreateMeshObjectAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> duplicate_mesh_instance(
+        const DuplicateMeshInstanceAction& action);
     [[nodiscard]] core::Result<ApplicationAction> preview_action(
         const editor::AuthoringPreview& preview) const;
     [[nodiscard]] core::Result<DispatchReceipt> undo();

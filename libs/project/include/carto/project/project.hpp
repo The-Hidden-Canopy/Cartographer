@@ -22,6 +22,7 @@ class ApplicationSession;
 
 namespace carto::editor {
 class CreateMeshObjectCommand;
+class DuplicateProjectMeshInstanceCommand;
 class DeleteProjectSelectedFaceCommand;
 class DissolveProjectSelectedEdgeCommand;
 class ExtrudeProjectSelectedFaceCommand;
@@ -106,6 +107,7 @@ public:
 private:
     friend class ::carto::application::ApplicationSession;
     friend class ::carto::editor::CreateMeshObjectCommand;
+    friend class ::carto::editor::DuplicateProjectMeshInstanceCommand;
     friend class ::carto::editor::DeleteProjectSelectedFaceCommand;
     friend class ::carto::editor::DissolveProjectSelectedEdgeCommand;
     friend class ::carto::editor::ExtrudeProjectSelectedFaceCommand;
