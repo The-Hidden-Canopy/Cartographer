@@ -14,6 +14,7 @@ evidence only for the named behavior; it does not promote deferred features.
 | project-bound vertex tool | project vertex tool test | selected second asset changes only that asset; wrong mode, invalid geometry, stale owner, and undo/redo fail safely |
 | primitive creation uses the command boundary | mesh-object command test | object/mesh creation is reversible and stable IDs survive redo |
 | root-level mesh instance duplication | core/application command tests | only a visible, unlocked root mesh source with a finite offset can produce a second root object; the mesh asset is shared rather than copied, source state is preserved, undo/redo and reopen retain identity, and invalid sources fail without mutation |
+| heterogeneous production receipt admission | production closure tests | source revision/digest, algorithm/settings/platform, quality, confidence, cost, and output identity are bound; stale, over-budget, failed, or superseded evidence cannot publish |
 | single-face extrusion | face extrusion command test | side/cap topology validates; failed distance is atomic; undo/redo works |
 | selection mode isolation | selection state test | changing object/vertex/face modes clears incompatible active selections |
 | stale selection context | selection state and project vertex tool tests | missing IDs, different mesh instances, changed mesh revisions, rebinding, and stale owners fail closed |

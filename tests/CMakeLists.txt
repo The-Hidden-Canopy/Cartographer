@@ -33,6 +33,16 @@ target_link_libraries(cartographer_evaluation_attributes_tests
 carto_target(cartographer_evaluation_attributes_tests)
 add_test(NAME cartographer_evaluation_attributes_tests COMMAND cartographer_evaluation_attributes_tests)
 
+add_executable(cartographer_production_closure_tests
+    production_closure_tests.cpp
+)
+target_link_libraries(cartographer_production_closure_tests
+    PRIVATE
+        carto_production
+)
+carto_target(cartographer_production_closure_tests)
+add_test(NAME cartographer_production_closure_tests COMMAND cartographer_production_closure_tests)
+
 add_executable(cartographer_web_geometry_tests
     web_geometry_tests.cpp
 )
