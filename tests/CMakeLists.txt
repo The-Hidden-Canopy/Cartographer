@@ -60,6 +60,82 @@ target_link_libraries(cartographer_surface_closure_tests
 carto_target(cartographer_surface_closure_tests)
 add_test(NAME cartographer_surface_closure_tests COMMAND cartographer_surface_closure_tests)
 
+add_executable(cartographer_surface_fidelity_package_json_tests
+    surface_fidelity_package_json_tests.cpp
+)
+target_link_libraries(cartographer_surface_fidelity_package_json_tests
+    PRIVATE
+        carto_surface_core
+        carto_geometry
+)
+carto_target(cartographer_surface_fidelity_package_json_tests)
+add_test(NAME cartographer_surface_fidelity_package_json_tests
+    COMMAND cartographer_surface_fidelity_package_json_tests)
+
+add_executable(cartographer_surface_workflow_tests
+    surface_workflow_tests.cpp
+)
+target_link_libraries(cartographer_surface_workflow_tests
+    PRIVATE
+        carto_surface_core
+)
+carto_target(cartographer_surface_workflow_tests)
+add_test(NAME cartographer_surface_workflow_tests COMMAND cartographer_surface_workflow_tests)
+
+add_executable(cartographer_surface_spectrum_tests
+    surface_spectrum_tests.cpp
+)
+target_link_libraries(cartographer_surface_spectrum_tests
+    PRIVATE
+        carto_surface_core
+        carto_geometry
+)
+carto_target(cartographer_surface_spectrum_tests)
+add_test(NAME cartographer_surface_spectrum_tests COMMAND cartographer_surface_spectrum_tests)
+
+add_executable(cartographer_surface_distribution_tests
+    surface_distribution_tests.cpp
+)
+target_link_libraries(cartographer_surface_distribution_tests
+    PRIVATE
+        carto_surface_core
+)
+carto_target(cartographer_surface_distribution_tests)
+add_test(NAME cartographer_surface_distribution_tests COMMAND cartographer_surface_distribution_tests)
+
+add_executable(cartographer_surface_qem_tests
+    surface_qem_tests.cpp
+)
+target_link_libraries(cartographer_surface_qem_tests
+    PRIVATE
+        carto_surface_core
+        carto_geometry
+)
+carto_target(cartographer_surface_qem_tests)
+add_test(NAME cartographer_surface_qem_tests COMMAND cartographer_surface_qem_tests)
+
+add_executable(cartographer_surface_normal_closure_tests
+    surface_normal_closure_tests.cpp
+)
+target_link_libraries(cartographer_surface_normal_closure_tests
+    PRIVATE
+        carto_surface_core
+        carto_geometry
+)
+carto_target(cartographer_surface_normal_closure_tests)
+add_test(NAME cartographer_surface_normal_closure_tests COMMAND cartographer_surface_normal_closure_tests)
+
+add_executable(cartographer_surface_visibility_closure_tests
+    surface_visibility_closure_tests.cpp
+)
+target_link_libraries(cartographer_surface_visibility_closure_tests
+    PRIVATE
+        carto_surface_core
+        carto_geometry
+)
+carto_target(cartographer_surface_visibility_closure_tests)
+add_test(NAME cartographer_surface_visibility_closure_tests COMMAND cartographer_surface_visibility_closure_tests)
+
 if(CARTO_BUILD_DEVICE_CPU)
     add_executable(cartographer_device_tests
         device_tests.cpp

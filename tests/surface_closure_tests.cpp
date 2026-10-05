@@ -157,6 +157,16 @@ void representation_tree_and_vanta_package_are_fail_closed() {
         compiled.value(), domain.value(), options);
     REQUIRE(closure);
 
+    const auto invalid_mode = carto::surface::compile_surface_representation(
+        compiled.value(), domain.value(), options,
+        static_cast<carto::surface::RepresentationMode>(99));
+    REQUIRE(!invalid_mode);
+
+    auto invalid_closure = closure.value();
+    invalid_closure.kind = static_cast<carto::surface::SurfaceRepresentationKind>(99);
+    REQUIRE(!invalid_closure.refresh_digest());
+    REQUIRE(!invalid_closure.validate(compiled.value(), domain.value()));
+
     const carto::surface::RepresentationId root_id{
         closure.value().representation.value == 1U ? 2U : 1U};
     const std::string root_digest = test_digest("surface-root");
@@ -181,6 +191,10 @@ void representation_tree_and_vanta_package_are_fail_closed() {
     }));
     REQUIRE(tree.validate(domain.value().id));
 
+    auto invalid_node = tree.nodes().front();
+    invalid_node.kind = static_cast<carto::surface::SurfaceRepresentationKind>(99);
+    REQUIRE(!invalid_node.validate());
+
     carto::surface::RepresentationMigration migration{
         domain.value().id,
         root_id,
@@ -194,6 +208,11 @@ void representation_tree_and_vanta_package_are_fail_closed() {
     };
     REQUIRE(migration.refresh_digest());
     REQUIRE(migration.validate());
+
+    auto invalid_migration = migration;
+    invalid_migration.targets.front() = static_cast<carto::surface::MigrationTarget>(99);
+    REQUIRE(!invalid_migration.refresh_digest());
+    REQUIRE(!invalid_migration.validate());
 
     carto::surface::VantaFidelityPackage package;
     package.source_revision = compiled.value().source_revision;
@@ -212,6 +231,45 @@ void representation_tree_and_vanta_package_are_fail_closed() {
     package.migrations.push_back(migration);
     REQUIRE(package.refresh_digest());
     REQUIRE(package.validate(compiled.value()));
+
+    const auto foreign_domain = carto::surface::build_surface_domain(
+        compiled.value(), carto::surface::SurfaceDomainId{21U});
+    REQUIRE(foreign_domain);
+    const carto::surface::RepresentationId foreign_root_id{
+        closure.value().representation.value == 999U ? 1000U : 999U};
+    const carto::surface::SurfaceRepresentationNode foreign_root{
+        foreign_root_id,
+        foreign_domain.value().id,
+        std::nullopt,
+        {},
+        carto::surface::SurfaceRepresentationKind::authored,
+        {},
+        test_digest("foreign-root"),
+    };
+    REQUIRE(foreign_root.validate());
+
+    auto cross_domain_base = package;
+    cross_domain_base.domains.push_back(foreign_domain.value());
+    cross_domain_base.representations.push_back(foreign_root);
+    REQUIRE(cross_domain_base.refresh_digest());
+    REQUIRE(cross_domain_base.validate(compiled.value()));
+
+    auto cross_domain_runtime = cross_domain_base;
+    cross_domain_runtime.runtime_records.front().representation = foreign_root_id;
+    REQUIRE(cross_domain_runtime.refresh_digest());
+    REQUIRE(!cross_domain_runtime.validate(compiled.value()));
+
+    auto cross_domain_closure = cross_domain_base;
+    cross_domain_closure.closures.front().representation = foreign_root_id;
+    REQUIRE(cross_domain_closure.closures.front().refresh_digest());
+    REQUIRE(cross_domain_closure.refresh_digest());
+    REQUIRE(!cross_domain_closure.validate(compiled.value()));
+
+    auto cross_domain_migration = cross_domain_base;
+    cross_domain_migration.migrations.front().source_representation = foreign_root_id;
+    REQUIRE(cross_domain_migration.migrations.front().refresh_digest());
+    REQUIRE(cross_domain_migration.refresh_digest());
+    REQUIRE(!cross_domain_migration.validate(compiled.value()));
 
     auto tampered = package;
     tampered.digest[0] = tampered.digest[0] == '0' ? '1' : '0';

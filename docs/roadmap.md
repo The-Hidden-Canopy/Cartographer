@@ -53,6 +53,12 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] public surface-fidelity first milestone: revision-bound SurfaceDomain, bounded differential/frequency analysis, geometry-only baseline, geometry-derived NDF, directional visibility closure, CPU radiometric envelopes, appearance admission, representation tree, and derived VANTA fidelity package
 - [x] native Surface Fidelity workbench instrument: explicit triangle-budget preview, appearance admission readout, revision-bound ghost overlay, and stale-preview invalidation without authoring mutation
 - [x] public surface process contracts: explicit migration receipts, material stratigraphy/depth exposure, deterministic weathering state, manufacturing history, contact graph, semantic edge profiles, and material-derived geometry intent without authored-topology mutation
+- [x] standalone surface workflow tranche: deterministic candidate planning, append-only evidence reuse, face/edge/material/process/semantic invalidation, and scene-wide fidelity budget selection
+- [x] bounded native surface graph spectrum reference: revision-bound domain graph, mass-normalized Laplacian, deterministic low modes, signal coefficients, and CPU acceptance/benchmark receipts
+- [x] bounded equal-bin surface distribution metrics: normalized weights, Jensen-Shannon, Fisher-Rao, Wasserstein/EMD, and capped Sinkhorn receipts with explicit support matching
+- [x] bounded constrained QEM candidate compiler: plane quadrics, protected domain boundaries, deterministic collapse receipts, exact target admission, and output topology validation
+- [x] QEM-to-distribution normal closure receipt: area-weighted source/candidate normal histograms, correlated distribution metrics, area residual, and revision-bound validation
+- [x] bounded geometric visibility closure: explicit hemisphere rays, source/candidate occlusion histograms, average visibility residual, and fail-closed receipt validation
 - [ ] private algorithmic representation and continuity work remains outside the public build boundary and requires separate release review
 - [ ] next-level polygon representation inheritance, view/material/constraint/fracture policy execution, and VANTA/runtime admission
 - [x] backend-neutral surface-identity buffer planning and revision-bound CPU temporal-history rejection; native shader binding and GPU acceptance remain deferred

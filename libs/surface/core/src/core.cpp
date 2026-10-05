@@ -44,6 +44,45 @@ bool valid_hex_digest(std::string_view value) {
     return value.size() == 64U && assets::Sha256Digest::from_hex(value).has_value();
 }
 
+bool valid_representation_kind(SurfaceRepresentationKind kind) {
+    switch (kind) {
+    case SurfaceRepresentationKind::authored:
+    case SurfaceRepresentationKind::dense_geometry:
+    case SurfaceRepresentationKind::simplified_geometry:
+    case SurfaceRepresentationKind::displacement_surface:
+    case SurfaceRepresentationKind::normal_distribution:
+    case SurfaceRepresentationKind::closure_proxy:
+    case SurfaceRepresentationKind::collision_proxy:
+    case SurfaceRepresentationKind::runtime_cluster:
+        return true;
+    }
+    return false;
+}
+
+bool valid_representation_mode(RepresentationMode mode) {
+    switch (mode) {
+    case RepresentationMode::geometry_only:
+    case RepresentationMode::fidelity_closure:
+        return true;
+    }
+    return false;
+}
+
+bool valid_migration_target(MigrationTarget target) {
+    switch (target) {
+    case MigrationTarget::displacement:
+    case MigrationTarget::normal_field:
+    case MigrationTarget::ndf:
+    case MigrationTarget::roughness:
+    case MigrationTarget::anisotropy:
+    case MigrationTarget::cavity:
+    case MigrationTarget::directional_visibility:
+    case MigrationTarget::silhouette_descriptor:
+        return true;
+    }
+    return false;
+}
+
 assets::Sha256Digest digest_text(std::string_view value) {
     return assets::sha256(std::span<const std::uint8_t>{
         reinterpret_cast<const std::uint8_t*>(value.data()), value.size()});
@@ -1149,7 +1188,8 @@ std::string SurfaceClosurePolygon::canonical() const {
 
 core::Result<void> SurfaceClosurePolygon::refresh_digest() {
     if (!domain || !representation || source_revision.exhausted() || source_faces.empty() ||
-        algorithm_version.empty()) {
+        algorithm_version.empty() || !valid_representation_kind(kind) ||
+        !valid_representation_mode(mode)) {
         return core::Result<void>::failure(validation(
             "surface closure cannot refresh digest from incomplete provenance"));
     }
@@ -1163,6 +1203,7 @@ core::Result<void> SurfaceClosurePolygon::validate(
     if (auto result = source_domain.validate(source); !result) return result;
     if (domain != source_domain.id || source_revision != source_domain.source_revision ||
         source_faces != source_domain.source_faces || !representation || algorithm_version.empty() ||
+        !valid_representation_kind(kind) || !valid_representation_mode(mode) ||
         !valid_hex_digest(digest) || digest != digest_hex(canonical())) {
         return core::Result<void>::failure(validation(
             "surface closure provenance does not match its source domain"));
@@ -1178,6 +1219,10 @@ core::Result<SurfaceClosurePolygon> compile_surface_representation(
     const SurfaceDomain& domain,
     const SurfaceClosureCompileOptions& options,
     RepresentationMode mode) {
+    if (!valid_representation_mode(mode)) {
+        return core::Result<SurfaceClosurePolygon>::failure(
+            invalid("surface closure representation mode is invalid"));
+    }
     if (auto result = options.validate(); !result) {
         return core::Result<SurfaceClosurePolygon>::failure(result.error());
     }
@@ -1330,6 +1375,7 @@ core::Result<void> admit_surface_representation(
 core::Result<void> RepresentationMigration::validate() const {
     if (!domain || !source_representation || !target_representation ||
         source_representation == target_representation || targets.empty() ||
+        !std::all_of(targets.begin(), targets.end(), valid_migration_target) ||
         !std::is_sorted(targets.begin(), targets.end()) ||
         std::adjacent_find(targets.begin(), targets.end()) != targets.end() ||
         !finite_nonnegative(residual_radiometric_error) || source_revision.exhausted() ||
@@ -1356,6 +1402,7 @@ std::string RepresentationMigration::canonical() const {
 core::Result<void> RepresentationMigration::refresh_digest() {
     if (!domain || !source_representation || !target_representation ||
         source_representation == target_representation || targets.empty() ||
+        !std::all_of(targets.begin(), targets.end(), valid_migration_target) ||
         !std::is_sorted(targets.begin(), targets.end()) ||
         std::adjacent_find(targets.begin(), targets.end()) != targets.end() ||
         !finite_nonnegative(residual_radiometric_error) || source_revision.exhausted() ||
@@ -1372,6 +1419,7 @@ core::Result<void> SurfaceRepresentationNode::validate() const {
         std::adjacent_find(children.begin(), children.end()) != children.end() ||
         !std::is_sorted(children.begin(), children.end()) ||
         (parent.has_value() && (!*parent || *parent == id)) ||
+        !valid_representation_kind(kind) ||
         !valid_hex_digest(content_digest)) {
         return core::Result<void>::failure(validation("surface representation node is invalid"));
     }
@@ -1493,10 +1541,12 @@ core::Result<void> VantaFidelityPackage::validate(
         }
     }
     std::set<RepresentationId> representation_ids;
+    std::map<RepresentationId, SurfaceDomainId> representation_domains;
     for (const auto& representation : representations) {
         if (auto result = representation.validate(); !result) return result;
         if (!domain_ids.contains(representation.domain) ||
-            !representation_ids.insert(representation.id).second) {
+            !representation_ids.insert(representation.id).second ||
+            !representation_domains.emplace(representation.id, representation.domain).second) {
             return core::Result<void>::failure(validation(
                 "VANTA fidelity package has an invalid representation reference"));
         }
@@ -1512,7 +1562,9 @@ core::Result<void> VantaFidelityPackage::validate(
     }
     for (const auto& runtime : runtime_records) {
         if (auto result = runtime.validate(); !result) return result;
-        if (!domain_ids.contains(runtime.domain) || !representation_ids.contains(runtime.representation)) {
+        const auto representation = representation_domains.find(runtime.representation);
+        if (!domain_ids.contains(runtime.domain) || representation == representation_domains.end() ||
+            representation->second != runtime.domain) {
             return core::Result<void>::failure(validation(
                 "VANTA fidelity package has an invalid runtime record reference"));
         }
@@ -1526,16 +1578,24 @@ core::Result<void> VantaFidelityPackage::validate(
                 "VANTA fidelity package closure references an unknown domain"));
         }
         if (auto result = closure.validate(source, *domain); !result) return result;
-        if (!representation_ids.contains(closure.representation)) {
+        const auto representation = representation_domains.find(closure.representation);
+        if (representation == representation_domains.end() ||
+            representation->second != closure.domain) {
             return core::Result<void>::failure(validation(
                 "VANTA fidelity package closure references an unknown representation"));
         }
     }
     for (const auto& migration : migrations) {
         if (auto result = migration.validate(); !result) return result;
+        const auto source_representation =
+            representation_domains.find(migration.source_representation);
+        const auto target_representation =
+            representation_domains.find(migration.target_representation);
         if (!domain_ids.contains(migration.domain) ||
-            !representation_ids.contains(migration.source_representation) ||
-            !representation_ids.contains(migration.target_representation) ||
+            source_representation == representation_domains.end() ||
+            target_representation == representation_domains.end() ||
+            source_representation->second != migration.domain ||
+            target_representation->second != migration.domain ||
             migration.source_revision != source_revision) {
             return core::Result<void>::failure(validation(
                 "VANTA fidelity package migration references an unknown or stale representation"));

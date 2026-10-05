@@ -1,6 +1,16 @@
 add_library(carto_surface_core STATIC
+    src/budget.cpp
+    src/candidate.cpp
     src/core.cpp
+    src/distribution.cpp
+    src/evidence.cpp
+    src/fidelity_package_json.cpp
+    src/invalidation.cpp
+    src/normal_closure.cpp
     src/process.cpp
+    src/qem.cpp
+    src/spectrum.cpp
+    src/visibility_closure.cpp
 )
 
 target_include_directories(carto_surface_core

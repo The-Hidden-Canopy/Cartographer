@@ -23,12 +23,16 @@ The focused test proves:
 4. a fidelity closure candidate has lower or equal bounded reference-space
    radiometric and specular error than the geometry-only proxy on the fixture;
 5. the appearance admission gate rejects a forged error envelope;
-6. representation parent/child links, runtime references, closure provenance,
-   and VANTA package digests are validated;
+6. representation parent/child links, same-domain runtime/closure/migration
+   references, closure provenance, and VANTA package digests are validated;
 7. package tampering is rejected before runtime consumption;
 8. material stratigraphy/depth exposure, causal weathering, manufacturing
    history ordering, contact graph identity, edge profiles, material-derived
    geometry intent, and migration receipts are bounded and deterministic.
+
+The separate QEM acceptance in `surface-qem-acceptance.md` is a candidate
+compiler rung only. It does not change this document's claim that the existing
+surface closure compiler still uses the explicit bounded baseline proxy.
 
 ## Optional benchmark
 
@@ -44,6 +48,10 @@ The CSV reports compile time and error-envelope values for deterministic
 geometry-only and fidelity candidates at equal triangle budgets. It does not
 represent a GPU render time, an 8K frame rate, or a claim that the current
 triangle selector is a production decimator.
+
+The cross-repository spectrum layer has a separate focused acceptance and
+benchmark in `surface-spectrum-acceptance.md`. It is revision-bound analysis
+input only and does not upgrade this document's closure or renderer evidence.
 
 ## Native workbench connection
 
