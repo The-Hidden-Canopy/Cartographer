@@ -145,6 +145,30 @@ class PublicBoundaryAuditTests(unittest.TestCase):
             self.assertIn("recognizable credential pattern", result.stdout)
             self.assertNotIn(secret, result.stdout)
 
+    def test_workstation_path_fails_without_printing_value(self) -> None:
+        with self.make_repo() as temporary:
+            repo = Path(temporary)
+            leaked_path = "E:" + r"\HiddenCanopy\.cartographer-docuseries-archive-20261004"
+            (repo / "notes.md").write_text(f"archive: `{leaked_path}`\n", encoding="utf-8")
+            result = audit(repo)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("workstation path", result.stdout)
+            self.assertNotIn(leaked_path, result.stdout)
+
+    def test_deleted_workstation_path_is_caught_in_history(self) -> None:
+        with self.make_repo() as temporary:
+            repo = Path(temporary)
+            leaked_path = "C:" + r"\Users\envyn\private-cache"
+            notes = repo / "notes.md"
+            notes.write_text(f"cache: {leaked_path}\n", encoding="utf-8")
+            git(repo, "add", "notes.md")
+            git(repo, "commit", "-q", "-m", "workstation path fixture")
+            notes.unlink()
+            result = audit(repo)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("workstation path", result.stdout)
+            self.assertNotIn(leaked_path, result.stdout)
+
     def test_review_path_is_visible_and_optional(self) -> None:
         with self.make_repo() as temporary:
             repo = Path(temporary)

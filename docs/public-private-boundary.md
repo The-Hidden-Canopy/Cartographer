@@ -131,8 +131,9 @@ python scripts/public_boundary_audit.py --check-ignore-policy
 ```
 
 It checks tracked files, tracked-but-ignored files, non-ignored working-tree
-files, recognizable credential patterns, required quarantine rules, and all
-reachable Git history. The tracked-but-ignored check is explicit because
+files, recognizable credential patterns, workstation-specific paths, required
+quarantine rules, and all reachable Git history. The tracked-but-ignored check
+is explicit because
 `.gitignore` is not retroactive. It never rewrites history, expires reflogs,
 deletes files, or contacts a remote. Use `--include-reflog` for a local hygiene
 audit that also inspects reflog/unreachable objects. Legacy GMIB, anatomy, OWH,

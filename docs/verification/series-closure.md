@@ -2,10 +2,9 @@
 
 The supplied engineering series are source material for bounded implementation
 work; they are not themselves an open working directory. On 4 October 2026,
-the local Cartographer bundles under `tmp/` were moved to the private,
-recoverable archive outside this checkout:
-
-`private archive outside this checkout`
+the local Cartographer bundles under `tmp/` were moved to a private,
+recoverable archive outside this checkout. The archive location is deliberately
+not recorded in the public repository.
 
 Run the read-only guard from the repository root:
 

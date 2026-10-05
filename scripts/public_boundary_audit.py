@@ -117,6 +117,18 @@ SECRET_PATTERNS = (
     ),
 )
 
+# A public source tree must not preserve workstation-specific roots. Besides
+# leaking local layout, these paths make release instructions non-portable and
+# can disclose where private material was staged. The check is deliberately
+# narrow: generic tool-install examples such as `C:\\Program Files` remain
+# valid, while user/workspace roots and home directories fail closed.
+WORKSTATION_PATH_PATTERNS = (
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9])(?:[A-Z]:[\\/](?:Users[\\/][^\\/\s]+|HiddenCanopy)(?:[\\/]|$))"
+    ),
+    re.compile(r"(?<![A-Za-z0-9_])/home/[A-Za-z0-9._-]+(?:/|$)"),
+)
+
 GIT_SECRET_PATTERN = (
     r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|"
     r"AKIA[0-9A-Z]{16}|"
@@ -127,6 +139,11 @@ GIT_SECRET_PATTERN = (
     r"Bearer[[:space:]]+[A-Za-z0-9._~+/=-]{20,}|"
     r"(api[_-]?key|access[_-]?token|client_secret|password)[[:space:]]*[:=]"
     r"[[:space:]]*[\"'][^\"']{12,}[\"']"
+)
+
+GIT_WORKSTATION_PATH_PATTERN = (
+    r"[A-Za-z]:[\\/]((Users)[\\/][^[:space:]]+|HiddenCanopy[\\/])|"
+    r"/home/[A-Za-z0-9._-]+/"
 )
 
 MAX_TEXT_SCAN_BYTES = 4 * 1024 * 1024
@@ -333,6 +350,10 @@ def has_secret_pattern(text: str) -> bool:
     return any(pattern.search(text) for pattern in SECRET_PATTERNS)
 
 
+def has_workstation_path(text: str) -> bool:
+    return any(pattern.search(text) for pattern in WORKSTATION_PATH_PATTERNS)
+
+
 def check_ignore_policy(root: Path, findings: list[str]) -> None:
     for probe in REQUIRED_IGNORE_PROBES:
         result = run_git(root, "check-ignore", "--no-index", "-q", "--", probe)
@@ -405,12 +426,18 @@ def main() -> int:
         text = read_current_text(root, path)
         if text is not None and has_secret_pattern(text):
             findings.append(f"current file {path}: recognizable credential pattern")
+        if text is not None and has_workstation_path(text):
+            findings.append(f"current file {path}: workstation path")
 
     for commit in commits:
         result = run_git(root, "grep", "-I", "-l", "-E", GIT_SECRET_PATTERN, commit, "--")
         if result.returncode == 0:
             for path in result.stdout.splitlines():
                 findings.append(f"history content {commit[:12]}:{path}: recognizable credential pattern")
+        result = run_git(root, "grep", "-I", "-l", "-E", GIT_WORKSTATION_PATH_PATTERN, commit, "--")
+        if result.returncode == 0:
+            for path in result.stdout.splitlines():
+                findings.append(f"history content {commit[:12]}:{path}: workstation path")
 
     if arguments.check_ignore_policy:
         check_ignore_policy(root, findings)
