@@ -130,6 +130,8 @@ DXGI_FORMAT format(gpu::Format value) {
     case gpu::Format::rgba16_float: return DXGI_FORMAT_R16G16B16A16_FLOAT;
     case gpu::Format::rgba32_float: return DXGI_FORMAT_R32G32B32A32_FLOAT;
     case gpu::Format::rg16_float: return DXGI_FORMAT_R16G16_FLOAT;
+    case gpu::Format::rgba8_e4m3: return DXGI_FORMAT_R8G8B8A8_UINT;
+    case gpu::Format::rg8_e4m3: return DXGI_FORMAT_R8G8_UINT;
     case gpu::Format::rg32_float: return DXGI_FORMAT_R32G32_FLOAT;
     case gpu::Format::rg32_uint: return DXGI_FORMAT_R32G32_UINT;
     case gpu::Format::r16_float: return DXGI_FORMAT_R16_FLOAT;

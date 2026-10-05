@@ -32,6 +32,17 @@ struct Options {
     bool static_motion = false;
 };
 
+struct Config {
+    const char* variant_prefix;
+    const char* shader_label;
+    const char* shader_file;
+    carto::gpu::Format color_format;
+    carto::gpu::Format motion_format;
+    const char* color_name;
+    const char* motion_name;
+    const char* history_layout;
+};
+
 struct Timing {
     double cpu_microseconds = 0.0;
     double gpu_microseconds = 0.0;
@@ -262,13 +273,23 @@ int main(int argc, char** argv) {
             throw std::runtime_error("D3D12 timestamp queries are unavailable");
         }
 
+        const std::array<Config, 2U> configs{{
+            {"", "cartographer_temporal_bench", "cartographer_temporal.hlsl",
+             carto::gpu::Format::rgba16_float, carto::gpu::Format::rg16_float,
+             "rgba16_float", "rg16_float", "rgba16f_history"},
+            {"fp8_", "cartographer_temporal_fp8_bench", "cartographer_temporal_fp8.hlsl",
+             carto::gpu::Format::rgba8_e4m3, carto::gpu::Format::rg8_e4m3,
+             "rgba8_e4m3", "rg8_e4m3", "rgba8_e4m3_history"},
+        }};
+        bool header_written = false;
+        for (const Config& config : configs) {
         const auto shader = expect(
             carto::d3d12::compile_hlsl(carto::d3d12::ShaderSource{
-                "cartographer_temporal_bench",
+                config.shader_label,
                 carto::gpu::ShaderStage::compute,
                 "CSMain",
-                "cartographer_temporal.hlsl",
-                read_shader("cartographer_temporal.hlsl"),
+                config.shader_file,
+                read_shader(config.shader_file),
                 true,
                 false,
             }),
@@ -307,19 +328,19 @@ int main(int argc, char** argv) {
             }), "create temporal texture");
         };
         const auto current = make_texture(
-            carto::gpu::Format::rgba16_float,
+            config.color_format,
             carto::gpu::TextureUsage::sampled,
             {0.15F, 0.25F, 0.35F, 1.0F});
         const auto history = make_texture(
-            carto::gpu::Format::rgba16_float,
+            config.color_format,
             carto::gpu::TextureUsage::sampled,
             {0.35F, 0.25F, 0.15F, 1.0F});
         const auto motion = make_texture(
-            carto::gpu::Format::rg16_float,
+            config.motion_format,
             carto::gpu::TextureUsage::sampled,
             {0.0F, 0.0F, 0.0F, 0.0F});
         const auto resolved = make_texture(
-            carto::gpu::Format::rgba16_float,
+            config.color_format,
             carto::gpu::TextureUsage::storage,
             {0.0F, 0.0F, 0.0F, 1.0F});
         const auto timestamp_readback = expect(device->create_buffer(carto::gpu::BufferDesc{
@@ -344,7 +365,7 @@ int main(int argc, char** argv) {
             "history resolve",
             carto::device::PrecisionRole::compressed_operand,
             carto::device::KernelDirection::compute,
-            "rgba16f_history",
+            config.history_layout,
             "fp32",
             carto::device::BackendKind::d3d12,
             false,
@@ -386,11 +407,14 @@ int main(int argc, char** argv) {
 
         const double pixels = static_cast<double>(options.extent) *
             static_cast<double>(options.extent) * static_cast<double>(options.iterations);
-        std::cout << std::fixed << std::setprecision(3)
-                  << "kernel_id,variant,threadgroup_x,threadgroup_y,extent,iterations,warmup_dispatches,submissions,pixels,cpu_total_us,"
+        std::cout << std::fixed << std::setprecision(3);
+        if (!header_written) {
+            header_written = true;
+            std::cout << "kernel_id,variant,threadgroup_x,threadgroup_y,extent,iterations,warmup_dispatches,submissions,pixels,cpu_total_us,"
                      "cpu_us_per_dispatch,gpu_total_us,gpu_us_per_dispatch,gpu_mpix_per_s,"
-                     "timestamp_frequency,color_format,motion_format\n"
-                  << temporal_contract.kernel_id << ",legacy,8,8," << options.extent << ','
+                     "timestamp_frequency,color_format,motion_format\n";
+        }
+        std::cout << temporal_contract.kernel_id << ',' << config.variant_prefix << "legacy,8,8," << options.extent << ','
                   << options.iterations << ','
                   << warmup_iterations << ",1,"
                   << pixels << ',' << legacy_batched.cpu_microseconds << ','
@@ -399,8 +423,8 @@ int main(int argc, char** argv) {
                   << legacy_batched.gpu_microseconds / static_cast<double>(options.iterations) << ','
                   << pixels / legacy_batched.gpu_microseconds << ','
                   << device->timestamp_frequency(carto::gpu::QueueType::compute)
-                  << ",rgba16_float,rg16_float\n"
-                  << temporal_contract.kernel_id << ",optimized,8,8," << options.extent << ','
+                  << ',' << config.color_name << ',' << config.motion_name << '\n'
+                  << temporal_contract.kernel_id << ',' << config.variant_prefix << "optimized,8,8," << options.extent << ','
                   << options.iterations << ',' << warmup_iterations << ",1,"
                   << pixels << ',' << optimized_batched.cpu_microseconds << ','
                   << optimized_batched.cpu_microseconds / static_cast<double>(options.iterations) << ','
@@ -408,8 +432,8 @@ int main(int argc, char** argv) {
                   << optimized_batched.gpu_microseconds / static_cast<double>(options.iterations) << ','
                   << pixels / optimized_batched.gpu_microseconds << ','
                   << device->timestamp_frequency(carto::gpu::QueueType::compute)
-                  << ",rgba16_float,rg16_float\n"
-                  << temporal_contract.kernel_id << ",optimized_per_submit,8,8," << options.extent << ','
+                  << ',' << config.color_name << ',' << config.motion_name << '\n'
+                  << temporal_contract.kernel_id << ',' << config.variant_prefix << "optimized_per_submit,8,8," << options.extent << ','
                   << options.iterations << ','
                   << warmup_iterations << ',' << options.iterations << ',' << pixels << ','
                   << per_submit_cpu << ','
@@ -418,7 +442,7 @@ int main(int argc, char** argv) {
                   << per_submit_gpu / static_cast<double>(options.iterations) << ','
                   << pixels / per_submit_gpu << ','
                   << device->timestamp_frequency(carto::gpu::QueueType::compute)
-                  << ",rgba16_float,rg16_float\n";
+                  << ',' << config.color_name << ',' << config.motion_name << '\n';
 
         if (!device->debug_receipts().empty()) {
             std::ostringstream message;
@@ -429,6 +453,7 @@ int main(int argc, char** argv) {
         destroy_temporal_resources(
             *device, shader_handle, pipeline, current, history, motion, resolved,
             timestamp_readback);
+        }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "D3D12 kernel benchmark failed: " << error.what() << '\n';

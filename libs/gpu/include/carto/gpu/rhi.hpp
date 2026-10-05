@@ -50,6 +50,10 @@ enum class Format {
     rgba16_float,
     rgba32_float,
     rg16_float,
+    // Emulated FP8 (OCP E4M3FN). No DXGI FP8 format exists, so storage is
+    // 8-bit integer channels that shaders encode/decode explicitly.
+    rgba8_e4m3,
+    rg8_e4m3,
     rg32_float,
     rg32_uint,
     r16_float,
