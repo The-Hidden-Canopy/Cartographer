@@ -24,6 +24,12 @@ and its downstream products in cook order. This keeps a material or source
 change from recooking unrelated products without pretending that the graph is
 an interactive worker pool.
 
+`ProductionArtifactStore` is the byte boundary for this contract. It publishes
+immutable bytes to the existing SHA-256 blob store only after the receipt,
+current source, policy, payload size, and payload digest agree. Reads require a
+current admitted receipt and reverify the blob; a stale source or missing
+receipt cannot fall back to an older artifact.
+
 This is deliberately a contract layer, not a pretend GPU backend. GPU queues,
 VANTA residency, remote workers, and private production adapters consume the
 same receipt shape when those execution paths are enabled.

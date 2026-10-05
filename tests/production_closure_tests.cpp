@@ -1,7 +1,9 @@
 #include <carto/production/closure.hpp>
 #include <carto/production/dependency.hpp>
+#include <carto/production/artifact_store.hpp>
 
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <span>
 #include <string_view>
@@ -193,6 +195,50 @@ void cook_graph_is_deterministic_and_minimally_invalidating() {
     require(invalid.size() == 0U, "rejected graph nodes do not mutate the graph");
 }
 
+void artifact_store_binds_bytes_to_admitted_receipts() {
+    const auto root = std::filesystem::temp_directory_path() /
+        "cartographer-production-closure-test";
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(root, cleanup_error);
+    carto::assets::BlobStore blobs(root / "blobs");
+    carto::production::ProductionArtifactStore store(blobs);
+
+    const std::string payload_text = "derived-render-mesh";
+    const auto payload = std::span<const std::uint8_t>{
+        reinterpret_cast<const std::uint8_t*>(payload_text.data()), payload_text.size()};
+    auto receipt = admitted_receipt();
+    receipt.output_digest = digest(payload_text);
+    receipt.output_bytes = payload.size();
+    require(static_cast<bool>(receipt.refresh_digest()),
+            "artifact receipt refreshes after binding its payload");
+    const carto::production::AdmissionPolicy policy{
+        .max_measured_error = 0.05,
+        .min_confidence = 0.9,
+        .max_resident_bytes = 16'384U,
+    };
+    require(static_cast<bool>(store.publish(receipt, payload, receipt.key.source, policy)),
+            "matching derived bytes publish with their receipt");
+    const auto restored = store.read(receipt.key, receipt.key.source, policy);
+    require(restored && std::string(reinterpret_cast<const char*>(restored.value().data()),
+                                    restored.value().size()) == payload_text,
+            "admitted derived bytes reopen through the receipt key");
+
+    const auto wrong_payload = std::span<const std::uint8_t>{
+        reinterpret_cast<const std::uint8_t*>("tampered"), 8U};
+    require(!store.publish(receipt, wrong_payload, receipt.key.source, policy),
+            "payload digest mismatch is rejected before publication");
+    require(store.ledger().size() == 1U,
+            "rejected payload does not append evidence");
+
+    auto stale_source = receipt.key.source;
+    stale_source.revision = carto::core::Revision{2U};
+    const auto stale_read = store.read(receipt.key, stale_source, policy);
+    require(!stale_read && stale_read.error().code == carto::core::ErrorCode::stale_data,
+            "stale source cannot read an admitted derived artifact");
+
+    std::filesystem::remove_all(root, cleanup_error);
+}
+
 } // namespace
 
 int main() {
@@ -202,5 +248,6 @@ int main() {
     ledger_never_falls_back_to_stale_evidence();
     ledger_round_trips_and_rejects_malformed_input();
     cook_graph_is_deterministic_and_minimally_invalidating();
+    artifact_store_binds_bytes_to_admitted_receipts();
     std::cout << "production closure tests passed\n";
 }

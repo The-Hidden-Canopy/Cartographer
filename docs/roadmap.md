@@ -16,6 +16,7 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] bounded root-level mesh instancing with shared asset identity, explicit local placement, and reversible history
 - [x] heterogeneous production receipt/admission contract with stale-source and budget fail-closed checks
 - [x] bounded production cook graph with deterministic ordering and minimal downstream invalidation
+- [x] content-addressed derived-byte publish/read binding with stale-read rejection
 - [x] versioned project format with atomic save/load
 - [x] v6 project format with v1/v2/v3/v4/v5 compatibility, explicit meters/right-handed/Y-up contract, optional graph reference, bounded project-bound topology receipt lineage, generic scientific model records, and validated per-mesh attribute/UV persistence
 - [x] OBJ import/export with explicit feature-loss warnings

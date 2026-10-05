@@ -1,4 +1,5 @@
 add_library(carto_production STATIC
+    src/artifact_store.cpp
     src/closure.cpp
     src/dependency.cpp
 )
