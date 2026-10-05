@@ -1,5 +1,6 @@
 add_library(carto_production STATIC
     src/closure.cpp
+    src/dependency.cpp
 )
 
 target_include_directories(carto_production

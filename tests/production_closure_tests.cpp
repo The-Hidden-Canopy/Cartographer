@@ -1,9 +1,11 @@
 #include <carto/production/closure.hpp>
+#include <carto/production/dependency.hpp>
 
 #include <cstdlib>
 #include <iostream>
 #include <span>
 #include <string_view>
+#include <utility>
 
 namespace {
 
@@ -130,6 +132,67 @@ void ledger_round_trips_and_rejects_malformed_input() {
     require(!trailing, "trailing serialized data is rejected");
 }
 
+carto::production::ProductionCookKey cook_key(
+    std::string identity,
+    std::string token) {
+    carto::production::ProductionCookKey key;
+    key.source = {std::move(identity), carto::core::Revision{1U}, digest(token + "-source")};
+    key.kind = carto::production::ArtifactKind::render_mesh;
+    key.form = carto::production::ExecutionForm::cached;
+    key.algorithm = "cook-v1";
+    key.settings_digest = digest(token + "-settings");
+    key.platform_profile = "cpu-reference";
+    return key;
+}
+
+void cook_graph_is_deterministic_and_minimally_invalidating() {
+    const auto source = cook_key("source", "source");
+    const auto material = cook_key("material", "material");
+    const auto mesh = cook_key("mesh", "mesh");
+    const auto unrelated = cook_key("unrelated", "unrelated");
+    const auto external = cook_key("external", "external");
+
+    carto::production::ProductionCookGraph graph;
+    require(static_cast<bool>(graph.add_node(source)), "source node enters cook graph");
+    require(static_cast<bool>(graph.add_node(material, {source})),
+            "material node enters cook graph");
+    require(static_cast<bool>(graph.add_node(mesh, {material, external})),
+            "mesh node enters cook graph with external input");
+    require(static_cast<bool>(graph.add_node(unrelated)),
+            "unrelated node enters cook graph");
+
+    const auto order = graph.topological_order();
+    require(order && order.value().size() == 4U, "cook graph has a full topological order");
+    require(order.value()[0] == source && order.value()[1] == material &&
+                order.value()[2] == mesh,
+            "registered dependencies precede their derived products");
+
+    const auto material_invalidation = graph.invalidation_order(material);
+    require(material_invalidation && material_invalidation.value().size() == 2U,
+            "material invalidation is bounded to dependent products");
+    require(material_invalidation.value()[0] == material &&
+                material_invalidation.value()[1] == mesh,
+            "material invalidation is deterministic and downstream-only");
+
+    const auto external_invalidation = graph.invalidation_order(external);
+    require(external_invalidation && external_invalidation.value().size() == 1U &&
+                external_invalidation.value()[0] == mesh,
+            "external source invalidation reaches only direct dependents");
+
+    carto::production::ProductionCookGraph cyclic;
+    const auto left = cook_key("left", "left");
+    const auto right = cook_key("right", "right");
+    require(static_cast<bool>(cyclic.add_node(left, {right})),
+            "incomplete graph may name an external dependency");
+    require(!cyclic.add_node(right, {left}), "cycle is rejected when it becomes closed");
+    require(cyclic.size() == 1U, "rejected cycle does not mutate the graph");
+
+    carto::production::ProductionCookGraph invalid;
+    require(!invalid.add_node(left, {left}), "self-dependency is rejected");
+    require(!invalid.add_node(left, {right, right}), "duplicate dependency is rejected");
+    require(invalid.size() == 0U, "rejected graph nodes do not mutate the graph");
+}
+
 } // namespace
 
 int main() {
@@ -138,5 +201,6 @@ int main() {
     failed_receipts_cannot_publish_output();
     ledger_never_falls_back_to_stale_evidence();
     ledger_round_trips_and_rejects_malformed_input();
+    cook_graph_is_deterministic_and_minimally_invalidating();
     std::cout << "production closure tests passed\n";
 }
