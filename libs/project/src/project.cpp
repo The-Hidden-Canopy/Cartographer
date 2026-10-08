@@ -12,6 +12,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <set>
 #include <sstream>
 #include <system_error>
@@ -22,6 +23,8 @@
 #ifdef _WIN32
 #    define NOMINMAX
 #    include <windows.h>
+#else
+#    include <unistd.h>
 #endif
 
 namespace carto::project {
@@ -56,6 +59,47 @@ constexpr std::uint64_t kMaxSerializedUvSets = 1'000'000U;
 constexpr std::uintmax_t kMaxSerializedProjectBytes = 128ULL * 1024ULL * 1024ULL;
 std::mutex g_project_save_mutex;
 std::atomic<std::uint64_t> g_project_temp_counter{0U};
+std::atomic<std::uint64_t> g_project_namespace_counter{0U};
+
+bool valid_source_namespace(std::string_view value) {
+    return !value.empty() && value.size() <= 128U &&
+        std::all_of(value.begin(), value.end(), [](unsigned char byte) {
+            return (byte >= 'a' && byte <= 'z') ||
+                (byte >= 'A' && byte <= 'Z') ||
+                (byte >= '0' && byte <= '9') || byte == '.' || byte == '_' ||
+                byte == '-';
+        });
+}
+
+std::string namespace_from_seed(std::string_view seed, std::string_view prefix) {
+    const auto* data = reinterpret_cast<const std::uint8_t*>(seed.data());
+    const auto digest = assets::sha256(std::span<const std::uint8_t>(data, seed.size()));
+    return std::string(prefix) + digest.hex().substr(0U, 32U);
+}
+
+std::string new_source_namespace() {
+    std::ostringstream seed;
+    seed << std::chrono::steady_clock::now().time_since_epoch().count() << ':'
+         << std::chrono::system_clock::now().time_since_epoch().count() << ':'
+         << std::hash<std::thread::id>{}(std::this_thread::get_id()) << ':';
+#ifdef _WIN32
+    seed << GetCurrentProcessId() << ':';
+#else
+    seed << getpid() << ':';
+#endif
+    seed
+         << g_project_namespace_counter.fetch_add(1U, std::memory_order_relaxed);
+    try {
+        std::random_device entropy;
+        for (std::size_t index = 0U; index < 4U; ++index) {
+            seed << ':' << entropy();
+        }
+    } catch (...) {
+        // Identity uniqueness does not grant authority or provide secrecy.
+        // Clock, thread, and process-local sequence remain a safe fallback.
+    }
+    return namespace_from_seed(seed.str(), "cartographer.project.");
+}
 
 core::Result<void> validate_serialized_count(
     std::uint64_t count,
@@ -276,6 +320,28 @@ core::Result<void> atomic_replace(
 #endif
 }
 
+bool mesh_declares_material_region(
+    const geometry::EditableMesh& mesh,
+    std::uint32_t region_id) {
+    for (const std::string_view layer_id : {
+             std::string_view{"condition.material_region"},
+             std::string_view{"cartographer.material_slot"}}) {
+        const auto* layer = mesh.attributes().find(layer_id);
+        if (layer == nullptr || layer->descriptor.domain != attributes::AttributeDomain::face ||
+            layer->descriptor.type != attributes::AttributeType::uint32) {
+            continue;
+        }
+        if (std::any_of(layer->values.begin(), layer->values.end(),
+                [region_id](const attributes::AttributeValue& value) {
+                    const auto* encoded = std::get_if<std::uint32_t>(&value);
+                    return encoded != nullptr && *encoded == region_id;
+                })) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 core::Result<void> AssetReference::validate() const {
@@ -303,6 +369,9 @@ core::Result<void> TopologyReceiptRecord::validate() const {
     }
     return receipt.validate();
 }
+
+ProjectDocument::ProjectDocument()
+    : source_namespace_(new_source_namespace()) {}
 
 core::Result<ProjectDocument> ProjectDocument::create(std::string name) {
     ProjectDocument document;
@@ -484,6 +553,15 @@ core::Result<core::Revision> ProjectDocument::replace_mesh_if_revision(
     if (auto result = mesh.validate(); !result) {
         return core::Result<core::Revision>::failure(result.error());
     }
+    for (const auto& [identity, assignment] : material_catalog_.assignments()) {
+        static_cast<void>(identity);
+        if (assignment.key.mesh_asset == mesh_asset &&
+            !mesh_declares_material_region(mesh, assignment.key.region_id)) {
+            return core::Result<core::Revision>::failure(Diagnostic(
+                ErrorCode::validation_failed,
+                "mesh replacement would orphan a material-region assignment"));
+        }
+    }
     if (iterator->second.revision().exhausted() || mesh.revision().exhausted()) {
         return core::Result<core::Revision>::failure(Diagnostic(
             ErrorCode::invalid_state,
@@ -526,6 +604,24 @@ core::Result<void> ProjectDocument::remove_mesh(std::uint64_t mesh_asset) {
             return core::Result<void>::failure(Diagnostic(
                 ErrorCode::invalid_state,
                 "cannot remove a mesh asset referenced by a semantic area"));
+        }
+    }
+    for (const auto& [identity, assignment] : material_catalog_.assignments()) {
+        static_cast<void>(identity);
+        if (assignment.key.mesh_asset == mesh_asset) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::invalid_state,
+                "cannot remove a mesh asset referenced by a material-region assignment"));
+        }
+    }
+    for (const auto& [identity, variant] : material_catalog_.variants()) {
+        static_cast<void>(identity);
+        if (std::binary_search(
+                variant.permitted_mesh_assets.begin(),
+                variant.permitted_mesh_assets.end(), mesh_asset)) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::invalid_state,
+                "cannot remove a mesh asset referenced by a material-variant scope"));
         }
     }
     meshes_.erase(mesh_asset);
@@ -629,6 +725,46 @@ core::Result<void> ProjectDocument::set_world_model(world::WorldModel model) {
     return core::Result<void>::success();
 }
 
+core::Result<void> ProjectDocument::set_material_catalog(MaterialCatalog catalog) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (auto result = catalog.validate(); !result) {
+        return core::Result<void>::failure(result.error().with_context(
+            "material catalog admission"));
+    }
+    for (const auto& [identity, variant] : catalog.variants()) {
+        static_cast<void>(identity);
+        for (const std::uint64_t mesh_asset : variant.permitted_mesh_assets) {
+            if (!meshes_.contains(mesh_asset)) {
+                return core::Result<void>::failure(Diagnostic(
+                    ErrorCode::not_found,
+                    "material variant scope references a missing mesh asset"));
+            }
+        }
+    }
+    for (const auto& [identity, assignment] : catalog.assignments()) {
+        static_cast<void>(identity);
+        const auto mesh = meshes_.find(assignment.key.mesh_asset);
+        if (mesh == meshes_.end()) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::not_found,
+                "material-region assignment references a missing mesh asset"));
+        }
+        if (!mesh_declares_material_region(mesh->second, assignment.key.region_id)) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::not_found,
+                "material-region assignment references a missing authored region"));
+        }
+    }
+    if (material_catalog_.serialize() == catalog.serialize()) {
+        return core::Result<void>::success();
+    }
+    material_catalog_ = std::move(catalog);
+    bump_revision();
+    return core::Result<void>::success();
+}
+
 core::Result<void> ProjectDocument::set_object_transform(
     scene::ObjectId object,
     core::Transform transform) {
@@ -664,6 +800,10 @@ core::Result<void> ProjectDocument::validate() const {
     }
     if (name_.empty()) {
         return core::Result<void>::failure(parse_error("project name is empty"));
+    }
+    if (!valid_source_namespace(source_namespace_)) {
+        return core::Result<void>::failure(parse_error(
+            "project source namespace is invalid"));
     }
     if (auto result = scene_.validate(); !result) {
         return result;
@@ -740,6 +880,31 @@ core::Result<void> ProjectDocument::validate() const {
                 "variant layer base revision is newer than the project"));
         }
     }
+    if (auto result = material_catalog_.validate(); !result) {
+        return core::Result<void>::failure(result.error().with_context(
+            "project material catalog"));
+    }
+    for (const auto& [identity, variant] : material_catalog_.variants()) {
+        static_cast<void>(identity);
+        for (const std::uint64_t mesh_asset : variant.permitted_mesh_assets) {
+            if (!meshes_.contains(mesh_asset)) {
+                return core::Result<void>::failure(parse_error(
+                    "material variant scope references a missing mesh asset"));
+            }
+        }
+    }
+    for (const auto& [identity, assignment] : material_catalog_.assignments()) {
+        static_cast<void>(identity);
+        const auto mesh = meshes_.find(assignment.key.mesh_asset);
+        if (mesh == meshes_.end()) {
+            return core::Result<void>::failure(parse_error(
+                "material-region assignment references a missing mesh asset"));
+        }
+        if (!mesh_declares_material_region(mesh->second, assignment.key.region_id)) {
+            return core::Result<void>::failure(parse_error(
+                "material-region assignment references a missing authored region"));
+        }
+    }
     for (const auto& object : scene_.objects_sorted()) {
         if (object.mesh_asset.has_value() && !meshes_.contains(*object.mesh_asset)) {
             return core::Result<void>::failure(
@@ -751,11 +916,13 @@ core::Result<void> ProjectDocument::validate() const {
 
 void ProjectDocument::swap(ProjectDocument& other) noexcept {
     name_.swap(other.name_);
+    source_namespace_.swap(other.source_namespace_);
     scene_.swap(other.scene_);
     meshes_.swap(other.meshes_);
     topology_receipts_.swap(other.topology_receipts_);
     std::swap(scientific_model_, other.scientific_model_);
     std::swap(world_model_, other.world_model_);
+    std::swap(material_catalog_, other.material_catalog_);
     std::swap(evaluation_graph_digest_, other.evaluation_graph_digest_);
     std::swap(next_mesh_id_, other.next_mesh_id_);
     std::swap(revision_, other.revision_);
@@ -767,6 +934,7 @@ std::string ProjectDocument::serialize() const {
     output << "AUTHORING " << std::quoted(std::string(kAuthoringFormat)) << ' '
            << std::quoted(std::string(kAuthoringUnits)) << ' '
            << std::quoted(std::string(kAuthoringCoordinateSystem)) << '\n';
+    output << "SOURCE_NAMESPACE " << std::quoted(source_namespace_) << '\n';
     output << "NAME " << std::quoted(name_) << '\n';
     output << "REVISION " << revision_.value() << '\n';
 
@@ -848,6 +1016,7 @@ std::string ProjectDocument::serialize() const {
     }
     output << "SCIENTIFIC_MODEL " << std::quoted(scientific_model_.serialize()) << '\n';
     output << "WORLD_MODEL " << std::quoted(world_model_.serialize()) << '\n';
+    output << "MATERIAL_CATALOG " << std::quoted(material_catalog_.serialize()) << '\n';
     output << "END\n";
     return output.str();
 }
@@ -888,10 +1057,48 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
         }
     }
 
+    ProjectDocument document;
+    if (version.value() >= 9U) {
+        if (auto result = require_line(input, "SOURCE_NAMESPACE"); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+        if (!(input >> std::quoted(document.source_namespace_)) ||
+            !valid_source_namespace(document.source_namespace_)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project source namespace is invalid"));
+        }
+    } else {
+        const auto position = input.tellg();
+        std::string legacy_probe;
+        if (!(input >> legacy_probe)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project name record is missing"));
+        }
+        input.clear();
+        input.seekg(position);
+        if (legacy_probe == "SOURCE_NAMESPACE") {
+            if (version.value() < 4U) {
+                return core::Result<ProjectDocument>::failure(Diagnostic(
+                    ErrorCode::version_mismatch,
+                    "source namespace records require project schema version 4"));
+            }
+            if (auto result = require_line(input, "SOURCE_NAMESPACE"); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            if (!(input >> std::quoted(document.source_namespace_)) ||
+                !valid_source_namespace(document.source_namespace_)) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project source namespace is invalid"));
+            }
+        } else {
+            document.source_namespace_ = namespace_from_seed(
+                text, "cartographer.project.migrated.");
+        }
+    }
+
     if (auto result = require_line(input, "NAME"); !result) {
         return core::Result<ProjectDocument>::failure(result.error());
     }
-    ProjectDocument document;
     if (!(input >> std::quoted(document.name_)) || document.name_.empty()) {
         return core::Result<ProjectDocument>::failure(parse_error("project name is invalid"));
     }
@@ -1396,6 +1603,33 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
     if (version.value() >= 7U && !world_model_seen) {
         return core::Result<ProjectDocument>::failure(parse_error(
             "project schema v7 is missing its world model record"));
+    }
+    bool material_catalog_seen = false;
+    if (terminal_record == "MATERIAL_CATALOG") {
+        std::string encoded_material_catalog;
+        if (!(input >> std::quoted(encoded_material_catalog))) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project material catalog record is invalid"));
+        }
+        if (encoded_material_catalog.size() > MaterialCatalog::kMaxSerializedBytes) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project material catalog record exceeds its size limit"));
+        }
+        const auto material_catalog = MaterialCatalog::deserialize(encoded_material_catalog);
+        if (!material_catalog) {
+            return core::Result<ProjectDocument>::failure(
+                material_catalog.error().with_context("serialized material catalog"));
+        }
+        document.material_catalog_ = material_catalog.value();
+        material_catalog_seen = true;
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(
+                parse_error("project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 8U && !material_catalog_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v8 or newer is missing its material catalog record"));
     }
     if (terminal_record != "END") {
         return core::Result<ProjectDocument>::failure(

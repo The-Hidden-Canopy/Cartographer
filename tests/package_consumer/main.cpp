@@ -20,8 +20,8 @@ int main() {
     }
 
     const carto::project::ProjectDocument project;
-    if (!project.validate() || project.schema_version() != 7U) {
-        std::cerr << "installed project target does not expose schema v7\n";
+    if (!project.validate() || project.schema_version() < 7U) {
+        std::cerr << "installed project target does not expose schema v7 or newer\n";
         return EXIT_FAILURE;
     }
 

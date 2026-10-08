@@ -12,6 +12,7 @@ target_link_libraries(cartographer_cli
         carto_render
         carto_application
         carto_io
+        carto_production
         carto_providers
 )
 

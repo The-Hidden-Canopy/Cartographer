@@ -6,6 +6,8 @@
 #include <carto/application/application.hpp>
 #include <carto/geometry/primitives.hpp>
 #include <carto/journal/journal.hpp>
+#include <carto/production/preparation_operation.hpp>
+#include <carto/production/preparation_scope.hpp>
 #include <carto/providers/registry.hpp>
 #include <carto/project/project.hpp>
 #include <carto/project/transaction.hpp>
@@ -190,6 +192,17 @@ Result<std::uint64_t> parse_gene_id_argument(std::string_view text) {
         return Result<std::uint64_t>::failure(carto::core::Diagnostic(
             carto::core::ErrorCode::invalid_argument,
             "functional genome gene id must be a non-zero unsigned integer"));
+    }
+    return Result<std::uint64_t>::success(value);
+}
+
+Result<std::uint64_t> parse_mesh_asset_id_argument(std::string_view text) {
+    std::uint64_t value = 0U;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || value == 0U) {
+        return Result<std::uint64_t>::failure(carto::core::Diagnostic(
+            carto::core::ErrorCode::invalid_argument,
+            "export mesh asset id must be a non-zero unsigned integer"));
     }
     return Result<std::uint64_t>::success(value);
 }
@@ -2414,7 +2427,10 @@ int import_functional_genome_exchange(
     return EXIT_SUCCESS;
 }
 
-int export_obj(const std::filesystem::path& project_path, const std::filesystem::path& obj_path) {
+int export_obj(
+    const std::filesystem::path& project_path,
+    const std::filesystem::path& obj_path,
+    std::optional<std::uint64_t> mesh_asset) {
     carto::providers::Registry providers;
     if (auto result = carto::io::register_builtin_obj_providers(providers); !result) {
         print_error(result.error().with_context("OBJ exporter provider"));
@@ -2429,16 +2445,20 @@ int export_obj(const std::filesystem::path& project_path, const std::filesystem:
         print_error(document.error());
         return EXIT_FAILURE;
     }
-    if (document.value().meshes().empty()) {
-        std::cerr << "error: project has no mesh assets\n";
+    const auto resolved_mesh = carto::production::resolve_single_mesh_export(
+        document.value(), mesh_asset);
+    if (!resolved_mesh) {
+        print_error(resolved_mesh.error());
         return EXIT_FAILURE;
     }
-    auto report = carto::io::export_obj(document.value().meshes().begin()->second, obj_path);
+    auto report = carto::io::export_obj(
+        document.value().meshes().at(resolved_mesh.value()), obj_path);
     if (!report) {
         print_error(report.error());
         return EXIT_FAILURE;
     }
-    std::cout << "exported " << obj_path << " vertices=" << report.value().vertices
+    std::cout << "exported " << obj_path << " mesh_asset=" << resolved_mesh.value()
+              << " vertices=" << report.value().vertices
               << " triangles=" << report.value().triangles << '\n';
     for (const auto& warning : report.value().warnings) {
         std::cout << "warning: " << warning << '\n';
@@ -2446,7 +2466,10 @@ int export_obj(const std::filesystem::path& project_path, const std::filesystem:
     return EXIT_SUCCESS;
 }
 
-int export_ply(const std::filesystem::path& project_path, const std::filesystem::path& ply_path) {
+int export_ply(
+    const std::filesystem::path& project_path,
+    const std::filesystem::path& ply_path,
+    std::optional<std::uint64_t> mesh_asset) {
     carto::providers::Registry providers;
     if (auto result = carto::io::register_builtin_ply_providers(providers); !result) {
         print_error(result.error().with_context("PLY exporter provider"));
@@ -2461,22 +2484,29 @@ int export_ply(const std::filesystem::path& project_path, const std::filesystem:
         print_error(document.error());
         return EXIT_FAILURE;
     }
-    if (document.value().meshes().empty()) {
-        std::cerr << "error: project has no mesh assets\n";
+    const auto resolved_mesh = carto::production::resolve_single_mesh_export(
+        document.value(), mesh_asset);
+    if (!resolved_mesh) {
+        print_error(resolved_mesh.error());
         return EXIT_FAILURE;
     }
-    auto report = carto::io::export_ply(document.value().meshes().begin()->second, ply_path);
+    auto report = carto::io::export_ply(
+        document.value().meshes().at(resolved_mesh.value()), ply_path);
     if (!report) {
         print_error(report.error());
         return EXIT_FAILURE;
     }
-    std::cout << "exported " << ply_path << " vertices=" << report.value().vertices
+    std::cout << "exported " << ply_path << " mesh_asset=" << resolved_mesh.value()
+              << " vertices=" << report.value().vertices
               << " faces=" << report.value().faces << " triangles=" << report.value().triangles << '\n';
     for (const auto& warning : report.value().warnings) std::cout << "warning: " << warning << '\n';
     return EXIT_SUCCESS;
 }
 
-int export_stl(const std::filesystem::path& project_path, const std::filesystem::path& stl_path) {
+int export_stl(
+    const std::filesystem::path& project_path,
+    const std::filesystem::path& stl_path,
+    std::optional<std::uint64_t> mesh_asset) {
     carto::providers::Registry providers;
     if (auto result = carto::io::register_builtin_stl_providers(providers); !result) {
         print_error(result.error().with_context("STL exporter provider"));
@@ -2491,16 +2521,20 @@ int export_stl(const std::filesystem::path& project_path, const std::filesystem:
         print_error(document.error());
         return EXIT_FAILURE;
     }
-    if (document.value().meshes().empty()) {
-        std::cerr << "error: project has no mesh assets\n";
+    const auto resolved_mesh = carto::production::resolve_single_mesh_export(
+        document.value(), mesh_asset);
+    if (!resolved_mesh) {
+        print_error(resolved_mesh.error());
         return EXIT_FAILURE;
     }
-    auto report = carto::io::export_stl(document.value().meshes().begin()->second, stl_path);
+    auto report = carto::io::export_stl(
+        document.value().meshes().at(resolved_mesh.value()), stl_path);
     if (!report) {
         print_error(report.error());
         return EXIT_FAILURE;
     }
-    std::cout << "exported " << stl_path << " vertices=" << report.value().vertices
+    std::cout << "exported " << stl_path << " mesh_asset=" << resolved_mesh.value()
+              << " vertices=" << report.value().vertices
               << " triangles=" << report.value().triangles << '\n';
     for (const auto& warning : report.value().warnings) std::cout << "warning: " << warning << '\n';
     return EXIT_SUCCESS;
@@ -2638,6 +2672,235 @@ int export_gltf(const std::filesystem::path& project_path, const std::filesystem
     return EXIT_SUCCESS;
 }
 
+const char* preparation_stage_name(carto::production::PreparationStage stage) {
+    using carto::production::PreparationStage;
+    switch (stage) {
+    case PreparationStage::resolve: return "resolve";
+    case PreparationStage::plan: return "plan";
+    case PreparationStage::validate: return "validate";
+    case PreparationStage::execute: return "execute";
+    case PreparationStage::verify: return "verify";
+    case PreparationStage::publish: return "publish";
+    }
+    return "unknown";
+}
+
+Result<carto::production::PreparationProfile> load_preparation_profile(
+    const std::filesystem::path& path) {
+    const auto text = read_bounded_text(
+        path, carto::production::kMaxPreparationProfileBytes,
+        "preparation profile");
+    if (!text) {
+        return Result<carto::production::PreparationProfile>::failure(
+            text.error());
+    }
+    const auto profile = carto::production::PreparationProfile::deserialize(
+        text.value());
+    if (!profile) {
+        return Result<carto::production::PreparationProfile>::failure(
+            profile.error().with_context("preparation profile " + path.string()));
+    }
+    return profile;
+}
+
+int write_default_preparation_profile(const std::filesystem::path& path) {
+    const auto profile = carto::production::portable_preparation_profile();
+    const auto digest = profile.canonical_digest();
+    if (!digest) {
+        print_error(digest.error());
+        return EXIT_FAILURE;
+    }
+    if (const auto written = write_new_text_atomically(
+            path, profile.serialize(), "preparation profile"); !written) {
+        print_error(written.error());
+        return EXIT_FAILURE;
+    }
+    std::cout << "preparation_profile_written"
+              << " identity=" << profile.identity
+              << " digest=" << digest.value().hex()
+              << " path=" << std::quoted(path.string()) << '\n';
+    return EXIT_SUCCESS;
+}
+
+int inspect_preparation_profile(const std::filesystem::path& path) {
+    const auto profile = load_preparation_profile(path);
+    if (!profile) {
+        print_error(profile.error());
+        return EXIT_FAILURE;
+    }
+    const auto digest = profile.value().canonical_digest();
+    if (!digest) {
+        print_error(digest.error());
+        return EXIT_FAILURE;
+    }
+    std::cout << "preparation_profile"
+              << " identity=" << profile.value().identity
+              << " digest=" << digest.value().hex()
+              << " active_render_uv="
+              << (profile.value().use_active_render_uv ? "true" : "false")
+              << " unique_lightmap_uv="
+              << (profile.value().include_unique_lightmap_uv ? "true" : "false")
+              << " tangents="
+              << (profile.value().generate_tangents_when_uv_present ? "true" : "false")
+              << " lookdev="
+              << (profile.value().include_lookdev ? "true" : "false")
+              << " required_lookdev="
+              << (profile.value().require_lookdev_for_material_regions ? "true" : "false")
+              << '\n';
+    return EXIT_SUCCESS;
+}
+
+int prepare_project(int argc, char** argv) {
+    using namespace carto;
+    const std::filesystem::path project_path(argv[2]);
+    const std::filesystem::path output_root(argv[3]);
+    int scope_index = 4;
+    production::PreparationProfile profile =
+        production::portable_preparation_profile();
+    if (argc >= 7 && std::string_view(argv[scope_index]) == "--profile") {
+        const auto loaded = load_preparation_profile(argv[scope_index + 1]);
+        if (!loaded) {
+            print_error(loaded.error());
+            return EXIT_FAILURE;
+        }
+        profile = loaded.value();
+        scope_index += 2;
+    }
+    if (scope_index >= argc) {
+        std::cerr << "error: prepare requires an explicit scope\n";
+        return EXIT_FAILURE;
+    }
+    const std::string_view scope_name(argv[scope_index]);
+    const int scope_argument_count = argc - scope_index;
+    auto document = project::ProjectDocument::load(project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+
+    production::PreparationScopeRequest scope;
+    scope.expected_source_revision = document.value().revision();
+    if (scope_name == "scene" && scope_argument_count == 1) {
+        scope.kind = production::PreparationScopeKind::scene;
+    } else if (scope_name == "asset" && scope_argument_count == 2) {
+        scope.kind = production::PreparationScopeKind::asset;
+        const auto identity = parse_mesh_asset_id_argument(argv[scope_index + 1]);
+        if (!identity) {
+            print_error(identity.error());
+            return EXIT_FAILURE;
+        }
+        scope.asset_ids.push_back(identity.value());
+    } else if (scope_name == "assembly" && scope_argument_count == 2) {
+        scope.kind = production::PreparationScopeKind::assembly;
+        const auto identity = parse_mesh_asset_id_argument(argv[scope_index + 1]);
+        if (!identity) {
+            print_error(identity.error());
+            return EXIT_FAILURE;
+        }
+        scope.node_ids.push_back(identity.value());
+    } else if (scope_name == "selection" && scope_argument_count >= 2) {
+        scope.kind = production::PreparationScopeKind::selection;
+        for (int index = scope_index + 1; index < argc; ++index) {
+            const auto identity = parse_mesh_asset_id_argument(argv[index]);
+            if (!identity) {
+                print_error(identity.error());
+                return EXIT_FAILURE;
+            }
+            scope.node_ids.push_back(identity.value());
+        }
+        std::sort(scope.node_ids.begin(), scope.node_ids.end());
+    } else {
+        std::cerr << "error: prepare scope must be scene, asset <mesh-id>, "
+                     "assembly <node-id>, or selection <node-id>...\n";
+        return EXIT_FAILURE;
+    }
+
+    const auto current = production::read_selected_prepared_scene(output_root);
+    if (!current) {
+        print_error(current.error().with_context("prepared output baseline"));
+        return EXIT_FAILURE;
+    }
+    std::optional<assets::Sha256Digest> expected;
+    if (current.value().has_value()) {
+        expected = current.value()->prepared_scene_digest;
+    }
+    auto source_root = project_path.parent_path();
+    if (source_root.empty()) source_root = std::filesystem::current_path();
+    const production::PreparationOperationRequest request{
+        .scope = std::move(scope),
+        .profile = std::move(profile),
+        .source_root = std::move(source_root),
+        .output_root = output_root,
+        .expected_selected_digest = expected,
+        .stop_token = {},
+    };
+    const auto report = production::prepare_and_publish(document.value(), request);
+    for (const auto& diagnostic : report.diagnostics) {
+        std::cerr << "diagnostic code=" << diagnostic.code
+                  << " stage=" << preparation_stage_name(diagnostic.stage)
+                  << " message=" << std::quoted(diagnostic.message);
+        if (diagnostic.source_primary.has_value()) {
+            std::cerr << " source_primary=" << diagnostic.source_primary.value();
+        }
+        if (diagnostic.source_secondary.has_value()) {
+            std::cerr << " source_secondary=" << diagnostic.source_secondary.value();
+        }
+        if (!diagnostic.capability.empty()) {
+            std::cerr << " capability=" << diagnostic.capability;
+        }
+        std::cerr << '\n';
+    }
+    if (!report.succeeded()) return EXIT_FAILURE;
+    std::cout << "prepared"
+              << " operation=" << report.operation_id.hex()
+              << " source_revision=" << report.source_revision.value()
+              << " profile=" << report.envelope->profile_identity
+              << " profile_digest=" << report.envelope->profile_digest.hex()
+              << " assets=" << report.resolved_scope->asset_ids.size()
+              << " nodes=" << report.resolved_scope->node_ids.size()
+              << " products=" << report.envelope->products.size()
+              << " revision=" << report.publication->prepared_scene_digest.hex()
+              << " reused="
+              << (report.publication->reused_immutable_revision ? "true" : "false")
+              << " output=" << std::quoted(output_root.string()) << '\n';
+    return EXIT_SUCCESS;
+}
+
+int inspect_prepared(const std::filesystem::path& output_root) {
+    const auto selected = carto::production::read_selected_prepared_scene(output_root);
+    if (!selected) {
+        print_error(selected.error());
+        return EXIT_FAILURE;
+    }
+    if (!selected.value().has_value()) {
+        std::cerr << "error: no prepared revision is selected\n";
+        return EXIT_FAILURE;
+    }
+    const auto& revision = selected.value().value();
+    std::cout << "prepared revision=" << revision.prepared_scene_digest.hex()
+              << " source=" << revision.envelope.source_namespace
+              << " source_revision=" << revision.envelope.source_revision.value()
+              << " profile=" << revision.envelope.profile_identity
+              << " assets=" << revision.envelope.assets.size()
+              << " nodes=" << revision.envelope.nodes.size()
+              << " products=" << revision.envelope.products.size()
+              << " bindings=" << revision.envelope.material_bindings.size() << '\n';
+    for (const auto& capability : revision.envelope.capabilities) {
+        std::cout << "capability feature=" << capability.feature
+                  << " evidence=" << static_cast<unsigned>(capability.evidence)
+                  << " required=" << (capability.required ? "true" : "false")
+                  << " detail=" << std::quoted(capability.detail) << '\n';
+    }
+    for (const auto& product : revision.envelope.products) {
+        std::cout << "product identity=" << product.identity
+                  << " kind=" << static_cast<unsigned>(product.kind)
+                  << " version=" << product.format_version
+                  << " digest=" << product.content_digest.hex()
+                  << " path=" << std::quoted(product.relative_path) << '\n';
+    }
+    return EXIT_SUCCESS;
+}
+
 void usage(std::ostream& output) {
     output << "Cartographer " << CARTOGRAPHER_VERSION << "\n"
            << "Usage:\n"
@@ -2668,10 +2931,18 @@ void usage(std::ostream& output) {
            << "  cartographer_cli import-functional-genome-exchange <exchange.carto-genome> <project.carto>\n"
            << "  cartographer_cli inspect-anatomy-provider-candidate <candidate.carto-anatomy>\n"
            << "  cartographer_cli export-anatomy-provider-candidate <project.carto> <candidate.carto-anatomy>\n"
-           << "  cartographer_cli export-obj <project.carto> <mesh.obj>\n"
-           << "  cartographer_cli export-ply <project.carto> <mesh.ply>\n"
-           << "  cartographer_cli export-stl <project.carto> <mesh.stl>\n"
+           << "  cartographer_cli export-obj <project.carto> [mesh-asset-id] <mesh.obj>\n"
+           << "  cartographer_cli export-ply <project.carto> [mesh-asset-id] <mesh.ply>\n"
+           << "  cartographer_cli export-stl <project.carto> [mesh-asset-id] <mesh.stl>\n"
            << "  cartographer_cli export-gltf <project.carto> <scene.gltf>\n"
+           << "  cartographer_cli write-default-preparation-profile <profile.carto-prep>\n"
+           << "  cartographer_cli inspect-preparation-profile <profile.carto-prep>\n"
+           << "  cartographer_cli prepare <project.carto> <output-directory> scene\n"
+           << "  cartographer_cli prepare <project.carto> <output-directory> --profile <profile.carto-prep> scene\n"
+           << "  cartographer_cli prepare <project.carto> <output-directory> asset <mesh-asset-id>\n"
+           << "  cartographer_cli prepare <project.carto> <output-directory> assembly <node-id>\n"
+           << "  cartographer_cli prepare <project.carto> <output-directory> selection <node-id>...\n"
+           << "  cartographer_cli inspect-prepared <output-directory>\n"
            << "  cartographer_cli import-obj <mesh.obj> <project.carto>\n"
            << "  cartographer_cli import-ply <mesh.ply> <project.carto>\n"
            << "  cartographer_cli import-stl <mesh.stl> <project.carto>\n";
@@ -2774,17 +3045,47 @@ int main(int argc, char** argv) {
     if (command == "export-anatomy-provider-candidate" && argc == 4) {
         return export_anatomy_provider_candidate(argv[2], argv[3]);
     }
-    if (command == "export-obj" && argc == 4) {
-        return export_obj(argv[2], argv[3]);
+    if (command == "export-obj" && (argc == 4 || argc == 5)) {
+        if (argc == 4) return export_obj(argv[2], argv[3], std::nullopt);
+        const auto mesh_asset = parse_mesh_asset_id_argument(argv[3]);
+        if (!mesh_asset) {
+            print_error(mesh_asset.error());
+            return EXIT_FAILURE;
+        }
+        return export_obj(argv[2], argv[4], mesh_asset.value());
     }
-    if (command == "export-ply" && argc == 4) {
-        return export_ply(argv[2], argv[3]);
+    if (command == "export-ply" && (argc == 4 || argc == 5)) {
+        if (argc == 4) return export_ply(argv[2], argv[3], std::nullopt);
+        const auto mesh_asset = parse_mesh_asset_id_argument(argv[3]);
+        if (!mesh_asset) {
+            print_error(mesh_asset.error());
+            return EXIT_FAILURE;
+        }
+        return export_ply(argv[2], argv[4], mesh_asset.value());
     }
-    if (command == "export-stl" && argc == 4) {
-        return export_stl(argv[2], argv[3]);
+    if (command == "export-stl" && (argc == 4 || argc == 5)) {
+        if (argc == 4) return export_stl(argv[2], argv[3], std::nullopt);
+        const auto mesh_asset = parse_mesh_asset_id_argument(argv[3]);
+        if (!mesh_asset) {
+            print_error(mesh_asset.error());
+            return EXIT_FAILURE;
+        }
+        return export_stl(argv[2], argv[4], mesh_asset.value());
     }
     if (command == "export-gltf" && argc == 4) {
         return export_gltf(argv[2], argv[3]);
+    }
+    if (command == "write-default-preparation-profile" && argc == 3) {
+        return write_default_preparation_profile(argv[2]);
+    }
+    if (command == "inspect-preparation-profile" && argc == 3) {
+        return inspect_preparation_profile(argv[2]);
+    }
+    if (command == "prepare" && argc >= 5) {
+        return prepare_project(argc, argv);
+    }
+    if (command == "inspect-prepared" && argc == 3) {
+        return inspect_prepared(argv[2]);
     }
     if (command == "import-obj" && argc == 4) {
         return import_obj(argv[2], argv[3]);

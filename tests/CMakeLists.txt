@@ -73,6 +73,66 @@ add_test(
 )
 set_tests_properties(cartographer_package_consumer_tests PROPERTIES RUN_SERIAL TRUE)
 
+add_executable(cartographer_material_catalog_tests
+    material_catalog_tests.cpp
+)
+target_link_libraries(cartographer_material_catalog_tests
+    PRIVATE
+        carto_project
+)
+carto_target(cartographer_material_catalog_tests)
+add_test(NAME cartographer_material_catalog_tests COMMAND cartographer_material_catalog_tests)
+
+add_executable(cartographer_preparation_scope_tests
+    preparation_scope_tests.cpp
+)
+target_link_libraries(cartographer_preparation_scope_tests
+    PRIVATE
+        carto_production
+)
+carto_target(cartographer_preparation_scope_tests)
+add_test(NAME cartographer_preparation_scope_tests COMMAND cartographer_preparation_scope_tests)
+
+add_executable(cartographer_preparation_operation_tests
+    preparation_operation_tests.cpp
+)
+target_link_libraries(cartographer_preparation_operation_tests
+    PRIVATE
+        carto_production
+)
+carto_target(cartographer_preparation_operation_tests)
+add_test(NAME cartographer_preparation_operation_tests COMMAND cartographer_preparation_operation_tests)
+
+add_executable(cartographer_preparation_job_tests
+    preparation_job_tests.cpp
+)
+target_link_libraries(cartographer_preparation_job_tests
+    PRIVATE
+        carto_production
+)
+carto_target(cartographer_preparation_job_tests)
+add_test(NAME cartographer_preparation_job_tests COMMAND cartographer_preparation_job_tests)
+
+add_executable(cartographer_prepared_scene_tests
+    prepared_scene_tests.cpp
+)
+target_link_libraries(cartographer_prepared_scene_tests
+    PRIVATE
+        carto_production
+)
+carto_target(cartographer_prepared_scene_tests)
+add_test(NAME cartographer_prepared_scene_tests COMMAND cartographer_prepared_scene_tests)
+
+add_executable(cartographer_prepared_publication_tests
+    prepared_publication_tests.cpp
+)
+target_link_libraries(cartographer_prepared_publication_tests
+    PRIVATE
+        carto_production
+)
+carto_target(cartographer_prepared_publication_tests)
+add_test(NAME cartographer_prepared_publication_tests COMMAND cartographer_prepared_publication_tests)
+
 add_executable(cartographer_texture_source_tests
     texture_source_tests.cpp
 )

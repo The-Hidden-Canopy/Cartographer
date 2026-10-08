@@ -5,6 +5,7 @@
 #include <carto/core/result.hpp>
 #include <carto/geometry/mesh.hpp>
 #include <carto/project/file_lock.hpp>
+#include <carto/project/material_catalog.hpp>
 #include <carto/scientific/model.hpp>
 #include <carto/scene/scene.hpp>
 #include <carto/world/model.hpp>
@@ -23,6 +24,7 @@ class ApplicationSession;
 
 namespace carto::editor {
 class CreateMeshObjectCommand;
+class DuplicateProjectMeshInstanceCommand;
 class DeleteProjectSelectedFaceCommand;
 class DissolveProjectSelectedEdgeCommand;
 class ExtrudeProjectSelectedFaceCommand;
@@ -68,14 +70,14 @@ struct TopologyReceiptRecord {
 
 class ProjectDocument {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 7;
+    static constexpr std::uint32_t kSchemaVersion = 9;
     static constexpr std::uint32_t kMinimumReadableSchemaVersion = 1;
     static constexpr std::string_view kMagic = "CARTOGRAPHER_PROJECT";
     static constexpr std::string_view kAuthoringFormat = "cartographer.authoring";
     static constexpr std::string_view kAuthoringUnits = "meters";
     static constexpr std::string_view kAuthoringCoordinateSystem = "right_handed_y_up";
 
-    ProjectDocument() = default;
+    ProjectDocument();
     ProjectDocument(const ProjectDocument&) = default;
     ProjectDocument(ProjectDocument&&) = default;
 
@@ -88,6 +90,9 @@ public:
     [[nodiscard]] core::Result<void> validate() const;
 
     [[nodiscard]] const std::string& name() const noexcept { return name_; }
+    [[nodiscard]] const std::string& source_namespace() const noexcept {
+        return source_namespace_;
+    }
     [[nodiscard]] const scene::Scene& scene() const noexcept { return scene_; }
     [[nodiscard]] const std::map<std::uint64_t, geometry::EditableMesh>& meshes() const noexcept {
         return meshes_;
@@ -104,12 +109,16 @@ public:
     [[nodiscard]] const world::WorldModel& world_model() const noexcept {
         return world_model_;
     }
+    [[nodiscard]] const MaterialCatalog& material_catalog() const noexcept {
+        return material_catalog_;
+    }
     [[nodiscard]] core::Revision revision() const noexcept { return revision_; }
     [[nodiscard]] std::uint32_t schema_version() const noexcept { return kSchemaVersion; }
 
 private:
     friend class ::carto::application::ApplicationSession;
     friend class ::carto::editor::CreateMeshObjectCommand;
+    friend class ::carto::editor::DuplicateProjectMeshInstanceCommand;
     friend class ::carto::editor::DeleteProjectSelectedFaceCommand;
     friend class ::carto::editor::DissolveProjectSelectedEdgeCommand;
     friend class ::carto::editor::ExtrudeProjectSelectedFaceCommand;
@@ -158,6 +167,7 @@ private:
     [[nodiscard]] core::Result<void> set_scientific_model(
         scientific::ScientificModel model);
     [[nodiscard]] core::Result<void> set_world_model(world::WorldModel model);
+    [[nodiscard]] core::Result<void> set_material_catalog(MaterialCatalog catalog);
     [[nodiscard]] core::Result<void> set_object_transform(
         scene::ObjectId object,
         core::Transform transform);
@@ -177,11 +187,13 @@ private:
     void bump_revision() noexcept { revision_ = revision_.next(); }
 
     std::string name_ = "Untitled";
+    std::string source_namespace_;
     scene::Scene scene_;
     std::map<std::uint64_t, geometry::EditableMesh> meshes_;
     std::vector<TopologyReceiptRecord> topology_receipts_;
     scientific::ScientificModel scientific_model_;
     world::WorldModel world_model_;
+    MaterialCatalog material_catalog_;
     std::optional<assets::Sha256Digest> evaluation_graph_digest_;
     std::uint64_t next_mesh_id_ = 1;
     core::Revision revision_{};

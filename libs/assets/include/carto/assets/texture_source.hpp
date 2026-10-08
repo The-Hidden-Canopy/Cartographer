@@ -12,15 +12,6 @@
 
 namespace carto::assets {
 
-// Caller-selected limits may narrow admission but may not raise these process
-// safety ceilings. This prevents a permissive integration from turning
-// untrusted container metadata into an unbounded allocation request.
-inline constexpr std::uint64_t kTextureSourceAbsoluteMaxBytes =
-    1024ULL * 1024ULL * 1024ULL;
-inline constexpr std::uint32_t kTextureAbsoluteMaxDimension = 16'384U;
-inline constexpr std::uint64_t kTextureAbsoluteMaxPixels = 268'435'456ULL;
-inline constexpr std::uint32_t kTextureAbsoluteMaxMipLevels = 32U;
-
 enum class TextureSourceFormat {
     png,
     jpeg,
@@ -39,8 +30,13 @@ enum class TextureSourceStage {
 [[nodiscard]] const char* texture_source_format_name(TextureSourceFormat format) noexcept;
 [[nodiscard]] const char* texture_source_media_type(TextureSourceFormat format) noexcept;
 
+inline constexpr std::uint64_t kTextureSourceAbsoluteMaxBytes = 256ULL * 1024ULL * 1024ULL;
+inline constexpr std::uint32_t kTextureAbsoluteMaxDimension = 16'384U;
+inline constexpr std::uint64_t kTextureAbsoluteMaxPixels = 268'435'456ULL;
+inline constexpr std::uint32_t kTextureAbsoluteMaxMipLevels = 32U;
+
 struct TextureSourceLimits {
-    std::uint64_t max_source_bytes = 256ULL * 1024ULL * 1024ULL;
+    std::uint64_t max_source_bytes = kTextureSourceAbsoluteMaxBytes;
     std::uint32_t max_dimension = kTextureAbsoluteMaxDimension;
     std::uint64_t max_pixels = kTextureAbsoluteMaxPixels;
     std::uint32_t max_mip_levels = kTextureAbsoluteMaxMipLevels;

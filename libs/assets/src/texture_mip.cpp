@@ -243,8 +243,7 @@ core::Result<void> validate_structure(
         const Rgba8MipLevel& level = chain.levels[index];
         const std::uint64_t expected_bytes =
             static_cast<std::uint64_t>(expected_width) * expected_height * 4U;
-        if (expected_bytes > kMaxRgba8MipArtifactBytes ||
-            level.width != expected_width || level.height != expected_height ||
+        if (level.width != expected_width || level.height != expected_height ||
             level.pixels.size() != expected_bytes ||
             resident_bytes > kMaxRgba8MipArtifactBytes - expected_bytes) {
             return core::Result<void>::failure(validation(

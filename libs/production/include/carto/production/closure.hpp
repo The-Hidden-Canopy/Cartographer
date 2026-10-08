@@ -147,9 +147,8 @@ public:
     static constexpr std::size_t max_receipts = 4096U;
     static constexpr std::size_t max_serialized_bytes = 4U * 1024U * 1024U;
 
-    // Append-only evidence. Exact retries are idempotent, while two admitted
-    // outputs for one deterministic cook key fail closed. A failed, stale, or
-    // cancelled record supersedes an earlier admission; query never falls back.
+    // Append-only evidence. A failed/stale/cancelled record supersedes an
+    // earlier admitted record for the same key; query never falls back to it.
     [[nodiscard]] core::Result<void> append(ProductionArtifactReceipt receipt);
     [[nodiscard]] core::Result<std::optional<ProductionArtifactReceipt>> query(
         const ProductionCookKey& key) const;

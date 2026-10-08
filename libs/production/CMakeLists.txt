@@ -5,6 +5,11 @@ add_library(carto_production STATIC
     src/dependency.cpp
     src/lookdev_draw_package.cpp
     src/material_artifact.cpp
+    src/preparation_job.cpp
+    src/preparation_operation.cpp
+    src/preparation_scope.cpp
+    src/prepared_publication.cpp
+    src/prepared_scene.cpp
     src/render_mesh.cpp
 )
 

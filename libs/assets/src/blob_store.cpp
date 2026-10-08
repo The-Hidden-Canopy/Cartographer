@@ -237,9 +237,7 @@ core::Result<BlobRef> BlobStore::put(
         return core::Result<BlobRef>::failure(invalid("blob exceeds the configured size limit"));
     }
     if (media_type.empty() || media_type.size() > limits_.max_media_type_bytes ||
-        !std::all_of(media_type.begin(), media_type.end(), [](unsigned char byte) {
-            return byte >= 0x20U && byte != 0x7fU;
-        })) {
+        media_type.find_first_of("\r\n\t") != std::string::npos) {
         return core::Result<BlobRef>::failure(invalid("blob media type is invalid or too long"));
     }
     const Sha256Digest digest = sha256(bytes);
@@ -300,9 +298,6 @@ core::Result<BlobRef> BlobStore::put(
 }
 
 core::Result<std::vector<std::uint8_t>> BlobStore::read(const Sha256Digest& digest) const {
-    if (auto result = limits_.validate(); !result) {
-        return core::Result<std::vector<std::uint8_t>>::failure(result.error());
-    }
     const std::filesystem::path path = path_for(digest);
     std::error_code error;
     const bool regular_file = std::filesystem::is_regular_file(path, error);

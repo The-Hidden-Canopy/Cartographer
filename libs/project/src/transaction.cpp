@@ -175,6 +175,11 @@ core::Result<void> ProjectTransaction::set_world_model(world::WorldModel model) 
     return staged_.set_world_model(std::move(model));
 }
 
+core::Result<void> ProjectTransaction::set_material_catalog(MaterialCatalog catalog) {
+    if (auto result = ensure_active(); !result) return result;
+    return staged_.set_material_catalog(std::move(catalog));
+}
+
 core::Result<void> ProjectTransaction::set_object_transform(
     scene::ObjectId object,
     core::Transform transform) {

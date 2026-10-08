@@ -10,8 +10,6 @@ namespace carto::production {
 
 // Binds immutable content-addressed bytes to an admitted production receipt.
 // The blob store owns bytes; this layer owns admission and source freshness.
-// One instance is intentionally single-writer; callers must serialize access
-// until a durable multi-worker ledger owns cross-thread/process publication.
 class ProductionArtifactStore final {
 public:
     explicit ProductionArtifactStore(assets::BlobStore& blobs) noexcept

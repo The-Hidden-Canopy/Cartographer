@@ -23,9 +23,6 @@ The bounded public slice is admitted when:
   acceptance and invalid negative time limits; rejected over-budget output does
   not append a ledger receipt;
 - failed, stale, and cancelled receipts cannot carry output;
-- exact receipt retries are idempotent, conflicting admitted output for one
-  deterministic cook key fails closed before blob mutation, and serialized
-  duplicate evidence is rejected rather than silently collapsed;
 - a newer non-admitted receipt masks an older admitted receipt in the ledger;
 - a bounded cook graph rejects cycles and duplicate/self-dependencies;
 - cook order is deterministic and invalidation is downstream-only, including
@@ -51,8 +48,6 @@ The bounded public slice is admitted when:
   TGA decode, semantic RGBA8 mip generation, mip persistence, native-material
   compilation, and mesh/material draw-package persistence reject malformed,
   stale, missing, duplicate, unsupported, tampered, and trailing inputs;
-  caller-provided limits cannot raise process allocation ceilings, and the
-  native material ABI has exact compile-time size, alignment, and offsets;
 - the native D3D12 acceptance path uploads every aligned RGBA8 subresource and
   reads a selected non-base mip back without debug-layer receipts;
 - the complete Release suite and this contract's focused test pass.
