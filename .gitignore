@@ -1,0 +1,146 @@
+# Build output and local tool state
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+/install/
+/dist/
+/coverage/
+/Testing/
+/.cache/
+/tmp/
+
+# Source docuseries, office documents, and ad-hoc archives are release inputs,
+# not public source. Publish an intentionally reviewed derived document instead.
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.pdf
+*.docx
+*.pptx
+*.xlsx
+
+# GitHub Actions is opt-in for this local/public checkout; do not stage
+# workflow definitions unless CI is intentionally re-enabled.
+/.github/workflows/
+
+# Generated build-system state outside a preset build directory
+*.ninja
+.ninja_deps
+.ninja_log
+.ninja_lock
+CMakeUserPresets.json
+
+# IDE files
+.vs/
+.vscode/
+__pycache__/
+*.pyc
+*.user
+*.suo
+
+# CMake-generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+compile_commands.json
+_deps/
+
+# Platform output
+*.obj
+*.o
+*.a
+*.lib
+*.dll
+*.dylib
+*.so
+*.exe
+
+# Local project files and test artifacts
+*.carto.tmp
+*.carto.tmp-*
+*.carto.journal
+*.carto.lock
+*.journal.lock
+*.log
+
+# Local credentials and environment (never commit workstation secrets)
+.env
+.env.*
+!.env.example
+*.env
+!*.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.der
+*.jks
+*.keystore
+*.secret
+*.credentials
+
+# Private model and weight artifacts are kept behind the moat by default.
+*.gguf
+*.safetensors
+*.onnx
+*.pt
+*.pth
+*.ckpt
+
+# Private hub/API adapters are maintained outside the Cartographer checkout
+/.hub/
+/hub-local/
+
+# Keep explicit quarantine paths so models, weights, prompts, telemetry,
+# tuning, private runtime snapshots, and protected execution source cannot be
+# staged accidentally. Reviewed public shaders and geometry tests remain
+# visible to review.
+/.moat/
+/moat/
+/.private-runtime/
+/private-runtime/
+/models-private/
+/weights-private/
+/prompts-private/
+/telemetry-private/
+/tuning-private/
+
+# Private/uncleared integration material must stay out of the public tree
+# until provenance and licensing are cleared.
+/private/
+/.private/
+/docs/anatomy/
+/docs/spec/
+*.owh.carto
+*.private.*
+.codex-remote-attachments/
+
+# Protected invention-bearing algorithm surfaces stay outside the public tree.
+/libs/ai/
+/libs/device/include/carto/device/kernel_evidence.hpp
+/libs/device/src/kernel_evidence.cpp
+/libs/render/include/carto/render/gpu_plan.hpp
+/libs/render/src/gpu_plan.cpp
+/benchmarks/d3d12_kernels.cpp
+/benchmarks/scientific_kernels.cpp
+/tests/ai_tests.cpp
+/tests/kernel_evidence_tests.cpp
+/docs/architecture/kernel-evidence.md
+/docs/verification/native-kernel-benchmark.md
+/docs/verification/scientific-kernel-benchmark.md
+/libs/web_geometry/certified/
+/libs/polygon/
+/tests/certified_geometry_tests.cpp
+/tests/polygon_tests.cpp
+/benchmarks/certified_geometry.cpp
+/benchmarks/polygon.cpp
+/docs/protected/
+/docs/internal/
+/docs/private/
