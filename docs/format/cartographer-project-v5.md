@@ -1,6 +1,6 @@
 # Cartographer project format v5 (legacy)
 
-Current saves use [project format v7](cartographer-project-v7.md). Version 5
+Current saves use [project format v9](cartographer-project-v9.md). Version 5
 remains readable for migration, but it has no persisted mesh attribute or UV
 records; a v5 mesh therefore loads with an empty attribute payload and is
 upgraded to the current format on its next save.

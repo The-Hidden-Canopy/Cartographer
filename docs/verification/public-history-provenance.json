@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "purpose": "Owner-reviewed classification of legacy integration roots retained only in reachable public history.",
+  "entries": [
+    {
+      "root": "apps/gmib",
+      "commits": [
+        "f606cdc378118d388b7884793462904570d303a5",
+        "46837294a4b7541b74c44fc9625a8a86d28e2a70"
+      ],
+      "disposition": "first_party_removed_from_current_public_tree",
+      "license_basis": "repository_apache_2_0",
+      "owner_reviewed": true,
+      "reviewed_on": "2026-10-04"
+    },
+    {
+      "root": "libs/simulation",
+      "commits": [
+        "f606cdc378118d388b7884793462904570d303a5",
+        "46837294a4b7541b74c44fc9625a8a86d28e2a70"
+      ],
+      "disposition": "first_party_removed_from_current_public_tree",
+      "license_basis": "repository_apache_2_0",
+      "owner_reviewed": true,
+      "reviewed_on": "2026-10-04"
+    },
+    {
+      "root": "docs/architecture/gmib-integration.md",
+      "commits": [
+        "f606cdc378118d388b7884793462904570d303a5",
+        "46837294a4b7541b74c44fc9625a8a86d28e2a70"
+      ],
+      "disposition": "first_party_removed_from_current_public_tree",
+      "license_basis": "repository_apache_2_0",
+      "owner_reviewed": true,
+      "reviewed_on": "2026-10-04"
+    }
+  ]
+}

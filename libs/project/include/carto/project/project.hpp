@@ -70,7 +70,7 @@ struct TopologyReceiptRecord {
 
 class ProjectDocument {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 9;
+    static constexpr std::uint32_t kSchemaVersion = 10;
     static constexpr std::uint32_t kMinimumReadableSchemaVersion = 1;
     static constexpr std::string_view kMagic = "CARTOGRAPHER_PROJECT";
     static constexpr std::string_view kAuthoringFormat = "cartographer.authoring";
@@ -111,6 +111,15 @@ public:
     }
     [[nodiscard]] const MaterialCatalog& material_catalog() const noexcept {
         return material_catalog_;
+    }
+    // Opaque serialized semantic sidecar bytes and the digest that binds
+    // them. ProjectDocument stores the bytes verbatim and never parses them;
+    // semantic meaning stays behind the carto_semantic boundary.
+    [[nodiscard]] const std::optional<std::string>& semantic_sidecar_bytes() const noexcept {
+        return semantic_sidecar_bytes_;
+    }
+    [[nodiscard]] const std::optional<assets::Sha256Digest>& semantic_sidecar_digest() const noexcept {
+        return semantic_sidecar_digest_;
     }
     [[nodiscard]] core::Revision revision() const noexcept { return revision_; }
     [[nodiscard]] std::uint32_t schema_version() const noexcept { return kSchemaVersion; }
@@ -168,6 +177,11 @@ private:
         scientific::ScientificModel model);
     [[nodiscard]] core::Result<void> set_world_model(world::WorldModel model);
     [[nodiscard]] core::Result<void> set_material_catalog(MaterialCatalog catalog);
+    // Binds one opaque serialized semantic sidecar and its digest. The digest
+    // must equal the SHA-256 of the exact bytes; mismatches fail closed.
+    [[nodiscard]] core::Result<void> set_semantic_sidecar(
+        std::string serialized_sidecar,
+        assets::Sha256Digest digest);
     [[nodiscard]] core::Result<void> set_object_transform(
         scene::ObjectId object,
         core::Transform transform);
@@ -194,6 +208,8 @@ private:
     scientific::ScientificModel scientific_model_;
     world::WorldModel world_model_;
     MaterialCatalog material_catalog_;
+    std::optional<std::string> semantic_sidecar_bytes_;
+    std::optional<assets::Sha256Digest> semantic_sidecar_digest_;
     std::optional<assets::Sha256Digest> evaluation_graph_digest_;
     std::uint64_t next_mesh_id_ = 1;
     core::Revision revision_{};

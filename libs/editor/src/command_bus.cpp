@@ -2435,4 +2435,124 @@ core::Result<void> CreateMeshObjectCommand::remove_instance() {
     return core::Result<void>::success();
 }
 
+DuplicateProjectMeshInstanceCommand::DuplicateProjectMeshInstanceCommand(
+    ProjectCommandAdmission,
+    project::ProjectDocument& document,
+    scene::ObjectId source,
+    std::string object_name,
+    core::Vec3d local_translation_offset)
+    : document_(&document),
+      source_(source),
+      object_name_(std::move(object_name)),
+      local_translation_offset_(local_translation_offset) {}
+
+core::Result<void> DuplicateProjectMeshInstanceCommand::execute() {
+    if (!document_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "duplicate mesh instance command has no project"));
+    }
+    if (object_.has_value()) {
+        return restore_instance();
+    }
+    return create_first_instance();
+}
+
+core::Result<void> DuplicateProjectMeshInstanceCommand::undo() {
+    if (!document_ || !object_.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "duplicate mesh instance command has no instance to undo"));
+    }
+    return remove_instance();
+}
+
+core::Result<void> DuplicateProjectMeshInstanceCommand::create_first_instance() {
+    if (!source_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "duplicate mesh instance requires a non-zero source object id"));
+    }
+    if (!local_translation_offset_.finite()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "duplicate mesh instance offset must contain finite values"));
+    }
+
+    const auto* source = document_->scene().find(source_);
+    if (!source) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "duplicate mesh instance source object does not exist"));
+    }
+    if (source->locked) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "duplicate mesh instance source object is locked"));
+    }
+    if (!source->visible) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "duplicate mesh instance source object is hidden"));
+    }
+    if (source->parent.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "duplicate mesh instance only supports root-level source objects"));
+    }
+    if (!source->mesh_asset.has_value() || !document_->meshes().contains(*source->mesh_asset)) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "duplicate mesh instance source object has no available mesh asset"));
+    }
+    const std::uint64_t mesh_asset = *source->mesh_asset;
+
+    core::Transform transform = source->local_transform;
+    transform.translation = transform.translation + local_translation_offset_;
+    if (!transform.finite()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "duplicate mesh instance transform must contain finite values"));
+    }
+
+    const project::ProjectDocument before = *document_;
+    const auto rollback = [this, &before](core::Diagnostic diagnostic) {
+        *document_ = before;
+        object_.reset();
+        return core::Result<void>::failure(std::move(diagnostic));
+    };
+
+    auto object = document_->create_object(object_name_, transform);
+    if (!object) {
+        return rollback(object.error());
+    }
+    const scene::ObjectId object_id = object.value();
+    if (auto attach = document_->attach_mesh(object_id, mesh_asset); !attach) {
+        return rollback(attach.error());
+    }
+    const auto* inserted = document_->scene().find(object_id);
+    if (!inserted || inserted->mesh_asset != std::optional<std::uint64_t>{mesh_asset} ||
+        inserted->parent.has_value() ||
+        !inserted->visible || inserted->locked) {
+        return rollback(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "duplicated mesh instance violated root-level instance invariants"));
+    }
+    object_ = *inserted;
+    return core::Result<void>::success();
+}
+
+core::Result<void> DuplicateProjectMeshInstanceCommand::restore_instance() {
+    if (!object_.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "duplicate mesh instance command has incomplete restoration state"));
+    }
+    return document_->insert_object(*object_);
+}
+
+core::Result<void> DuplicateProjectMeshInstanceCommand::remove_instance() {
+    return document_->remove_object(object_->id);
+}
+
 } // namespace carto::editor

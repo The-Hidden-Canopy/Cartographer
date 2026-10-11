@@ -5,7 +5,7 @@ retains the v5 authoring envelope, topology receipt ledger, optional
 evaluation-graph digest, and scientific model record, and adds validated mesh
 attribute payloads with explicit UV-set identity.
 
-New saves use [project format v7](cartographer-project-v7.md). The parser still
+New saves use [project format v9](cartographer-project-v9.md). The parser still
 reads v6. Legacy v5 meshes have no
 attribute records and load with an empty payload; saving them upgrades the
 document to the current format. Unknown versions, duplicate identities, invalid enum values,

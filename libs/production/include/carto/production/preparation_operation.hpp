@@ -19,8 +19,9 @@ class ProjectDocument;
 
 namespace carto::production {
 
-inline constexpr std::uint32_t kPreparationProfileVersion = 1U;
+inline constexpr std::uint32_t kPreparationProfileVersion = 2U;
 inline constexpr std::size_t kMaxPreparationProfileBytes = 64U * 1024U;
+inline constexpr std::size_t kMaxPreparationProductPolicies = 64U;
 
 enum class PreparationStage : std::uint8_t {
     resolve,
@@ -49,6 +50,36 @@ struct PreparationDiagnostic {
     std::vector<std::string> context;
 };
 
+// Engine-independent preparation product class. The ordinal layout mirrors
+// PreparedProductKind so profiles and products agree on class identity.
+enum class PreparationProductClass : std::uint8_t {
+    render_mesh,
+    lookdev_draw_package,
+    world_model,
+    material_catalog,
+    texture_source,
+    semantic_sidecar,
+    connection_port_graph,
+    physical_twin,
+    collision_candidates,
+    navigation,
+    kinematic_graph,
+    temporal_clip,
+    archetype,
+};
+
+// Per-product-class preparation policy. Omission from the profile selects
+// the portable default: the class is included and only lossless preparation
+// is admitted. The approximation error budget is the maximum permitted
+// deviation for that class; zero requires an exact product.
+struct PreparationProductPolicy {
+    PreparationProductClass product_class = PreparationProductClass::render_mesh;
+    bool include = true;
+    double max_approximation_error = 0.0;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
 // Engine-independent preparation policy. It describes deterministic source
 // interpretation, not a destination-engine implementation or support claim.
 struct PreparationProfile {
@@ -61,6 +92,12 @@ struct PreparationProfile {
     std::optional<std::string> vertex_color_layer;
     bool include_lookdev = true;
     bool require_lookdev_for_material_regions = false;
+    std::vector<PreparationProductPolicy> product_policies;
+
+    [[nodiscard]] bool includes_product_class(
+        PreparationProductClass product_class) const noexcept;
+    [[nodiscard]] double approximation_error_budget(
+        PreparationProductClass product_class) const noexcept;
 
     [[nodiscard]] core::Result<void> validate() const;
     [[nodiscard]] std::string serialize() const;

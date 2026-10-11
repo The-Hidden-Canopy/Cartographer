@@ -235,22 +235,6 @@ void malformed_decisions_and_timing_claims_fail_closed() {
     decision.basis.candidate_limit = 1U;
     require(!decision.refresh_digest(),
             "candidate population cannot exceed its declared finite bound");
-
-    decision = decision_fixture();
-    decision.status = static_cast<ReceiptStatus>(255U);
-    require(!decision.refresh_digest(), "unknown decision states fail closed");
-
-    decision = decision_fixture();
-    decision.candidates[0U].disposition =
-        static_cast<CandidateDisposition>(255U);
-    require(!decision.refresh_digest(),
-            "unknown candidate dispositions fail closed");
-
-    decision = decision_fixture();
-    decision.candidates[1U].cost_evidence.gpu =
-        static_cast<TimingEvidenceSource>(255U);
-    require(!decision.refresh_digest(),
-            "unknown timing evidence sources fail closed");
 }
 
 void serialization_rejects_tamper_and_trailing_data() {

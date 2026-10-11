@@ -180,6 +180,13 @@ core::Result<void> ProjectTransaction::set_material_catalog(MaterialCatalog cata
     return staged_.set_material_catalog(std::move(catalog));
 }
 
+core::Result<void> ProjectTransaction::set_semantic_sidecar(
+    std::string serialized_sidecar,
+    assets::Sha256Digest digest) {
+    if (auto result = ensure_active(); !result) return result;
+    return staged_.set_semantic_sidecar(std::move(serialized_sidecar), digest);
+}
+
 core::Result<void> ProjectTransaction::set_object_transform(
     scene::ObjectId object,
     core::Transform transform) {

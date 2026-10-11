@@ -14,21 +14,23 @@ permanently proprietary.
 | --- | --- |
 | `.carto` authoring format and validation | model weights, private prompts, provider credentials, and routing policy |
 | provider-neutral scientific entities, fields, studies, results, and provenance | private genome interpretation, solver binaries, anatomy catalogs, and unpublished scientific datasets |
-| geometry, topology, evaluation, and mesh-attribute kernels | unreleased algorithm implementations, optimization recipes, and tuning data |
+| geometry, topology, evaluation, and mesh-attribute kernels | proprietary native kernels, protected adaptive-representation and continuity algorithms, optimization recipes, and tuning data |
 | scene, project, revision, undo/redo, and receipts | private telemetry, workflow-learning stores, and unreleased datasets |
 | provider-neutral semantic areas/paths, structure graphs, reconstructible instance fields, and sparse variants | runtime materialization policy, proprietary world generation, and unreleased game-world corpora |
 | OBJ, PLY, STL, glTF, and other reviewed interchange | private schemas, catalogs, and hosted-service state |
 | render-graph, RHI, CPU reference, and clean-room GPU contracts | proprietary GPU passes, performance recipes, and entitlements |
 | generic Vulkan/D3D12/backend acceptance and offline benchmarks | credentials, internal automation, and uncleared source specifications |
-| offline UI/workbench and local human-action contracts | authoring planners, operation catalogs, account authority, and service-side collaboration state |
+| offline UI/workbench and provider-neutral proposal contracts | account authority and service-side collaboration state |
 
-The public side does not expose a private authoring-service contract or remote
-mutation adapter. It must not expose raw mutable authoring pointers or permit a
-remote service to bypass local validation.
+The public side may expose a typed context and a typed proposal contract. It may
+not expose raw mutable authoring pointers or permit a remote service to bypass
+local validation.
 
-Protected algorithm surfaces, benchmarks, and source specifications live in an
-adjacent private companion tree. The public checkout has no target, header,
-test, benchmark, or documentation path for those unreleased surfaces.
+Protected algorithm surfaces include adaptive representation/certification
+policy, persistent topological continuity identity, field-growth or other
+private geometry-generation previews, and their benchmarks and specifications.
+They live in the adjacent private companion tree. The public checkout has no
+target, header, test, benchmark, or documentation path for those surfaces.
 
 ## Plugin-package rule
 
@@ -137,18 +139,21 @@ python scripts/public_boundary_audit.py --check-ignore-policy
 ```
 
 It checks tracked files, tracked-but-ignored files, non-ignored working-tree
-files, recognizable credential patterns, protected execution-source
-signatures, workstation-specific user/workspace roots, required quarantine
-rules, and all reachable Git history. The
-tracked-but-ignored check is explicit because
+files, recognizable credential patterns, workstation-specific paths, required
+quarantine rules, and all reachable Git history. The tracked-but-ignored check
+is explicit because
 `.gitignore` is not retroactive. It never rewrites history, expires reflogs,
 deletes files, or contacts a remote. Use `--include-reflog` for a local hygiene
 audit that also inspects reflog/unreachable objects. Legacy GMIB, anatomy, OWH,
-and simulation paths are reported for provenance/licensing review;
-`--fail-on-review` makes those review items blocking for an owner-approved
-release gate. Automatic hosted CI is currently disabled to avoid CI spend; if
-CI is re-enabled, it must invoke the same blocking mode so an unclassified
-legacy path cannot pass the public build merely because it is absent from the
-current checkout. Clearing the gate requires provenance/licensing
-classification or owner-approved history remediation; this repository does not
-rewrite history automatically.
+and simulation paths are reported for provenance/licensing review unless an
+exact root is covered by the owner-reviewed
+`docs/verification/public-history-provenance.json` manifest. The manifest is
+machine-checked and cannot classify a forbidden path or an entry without
+explicit owner review, disposition, license basis, and commit identities.
+`--fail-on-review` makes any unclassified review item blocking for an
+owner-approved release gate. Automatic hosted CI is currently disabled to
+avoid CI spend; if CI is re-enabled, it must invoke the same blocking mode so
+an unclassified legacy path cannot pass the public build merely because it is
+absent from the current checkout. Clearing the gate requires provenance/
+licensing classification or owner-approved history remediation; this
+repository does not rewrite history automatically.

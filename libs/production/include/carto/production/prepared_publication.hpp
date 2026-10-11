@@ -20,6 +20,7 @@ struct PreparedProductPayload {
 
 struct PreparedPublicationReceipt {
     assets::Sha256Digest prepared_scene_digest;
+    assets::Sha256Digest dependency_closure_digest;
     std::optional<assets::Sha256Digest> previous_selected_digest;
     core::Revision source_revision;
     std::filesystem::path revision_path;
@@ -31,6 +32,13 @@ struct SelectedPreparedScene {
     PreparedSceneEnvelope envelope;
     std::filesystem::path revision_path;
 };
+
+// Canonical, deterministic hash of the envelope's resolved dependency set.
+// Dependency records are already canonically sorted and unique in a valid
+// envelope; hashing their canonical text binds the receipt to the exact
+// resolved closure rather than to manifest bytes.
+[[nodiscard]] core::Result<assets::Sha256Digest> prepared_dependency_closure_digest(
+    const PreparedSceneEnvelope& envelope);
 
 // Publishes one complete immutable revision under output_root/revisions and
 // atomically selects it through output_root/current. expected_selected_digest

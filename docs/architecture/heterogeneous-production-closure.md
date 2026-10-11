@@ -19,10 +19,8 @@ evidence bundles without requiring the public repository to own VANTA's runtime.
    when configured, equality is admitted and any value above the ceiling is
    rejected. The per-publication output bound is distinct from the blob store's
    global storage limit.
-4. The append-only ledger treats an exact retry as idempotent, rejects two
-   different admitted outputs for one deterministic cook key, and never falls
-   back to an older admitted product after a newer failure, cancellation, or
-   stale result for the same key.
+4. The append-only ledger never falls back to an older admitted product after a
+   newer failure, cancellation, or stale result for the same key.
 5. A durable decision receipt binds every considered artifact, the exact
    selected index, opaque policy identity, canonical public-threshold digest,
    hardware profile, rejection reason, and timing-evidence basis. Publication
@@ -46,9 +44,7 @@ assuming they do not overlap.
 immutable bytes to the existing SHA-256 blob store only after the receipt,
 current source, policy, payload size, and payload digest agree. Reads require a
 current admitted receipt and reverify the blob; a stale source or missing
-receipt cannot fall back to an older artifact. A conflicting deterministic
-output is rejected before blob creation, so failed admission does not leave an
-unreferenced payload mutation.
+receipt cannot fall back to an older artifact.
 
 This is deliberately a contract layer, not a pretend GPU backend. GPU queues,
 VANTA residency, remote workers, and private production adapters consume the
@@ -119,16 +115,13 @@ and origin canonicalization, produces digest-bound top-left RGBA8 pixels.
 Deterministic semantic mip generation filters sRGB in linear light,
 renormalizes normal maps, handles odd extents, and optionally preserves alpha
 coverage. Canonical persistence binds every level and rejects unknown framing,
-tamper, truncation, trailing bytes, and source-limit violations. Caller-selected
-limits may narrow, but cannot raise, the absolute source-byte, dimension,
-decoded-pixel, mip-count, or blob-store allocation ceilings.
+tamper, truncation, trailing bytes, and source-limit violations.
 
 `CompiledMaterialArtifact` lowers one supported public material into the exact
 native PBR constant ABI, including scalar dielectric F0 and clearcoat. It binds
 source identity, revision, canonical source digest, feature mask, constants,
-and artifact digest. Compile-time size, alignment, and field-offset assertions
-freeze that cross-backend layout. Unsupported authored bindings fail compilation
-instead of silently disappearing.
+and artifact digest. Unsupported authored bindings fail compilation instead of
+silently disappearing.
 
 `LookdevDrawPackage` binds one exact render-mesh artifact to exactly one compiled
 material artifact for every canonical submesh. It persists draw ranges,

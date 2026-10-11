@@ -395,6 +395,55 @@ void publication_rejects_missing_selector_over_nonempty_store() {
         "selector-loss rejection preserves the existing immutable revision");
 }
 
+void dependency_closure_digest_binds_the_resolved_closure() {
+    using namespace carto;
+    TempDirectory temp;
+    const auto root = temp.path() / "closure";
+    const auto first = make_fixture(20U, "closure-first-product");
+    const auto second = make_fixture(21U, "closure-second-product");
+    const auto first_closure =
+        production::prepared_dependency_closure_digest(first.envelope);
+    const auto second_closure =
+        production::prepared_dependency_closure_digest(second.envelope);
+    require(first_closure && second_closure &&
+            !first_closure.value().is_zero() && !second_closure.value().is_zero() &&
+            first_closure.value() != second_closure.value(),
+        "distinct resolved dependency closures hash distinctly");
+    const auto replay_closure =
+        production::prepared_dependency_closure_digest(first.envelope);
+    require(replay_closure &&
+            replay_closure.value() == first_closure.value(),
+        "dependency-closure hashing is deterministic");
+
+    auto invalid = first.envelope;
+    invalid.dependencies.clear();
+    require(!production::prepared_dependency_closure_digest(invalid),
+        "dependency-closure hashing fails closed for an invalid envelope");
+
+    const auto published_first = production::publish_prepared_scene(
+        root, first.envelope, first.payloads, std::nullopt);
+    require(published_first &&
+            published_first.value().dependency_closure_digest == first_closure.value(),
+        "the publication receipt carries the dependency-closure digest");
+    const auto published_second = production::publish_prepared_scene(
+        root, second.envelope, second.payloads,
+        published_first.value().prepared_scene_digest);
+    require(published_second && published_second.value().dependency_closure_digest ==
+            second_closure.value() &&
+            published_second.value().dependency_closure_digest !=
+                published_first.value().dependency_closure_digest,
+        "a changed dependency set changes the receipt closure digest");
+
+    const auto selected = production::read_selected_prepared_scene(root);
+    require(selected && selected.value().has_value(),
+        "closure fixture reopens its selected revision");
+    const auto reread_closure = production::prepared_dependency_closure_digest(
+        selected.value()->envelope);
+    require(reread_closure && reread_closure.value() ==
+            published_second.value().dependency_closure_digest,
+        "the published dependency-closure digest reopens with the revision");
+}
+
 } // namespace
 
 int main() {
@@ -403,6 +452,7 @@ int main() {
     publication_is_bound_to_source_lineage();
     publication_rejects_linked_ancestor_paths();
     publication_rejects_missing_selector_over_nonempty_store();
+    dependency_closure_digest_binds_the_resolved_closure();
     std::cout << "prepared publication tests passed\n";
     return EXIT_SUCCESS;
 }

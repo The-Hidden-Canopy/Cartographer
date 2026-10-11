@@ -26,18 +26,6 @@ core::Result<void> ProductionArtifactStore::publish(
             "production payload does not match its admitted output identity"));
     }
 
-    // Reject deterministic identity conflicts before touching content-addressed
-    // storage. The ledger performs the same check at append time so direct
-    // ledger users and store users share one fail-closed contract.
-    const auto existing = ledger_.query(receipt.key);
-    if (!existing) return core::Result<void>::failure(existing.error());
-    if (existing.value().has_value() &&
-        (existing.value()->output_digest != receipt.output_digest ||
-         existing.value()->output_bytes != receipt.output_bytes)) {
-        return core::Result<void>::failure(validation(
-            "deterministic production cook key has conflicting admitted output"));
-    }
-
     const auto stored = blobs_.put(payload, "application/vnd.cartographer.derived");
     if (!stored) return core::Result<void>::failure(stored.error());
     if (stored.value().digest != receipt.output_digest ||

@@ -37,10 +37,10 @@
       }
     },
     {
-      "name": "benchmark-release",
-      "displayName": "Cartographer public geometry benchmarks",
+      "name": "kernel-bench-release",
+      "displayName": "Cartographer native kernel benchmark",
       "inherits": "headless-release",
-      "binaryDir": "${sourceDir}/build/benchmarks",
+      "binaryDir": "${sourceDir}/build/kernel-bench",
       "cacheVariables": {
         "CARTO_BUILD_BENCHMARKS": "ON"
       }
@@ -73,6 +73,15 @@
       }
     },
     {
+      "name": "d3d12-kernel-bench-release",
+      "displayName": "Cartographer D3D12 kernel benchmark",
+      "inherits": "d3d12-headless-release",
+      "binaryDir": "${sourceDir}/build/d3d12-kernel-bench-release",
+      "cacheVariables": {
+        "CARTO_BUILD_BENCHMARKS": "ON"
+      }
+    },
+    {
       "name": "d3d12-desktop-compile",
       "displayName": "Cartographer native D3D12 desktop compile",
       "inherits": "d3d12-headless-release",
@@ -92,8 +101,8 @@
       "configurePreset": "headless-release"
     },
     {
-      "name": "benchmark-release",
-      "configurePreset": "benchmark-release"
+      "name": "kernel-bench-release",
+      "configurePreset": "kernel-bench-release"
     },
     {
       "name": "sdk-shared-release",
@@ -106,6 +115,10 @@
     {
       "name": "d3d12-headless-release",
       "configurePreset": "d3d12-headless-release"
+    },
+    {
+      "name": "d3d12-kernel-bench-release",
+      "configurePreset": "d3d12-kernel-bench-release"
     },
     {
       "name": "d3d12-desktop-compile",
@@ -128,8 +141,8 @@
       }
     },
     {
-      "name": "benchmark-release",
-      "configurePreset": "benchmark-release",
+      "name": "kernel-bench-release",
+      "configurePreset": "kernel-bench-release",
       "output": {
         "outputOnFailure": true
       }

@@ -13,9 +13,16 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] revision-bound atomic vertex MeshPatch with inverse generation
 - [x] deterministic compiled mesh, normals, bounds, and source revisions
 - [x] reversible transform command and history boundary
+- [x] bounded root-level mesh instancing with shared asset identity, explicit local placement, and reversible history
+- [x] heterogeneous production receipt/admission contract with stale-source and budget fail-closed checks
+- [x] bounded production cook graph with deterministic ordering and minimal downstream invalidation
+- [x] content-addressed derived-byte publish/read binding with stale-read rejection
 - [x] versioned project format with atomic save/load
 - [x] v6 project format with v1/v2/v3/v4/v5 compatibility, explicit meters/right-handed/Y-up contract, optional graph reference, bounded project-bound topology receipt lineage, generic scientific model records, and validated per-mesh attribute/UV persistence
 - [x] v7 project format with v1-v6 readability, five provider-neutral world primitives, deterministic nested persistence, journaled replacement, and dangling authoring-binding rejection
+- [x] v8 project format with v1-v7 readability and durable material, texture, sampler, variant, and material-region assignment authoring truth
+- [x] v9 project format with v1-v8 migration and a durable source namespace that prevents same-name projects from colliding at destination mappings
+- [x] neutral preparation v1 with saved profiles, explicit asset/selection/assembly/scene scope, scoped material and texture closure, deterministic envelopes, cancellation, atomic compare-and-swap publication, CLI/desktop routing, and last-valid recovery
 - [x] OBJ import/export with explicit feature-loss warnings
 - [x] bounded ASCII PLY and binary/ASCII STL interchange with explicit feature-loss warnings
 - [x] bounded glTF export profile with explicit feature-loss warnings
@@ -38,7 +45,8 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] backend-neutral generational GPU handles, deferred submission retirement, render-graph validation, and offscreen viewport planning
 - [x] backend-neutral device contract, semantic command IR, CPU reference execution/raster acceptance, and RGBA32F texture sampling
 - [x] deterministic CPU PBR/HDR, shadow-PCF, and temporal-history reference contracts
-- [x] GPU preparation ABI, explicit vertex layouts, and packaged native shader sources
+- [x] GPU preparation ABI, explicit vertex layouts, canonical render pass plan, packaged native shader sources, and bounded D3D12 execution evidence
+- [x] precision-role kernel contracts, local evidence receipts, artifact identity, explicit fallback boundaries, and bounded native receipt validation
 - [x] evaluation graph identity/DAG validation, deterministic digest, cache key, and stale-publication gate
 - [x] bounded versioned evaluation-graph serialization with hostile-input rejection
 - [x] domain-specific attribute layers with explicit topology-transfer policy
@@ -50,13 +58,23 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] web geometry read-only cluster diagnostics snapshots with explicit grouping-only warnings and package-bound conservative error receipts for editor/problem consumers
 - [x] web geometry backend-neutral cluster-overlay projection math with explicit matrix conventions, clipping, viewport bounds, and fail-closed non-finite handling
 - [x] web geometry deterministic package-bound page-interest planning from visible overlay identities without residency mutation
+- [x] public surface-fidelity first milestone: revision-bound SurfaceDomain, bounded differential/frequency analysis, geometry-only baseline, geometry-derived NDF, directional visibility closure, CPU radiometric envelopes, appearance admission, representation tree, and derived VANTA fidelity package
+- [x] native Surface Fidelity workbench instrument: explicit triangle-budget preview, appearance admission readout, revision-bound ghost overlay, and stale-preview invalidation without authoring mutation
+- [x] public surface process contracts: explicit migration receipts, material stratigraphy/depth exposure, deterministic weathering state, manufacturing history, contact graph, semantic edge profiles, and material-derived geometry intent without authored-topology mutation
+- [x] standalone surface workflow tranche: deterministic candidate planning, append-only evidence reuse, face/edge/material/process/semantic invalidation, and scene-wide fidelity budget selection
+- [x] bounded native surface graph spectrum reference: revision-bound domain graph, mass-normalized Laplacian, deterministic low modes, signal coefficients, and CPU acceptance/benchmark receipts
+- [x] bounded equal-bin surface distribution metrics: normalized weights, Jensen-Shannon, Fisher-Rao, Wasserstein/EMD, and capped Sinkhorn receipts with explicit support matching
+- [x] bounded constrained QEM candidate compiler: plane quadrics, protected domain boundaries, deterministic collapse receipts, exact target admission, and output topology validation
+- [x] QEM-to-distribution normal closure receipt: area-weighted source/candidate normal histograms, correlated distribution metrics, area residual, and revision-bound validation
+- [x] bounded geometric visibility closure: explicit hemisphere rays, source/candidate occlusion histograms, average visibility residual, and fail-closed receipt validation
 - [ ] private algorithmic representation and continuity work remains outside the public build boundary and requires separate release review
-- [ ] next-level polygon representation inheritance, backend-neutral identity-buffer planning, temporal-history consumers, view/material/constraint/fracture policy execution, and VANTA/runtime admission
+- [ ] next-level polygon representation inheritance, view/material/constraint/fracture policy execution, and VANTA/runtime admission
+- [x] backend-neutral surface-identity buffer planning and revision-bound CPU temporal-history rejection; native shader binding and GPU acceptance remain deferred
 - [ ] web geometry VANTA import admission, native overlay rendering/pointer integration, and native runtime admission
 - [x] project-package graph reference binding, journal/checkpoint preservation, polygon topology-provenance adapter, v5 scientific-model and v5 project-bound topology receipt persistence
 - [x] opt-in Windows D3D12 adapter/resource boundary and native identity smoke acceptance
 - [x] bounded D3D12 native acceptance tranche: runtime DXIL suite, offscreen sampled-material PBR into an HDR target, HDR-to-display tone-map execution/readback, shadow-depth execution/readback, temporal resolve over current/history/motion inputs, storage-texture compute dispatch/readback, deferred descriptor/resource lifetime, typed DXGI back-buffer import, resize/present, desktop launch smoke, and an 8K temporal dispatch with bounded probe readback on the Quadro P5200
-- [ ] private execution optimization and measured benchmark work remains outside the public repository
+- [x] D3D12 native timestamp capture, queue-aware compute shader states, in-flight command-context reuse, and a warmed ontology-identified temporal-kernel stress benchmark with separate GPU/host timing receipts; invariant temporal bindings are hoisted out of batched dispatch loops after same-adapter A/B measurement
 - [ ] D3D12 production backend with full render-graph parity (PBR/HDR/IBL/shadow/temporal execution, final presentation integration, input/DPI workflow, and GPU performance/8K frame evidence remain)
 - [x] SHA-256 content-addressed blob store with atomic publication and integrity verification
 - [x] append-only revision-bound journal with hash chain, verification, replay callback, content-addressed checkpoints, and staged transaction publication
@@ -68,7 +86,8 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] content-addressed evaluation-graph snapshot reference in the package manifest
 - [ ] SQLite WAL authoring database, migrations, integrity scanner, and cache separation
 - [x] read-only startup recovery inspection plus explicit human recovery of the latest verified snapshot-bearing journal entry
-- [ ] startup recovery UI, recovery-versus-explicit-save decision surface, and crash-injection acceptance (snapshot-envelope replay is present)
+- [x] explicit desktop recovery action with dirty-session discard decision over the verified snapshot-envelope replay path
+- [ ] automatic startup recovery and crash-injection acceptance
 - [x] bounded opaque C ABI smoke surface with a C compiler/linker fixture
 - [x] opt-in shared-library packaging for the bounded C ABI with explicit platform symbol visibility
 - [x] bounded ABI range negotiation; C++/Python/C# bindings remain deferred
@@ -184,6 +203,29 @@ workflows are independently tested. The staged transaction boundary now carries
 an optional graph reference through document, journal, and checkpoint state, but
 does not make the package manifest and document database one atomic multi-file
 commit.
+
+## Cartographer as VANTA world compiler
+
+The compiler tranche turns Cartographer from a scene authoring tool into the
+durable authoring truth and neutral prepared-product compiler for a VANTA
+world: Cartographer owns durable authoring truth and neutral, versioned,
+digest-bound prepared products; VANTA owns runtime embodiment; games own
+domain truth. Every product below is a headless, serialization-ready record
+with fail-closed validation — no engine types, runtime handles, or mutation
+authority — and each tranche is implemented with tests. VANTA lowering and
+game adapters live outside this repository; native-evidence and full-game
+acceptance tiers are deferred to VANTA/game integration.
+
+- [x] prepared intermediate representation: neutral preparation with saved v1 profiles now extended by [preparation profile v2](format/preparation-profile-v2.md) per-product-class inclusion toggles and approximation error budgets with v1 read compatibility, explicit stable-ID scope, destination-neutral [prepared scene envelopes](architecture/prepared-scene-envelope.md), atomic compare-and-swap publication with dependency-closure digests, and last-valid recovery
+- [x] semantic ABI tranche ([semantic extension](architecture/semantic-extension.md)): digest-bound `SemanticSidecar` with donor-owned opaque payloads, per-field native-lowerable versus game-owned ownership manifests, a fail-closed cross-game schema registry, digest-bound tag lowering maps, explicit game-owned-preserving migration plans, read-only inspection/query, and v10 project format persistence that stores sidecar bytes verbatim and never parses them
+- [x] ports tranche ([connection ports](architecture/connection-ports.md)): neutral `ConnectionPort` records with reference frames and namespaced compatibility vocabularies, capability contracts, pure fail-closed compatibility checks, acyclic typed connection graphs, and strict never-promoted acceptance tiers with runtime attachment state fenced out of authoring truth
+- [x] physical twin tranche ([physical twin](architecture/physical-twin.md)): derived geometry evidence, VANTA catalog identity-only material intent, construction profiles, deterministic mass derivation receipts, the physical surface ledger, ground-pressure evidence, and conservation-checking twin acceptance receipts, with game-owned condition state fenced out of canonical digests
+- [x] collision tranche ([collision representations](architecture/collision-representations.md)): primitive/compound/convex/triangle candidate fits over compiled authoring meshes, measured error metrics and digest-bound threshold policies, per-game collision profiles, per-node motion policies, and certified-variant selection receipts that never certify a fallback
+- [x] navigation and representation tranche ([navigation products](architecture/navigation-products.md), [representation federation](architecture/representation-federation.md)): regions, routes, corridors, structure access points, off-mesh link candidates, agent profiles, and a digest-bound prepared navigation envelope with compile-time fences against dynamic cost or knowledge fields; representation families with error envelopes, continuity-preserving variant replacement, certifications, hard-bound deterministic hardware-profile selection, and an append-only runtime evidence ledger
+- [x] kinematic/temporal/archetype tranche ([kinematic graph](architecture/kinematic-graph.md), [temporal products](architecture/temporal-products.md), [archetype inference](architecture/archetype-inference.md)): rooted-tree kinematic graphs with authored joint limits, skin bindings content-addressed against mesh and graph digests, skeletal/archetype lowering descriptors with fail-closed capability admission; digest-bound channels, clips, sequences, explicit event bindings, root-motion proposals, and deterministic CPU sample references; canonical structural digests, repetition-economy archetype candidates with deterministic receipts, and persistent content-derived instance identity that survives reimport without resurrecting dead instances
+- [x] reimport and cooking tranche: three-way reimport reconciliation over runtime snapshots, prepared deltas, and authored sources with digest-bound plans and receipts, `DestinationCapabilityProfile` demand answering with exact unsupported results, declarative digest-bound `ProductionRecipe` expansion that fails closed on unsupported required capabilities, world-primitive correspondences and extension bindings, and dependency-closure digests on publication receipts
+- [x] verification tranche ([verification evidence](architecture/verification-evidence.md)): append-only capability claim and explicit non-claim ledgers bound to admission receipts, deterministic regression gates over prepared digests and correspondence counts, named failure injection between planning and publishing, and whole-pipeline deterministic digest-bound evidence reports
+- [ ] VANTA lowering of every product above, native-evidence and full-game acceptance tiers, and destination/game adapters remain out-of-repo work owned by the VANTA and game repositories
 
 ## 0.2 - non-destructive DCC maturity
 

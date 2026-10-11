@@ -3,6 +3,7 @@
 #include <carto/gpu/lifetime.hpp>
 #include <carto/gpu/rhi.hpp>
 #include <carto/render/material.hpp>
+#include <carto/render/gpu_plan.hpp>
 #include <carto/render/lighting.hpp>
 #include <carto/render/render_request.hpp>
 #include <carto/render/temporal.hpp>
@@ -256,6 +257,8 @@ void shadow_and_temporal_reference_contracts_preserve_boundaries() {
         0.5F,
         2.0F,
         1.0F,
+        {},
+        {},
     });
     REQUIRE(temporal);
     REQUIRE(temporal.value().history_used);
@@ -276,6 +279,8 @@ void shadow_and_temporal_reference_contracts_preserve_boundaries() {
         0.9F,
         0.25F,
         1.0F,
+        {},
+        {},
     });
     REQUIRE(stale_temporal);
     REQUIRE(!stale_temporal.value().history_used);
@@ -294,9 +299,96 @@ void shadow_and_temporal_reference_contracts_preserve_boundaries() {
         1.5F,
         0.25F,
         1.0F,
+        {},
+        {},
     });
     REQUIRE(!invalid_temporal);
     REQUIRE(invalid_temporal.error().code == ErrorCode::invalid_argument);
+
+    const std::vector<std::uint64_t> current_identity = {11U, 22U};
+    const std::vector<std::uint64_t> history_identity = {11U, 99U};
+    const auto identity_temporal = carto::render::resolve_temporal_reference({
+        carto::core::Revision{4U},
+        carto::core::Revision{4U},
+        2U,
+        1U,
+        current,
+        history,
+        {},
+        true,
+        false,
+        0.5F,
+        2.0F,
+        1.0F,
+        current_identity,
+        history_identity,
+    });
+    REQUIRE(identity_temporal);
+    REQUIRE(identity_temporal.value().history_used);
+    REQUIRE(identity_temporal.value().identity_rejected_pixels == 1U);
+    REQUIRE(std::abs(identity_temporal.value().rgba[0] - 0.5F) < 0.001F);
+    REQUIRE(identity_temporal.value().rgba[4] == current[4]);
+
+    const auto missing_history_identity = carto::render::resolve_temporal_reference({
+        carto::core::Revision{4U},
+        carto::core::Revision{4U},
+        2U,
+        1U,
+        current,
+        history,
+        {},
+        true,
+        false,
+        0.5F,
+        2.0F,
+        1.0F,
+        current_identity,
+        {},
+    });
+    REQUIRE(!missing_history_identity);
+    REQUIRE(missing_history_identity.error().code == ErrorCode::invalid_argument);
+}
+
+void gpu_plan_attaches_explicit_kernel_intents_to_each_pass() {
+    const carto::render::RenderRequest request{
+        carto::core::Revision{8U},
+        carto::scene::ObjectId{3U},
+        {1280U, 720U},
+        carto::render::RenderQualityProfile::interactive,
+        0U,
+        carto::render::OutputFormat::png,
+        false,
+        false,
+        {},
+    };
+    const auto plan = carto::render::prepare_gpu_render_plan(request, true, false);
+    REQUIRE(plan);
+    REQUIRE(plan.value().kernels.size() == 5U);
+    REQUIRE(plan.value().kernels.size() == plan.value().graph.pass_order.size());
+    for (const auto& kernel : plan.value().kernels) {
+        REQUIRE(kernel.pass);
+        REQUIRE(carto::device::validate(kernel.contract));
+        REQUIRE(kernel.contract.requested_arithmetic == "fp32");
+        REQUIRE(!kernel.contract.fallback_allowed);
+    }
+
+    const carto::render::RenderRequest identity_request{
+        carto::core::Revision{9U},
+        carto::scene::ObjectId{3U},
+        {1280U, 720U},
+        carto::render::RenderQualityProfile::reference,
+        0U,
+        carto::render::OutputFormat::png,
+        false,
+        false,
+        {carto::render::CaptureResource::surface_identity},
+    };
+    const auto identity_plan = carto::render::prepare_gpu_render_plan(
+        identity_request, true, true);
+    REQUIRE(identity_plan);
+    REQUIRE(identity_plan.value().surface_identity.has_value());
+    REQUIRE(identity_plan.value().history_surface_identity.has_value());
+    REQUIRE(identity_plan.value().graph.pass_order.size() == 5U);
 }
 
 ResourceDesc make_buffer(std::string name, std::uint32_t alias_group = 0U) {
@@ -474,6 +566,7 @@ int main() {
         exact_rhi_descriptors_reject_ambiguous_intent();
         texture_material_and_render_contracts_preserve_fidelity();
         shadow_and_temporal_reference_contracts_preserve_boundaries();
+        gpu_plan_attaches_explicit_kernel_intents_to_each_pass();
         valid_graph_compiles_with_write_barriers();
         graph_rejects_invalid_descriptors_and_hazards();
         graph_rejects_overlapping_alias_lifetimes();

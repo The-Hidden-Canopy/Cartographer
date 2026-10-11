@@ -7,12 +7,14 @@
 #include <carto/production/material_artifact.hpp>
 #include <carto/production/prepared_scene.hpp>
 #include <carto/project/transaction.hpp>
+#include <carto/world/model.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <span>
 #include <string>
@@ -176,7 +178,70 @@ struct Fixture {
     carto::production::LookdevDrawPackage lookdev;
 };
 
-Fixture make_fixture() {
+carto::world::WorldModel workshop_world_model() {
+    using namespace carto;
+    world::WorldModel model;
+    require(static_cast<bool>(model.insert_area(world::SemanticArea{
+                .id = world::AreaId{101U},
+                .semantic_type = "camp.inner",
+                .geometry = world::AuthoringBinding{
+                    world::AuthoringBindingKind::mesh_asset, 1U},
+                .parent = std::nullopt,
+                .tags = {"motel", "roof"},
+            })),
+        "semantic area enters world fixture");
+    require(static_cast<bool>(model.insert_area(world::SemanticArea{
+                .id = world::AreaId{102U},
+                .semantic_type = "camp.outer",
+                .geometry = world::AuthoringBinding{
+                    world::AuthoringBindingKind::none, 0U},
+                .parent = world::AreaId{101U},
+                .tags = {},
+            })),
+        "child semantic area enters world fixture");
+    require(static_cast<bool>(model.insert_path(world::SemanticPath{
+                .id = world::PathId{201U},
+                .semantic_type = "route.supply",
+                .control_points = {{0.0, 0.0, 0.0}, {4.0, 0.0, 0.0}},
+                .start_area = world::AreaId{101U},
+                .end_area = world::AreaId{102U},
+                .width = 2.0,
+                .closed = false,
+            })),
+        "semantic path enters world fixture");
+    std::map<std::uint64_t, world::StructureNode> nodes;
+    nodes.emplace(1U, world::StructureNode{
+        1U, "room.a", world::AreaId{101U}});
+    nodes.emplace(2U, world::StructureNode{
+        2U, "room.b", world::AreaId{102U}});
+    std::map<std::uint64_t, world::StructureEdge> edges;
+    edges.emplace(1U, world::StructureEdge{
+        1U, 1U, 2U, "adjacent", world::PathId{201U}, false});
+    require(static_cast<bool>(model.insert_structure_graph(world::StructureGraph{
+                world::StructureGraphId{301U}, "structure.block",
+                std::move(nodes), std::move(edges)})),
+        "structure graph enters world fixture");
+    require(static_cast<bool>(model.insert_instance_field(world::InstanceField{
+                .id = world::InstanceFieldId{401U},
+                .semantic_type = "field.debris",
+                .area = world::AreaId{101U},
+                .bounds = core::Bounds3d{{0.0, 0.0, 0.0}, {8.0, 2.0, 8.0}},
+                .recipe_identity = "recipe.debris.v1",
+                .recipe_digest = digest("recipe-bytes"),
+                .seed = 7U,
+                .maximum_instances = 64U,
+                .suppressed_instances = {2U, 5U},
+                .geometry_evidence = std::nullopt,
+                .physical_material_intent = {},
+                .construction_profile = {},
+                .surface_domain_identity = {},
+            })),
+        "instance field enters world fixture");
+    require(static_cast<bool>(model.validate()), "world fixture validates");
+    return model;
+}
+
+Fixture make_fixture(const carto::world::WorldModel& world_model = {}) {
     using namespace carto;
     TempDirectory temp;
     Fixture fixture;
@@ -190,6 +255,10 @@ Fixture make_fixture() {
     require(static_cast<bool>(transaction.value().set_material_catalog(
                 workshop_catalog(mesh.value()))),
         "workshop catalog enters project");
+    if (!world_model.empty()) {
+        require(static_cast<bool>(transaction.value().set_world_model(world_model)),
+            "workshop world model enters project");
+    }
     const auto root = transaction.value().create_object("Workshop root");
     require(static_cast<bool>(root) &&
             transaction.value().attach_mesh(root.value(), mesh.value()),
@@ -410,6 +479,172 @@ void malformed_envelopes_fail_closed() {
         "hostile collection counts are rejected before allocation");
 }
 
+void world_primitives_compose_with_stable_correspondence() {
+    using namespace carto;
+    const Fixture fixture = make_fixture(workshop_world_model());
+    const auto prepared = compose(fixture);
+    const auto world_product = std::find_if(prepared.products.begin(),
+        prepared.products.end(),
+        [](const production::PreparedProductReference& product) {
+            return product.kind == production::PreparedProductKind::world_model;
+        });
+    require(world_product != prepared.products.end(),
+        "the durable world model is declared as one content-addressed product");
+
+    const auto count_prepared = [&prepared](production::PreparedEntityKind kind) {
+        return static_cast<std::size_t>(std::count_if(prepared.correspondences.begin(),
+            prepared.correspondences.end(),
+            [kind](const production::PreparedSourceCorrespondence& correspondence) {
+                return correspondence.prepared_kind == kind;
+            }));
+    };
+    require(count_prepared(production::PreparedEntityKind::semantic_area) == 2U &&
+            count_prepared(production::PreparedEntityKind::semantic_path) == 1U &&
+            count_prepared(production::PreparedEntityKind::structure_graph) == 1U &&
+            count_prepared(production::PreparedEntityKind::instance_field) == 1U,
+        "every durable world primitive receives an explicit stable correspondence");
+    const auto area_correspondence = std::find_if(prepared.correspondences.begin(),
+        prepared.correspondences.end(),
+        [](const production::PreparedSourceCorrespondence& correspondence) {
+            return correspondence.prepared_kind ==
+                production::PreparedEntityKind::semantic_area &&
+                correspondence.prepared_primary == 101U;
+        });
+    require(area_correspondence != prepared.correspondences.end() &&
+            area_correspondence->source_kind ==
+                production::PreparedSourceEntityKind::semantic_area &&
+            area_correspondence->source_primary == 101U &&
+            area_correspondence->source_secondary == 0U &&
+            area_correspondence->prepared_secondary == 0U,
+        "world correspondences preserve stable source identity exactly");
+
+    const std::string encoded = prepared.serialize();
+    const auto reopened = production::PreparedSceneEnvelope::deserialize(encoded);
+    require(reopened && reopened.value().serialize() == encoded,
+        "world-primitive correspondences survive a deterministic round trip");
+    const auto first_digest = prepared.canonical_digest();
+    const auto second_digest = reopened.value().canonical_digest();
+    require(first_digest && second_digest &&
+            first_digest.value() == second_digest.value(),
+        "world correspondence identity survives reopen");
+
+    auto missing_world = prepared;
+    missing_world.products.erase(std::remove_if(missing_world.products.begin(),
+        missing_world.products.end(),
+        [](const production::PreparedProductReference& product) {
+            return product.kind == production::PreparedProductKind::world_model;
+        }), missing_world.products.end());
+    missing_world.dependencies.erase(std::remove_if(
+        missing_world.dependencies.begin(), missing_world.dependencies.end(),
+        [](const production::PreparedDependencyReference& dependency) {
+            return dependency.identity == "world.model";
+        }), missing_world.dependencies.end());
+    require(!missing_world.validate(),
+        "world correspondences fail closed without the world-model product");
+
+    auto drifted_identity = prepared;
+    auto drifted_entry = std::find_if(drifted_identity.correspondences.begin(),
+        drifted_identity.correspondences.end(),
+        [](const production::PreparedSourceCorrespondence& correspondence) {
+            return correspondence.prepared_kind ==
+                production::PreparedEntityKind::semantic_area &&
+                correspondence.prepared_primary == 101U;
+        });
+    require(drifted_entry != drifted_identity.correspondences.end(),
+        "drift fixture contains the selected world correspondence");
+    drifted_entry->prepared_primary = 102U;
+    require(!drifted_identity.validate(),
+        "world correspondences must preserve exact source identity");
+}
+
+void extension_bindings_are_digest_bound_and_fail_closed() {
+    using namespace carto;
+    const Fixture fixture = make_fixture();
+    auto prepared = compose(fixture);
+    prepared.extension_bindings.push_back(production::PreparedExtensionBinding{
+        "ext.motel-decay", "carto.semantic-sidecar.v1", digest("decay-payload")});
+    prepared.extension_bindings.push_back(production::PreparedExtensionBinding{
+        "ext.weather", "carto.environment.v2", digest("weather-payload")});
+    require(static_cast<bool>(prepared.validate()),
+        "canonically sorted extension bindings validate");
+
+    const auto bound_digest = prepared.canonical_digest();
+    require(bound_digest && !bound_digest.value().is_zero(),
+        "extension bindings participate in the canonical digest");
+    auto rebuilt = compose(fixture);
+    rebuilt.extension_bindings.push_back(production::PreparedExtensionBinding{
+        "ext.motel-decay", "carto.semantic-sidecar.v1", digest("decay-payload")});
+    rebuilt.extension_bindings.push_back(production::PreparedExtensionBinding{
+        "ext.weather", "carto.environment.v2", digest("weather-payload")});
+    const auto rebuilt_digest = rebuilt.canonical_digest();
+    require(rebuilt_digest && rebuilt_digest.value() == bound_digest.value(),
+        "identical extension bindings reproduce the identical digest");
+
+    auto unsorted = prepared;
+    std::swap(unsorted.extension_bindings.front(), unsorted.extension_bindings.back());
+    require(!unsorted.validate(),
+        "extension bindings must be canonically sorted and unique");
+    auto duplicated = prepared;
+    duplicated.extension_bindings.back().extension_identity =
+        duplicated.extension_bindings.front().extension_identity;
+    require(!duplicated.validate(), "extension binding identities must be unique");
+    auto zero_digest = prepared;
+    zero_digest.extension_bindings.front().payload_digest = assets::Sha256Digest{};
+    require(!zero_digest.validate(),
+        "extension bindings refuse a zero payload digest");
+    auto unsafe_identity = prepared;
+    unsafe_identity.extension_bindings.front().extension_identity =
+        "not a safe identity";
+    require(!unsafe_identity.validate(),
+        "extension binding identities are bounded safe tokens");
+
+    auto drifted = prepared;
+    drifted.extension_bindings.front().payload_digest = digest("other-payload");
+    const auto drifted_digest = drifted.canonical_digest();
+    require(drifted_digest && drifted_digest.value() != bound_digest.value(),
+        "a drifted extension payload changes the canonical digest");
+
+    const std::string encoded = prepared.serialize();
+    require(encoded.find("EXTENSION_BINDINGS 2\n") != std::string::npos,
+        "extension bindings are serialized into the canonical text");
+    const auto reopened = production::PreparedSceneEnvelope::deserialize(encoded);
+    require(reopened && reopened.value().serialize() == encoded &&
+            reopened.value().canonical_digest().value() == bound_digest.value(),
+        "extension bindings survive reopen with a stable digest");
+
+    const auto unbound = compose(fixture);
+    const std::string unbound_encoded = unbound.serialize();
+    const auto section_at = unbound_encoded.find("EXTENSION_BINDINGS 0\n");
+    require(section_at != std::string::npos,
+        "unbound envelopes serialize an empty extension-binding section");
+    std::string legacy = unbound_encoded;
+    legacy.erase(section_at, std::string{"EXTENSION_BINDINGS 0\n"}.size());
+    const auto reopened_legacy =
+        production::PreparedSceneEnvelope::deserialize(legacy);
+    require(reopened_legacy &&
+            reopened_legacy.value().extension_bindings.empty() &&
+            reopened_legacy.value().serialize() == unbound_encoded,
+        "envelopes serialized before extension bindings reopen with an empty set");
+
+    const char* kHostilePrefix =
+        "CARTOGRAPHER_PREPARED_SCENE 1\n"
+        "SOURCE \"x\" 1 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"
+        "PROFILE \"x\" 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"
+        "COORDINATES 1 0 1 2\nPRODUCTS 0\nASSETS 0\nNODES 0\n"
+        "MATERIAL_BINDINGS 0\nDEPENDENCIES 0\nCAPABILITIES 0\nCORRESPONDENCES 0\n";
+    require(!production::PreparedSceneEnvelope::deserialize(
+                std::string{kHostilePrefix} + "EXTENSION_BINDINGS 4097\n"),
+        "oversized extension-binding counts are rejected before allocation");
+    require(!production::PreparedSceneEnvelope::deserialize(
+                std::string{kHostilePrefix} +
+                "EXTENSION_BINDINGS 1\nEXTENSION_BINDING \"ext.a\" \"schema.v1\" not-a-digest\n"),
+        "malformed extension-binding digests fail closed");
+    require(!production::PreparedSceneEnvelope::deserialize(
+                std::string{kHostilePrefix} +
+                "CORRESPONDENCES 1\nCORRESPONDENCE 0 1 0 7 1 0\nEND\n"),
+        "unknown correspondence kinds fail closed");
+}
+
 } // namespace
 
 int main() {
@@ -417,6 +652,8 @@ int main() {
     stale_and_incomplete_composition_fails_closed();
     prepared_composition_obeys_resolved_scope();
     malformed_envelopes_fail_closed();
+    world_primitives_compose_with_stable_correspondence();
+    extension_bindings_are_digest_bound_and_fail_closed();
     std::cout << "prepared scene tests passed\n";
     return EXIT_SUCCESS;
 }

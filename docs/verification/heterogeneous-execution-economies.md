@@ -1,8 +1,10 @@
 # Heterogeneous execution economies closure ledger
 
-This ledger records the reviewed public implementation and its remaining
-external gates. It intentionally excludes private runtime architecture,
-thresholds, corpora, and optimization recipes.
+The 200-volume engineering series was reconciled against the frozen
+Cartographer baseline and the current public/private boundary. This ledger
+records implementation evidence without copying the source series, private
+runtime architecture, thresholds, game corpus, or optimization recipes into
+the public repository.
 
 “Public tranche complete” means the locally actionable Cartographer contract,
 producer, persistence, and adversarial tests exist. It does not promote a
@@ -14,8 +16,8 @@ private runtime integration or hardware/corpus result that was not executed.
 | 2. Universal world primitives | Schema-v7 `SemanticArea`, `SemanticPath`, `StructureGraph`, `InstanceField`, and `VariantLayer`; canonical digest; journaled admission; binding deletion guards | Runtime blueprint/materialization consumer |
 | 3. Representation/truth evidence | Source/representation/spatial/context identity, quality/cost receipt, bounded candidate decision, rejection preservation, canonical policy digest | Private cross-consumer selection and truth-admission policy |
 | 4. Sparse cook graph | Deterministic DAG plus typed grid/level tile ranges and overlap-filtered invalidation | Distributed worker scheduling and runtime cache residency |
-| 5. Precision/page inputs | Existing runtime-page contracts, render upload ABI, and explicit precision requirement identity | Consumer-specific page compiler and measured runtime precision promotion |
-| 6. Work planning | Public cook-graph dependencies and explicit threshold contracts keep declared estimates distinct from measured evidence | Measured runtime scheduler, learned prediction, and adaptive authority |
+| 5. Precision/page inputs | Existing public surface/runtime-page contracts, render upload ABI, explicit precision requirement identity | Consumer-specific page compiler and measured runtime precision promotion |
+| 6. Information planning | Existing bounded public surface work planner and fidelity-budget selector use estimates labeled as estimates | Measured runtime scheduler, learned prediction, and adaptive authority |
 | 7. Blueprint/semantic authoring | World primitives provide stable areas, paths, structures, recipes, variants, and project revision basis | Runtime materialization and semantic LOD execution |
 | 8. Material specialization | Compiled material artifact binds supported PBR constants and texture identities; unsupported bindings fail | Private material-graph lowering and consumer-specific runtime shaders beyond the reviewed public profile |
 | 9. Portable geometry reuse | Existing web-geometry package, runtime pages, provenance, evaluation publication, and invalidation contracts | Cross-pass runtime scheduling and reuse policy |
@@ -41,6 +43,27 @@ unbound spatial footprints, incompatible spatial frames, graph cycles,
 duplicate candidate evidence, policy/source substitution, false GPU timing,
 over-budget output, cancellation/failure, tamper, truncation, and trailing
 bytes.
+
+## Local closure receipt — 2026-10-07
+
+The current headless Release build passed all 41 registered tests. This run
+includes installed-package consumption plus adversarial preparation tests for:
+
+- background/headless identity parity, repeated pre-cancellation, and stale
+  compare-and-swap publication;
+- output-root source-namespace takeover, source-revision rollback, and
+  conflicting content claiming the same source revision, including selector
+  loss over a non-empty immutable revision store;
+- symbolic-link and Windows junction/reparse ancestors on prepared output,
+  prepared input, and authoring texture input; and
+- preservation of the selected last-valid revision after every rejected
+  publication attempt.
+
+The strict public-boundary audit and docseries-closure check also passed on the
+working tree. These are source-tree checks, not evidence that native Unreal,
+Unity, private VANTA, or the optional ImGui/Vulkan desktop configuration ran.
+The desktop source is connected to the bounded preparation job, but no local
+pinned Dear ImGui source was available for a compile or launch receipt.
 
 ## Acceptance boundary
 

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <map>
 #include <set>
@@ -44,6 +45,11 @@ core::Diagnostic stale(std::string message) {
 
 core::Diagnostic validation(std::string message) {
     return core::Diagnostic(core::ErrorCode::validation_failed, std::move(message));
+}
+
+assets::Sha256Digest digest_text(std::string_view text) {
+    return assets::sha256(std::span<const std::uint8_t>{
+        reinterpret_cast<const std::uint8_t*>(text.data()), text.size()});
 }
 
 std::string unique_suffix() {
@@ -445,6 +451,26 @@ bool same_optional_digest(
 
 } // namespace
 
+core::Result<assets::Sha256Digest> prepared_dependency_closure_digest(
+    const PreparedSceneEnvelope& envelope) {
+    if (auto result = envelope.validate(); !result) {
+        return core::Result<assets::Sha256Digest>::failure(result.error());
+    }
+    std::ostringstream output;
+    output << "CARTOGRAPHER_PREPARED_DEPENDENCY_CLOSURE 1\n";
+    for (const auto& dependency : envelope.dependencies) {
+        output << "DEPENDENCY " << std::quoted(dependency.identity) << ' '
+               << static_cast<unsigned>(dependency.disposition) << ' '
+               << (dependency.required ? 1U : 0U) << ' '
+               << dependency.revision.value() << ' '
+               << (dependency.content_digest.has_value()
+                       ? dependency.content_digest->hex() : std::string{"-"})
+               << ' ' << std::quoted(dependency.relative_path) << '\n';
+    }
+    output << "END\n";
+    return core::Result<assets::Sha256Digest>::success(digest_text(output.str()));
+}
+
 core::Result<PreparedPublicationReceipt> publish_prepared_scene(
     const std::filesystem::path& output_root,
     const PreparedSceneEnvelope& envelope,
@@ -464,6 +490,10 @@ core::Result<PreparedPublicationReceipt> publish_prepared_scene(
     const auto envelope_digest = envelope.canonical_digest();
     if (!envelope_digest) {
         return core::Result<PreparedPublicationReceipt>::failure(envelope_digest.error());
+    }
+    const auto closure_digest = prepared_dependency_closure_digest(envelope);
+    if (!closure_digest) {
+        return core::Result<PreparedPublicationReceipt>::failure(closure_digest.error());
     }
 
     std::map<std::string, const PreparedProductPayload*> payload_map;
@@ -632,8 +662,8 @@ core::Result<PreparedPublicationReceipt> publish_prepared_scene(
         }
     }
     return core::Result<PreparedPublicationReceipt>::success(PreparedPublicationReceipt{
-        envelope_digest.value(), selected.value(), envelope.source_revision,
-        final_path, reused});
+        envelope_digest.value(), closure_digest.value(), selected.value(),
+        envelope.source_revision, final_path, reused});
 }
 
 core::Result<std::optional<SelectedPreparedScene>> read_selected_prepared_scene(

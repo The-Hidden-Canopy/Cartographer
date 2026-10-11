@@ -10,19 +10,23 @@ The public repository contains generic authoring and interchange behavior:
 
 - versioned `.carto` authoring data and validation;
 - scene, geometry, topology, revision, undo/redo, and local receipts;
-- versioned `.carto` persistence for generic scientific entities plus project-bound
+- v5 `.carto` persistence for generic scientific entities plus project-bound
   topology receipt lineage;
 - OBJ, PLY, STL, and bounded glTF interchange;
-- backend-neutral render-graph and public GPU contracts; and
-- optional generic Vulkan, D3D12, and native-shell acceptance seams.
+- backend-neutral render-graph and GPU contracts;
+- local precision-role and kernel execution receipts with explicit artifact
+  identity and no outbound telemetry;
+- optional generic Vulkan and native-shell acceptance seams; and
+- provider-neutral, revision-bound proposal contracts.
 
-The public C++ export surface for topology lineage is intentionally
+The public C++ export surface for polygon-kernel lineage is intentionally
 narrow and installable without private integrations:
 
 ```cpp
 #include <carto/geometry/mesh.hpp>
 #include <carto/geometry/topology_edit.hpp>
 #include <carto/mesh_attributes/provenance.hpp>
+#include <carto/polygon/polygon.hpp>
 ```
 
 `carto_geometry` owns validated `TopologyEditReceipt` values and deterministic
@@ -42,7 +46,7 @@ receipt-aware replacement contract is available through `ProjectTransaction`,
 so its staged document and journal snapshot preserve the same lineage. Save/load
 round-trips the bounded receipt codec and rejects duplicate, future, dangling,
 or malformed records. The ledger is historical metadata: undo and redo publish
-authoritative snapshots without fabricating inverse receipts. Direct mesh
+authoritative snapshots without fabricating inverse receipts. Direct kernel
 calls, other replacement paths, and future modeling operators must opt into
 the API before they can claim durable lineage. Receipt decoding also applies
 bounded byte and aggregate identity/source-element budgets before allocating
@@ -92,6 +96,11 @@ These surfaces do not contain account authority, credentials, model weights,
 provider routing, private telemetry, runtime entity handles, or hosted project
 state.
 
+Kernel evidence is intentionally local and operator-readable. It distinguishes
+requested representation from actual arithmetic/path and records fallback
+reasons without collecting usage, timing, power, prompts, model handles, or
+account identity.
+
 ## Moat boundary
 
 The public default is open Canopy. The permanently private boundary is the
@@ -123,13 +132,22 @@ This is a build boundary, not a license grant. The presence of a generic
 interchange profile does not imply compatibility, endorsement, or access to a
 private runtime.
 
-## Private service boundary
+## Proposal boundary
 
-The public repository contains no private authoring planner, operation catalog,
-service client, account authority, or remote mutation adapter. Private runtime
-packages and their Hub control plane live in private repositories and expose
-only authenticated, organization-scoped, allowlisted artifact operations.
-Project files remain local authoring truth. Private service state must not place
+The supported Hub shape is:
+
+```text
+local revision-bound context
+    -> optional Hub request
+    -> typed proposal / study / export
+    -> local revision and policy validation
+    -> local preview
+    -> local governed apply
+```
+
+The Hub never receives a mutable mesh pointer and never silently changes a
+Cartographer document. Project files remain local authoring truth. Private
+service state belongs in a private service record or sidecar; it must not place
 credentials, prompts, model handles, telemetry payloads, or runtime entity IDs
 inside ordinary `.carto` files.
 

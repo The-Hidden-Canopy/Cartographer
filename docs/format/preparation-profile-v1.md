@@ -1,5 +1,9 @@
 # Preparation profile v1
 
+> Version 2 is the current preparation profile schema; it adds per-product-class
+> inclusion toggles and approximation error budgets and remains readable here.
+> See [preparation profile v2](preparation-profile-v2.md) for the current grammar.
+
 Preparation profiles are bounded, destination-neutral policy records consumed
 by the shared preparation operation. They preserve reproducible channel and
 lookdev choices without storing an output path, mutable UI selection, native
@@ -21,7 +25,8 @@ token; layer names are bounded printable text. Disabling the active render UV
 also requires lightmap selection and tangent generation to be disabled.
 Required lookdev cannot be enabled while lookdev generation is disabled.
 
-The reader is bounded to 64 KiB, accepts only version 1, validates every
+The reader is bounded to 64 KiB, accepts version 1 (and the current version 2;
+see [preparation profile v2](preparation-profile-v2.md)), validates every
 effective setting, and rejects trailing records. The canonical SHA-256 digest
 is computed from the exact normalized serialization and is recorded in each
 prepared-scene envelope. Loading a profile does not grant a provider or

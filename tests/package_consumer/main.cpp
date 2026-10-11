@@ -1,3 +1,5 @@
+#include <carto/production/preparation_operation.hpp>
+#include <carto/production/preparation_job.hpp>
 #include <carto/project/project.hpp>
 #include <carto/world/model.hpp>
 
@@ -20,8 +22,17 @@ int main() {
     }
 
     const carto::project::ProjectDocument project;
-    if (!project.validate() || project.schema_version() < 7U) {
-        std::cerr << "installed project target does not expose schema v7 or newer\n";
+    if (!project.validate() || project.schema_version() !=
+            carto::project::ProjectDocument::kSchemaVersion ||
+        !project.material_catalog().empty() ||
+        !project.source_namespace().starts_with("cartographer.project.")) {
+        std::cerr << "installed project target does not expose the current schema\n";
+        return EXIT_FAILURE;
+    }
+
+    const auto profile = carto::production::portable_preparation_profile();
+    if (!profile.validate() || !profile.canonical_digest()) {
+        std::cerr << "installed production target does not expose preparation\n";
         return EXIT_FAILURE;
     }
 

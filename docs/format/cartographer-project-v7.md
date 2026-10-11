@@ -1,6 +1,6 @@
 # Cartographer project format v7
 
-Cartographer v7 is the current deterministic `.carto` authoring format. It
+Cartographer v7 is a readable legacy `.carto` authoring format. It
 retains the v6 authoring envelope, mesh attributes and UV sets, topology
 receipt ledger, optional evaluation-graph digest, and provider-neutral
 scientific model. Version 7 adds a required, independently versioned
@@ -14,7 +14,8 @@ scientific model. Version 7 adds a required, independently versioned
   and sparse suppression identity; and
 - `VariantLayer` for sparse property overrides bound to a project revision.
 
-New saves write v7. The parser continues to read v1 through v6; those projects
+New saves use [project format v9](cartographer-project-v9.md). The parser
+continues to read v7 as well as v1 through v6; those older projects
 load with an empty world model and upgrade on their next save. A v7 document
 must contain the record even when the model is empty. Unknown versions,
 oversized counts, duplicate identities, unresolved cross-references, hierarchy

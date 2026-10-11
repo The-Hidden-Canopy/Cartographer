@@ -62,10 +62,11 @@ render-graph, presentation, or native GPU evidence.
 `carto_render` exposes aligned `GpuFrameConstants`, `GpuObjectConstants`,
 `GpuMaterialConstants`, `GpuLightConstants`, and `GpuTemporalConstants`.
 Material and light packers reject non-finite or non-representable values rather
-than truncating authoring data. Public render-graph construction uses ordinary
-resource and pass descriptors without publishing private execution identities
-or optimization policy. `PipelineDesc` carries an explicit vertex input layout;
-the D3D12 backend maps it to native input elements.
+than truncating authoring data. `prepare_gpu_render_plan` declares the bounded
+shadow, opaque PBR, temporal, tone-map, and optional present passes against the
+validated render graph and attaches a `KernelContract` to every prepared pass.
+`PipelineDesc` carries an explicit vertex input layout; the D3D12 backend maps
+it to native input elements.
 
 The D3D12 target packages forward PBR, depth-shadow, temporal-resolve, and HDR
 tone-map HLSL sources. A bounded headless acceptance now executes the forward
@@ -82,6 +83,22 @@ swapchain resize/present, a bounded desktop launch smoke, and an 8192x8192
 temporal dispatch followed by bounded RGBA32F probe readback. It is
 graphics-device evidence, not a GPU topology-kernel benchmark, full render-graph
 parity, or a general production-renderer claim.
+
+## N6: precision and evidence boundary
+
+`carto_device/kernel_evidence.hpp` makes the software-defined precision
+boundary explicit. A kernel contract names its precision role, direction,
+requested representation, requested arithmetic, optional backend, and fallback
+policy. A local execution receipt records the actual representation, actual
+arithmetic, actual path, device identity, source/binary/compiler identities,
+submission serial, and any explicit fallback reason.
+
+The validator rejects backend/path mismatches, silent representation changes,
+fallbacks not permitted by the contract, missing fallback reasons, and native
+receipts without SHA-256 source and binary identity. The process-local ledger
+is append-only and has no network/export surface. It deliberately carries no
+timing or throughput fields, so experiment claims cannot be manufactured by
+the runtime contract. This is evidence plumbing, not a telemetry system.
 
 ## Backend boundary
 

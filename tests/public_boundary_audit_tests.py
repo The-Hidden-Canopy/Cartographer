@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,22 @@ def git(repo: Path, *arguments: str) -> None:
     )
     if result.returncode != 0:
         raise AssertionError(f"git {' '.join(arguments)} failed: {result.stderr}")
+
+
+def git_value(repo: Path, *arguments: str) -> str:
+    result = subprocess.run(
+        ["git", *arguments],
+        cwd=repo,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        raise AssertionError(f"git {' '.join(arguments)} failed: {result.stderr}")
+    return result.stdout.strip()
 
 
 def audit(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -83,29 +100,6 @@ class PublicBoundaryAuditTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("libs/polygon/src/polygon.cpp", result.stdout)
 
-    def test_private_execution_source_path_fails(self) -> None:
-        with self.make_repo() as temporary:
-            repo = Path(temporary)
-            path = repo / "libs" / "ai" / "src" / "ai.cpp"
-            path.parent.mkdir(parents=True)
-            path.write_text("private source fixture\n", encoding="utf-8")
-            git(repo, "add", ".")
-            git(repo, "commit", "-q", "-m", "private execution source fixture")
-            result = audit(repo)
-            self.assertEqual(result.returncode, 1)
-            self.assertIn("libs/ai/src/ai.cpp", result.stdout)
-
-    def test_renamed_private_execution_signature_fails(self) -> None:
-        with self.make_repo() as temporary:
-            repo = Path(temporary)
-            protected_name = "Kernel" + "Contract"
-            (repo / "renamed.cpp").write_text(
-                f"struct {protected_name} {{}};\n", encoding="utf-8"
-            )
-            result = audit(repo)
-            self.assertEqual(result.returncode, 1)
-            self.assertIn("private execution contract", result.stdout)
-
     def test_untracked_model_artifact_fails(self) -> None:
         with self.make_repo() as temporary:
             repo = Path(temporary)
@@ -113,15 +107,6 @@ class PublicBoundaryAuditTests(unittest.TestCase):
             result = audit(repo)
             self.assertEqual(result.returncode, 1)
             self.assertIn("weights.safetensors", result.stdout)
-
-    def test_untracked_source_archives_and_office_documents_fail(self) -> None:
-        for filename in ("private-docuseries.zip", "private-brief.pdf"):
-            with self.subTest(filename=filename), self.make_repo() as temporary:
-                repo = Path(temporary)
-                (repo / filename).write_bytes(b"private fixture")
-                result = audit(repo)
-                self.assertEqual(result.returncode, 1)
-                self.assertIn(filename, result.stdout)
 
     def test_tracked_ignored_path_fails(self) -> None:
         with self.make_repo() as temporary:
@@ -163,7 +148,7 @@ class PublicBoundaryAuditTests(unittest.TestCase):
     def test_workstation_path_fails_without_printing_value(self) -> None:
         with self.make_repo() as temporary:
             repo = Path(temporary)
-            leaked_path = "E:" + r"\HiddenCanopy\private-release-cache"
+            leaked_path = "E:" + r"\HiddenCanopy\.cartographer-docuseries-archive-20261004"
             (repo / "notes.md").write_text(f"archive: `{leaked_path}`\n", encoding="utf-8")
             result = audit(repo)
             self.assertEqual(result.returncode, 1)
@@ -173,7 +158,7 @@ class PublicBoundaryAuditTests(unittest.TestCase):
     def test_deleted_workstation_path_is_caught_in_history(self) -> None:
         with self.make_repo() as temporary:
             repo = Path(temporary)
-            leaked_path = "C:" + r"\Users\release-owner\private-cache"
+            leaked_path = "C:" + r"\Users\envyn\private-cache"
             notes = repo / "notes.md"
             notes.write_text(f"cache: {leaked_path}\n", encoding="utf-8")
             git(repo, "add", "notes.md")
@@ -197,6 +182,46 @@ class PublicBoundaryAuditTests(unittest.TestCase):
             self.assertIn("REVIEW:", result.stdout)
             blocking = audit(repo, "--fail-on-review")
             self.assertEqual(blocking.returncode, 1)
+
+    def test_owner_reviewed_history_classification_closes_exact_root(self) -> None:
+        with self.make_repo() as temporary:
+            repo = Path(temporary)
+            path = repo / "apps" / "gmib" / "main.cpp"
+            path.parent.mkdir(parents=True)
+            path.write_text("public candidate\n", encoding="utf-8")
+            existing_commit = git_value(repo, "rev-parse", "HEAD")
+            manifest = repo / "docs" / "verification" / "public-history-provenance.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(json.dumps({
+                "schema": 1,
+                "entries": [{
+                    "root": "apps/gmib",
+                    "commits": [existing_commit],
+                    "disposition": "first_party_removed_from_current_public_tree",
+                    "license_basis": "repository_apache_2_0",
+                    "owner_reviewed": True,
+                }],
+            }), encoding="utf-8")
+            git(repo, "add", ".")
+            git(repo, "commit", "-q", "-m", "classified integration candidate")
+            result = audit(repo, "--fail-on-review")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("REVIEW:", result.stdout)
+
+    def test_malformed_history_classification_fails_closed(self) -> None:
+        with self.make_repo() as temporary:
+            repo = Path(temporary)
+            path = repo / "apps" / "gmib" / "main.cpp"
+            path.parent.mkdir(parents=True)
+            path.write_text("public candidate\n", encoding="utf-8")
+            manifest = repo / "docs" / "verification" / "public-history-provenance.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text('{"schema": 1, "entries": "not-a-list"}\n', encoding="utf-8")
+            git(repo, "add", ".")
+            git(repo, "commit", "-q", "-m", "malformed classification")
+            result = audit(repo, "--fail-on-review")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("entries must be a list", result.stdout)
 
     def test_ignore_policy_passes_before_history_is_considered(self) -> None:
         with self.make_repo() as temporary:

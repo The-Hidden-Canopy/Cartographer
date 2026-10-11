@@ -69,16 +69,19 @@ do not provide a second authoring path.
 The `CheckpointStore` persists and verifies snapshot bytes plus the journal
 prefix, can identify pending entries after restart, and fails closed when a
 checkpoint metadata file matching the checkpoint naming contract is malformed
-instead of silently selecting an older record. Startup recovery UI, SQLite WAL
-storage, and patch-specific delta replay are not implemented. The
+instead of silently selecting an older record. The desktop shell now exposes
+an explicit human-only recovery action over this boundary, including a dirty
+session discard decision. Automatic startup recovery, SQLite WAL storage, and
+patch-specific delta replay are not implemented. The
 `recover_from_journal` adapter does support the bounded snapshot-bearing
 envelopes emitted by the application and project transaction paths; it returns
 a validated candidate and fails closed on unknown envelopes or revision
 mismatches. Application journal binding also requires the expected event type
 and exact envelope shape, rather than searching for a document marker. A
 journal or checkpoint therefore must not be presented as proof
-that a crash-recovered document is ready for promotion without the remaining
-user-visible recovery workflow.
+that a crash-recovered document is ready for promotion without a successful
+explicit recovery decision and full validation. Crash-injection acceptance and
+automatic startup recovery remain separate evidence gates.
 
 `ApplicationSession::inspect_recovery` is the non-mutating application-side
 evidence boundary for startup integration. It verifies the project and its

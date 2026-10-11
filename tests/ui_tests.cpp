@@ -1,4 +1,5 @@
 #include <carto/ui/ui.hpp>
+#include <carto/journal/journal.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -149,16 +150,18 @@ void ui_distinguishes_unsaved_from_saved_state() {
     REQUIRE(snapshot.project_status_text == "Modified");
 }
 
-void public_ui_exposes_no_private_mutation_surface() {
+void ui_rejects_unadmitted_ai_proposals() {
     carto::application::ApplicationSession session;
     carto::ui::UiController ui(session);
     const auto before = session.snapshot();
-    const auto public_snapshot = ui.snapshot();
-    REQUIRE(!public_snapshot.ai_available);
-    REQUIRE(public_snapshot.ai_status.find("not included") != std::string::npos);
+
+    const auto rejected = ui.submit_ai_proposal(
+        carto::application::CreateBoxAction{"AI Box", {1.0, 1.0, 1.0}});
+    REQUIRE(!rejected);
     REQUIRE(session.snapshot().project_revision == before.project_revision);
     REQUIRE(session.snapshot().objects.empty());
     REQUIRE(ui.snapshot().operations.empty());
+    REQUIRE(!ui.snapshot().ui_problems.empty());
 
     REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
         "Human Box", {1.0, 1.0, 1.0}}));
@@ -210,8 +213,9 @@ void ui_preserves_required_viewport_and_supports_mode_theme_density() {
     REQUIRE(snapshot.theme == carto::ui::Theme::high_contrast);
     REQUIRE(snapshot.operator_mode == carto::ui::OperatorMode::ai_first);
     REQUIRE(snapshot.workspace_kind == carto::ui::Workspace::ai);
-    REQUIRE(!snapshot.ai_available);
-    REQUIRE(snapshot.ai_status.find("not included") != std::string::npos);
+    REQUIRE(snapshot.ai_available);
+    REQUIRE(snapshot.ai_auto_approve);
+    REQUIRE(snapshot.ai_status.find("Native planner") != std::string::npos);
     REQUIRE(std::find(snapshot.visible_panels.begin(), snapshot.visible_panels.end(),
                       carto::ui::Panel::viewport) != snapshot.visible_panels.end());
 }
@@ -223,6 +227,7 @@ void ui_persists_preferences_and_resets_corrupt_state() {
     REQUIRE(ui.set_density(carto::ui::Density::touch));
     REQUIRE(ui.set_theme(carto::ui::Theme::light));
     REQUIRE(ui.set_bottom_panel(carto::ui::BottomPanel::problems));
+    REQUIRE(ui.set_ai_auto_approve(false));
     const auto path = temp.path() / "workspace.prefs";
     REQUIRE(ui.save_preferences(path));
 
@@ -232,6 +237,7 @@ void ui_persists_preferences_and_resets_corrupt_state() {
     REQUIRE(reopened.snapshot().density == carto::ui::Density::touch);
     REQUIRE(reopened.snapshot().theme == carto::ui::Theme::light);
     REQUIRE(reopened.snapshot().bottom_panel == carto::ui::BottomPanel::problems);
+    REQUIRE(!reopened.snapshot().ai_auto_approve);
     REQUIRE(reopened.set_panel_visible(carto::ui::Panel::scene, false));
     auto reopened_application_snapshot = reopened_session.snapshot();
     REQUIRE(std::find(reopened_application_snapshot.workspace.visible_panes.begin(),
@@ -250,19 +256,7 @@ void ui_persists_preferences_and_resets_corrupt_state() {
                   "panels=scene,viewport,inspector,operations,problems\n";
     }
     REQUIRE(reopened.load_preferences(path));
-
-    {
-        std::ofstream legacy_private(path, std::ios::binary | std::ios::trunc);
-        legacy_private << "header=CARTOGRAPHER_UI_PREFS_V2\n"
-                          "operator_mode=person-first\n"
-                          "workspace=model\n"
-                          "density=standard\n"
-                          "theme=dark\n"
-                          "bottom_panel=operations\n"
-                          "ai_auto_approve=1\n"
-                          "panels=scene,viewport,inspector,operations,problems\n";
-    }
-    REQUIRE(reopened.load_preferences(path));
+    REQUIRE(reopened.snapshot().ai_auto_approve);
 
     {
         std::ofstream corrupt(path, std::ios::binary | std::ios::trunc);
@@ -364,6 +358,175 @@ void workbench_preferences_round_trip_and_fail_closed() {
     REQUIRE(!carto::ui::load_workbench_preferences(path));
 }
 
+void ui_connects_surface_fidelity_preview_without_authoring_mutation() {
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+
+    REQUIRE(!ui.compile_surface_preview(6U));
+    REQUIRE(ui.snapshot().surface_fidelity.status ==
+            carto::ui::SurfaceFidelityStatus::unavailable);
+
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{"Surface box", {2.0, 2.0, 2.0}}));
+    const auto before = ui.snapshot();
+    REQUIRE(before.objects.size() == 1U);
+    const auto object = before.objects.front().object.id;
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{object}));
+    const auto selected = ui.snapshot();
+    const auto revision = selected.project_revision;
+    const auto bounded = ui.compile_surface_preview(
+        carto::ui::kMaxSurfacePreviewTriangles + 1U,
+        carto::surface::RepresentationMode::fidelity_closure);
+    REQUIRE(!bounded);
+    REQUIRE(bounded.error().code == carto::core::ErrorCode::unsupported);
+    REQUIRE(ui.snapshot().surface_fidelity.status ==
+            carto::ui::SurfaceFidelityStatus::unavailable);
+    REQUIRE(ui.snapshot().operations.size() == 1U);
+    REQUIRE(ui.compile_surface_preview(
+        6U, carto::surface::RepresentationMode::fidelity_closure));
+
+    auto preview = ui.snapshot().surface_fidelity;
+    REQUIRE(preview.status == carto::ui::SurfaceFidelityStatus::ready);
+    REQUIRE(preview.admitted);
+    REQUIRE(preview.object.has_value() && *preview.object == object);
+    REQUIRE(preview.source_triangles == 12U);
+    REQUIRE(preview.target_triangles == 6U);
+    REQUIRE(preview.mode == carto::surface::RepresentationMode::fidelity_closure);
+    REQUIRE(preview.compiled != nullptr);
+    REQUIRE(preview.compiled->geometry.triangle_count() == 6U);
+    REQUIRE(!preview.domain_digest.empty());
+    REQUIRE(!preview.representation_digest.empty());
+    REQUIRE(preview.validate());
+    REQUIRE(ui.snapshot().project_revision == revision);
+    REQUIRE(ui.snapshot().operations.size() == 1U);
+
+    REQUIRE(ui.dispatch(carto::application::SetObjectTransformAction{
+        object, carto::core::Transform{{1.0, 0.0, 0.0}, carto::core::Quaternion::identity(),
+                                       {1.0, 1.0, 1.0}}}));
+    preview = ui.snapshot().surface_fidelity;
+    REQUIRE(preview.status == carto::ui::SurfaceFidelityStatus::stale);
+    REQUIRE(!preview.admitted);
+
+    REQUIRE(ui.clear_surface_preview());
+    REQUIRE(ui.snapshot().surface_fidelity.status == carto::ui::SurfaceFidelityStatus::idle);
+}
+
+void ui_imports_mesh_through_provider_and_authoring_boundaries() {
+    TempDirectory temp;
+    const auto project_path = temp.path() / "wired-import.carto";
+    const auto obj_path = temp.path() / "triangle.obj";
+    const auto ply_path = temp.path() / "triangle.ply";
+    const auto stl_path = temp.path() / "triangle.stl";
+    {
+        std::ofstream obj(obj_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(obj));
+        obj << "v 0 0 0\n"
+               "v 1 0 0\n"
+               "v 0 1 0\n"
+               "f 1 2 3\n";
+    }
+    {
+        std::ofstream ply(ply_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(ply));
+        ply << "ply\n"
+               "format ascii 1.0\n"
+               "element vertex 3\n"
+               "property float x\n"
+               "property float y\n"
+               "property float z\n"
+               "element face 1\n"
+               "property list uchar int vertex_indices\n"
+               "end_header\n"
+               "0 0 0\n"
+               "1 0 0\n"
+               "0 1 0\n"
+               "3 0 1 2\n";
+    }
+    {
+        std::ofstream stl(stl_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(stl));
+        stl << "solid triangle\n"
+               "facet normal 0 0 1\n"
+               "outer loop\n"
+               "vertex 0 0 0\n"
+               "vertex 1 0 0\n"
+               "vertex 0 1 0\n"
+               "endloop\n"
+               "endfacet\n"
+               "endsolid triangle\n";
+    }
+
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.dispatch(carto::application::SaveProjectAction{project_path}));
+    const auto revision_before = ui.snapshot().project_revision;
+
+    const auto imported = ui.import_mesh(obj_path, carto::ui::MeshImportFormat::obj);
+    REQUIRE(imported);
+    REQUIRE(imported.value().object_name == "triangle");
+    REQUIRE(imported.value().vertices == 3U);
+    REQUIRE(imported.value().faces == 1U);
+    REQUIRE(imported.value().triangles == 1U);
+    REQUIRE(imported.value().dispatch.action == "Create Mesh Object");
+    REQUIRE(imported.value().dispatch.document_changed);
+    REQUIRE(imported.value().dispatch.source == carto::application::OperationSource::human);
+
+    const auto snapshot = ui.snapshot();
+    REQUIRE(snapshot.project_revision > revision_before);
+    REQUIRE(snapshot.dirty);
+    REQUIRE(snapshot.objects.size() == 1U);
+    REQUIRE(snapshot.objects.front().object.name == "triangle");
+    REQUIRE(snapshot.objects.front().object.mesh_asset.has_value());
+    REQUIRE(snapshot.viewport.scene.instances().size() == 1U);
+    REQUIRE(!snapshot.operations.empty());
+    REQUIRE(snapshot.operations.back().action == "Create Mesh Object");
+
+    const auto recovery = carto::application::ApplicationSession::inspect_recovery(project_path);
+    REQUIRE(recovery);
+    REQUIRE(recovery.value().state == carto::application::RecoveryInspectionState::pending);
+    REQUIRE(!recovery.value().journal_entries.empty());
+    REQUIRE(recovery.value().journal_entries.back().event_type ==
+            "cartographer.application_action");
+    carto::journal::Journal journal(std::filesystem::path(project_path.string() + ".journal"));
+    const auto journal_entries = journal.read_all();
+    REQUIRE(journal_entries);
+    REQUIRE(!journal_entries.value().empty());
+    const std::string journal_payload(
+        journal_entries.value().back().payload.begin(),
+        journal_entries.value().back().payload.end());
+    REQUIRE(journal_payload.find("operation=Create Mesh Object") != std::string::npos);
+
+    const auto imported_ply = ui.import_mesh(ply_path, carto::ui::MeshImportFormat::ply);
+    REQUIRE(imported_ply);
+    REQUIRE(imported_ply.value().vertices == 3U);
+    REQUIRE(imported_ply.value().faces == 1U);
+    REQUIRE(imported_ply.value().triangles == 1U);
+    const auto imported_stl = ui.import_mesh(stl_path, carto::ui::MeshImportFormat::stl);
+    REQUIRE(imported_stl);
+    REQUIRE(imported_stl.value().vertices == 3U);
+    REQUIRE(imported_stl.value().faces == 1U);
+    REQUIRE(imported_stl.value().triangles == 1U);
+    REQUIRE(ui.snapshot().objects.size() == 3U);
+
+    const auto stable_revision = ui.snapshot().project_revision;
+    const auto stable_operations = ui.snapshot().operations.size();
+    const auto missing = ui.import_mesh(
+        temp.path() / "missing.obj", carto::ui::MeshImportFormat::obj);
+    REQUIRE(!missing);
+    REQUIRE(ui.snapshot().project_revision == stable_revision);
+    REQUIRE(ui.snapshot().objects.size() == 3U);
+    REQUIRE(ui.snapshot().operations.size() == stable_operations);
+    REQUIRE(!ui.snapshot().ui_problems.empty());
+
+    const auto unsupported = ui.import_mesh(
+        obj_path, static_cast<carto::ui::MeshImportFormat>(99));
+    REQUIRE(!unsupported);
+    REQUIRE(unsupported.error().code == carto::core::ErrorCode::unsupported);
+    REQUIRE(ui.snapshot().project_revision == stable_revision);
+
+    REQUIRE(ui.handle_shortcut(carto::ui::Shortcut::save));
+    REQUIRE(!ui.snapshot().dirty);
+}
+
 void ui_failed_shortcuts_and_actions_remain_bounded() {
     carto::application::ApplicationSession session;
     carto::ui::UiController ui(session);
@@ -396,6 +559,18 @@ void ui_command_palette_is_bounded_and_explicit_about_deferred_features() {
         [](const auto& command) { return command.id == "edit.repeat-last"; });
     REQUIRE(repeat != ui.snapshot().commands.end());
     REQUIRE(repeat->shortcut == "Ctrl+R");
+    const auto import_mesh = std::find_if(
+        ui.snapshot().commands.begin(), ui.snapshot().commands.end(),
+        [](const auto& command) { return command.id == "file.import-mesh"; });
+    REQUIRE(import_mesh != ui.snapshot().commands.end());
+    REQUIRE(import_mesh->supported);
+    REQUIRE(import_mesh->shortcut == "Ctrl+I");
+    const auto duplicate = std::find_if(
+        ui.snapshot().commands.begin(), ui.snapshot().commands.end(),
+        [](const auto& command) { return command.id == "edit.duplicate"; });
+    REQUIRE(duplicate != ui.snapshot().commands.end());
+    REQUIRE(duplicate->supported);
+    REQUIRE(duplicate->shortcut == "Ctrl+D");
     REQUIRE(ui.handle_shortcut(carto::ui::Shortcut::edge_mode));
     REQUIRE(ui.snapshot().selection.mode == carto::editor::SelectionMode::edge);
     REQUIRE(ui.snapshot().project_revision == carto::core::Revision{});
@@ -503,11 +678,13 @@ int main() {
         preferences_validate_shell_invariants();
         ui_routes_authoritative_actions_and_operation_lineage();
         ui_distinguishes_unsaved_from_saved_state();
-        public_ui_exposes_no_private_mutation_surface();
+        ui_rejects_unadmitted_ai_proposals();
         ui_routes_edge_selection_without_authoring_mutation();
         ui_preserves_required_viewport_and_supports_mode_theme_density();
         ui_persists_preferences_and_resets_corrupt_state();
         workbench_preferences_round_trip_and_fail_closed();
+        ui_connects_surface_fidelity_preview_without_authoring_mutation();
+        ui_imports_mesh_through_provider_and_authoring_boundaries();
         ui_failed_shortcuts_and_actions_remain_bounded();
         ui_command_palette_is_bounded_and_explicit_about_deferred_features();
         native_key_contract_maps_core_control_without_imgui();

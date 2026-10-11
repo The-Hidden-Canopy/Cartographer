@@ -9,6 +9,7 @@ does not rewrite history, expire reflogs, delete files, or contact a remote.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -16,18 +17,6 @@ from pathlib import Path
 
 
 FORBIDDEN_PREFIXES = (
-    "libs/ai/",
-    "libs/device/include/carto/device/kernel_evidence.hpp",
-    "libs/device/src/kernel_evidence.cpp",
-    "libs/render/include/carto/render/gpu_plan.hpp",
-    "libs/render/src/gpu_plan.cpp",
-    "benchmarks/d3d12_kernels.cpp",
-    "benchmarks/scientific_kernels.cpp",
-    "tests/ai_tests.cpp",
-    "tests/kernel_evidence_tests.cpp",
-    "docs/architecture/kernel-evidence.md",
-    "docs/verification/native-kernel-benchmark.md",
-    "docs/verification/scientific-kernel-benchmark.md",
     ".hub/",
     "hub-local/",
     ".moat/",
@@ -51,9 +40,10 @@ FORBIDDEN_PREFIXES = (
     "tests/polygon_tests.cpp",
     "benchmarks/certified_geometry.cpp",
     "benchmarks/polygon.cpp",
-    "docs/protected/",
-    "docs/internal/",
-    "docs/private/",
+    "docs/architecture/consequence-certified-adaptive-geometry.md",
+    "docs/verification/consequence-certified-adaptive-geometry.md",
+    "docs/architecture/persistent-polygons.md",
+    "docs/verification/persistent-polygons.md",
 )
 
 FORBIDDEN_SUFFIXES = (
@@ -74,16 +64,6 @@ FORBIDDEN_SUFFIXES = (
     ".pt",
     ".pth",
     ".ckpt",
-    ".zip",
-    ".7z",
-    ".rar",
-    ".tar",
-    ".tar.gz",
-    ".tgz",
-    ".pdf",
-    ".docx",
-    ".pptx",
-    ".xlsx",
 )
 
 REVIEW_PREFIXES = (
@@ -94,13 +74,10 @@ REVIEW_PREFIXES = (
     "docs/architecture/gmib-integration.md",
 )
 
+HISTORY_PROVENANCE_MANIFEST = "docs/verification/public-history-provenance.json"
+HISTORY_PROVENANCE_SCHEMA = 1
+
 REQUIRED_IGNORE_PROBES = (
-    "libs/ai/src/ai.cpp",
-    "libs/device/include/carto/device/kernel_evidence.hpp",
-    "libs/render/src/gpu_plan.cpp",
-    "benchmarks/d3d12_kernels.cpp",
-    "tests/ai_tests.cpp",
-    "docs/architecture/kernel-evidence.md",
     ".env",
     "local.env",
     "secret.pfx",
@@ -113,16 +90,10 @@ REQUIRED_IGNORE_PROBES = (
     "model.pt",
     "model.pth",
     "model.ckpt",
-    "private-docuseries.zip",
-    "private-brief.pdf",
-    "private-notes.docx",
     ".hub/adapter.json",
     "models-private/model.bin",
     "private-runtime/snapshot.db",
     "docs/spec/source.pdf",
-    "docs/protected/algorithm.md",
-    "docs/internal/design.md",
-    "docs/private/notes.md",
     "libs/polygon/src/polygon.cpp",
     "libs/web_geometry/certified/src/certified.cpp",
     "sample.owh.carto",
@@ -146,30 +117,16 @@ SECRET_PATTERNS = (
     ),
 )
 
-# Public source and release instructions must not expose user- or workspace-
-# specific roots. Generic install examples such as C:\\Program Files remain
-# valid; user homes and the private workspace root fail closed.
+# A public source tree must not preserve workstation-specific roots. Besides
+# leaking local layout, these paths make release instructions non-portable and
+# can disclose where private material was staged. The check is deliberately
+# narrow: generic tool-install examples such as `C:\\Program Files` remain
+# valid, while user/workspace roots and home directories fail closed.
 WORKSTATION_PATH_PATTERNS = (
     re.compile(
         r"(?i)(?<![A-Za-z0-9])(?:[A-Z]:[\\/](?:Users[\\/][^\\/\s]+|HiddenCanopy)(?:[\\/]|$))"
     ),
     re.compile(r"(?<![A-Za-z0-9_])/home/[A-Za-z0-9._-]+(?:/|$)"),
-)
-
-# These implementation signatures identify the private authoring and execution
-# source family even if somebody renames the original files. Keep the tokens
-# split in this audit's own source so the audit does not match itself.
-PROTECTED_CONTENT_TERMS = (
-    ("private authoring target", "carto_" + "ai"),
-    ("private operation map", "build_" + "operation_ontology"),
-    ("private tool execution taxonomy", "Tool" + "KernelKind"),
-    ("private execution contract", "Kernel" + "Contract"),
-    ("private execution receipt", "KernelExecution" + "Receipt"),
-    ("private evidence ledger", "KernelEvidence" + "Ledger"),
-    ("private render plan", "GpuKernel" + "Plan"),
-    ("private render planner", "prepare_gpu_" + "render_plan"),
-    ("private precision taxonomy", "Precision" + "Role"),
-    ("private operation identity", "geometry." + "EditableMesh."),
 )
 
 GIT_SECRET_PATTERN = (
@@ -187,10 +144,6 @@ GIT_SECRET_PATTERN = (
 GIT_WORKSTATION_PATH_PATTERN = (
     r"[A-Za-z]:[\\/]((Users)[\\/][^[:space:]]+|HiddenCanopy[\\/])|"
     r"/home/[A-Za-z0-9._-]+/"
-)
-
-GIT_PROTECTED_CONTENT_PATTERN = "|".join(
-    re.escape(term) for _, term in PROTECTED_CONTENT_TERMS
 )
 
 MAX_TEXT_SCAN_BYTES = 4 * 1024 * 1024
@@ -233,7 +186,7 @@ def path_reason(path: str) -> str | None:
     if name.endswith(".env") and name != ".env.example":
         return "environment/credential file"
     if any(normalized.endswith(suffix) for suffix in FORBIDDEN_SUFFIXES):
-        return "quarantined credential, model, source, or document suffix"
+        return "credential/model artifact suffix"
     return None
 
 
@@ -243,6 +196,91 @@ def review_root(path: str) -> str | None:
         if normalized == prefix or normalized.startswith(prefix + "/"):
             return prefix
     return None
+
+
+def load_classified_history_roots(
+    root: Path,
+    candidates: set[str],
+    findings: list[str],
+    strict: bool,
+    history_commits: set[str],
+) -> set[str]:
+    """Load explicit owner classifications for historical review roots.
+
+    The manifest is deliberately narrow. It can classify only a known review
+    root, and every entry must carry an owner-review marker, a disposition,
+    and a repository-license basis. Missing or malformed metadata fails closed
+    when the blocking release mode is requested.
+    """
+    if not candidates:
+        return set()
+    manifest_path = root / HISTORY_PROVENANCE_MANIFEST
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        if strict:
+            findings.append(
+                f"history provenance manifest {HISTORY_PROVENANCE_MANIFEST}: unavailable"
+            )
+        return set()
+    except (OSError, json.JSONDecodeError) as error:
+        findings.append(
+            f"history provenance manifest {HISTORY_PROVENANCE_MANIFEST}: unavailable or invalid ({error})"
+        )
+        return set()
+    if not isinstance(payload, dict) or payload.get("schema") != HISTORY_PROVENANCE_SCHEMA:
+        findings.append(
+            f"history provenance manifest {HISTORY_PROVENANCE_MANIFEST}: unsupported schema"
+        )
+        return set()
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        findings.append(
+            f"history provenance manifest {HISTORY_PROVENANCE_MANIFEST}: entries must be a list"
+        )
+        return set()
+
+    classified: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            findings.append(
+                f"history provenance manifest {HISTORY_PROVENANCE_MANIFEST}: entry is not an object"
+            )
+            continue
+        candidate_root = entry.get("root")
+        normalized_root = normalize_path(candidate_root) if isinstance(candidate_root, str) else ""
+        if normalized_root not in REVIEW_PREFIXES:
+            findings.append(
+                f"history provenance manifest {HISTORY_PROVENANCE_MANIFEST}: unknown review root {candidate_root!r}"
+            )
+            continue
+        if normalized_root not in candidates:
+            continue
+        commits = entry.get("commits")
+        if (
+            entry.get("owner_reviewed") is not True
+            or entry.get("disposition") != "first_party_removed_from_current_public_tree"
+            or entry.get("license_basis") != "repository_apache_2_0"
+            or not isinstance(commits, list)
+            or not commits
+            or any(
+                not isinstance(commit, str)
+                or re.fullmatch(r"[0-9a-f]{40}", commit) is None
+                for commit in commits
+            )
+            or any(commit not in history_commits for commit in commits)
+        ):
+            findings.append(
+                f"history provenance manifest {HISTORY_PROVENANCE_MANIFEST}: incomplete classification for {normalized_root}"
+            )
+            continue
+        if normalized_root in classified:
+            findings.append(
+                f"history provenance manifest {HISTORY_PROVENANCE_MANIFEST}: duplicate classification for {normalized_root}"
+            )
+            continue
+        classified.add(normalized_root)
+    return classified
 
 
 def nul_paths(result: subprocess.CompletedProcess[str]) -> list[str]:
@@ -353,7 +391,7 @@ def main() -> int:
         return 2
 
     findings: list[str] = []
-    reviews: list[str] = []
+    review_candidates: list[tuple[str, str]] = []
     tracked, untracked = current_paths(root)
     tracked_ignored = tracked_ignored_paths(root)
     deleted_paths = deleted_worktree_paths(root)
@@ -373,9 +411,7 @@ def main() -> int:
                 findings.append(f"{source} path {path}: {reason}")
             review = review_root(path)
             if review is not None:
-                reviews.append(
-                    f"{source} root {review}: legacy integration path requires provenance/licensing review"
-                )
+                review_candidates.append((f"{source} root", review))
 
     for path in historical:
         reason = path_reason(path)
@@ -384,9 +420,7 @@ def main() -> int:
             findings.append(f"{scope} path {path}: {reason}")
         review = review_root(path)
         if review is not None:
-            reviews.append(
-                f"history root {review}: legacy integration path requires provenance/licensing review"
-            )
+            review_candidates.append(("history root", review))
 
     for path in sorted(set(tracked + untracked)):
         text = read_current_text(root, path)
@@ -394,10 +428,6 @@ def main() -> int:
             findings.append(f"current file {path}: recognizable credential pattern")
         if text is not None and has_workstation_path(text):
             findings.append(f"current file {path}: workstation path")
-        if text is not None:
-            for label, term in PROTECTED_CONTENT_TERMS:
-                if term in text:
-                    findings.append(f"current file {path}: {label}")
 
     for commit in commits:
         result = run_git(root, "grep", "-I", "-l", "-E", GIT_SECRET_PATTERN, commit, "--")
@@ -408,17 +438,19 @@ def main() -> int:
         if result.returncode == 0:
             for path in result.stdout.splitlines():
                 findings.append(f"history content {commit[:12]}:{path}: workstation path")
-        result = run_git(root, "grep", "-I", "-l", "-E", GIT_PROTECTED_CONTENT_PATTERN, commit, "--")
-        if result.returncode == 0:
-            for path in result.stdout.splitlines():
-                findings.append(
-                    f"history content {commit[:12]}:{path}: protected execution source signature"
-                )
 
     if arguments.check_ignore_policy:
         check_ignore_policy(root, findings)
 
-    reviews = sorted(set(reviews))
+    candidate_roots = {review for _, review in review_candidates}
+    classified_roots = load_classified_history_roots(
+        root, candidate_roots, findings, arguments.fail_on_review, set(commits)
+    )
+    reviews = sorted({
+        f"{scope} {review}: legacy integration path requires provenance/licensing review"
+        for scope, review in review_candidates
+        if review not in classified_roots
+    })
     findings = sorted(set(findings))
     print(f"Cartographer public boundary audit: {root}")
     if reviews:

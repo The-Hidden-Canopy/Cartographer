@@ -7,7 +7,7 @@ project(Cartographer
 )
 
 option(CARTO_BUILD_TESTS "Build headless unit and invariant tests" ON)
-option(CARTO_BUILD_BENCHMARKS "Build public CPU geometry and web-geometry benchmarks" OFF)
+option(CARTO_BUILD_BENCHMARKS "Build native CPU geometry and scientific kernel benchmarks" OFF)
 option(CARTO_BUILD_CLI "Build the headless Cartographer CLI" ON)
 option(CARTO_BUILD_DEVICE_CPU "Build the CPU reference device" ON)
 option(CARTO_BUILD_SDK_SHARED "Build the public C ABI as an opt-in shared library" OFF)
@@ -30,27 +30,16 @@ option(CARTO_BUILD_GMIB_GAME "Build the Cartographer-hosted GMIB game surface" O
 # not from whichever project owns the outer CMake configure.
 get_filename_component(_carto_public_root "${CMAKE_CURRENT_SOURCE_DIR}" REALPATH)
 set(_carto_protected_public_paths
-    "${_carto_public_root}/libs/ai"
-    "${_carto_public_root}/libs/device/include/carto/device/kernel_evidence.hpp"
-    "${_carto_public_root}/libs/device/src/kernel_evidence.cpp"
-    "${_carto_public_root}/libs/render/include/carto/render/gpu_plan.hpp"
-    "${_carto_public_root}/libs/render/src/gpu_plan.cpp"
-    "${_carto_public_root}/benchmarks/d3d12_kernels.cpp"
-    "${_carto_public_root}/benchmarks/scientific_kernels.cpp"
-    "${_carto_public_root}/tests/ai_tests.cpp"
-    "${_carto_public_root}/tests/kernel_evidence_tests.cpp"
     "${_carto_public_root}/libs/web_geometry/certified"
     "${_carto_public_root}/libs/polygon"
     "${_carto_public_root}/tests/certified_geometry_tests.cpp"
     "${_carto_public_root}/tests/polygon_tests.cpp"
     "${_carto_public_root}/benchmarks/certified_geometry.cpp"
     "${_carto_public_root}/benchmarks/polygon.cpp"
-    "${_carto_public_root}/docs/protected"
-    "${_carto_public_root}/docs/internal"
-    "${_carto_public_root}/docs/private"
-    "${_carto_public_root}/docs/architecture/kernel-evidence.md"
-    "${_carto_public_root}/docs/verification/native-kernel-benchmark.md"
-    "${_carto_public_root}/docs/verification/scientific-kernel-benchmark.md"
+    "${_carto_public_root}/docs/architecture/consequence-certified-adaptive-geometry.md"
+    "${_carto_public_root}/docs/verification/consequence-certified-adaptive-geometry.md"
+    "${_carto_public_root}/docs/architecture/persistent-polygons.md"
+    "${_carto_public_root}/docs/verification/persistent-polygons.md"
 )
 foreach(_carto_protected_path IN LISTS _carto_protected_public_paths)
     if(EXISTS "${_carto_protected_path}")
@@ -154,10 +143,20 @@ if(CARTO_BUILD_PRIVATE_INTEGRATIONS)
 endif()
 add_subdirectory(libs/geometry/mesh)
 add_subdirectory(libs/assets)
+add_subdirectory(libs/temporal)
+add_subdirectory(libs/surface/core)
+add_subdirectory(libs/physical)
 add_subdirectory(libs/scientific)
 add_subdirectory(libs/world)
+add_subdirectory(libs/semantic)
+add_subdirectory(libs/connection)
+add_subdirectory(libs/navgraph)
+add_subdirectory(libs/kinematic)
+add_subdirectory(libs/archetype)
 add_subdirectory(libs/mesh_attributes)
 add_subdirectory(libs/web_geometry/core)
+add_subdirectory(libs/collision)
+add_subdirectory(libs/representation)
 add_subdirectory(libs/web_geometry/compile)
 add_subdirectory(libs/web_geometry/package)
 add_subdirectory(libs/eval)
@@ -175,8 +174,10 @@ add_subdirectory(libs/plugin_protocol)
 add_subdirectory(libs/plugin_package)
 add_subdirectory(libs/project)
 add_subdirectory(libs/editor)
+add_subdirectory(libs/ai)
 add_subdirectory(libs/render)
 add_subdirectory(libs/production)
+add_subdirectory(libs/verification)
 if(CARTO_BUILD_GMIB_GRAPHICS)
     add_subdirectory(
         "${CARTO_PRIVATE_SOURCE_ROOT}/libs/gmib"

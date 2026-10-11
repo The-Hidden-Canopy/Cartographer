@@ -10,19 +10,6 @@
 /.cache/
 /tmp/
 
-# Source docuseries, office documents, and ad-hoc archives are release inputs,
-# not public source. Publish an intentionally reviewed derived document instead.
-*.zip
-*.7z
-*.rar
-*.tar
-*.tar.gz
-*.tgz
-*.pdf
-*.docx
-*.pptx
-*.xlsx
-
 # GitHub Actions is opt-in for this local/public checkout; do not stage
 # workflow definitions unless CI is intentionally re-enabled.
 /.github/workflows/
@@ -98,10 +85,10 @@ _deps/
 /.hub/
 /hub-local/
 
-# Keep explicit quarantine paths so models, weights, prompts, telemetry,
-# tuning, private runtime snapshots, and protected execution source cannot be
-# staged accidentally. Reviewed public shaders and geometry tests remain
-# visible to review.
+# Only moat material is permanently private. Keep explicit quarantine paths so
+# models, weights, prompts, telemetry, tuning, and private runtime snapshots
+# cannot be staged accidentally; ordinary public kernels, tests, shaders, and
+# benchmarks remain visible to review.
 /.moat/
 /moat/
 /.private-runtime/
@@ -123,24 +110,13 @@ _deps/
 .codex-remote-attachments/
 
 # Protected invention-bearing algorithm surfaces stay outside the public tree.
-/libs/ai/
-/libs/device/include/carto/device/kernel_evidence.hpp
-/libs/device/src/kernel_evidence.cpp
-/libs/render/include/carto/render/gpu_plan.hpp
-/libs/render/src/gpu_plan.cpp
-/benchmarks/d3d12_kernels.cpp
-/benchmarks/scientific_kernels.cpp
-/tests/ai_tests.cpp
-/tests/kernel_evidence_tests.cpp
-/docs/architecture/kernel-evidence.md
-/docs/verification/native-kernel-benchmark.md
-/docs/verification/scientific-kernel-benchmark.md
 /libs/web_geometry/certified/
 /libs/polygon/
 /tests/certified_geometry_tests.cpp
 /tests/polygon_tests.cpp
 /benchmarks/certified_geometry.cpp
 /benchmarks/polygon.cpp
-/docs/protected/
-/docs/internal/
-/docs/private/
+/docs/architecture/consequence-certified-adaptive-geometry.md
+/docs/verification/consequence-certified-adaptive-geometry.md
+/docs/architecture/persistent-polygons.md
+/docs/verification/persistent-polygons.md

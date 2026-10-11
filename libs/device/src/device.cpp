@@ -1,22 +1,10 @@
 #include <carto/device/device.hpp>
+#include <carto/device/kernel_evidence.hpp>
 
-#include <cctype>
 #include <cmath>
 #include <utility>
 
 namespace carto::device {
-
-namespace {
-
-bool is_sha256_digest(std::string_view value) noexcept {
-    if (value.size() != 64U) return false;
-    for (const char character : value) {
-        if (std::isxdigit(static_cast<unsigned char>(character)) == 0) return false;
-    }
-    return true;
-}
-
-} // namespace
 
 core::Result<void> validate(const ShaderBinary& binary) {
     if (binary.debug_name.empty() || binary.entry_point.empty() || binary.bytes.empty()) {

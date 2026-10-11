@@ -1281,7 +1281,10 @@ void d3d12_executes_builtin_shader_suite_and_dispatches_compute() {
         0.5F, 0.0F, 0.0F, 0.0F,
         0.0F, 0.0F, 0.125F, 0.125F,
     };
-    const std::array<std::uint32_t, 4U> temporal_flags = {1U, 0U, 0U, 0U};
+    // The acceptance fixture uses a cleared, explicitly static motion field.
+    // history_flags.w selects the shader's zero-motion fast path; production
+    // callers must set it only when that invariant is authoritative.
+    const std::array<std::uint32_t, 4U> temporal_flags = {1U, 0U, 0U, 1U};
     std::array<std::uint8_t, 48U> temporal_constants{};
     std::memcpy(temporal_constants.data(), temporal_float_constants.data(),
                 sizeof(temporal_float_constants));

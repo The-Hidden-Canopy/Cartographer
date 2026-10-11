@@ -53,7 +53,7 @@ struct TimingSummary {
     std::size_t checksum = 0U;
 };
 
-struct OperationSpec {
+struct KernelSpec {
     std::string_view name;
     bool (*run)(EditableMesh&, const Fixture&);
     bool requires_interior_edge = false;
@@ -158,7 +158,7 @@ bool run_dissolve(EditableMesh& mesh, const Fixture& fixture) {
 
 [[nodiscard]] TimingSummary benchmark(
     const Fixture& fixture,
-    const OperationSpec& operation,
+    const KernelSpec& kernel,
     std::size_t iterations) {
     const std::size_t total = kWarmupIterations + iterations;
     std::vector<EditableMesh> workspaces;
@@ -173,15 +173,15 @@ bool run_dissolve(EditableMesh& mesh, const Fixture& fixture) {
     for (std::size_t index = 0U; index < total; ++index) {
         auto& workspace = workspaces[index];
         const auto started = std::chrono::steady_clock::now();
-        const bool succeeded = operation.run(workspace, fixture);
+        const bool succeeded = kernel.run(workspace, fixture);
         const auto finished = std::chrono::steady_clock::now();
         if (!succeeded) {
             throw std::runtime_error(
-                std::string(operation.name) + " rejected its benchmark fixture");
+                std::string(kernel.name) + " rejected its benchmark fixture");
         }
         if (auto result = workspace.validate(); !result) {
             throw std::runtime_error(
-                std::string(operation.name) + " produced invalid topology: " + result.error().message);
+                std::string(kernel.name) + " produced invalid topology: " + result.error().message);
         }
         checksum += workspace.vertex_count() + workspace.face_count() +
             static_cast<std::size_t>(workspace.revision().value());
@@ -215,25 +215,25 @@ int main() {
             SizeCase{8U, 8U, 250U},
             SizeCase{16U, 16U, 50U},
         };
-        constexpr std::array<OperationSpec, 8U> operations = {
-            OperationSpec{"extrude_face", run_extrude},
-            OperationSpec{"inset_face", run_inset},
-            OperationSpec{"set_vertex_position", run_vertex_position},
-            OperationSpec{"slide_vertex", run_vertex_slide},
-            OperationSpec{"delete_face", run_delete},
-            OperationSpec{"split_edge", run_split},
-            OperationSpec{"bevel_edge", run_bevel, true},
-            OperationSpec{"dissolve_edge", run_dissolve, true},
+        constexpr std::array<KernelSpec, 8U> kernels = {
+            KernelSpec{"geometry.EditableMesh.extrude_face", run_extrude},
+            KernelSpec{"geometry.EditableMesh.inset_face", run_inset},
+            KernelSpec{"geometry.EditableMesh.set_vertex_position", run_vertex_position},
+            KernelSpec{"geometry.EditableMesh.slide_vertex", run_vertex_slide},
+            KernelSpec{"geometry.EditableMesh.delete_face", run_delete},
+            KernelSpec{"geometry.EditableMesh.split_edge", run_split},
+            KernelSpec{"geometry.EditableMesh.bevel_edge", run_bevel, true},
+            KernelSpec{"geometry.EditableMesh.dissolve_edge", run_dissolve, true},
         };
 
-        std::cout << "operation,rows,columns,vertices,faces,iterations,min_us,median_us,p95_us,mean_us,checksum\n";
+        std::cout << "kernel,rows,columns,vertices,faces,iterations,min_us,median_us,p95_us,mean_us,checksum\n";
         std::cout << std::fixed << std::setprecision(3);
         for (const auto& size : sizes) {
             const Fixture fixture = make_fixture(size);
-            for (const auto& operation : operations) {
-                if (operation.requires_interior_edge && !fixture.has_interior_edge) continue;
-                const auto summary = benchmark(fixture, operation, size.iterations);
-                std::cout << operation.name << ',' << size.rows << ',' << size.columns << ','
+            for (const auto& kernel : kernels) {
+                if (kernel.requires_interior_edge && !fixture.has_interior_edge) continue;
+                const auto summary = benchmark(fixture, kernel, size.iterations);
+                std::cout << kernel.name << ',' << size.rows << ',' << size.columns << ','
                     << fixture.mesh.vertex_count() << ',' << fixture.mesh.face_count() << ','
                     << size.iterations << ',' << summary.minimum_microseconds << ','
                     << summary.median_microseconds << ',' << summary.p95_microseconds << ','

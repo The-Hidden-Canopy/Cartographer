@@ -535,6 +535,8 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return create_plane(value);
             } else if constexpr (std::is_same_v<Action, CreateMeshObjectAction>) {
                 return create_mesh_object(value);
+            } else if constexpr (std::is_same_v<Action, DuplicateMeshInstanceAction>) {
+                return duplicate_mesh_instance(value);
             } else if constexpr (std::is_same_v<Action, UndoAction>) {
                 return undo();
             } else {
@@ -1324,6 +1326,28 @@ core::Result<DispatchReceipt> ApplicationSession::create_mesh_object(
             admission,
             document_, action.object_name, action.mesh),
         "Create Mesh Object");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::duplicate_mesh_instance(
+    const DuplicateMeshInstanceAction& action) {
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::DuplicateProjectMeshInstanceCommand>(
+            admission,
+            document_,
+            action.source,
+            action.object_name,
+            action.local_translation_offset),
+        "Duplicate Mesh Instance",
+        AffectedSet{{action.source}, {}, {}, {}},
+        ParameterPayload{
+            std::nullopt,
+            std::nullopt,
+            action.local_translation_offset,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt});
 }
 
 core::Result<DispatchReceipt> ApplicationSession::undo() {

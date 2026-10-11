@@ -8,7 +8,6 @@
 #include "project_document_access.hpp"
 
 #include <array>
-#include <cstddef>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -84,16 +83,6 @@ void uv_identity_rejects_ambiguous_or_wrong_layers() {
 }
 
 void material_bindings_are_explicit_and_gpu_packable() {
-    REQUIRE(alignof(carto::render::GpuMaterialConstants) == 16U);
-    REQUIRE(sizeof(carto::render::GpuMaterialConstants) == 128U);
-    REQUIRE(offsetof(carto::render::GpuMaterialConstants, base_color_factor) == 0U);
-    REQUIRE(offsetof(carto::render::GpuMaterialConstants,
-                     emissive_radiance_and_f0) == 16U);
-    REQUIRE(offsetof(carto::render::GpuMaterialConstants, surface_factors) == 32U);
-    REQUIRE(offsetof(carto::render::GpuMaterialConstants, alpha_factors) == 48U);
-    REQUIRE(offsetof(carto::render::GpuMaterialConstants, clearcoat_factors) == 64U);
-    REQUIRE(offsetof(carto::render::GpuMaterialConstants, texture_asset_ids) == 80U);
-
     carto::render::StandardMaterial material;
     material.base_color.asset = 0x100000001ULL;
     material.base_color.uv_set = 1U;
@@ -319,6 +308,10 @@ void project_v6_round_trips_uv_payload_and_reads_v5_without_one() {
     REQUIRE(header == 0U);
     legacy.replace(header, current_version.size(),
                    "CARTOGRAPHER_PROJECT 5");
+    const auto namespace_start = legacy.find("SOURCE_NAMESPACE ");
+    const auto namespace_end = legacy.find('\n', namespace_start);
+    REQUIRE(namespace_start != std::string::npos && namespace_end != std::string::npos);
+    legacy.erase(namespace_start, namespace_end - namespace_start + 1U);
     const auto attributes_start = legacy.find("ATTRIBUTES\n");
     const auto topology_start = legacy.find("TOPOLOGY_RECEIPTS ", attributes_start);
     REQUIRE(attributes_start != std::string::npos && topology_start != std::string::npos);

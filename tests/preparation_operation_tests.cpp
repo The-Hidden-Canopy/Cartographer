@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -680,6 +681,129 @@ void selected_second_mesh_and_complete_assembly_prepare_exactly() {
         "clean and repeated preparation resolve identical workshop meaning");
 }
 
+void profile_v2_policies_and_v1_compatibility() {
+    using namespace carto;
+    const std::string v1 =
+        "CARTOGRAPHER_PREPARATION_PROFILE 1\n"
+        "IDENTITY \"legacy.portable.v1\"\n"
+        "CHANNELS 1 1 1 \"condition.material_region\" \"\"\n"
+        "LOOKDEV 1 0\n"
+        "END\n";
+    const auto decoded = production::PreparationProfile::deserialize(v1);
+    require(decoded && decoded.value().identity == "legacy.portable.v1" &&
+            decoded.value().use_active_render_uv &&
+            decoded.value().product_policies.empty() &&
+            decoded.value().includes_product_class(
+                production::PreparationProductClass::collision_candidates) &&
+            decoded.value().includes_product_class(
+                production::PreparationProductClass::archetype) &&
+            decoded.value().approximation_error_budget(
+                production::PreparationProductClass::kinematic_graph) == 0.0,
+        "a v1 profile reopens with every product class included and exact-only budgets");
+
+    const std::string upgraded = decoded.value().serialize();
+    require(upgraded.starts_with("CARTOGRAPHER_PREPARATION_PROFILE 2\n") &&
+            upgraded.find("PRODUCTS 0\n") != std::string::npos,
+        "a v1 profile upgrades to the canonical v2 serialization");
+    const auto reread = production::PreparationProfile::deserialize(upgraded);
+    require(reread && reread.value().serialize() == upgraded,
+        "an upgraded v2 profile round-trips exactly");
+    require(!production::PreparationProfile::deserialize(
+                std::string{"CARTOGRAPHER_PREPARATION_PROFILE 1\n"
+                            "IDENTITY \"legacy.portable.v1\"\n"
+                            "CHANNELS 1 1 1 \"\" \"\"\n"
+                            "LOOKDEV 1 0\n"
+                            "PRODUCTS 1\n"
+                            "PRODUCT_CLASS 8 0 0\n"
+                            "END\n"}),
+        "v1 profiles reject records they never defined");
+
+    auto profile = production::portable_preparation_profile();
+    profile.product_policies.push_back(production::PreparationProductPolicy{
+        production::PreparationProductClass::collision_candidates, false, 0.0});
+    profile.product_policies.push_back(production::PreparationProductPolicy{
+        production::PreparationProductClass::navigation, true, 0.25});
+    require(static_cast<bool>(profile.validate()),
+        "bounded per-product-class policies validate");
+    require(!profile.includes_product_class(
+                production::PreparationProductClass::collision_candidates) &&
+            profile.includes_product_class(
+                production::PreparationProductClass::render_mesh) &&
+            profile.approximation_error_budget(
+                production::PreparationProductClass::navigation) == 0.25 &&
+            profile.approximation_error_budget(
+                production::PreparationProductClass::render_mesh) == 0.0,
+        "policy helpers honor explicit policies and portable defaults");
+
+    const std::string encoded = profile.serialize();
+    require(encoded.find("PRODUCT_CLASS 8 0 0\n") != std::string::npos &&
+            encoded.find("PRODUCT_CLASS 9 1 0.25\n") != std::string::npos,
+        "product policies serialize into the canonical v2 text");
+    const auto reopened = production::PreparationProfile::deserialize(encoded);
+    require(reopened && reopened.value().serialize() == encoded &&
+            reopened.value().canonical_digest().value() ==
+                profile.canonical_digest().value(),
+        "product policies round-trip with stable meaning and identity");
+    require(!production::PreparationProfile::deserialize(encoded + "TRAILING\n"),
+        "v2 profiles reject trailing records");
+
+    auto unsorted = profile;
+    std::swap(unsorted.product_policies.front(), unsorted.product_policies.back());
+    require(!unsorted.validate(),
+        "product policies must be canonically ordered by class");
+    auto duplicated = profile;
+    duplicated.product_policies.back().product_class =
+        duplicated.product_policies.front().product_class;
+    require(!duplicated.validate(), "one policy per product class is enforced");
+    auto contradictory = profile;
+    contradictory.product_policies.front().include = false;
+    contradictory.product_policies.front().max_approximation_error = 0.5;
+    require(!contradictory.validate(),
+        "an excluded product class cannot carry an approximation budget");
+    auto negative_budget = profile;
+    negative_budget.product_policies.back().max_approximation_error = -0.1;
+    require(!negative_budget.validate(),
+        "approximation error budgets must be non-negative");
+    auto non_finite_budget = profile;
+    non_finite_budget.product_policies.back().max_approximation_error =
+        std::numeric_limits<double>::quiet_NaN();
+    require(!non_finite_budget.validate(),
+        "approximation error budgets must be finite");
+
+    require(!production::PreparationProfile::deserialize(
+                std::string{"CARTOGRAPHER_PREPARATION_PROFILE 2\n"
+                            "IDENTITY \"hostile.v2\"\n"
+                            "CHANNELS 1 1 1 \"\" \"\"\n"
+                            "LOOKDEV 1 0\n"
+                            "PRODUCTS 65\n"}),
+        "oversized product policy counts are rejected before allocation");
+    require(!production::PreparationProfile::deserialize(
+                std::string{"CARTOGRAPHER_PREPARATION_PROFILE 2\n"
+                            "IDENTITY \"hostile.v2\"\n"
+                            "CHANNELS 1 1 1 \"\" \"\"\n"
+                            "LOOKDEV 1 0\n"
+                            "PRODUCTS 1\n"
+                            "PRODUCT_CLASS 13 1 0\n"
+                            "END\n"}),
+        "unknown product classes fail closed");
+    require(!production::PreparationProfile::deserialize(
+                std::string{"CARTOGRAPHER_PREPARATION_PROFILE 2\n"
+                            "IDENTITY \"hostile.v2\"\n"
+                            "CHANNELS 1 1 1 \"\" \"\"\n"
+                            "LOOKDEV 1 0\n"
+                            "PRODUCTS 1\n"
+                            "PRODUCT_CLASS 8 2 0\n"
+                            "END\n"}),
+        "non-Boolean product policy fields fail closed");
+    require(!production::PreparationProfile::deserialize(
+                std::string{"CARTOGRAPHER_PREPARATION_PROFILE 3\n"
+                            "IDENTITY \"future.v3\"\n"
+                            "CHANNELS 1 1 1 \"\" \"\"\n"
+                            "LOOKDEV 1 0\n"
+                            "END\n"}),
+        "future preparation profile versions fail closed");
+}
+
 } // namespace
 
 int main() {
@@ -687,6 +811,7 @@ int main() {
     invalid_or_stale_requests_fail_before_mutation();
     portable_source_meaning_survives_narrower_optional_lookdev();
     profiles_round_trip_and_hostile_inputs_fail_closed();
+    profile_v2_policies_and_v1_compatibility();
     cancellation_never_replaces_last_valid_output();
     texture_capture_rejects_linked_source_ancestors();
     selected_second_mesh_and_complete_assembly_prepare_exactly();

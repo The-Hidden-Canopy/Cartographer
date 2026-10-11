@@ -70,6 +70,11 @@ bool safe_layer_name(const std::optional<std::string>& value) {
         });
 }
 
+bool valid_product_class(PreparationProductClass value) {
+    return static_cast<unsigned>(value) <=
+        static_cast<unsigned>(PreparationProductClass::archetype);
+}
+
 const char* stage_name(PreparationStage stage) noexcept {
     switch (stage) {
     case PreparationStage::resolve: return "resolve";
@@ -355,20 +360,63 @@ std::string operation_identity_text(
 
 } // namespace
 
+core::Result<void> PreparationProductPolicy::validate() const {
+    if (!valid_product_class(product_class) ||
+        !std::isfinite(max_approximation_error) ||
+        max_approximation_error < 0.0 ||
+        (!include && max_approximation_error != 0.0)) {
+        return core::Result<void>::failure(invalid(
+            "preparation product class, inclusion, or approximation error budget is invalid"));
+    }
+    return core::Result<void>::success();
+}
+
 core::Result<void> PreparationProfile::validate() const {
     if (!safe_identity(identity) || !safe_layer_name(material_region_layer) ||
         !safe_layer_name(vertex_color_layer) ||
         (!use_active_render_uv && (include_unique_lightmap_uv ||
             generate_tangents_when_uv_present)) ||
-        (require_lookdev_for_material_regions && !include_lookdev)) {
+        (require_lookdev_for_material_regions && !include_lookdev) ||
+        product_policies.size() > kMaxPreparationProductPolicies ||
+        !std::is_sorted(product_policies.begin(), product_policies.end(),
+            [](const auto& left, const auto& right) {
+                return left.product_class < right.product_class;
+            }) ||
+        std::adjacent_find(product_policies.begin(), product_policies.end(),
+            [](const auto& left, const auto& right) {
+                return left.product_class == right.product_class;
+            }) != product_policies.end() ||
+        std::any_of(product_policies.begin(), product_policies.end(),
+            [](const auto& policy) { return !policy.validate(); })) {
         return core::Result<void>::failure(invalid(
-            "preparation profile identity, channel policy, or lookdev policy is invalid"));
+            "preparation profile identity, channel policy, lookdev policy, or product policies are invalid"));
     }
     return core::Result<void>::success();
 }
 
+bool PreparationProfile::includes_product_class(
+    PreparationProductClass product_class) const noexcept {
+    const auto policy = std::find_if(product_policies.begin(),
+        product_policies.end(),
+        [product_class](const PreparationProductPolicy& candidate) {
+            return candidate.product_class == product_class;
+        });
+    return policy == product_policies.end() || policy->include;
+}
+
+double PreparationProfile::approximation_error_budget(
+    PreparationProductClass product_class) const noexcept {
+    const auto policy = std::find_if(product_policies.begin(),
+        product_policies.end(),
+        [product_class](const PreparationProductPolicy& candidate) {
+            return candidate.product_class == product_class;
+        });
+    return policy == product_policies.end() ? 0.0 : policy->max_approximation_error;
+}
+
 std::string PreparationProfile::serialize() const {
     std::ostringstream output;
+    output << std::setprecision(std::numeric_limits<double>::max_digits10);
     output << kProfileMagic << ' ' << kPreparationProfileVersion << '\n'
            << "IDENTITY " << std::quoted(identity) << '\n'
            << "CHANNELS " << (use_active_render_uv ? 1U : 0U) << ' '
@@ -378,7 +426,14 @@ std::string PreparationProfile::serialize() const {
            << std::quoted(vertex_color_layer.value_or("")) << '\n'
            << "LOOKDEV " << (include_lookdev ? 1U : 0U) << ' '
            << (require_lookdev_for_material_regions ? 1U : 0U) << '\n'
-           << "END\n";
+           << "PRODUCTS " << product_policies.size() << '\n';
+    for (const auto& policy : product_policies) {
+        output << "PRODUCT_CLASS "
+               << static_cast<unsigned>(policy.product_class) << ' '
+               << (policy.include ? 1U : 0U) << ' '
+               << policy.max_approximation_error << '\n';
+    }
+    output << "END\n";
     return output.str();
 }
 
@@ -399,7 +454,7 @@ core::Result<PreparationProfile> PreparationProfile::deserialize(
     std::string token;
     std::uint64_t version = 0U;
     if (!(input >> token >> version) || token != kProfileMagic ||
-        version != kPreparationProfileVersion) {
+        (version != 1U && version != kPreparationProfileVersion)) {
         return core::Result<PreparationProfile>::failure(
             core::Diagnostic(core::ErrorCode::version_mismatch,
                 "unsupported preparation profile schema version"));
@@ -451,7 +506,53 @@ core::Result<PreparationProfile> PreparationProfile::deserialize(
     profile.include_lookdev = include_lookdev != 0U;
     profile.require_lookdev_for_material_regions = require_lookdev != 0U;
 
-    if (!(input >> token) || token != "END") {
+    // Version 1 profiles predate per-product-class policies; they reopen with
+    // every product class included under the portable exact-only default.
+    // Version 2 profiles may carry one bounded, canonically ordered policy per
+    // product class before the terminal record.
+    if (version >= 2U) {
+        if (!(input >> token)) {
+            return core::Result<PreparationProfile>::failure(invalid(
+                "preparation profile is missing its terminal record"));
+        }
+        if (token == "PRODUCTS") {
+            std::uint64_t policy_count = 0U;
+            if (!(input >> policy_count) ||
+                policy_count > kMaxPreparationProductPolicies) {
+                return core::Result<PreparationProfile>::failure(invalid(
+                    "preparation product policy count is invalid"));
+            }
+            profile.product_policies.reserve(
+                static_cast<std::size_t>(policy_count));
+            for (std::uint64_t index = 0U; index < policy_count; ++index) {
+                PreparationProductPolicy policy;
+                unsigned product_class = 0U;
+                unsigned include = 0U;
+                double max_approximation_error = 0.0;
+                if (!(input >> token) || token != "PRODUCT_CLASS" ||
+                    !(input >> product_class >> include >>
+                        max_approximation_error) ||
+                    product_class >
+                        static_cast<unsigned>(PreparationProductClass::archetype) ||
+                    include > 1U) {
+                    return core::Result<PreparationProfile>::failure(invalid(
+                        "preparation product policy is invalid"));
+                }
+                policy.product_class =
+                    static_cast<PreparationProductClass>(product_class);
+                policy.include = include != 0U;
+                policy.max_approximation_error = max_approximation_error;
+                profile.product_policies.push_back(std::move(policy));
+            }
+            if (!(input >> token) || token != "END") {
+                return core::Result<PreparationProfile>::failure(invalid(
+                    "preparation profile is missing its terminal record"));
+            }
+        } else if (token != "END") {
+            return core::Result<PreparationProfile>::failure(invalid(
+                "preparation profile is missing its terminal record"));
+        }
+    } else if (!(input >> token) || token != "END") {
         return core::Result<PreparationProfile>::failure(invalid(
             "preparation profile is missing its terminal record"));
     }

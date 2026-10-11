@@ -13,10 +13,6 @@
 
 namespace carto::assets {
 
-inline constexpr std::uint64_t kBlobStoreAbsoluteMaxBlobBytes =
-    1024ULL * 1024ULL * 1024ULL;
-inline constexpr std::uint32_t kBlobStoreAbsoluteMaxMediaTypeBytes = 1024U;
-
 struct Sha256Digest {
     std::array<std::uint8_t, 32> bytes{};
 
@@ -37,8 +33,6 @@ struct BlobRef {
 struct BlobStoreLimits {
     std::uint64_t max_blob_bytes = 256ULL * 1024ULL * 1024ULL;
     std::uint32_t max_media_type_bytes = 256U;
-
-    [[nodiscard]] core::Result<void> validate() const;
 };
 
 class BlobStore {

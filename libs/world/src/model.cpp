@@ -22,6 +22,7 @@ constexpr std::size_t kMaxNameBytes = 256U;
 constexpr std::size_t kMaxTagBytes = 128U;
 constexpr std::size_t kMaxTagsPerArea = 64U;
 constexpr std::size_t kMaxRecipeBytes = 256U;
+constexpr std::size_t kMaxIntentBytes = 256U;
 constexpr std::size_t kMaxPropertyBytes = 128U;
 constexpr std::size_t kMaxValueBytes = 4096U;
 constexpr std::uint64_t kMaxGeneratedInstances = 1'000'000'000U;
@@ -294,6 +295,13 @@ core::Result<void> InstanceField::validate() const {
         return core::Result<void>::failure(validation(
             "suppressed instance identities must be non-zero, sorted, and unique"));
     }
+    if ((geometry_evidence.has_value() && geometry_evidence->is_zero()) ||
+        !safe_text(physical_material_intent, kMaxIntentBytes, true) ||
+        !safe_text(construction_profile, kMaxIntentBytes, true) ||
+        !safe_text(surface_domain_identity, kMaxIntentBytes, true)) {
+        return core::Result<void>::failure(invalid(
+            "instance field geometry evidence or materialization intent is invalid"));
+    }
     return core::Result<void>::success();
 }
 
@@ -556,7 +564,11 @@ std::string WorldModel::serialize() const {
         for (const auto suppressed : field.suppressed_instances) {
             output << ' ' << suppressed;
         }
-        output << '\n';
+        output << ' '
+               << (field.geometry_evidence.has_value() ? field.geometry_evidence->hex() : "-")
+               << ' ' << std::quoted(field.physical_material_intent) << ' '
+               << std::quoted(field.construction_profile) << ' '
+               << std::quoted(field.surface_domain_identity) << '\n';
     }
 
     output << "VARIANT_LAYERS " << variant_layers_.size() << '\n';
@@ -599,7 +611,7 @@ core::Result<WorldModel> WorldModel::deserialize(std::string_view text) {
     std::string magic;
     std::uint32_t version = 0U;
     if (!(input >> magic) || !read_integer(input, version) ||
-        magic != kMagic || version != kSchemaVersion) {
+        magic != kMagic || (version != 1U && version != kSchemaVersion)) {
         return core::Result<WorldModel>::failure(parse_error(
             "world model framing or schema version is invalid"));
     }
@@ -752,6 +764,27 @@ core::Result<WorldModel> WorldModel::deserialize(std::string_view text) {
                     "world model suppressed instance identity is malformed"));
             }
             field.suppressed_instances.push_back(suppressed);
+        }
+        if (version >= 2U) {
+            std::string evidence;
+            if (!(input >> evidence)) {
+                return core::Result<WorldModel>::failure(parse_error(
+                    "world model instance-field geometry evidence is malformed"));
+            }
+            if (evidence != "-") {
+                const auto parsed_evidence = assets::Sha256Digest::from_hex(evidence);
+                if (!parsed_evidence) {
+                    return core::Result<WorldModel>::failure(parse_error(
+                        "world model instance-field geometry evidence is malformed"));
+                }
+                field.geometry_evidence = parsed_evidence.value();
+            }
+            if (!(input >> std::quoted(field.physical_material_intent) >>
+                  std::quoted(field.construction_profile) >>
+                  std::quoted(field.surface_domain_identity))) {
+                return core::Result<WorldModel>::failure(parse_error(
+                    "world model instance-field materialization intent is malformed"));
+            }
         }
         if (auto result = model.insert_instance_field(std::move(field)); !result) {
             return core::Result<WorldModel>::failure(result.error());

@@ -40,6 +40,21 @@ core::Result<TemporalResolveResult> resolve_temporal_reference(
         return core::Result<TemporalResolveResult>::failure(invalid(
             "temporal motion data does not match the current extent"));
     }
+    const bool has_current_identity = !input.current_surface_identity.empty();
+    const bool has_history_identity = !input.history_surface_identity.empty();
+    if (has_history_identity && !has_current_identity) {
+        return core::Result<TemporalResolveResult>::failure(invalid(
+            "temporal history identity requires current surface identity"));
+    }
+    if (has_current_identity && input.current_surface_identity.size() != pixels) {
+        return core::Result<TemporalResolveResult>::failure(invalid(
+            "temporal current surface identity does not match its extent"));
+    }
+    if (input.history_valid && has_current_identity &&
+        (!has_history_identity || input.history_surface_identity.size() != pixels)) {
+        return core::Result<TemporalResolveResult>::failure(invalid(
+            "valid temporal history requires a matching surface identity image"));
+    }
     if (!std::isfinite(input.feedback) || input.feedback < 0.0F || input.feedback > 1.0F ||
         !std::isfinite(input.neighborhood_clamp) || input.neighborhood_clamp < 0.0F ||
         !std::isfinite(input.motion_rejection) || input.motion_rejection < 0.0F) {
@@ -76,6 +91,12 @@ core::Result<TemporalResolveResult> resolve_temporal_reference(
 
     for (std::uint64_t pixel = 0U; pixel < pixels; ++pixel) {
         float weight = input.feedback;
+        if (has_current_identity && has_history_identity &&
+            input.current_surface_identity[static_cast<std::size_t>(pixel)] !=
+                input.history_surface_identity[static_cast<std::size_t>(pixel)]) {
+            weight = 0.0F;
+            ++result.identity_rejected_pixels;
+        }
         if (!input.motion_magnitude.empty()) {
             const float motion = input.motion_magnitude[static_cast<std::size_t>(pixel)];
             if (input.motion_rejection == 0.0F || motion >= input.motion_rejection) {

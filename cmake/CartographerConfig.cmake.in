@@ -5,5 +5,81 @@ if(@CARTO_ENABLE_VULKAN@)
     find_dependency(Vulkan)
 endif()
 
+# Single-config generators export the static libraries with the canonical
+# `NOCONFIG` location. Map consumer build types to that location so an
+# installed package remains consumable under Release/Debug-style requests.
+set(CMAKE_MAP_IMPORTED_CONFIG_DEBUG NOCONFIG)
+set(CMAKE_MAP_IMPORTED_CONFIG_RELEASE NOCONFIG)
+set(CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO NOCONFIG)
+set(CMAKE_MAP_IMPORTED_CONFIG_MINSIZEREL NOCONFIG)
+
 include("${CMAKE_CURRENT_LIST_DIR}/CartographerTargets.cmake")
+
+# `CMAKE_MAP_IMPORTED_CONFIG_*` is an initializer on some CMake versions, so
+# apply the mapping to the imported targets as well. This keeps the package
+# usable when a single-config consumer requests a named build type.
+set(_carto_exported_targets
+    Cartographer::carto_core
+    Cartographer::carto_scene
+    Cartographer::carto_attributes
+    Cartographer::carto_geometry
+    Cartographer::carto_assets
+    Cartographer::carto_temporal
+    Cartographer::carto_surface_core
+    Cartographer::carto_physical
+    Cartographer::carto_scientific
+    Cartographer::carto_world
+    Cartographer::carto_semantic
+    Cartographer::carto_connection
+    Cartographer::carto_navgraph
+    Cartographer::carto_kinematic
+    Cartographer::carto_archetype
+    Cartographer::carto_mesh_attributes
+    Cartographer::carto_web_geometry_core
+    Cartographer::carto_collision
+    Cartographer::carto_representation
+    Cartographer::carto_web_geometry_compile
+    Cartographer::carto_web_geometry_package
+    Cartographer::carto_eval
+    Cartographer::carto_web_geometry_evaluation
+    Cartographer::carto_gpu
+    Cartographer::carto_journal
+    Cartographer::carto_render_graph
+    Cartographer::carto_device_ir
+    Cartographer::carto_device
+    Cartographer::carto_device_cpu
+    Cartographer::carto_providers
+    Cartographer::carto_plugin_protocol
+    Cartographer::carto_plugin_package
+    Cartographer::carto_project
+    Cartographer::carto_editor
+    Cartographer::carto_ai
+    Cartographer::carto_render
+    Cartographer::carto_production
+    Cartographer::carto_verification
+    Cartographer::carto_application
+    Cartographer::carto_ui
+    Cartographer::carto_sdk
+    Cartographer::carto_io)
+foreach(_carto_imported_target IN LISTS _carto_exported_targets)
+    if(TARGET "${_carto_imported_target}")
+        get_target_property(_carto_noconfig_location
+            "${_carto_imported_target}" IMPORTED_LOCATION_NOCONFIG)
+        if(_carto_noconfig_location AND
+           NOT _carto_noconfig_location STREQUAL "_carto_noconfig_location-NOTFOUND")
+            set_property(TARGET "${_carto_imported_target}" PROPERTY
+                IMPORTED_LOCATION_DEBUG "${_carto_noconfig_location}")
+            set_property(TARGET "${_carto_imported_target}" PROPERTY
+                IMPORTED_LOCATION_RELEASE "${_carto_noconfig_location}")
+            set_property(TARGET "${_carto_imported_target}" PROPERTY
+                IMPORTED_LOCATION_RELWITHDEBINFO "${_carto_noconfig_location}")
+            set_property(TARGET "${_carto_imported_target}" PROPERTY
+                IMPORTED_LOCATION_MINSIZEREL "${_carto_noconfig_location}")
+        endif()
+    endif()
+endforeach()
+unset(_carto_exported_targets)
+unset(_carto_noconfig_location)
+unset(_carto_imported_target)
+
 check_required_components(Cartographer)

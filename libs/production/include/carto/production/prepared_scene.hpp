@@ -4,6 +4,7 @@
 #include <carto/core/math.hpp>
 #include <carto/core/result.hpp>
 #include <carto/core/revision.hpp>
+#include <carto/production/dependency.hpp>
 #include <carto/production/lookdev_draw_package.hpp>
 #include <carto/production/preparation_scope.hpp>
 #include <carto/production/render_mesh.hpp>
@@ -21,11 +22,16 @@ namespace carto::project {
 class ProjectDocument;
 }
 
+namespace carto::navgraph {
+struct PreparedNavigationEnvelope;
+}
+
 namespace carto::production {
 
 inline constexpr std::uint32_t kPreparedSceneVersion = 1U;
 inline constexpr std::size_t kMaxPreparedSceneBytes = 32U * 1024U * 1024U;
 inline constexpr std::size_t kMaxPreparedSceneRecords = 65'536U;
+inline constexpr std::size_t kMaxPreparedExtensionBindings = 4'096U;
 
 enum class PreparedHandedness : std::uint8_t {
     right_handed,
@@ -56,6 +62,14 @@ enum class PreparedProductKind : std::uint8_t {
     world_model,
     material_catalog,
     texture_source,
+    semantic_sidecar,
+    connection_port_graph,
+    physical_twin,
+    collision_candidates,
+    navigation,
+    kinematic_graph,
+    temporal_clip,
+    archetype,
 };
 
 enum PreparedMeshChannel : std::uint32_t {
@@ -156,12 +170,20 @@ enum class PreparedSourceEntityKind : std::uint8_t {
     mesh_asset,
     scene_node,
     material_region,
+    semantic_area,
+    semantic_path,
+    structure_graph,
+    instance_field,
 };
 
 enum class PreparedEntityKind : std::uint8_t {
     asset,
     node,
     material_binding,
+    semantic_area,
+    semantic_path,
+    structure_graph,
+    instance_field,
 };
 
 struct PreparedSourceCorrespondence {
@@ -171,6 +193,18 @@ struct PreparedSourceCorrespondence {
     PreparedEntityKind prepared_kind = PreparedEntityKind::asset;
     std::uint64_t prepared_primary = 0U;
     std::uint64_t prepared_secondary = 0U;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+// Stable, digest-bound reference to provider extension content that augments a
+// prepared scene. The binding names the extension source and the exact payload
+// bytes through content identity; it grants no runtime handle and no mutation
+// authority, and the payload itself is carried by the destination-side adapter.
+struct PreparedExtensionBinding {
+    std::string extension_identity;
+    std::string schema_identity;
+    assets::Sha256Digest payload_digest;
 
     [[nodiscard]] core::Result<void> validate() const;
 };
@@ -193,6 +227,7 @@ struct PreparedSceneEnvelope {
     std::vector<PreparedDependencyReference> dependencies;
     std::vector<PreparedCapabilityResult> capabilities;
     std::vector<PreparedSourceCorrespondence> correspondences;
+    std::vector<PreparedExtensionBinding> extension_bindings;
 
     [[nodiscard]] core::Result<void> validate() const;
     [[nodiscard]] std::string serialize() const;
@@ -235,5 +270,30 @@ compose_prepared_material_catalog(
     std::string profile_identity,
     assets::Sha256Digest profile_digest,
     std::span<const PreparedAssetInput> asset_inputs);
+
+// Composes the prepared navigation product reference for a scene-scope
+// prepared composition that includes a navigation product, following the
+// world.model product pattern: one content-addressed product bound to the
+// envelope's canonical prepared digest. The envelope itself stays the
+// authoritative compiled record; this reference only names it inside the
+// prepared composition.
+[[nodiscard]] core::Result<PreparedProductReference> compose_prepared_navigation_product(
+    const navgraph::PreparedNavigationEnvelope& envelope);
+
+// Wires a prepared navigation product into a production cook graph. The
+// registered node is keyed by the envelope's stable prepared identity — its
+// source namespace, source revision, and canonical digest — so the cook key
+// changes exactly when the prepared navigation bytes change. Its spatial
+// footprint is the union of the envelope's navigation tile footprints mapped
+// field-for-field onto SpatialTileRange, and that canonical range is bound
+// into the key's spatial_scope, so a changed durable area or path re-cooks
+// the navigation product only while the dirty region intersects the
+// footprint instead of recooking the whole scene. With no footprint evidence
+// the node stays global and is never spatially skipped. Returns the
+// registered cook key.
+[[nodiscard]] core::Result<ProductionCookKey> register_prepared_navigation_node(
+    ProductionCookGraph& graph,
+    const navgraph::PreparedNavigationEnvelope& envelope,
+    std::vector<ProductionCookKey> dependencies = {});
 
 } // namespace carto::production

@@ -1,5 +1,6 @@
 add_library(carto_render STATIC
     src/gpu_abi.cpp
+    src/gpu_plan.cpp
     src/lighting.cpp
     src/material.cpp
     src/render_request.cpp

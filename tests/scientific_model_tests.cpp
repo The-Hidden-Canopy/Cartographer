@@ -3692,6 +3692,10 @@ void scientific_model_mutation_is_journaled_and_reopens() {
     REQUIRE(current_header != std::string::npos);
     legacy_v4.replace(current_header, current_version.size(),
                       "CARTOGRAPHER_PROJECT 4");
+    const auto namespace_start = legacy_v4.find("SOURCE_NAMESPACE ");
+    const auto namespace_end = legacy_v4.find('\n', namespace_start);
+    REQUIRE(namespace_start != std::string::npos && namespace_end != std::string::npos);
+    legacy_v4.erase(namespace_start, namespace_end - namespace_start + 1U);
     const auto loaded_v4 = carto::project::ProjectDocument::deserialize(legacy_v4);
     REQUIRE(loaded_v4);
     REQUIRE(loaded_v4.value().scientific_model().empty());

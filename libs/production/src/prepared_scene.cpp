@@ -1,5 +1,6 @@
 #include <carto/production/prepared_scene.hpp>
 
+#include <carto/navgraph/envelope.hpp>
 #include <carto/project/project.hpp>
 
 #include <algorithm>
@@ -89,7 +90,7 @@ unsigned axis_dimension(PreparedAxis value) {
 
 bool valid_product_kind(PreparedProductKind value) {
     return static_cast<unsigned>(value) <=
-        static_cast<unsigned>(PreparedProductKind::texture_source);
+        static_cast<unsigned>(PreparedProductKind::archetype);
 }
 
 bool valid_dependency_disposition(PreparedDependencyDisposition value) {
@@ -104,12 +105,33 @@ bool valid_capability_evidence(PreparedCapabilityEvidence value) {
 
 bool valid_source_kind(PreparedSourceEntityKind value) {
     return static_cast<unsigned>(value) <=
-        static_cast<unsigned>(PreparedSourceEntityKind::material_region);
+        static_cast<unsigned>(PreparedSourceEntityKind::instance_field);
 }
 
 bool valid_prepared_kind(PreparedEntityKind value) {
     return static_cast<unsigned>(value) <=
-        static_cast<unsigned>(PreparedEntityKind::material_binding);
+        static_cast<unsigned>(PreparedEntityKind::instance_field);
+}
+
+// World-model primitives preserve their stable source identity inside the
+// prepared world-model product, so source and prepared world kinds share one
+// ordinal layout and map onto each other one-to-one.
+bool is_world_source_kind(PreparedSourceEntityKind value) {
+    return value == PreparedSourceEntityKind::semantic_area ||
+        value == PreparedSourceEntityKind::semantic_path ||
+        value == PreparedSourceEntityKind::structure_graph ||
+        value == PreparedSourceEntityKind::instance_field;
+}
+
+bool is_world_prepared_kind(PreparedEntityKind value) {
+    return value == PreparedEntityKind::semantic_area ||
+        value == PreparedEntityKind::semantic_path ||
+        value == PreparedEntityKind::structure_graph ||
+        value == PreparedEntityKind::instance_field;
+}
+
+PreparedEntityKind world_prepared_kind(PreparedSourceEntityKind kind) {
+    return static_cast<PreparedEntityKind>(static_cast<unsigned>(kind));
 }
 
 template <typename T, typename Projection>
@@ -442,13 +464,28 @@ core::Result<void> PreparedCapabilityResult::validate() const {
 
 core::Result<void> PreparedSourceCorrespondence::validate() const {
     const bool region_source = source_kind == PreparedSourceEntityKind::material_region;
+    const bool world_source = is_world_source_kind(source_kind);
     const bool binding_target = prepared_kind == PreparedEntityKind::material_binding;
+    const bool world_target = is_world_prepared_kind(prepared_kind);
     if (!valid_source_kind(source_kind) || !valid_prepared_kind(prepared_kind) ||
         source_primary == 0U || prepared_primary == 0U ||
         (region_source != (source_secondary != 0U)) ||
-        (binding_target != (prepared_secondary != 0U))) {
+        (binding_target != (prepared_secondary != 0U)) ||
+        (world_source != world_target) ||
+        (world_source &&
+            (world_prepared_kind(source_kind) != prepared_kind ||
+                source_primary != prepared_primary || prepared_secondary != 0U))) {
         return core::Result<void>::failure(invalid(
             "prepared source correspondence is invalid"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> PreparedExtensionBinding::validate() const {
+    if (!safe_identity(extension_identity) || !safe_identity(schema_identity) ||
+        payload_digest.is_zero()) {
+        return core::Result<void>::failure(invalid(
+            "prepared extension identity, schema, or payload digest is invalid"));
     }
     return core::Result<void>::success();
 }
@@ -467,7 +504,8 @@ core::Result<void> PreparedSceneEnvelope::validate() const {
         material_bindings.size() > kMaxPreparedSceneRecords ||
         dependencies.size() > kMaxPreparedSceneRecords ||
         capabilities.size() > kMaxPreparedSceneRecords ||
-        correspondences.size() > kMaxPreparedSceneRecords) {
+        correspondences.size() > kMaxPreparedSceneRecords ||
+        extension_bindings.size() > kMaxPreparedExtensionBindings) {
         return core::Result<void>::failure(validation(
             "prepared scene exceeds a bounded collection size"));
     }
@@ -489,6 +527,9 @@ core::Result<void> PreparedSceneEnvelope::validate() const {
                 static_cast<unsigned>(value.source_kind), value.source_primary,
                 value.source_secondary, static_cast<unsigned>(value.prepared_kind),
                 value.prepared_primary, value.prepared_secondary};
+        }) ||
+        !strictly_sorted_unique(extension_bindings, [](const auto& value) {
+            return value.extension_identity;
         })) {
         return core::Result<void>::failure(validation(
             "prepared-scene records must be canonically sorted and unique"));
@@ -497,11 +538,15 @@ core::Result<void> PreparedSceneEnvelope::validate() const {
     std::map<std::string, const PreparedProductReference*> product_map;
     std::set<std::string> portable_paths;
     std::size_t material_catalog_products = 0U;
+    std::size_t world_model_products = 0U;
     for (const auto& product : products) {
         if (auto result = product.validate(); !result) return result;
         product_map.emplace(product.identity, &product);
         if (product.kind == PreparedProductKind::material_catalog) {
             ++material_catalog_products;
+        }
+        if (product.kind == PreparedProductKind::world_model) {
+            ++world_model_products;
         }
         if (!portable_paths.insert(case_fold(product.relative_path)).second) {
             return core::Result<void>::failure(validation(
@@ -643,12 +688,24 @@ core::Result<void> PreparedSceneEnvelope::validate() const {
             covered_bindings.insert(key);
             break;
         }
+        default:
+            // World-model primitives are preserved inside the content-addressed
+            // world-model product; the envelope carries their stable identity
+            // correspondences but not their bodies.
+            if (world_model_products == 0U) {
+                return core::Result<void>::failure(validation(
+                    "world correspondence requires the prepared world-model product"));
+            }
+            break;
         }
     }
     if (covered_assets.size() != assets.size() || covered_nodes.size() != nodes.size() ||
         covered_bindings.size() != material_bindings.size()) {
         return core::Result<void>::failure(validation(
             "prepared entities do not all have explicit source correspondence"));
+    }
+    for (const auto& binding : extension_bindings) {
+        if (auto result = binding.validate(); !result) return result;
     }
     return core::Result<void>::success();
 }
@@ -727,6 +784,12 @@ std::string PreparedSceneEnvelope::serialize() const {
                << correspondence.prepared_primary << ' '
                << correspondence.prepared_secondary << '\n';
     }
+    output << "EXTENSION_BINDINGS " << extension_bindings.size() << '\n';
+    for (const auto& binding : extension_bindings) {
+        output << "EXTENSION_BINDING " << std::quoted(binding.extension_identity) << ' '
+               << std::quoted(binding.schema_identity) << ' '
+               << binding.payload_digest.hex() << '\n';
+    }
     output << "END\n";
     return output.str();
 }
@@ -802,7 +865,7 @@ core::Result<PreparedSceneEnvelope> PreparedSceneEnvelope::deserialize(
         PreparedProductReference product;
         if (!require_token(input, "PRODUCT") ||
             !(input >> std::quoted(product.identity)) ||
-            !read_enum(input, static_cast<unsigned>(PreparedProductKind::texture_source),
+            !read_enum(input, static_cast<unsigned>(PreparedProductKind::archetype),
                 product.kind) ||
             !read_unsigned(input, product.format_version) ||
             !(input >> encoded_digest >> std::quoted(product.relative_path))) {
@@ -943,12 +1006,12 @@ core::Result<PreparedSceneEnvelope> PreparedSceneEnvelope::deserialize(
         PreparedSourceCorrespondence correspondence;
         if (!require_token(input, "CORRESPONDENCE") ||
             !read_enum(input,
-                static_cast<unsigned>(PreparedSourceEntityKind::material_region),
+                static_cast<unsigned>(PreparedSourceEntityKind::instance_field),
                 correspondence.source_kind) ||
             !read_unsigned(input, correspondence.source_primary) ||
             !read_unsigned(input, correspondence.source_secondary) ||
             !read_enum(input,
-                static_cast<unsigned>(PreparedEntityKind::material_binding),
+                static_cast<unsigned>(PreparedEntityKind::instance_field),
                 correspondence.prepared_kind) ||
             !read_unsigned(input, correspondence.prepared_primary) ||
             !read_unsigned(input, correspondence.prepared_secondary)) {
@@ -957,7 +1020,46 @@ core::Result<PreparedSceneEnvelope> PreparedSceneEnvelope::deserialize(
         }
         scene.correspondences.push_back(std::move(correspondence));
     }
-    if (!require_token(input, "END")) {
+
+    // Extension bindings were introduced after the first prepared-scene
+    // consumers; absent section means an empty binding set so previously
+    // serialized envelopes still reopen deterministically.
+    std::string section;
+    if (!(input >> section)) {
+        return core::Result<PreparedSceneEnvelope>::failure(validation(
+            "prepared scene is missing its terminal record"));
+    }
+    if (section == "EXTENSION_BINDINGS") {
+        std::uint64_t binding_count = 0U;
+        if (!read_unsigned(input, binding_count) ||
+            binding_count > kMaxPreparedExtensionBindings) {
+            return core::Result<PreparedSceneEnvelope>::failure(validation(
+                "prepared-scene extension-binding count is invalid"));
+        }
+        scene.extension_bindings.reserve(
+            static_cast<std::size_t>(binding_count));
+        for (std::uint64_t index = 0U; index < binding_count; ++index) {
+            PreparedExtensionBinding binding;
+            std::string encoded_digest;
+            if (!require_token(input, "EXTENSION_BINDING") ||
+                !(input >> std::quoted(binding.extension_identity)) ||
+                !(input >> std::quoted(binding.schema_identity)) ||
+                !(input >> encoded_digest)) {
+                return core::Result<PreparedSceneEnvelope>::failure(validation(
+                    "prepared-scene extension-binding record is invalid"));
+            }
+            const auto digest = parse_digest(encoded_digest);
+            if (!digest) {
+                return core::Result<PreparedSceneEnvelope>::failure(digest.error());
+            }
+            binding.payload_digest = digest.value();
+            scene.extension_bindings.push_back(std::move(binding));
+        }
+        if (!require_token(input, "END")) {
+            return core::Result<PreparedSceneEnvelope>::failure(validation(
+                "prepared scene is missing its terminal record"));
+        }
+    } else if (section != "END") {
         return core::Result<PreparedSceneEnvelope>::failure(validation(
             "prepared scene is missing its terminal record"));
     }
@@ -1195,6 +1297,36 @@ core::Result<PreparedSceneEnvelope> compose_prepared_scene(
             world::WorldModel::kSchemaVersion, world_digest.value(),
             "products/world-model-v" +
                 std::to_string(world::WorldModel::kSchemaVersion) + ".txt"});
+        // The world model ships as one content-addressed product; each durable
+        // world primitive still receives an explicit stable-identity
+        // correspondence so consumers can bind source semantics to the
+        // prepared carrier without reverse-engineering it.
+        for (const auto& [area_id, area] : document.world_model().areas()) {
+            static_cast<void>(area);
+            scene.correspondences.push_back(PreparedSourceCorrespondence{
+                PreparedSourceEntityKind::semantic_area, area_id.value, 0U,
+                PreparedEntityKind::semantic_area, area_id.value, 0U});
+        }
+        for (const auto& [path_id, path] : document.world_model().paths()) {
+            static_cast<void>(path);
+            scene.correspondences.push_back(PreparedSourceCorrespondence{
+                PreparedSourceEntityKind::semantic_path, path_id.value, 0U,
+                PreparedEntityKind::semantic_path, path_id.value, 0U});
+        }
+        for (const auto& [graph_id, graph] :
+            document.world_model().structure_graphs()) {
+            static_cast<void>(graph);
+            scene.correspondences.push_back(PreparedSourceCorrespondence{
+                PreparedSourceEntityKind::structure_graph, graph_id.value, 0U,
+                PreparedEntityKind::structure_graph, graph_id.value, 0U});
+        }
+        for (const auto& [field_id, field] :
+            document.world_model().instance_fields()) {
+            static_cast<void>(field);
+            scene.correspondences.push_back(PreparedSourceCorrespondence{
+                PreparedSourceEntityKind::instance_field, field_id.value, 0U,
+                PreparedEntityKind::instance_field, field_id.value, 0U});
+        }
     }
 
     for (const auto& product : scene.products) {
@@ -1266,10 +1398,101 @@ core::Result<PreparedSceneEnvelope> compose_prepared_scene(
                     right.source_secondary, static_cast<unsigned>(right.prepared_kind),
                     right.prepared_primary, right.prepared_secondary};
         });
+    std::sort(scene.extension_bindings.begin(), scene.extension_bindings.end(),
+        [](const auto& left, const auto& right) {
+            return left.extension_identity < right.extension_identity;
+        });
     if (auto result = scene.validate(); !result) {
         return core::Result<PreparedSceneEnvelope>::failure(result.error());
     }
     return core::Result<PreparedSceneEnvelope>::success(std::move(scene));
+}
+
+core::Result<PreparedProductReference> compose_prepared_navigation_product(
+    const navgraph::PreparedNavigationEnvelope& envelope) {
+    if (auto result = envelope.validate(); !result) {
+        return core::Result<PreparedProductReference>::failure(
+            result.error().with_context("prepared navigation product"));
+    }
+    const auto digest = envelope.canonical_digest();
+    if (!digest) {
+        return core::Result<PreparedProductReference>::failure(
+            digest.error().with_context("prepared navigation product"));
+    }
+    PreparedProductReference product;
+    product.identity = "world.navigation";
+    product.kind = PreparedProductKind::navigation;
+    product.format_version = navgraph::PreparedNavigationEnvelope::kSchemaVersion;
+    product.content_digest = digest.value();
+    product.relative_path =
+        "products/navigation-envelope-v" +
+        std::to_string(navgraph::PreparedNavigationEnvelope::kSchemaVersion) + ".bin";
+    if (auto result = product.validate(); !result) {
+        return core::Result<PreparedProductReference>::failure(result.error());
+    }
+    return core::Result<PreparedProductReference>::success(std::move(product));
+}
+
+core::Result<ProductionCookKey> register_prepared_navigation_node(
+    ProductionCookGraph& graph,
+    const navgraph::PreparedNavigationEnvelope& envelope,
+    std::vector<ProductionCookKey> dependencies) {
+    if (auto result = envelope.validate(); !result) {
+        return core::Result<ProductionCookKey>::failure(
+            result.error().with_context("prepared navigation cook node"));
+    }
+    const auto digest = envelope.canonical_digest();
+    if (!digest) {
+        return core::Result<ProductionCookKey>::failure(
+            digest.error().with_context("prepared navigation cook node"));
+    }
+
+    // The invalidation helpers carry the same field shape as SpatialTileRange,
+    // so the union footprint maps across without transformation; mixed grids
+    // or levels fail closed inside the union instead of assuming non-overlap.
+    std::optional<SpatialTileRange> footprint;
+    if (!envelope.footprints.empty()) {
+        const auto unioned = navgraph::union_footprints(
+            envelope.footprints.front().grid_identity,
+            envelope.footprints.front().level,
+            envelope.footprints);
+        if (!unioned) {
+            return core::Result<ProductionCookKey>::failure(
+                unioned.error().with_context("prepared navigation cook node"));
+        }
+        SpatialTileRange range;
+        range.grid_identity = unioned.value().grid_identity;
+        range.level = unioned.value().level;
+        range.minimum_x = unioned.value().minimum_x;
+        range.minimum_y = unioned.value().minimum_y;
+        range.minimum_z = unioned.value().minimum_z;
+        range.maximum_x = unioned.value().maximum_x;
+        range.maximum_y = unioned.value().maximum_y;
+        range.maximum_z = unioned.value().maximum_z;
+        footprint = std::move(range);
+    }
+
+    ProductionCookKey key;
+    key.source = AuthoritativeSource{
+        envelope.source_namespace, envelope.source_revision, digest.value()};
+    // Navigation ships as a spatially scoped, runtime-residency consumed
+    // derived product; the algorithm names the exact derivation.
+    key.kind = ArtifactKind::residency_page;
+    key.form = ExecutionForm::offline;
+    key.algorithm = "navigation-envelope-v1";
+    key.settings_digest = digest_text("carto.navgraph/prepared-envelope-v1");
+    key.platform_profile = "provider-neutral";
+    if (footprint.has_value()) {
+        key.spatial_scope = footprint->canonical();
+    }
+
+    const auto registered = footprint.has_value()
+        ? graph.add_spatial_node(key, footprint.value(), std::move(dependencies))
+        : graph.add_node(key, std::move(dependencies));
+    if (!registered) {
+        return core::Result<ProductionCookKey>::failure(registered.error());
+    }
+    return core::Result<ProductionCookKey>::success(std::move(key));
 }
 
 } // namespace carto::production

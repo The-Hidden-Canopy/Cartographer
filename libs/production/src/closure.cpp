@@ -463,29 +463,11 @@ core::Result<void> validate_publication(
 }
 
 core::Result<void> ProductionReceiptLedger::append(ProductionArtifactReceipt receipt) {
-    if (auto result = receipt.validate(); !result) return result;
-    for (const auto& existing : records_) {
-        if (existing.receipt_digest == receipt.receipt_digest) {
-            if (existing.canonical_without_digest() !=
-                receipt.canonical_without_digest()) {
-                return core::Result<void>::failure(validation(
-                    "production receipt digest is reused by different evidence"));
-            }
-            return core::Result<void>::success();
-        }
-        if (existing.key == receipt.key &&
-            existing.status == ReceiptStatus::admitted &&
-            receipt.status == ReceiptStatus::admitted &&
-            (existing.output_digest != receipt.output_digest ||
-             existing.output_bytes != receipt.output_bytes)) {
-            return core::Result<void>::failure(validation(
-                "deterministic production cook key has conflicting admitted output"));
-        }
-    }
     if (records_.size() >= max_receipts) {
         return core::Result<void>::failure(validation(
             "production receipt ledger has reached its bounded capacity"));
     }
+    if (auto result = receipt.validate(); !result) return result;
     records_.push_back(std::move(receipt));
     return core::Result<void>::success();
 }
@@ -659,13 +641,8 @@ core::Result<ProductionReceiptLedger> ProductionReceiptLedger::deserialize(
         record.status = status.value();
         record.output_digest = output_digest.value();
         record.receipt_digest = receipt_digest.value();
-        const std::size_t previous_size = ledger.size();
         if (auto result = ledger.append(std::move(record)); !result) {
             return core::Result<ProductionReceiptLedger>::failure(result.error());
-        }
-        if (ledger.size() != previous_size + 1U) {
-            return core::Result<ProductionReceiptLedger>::failure(validation(
-                "serialized production ledger contains duplicate receipt evidence"));
         }
     }
 

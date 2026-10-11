@@ -28,6 +28,11 @@ above it; `carto_device_cpu` provides the first executable semantic oracle.
   math, immutable render-request quality profiles, aligned GPU frame/material/
   light/temporal constants, and a canonical shadow/opaque/temporal/tone-map/
   present graph plan.
+- `carto_device` exposes a local kernel precision/evidence contract. It keeps
+  requested representation separate from actual arithmetic and execution
+  path, requires native source/binary identity, records explicit fallback
+  reasons, and never exports telemetry. See
+  [kernel-evidence.md](kernel-evidence.md).
 - `carto_render_graph` validates resource descriptors, read-before-write
   hazards, write transitions, stage/format compatibility, and alias lifetime
   overlap. Its output is a deterministic compiled description, not a GPU
@@ -47,12 +52,12 @@ RGBA32F texture transfer and sampling semantics. None of these layers provides
 a surface, swapchain, or native Vulkan execution.
 Deferred destruction planning exists, but native resource retirement is still
 a backend concern.
-The GPU preparation tranche adds `carto_render`'s aligned ABI plus packaged
-D3D12 HLSL sources for forward PBR, depth shadows, temporal
+The GPU preparation tranche adds `carto_render`'s aligned ABI and pass plan,
+plus packaged D3D12 HLSL sources for forward PBR, depth shadows, temporal
 resolve, and HDR tone mapping. The bounded D3D12 receipt now compiles and
 executes those PBR/HDR, shadow-depth, and temporal paths with native readback;
-the CPU path remains the public reference authority, and the receipt does not
-imply IBL or full render-graph parity.
+the CPU path remains the authoring and kernel-benchmark authority, and the
+receipt does not imply IBL or full render-graph parity.
 The D3D12 shader binary boundary also retains SHA-256 source and bytecode
 identity when runtime DXC is available; the compiler field identifies the
 invocation recipe and does not overclaim executable provenance.

@@ -58,6 +58,9 @@ public:
         scientific::ScientificModel model);
     [[nodiscard]] core::Result<void> set_world_model(world::WorldModel model);
     [[nodiscard]] core::Result<void> set_material_catalog(MaterialCatalog catalog);
+    [[nodiscard]] core::Result<void> set_semantic_sidecar(
+        std::string serialized_sidecar,
+        assets::Sha256Digest digest);
     [[nodiscard]] core::Result<void> set_object_transform(
         scene::ObjectId object,
         core::Transform transform);

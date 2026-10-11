@@ -57,6 +57,9 @@ constexpr std::uint64_t kMaxSerializedAttributeLayers = 1'000'000U;
 constexpr std::uint64_t kMaxSerializedAttributeValues = 1'000'000U;
 constexpr std::uint64_t kMaxSerializedUvSets = 1'000'000U;
 constexpr std::uintmax_t kMaxSerializedProjectBytes = 128ULL * 1024ULL * 1024ULL;
+// Mirrors carto::semantic::SemanticSidecar::kMaxSerializedBytes. The value is
+// duplicated here so libs/project keeps no dependency on carto_semantic.
+constexpr std::uint64_t kMaxSerializedSemanticSidecarBytes = 16ULL * 1024ULL * 1024ULL;
 std::mutex g_project_save_mutex;
 std::atomic<std::uint64_t> g_project_temp_counter{0U};
 std::atomic<std::uint64_t> g_project_namespace_counter{0U};
@@ -765,6 +768,38 @@ core::Result<void> ProjectDocument::set_material_catalog(MaterialCatalog catalog
     return core::Result<void>::success();
 }
 
+core::Result<void> ProjectDocument::set_semantic_sidecar(
+    std::string serialized_sidecar,
+    assets::Sha256Digest digest) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (serialized_sidecar.empty() ||
+        serialized_sidecar.size() > kMaxSerializedSemanticSidecarBytes) {
+        return core::Result<void>::failure(invalid(
+            "semantic sidecar bytes are empty or exceed the serialized byte bound"));
+    }
+    if (digest.is_zero()) {
+        return core::Result<void>::failure(invalid(
+            "semantic sidecar digest must not be zero"));
+    }
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(serialized_sidecar.data());
+    if (assets::sha256(std::span<const std::uint8_t>(bytes, serialized_sidecar.size())) != digest) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::validation_failed,
+            "semantic sidecar digest does not bind the serialized bytes"));
+    }
+    if (semantic_sidecar_bytes_.has_value() &&
+        *semantic_sidecar_bytes_ == serialized_sidecar &&
+        semantic_sidecar_digest_.has_value() && *semantic_sidecar_digest_ == digest) {
+        return core::Result<void>::success();
+    }
+    semantic_sidecar_bytes_ = std::move(serialized_sidecar);
+    semantic_sidecar_digest_ = digest;
+    bump_revision();
+    return core::Result<void>::success();
+}
+
 core::Result<void> ProjectDocument::set_object_transform(
     scene::ObjectId object,
     core::Transform transform) {
@@ -850,6 +885,24 @@ core::Result<void> ProjectDocument::validate() const {
         return core::Result<void>::failure(parse_error(
             "project evaluation graph digest must not be zero"));
     }
+    if (semantic_sidecar_digest_.has_value() != semantic_sidecar_bytes_.has_value()) {
+        return core::Result<void>::failure(parse_error(
+            "project semantic sidecar bytes and digest must be set together"));
+    }
+    if (semantic_sidecar_bytes_.has_value()) {
+        if (semantic_sidecar_bytes_->empty() ||
+            semantic_sidecar_bytes_->size() > kMaxSerializedSemanticSidecarBytes) {
+            return core::Result<void>::failure(parse_error(
+                "project semantic sidecar bytes exceed the serialized byte bound"));
+        }
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(
+            semantic_sidecar_bytes_->data());
+        if (assets::sha256(std::span<const std::uint8_t>(
+                bytes, semantic_sidecar_bytes_->size())) != *semantic_sidecar_digest_) {
+            return core::Result<void>::failure(parse_error(
+                "project semantic sidecar digest does not bind its bytes"));
+        }
+    }
     if (auto result = world_model_.validate(); !result) {
         return core::Result<void>::failure(result.error().with_context(
             "project world model"));
@@ -923,6 +976,8 @@ void ProjectDocument::swap(ProjectDocument& other) noexcept {
     std::swap(scientific_model_, other.scientific_model_);
     std::swap(world_model_, other.world_model_);
     std::swap(material_catalog_, other.material_catalog_);
+    std::swap(semantic_sidecar_bytes_, other.semantic_sidecar_bytes_);
+    std::swap(semantic_sidecar_digest_, other.semantic_sidecar_digest_);
     std::swap(evaluation_graph_digest_, other.evaluation_graph_digest_);
     std::swap(next_mesh_id_, other.next_mesh_id_);
     std::swap(revision_, other.revision_);
@@ -1017,6 +1072,10 @@ std::string ProjectDocument::serialize() const {
     output << "SCIENTIFIC_MODEL " << std::quoted(scientific_model_.serialize()) << '\n';
     output << "WORLD_MODEL " << std::quoted(world_model_.serialize()) << '\n';
     output << "MATERIAL_CATALOG " << std::quoted(material_catalog_.serialize()) << '\n';
+    if (semantic_sidecar_bytes_.has_value()) {
+        output << "SEMANTIC_SIDECAR " << semantic_sidecar_digest_->hex() << ' '
+               << std::quoted(*semantic_sidecar_bytes_) << '\n';
+    }
     output << "END\n";
     return output.str();
 }
@@ -1068,32 +1127,8 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
                 "project source namespace is invalid"));
         }
     } else {
-        const auto position = input.tellg();
-        std::string legacy_probe;
-        if (!(input >> legacy_probe)) {
-            return core::Result<ProjectDocument>::failure(parse_error(
-                "project name record is missing"));
-        }
-        input.clear();
-        input.seekg(position);
-        if (legacy_probe == "SOURCE_NAMESPACE") {
-            if (version.value() < 4U) {
-                return core::Result<ProjectDocument>::failure(Diagnostic(
-                    ErrorCode::version_mismatch,
-                    "source namespace records require project schema version 4"));
-            }
-            if (auto result = require_line(input, "SOURCE_NAMESPACE"); !result) {
-                return core::Result<ProjectDocument>::failure(result.error());
-            }
-            if (!(input >> std::quoted(document.source_namespace_)) ||
-                !valid_source_namespace(document.source_namespace_)) {
-                return core::Result<ProjectDocument>::failure(parse_error(
-                    "project source namespace is invalid"));
-            }
-        } else {
-            document.source_namespace_ = namespace_from_seed(
-                text, "cartographer.project.migrated.");
-        }
+        document.source_namespace_ = namespace_from_seed(
+            text, "cartographer.project.migrated.");
     }
 
     if (auto result = require_line(input, "NAME"); !result) {
@@ -1606,6 +1641,11 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
     }
     bool material_catalog_seen = false;
     if (terminal_record == "MATERIAL_CATALOG") {
+        if (version.value() < 8U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "material catalog records require project schema version 8"));
+        }
         std::string encoded_material_catalog;
         if (!(input >> std::quoted(encoded_material_catalog))) {
             return core::Result<ProjectDocument>::failure(parse_error(
@@ -1630,6 +1670,38 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
     if (version.value() >= 8U && !material_catalog_seen) {
         return core::Result<ProjectDocument>::failure(parse_error(
             "project schema v8 or newer is missing its material catalog record"));
+    }
+    if (terminal_record == "SEMANTIC_SIDECAR") {
+        if (version.value() < 10U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "semantic sidecar records require project schema version 10"));
+        }
+        std::string encoded_digest;
+        std::string encoded_sidecar;
+        if (!(input >> encoded_digest >> std::quoted(encoded_sidecar))) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project semantic sidecar record is invalid"));
+        }
+        if (encoded_sidecar.empty() ||
+            encoded_sidecar.size() > kMaxSerializedSemanticSidecarBytes) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project semantic sidecar record exceeds its size limit"));
+        }
+        const auto digest = assets::Sha256Digest::from_hex(encoded_digest);
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(encoded_sidecar.data());
+        if (!digest || digest.value().is_zero() ||
+            assets::sha256(std::span<const std::uint8_t>(
+                bytes, encoded_sidecar.size())) != digest.value()) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project semantic sidecar digest does not bind its bytes"));
+        }
+        document.semantic_sidecar_bytes_ = std::move(encoded_sidecar);
+        document.semantic_sidecar_digest_ = digest.value();
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(
+                parse_error("project is missing its terminal record"));
+        }
     }
     if (terminal_record != "END") {
         return core::Result<ProjectDocument>::failure(

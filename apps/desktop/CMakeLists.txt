@@ -23,6 +23,7 @@ target_link_libraries(cartographer_desktop
         carto_application
         carto_ui
         carto_io
+        carto_production
         carto_vulkan
         carto_imgui
         Vulkan::Vulkan

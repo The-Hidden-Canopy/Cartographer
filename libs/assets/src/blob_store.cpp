@@ -201,17 +201,6 @@ Sha256Digest sha256(std::span<const std::uint8_t> bytes) {
     return state.finish();
 }
 
-core::Result<void> BlobStoreLimits::validate() const {
-    if (max_blob_bytes == 0U ||
-        max_blob_bytes > kBlobStoreAbsoluteMaxBlobBytes ||
-        max_media_type_bytes == 0U ||
-        max_media_type_bytes > kBlobStoreAbsoluteMaxMediaTypeBytes) {
-        return core::Result<void>::failure(invalid(
-            "blob-store limits must be non-zero and within process safety bounds"));
-    }
-    return core::Result<void>::success();
-}
-
 BlobStore::BlobStore(std::filesystem::path root, BlobStoreLimits limits)
     : root_(std::move(root)), limits_(limits) {}
 
@@ -230,9 +219,6 @@ core::Result<BlobRef> BlobStore::put(
 core::Result<BlobRef> BlobStore::put(
     std::span<const std::uint8_t> bytes,
     std::string media_type) {
-    if (auto result = limits_.validate(); !result) {
-        return core::Result<BlobRef>::failure(result.error());
-    }
     if (bytes.size() > limits_.max_blob_bytes) {
         return core::Result<BlobRef>::failure(invalid("blob exceeds the configured size limit"));
     }

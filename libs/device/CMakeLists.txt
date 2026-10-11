@@ -1,5 +1,6 @@
 add_library(carto_device STATIC
     src/device.cpp
+    src/kernel_evidence.cpp
 )
 
 target_include_directories(carto_device

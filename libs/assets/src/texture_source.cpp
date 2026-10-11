@@ -29,18 +29,6 @@ core::Diagnostic validation(std::string message) {
     return core::Diagnostic(core::ErrorCode::validation_failed, std::move(message));
 }
 
-bool valid_texture_source_format(TextureSourceFormat format) {
-    switch (format) {
-    case TextureSourceFormat::png:
-    case TextureSourceFormat::jpeg:
-    case TextureSourceFormat::tga:
-    case TextureSourceFormat::dds:
-    case TextureSourceFormat::exr:
-        return true;
-    }
-    return false;
-}
-
 std::uint16_t read_le16(std::span<const std::uint8_t> bytes, std::size_t offset) {
     return static_cast<std::uint16_t>(bytes[offset]) |
         static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[offset + 1U]) << 8U);
@@ -485,13 +473,9 @@ const char* texture_source_media_type(TextureSourceFormat format) noexcept {
 
 core::Result<void> TextureSourceLimits::validate() const {
     if (max_source_bytes == 0U || max_dimension == 0U || max_pixels == 0U ||
-        max_mip_levels == 0U ||
-        max_source_bytes > kTextureSourceAbsoluteMaxBytes ||
-        max_dimension > kTextureAbsoluteMaxDimension ||
-        max_pixels > kTextureAbsoluteMaxPixels ||
-        max_mip_levels > kTextureAbsoluteMaxMipLevels) {
+        max_mip_levels == 0U || max_mip_levels > 32U) {
         return core::Result<void>::failure(invalid(
-            "texture source limits must be non-zero and within process safety bounds"));
+            "texture source limits must be finite, non-zero, and bounded"));
     }
     return core::Result<void>::success();
 }
@@ -499,11 +483,9 @@ core::Result<void> TextureSourceLimits::validate() const {
 core::Result<void> TextureSourceAdmission::validate(
     const TextureSourceLimits& limits) const {
     if (auto result = limits.validate(); !result) return result;
-    if (!valid_texture_source_format(format) ||
-        (stage != TextureSourceStage::container_inspected &&
-         stage != TextureSourceStage::decoded)) {
-        return core::Result<void>::failure(validation(
-            "texture source format or stage is invalid"));
+    if (stage != TextureSourceStage::container_inspected &&
+        stage != TextureSourceStage::decoded) {
+        return core::Result<void>::failure(validation("texture source stage is invalid"));
     }
     if (source.bytes == 0U || source.bytes > limits.max_source_bytes ||
         source.digest.is_zero() || source.media_type != texture_source_media_type(format) ||

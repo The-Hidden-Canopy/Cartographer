@@ -1,5 +1,6 @@
 add_library(carto_production STATIC
     src/artifact_store.cpp
+    src/capability_profile.cpp
     src/closure.cpp
     src/decision.cpp
     src/dependency.cpp
@@ -10,6 +11,8 @@ add_library(carto_production STATIC
     src/preparation_scope.cpp
     src/prepared_publication.cpp
     src/prepared_scene.cpp
+    src/recipe.cpp
+    src/reimport.cpp
     src/render_mesh.cpp
 )
 
@@ -26,6 +29,7 @@ target_link_libraries(carto_production
         carto_project
         carto_geometry
         carto_render
+        carto_navgraph
 )
 carto_target(carto_production)
 

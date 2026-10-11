@@ -1064,6 +1064,148 @@ void create_mesh_object_command_preserves_ids_across_undo_redo() {
     REQUIRE(*invalid_document.value().scene().objects_sorted().front().mesh_asset == 1U);
 }
 
+void duplicate_mesh_instance_command_shares_asset_and_preserves_history() {
+    auto document = carto::project::ProjectDocument::create("Mesh instancing workflow");
+    REQUIRE(document);
+    auto primitive = carto::geometry::make_box({2.0, 2.0, 2.0});
+    REQUIRE(primitive);
+
+    carto::editor::CommandBus bus;
+    auto access = carto::project::testing::editor_access(document.value());
+    REQUIRE(bus.execute(access.create_mesh_object_command("Module", std::move(primitive.value()))));
+    const auto source_id = document.value().scene().objects_sorted().front().id;
+    const auto source_before = *document.value().scene().find(source_id);
+
+    carto::core::Transform placed = source_before.local_transform;
+    placed.translation = {10.0, 2.0, -4.0};
+    placed.rotation = {0.0, 0.0, 0.7071067811865475, 0.7071067811865475};
+    placed.scale = {1.5, 0.5, 2.0};
+    REQUIRE(bus.execute(access.set_project_object_transform_command(
+        source_id, source_before.local_transform, placed)));
+    const auto source = *document.value().scene().find(source_id);
+    REQUIRE(source.mesh_asset.has_value());
+    const auto shared_mesh_asset = *source.mesh_asset;
+    const carto::core::Vec3d offset{3.5, 0.0, -1.25};
+
+    REQUIRE(bus.execute(access.duplicate_mesh_instance_command(
+        source_id, "Module east", offset)));
+    REQUIRE(document.value().scene().size() == 2U);
+    REQUIRE(document.value().meshes().size() == 1U);
+    const auto instances = document.value().scene().objects_sorted();
+    const auto duplicate_iterator = std::find_if(
+        instances.begin(), instances.end(), [](const carto::scene::SceneObject& object) {
+            return object.name == "Module east";
+        });
+    REQUIRE(duplicate_iterator != instances.end());
+    const auto duplicate = *duplicate_iterator;
+    REQUIRE(duplicate.id != source_id);
+    REQUIRE(!duplicate.parent.has_value());
+    REQUIRE(duplicate.visible);
+    REQUIRE(!duplicate.locked);
+    REQUIRE(duplicate.mesh_asset.has_value());
+    REQUIRE(*duplicate.mesh_asset == shared_mesh_asset);
+    REQUIRE(duplicate.local_transform.translation.x == source.local_transform.translation.x + offset.x);
+    REQUIRE(duplicate.local_transform.translation.y == source.local_transform.translation.y + offset.y);
+    REQUIRE(duplicate.local_transform.translation.z == source.local_transform.translation.z + offset.z);
+    REQUIRE(duplicate.local_transform.rotation.z == source.local_transform.rotation.z);
+    REQUIRE(duplicate.local_transform.rotation.w == source.local_transform.rotation.w);
+    REQUIRE(duplicate.local_transform.scale.x == source.local_transform.scale.x);
+    REQUIRE(duplicate.local_transform.scale.y == source.local_transform.scale.y);
+    REQUIRE(duplicate.local_transform.scale.z == source.local_transform.scale.z);
+    const auto* source_after_duplicate = document.value().scene().find(source_id);
+    REQUIRE(source_after_duplicate);
+    REQUIRE(source_after_duplicate->mesh_asset == source.mesh_asset);
+    REQUIRE(source_after_duplicate->local_transform.translation.x == source.local_transform.translation.x);
+    REQUIRE(source_after_duplicate->local_transform.translation.y == source.local_transform.translation.y);
+    REQUIRE(source_after_duplicate->local_transform.translation.z == source.local_transform.translation.z);
+    REQUIRE(document.value().validate());
+
+    const auto persisted = carto::project::ProjectDocument::deserialize(document.value().serialize());
+    REQUIRE(persisted);
+    REQUIRE(persisted.value().scene().size() == 2U);
+    REQUIRE(persisted.value().meshes().size() == 1U);
+    const auto* persisted_duplicate = persisted.value().scene().find(duplicate.id);
+    REQUIRE(persisted_duplicate);
+    REQUIRE(persisted_duplicate->mesh_asset == duplicate.mesh_asset);
+    REQUIRE(persisted.value().validate());
+
+    REQUIRE(bus.undo());
+    REQUIRE(document.value().scene().size() == 1U);
+    REQUIRE(document.value().meshes().size() == 1U);
+    REQUIRE(document.value().scene().find(source_id));
+    REQUIRE(*document.value().scene().find(source_id)->mesh_asset == shared_mesh_asset);
+    REQUIRE(document.value().validate());
+
+    REQUIRE(bus.redo());
+    REQUIRE(document.value().scene().size() == 2U);
+    REQUIRE(document.value().meshes().size() == 1U);
+    const auto* restored = document.value().scene().find(duplicate.id);
+    REQUIRE(restored);
+    REQUIRE(restored->mesh_asset == duplicate.mesh_asset);
+    REQUIRE(restored->local_transform.translation.x == duplicate.local_transform.translation.x);
+    REQUIRE(restored->local_transform.translation.y == duplicate.local_transform.translation.y);
+    REQUIRE(restored->local_transform.translation.z == duplicate.local_transform.translation.z);
+
+    const auto before_rejections = document.value().serialize();
+    carto::editor::CommandBus rejected_bus;
+    REQUIRE(!rejected_bus.execute(access.duplicate_mesh_instance_command(
+        carto::scene::ObjectId{999U}, "Missing", {0.0, 0.0, 0.0})));
+    REQUIRE(!rejected_bus.execute(access.duplicate_mesh_instance_command(
+        source_id,
+        "Non-finite",
+        {std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0})));
+    REQUIRE(!rejected_bus.execute(access.duplicate_mesh_instance_command(
+        source_id, "", {0.0, 0.0, 0.0})));
+    REQUIRE(rejected_bus.undo_count() == 0U);
+    REQUIRE(document.value().serialize() == before_rejections);
+
+    const auto expect_source_rejected = [](
+                                            bool visible,
+                                            bool locked,
+                                            bool parented,
+                                            bool has_mesh) {
+        auto rejected_document = carto::project::ProjectDocument::create("Rejected mesh instance");
+        REQUIRE(rejected_document);
+        auto rejected_access = carto::project::testing::access(rejected_document.value());
+        std::optional<carto::scene::ObjectId> parent;
+        if (parented) {
+            const auto parent_id = rejected_access.create_object("Parent");
+            REQUIRE(parent_id);
+            parent = parent_id.value();
+        }
+
+        std::optional<std::uint64_t> mesh_asset;
+        if (has_mesh) {
+            auto primitive = carto::geometry::make_plane(1.0, 1.0);
+            REQUIRE(primitive);
+            const auto asset = rejected_access.add_mesh(std::move(primitive.value()));
+            REQUIRE(asset);
+            mesh_asset = asset.value();
+        }
+
+        const carto::scene::ObjectId source_id{parented ? 2U : 1U};
+        REQUIRE(rejected_access.insert_object(carto::scene::SceneObject{
+            source_id,
+            "Rejected source",
+            carto::core::Transform::identity(),
+            parent,
+            mesh_asset,
+            visible,
+            locked}));
+        const auto before = rejected_document.value().serialize();
+        carto::editor::CommandBus rejected_history;
+        REQUIRE(!rejected_history.execute(
+            carto::project::testing::editor_access(rejected_document.value())
+                .duplicate_mesh_instance_command(source_id, "Rejected copy", {1.0, 0.0, 0.0})));
+        REQUIRE(rejected_history.undo_count() == 0U);
+        REQUIRE(rejected_document.value().serialize() == before);
+    };
+    expect_source_rejected(false, false, false, true);
+    expect_source_rejected(true, true, false, true);
+    expect_source_rejected(true, false, true, true);
+    expect_source_rejected(true, false, false, false);
+}
+
 void stale_render_result_is_rejected() {
     auto mesh = triangle_mesh();
     const auto compiled = mesh.compile();
@@ -1204,10 +1346,19 @@ void project_round_trips_authoritative_state_and_rejects_future_versions() {
     REQUIRE(serialized_before.find(
                 "AUTHORING \"cartographer.authoring\" \"meters\" \"right_handed_y_up\"") !=
             std::string::npos);
+    REQUIRE(serialized_before.find(
+                "SOURCE_NAMESPACE \"" + document.value().source_namespace() + "\"") !=
+            std::string::npos);
+    auto independent = carto::project::ProjectDocument::create("Round Trip");
+    REQUIRE(independent);
+    REQUIRE(independent.value().source_namespace() !=
+            document.value().source_namespace());
     REQUIRE(document.value().save_atomic(path));
     auto loaded = carto::project::ProjectDocument::load(path);
     REQUIRE(loaded);
     REQUIRE(loaded.value().serialize() == serialized_before);
+    REQUIRE(loaded.value().source_namespace() ==
+            document.value().source_namespace());
     REQUIRE(loaded.value().scene().find(object.value()) != nullptr);
     REQUIRE(loaded.value().meshes().at(mesh_id.value()).vertex_count() == 3U);
 
@@ -1233,6 +1384,14 @@ void project_round_trips_authoritative_state_and_rejects_future_versions() {
         carto::project::ProjectDocument::deserialize(missing_authoring);
     REQUIRE(!missing_authoring_rejected);
     REQUIRE(missing_authoring_rejected.error().code == carto::core::ErrorCode::validation_failed);
+
+    std::string missing_namespace = serialized_before;
+    const auto namespace_start = missing_namespace.find("SOURCE_NAMESPACE ");
+    REQUIRE(namespace_start != std::string::npos);
+    const auto namespace_end = missing_namespace.find('\n', namespace_start);
+    REQUIRE(namespace_end != std::string::npos);
+    missing_namespace.erase(namespace_start, namespace_end - namespace_start + 1U);
+    REQUIRE(!carto::project::ProjectDocument::deserialize(missing_namespace));
 
     REQUIRE(carto::core::Revision(carto::core::Revision::max_value()).next() ==
             carto::core::Revision(carto::core::Revision::max_value()));
@@ -1739,6 +1898,7 @@ int main() {
         {"tool registry dispatches through history", tool_registry_dispatches_registered_commands_through_history},
         {"project vertex tool routes through history", project_vertex_tool_routes_through_history_and_rejects_bad_context},
         {"create mesh object command preserves ids", create_mesh_object_command_preserves_ids_across_undo_redo},
+        {"duplicate mesh instance command shares assets", duplicate_mesh_instance_command_shares_asset_and_preserves_history},
         {"project round trip and future version rejection", project_round_trips_authoritative_state_and_rejects_future_versions},
         {"project save failure and path bounds", project_save_failure_does_not_replace_existing_file_and_paths_are_bounded},
         {"project persists topology receipts and rejects stale lineage", project_persists_topology_receipts_and_rejects_stale_lineage},

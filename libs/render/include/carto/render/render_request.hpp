@@ -37,6 +37,7 @@ enum class CaptureResource {
     depth,
     normals,
     object_id,
+    surface_identity,
 };
 
 struct RenderQualitySettings {

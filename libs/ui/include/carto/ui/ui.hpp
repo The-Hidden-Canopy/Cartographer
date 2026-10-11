@@ -1,11 +1,14 @@
 #pragma once
 
+#include <carto/ai/ai.hpp>
 #include <carto/application/application.hpp>
 #include <carto/core/result.hpp>
+#include <carto/surface/core.hpp>
 
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -206,12 +209,32 @@ struct CommandView {
     std::string unavailable_reason;
 };
 
+enum class MeshImportFormat {
+    obj,
+    ply,
+    stl,
+};
+
+// A front-end import result carries both interchange evidence and the
+// authoritative application receipt. The parsed mesh is never exposed as a
+// second mutable UI copy: admission finishes through CreateMeshObjectAction.
+struct MeshImportReceipt {
+    MeshImportFormat format = MeshImportFormat::obj;
+    std::string object_name;
+    std::size_t vertices = 0U;
+    std::size_t faces = 0U;
+    std::size_t triangles = 0U;
+    std::vector<std::string> warnings;
+    application::DispatchReceipt dispatch;
+};
+
 struct UiPreferences {
     OperatorMode operator_mode = OperatorMode::person_first;
     Workspace workspace = Workspace::model;
     Density density = Density::standard;
     Theme theme = Theme::dark;
     BottomPanel bottom_panel = BottomPanel::operations;
+    bool ai_auto_approve = true;
     std::vector<Panel> visible_panels{
         Panel::scene,
         Panel::viewport,
@@ -267,6 +290,44 @@ struct WorkbenchPreferences {
     [[nodiscard]] core::Result<void> validate() const;
 };
 
+enum class SurfaceFidelityStatus {
+    idle,
+    ready,
+    stale,
+    unavailable,
+    rejected,
+};
+
+// The native workbench invokes the reference compiler synchronously. Keep
+// that presentation-only path explicitly bounded until a worker-owned
+// compiler service exists; large production meshes belong in an offline or
+// renderer-owned pipeline, not in the UI event loop.
+inline constexpr std::uint32_t kMaxSurfacePreviewTriangles = 4096U;
+
+// A bounded presentation projection of a surface compiler result. The
+// compiled polygon itself remains a derived preview owned by the controller;
+// this view carries only the evidence the native shell needs to display and
+// never becomes project or renderer truth.
+struct SurfaceFidelityView {
+    SurfaceFidelityStatus status = SurfaceFidelityStatus::idle;
+    std::string status_text;
+    std::optional<scene::ObjectId> object;
+    std::uint64_t project_generation = 0U;
+    core::Revision project_revision;
+    core::Revision source_revision;
+    std::uint32_t source_triangles = 0U;
+    std::uint32_t target_triangles = 0U;
+    surface::RepresentationMode mode = surface::RepresentationMode::fidelity_closure;
+    surface::SurfaceErrorEnvelope error;
+    bool admitted = false;
+    std::shared_ptr<const surface::SurfaceClosurePolygon> compiled;
+    std::string domain_digest;
+    std::string representation_digest;
+    std::optional<core::Diagnostic> diagnostic;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
 // A UI snapshot is a presentation projection. The inherited application
 // snapshot remains the only authoring data source; UI-only state is kept in
 // the additional fields below and is never serialized into a project.
@@ -285,7 +346,9 @@ struct UiSnapshot : application::ApplicationSnapshot {
     std::vector<CommandView> commands;
     std::vector<core::Diagnostic> ui_problems;
     UiColorTokens colors;
+    SurfaceFidelityView surface_fidelity;
     bool ai_available = false;
+    bool ai_auto_approve = true;
     std::string ai_status;
 };
 
@@ -298,7 +361,12 @@ struct UiSnapshot : application::ApplicationSnapshot {
 [[nodiscard]] core::Result<WorkspaceDefinition> workspace_definition(Workspace workspace);
 [[nodiscard]] const char* panel_name(Panel panel) noexcept;
 [[nodiscard]] const char* bottom_panel_name(BottomPanel panel) noexcept;
+[[nodiscard]] const char* mesh_import_format_name(MeshImportFormat format) noexcept;
 [[nodiscard]] const char* workbench_instrument_name(WorkbenchInstrument instrument) noexcept;
+[[nodiscard]] const char* surface_fidelity_status_name(
+    SurfaceFidelityStatus status) noexcept;
+[[nodiscard]] const char* surface_fidelity_mode_name(
+    surface::RepresentationMode mode) noexcept;
 
 [[nodiscard]] core::Result<void> save_workbench_preferences(
     const std::filesystem::path& path,
@@ -319,15 +387,42 @@ public:
         editor::PreviewKind kind) const;
     [[nodiscard]] core::Result<application::DispatchReceipt> commit_preview(
         editor::AuthoringPreview& preview);
+    // Native AI proposals carry their copied context so a stale selection or
+    // project revision cannot be reused. Safe native operations may be
+    // auto-applied by policy; the host still uses the typed preview boundary.
+    [[nodiscard]] core::Result<ai::Proposal> propose_ai(std::string_view intent);
+    [[nodiscard]] core::Result<editor::AuthoringPreview> begin_ai_preview(
+        const ai::Proposal& proposal) const;
+    [[nodiscard]] core::Result<application::DispatchReceipt> apply_ai_intent(
+        std::string_view intent);
+    [[nodiscard]] core::Result<application::DispatchReceipt> commit_ai_preview(
+        editor::AuthoringPreview& preview,
+        const ai::Proposal& proposal);
+    [[nodiscard]] core::Result<application::DispatchReceipt> submit_ai_proposal(
+        const application::ApplicationAction& action);
+    // Resolves the built-in provider, parses bounded interchange input, and
+    // admits the resulting mesh through the same human application boundary
+    // used by native modelling controls. Failures never mutate the project.
+    [[nodiscard]] core::Result<MeshImportReceipt> import_mesh(
+        const std::filesystem::path& path,
+        MeshImportFormat format);
     [[nodiscard]] core::Result<void> set_operator_mode(OperatorMode mode);
     [[nodiscard]] core::Result<void> set_workspace(Workspace workspace);
     [[nodiscard]] core::Result<void> set_density(Density density);
     [[nodiscard]] core::Result<void> set_theme(Theme theme);
     [[nodiscard]] core::Result<void> set_bottom_panel(BottomPanel panel);
+    [[nodiscard]] core::Result<void> set_ai_auto_approve(bool enabled);
     [[nodiscard]] core::Result<void> set_panel_visible(Panel panel, bool visible);
     [[nodiscard]] core::Result<void> reset_preferences();
     [[nodiscard]] core::Result<void> handle_shortcut(Shortcut shortcut);
     [[nodiscard]] core::Result<void> set_command_palette_query(std::string query);
+    // Compiles a revision-bound, read-only surface representation preview from
+    // the currently selected viewport instance. It never mutates authoring
+    // state or records a project operation.
+    [[nodiscard]] core::Result<void> compile_surface_preview(
+        std::uint32_t target_triangles,
+        surface::RepresentationMode mode = surface::RepresentationMode::fidelity_closure);
+    [[nodiscard]] core::Result<void> clear_surface_preview();
     [[nodiscard]] core::Result<void> save_preferences(
         const std::filesystem::path& path) const;
     [[nodiscard]] core::Result<void> load_preferences(
@@ -352,10 +447,12 @@ private:
 
     application::ApplicationSession& session_;
     UiPreferences preferences_;
+    ai::NativePlanner native_planner_;
     bool command_palette_open_ = false;
     std::string command_palette_query_;
     std::vector<OperationView> operations_;
     std::vector<core::Diagnostic> ui_problems_;
+    std::optional<SurfaceFidelityView> surface_fidelity_;
     std::uint64_t next_operation_id_ = 1U;
 };
 

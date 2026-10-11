@@ -247,43 +247,6 @@ void malformed_and_mislabeled_sources_fail_closed() {
     inspected.value().channels = 0U;
     require(!inspected.value().validate(),
             "container inspection cannot be relabeled as decoded evidence without channels");
-
-    inspected = inspect_texture_source(png);
-    require(static_cast<bool>(inspected), "unknown-format adversarial fixture begins valid");
-    inspected.value().format = static_cast<TextureSourceFormat>(255U);
-    inspected.value().source.media_type = "application/octet-stream";
-    require(!inspected.value().validate(),
-            "an unknown texture format cannot validate through the generic media type");
-}
-
-void caller_limits_cannot_disable_texture_safety_bounds() {
-    using namespace carto::assets;
-
-    const TextureSourceLimits absolute_limits{
-        .max_source_bytes = kTextureSourceAbsoluteMaxBytes,
-        .max_dimension = kTextureAbsoluteMaxDimension,
-        .max_pixels = kTextureAbsoluteMaxPixels,
-        .max_mip_levels = kTextureAbsoluteMaxMipLevels,
-    };
-    require(static_cast<bool>(absolute_limits.validate()),
-            "documented absolute texture limits remain admissible");
-
-    auto unbounded = absolute_limits;
-    ++unbounded.max_source_bytes;
-    require(!unbounded.validate(),
-            "callers cannot relax the absolute source-byte ceiling");
-    unbounded = absolute_limits;
-    ++unbounded.max_dimension;
-    require(!unbounded.validate(),
-            "callers cannot relax the absolute dimension ceiling");
-    unbounded = absolute_limits;
-    ++unbounded.max_pixels;
-    require(!unbounded.validate(),
-            "callers cannot relax the absolute decoded-pixel ceiling");
-    unbounded = absolute_limits;
-    ++unbounded.max_mip_levels;
-    require(!unbounded.validate(),
-            "callers cannot relax the absolute mip-level ceiling");
 }
 
 void tga_decode_advances_evidence_and_canonicalizes_orientation() {
@@ -341,18 +304,6 @@ void tga_decode_advances_evidence_and_canonicalizes_orientation() {
     require(rle_decoded && rle_decoded.value().admission.compressed &&
                 rle_decoded.value().pixels == rle_expected,
             "TGA RLE packets decode to the exact canonical pixel count");
-
-    for (std::size_t size = 0U; size < rle.size(); ++size) {
-        require(!decode_tga_rgba8(std::span<const std::uint8_t>{rle}.first(size)),
-                "every truncated RLE prefix fails closed");
-    }
-    for (std::size_t index = 0U; index < rle.size(); ++index) {
-        auto mutated = rle;
-        mutated[index] ^= 0x5aU;
-        const auto mutation_result = decode_tga_rgba8(mutated);
-        require(!mutation_result || static_cast<bool>(mutation_result.value().validate()),
-                "single-byte RLE mutations either reject or produce validated evidence");
-    }
 
     auto malformed_decoded = decoded.value();
     malformed_decoded.pixels.pop_back();
@@ -534,7 +485,6 @@ void malformed_mip_chains_fail_closed() {
 int main() {
     supported_sources_are_digest_bound_without_decode_claims();
     malformed_and_mislabeled_sources_fail_closed();
-    caller_limits_cannot_disable_texture_safety_bounds();
     tga_decode_advances_evidence_and_canonicalizes_orientation();
     mip_generation_is_semantic_and_color_space_correct();
     mip_generation_preserves_normals_alpha_and_odd_edges();

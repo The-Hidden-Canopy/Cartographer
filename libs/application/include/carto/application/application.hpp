@@ -268,6 +268,14 @@ struct CreateMeshObjectAction {
     geometry::EditableMesh mesh;
 };
 
+// Duplicates only an authored mesh instance. The new root object retains the
+// source mesh asset identity; it does not copy geometry or hierarchy state.
+struct DuplicateMeshInstanceAction {
+    scene::ObjectId source;
+    std::string object_name;
+    core::Vec3d local_translation_offset{};
+};
+
 struct UndoAction {};
 struct RedoAction {};
 
@@ -292,13 +300,14 @@ using ApplicationAction = std::variant<
     CreateBoxAction,
     CreatePlaneAction,
     CreateMeshObjectAction,
+    DuplicateMeshInstanceAction,
     UndoAction,
     RedoAction>;
 
-// The explicit human/local front-end adapter is the only public production
-// factory for HumanActionAdmission. The source/provenance overload is private
-// to the application host boundary and cannot be used as a public raw mutation
-// route.
+// The explicit human/local front-end adapter is the only production factory
+// for HumanActionAdmission. AI proposals use the separate UI proposal API;
+// the source/provenance overload is private to that host boundary and cannot
+// be used as a public raw AI mutation route.
 class HumanApplicationAccess final {
 public:
     [[nodiscard]] static core::Result<DispatchReceipt> dispatch(
@@ -380,6 +389,8 @@ private:
     [[nodiscard]] core::Result<DispatchReceipt> create_plane(const CreatePlaneAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_mesh_object(
         const CreateMeshObjectAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> duplicate_mesh_instance(
+        const DuplicateMeshInstanceAction& action);
     [[nodiscard]] core::Result<ApplicationAction> preview_action(
         const editor::AuthoringPreview& preview) const;
     [[nodiscard]] core::Result<DispatchReceipt> undo();

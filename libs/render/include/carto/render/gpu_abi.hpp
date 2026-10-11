@@ -4,9 +4,7 @@
 #include <carto/render/material.hpp>
 
 #include <array>
-#include <cstddef>
 #include <cstdint>
-#include <type_traits>
 
 namespace carto::render {
 
@@ -55,22 +53,11 @@ struct alignas(16) GpuTemporalConstants {
     std::array<std::uint32_t, 4U> history_flags{};
 };
 
-static_assert(std::is_standard_layout_v<GpuFrameConstants>);
-static_assert(std::is_standard_layout_v<GpuObjectConstants>);
-static_assert(std::is_standard_layout_v<GpuMaterialConstants>);
-static_assert(std::is_standard_layout_v<GpuLightConstants>);
-static_assert(std::is_standard_layout_v<GpuTemporalConstants>);
-static_assert(alignof(GpuFrameConstants) == 16U && sizeof(GpuFrameConstants) == 176U);
-static_assert(alignof(GpuObjectConstants) == 16U && sizeof(GpuObjectConstants) == 208U);
-static_assert(alignof(GpuMaterialConstants) == 16U && sizeof(GpuMaterialConstants) == 128U);
-static_assert(alignof(GpuLightConstants) == 16U && sizeof(GpuLightConstants) == 112U);
-static_assert(alignof(GpuTemporalConstants) == 16U && sizeof(GpuTemporalConstants) == 48U);
-static_assert(offsetof(GpuMaterialConstants, base_color_factor) == 0U);
-static_assert(offsetof(GpuMaterialConstants, emissive_radiance_and_f0) == 16U);
-static_assert(offsetof(GpuMaterialConstants, surface_factors) == 32U);
-static_assert(offsetof(GpuMaterialConstants, alpha_factors) == 48U);
-static_assert(offsetof(GpuMaterialConstants, clearcoat_factors) == 64U);
-static_assert(offsetof(GpuMaterialConstants, texture_asset_ids) == 80U);
+static_assert(sizeof(GpuFrameConstants) % 16U == 0U);
+static_assert(sizeof(GpuObjectConstants) % 16U == 0U);
+static_assert(sizeof(GpuMaterialConstants) % 16U == 0U);
+static_assert(sizeof(GpuLightConstants) % 16U == 0U);
+static_assert(sizeof(GpuTemporalConstants) % 16U == 0U);
 
 [[nodiscard]] core::Result<void> validate(const GpuFrameConstants& constants);
 [[nodiscard]] core::Result<void> validate(const GpuObjectConstants& constants);

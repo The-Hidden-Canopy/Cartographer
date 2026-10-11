@@ -102,6 +102,10 @@ carto::world::WorldModel world_fixture(
                 .seed = 42U,
                 .maximum_instances = 1'000U,
                 .suppressed_instances = {2U, 19U},
+                .geometry_evidence = std::nullopt,
+                .physical_material_intent = "",
+                .construction_profile = "",
+                .surface_domain_identity = "",
             })),
             "instance field enters fixture");
 
@@ -182,6 +186,10 @@ void cross_reference_and_population_failures_are_blocked() {
         .seed = 1U,
         .maximum_instances = 4U,
         .suppressed_instances = {3U, 2U},
+        .geometry_evidence = std::nullopt,
+        .physical_material_intent = "",
+        .construction_profile = "",
+        .surface_domain_identity = "",
     };
     require(!bad_field.validate(),
             "unsorted reconstructible-population exceptions are rejected");
@@ -351,6 +359,11 @@ void project_schema_migration_is_explicit_and_fail_closed() {
     const auto header = legacy.find(current_header);
     require(header == 0U, "legacy fixture finds the current project header");
     legacy.replace(header, current_header.size(), "CARTOGRAPHER_PROJECT 6");
+    const auto namespace_start = legacy.find("SOURCE_NAMESPACE ");
+    const auto namespace_end = legacy.find('\n', namespace_start);
+    require(namespace_start != std::string::npos && namespace_end != std::string::npos,
+            "legacy fixture finds the current source namespace record");
+    legacy.erase(namespace_start, namespace_end - namespace_start + 1U);
     const auto reopened_legacy = project::ProjectDocument::deserialize(legacy);
     require(reopened_legacy && reopened_legacy.value().world_model().empty(),
             "schema-v6 projects remain readable with an explicit empty world model");
@@ -366,6 +379,176 @@ void project_schema_migration_is_explicit_and_fail_closed() {
             "future-revision transaction rolls back");
 }
 
+void schema_v1_world_documents_still_load_with_defaulted_material_intent() {
+    using namespace carto::world;
+    const std::string recipe = digest("vegetation-grid-v1").hex();
+    const std::string v1 =
+        "CARTOGRAPHER_WORLD_MODEL 1\n"
+        "AREAS 1\n"
+        "AREA 1 0 0 0 \"building\" 0\n"
+        "PATHS 0\n"
+        "STRUCTURE_GRAPHS 0\n"
+        "INSTANCE_FIELDS 1\n"
+        "INSTANCE_FIELD 1 1 0 0 0 10 3 10 42 1000 \"vegetation\" "
+        "\"public/vegetation-grid/v1\" " + recipe + " 2 2 19\n"
+        "VARIANT_LAYERS 0\n"
+        "END\n";
+
+    const auto reopened = WorldModel::deserialize(v1);
+    require(static_cast<bool>(reopened), "schema-v1 world document still loads");
+    require(reopened.value().areas().size() == 1U &&
+                reopened.value().instance_fields().size() == 1U,
+            "schema-v1 primitives survive the versioned read path");
+    const auto& field = reopened.value().instance_fields().at(InstanceFieldId{1U});
+    require(field.seed == 42U && field.maximum_instances == 1'000U &&
+                field.suppressed_instances == std::vector<std::uint64_t>({2U, 19U}),
+            "schema-v1 instance field population is preserved exactly");
+    require(!field.geometry_evidence && field.physical_material_intent.empty() &&
+                field.construction_profile.empty() && field.surface_domain_identity.empty(),
+            "schema-v1 instance fields load with defaulted materialization intent");
+
+    const std::string upgraded = reopened.value().serialize();
+    require(upgraded.rfind("CARTOGRAPHER_WORLD_MODEL 2\n", 0U) == 0U,
+            "re-saved schema-v1 document upgrades to schema-v2 framing");
+    const auto rereopened = WorldModel::deserialize(upgraded);
+    require(rereopened && rereopened.value().serialize() == upgraded,
+            "upgraded schema-v2 document round trips deterministically");
+
+    WorldModel equivalent;
+    require(static_cast<bool>(equivalent.insert_area(SemanticArea{
+                .id = AreaId{1U},
+                .semantic_type = "building",
+                .geometry = {},
+                .parent = std::nullopt,
+                .tags = {},
+            })),
+            "equivalent v2 area enters through the governed boundary");
+    require(static_cast<bool>(equivalent.insert_instance_field(InstanceField{
+                .id = InstanceFieldId{1U},
+                .semantic_type = "vegetation",
+                .area = AreaId{1U},
+                .bounds = {{0.0, 0.0, 0.0}, {10.0, 3.0, 10.0}},
+                .recipe_identity = "public/vegetation-grid/v1",
+                .recipe_digest = digest("vegetation-grid-v1"),
+                .seed = 42U,
+                .maximum_instances = 1'000U,
+                .suppressed_instances = {2U, 19U},
+                .geometry_evidence = std::nullopt,
+                .physical_material_intent = "",
+                .construction_profile = "",
+                .surface_domain_identity = "",
+            })),
+            "equivalent v2 instance field enters with defaulted intent");
+    const auto v1_digest = reopened.value().canonical_digest();
+    const auto v2_digest = equivalent.canonical_digest();
+    require(v1_digest && v2_digest && v1_digest.value() == v2_digest.value(),
+            "schema-v1 content digests identically to the equivalent v2 authoring state");
+}
+
+void schema_v2_material_intent_round_trips_and_fails_closed() {
+    using namespace carto::world;
+    WorldModel model;
+    require(static_cast<bool>(model.insert_area(SemanticArea{
+                .id = AreaId{3U},
+                .semantic_type = "building",
+                .geometry = {},
+                .parent = std::nullopt,
+                .tags = {},
+            })),
+            "schema-v2 area enters the fixture");
+    require(static_cast<bool>(model.insert_instance_field(InstanceField{
+                .id = InstanceFieldId{5U},
+                .semantic_type = "trees",
+                .area = AreaId{3U},
+                .bounds = {{0.0, 0.0, 0.0}, {8.0, 4.0, 8.0}},
+                .recipe_identity = "public/tree-cluster/v2",
+                .recipe_digest = digest("tree-cluster-v2"),
+                .seed = 7U,
+                .maximum_instances = 64U,
+                .suppressed_instances = {2U, 19U},
+                .geometry_evidence = digest("tree-cluster-evidence"),
+                .physical_material_intent = "vanta.physical.intent.weathered-wood",
+                .construction_profile = "public/construction/timber-frame/v2",
+                .surface_domain_identity = "condition.surface.exterior-shell",
+            })),
+            "schema-v2 instance field carries geometry evidence and physical intent");
+    require(static_cast<bool>(model.validate()), "schema-v2 fixture validates");
+
+    const std::string encoded = model.serialize();
+    require(encoded.find("\"vanta.physical.intent.weathered-wood\"") != std::string::npos,
+            "schema-v2 serialization carries the materialization intent");
+    const auto reopened = WorldModel::deserialize(encoded);
+    require(reopened && reopened.value().serialize() == encoded,
+            "schema-v2 world model round trips deterministically");
+    const auto& field = reopened.value().instance_fields().at(InstanceFieldId{5U});
+    require(field.geometry_evidence.has_value() &&
+                field.geometry_evidence.value() == digest("tree-cluster-evidence") &&
+                field.physical_material_intent == "vanta.physical.intent.weathered-wood" &&
+                field.construction_profile == "public/construction/timber-frame/v2" &&
+                field.surface_domain_identity == "condition.surface.exterior-shell",
+            "schema-v2 intent references survive the round trip exactly");
+
+    const auto first_digest = model.canonical_digest();
+    const auto second_digest = reopened.value().canonical_digest();
+    require(first_digest && second_digest && first_digest.value() == second_digest.value(),
+            "schema-v2 digest survives reopen");
+
+    auto invalid_evidence = InstanceField{
+        .id = InstanceFieldId{6U},
+        .semantic_type = "trees",
+        .area = std::nullopt,
+        .bounds = {{0.0, 0.0, 0.0}, {1.0, 1.0, 1.0}},
+        .recipe_identity = "trees/v1",
+        .recipe_digest = digest("trees"),
+        .seed = 1U,
+        .maximum_instances = 4U,
+        .suppressed_instances = {},
+        .geometry_evidence = carto::assets::Sha256Digest{},
+        .physical_material_intent = "",
+        .construction_profile = "",
+        .surface_domain_identity = "",
+    };
+    require(!invalid_evidence.validate(),
+            "present-but-zero geometry evidence is rejected");
+    auto unsafe_intent = InstanceField{
+        .id = InstanceFieldId{7U},
+        .semantic_type = "trees",
+        .area = std::nullopt,
+        .bounds = {{0.0, 0.0, 0.0}, {1.0, 1.0, 1.0}},
+        .recipe_identity = "trees/v1",
+        .recipe_digest = digest("trees"),
+        .seed = 1U,
+        .maximum_instances = 4U,
+        .suppressed_instances = {},
+        .geometry_evidence = std::nullopt,
+        .physical_material_intent = "bad\nintent",
+        .construction_profile = "",
+        .surface_domain_identity = "",
+    };
+    require(!unsafe_intent.validate(),
+            "control text cannot enter a materialization intent reference");
+
+    std::string future = encoded;
+    future.replace(0U, std::string{"CARTOGRAPHER_WORLD_MODEL 2"}.size(),
+        "CARTOGRAPHER_WORLD_MODEL 99");
+    require(!WorldModel::deserialize(future),
+            "unknown future world-model versions fail precisely");
+    require(!WorldModel::deserialize(encoded + "unexpected"),
+            "trailing schema-v2 world-model data is rejected");
+    const std::string bad_evidence =
+        "CARTOGRAPHER_WORLD_MODEL 2\n"
+        "AREAS 0\n"
+        "PATHS 0\n"
+        "STRUCTURE_GRAPHS 0\n"
+        "INSTANCE_FIELDS 1\n"
+        "INSTANCE_FIELD 5 0 0 0 0 1 1 1 1 4 \"trees\" \"trees/v1\" " +
+        digest("trees").hex() + " 0 nothex \"\" \"\" \"\"\n"
+        "VARIANT_LAYERS 0\n"
+        "END\n";
+    require(!WorldModel::deserialize(bad_evidence),
+            "malformed schema-v2 geometry evidence is rejected");
+}
+
 } // namespace
 
 int main() {
@@ -374,6 +557,8 @@ int main() {
     malformed_world_bytes_fail_closed();
     project_transaction_journals_world_authoring_and_preserves_bindings();
     project_schema_migration_is_explicit_and_fail_closed();
+    schema_v1_world_documents_still_load_with_defaulted_material_intent();
+    schema_v2_material_intent_round_trips_and_fails_closed();
     std::cout << "world model tests passed\n";
     return EXIT_SUCCESS;
 }

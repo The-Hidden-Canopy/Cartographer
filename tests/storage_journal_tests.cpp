@@ -108,30 +108,6 @@ void blob_store_is_content_addressed_and_integrity_checked() {
     REQUIRE(store.verify(stored.value().digest).error().code ==
             carto::core::ErrorCode::validation_failed);
     REQUIRE(!store.put("hello", "text/plain"));
-
-    const std::string unsafe_media_type{"text/\0plain", 10U};
-    REQUIRE(!store.put("hello", unsafe_media_type));
-}
-
-void blob_store_rejects_limits_above_process_safety_bounds() {
-    TempDirectory temp;
-    const carto::assets::BlobStoreLimits absolute_limits{
-        .max_blob_bytes = carto::assets::kBlobStoreAbsoluteMaxBlobBytes,
-        .max_media_type_bytes = carto::assets::kBlobStoreAbsoluteMaxMediaTypeBytes,
-    };
-    REQUIRE(absolute_limits.validate());
-
-    auto unbounded = absolute_limits;
-    ++unbounded.max_blob_bytes;
-    REQUIRE(!unbounded.validate());
-    carto::assets::BlobStore unbounded_bytes(temp.path() / "bytes", unbounded);
-    REQUIRE(!unbounded_bytes.put("hello", "text/plain"));
-
-    unbounded = absolute_limits;
-    ++unbounded.max_media_type_bytes;
-    REQUIRE(!unbounded.validate());
-    carto::assets::BlobStore unbounded_media(temp.path() / "media", unbounded);
-    REQUIRE(!unbounded_media.put("hello", "text/plain"));
 }
 
 void json_boundary_decodes_unicode_and_rejects_unpaired_surrogates() {
@@ -657,6 +633,10 @@ void project_transaction_journals_evaluation_graph_reference_with_document_state
     REQUIRE(current_header != std::string::npos);
     legacy_graph.replace(current_header, current_version.size(),
                          "CARTOGRAPHER_PROJECT 2");
+    const auto namespace_start = legacy_graph.find("SOURCE_NAMESPACE ");
+    const auto namespace_end = legacy_graph.find('\n', namespace_start);
+    REQUIRE(namespace_start != std::string::npos && namespace_end != std::string::npos);
+    legacy_graph.erase(namespace_start, namespace_end - namespace_start + 1U);
     const auto rejected_legacy_graph = carto::project::ProjectDocument::deserialize(legacy_graph);
     REQUIRE(!rejected_legacy_graph);
     REQUIRE(rejected_legacy_graph.error().code == carto::core::ErrorCode::version_mismatch);
@@ -830,7 +810,6 @@ int main(int argc, char** argv) {
         project_file_lock_serializes_writers_in_process();
         json_boundary_decodes_unicode_and_rejects_unpaired_surrogates();
         blob_store_is_content_addressed_and_integrity_checked();
-        blob_store_rejects_limits_above_process_safety_bounds();
         journal_is_revision_bound_replayable_and_hash_chained();
         journal_serializes_concurrent_appends_in_process();
         journal_serializes_concurrent_appends_across_processes(

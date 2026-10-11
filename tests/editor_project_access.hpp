@@ -52,6 +52,15 @@ public:
             admission, document_, std::move(object_name), std::move(mesh));
     }
 
+    [[nodiscard]] std::unique_ptr<editor::EditorCommand> duplicate_mesh_instance_command(
+        scene::ObjectId source,
+        std::string object_name,
+        core::Vec3d local_translation_offset) {
+        editor::ProjectCommandAdmission admission;
+        return std::make_unique<editor::DuplicateProjectMeshInstanceCommand>(
+            admission, document_, source, std::move(object_name), local_translation_offset);
+    }
+
     [[nodiscard]] std::unique_ptr<editor::EditorCommand>
     set_project_object_transform_command(
         scene::ObjectId object,

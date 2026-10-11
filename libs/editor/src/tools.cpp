@@ -167,7 +167,8 @@ core::Result<void> ToolRegistry::register_tool(
 
 core::Result<void> ToolRegistry::register_builtin_tools() {
     if (auto result = register_tool(
-        {"mesh.extrude-face", "Extrude selected face"},
+        {"mesh.extrude-face", "Extrude selected face",
+         ToolKernelKind::editable_mesh_extrude_face},
         [](const ToolContext& context, const ToolArguments& arguments)
             -> core::Result<std::unique_ptr<EditorCommand>> {
             return context.make_extrude_selected_face_command(arguments.distance);
@@ -176,7 +177,8 @@ core::Result<void> ToolRegistry::register_builtin_tools() {
         return result;
     }
     if (auto result = register_tool(
-        {"mesh.inset-face", "Inset selected face"},
+        {"mesh.inset-face", "Inset selected face",
+         ToolKernelKind::editable_mesh_inset_face},
         [](const ToolContext& context, const ToolArguments& arguments)
             -> core::Result<std::unique_ptr<EditorCommand>> {
             return context.make_inset_selected_face_command(arguments.distance);
@@ -185,7 +187,8 @@ core::Result<void> ToolRegistry::register_builtin_tools() {
         return result;
     }
     if (auto result = register_tool(
-        {"mesh.poke-face", "Poke selected face"},
+        {"mesh.poke-face", "Poke selected face",
+         ToolKernelKind::editable_mesh_poke_face},
         [](const ToolContext& context, const ToolArguments&)
             -> core::Result<std::unique_ptr<EditorCommand>> {
             return context.make_poke_selected_face_command();
@@ -194,7 +197,8 @@ core::Result<void> ToolRegistry::register_builtin_tools() {
         return result;
     }
     if (auto result = register_tool(
-        {"mesh.remove-face", "Delete selected face"},
+        {"mesh.remove-face", "Delete selected face",
+         ToolKernelKind::editable_mesh_delete_face},
         [](const ToolContext& context, const ToolArguments& arguments)
             -> core::Result<std::unique_ptr<EditorCommand>> {
             return context.make_delete_selected_face_command(
@@ -204,7 +208,8 @@ core::Result<void> ToolRegistry::register_builtin_tools() {
         return result;
     }
     if (auto result = register_tool(
-        {"mesh.set-vertex-position", "Set selected vertex position"},
+        {"mesh.set-vertex-position", "Set selected vertex position",
+         ToolKernelKind::editable_mesh_set_vertex_position},
         [](const ToolContext& context, const ToolArguments& arguments)
             -> core::Result<std::unique_ptr<EditorCommand>> {
             return context.make_set_selected_vertex_position_command(arguments.position);
@@ -213,7 +218,8 @@ core::Result<void> ToolRegistry::register_builtin_tools() {
         return result;
     }
     if (auto result = register_tool(
-        {"mesh.slide-vertex", "Slide selected vertex"},
+        {"mesh.slide-vertex", "Slide selected vertex",
+         ToolKernelKind::editable_mesh_slide_vertex},
         [](const ToolContext& context, const ToolArguments& arguments)
             -> core::Result<std::unique_ptr<EditorCommand>> {
             return context.make_slide_selected_vertex_command(
@@ -223,7 +229,8 @@ core::Result<void> ToolRegistry::register_builtin_tools() {
         return result;
     }
     if (auto result = register_tool(
-        {"mesh.split-edge", "Split selected edge"},
+        {"mesh.split-edge", "Split selected edge",
+         ToolKernelKind::editable_mesh_split_edge},
         [](const ToolContext& context, const ToolArguments& arguments)
             -> core::Result<std::unique_ptr<EditorCommand>> {
             return context.make_split_selected_edge_command(arguments.factor);
@@ -232,7 +239,8 @@ core::Result<void> ToolRegistry::register_builtin_tools() {
         return result;
     }
     if (auto result = register_tool(
-        {"mesh.bevel-edge", "Bevel selected edge"},
+        {"mesh.bevel-edge", "Bevel selected edge",
+         ToolKernelKind::editable_mesh_bevel_edge},
         [](const ToolContext& context, const ToolArguments& arguments)
             -> core::Result<std::unique_ptr<EditorCommand>> {
             return context.make_bevel_selected_edge_command(
@@ -242,7 +250,8 @@ core::Result<void> ToolRegistry::register_builtin_tools() {
         return result;
     }
     if (auto result = register_tool(
-        {"mesh.bevel-vertex", "Bevel selected vertex"},
+        {"mesh.bevel-vertex", "Bevel selected vertex",
+         ToolKernelKind::editable_mesh_bevel_vertex},
         [](const ToolContext& context, const ToolArguments& arguments)
             -> core::Result<std::unique_ptr<EditorCommand>> {
             return context.make_bevel_selected_vertex_command(
@@ -252,7 +261,8 @@ core::Result<void> ToolRegistry::register_builtin_tools() {
         return result;
     }
     if (auto result = register_tool(
-        {"mesh.dissolve-edge", "Dissolve selected edge"},
+        {"mesh.dissolve-edge", "Dissolve selected edge",
+         ToolKernelKind::editable_mesh_dissolve_edge},
         [](const ToolContext& context, const ToolArguments&)
             -> core::Result<std::unique_ptr<EditorCommand>> {
             return context.make_dissolve_selected_edge_command();
@@ -261,7 +271,8 @@ core::Result<void> ToolRegistry::register_builtin_tools() {
         return result;
     }
     if (auto result = register_tool(
-        {"mesh.tri-to-quad", "Convert selected triangles to quad"},
+        {"mesh.tri-to-quad", "Convert selected triangles to quad",
+         ToolKernelKind::editable_mesh_tri_to_quad},
         [](const ToolContext& context, const ToolArguments&)
             -> core::Result<std::unique_ptr<EditorCommand>> {
             return context.make_tri_to_quad_selected_faces_command();
@@ -270,7 +281,8 @@ core::Result<void> ToolRegistry::register_builtin_tools() {
         return result;
     }
     return register_tool(
-        {"mesh.merge-vertices", "Merge selected vertices"},
+        {"mesh.merge-vertices", "Merge selected vertices",
+         ToolKernelKind::editable_mesh_merge_vertices},
         [](const ToolContext& context, const ToolArguments&)
             -> core::Result<std::unique_ptr<EditorCommand>> {
             return context.make_merge_selected_vertices_command();

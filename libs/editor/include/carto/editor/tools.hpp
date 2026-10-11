@@ -14,9 +14,30 @@
 
 namespace carto::editor {
 
+// The registered native kernel identity is editor metadata, not an AI
+// capability. Keeping it beside the factory registration lets descriptive
+// consumers detect an ID/factory contract drift instead of guessing from the
+// display name or tool ID alone.
+enum class ToolKernelKind {
+    unclassified,
+    editable_mesh_extrude_face,
+    editable_mesh_inset_face,
+    editable_mesh_delete_face,
+    editable_mesh_set_vertex_position,
+    editable_mesh_slide_vertex,
+    editable_mesh_split_edge,
+    editable_mesh_bevel_edge,
+    editable_mesh_bevel_vertex,
+    editable_mesh_dissolve_edge,
+    editable_mesh_tri_to_quad,
+    editable_mesh_merge_vertices,
+    editable_mesh_poke_face,
+};
+
 struct ToolDescriptor {
     std::string id;
     std::string display_name;
+    ToolKernelKind kernel = ToolKernelKind::unclassified;
 };
 
 struct ToolContext {

@@ -10,6 +10,17 @@ add_executable(cartographer_render_architecture_tests
     render_architecture_tests.cpp
 )
 
+add_executable(cartographer_kernel_evidence_tests
+    kernel_evidence_tests.cpp
+)
+target_link_libraries(cartographer_kernel_evidence_tests
+    PRIVATE
+        carto_device
+        carto_gpu
+)
+carto_target(cartographer_kernel_evidence_tests)
+add_test(NAME cartographer_kernel_evidence_tests COMMAND cartographer_kernel_evidence_tests)
+
 add_executable(cartographer_evaluation_attributes_tests
     evaluation_attributes_tests.cpp
 )
@@ -28,8 +39,6 @@ add_executable(cartographer_production_closure_tests
 target_link_libraries(cartographer_production_closure_tests
     PRIVATE
         carto_production
-        carto_project
-        carto_journal
 )
 carto_target(cartographer_production_closure_tests)
 add_test(NAME cartographer_production_closure_tests COMMAND cartographer_production_closure_tests)
@@ -57,6 +66,17 @@ target_link_libraries(cartographer_world_model_tests
 carto_target(cartographer_world_model_tests)
 add_test(NAME cartographer_world_model_tests COMMAND cartographer_world_model_tests)
 
+add_executable(cartographer_material_catalog_tests
+    material_catalog_tests.cpp
+)
+target_link_libraries(cartographer_material_catalog_tests
+    PRIVATE
+        carto_project
+        carto_journal
+)
+carto_target(cartographer_material_catalog_tests)
+add_test(NAME cartographer_material_catalog_tests COMMAND cartographer_material_catalog_tests)
+
 add_test(
     NAME cartographer_package_consumer_tests
     COMMAND
@@ -72,66 +92,6 @@ add_test(
         -P "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/RunPackageConsumer.cmake"
 )
 set_tests_properties(cartographer_package_consumer_tests PROPERTIES RUN_SERIAL TRUE)
-
-add_executable(cartographer_material_catalog_tests
-    material_catalog_tests.cpp
-)
-target_link_libraries(cartographer_material_catalog_tests
-    PRIVATE
-        carto_project
-)
-carto_target(cartographer_material_catalog_tests)
-add_test(NAME cartographer_material_catalog_tests COMMAND cartographer_material_catalog_tests)
-
-add_executable(cartographer_preparation_scope_tests
-    preparation_scope_tests.cpp
-)
-target_link_libraries(cartographer_preparation_scope_tests
-    PRIVATE
-        carto_production
-)
-carto_target(cartographer_preparation_scope_tests)
-add_test(NAME cartographer_preparation_scope_tests COMMAND cartographer_preparation_scope_tests)
-
-add_executable(cartographer_preparation_operation_tests
-    preparation_operation_tests.cpp
-)
-target_link_libraries(cartographer_preparation_operation_tests
-    PRIVATE
-        carto_production
-)
-carto_target(cartographer_preparation_operation_tests)
-add_test(NAME cartographer_preparation_operation_tests COMMAND cartographer_preparation_operation_tests)
-
-add_executable(cartographer_preparation_job_tests
-    preparation_job_tests.cpp
-)
-target_link_libraries(cartographer_preparation_job_tests
-    PRIVATE
-        carto_production
-)
-carto_target(cartographer_preparation_job_tests)
-add_test(NAME cartographer_preparation_job_tests COMMAND cartographer_preparation_job_tests)
-
-add_executable(cartographer_prepared_scene_tests
-    prepared_scene_tests.cpp
-)
-target_link_libraries(cartographer_prepared_scene_tests
-    PRIVATE
-        carto_production
-)
-carto_target(cartographer_prepared_scene_tests)
-add_test(NAME cartographer_prepared_scene_tests COMMAND cartographer_prepared_scene_tests)
-
-add_executable(cartographer_prepared_publication_tests
-    prepared_publication_tests.cpp
-)
-target_link_libraries(cartographer_prepared_publication_tests
-    PRIVATE
-        carto_production
-)
-carto_target(cartographer_prepared_publication_tests)
-add_test(NAME cartographer_prepared_publication_tests COMMAND cartographer_prepared_publication_tests)
 
 add_executable(cartographer_texture_source_tests
     texture_source_tests.cpp
@@ -164,6 +124,62 @@ carto_target(cartographer_lookdev_draw_package_tests)
 add_test(NAME cartographer_lookdev_draw_package_tests
     COMMAND cartographer_lookdev_draw_package_tests)
 
+add_executable(cartographer_prepared_scene_tests
+    prepared_scene_tests.cpp
+)
+target_link_libraries(cartographer_prepared_scene_tests
+    PRIVATE
+        carto_production
+        carto_journal
+)
+carto_target(cartographer_prepared_scene_tests)
+add_test(NAME cartographer_prepared_scene_tests COMMAND cartographer_prepared_scene_tests)
+
+add_executable(cartographer_preparation_scope_tests
+    preparation_scope_tests.cpp
+)
+target_link_libraries(cartographer_preparation_scope_tests
+    PRIVATE
+        carto_production
+        carto_journal
+)
+carto_target(cartographer_preparation_scope_tests)
+add_test(NAME cartographer_preparation_scope_tests COMMAND cartographer_preparation_scope_tests)
+
+add_executable(cartographer_prepared_publication_tests
+    prepared_publication_tests.cpp
+)
+target_link_libraries(cartographer_prepared_publication_tests
+    PRIVATE
+        carto_production
+)
+carto_target(cartographer_prepared_publication_tests)
+add_test(NAME cartographer_prepared_publication_tests
+    COMMAND cartographer_prepared_publication_tests)
+
+add_executable(cartographer_preparation_operation_tests
+    preparation_operation_tests.cpp
+)
+target_link_libraries(cartographer_preparation_operation_tests
+    PRIVATE
+        carto_production
+        carto_journal
+)
+carto_target(cartographer_preparation_operation_tests)
+add_test(NAME cartographer_preparation_operation_tests
+    COMMAND cartographer_preparation_operation_tests)
+
+add_executable(cartographer_preparation_job_tests
+    preparation_job_tests.cpp
+)
+target_link_libraries(cartographer_preparation_job_tests
+    PRIVATE
+        carto_production
+)
+carto_target(cartographer_preparation_job_tests)
+add_test(NAME cartographer_preparation_job_tests
+    COMMAND cartographer_preparation_job_tests)
+
 add_executable(cartographer_web_geometry_tests
     web_geometry_tests.cpp
 )
@@ -179,6 +195,93 @@ target_link_libraries(cartographer_web_geometry_tests
 )
 carto_target(cartographer_web_geometry_tests)
 add_test(NAME cartographer_web_geometry_tests COMMAND cartographer_web_geometry_tests)
+
+add_executable(cartographer_surface_closure_tests
+    surface_closure_tests.cpp
+)
+target_link_libraries(cartographer_surface_closure_tests
+    PRIVATE
+        carto_surface_core
+        carto_geometry
+)
+carto_target(cartographer_surface_closure_tests)
+add_test(NAME cartographer_surface_closure_tests COMMAND cartographer_surface_closure_tests)
+
+add_executable(cartographer_surface_fidelity_package_json_tests
+    surface_fidelity_package_json_tests.cpp
+)
+target_link_libraries(cartographer_surface_fidelity_package_json_tests
+    PRIVATE
+        carto_surface_core
+        carto_geometry
+)
+carto_target(cartographer_surface_fidelity_package_json_tests)
+add_test(NAME cartographer_surface_fidelity_package_json_tests
+    COMMAND cartographer_surface_fidelity_package_json_tests)
+
+add_executable(cartographer_surface_workflow_tests
+    surface_workflow_tests.cpp
+)
+target_link_libraries(cartographer_surface_workflow_tests
+    PRIVATE
+        carto_surface_core
+)
+carto_target(cartographer_surface_workflow_tests)
+add_test(NAME cartographer_surface_workflow_tests COMMAND cartographer_surface_workflow_tests)
+
+add_executable(cartographer_surface_spectrum_tests
+    surface_spectrum_tests.cpp
+)
+target_link_libraries(cartographer_surface_spectrum_tests
+    PRIVATE
+        carto_surface_core
+        carto_geometry
+)
+carto_target(cartographer_surface_spectrum_tests)
+add_test(NAME cartographer_surface_spectrum_tests COMMAND cartographer_surface_spectrum_tests)
+
+add_executable(cartographer_surface_distribution_tests
+    surface_distribution_tests.cpp
+)
+target_link_libraries(cartographer_surface_distribution_tests
+    PRIVATE
+        carto_surface_core
+)
+carto_target(cartographer_surface_distribution_tests)
+add_test(NAME cartographer_surface_distribution_tests COMMAND cartographer_surface_distribution_tests)
+
+add_executable(cartographer_surface_qem_tests
+    surface_qem_tests.cpp
+)
+target_link_libraries(cartographer_surface_qem_tests
+    PRIVATE
+        carto_surface_core
+        carto_geometry
+)
+carto_target(cartographer_surface_qem_tests)
+add_test(NAME cartographer_surface_qem_tests COMMAND cartographer_surface_qem_tests)
+
+add_executable(cartographer_surface_normal_closure_tests
+    surface_normal_closure_tests.cpp
+)
+target_link_libraries(cartographer_surface_normal_closure_tests
+    PRIVATE
+        carto_surface_core
+        carto_geometry
+)
+carto_target(cartographer_surface_normal_closure_tests)
+add_test(NAME cartographer_surface_normal_closure_tests COMMAND cartographer_surface_normal_closure_tests)
+
+add_executable(cartographer_surface_visibility_closure_tests
+    surface_visibility_closure_tests.cpp
+)
+target_link_libraries(cartographer_surface_visibility_closure_tests
+    PRIVATE
+        carto_surface_core
+        carto_geometry
+)
+carto_target(cartographer_surface_visibility_closure_tests)
+add_test(NAME cartographer_surface_visibility_closure_tests COMMAND cartographer_surface_visibility_closure_tests)
 
 if(CARTO_BUILD_DEVICE_CPU)
     add_executable(cartographer_device_tests
@@ -263,12 +366,20 @@ if(NOT CARTO_BUILD_PRIVATE_INTEGRATIONS)
     add_executable(cartographer_public_boundary_tests
         public_boundary_tests.cpp
     )
+    target_link_libraries(cartographer_public_boundary_tests
+        PRIVATE
+            carto_production
+    )
     carto_target(cartographer_public_boundary_tests)
     add_test(NAME cartographer_public_boundary_tests COMMAND cartographer_public_boundary_tests)
 endif()
 
 add_executable(cartographer_preview_transaction_tests
     preview_transaction_tests.cpp
+)
+
+add_executable(cartographer_ai_tests
+    ai_tests.cpp
 )
 
 add_executable(cartographer_topology_edit_tests
@@ -415,6 +526,7 @@ target_link_libraries(cartographer_public_api_tests
         carto_application
         carto_editor
         carto_mesh_attributes
+        carto_production
         carto_project
 )
 
@@ -431,6 +543,16 @@ target_link_libraries(cartographer_preview_transaction_tests
 carto_target(cartographer_preview_transaction_tests)
 add_test(NAME cartographer_preview_transaction_tests COMMAND cartographer_preview_transaction_tests)
 
+target_link_libraries(cartographer_ai_tests
+    PRIVATE
+        carto_ai
+        carto_ui
+        carto_application
+)
+
+carto_target(cartographer_ai_tests)
+add_test(NAME cartographer_ai_tests COMMAND cartographer_ai_tests)
+
 target_link_libraries(cartographer_topology_edit_tests
     PRIVATE
         carto_application
@@ -440,3 +562,365 @@ target_link_libraries(cartographer_topology_edit_tests
 
 carto_target(cartographer_topology_edit_tests)
 add_test(NAME cartographer_topology_edit_tests COMMAND cartographer_topology_edit_tests)
+
+add_executable(cartographer_reimport_tests
+    reimport_tests.cpp
+)
+target_link_libraries(cartographer_reimport_tests
+    PRIVATE
+        carto_production
+)
+carto_target(cartographer_reimport_tests)
+add_test(NAME cartographer_reimport_tests COMMAND cartographer_reimport_tests)
+
+add_executable(cartographer_production_capability_profile_tests
+    production_capability_profile_tests.cpp
+)
+target_link_libraries(cartographer_production_capability_profile_tests
+    PRIVATE
+        carto_production
+)
+carto_target(cartographer_production_capability_profile_tests)
+add_test(NAME cartographer_production_capability_profile_tests
+    COMMAND cartographer_production_capability_profile_tests)
+
+add_executable(cartographer_production_recipe_tests
+    production_recipe_tests.cpp
+)
+target_link_libraries(cartographer_production_recipe_tests
+    PRIVATE
+        carto_production
+)
+carto_target(cartographer_production_recipe_tests)
+add_test(NAME cartographer_production_recipe_tests
+    COMMAND cartographer_production_recipe_tests)
+
+add_executable(cartographer_semantic_sidecar_tests
+    semantic_sidecar_tests.cpp
+)
+target_link_libraries(cartographer_semantic_sidecar_tests
+    PRIVATE
+        carto_semantic
+        carto_project
+        carto_journal
+)
+carto_target(cartographer_semantic_sidecar_tests)
+add_test(NAME cartographer_semantic_sidecar_tests
+    COMMAND cartographer_semantic_sidecar_tests)
+
+add_executable(cartographer_semantic_schema_tests
+    semantic_schema_tests.cpp
+)
+target_link_libraries(cartographer_semantic_schema_tests
+    PRIVATE
+        carto_semantic
+)
+carto_target(cartographer_semantic_schema_tests)
+add_test(NAME cartographer_semantic_schema_tests
+    COMMAND cartographer_semantic_schema_tests)
+
+add_executable(cartographer_semantic_lowering_tests
+    semantic_lowering_tests.cpp
+)
+target_link_libraries(cartographer_semantic_lowering_tests
+    PRIVATE
+        carto_semantic
+)
+carto_target(cartographer_semantic_lowering_tests)
+add_test(NAME cartographer_semantic_lowering_tests
+    COMMAND cartographer_semantic_lowering_tests)
+
+add_executable(cartographer_semantic_migration_tests
+    semantic_migration_tests.cpp
+)
+target_link_libraries(cartographer_semantic_migration_tests
+    PRIVATE
+        carto_semantic
+)
+carto_target(cartographer_semantic_migration_tests)
+add_test(NAME cartographer_semantic_migration_tests
+    COMMAND cartographer_semantic_migration_tests)
+
+add_executable(cartographer_semantic_query_tests
+    semantic_query_tests.cpp
+)
+target_link_libraries(cartographer_semantic_query_tests
+    PRIVATE
+        carto_semantic
+        carto_project
+        carto_journal
+)
+carto_target(cartographer_semantic_query_tests)
+add_test(NAME cartographer_semantic_query_tests
+    COMMAND cartographer_semantic_query_tests)
+
+add_executable(cartographer_connection_port_tests
+    connection_port_tests.cpp
+)
+target_link_libraries(cartographer_connection_port_tests
+    PRIVATE
+        carto_connection
+)
+carto_target(cartographer_connection_port_tests)
+add_test(NAME cartographer_connection_port_tests
+    COMMAND cartographer_connection_port_tests)
+
+add_executable(cartographer_connection_port_graph_tests
+    connection_port_graph_tests.cpp
+)
+target_link_libraries(cartographer_connection_port_graph_tests
+    PRIVATE
+        carto_connection
+)
+carto_target(cartographer_connection_port_graph_tests)
+add_test(NAME cartographer_connection_port_graph_tests
+    COMMAND cartographer_connection_port_graph_tests)
+
+add_executable(cartographer_physical_mass_tests
+    physical_mass_tests.cpp
+)
+target_link_libraries(cartographer_physical_mass_tests
+    PRIVATE
+        carto_physical
+)
+carto_target(cartographer_physical_mass_tests)
+add_test(NAME cartographer_physical_mass_tests
+    COMMAND cartographer_physical_mass_tests)
+
+add_executable(cartographer_physical_twin_tests
+    physical_twin_tests.cpp
+)
+target_link_libraries(cartographer_physical_twin_tests
+    PRIVATE
+        carto_physical
+)
+carto_target(cartographer_physical_twin_tests)
+add_test(NAME cartographer_physical_twin_tests
+    COMMAND cartographer_physical_twin_tests)
+
+add_executable(cartographer_surface_ledger_tests
+    surface_ledger_tests.cpp
+)
+target_link_libraries(cartographer_surface_ledger_tests
+    PRIVATE
+        carto_physical
+)
+carto_target(cartographer_surface_ledger_tests)
+add_test(NAME cartographer_surface_ledger_tests
+    COMMAND cartographer_surface_ledger_tests)
+
+add_executable(cartographer_collision_candidate_tests
+    collision_candidate_tests.cpp
+)
+target_link_libraries(cartographer_collision_candidate_tests
+    PRIVATE
+        carto_collision
+)
+carto_target(cartographer_collision_candidate_tests)
+add_test(NAME cartographer_collision_candidate_tests
+    COMMAND cartographer_collision_candidate_tests)
+
+add_executable(cartographer_collision_policy_tests
+    collision_policy_tests.cpp
+)
+target_link_libraries(cartographer_collision_policy_tests
+    PRIVATE
+        carto_collision
+)
+carto_target(cartographer_collision_policy_tests)
+add_test(NAME cartographer_collision_policy_tests
+    COMMAND cartographer_collision_policy_tests)
+
+add_executable(cartographer_navgraph_tests
+    navgraph_tests.cpp
+)
+target_link_libraries(cartographer_navgraph_tests
+    PRIVATE
+        carto_navgraph
+        carto_assets
+        carto_production
+)
+carto_target(cartographer_navgraph_tests)
+add_test(NAME cartographer_navgraph_tests COMMAND cartographer_navgraph_tests)
+
+add_executable(cartographer_navgraph_agent_profile_tests
+    navgraph_agent_profile_tests.cpp
+)
+target_link_libraries(cartographer_navgraph_agent_profile_tests
+    PRIVATE
+        carto_navgraph
+        carto_assets
+)
+carto_target(cartographer_navgraph_agent_profile_tests)
+add_test(NAME cartographer_navgraph_agent_profile_tests
+    COMMAND cartographer_navgraph_agent_profile_tests)
+
+add_executable(cartographer_representation_tests
+    representation_tests.cpp
+)
+target_link_libraries(cartographer_representation_tests
+    PRIVATE
+        carto_representation
+)
+carto_target(cartographer_representation_tests)
+add_test(NAME cartographer_representation_tests
+    COMMAND cartographer_representation_tests)
+
+add_executable(cartographer_representation_continuity_tests
+    representation_continuity_tests.cpp
+)
+target_link_libraries(cartographer_representation_continuity_tests
+    PRIVATE
+        carto_representation
+)
+carto_target(cartographer_representation_continuity_tests)
+add_test(NAME cartographer_representation_continuity_tests
+    COMMAND cartographer_representation_continuity_tests)
+
+add_executable(cartographer_kinematic_graph_tests
+    kinematic_graph_tests.cpp
+)
+target_link_libraries(cartographer_kinematic_graph_tests
+    PRIVATE
+        carto_kinematic
+)
+carto_target(cartographer_kinematic_graph_tests)
+add_test(NAME cartographer_kinematic_graph_tests
+    COMMAND cartographer_kinematic_graph_tests)
+
+add_executable(cartographer_kinematic_identity_tests
+    kinematic_identity_tests.cpp
+)
+target_link_libraries(cartographer_kinematic_identity_tests
+    PRIVATE
+        carto_kinematic
+)
+carto_target(cartographer_kinematic_identity_tests)
+add_test(NAME cartographer_kinematic_identity_tests
+    COMMAND cartographer_kinematic_identity_tests)
+
+add_executable(cartographer_kinematic_limits_tests
+    kinematic_limits_tests.cpp
+)
+target_link_libraries(cartographer_kinematic_limits_tests
+    PRIVATE
+        carto_kinematic
+)
+carto_target(cartographer_kinematic_limits_tests)
+add_test(NAME cartographer_kinematic_limits_tests
+    COMMAND cartographer_kinematic_limits_tests)
+
+add_executable(cartographer_temporal_channel_tests
+    temporal_channel_tests.cpp
+)
+target_link_libraries(cartographer_temporal_channel_tests
+    PRIVATE
+        carto_temporal
+)
+carto_target(cartographer_temporal_channel_tests)
+add_test(NAME cartographer_temporal_channel_tests
+    COMMAND cartographer_temporal_channel_tests)
+
+add_executable(cartographer_motion_sequence_tests
+    motion_sequence_tests.cpp
+)
+target_link_libraries(cartographer_motion_sequence_tests
+    PRIVATE
+        carto_temporal
+)
+carto_target(cartographer_motion_sequence_tests)
+add_test(NAME cartographer_motion_sequence_tests
+    COMMAND cartographer_motion_sequence_tests)
+
+add_executable(cartographer_temporal_sampling_tests
+    temporal_sampling_tests.cpp
+)
+target_link_libraries(cartographer_temporal_sampling_tests
+    PRIVATE
+        carto_temporal
+)
+carto_target(cartographer_temporal_sampling_tests)
+add_test(NAME cartographer_temporal_sampling_tests
+    COMMAND cartographer_temporal_sampling_tests)
+
+add_executable(cartographer_archetype_inference_tests
+    archetype_inference_tests.cpp
+)
+target_link_libraries(cartographer_archetype_inference_tests
+    PRIVATE
+        carto_archetype
+)
+carto_target(cartographer_archetype_inference_tests)
+add_test(NAME cartographer_archetype_inference_tests
+    COMMAND cartographer_archetype_inference_tests)
+
+add_executable(cartographer_instance_identity_tests
+    instance_identity_tests.cpp
+)
+target_link_libraries(cartographer_instance_identity_tests
+    PRIVATE
+        carto_archetype
+)
+carto_target(cartographer_instance_identity_tests)
+add_test(NAME cartographer_instance_identity_tests
+    COMMAND cartographer_instance_identity_tests)
+
+add_executable(cartographer_verification_capability_ledger_tests
+    verification_capability_ledger_tests.cpp
+)
+target_link_libraries(cartographer_verification_capability_ledger_tests
+    PRIVATE
+        carto_verification
+        carto_journal
+)
+carto_target(cartographer_verification_capability_ledger_tests)
+add_test(NAME cartographer_verification_capability_ledger_tests
+    COMMAND cartographer_verification_capability_ledger_tests)
+
+add_executable(cartographer_verification_failure_injection_tests
+    verification_failure_injection_tests.cpp
+)
+target_link_libraries(cartographer_verification_failure_injection_tests
+    PRIVATE
+        carto_verification
+        carto_journal
+)
+carto_target(cartographer_verification_failure_injection_tests)
+add_test(NAME cartographer_verification_failure_injection_tests
+    COMMAND cartographer_verification_failure_injection_tests)
+
+add_executable(cartographer_verification_regression_gates_tests
+    verification_regression_gates_tests.cpp
+)
+target_link_libraries(cartographer_verification_regression_gates_tests
+    PRIVATE
+        carto_verification
+        carto_journal
+)
+carto_target(cartographer_verification_regression_gates_tests)
+add_test(NAME cartographer_verification_regression_gates_tests
+    COMMAND cartographer_verification_regression_gates_tests)
+
+add_executable(cartographer_verification_evidence_report_tests
+    verification_evidence_report_tests.cpp
+)
+target_link_libraries(cartographer_verification_evidence_report_tests
+    PRIVATE
+        carto_verification
+        carto_journal
+)
+carto_target(cartographer_verification_evidence_report_tests)
+add_test(NAME cartographer_verification_evidence_report_tests
+    COMMAND cartographer_verification_evidence_report_tests)
+
+add_executable(cartographer_verification_corrupt_artifact_tests
+    verification_corrupt_artifact_tests.cpp
+)
+target_link_libraries(cartographer_verification_corrupt_artifact_tests
+    PRIVATE
+        carto_verification
+        carto_journal
+)
+carto_target(cartographer_verification_corrupt_artifact_tests)
+add_test(NAME cartographer_verification_corrupt_artifact_tests
+    COMMAND cartographer_verification_corrupt_artifact_tests)

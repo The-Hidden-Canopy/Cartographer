@@ -879,4 +879,36 @@ private:
     std::optional<scene::SceneObject> object_;
 };
 
+// Creates a second root-level scene object that references an existing mesh
+// asset. This deliberately duplicates no geometry and clones no hierarchy:
+// modelling edits to the shared asset remain explicit, while object placement
+// stays independently undoable.
+class DuplicateProjectMeshInstanceCommand final : public EditorCommand {
+public:
+    DuplicateProjectMeshInstanceCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        scene::ObjectId source,
+        std::string object_name,
+        core::Vec3d local_translation_offset);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Duplicate Mesh Instance"; }
+
+private:
+    friend class ::carto::application::ApplicationSession;
+    friend struct ToolContext;
+
+    [[nodiscard]] core::Result<void> create_first_instance();
+    [[nodiscard]] core::Result<void> restore_instance();
+    [[nodiscard]] core::Result<void> remove_instance();
+
+    project::ProjectDocument* document_;
+    scene::ObjectId source_;
+    std::string object_name_;
+    core::Vec3d local_translation_offset_;
+    std::optional<scene::SceneObject> object_;
+};
+
 } // namespace carto::editor

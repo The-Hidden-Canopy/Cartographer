@@ -117,6 +117,15 @@ struct InstanceField {
     // Stable generated instance identities omitted from reconstruction. The
     // vector must be sorted and unique so its canonical form is unambiguous.
     std::vector<std::uint64_t> suppressed_instances;
+    // Schema v2: provider-neutral physical-materialization intent contributed
+    // by Cartographer. Geometry evidence is content-addressed; the remaining
+    // references are stable identifiers, not runtime handles. VANTA resolves
+    // native material and construction facts; these fields grant no mutation
+    // authority and stay empty when the authoring source never set them.
+    std::optional<assets::Sha256Digest> geometry_evidence;
+    std::string physical_material_intent;
+    std::string construction_profile;
+    std::string surface_domain_identity;
 
     [[nodiscard]] core::Result<void> validate() const;
 };
@@ -164,7 +173,7 @@ struct VariantLayer {
 // absent; consumers receive immutable, revision-bound project snapshots.
 class WorldModel final {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 1U;
+    static constexpr std::uint32_t kSchemaVersion = 2U;
     static constexpr std::size_t kMaxSerializedBytes = 16U * 1024U * 1024U;
     static constexpr std::size_t kMaxPrimitivesPerKind = 65'536U;
     static constexpr std::size_t kMaxControlPointsPerPath = 65'536U;
