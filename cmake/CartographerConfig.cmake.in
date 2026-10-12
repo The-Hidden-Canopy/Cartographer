@@ -6,4 +6,98 @@ if(@CARTO_ENABLE_VULKAN@)
 endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/CartographerTargets.cmake")
+
+# The export can contain either a named configuration (for example Release)
+# or NOCONFIG, depending on the producer generator. Fill only missing named
+# configurations after loading the export; a global NOCONFIG mapping would
+# incorrectly override a real Release location.
+set(_carto_exported_targets
+    Cartographer::carto_core
+    Cartographer::carto_scene
+    Cartographer::carto_attributes
+    Cartographer::carto_geometry
+    Cartographer::carto_assets
+    Cartographer::carto_hydro
+    Cartographer::carto_temporal
+    Cartographer::carto_surface_core
+    Cartographer::carto_physical
+    Cartographer::carto_scientific
+    Cartographer::carto_world
+    Cartographer::carto_semantic
+    Cartographer::carto_connection
+    Cartographer::carto_navgraph
+    Cartographer::carto_kinematic
+    Cartographer::carto_archetype
+    Cartographer::carto_mesh_attributes
+    Cartographer::carto_web_geometry_core
+    Cartographer::carto_collision
+    Cartographer::carto_representation
+    Cartographer::carto_biological
+    Cartographer::carto_production_authoring
+    Cartographer::carto_web_geometry_compile
+    Cartographer::carto_web_geometry_package
+    Cartographer::carto_eval
+    Cartographer::carto_web_geometry_evaluation
+    Cartographer::carto_gpu
+    Cartographer::carto_journal
+    Cartographer::carto_render_graph
+    Cartographer::carto_device_ir
+    Cartographer::carto_device
+    Cartographer::carto_device_cpu
+    Cartographer::carto_providers
+    Cartographer::carto_plugin_protocol
+    Cartographer::carto_plugin_package
+    Cartographer::carto_market
+    Cartographer::carto_project
+    Cartographer::carto_editor
+    Cartographer::carto_ai
+    Cartographer::carto_render
+    Cartographer::carto_production
+    Cartographer::carto_verification
+    Cartographer::carto_application
+    Cartographer::carto_ui
+    Cartographer::carto_sdk
+    Cartographer::carto_io)
+foreach(_carto_imported_target IN LISTS _carto_exported_targets)
+    if(TARGET "${_carto_imported_target}")
+        get_target_property(_carto_noconfig_location
+            "${_carto_imported_target}" IMPORTED_LOCATION_NOCONFIG)
+        if(NOT _carto_noconfig_location OR
+           _carto_noconfig_location STREQUAL "_carto_noconfig_location-NOTFOUND")
+            set(_carto_noconfig_location "")
+        endif()
+        get_target_property(_carto_release_location
+            "${_carto_imported_target}" IMPORTED_LOCATION_RELEASE)
+        if(NOT _carto_release_location OR
+           _carto_release_location STREQUAL "_carto_release_location-NOTFOUND")
+            set(_carto_release_location "")
+        endif()
+        foreach(_carto_configuration IN ITEMS DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+            get_target_property(_carto_configuration_location
+                "${_carto_imported_target}" IMPORTED_LOCATION_${_carto_configuration})
+            if(NOT _carto_configuration_location OR
+               _carto_configuration_location STREQUAL "_carto_configuration_location-NOTFOUND")
+                if(_carto_noconfig_location)
+                    set(_carto_fallback_location "${_carto_noconfig_location}")
+                elseif(_carto_release_location)
+                    set(_carto_fallback_location "${_carto_release_location}")
+                else()
+                    set(_carto_fallback_location "")
+                endif()
+                if(_carto_fallback_location)
+                    set_property(TARGET "${_carto_imported_target}" PROPERTY
+                        IMPORTED_LOCATION_${_carto_configuration} "${_carto_fallback_location}")
+                endif()
+            endif()
+        endforeach()
+    endif()
+endforeach()
+unset(_carto_exported_targets)
+unset(_carto_noconfig_location)
+unset(_carto_release_location)
+unset(_carto_configuration)
+unset(_carto_configuration_location)
+unset(_carto_fallback_location)
+unset(_carto_imported_target)
+
 check_required_components(Cartographer)

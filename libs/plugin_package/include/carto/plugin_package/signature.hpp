@@ -8,6 +8,7 @@
 #include <map>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace carto::plugin_package {
@@ -35,6 +36,16 @@ struct Signature {
     const std::map<std::string, std::vector<std::uint8_t>>& entries,
     const assets::Sha256Digest& manifest_digest,
     const assets::Sha256Digest& archive_digest,
+    const KeyRing& key_ring);
+
+// Verifies a caller-defined, already domain-separated detached signature.
+// The key ring contains public verification keys only; private signing keys
+// stay in the publisher or service boundary.
+[[nodiscard]] core::Result<SignatureVerdict> verify_detached_signature(
+    std::string_view key_id,
+    std::string_view algorithm,
+    std::span<const std::uint8_t> message,
+    std::span<const std::uint8_t, 64> signature,
     const KeyRing& key_ring);
 
 } // namespace carto::plugin_package

@@ -2,6 +2,16 @@ add_executable(cartographer_tests
     test_main.cpp
 )
 
+add_executable(cartographer_hydro_tests
+    hydro_tests.cpp
+)
+target_link_libraries(cartographer_hydro_tests
+    PRIVATE
+        carto_hydro
+)
+carto_target(cartographer_hydro_tests)
+add_test(NAME cartographer_hydro_tests COMMAND cartographer_hydro_tests)
+
 add_executable(cartographer_application_tests
     application_tests.cpp
 )
@@ -43,6 +53,29 @@ target_link_libraries(cartographer_production_closure_tests
 carto_target(cartographer_production_closure_tests)
 add_test(NAME cartographer_production_closure_tests COMMAND cartographer_production_closure_tests)
 
+
+add_executable(cartographer_biological_authoring_tests
+    biological_authoring_tests.cpp
+)
+target_link_libraries(cartographer_biological_authoring_tests
+    PRIVATE
+        carto_biological
+)
+carto_target(cartographer_biological_authoring_tests)
+add_test(NAME cartographer_biological_authoring_tests
+    COMMAND cartographer_biological_authoring_tests)
+
+add_executable(cartographer_production_authoring_tests
+    production_authoring_tests.cpp
+)
+target_link_libraries(cartographer_production_authoring_tests
+    PRIVATE
+        carto_production_authoring
+)
+carto_target(cartographer_production_authoring_tests)
+add_test(NAME cartographer_production_authoring_tests
+    COMMAND cartographer_production_authoring_tests)
+
 add_executable(cartographer_production_decision_tests
     production_decision_tests.cpp
 )
@@ -77,6 +110,12 @@ target_link_libraries(cartographer_material_catalog_tests
 carto_target(cartographer_material_catalog_tests)
 add_test(NAME cartographer_material_catalog_tests COMMAND cartographer_material_catalog_tests)
 
+set(_carto_package_consumer_vulkan_args)
+if(CARTO_ENABLE_VULKAN AND NOT CARTO_VULKAN_SDK_ROOT STREQUAL "")
+    list(APPEND _carto_package_consumer_vulkan_args
+        "-DCARTO_VULKAN_ROOT=${CARTO_VULKAN_SDK_ROOT}")
+endif()
+
 add_test(
     NAME cartographer_package_consumer_tests
     COMMAND
@@ -89,9 +128,11 @@ add_test(
         "-DCARTO_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}"
         "-DCARTO_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}"
         "-DCARTO_CTEST_COMMAND=${CMAKE_CTEST_COMMAND}"
+        ${_carto_package_consumer_vulkan_args}
         -P "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/RunPackageConsumer.cmake"
 )
 set_tests_properties(cartographer_package_consumer_tests PROPERTIES RUN_SERIAL TRUE)
+unset(_carto_package_consumer_vulkan_args)
 
 add_executable(cartographer_texture_source_tests
     texture_source_tests.cpp
@@ -1089,3 +1130,14 @@ target_link_libraries(cartographer_verification_corrupt_artifact_tests
 carto_target(cartographer_verification_corrupt_artifact_tests)
 add_test(NAME cartographer_verification_corrupt_artifact_tests
     COMMAND cartographer_verification_corrupt_artifact_tests)
+
+add_executable(cartographer_community_market_tests
+    community_market_tests.cpp
+)
+target_link_libraries(cartographer_community_market_tests
+    PRIVATE
+        carto_market
+)
+carto_target(cartographer_community_market_tests)
+add_test(NAME cartographer_community_market_tests
+    COMMAND cartographer_community_market_tests)

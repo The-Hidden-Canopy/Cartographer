@@ -16,11 +16,22 @@ option(CARTO_BUILD_PRIVATE_INTEGRATIONS
 set(CARTO_PRIVATE_SOURCE_ROOT "" CACHE PATH
     "Out-of-tree Cartographer-private source root")
 option(CARTO_ENABLE_VULKAN "Enable the optional Vulkan render backend" OFF)
+set(CARTO_VULKAN_SDK_ROOT "" CACHE PATH
+    "Vulkan SDK root used for headers, libraries, and shader tools")
+set(CARTO_GLSLC_EXECUTABLE "" CACHE FILEPATH
+    "Path to glslc used to compile Cartographer Vulkan shaders")
 option(CARTO_ENABLE_D3D12 "Enable the optional Windows D3D12 render backend" OFF)
 option(CARTO_BUILD_D3D12_DESKTOP
     "Build the optional native Win32/D3D12 presentation shell" OFF)
 option(CARTO_BUILD_DESKTOP "Build the optional Dear ImGui/Vulkan desktop shell" OFF)
 set(CARTO_IMGUI_ROOT "" CACHE PATH "Path to a pinned Dear ImGui source tree")
+option(CARTO_USE_BUNDLED_IMGUI
+    "Use the pinned public Dear ImGui source included in third_party/imgui" ON)
+if(CARTO_USE_BUNDLED_IMGUI AND CARTO_IMGUI_ROOT STREQUAL "" AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/imgui.h")
+    set(CARTO_IMGUI_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui" CACHE PATH
+        "Path to a pinned Dear ImGui source tree" FORCE)
+endif()
 option(CARTO_BUILD_GMIB_GRAPHICS "Build the optional GMIB presentation consumer" OFF)
 set(CARTO_GMIB_ROOT "" CACHE PATH "Standalone GMIB source root for the optional graphics consumer")
 option(CARTO_BUILD_GMIB_GAME "Build the Cartographer-hosted GMIB game surface" OFF)
@@ -143,6 +154,7 @@ if(CARTO_BUILD_PRIVATE_INTEGRATIONS)
 endif()
 add_subdirectory(libs/geometry/mesh)
 add_subdirectory(libs/assets)
+add_subdirectory(libs/hydro)
 add_subdirectory(libs/temporal)
 add_subdirectory(libs/surface/core)
 add_subdirectory(libs/physical)
@@ -157,6 +169,8 @@ add_subdirectory(libs/mesh_attributes)
 add_subdirectory(libs/web_geometry/core)
 add_subdirectory(libs/collision)
 add_subdirectory(libs/representation)
+add_subdirectory(libs/biological)
+add_subdirectory(libs/production_authoring)
 add_subdirectory(libs/web_geometry/compile)
 add_subdirectory(libs/web_geometry/package)
 add_subdirectory(libs/eval)
@@ -172,6 +186,7 @@ endif()
 add_subdirectory(libs/providers)
 add_subdirectory(libs/plugin_protocol)
 add_subdirectory(libs/plugin_package)
+add_subdirectory(libs/market)
 add_subdirectory(libs/project)
 add_subdirectory(libs/editor)
 add_subdirectory(libs/ai)
@@ -230,7 +245,49 @@ if(CARTO_BUILD_GMIB_GAME)
 endif()
 
 if(CARTO_ENABLE_VULKAN)
+    if(CARTO_VULKAN_SDK_ROOT STREQUAL "" AND DEFINED ENV{VULKAN_SDK})
+        set(CARTO_VULKAN_SDK_ROOT "$ENV{VULKAN_SDK}" CACHE PATH
+            "Vulkan SDK root used for headers, libraries, and shader tools" FORCE)
+    endif()
+    if(CARTO_VULKAN_SDK_ROOT STREQUAL "" AND WIN32)
+        file(GLOB _carto_vulkan_sdk_candidates LIST_DIRECTORIES true "C:/VulkanSDK/*")
+        list(SORT _carto_vulkan_sdk_candidates COMPARE NATURAL ORDER DESCENDING)
+        foreach(_carto_vulkan_sdk_candidate IN LISTS _carto_vulkan_sdk_candidates)
+            if(EXISTS "${_carto_vulkan_sdk_candidate}/Include/vulkan/vulkan.h" AND
+               EXISTS "${_carto_vulkan_sdk_candidate}/Lib/vulkan-1.lib")
+                set(CARTO_VULKAN_SDK_ROOT "${_carto_vulkan_sdk_candidate}" CACHE PATH
+                    "Vulkan SDK root used for headers, libraries, and shader tools" FORCE)
+                break()
+            endif()
+        endforeach()
+    endif()
+    if(NOT CARTO_VULKAN_SDK_ROOT STREQUAL "")
+        list(PREPEND CMAKE_PREFIX_PATH "${CARTO_VULKAN_SDK_ROOT}")
+        set(Vulkan_ROOT "${CARTO_VULKAN_SDK_ROOT}")
+    endif()
     find_package(Vulkan QUIET)
+    if(NOT Vulkan_FOUND AND NOT CARTO_VULKAN_SDK_ROOT STREQUAL "")
+        find_path(CARTO_VULKAN_INCLUDE_DIR
+            NAMES vulkan/vulkan.h
+            HINTS "${CARTO_VULKAN_SDK_ROOT}/Include"
+            NO_DEFAULT_PATH
+        )
+        find_library(CARTO_VULKAN_LIBRARY
+            NAMES vulkan-1
+            HINTS "${CARTO_VULKAN_SDK_ROOT}/Lib"
+            NO_DEFAULT_PATH
+        )
+        if(CARTO_VULKAN_INCLUDE_DIR AND CARTO_VULKAN_LIBRARY)
+            if(NOT TARGET Vulkan::Vulkan)
+                add_library(Vulkan::Vulkan UNKNOWN IMPORTED)
+            endif()
+            set_target_properties(Vulkan::Vulkan PROPERTIES
+                IMPORTED_LOCATION "${CARTO_VULKAN_LIBRARY}"
+                INTERFACE_INCLUDE_DIRECTORIES "${CARTO_VULKAN_INCLUDE_DIR}"
+            )
+            set(Vulkan_FOUND TRUE)
+        endif()
+    endif()
     if(NOT Vulkan_FOUND)
         message(FATAL_ERROR "CARTO_ENABLE_VULKAN=ON requires a discoverable Vulkan SDK")
     endif()
@@ -262,11 +319,26 @@ if(CARTO_BUILD_DESKTOP)
     if(NOT CARTO_ENABLE_VULKAN)
         message(FATAL_ERROR "CARTO_BUILD_DESKTOP=ON requires CARTO_ENABLE_VULKAN=ON")
     endif()
-    if(NOT EXISTS "${CARTO_IMGUI_ROOT}/imgui.h" OR
-       NOT EXISTS "${CARTO_IMGUI_ROOT}/backends/imgui_impl_win32.cpp" OR
-       NOT EXISTS "${CARTO_IMGUI_ROOT}/backends/imgui_impl_vulkan.cpp")
+    set(_carto_imgui_required_files
+        imgui.h
+        imgui.cpp
+        imgui_draw.cpp
+        imgui_tables.cpp
+        imgui_widgets.cpp
+        backends/imgui_impl_win32.h
+        backends/imgui_impl_win32.cpp
+        backends/imgui_impl_vulkan.h
+        backends/imgui_impl_vulkan.cpp
+    )
+    set(_carto_imgui_missing_files)
+    foreach(_carto_imgui_required_file IN LISTS _carto_imgui_required_files)
+        if(NOT EXISTS "${CARTO_IMGUI_ROOT}/${_carto_imgui_required_file}")
+            list(APPEND _carto_imgui_missing_files "${_carto_imgui_required_file}")
+        endif()
+    endforeach()
+    if(_carto_imgui_missing_files)
         message(FATAL_ERROR
-            "CARTO_BUILD_DESKTOP=ON requires CARTO_IMGUI_ROOT pointing to a pinned Dear ImGui source tree")
+            "CARTO_BUILD_DESKTOP=ON requires CARTO_IMGUI_ROOT with the pinned Dear ImGui sources; missing: ${_carto_imgui_missing_files}")
     endif()
     add_subdirectory(apps/desktop)
 endif()

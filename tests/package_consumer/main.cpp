@@ -1,13 +1,42 @@
+#include <carto/production/bake_graph.hpp>
+#include <carto/biological/authoring.hpp>
+#include <carto/production_authoring/authoring.hpp>
 #include <carto/production/preparation_operation.hpp>
 #include <carto/production/preparation_job.hpp>
 #include <carto/project/project.hpp>
+#include <carto/ui/ui.hpp>
 #include <carto/world/model.hpp>
 
 #include <cstdlib>
+#include <cstdint>
 #include <iostream>
 #include <optional>
+#include <span>
 
 int main() {
+    carto::production::ProductionCookGraph bake_graph;
+    if (!bake_graph.validate()) {
+        std::cerr << "installed production BakeGraph target does not expose the public compiler boundary\n";
+        return EXIT_FAILURE;
+    }
+
+    carto::biological::BiologicalAuthoringDocument biological;
+    biological.source = carto::biological::AuthoringSourceIdentity{
+        "package/biological", 1U, carto::core::Revision{1U},
+        carto::assets::sha256(std::span<const std::uint8_t>{
+            reinterpret_cast<const std::uint8_t*>("package-biological"), 18U})};
+    biological.organism_family = "package-smoke";
+    if (!biological.validate()) {
+        std::cerr << "installed biological target does not expose the public authoring boundary\n";
+        return EXIT_FAILURE;
+    }
+
+    carto::production_authoring::SculptStack sculpt;
+    if (sculpt.mesh_asset != 0U || sculpt.validate()) {
+        std::cerr << "installed production authoring target has an invalid default state\n";
+        return EXIT_FAILURE;
+    }
+
     carto::world::WorldModel world;
     const auto inserted = world.insert_area(carto::world::SemanticArea{
         .id = carto::world::AreaId{1U},
@@ -33,6 +62,13 @@ int main() {
     const auto profile = carto::production::portable_preparation_profile();
     if (!profile.validate() || !profile.canonical_digest()) {
         std::cerr << "installed production target does not expose preparation\n";
+        return EXIT_FAILURE;
+    }
+
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    if (ui.snapshot().market.status != carto::ui::MarketStatus::unconfigured) {
+        std::cerr << "installed UI target does not expose the bounded market projection\n";
         return EXIT_FAILURE;
     }
 

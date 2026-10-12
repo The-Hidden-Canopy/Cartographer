@@ -3,6 +3,7 @@
 #include <carto/ai/ai.hpp>
 #include <carto/application/application.hpp>
 #include <carto/core/result.hpp>
+#include <carto/market/market.hpp>
 #include <carto/surface/core.hpp>
 
 #include <array>
@@ -253,6 +254,38 @@ struct MeshImportReceipt {
     application::DispatchReceipt dispatch;
 };
 
+enum class MarketStatus {
+    unconfigured,
+    empty,
+    ready,
+    error,
+};
+
+// A read-only projection of the local, data-only market library. This is
+// deliberately not a catalog, entitlement, payment, or runtime-authority
+// model. The UI can show what the local library validated and installed; it
+// cannot claim remote availability or executable capability.
+struct MarketPackageView {
+    std::string package_id;
+    std::string listing_id;
+    std::string listing_version_id;
+    std::string publisher_id;
+    std::string license_id;
+    std::optional<std::string> source_revision;
+    std::string content_digest;
+    std::string package_digest;
+    std::uint64_t payload_bytes = 0U;
+    std::uint32_t payload_files = 0U;
+    bool publication_receipt_bound = false;
+};
+
+struct MarketView {
+    MarketStatus status = MarketStatus::unconfigured;
+    std::string status_text;
+    std::filesystem::path library_root;
+    std::vector<MarketPackageView> packages;
+};
+
 struct UiPreferences {
     OperatorMode operator_mode = OperatorMode::person_first;
     Workspace workspace = Workspace::model;
@@ -372,6 +405,7 @@ struct UiSnapshot : application::ApplicationSnapshot {
     std::vector<core::Diagnostic> ui_problems;
     UiColorTokens colors;
     SurfaceFidelityView surface_fidelity;
+    MarketView market;
     bool ai_available = false;
     bool ai_auto_approve = true;
     std::string ai_status;
@@ -387,6 +421,7 @@ struct UiSnapshot : application::ApplicationSnapshot {
 [[nodiscard]] const char* panel_name(Panel panel) noexcept;
 [[nodiscard]] const char* bottom_panel_name(BottomPanel panel) noexcept;
 [[nodiscard]] const char* mesh_import_format_name(MeshImportFormat format) noexcept;
+[[nodiscard]] const char* market_status_name(MarketStatus status) noexcept;
 [[nodiscard]] const char* workbench_instrument_name(WorkbenchInstrument instrument) noexcept;
 [[nodiscard]] const char* surface_fidelity_status_name(
     SurfaceFidelityStatus status) noexcept;
@@ -431,6 +466,16 @@ public:
     [[nodiscard]] core::Result<MeshImportReceipt> import_mesh(
         const std::filesystem::path& path,
         MeshImportFormat format);
+    // Connects the native shell to a local, provider-neutral market library.
+    // Refresh and install revalidate package contents and receipts; no network
+    // or executable package path is reachable through this controller.
+    [[nodiscard]] core::Result<void> configure_market_library(
+        const std::filesystem::path& root);
+    [[nodiscard]] core::Result<void> refresh_market_library();
+    [[nodiscard]] core::Result<market::MarketInstallReceipt> install_market_directory(
+        const std::filesystem::path& package_root);
+    [[nodiscard]] core::Result<market::MarketInstallReceipt> install_market_archive(
+        const std::filesystem::path& archive_path);
     [[nodiscard]] core::Result<void> set_operator_mode(OperatorMode mode);
     [[nodiscard]] core::Result<void> set_workspace(Workspace workspace);
     [[nodiscard]] core::Result<void> set_density(Density density);
@@ -469,6 +514,7 @@ private:
         const application::DispatchReceipt& receipt,
         OperationCategory category);
     void record_ui_problem(core::Diagnostic diagnostic);
+    void record_market_failure(core::Diagnostic diagnostic);
 
     application::ApplicationSession& session_;
     UiPreferences preferences_;
@@ -478,6 +524,8 @@ private:
     std::vector<OperationView> operations_;
     std::vector<core::Diagnostic> ui_problems_;
     std::optional<SurfaceFidelityView> surface_fidelity_;
+    std::unique_ptr<market::MarketLibrary> market_library_;
+    MarketView market_view_;
     std::uint64_t next_operation_id_ = 1U;
 };
 

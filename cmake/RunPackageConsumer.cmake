@@ -12,14 +12,18 @@ if(NOT DEFINED CARTO_CONFIG OR CARTO_CONFIG STREQUAL "")
     if(DEFINED CARTO_BUILD_TYPE AND NOT CARTO_BUILD_TYPE STREQUAL "")
         set(CARTO_CONFIG "${CARTO_BUILD_TYPE}")
     else()
-        set(CARTO_CONFIG "Release")
+        set(CARTO_CONFIG "")
     endif()
 endif()
-if(NOT CARTO_CONFIG MATCHES "^[A-Za-z0-9_.-]+$")
+if(NOT CARTO_CONFIG STREQUAL "" AND NOT CARTO_CONFIG MATCHES "^[A-Za-z0-9_.-]+$")
     message(FATAL_ERROR "Cartographer package consumer configuration is unsafe")
 endif()
 
-set(smoke_root "${CARTO_BINARY_DIR}/package-consumer-smoke/${CARTO_CONFIG}")
+set(smoke_configuration "${CARTO_CONFIG}")
+if(smoke_configuration STREQUAL "")
+    set(smoke_configuration "single-config")
+endif()
+set(smoke_root "${CARTO_BINARY_DIR}/package-consumer-smoke/${smoke_configuration}")
 set(install_root "${smoke_root}/install")
 set(consumer_build "${smoke_root}/build")
 file(REMOVE_RECURSE "${smoke_root}")
@@ -55,6 +59,9 @@ endif()
 if(DEFINED CARTO_GENERATOR_TOOLSET AND NOT CARTO_GENERATOR_TOOLSET STREQUAL "")
     list(APPEND configure_command -T "${CARTO_GENERATOR_TOOLSET}")
 endif()
+if(DEFINED CARTO_VULKAN_ROOT AND NOT CARTO_VULKAN_ROOT STREQUAL "")
+    list(APPEND configure_command "-DVulkan_ROOT=${CARTO_VULKAN_ROOT}")
+endif()
 execute_process(
     COMMAND ${configure_command}
     RESULT_VARIABLE configure_result
@@ -67,8 +74,12 @@ if(NOT configure_result EQUAL 0)
         "${configure_output}\n${configure_error}")
 endif()
 
+set(build_command "${CMAKE_COMMAND}" --build "${consumer_build}")
+if(NOT CARTO_CONFIG STREQUAL "")
+    list(APPEND build_command --config "${CARTO_CONFIG}")
+endif()
 execute_process(
-    COMMAND "${CMAKE_COMMAND}" --build "${consumer_build}" --config "${CARTO_CONFIG}"
+    COMMAND ${build_command}
     RESULT_VARIABLE build_result
     OUTPUT_VARIABLE build_output
     ERROR_VARIABLE build_error
@@ -79,11 +90,14 @@ if(NOT build_result EQUAL 0)
         "${build_output}\n${build_error}")
 endif()
 
+set(test_command "${CARTO_CTEST_COMMAND}"
+    --test-dir "${consumer_build}"
+    --output-on-failure)
+if(NOT CARTO_CONFIG STREQUAL "")
+    list(APPEND test_command -C "${CARTO_CONFIG}")
+endif()
 execute_process(
-    COMMAND "${CARTO_CTEST_COMMAND}"
-        --test-dir "${consumer_build}"
-        -C "${CARTO_CONFIG}"
-        --output-on-failure
+    COMMAND ${test_command}
     RESULT_VARIABLE test_result
     OUTPUT_VARIABLE test_output
     ERROR_VARIABLE test_error

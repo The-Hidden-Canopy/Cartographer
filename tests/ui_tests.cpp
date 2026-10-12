@@ -540,6 +540,67 @@ void ui_imports_mesh_through_provider_and_authoring_boundaries() {
     REQUIRE(!ui.snapshot().dirty);
 }
 
+void ui_connects_local_market_boundary_and_fails_closed() {
+    TempDirectory temp;
+    const auto package = temp.path() / "package";
+    const auto library = temp.path() / "library";
+    std::filesystem::create_directories(package);
+    {
+        std::ofstream payload(package / "geometry.bin", std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(payload));
+        payload << "cartographer-data-only-payload";
+    }
+
+    carto::market::MarketPackageManifest manifest;
+    manifest.package_id = "sample.geometry";
+    manifest.listing_id = "sample-listing";
+    manifest.listing_version_id = "1.0.0";
+    manifest.publisher_id = "local-publisher";
+    manifest.license_id = "cc0-1.0";
+    manifest.entrypoints.push_back({"asset", "geometry.bin"});
+    const auto content_digest = carto::market::MarketPackageValidator::directory_payload_digest(package);
+    REQUIRE(content_digest);
+    manifest.content_digest = content_digest.value();
+    {
+        std::ofstream descriptor(package / "manifest.json", std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(descriptor));
+        descriptor << manifest.serialize();
+    }
+
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.snapshot().market.status == carto::ui::MarketStatus::unconfigured);
+    REQUIRE(ui.configure_market_library(library));
+    REQUIRE(ui.snapshot().market.status == carto::ui::MarketStatus::empty);
+    REQUIRE(ui.snapshot().market.packages.empty());
+    const auto refresh_command = std::find_if(
+        ui.snapshot().commands.begin(), ui.snapshot().commands.end(),
+        [](const auto& command) { return command.id == "market.refresh"; });
+    REQUIRE(refresh_command != ui.snapshot().commands.end());
+    REQUIRE(refresh_command->supported);
+
+    const auto installed = ui.install_market_directory(package);
+    REQUIRE(installed);
+    auto snapshot = ui.snapshot();
+    REQUIRE(snapshot.market.status == carto::ui::MarketStatus::ready);
+    REQUIRE(snapshot.market.packages.size() == 1U);
+    REQUIRE(snapshot.market.packages.front().package_id == "sample.geometry");
+    REQUIRE(snapshot.market.packages.front().listing_version_id == "1.0.0");
+    REQUIRE(!snapshot.market.packages.front().publication_receipt_bound);
+    REQUIRE(snapshot.market.packages.front().package_digest.starts_with("sha256:"));
+
+    const auto installed_payload = installed.value().install_root / "geometry.bin";
+    {
+        std::ofstream tampered(installed_payload, std::ios::binary | std::ios::app);
+        REQUIRE(static_cast<bool>(tampered));
+        tampered << "tampered";
+    }
+    const auto refresh = ui.refresh_market_library();
+    REQUIRE(!refresh);
+    REQUIRE(ui.snapshot().market.status == carto::ui::MarketStatus::error);
+    REQUIRE(ui.snapshot().market.packages.empty());
+}
+
 void ui_failed_shortcuts_and_actions_remain_bounded() {
     carto::application::ApplicationSession session;
     carto::ui::UiController ui(session);
@@ -1089,6 +1150,7 @@ int main() {
         workbench_preferences_round_trip_and_fail_closed();
         ui_connects_surface_fidelity_preview_without_authoring_mutation();
         ui_imports_mesh_through_provider_and_authoring_boundaries();
+        ui_connects_local_market_boundary_and_fails_closed();
         ui_failed_shortcuts_and_actions_remain_bounded();
         ui_command_palette_is_bounded_and_explicit_about_deferred_features();
         native_key_contract_maps_core_control_without_imgui();

@@ -118,4 +118,24 @@ core::Result<SignatureVerdict> verify_package_signature(
     return core::Result<SignatureVerdict>::success(SignatureVerdict::verified);
 }
 
+core::Result<SignatureVerdict> verify_detached_signature(
+    std::string_view key_id,
+    std::string_view algorithm,
+    std::span<const std::uint8_t> message,
+    std::span<const std::uint8_t, 64> signature,
+    const KeyRing& key_ring) {
+    if (algorithm != "ed25519") {
+        return core::Result<SignatureVerdict>::success(SignatureVerdict::algorithm_unsupported);
+    }
+    const auto key = std::find_if(key_ring.keys.begin(), key_ring.keys.end(), [key_id](const auto& candidate) {
+        return candidate.first == key_id;
+    });
+    if (key == key_ring.keys.end()) return core::Result<SignatureVerdict>::success(SignatureVerdict::unknown_key);
+    const std::span<const std::uint8_t, 32> public_key(key->second.data(), 32U);
+    if (!ed25519_verify(public_key, message, signature)) {
+        return core::Result<SignatureVerdict>::success(SignatureVerdict::invalid);
+    }
+    return core::Result<SignatureVerdict>::success(SignatureVerdict::verified);
+}
+
 } // namespace carto::plugin_package

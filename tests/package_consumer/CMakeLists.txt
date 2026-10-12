@@ -8,8 +8,12 @@ add_executable(cartographer_package_consumer main.cpp)
 target_compile_features(cartographer_package_consumer PRIVATE cxx_std_23)
 target_link_libraries(cartographer_package_consumer
     PRIVATE
+        Cartographer::carto_biological
+        Cartographer::carto_production_authoring
         Cartographer::carto_project
         Cartographer::carto_production
+        Cartographer::carto_hydro
+        Cartographer::carto_ui
 )
 
 enable_testing()

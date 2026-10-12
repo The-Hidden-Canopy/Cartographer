@@ -34,13 +34,15 @@ if not exist "%VULKAN_SDK%\Bin\glslc.exe" (
     exit /b 2
 )
 
+if not defined CARTO_IMGUI_ROOT if exist "%CARTO_SOURCE%\third_party\imgui\imgui.h" set "CARTO_IMGUI_ROOT=%CARTO_SOURCE%\third_party\imgui"
 if not defined CARTO_IMGUI_ROOT if defined LOCALAPPDATA if exist "%LOCALAPPDATA%\HiddenCanopy\Dependencies\imgui-v1.92.9\imgui.h" set "CARTO_IMGUI_ROOT=%LOCALAPPDATA%\HiddenCanopy\Dependencies\imgui-v1.92.9"
 if not defined CARTO_IMGUI_ROOT (
     for /f "delims=" %%I in ('dir /b /ad /o-n "%TEMP%\cartographer-imgui-*" 2^>nul') do if not defined CARTO_IMGUI_ROOT set "CARTO_IMGUI_ROOT=%TEMP%\%%I"
 )
 if not defined CARTO_IMGUI_ROOT (
     echo ERROR: A pinned Dear ImGui source tree is required to build the Cartographer workbench.
-    echo        Set CARTO_IMGUI_ROOT to a tree containing imgui.h and the Win32/Vulkan backends.
+    echo        The repository includes one at third_party\imgui; otherwise set CARTO_IMGUI_ROOT
+    echo        to a separately reviewed tree containing imgui.h and the Win32/Vulkan backends.
     exit /b 2
 )
 if not exist "%CARTO_IMGUI_ROOT%\imgui.h" (
@@ -87,9 +89,11 @@ echo [Cartographer] ImGui:  %CARTO_IMGUI_ROOT%
 cmake.exe -S "%CARTO_SOURCE%" -B "%CARTO_BUILD_DIR%" -G Ninja ^
     -DCMAKE_BUILD_TYPE=Release ^
     -DCMAKE_EXE_LINKER_FLAGS=-static ^
+    -DCARTO_VULKAN_SDK_ROOT="%VULKAN_SDK%" ^
     -DVulkan_INCLUDE_DIR="%VULKAN_SDK%\Include" ^
     -DVulkan_LIBRARY="%VULKAN_SDK%\Lib\vulkan-1.lib" ^
     -DCARTO_IMGUI_ROOT="%CARTO_IMGUI_ROOT%" ^
+    -DCARTO_USE_BUNDLED_IMGUI=ON ^
     -DCARTO_ENABLE_D3D12=OFF ^
     -DCARTO_BUILD_D3D12_DESKTOP=OFF ^
     -DCARTO_ENABLE_VULKAN=ON ^

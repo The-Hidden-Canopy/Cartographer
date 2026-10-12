@@ -41,6 +41,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -99,6 +100,14 @@ using carto::ui::UiSnapshot;
     return utf8_path;
 }
 
+[[nodiscard]] std::optional<std::string> preferred_system_font_path(
+    std::initializer_list<const wchar_t*> file_names) {
+    for (const wchar_t* file_name : file_names) {
+        if (const auto path = system_font_path(file_name); path.has_value()) return path;
+    }
+    return std::nullopt;
+}
+
 void check_vk(VkResult result, const char* operation) {
     if (result != VK_SUCCESS) {
         throw std::runtime_error(std::string(operation) + " failed with Vulkan result " +
@@ -118,13 +127,12 @@ public:
                  "vkCreateWin32SurfaceKHR");
         choose_device();
         create_device();
-        create_render_pass();
         create_command_objects();
         create_descriptor_pool();
         create_swapchain();
 
         ImGui_ImplVulkan_InitInfo init_info{};
-        init_info.ApiVersion = VK_API_VERSION_1_0;
+        init_info.ApiVersion = VK_API_VERSION_1_1;
         init_info.Instance = instance_;
         init_info.PhysicalDevice = physical_device_;
         init_info.Device = device_;
@@ -299,7 +307,7 @@ private:
         app.applicationVersion = 1;
         app.pEngineName = "Cartographer";
         app.engineVersion = 1;
-        app.apiVersion = VK_API_VERSION_1_0;
+        app.apiVersion = VK_API_VERSION_1_1;
         VkInstanceCreateInfo info{};
         info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         info.pApplicationInfo = &app;
@@ -315,6 +323,20 @@ private:
         std::vector<VkPhysicalDevice> devices(count);
         check_vk(vkEnumeratePhysicalDevices(instance_, &count, devices.data()), "vkEnumeratePhysicalDevices");
         for (VkPhysicalDevice device : devices) {
+            std::uint32_t extension_count = 0U;
+            check_vk(vkEnumerateDeviceExtensionProperties(
+                         device, nullptr, &extension_count, nullptr),
+                     "vkEnumerateDeviceExtensionProperties");
+            std::vector<VkExtensionProperties> extensions(extension_count);
+            check_vk(vkEnumerateDeviceExtensionProperties(
+                         device, nullptr, &extension_count, extensions.data()),
+                     "vkEnumerateDeviceExtensionProperties");
+            const bool supports_swapchain = std::any_of(
+                extensions.begin(), extensions.end(), [](const VkExtensionProperties& extension) {
+                    return std::string_view(extension.extensionName) == VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+                });
+            if (!supports_swapchain) continue;
+
             std::uint32_t queue_count = 0;
             vkGetPhysicalDeviceQueueFamilyProperties(device, &queue_count, nullptr);
             std::vector<VkQueueFamilyProperties> queues(queue_count);
@@ -381,6 +403,7 @@ private:
         info.dependencyCount = 1;
         info.pDependencies = &dependency;
         check_vk(vkCreateRenderPass(device_, &info, nullptr, &render_pass_), "vkCreateRenderPass");
+        render_pass_format_ = swapchain_format_;
     }
 
     void create_command_objects() {
@@ -439,7 +462,7 @@ private:
         check_vk(vkCreateDescriptorPool(device_, &info, nullptr, &descriptor_pool_), "vkCreateDescriptorPool");
     }
 
-    void create_swapchain() {
+    void select_swapchain_configuration() {
         VkSurfaceCapabilitiesKHR capabilities{};
         check_vk(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device_, surface_, &capabilities),
                  "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
@@ -458,20 +481,30 @@ private:
         check_vk(vkGetPhysicalDeviceSurfacePresentModesKHR(
                      physical_device_, surface_, &present_mode_count, present_modes.data()),
                  "vkGetPhysicalDeviceSurfacePresentModesKHR");
-        const VkPresentModeKHR present_mode = select_present_mode(present_modes);
+        swapchain_present_mode_ = select_present_mode(present_modes);
+        swapchain_pre_transform_ = capabilities.currentTransform;
         VkSurfaceFormatKHR selected_format{};
-        bool found_preferred_format = false;
-        for (const auto& format : formats) {
-            if (format.format == VK_FORMAT_B8G8R8A8_UNORM) {
-                selected_format = format;
-                found_preferred_format = true;
+        constexpr std::array<VkFormat, 4> preferred_formats{
+            VK_FORMAT_B8G8R8A8_UNORM,
+            VK_FORMAT_B8G8R8A8_SRGB,
+            VK_FORMAT_R8G8B8A8_UNORM,
+            VK_FORMAT_R8G8B8A8_SRGB,
+        };
+        for (const VkFormat preferred : preferred_formats) {
+            const auto format = std::find_if(
+                formats.begin(), formats.end(), [preferred](const VkSurfaceFormatKHR& candidate) {
+                    return candidate.format == preferred;
+                });
+            if (format != formats.end()) {
+                selected_format = *format;
                 break;
             }
         }
-        if (!found_preferred_format) {
-            throw std::runtime_error("desktop shell requires a BGRA8 UNORM swapchain format");
+        if (selected_format.format == VK_FORMAT_UNDEFINED) {
+            selected_format = formats.front();
         }
         swapchain_format_ = selected_format.format;
+        swapchain_color_space_ = selected_format.colorSpace;
         VkExtent2D extent = capabilities.currentExtent;
         if (extent.width == std::numeric_limits<std::uint32_t>::max()) {
             extent = {client_width(), client_height()};
@@ -485,20 +518,31 @@ private:
         if (image_count_ < 2U) {
             throw std::runtime_error("desktop shell requires at least two swapchain images");
         }
+    }
+
+    void create_swapchain() {
+        select_swapchain_configuration();
+        if (render_pass_ == VK_NULL_HANDLE || render_pass_format_ != swapchain_format_) {
+            if (render_pass_ != VK_NULL_HANDLE) {
+                vkDestroyRenderPass(device_, render_pass_, nullptr);
+                render_pass_ = VK_NULL_HANDLE;
+            }
+            create_render_pass();
+        }
 
         VkSwapchainCreateInfoKHR info{};
         info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
         info.surface = surface_;
         info.minImageCount = image_count_;
         info.imageFormat = swapchain_format_;
-        info.imageColorSpace = selected_format.colorSpace;
-        info.imageExtent = extent;
+        info.imageColorSpace = swapchain_color_space_;
+        info.imageExtent = {swapchain_width_, swapchain_height_};
         info.imageArrayLayers = 1;
         info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        info.preTransform = capabilities.currentTransform;
+        info.preTransform = swapchain_pre_transform_;
         info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-        info.presentMode = present_mode;
+        info.presentMode = swapchain_present_mode_;
         info.clipped = VK_TRUE;
         check_vk(vkCreateSwapchainKHR(device_, &info, nullptr, &swapchain_), "vkCreateSwapchainKHR");
 
@@ -594,6 +638,9 @@ private:
     std::uint32_t queue_family_ = 0;
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFormat swapchain_format_ = VK_FORMAT_B8G8R8A8_UNORM;
+    VkColorSpaceKHR swapchain_color_space_ = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    VkPresentModeKHR swapchain_present_mode_ = VK_PRESENT_MODE_FIFO_KHR;
+    VkSurfaceTransformFlagBitsKHR swapchain_pre_transform_ = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     std::uint32_t swapchain_width_ = 0;
     std::uint32_t swapchain_height_ = 0;
     std::uint32_t image_count_ = 2;
@@ -601,6 +648,7 @@ private:
     std::vector<VkImageView> image_views_;
     std::vector<VkFramebuffer> framebuffers_;
     VkRenderPass render_pass_ = VK_NULL_HANDLE;
+    VkFormat render_pass_format_ = VK_FORMAT_UNDEFINED;
     VkCommandPool command_pool_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
     std::vector<FrameContext> frame_contexts_;
@@ -618,6 +666,7 @@ DesktopState* g_state = nullptr;
 enum class ShellSurface {
     workspace,
     project,
+    market,
     diagnostics,
     settings,
 };
@@ -809,6 +858,7 @@ struct NativeSculptStrokeCapture {
 
 enum class FileDialogKind {
     project,
+    market_package,
     mesh_import,
     gltf,
     obj,
@@ -830,6 +880,13 @@ enum class StandardMeshExport {
     dialog.lpstrFile = path;
     dialog.nMaxFile = MAX_PATH;
     switch (kind) {
+    case FileDialogKind::market_package:
+        dialog.lpstrFilter =
+            L"Cartographer Market package (*.cartomarket;*.cartoplug;*.zip)\0"
+            L"*.cartomarket;*.cartoplug;*.zip\0"
+            L"Cartographer Market directory manifest (manifest.json)\0manifest.json\0"
+            L"All Files\0*.*\0";
+        break;
     case FileDialogKind::mesh_import:
         dialog.lpstrFilter =
             L"Supported Meshes (*.obj;*.ply;*.stl)\0*.obj;*.ply;*.stl\0"
@@ -889,6 +946,18 @@ enum class StandardMeshExport {
     return path;
 }
 
+[[nodiscard]] std::optional<std::filesystem::path> market_library_path(bool create_parent) {
+    const auto workspace_path = user_preference_path(create_parent);
+    if (!workspace_path.has_value()) return std::nullopt;
+    auto directory = workspace_path->parent_path() / L"market-library";
+    if (create_parent) {
+        std::error_code error;
+        std::filesystem::create_directories(directory, error);
+        if (error) return std::nullopt;
+    }
+    return directory;
+}
+
 struct DesktopState {
     ApplicationSession session;
     carto::ui::UiController ui;
@@ -939,7 +1008,7 @@ struct DesktopState {
     std::optional<std::uint64_t> selected_operation_id;
     std::unique_ptr<carto::production::PreparationJob> preparation_job;
 
-    static constexpr float kWorkbenchRackWidth = 128.0F;
+    static constexpr float kWorkbenchRackWidth = 148.0F;
     static constexpr float kWorkbenchSnapDistance = 18.0F;
     static constexpr float kWorkbenchPlacementMargin = 12.0F;
 
@@ -953,15 +1022,18 @@ struct DesktopState {
         font_config.OversampleV = 1;
         font_config.PixelSnapH = false;
 
-        if (const auto path = system_font_path(L"segoeui.ttf"); path.has_value()) {
+        if (const auto path = preferred_system_font_path(
+                {L"Aptos.ttf", L"segoeui.ttf"}); path.has_value()) {
             body_font = io.Fonts->AddFontFromFileTTF(
                 path->c_str(), 14.5F, &font_config, glyph_ranges);
         }
-        if (const auto path = system_font_path(L"segoeuib.ttf"); path.has_value()) {
+        if (const auto path = preferred_system_font_path(
+                {L"AptosDisplay-Bold.ttf", L"segoeuib.ttf"}); path.has_value()) {
             heading_font = io.Fonts->AddFontFromFileTTF(
-                path->c_str(), 17.0F, &font_config, glyph_ranges);
+                path->c_str(), 18.0F, &font_config, glyph_ranges);
         }
-        if (const auto path = system_font_path(L"CascadiaMono.ttf"); path.has_value()) {
+        if (const auto path = preferred_system_font_path(
+                {L"CascadiaMono.ttf", L"consola.ttf"}); path.has_value()) {
             mono_font = io.Fonts->AddFontFromFileTTF(
                 path->c_str(), 13.0F, &font_config, glyph_ranges);
         }
@@ -1028,6 +1100,20 @@ struct DesktopState {
         for (std::size_t index = 0U; index < carto::ui::kWorkbenchInstrumentCount; ++index) {
             const auto instrument = static_cast<carto::ui::WorkbenchInstrument>(index);
             workbench_visible(workbench, instrument) = workbench.persisted.instruments[index].visible;
+        }
+    }
+
+    void load_market_library() {
+        const auto path = market_library_path(true);
+        if (!path.has_value()) {
+            action_feedback = "Cartographer could not prepare its local market library.";
+            action_feedback_error = true;
+            return;
+        }
+        const auto result = ui.configure_market_library(*path);
+        if (!result) {
+            action_feedback = result.error().message;
+            action_feedback_error = true;
         }
     }
 
@@ -1264,6 +1350,23 @@ struct DesktopState {
         action_feedback_error = false;
         workbench.assets = true;
         mark_custom_workbench();
+    }
+
+    void install_market_package() {
+        const auto package = choose_file(false, FileDialogKind::market_package);
+        if (!package.has_value()) return;
+        const auto installed = package->filename().wstring() == L"manifest.json"
+            ? ui.install_market_directory(package->parent_path())
+            : ui.install_market_archive(*package);
+        if (!installed) {
+            action_feedback = installed.error().message;
+            action_feedback_error = true;
+            return;
+        }
+        action_feedback = "Installed " + installed.value().package_id + "@" +
+            installed.value().listing_version_id + " into the local data-only library.";
+        action_feedback_error = false;
+        surface = ShellSurface::market;
     }
 
     bool route_native_key(const carto::ui::NativeKeyEvent& event) {
@@ -1991,24 +2094,25 @@ struct DesktopState {
         style.Colors[ImGuiCol_Tab] = color(snapshot.colors.panel_0);
         style.Colors[ImGuiCol_TabHovered] = color(snapshot.colors.panel_hover);
         style.Colors[ImGuiCol_TabActive] = color(snapshot.colors.panel_selected);
-        // HAVEN-inspired geometry: cards and controls should feel calm and
-        // current while the workbench remains physically rearrangeable.
-        style.WindowRounding = 12.0F;
-        style.ChildRounding = 12.0F;
-        style.FrameRounding = 8.0F;
-        style.PopupRounding = 10.0F;
-        style.ScrollbarRounding = 8.0F;
-        style.WindowBorderSize = 0.0F;
+        // The workbench is equipment, not a dashboard. Keep the HAVEN-derived
+        // palette, but use a restrained instrument geometry so rails, cards,
+        // and floating tools read as parts of one machine.
+        style.WindowRounding = 6.0F;
+        style.ChildRounding = 5.0F;
+        style.FrameRounding = 4.0F;
+        style.PopupRounding = 5.0F;
+        style.ScrollbarRounding = 3.0F;
+        style.WindowBorderSize = 1.0F;
         style.ChildBorderSize = 1.0F;
         style.FrameBorderSize = 1.0F;
-        style.ScrollbarSize = 10.0F;
-        style.GrabMinSize = 16.0F;
-        style.ItemSpacing = ImVec2(10.0F, 8.0F);
-        style.ItemInnerSpacing = ImVec2(8.0F, 6.0F);
+        style.ScrollbarSize = 9.0F;
+        style.GrabMinSize = 14.0F;
+        style.ItemSpacing = ImVec2(8.0F, 7.0F);
+        style.ItemInnerSpacing = ImVec2(6.0F, 5.0F);
         style.SelectableTextAlign = ImVec2(0.0F, 0.5F);
         style.WindowPadding = snapshot.density == carto::ui::Density::compact
             ? ImVec2(10, 8) : snapshot.density == carto::ui::Density::touch
-            ? ImVec2(14, 12) : ImVec2(12, 10);
+            ? ImVec2(14, 12) : ImVec2(13, 10);
         style.FramePadding = snapshot.density == carto::ui::Density::compact
             ? ImVec2(8, 5) : snapshot.density == carto::ui::Density::touch
             ? ImVec2(11, 8) : ImVec2(9, 6);
@@ -2051,6 +2155,7 @@ struct DesktopState {
         switch (surface) {
         case ShellSurface::workspace: return "Workspace";
         case ShellSurface::project: return "Project";
+        case ShellSurface::market: return "Market";
         case ShellSurface::diagnostics: return "Diagnostics";
         case ShellSurface::settings: return "Settings";
         }
@@ -2063,7 +2168,9 @@ struct DesktopState {
     }
 
     void draw_shell_header(const UiSnapshot& snapshot) {
-        ImGui::BeginChild("ShellHeader", ImVec2(0, 84), true, ImGuiWindowFlags_NoScrollbar);
+        const bool compact_header = ImGui::GetWindowWidth() < 900.0F;
+        ImGui::BeginChild("ShellHeader", ImVec2(0, compact_header ? 112.0F : 84.0F),
+                          true, ImGuiWindowFlags_NoScrollbar);
         ImGui::BeginGroup();
         heading_text_colored(snapshot.colors.accent_primary, "CARTOGRAPHER");
         ImGui::SameLine();
@@ -2074,7 +2181,8 @@ struct DesktopState {
         mono_text_disabled(project_location(snapshot).c_str());
         ImGui::EndGroup();
 
-        ImGui::SameLine(std::max(240.0F, ImGui::GetWindowWidth() - 555.0F));
+        if (compact_header) ImGui::Dummy(ImVec2(0, 4));
+        else ImGui::SameLine(std::max(240.0F, ImGui::GetWindowWidth() - 555.0F));
         ImGui::BeginGroup();
         const ImVec4 status = status_color(snapshot);
         ImVec4 status_surface = status;
@@ -2102,11 +2210,13 @@ struct DesktopState {
         }
         if (snapshot.theme == carto::ui::Theme::light) ImGui::PopStyleColor();
         ImGui::SameLine();
-        if (ImGui::Button("Command palette  Ctrl+K")) {
+        if (ImGui::Button(compact_header ? "Commands" : "Command palette  Ctrl+K")) {
             static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::toggle_command_palette));
         }
         ImGui::SameLine();
-        if (ImGui::Button("Compose")) ImGui::OpenPopup("Compose workbench");
+        if (ImGui::Button(compact_header ? "Flow" : "Compose")) {
+            ImGui::OpenPopup("Compose workbench");
+        }
         if (ImGui::BeginPopup("Compose workbench")) {
             ImGui::TextDisabled("Assemble the work surface for your flow.");
             ImGui::TextDisabled("Learns from your choices only; stays local.");
@@ -2148,31 +2258,48 @@ struct DesktopState {
     }
 
     void draw_navigation_rail(const UiSnapshot& snapshot) {
-        ImGui::BeginChild("ProductRail", ImVec2(232, 0), true);
-        ImGui::TextColored(color(snapshot.colors.accent_primary), "C");
-        ImGui::SameLine();
-        heading_text("Spatial authoring");
-        ImGui::TextDisabled("A truthful workspace for geometry, history, and evidence.");
+        const float available_width = ImGui::GetContentRegionAvail().x;
+        const bool narrow = available_width < 760.0F;
+        const float rail_width = narrow ? 72.0F : available_width < 980.0F ? 184.0F : 232.0F;
+        ImGui::BeginChild("ProductRail", ImVec2(rail_width, 0), true);
+        if (narrow) {
+            heading_text_colored(snapshot.colors.accent_primary, "C");
+            ImGui::TextDisabled("Carto");
+        } else {
+            ImGui::TextColored(color(snapshot.colors.accent_primary), "C");
+            ImGui::SameLine();
+            heading_text("Spatial authoring");
+            ImGui::TextDisabled("A truthful workspace for geometry, history, and evidence.");
+        }
         ImGui::Dummy(ImVec2(0, 6));
 
-        const auto nav_item = [this, &snapshot](const char* label, const char* detail,
-                                                 ShellSurface target) {
+        const auto nav_item = [this, &snapshot, narrow](const char* label, const char* compact_label,
+                                                        const char* detail, ShellSurface target) {
             const bool selected = surface == target;
             if (selected) {
                 ImGui::PushStyleColor(ImGuiCol_Header, color(snapshot.colors.panel_selected));
                 ImGui::PushStyleColor(ImGuiCol_Text, color(snapshot.colors.accent_primary));
             }
-            if (ImGui::Selectable(label, selected, 0, ImVec2(0, 32))) surface = target;
+            const char* shown_label = narrow ? compact_label : label;
+            if (ImGui::Selectable(shown_label, selected, 0, ImVec2(0, 32))) surface = target;
             if (selected) ImGui::PopStyleColor(2);
-            ImGui::TextDisabled("  %s", detail);
+            if (narrow && ImGui::IsItemHovered()) {
+                ImGui::BeginTooltip();
+                ImGui::TextUnformatted(label);
+                ImGui::TextDisabled("%s", detail);
+                ImGui::EndTooltip();
+            } else if (!narrow) {
+                ImGui::TextDisabled("  %s", detail);
+            }
         };
-        nav_item("Workspace", "Author geometry", ShellSurface::workspace);
-        nav_item("Project", "Persistence and revision", ShellSurface::project);
-        nav_item("Diagnostics", "Problems and capability", ShellSurface::diagnostics);
-        nav_item("Settings", "Density, theme, operator", ShellSurface::settings);
+        nav_item("Workspace", "W", "Author geometry", ShellSurface::workspace);
+        nav_item("Project", "P", "Persistence and revision", ShellSurface::project);
+        nav_item("Market", "M", "Local data packages", ShellSurface::market);
+        nav_item("Diagnostics", "D", "Problems and capability", ShellSurface::diagnostics);
+        nav_item("Settings", "S", "Density, theme, operator", ShellSurface::settings);
 
         ImGui::Spacing();
-        if (ImGui::Button("+  New Project", ImVec2(-1, 34))) {
+        if (ImGui::Button(narrow ? "+" : "+  New Project", ImVec2(-1, 34))) {
             carto::application::NewProjectAction action{"Untitled"};
             if (snapshot.dirty) {
                 action.discard_dirty = true;
@@ -2181,7 +2308,7 @@ struct DesktopState {
                 static_cast<void>(dispatch(action));
             }
         }
-        if (ImGui::Button("Open Project", ImVec2(-1, 30))) {
+        if (ImGui::Button(narrow ? "Open" : "Open Project", ImVec2(-1, 30))) {
             if (const auto path = choose_file(false); path.has_value()) {
                 carto::application::OpenProjectAction action{*path};
                 if (snapshot.dirty) {
@@ -2195,17 +2322,27 @@ struct DesktopState {
 
         ImGui::Dummy(ImVec2(0, 8));
         ImGui::Separator();
-        ImGui::TextDisabled("Session");
-        ImGui::Text("Revision %llu", static_cast<unsigned long long>(snapshot.project_revision.value()));
-        ImGui::Text("%zu object%s", snapshot.objects.size(), snapshot.objects.size() == 1U ? "" : "s");
-        ImGui::TextColored(status_color(snapshot), "%s", snapshot.project_status_text.c_str());
-        if (snapshot.dirty) ImGui::TextColored(color(snapshot.colors.modified), "Unsaved changes");
-        ImGui::Spacing();
-        ImGui::TextDisabled("Native shell");
-        ImGui::TextColored(renderer_ready ? color(snapshot.colors.semantic_success)
-                                          : color(snapshot.colors.semantic_error),
-                          renderer_ready ? "Active" : "Unavailable");
-        ImGui::TextDisabled("Mutations remain behind the application session.");
+        ImGui::TextDisabled(narrow ? "State" : "Session");
+        if (narrow) {
+            ImGui::Text("R%llu", static_cast<unsigned long long>(snapshot.project_revision.value()));
+            ImGui::Text("%zu obj", snapshot.objects.size());
+            ImGui::TextColored(status_color(snapshot), "%s", snapshot.dirty ? "●" : "○");
+            ImGui::Spacing();
+            ImGui::TextColored(renderer_ready ? color(snapshot.colors.semantic_success)
+                                              : color(snapshot.colors.semantic_error),
+                              renderer_ready ? "●" : "×");
+        } else {
+            ImGui::Text("Revision %llu", static_cast<unsigned long long>(snapshot.project_revision.value()));
+            ImGui::Text("%zu object%s", snapshot.objects.size(), snapshot.objects.size() == 1U ? "" : "s");
+            ImGui::TextColored(status_color(snapshot), "%s", snapshot.project_status_text.c_str());
+            if (snapshot.dirty) ImGui::TextColored(color(snapshot.colors.modified), "Unsaved changes");
+            ImGui::Spacing();
+            ImGui::TextDisabled("Native shell");
+            ImGui::TextColored(renderer_ready ? color(snapshot.colors.semantic_success)
+                                              : color(snapshot.colors.semantic_error),
+                              renderer_ready ? "Active" : "Unavailable");
+            ImGui::TextDisabled("Mutations remain behind the application session.");
+        }
         ImGui::EndChild();
     }
 
@@ -2571,6 +2708,19 @@ struct DesktopState {
             if (ImGui::MenuItem("Recover latest journal snapshot")) {
                 recover_latest_snapshot(snapshot);
             }
+            if (ImGui::MenuItem("Install data-only market package...")) {
+                install_market_package();
+            }
+            if (ImGui::MenuItem("Refresh local market library")) {
+                const auto refreshed = ui.refresh_market_library();
+                if (!refreshed) {
+                    action_feedback = refreshed.error().message;
+                    action_feedback_error = true;
+                } else {
+                    action_feedback = "Local market library refreshed.";
+                    action_feedback_error = false;
+                }
+            }
             const bool preparation_active = preparation_job != nullptr &&
                 !carto::production::preparation_job_state_is_terminal(
                     preparation_job->snapshot().state);
@@ -2777,6 +2927,16 @@ struct DesktopState {
                     static_cast<void>(ui.reset_preferences());
                     reset_workbench();
                 }
+                else if (command.id == "market.refresh") {
+                    const auto refreshed = ui.refresh_market_library();
+                    if (!refreshed) {
+                        action_feedback = refreshed.error().message;
+                        action_feedback_error = true;
+                    } else {
+                        action_feedback = "Local market library refreshed.";
+                        action_feedback_error = false;
+                    }
+                }
                 else if (command.id == "create.box") dispatch(carto::application::CreateBoxAction{"Box", {2.0, 2.0, 2.0}});
                 else if (command.id == "create.plane") dispatch(carto::application::CreatePlaneAction{"Plane", 2.0, 2.0});
                 static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::close_overlay));
@@ -2830,6 +2990,20 @@ struct DesktopState {
             return ImGui::ColorConvertFloat4ToU32(color(token));
         };
         draw->AddRectFilled(origin, origin + extent, rgba(snapshot.colors.canvas_0, 1.0F));
+        const float grid_step = snapshot.density == carto::ui::Density::compact ? 28.0F : 36.0F;
+        const ImU32 grid_color = rgba(snapshot.colors.border_soft, 0.22F);
+        for (float x = origin.x + grid_step; x < origin.x + extent.x; x += grid_step) {
+            draw->AddLine(ImVec2(x, origin.y), ImVec2(x, origin.y + extent.y), grid_color, 1.0F);
+        }
+        for (float y = origin.y + grid_step; y < origin.y + extent.y; y += grid_step) {
+            draw->AddLine(ImVec2(origin.x, y), ImVec2(origin.x + extent.x, y), grid_color, 1.0F);
+        }
+        draw->AddLine(ImVec2(origin.x + extent.x * 0.5F, origin.y),
+                      ImVec2(origin.x + extent.x * 0.5F, origin.y + extent.y),
+                      rgba(snapshot.colors.accent_primary, 0.12F), 1.0F);
+        draw->AddLine(ImVec2(origin.x, origin.y + extent.y * 0.5F),
+                      ImVec2(origin.x + extent.x, origin.y + extent.y * 0.5F),
+                      rgba(snapshot.colors.accent_primary, 0.12F), 1.0F);
         const auto instances = snapshot.viewport.scene.instances();
         bool invalid_render_snapshot = false;
         Vec3d minimum{std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
@@ -3814,6 +3988,85 @@ struct DesktopState {
         ImGui::EndChild();
     }
 
+    void draw_market_surface(const UiSnapshot& snapshot) {
+        ImGui::BeginChild("MarketSurface", ImVec2(0, 0), false);
+        heading_text_colored(snapshot.colors.accent_primary, "Community Market");
+        ImGui::TextDisabled(
+            "Local provider-neutral package library. Packages are validated as data-only before install.");
+        ImGui::Dummy(ImVec2(0, 6));
+
+        ImGui::BeginChild("MarketOverview", ImVec2(0, 128), true);
+        ImGui::TextDisabled("Library boundary");
+        if (snapshot.market.library_root.empty()) {
+            ImGui::TextColored(color(snapshot.colors.semantic_warning), "Not configured");
+            ImGui::TextDisabled("The desktop shell has not configured a local package library.");
+        } else {
+            ImGui::Text("Status: %s", carto::ui::market_status_name(snapshot.market.status));
+            mono_text_disabled(snapshot.market.library_root.string().c_str());
+            ImGui::TextWrapped("%s", snapshot.market.status_text.c_str());
+        }
+        if (ImGui::Button("Install data-only package...", ImVec2(208, 32))) {
+            install_market_package();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Refresh", ImVec2(96, 32))) {
+            const auto refreshed = ui.refresh_market_library();
+            if (!refreshed) {
+                action_feedback = refreshed.error().message;
+                action_feedback_error = true;
+            } else {
+                action_feedback = "Local market library refreshed.";
+                action_feedback_error = false;
+            }
+        }
+        ImGui::EndChild();
+
+        ImGui::BeginChild("MarketPackages", ImVec2(0, 0), true);
+        ImGui::TextDisabled("Installed packages");
+        if (snapshot.market.status == carto::ui::MarketStatus::error) {
+            ImGui::TextColored(color(snapshot.colors.semantic_error), "Market evidence is invalid");
+            ImGui::TextWrapped("%s", snapshot.market.status_text.c_str());
+            ImGui::TextDisabled(
+                "The library is fail-closed. Repair or remove the invalid local package evidence, then refresh.");
+        } else if (snapshot.market.packages.empty()) {
+            ImGui::TextDisabled(
+                "No validated package is installed. Use Install data-only package to add a local directory.");
+        } else {
+            for (const auto& package : snapshot.market.packages) {
+                ImGui::PushID((package.package_id + "@" + package.listing_version_id).c_str());
+                ImGui::BeginChild("PackageCard", ImVec2(0, 170), true);
+                ImGui::TextColored(color(snapshot.colors.accent_secondary), "%s@%s",
+                                   package.package_id.c_str(), package.listing_version_id.c_str());
+                ImGui::TextDisabled("Listing %s  ·  Publisher %s  ·  License %s",
+                                    package.listing_id.c_str(), package.publisher_id.c_str(),
+                                    package.license_id.c_str());
+                if (package.source_revision.has_value()) {
+                    ImGui::TextDisabled("Source revision %s", package.source_revision->c_str());
+                }
+                ImGui::Text("Payload %llu bytes  ·  %u file(s)",
+                            static_cast<unsigned long long>(package.payload_bytes),
+                            package.payload_files);
+                ImGui::TextDisabled("Content %s", package.content_digest.c_str());
+                ImGui::TextDisabled("Package %s", package.package_digest.c_str());
+                if (package.publication_receipt_bound) {
+                    ImGui::TextColored(color(snapshot.colors.semantic_success),
+                                       "Detached publication receipt bound at install");
+                } else {
+                    ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                                       "Local package · no publication receipt");
+                }
+                ImGui::EndChild();
+                ImGui::PopID();
+            }
+        }
+        if (!action_feedback.empty()) {
+            ImGui::Separator();
+            draw_action_feedback(snapshot);
+        }
+        ImGui::EndChild();
+        ImGui::EndChild();
+    }
+
     void draw_diagnostics_surface(const UiSnapshot& snapshot) {
         ImGui::BeginChild("DiagnosticsSurface", ImVec2(0, 0), false);
         heading_text_colored(snapshot.colors.accent_primary, "Diagnostics");
@@ -4177,6 +4430,9 @@ struct DesktopState {
         case ShellSurface::project:
             draw_project_surface(snapshot);
             break;
+        case ShellSurface::market:
+            draw_market_surface(snapshot);
+            break;
         case ShellSurface::diagnostics:
             draw_diagnostics_surface(snapshot);
             break;
@@ -4308,6 +4564,7 @@ int run(HINSTANCE instance) {
     state.load_preferences();
     g_state = &state;
     state.window = create_window(instance);
+    state.load_market_library();
     state.load_workbench_preferences();
     ImGui::CreateContext();
     // UI preferences are owned by UiController; do not let Dear ImGui create

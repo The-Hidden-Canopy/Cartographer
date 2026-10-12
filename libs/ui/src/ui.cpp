@@ -844,6 +844,16 @@ const char* mesh_import_format_name(MeshImportFormat format) noexcept {
     return "unknown";
 }
 
+const char* market_status_name(MarketStatus status) noexcept {
+    switch (status) {
+    case MarketStatus::unconfigured: return "unconfigured";
+    case MarketStatus::empty: return "empty";
+    case MarketStatus::ready: return "ready";
+    case MarketStatus::error: return "error";
+    }
+    return "unknown";
+}
+
 const char* workbench_instrument_name(WorkbenchInstrument instrument) noexcept {
     switch (instrument) {
     case WorkbenchInstrument::scene: return "scene";
@@ -1411,6 +1421,118 @@ core::Result<MeshImportReceipt> UiController::import_mesh(
     });
 }
 
+core::Result<void> UiController::configure_market_library(
+    const std::filesystem::path& root) {
+    if (root.empty()) {
+        return core::Result<void>::failure(invalid("market library root must not be empty"));
+    }
+    market_library_ = std::make_unique<market::MarketLibrary>(root);
+    market_view_ = MarketView{};
+    market_view_.library_root = root;
+    return refresh_market_library();
+}
+
+core::Result<void> UiController::refresh_market_library() {
+    if (!market_library_) {
+        market_view_ = MarketView{};
+        const auto diagnostic = invalid_state("market library is not configured");
+        record_market_failure(diagnostic);
+        return core::Result<void>::failure(diagnostic);
+    }
+
+    const auto listed = market_library_->list();
+    if (!listed) {
+        const auto diagnostic = listed.error().with_context("local market library refresh");
+        record_market_failure(diagnostic);
+        return core::Result<void>::failure(diagnostic);
+    }
+
+    MarketView next;
+    next.library_root = market_library_->root();
+    next.status = listed.value().empty() ? MarketStatus::empty : MarketStatus::ready;
+    next.status_text = listed.value().empty()
+        ? "No validated data-only packages are installed."
+        : std::to_string(listed.value().size()) + " validated data-only package(s) installed.";
+    next.packages.reserve(listed.value().size());
+    for (const auto& receipt : listed.value()) {
+        const auto report = market_library_->inspect(
+            receipt.package_id, receipt.listing_version_id);
+        if (!report) {
+            const auto diagnostic = report.error().with_context(
+                "local market package refresh: " + receipt.package_id + "@" +
+                receipt.listing_version_id);
+            record_market_failure(diagnostic);
+            return core::Result<void>::failure(diagnostic);
+        }
+        const auto& manifest = report.value().manifest;
+        next.packages.push_back(MarketPackageView{
+            manifest.package_id,
+            manifest.listing_id,
+            manifest.listing_version_id,
+            manifest.publisher_id,
+            manifest.license_id,
+            manifest.source_revision,
+            "sha256:" + manifest.content_digest.hex(),
+            "sha256:" + report.value().computed_package_digest.hex(),
+            report.value().payload_bytes,
+            report.value().payload_files,
+            receipt.publication_receipt_digest.has_value(),
+        });
+    }
+    market_view_ = std::move(next);
+    return core::Result<void>::success();
+}
+
+core::Result<market::MarketInstallReceipt> UiController::install_market_directory(
+    const std::filesystem::path& package_root) {
+    if (!market_library_) {
+        const auto diagnostic = invalid_state("market library is not configured");
+        record_market_failure(diagnostic);
+        return core::Result<market::MarketInstallReceipt>::failure(diagnostic);
+    }
+    if (package_root.empty()) {
+        const auto diagnostic = invalid("market package directory must not be empty");
+        record_market_failure(diagnostic);
+        return core::Result<market::MarketInstallReceipt>::failure(diagnostic);
+    }
+    const auto installed = market_library_->install_directory(package_root);
+    if (!installed) {
+        const auto diagnostic = installed.error().with_context("local market package install");
+        record_market_failure(diagnostic);
+        return core::Result<market::MarketInstallReceipt>::failure(diagnostic);
+    }
+    if (auto refreshed = refresh_market_library(); !refreshed) {
+        return core::Result<market::MarketInstallReceipt>::failure(
+            refreshed.error().with_context("market package installed but refresh failed"));
+    }
+    return installed;
+}
+
+core::Result<market::MarketInstallReceipt> UiController::install_market_archive(
+    const std::filesystem::path& archive_path) {
+    if (!market_library_) {
+        const auto diagnostic = invalid_state("market library is not configured");
+        record_market_failure(diagnostic);
+        return core::Result<market::MarketInstallReceipt>::failure(diagnostic);
+    }
+    if (archive_path.empty()) {
+        const auto diagnostic = invalid("market archive path must not be empty");
+        record_market_failure(diagnostic);
+        return core::Result<market::MarketInstallReceipt>::failure(diagnostic);
+    }
+    const auto installed = market_library_->install_archive(archive_path);
+    if (!installed) {
+        const auto diagnostic = installed.error().with_context("local market archive install");
+        record_market_failure(diagnostic);
+        return core::Result<market::MarketInstallReceipt>::failure(diagnostic);
+    }
+    if (auto refreshed = refresh_market_library(); !refreshed) {
+        return core::Result<market::MarketInstallReceipt>::failure(
+            refreshed.error().with_context("market archive installed but refresh failed"));
+    }
+    return installed;
+}
+
 core::Result<application::DispatchReceipt> UiController::dispatch_with_category(
     const application::ApplicationAction& action,
     OperationCategory category) {
@@ -1683,6 +1805,9 @@ std::vector<CommandView> UiController::command_views() const {
         {"operator.person", "Person-First Mode", {}, true, {}},
         {"operator.ai", "AI-First Mode", {}, true, {}},
         {"workspace.reset", "Reset Workspace", {}, true, {}},
+        {"market.refresh", "Refresh Local Market Library", {},
+         market_library_ != nullptr, market_library_ == nullptr
+             ? "The local market library is not configured" : ""},
     };
 }
 
@@ -1698,6 +1823,16 @@ void UiController::record_operation(
 void UiController::record_ui_problem(core::Diagnostic diagnostic) {
     if (ui_problems_.size() >= kMaxUiProblems) ui_problems_.erase(ui_problems_.begin());
     ui_problems_.push_back(std::move(diagnostic));
+}
+
+void UiController::record_market_failure(core::Diagnostic diagnostic) {
+    market_view_.status = MarketStatus::error;
+    market_view_.status_text = diagnostic.message;
+    market_view_.packages.clear();
+    if (ui_problems_.empty() || ui_problems_.back().code != diagnostic.code ||
+        ui_problems_.back().message != diagnostic.message) {
+        record_ui_problem(diagnostic);
+    }
 }
 
 core::Result<void> UiController::save_preferences(
@@ -1809,6 +1944,7 @@ UiSnapshot UiController::snapshot() const {
     result.ai_status = preferences_.ai_auto_approve
         ? "Native planner ready. Safe proposals auto-apply through the revision-bound command path."
         : "Native planner ready. Proposals require explicit Apply through the revision-bound command path.";
+    result.market = market_view_;
     if (surface_fidelity_.has_value()) {
         result.surface_fidelity = *surface_fidelity_;
         const auto& preview = *surface_fidelity_;

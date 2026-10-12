@@ -1,10 +1,19 @@
-find_program(CARTO_GLSLC_EXECUTABLE
-    NAMES glslc
-    HINTS "$ENV{VULKAN_SDK}/Bin"
-)
+if(CARTO_GLSLC_EXECUTABLE STREQUAL "")
+    if(Vulkan_GLSLC_EXECUTABLE)
+        set(CARTO_GLSLC_EXECUTABLE "${Vulkan_GLSLC_EXECUTABLE}" CACHE FILEPATH
+            "Path to glslc used to compile Cartographer Vulkan shaders" FORCE)
+    else()
+        find_program(CARTO_GLSLC_EXECUTABLE
+            NAMES glslc
+            HINTS
+                "$ENV{VULKAN_SDK}/Bin"
+                "${CARTO_VULKAN_SDK_ROOT}/Bin"
+        )
+    endif()
+endif()
 if(NOT CARTO_GLSLC_EXECUTABLE)
     message(FATAL_ERROR
-        "CARTO_ENABLE_VULKAN=ON requires glslc from the selected Vulkan SDK")
+        "CARTO_ENABLE_VULKAN=ON requires glslc from the selected Vulkan SDK; set CARTO_GLSLC_EXECUTABLE or CARTO_VULKAN_SDK_ROOT")
 endif()
 
 set(CARTO_VULKAN_SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")

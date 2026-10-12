@@ -14,6 +14,8 @@ permanently proprietary.
 | --- | --- |
 | `.carto` authoring format and validation | model weights, private prompts, provider credentials, and routing policy |
 | provider-neutral scientific entities, fields, studies, results, and provenance | private genome interpretation, solver binaries, anatomy catalogs, and unpublished scientific datasets |
+| revision/digest-bound biological authoring records for microstructure, anatomy, tissue, morphology, and representation correspondence | private biological solvers, runtime lowering policy, game-owned organism history, and proprietary organism datasets |
+| revision/digest-bound SculptStack and GarmentAsset authoring, constraints, and prepared-product receipts | private brush/remesh/cloth kernels, native solver policy, runtime cloth state, and game-owned clothing history |
 | geometry, topology, evaluation, and mesh-attribute kernels | proprietary native kernels, protected adaptive-representation and continuity algorithms, optimization recipes, and tuning data |
 | scene, project, revision, undo/redo, and receipts | private telemetry, workflow-learning stores, and unreleased datasets |
 | provider-neutral semantic areas/paths, structure graphs, reconstructible instance fields, and sparse variants | runtime materialization policy, proprietary world generation, and unreleased game-world corpora |

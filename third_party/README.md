@@ -2,10 +2,15 @@
 
 The headless Cartographer build has no third-party runtime dependency.
 
-The optional Windows desktop target uses Dear ImGui. Configure it with
-`-DCARTO_IMGUI_ROOT=<path-to-a-pinned-imgui-tree>` and retain the upstream
-license and attribution alongside the dependency. The repository intentionally
-does not fetch source code during a normal configure or build.
+The optional Windows desktop target uses the pinned Dear ImGui source tree in
+`third_party/imgui` (v1.92.9, commit
+`01380c579715e62fb9a8d6ec0502c4ea83bfde6e`). The upstream MIT license is kept
+at `third_party/imgui/LICENSE.txt`. Consumers that carry a separately reviewed
+Dear ImGui checkout may override the bundled copy with
+`-DCARTO_IMGUI_ROOT=<path-to-a-pinned-imgui-tree>` and can disable the bundled
+default with `-DCARTO_USE_BUNDLED_IMGUI=OFF`.
+
+The build does not download source code during configure or build.
 
 The adapter targets the current Vulkan backend initialization shape: the
 application supplies `ImGui_ImplVulkan_InitInfo::ApiVersion` and the main

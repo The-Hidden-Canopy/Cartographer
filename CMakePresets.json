@@ -64,6 +64,19 @@
       }
     },
     {
+      "name": "desktop-vulkan-release",
+      "displayName": "Cartographer Vulkan/ImGui desktop shell",
+      "inherits": "vulkan-headless-release",
+      "binaryDir": "${sourceDir}/build/desktop-vulkan-release",
+      "cacheVariables": {
+        "CARTO_BUILD_DESKTOP": "ON",
+        "CARTO_BUILD_TESTS": "OFF",
+        "CARTO_BUILD_CLI": "OFF",
+        "CARTO_BUILD_DEVICE_CPU": "OFF",
+        "CARTO_USE_BUNDLED_IMGUI": "ON"
+      }
+    },
+    {
       "name": "d3d12-headless-release",
       "displayName": "Cartographer D3D12 headless acceptance",
       "inherits": "headless-release",
@@ -111,6 +124,10 @@
     {
       "name": "vulkan-headless-release",
       "configurePreset": "vulkan-headless-release"
+    },
+    {
+      "name": "desktop-vulkan-release",
+      "configurePreset": "desktop-vulkan-release"
     },
     {
       "name": "d3d12-headless-release",
