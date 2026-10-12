@@ -45,3 +45,11 @@ loss cannot make an owned root appear new or permit a lineage takeover.
 This boundary proves coherent portable file publication. It does not claim an
 Unreal, Unity, or private runtime editor applied native changes atomically;
 native adapters own their own staging, mapping, rollback, and evidence.
+
+The checked-in `tests/fixtures/cartographer-destination-prepared-v1` publication is
+the producer-side compatibility fixture for one destination adapter. The
+Cartographer test reopens the selected revision, manifest, render-mesh product,
+and material-catalog product with Cartographer's own readers and verifies their
+content identities. The fixture contains only this neutral publication
+contract: destination runtime code, handles, telemetry, and private worker
+implementation remain outside this repository.
