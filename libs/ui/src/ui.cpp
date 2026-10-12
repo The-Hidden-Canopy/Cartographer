@@ -1,10 +1,17 @@
 #include <carto/ui/ui.hpp>
 
+#include <carto/io/builtin_provider.hpp>
+#include <carto/io/obj.hpp>
+#include <carto/io/ply.hpp>
+#include <carto/io/stl.hpp>
+#include <carto/providers/registry.hpp>
+
 #include <algorithm>
 #include <atomic>
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -13,6 +20,7 @@
 #include <string_view>
 #include <system_error>
 #include <type_traits>
+#include <tuple>
 #include <utility>
 
 #ifdef _WIN32
@@ -119,8 +127,8 @@ std::vector<WorkspaceDefinition> make_workspace_registry() {
     };
     return {
         {Workspace::model, "model", "Model", model_panels, BottomPanel::operations, true, {}},
-        future(Workspace::sculpt, "sculpt", "Sculpt", model_panels, BottomPanel::operations,
-               "sculpt authoring tools are not available in this build"),
+        {Workspace::sculpt, "sculpt", "Sculpt", model_panels, BottomPanel::operations,
+         true, {}},
         future(Workspace::cad, "cad", "CAD", graph_panels, BottomPanel::graph,
                "CAD sketch and constraint tools are not available in this build"),
         future(Workspace::build, "build", "Build", asset_panels, BottomPanel::assets,
@@ -171,6 +179,9 @@ bool is_operation_action(const application::ApplicationAction& action) {
             std::is_same_v<Action, application::CreateBoxAction> ||
             std::is_same_v<Action, application::CreatePlaneAction> ||
             std::is_same_v<Action, application::CreateMeshObjectAction> ||
+            std::is_same_v<Action, application::AppendSculptStrokeAction> ||
+            std::is_same_v<Action, application::AppendSculptSurfaceStrokeAction> ||
+            std::is_same_v<Action, application::SetSculptLayerVisibilityAction> ||
             std::is_same_v<Action, application::SetObjectTransformAction>;
     }, action);
 }
@@ -824,6 +835,15 @@ const char* bottom_panel_name(BottomPanel panel) noexcept {
     return "unknown";
 }
 
+const char* mesh_import_format_name(MeshImportFormat format) noexcept {
+    switch (format) {
+    case MeshImportFormat::obj: return "OBJ";
+    case MeshImportFormat::ply: return "PLY";
+    case MeshImportFormat::stl: return "STL";
+    }
+    return "unknown";
+}
+
 const char* workbench_instrument_name(WorkbenchInstrument instrument) noexcept {
     switch (instrument) {
     case WorkbenchInstrument::scene: return "scene";
@@ -916,6 +936,215 @@ std::optional<editor::SelectionOperation> selection_operation_for_native_pointer
     if (control) return editor::SelectionOperation::toggle;
     if (shift) return editor::SelectionOperation::add;
     return editor::SelectionOperation::replace;
+}
+
+core::Result<production::SculptStrokeSample> sample_sculpt_viewport_surface(
+    std::span<const SculptViewportTriangle> triangles,
+    scene::ObjectId object,
+    core::Vec2d screen_position) {
+    if (object.value == 0U || !screen_position.finite()) {
+        return core::Result<production::SculptStrokeSample>::failure(invalid(
+            "Sculpt viewport sample requires a mesh identity and finite screen point"));
+    }
+
+    std::optional<production::SculptStrokeSample> best_sample;
+    double best_depth = -std::numeric_limits<double>::infinity();
+    std::array<std::uint64_t, 4> best_identity{};
+    for (const SculptViewportTriangle& triangle : triangles) {
+        if (triangle.object != object) continue;
+        if (triangle.face.value == 0U || triangle.vertices[0].value == 0U ||
+            triangle.vertices[1].value == 0U || triangle.vertices[2].value == 0U ||
+            triangle.vertices[0] == triangle.vertices[1] ||
+            triangle.vertices[0] == triangle.vertices[2] ||
+            triangle.vertices[1] == triangle.vertices[2]) {
+            return core::Result<production::SculptStrokeSample>::failure(validation(
+                "Sculpt viewport triangle has invalid stable source identity"));
+        }
+        for (std::size_t index = 0U; index < triangle.screen_positions.size(); ++index) {
+            if (!triangle.screen_positions[index].finite() ||
+                !triangle.local_positions[index].finite() ||
+                !std::isfinite(triangle.camera_depth[index])) {
+                return core::Result<production::SculptStrokeSample>::failure(validation(
+                    "Sculpt viewport triangle contains non-finite projected source data"));
+            }
+        }
+
+        const core::Vec2d& a = triangle.screen_positions[0];
+        const core::Vec2d& b = triangle.screen_positions[1];
+        const core::Vec2d& c = triangle.screen_positions[2];
+        const double denominator = (b.y - c.y) * (a.x - c.x) +
+            (c.x - b.x) * (a.y - c.y);
+        if (!std::isfinite(denominator) || std::abs(denominator) <= 1.0e-12) continue;
+        const double first = ((b.y - c.y) * (screen_position.x - c.x) +
+            (c.x - b.x) * (screen_position.y - c.y)) / denominator;
+        const double second = ((c.y - a.y) * (screen_position.x - c.x) +
+            (a.x - c.x) * (screen_position.y - c.y)) / denominator;
+        const double third = 1.0 - first - second;
+        constexpr double barycentric_tolerance = 1.0e-10;
+        if (!std::isfinite(first) || !std::isfinite(second) || !std::isfinite(third) ||
+            first < -barycentric_tolerance || second < -barycentric_tolerance ||
+            third < -barycentric_tolerance) {
+            continue;
+        }
+
+        std::array<double, 3> weights{
+            std::clamp(first, 0.0, 1.0),
+            std::clamp(second, 0.0, 1.0),
+            std::clamp(third, 0.0, 1.0)};
+        const double total = weights[0] + weights[1] + weights[2];
+        if (!std::isfinite(total) || total <= 0.0) {
+            return core::Result<production::SculptStrokeSample>::failure(validation(
+                "Sculpt viewport hit produced invalid barycentric coordinates"));
+        }
+        for (double& weight : weights) weight /= total;
+        const double depth = triangle.camera_depth[0] * weights[0] +
+            triangle.camera_depth[1] * weights[1] +
+            triangle.camera_depth[2] * weights[2];
+        if (!std::isfinite(depth)) {
+            return core::Result<production::SculptStrokeSample>::failure(validation(
+                "Sculpt viewport hit produced a non-finite camera depth"));
+        }
+        const std::array<std::uint64_t, 4> identity{
+            triangle.face.value,
+            triangle.vertices[0].value,
+            triangle.vertices[1].value,
+            triangle.vertices[2].value};
+        const double depth_tolerance = 1.0e-12 * std::max({
+            1.0, std::abs(depth), best_sample.has_value() ? std::abs(best_depth) : 0.0});
+        const bool nearer = !best_sample.has_value() || depth > best_depth + depth_tolerance;
+        const bool stable_tie = best_sample.has_value() &&
+            std::abs(depth - best_depth) <= depth_tolerance && identity < best_identity;
+        if (!nearer && !stable_tie) continue;
+
+        core::Vec3d position{};
+        for (std::size_t index = 0U; index < weights.size(); ++index) {
+            position = position + triangle.local_positions[index] * weights[index];
+        }
+        if (!position.finite() || !std::isfinite(depth)) {
+            return core::Result<production::SculptStrokeSample>::failure(validation(
+                "Sculpt viewport hit produced a non-finite source sample"));
+        }
+        production::SculptSurfaceAnchor anchor{
+            triangle.face, triangle.vertices, weights};
+        if (auto result = anchor.validate(); !result) {
+            return core::Result<production::SculptStrokeSample>::failure(result.error());
+        }
+        best_sample = production::SculptStrokeSample{
+            position, 1.0, std::move(anchor), std::nullopt};
+        best_depth = depth;
+        best_identity = identity;
+    }
+    if (!best_sample.has_value()) {
+        return core::Result<production::SculptStrokeSample>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "Sculpt viewport cursor does not project onto the selected mesh surface"));
+    }
+    return core::Result<production::SculptStrokeSample>::success(std::move(*best_sample));
+}
+
+core::Result<std::vector<production::SculptStrokeSample>> sample_sculpt_viewport_stroke(
+    std::span<const SculptViewportTriangle> triangles,
+    scene::ObjectId object,
+    std::span<const core::Vec2d> screen_path,
+    double maximum_spacing_pixels) {
+    constexpr std::size_t maximum_raw_points = 8192U;
+    if (screen_path.empty() || screen_path.size() > maximum_raw_points ||
+        !std::isfinite(maximum_spacing_pixels) || maximum_spacing_pixels <= 0.0 ||
+        maximum_spacing_pixels > 512.0) {
+        return core::Result<std::vector<production::SculptStrokeSample>>::failure(invalid(
+            "Sculpt viewport path or resampling spacing is outside its bound"));
+    }
+    double total_path_length = 0.0;
+    for (std::size_t index = 0U; index < screen_path.size(); ++index) {
+        if (!screen_path[index].finite()) {
+            return core::Result<std::vector<production::SculptStrokeSample>>::failure(invalid(
+                "Sculpt viewport path contains a non-finite cursor point"));
+        }
+        if (index == 0U) continue;
+        const double segment_length = std::hypot(
+            screen_path[index].x - screen_path[index - 1U].x,
+            screen_path[index].y - screen_path[index - 1U].y);
+        if (!std::isfinite(segment_length) ||
+            segment_length > std::numeric_limits<double>::max() - total_path_length) {
+            return core::Result<std::vector<production::SculptStrokeSample>>::failure(validation(
+                "Sculpt viewport path length exceeds its numeric bound"));
+        }
+        total_path_length += segment_length;
+    }
+    const double spacing_intervals = std::ceil(total_path_length / maximum_spacing_pixels);
+    if (!std::isfinite(spacing_intervals) ||
+        spacing_intervals + 1.0 >
+            static_cast<double>(production::kMaxSculptSamplesPerStroke)) {
+        return core::Result<std::vector<production::SculptStrokeSample>>::failure(invalid(
+            "Sculpt viewport stroke exceeds its deterministic sample bound"));
+    }
+
+    std::vector<production::SculptStrokeSample> samples;
+    samples.reserve(std::min(
+        production::kMaxSculptSamplesPerStroke, screen_path.size() + 16U));
+    const auto append_sample = [&triangles, object, &samples](core::Vec2d point)
+        -> core::Result<void> {
+        auto sample = sample_sculpt_viewport_surface(triangles, object, point);
+        if (!sample) return core::Result<void>::failure(sample.error());
+        if (samples.size() >= production::kMaxSculptSamplesPerStroke) {
+            return core::Result<void>::failure(invalid(
+                "Sculpt viewport stroke exceeds its deterministic sample bound"));
+        }
+        samples.push_back(std::move(sample.value()));
+        return core::Result<void>::success();
+    };
+
+    if (auto result = append_sample(screen_path.front()); !result) {
+        return core::Result<std::vector<production::SculptStrokeSample>>::failure(result.error());
+    }
+    core::Vec2d last_emitted = screen_path.front();
+    double distance_until_sample = maximum_spacing_pixels;
+    for (std::size_t segment = 1U; segment < screen_path.size(); ++segment) {
+        const core::Vec2d start = screen_path[segment - 1U];
+        const core::Vec2d end = screen_path[segment];
+        if (!start.finite() || !end.finite()) {
+            return core::Result<std::vector<production::SculptStrokeSample>>::failure(invalid(
+                "Sculpt viewport path contains a non-finite cursor point"));
+        }
+        const core::Vec2d delta{end.x - start.x, end.y - start.y};
+        const double length = std::hypot(delta.x, delta.y);
+        if (!std::isfinite(length)) {
+            return core::Result<std::vector<production::SculptStrokeSample>>::failure(validation(
+                "Sculpt viewport path segment length is non-finite"));
+        }
+        if (length <= 1.0e-12) continue;
+
+        double travelled = 0.0;
+        while (length - travelled + 1.0e-12 >= distance_until_sample) {
+            travelled += distance_until_sample;
+            const double fraction = std::min(1.0, travelled / length);
+            const core::Vec2d point{
+                start.x + delta.x * fraction,
+                start.y + delta.y * fraction};
+            if (auto result = append_sample(point); !result) {
+                return core::Result<std::vector<production::SculptStrokeSample>>::failure(
+                    result.error());
+            }
+            last_emitted = point;
+            distance_until_sample = maximum_spacing_pixels;
+        }
+        distance_until_sample -= length - travelled;
+        distance_until_sample = std::clamp(
+            distance_until_sample, 1.0e-12, maximum_spacing_pixels);
+    }
+
+    const core::Vec2d endpoint = screen_path.back();
+    if (!endpoint.finite()) {
+        return core::Result<std::vector<production::SculptStrokeSample>>::failure(invalid(
+            "Sculpt viewport path contains a non-finite cursor point"));
+    }
+    if (std::hypot(endpoint.x - last_emitted.x, endpoint.y - last_emitted.y) > 1.0e-9) {
+        if (auto result = append_sample(endpoint); !result) {
+            return core::Result<std::vector<production::SculptStrokeSample>>::failure(
+                result.error());
+        }
+    }
+    return core::Result<std::vector<production::SculptStrokeSample>>::success(std::move(samples));
 }
 
 core::Result<void> save_workbench_preferences(
@@ -1094,6 +1323,92 @@ core::Result<application::DispatchReceipt> UiController::submit_ai_proposal(
         "raw AI application actions are rejected; submit a typed proposal and preview it first");
     record_ui_problem(diagnostic);
     return core::Result<application::DispatchReceipt>::failure(diagnostic);
+}
+
+core::Result<MeshImportReceipt> UiController::import_mesh(
+    const std::filesystem::path& path,
+    MeshImportFormat format) {
+    const auto fail = [this](core::Diagnostic diagnostic) {
+        auto surfaced = diagnostic.with_context("native mesh import");
+        record_ui_problem(surfaced);
+        return core::Result<MeshImportReceipt>::failure(std::move(surfaced));
+    };
+    if (path.empty() || path.filename().empty()) {
+        return fail(invalid("mesh import path must name a file"));
+    }
+
+    providers::Registry providers;
+    const auto registered = [&]() -> core::Result<void> {
+        switch (format) {
+        case MeshImportFormat::obj:
+            return io::register_builtin_obj_providers(providers);
+        case MeshImportFormat::ply:
+            return io::register_builtin_ply_providers(providers);
+        case MeshImportFormat::stl:
+            return io::register_builtin_stl_providers(providers);
+        }
+        return core::Result<void>::failure(unsupported("mesh import format is unsupported"));
+    }();
+    if (!registered) return fail(registered.error());
+
+    const std::string capability = [&]() -> std::string {
+        switch (format) {
+        case MeshImportFormat::obj: return "geometry.import.obj";
+        case MeshImportFormat::ply: return "geometry.import.ply";
+        case MeshImportFormat::stl: return "geometry.import.stl";
+        }
+        return {};
+    }();
+    if (capability.empty()) {
+        return fail(unsupported("mesh import format has no provider capability"));
+    }
+    if (auto resolved = providers.resolve(capability); !resolved) {
+        return fail(resolved.error());
+    }
+
+    geometry::EditableMesh mesh;
+    io::IoReport report;
+    switch (format) {
+    case MeshImportFormat::obj: {
+        auto imported = io::import_obj(path);
+        if (!imported) return fail(imported.error());
+        mesh = std::move(imported.value().mesh);
+        report = std::move(imported.value().report);
+        break;
+    }
+    case MeshImportFormat::ply: {
+        auto imported = io::import_ply(path);
+        if (!imported) return fail(imported.error());
+        mesh = std::move(imported.value().mesh);
+        report = std::move(imported.value().report);
+        break;
+    }
+    case MeshImportFormat::stl: {
+        auto imported = io::import_stl(path);
+        if (!imported) return fail(imported.error());
+        mesh = std::move(imported.value().mesh);
+        report = std::move(imported.value().report);
+        break;
+    }
+    default:
+        return fail(unsupported("mesh import format is unsupported"));
+    }
+
+    std::string object_name = path.stem().string();
+    if (object_name.empty()) object_name = "Imported Mesh";
+    auto admitted = dispatch(application::CreateMeshObjectAction{object_name, std::move(mesh)});
+    if (!admitted) {
+        return core::Result<MeshImportReceipt>::failure(admitted.error());
+    }
+    return core::Result<MeshImportReceipt>::success(MeshImportReceipt{
+        format,
+        std::move(object_name),
+        report.vertices,
+        report.faces,
+        report.triangles,
+        std::move(report.warnings),
+        std::move(admitted).value(),
+    });
 }
 
 core::Result<application::DispatchReceipt> UiController::dispatch_with_category(
@@ -1354,6 +1669,8 @@ core::Result<void> UiController::sync_application_workspace(
 std::vector<CommandView> UiController::command_views() const {
     return {
         {"project.save", "Save Project", "Ctrl+S", true, {}},
+        {"file.import-mesh", "Import Mesh", "Ctrl+I", true, {}},
+        {"edit.duplicate", "Duplicate Selected Object", "Ctrl+D", true, {}},
         {"edit.undo", "Undo", "Ctrl+Z", true, {}},
         {"edit.redo", "Redo", "Ctrl+Y", true, {}},
         {"edit.repeat-last", "Repeat Last Tool", "Ctrl+R", true, {}},

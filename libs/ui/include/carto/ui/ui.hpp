@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -189,6 +190,30 @@ struct NativePointerEvent {
     bool pressed = true;
 };
 
+// Triangle identity and source positions captured from one viewport snapshot.
+// The desktop's current orthographic view looks down +Y; `camera_depth` stores
+// world Y so overlapping screen-space hits resolve to the frontmost surface.
+struct SculptViewportTriangle {
+    scene::ObjectId object;
+    geometry::FaceId face;
+    std::array<core::Vec2d, 3> screen_positions{};
+    std::array<geometry::VertexId, 3> vertices{};
+    std::array<core::Vec3d, 3> local_positions{};
+    std::array<double, 3> camera_depth{};
+};
+
+[[nodiscard]] core::Result<production::SculptStrokeSample> sample_sculpt_viewport_surface(
+    std::span<const SculptViewportTriangle> triangles,
+    scene::ObjectId object,
+    core::Vec2d screen_position);
+
+[[nodiscard]] core::Result<std::vector<production::SculptStrokeSample>>
+sample_sculpt_viewport_stroke(
+    std::span<const SculptViewportTriangle> triangles,
+    scene::ObjectId object,
+    std::span<const core::Vec2d> screen_path,
+    double maximum_spacing_pixels);
+
 [[nodiscard]] std::optional<editor::SelectionOperation>
 selection_operation_for_native_pointer(const NativePointerEvent& event) noexcept;
 
@@ -207,6 +232,25 @@ struct CommandView {
     std::string shortcut;
     bool supported = true;
     std::string unavailable_reason;
+};
+
+enum class MeshImportFormat {
+    obj,
+    ply,
+    stl,
+};
+
+// A front-end import result carries both interchange evidence and the
+// authoritative application receipt. The parsed mesh is never exposed as a
+// second mutable UI copy: admission finishes through CreateMeshObjectAction.
+struct MeshImportReceipt {
+    MeshImportFormat format = MeshImportFormat::obj;
+    std::string object_name;
+    std::size_t vertices = 0U;
+    std::size_t faces = 0U;
+    std::size_t triangles = 0U;
+    std::vector<std::string> warnings;
+    application::DispatchReceipt dispatch;
 };
 
 struct UiPreferences {
@@ -342,6 +386,7 @@ struct UiSnapshot : application::ApplicationSnapshot {
 [[nodiscard]] core::Result<WorkspaceDefinition> workspace_definition(Workspace workspace);
 [[nodiscard]] const char* panel_name(Panel panel) noexcept;
 [[nodiscard]] const char* bottom_panel_name(BottomPanel panel) noexcept;
+[[nodiscard]] const char* mesh_import_format_name(MeshImportFormat format) noexcept;
 [[nodiscard]] const char* workbench_instrument_name(WorkbenchInstrument instrument) noexcept;
 [[nodiscard]] const char* surface_fidelity_status_name(
     SurfaceFidelityStatus status) noexcept;
@@ -380,6 +425,12 @@ public:
         const ai::Proposal& proposal);
     [[nodiscard]] core::Result<application::DispatchReceipt> submit_ai_proposal(
         const application::ApplicationAction& action);
+    // Resolves the built-in provider, parses bounded interchange input, and
+    // admits the resulting mesh through the same human application boundary
+    // used by native modelling controls. Failures never mutate the project.
+    [[nodiscard]] core::Result<MeshImportReceipt> import_mesh(
+        const std::filesystem::path& path,
+        MeshImportFormat format);
     [[nodiscard]] core::Result<void> set_operator_mode(OperatorMode mode);
     [[nodiscard]] core::Result<void> set_workspace(Workspace workspace);
     [[nodiscard]] core::Result<void> set_density(Density density);

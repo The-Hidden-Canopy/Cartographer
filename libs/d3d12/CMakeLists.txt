@@ -1,6 +1,8 @@
 add_library(carto_d3d12 STATIC
     src/device.cpp
+    src/projection_worker.cpp
     src/swapchain.cpp
+    src/texture_upload.cpp
 )
 
 target_include_directories(carto_d3d12
@@ -42,7 +44,41 @@ target_link_libraries(carto_d3d12
 
 carto_target(carto_d3d12)
 
+add_library(carto_d3d12_bake STATIC
+    src/bake_graph.cpp
+)
+target_include_directories(carto_d3d12_bake
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    PRIVATE
+        "${PROJECT_SOURCE_DIR}/libs/production/src"
+)
+target_link_libraries(carto_d3d12_bake
+    PUBLIC
+        carto_d3d12
+        carto_production
+)
+carto_target(carto_d3d12_bake)
+
+add_library(carto_d3d12_sculpt_preview STATIC
+    src/sculpt_preview.cpp
+)
+target_include_directories(carto_d3d12_sculpt_preview
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(carto_d3d12_sculpt_preview
+    PUBLIC
+        carto_d3d12
+        carto_production
+)
+carto_target(carto_d3d12_sculpt_preview)
+
 install(TARGETS carto_d3d12 EXPORT CartographerTargets)
+install(TARGETS carto_d3d12_bake EXPORT CartographerTargets)
+install(TARGETS carto_d3d12_sculpt_preview EXPORT CartographerTargets)
 install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY shaders/ DESTINATION share/cartographer/shaders
     FILES_MATCHING PATTERN "*.hlsl")

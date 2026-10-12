@@ -1048,6 +1048,37 @@ core::Result<TopologyEditReceipt> EditableMesh::split_edge(EdgeId id, double fac
     for (const EdgeId created : receipt.created_edges) {
         add_origin(receipt.edge_origins, created, OriginKind::split_from, {id.value});
     }
+    for (const CornerId created : receipt.created_corners) {
+        const auto destination_corner = corners_.find(created);
+        if (destination_corner == corners_.end() ||
+            destination_corner->second.vertex != created_vertex) {
+            *this = before;
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::stale_data,
+                "mesh edge split created a corner outside the inserted vertex"));
+        }
+        const auto first_corner = std::find_if(
+            before.corners_.begin(), before.corners_.end(), [destination_corner, edge](const auto& item) {
+                return item.second.face == destination_corner->second.face &&
+                    item.second.vertex == edge.first;
+            });
+        const auto second_corner = std::find_if(
+            before.corners_.begin(), before.corners_.end(), [destination_corner, edge](const auto& item) {
+                return item.second.face == destination_corner->second.face &&
+                    item.second.vertex == edge.second;
+            });
+        if (first_corner == before.corners_.end() || second_corner == before.corners_.end()) {
+            *this = before;
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::stale_data,
+                "mesh edge split cannot bind a created corner to both source endpoints"));
+        }
+        std::vector<std::uint64_t> source_corners{
+            first_corner->first.value, second_corner->first.value};
+        std::sort(source_corners.begin(), source_corners.end());
+        add_origin(receipt.corner_origins, created, OriginKind::interpolated_from,
+            std::move(source_corners));
+    }
     if (auto result = receipt.validate(); !result) {
         *this = before;
         return core::Result<TopologyEditReceipt>::failure(result.error());

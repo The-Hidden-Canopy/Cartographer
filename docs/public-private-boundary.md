@@ -16,6 +16,7 @@ permanently proprietary.
 | provider-neutral scientific entities, fields, studies, results, and provenance | private genome interpretation, solver binaries, anatomy catalogs, and unpublished scientific datasets |
 | geometry, topology, evaluation, and mesh-attribute kernels | proprietary native kernels, protected adaptive-representation and continuity algorithms, optimization recipes, and tuning data |
 | scene, project, revision, undo/redo, and receipts | private telemetry, workflow-learning stores, and unreleased datasets |
+| provider-neutral semantic areas/paths, structure graphs, reconstructible instance fields, and sparse variants | runtime materialization policy, proprietary world generation, and unreleased game-world corpora |
 | OBJ, PLY, STL, glTF, and other reviewed interchange | private schemas, catalogs, and hosted-service state |
 | render-graph, RHI, CPU reference, and clean-room GPU contracts | proprietary GPU passes, performance recipes, and entitlements |
 | generic Vulkan/D3D12/backend acceptance and offline benchmarks | credentials, internal automation, and uncleared source specifications |
@@ -80,6 +81,13 @@ explicit lineage/signature bindings and derived coordinates. It does not
 contain private morphospace models, alignment weights, genome interpretation
 logic, or provider output.
 sequence/adaptation payload is not implicitly a functional genome.
+
+The v7 world record is likewise generic authoring truth. It stores stable
+semantic identity, explicit Cartographer geometry bindings, bounded path and
+structure topology, deterministic instance recipe/seed/extent metadata, and
+sparse canonical property edits. It does not store a private generator,
+adaptive representation or certification policy, runtime entity handles,
+VANTA residency state, private game content, or execution telemetry.
 
 The anatomy provider candidate envelope is likewise provider-neutral. It carries
 source revision and geometry/manifest digests, but no provider credentials,

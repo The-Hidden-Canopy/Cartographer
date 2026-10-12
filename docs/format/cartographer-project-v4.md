@@ -1,6 +1,6 @@
 # Cartographer project format v4 (historical)
 
-Current saves use [project format v6](cartographer-project-v6.md). This page
+Current saves use [project format v9](cartographer-project-v9.md). This page
 documents the v4 topology-lineage format that remains readable for migration.
 
 Cartographer v4 keeps the v3 authoring envelope and adds a bounded, durable

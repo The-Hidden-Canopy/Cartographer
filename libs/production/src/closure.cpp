@@ -48,6 +48,10 @@ bool valid_artifact_kind(ArtifactKind kind) {
     case ArtifactKind::residency_page:
     case ArtifactKind::publication_package:
     case ArtifactKind::evidence_bundle:
+    case ArtifactKind::baked_texture:
+    case ArtifactKind::cloth_simulation:
+    case ArtifactKind::cloth_rest_pose:
+    case ArtifactKind::multires_hierarchy:
         return true;
     }
     return false;
@@ -81,7 +85,11 @@ std::optional<ArtifactKind> artifact_kind_from_name(std::string_view name) {
                             ArtifactKind::material_package,
                             ArtifactKind::residency_page,
                             ArtifactKind::publication_package,
-                            ArtifactKind::evidence_bundle}) {
+                            ArtifactKind::evidence_bundle,
+                            ArtifactKind::baked_texture,
+                            ArtifactKind::cloth_simulation,
+                            ArtifactKind::cloth_rest_pose,
+                            ArtifactKind::multires_hierarchy}) {
         if (name == artifact_kind_name(kind)) return kind;
     }
     return std::nullopt;
@@ -142,6 +150,10 @@ const char* artifact_kind_name(ArtifactKind kind) noexcept {
     case ArtifactKind::residency_page: return "residency-page";
     case ArtifactKind::publication_package: return "publication-package";
     case ArtifactKind::evidence_bundle: return "evidence-bundle";
+    case ArtifactKind::baked_texture: return "baked-texture";
+    case ArtifactKind::cloth_simulation: return "cloth-simulation";
+    case ArtifactKind::cloth_rest_pose: return "cloth-rest-pose";
+    case ArtifactKind::multires_hierarchy: return "multires-hierarchy";
     }
     return "unknown";
 }
@@ -184,6 +196,31 @@ std::string AuthoritativeSource::canonical() const {
         ";content=" + content_digest.hex();
 }
 
+core::Result<void> ProductionDecisionContext::validate() const {
+    if ((!truth_class.empty() && !safe_text(truth_class, 128U)) ||
+        (!observer_class.empty() && !safe_text(observer_class, 128U)) ||
+        (!precision_requirement.empty() && !safe_text(precision_requirement, 128U)) ||
+        (!materialization_requirement.empty() &&
+         !safe_text(materialization_requirement, 128U))) {
+        return core::Result<void>::failure(invalid(
+            "production decision context identifiers are unsafe or too long"));
+    }
+    return core::Result<void>::success();
+}
+
+std::string ProductionDecisionContext::canonical() const {
+    if (truth_class.empty() && observer_class.empty() &&
+        precision_requirement.empty() && materialization_requirement.empty()) {
+        return {};
+    }
+    std::ostringstream output;
+    output << "truth=" << std::quoted(truth_class)
+           << ";observer=" << std::quoted(observer_class)
+           << ";precision=" << std::quoted(precision_requirement)
+           << ";materialization=" << std::quoted(materialization_requirement);
+    return output.str();
+}
+
 core::Result<void> ProductionCookKey::validate() const {
     if (auto result = source.validate(); !result) return result;
     if (!valid_artifact_kind(kind) || !valid_execution_form(form)) {
@@ -194,13 +231,32 @@ core::Result<void> ProductionCookKey::validate() const {
         return core::Result<void>::failure(invalid(
             "production cook key requires safe algorithm/platform and settings digest"));
     }
+    if ((!representation_kind.empty() && !safe_text(representation_kind, 128U)) ||
+        (!spatial_scope.empty() && !safe_text(spatial_scope, 256U))) {
+        return core::Result<void>::failure(invalid(
+            "production cook key representation or spatial scope is unsafe or too long"));
+    }
+    if (auto result = decision_context.validate(); !result) return result;
     return core::Result<void>::success();
 }
 
 std::string ProductionCookKey::canonical() const {
-    return "source{" + source.canonical() + "};kind=" + artifact_kind_name(kind) +
+    auto output = "source{" + source.canonical() + "};kind=" + artifact_kind_name(kind) +
         ";form=" + execution_form_name(form) + ";algorithm=" + algorithm +
         ";settings=" + settings_digest.hex() + ";platform=" + platform_profile;
+    if (!representation_kind.empty() || !spatial_scope.empty()) {
+        std::ostringstream scoped;
+        scoped << output << ";representation=" << std::quoted(representation_kind)
+               << ";spatial=" << std::quoted(spatial_scope);
+        output = scoped.str();
+    }
+    const auto context = decision_context.canonical();
+    if (!context.empty()) {
+        std::ostringstream scoped;
+        scoped << output << ";decision-context=" << std::quoted(context);
+        output = scoped.str();
+    }
+    return output;
 }
 
 core::Result<void> QualityTelemetry::validate() const {
@@ -302,7 +358,63 @@ core::Result<void> AdmissionPolicy::validate() const {
         return core::Result<void>::failure(invalid(
             "production admission confidence budget is invalid"));
     }
+    if ((max_cook_milliseconds.has_value() &&
+         !finite_nonnegative(max_cook_milliseconds.value())) ||
+        (max_cpu_milliseconds.has_value() &&
+         !finite_nonnegative(max_cpu_milliseconds.value())) ||
+        (max_gpu_milliseconds.has_value() &&
+         !finite_nonnegative(max_gpu_milliseconds.value()))) {
+        return core::Result<void>::failure(invalid(
+            "production admission time budget is invalid"));
+    }
     return core::Result<void>::success();
+}
+
+std::string AdmissionPolicy::canonical() const {
+    const auto append_optional_double = [](std::ostringstream& output,
+                                           const std::optional<double>& value) {
+        if (value.has_value()) {
+            const double canonical_value = value.value() == 0.0 ? 0.0 : value.value();
+            output << std::setprecision(17) << canonical_value;
+        } else {
+            output << "none";
+        }
+    };
+    const auto append_optional_u64 = [](std::ostringstream& output,
+                                        const std::optional<std::uint64_t>& value) {
+        if (value.has_value()) {
+            output << value.value();
+        } else {
+            output << "none";
+        }
+    };
+
+    std::ostringstream output;
+    output << "admission-policy-v1{max-error=";
+    append_optional_double(output, max_measured_error);
+    const double canonical_confidence = min_confidence == 0.0 ? 0.0 : min_confidence;
+    output << ";min-confidence=" << std::setprecision(17) << canonical_confidence
+           << ";max-resident=";
+    append_optional_u64(output, max_resident_bytes);
+    output << ";max-cook-ms=";
+    append_optional_double(output, max_cook_milliseconds);
+    output << ";max-cpu-ms=";
+    append_optional_double(output, max_cpu_milliseconds);
+    output << ";max-gpu-ms=";
+    append_optional_double(output, max_gpu_milliseconds);
+    output << ";max-disk=";
+    append_optional_u64(output, max_disk_bytes);
+    output << ";max-output=";
+    append_optional_u64(output, max_output_bytes);
+    output << '}';
+    return output.str();
+}
+
+core::Result<assets::Sha256Digest> AdmissionPolicy::canonical_digest() const {
+    if (auto result = validate(); !result) {
+        return core::Result<assets::Sha256Digest>::failure(result.error());
+    }
+    return core::Result<assets::Sha256Digest>::success(digest_text(canonical()));
 }
 
 core::Result<void> validate_publication(
@@ -333,6 +445,31 @@ core::Result<void> validate_publication(
         receipt.cost.resident_bytes > policy.max_resident_bytes.value()) {
         return core::Result<void>::failure(validation(
             "production receipt exceeds the resident-memory admission budget"));
+    }
+    if (policy.max_cook_milliseconds.has_value() &&
+        receipt.cost.cook_milliseconds > policy.max_cook_milliseconds.value()) {
+        return core::Result<void>::failure(validation(
+            "production receipt exceeds the cook-time admission budget"));
+    }
+    if (policy.max_cpu_milliseconds.has_value() &&
+        receipt.cost.cpu_milliseconds > policy.max_cpu_milliseconds.value()) {
+        return core::Result<void>::failure(validation(
+            "production receipt exceeds the CPU-time admission budget"));
+    }
+    if (policy.max_gpu_milliseconds.has_value() &&
+        receipt.cost.gpu_milliseconds > policy.max_gpu_milliseconds.value()) {
+        return core::Result<void>::failure(validation(
+            "production receipt exceeds the GPU-time admission budget"));
+    }
+    if (policy.max_disk_bytes.has_value() &&
+        receipt.cost.disk_bytes > policy.max_disk_bytes.value()) {
+        return core::Result<void>::failure(validation(
+            "production receipt exceeds the disk-space admission budget"));
+    }
+    if (policy.max_output_bytes.has_value() &&
+        receipt.output_bytes > policy.max_output_bytes.value()) {
+        return core::Result<void>::failure(validation(
+            "production receipt exceeds the artifact-output admission budget"));
     }
     return core::Result<void>::success();
 }
@@ -376,7 +513,7 @@ core::Result<void> ProductionReceiptLedger::validate() const {
 
 std::string ProductionReceiptLedger::serialize() const {
     std::ostringstream output;
-    output << "CARTOGRAPHER_PRODUCTION_LEDGER_V1\n"
+    output << "CARTOGRAPHER_PRODUCTION_LEDGER_V2\n"
            << "records " << records_.size() << '\n';
     output << std::setprecision(17);
     for (const auto& record : records_) {
@@ -389,6 +526,12 @@ std::string ProductionReceiptLedger::serialize() const {
                << std::quoted(key.algorithm) << ' '
                << key.settings_digest.hex() << ' '
                << std::quoted(key.platform_profile) << ' '
+               << std::quoted(key.representation_kind) << ' '
+               << std::quoted(key.spatial_scope) << ' '
+               << std::quoted(key.decision_context.truth_class) << ' '
+               << std::quoted(key.decision_context.observer_class) << ' '
+               << std::quoted(key.decision_context.precision_requirement) << ' '
+               << std::quoted(key.decision_context.materialization_requirement) << ' '
                << receipt_status_name(record.status) << ' '
                << record.output_digest.hex() << ' ' << record.output_bytes << ' '
                << record.quality.measured_error << ' '
@@ -412,10 +555,13 @@ core::Result<ProductionReceiptLedger> ProductionReceiptLedger::deserialize(
     }
     std::istringstream input{std::string(text)};
     std::string magic;
-    if (!(input >> magic) || magic != "CARTOGRAPHER_PRODUCTION_LEDGER_V1") {
+    if (!(input >> magic) ||
+        (magic != "CARTOGRAPHER_PRODUCTION_LEDGER_V1" &&
+         magic != "CARTOGRAPHER_PRODUCTION_LEDGER_V2")) {
         return core::Result<ProductionReceiptLedger>::failure(validation(
             "production ledger magic or version is invalid"));
     }
+    const bool has_scoped_keys = magic == "CARTOGRAPHER_PRODUCTION_LEDGER_V2";
     std::string records_token;
     std::uint64_t encoded_count = 0U;
     if (!(input >> records_token >> encoded_count) || records_token != "records" ||
@@ -459,9 +605,23 @@ core::Result<ProductionReceiptLedger> ProductionReceiptLedger::deserialize(
         if (!settings_digest) {
             return core::Result<ProductionReceiptLedger>::failure(settings_digest.error());
         }
-        if (!(input >> std::quoted(record.key.platform_profile) >> status_name_value)) {
+        if (!(input >> std::quoted(record.key.platform_profile))) {
             return core::Result<ProductionReceiptLedger>::failure(validation(
-                "production ledger platform or status is invalid"));
+                "production ledger platform is invalid"));
+        }
+        if (has_scoped_keys &&
+            !(input >> std::quoted(record.key.representation_kind) >>
+              std::quoted(record.key.spatial_scope) >>
+              std::quoted(record.key.decision_context.truth_class) >>
+              std::quoted(record.key.decision_context.observer_class) >>
+              std::quoted(record.key.decision_context.precision_requirement) >>
+              std::quoted(record.key.decision_context.materialization_requirement))) {
+            return core::Result<ProductionReceiptLedger>::failure(validation(
+                "production ledger decision context is invalid"));
+        }
+        if (!(input >> status_name_value)) {
+            return core::Result<ProductionReceiptLedger>::failure(validation(
+                "production ledger status is invalid"));
         }
         const auto status = receipt_status_from_name(status_name_value);
         if (!status.has_value()) {

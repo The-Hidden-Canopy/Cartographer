@@ -50,6 +50,15 @@ core::Result<std::array<float, 4U>> narrow_vec4(
         x.value(), y.value(), z.value(), w.value()});
 }
 
+bool native_binding_is_supported(const TextureRef& binding) {
+    if (!binding) return true;
+    return binding.uv_set == kUv0 && binding.sampler == 0U &&
+        binding.transform == TextureTransform{} &&
+        binding.channels == ChannelMapping{} &&
+        binding.interpretation == TextureInterpretation::asset &&
+        binding.normal_convention == NormalConvention::directx_y_minus;
+}
+
 } // namespace
 
 core::Result<void> validate(const GpuFrameConstants& constants) {
@@ -81,8 +90,9 @@ core::Result<void> validate(const GpuObjectConstants& constants) {
 
 core::Result<void> validate(const GpuMaterialConstants& constants) {
     if (!finite(constants.base_color_factor) ||
-        !finite(constants.emissive_factor_and_strength) ||
-        !finite(constants.surface_factors) || !finite(constants.alpha_factors)) {
+        !finite(constants.emissive_radiance_and_f0) ||
+        !finite(constants.surface_factors) || !finite(constants.alpha_factors) ||
+        !finite(constants.clearcoat_factors)) {
         return core::Result<void>::failure(invalid(
             "GPU material constants must contain finite floating-point values"));
     }
@@ -103,7 +113,18 @@ core::Result<void> validate(const GpuMaterialConstants& constants) {
         constants.alpha_factors[1] < 0.0F ||
         constants.alpha_factors[1] > 2.0F ||
         constants.alpha_factors[2] < 0.0F ||
-        constants.alpha_factors[2] > 1.0F) {
+        constants.alpha_factors[2] > 1.0F ||
+        constants.emissive_radiance_and_f0[0] < 0.0F ||
+        constants.emissive_radiance_and_f0[1] < 0.0F ||
+        constants.emissive_radiance_and_f0[2] < 0.0F ||
+        constants.emissive_radiance_and_f0[3] < 0.0F ||
+        constants.emissive_radiance_and_f0[3] > 1.0F ||
+        constants.clearcoat_factors[0] < 0.0F ||
+        constants.clearcoat_factors[0] > 1.0F ||
+        constants.clearcoat_factors[1] < 0.0F ||
+        constants.clearcoat_factors[1] > 1.0F ||
+        constants.clearcoat_factors[2] != 0.0F ||
+        constants.clearcoat_factors[3] != 0.0F) {
         return core::Result<void>::failure(validation(
             "GPU material constants contain out-of-range surface factors"));
     }
@@ -152,27 +173,48 @@ core::Result<GpuMaterialConstants> pack_material_for_gpu(
     if (auto result = material.validate(); !result) {
         return core::Result<GpuMaterialConstants>::failure(result.error());
     }
+    for (const TextureRef* binding : {
+             &material.base_color,
+             &material.metallic_roughness,
+             &material.normal,
+             &material.occlusion,
+             &material.emissive}) {
+        if (!native_binding_is_supported(*binding)) {
+            return core::Result<GpuMaterialConstants>::failure(
+                core::Diagnostic(core::ErrorCode::unsupported,
+                    "native PBR material packing does not yet support non-UV0 bindings, "
+                    "custom samplers/transforms/channels, interpretation overrides, or "
+                    "OpenGL normal convention"));
+        }
+    }
     const auto base = narrow_vec4(material.base_color_factor, "base_color_factor");
     if (!base) return core::Result<GpuMaterialConstants>::failure(base.error());
-    const auto emissive_x = narrow(material.emissive_factor.x, "emissive_factor");
-    const auto emissive_y = narrow(material.emissive_factor.y, "emissive_factor");
-    const auto emissive_z = narrow(material.emissive_factor.z, "emissive_factor");
+    const auto emissive_x = narrow(
+        material.emissive_factor.x * material.emissive_strength, "emissive_radiance");
+    const auto emissive_y = narrow(
+        material.emissive_factor.y * material.emissive_strength, "emissive_radiance");
+    const auto emissive_z = narrow(
+        material.emissive_factor.z * material.emissive_strength, "emissive_radiance");
     const auto metallic = narrow(material.metallic, "metallic");
     const auto roughness = narrow(material.roughness, "roughness");
     const auto normal_scale = narrow(material.normal_scale, "normal_scale");
     const auto occlusion = narrow(material.occlusion_strength, "occlusion_strength");
     const auto alpha_cutoff = narrow(material.alpha_cutoff, "alpha_cutoff");
-    const auto emissive_strength = narrow(material.emissive_strength, "emissive_strength");
+    const auto dielectric_f0 = narrow(material.dielectric_f0, "dielectric_f0");
+    const auto clearcoat = narrow(material.clearcoat, "clearcoat");
+    const auto clearcoat_roughness = narrow(
+        material.clearcoat_roughness, "clearcoat_roughness");
     if (!emissive_x || !emissive_y || !emissive_z || !metallic || !roughness ||
-        !normal_scale || !occlusion || !alpha_cutoff || !emissive_strength) {
+        !normal_scale || !occlusion || !alpha_cutoff ||
+        !dielectric_f0 || !clearcoat || !clearcoat_roughness) {
         return core::Result<GpuMaterialConstants>::failure(invalid(
             "material value cannot be represented by the GPU ABI"));
     }
 
     GpuMaterialConstants result{};
     result.base_color_factor = base.value();
-    result.emissive_factor_and_strength = {
-        emissive_x.value(), emissive_y.value(), emissive_z.value(), emissive_strength.value()};
+    result.emissive_radiance_and_f0 = {
+        emissive_x.value(), emissive_y.value(), emissive_z.value(), dielectric_f0.value()};
     result.surface_factors = {
         metallic.value(), roughness.value(), normal_scale.value(), occlusion.value()};
     result.alpha_factors = {
@@ -181,6 +223,8 @@ core::Result<GpuMaterialConstants> pack_material_for_gpu(
         material.normal.normal_convention == NormalConvention::opengl_y_plus ? 1.0F : 0.0F,
         0.0F,
     };
+    result.clearcoat_factors = {
+        clearcoat.value(), clearcoat_roughness.value(), 0.0F, 0.0F};
     const auto split_asset_id = [](assets::TextureAssetId value) {
         return std::array<std::uint32_t, 2U>{
             static_cast<std::uint32_t>(value & 0xffffffffULL),

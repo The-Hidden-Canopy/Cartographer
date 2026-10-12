@@ -627,10 +627,16 @@ void project_transaction_journals_evaluation_graph_reference_with_document_state
         checkpoint_text.substr(0, checkpoint_text.find("EVALUATION_GRAPH_DIGEST")) +
         "EVALUATION_GRAPH_DIGEST 0000000000000000000000000000000000000000000000000000000000000000\nEND\n"));
     std::string legacy_graph = checkpoint_text;
-    const auto current_header = legacy_graph.find("CARTOGRAPHER_PROJECT 6");
+    const std::string current_version = "CARTOGRAPHER_PROJECT " +
+        std::to_string(carto::project::ProjectDocument::kSchemaVersion);
+    const auto current_header = legacy_graph.find(current_version);
     REQUIRE(current_header != std::string::npos);
-    legacy_graph.replace(current_header, std::string("CARTOGRAPHER_PROJECT 6").size(),
+    legacy_graph.replace(current_header, current_version.size(),
                          "CARTOGRAPHER_PROJECT 2");
+    const auto namespace_start = legacy_graph.find("SOURCE_NAMESPACE ");
+    const auto namespace_end = legacy_graph.find('\n', namespace_start);
+    REQUIRE(namespace_start != std::string::npos && namespace_end != std::string::npos);
+    legacy_graph.erase(namespace_start, namespace_end - namespace_start + 1U);
     const auto rejected_legacy_graph = carto::project::ProjectDocument::deserialize(legacy_graph);
     REQUIRE(!rejected_legacy_graph);
     REQUIRE(rejected_legacy_graph.error().code == carto::core::ErrorCode::version_mismatch);

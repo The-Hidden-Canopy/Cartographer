@@ -91,7 +91,13 @@ core::Result<void> TextureTransform::validate() const {
 }
 
 core::Result<void> TextureRef::validate() const {
-    if (!asset) return core::Result<void>::success();
+    if (!asset) {
+        if (!(*this == TextureRef{})) {
+            return core::Result<void>::failure(validation(
+                "unbound texture references cannot carry hidden binding state"));
+        }
+        return core::Result<void>::success();
+    }
     if (uv_set == 0U) {
         return core::Result<void>::failure(validation(
             "texture bindings require an explicit non-zero UV set identity"));
@@ -132,7 +138,12 @@ core::Result<void> StandardMaterial::validate() const {
         !std::isfinite(roughness) || roughness < 0.0 || roughness > 1.0 ||
         !finite_nonnegative(normal_scale) || !std::isfinite(occlusion_strength) ||
         occlusion_strength < 0.0 || occlusion_strength > 1.0 ||
-        !finite_nonnegative(emissive_strength) || !std::isfinite(alpha_cutoff) ||
+        !finite_nonnegative(emissive_strength) ||
+        !std::isfinite(dielectric_f0) || dielectric_f0 < 0.0 || dielectric_f0 > 1.0 ||
+        !std::isfinite(clearcoat) || clearcoat < 0.0 || clearcoat > 1.0 ||
+        !std::isfinite(clearcoat_roughness) ||
+        clearcoat_roughness < 0.0 || clearcoat_roughness > 1.0 ||
+        !std::isfinite(alpha_cutoff) ||
         alpha_cutoff < 0.0 || alpha_cutoff > 1.0) {
         return core::Result<void>::failure(
             invalid("material scalar factors are outside their supported ranges"));
@@ -140,6 +151,15 @@ core::Result<void> StandardMaterial::validate() const {
     if (emissive_factor.x < 0.0 || emissive_factor.y < 0.0 || emissive_factor.z < 0.0) {
         return core::Result<void>::failure(
             validation("material emissive factors must be non-negative"));
+    }
+    switch (alpha_mode) {
+    case AlphaMode::opaque:
+    case AlphaMode::masked:
+    case AlphaMode::blended:
+        break;
+    default:
+        return core::Result<void>::failure(invalid(
+            "material alpha mode is unknown"));
     }
     for (const TextureRef* binding : {
              &base_color, &metallic_roughness, &normal, &occlusion, &emissive}) {
@@ -186,7 +206,11 @@ core::Result<PbrEvaluation> evaluate_pbr_reference(
         material.base_color_factor.y,
         material.base_color_factor.z,
     };
-    const Vec3d dielectric_f0{0.04, 0.04, 0.04};
+    const Vec3d dielectric_f0{
+        material.dielectric_f0,
+        material.dielectric_f0,
+        material.dielectric_f0,
+    };
     const Vec3d f0 = add(
         scale(dielectric_f0, 1.0 - material.metallic),
         scale(base_color, material.metallic));
@@ -194,6 +218,7 @@ core::Result<PbrEvaluation> evaluate_pbr_reference(
         scale(Vec3d{1.0, 1.0, 1.0} - f0, 1.0 - material.metallic);
     Vec3d direct_diffuse{};
     Vec3d direct_specular{};
+    Vec3d clearcoat_specular{};
     if (n_dot_l > 0.0 && n_dot_v > 0.0) {
         const Vec3d half_vector = (view + light_direction).normalized();
         if (!finite(half_vector)) {
@@ -214,23 +239,62 @@ core::Result<PbrEvaluation> evaluate_pbr_reference(
         const double fresnel_factor = std::pow(1.0 - v_dot_h, 5.0);
         const Vec3d fresnel = add(f0, scale(
             Vec3d{1.0, 1.0, 1.0} - f0, fresnel_factor));
+        constexpr double clearcoat_f0 = 0.04;
+        const double clearcoat_fresnel = clearcoat_f0 +
+            (1.0 - clearcoat_f0) * fresnel_factor;
+        const double base_attenuation =
+            std::clamp(1.0 - material.clearcoat * clearcoat_fresnel, 0.0, 1.0);
         const Vec3d diffuse_weight = scale(
             Vec3d{1.0, 1.0, 1.0} - fresnel, 1.0 - material.metallic);
         direct_diffuse = scale(
-            multiply(diffuse_weight, base_color), n_dot_l / kPi);
+            multiply(diffuse_weight, base_color),
+            base_attenuation * n_dot_l / kPi);
         direct_specular = scale(
-            fresnel, distribution * geometry / std::max(1e-12, 4.0 * n_dot_l * n_dot_v));
+            fresnel,
+            base_attenuation * distribution * geometry * n_dot_l /
+                std::max(1e-12, 4.0 * n_dot_l * n_dot_v));
+        const double clearcoat_alpha = std::max(
+            0.045, material.clearcoat_roughness * material.clearcoat_roughness);
+        const double clearcoat_alpha_squared = clearcoat_alpha * clearcoat_alpha;
+        const double clearcoat_denominator =
+            n_dot_h * n_dot_h * (clearcoat_alpha_squared - 1.0) + 1.0;
+        const double clearcoat_distribution = clearcoat_alpha_squared /
+            (kPi * clearcoat_denominator * clearcoat_denominator);
+        const auto clearcoat_smith = [clearcoat_alpha](double n_dot_x) {
+            const double k =
+                (clearcoat_alpha + 1.0) * (clearcoat_alpha + 1.0) / 8.0;
+            return n_dot_x / (n_dot_x * (1.0 - k) + k);
+        };
+        const double clearcoat_geometry =
+            clearcoat_smith(n_dot_l) * clearcoat_smith(n_dot_v);
+        const double clearcoat_value = material.clearcoat * clearcoat_fresnel *
+            clearcoat_distribution * clearcoat_geometry * n_dot_l /
+            std::max(1e-12, 4.0 * n_dot_l * n_dot_v);
+        clearcoat_specular = {
+            clearcoat_value, clearcoat_value, clearcoat_value};
     }
 
-    const Vec3d ibl_diffuse = multiply(
-        surface.irradiance,
-        scale(multiply(dielectric_diffuse_weight, base_color), material.occlusion_strength));
+    constexpr double clearcoat_f0 = 0.04;
+    const double clearcoat_view_fresnel = clearcoat_f0 +
+        (1.0 - clearcoat_f0) * std::pow(1.0 - n_dot_v, 5.0);
+    const double ibl_base_attenuation =
+        std::clamp(1.0 - material.clearcoat * clearcoat_view_fresnel, 0.0, 1.0);
+    const Vec3d ibl_diffuse = multiply(surface.irradiance, scale(
+        multiply(dielectric_diffuse_weight, base_color),
+        material.occlusion_strength * ibl_base_attenuation));
     const Vec3d specular_brdf = add(
         scale(f0, surface.brdf_lut[0]),
         Vec3d{surface.brdf_lut[1], surface.brdf_lut[1], surface.brdf_lut[1]});
-    const Vec3d ibl_specular = multiply(surface.prefiltered_environment, specular_brdf);
+    const Vec3d base_ibl_specular = scale(
+        multiply(surface.prefiltered_environment, specular_brdf), ibl_base_attenuation);
+    const double clearcoat_ibl_brdf = material.clearcoat *
+        (clearcoat_f0 * surface.brdf_lut[0] + surface.brdf_lut[1]);
+    const Vec3d clearcoat_ibl_specular =
+        surface.prefiltered_environment * clearcoat_ibl_brdf;
+    const Vec3d ibl_specular = add(base_ibl_specular, clearcoat_ibl_specular);
     const Vec3d emissive = material.emissive_factor * material.emissive_strength;
-    const Vec3d lit_direct = multiply(add(direct_diffuse, direct_specular), light.radiance);
+    const Vec3d lit_direct = multiply(
+        add(add(direct_diffuse, direct_specular), clearcoat_specular), light.radiance);
     const Vec3d hdr = add(add(lit_direct, add(ibl_diffuse, ibl_specular)), emissive);
     if (!finite(hdr)) {
         return core::Result<PbrEvaluation>::failure(
@@ -239,6 +303,7 @@ core::Result<PbrEvaluation> evaluate_pbr_reference(
     return core::Result<PbrEvaluation>::success(PbrEvaluation{
         direct_diffuse,
         direct_specular,
+        clearcoat_specular,
         ibl_diffuse,
         ibl_specular,
         emissive,

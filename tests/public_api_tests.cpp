@@ -5,10 +5,14 @@
 #include <carto/geometry/mesh.hpp>
 #include <carto/geometry/primitives.hpp>
 #include <carto/mesh_attributes/provenance.hpp>
+#include <carto/production/preparation_operation.hpp>
+#include <carto/production/preparation_job.hpp>
+#include <carto/production/prepared_publication.hpp>
 #include <carto/project/project.hpp>
 
 #include <concepts>
 #include <string_view>
+#include <utility>
 
 namespace {
 
@@ -41,11 +45,36 @@ concept has_unadmitted_tool_context = requires(
     carto::editor::ToolContext(document, selection);
 };
 
+template <typename Request>
+concept has_client_source_namespace = requires(Request& request) {
+    request.source_namespace;
+};
+
 static_assert(!has_public_create_object<carto::project::ProjectDocument>);
 static_assert(!has_public_assignment<carto::project::ProjectDocument>);
 static_assert(!has_public_admission_constructor<carto::editor::ProjectCommandAdmission>);
 static_assert(!has_unadmitted_dispatch<carto::application::ApplicationSession>);
 static_assert(!has_unadmitted_tool_context<carto::project::ProjectDocument>);
+static_assert(!has_client_source_namespace<
+    carto::production::PreparationOperationRequest>);
+static_assert(requires(const carto::production::PreparedSceneEnvelope& envelope) {
+    envelope.validate();
+    envelope.serialize();
+    envelope.canonical_digest();
+});
+static_assert(requires(std::string_view text) {
+    carto::production::PreparedSceneEnvelope::deserialize(text);
+});
+static_assert(requires(
+    const carto::project::ProjectDocument& document,
+    const carto::production::PreparationOperationRequest& request) {
+    carto::production::prepare_and_publish(document, request);
+});
+static_assert(requires(
+    const carto::project::ProjectDocument& document,
+    carto::production::PreparationOperationRequest request) {
+    carto::production::PreparationJob::start(document, std::move(request));
+});
 static_assert(requires(const carto::geometry::TopologyEditReceipt& receipt) {
     receipt.validate();
     receipt.serialize();
@@ -76,6 +105,9 @@ static_assert(requires(const carto::geometry::EditableMesh& source,
 } // namespace
 
 int main() {
+    const auto profile = carto::production::portable_preparation_profile();
+    if (!profile.validate() || !profile.canonical_digest()) return 1;
+
     auto source = carto::geometry::make_plane(2.0, 2.0);
     if (!source) return 1;
     carto::geometry::EditableMesh destination = source.value();

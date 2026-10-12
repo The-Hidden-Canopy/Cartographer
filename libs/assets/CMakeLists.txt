@@ -1,6 +1,8 @@
 add_library(carto_assets STATIC
     src/blob_store.cpp
     src/texture.cpp
+    src/texture_mip.cpp
+    src/texture_source.cpp
 )
 
 target_include_directories(carto_assets

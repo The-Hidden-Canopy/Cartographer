@@ -95,23 +95,65 @@ void material_bindings_are_explicit_and_gpu_packable() {
     material.normal.normal_convention = carto::render::NormalConvention::opengl_y_plus;
     material.occlusion.asset = 4U;
     material.emissive.asset = 5U;
+    material.dielectric_f0 = 0.08;
+    material.clearcoat = 0.75;
+    material.clearcoat_roughness = 0.2;
     material.alpha_mode = carto::render::AlphaMode::masked;
     REQUIRE(material.validate());
-    const auto packed = carto::render::pack_material_for_gpu(material);
+    REQUIRE(!carto::render::pack_material_for_gpu(material));
+
+    carto::render::StandardMaterial native_material = material;
+    native_material.base_color.uv_set = carto::render::kUv0;
+    native_material.base_color.sampler = 0U;
+    native_material.base_color.transform = {};
+    native_material.base_color.channels = {};
+    native_material.metallic_roughness.uv_set = carto::render::kUv0;
+    native_material.normal.normal_convention =
+        carto::render::NormalConvention::directx_y_minus;
+    const auto packed = carto::render::pack_material_for_gpu(native_material);
     REQUIRE(packed);
     REQUIRE(packed.value().texture_asset_ids[0] == 1U);
     REQUIRE(packed.value().texture_asset_ids[1] == 1U);
     REQUIRE(packed.value().texture_asset_ids[4] == 3U);
     REQUIRE(packed.value().alpha_factors[1] == 1.0F);
-    REQUIRE(packed.value().alpha_factors[2] == 1.0F);
+    REQUIRE(packed.value().alpha_factors[2] == 0.0F);
+    REQUIRE(packed.value().emissive_radiance_and_f0[3] == 0.08F);
+    REQUIRE(packed.value().clearcoat_factors[0] == 0.75F);
+    REQUIRE(packed.value().clearcoat_factors[1] == 0.2F);
 
-    carto::render::MaterialAsset asset{7U, "brick", material, carto::core::Revision{3U}};
+    carto::render::MaterialAsset asset{
+        7U, "brick", native_material, carto::core::Revision{3U}};
     REQUIRE(asset.validate());
     asset.id = 0U;
     REQUIRE(!asset.validate());
 
     material.normal.uv_set = 0U;
     REQUIRE(!material.validate());
+
+    carto::render::StandardMaterial invalid_photoreal;
+    invalid_photoreal.dielectric_f0 = -0.01;
+    REQUIRE(!invalid_photoreal.validate());
+    invalid_photoreal.dielectric_f0 = 0.04;
+    invalid_photoreal.clearcoat = 1.01;
+    REQUIRE(!invalid_photoreal.validate());
+    invalid_photoreal.clearcoat = 1.0;
+    invalid_photoreal.clearcoat_roughness = 1.01;
+    REQUIRE(!invalid_photoreal.validate());
+
+    carto::render::StandardMaterial unsupported_native;
+    unsupported_native.base_color.asset = 11U;
+    unsupported_native.base_color.interpretation =
+        carto::render::TextureInterpretation::linear;
+    REQUIRE(unsupported_native.validate());
+    REQUIRE(!carto::render::pack_material_for_gpu(unsupported_native));
+
+    carto::render::StandardMaterial hidden_unbound_state;
+    hidden_unbound_state.normal.normal_convention =
+        carto::render::NormalConvention::opengl_y_plus;
+    REQUIRE(!hidden_unbound_state.validate());
+    hidden_unbound_state.normal = {};
+    hidden_unbound_state.alpha_mode = static_cast<carto::render::AlphaMode>(99);
+    REQUIRE(!hidden_unbound_state.validate());
 }
 
 void tangent_generation_is_deterministic_and_fail_closed() {
@@ -248,7 +290,9 @@ void project_v6_round_trips_uv_payload_and_reads_v5_without_one() {
     REQUIRE(mesh_id);
 
     const auto serialized = document.value().serialize();
-    REQUIRE(serialized.find("CARTOGRAPHER_PROJECT 6") == 0U);
+    const std::string current_version = "CARTOGRAPHER_PROJECT " +
+        std::to_string(carto::project::ProjectDocument::kSchemaVersion);
+    REQUIRE(serialized.find(current_version) == 0U);
     REQUIRE(serialized.find("ATTRIBUTES\n") != std::string::npos);
     REQUIRE(serialized.find("UV_SET 9") != std::string::npos);
     const auto reopened = carto::project::ProjectDocument::deserialize(serialized);
@@ -260,14 +304,23 @@ void project_v6_round_trips_uv_payload_and_reads_v5_without_one() {
     REQUIRE(reopened.value().serialize() == serialized);
 
     std::string legacy = serialized;
-    const auto header = legacy.find("CARTOGRAPHER_PROJECT 6");
+    const auto header = legacy.find(current_version);
     REQUIRE(header == 0U);
-    legacy.replace(header, std::string("CARTOGRAPHER_PROJECT 6").size(),
+    legacy.replace(header, current_version.size(),
                    "CARTOGRAPHER_PROJECT 5");
+    const auto namespace_start = legacy.find("SOURCE_NAMESPACE ");
+    const auto namespace_end = legacy.find('\n', namespace_start);
+    REQUIRE(namespace_start != std::string::npos && namespace_end != std::string::npos);
+    legacy.erase(namespace_start, namespace_end - namespace_start + 1U);
     const auto attributes_start = legacy.find("ATTRIBUTES\n");
     const auto topology_start = legacy.find("TOPOLOGY_RECEIPTS ", attributes_start);
     REQUIRE(attributes_start != std::string::npos && topology_start != std::string::npos);
     legacy.erase(attributes_start, topology_start - attributes_start);
+    const auto world_start = legacy.find("WORLD_MODEL ");
+    REQUIRE(world_start != std::string::npos);
+    const auto world_end = legacy.rfind("\nEND\n");
+    REQUIRE(world_end != std::string::npos);
+    legacy.erase(world_start, world_end - world_start + 1U);
     const auto legacy_reopened = carto::project::ProjectDocument::deserialize(legacy);
     REQUIRE(legacy_reopened);
     REQUIRE(!legacy_reopened.value().meshes().at(mesh_id.value()).has_attribute_payload());

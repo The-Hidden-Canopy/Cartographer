@@ -1,4 +1,5 @@
 #include <carto/ui/ui.hpp>
+#include <carto/journal/journal.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -22,6 +23,19 @@ public:
     do {                                                                                 \
         if (!(condition)) throw TestFailure(std::string("requirement failed: ") + #condition); \
     } while (false)
+
+bool same_positions(
+    const std::vector<carto::core::Vec3d>& left,
+    const std::vector<carto::core::Vec3d>& right) {
+    if (left.size() != right.size()) return false;
+    for (std::size_t index = 0U; index < left.size(); ++index) {
+        if (left[index].x != right[index].x || left[index].y != right[index].y ||
+            left[index].z != right[index].z) {
+            return false;
+        }
+    }
+    return true;
+}
 
 class TempDirectory final {
 public:
@@ -409,6 +423,123 @@ void ui_connects_surface_fidelity_preview_without_authoring_mutation() {
     REQUIRE(ui.snapshot().surface_fidelity.status == carto::ui::SurfaceFidelityStatus::idle);
 }
 
+void ui_imports_mesh_through_provider_and_authoring_boundaries() {
+    TempDirectory temp;
+    const auto project_path = temp.path() / "wired-import.carto";
+    const auto obj_path = temp.path() / "triangle.obj";
+    const auto ply_path = temp.path() / "triangle.ply";
+    const auto stl_path = temp.path() / "triangle.stl";
+    {
+        std::ofstream obj(obj_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(obj));
+        obj << "v 0 0 0\n"
+               "v 1 0 0\n"
+               "v 0 1 0\n"
+               "f 1 2 3\n";
+    }
+    {
+        std::ofstream ply(ply_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(ply));
+        ply << "ply\n"
+               "format ascii 1.0\n"
+               "element vertex 3\n"
+               "property float x\n"
+               "property float y\n"
+               "property float z\n"
+               "element face 1\n"
+               "property list uchar int vertex_indices\n"
+               "end_header\n"
+               "0 0 0\n"
+               "1 0 0\n"
+               "0 1 0\n"
+               "3 0 1 2\n";
+    }
+    {
+        std::ofstream stl(stl_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(stl));
+        stl << "solid triangle\n"
+               "facet normal 0 0 1\n"
+               "outer loop\n"
+               "vertex 0 0 0\n"
+               "vertex 1 0 0\n"
+               "vertex 0 1 0\n"
+               "endloop\n"
+               "endfacet\n"
+               "endsolid triangle\n";
+    }
+
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.dispatch(carto::application::SaveProjectAction{project_path}));
+    const auto revision_before = ui.snapshot().project_revision;
+
+    const auto imported = ui.import_mesh(obj_path, carto::ui::MeshImportFormat::obj);
+    REQUIRE(imported);
+    REQUIRE(imported.value().object_name == "triangle");
+    REQUIRE(imported.value().vertices == 3U);
+    REQUIRE(imported.value().faces == 1U);
+    REQUIRE(imported.value().triangles == 1U);
+    REQUIRE(imported.value().dispatch.action == "Create Mesh Object");
+    REQUIRE(imported.value().dispatch.document_changed);
+    REQUIRE(imported.value().dispatch.source == carto::application::OperationSource::human);
+
+    const auto snapshot = ui.snapshot();
+    REQUIRE(snapshot.project_revision > revision_before);
+    REQUIRE(snapshot.dirty);
+    REQUIRE(snapshot.objects.size() == 1U);
+    REQUIRE(snapshot.objects.front().object.name == "triangle");
+    REQUIRE(snapshot.objects.front().object.mesh_asset.has_value());
+    REQUIRE(snapshot.viewport.scene.instances().size() == 1U);
+    REQUIRE(!snapshot.operations.empty());
+    REQUIRE(snapshot.operations.back().action == "Create Mesh Object");
+
+    const auto recovery = carto::application::ApplicationSession::inspect_recovery(project_path);
+    REQUIRE(recovery);
+    REQUIRE(recovery.value().state == carto::application::RecoveryInspectionState::pending);
+    REQUIRE(!recovery.value().journal_entries.empty());
+    REQUIRE(recovery.value().journal_entries.back().event_type ==
+            "cartographer.application_action");
+    carto::journal::Journal journal(std::filesystem::path(project_path.string() + ".journal"));
+    const auto journal_entries = journal.read_all();
+    REQUIRE(journal_entries);
+    REQUIRE(!journal_entries.value().empty());
+    const std::string journal_payload(
+        journal_entries.value().back().payload.begin(),
+        journal_entries.value().back().payload.end());
+    REQUIRE(journal_payload.find("operation=Create Mesh Object") != std::string::npos);
+
+    const auto imported_ply = ui.import_mesh(ply_path, carto::ui::MeshImportFormat::ply);
+    REQUIRE(imported_ply);
+    REQUIRE(imported_ply.value().vertices == 3U);
+    REQUIRE(imported_ply.value().faces == 1U);
+    REQUIRE(imported_ply.value().triangles == 1U);
+    const auto imported_stl = ui.import_mesh(stl_path, carto::ui::MeshImportFormat::stl);
+    REQUIRE(imported_stl);
+    REQUIRE(imported_stl.value().vertices == 3U);
+    REQUIRE(imported_stl.value().faces == 1U);
+    REQUIRE(imported_stl.value().triangles == 1U);
+    REQUIRE(ui.snapshot().objects.size() == 3U);
+
+    const auto stable_revision = ui.snapshot().project_revision;
+    const auto stable_operations = ui.snapshot().operations.size();
+    const auto missing = ui.import_mesh(
+        temp.path() / "missing.obj", carto::ui::MeshImportFormat::obj);
+    REQUIRE(!missing);
+    REQUIRE(ui.snapshot().project_revision == stable_revision);
+    REQUIRE(ui.snapshot().objects.size() == 3U);
+    REQUIRE(ui.snapshot().operations.size() == stable_operations);
+    REQUIRE(!ui.snapshot().ui_problems.empty());
+
+    const auto unsupported = ui.import_mesh(
+        obj_path, static_cast<carto::ui::MeshImportFormat>(99));
+    REQUIRE(!unsupported);
+    REQUIRE(unsupported.error().code == carto::core::ErrorCode::unsupported);
+    REQUIRE(ui.snapshot().project_revision == stable_revision);
+
+    REQUIRE(ui.handle_shortcut(carto::ui::Shortcut::save));
+    REQUIRE(!ui.snapshot().dirty);
+}
+
 void ui_failed_shortcuts_and_actions_remain_bounded() {
     carto::application::ApplicationSession session;
     carto::ui::UiController ui(session);
@@ -441,6 +572,18 @@ void ui_command_palette_is_bounded_and_explicit_about_deferred_features() {
         [](const auto& command) { return command.id == "edit.repeat-last"; });
     REQUIRE(repeat != ui.snapshot().commands.end());
     REQUIRE(repeat->shortcut == "Ctrl+R");
+    const auto import_mesh = std::find_if(
+        ui.snapshot().commands.begin(), ui.snapshot().commands.end(),
+        [](const auto& command) { return command.id == "file.import-mesh"; });
+    REQUIRE(import_mesh != ui.snapshot().commands.end());
+    REQUIRE(import_mesh->supported);
+    REQUIRE(import_mesh->shortcut == "Ctrl+I");
+    const auto duplicate = std::find_if(
+        ui.snapshot().commands.begin(), ui.snapshot().commands.end(),
+        [](const auto& command) { return command.id == "edit.duplicate"; });
+    REQUIRE(duplicate != ui.snapshot().commands.end());
+    REQUIRE(duplicate->supported);
+    REQUIRE(duplicate->shortcut == "Ctrl+D");
     REQUIRE(ui.handle_shortcut(carto::ui::Shortcut::edge_mode));
     REQUIRE(ui.snapshot().selection.mode == carto::editor::SelectionMode::edge);
     REQUIRE(ui.snapshot().project_revision == carto::core::Revision{});
@@ -518,6 +661,8 @@ void workspace_registry_is_canonical_and_fail_closed() {
     REQUIRE(model && model.value().available);
     const auto ai = carto::ui::workspace_definition(carto::ui::Workspace::ai);
     REQUIRE(ai && ai.value().available);
+    const auto sculpt = carto::ui::workspace_definition(carto::ui::Workspace::sculpt);
+    REQUIRE(sculpt && sculpt.value().available);
     const auto future = carto::ui::workspace_definition(carto::ui::Workspace::cad);
     REQUIRE(future && !future.value().available);
     REQUIRE(!future.value().unavailable_reason.empty());
@@ -539,6 +684,395 @@ void workspace_registry_is_canonical_and_fail_closed() {
     REQUIRE(!unavailable);
     REQUIRE(unavailable.error().code == carto::core::ErrorCode::invalid_state);
     REQUIRE(ui.snapshot().workspace_kind == carto::ui::Workspace::ai);
+
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::sculpt));
+    const auto sculpt_snapshot = ui.snapshot();
+    REQUIRE(sculpt_snapshot.workspace_kind == carto::ui::Workspace::sculpt);
+    REQUIRE(sculpt_snapshot.bottom_panel == carto::ui::BottomPanel::operations);
+}
+
+void sculpt_viewport_sampling_preserves_frontmost_surface_and_path_spacing() {
+    using carto::core::Vec2d;
+    using carto::core::Vec3d;
+    using carto::geometry::FaceId;
+    using carto::geometry::VertexId;
+    using carto::scene::ObjectId;
+    using carto::ui::SculptViewportTriangle;
+
+    const ObjectId object{17U};
+    const auto make_triangle = [](ObjectId owner, FaceId face, std::uint64_t first_id,
+                                  double depth) {
+        return SculptViewportTriangle{
+            owner,
+            face,
+            {Vec2d{0.0, 0.0}, Vec2d{10.0, 0.0}, Vec2d{0.0, 10.0}},
+            {VertexId{first_id}, VertexId{first_id + 1U}, VertexId{first_id + 2U}},
+            {Vec3d{0.0, depth, 0.0}, Vec3d{10.0, depth, 0.0}, Vec3d{0.0, depth, 10.0}},
+            {depth, depth, depth}};
+    };
+    std::vector<SculptViewportTriangle> triangles{
+        make_triangle(object, FaceId{1U}, 1U, 2.0),
+        make_triangle(object, FaceId{2U}, 4U, 1.0),
+        make_triangle(ObjectId{18U}, FaceId{3U}, 7U, 9.0)};
+
+    const auto hit = carto::ui::sample_sculpt_viewport_surface(
+        triangles, object, Vec2d{2.0, 2.0});
+    REQUIRE(hit);
+    REQUIRE(hit.value().surface_anchor.has_value());
+    REQUIRE(hit.value().surface_anchor->face == FaceId{1U});
+    REQUIRE(hit.value().position.x == 2.0);
+    REQUIRE(hit.value().position.y == 2.0);
+    REQUIRE(hit.value().position.z == 2.0);
+    REQUIRE(hit.value().surface_anchor->validate());
+
+    const std::vector<Vec2d> direct_path{{1.0, 1.0}, {7.0, 1.0}};
+    const std::vector<Vec2d> segmented_path{{1.0, 1.0}, {3.0, 1.0}, {7.0, 1.0}};
+    const auto direct = carto::ui::sample_sculpt_viewport_stroke(
+        triangles, object, direct_path, 2.0);
+    const auto segmented = carto::ui::sample_sculpt_viewport_stroke(
+        triangles, object, segmented_path, 2.0);
+    REQUIRE(direct);
+    REQUIRE(segmented);
+    REQUIRE(direct.value() == segmented.value());
+    REQUIRE(direct.value().size() == 4U);
+    for (const auto& sample : direct.value()) {
+        REQUIRE(sample.surface_anchor.has_value());
+        REQUIRE(sample.surface_anchor->face == FaceId{1U});
+        REQUIRE(sample.position.y == 2.0);
+    }
+
+    std::reverse(triangles.begin(), triangles.end());
+    const auto reordered_hit = carto::ui::sample_sculpt_viewport_surface(
+        triangles, object, Vec2d{2.0, 2.0});
+    REQUIRE(reordered_hit);
+    REQUIRE(reordered_hit.value() == hit.value());
+
+    const auto miss = carto::ui::sample_sculpt_viewport_surface(
+        triangles, object, Vec2d{12.0, 12.0});
+    REQUIRE(!miss);
+    REQUIRE(miss.error().code == carto::core::ErrorCode::not_found);
+    const std::vector<Vec2d> leaving_surface{{1.0, 1.0}, {12.0, 12.0}};
+    REQUIRE(!carto::ui::sample_sculpt_viewport_stroke(
+        triangles, object, leaving_surface, 2.0));
+    const std::vector<Vec2d> non_finite_path{{1.0, 1.0},
+        {std::numeric_limits<double>::quiet_NaN(), 2.0}};
+    REQUIRE(!carto::ui::sample_sculpt_viewport_stroke(
+        triangles, object, non_finite_path, 2.0));
+    REQUIRE(!carto::ui::sample_sculpt_viewport_stroke(
+        triangles, object, direct_path, 0.0));
+    REQUIRE(!carto::ui::sample_sculpt_viewport_stroke(
+        triangles, object, direct_path, 1.0e-12));
+}
+
+void sculpt_surface_strokes_commit_anchored_samples_through_human_commands() {
+    TempDirectory temp;
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.dispatch(carto::application::NewProjectAction{"Sculpt surface stroke test"}));
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{"Surface mesh", {2.0, 2.0, 2.0}}));
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::sculpt));
+
+    const auto initial = ui.snapshot();
+    REQUIRE(initial.objects.size() == 1U);
+    const carto::scene::ObjectId object = initial.objects.front().object.id;
+    const std::uint64_t mesh_asset = *initial.objects.front().object.mesh_asset;
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{object}));
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::vertex}));
+    REQUIRE(ui.dispatch(carto::application::SelectVertexAction{
+        object, carto::geometry::VertexId{1U}}));
+    const auto selected = ui.snapshot();
+    const auto* instance = selected.viewport.scene.find(object);
+    REQUIRE(instance != nullptr);
+    REQUIRE(instance->mesh != nullptr);
+    const auto source_positions = instance->mesh->positions;
+
+    std::vector<carto::ui::SculptViewportTriangle> triangles;
+    for (std::size_t index = 0U; index + 2U < instance->mesh->indices.size(); index += 3U) {
+        const std::array<std::uint32_t, 3> corners{
+            instance->mesh->indices[index],
+            instance->mesh->indices[index + 1U],
+            instance->mesh->indices[index + 2U]};
+        carto::ui::SculptViewportTriangle triangle;
+        triangle.object = object;
+        triangle.face = instance->mesh->triangle_faces[index / 3U];
+        for (std::size_t corner = 0U; corner < corners.size(); ++corner) {
+            const std::uint32_t source_index = corners[corner];
+            triangle.vertices[corner] = instance->mesh->vertex_ids[source_index];
+            triangle.local_positions[corner] = instance->mesh->positions[source_index];
+            triangle.screen_positions[corner] = {
+                triangle.local_positions[corner].x,
+                triangle.local_positions[corner].z};
+            triangle.camera_depth[corner] = triangle.local_positions[corner].y;
+        }
+        triangles.push_back(std::move(triangle));
+    }
+    const std::vector<carto::core::Vec2d> cursor_path{
+        {-0.6, 0.0}, {-0.1, 0.0}, {0.6, 0.0}};
+    const auto samples = carto::ui::sample_sculpt_viewport_stroke(
+        triangles, object, cursor_path, 0.2);
+    REQUIRE(samples);
+    REQUIRE(samples.value().size() >= 4U);
+    auto authored_mesh = carto::geometry::make_box(carto::core::Vec3d{2.0, 2.0, 2.0});
+    REQUIRE(authored_mesh);
+    for (const auto& sample : samples.value()) {
+        REQUIRE(sample.surface_anchor.has_value());
+        const auto resolved = carto::production::resolve_sculpt_surface_anchor(
+            authored_mesh.value(), *sample.surface_anchor);
+        REQUIRE(resolved);
+        REQUIRE(sample.position.x == resolved.value().x);
+        REQUIRE(sample.position.y == resolved.value().y);
+        REQUIRE(sample.position.z == resolved.value().z);
+        REQUIRE(sample.position.y == 1.0);
+    }
+
+    const auto revision = selected.project_revision;
+    const auto missing_anchor_samples = [&samples]() {
+        auto result = samples.value();
+        result.front().surface_anchor.reset();
+        return result;
+    }();
+    const auto missing_anchor = ui.dispatch(
+        carto::application::AppendSculptSurfaceStrokeAction{
+            revision, object, mesh_asset, carto::production::SculptStrokeMode::add,
+            2.5, 0.05, missing_anchor_samples});
+    REQUIRE(!missing_anchor);
+    REQUIRE(ui.snapshot().project_revision == revision);
+    REQUIRE(ui.snapshot().sculpt_layers.empty());
+
+    auto wrong_source_samples = samples.value();
+    wrong_source_samples.front().position.x += 0.01;
+    const auto stale_anchor = ui.dispatch(
+        carto::application::AppendSculptSurfaceStrokeAction{
+            revision, object, mesh_asset, carto::production::SculptStrokeMode::add,
+            2.5, 0.05, wrong_source_samples});
+    REQUIRE(!stale_anchor);
+    REQUIRE(stale_anchor.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(ui.snapshot().project_revision == revision);
+
+    const auto committed = ui.dispatch(carto::application::AppendSculptSurfaceStrokeAction{
+        revision, object, mesh_asset, carto::production::SculptStrokeMode::add,
+        2.5, 0.05, samples.value()});
+    REQUIRE(committed);
+    REQUIRE(committed.value().action == "Add Sculpt Surface Stroke");
+    REQUIRE(committed.value().document_changed);
+    REQUIRE(!ui.snapshot().operations.empty());
+    REQUIRE(ui.snapshot().operations.back().action == "Add Sculpt Surface Stroke");
+    const auto sculpted = ui.snapshot();
+    const auto* sculpted_instance = sculpted.viewport.scene.find(object);
+    REQUIRE(sculpted_instance != nullptr);
+    REQUIRE(sculpted_instance->mesh != nullptr);
+    REQUIRE(sculpted_instance->mesh->positions.size() == source_positions.size());
+    REQUIRE(!same_positions(sculpted_instance->mesh->positions, source_positions));
+    const auto authored_revision = ui.snapshot().project_revision;
+
+    const auto ai_mutation = ui.submit_ai_proposal(
+        carto::application::AppendSculptSurfaceStrokeAction{
+            authored_revision, object, mesh_asset, carto::production::SculptStrokeMode::add,
+            2.5, 0.05, samples.value()});
+    REQUIRE(!ai_mutation);
+    REQUIRE(ui.snapshot().project_revision == authored_revision);
+
+    const auto stored = ui.snapshot();
+    REQUIRE(stored.sculpt_layers.size() == 1U);
+    REQUIRE(stored.sculpt_layers.front().stroke_count == 1U);
+    const auto stale = ui.dispatch(carto::application::AppendSculptSurfaceStrokeAction{
+        revision, object, mesh_asset, carto::production::SculptStrokeMode::add,
+        2.5, 0.05, samples.value()});
+    REQUIRE(!stale);
+    REQUIRE(stale.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(ui.snapshot().project_revision == authored_revision);
+
+    const auto path = temp.path() / "surface-sculpt.carto";
+    REQUIRE(ui.dispatch(carto::application::SaveProjectAction{path}));
+    const auto reopened = carto::project::ProjectDocument::load(path);
+    REQUIRE(reopened);
+    const auto decoded = carto::production::SculptStack::deserialize(
+        reopened.value().sculpt_stacks().at(mesh_asset).bytes);
+    REQUIRE(decoded);
+    const auto& stroke = decoded.value().layers.front().strokes.front();
+    REQUIRE(stroke.samples == samples.value());
+    const auto evaluated = carto::production::compile_sculpt_stack(
+        decoded.value(), reopened.value().meshes().at(mesh_asset));
+    REQUIRE(evaluated);
+    REQUIRE(evaluated.value().maximum_displacement > 0.0);
+}
+
+void sculpt_point_strokes_are_revision_bound_human_commands() {
+    TempDirectory temp;
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.dispatch(carto::application::NewProjectAction{"Sculpt workspace test"}));
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{"Sculpt mesh", {2.0, 2.0, 2.0}}));
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::sculpt));
+
+    auto snapshot = ui.snapshot();
+    REQUIRE(snapshot.objects.size() == 1U);
+    const carto::scene::ObjectId object = snapshot.objects.front().object.id;
+    const std::uint64_t mesh_asset = *snapshot.objects.front().object.mesh_asset;
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{object}));
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::vertex}));
+    REQUIRE(ui.dispatch(carto::application::SelectVertexAction{
+        object, carto::geometry::VertexId{1U}}));
+
+    const auto selected = ui.snapshot();
+    const auto* source_instance = selected.viewport.scene.find(object);
+    REQUIRE(source_instance != nullptr);
+    REQUIRE(source_instance->mesh != nullptr);
+    const auto source_positions = source_instance->mesh->positions;
+    const auto original_revision = selected.project_revision;
+    const auto invalid_mode = ui.dispatch(carto::application::AppendSculptStrokeAction{
+        original_revision, static_cast<carto::production::SculptStrokeMode>(99U), 0.5, 0.05});
+    REQUIRE(!invalid_mode);
+    REQUIRE(ui.snapshot().project_revision == original_revision);
+    const auto invalid_radius = ui.dispatch(carto::application::AppendSculptStrokeAction{
+        original_revision, carto::production::SculptStrokeMode::add, -1.0, 0.05});
+    REQUIRE(!invalid_radius);
+    REQUIRE(ui.snapshot().project_revision == original_revision);
+
+    const auto raw_ai = ui.submit_ai_proposal(
+        carto::application::AppendSculptStrokeAction{
+            original_revision, carto::production::SculptStrokeMode::add, 0.5, 0.05});
+    REQUIRE(!raw_ai);
+    REQUIRE(ui.snapshot().project_revision == original_revision);
+
+    const auto committed = ui.dispatch(carto::application::AppendSculptStrokeAction{
+        original_revision, carto::production::SculptStrokeMode::add, 0.5, 0.05});
+    REQUIRE(committed);
+    REQUIRE(committed.value().action == "Add Sculpt Stroke");
+    REQUIRE(committed.value().document_changed);
+    REQUIRE(committed.value().affected.objects == std::vector<carto::scene::ObjectId>{object});
+    REQUIRE(committed.value().affected.vertices ==
+        std::vector<carto::geometry::VertexId>{carto::geometry::VertexId{1U}});
+    const auto authored_revision = ui.snapshot().project_revision;
+    REQUIRE(authored_revision > original_revision);
+
+    const auto stale = ui.dispatch(carto::application::AppendSculptStrokeAction{
+        original_revision, carto::production::SculptStrokeMode::add, 0.5, 0.05});
+    REQUIRE(!stale);
+    REQUIRE(stale.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(ui.snapshot().project_revision == authored_revision);
+
+    const auto layer_snapshot = ui.snapshot();
+    REQUIRE(layer_snapshot.sculpt_mesh_asset == mesh_asset);
+    REQUIRE(layer_snapshot.sculpt_layers.size() == 1U);
+    REQUIRE(!layer_snapshot.sculpt_layers.front().identity.empty());
+    REQUIRE(layer_snapshot.sculpt_layers.front().visible);
+    REQUIRE(layer_snapshot.sculpt_layers.front().stroke_count == 1U);
+    const auto path = temp.path() / "sculpt.carto";
+    REQUIRE(ui.dispatch(carto::application::SaveProjectAction{path}));
+
+    const auto wrong_mesh = ui.dispatch(
+        carto::application::SetSculptLayerVisibilityAction{
+            authored_revision, mesh_asset + 1U,
+            layer_snapshot.sculpt_layers.front().identity, false});
+    REQUIRE(!wrong_mesh);
+    REQUIRE(wrong_mesh.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(ui.snapshot().project_revision == authored_revision);
+
+    const auto missing_layer = ui.dispatch(
+        carto::application::SetSculptLayerVisibilityAction{
+            authored_revision, mesh_asset, "missing.layer", false});
+    REQUIRE(!missing_layer);
+    REQUIRE(missing_layer.error().code == carto::core::ErrorCode::not_found);
+    REQUIRE(ui.snapshot().project_revision == authored_revision);
+    REQUIRE(ui.snapshot().sculpt_layers.front().visible);
+
+    const auto ai_visibility = ui.submit_ai_proposal(
+        carto::application::SetSculptLayerVisibilityAction{
+            authored_revision, mesh_asset,
+            layer_snapshot.sculpt_layers.front().identity, false});
+    REQUIRE(!ai_visibility);
+    REQUIRE(ui.snapshot().project_revision == authored_revision);
+    REQUIRE(ui.snapshot().sculpt_layers.front().visible);
+
+    const auto hidden = ui.dispatch(carto::application::SetSculptLayerVisibilityAction{
+        authored_revision, mesh_asset,
+        layer_snapshot.sculpt_layers.front().identity, false});
+    REQUIRE(hidden);
+    REQUIRE(hidden.value().action == "Set Sculpt Layer Visibility");
+    REQUIRE(hidden.value().document_changed);
+    REQUIRE(ui.snapshot().operations.back().action == "Set Sculpt Layer Visibility");
+    carto::journal::Journal journal(std::filesystem::path(path.string() + ".journal"));
+    const auto journal_entries = journal.read_all();
+    REQUIRE(journal_entries);
+    REQUIRE(journal_entries.value().back().event_type == "cartographer.application_action");
+    const std::string journal_payload(
+        journal_entries.value().back().payload.begin(),
+        journal_entries.value().back().payload.end());
+    REQUIRE(journal_payload.find("operation=Set Sculpt Layer Visibility") != std::string::npos);
+    const auto hidden_revision = ui.snapshot().project_revision;
+    REQUIRE(!ui.snapshot().sculpt_layers.front().visible);
+    const auto hidden_view = ui.snapshot();
+    const auto* hidden_instance = hidden_view.viewport.scene.find(object);
+    REQUIRE(hidden_instance != nullptr);
+    REQUIRE(hidden_instance->mesh != nullptr);
+    REQUIRE(same_positions(hidden_instance->mesh->positions, source_positions));
+
+    const auto stale_visibility = ui.dispatch(
+        carto::application::SetSculptLayerVisibilityAction{
+            authored_revision, mesh_asset,
+            layer_snapshot.sculpt_layers.front().identity, true});
+    REQUIRE(!stale_visibility);
+    REQUIRE(stale_visibility.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(ui.snapshot().project_revision == hidden_revision);
+    REQUIRE(!ui.snapshot().sculpt_layers.front().visible);
+
+    REQUIRE(ui.dispatch(carto::application::UndoAction{}));
+    REQUIRE(ui.snapshot().project_revision > authored_revision);
+    REQUIRE(ui.snapshot().sculpt_layers.front().visible);
+    REQUIRE(ui.dispatch(carto::application::RedoAction{}));
+    REQUIRE(ui.snapshot().project_revision > authored_revision);
+    REQUIRE(!ui.snapshot().sculpt_layers.front().visible);
+    REQUIRE(ui.dispatch(carto::application::SaveProjectAction{path}));
+
+    const auto reopened = carto::project::ProjectDocument::load(path);
+    REQUIRE(reopened);
+    REQUIRE(reopened.value().sculpt_stacks().contains(mesh_asset));
+    const auto& stored = reopened.value().sculpt_stacks().at(mesh_asset);
+    const auto stack = carto::production::SculptStack::deserialize(stored.bytes);
+    REQUIRE(stack);
+    REQUIRE(stack.value().validate());
+    REQUIRE(stack.value().layers.size() == 1U);
+    REQUIRE(stack.value().layers.front().strokes.size() == 1U);
+    REQUIRE(!stack.value().layers.front().visible);
+    const auto mesh = reopened.value().meshes().find(mesh_asset);
+    REQUIRE(mesh != reopened.value().meshes().end());
+    const auto evaluation = carto::production::compile_sculpt_stack(stack.value(), mesh->second);
+    REQUIRE(evaluation);
+    REQUIRE(evaluation.value().maximum_displacement == 0.0);
+
+    const auto enabled = ui.dispatch(carto::application::SetSculptLayerVisibilityAction{
+        ui.snapshot().project_revision, mesh_asset,
+        layer_snapshot.sculpt_layers.front().identity, true});
+    REQUIRE(enabled);
+    REQUIRE(ui.snapshot().sculpt_layers.front().visible);
+    const auto enabled_view = ui.snapshot();
+    const auto* enabled_instance = enabled_view.viewport.scene.find(object);
+    REQUIRE(enabled_instance != nullptr);
+    REQUIRE(enabled_instance->mesh != nullptr);
+    REQUIRE(!same_positions(enabled_instance->mesh->positions, source_positions));
+    REQUIRE(ui.dispatch(carto::application::SaveProjectAction{path}));
+    const auto reopened_enabled = carto::project::ProjectDocument::load(path);
+    REQUIRE(reopened_enabled);
+    const auto enabled_stack = carto::production::SculptStack::deserialize(
+        reopened_enabled.value().sculpt_stacks().at(mesh_asset).bytes);
+    REQUIRE(enabled_stack);
+    REQUIRE(enabled_stack.value().layers.front().visible);
+    const auto enabled_mesh = reopened_enabled.value().meshes().find(mesh_asset);
+    REQUIRE(enabled_mesh != reopened_enabled.value().meshes().end());
+    const auto enabled_evaluation = carto::production::compile_sculpt_stack(
+        enabled_stack.value(), enabled_mesh->second);
+    REQUIRE(enabled_evaluation);
+    REQUIRE(enabled_evaluation.value().maximum_displacement > 0.0);
+
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    const auto no_vertex = ui.dispatch(carto::application::AppendSculptStrokeAction{
+        ui.snapshot().project_revision, carto::production::SculptStrokeMode::add, 0.5, 0.05});
+    REQUIRE(!no_vertex);
+    REQUIRE(ui.snapshot().project_revision == reopened_enabled.value().revision());
 }
 
 } // namespace
@@ -554,10 +1088,14 @@ int main() {
         ui_persists_preferences_and_resets_corrupt_state();
         workbench_preferences_round_trip_and_fail_closed();
         ui_connects_surface_fidelity_preview_without_authoring_mutation();
+        ui_imports_mesh_through_provider_and_authoring_boundaries();
         ui_failed_shortcuts_and_actions_remain_bounded();
         ui_command_palette_is_bounded_and_explicit_about_deferred_features();
         native_key_contract_maps_core_control_without_imgui();
         workspace_registry_is_canonical_and_fail_closed();
+        sculpt_viewport_sampling_preserves_frontmost_surface_and_path_spacing();
+        sculpt_surface_strokes_commit_anchored_samples_through_human_commands();
+        sculpt_point_strokes_are_revision_bound_human_commands();
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         return 1;

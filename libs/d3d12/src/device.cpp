@@ -552,6 +552,7 @@ struct D3D12Device::Impl {
     D3D12DeviceOptions options;
     device::DeviceIdentity identity;
     gpu::DeviceCapabilities capabilities;
+    bool software_adapter = false;
     ComPtr<IDXGIFactory6> factory;
     ComPtr<IDXGIAdapter1> adapter;
     ComPtr<ID3D12Device> device;
@@ -696,6 +697,8 @@ core::Result<std::unique_ptr<D3D12Device>> D3D12Device::create(D3D12DeviceOption
             continue;
         }
         impl->adapter = std::move(candidate);
+        impl->software_adapter =
+            (descriptor.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0U;
         impl->identity.adapter_name = wide_name(descriptor.Description);
         impl->identity.vendor_id = descriptor.VendorId;
         impl->identity.device_id = descriptor.DeviceId;
@@ -887,6 +890,7 @@ const device::DeviceIdentity& D3D12Device::identity() const noexcept { return im
 const gpu::DeviceCapabilities& D3D12Device::capabilities() const noexcept {
     return impl_->capabilities;
 }
+bool D3D12Device::is_software_adapter() const noexcept { return impl_->software_adapter; }
 
 core::Result<gpu::BufferHandle> D3D12Device::create_buffer(const gpu::BufferDesc& descriptor) {
     if (impl_->device_lost) {
@@ -1316,6 +1320,15 @@ core::Result<gpu::PipelineHandle> D3D12Device::create_pipeline(
                     "D3D12 compute resource bindings must all be staged for compute"));
             }
         }
+        constexpr std::uint32_t kRootSignatureDwordLimit = 64U;
+        const std::uint32_t root_cost = descriptor.push_constant_bytes /
+                static_cast<std::uint32_t>(sizeof(std::uint32_t)) +
+            descriptor.sampled_texture_count +
+            (descriptor.descriptor_bindings.size() > descriptor.sampled_texture_count ? 1U : 0U);
+        if (root_cost > kRootSignatureDwordLimit) {
+            return core::Result<gpu::PipelineHandle>::failure(invalid(
+                "D3D12 compute root-signature cost exceeds 64 DWORDs"));
+        }
 
         Impl::PipelineResource value{};
         value.descriptor = descriptor;
@@ -1416,6 +1429,19 @@ core::Result<gpu::PipelineHandle> D3D12Device::create_pipeline(
     if (vertex_shader == nullptr || fragment_shader == nullptr) {
         return core::Result<gpu::PipelineHandle>::failure(validation(
             "D3D12 graphics pipelines require one vertex and one fragment shader"));
+    }
+    constexpr std::uint32_t kRootSignatureDwordLimit = 64U;
+    const std::uint32_t graphics_sampled_texture_count =
+        descriptor.sampled_texture_count != 0U
+        ? descriptor.sampled_texture_count
+        : (descriptor.descriptor_bindings.empty() ? 0U : 1U);
+    const std::uint32_t root_cost = descriptor.push_constant_bytes /
+            static_cast<std::uint32_t>(sizeof(std::uint32_t)) +
+        graphics_sampled_texture_count +
+        (graphics_sampled_texture_count == 0U ? 0U : 1U);
+    if (root_cost > kRootSignatureDwordLimit) {
+        return core::Result<gpu::PipelineHandle>::failure(invalid(
+            "D3D12 graphics root-signature cost exceeds 64 DWORDs"));
     }
     Impl::PipelineResource value{};
     value.descriptor = descriptor;
@@ -2000,7 +2026,9 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
         }
         return core::Result<void>::success();
     };
-    auto transition = [this, &queue_resource, &remember_native_state, queue](
+    std::map<device_ir::ResourceHandle, device_ir::ResourceState> copy_texture_roles;
+    auto transition = [this, &queue_resource, &remember_native_state,
+                       &copy_texture_roles, queue](
         const device_ir::CmdTransitionResource& command) -> core::Result<void> {
         const auto current = impl_->resource_states.find(command.resource);
         if (current == impl_->resource_states.end() || current->second != command.before) {
@@ -2030,7 +2058,8 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
         };
         const bool copy_queue = queue == gpu::QueueType::copy;
         const auto result = std::visit(
-            [&record, this, &command, copy_queue](const auto handle) -> core::Result<void> {
+            [&record, this, &command, &copy_texture_roles,
+             copy_queue](const auto handle) -> core::Result<void> {
                 using Handle = std::decay_t<decltype(handle)>;
                 if constexpr (std::is_same_v<Handle, gpu::BufferHandle>) {
                     auto resource = impl_->buffers.resolve(handle);
@@ -2064,14 +2093,21 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
                     if (copy_queue &&
                         (command.after == device_ir::ResourceState::copy_source ||
                          command.after == device_ir::ResourceState::copy_destination)) {
-                        // Copy queues use COMMON as the native ownership state and
-                        // rely on D3D12's copy-state promotion/decay. Keep the
-                        // semantic state explicit while leaving the native state
-                        // at COMMON for the copy command list.
+                        // Copy command lists operate textures in COMMON and use
+                        // promotion/decay. A COPY_DEST/COPY_SOURCE role change
+                        // needs an execution boundary so the first promotion can
+                        // decay before the opposite role is promoted.
+                        const auto active_role = copy_texture_roles.find(command.resource);
+                        if (active_role != copy_texture_roles.end() &&
+                            active_role->second != command.after) {
+                            return core::Result<void>::failure(unsupported(
+                                "D3D12 copy-queue texture role changes require a submission boundary"));
+                        }
                         if (resource.value()->native_state != D3D12_RESOURCE_STATE_COMMON) {
                             return core::Result<void>::failure(unsupported(
                                 "D3D12 copy-queue texture use requires native COMMON ownership"));
                         }
+                        copy_texture_roles[command.resource] = command.after;
                         impl_->resource_states[command.resource] = command.after;
                         return core::Result<void>::success();
                     }
@@ -2159,12 +2195,16 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
                     if (!source) return core::Result<void>::failure(source.error());
                     if (!destination) return core::Result<void>::failure(destination.error());
                     const D3D12_RESOURCE_DESC descriptor = destination.value()->resource->GetDesc();
+                    if (value.mip_level >= descriptor.MipLevels) {
+                        return core::Result<void>::failure(invalid(
+                            "D3D12 buffer-to-texture copy mip level is out of range"));
+                    }
                     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
                     UINT row_count = 0U;
                     UINT64 row_size = 0U;
                     UINT64 total_bytes = 0U;
                     impl_->device->GetCopyableFootprints(
-                        &descriptor, 0U, 1U, value.source_offset,
+                        &descriptor, value.mip_level, 1U, value.source_offset,
                         &footprint, &row_count, &row_size, &total_bytes);
                     static_cast<void>(row_count);
                     static_cast<void>(row_size);
@@ -2180,7 +2220,7 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
                     D3D12_TEXTURE_COPY_LOCATION destination_location{};
                     destination_location.pResource = destination.value()->resource.Get();
                     destination_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                    destination_location.SubresourceIndex = 0U;
+                    destination_location.SubresourceIndex = value.mip_level;
                     queue_resource.command_list->CopyTextureRegion(
                         &destination_location, 0U, 0U, 0U, &source_location, nullptr);
                     return core::Result<void>::success();
@@ -2196,12 +2236,16 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
                     if (!source) return core::Result<void>::failure(source.error());
                     if (!destination) return core::Result<void>::failure(destination.error());
                     const D3D12_RESOURCE_DESC descriptor = source.value()->resource->GetDesc();
+                    if (value.mip_level >= descriptor.MipLevels) {
+                        return core::Result<void>::failure(invalid(
+                            "D3D12 texture-to-buffer copy mip level is out of range"));
+                    }
                     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
                     UINT row_count = 0U;
                     UINT64 row_size = 0U;
                     UINT64 total_bytes = 0U;
                     impl_->device->GetCopyableFootprints(
-                        &descriptor, 0U, 1U, value.destination_offset,
+                        &descriptor, value.mip_level, 1U, value.destination_offset,
                         &footprint, &row_count, &row_size, &total_bytes);
                     static_cast<void>(row_count);
                     static_cast<void>(row_size);
@@ -2213,7 +2257,7 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
                     D3D12_TEXTURE_COPY_LOCATION source_location{};
                     source_location.pResource = source.value()->resource.Get();
                     source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                    source_location.SubresourceIndex = 0U;
+                    source_location.SubresourceIndex = value.mip_level;
                     D3D12_TEXTURE_COPY_LOCATION destination_location{};
                     destination_location.pResource = destination.value()->resource.Get();
                     destination_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;

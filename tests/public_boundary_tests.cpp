@@ -1,3 +1,5 @@
+#include <carto/production/preparation_operation.hpp>
+
 #include <iostream>
 
 #if defined(CARTO_BUILD_PRIVATE_INTEGRATIONS)
@@ -13,6 +15,8 @@
 #endif
 
 int main() {
+    const auto profile = carto::production::portable_preparation_profile();
+    if (!profile.validate()) return 1;
     std::cout << "Cartographer public boundary excludes private integration headers\n";
     return 0;
 }

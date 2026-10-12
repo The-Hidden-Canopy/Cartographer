@@ -106,6 +106,13 @@ struct StandardMaterial {
     double occlusion_strength = 1.0;
     core::Vec3d emissive_factor{};
     double emissive_strength = 0.0;
+    // Material V2 direct-light controls. Scalar dielectric F0 keeps the first
+    // native contract bounded while allowing physically meaningful IOR-like
+    // reflectance control. Clearcoat is an energy-conserving secondary GGX
+    // lobe with its own roughness.
+    double dielectric_f0 = 0.04;
+    double clearcoat = 0.0;
+    double clearcoat_roughness = 0.1;
     AlphaMode alpha_mode = AlphaMode::opaque;
     double alpha_cutoff = 0.5;
     TextureRef base_color;
@@ -144,6 +151,7 @@ struct PbrSurface {
 struct PbrEvaluation {
     core::Vec3d direct_diffuse{};
     core::Vec3d direct_specular{};
+    core::Vec3d clearcoat_specular{};
     core::Vec3d ibl_diffuse{};
     core::Vec3d ibl_specular{};
     core::Vec3d emissive{};

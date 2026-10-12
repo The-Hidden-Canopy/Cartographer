@@ -1,14 +1,18 @@
 #include <carto/application/application.hpp>
+#include <carto/attributes/transfer.hpp>
 #include <carto/geometry/primitives.hpp>
 #include <carto/geometry/mesh.hpp>
+#include <carto/mesh_attributes/provenance.hpp>
 
 #include <algorithm>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -185,6 +189,114 @@ void edge_split_is_atomic_and_reports_topology_delta() {
     REQUIRE(box.value().find_edge(edge) == nullptr);
     REQUIRE(box.value().find_vertex(split.value().created_vertices.front()) != nullptr);
     REQUIRE(box.value().validate());
+}
+
+void edge_split_interpolates_corner_origins_without_flattening_uv_seams() {
+    using namespace carto;
+    geometry::EditableMesh mesh;
+    REQUIRE(mesh.insert_bulk(
+        {{geometry::VertexId{1U}, {-1.0, 0.0, 0.0}},
+         {geometry::VertexId{2U}, {0.0, 0.0, 0.0}},
+         {geometry::VertexId{3U}, {1.0, 0.0, 0.0}},
+         {geometry::VertexId{4U}, {-1.0, 1.0, 0.0}},
+         {geometry::VertexId{5U}, {0.0, 1.0, 0.0}},
+         {geometry::VertexId{6U}, {1.0, 1.0, 0.0}}},
+        {{geometry::FaceId{1U}, {geometry::VertexId{1U}, geometry::VertexId{2U},
+             geometry::VertexId{5U}, geometry::VertexId{4U}}},
+         {geometry::FaceId{2U}, {geometry::VertexId{2U}, geometry::VertexId{3U},
+             geometry::VertexId{6U}, geometry::VertexId{5U}}}}));
+    const auto source_topology = mesh.topology();
+    REQUIRE(source_topology);
+    const auto shared_edge = std::find_if(
+        source_topology.value().edges.begin(), source_topology.value().edges.end(),
+        [](const geometry::EdgeRecord& edge) {
+            return edge.second_half_edge.has_value() &&
+                edge.first == geometry::VertexId{2U} && edge.second == geometry::VertexId{5U};
+        });
+    REQUIRE(shared_edge != source_topology.value().edges.end());
+
+    std::vector<geometry::CornerRecord> source_corners = source_topology.value().corners;
+    std::sort(source_corners.begin(), source_corners.end(), [](const auto& left, const auto& right) {
+        return left.id < right.id;
+    });
+    std::vector<attributes::AttributeValue> uv_values;
+    std::map<geometry::CornerId, core::Vec2d> uv_by_corner;
+    uv_values.reserve(source_corners.size());
+    for (const auto& corner : source_corners) {
+        const double face_seam = static_cast<double>(corner.face.value) * 10.0;
+        const core::Vec2d uv{face_seam + static_cast<double>(corner.vertex.value),
+            face_seam - static_cast<double>(corner.vertex.value)};
+        uv_by_corner.emplace(corner.id, uv);
+        uv_values.emplace_back(uv);
+    }
+    attributes::AttributeSet source_attributes({
+        {attributes::AttributeDomain::vertex, mesh.vertex_count()},
+        {attributes::AttributeDomain::edge, source_topology.value().edges.size()},
+        {attributes::AttributeDomain::face, mesh.face_count()},
+        {attributes::AttributeDomain::corner, source_corners.size()}});
+    REQUIRE(source_attributes.add_layer(attributes::AttributeLayer{
+        {"uv0", attributes::AttributeDomain::corner, attributes::AttributeType::vec2},
+        std::move(uv_values)}));
+    REQUIRE(mesh.set_attribute_payload(std::move(source_attributes), attributes::UvSetTable{}));
+
+    const geometry::EditableMesh source_with_attributes = mesh;
+    geometry::EditableMesh geometry_source = mesh;
+    REQUIRE(geometry_source.clear_attribute_payload());
+    const geometry::EditableMesh source_without_attributes = geometry_source;
+    const auto split = geometry_source.split_edge(shared_edge->id, 0.5);
+    REQUIRE(split);
+    REQUIRE(split.value().corner_origins.size() == split.value().created_corners.size());
+    const auto provenance = mesh_attributes::provenance_from_receipt(
+        source_without_attributes, geometry_source, split.value());
+    REQUIRE(provenance);
+    attributes::AttributeTransferPolicy policy;
+    policy.per_layer.emplace("uv0", attributes::TransferMode::interpolate);
+    auto transferred = attributes::transfer(
+        source_with_attributes.attributes(), provenance.value(), policy);
+    REQUIRE(transferred);
+    REQUIRE(geometry_source.set_attribute_payload(
+        std::move(transferred.value()), source_with_attributes.uv_sets()));
+
+    auto compound_receipt = split.value();
+    compound_receipt.revision_before = source_with_attributes.revision();
+    compound_receipt.revision_after = geometry_source.revision();
+    REQUIRE(compound_receipt.validate());
+    REQUIRE(mesh_attributes::provenance_from_receipt(
+        source_with_attributes, geometry_source, compound_receipt));
+
+    const auto destination_topology = geometry_source.topology();
+    REQUIRE(destination_topology);
+    std::vector<geometry::CornerRecord> destination_corners = destination_topology.value().corners;
+    std::sort(destination_corners.begin(), destination_corners.end(),
+        [](const auto& left, const auto& right) { return left.id < right.id; });
+    const auto* transferred_uv = geometry_source.attributes().find("uv0");
+    REQUIRE(transferred_uv != nullptr);
+    std::map<geometry::FaceId, core::Vec2d> split_uv_by_face;
+    for (std::size_t index = 0U; index < destination_corners.size(); ++index) {
+        const auto& corner = destination_corners[index];
+        if (corner.vertex != split.value().created_vertices.front()) continue;
+        const auto first_source = std::find_if(
+            source_corners.begin(), source_corners.end(), [&](const auto& candidate) {
+                return candidate.face == corner.face && candidate.vertex == shared_edge->first;
+            });
+        const auto second_source = std::find_if(
+            source_corners.begin(), source_corners.end(), [&](const auto& candidate) {
+                return candidate.face == corner.face && candidate.vertex == shared_edge->second;
+            });
+        REQUIRE(first_source != source_corners.end());
+        REQUIRE(second_source != source_corners.end());
+        const auto first_uv = uv_by_corner.at(first_source->id);
+        const auto second_uv = uv_by_corner.at(second_source->id);
+        const core::Vec2d expected{(first_uv.x + second_uv.x) * 0.5,
+            (first_uv.y + second_uv.y) * 0.5};
+        const core::Vec2d actual = std::get<core::Vec2d>(transferred_uv->values[index]);
+        REQUIRE(actual.x == expected.x);
+        REQUIRE(actual.y == expected.y);
+        split_uv_by_face.emplace(corner.face, actual);
+    }
+    REQUIRE(split_uv_by_face.size() == 2U);
+    REQUIRE(split_uv_by_face.at(geometry::FaceId{1U}).x !=
+        split_uv_by_face.at(geometry::FaceId{2U}).x);
 }
 
 void edge_split_rejects_invalid_factors_without_mutation() {
@@ -1598,6 +1710,7 @@ int main() {
         face_delete_preserves_shared_vertices_when_removing_orphans();
         face_extrude_is_atomic_and_advances_once();
         edge_split_is_atomic_and_reports_topology_delta();
+        edge_split_interpolates_corner_origins_without_flattening_uv_seams();
         edge_split_rejects_invalid_factors_without_mutation();
         edge_bevel_is_bounded_atomic_and_reports_lineage();
         edge_bevel_rejects_boundary_large_and_multisegment_inputs_without_mutation();

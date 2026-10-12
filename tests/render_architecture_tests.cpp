@@ -155,6 +155,9 @@ void texture_material_and_render_contracts_preserve_fidelity() {
     material.roughness = 0.25;
     material.emissive_factor = {0.1, 0.05, 0.0};
     material.emissive_strength = 0.5;
+    material.dielectric_f0 = 0.08;
+    material.clearcoat = 0.8;
+    material.clearcoat_roughness = 0.2;
     REQUIRE(material.validate());
 
     const auto evaluation = carto::render::evaluate_pbr_reference(
@@ -169,6 +172,7 @@ void texture_material_and_render_contracts_preserve_fidelity() {
         carto::render::PbrLight{{0.0, 0.0, 1.0}, {20.0, 20.0, 20.0}});
     REQUIRE(evaluation);
     REQUIRE(evaluation.value().hdr_color.x > 1.0);
+    REQUIRE(evaluation.value().clearcoat_specular.x > 0.0);
     const auto mapped = carto::render::tone_map(
         evaluation.value().hdr_color, carto::render::ToneMapMode::aces_fitted);
     REQUIRE(mapped);

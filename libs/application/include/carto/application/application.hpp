@@ -11,6 +11,7 @@
 #include <carto/geometry/primitives.hpp>
 #include <carto/journal/journal.hpp>
 #include <carto/project/project.hpp>
+#include <carto/production/sculpt_stack.hpp>
 #include <carto/render/render_scene.hpp>
 
 #include <cstddef>
@@ -85,6 +86,14 @@ struct ViewportState {
     std::optional<core::Diagnostic> error;
 };
 
+struct SculptLayerView {
+    std::string identity;
+    std::string name;
+    bool visible = true;
+    double weight = 1.0;
+    std::size_t stroke_count = 0U;
+};
+
 struct ApplicationSnapshot {
     std::string project_name;
     std::optional<std::filesystem::path> project_path;
@@ -99,6 +108,8 @@ struct ApplicationSnapshot {
     std::vector<core::Diagnostic> problems;
     WorkspaceState workspace;
     ViewportState viewport;
+    std::optional<std::uint64_t> sculpt_mesh_asset;
+    std::vector<SculptLayerView> sculpt_layers;
 };
 
 enum class RecoveryInspectionState {
@@ -268,6 +279,37 @@ struct CreateMeshObjectAction {
     geometry::EditableMesh mesh;
 };
 
+// Appends one deterministic point stroke to the currently selected vertex's
+// project-bound SculptStack. The UI snapshot revision is rechecked before
+// authoring and only the human command boundary may apply this action.
+struct AppendSculptStrokeAction {
+    core::Revision expected_project_revision;
+    production::SculptStrokeMode mode = production::SculptStrokeMode::add;
+    double radius = 0.25;
+    double strength = 0.05;
+};
+
+// Commits samples captured against a viewport snapshot. Each sample must carry
+// a stable source-surface anchor that resolves against the current mesh.
+struct AppendSculptSurfaceStrokeAction {
+    core::Revision expected_project_revision;
+    scene::ObjectId object;
+    std::uint64_t mesh_asset = 0U;
+    production::SculptStrokeMode mode = production::SculptStrokeMode::add;
+    double radius = 0.25;
+    double strength = 0.05;
+    std::vector<production::SculptStrokeSample> samples;
+};
+
+// Updates one layer on the currently selected mesh. Visibility edits are
+// revision-bound project mutations and may only enter through the human path.
+struct SetSculptLayerVisibilityAction {
+    core::Revision expected_project_revision;
+    std::uint64_t mesh_asset = 0U;
+    std::string layer_identity;
+    bool visible = true;
+};
+
 // Duplicates only an authored mesh instance. The new root object retains the
 // source mesh asset identity; it does not copy geometry or hierarchy state.
 struct DuplicateMeshInstanceAction {
@@ -300,6 +342,9 @@ using ApplicationAction = std::variant<
     CreateBoxAction,
     CreatePlaneAction,
     CreateMeshObjectAction,
+    AppendSculptStrokeAction,
+    AppendSculptSurfaceStrokeAction,
+    SetSculptLayerVisibilityAction,
     DuplicateMeshInstanceAction,
     UndoAction,
     RedoAction>;
@@ -389,6 +434,19 @@ private:
     [[nodiscard]] core::Result<DispatchReceipt> create_plane(const CreatePlaneAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_mesh_object(
         const CreateMeshObjectAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> append_sculpt_stroke(
+        const AppendSculptStrokeAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> append_sculpt_surface_stroke(
+        const AppendSculptSurfaceStrokeAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> commit_sculpt_stroke(
+        std::uint64_t mesh_asset,
+        scene::ObjectId object,
+        production::SculptStroke stroke,
+        std::string action_name,
+        AffectedSet affected,
+        std::optional<ParameterPayload> parameters = std::nullopt);
+    [[nodiscard]] core::Result<DispatchReceipt> set_sculpt_layer_visibility(
+        const SetSculptLayerVisibilityAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> duplicate_mesh_instance(
         const DuplicateMeshInstanceAction& action);
     [[nodiscard]] core::Result<ApplicationAction> preview_action(
@@ -422,6 +480,7 @@ private:
         std::uint64_t project_generation = 0U;
         const geometry::EditableMesh* source = nullptr;
         core::Revision source_revision;
+        std::optional<assets::Sha256Digest> sculpt_stack_digest;
         std::shared_ptr<const geometry::CompiledMesh> mesh;
     };
 

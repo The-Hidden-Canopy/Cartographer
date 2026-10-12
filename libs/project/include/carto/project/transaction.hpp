@@ -56,6 +56,23 @@ public:
         std::optional<assets::Sha256Digest> digest);
     [[nodiscard]] core::Result<void> set_scientific_model(
         scientific::ScientificModel model);
+    [[nodiscard]] core::Result<void> set_world_model(world::WorldModel model);
+    [[nodiscard]] core::Result<void> set_material_catalog(MaterialCatalog catalog);
+    [[nodiscard]] core::Result<void> set_semantic_sidecar(
+        std::string serialized_sidecar,
+        assets::Sha256Digest digest);
+    [[nodiscard]] core::Result<void> set_sculpt_stack(
+        std::uint64_t mesh_asset,
+        std::string serialized_stack,
+        assets::Sha256Digest digest);
+    [[nodiscard]] core::Result<void> set_garment_asset(
+        std::uint64_t mesh_asset,
+        std::string serialized_asset,
+        assets::Sha256Digest digest);
+    [[nodiscard]] core::Result<void> set_cloth_rest_pose_receipt(
+        std::uint64_t mesh_asset,
+        std::string serialized_receipt,
+        assets::Sha256Digest digest);
     [[nodiscard]] core::Result<void> set_object_transform(
         scene::ObjectId object,
         core::Transform transform);

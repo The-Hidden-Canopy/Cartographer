@@ -1,9 +1,9 @@
 # Cartographer project format v5 (legacy)
 
-Current saves use [project format v6](cartographer-project-v6.md). Version 5
+Current saves use [project format v9](cartographer-project-v9.md). Version 5
 remains readable for migration, but it has no persisted mesh attribute or UV
 records; a v5 mesh therefore loads with an empty attribute payload and is
-upgraded to v6 on its next save.
+upgraded to the current format on its next save.
 
 Cartographer v5 keeps the v4 authoring envelope, topology lineage ledger, and
 optional evaluation-graph reference, then adds a bounded generic scientific

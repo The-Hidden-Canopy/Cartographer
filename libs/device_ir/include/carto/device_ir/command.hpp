@@ -64,12 +64,14 @@ struct CmdCopyBufferToTexture {
     gpu::BufferHandle source;
     gpu::TextureHandle destination;
     std::uint64_t source_offset = 0U;
+    std::uint32_t mip_level = 0U;
 };
 
 struct CmdCopyTextureToBuffer {
     gpu::TextureHandle source;
     gpu::BufferHandle destination;
     std::uint64_t destination_offset = 0U;
+    std::uint32_t mip_level = 0U;
 };
 
 struct CmdCopyTexture {

@@ -10,10 +10,13 @@ cbuffer PushConstants : register(b0)
     float4x4 model;
     float4 camera_position_exposure;
     float4 base_color_factor;
-    float4 emissive_factor_and_strength;
+    float4 emissive_radiance_and_f0;
     float4 surface_factors;
     float4 light_direction_intensity;
     float4 light_radiance_range;
+    // The compact float2 keeps this descriptor-heavy root signature at the
+    // D3D12 64-DWORD limit.
+    float2 clearcoat_factors;
 };
 
 Texture2D<float4> base_color_texture : register(t0);
@@ -97,28 +100,42 @@ float4 PSMain(VertexOutput input) : SV_TARGET
         metallic_roughness_texture.Sample(linear_clamp_sampler, input.uv).b);
     const float roughness = saturate(surface_factors.y *
         metallic_roughness_texture.Sample(linear_clamp_sampler, input.uv).g);
-    const float3 f0 = lerp(float3(0.04, 0.04, 0.04), base_color, metallic);
+    const float dielectric_f0 = saturate(emissive_radiance_and_f0.w);
+    const float clearcoat = saturate(clearcoat_factors.x);
+    const float clearcoat_roughness = saturate(clearcoat_factors.y);
+    const float3 f0 = lerp(
+        float3(dielectric_f0, dielectric_f0, dielectric_f0), base_color, metallic);
     const float3 half_vector = normalize(view + light_direction);
     const float n_dot_h = max(dot(normal, half_vector), 0.0);
     const float v_dot_h = max(dot(view, half_vector), 0.0);
     const float3 fresnel = fresnel_schlick(v_dot_h, f0);
+    const float clearcoat_fresnel = 0.04 + 0.96 * pow(1.0 - v_dot_h, 5.0);
+    const float base_attenuation = saturate(1.0 - clearcoat * clearcoat_fresnel);
     const float distribution = distribution_ggx(n_dot_h, roughness);
     const float geometry = geometry_schlick_ggx(n_dot_l, roughness) *
         geometry_schlick_ggx(n_dot_v, roughness);
-    const float3 specular = fresnel * distribution * geometry /
+    const float3 specular = fresnel * distribution * geometry * base_attenuation /
         max(4.0 * n_dot_l * n_dot_v, 1e-5);
     const float3 diffuse_weight = (1.0 - fresnel) * (1.0 - metallic);
-    const float3 diffuse = diffuse_weight * base_color / 3.14159265;
+    const float3 diffuse = diffuse_weight * base_color * base_attenuation / 3.14159265;
+    const float clearcoat_distribution = distribution_ggx(
+        n_dot_h, clearcoat_roughness);
+    const float clearcoat_geometry =
+        geometry_schlick_ggx(n_dot_l, clearcoat_roughness) *
+        geometry_schlick_ggx(n_dot_v, clearcoat_roughness);
+    const float3 clearcoat_specular = clearcoat * clearcoat_fresnel *
+        clearcoat_distribution * clearcoat_geometry /
+        max(4.0 * n_dot_l * n_dot_v, 1e-5);
     const float shadow = saturate(light_radiance_range.w);
     const float occlusion = lerp(
         1.0,
         saturate(occlusion_texture.Sample(linear_clamp_sampler, input.uv).r),
         saturate(surface_factors.w));
-    const float3 direct = (diffuse + specular) *
+    const float3 direct = (diffuse + specular + clearcoat_specular) *
         (n_dot_l * light_radiance_range.rgb * shadow);
     const float3 ambient = base_color * (0.03 * occlusion);
     const float3 emissive = emissive_texture.Sample(linear_clamp_sampler, input.uv).rgb *
-        emissive_factor_and_strength.rgb * emissive_factor_and_strength.w;
+        emissive_radiance_and_f0.rgb;
     const float alpha = sampled_base.a * base_color_factor.a;
     // A negative light-direction w encodes masked alpha and its cutoff. The
     // positive path remains opaque/blended-compatible for the current pass.

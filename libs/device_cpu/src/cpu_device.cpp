@@ -585,6 +585,10 @@ core::Result<gpu::SubmissionSerial> CpuDevice::submit(
                     }
                     auto source = buffers_.resolve(value.source);
                     auto destination = textures_.resolve(value.destination);
+                    if (value.mip_level != 0U) {
+                        return core::Result<void>::failure(unsupported(
+                            "CPU reference texture copies support only mip level zero"));
+                    }
                     if (!source || !destination ||
                         destination.value()->descriptor.format != gpu::Format::rgba32_float) {
                         return core::Result<void>::failure(unsupported(
@@ -614,6 +618,10 @@ core::Result<gpu::SubmissionSerial> CpuDevice::submit(
                     }
                     auto source = textures_.resolve(value.source);
                     auto destination = buffers_.resolve(value.destination);
+                    if (value.mip_level != 0U) {
+                        return core::Result<void>::failure(unsupported(
+                            "CPU reference texture copies support only mip level zero"));
+                    }
                     if (!source || !destination ||
                         source.value()->descriptor.format != gpu::Format::rgba32_float) {
                         return core::Result<void>::failure(unsupported(

@@ -15,6 +15,7 @@ target_link_libraries(carto_application
         carto_journal
         carto_project
         carto_editor
+        carto_production
         carto_render
 )
 

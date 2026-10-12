@@ -1,13 +1,14 @@
 # Cartographer project format v6
 
-Cartographer v6 is the current line-oriented `.carto` authoring format. It
+Cartographer v6 is a readable legacy `.carto` authoring format. It
 retains the v5 authoring envelope, topology receipt ledger, optional
 evaluation-graph digest, and scientific model record, and adds validated mesh
 attribute payloads with explicit UV-set identity.
 
-New saves write v6. The parser reads v1 through v5. Legacy v5 meshes have no
+New saves use [project format v9](cartographer-project-v9.md). The parser still
+reads v6. Legacy v5 meshes have no
 attribute records and load with an empty payload; saving them upgrades the
-document to v6. Unknown versions, duplicate identities, invalid enum values,
+document to the current format. Unknown versions, duplicate identities, invalid enum values,
 non-finite numbers, oversized counts, and mismatched domain cardinalities fail
 closed before a document is published.
 

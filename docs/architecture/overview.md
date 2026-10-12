@@ -24,6 +24,7 @@ tool input
 | `carto_geometry` | editable mesh topology and derived compilation | UI state or GPU handles |
 | `carto_web_geometry_*` | deterministic derived clusters, provenance, runtime pages, and portable package bytes | authoring mutation, runtime residency, renderer scheduling, or VANTA scene authority |
 | `carto_assets` | content-addressed immutable blob bytes and digest verification | authoring ownership or import policy |
+| `carto_world` | semantic areas/paths, structure graphs, reconstructible instance fields, sparse variants, validation, and canonical persistence | runtime materialization, adaptive selection, or VANTA authority |
 | `carto_project` | versioned authoring persistence and asset references | render caches |
 | `carto_journal` | bounded revision-bound recovery records and hash-chain verification | explicit save state or editor history ownership |
 | `carto_providers` | capability descriptors and explicit provider lifecycle | dynamic code loading or permissions |

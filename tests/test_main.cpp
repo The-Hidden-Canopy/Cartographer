@@ -1346,18 +1346,30 @@ void project_round_trips_authoritative_state_and_rejects_future_versions() {
     REQUIRE(serialized_before.find(
                 "AUTHORING \"cartographer.authoring\" \"meters\" \"right_handed_y_up\"") !=
             std::string::npos);
+    REQUIRE(serialized_before.find(
+                "SOURCE_NAMESPACE \"" + document.value().source_namespace() + "\"") !=
+            std::string::npos);
+    auto independent = carto::project::ProjectDocument::create("Round Trip");
+    REQUIRE(independent);
+    REQUIRE(independent.value().source_namespace() !=
+            document.value().source_namespace());
     REQUIRE(document.value().save_atomic(path));
     auto loaded = carto::project::ProjectDocument::load(path);
     REQUIRE(loaded);
     REQUIRE(loaded.value().serialize() == serialized_before);
+    REQUIRE(loaded.value().source_namespace() ==
+            document.value().source_namespace());
     REQUIRE(loaded.value().scene().find(object.value()) != nullptr);
     REQUIRE(loaded.value().meshes().at(mesh_id.value()).vertex_count() == 3U);
 
     std::string future = serialized_before;
-    const std::string version = "CARTOGRAPHER_PROJECT 6";
+    const std::string version = "CARTOGRAPHER_PROJECT " +
+        std::to_string(carto::project::ProjectDocument::kSchemaVersion);
     const auto position = future.find(version);
     REQUIRE(position != std::string::npos);
-    future.replace(position, version.size(), "CARTOGRAPHER_PROJECT 7");
+    future.replace(
+        position, version.size(), "CARTOGRAPHER_PROJECT " +
+            std::to_string(carto::project::ProjectDocument::kSchemaVersion + 1U));
     const auto rejected = carto::project::ProjectDocument::deserialize(future);
     REQUIRE(!rejected);
     REQUIRE(rejected.error().code == carto::core::ErrorCode::version_mismatch);
@@ -1372,6 +1384,14 @@ void project_round_trips_authoritative_state_and_rejects_future_versions() {
         carto::project::ProjectDocument::deserialize(missing_authoring);
     REQUIRE(!missing_authoring_rejected);
     REQUIRE(missing_authoring_rejected.error().code == carto::core::ErrorCode::validation_failed);
+
+    std::string missing_namespace = serialized_before;
+    const auto namespace_start = missing_namespace.find("SOURCE_NAMESPACE ");
+    REQUIRE(namespace_start != std::string::npos);
+    const auto namespace_end = missing_namespace.find('\n', namespace_start);
+    REQUIRE(namespace_end != std::string::npos);
+    missing_namespace.erase(namespace_start, namespace_end - namespace_start + 1U);
+    REQUIRE(!carto::project::ProjectDocument::deserialize(missing_namespace));
 
     REQUIRE(carto::core::Revision(carto::core::Revision::max_value()).next() ==
             carto::core::Revision(carto::core::Revision::max_value()));
@@ -1540,7 +1560,10 @@ void project_persists_topology_receipts_and_rejects_stale_lineage() {
     REQUIRE(document.value().validate());
 
     const std::string serialized = document.value().serialize();
-    REQUIRE(serialized.find("CARTOGRAPHER_PROJECT 6") != std::string::npos);
+    REQUIRE(serialized.find(
+                "CARTOGRAPHER_PROJECT " +
+                std::to_string(carto::project::ProjectDocument::kSchemaVersion)) !=
+            std::string::npos);
     REQUIRE(serialized.find("TOPOLOGY_RECEIPTS 1") != std::string::npos);
 
     auto empty_document = carto::project::ProjectDocument::create("Missing Ledger");

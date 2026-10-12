@@ -3665,7 +3665,9 @@ void scientific_model_mutation_is_journaled_and_reopens() {
     REQUIRE(entries);
     REQUIRE(entries.value().size() == 1U);
     const std::string payload(entries.value().front().payload.begin(), entries.value().front().payload.end());
-    REQUIRE(payload.find("CARTOGRAPHER_PROJECT 6") != std::string::npos);
+    const std::string current_version = "CARTOGRAPHER_PROJECT " +
+        std::to_string(carto::project::ProjectDocument::kSchemaVersion);
+    REQUIRE(payload.find(current_version) != std::string::npos);
     REQUIRE(payload.find("SCIENTIFIC_MODEL") != std::string::npos);
 
     const auto path = temp.path() / "scientific.carto";
@@ -3686,10 +3688,14 @@ void scientific_model_mutation_is_journaled_and_reopens() {
     REQUIRE(!carto::project::ProjectDocument::deserialize(missing_scientific));
 
     std::string legacy_v4 = missing_scientific;
-    const auto current_header = legacy_v4.find("CARTOGRAPHER_PROJECT 6");
+    const auto current_header = legacy_v4.find(current_version);
     REQUIRE(current_header != std::string::npos);
-    legacy_v4.replace(current_header, std::string("CARTOGRAPHER_PROJECT 6").size(),
+    legacy_v4.replace(current_header, current_version.size(),
                       "CARTOGRAPHER_PROJECT 4");
+    const auto namespace_start = legacy_v4.find("SOURCE_NAMESPACE ");
+    const auto namespace_end = legacy_v4.find('\n', namespace_start);
+    REQUIRE(namespace_start != std::string::npos && namespace_end != std::string::npos);
+    legacy_v4.erase(namespace_start, namespace_end - namespace_start + 1U);
     const auto loaded_v4 = carto::project::ProjectDocument::deserialize(legacy_v4);
     REQUIRE(loaded_v4);
     REQUIRE(loaded_v4.value().scientific_model().empty());

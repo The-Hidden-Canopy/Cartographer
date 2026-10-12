@@ -104,7 +104,41 @@ target_link_libraries(cartographer_scientific_bench
 
 carto_target(cartographer_scientific_bench)
 
+add_executable(cartographer_production_cook_bench
+    production_cook.cpp
+)
+
+target_link_libraries(cartographer_production_cook_bench
+    PRIVATE
+        carto_archetype
+        carto_production
+)
+
+carto_target(cartographer_production_cook_bench)
+
+add_executable(cartographer_collision_kernels_bench
+    collision_kernels.cpp
+)
+
+target_link_libraries(cartographer_collision_kernels_bench
+    PRIVATE
+        carto_collision
+)
+
+carto_target(cartographer_collision_kernels_bench)
+
 if(CARTO_ENABLE_D3D12)
+    add_executable(cartographer_d3d12_ao_bench
+        d3d12_ao.cpp
+    )
+    target_link_libraries(cartographer_d3d12_ao_bench
+        PRIVATE
+            carto_d3d12_bake
+            carto_project
+            carto_production
+    )
+    carto_target(cartographer_d3d12_ao_bench)
+
     add_executable(cartographer_d3d12_kernel_bench
         d3d12_kernels.cpp
     )

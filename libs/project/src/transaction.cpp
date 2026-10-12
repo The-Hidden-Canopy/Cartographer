@@ -170,6 +170,48 @@ core::Result<void> ProjectTransaction::set_scientific_model(
     return staged_.set_scientific_model(std::move(model));
 }
 
+core::Result<void> ProjectTransaction::set_world_model(world::WorldModel model) {
+    if (auto result = ensure_active(); !result) return result;
+    return staged_.set_world_model(std::move(model));
+}
+
+core::Result<void> ProjectTransaction::set_material_catalog(MaterialCatalog catalog) {
+    if (auto result = ensure_active(); !result) return result;
+    return staged_.set_material_catalog(std::move(catalog));
+}
+
+core::Result<void> ProjectTransaction::set_semantic_sidecar(
+    std::string serialized_sidecar,
+    assets::Sha256Digest digest) {
+    if (auto result = ensure_active(); !result) return result;
+    return staged_.set_semantic_sidecar(std::move(serialized_sidecar), digest);
+}
+
+core::Result<void> ProjectTransaction::set_sculpt_stack(
+    std::uint64_t mesh_asset,
+    std::string serialized_stack,
+    assets::Sha256Digest digest) {
+    if (auto result = ensure_active(); !result) return result;
+    return staged_.set_sculpt_stack(mesh_asset, std::move(serialized_stack), digest);
+}
+
+core::Result<void> ProjectTransaction::set_garment_asset(
+    std::uint64_t mesh_asset,
+    std::string serialized_asset,
+    assets::Sha256Digest digest) {
+    if (auto result = ensure_active(); !result) return result;
+    return staged_.set_garment_asset(mesh_asset, std::move(serialized_asset), digest);
+}
+
+core::Result<void> ProjectTransaction::set_cloth_rest_pose_receipt(
+    std::uint64_t mesh_asset,
+    std::string serialized_receipt,
+    assets::Sha256Digest digest) {
+    if (auto result = ensure_active(); !result) return result;
+    return staged_.set_cloth_rest_pose_receipt(
+        mesh_asset, std::move(serialized_receipt), digest);
+}
+
 core::Result<void> ProjectTransaction::set_object_transform(
     scene::ObjectId object,
     core::Transform transform) {

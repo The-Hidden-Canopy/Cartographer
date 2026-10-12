@@ -1,6 +1,7 @@
 #include <carto/application/application.hpp>
 #include <carto/project/recovery.hpp>
 
+#include <algorithm>
 #include <charconv>
 #include <memory>
 #include <limits>
@@ -535,6 +536,12 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return create_plane(value);
             } else if constexpr (std::is_same_v<Action, CreateMeshObjectAction>) {
                 return create_mesh_object(value);
+            } else if constexpr (std::is_same_v<Action, AppendSculptStrokeAction>) {
+                return append_sculpt_stroke(value);
+            } else if constexpr (std::is_same_v<Action, AppendSculptSurfaceStrokeAction>) {
+                return append_sculpt_surface_stroke(value);
+            } else if constexpr (std::is_same_v<Action, SetSculptLayerVisibilityAction>) {
+                return set_sculpt_layer_visibility(value);
             } else if constexpr (std::is_same_v<Action, DuplicateMeshInstanceAction>) {
                 return duplicate_mesh_instance(value);
             } else if constexpr (std::is_same_v<Action, UndoAction>) {
@@ -1328,6 +1335,361 @@ core::Result<DispatchReceipt> ApplicationSession::create_mesh_object(
         "Create Mesh Object");
 }
 
+core::Result<DispatchReceipt> ApplicationSession::append_sculpt_stroke(
+    const AppendSculptStrokeAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "SculptStack authoring requires the human command boundary"));
+    }
+    if (action.expected_project_revision != document_.revision()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "SculptStack authoring snapshot no longer matches the project revision"));
+    }
+    if (selection_.mode() != editor::SelectionMode::vertex ||
+        selection_.selected_vertices().size() != 1U ||
+        !selection_.component_object().has_value()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "SculptStack point strokes require exactly one selected mesh vertex"));
+    }
+
+    const scene::ObjectId object_id = *selection_.component_object();
+    const scene::SceneObject* object = document_.scene().find(object_id);
+    if (!object || !object->mesh_asset.has_value()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "SculptStack selection owner or mesh asset is missing"));
+    }
+    if (object->locked || !object->visible) {
+        return failure(invalid_state(
+            "hidden or locked scene objects cannot receive sculpt strokes"));
+    }
+    const std::uint64_t mesh_asset = *object->mesh_asset;
+    const auto mesh = document_.meshes().find(mesh_asset);
+    if (mesh == document_.meshes().end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "SculptStack selection references a missing mesh asset"));
+    }
+    if (auto result = selection_.validate(document_.scene(), &mesh->second); !result) {
+        return failure(result.error().with_context("SculptStack selection"));
+    }
+    const geometry::VertexId vertex_id = selection_.selected_vertices().front();
+    const geometry::Vertex* vertex = mesh->second.find_vertex(vertex_id);
+    if (!vertex) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "SculptStack selected vertex is no longer present in the source mesh"));
+    }
+
+    production::SculptStroke stroke;
+    stroke.mode = action.mode;
+    stroke.radius = action.radius;
+    stroke.strength = action.strength;
+    stroke.samples.push_back(production::SculptStrokeSample{vertex->position, 1.0});
+    return commit_sculpt_stroke(
+        mesh_asset,
+        object_id,
+        std::move(stroke),
+        "Add Sculpt Stroke",
+        AffectedSet{{object_id}, {vertex_id}, {}, {}},
+        ParameterPayload{
+            std::nullopt, action.radius, vertex->position, std::nullopt,
+            action.strength, std::nullopt, std::nullopt});
+}
+
+core::Result<DispatchReceipt> ApplicationSession::append_sculpt_surface_stroke(
+    const AppendSculptSurfaceStrokeAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "Sculpt surface authoring requires the human command boundary"));
+    }
+    if (action.expected_project_revision != document_.revision()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "Sculpt surface snapshot no longer matches the project revision"));
+    }
+    const scene::SceneObject* object = document_.scene().find(action.object);
+    if (object == nullptr || !object->mesh_asset.has_value() ||
+        *object->mesh_asset != action.mesh_asset) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "Sculpt surface target no longer matches its authored mesh"));
+    }
+    if (object->locked || !object->visible) {
+        return failure(invalid_state(
+            "hidden or locked scene objects cannot receive sculpt surface strokes"));
+    }
+    const auto mesh = document_.meshes().find(action.mesh_asset);
+    if (mesh == document_.meshes().end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "Sculpt surface target mesh is missing"));
+    }
+    if (action.samples.empty() ||
+        action.samples.size() > production::kMaxSculptSamplesPerStroke) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "Sculpt surface stroke sample count is outside its supported bound"));
+    }
+
+    production::SculptStroke stroke;
+    stroke.mode = action.mode;
+    stroke.radius = action.radius;
+    stroke.strength = action.strength;
+    stroke.samples = action.samples;
+    std::vector<geometry::VertexId> affected_vertices;
+    std::vector<geometry::FaceId> affected_faces;
+    affected_vertices.reserve(action.samples.size() * 3U);
+    affected_faces.reserve(action.samples.size());
+    for (const production::SculptStrokeSample& sample : action.samples) {
+        if (!sample.surface_anchor.has_value()) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::validation_failed,
+                "Sculpt surface stroke samples must retain stable source anchors"));
+        }
+        const production::SculptSurfaceAnchor& anchor = *sample.surface_anchor;
+        if (auto result = anchor.validate(); !result) {
+            return failure(result.error().with_context("Sculpt surface stroke anchor"));
+        }
+        const auto resolved = production::resolve_sculpt_surface_anchor(mesh->second, anchor);
+        if (!resolved) {
+            return failure(resolved.error().with_context("Sculpt surface stroke source"));
+        }
+        if (sample.position.x != resolved.value().x ||
+            sample.position.y != resolved.value().y ||
+            sample.position.z != resolved.value().z) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "Sculpt surface sample position no longer matches its source anchor"));
+        }
+        affected_faces.push_back(anchor.face);
+        affected_vertices.insert(
+            affected_vertices.end(), anchor.vertices.begin(), anchor.vertices.end());
+    }
+    std::sort(affected_vertices.begin(), affected_vertices.end(),
+        [](geometry::VertexId left, geometry::VertexId right) {
+            return left.value < right.value;
+        });
+    affected_vertices.erase(
+        std::unique(affected_vertices.begin(), affected_vertices.end()),
+        affected_vertices.end());
+    std::sort(affected_faces.begin(), affected_faces.end(),
+        [](geometry::FaceId left, geometry::FaceId right) {
+            return left.value < right.value;
+        });
+    affected_faces.erase(std::unique(affected_faces.begin(), affected_faces.end()),
+        affected_faces.end());
+
+    return commit_sculpt_stroke(
+        action.mesh_asset,
+        action.object,
+        std::move(stroke),
+        "Add Sculpt Surface Stroke",
+        AffectedSet{{action.object}, std::move(affected_vertices), {}, std::move(affected_faces)},
+        ParameterPayload{
+            std::nullopt, action.radius, action.samples.front().position, std::nullopt,
+            action.strength, std::nullopt, std::nullopt});
+}
+
+core::Result<DispatchReceipt> ApplicationSession::commit_sculpt_stroke(
+    std::uint64_t mesh_asset,
+    scene::ObjectId object_id,
+    production::SculptStroke stroke,
+    std::string action_name,
+    AffectedSet affected,
+    std::optional<ParameterPayload> parameters) {
+    const scene::SceneObject* object = document_.scene().find(object_id);
+    if (object == nullptr || !object->mesh_asset.has_value() ||
+        *object->mesh_asset != mesh_asset) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "Sculpt stroke owner no longer matches its mesh asset"));
+    }
+    const auto mesh = document_.meshes().find(mesh_asset);
+    if (mesh == document_.meshes().end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "Sculpt stroke mesh asset is missing"));
+    }
+
+    std::optional<project::SerializedSculptStack> before;
+    production::SculptStack stack;
+    const auto current = document_.sculpt_stacks().find(mesh_asset);
+    if (current == document_.sculpt_stacks().end()) {
+        auto created = production::make_sculpt_stack(document_, mesh_asset);
+        if (!created) return failure(created.error().with_context("create SculptStack"));
+        stack = std::move(created.value());
+    } else {
+        before = current->second;
+        auto decoded = production::SculptStack::deserialize(current->second.bytes);
+        if (!decoded) return failure(decoded.error().with_context("read existing SculptStack"));
+        stack = std::move(decoded.value());
+    }
+    stack.format_version = production::kSculptStackVersion;
+    for (production::SculptLayer& layer : stack.layers) {
+        for (production::SculptStroke& existing : layer.strokes) {
+            if (existing.symmetry != production::SculptSymmetryMode::mirror_x) {
+                existing.symmetry_plane_x = 0.0;
+            }
+        }
+    }
+
+    production::SculptLayer* target_layer = nullptr;
+    for (auto layer = stack.layers.rbegin(); layer != stack.layers.rend(); ++layer) {
+        if (layer->visible && layer->weight > 0.0) {
+            target_layer = &*layer;
+            break;
+        }
+    }
+    if (target_layer == nullptr) {
+        std::set<std::string> used_layer_ids;
+        for (const production::SculptLayer& layer : stack.layers) {
+            used_layer_ids.insert(layer.identity);
+        }
+        const std::string revision_tag = std::to_string(document_.revision().value());
+        std::string layer_id = "ui.layer.rev" + revision_tag;
+        for (std::uint32_t suffix = 1U; used_layer_ids.contains(layer_id); ++suffix) {
+            layer_id = "ui.layer.rev" + revision_tag + "." + std::to_string(suffix);
+        }
+        stack.layers.push_back(production::SculptLayer{
+            std::move(layer_id), "Sculpt", true, 1.0, {}});
+        target_layer = &stack.layers.back();
+    }
+
+    const std::string revision_tag = std::to_string(document_.revision().value());
+    stroke.identity = "ui.stroke.rev" + revision_tag;
+    const auto stroke_identity_exists = [&stack](std::string_view identity) {
+        for (const production::SculptLayer& layer : stack.layers) {
+            for (const production::SculptStroke& existing : layer.strokes) {
+                if (existing.identity == identity) return true;
+            }
+        }
+        return false;
+    };
+    for (std::uint32_t suffix = 1U; stroke_identity_exists(stroke.identity); ++suffix) {
+        stroke.identity = "ui.stroke.rev" + revision_tag + "." + std::to_string(suffix);
+    }
+    target_layer->strokes.push_back(std::move(stroke));
+
+    if (auto result = stack.validate(); !result) {
+        return failure(result.error().with_context("SculptStack point stroke"));
+    }
+    const auto evaluation = production::compile_sculpt_stack(stack, mesh->second);
+    if (!evaluation) {
+        return failure(evaluation.error().with_context("SculptStack reference evaluation"));
+    }
+    const std::string serialized = stack.serialize();
+    const auto digest = stack.digest();
+    if (serialized.empty() || !digest) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::validation_failed,
+            "SculptStack stroke did not produce canonical source bytes"));
+    }
+
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectSculptStackCommand>(
+            admission, document_, mesh_asset, std::move(before),
+            project::SerializedSculptStack{serialized, digest.value()}),
+        std::move(action_name),
+        std::move(affected),
+        std::move(parameters));
+}
+
+core::Result<DispatchReceipt> ApplicationSession::set_sculpt_layer_visibility(
+    const SetSculptLayerVisibilityAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "SculptStack layer visibility requires the human command boundary"));
+    }
+    if (action.expected_project_revision != document_.revision()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "SculptStack layer visibility snapshot no longer matches the project revision"));
+    }
+    if (!selection_.component_object().has_value()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "SculptStack layer visibility requires a selected mesh component"));
+    }
+    const scene::ObjectId object_id = *selection_.component_object();
+    const scene::SceneObject* object = document_.scene().find(object_id);
+    if (!object || !object->mesh_asset.has_value() ||
+        *object->mesh_asset != action.mesh_asset) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "SculptStack layer visibility target no longer matches the selected mesh"));
+    }
+    if (object->locked || !object->visible) {
+        return failure(invalid_state(
+            "hidden or locked scene objects cannot edit SculptStack layers"));
+    }
+    const auto mesh = document_.meshes().find(action.mesh_asset);
+    if (mesh == document_.meshes().end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "SculptStack layer visibility target mesh is missing"));
+    }
+    if (auto result = selection_.validate(document_.scene(), &mesh->second); !result) {
+        return failure(result.error().with_context("SculptStack layer selection"));
+    }
+    const auto current = document_.sculpt_stacks().find(action.mesh_asset);
+    if (current == document_.sculpt_stacks().end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "selected mesh has no authored SculptStack layers"));
+    }
+    auto decoded = production::SculptStack::deserialize(current->second.bytes);
+    if (!decoded) {
+        return failure(decoded.error().with_context("read SculptStack layers"));
+    }
+    production::SculptStack stack = std::move(decoded.value());
+    const auto layer = std::find_if(
+        stack.layers.begin(), stack.layers.end(), [&action](const production::SculptLayer& item) {
+            return item.identity == action.layer_identity;
+        });
+    if (layer == stack.layers.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "SculptStack layer identity is not present on the selected mesh"));
+    }
+    if (layer->visible == action.visible) {
+        return accepted("Set Sculpt Layer Visibility", document_.revision());
+    }
+
+    layer->visible = action.visible;
+    if (auto result = stack.validate(); !result) {
+        return failure(result.error().with_context("SculptStack layer visibility"));
+    }
+    const auto evaluation = production::compile_sculpt_stack(stack, mesh->second);
+    if (!evaluation) {
+        return failure(evaluation.error().with_context("SculptStack layer evaluation"));
+    }
+    const std::string serialized = stack.serialize();
+    const auto digest = stack.digest();
+    if (serialized.empty() || !digest) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::validation_failed,
+            "SculptStack layer visibility did not produce canonical source bytes"));
+    }
+
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectSculptStackCommand>(
+            admission,
+            document_,
+            action.mesh_asset,
+            current->second,
+            project::SerializedSculptStack{serialized, digest.value()}),
+        "Set Sculpt Layer Visibility",
+        AffectedSet{{object_id}, {}, {}, {}});
+}
+
 core::Result<DispatchReceipt> ApplicationSession::duplicate_mesh_instance(
     const DuplicateMeshInstanceAction& action) {
     editor::ProjectCommandAdmission admission;
@@ -1462,6 +1824,30 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
     result.selection.faces = selection_.selected_faces();
     result.selection.component_object = selection_.component_object();
     result.selection.component_mesh_revision = selection_.component_mesh_revision();
+    if (result.selection.component_object.has_value()) {
+        const scene::SceneObject* selected_object = document_.scene().find(
+            *result.selection.component_object);
+        if (selected_object != nullptr && selected_object->mesh_asset.has_value()) {
+            result.sculpt_mesh_asset = *selected_object->mesh_asset;
+            const auto stored_stack = document_.sculpt_stacks().find(*result.sculpt_mesh_asset);
+            if (stored_stack != document_.sculpt_stacks().end()) {
+                auto stack = production::SculptStack::deserialize(stored_stack->second.bytes);
+                if (!stack) {
+                    append_problem(stack.error().with_context("SculptStack snapshot"));
+                } else {
+                    result.sculpt_layers.reserve(stack.value().layers.size());
+                    for (const production::SculptLayer& layer : stack.value().layers) {
+                        result.sculpt_layers.push_back(SculptLayerView{
+                            layer.identity,
+                            layer.name,
+                            layer.visible,
+                            layer.weight,
+                            layer.strokes.size()});
+                    }
+                }
+            }
+        }
+    }
     result.viewport.project_revision = document_.revision();
 
     render::RenderScene viewport_scene;
@@ -1485,16 +1871,70 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
             break;
         }
         const auto source_revision = mesh->second.revision();
+        const auto stored_stack = document_.sculpt_stacks().find(*object.mesh_asset);
+        const std::optional<assets::Sha256Digest> sculpt_stack_digest =
+            stored_stack == document_.sculpt_stacks().end()
+                ? std::nullopt
+                : std::optional<assets::Sha256Digest>{stored_stack->second.digest};
         const auto cached = viewport_mesh_cache_.find(*object.mesh_asset);
         std::shared_ptr<const geometry::CompiledMesh> compiled_mesh;
         if (cached != viewport_mesh_cache_.end() &&
             cached->second.project_generation == project_generation_ &&
             cached->second.source == &mesh->second &&
             cached->second.source_revision == source_revision &&
+            cached->second.sculpt_stack_digest == sculpt_stack_digest &&
             cached->second.mesh != nullptr) {
             compiled_mesh = cached->second.mesh;
         } else {
-            auto compiled = mesh->second.compile();
+            geometry::EditableMesh viewport_mesh = mesh->second;
+            if (stored_stack != document_.sculpt_stacks().end()) {
+                auto stack = production::SculptStack::deserialize(stored_stack->second.bytes);
+                if (!stack) {
+                    result.viewport.error = stack.error().with_context(
+                        "SculptStack viewport source");
+                    break;
+                }
+                const auto digest = stack.value().digest();
+                if (!digest || digest.value() != stored_stack->second.digest) {
+                    result.viewport.error = core::Diagnostic(
+                        core::ErrorCode::validation_failed,
+                        "SculptStack viewport bytes do not match their recorded digest");
+                    break;
+                }
+                const auto evaluation = production::compile_sculpt_stack(
+                    stack.value(), mesh->second);
+                if (!evaluation) {
+                    result.viewport.error = evaluation.error().with_context(
+                        "SculptStack viewport evaluation");
+                    break;
+                }
+                geometry::MeshPatch patch;
+                patch.expected_revision = viewport_mesh.revision();
+                for (const geometry::Vertex& evaluated : evaluation.value().vertices) {
+                    const geometry::Vertex* source = viewport_mesh.find_vertex(evaluated.id);
+                    if (source == nullptr) {
+                        result.viewport.error = core::Diagnostic(
+                            core::ErrorCode::stale_data,
+                            "SculptStack viewport output references a missing source vertex");
+                        break;
+                    }
+                    if (source->position.x != evaluated.position.x ||
+                        source->position.y != evaluated.position.y ||
+                        source->position.z != evaluated.position.z) {
+                        patch.vertex_changes.push_back(geometry::VertexChange{
+                            evaluated.id, source->position, evaluated.position});
+                    }
+                }
+                if (result.viewport.error.has_value()) break;
+                if (!patch.vertex_changes.empty()) {
+                    if (auto applied = viewport_mesh.apply_patch(patch); !applied) {
+                        result.viewport.error = applied.error().with_context(
+                            "SculptStack viewport projection");
+                        break;
+                    }
+                }
+            }
+            auto compiled = viewport_mesh.compile();
             if (!compiled) {
                 result.viewport.error = compiled.error().with_context("viewport compilation");
                 break;
@@ -1502,7 +1942,8 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
             auto owned_mesh = std::make_shared<geometry::CompiledMesh>(std::move(compiled.value()));
             compiled_mesh = owned_mesh;
             viewport_mesh_cache_[*object.mesh_asset] = ViewportMeshCacheEntry{
-                project_generation_, &mesh->second, source_revision, std::move(owned_mesh)};
+                project_generation_, &mesh->second, source_revision,
+                sculpt_stack_digest, std::move(owned_mesh)};
         }
         if (auto inserted = viewport_scene.upsert({
                 object.id, compiled_mesh, object_view.world_transform,

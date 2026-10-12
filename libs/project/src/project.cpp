@@ -12,6 +12,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <set>
 #include <sstream>
 #include <system_error>
@@ -22,6 +23,8 @@
 #ifdef _WIN32
 #    define NOMINMAX
 #    include <windows.h>
+#else
+#    include <unistd.h>
 #endif
 
 namespace carto::project {
@@ -53,9 +56,59 @@ constexpr std::uint64_t kMaxSerializedAttributeDomains = 64U;
 constexpr std::uint64_t kMaxSerializedAttributeLayers = 1'000'000U;
 constexpr std::uint64_t kMaxSerializedAttributeValues = 1'000'000U;
 constexpr std::uint64_t kMaxSerializedUvSets = 1'000'000U;
+constexpr std::uint64_t kMaxSerializedSculptStacks = 100'000U;
+constexpr std::uint64_t kMaxSerializedGarmentAssets = 100'000U;
+constexpr std::uint64_t kMaxSerializedClothRestPoseReceipts = 100'000U;
 constexpr std::uintmax_t kMaxSerializedProjectBytes = 128ULL * 1024ULL * 1024ULL;
+// Mirrors carto::semantic::SemanticSidecar::kMaxSerializedBytes. The value is
+// duplicated here so libs/project keeps no dependency on carto_semantic.
+constexpr std::uint64_t kMaxSerializedSemanticSidecarBytes = 16ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaxSerializedSculptStackBytes = 16ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaxSerializedGarmentAssetBytes = 16ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaxSerializedClothRestPoseReceiptBytes = 16ULL * 1024ULL;
 std::mutex g_project_save_mutex;
 std::atomic<std::uint64_t> g_project_temp_counter{0U};
+std::atomic<std::uint64_t> g_project_namespace_counter{0U};
+
+bool valid_source_namespace(std::string_view value) {
+    return !value.empty() && value.size() <= 128U &&
+        std::all_of(value.begin(), value.end(), [](unsigned char byte) {
+            return (byte >= 'a' && byte <= 'z') ||
+                (byte >= 'A' && byte <= 'Z') ||
+                (byte >= '0' && byte <= '9') || byte == '.' || byte == '_' ||
+                byte == '-';
+        });
+}
+
+std::string namespace_from_seed(std::string_view seed, std::string_view prefix) {
+    const auto* data = reinterpret_cast<const std::uint8_t*>(seed.data());
+    const auto digest = assets::sha256(std::span<const std::uint8_t>(data, seed.size()));
+    return std::string(prefix) + digest.hex().substr(0U, 32U);
+}
+
+std::string new_source_namespace() {
+    std::ostringstream seed;
+    seed << std::chrono::steady_clock::now().time_since_epoch().count() << ':'
+         << std::chrono::system_clock::now().time_since_epoch().count() << ':'
+         << std::hash<std::thread::id>{}(std::this_thread::get_id()) << ':';
+#ifdef _WIN32
+    seed << GetCurrentProcessId() << ':';
+#else
+    seed << getpid() << ':';
+#endif
+    seed
+         << g_project_namespace_counter.fetch_add(1U, std::memory_order_relaxed);
+    try {
+        std::random_device entropy;
+        for (std::size_t index = 0U; index < 4U; ++index) {
+            seed << ':' << entropy();
+        }
+    } catch (...) {
+        // Identity uniqueness does not grant authority or provide secrecy.
+        // Clock, thread, and process-local sequence remain a safe fallback.
+    }
+    return namespace_from_seed(seed.str(), "cartographer.project.");
+}
 
 core::Result<void> validate_serialized_count(
     std::uint64_t count,
@@ -276,6 +329,28 @@ core::Result<void> atomic_replace(
 #endif
 }
 
+bool mesh_declares_material_region(
+    const geometry::EditableMesh& mesh,
+    std::uint32_t region_id) {
+    for (const std::string_view layer_id : {
+             std::string_view{"condition.material_region"},
+             std::string_view{"cartographer.material_slot"}}) {
+        const auto* layer = mesh.attributes().find(layer_id);
+        if (layer == nullptr || layer->descriptor.domain != attributes::AttributeDomain::face ||
+            layer->descriptor.type != attributes::AttributeType::uint32) {
+            continue;
+        }
+        if (std::any_of(layer->values.begin(), layer->values.end(),
+                [region_id](const attributes::AttributeValue& value) {
+                    const auto* encoded = std::get_if<std::uint32_t>(&value);
+                    return encoded != nullptr && *encoded == region_id;
+                })) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 core::Result<void> AssetReference::validate() const {
@@ -303,6 +378,9 @@ core::Result<void> TopologyReceiptRecord::validate() const {
     }
     return receipt.validate();
 }
+
+ProjectDocument::ProjectDocument()
+    : source_namespace_(new_source_namespace()) {}
 
 core::Result<ProjectDocument> ProjectDocument::create(std::string name) {
     ProjectDocument document;
@@ -356,6 +434,15 @@ core::Result<void> ProjectDocument::insert_object(scene::SceneObject object) {
 core::Result<void> ProjectDocument::remove_object(scene::ObjectId object) {
     if (revision_.exhausted()) {
         return core::Result<void>::failure(exhausted_revision());
+    }
+    for (const auto& [identity, area] : world_model_.areas()) {
+        static_cast<void>(identity);
+        if (area.geometry.kind == world::AuthoringBindingKind::scene_object &&
+            area.geometry.identity == object.value) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::invalid_state,
+                "cannot remove a scene object referenced by a semantic area"));
+        }
     }
     if (auto result = scene_.remove_object(object); !result) {
         return result;
@@ -475,6 +562,15 @@ core::Result<core::Revision> ProjectDocument::replace_mesh_if_revision(
     if (auto result = mesh.validate(); !result) {
         return core::Result<core::Revision>::failure(result.error());
     }
+    for (const auto& [identity, assignment] : material_catalog_.assignments()) {
+        static_cast<void>(identity);
+        if (assignment.key.mesh_asset == mesh_asset &&
+            !mesh_declares_material_region(mesh, assignment.key.region_id)) {
+            return core::Result<core::Revision>::failure(Diagnostic(
+                ErrorCode::validation_failed,
+                "mesh replacement would orphan a material-region assignment"));
+        }
+    }
     if (iterator->second.revision().exhausted() || mesh.revision().exhausted()) {
         return core::Result<core::Revision>::failure(Diagnostic(
             ErrorCode::invalid_state,
@@ -488,6 +584,7 @@ core::Result<core::Revision> ProjectDocument::replace_mesh_if_revision(
     }
     const core::Revision applied_revision = mesh.revision();
     iterator->second = std::move(mesh);
+    cloth_rest_pose_receipts_.erase(mesh_asset);
     if (receipt.has_value()) {
         topology_receipts_.push_back(TopologyReceiptRecord{mesh_asset, std::move(*receipt)});
     }
@@ -510,7 +607,37 @@ core::Result<void> ProjectDocument::remove_mesh(std::uint64_t mesh_asset) {
                 "cannot remove a mesh asset still referenced by a scene object"));
         }
     }
+    for (const auto& [identity, area] : world_model_.areas()) {
+        static_cast<void>(identity);
+        if (area.geometry.kind == world::AuthoringBindingKind::mesh_asset &&
+            area.geometry.identity == mesh_asset) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::invalid_state,
+                "cannot remove a mesh asset referenced by a semantic area"));
+        }
+    }
+    for (const auto& [identity, assignment] : material_catalog_.assignments()) {
+        static_cast<void>(identity);
+        if (assignment.key.mesh_asset == mesh_asset) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::invalid_state,
+                "cannot remove a mesh asset referenced by a material-region assignment"));
+        }
+    }
+    for (const auto& [identity, variant] : material_catalog_.variants()) {
+        static_cast<void>(identity);
+        if (std::binary_search(
+                variant.permitted_mesh_assets.begin(),
+                variant.permitted_mesh_assets.end(), mesh_asset)) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::invalid_state,
+                "cannot remove a mesh asset referenced by a material-variant scope"));
+        }
+    }
     meshes_.erase(mesh_asset);
+    sculpt_stacks_.erase(mesh_asset);
+    garment_assets_.erase(mesh_asset);
+    cloth_rest_pose_receipts_.erase(mesh_asset);
     topology_receipts_.erase(
         std::remove_if(
             topology_receipts_.begin(), topology_receipts_.end(),
@@ -572,6 +699,253 @@ core::Result<void> ProjectDocument::set_scientific_model(
     return core::Result<void>::success();
 }
 
+core::Result<void> ProjectDocument::set_world_model(world::WorldModel model) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (auto result = model.validate(); !result) {
+        return core::Result<void>::failure(result.error().with_context(
+            "world model admission"));
+    }
+    for (const auto& [identity, area] : model.areas()) {
+        static_cast<void>(identity);
+        if (area.geometry.kind == world::AuthoringBindingKind::scene_object &&
+            scene_.find(scene::ObjectId{area.geometry.identity}) == nullptr) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::not_found,
+                "semantic area references a missing scene object"));
+        }
+        if (area.geometry.kind == world::AuthoringBindingKind::mesh_asset &&
+            !meshes_.contains(area.geometry.identity)) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::not_found,
+                "semantic area references a missing mesh asset"));
+        }
+    }
+    for (const auto& [identity, layer] : model.variant_layers()) {
+        static_cast<void>(identity);
+        if (layer.base_project_revision > revision_) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::stale_data,
+                "variant layer base revision is newer than the project"));
+        }
+    }
+    if (world_model_.serialize() == model.serialize()) {
+        return core::Result<void>::success();
+    }
+    world_model_ = std::move(model);
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::set_material_catalog(MaterialCatalog catalog) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (auto result = catalog.validate(); !result) {
+        return core::Result<void>::failure(result.error().with_context(
+            "material catalog admission"));
+    }
+    for (const auto& [identity, variant] : catalog.variants()) {
+        static_cast<void>(identity);
+        for (const std::uint64_t mesh_asset : variant.permitted_mesh_assets) {
+            if (!meshes_.contains(mesh_asset)) {
+                return core::Result<void>::failure(Diagnostic(
+                    ErrorCode::not_found,
+                    "material variant scope references a missing mesh asset"));
+            }
+        }
+    }
+    for (const auto& [identity, assignment] : catalog.assignments()) {
+        static_cast<void>(identity);
+        const auto mesh = meshes_.find(assignment.key.mesh_asset);
+        if (mesh == meshes_.end()) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::not_found,
+                "material-region assignment references a missing mesh asset"));
+        }
+        if (!mesh_declares_material_region(mesh->second, assignment.key.region_id)) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::not_found,
+                "material-region assignment references a missing authored region"));
+        }
+    }
+    if (material_catalog_.serialize() == catalog.serialize()) {
+        return core::Result<void>::success();
+    }
+    material_catalog_ = std::move(catalog);
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::set_semantic_sidecar(
+    std::string serialized_sidecar,
+    assets::Sha256Digest digest) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (serialized_sidecar.empty() ||
+        serialized_sidecar.size() > kMaxSerializedSemanticSidecarBytes) {
+        return core::Result<void>::failure(invalid(
+            "semantic sidecar bytes are empty or exceed the serialized byte bound"));
+    }
+    if (digest.is_zero()) {
+        return core::Result<void>::failure(invalid(
+            "semantic sidecar digest must not be zero"));
+    }
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(serialized_sidecar.data());
+    if (assets::sha256(std::span<const std::uint8_t>(bytes, serialized_sidecar.size())) != digest) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::validation_failed,
+            "semantic sidecar digest does not bind the serialized bytes"));
+    }
+    if (semantic_sidecar_bytes_.has_value() &&
+        *semantic_sidecar_bytes_ == serialized_sidecar &&
+        semantic_sidecar_digest_.has_value() && *semantic_sidecar_digest_ == digest) {
+        return core::Result<void>::success();
+    }
+    semantic_sidecar_bytes_ = std::move(serialized_sidecar);
+    semantic_sidecar_digest_ = digest;
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::set_sculpt_stack(
+    std::uint64_t mesh_asset,
+    std::string serialized_stack,
+    assets::Sha256Digest digest) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (mesh_asset == 0U || !meshes_.contains(mesh_asset)) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::not_found, "SculptStack target mesh asset does not exist"));
+    }
+    if (serialized_stack.empty() ||
+        serialized_stack.size() > kMaxSerializedSculptStackBytes || digest.is_zero()) {
+        return core::Result<void>::failure(invalid(
+            "SculptStack bytes or digest are outside the supported bounds"));
+    }
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(serialized_stack.data());
+    if (assets::sha256(std::span<const std::uint8_t>(bytes, serialized_stack.size())) != digest) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::validation_failed, "SculptStack digest does not bind its serialized bytes"));
+    }
+    const auto existing = sculpt_stacks_.find(mesh_asset);
+    if (existing != sculpt_stacks_.end() && existing->second.bytes == serialized_stack &&
+        existing->second.digest == digest) {
+        return core::Result<void>::success();
+    }
+    if (existing == sculpt_stacks_.end() &&
+        sculpt_stacks_.size() >= kMaxSerializedSculptStacks) {
+        return core::Result<void>::failure(invalid(
+            "project contains the maximum number of serialized SculptStacks"));
+    }
+    sculpt_stacks_[mesh_asset] = SerializedSculptStack{
+        std::move(serialized_stack), digest};
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::erase_sculpt_stack_if_revision(
+    std::uint64_t mesh_asset,
+    core::Revision expected_revision) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (revision_ != expected_revision) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::stale_data,
+            "SculptStack removal revision does not match the current project"));
+    }
+    const auto existing = sculpt_stacks_.find(mesh_asset);
+    if (existing == sculpt_stacks_.end()) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::not_found, "project SculptStack does not exist"));
+    }
+    sculpt_stacks_.erase(existing);
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::set_garment_asset(
+    std::uint64_t mesh_asset,
+    std::string serialized_asset,
+    assets::Sha256Digest digest) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (mesh_asset == 0U || !meshes_.contains(mesh_asset)) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::not_found, "GarmentAsset target mesh asset does not exist"));
+    }
+    if (serialized_asset.empty() ||
+        serialized_asset.size() > kMaxSerializedGarmentAssetBytes || digest.is_zero()) {
+        return core::Result<void>::failure(invalid(
+            "GarmentAsset bytes or digest are outside the supported bounds"));
+    }
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(serialized_asset.data());
+    if (assets::sha256(std::span<const std::uint8_t>(bytes, serialized_asset.size())) != digest) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::validation_failed,
+            "GarmentAsset digest does not bind its serialized bytes"));
+    }
+    const auto existing = garment_assets_.find(mesh_asset);
+    if (existing != garment_assets_.end() && existing->second.bytes == serialized_asset &&
+        existing->second.digest == digest) {
+        return core::Result<void>::success();
+    }
+    if (existing == garment_assets_.end() &&
+        garment_assets_.size() >= kMaxSerializedGarmentAssets) {
+        return core::Result<void>::failure(invalid(
+            "project contains the maximum number of serialized GarmentAssets"));
+    }
+    garment_assets_[mesh_asset] = SerializedGarmentAsset{
+        std::move(serialized_asset), digest};
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::set_cloth_rest_pose_receipt(
+    std::uint64_t mesh_asset,
+    std::string serialized_receipt,
+    assets::Sha256Digest digest) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (mesh_asset == 0U || !meshes_.contains(mesh_asset)) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::not_found,
+            "cloth rest-pose receipt target mesh asset does not exist"));
+    }
+    if (serialized_receipt.empty() ||
+        serialized_receipt.size() > kMaxSerializedClothRestPoseReceiptBytes ||
+        digest.is_zero()) {
+        return core::Result<void>::failure(invalid(
+            "cloth rest-pose receipt bytes or digest are outside the supported bounds"));
+    }
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(serialized_receipt.data());
+    if (assets::sha256(std::span<const std::uint8_t>(bytes, serialized_receipt.size())) != digest) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::validation_failed,
+            "cloth rest-pose receipt digest does not bind its serialized bytes"));
+    }
+    const auto existing = cloth_rest_pose_receipts_.find(mesh_asset);
+    if (existing != cloth_rest_pose_receipts_.end() &&
+        existing->second.bytes == serialized_receipt && existing->second.digest == digest) {
+        return core::Result<void>::success();
+    }
+    if (existing == cloth_rest_pose_receipts_.end() &&
+        cloth_rest_pose_receipts_.size() >= kMaxSerializedClothRestPoseReceipts) {
+        return core::Result<void>::failure(invalid(
+            "project contains the maximum number of cloth rest-pose receipts"));
+    }
+    cloth_rest_pose_receipts_[mesh_asset] = SerializedClothRestPoseReceipt{
+        std::move(serialized_receipt), digest};
+    bump_revision();
+    return core::Result<void>::success();
+}
+
 core::Result<void> ProjectDocument::set_object_transform(
     scene::ObjectId object,
     core::Transform transform) {
@@ -607,6 +981,10 @@ core::Result<void> ProjectDocument::validate() const {
     }
     if (name_.empty()) {
         return core::Result<void>::failure(parse_error("project name is empty"));
+    }
+    if (!valid_source_namespace(source_namespace_)) {
+        return core::Result<void>::failure(parse_error(
+            "project source namespace is invalid"));
     }
     if (auto result = scene_.validate(); !result) {
         return result;
@@ -653,6 +1031,143 @@ core::Result<void> ProjectDocument::validate() const {
         return core::Result<void>::failure(parse_error(
             "project evaluation graph digest must not be zero"));
     }
+    if (semantic_sidecar_digest_.has_value() != semantic_sidecar_bytes_.has_value()) {
+        return core::Result<void>::failure(parse_error(
+            "project semantic sidecar bytes and digest must be set together"));
+    }
+    if (semantic_sidecar_bytes_.has_value()) {
+        if (semantic_sidecar_bytes_->empty() ||
+            semantic_sidecar_bytes_->size() > kMaxSerializedSemanticSidecarBytes) {
+            return core::Result<void>::failure(parse_error(
+                "project semantic sidecar bytes exceed the serialized byte bound"));
+        }
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(
+            semantic_sidecar_bytes_->data());
+        if (assets::sha256(std::span<const std::uint8_t>(
+                bytes, semantic_sidecar_bytes_->size())) != *semantic_sidecar_digest_) {
+            return core::Result<void>::failure(parse_error(
+                "project semantic sidecar digest does not bind its bytes"));
+        }
+    }
+    if (sculpt_stacks_.size() > kMaxSerializedSculptStacks) {
+        return core::Result<void>::failure(parse_error(
+            "project contains too many serialized SculptStacks"));
+    }
+    for (const auto& [mesh_asset, stack] : sculpt_stacks_) {
+        if (mesh_asset == 0U || !meshes_.contains(mesh_asset)) {
+            return core::Result<void>::failure(parse_error(
+                "SculptStack references a missing mesh asset"));
+        }
+        if (stack.bytes.empty() || stack.bytes.size() > kMaxSerializedSculptStackBytes ||
+            stack.digest.is_zero()) {
+            return core::Result<void>::failure(parse_error(
+                "project SculptStack bytes or digest are outside the serialized bounds"));
+        }
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(stack.bytes.data());
+        if (assets::sha256(std::span<const std::uint8_t>(bytes, stack.bytes.size())) !=
+            stack.digest) {
+            return core::Result<void>::failure(parse_error(
+                "project SculptStack digest does not bind its serialized bytes"));
+        }
+    }
+    if (garment_assets_.size() > kMaxSerializedGarmentAssets) {
+        return core::Result<void>::failure(parse_error(
+            "project contains too many serialized GarmentAssets"));
+    }
+    for (const auto& [mesh_asset, asset] : garment_assets_) {
+        if (mesh_asset == 0U || !meshes_.contains(mesh_asset)) {
+            return core::Result<void>::failure(parse_error(
+                "GarmentAsset references a missing mesh asset"));
+        }
+        if (asset.bytes.empty() || asset.bytes.size() > kMaxSerializedGarmentAssetBytes ||
+            asset.digest.is_zero()) {
+            return core::Result<void>::failure(parse_error(
+                "project GarmentAsset bytes or digest are outside the serialized bounds"));
+        }
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(asset.bytes.data());
+        if (assets::sha256(std::span<const std::uint8_t>(bytes, asset.bytes.size())) !=
+            asset.digest) {
+            return core::Result<void>::failure(parse_error(
+                "project GarmentAsset digest does not bind its serialized bytes"));
+        }
+    }
+    if (cloth_rest_pose_receipts_.size() > kMaxSerializedClothRestPoseReceipts) {
+        return core::Result<void>::failure(parse_error(
+            "project contains too many cloth rest-pose receipts"));
+    }
+    for (const auto& [mesh_asset, receipt] : cloth_rest_pose_receipts_) {
+        if (mesh_asset == 0U || !meshes_.contains(mesh_asset)) {
+            return core::Result<void>::failure(parse_error(
+                "cloth rest-pose receipt references a missing mesh asset"));
+        }
+        if (receipt.bytes.empty() ||
+            receipt.bytes.size() > kMaxSerializedClothRestPoseReceiptBytes ||
+            receipt.digest.is_zero()) {
+            return core::Result<void>::failure(parse_error(
+                "cloth rest-pose receipt bytes or digest are outside the serialized bounds"));
+        }
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(receipt.bytes.data());
+        if (assets::sha256(std::span<const std::uint8_t>(bytes, receipt.bytes.size())) !=
+            receipt.digest) {
+            return core::Result<void>::failure(parse_error(
+                "cloth rest-pose receipt digest does not bind its serialized bytes"));
+        }
+    }
+    if (auto result = world_model_.validate(); !result) {
+        return core::Result<void>::failure(result.error().with_context(
+            "project world model"));
+    }
+    for (const auto& [identity, area] : world_model_.areas()) {
+        static_cast<void>(identity);
+        switch (area.geometry.kind) {
+        case world::AuthoringBindingKind::none:
+            break;
+        case world::AuthoringBindingKind::scene_object:
+            if (scene_.find(scene::ObjectId{area.geometry.identity}) == nullptr) {
+                return core::Result<void>::failure(parse_error(
+                    "semantic area references a missing scene object"));
+            }
+            break;
+        case world::AuthoringBindingKind::mesh_asset:
+            if (!meshes_.contains(area.geometry.identity)) {
+                return core::Result<void>::failure(parse_error(
+                    "semantic area references a missing mesh asset"));
+            }
+            break;
+        }
+    }
+    for (const auto& [identity, layer] : world_model_.variant_layers()) {
+        static_cast<void>(identity);
+        if (layer.base_project_revision > revision_) {
+            return core::Result<void>::failure(parse_error(
+                "variant layer base revision is newer than the project"));
+        }
+    }
+    if (auto result = material_catalog_.validate(); !result) {
+        return core::Result<void>::failure(result.error().with_context(
+            "project material catalog"));
+    }
+    for (const auto& [identity, variant] : material_catalog_.variants()) {
+        static_cast<void>(identity);
+        for (const std::uint64_t mesh_asset : variant.permitted_mesh_assets) {
+            if (!meshes_.contains(mesh_asset)) {
+                return core::Result<void>::failure(parse_error(
+                    "material variant scope references a missing mesh asset"));
+            }
+        }
+    }
+    for (const auto& [identity, assignment] : material_catalog_.assignments()) {
+        static_cast<void>(identity);
+        const auto mesh = meshes_.find(assignment.key.mesh_asset);
+        if (mesh == meshes_.end()) {
+            return core::Result<void>::failure(parse_error(
+                "material-region assignment references a missing mesh asset"));
+        }
+        if (!mesh_declares_material_region(mesh->second, assignment.key.region_id)) {
+            return core::Result<void>::failure(parse_error(
+                "material-region assignment references a missing authored region"));
+        }
+    }
     for (const auto& object : scene_.objects_sorted()) {
         if (object.mesh_asset.has_value() && !meshes_.contains(*object.mesh_asset)) {
             return core::Result<void>::failure(
@@ -664,10 +1179,18 @@ core::Result<void> ProjectDocument::validate() const {
 
 void ProjectDocument::swap(ProjectDocument& other) noexcept {
     name_.swap(other.name_);
+    source_namespace_.swap(other.source_namespace_);
     scene_.swap(other.scene_);
     meshes_.swap(other.meshes_);
     topology_receipts_.swap(other.topology_receipts_);
     std::swap(scientific_model_, other.scientific_model_);
+    std::swap(world_model_, other.world_model_);
+    std::swap(material_catalog_, other.material_catalog_);
+    std::swap(semantic_sidecar_bytes_, other.semantic_sidecar_bytes_);
+    std::swap(semantic_sidecar_digest_, other.semantic_sidecar_digest_);
+    sculpt_stacks_.swap(other.sculpt_stacks_);
+    garment_assets_.swap(other.garment_assets_);
+    cloth_rest_pose_receipts_.swap(other.cloth_rest_pose_receipts_);
     std::swap(evaluation_graph_digest_, other.evaluation_graph_digest_);
     std::swap(next_mesh_id_, other.next_mesh_id_);
     std::swap(revision_, other.revision_);
@@ -679,6 +1202,7 @@ std::string ProjectDocument::serialize() const {
     output << "AUTHORING " << std::quoted(std::string(kAuthoringFormat)) << ' '
            << std::quoted(std::string(kAuthoringUnits)) << ' '
            << std::quoted(std::string(kAuthoringCoordinateSystem)) << '\n';
+    output << "SOURCE_NAMESPACE " << std::quoted(source_namespace_) << '\n';
     output << "NAME " << std::quoted(name_) << '\n';
     output << "REVISION " << revision_.value() << '\n';
 
@@ -759,6 +1283,27 @@ std::string ProjectDocument::serialize() const {
         output << "EVALUATION_GRAPH_DIGEST " << evaluation_graph_digest_->hex() << '\n';
     }
     output << "SCIENTIFIC_MODEL " << std::quoted(scientific_model_.serialize()) << '\n';
+    output << "WORLD_MODEL " << std::quoted(world_model_.serialize()) << '\n';
+    output << "MATERIAL_CATALOG " << std::quoted(material_catalog_.serialize()) << '\n';
+    if (semantic_sidecar_bytes_.has_value()) {
+        output << "SEMANTIC_SIDECAR " << semantic_sidecar_digest_->hex() << ' '
+               << std::quoted(*semantic_sidecar_bytes_) << '\n';
+    }
+    output << "SCULPT_STACKS " << sculpt_stacks_.size() << '\n';
+    for (const auto& [mesh_asset, stack] : sculpt_stacks_) {
+        output << "SCULPT_STACK " << mesh_asset << ' ' << stack.digest.hex() << ' '
+               << std::quoted(stack.bytes) << '\n';
+    }
+    output << "GARMENT_ASSETS " << garment_assets_.size() << '\n';
+    for (const auto& [mesh_asset, asset] : garment_assets_) {
+        output << "GARMENT_ASSET " << mesh_asset << ' ' << asset.digest.hex() << ' '
+               << std::quoted(asset.bytes) << '\n';
+    }
+    output << "CLOTH_REST_POSE_RECEIPTS " << cloth_rest_pose_receipts_.size() << '\n';
+    for (const auto& [mesh_asset, receipt] : cloth_rest_pose_receipts_) {
+        output << "CLOTH_REST_POSE_RECEIPT " << mesh_asset << ' '
+               << receipt.digest.hex() << ' ' << std::quoted(receipt.bytes) << '\n';
+    }
     output << "END\n";
     return output.str();
 }
@@ -799,10 +1344,24 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
         }
     }
 
+    ProjectDocument document;
+    if (version.value() >= 9U) {
+        if (auto result = require_line(input, "SOURCE_NAMESPACE"); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+        if (!(input >> std::quoted(document.source_namespace_)) ||
+            !valid_source_namespace(document.source_namespace_)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project source namespace is invalid"));
+        }
+    } else {
+        document.source_namespace_ = namespace_from_seed(
+            text, "cartographer.project.migrated.");
+    }
+
     if (auto result = require_line(input, "NAME"); !result) {
         return core::Result<ProjectDocument>::failure(result.error());
     }
-    ProjectDocument document;
     if (!(input >> std::quoted(document.name_)) || document.name_.empty()) {
         return core::Result<ProjectDocument>::failure(parse_error("project name is invalid"));
     }
@@ -1275,6 +1834,286 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
     if (version.value() >= 5U && !scientific_model_seen) {
         return core::Result<ProjectDocument>::failure(parse_error(
             "project schema v5 is missing its scientific model record"));
+    }
+    bool world_model_seen = false;
+    if (terminal_record == "WORLD_MODEL") {
+        if (version.value() < 7U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "world model records require project schema version 7"));
+        }
+        std::string encoded_world_model;
+        if (!(input >> std::quoted(encoded_world_model))) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project world model record is invalid"));
+        }
+        if (encoded_world_model.size() > world::WorldModel::kMaxSerializedBytes) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project world model record exceeds its size limit"));
+        }
+        const auto world_model = world::WorldModel::deserialize(encoded_world_model);
+        if (!world_model) {
+            return core::Result<ProjectDocument>::failure(
+                world_model.error().with_context("serialized world model"));
+        }
+        document.world_model_ = world_model.value();
+        world_model_seen = true;
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(
+                parse_error("project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 7U && !world_model_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v7 is missing its world model record"));
+    }
+    bool material_catalog_seen = false;
+    if (terminal_record == "MATERIAL_CATALOG") {
+        if (version.value() < 8U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "material catalog records require project schema version 8"));
+        }
+        std::string encoded_material_catalog;
+        if (!(input >> std::quoted(encoded_material_catalog))) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project material catalog record is invalid"));
+        }
+        if (encoded_material_catalog.size() > MaterialCatalog::kMaxSerializedBytes) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project material catalog record exceeds its size limit"));
+        }
+        const auto material_catalog = MaterialCatalog::deserialize(encoded_material_catalog);
+        if (!material_catalog) {
+            return core::Result<ProjectDocument>::failure(
+                material_catalog.error().with_context("serialized material catalog"));
+        }
+        document.material_catalog_ = material_catalog.value();
+        material_catalog_seen = true;
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(
+                parse_error("project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 8U && !material_catalog_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v8 or newer is missing its material catalog record"));
+    }
+    if (terminal_record == "SEMANTIC_SIDECAR") {
+        if (version.value() < 10U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "semantic sidecar records require project schema version 10"));
+        }
+        std::string encoded_digest;
+        std::string encoded_sidecar;
+        if (!(input >> encoded_digest >> std::quoted(encoded_sidecar))) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project semantic sidecar record is invalid"));
+        }
+        if (encoded_sidecar.empty() ||
+            encoded_sidecar.size() > kMaxSerializedSemanticSidecarBytes) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project semantic sidecar record exceeds its size limit"));
+        }
+        const auto digest = assets::Sha256Digest::from_hex(encoded_digest);
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(encoded_sidecar.data());
+        if (!digest || digest.value().is_zero() ||
+            assets::sha256(std::span<const std::uint8_t>(
+                bytes, encoded_sidecar.size())) != digest.value()) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project semantic sidecar digest does not bind its bytes"));
+        }
+        document.semantic_sidecar_bytes_ = std::move(encoded_sidecar);
+        document.semantic_sidecar_digest_ = digest.value();
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(
+                parse_error("project is missing its terminal record"));
+        }
+    }
+    bool sculpt_stacks_seen = false;
+    if (terminal_record == "SCULPT_STACKS") {
+        if (version.value() < 11U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "SculptStack records require project schema version 11"));
+        }
+        sculpt_stacks_seen = true;
+        auto stack_count = read_uint(input, "SculptStack count");
+        if (!stack_count) {
+            return core::Result<ProjectDocument>::failure(stack_count.error());
+        }
+        if (auto result = validate_serialized_count(
+                stack_count.value(), kMaxSerializedSculptStacks, "project SculptStack count");
+            !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+        for (std::uint64_t stack_index = 0U; stack_index < stack_count.value(); ++stack_index) {
+            if (auto result = require_line(input, "SCULPT_STACK"); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            auto mesh_asset = read_uint(input, "SculptStack mesh asset");
+            std::string encoded_digest;
+            std::string encoded_stack;
+            if (!mesh_asset || mesh_asset.value() == 0U ||
+                !(input >> encoded_digest >> std::quoted(encoded_stack))) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project SculptStack record is invalid"));
+            }
+            if (!document.meshes_.contains(mesh_asset.value())) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project SculptStack references an unknown mesh asset"));
+            }
+            if (encoded_stack.empty() ||
+                encoded_stack.size() > kMaxSerializedSculptStackBytes) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project SculptStack record exceeds its size limit"));
+            }
+            const auto digest = assets::Sha256Digest::from_hex(encoded_digest);
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(encoded_stack.data());
+            if (!digest || digest.value().is_zero() ||
+                assets::sha256(std::span<const std::uint8_t>(
+                    bytes, encoded_stack.size())) != digest.value()) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project SculptStack digest does not bind its serialized bytes"));
+            }
+            if (!document.sculpt_stacks_.emplace(mesh_asset.value(), SerializedSculptStack{
+                    std::move(encoded_stack), digest.value()}).second) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project contains a duplicate SculptStack mesh binding"));
+            }
+        }
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(
+                parse_error("project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 11U && !sculpt_stacks_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v11 is missing its SculptStack record"));
+    }
+    bool garment_assets_seen = false;
+    if (terminal_record == "GARMENT_ASSETS") {
+        if (version.value() < 12U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "GarmentAsset records require project schema version 12"));
+        }
+        garment_assets_seen = true;
+        auto asset_count = read_uint(input, "GarmentAsset count");
+        if (!asset_count) {
+            return core::Result<ProjectDocument>::failure(asset_count.error());
+        }
+        if (auto result = validate_serialized_count(
+                asset_count.value(), kMaxSerializedGarmentAssets,
+                "project GarmentAsset count"); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+        for (std::uint64_t asset_index = 0U; asset_index < asset_count.value(); ++asset_index) {
+            if (auto result = require_line(input, "GARMENT_ASSET"); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            auto mesh_asset = read_uint(input, "GarmentAsset mesh asset");
+            std::string encoded_digest;
+            std::string encoded_asset;
+            if (!mesh_asset || mesh_asset.value() == 0U ||
+                !(input >> encoded_digest >> std::quoted(encoded_asset))) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project GarmentAsset record is invalid"));
+            }
+            if (!document.meshes_.contains(mesh_asset.value())) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project GarmentAsset references an unknown mesh asset"));
+            }
+            if (encoded_asset.empty() || encoded_asset.size() > kMaxSerializedGarmentAssetBytes) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project GarmentAsset record exceeds its size limit"));
+            }
+            const auto digest = assets::Sha256Digest::from_hex(encoded_digest);
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(encoded_asset.data());
+            if (!digest || digest.value().is_zero() ||
+                assets::sha256(std::span<const std::uint8_t>(
+                    bytes, encoded_asset.size())) != digest.value()) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project GarmentAsset digest does not bind its serialized bytes"));
+            }
+            if (!document.garment_assets_.emplace(mesh_asset.value(), SerializedGarmentAsset{
+                    std::move(encoded_asset), digest.value()}).second) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project contains a duplicate GarmentAsset mesh binding"));
+            }
+        }
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(
+                parse_error("project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 12U && !garment_assets_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v12 is missing its GarmentAsset record"));
+    }
+    bool cloth_rest_pose_receipts_seen = false;
+    if (terminal_record == "CLOTH_REST_POSE_RECEIPTS") {
+        if (version.value() < 13U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "cloth rest-pose receipt records require project schema version 13"));
+        }
+        cloth_rest_pose_receipts_seen = true;
+        auto receipt_count = read_uint(input, "cloth rest-pose receipt count");
+        if (!receipt_count) {
+            return core::Result<ProjectDocument>::failure(receipt_count.error());
+        }
+        if (auto result = validate_serialized_count(
+                receipt_count.value(), kMaxSerializedClothRestPoseReceipts,
+                "project cloth rest-pose receipt count"); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+        for (std::uint64_t receipt_index = 0U;
+             receipt_index < receipt_count.value(); ++receipt_index) {
+            if (auto result = require_line(input, "CLOTH_REST_POSE_RECEIPT"); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            auto mesh_asset = read_uint(input, "cloth rest-pose receipt mesh asset");
+            std::string encoded_digest;
+            std::string encoded_receipt;
+            if (!mesh_asset || mesh_asset.value() == 0U ||
+                !(input >> encoded_digest >> std::quoted(encoded_receipt))) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project cloth rest-pose receipt record is invalid"));
+            }
+            if (!document.meshes_.contains(mesh_asset.value())) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "cloth rest-pose receipt references an unknown mesh asset"));
+            }
+            if (encoded_receipt.empty() ||
+                encoded_receipt.size() > kMaxSerializedClothRestPoseReceiptBytes) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "cloth rest-pose receipt record exceeds its size limit"));
+            }
+            const auto digest = assets::Sha256Digest::from_hex(encoded_digest);
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(encoded_receipt.data());
+            if (!digest || digest.value().is_zero() ||
+                assets::sha256(std::span<const std::uint8_t>(
+                    bytes, encoded_receipt.size())) != digest.value()) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "cloth rest-pose receipt digest does not bind its serialized bytes"));
+            }
+            if (!document.cloth_rest_pose_receipts_.emplace(
+                    mesh_asset.value(), SerializedClothRestPoseReceipt{
+                        std::move(encoded_receipt), digest.value()}).second) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project contains a duplicate cloth rest-pose receipt mesh binding"));
+            }
+        }
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(
+                parse_error("project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 13U && !cloth_rest_pose_receipts_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v13 is missing its cloth rest-pose receipt record"));
     }
     if (terminal_record != "END") {
         return core::Result<ProjectDocument>::failure(

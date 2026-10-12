@@ -106,6 +106,28 @@ private:
     std::optional<core::Revision> current_project_revision_;
 };
 
+class SetProjectSculptStackCommand final : public EditorCommand {
+public:
+    SetProjectSculptStackCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        std::uint64_t mesh_asset,
+        std::optional<project::SerializedSculptStack> before,
+        project::SerializedSculptStack after);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Set Project SculptStack"; }
+
+private:
+    project::ProjectDocument* document_;
+    std::uint64_t mesh_asset_;
+    std::optional<project::SerializedSculptStack> before_;
+    project::SerializedSculptStack after_;
+    core::Revision expected_project_revision_;
+    bool applied_ = false;
+};
+
 class SetVertexPositionCommand final : public EditorCommand {
 public:
     SetVertexPositionCommand(

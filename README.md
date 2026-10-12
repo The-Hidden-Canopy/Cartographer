@@ -61,11 +61,18 @@ checkout.
   default through the same validated preview/apply path, while review mode
   remains available. There is no Python, model runtime, network service, or
   outbound telemetry in this path.
+- `carto_world` provides five bounded provider-neutral authoring primitives:
+  semantic areas and paths, structure graphs, reconstructible instance fields,
+  and sparse variant layers. Cross-references, hierarchy, finite geometry,
+  recipe identity, population bounds, and canonical persistence fail closed;
+  runtime materialization and adaptive selection are deliberately absent.
 - `carto_project` persists authoring state in a versioned, deterministic text
-  format with pre-commit validation and atomic replacement. New saves use the
-  v5 authoring envelope with optional graph reference, topology lineage, and a
-  generic scientific model; v1/v2/v3/v4 projects remain readable. Render
-  caches are not serialized as project truth.
+  format with pre-commit validation and atomic replacement. New saves use v9,
+  including optional graph reference, topology lineage, mesh attributes/UVs,
+  generic scientific state, the five-primitive world model, and durable source
+  texture/material/sampler/variant assignments plus a stable project source
+  namespace; v1-v8 projects remain readable.
+  Render caches are not serialized as project truth.
 - `carto_scientific` provides typed, provider-neutral regions, fields, studies,
   results, probes, parameters, provenance, a bounded morphology structure graph,
   semantic functional-genome records with deterministic gene/module and
@@ -120,6 +127,18 @@ checkout.
   render-scene seam with stable source vertex/face identity mapping and
   validated material, PBR-reference, and render-request contracts; it is still
   not a frame renderer.
+- `carto_production` compiles revision-bound render/material/lookdev products
+  and composes them into a deterministic, engine-independent prepared-scene
+  envelope. The envelope preserves reusable assets, hierarchy, material-region
+  bindings, dependency closure, source correspondence, coordinate declarations,
+  and evidence-scoped capability results without importing Unreal, Unity, or
+  private VANTA types. Stable asset, selection, assembly, and scene requests
+  use one revision-bound [scope contract](docs/architecture/preparation-scope.md);
+  see also the [prepared-scene boundary](docs/architecture/prepared-scene-envelope.md),
+  [shared operation](docs/architecture/preparation-operation.md), and
+  [atomic publication contract](docs/architecture/prepared-publication.md).
+  Saved policy uses the bounded
+  [preparation-profile v1](docs/format/preparation-profile-v1.md) format.
 - `carto_gpu` provides typed generational resource handles, exact format/usage
   descriptors, device-capability contracts, deferred lifetime retirement, and
   backend-neutral descriptors; `carto_render_graph` validates and compiles
@@ -128,7 +147,7 @@ checkout.
   fidelity texture metadata, mip validation, and semantic color-space rules, and
   `carto_journal` provides revision-bound append-only records with a verified
   hash chain. These are foundations, not a replacement for the v1 project
-  serializer or a crash-recovery claim.
+  lineage or a crash-recovery claim.
 - `ProjectPackage` creates and validates the proposed human-readable package
   manifest/layout and owns the blob root. It intentionally does not create a
   fake `document.db`; SQLite WAL storage remains a separately accepted layer.
@@ -261,7 +280,19 @@ build\default\apps\cli\cartographer_cli.exe import-obj sample.obj roundtrip.cart
 build\default\apps\cli\cartographer_cli.exe export-ply sample.carto sample.ply
 build\default\apps\cli\cartographer_cli.exe export-stl sample.carto sample.stl
 build\default\apps\cli\cartographer_cli.exe export-gltf sample.carto scene.gltf
+build\default\apps\cli\cartographer_cli.exe write-default-preparation-profile portable.carto-prep
+build\default\apps\cli\cartographer_cli.exe inspect-preparation-profile portable.carto-prep
+build\default\apps\cli\cartographer_cli.exe prepare sample.carto sample.carto.prepared --profile portable.carto-prep scene
+build\default\apps\cli\cartographer_cli.exe prepare sample.carto sample.carto.prepared scene
+build\default\apps\cli\cartographer_cli.exe inspect-prepared sample.carto.prepared
 ```
+
+`prepare` captures one saved project revision, explicit stable-ID scope, and
+validated built-in or saved profile; compiles and verifies the closed product set; and atomically
+selects one immutable prepared revision. Failed, stale, corrupt, or incomplete
+attempts, including cancellation before publication, leave the last valid
+revision selected. `inspect-prepared` verifies the
+manifest and every included product without loading Unreal, Unity, or VANTA.
 
 `scientific-demo` creates a populated, deterministic authoring fixture covering
 morphology, field-linked growth domains, functional and sequence genome records, development, lineage,
@@ -397,7 +428,8 @@ compiled geometry rather than editable topology. `carto_render` cannot include
 editable topology internals. Authoring objects remain the source of truth;
 compiled geometry and render state are disposable, revision-tagged outputs.
 See [architecture overview](docs/architecture/overview.md), the [public proposal
-boundary](docs/architecture/proposal-boundary.md), and the [target map](docs/architecture/target-map.md).
+boundary](docs/architecture/proposal-boundary.md), the [world authoring
+boundary](docs/architecture/world-authoring.md), and the [target map](docs/architecture/target-map.md).
 
 ## Governance and provenance
 
@@ -407,7 +439,8 @@ contracts independent of moat runtimes. See [public provenance](docs/provenance.
 [ADR-0001](docs/adr/0001-standalone-authoring-boundaries.md), and the
 [capability matrix](docs/capability-matrix.md).
 The concrete 0.1 evidence is recorded in the
-[acceptance matrix](docs/verification/acceptance-matrix.md).
+[acceptance matrix](docs/verification/acceptance-matrix.md) and the
+[heterogeneous execution closure ledger](docs/verification/heterogeneous-execution-economies.md).
 
 Source released in this repository is licensed under the tracked
 [Apache License 2.0](LICENSE). That license does not grant rights to moat

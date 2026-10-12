@@ -28,9 +28,13 @@ struct alignas(16) GpuObjectConstants {
 
 struct alignas(16) GpuMaterialConstants {
     std::array<float, 4U> base_color_factor{};
-    std::array<float, 4U> emissive_factor_and_strength{};
+    // Emissive factor and strength are pre-multiplied before narrowing. The
+    // reclaimed w lane carries scalar dielectric F0 in the native push ABI.
+    std::array<float, 4U> emissive_radiance_and_f0{};
     std::array<float, 4U> surface_factors{};
     std::array<float, 4U> alpha_factors{};
+    // x clearcoat weight, y clearcoat roughness, z/w reserved.
+    std::array<float, 4U> clearcoat_factors{};
     // Each asset id is stored as low/high uint32 pairs. A backend resolves
     // those ids to descriptor indices during upload; truncation is forbidden.
     std::array<std::uint32_t, 12U> texture_asset_ids{};

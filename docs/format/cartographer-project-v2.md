@@ -2,7 +2,7 @@
 
 Cartographer v2 is the legacy deterministic line-oriented authoring model from
 v1 with an explicit authoring envelope before the document name. New saves use
-[project format v6](cartographer-project-v6.md), which retains the optional
+[project format v9](cartographer-project-v9.md), which retains the optional
 content-addressed evaluation-graph reference:
 
 ```text

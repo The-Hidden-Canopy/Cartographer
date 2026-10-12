@@ -123,6 +123,73 @@ core::Result<void> SetProjectObjectTransformCommand::apply(core::Transform trans
     return core::Result<void>::success();
 }
 
+SetProjectSculptStackCommand::SetProjectSculptStackCommand(
+    ProjectCommandAdmission,
+    project::ProjectDocument& document,
+    std::uint64_t mesh_asset,
+    std::optional<project::SerializedSculptStack> before,
+    project::SerializedSculptStack after)
+    : document_(&document),
+      mesh_asset_(mesh_asset),
+      before_(std::move(before)),
+      after_(std::move(after)),
+      expected_project_revision_(document.revision()) {}
+
+core::Result<void> SetProjectSculptStackCommand::execute() {
+    if (!document_ || mesh_asset_ == 0U || applied_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "project SculptStack command has incomplete or already-applied state"));
+    }
+    if (document_->revision() != expected_project_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "project SculptStack command revision no longer matches the project"));
+    }
+    const auto current = document_->sculpt_stacks().find(mesh_asset_);
+    if ((before_.has_value() &&
+            (current == document_->sculpt_stacks().end() || current->second != *before_)) ||
+        (!before_.has_value() && current != document_->sculpt_stacks().end())) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "project SculptStack changed before the command was applied"));
+    }
+    if (auto result = document_->set_sculpt_stack(
+            mesh_asset_, after_.bytes, after_.digest); !result) {
+        return result;
+    }
+    if (document_->revision() == expected_project_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "project SculptStack command did not change the project"));
+    }
+    expected_project_revision_ = document_->revision();
+    applied_ = true;
+    return core::Result<void>::success();
+}
+
+core::Result<void> SetProjectSculptStackCommand::undo() {
+    if (!document_ || !applied_ || mesh_asset_ == 0U ||
+        document_->revision() != expected_project_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "project SculptStack command cannot be undone in the current revision"));
+    }
+    const auto current = document_->sculpt_stacks().find(mesh_asset_);
+    if (current == document_->sculpt_stacks().end() || current->second != after_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "project SculptStack no longer matches the command being undone"));
+    }
+    core::Result<void> result = before_.has_value()
+        ? document_->set_sculpt_stack(mesh_asset_, before_->bytes, before_->digest)
+        : document_->erase_sculpt_stack_if_revision(mesh_asset_, expected_project_revision_);
+    if (!result) return result;
+    expected_project_revision_ = document_->revision();
+    applied_ = false;
+    return core::Result<void>::success();
+}
+
 SetVertexPositionCommand::SetVertexPositionCommand(
     geometry::EditableMesh& mesh,
     geometry::VertexId vertex,

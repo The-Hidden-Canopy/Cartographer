@@ -43,6 +43,7 @@ public:
     [[nodiscard]] device::BackendKind backend() const noexcept override;
     [[nodiscard]] const device::DeviceIdentity& identity() const noexcept override;
     [[nodiscard]] const gpu::DeviceCapabilities& capabilities() const noexcept override;
+    [[nodiscard]] bool is_software_adapter() const noexcept;
 
     [[nodiscard]] core::Result<gpu::BufferHandle> create_buffer(
         const gpu::BufferDesc& descriptor) override;

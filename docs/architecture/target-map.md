@@ -19,10 +19,11 @@ carto_core
   |     `-- consumed by carto_render
   |-- carto_render_graph (core + GPU resource planning)
   |-- carto_journal      (revision-bound recovery records)
+  |-- carto_world        (provider-neutral semantic world authoring)
   |-- carto_providers    (capability/lifecycle registry)
   |-- carto_plugin_protocol (bounded extension frames)
   |-- carto_sdk          (bounded opaque C ABI)
-  |-- carto_project       (scene + geometry + package graph snapshots)
+  |-- carto_project       (scene + geometry + world + package graph snapshots)
   |-- carto_editor        (scene + core)
   |-- carto_io            (geometry + core)
   |-- carto_application   (project + editor + render snapshot composition)
@@ -65,6 +66,7 @@ recorded in the roadmap. New targets must preserve these constraints:
 - geometry builds without renderer or application shell;
 - renderer consumes compiled geometry and never includes editable topology;
 - project persistence owns authoring state, not caches;
+- world primitives own semantic authoring state, not runtime materialization or adaptive policy;
 - blob storage owns immutable bytes, not project schema truth;
 - journal records are durable provenance, not the undo stack or a user save;
 - blob and journal primitives verify content and lineage before returning data;

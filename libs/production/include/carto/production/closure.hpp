@@ -19,6 +19,10 @@ enum class ArtifactKind {
     residency_page,
     publication_package,
     evidence_bundle,
+    baked_texture,
+    cloth_simulation,
+    cloth_rest_pose,
+    multires_hierarchy,
 };
 
 enum class ExecutionForm {
@@ -50,9 +54,23 @@ struct AuthoritativeSource {
     [[nodiscard]] bool operator==(const AuthoritativeSource&) const noexcept = default;
 };
 
+// Opaque, stable profile identifiers let public cook receipts bind a
+// decision context without carrying the private policy that interprets it.
+struct ProductionDecisionContext {
+    std::string truth_class;
+    std::string observer_class;
+    std::string precision_requirement;
+    std::string materialization_requirement;
+
+    [[nodiscard]] core::Result<void> validate() const;
+    [[nodiscard]] std::string canonical() const;
+    [[nodiscard]] bool operator==(const ProductionDecisionContext&) const noexcept = default;
+};
+
 // A cook key binds a derived product to the exact source, algorithm, settings,
-// platform, and execution form that produced it. It is intentionally public so
-// Cartographer workers and VANTA adapters can share the same admission key.
+// platform, and execution form that produced it, plus optional decision scope.
+// It is intentionally public so Cartographer workers and runtime adapters can
+// share the same admission key without exposing policy implementation.
 struct ProductionCookKey {
     AuthoritativeSource source;
     ArtifactKind kind = ArtifactKind::render_mesh;
@@ -60,6 +78,11 @@ struct ProductionCookKey {
     std::string algorithm;
     assets::Sha256Digest settings_digest;
     std::string platform_profile;
+    // Optional stable identifiers distinguish consumer representations and
+    // spatial scopes without exposing the policy that selected them.
+    std::string representation_kind;
+    std::string spatial_scope;
+    ProductionDecisionContext decision_context;
 
     [[nodiscard]] core::Result<void> validate() const;
     [[nodiscard]] std::string canonical() const;
@@ -104,8 +127,15 @@ struct AdmissionPolicy {
     std::optional<double> max_measured_error;
     double min_confidence = 0.0;
     std::optional<std::uint64_t> max_resident_bytes;
+    std::optional<double> max_cook_milliseconds;
+    std::optional<double> max_cpu_milliseconds;
+    std::optional<double> max_gpu_milliseconds;
+    std::optional<std::uint64_t> max_disk_bytes;
+    std::optional<std::uint64_t> max_output_bytes;
 
     [[nodiscard]] core::Result<void> validate() const;
+    [[nodiscard]] std::string canonical() const;
+    [[nodiscard]] core::Result<assets::Sha256Digest> canonical_digest() const;
 };
 
 // Validates a receipt immediately before publication. A receipt may be valid

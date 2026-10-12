@@ -4,13 +4,22 @@
 #include <carto/io/stl.hpp>
 #include <carto/io/gltf_export.hpp>
 #include <carto/application/application.hpp>
+#if CARTO_CLI_HAS_D3D12_BAKE
+#include <carto/d3d12/bake_graph.hpp>
+#endif
+#include <carto/assets/blob_store.hpp>
 #include <carto/geometry/primitives.hpp>
 #include <carto/journal/journal.hpp>
+#include <carto/production/bake_graph.hpp>
+#include <carto/production/cloth_solver.hpp>
+#include <carto/production/preparation_operation.hpp>
+#include <carto/production/preparation_scope.hpp>
 #include <carto/providers/registry.hpp>
 #include <carto/project/project.hpp>
 #include <carto/project/transaction.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <charconv>
@@ -194,6 +203,17 @@ Result<std::uint64_t> parse_gene_id_argument(std::string_view text) {
     return Result<std::uint64_t>::success(value);
 }
 
+Result<std::uint64_t> parse_mesh_asset_id_argument(std::string_view text) {
+    std::uint64_t value = 0U;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || value == 0U) {
+        return Result<std::uint64_t>::failure(carto::core::Diagnostic(
+            carto::core::ErrorCode::invalid_argument,
+            "export mesh asset id must be a non-zero unsigned integer"));
+    }
+    return Result<std::uint64_t>::success(value);
+}
+
 Result<double> parse_finite_double_argument(std::string_view text) {
     const std::string token(text);
     char* end = nullptr;
@@ -202,6 +222,46 @@ Result<double> parse_finite_double_argument(std::string_view text) {
         return Result<double>::failure(carto::core::Diagnostic(
             carto::core::ErrorCode::invalid_argument,
             "functional genome gene value must be a finite number"));
+    }
+    return Result<double>::success(value);
+}
+
+Result<std::uint64_t> parse_bake_u64_argument(
+    std::string_view text,
+    std::string_view label) {
+    std::uint64_t value = 0U;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) {
+        return Result<std::uint64_t>::failure(carto::core::Diagnostic(
+            carto::core::ErrorCode::invalid_argument,
+            std::string(label) + " must be an unsigned integer"));
+    }
+    return Result<std::uint64_t>::success(value);
+}
+
+Result<std::uint32_t> parse_bake_u32_argument(
+    std::string_view text,
+    std::string_view label) {
+    const auto value = parse_bake_u64_argument(text, label);
+    if (!value || value.value() > std::numeric_limits<std::uint32_t>::max()) {
+        return Result<std::uint32_t>::failure(value
+            ? carto::core::Diagnostic(carto::core::ErrorCode::invalid_argument,
+                std::string(label) + " exceeds the supported unsigned integer range")
+            : value.error());
+    }
+    return Result<std::uint32_t>::success(static_cast<std::uint32_t>(value.value()));
+}
+
+Result<double> parse_bake_positive_double_argument(
+    std::string_view text,
+    std::string_view label) {
+    const std::string token(text);
+    char* end = nullptr;
+    const double value = std::strtod(token.c_str(), &end);
+    if (end != token.c_str() + token.size() || !std::isfinite(value) || value <= 0.0) {
+        return Result<double>::failure(carto::core::Diagnostic(
+            carto::core::ErrorCode::invalid_argument,
+            std::string(label) + " must be finite and positive"));
     }
     return Result<double>::success(value);
 }
@@ -2414,7 +2474,10 @@ int import_functional_genome_exchange(
     return EXIT_SUCCESS;
 }
 
-int export_obj(const std::filesystem::path& project_path, const std::filesystem::path& obj_path) {
+int export_obj(
+    const std::filesystem::path& project_path,
+    const std::filesystem::path& obj_path,
+    std::optional<std::uint64_t> mesh_asset) {
     carto::providers::Registry providers;
     if (auto result = carto::io::register_builtin_obj_providers(providers); !result) {
         print_error(result.error().with_context("OBJ exporter provider"));
@@ -2429,16 +2492,20 @@ int export_obj(const std::filesystem::path& project_path, const std::filesystem:
         print_error(document.error());
         return EXIT_FAILURE;
     }
-    if (document.value().meshes().empty()) {
-        std::cerr << "error: project has no mesh assets\n";
+    const auto resolved_mesh = carto::production::resolve_single_mesh_export(
+        document.value(), mesh_asset);
+    if (!resolved_mesh) {
+        print_error(resolved_mesh.error());
         return EXIT_FAILURE;
     }
-    auto report = carto::io::export_obj(document.value().meshes().begin()->second, obj_path);
+    auto report = carto::io::export_obj(
+        document.value().meshes().at(resolved_mesh.value()), obj_path);
     if (!report) {
         print_error(report.error());
         return EXIT_FAILURE;
     }
-    std::cout << "exported " << obj_path << " vertices=" << report.value().vertices
+    std::cout << "exported " << obj_path << " mesh_asset=" << resolved_mesh.value()
+              << " vertices=" << report.value().vertices
               << " triangles=" << report.value().triangles << '\n';
     for (const auto& warning : report.value().warnings) {
         std::cout << "warning: " << warning << '\n';
@@ -2446,7 +2513,10 @@ int export_obj(const std::filesystem::path& project_path, const std::filesystem:
     return EXIT_SUCCESS;
 }
 
-int export_ply(const std::filesystem::path& project_path, const std::filesystem::path& ply_path) {
+int export_ply(
+    const std::filesystem::path& project_path,
+    const std::filesystem::path& ply_path,
+    std::optional<std::uint64_t> mesh_asset) {
     carto::providers::Registry providers;
     if (auto result = carto::io::register_builtin_ply_providers(providers); !result) {
         print_error(result.error().with_context("PLY exporter provider"));
@@ -2461,22 +2531,29 @@ int export_ply(const std::filesystem::path& project_path, const std::filesystem:
         print_error(document.error());
         return EXIT_FAILURE;
     }
-    if (document.value().meshes().empty()) {
-        std::cerr << "error: project has no mesh assets\n";
+    const auto resolved_mesh = carto::production::resolve_single_mesh_export(
+        document.value(), mesh_asset);
+    if (!resolved_mesh) {
+        print_error(resolved_mesh.error());
         return EXIT_FAILURE;
     }
-    auto report = carto::io::export_ply(document.value().meshes().begin()->second, ply_path);
+    auto report = carto::io::export_ply(
+        document.value().meshes().at(resolved_mesh.value()), ply_path);
     if (!report) {
         print_error(report.error());
         return EXIT_FAILURE;
     }
-    std::cout << "exported " << ply_path << " vertices=" << report.value().vertices
+    std::cout << "exported " << ply_path << " mesh_asset=" << resolved_mesh.value()
+              << " vertices=" << report.value().vertices
               << " faces=" << report.value().faces << " triangles=" << report.value().triangles << '\n';
     for (const auto& warning : report.value().warnings) std::cout << "warning: " << warning << '\n';
     return EXIT_SUCCESS;
 }
 
-int export_stl(const std::filesystem::path& project_path, const std::filesystem::path& stl_path) {
+int export_stl(
+    const std::filesystem::path& project_path,
+    const std::filesystem::path& stl_path,
+    std::optional<std::uint64_t> mesh_asset) {
     carto::providers::Registry providers;
     if (auto result = carto::io::register_builtin_stl_providers(providers); !result) {
         print_error(result.error().with_context("STL exporter provider"));
@@ -2491,16 +2568,20 @@ int export_stl(const std::filesystem::path& project_path, const std::filesystem:
         print_error(document.error());
         return EXIT_FAILURE;
     }
-    if (document.value().meshes().empty()) {
-        std::cerr << "error: project has no mesh assets\n";
+    const auto resolved_mesh = carto::production::resolve_single_mesh_export(
+        document.value(), mesh_asset);
+    if (!resolved_mesh) {
+        print_error(resolved_mesh.error());
         return EXIT_FAILURE;
     }
-    auto report = carto::io::export_stl(document.value().meshes().begin()->second, stl_path);
+    auto report = carto::io::export_stl(
+        document.value().meshes().at(resolved_mesh.value()), stl_path);
     if (!report) {
         print_error(report.error());
         return EXIT_FAILURE;
     }
-    std::cout << "exported " << stl_path << " vertices=" << report.value().vertices
+    std::cout << "exported " << stl_path << " mesh_asset=" << resolved_mesh.value()
+              << " vertices=" << report.value().vertices
               << " triangles=" << report.value().triangles << '\n';
     for (const auto& warning : report.value().warnings) std::cout << "warning: " << warning << '\n';
     return EXIT_SUCCESS;
@@ -2638,6 +2719,1617 @@ int export_gltf(const std::filesystem::path& project_path, const std::filesystem
     return EXIT_SUCCESS;
 }
 
+const char* preparation_stage_name(carto::production::PreparationStage stage) {
+    using carto::production::PreparationStage;
+    switch (stage) {
+    case PreparationStage::resolve: return "resolve";
+    case PreparationStage::plan: return "plan";
+    case PreparationStage::validate: return "validate";
+    case PreparationStage::execute: return "execute";
+    case PreparationStage::verify: return "verify";
+    case PreparationStage::publish: return "publish";
+    }
+    return "unknown";
+}
+
+Result<carto::production::PreparationProfile> load_preparation_profile(
+    const std::filesystem::path& path) {
+    const auto text = read_bounded_text(
+        path, carto::production::kMaxPreparationProfileBytes,
+        "preparation profile");
+    if (!text) {
+        return Result<carto::production::PreparationProfile>::failure(
+            text.error());
+    }
+    const auto profile = carto::production::PreparationProfile::deserialize(
+        text.value());
+    if (!profile) {
+        return Result<carto::production::PreparationProfile>::failure(
+            profile.error().with_context("preparation profile " + path.string()));
+    }
+    return profile;
+}
+
+int write_default_preparation_profile(const std::filesystem::path& path) {
+    const auto profile = carto::production::portable_preparation_profile();
+    const auto digest = profile.canonical_digest();
+    if (!digest) {
+        print_error(digest.error());
+        return EXIT_FAILURE;
+    }
+    if (const auto written = write_new_text_atomically(
+            path, profile.serialize(), "preparation profile"); !written) {
+        print_error(written.error());
+        return EXIT_FAILURE;
+    }
+    std::cout << "preparation_profile_written"
+              << " identity=" << profile.identity
+              << " digest=" << digest.value().hex()
+              << " path=" << std::quoted(path.string()) << '\n';
+    return EXIT_SUCCESS;
+}
+
+int inspect_preparation_profile(const std::filesystem::path& path) {
+    const auto profile = load_preparation_profile(path);
+    if (!profile) {
+        print_error(profile.error());
+        return EXIT_FAILURE;
+    }
+    const auto digest = profile.value().canonical_digest();
+    if (!digest) {
+        print_error(digest.error());
+        return EXIT_FAILURE;
+    }
+    std::cout << "preparation_profile"
+              << " identity=" << profile.value().identity
+              << " digest=" << digest.value().hex()
+              << " active_render_uv="
+              << (profile.value().use_active_render_uv ? "true" : "false")
+              << " unique_lightmap_uv="
+              << (profile.value().include_unique_lightmap_uv ? "true" : "false")
+              << " tangents="
+              << (profile.value().generate_tangents_when_uv_present ? "true" : "false")
+              << " lookdev="
+              << (profile.value().include_lookdev ? "true" : "false")
+              << " required_lookdev="
+              << (profile.value().require_lookdev_for_material_regions ? "true" : "false")
+              << '\n';
+    return EXIT_SUCCESS;
+}
+
+int prepare_project(int argc, char** argv) {
+    using namespace carto;
+    const std::filesystem::path project_path(argv[2]);
+    const std::filesystem::path output_root(argv[3]);
+    int scope_index = 4;
+    production::PreparationProfile profile =
+        production::portable_preparation_profile();
+    if (argc >= 7 && std::string_view(argv[scope_index]) == "--profile") {
+        const auto loaded = load_preparation_profile(argv[scope_index + 1]);
+        if (!loaded) {
+            print_error(loaded.error());
+            return EXIT_FAILURE;
+        }
+        profile = loaded.value();
+        scope_index += 2;
+    }
+    if (scope_index >= argc) {
+        std::cerr << "error: prepare requires an explicit scope\n";
+        return EXIT_FAILURE;
+    }
+    const std::string_view scope_name(argv[scope_index]);
+    const int scope_argument_count = argc - scope_index;
+    auto document = project::ProjectDocument::load(project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+
+    production::PreparationScopeRequest scope;
+    scope.expected_source_revision = document.value().revision();
+    if (scope_name == "scene" && scope_argument_count == 1) {
+        scope.kind = production::PreparationScopeKind::scene;
+    } else if (scope_name == "asset" && scope_argument_count == 2) {
+        scope.kind = production::PreparationScopeKind::asset;
+        const auto identity = parse_mesh_asset_id_argument(argv[scope_index + 1]);
+        if (!identity) {
+            print_error(identity.error());
+            return EXIT_FAILURE;
+        }
+        scope.asset_ids.push_back(identity.value());
+    } else if (scope_name == "assembly" && scope_argument_count == 2) {
+        scope.kind = production::PreparationScopeKind::assembly;
+        const auto identity = parse_mesh_asset_id_argument(argv[scope_index + 1]);
+        if (!identity) {
+            print_error(identity.error());
+            return EXIT_FAILURE;
+        }
+        scope.node_ids.push_back(identity.value());
+    } else if (scope_name == "selection" && scope_argument_count >= 2) {
+        scope.kind = production::PreparationScopeKind::selection;
+        for (int index = scope_index + 1; index < argc; ++index) {
+            const auto identity = parse_mesh_asset_id_argument(argv[index]);
+            if (!identity) {
+                print_error(identity.error());
+                return EXIT_FAILURE;
+            }
+            scope.node_ids.push_back(identity.value());
+        }
+        std::sort(scope.node_ids.begin(), scope.node_ids.end());
+    } else {
+        std::cerr << "error: prepare scope must be scene, asset <mesh-id>, "
+                     "assembly <node-id>, or selection <node-id>...\n";
+        return EXIT_FAILURE;
+    }
+
+    const auto current = production::read_selected_prepared_scene(output_root);
+    if (!current) {
+        print_error(current.error().with_context("prepared output baseline"));
+        return EXIT_FAILURE;
+    }
+    std::optional<assets::Sha256Digest> expected;
+    if (current.value().has_value()) {
+        expected = current.value()->prepared_scene_digest;
+    }
+    auto source_root = project_path.parent_path();
+    if (source_root.empty()) source_root = std::filesystem::current_path();
+    const production::PreparationOperationRequest request{
+        .scope = std::move(scope),
+        .profile = std::move(profile),
+        .source_root = std::move(source_root),
+        .output_root = output_root,
+        .expected_selected_digest = expected,
+        .stop_token = {},
+    };
+    const auto report = production::prepare_and_publish(document.value(), request);
+    for (const auto& diagnostic : report.diagnostics) {
+        std::cerr << "diagnostic code=" << diagnostic.code
+                  << " stage=" << preparation_stage_name(diagnostic.stage)
+                  << " message=" << std::quoted(diagnostic.message);
+        if (diagnostic.source_primary.has_value()) {
+            std::cerr << " source_primary=" << diagnostic.source_primary.value();
+        }
+        if (diagnostic.source_secondary.has_value()) {
+            std::cerr << " source_secondary=" << diagnostic.source_secondary.value();
+        }
+        if (!diagnostic.capability.empty()) {
+            std::cerr << " capability=" << diagnostic.capability;
+        }
+        std::cerr << '\n';
+    }
+    if (!report.succeeded()) return EXIT_FAILURE;
+    std::cout << "prepared"
+              << " operation=" << report.operation_id.hex()
+              << " source_revision=" << report.source_revision.value()
+              << " profile=" << report.envelope->profile_identity
+              << " profile_digest=" << report.envelope->profile_digest.hex()
+              << " assets=" << report.resolved_scope->asset_ids.size()
+              << " nodes=" << report.resolved_scope->node_ids.size()
+              << " products=" << report.envelope->products.size()
+              << " revision=" << report.publication->prepared_scene_digest.hex()
+              << " reused="
+              << (report.publication->reused_immutable_revision ? "true" : "false")
+              << " output=" << std::quoted(output_root.string()) << '\n';
+    return EXIT_SUCCESS;
+}
+
+int bake_ambient_occlusion(char** argv, bool use_d3d12_backend = false) {
+    using namespace carto;
+    const std::filesystem::path project_path(argv[2]);
+    const auto mesh_asset = parse_mesh_asset_id_argument(argv[3]);
+    const auto uv_set = parse_bake_u64_argument(argv[4], "UV set id");
+    const auto width = parse_bake_u32_argument(argv[5], "texture width");
+    const auto height = parse_bake_u32_argument(argv[6], "texture height");
+    const auto tile_u = parse_bake_u32_argument(argv[7], "UDIM tile U");
+    const auto tile_v = parse_bake_u32_argument(argv[8], "UDIM tile V");
+    const auto sample_count = parse_bake_u32_argument(argv[9], "AO sample count");
+    const auto max_distance = parse_bake_positive_double_argument(
+        argv[10], "AO maximum distance");
+    const auto seed = parse_bake_u64_argument(argv[11], "AO seed");
+    const std::filesystem::path output_root(argv[12]);
+    const auto report_parse_failure = [](const auto& result) {
+        if (result) return false;
+        print_error(result.error());
+        return true;
+    };
+    if (report_parse_failure(mesh_asset) || report_parse_failure(uv_set) ||
+        report_parse_failure(width) || report_parse_failure(height) ||
+        report_parse_failure(tile_u) || report_parse_failure(tile_v) ||
+        report_parse_failure(sample_count) || report_parse_failure(max_distance) ||
+        report_parse_failure(seed)) return EXIT_FAILURE;
+    if (output_root.empty() || output_root.filename().empty()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "bake output directory must name a new directory"));
+        return EXIT_FAILURE;
+    }
+
+    const auto document = project::ProjectDocument::load(project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto mesh = document.value().meshes().find(mesh_asset.value());
+    if (mesh == document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::not_found,
+            "AO bake mesh asset does not exist in the project"));
+        return EXIT_FAILURE;
+    }
+    const std::string mesh_identity = document.value().source_namespace() +
+        "/mesh/" + std::to_string(mesh_asset.value());
+    const auto source_binding = production::bind_bake_source(mesh_identity, mesh->second);
+    const auto target_binding = production::bind_bake_target(
+        mesh_identity, mesh->second, uv_set.value());
+    if (!source_binding || !target_binding) {
+        print_error(!source_binding ? source_binding.error() : target_binding.error());
+        return EXIT_FAILURE;
+    }
+
+    production::AmbientOcclusionRecipe recipe;
+    recipe.binding.identity = "bake/ao/mesh/" + std::to_string(mesh_asset.value()) +
+        "/uv/" + std::to_string(uv_set.value()) + "/tile/" +
+        std::to_string(tile_u.value()) + "/" + std::to_string(tile_v.value());
+    recipe.binding.source = source_binding.value();
+    recipe.binding.target = target_binding.value();
+    recipe.binding.target_uv_set = uv_set.value();
+    recipe.binding.width = width.value();
+    recipe.binding.height = height.value();
+    recipe.binding.tile_u = tile_u.value();
+    recipe.binding.tile_v = tile_v.value();
+    recipe.sample_count = sample_count.value();
+    recipe.max_distance = max_distance.value();
+    recipe.origin_bias = 1e-4;
+    recipe.seed = seed.value();
+    if (auto result = recipe.validate(); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto recipe_digest = recipe.canonical_digest();
+    if (!recipe_digest) {
+        print_error(recipe_digest.error());
+        return EXIT_FAILURE;
+    }
+
+    std::optional<production::AmbientOcclusionExecutionReport> cpu_report;
+#if CARTO_CLI_HAS_D3D12_BAKE
+    std::optional<d3d12::D3D12AmbientOcclusionBakeReport> d3d12_report;
+#endif
+    const production::AmbientOcclusionMapArtifact* artifact = nullptr;
+    std::string platform_profile = "carto.cpu-reference.v1";
+    const auto started = std::chrono::steady_clock::now();
+    if (use_d3d12_backend) {
+#if CARTO_CLI_HAS_D3D12_BAKE
+        const auto device_result = d3d12::D3D12Device::create();
+        if (!device_result) {
+            print_error(device_result.error().with_context("D3D12 AO bake worker"));
+            return EXIT_FAILURE;
+        }
+        d3d12_report.emplace(d3d12::compile_ambient_occlusion_d3d12(
+            *device_result.value(), recipe, mesh->second, mesh->second));
+        for (const auto& diagnostic : d3d12_report->bake.diagnostics) {
+            std::cerr << "diagnostic code=" << diagnostic.code
+                      << " message=" << std::quoted(diagnostic.message) << '\n';
+        }
+        if (!d3d12_report->succeeded()) return EXIT_FAILURE;
+        const auto profile = d3d12::d3d12_bake_platform_profile(
+            *d3d12_report->projection);
+        if (!profile) {
+            print_error(profile.error());
+            return EXIT_FAILURE;
+        }
+        platform_profile = profile.value();
+        artifact = &*d3d12_report->bake.artifact;
+#else
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "D3D12 AO backend is not enabled in this CLI build"));
+        return EXIT_FAILURE;
+#endif
+    } else {
+        cpu_report.emplace(production::compile_ambient_occlusion_cpu(
+            recipe, mesh->second, mesh->second));
+        for (const auto& diagnostic : cpu_report->diagnostics) {
+            std::cerr << "diagnostic code=" << diagnostic.code
+                      << " message=" << std::quoted(diagnostic.message) << '\n';
+        }
+        if (!cpu_report->succeeded() || !cpu_report->artifact.has_value()) {
+            return EXIT_FAILURE;
+        }
+        artifact = &*cpu_report->artifact;
+    }
+    const auto finished = std::chrono::steady_clock::now();
+
+    const auto current_document = project::ProjectDocument::load(project_path);
+    if (!current_document) {
+        print_error(current_document.error().with_context(
+            "reloading project before AO bake publication"));
+        return EXIT_FAILURE;
+    }
+    if (current_document.value().source_namespace() !=
+        document.value().source_namespace()) {
+        print_error(core::Diagnostic(core::ErrorCode::stale_data,
+            "project source namespace changed while the AO bake was running"));
+        return EXIT_FAILURE;
+    }
+    const auto current_mesh = current_document.value().meshes().find(mesh_asset.value());
+    if (current_mesh == current_document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::stale_data,
+            "project AO bake mesh disappeared while the bake was running"));
+        return EXIT_FAILURE;
+    }
+    if (auto result = production::validate_bake_sources(
+            recipe.binding, current_mesh->second, current_mesh->second); !result) {
+        print_error(result.error().with_context(
+            "revalidating project mesh before AO bake publication"));
+        return EXIT_FAILURE;
+    }
+
+    const auto payload = artifact->serialize();
+    const auto cook_key = production::bake_ambient_occlusion_cook_key(
+        recipe, platform_profile);
+    if (!payload || !cook_key) {
+        print_error(!payload ? payload.error() : cook_key.error());
+        return EXIT_FAILURE;
+    }
+    production::ProductionArtifactReceipt receipt;
+    receipt.key = cook_key.value();
+    receipt.status = production::ReceiptStatus::admitted;
+    receipt.output_digest = assets::sha256(payload.value());
+    receipt.output_bytes = payload.value().size();
+    if (use_d3d12_backend) {
+        receipt.quality.measured_error = 0.0;
+        receipt.quality.importance = 1.0;
+        receipt.quality.confidence = 1.0;
+    }
+    receipt.cost.cook_milliseconds = std::chrono::duration<double, std::milli>(
+        finished - started).count();
+    receipt.cost.disk_bytes = receipt.output_bytes;
+    if (auto result = receipt.refresh_digest(); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+
+    std::error_code output_error;
+    const auto parent = output_root.parent_path();
+    if (!parent.empty() &&
+        (!std::filesystem::exists(parent, output_error) || output_error ||
+         !std::filesystem::is_directory(parent, output_error) || output_error)) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            "bake output parent directory is unavailable"));
+        return EXIT_FAILURE;
+    }
+    output_error.clear();
+    if (std::filesystem::exists(output_root, output_error) || output_error) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "bake output directory refuses to overwrite an existing path"));
+        return EXIT_FAILURE;
+    }
+    std::filesystem::path staging_root = output_root;
+    staging_root += ".pending-" + recipe_digest.value().hex().substr(0U, 16U);
+    output_error.clear();
+    if (std::filesystem::exists(staging_root, output_error) || output_error) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "bake staging directory already exists and requires inspection"));
+        return EXIT_FAILURE;
+    }
+    output_error.clear();
+    if (!std::filesystem::create_directory(staging_root, output_error) || output_error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            "unable to create the new bake staging directory"));
+        return EXIT_FAILURE;
+    }
+
+    try {
+        assets::BlobStore blobs(staging_root / "blobs");
+        production::ProductionArtifactStore artifact_store(blobs);
+        const production::AuthoritativeSource current_source{
+            recipe.binding.source.identity,
+            recipe.binding.source.revision,
+            recipe.binding.source.content_digest};
+        const production::AdmissionPolicy policy;
+        if (use_d3d12_backend) {
+#if CARTO_CLI_HAS_D3D12_BAKE
+            if (auto result = d3d12::publish_ambient_occlusion_map_d3d12(
+                    artifact_store, receipt, *d3d12_report,
+                    current_mesh->second, current_mesh->second, policy,
+                    platform_profile); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+#endif
+        } else if (auto result = production::publish_ambient_occlusion_map(
+                artifact_store, receipt, *artifact, current_mesh->second,
+                current_mesh->second, policy, platform_profile); !result) {
+            print_error(result.error());
+            return EXIT_FAILURE;
+        }
+        const auto reopened = production::read_ambient_occlusion_map(
+            artifact_store, recipe, current_mesh->second, current_mesh->second,
+            policy, platform_profile);
+        if (!reopened) {
+            print_error(reopened.error());
+            return EXIT_FAILURE;
+        }
+        const std::string ledger_text = artifact_store.ledger().serialize();
+        const auto ledger = production::ProductionReceiptLedger::deserialize(ledger_text);
+        if (!ledger || ledger.value().size() != 1U) {
+            print_error(ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+                "AO bake receipt ledger did not reopen with exactly one record")
+                : ledger.error());
+            return EXIT_FAILURE;
+        }
+        const auto manifest_write = write_new_text_atomically(
+            staging_root / "receipts.carto-production-receipts", ledger_text,
+            "AO bake receipt ledger");
+        if (!manifest_write) {
+            print_error(manifest_write.error());
+            return EXIT_FAILURE;
+        }
+        const auto reopened_manifest = read_bounded_text(
+            staging_root / "receipts.carto-production-receipts",
+            production::ProductionReceiptLedger::max_serialized_bytes,
+            "AO bake receipt ledger");
+        if (!reopened_manifest ||
+            !production::ProductionReceiptLedger::deserialize(reopened_manifest.value())) {
+            print_error(reopened_manifest
+                ? core::Diagnostic(core::ErrorCode::validation_failed,
+                    "AO bake receipt manifest failed read-back validation")
+                : reopened_manifest.error());
+            return EXIT_FAILURE;
+        }
+        if (reopened.value().artifact_digest != artifact->artifact_digest) {
+            print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                "published AO artifact does not match the compiled artifact"));
+            return EXIT_FAILURE;
+        }
+        output_error.clear();
+        std::filesystem::rename(staging_root, output_root, output_error);
+        if (output_error) {
+            print_error(core::Diagnostic(core::ErrorCode::io_error,
+                "atomic bake output publication failed; inspect the staging directory"));
+            return EXIT_FAILURE;
+        }
+        std::cout << "baked"
+                  << " kind=ambient-occlusion"
+                  << " evidence=" << (use_d3d12_backend
+                      ? "carto.d3d12.cpu-reference-parity" : "carto.cpu-reference")
+                  << " platform_profile=" << std::quoted(platform_profile)
+                  << " source=" << std::quoted(current_source.identity)
+                  << " source_revision=" << current_source.revision.value()
+                  << " source_digest=" << current_source.content_digest.hex()
+                  << " mesh=" << mesh_asset.value()
+                  << " uv_set=" << uv_set.value()
+                  << " tile=" << tile_u.value() << ',' << tile_v.value()
+                  << " covered_texels=" << artifact->covered_texels
+                  << " rays_cast=" << artifact->rays_cast
+                  << " sampling_standard_error_upper_bound="
+                  << artifact->sampling_standard_error_upper_bound
+                  << " artifact_digest=" << artifact->artifact_digest.hex()
+                  << " payload_digest=" << receipt.output_digest.hex()
+                  << " receipt_digest=" << receipt.receipt_digest.hex();
+#if CARTO_CLI_HAS_D3D12_BAKE
+        if (d3d12_report.has_value()) {
+            const auto& worker = *d3d12_report->projection;
+            std::cout << " adapter=" << std::quoted(worker.adapter_name)
+                      << " adapter_id=" << std::quoted(worker.stable_adapter_id)
+                      << " driver=" << std::quoted(worker.driver)
+                      << " request_digest=" << worker.request_digest.hex()
+                      << " shader_source_digest=" << worker.shader_source_digest.hex()
+                      << " shader_binary_digest=" << worker.shader_binary_digest.hex()
+                      << " worker_wall_nanoseconds=" << worker.wall_time_nanoseconds;
+        }
+#endif
+        std::cout << " output=" << std::quoted(output_root.string()) << '\n';
+    } catch (const std::exception& error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            std::string("AO bake publication failed: ") + error.what()));
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+int bake_cloth_rest_pose(char** argv) {
+    using namespace carto;
+    const std::filesystem::path project_path(argv[2]);
+    const auto mesh_asset = parse_mesh_asset_id_argument(argv[3]);
+    const auto frame_count = parse_bake_u32_argument(argv[4], "cloth frame count");
+    const auto substeps = parse_bake_u32_argument(argv[5], "cloth substeps per frame");
+    const auto iterations = parse_bake_u32_argument(argv[6], "cloth projection iterations");
+    const auto settle_window = parse_bake_u32_argument(argv[7], "cloth settle window");
+    const auto settle_tolerance = parse_bake_positive_double_argument(
+        argv[8], "cloth settle displacement tolerance");
+    const std::filesystem::path output_root(argv[9]);
+    const auto report_parse_failure = [](const auto& result) {
+        if (result) return false;
+        print_error(result.error());
+        return true;
+    };
+    if (report_parse_failure(mesh_asset) || report_parse_failure(frame_count) ||
+        report_parse_failure(substeps) || report_parse_failure(iterations) ||
+        report_parse_failure(settle_window) || report_parse_failure(settle_tolerance)) {
+        return EXIT_FAILURE;
+    }
+    if (output_root.empty() || output_root.filename().empty()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "cloth bake output directory must name a new directory"));
+        return EXIT_FAILURE;
+    }
+
+    auto loaded_project = project::ProjectDocument::load(project_path);
+    if (!loaded_project) {
+        print_error(loaded_project.error());
+        return EXIT_FAILURE;
+    }
+    project::ProjectDocument document = std::move(loaded_project).value();
+    const core::Revision input_project_revision = document.revision();
+    const auto mesh = document.meshes().find(mesh_asset.value());
+    const auto garment_record = document.garment_assets().find(mesh_asset.value());
+    if (mesh == document.meshes().end() || garment_record == document.garment_assets().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::not_found,
+            "cloth bake requires an existing mesh with an authored GarmentAsset"));
+        return EXIT_FAILURE;
+    }
+    const project::SerializedGarmentAsset source_garment_record = garment_record->second;
+    auto garment = production::GarmentAsset::deserialize(garment_record->second.bytes);
+    if (!garment) {
+        print_error(garment.error().with_context("project GarmentAsset"));
+        return EXIT_FAILURE;
+    }
+    if (garment.value().mesh_asset != mesh_asset.value()) {
+        print_error(core::Diagnostic(core::ErrorCode::stale_data,
+            "GarmentAsset mesh identity differs from the requested source mesh"));
+        return EXIT_FAILURE;
+    }
+    if (auto result = garment.value().validate(mesh->second); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+
+    production::ClothSolverSettings settings;
+    settings.frame_count = frame_count.value();
+    settings.substeps_per_frame = substeps.value();
+    settings.projection_iterations = iterations.value();
+    settings.settle_window_frames = settle_window.value();
+    settings.settle_displacement_tolerance = settle_tolerance.value();
+    settings.require_settled = true;
+    if (auto result = settings.validate(); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+
+    const auto cook_started = std::chrono::steady_clock::now();
+    const auto simulation = production::compile_cloth_cpu(
+        garment.value(), mesh->second, settings);
+    if (!simulation) {
+        print_error(simulation.error().with_context("CPU cloth simulation"));
+        return EXIT_FAILURE;
+    }
+    const auto baked = production::bake_cloth_settled_rest_pose(
+        simulation.value(), garment.value(), mesh->second);
+    if (!baked) {
+        print_error(baked.error().with_context("settled cloth rest-pose bake"));
+        return EXIT_FAILURE;
+    }
+    const auto simulation_payload = simulation.value().serialize();
+    const auto simulation_key = production::cloth_production_cook_key(
+        garment.value(), settings, "cpu-reference");
+    const auto rest_pose_key = production::cloth_rest_pose_bake_cook_key(
+        simulation.value(), "cpu-reference");
+    const auto rest_pose_payload = baked.value().receipt.serialize();
+    if (!simulation_payload || !simulation_key || !rest_pose_key || !rest_pose_payload) {
+        const core::Diagnostic& failure = !simulation_payload ? simulation_payload.error() :
+            (!simulation_key ? simulation_key.error() :
+                (!rest_pose_key ? rest_pose_key.error() : rest_pose_payload.error()));
+        print_error(failure);
+        return EXIT_FAILURE;
+    }
+    const auto ensure_input_unchanged = [&]() -> core::Result<void> {
+        const auto latest = project::ProjectDocument::load(project_path);
+        if (!latest) return core::Result<void>::failure(latest.error());
+        const auto latest_mesh = latest.value().meshes().find(mesh_asset.value());
+        const auto latest_garment = latest.value().garment_assets().find(mesh_asset.value());
+        if (latest.value().revision() != input_project_revision) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "source project revision changed while the cloth bake was compiling"));
+        }
+        if (latest.value().source_namespace() != document.source_namespace()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "source project namespace changed while the cloth bake was compiling"));
+        }
+        if (latest_mesh == latest.value().meshes().end()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "source mesh disappeared while the cloth bake was compiling"));
+        }
+        if (latest_garment == latest.value().garment_assets().end() ||
+            latest_garment->second != source_garment_record) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "authored GarmentAsset changed while the cloth bake was compiling"));
+        }
+        const auto latest_binding = production::bind_bake_source(
+            simulation.value().source.identity, latest_mesh->second);
+        if (!latest_binding || latest_binding.value() != simulation.value().source) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "source mesh changed while the cloth bake was compiling"));
+        }
+        return core::Result<void>::success();
+    };
+    if (auto result = ensure_input_unchanged(); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto cook_finished = std::chrono::steady_clock::now();
+    const double cook_milliseconds = std::chrono::duration<double, std::milli>(
+        cook_finished - cook_started).count();
+
+    production::ProductionArtifactReceipt simulation_receipt;
+    simulation_receipt.key = simulation_key.value();
+    simulation_receipt.status = production::ReceiptStatus::admitted;
+    simulation_receipt.output_digest = assets::sha256(simulation_payload.value());
+    simulation_receipt.output_bytes = simulation_payload.value().size();
+    simulation_receipt.quality.measured_error = simulation.value().maximum_constraint_error;
+    simulation_receipt.quality.importance = 1.0;
+    simulation_receipt.quality.confidence = 1.0;
+    simulation_receipt.cost.cpu_milliseconds = cook_milliseconds;
+    simulation_receipt.cost.disk_bytes = simulation_receipt.output_bytes;
+    if (auto result = simulation_receipt.refresh_digest(); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    production::ProductionArtifactReceipt rest_pose_receipt;
+    rest_pose_receipt.key = rest_pose_key.value();
+    rest_pose_receipt.status = production::ReceiptStatus::admitted;
+    rest_pose_receipt.output_digest = assets::sha256(rest_pose_payload.value());
+    rest_pose_receipt.output_bytes = rest_pose_payload.value().size();
+    rest_pose_receipt.quality.measured_error = simulation.value().maximum_constraint_error;
+    rest_pose_receipt.quality.importance = 1.0;
+    rest_pose_receipt.quality.confidence = 1.0;
+    rest_pose_receipt.cost.cpu_milliseconds = cook_milliseconds;
+    rest_pose_receipt.cost.disk_bytes = rest_pose_receipt.output_bytes;
+    if (auto result = rest_pose_receipt.refresh_digest(); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+
+    std::error_code output_error;
+    const auto parent = output_root.parent_path();
+    if (!parent.empty() &&
+        (!std::filesystem::exists(parent, output_error) || output_error ||
+         !std::filesystem::is_directory(parent, output_error) || output_error)) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            "cloth bake output parent directory is unavailable"));
+        return EXIT_FAILURE;
+    }
+    output_error.clear();
+    if (std::filesystem::exists(output_root, output_error) || output_error) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "cloth bake output directory refuses to overwrite an existing path"));
+        return EXIT_FAILURE;
+    }
+    std::filesystem::path staging_root = output_root;
+    staging_root += ".pending-" + simulation.value().artifact_digest.hex().substr(0U, 16U);
+    output_error.clear();
+    if (std::filesystem::exists(staging_root, output_error) || output_error) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "cloth bake staging directory already exists and requires inspection"));
+        return EXIT_FAILURE;
+    }
+    output_error.clear();
+    if (!std::filesystem::create_directory(staging_root, output_error) || output_error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            "unable to create the new cloth bake staging directory"));
+        return EXIT_FAILURE;
+    }
+
+    try {
+      {
+        assets::BlobStore blobs(staging_root / "blobs");
+        production::ProductionArtifactStore artifact_store(blobs);
+        production::AdmissionPolicy simulation_policy;
+        simulation_policy.max_output_bytes = production::kMaxClothSimulationArtifactBytes;
+        production::AdmissionPolicy rest_pose_policy;
+        rest_pose_policy.max_output_bytes = production::kMaxClothRestPoseReceiptBytes;
+        if (auto result = production::publish_cloth_simulation(
+                artifact_store, simulation_receipt, simulation.value(), garment.value(),
+                mesh->second, simulation_policy); !result) {
+            print_error(result.error());
+            return EXIT_FAILURE;
+        }
+        if (auto result = production::publish_cloth_rest_pose_bake(
+                artifact_store, rest_pose_receipt, baked.value(), simulation.value(),
+                garment.value(), mesh->second, rest_pose_policy); !result) {
+            print_error(result.error());
+            return EXIT_FAILURE;
+        }
+        const auto reopened_simulation = production::read_cloth_simulation(
+            artifact_store, garment.value(), mesh->second, settings,
+            "cpu-reference", simulation_policy);
+        const auto reopened_bake = production::read_cloth_rest_pose_bake(
+            artifact_store, simulation.value(), garment.value(), mesh->second,
+            "cpu-reference", rest_pose_policy);
+        if (!reopened_simulation || !reopened_bake ||
+            reopened_simulation.value().artifact_digest != simulation.value().artifact_digest ||
+            reopened_bake.value().receipt.canonical() != baked.value().receipt.canonical()) {
+            print_error(!reopened_simulation ? reopened_simulation.error() :
+                (!reopened_bake ? reopened_bake.error() : core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "published cloth artifacts differ from their deterministic compile")));
+            return EXIT_FAILURE;
+        }
+        const std::string ledger_text = artifact_store.ledger().serialize();
+        const auto ledger = production::ProductionReceiptLedger::deserialize(ledger_text);
+        if (!ledger || ledger.value().size() != 2U) {
+            print_error(ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+                "cloth bake receipt ledger did not reopen with exactly two records")
+                : ledger.error());
+            return EXIT_FAILURE;
+        }
+        const auto ledger_write = write_new_text_atomically(
+            staging_root / "receipts.carto-production-receipts", ledger_text,
+            "cloth bake receipt ledger");
+        if (!ledger_write) {
+            print_error(ledger_write.error());
+            return EXIT_FAILURE;
+        }
+        const auto reopened_ledger_text = read_bounded_text(
+            staging_root / "receipts.carto-production-receipts",
+            production::ProductionReceiptLedger::max_serialized_bytes,
+            "cloth bake receipt ledger");
+        if (!reopened_ledger_text ||
+            !production::ProductionReceiptLedger::deserialize(reopened_ledger_text.value())) {
+            print_error(reopened_ledger_text
+                ? core::Diagnostic(core::ErrorCode::validation_failed,
+                    "cloth bake receipt ledger failed read-back validation")
+                : reopened_ledger_text.error());
+            return EXIT_FAILURE;
+        }
+      }
+
+      std::uint64_t output_mesh_asset_id = 0U;
+      {
+        journal::Journal project_journal(staging_root / "project.journal.log");
+        const std::string input_snapshot = document.serialize();
+        const auto* input_snapshot_bytes = reinterpret_cast<const std::uint8_t*>(
+            input_snapshot.data());
+        const auto anchored_snapshot = project_journal.append(journal::JournalAppend{
+            core::Revision{}, document.revision(), "project.snapshot",
+            std::span<const std::uint8_t>(input_snapshot_bytes, input_snapshot.size()),
+            std::nullopt});
+        if (!anchored_snapshot) {
+            print_error(anchored_snapshot.error());
+            return EXIT_FAILURE;
+        }
+        auto transaction = project::ProjectTransaction::begin(
+            document, project_journal, "cartographer_cli");
+        if (!transaction) {
+            print_error(transaction.error());
+            return EXIT_FAILURE;
+        }
+        const auto output_mesh_asset = transaction.value().add_mesh(baked.value().mesh);
+        if (!output_mesh_asset) {
+            print_error(output_mesh_asset.error());
+            return EXIT_FAILURE;
+        }
+        output_mesh_asset_id = output_mesh_asset.value();
+        if (auto result = production::stage_cloth_rest_pose_bake_receipt(
+                transaction.value(), output_mesh_asset.value(), baked.value(),
+                simulation.value(), garment.value(), mesh->second); !result) {
+            print_error(result.error());
+            return EXIT_FAILURE;
+        }
+        const auto committed = transaction.value().commit("cloth.rest-pose.bake");
+        if (!committed) {
+            print_error(committed.error());
+            return EXIT_FAILURE;
+        }
+        const auto project_write = document.save_atomic(staging_root / "project.carto");
+        if (!project_write) {
+            print_error(project_write.error());
+            return EXIT_FAILURE;
+        }
+      }
+        const auto reopened_project = project::ProjectDocument::load(
+            staging_root / "project.carto");
+        if (!reopened_project) {
+            print_error(reopened_project.error());
+            return EXIT_FAILURE;
+        }
+        const auto reopened_mesh = reopened_project.value().meshes().find(
+            output_mesh_asset_id);
+        const auto project_receipt = reopened_project.value().cloth_rest_pose_receipts().find(
+            output_mesh_asset_id);
+        if (reopened_mesh == reopened_project.value().meshes().end() ||
+            project_receipt == reopened_project.value().cloth_rest_pose_receipts().end()) {
+            print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                "cloth bake project failed to reopen its derived mesh or receipt"));
+            return EXIT_FAILURE;
+        }
+        const auto output_binding = production::bind_bake_source(
+            baked.value().receipt.output.identity, reopened_mesh->second);
+        const std::vector<std::uint8_t> project_receipt_bytes(
+            project_receipt->second.bytes.begin(), project_receipt->second.bytes.end());
+        const auto decoded_project_receipt = production::ClothRestPoseBakeReceipt::deserialize(
+            std::span<const std::uint8_t>{project_receipt_bytes});
+        if (!output_binding || output_binding.value() != baked.value().receipt.output ||
+            !decoded_project_receipt || decoded_project_receipt.value().canonical() !=
+                baked.value().receipt.canonical()) {
+            print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                "reopened project cloth mesh does not match its settled-pose receipt"));
+            return EXIT_FAILURE;
+        }
+
+        if (auto result = ensure_input_unchanged(); !result) {
+            print_error(result.error());
+            return EXIT_FAILURE;
+        }
+
+        output_error.clear();
+        std::filesystem::rename(staging_root, output_root, output_error);
+        if (output_error) {
+            print_error(core::Diagnostic(core::ErrorCode::io_error,
+                "atomic cloth bake publication failed; inspect the staging directory"));
+            return EXIT_FAILURE;
+        }
+        std::cout << "baked"
+                  << " kind=cloth-rest-pose"
+                  << " evidence=" << simulation.value().evidence_class
+                  << " source=" << std::quoted(simulation.value().source.identity)
+                  << " source_revision=" << simulation.value().source.revision.value()
+                  << " source_digest=" << simulation.value().source.content_digest.hex()
+                  << " mesh=" << mesh_asset.value()
+                  << " output_mesh=" << output_mesh_asset_id
+                  << " settled_frame=" << simulation.value().settled_frame.value()
+                  << " simulation_digest=" << simulation.value().artifact_digest.hex()
+                  << " output_digest=" << baked.value().receipt.output.content_digest.hex()
+                  << " receipt_digest=" << baked.value().receipt.receipt_digest.hex()
+                  << " output=" << std::quoted(output_root.string()) << '\n';
+    } catch (const std::exception& error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            std::string("cloth bake publication failed: ") + error.what()));
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+int inspect_cloth_rest_pose(const std::filesystem::path& output_root) {
+    using namespace carto;
+    const auto project = project::ProjectDocument::load(output_root / "project.carto");
+    if (!project) {
+        print_error(project.error());
+        return EXIT_FAILURE;
+    }
+    if (project.value().cloth_rest_pose_receipts().size() != 1U) {
+        print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+            "cloth package must contain exactly one project-bound rest-pose receipt"));
+        return EXIT_FAILURE;
+    }
+    const auto& [output_mesh_asset, stored_receipt] =
+        *project.value().cloth_rest_pose_receipts().begin();
+    const std::vector<std::uint8_t> stored_receipt_bytes(
+        stored_receipt.bytes.begin(), stored_receipt.bytes.end());
+    if (assets::sha256(std::span<const std::uint8_t>{stored_receipt_bytes}) !=
+        stored_receipt.digest) {
+        print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+            "project cloth receipt digest does not bind its bytes"));
+        return EXIT_FAILURE;
+    }
+    const auto project_receipt = production::ClothRestPoseBakeReceipt::deserialize(
+        std::span<const std::uint8_t>{stored_receipt_bytes});
+    if (!project_receipt) {
+        print_error(project_receipt.error());
+        return EXIT_FAILURE;
+    }
+    const auto output_mesh = project.value().meshes().find(output_mesh_asset);
+    if (output_mesh == project.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::not_found,
+            "project cloth receipt points to a missing derived mesh"));
+        return EXIT_FAILURE;
+    }
+
+    std::optional<production::GarmentAsset> source_garment;
+    const geometry::EditableMesh* source_mesh = nullptr;
+    for (const auto& [mesh_asset, record] : project.value().garment_assets()) {
+        const auto candidate = production::GarmentAsset::deserialize(record.bytes);
+        if (!candidate) {
+            print_error(candidate.error().with_context("project GarmentAsset"));
+            return EXIT_FAILURE;
+        }
+        if (candidate.value().project_namespace != project.value().source_namespace()) {
+            continue;
+        }
+        if (candidate.value().source.identity != project_receipt.value().source.identity ||
+            candidate.value().source.revision != project_receipt.value().source.revision ||
+            candidate.value().source.content_digest !=
+                project_receipt.value().source.content_digest) {
+            continue;
+        }
+        const auto candidate_mesh = project.value().meshes().find(mesh_asset);
+        if (candidate_mesh == project.value().meshes().end() ||
+            !candidate.value().validate(candidate_mesh->second)) {
+            print_error(core::Diagnostic(core::ErrorCode::stale_data,
+                "project GarmentAsset no longer binds its source mesh"));
+            return EXIT_FAILURE;
+        }
+        if (source_garment.has_value()) {
+            print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                "cloth receipt source binding matches multiple GarmentAssets"));
+            return EXIT_FAILURE;
+        }
+        source_garment = candidate.value();
+        source_mesh = &candidate_mesh->second;
+    }
+    if (!source_garment.has_value() || source_mesh == nullptr) {
+        print_error(core::Diagnostic(core::ErrorCode::not_found,
+            "cloth receipt source and GarmentAsset are missing from the package project"));
+        return EXIT_FAILURE;
+    }
+    const auto garment_digest = source_garment->digest();
+    if (!garment_digest || garment_digest.value() != project_receipt.value().garment_digest) {
+        print_error(garment_digest ? core::Diagnostic(core::ErrorCode::stale_data,
+            "cloth receipt garment digest differs from the project source")
+            : garment_digest.error());
+        return EXIT_FAILURE;
+    }
+
+    const auto ledger_text = read_bounded_text(
+        output_root / "receipts.carto-production-receipts",
+        production::ProductionReceiptLedger::max_serialized_bytes,
+        "cloth bake production receipt ledger");
+    if (!ledger_text) {
+        print_error(ledger_text.error());
+        return EXIT_FAILURE;
+    }
+    const auto ledger = production::ProductionReceiptLedger::deserialize(ledger_text.value());
+    if (!ledger || ledger.value().size() != 2U) {
+        print_error(ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+            "cloth package receipt ledger must contain exactly two records")
+            : ledger.error());
+        return EXIT_FAILURE;
+    }
+    const production::ProductionArtifactReceipt* simulation_record = nullptr;
+    const production::ProductionArtifactReceipt* rest_pose_record = nullptr;
+    for (const auto& record : ledger.value().records()) {
+        if (record.status != production::ReceiptStatus::admitted) continue;
+        if (record.key.kind == production::ArtifactKind::cloth_simulation) {
+            simulation_record = &record;
+        } else if (record.key.kind == production::ArtifactKind::cloth_rest_pose) {
+            rest_pose_record = &record;
+        }
+    }
+    if (simulation_record == nullptr || rest_pose_record == nullptr) {
+        print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+            "cloth package is missing its admitted simulation or rest-pose receipt"));
+        return EXIT_FAILURE;
+    }
+
+    production::AdmissionPolicy simulation_policy;
+    simulation_policy.max_output_bytes = production::kMaxClothSimulationArtifactBytes;
+    production::AdmissionPolicy rest_pose_policy;
+    rest_pose_policy.max_output_bytes = production::kMaxClothRestPoseReceiptBytes;
+    const production::AuthoritativeSource authoritative_source{
+        project_receipt.value().source.identity,
+        project_receipt.value().source.revision,
+        project_receipt.value().source.content_digest};
+    if (auto result = production::validate_publication(
+            *simulation_record, authoritative_source, simulation_policy); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    if (auto result = production::validate_publication(
+            *rest_pose_record, authoritative_source, rest_pose_policy); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    assets::BlobStore blobs(output_root / "blobs");
+    const auto simulation_bytes = blobs.read(simulation_record->output_digest);
+    const auto rest_pose_bytes = blobs.read(rest_pose_record->output_digest);
+    if (!simulation_bytes || !rest_pose_bytes) {
+        print_error(!simulation_bytes ? simulation_bytes.error() : rest_pose_bytes.error());
+        return EXIT_FAILURE;
+    }
+    const auto simulation = production::ClothSimulationArtifact::deserialize(
+        std::span<const std::uint8_t>{simulation_bytes.value()});
+    if (!simulation) {
+        print_error(simulation.error());
+        return EXIT_FAILURE;
+    }
+    if (auto result = simulation.value().validate(*source_garment, *source_mesh); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto expected_simulation_key = production::cloth_production_cook_key(
+        *source_garment, simulation.value().settings,
+        simulation_record->key.platform_profile);
+    const auto expected_rest_pose_key = production::cloth_rest_pose_bake_cook_key(
+        simulation.value(), rest_pose_record->key.platform_profile);
+    const auto stored_rest_pose = production::ClothRestPoseBakeReceipt::deserialize(
+        std::span<const std::uint8_t>{rest_pose_bytes.value()});
+    if (!expected_simulation_key || !expected_rest_pose_key || !stored_rest_pose ||
+        expected_simulation_key.value() != simulation_record->key ||
+        expected_rest_pose_key.value() != rest_pose_record->key ||
+        stored_rest_pose.value().canonical() != project_receipt.value().canonical() ||
+        stored_rest_pose.value().simulation_artifact_digest != simulation.value().artifact_digest) {
+        print_error(core::Diagnostic(core::ErrorCode::stale_data,
+            "cloth package artifacts do not match their source-bound cook receipts"));
+        return EXIT_FAILURE;
+    }
+    const std::string stored_payload(
+        rest_pose_bytes.value().begin(), rest_pose_bytes.value().end());
+    if (stored_payload != stored_receipt.bytes) {
+        print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+            "project and content-addressed cloth receipts disagree"));
+        return EXIT_FAILURE;
+    }
+    const auto rebuilt = production::bake_cloth_settled_rest_pose(
+        simulation.value(), *source_garment, *source_mesh);
+    const auto output_binding = production::bind_bake_source(
+        project_receipt.value().output.identity, output_mesh->second);
+    if (!rebuilt || !output_binding ||
+        rebuilt.value().receipt.canonical() != project_receipt.value().canonical() ||
+        output_binding.value() != project_receipt.value().output) {
+        print_error(!rebuilt ? rebuilt.error() : core::Diagnostic(
+            core::ErrorCode::validation_failed,
+            "cloth package derived mesh differs from its reconstructed receipt"));
+        return EXIT_FAILURE;
+    }
+
+    std::cout << "verified"
+              << " kind=cloth-rest-pose"
+              << " source=" << std::quoted(project_receipt.value().source.identity)
+              << " source_revision=" << project_receipt.value().source.revision.value()
+              << " mesh=" << source_garment->mesh_asset
+              << " output_mesh=" << output_mesh_asset
+              << " settled_frame=" << project_receipt.value().frame_index
+              << " simulation_digest=" << simulation.value().artifact_digest.hex()
+              << " output_digest=" << project_receipt.value().output.content_digest.hex()
+              << " receipt_digest=" << project_receipt.value().receipt_digest.hex()
+              << " package=" << std::quoted(output_root.string()) << '\n';
+    return EXIT_SUCCESS;
+}
+
+int inspect_ambient_occlusion_bake(
+    const std::filesystem::path& project_path,
+    std::string_view mesh_id_text,
+    const std::filesystem::path& output_root) {
+    using namespace carto;
+    const auto mesh_asset = parse_mesh_asset_id_argument(mesh_id_text);
+    if (!mesh_asset) {
+        print_error(mesh_asset.error());
+        return EXIT_FAILURE;
+    }
+    const auto document = project::ProjectDocument::load(project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto mesh = document.value().meshes().find(mesh_asset.value());
+    if (mesh == document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::not_found,
+            "AO bake mesh asset does not exist in the project"));
+        return EXIT_FAILURE;
+    }
+    const auto ledger_text = read_bounded_text(
+        output_root / "receipts.carto-production-receipts",
+        production::ProductionReceiptLedger::max_serialized_bytes,
+        "AO bake receipt ledger");
+    if (!ledger_text) {
+        print_error(ledger_text.error());
+        return EXIT_FAILURE;
+    }
+    const auto ledger = production::ProductionReceiptLedger::deserialize(ledger_text.value());
+    if (!ledger || ledger.value().size() != 1U) {
+        print_error(ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+            "AO bake receipt ledger must contain exactly one record") : ledger.error());
+        return EXIT_FAILURE;
+    }
+    const production::ProductionArtifactReceipt& receipt = ledger.value().records().front();
+    const bool d3d12_profile = receipt.key.platform_profile.rfind(
+        "carto.d3d12.", 0U) == 0U;
+    if (receipt.status != production::ReceiptStatus::admitted ||
+        receipt.key.kind != production::ArtifactKind::baked_texture ||
+        receipt.key.algorithm != production::kBakeAmbientOcclusionAlgorithm ||
+        (!d3d12_profile && receipt.key.platform_profile != "carto.cpu-reference.v1")) {
+        print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+            "receipt ledger does not contain one admitted CPU or D3D12 AO artifact"));
+        return EXIT_FAILURE;
+    }
+
+    try {
+        assets::BlobStore blobs(output_root / "blobs");
+        const auto payload = blobs.read(receipt.output_digest);
+        if (!payload || payload.value().size() != receipt.output_bytes ||
+            assets::sha256(payload.value()) != receipt.output_digest) {
+            print_error(payload ? core::Diagnostic(core::ErrorCode::validation_failed,
+                "AO bake payload disagrees with its production receipt") : payload.error());
+            return EXIT_FAILURE;
+        }
+        const auto artifact = production::AmbientOcclusionMapArtifact::deserialize(
+            payload.value());
+        if (!artifact) {
+            print_error(artifact.error());
+            return EXIT_FAILURE;
+        }
+        if (auto result = production::validate_bake_sources(
+                artifact.value().recipe.binding, mesh->second, mesh->second); !result) {
+            print_error(result.error());
+            return EXIT_FAILURE;
+        }
+        const auto expected_key = production::bake_ambient_occlusion_cook_key(
+            artifact.value().recipe, receipt.key.platform_profile);
+        if (!expected_key || expected_key.value() != receipt.key ||
+            artifact.value().recipe.binding.source.identity !=
+                document.value().source_namespace() + "/mesh/" +
+                    std::to_string(mesh_asset.value())) {
+            print_error(expected_key ? core::Diagnostic(core::ErrorCode::stale_data,
+                "AO bake recipe or source identity does not match the current project")
+                : expected_key.error());
+            return EXIT_FAILURE;
+        }
+        std::cout << "verified"
+                  << " kind=ambient-occlusion"
+                  << " evidence=" << (d3d12_profile
+                      ? "carto.d3d12.cpu-reference-parity" : "carto.cpu-reference")
+                  << " platform_profile=" << std::quoted(receipt.key.platform_profile)
+                  << " source=" << std::quoted(receipt.key.source.identity)
+                  << " source_revision=" << receipt.key.source.revision.value()
+                  << " source_digest=" << receipt.key.source.content_digest.hex()
+                  << " mesh=" << mesh_asset.value()
+                  << " uv_set=" << artifact.value().recipe.binding.target_uv_set
+                  << " covered_texels=" << artifact.value().covered_texels
+                  << " rays_cast=" << artifact.value().rays_cast
+                  << " artifact_digest=" << artifact.value().artifact_digest.hex()
+                  << " payload_digest=" << receipt.output_digest.hex()
+                  << " receipt_digest=" << receipt.receipt_digest.hex()
+                  << '\n';
+    } catch (const std::exception& error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            std::string("AO bake verification failed: ") + error.what()));
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+#if CARTO_CLI_HAS_D3D12_BAKE
+int bake_tangent_normal_map_d3d12(char** argv) {
+    using namespace carto;
+    const std::filesystem::path project_path(argv[2]);
+    const auto source_asset = parse_mesh_asset_id_argument(argv[3]);
+    const auto target_asset = parse_mesh_asset_id_argument(argv[4]);
+    const auto uv_set = parse_bake_u32_argument(argv[5], "UV set id");
+    const auto width = parse_bake_u32_argument(argv[6], "texture width");
+    const auto height = parse_bake_u32_argument(argv[7], "texture height");
+    const auto tile_u = parse_bake_u32_argument(argv[8], "tile U");
+    const auto tile_v = parse_bake_u32_argument(argv[9], "tile V");
+    const auto half_extent = parse_bake_positive_double_argument(
+        argv[10], "projection half extent");
+    const std::string_view reject_misses_text(argv[11]);
+    const std::filesystem::path output_root(argv[12]);
+    if (!source_asset || !target_asset || !uv_set || !width || !height ||
+        !tile_u || !tile_v || !half_extent ||
+        (reject_misses_text != "0" && reject_misses_text != "1")) {
+        const core::Diagnostic error = !source_asset ? source_asset.error()
+            : !target_asset ? target_asset.error()
+            : !uv_set ? uv_set.error()
+            : !width ? width.error()
+            : !height ? height.error()
+            : !tile_u ? tile_u.error()
+            : !tile_v ? tile_v.error()
+            : !half_extent ? half_extent.error()
+            : core::Diagnostic(core::ErrorCode::invalid_argument,
+                "reject-misses must be 0 or 1");
+        print_error(error);
+        return EXIT_FAILURE;
+    }
+    if (output_root.empty() || output_root.filename().empty()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "bake output directory must name a new directory"));
+        return EXIT_FAILURE;
+    }
+
+    const auto document = project::ProjectDocument::load(project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto source = document.value().meshes().find(source_asset.value());
+    const auto target = document.value().meshes().find(target_asset.value());
+    if (source == document.value().meshes().end() ||
+        target == document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::not_found,
+            "normal bake source or target mesh does not exist in the project"));
+        return EXIT_FAILURE;
+    }
+
+    const std::string source_identity = document.value().source_namespace() +
+        "/mesh/" + std::to_string(source_asset.value());
+    const std::string target_identity = document.value().source_namespace() +
+        "/mesh/" + std::to_string(target_asset.value());
+    const auto source_binding = production::bind_bake_source(source_identity, source->second);
+    const auto target_binding = production::bind_bake_target(
+        target_identity, target->second, uv_set.value());
+    if (!source_binding || !target_binding) {
+        print_error(!source_binding ? source_binding.error() : target_binding.error());
+        return EXIT_FAILURE;
+    }
+
+    production::BakeRecipe recipe;
+    recipe.identity = "bake/tangent-normal/source/" +
+        std::to_string(source_asset.value()) + "/target/" +
+        std::to_string(target_asset.value()) + "/uv/" + std::to_string(uv_set.value()) +
+        "/tile/" + std::to_string(tile_u.value()) + "/" + std::to_string(tile_v.value());
+    recipe.source = source_binding.value();
+    recipe.target = target_binding.value();
+    recipe.target_uv_set = uv_set.value();
+    recipe.width = width.value();
+    recipe.height = height.value();
+    recipe.tile_u = tile_u.value();
+    recipe.tile_v = tile_v.value();
+    recipe.projection_half_extent = half_extent.value();
+    recipe.reject_projection_misses = reject_misses_text == "1";
+    if (auto result = recipe.validate(); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto recipe_digest = recipe.canonical_digest();
+    if (!recipe_digest) {
+        print_error(recipe_digest.error());
+        return EXIT_FAILURE;
+    }
+
+    const auto device_result = d3d12::D3D12Device::create();
+    if (!device_result) {
+        print_error(device_result.error().with_context("D3D12 bake worker"));
+        return EXIT_FAILURE;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    const auto report = d3d12::compile_tangent_normal_map_d3d12(
+        *device_result.value(), recipe, source->second, target->second);
+    const auto finished = std::chrono::steady_clock::now();
+    for (const auto& diagnostic : report.bake.diagnostics) {
+        std::cerr << "diagnostic code=" << diagnostic.code
+                  << " message=" << std::quoted(diagnostic.message) << '\n';
+    }
+    if (!report.succeeded() || !report.projection.has_value() ||
+        !report.cpu_reference_artifact_digest.has_value()) return EXIT_FAILURE;
+
+    const auto current_document = project::ProjectDocument::load(project_path);
+    if (!current_document) {
+        print_error(current_document.error().with_context(
+            "reloading project before D3D12 bake publication"));
+        return EXIT_FAILURE;
+    }
+    if (current_document.value().source_namespace() !=
+        document.value().source_namespace()) {
+        print_error(core::Diagnostic(core::ErrorCode::stale_data,
+            "project source namespace changed while the D3D12 bake was running"));
+        return EXIT_FAILURE;
+    }
+    const auto current_source = current_document.value().meshes().find(source_asset.value());
+    const auto current_target = current_document.value().meshes().find(target_asset.value());
+    if (current_source == current_document.value().meshes().end() ||
+        current_target == current_document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::stale_data,
+            "project source or target mesh disappeared while the D3D12 bake was running"));
+        return EXIT_FAILURE;
+    }
+    if (auto result = production::validate_bake_sources(
+            recipe, current_source->second, current_target->second); !result) {
+        print_error(result.error().with_context(
+            "revalidating project meshes before D3D12 bake publication"));
+        return EXIT_FAILURE;
+    }
+
+    const auto platform_profile_result = d3d12::d3d12_bake_platform_profile(
+        *report.projection);
+    if (!platform_profile_result) {
+        print_error(platform_profile_result.error());
+        return EXIT_FAILURE;
+    }
+    const std::string platform_profile = platform_profile_result.value();
+    const auto payload = report.bake.artifact->serialize();
+    const auto cook_key = production::bake_production_cook_key(
+        recipe, production::BakeNormalSpace::tangent, platform_profile);
+    if (!payload || !cook_key) {
+        print_error(!payload ? payload.error() : cook_key.error());
+        return EXIT_FAILURE;
+    }
+    production::ProductionArtifactReceipt receipt;
+    receipt.key = cook_key.value();
+    receipt.status = production::ReceiptStatus::admitted;
+    receipt.output_digest = assets::sha256(payload.value());
+    receipt.output_bytes = payload.value().size();
+    receipt.quality.measured_error = 0.0;
+    receipt.quality.importance = 1.0;
+    receipt.quality.confidence = 1.0;
+    receipt.cost.cook_milliseconds = std::chrono::duration<double, std::milli>(
+        finished - started).count();
+    receipt.cost.gpu_milliseconds = static_cast<double>(
+        report.projection->wall_time_nanoseconds) / 1'000'000.0;
+    receipt.cost.disk_bytes = receipt.output_bytes;
+    if (auto result = receipt.refresh_digest(); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+
+    std::error_code output_error;
+    const auto parent = output_root.parent_path();
+    if (!parent.empty() &&
+        (!std::filesystem::exists(parent, output_error) || output_error ||
+         !std::filesystem::is_directory(parent, output_error) || output_error)) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            "bake output parent directory is unavailable"));
+        return EXIT_FAILURE;
+    }
+    output_error.clear();
+    if (std::filesystem::exists(output_root, output_error) || output_error) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "bake output directory refuses to overwrite an existing path"));
+        return EXIT_FAILURE;
+    }
+    std::filesystem::path staging_root = output_root;
+    staging_root += ".pending-" + recipe_digest.value().hex().substr(0U, 16U);
+    output_error.clear();
+    if (std::filesystem::exists(staging_root, output_error) || output_error) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "bake staging directory already exists and requires inspection"));
+        return EXIT_FAILURE;
+    }
+    output_error.clear();
+    if (!std::filesystem::create_directory(staging_root, output_error) || output_error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            "unable to create the new bake staging directory"));
+        return EXIT_FAILURE;
+    }
+
+    try {
+        assets::BlobStore blobs(staging_root / "blobs");
+        production::ProductionArtifactStore artifact_store(blobs);
+        const production::AdmissionPolicy policy;
+        if (auto result = d3d12::publish_tangent_normal_map_d3d12(
+                artifact_store, receipt, report, current_source->second,
+                current_target->second,
+                policy, platform_profile); !result) {
+            print_error(result.error());
+            return EXIT_FAILURE;
+        }
+        const auto reopened = production::read_normal_map(
+            artifact_store, recipe, production::BakeNormalSpace::tangent,
+            current_source->second, current_target->second, policy, platform_profile);
+        if (!reopened) {
+            print_error(reopened.error());
+            return EXIT_FAILURE;
+        }
+        if (reopened.value().artifact_digest != report.bake.artifact->artifact_digest) {
+            print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                "published D3D12 normal artifact does not match the compiled artifact"));
+            return EXIT_FAILURE;
+        }
+        const std::string ledger_text = artifact_store.ledger().serialize();
+        const auto ledger = production::ProductionReceiptLedger::deserialize(ledger_text);
+        if (!ledger || ledger.value().size() != 1U) {
+            print_error(ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+                "D3D12 bake receipt ledger did not reopen with exactly one record")
+                : ledger.error());
+            return EXIT_FAILURE;
+        }
+        const auto manifest_write = write_new_text_atomically(
+            staging_root / "receipts.carto-production-receipts", ledger_text,
+            "D3D12 bake receipt ledger");
+        if (!manifest_write) {
+            print_error(manifest_write.error());
+            return EXIT_FAILURE;
+        }
+        const auto reopened_manifest = read_bounded_text(
+            staging_root / "receipts.carto-production-receipts",
+            production::ProductionReceiptLedger::max_serialized_bytes,
+            "D3D12 bake receipt ledger");
+        if (!reopened_manifest) {
+            print_error(reopened_manifest.error());
+            return EXIT_FAILURE;
+        }
+        const auto verified_manifest = production::ProductionReceiptLedger::deserialize(
+            reopened_manifest.value());
+        if (!verified_manifest || verified_manifest.value().size() != 1U ||
+            verified_manifest.value().records().front().receipt_digest !=
+                receipt.receipt_digest) {
+            print_error(verified_manifest ? core::Diagnostic(
+                core::ErrorCode::validation_failed,
+                "D3D12 bake receipt manifest failed read-back validation")
+                : verified_manifest.error());
+            return EXIT_FAILURE;
+        }
+        output_error.clear();
+        std::filesystem::rename(staging_root, output_root, output_error);
+        if (output_error) {
+            print_error(core::Diagnostic(core::ErrorCode::io_error,
+                "atomic bake output publication failed; inspect the staging directory"));
+            return EXIT_FAILURE;
+        }
+        std::cout << "baked"
+                  << " kind=tangent-normal"
+                  << " evidence=carto.d3d12.cpu-reference-parity"
+                  << " source=" << std::quoted(recipe.source.identity)
+                  << " source_revision=" << recipe.source.revision.value()
+                  << " source_digest=" << recipe.source.content_digest.hex()
+                  << " target=" << std::quoted(recipe.target.identity)
+                  << " target_revision=" << recipe.target.revision.value()
+                  << " target_digest=" << recipe.target.content_digest.hex()
+                  << " uv_set=" << recipe.target_uv_set
+                  << " tile=" << recipe.tile_u << ',' << recipe.tile_v
+                  << " covered_texels=" << report.bake.artifact->covered_texels
+                  << " projected_texels=" << report.bake.artifact->projected_texels
+                  << " projection_misses=" << report.bake.artifact->projection_misses
+                  << " cpu_reference_digest=" <<
+                        report.cpu_reference_artifact_digest->hex()
+                  << " gpu_adapter=" << std::quoted(report.projection->adapter_name)
+                  << " gpu_adapter_id=" << std::quoted(report.projection->stable_adapter_id)
+                  << " gpu_driver=" << std::quoted(report.projection->driver)
+                  << " gpu_wall_nanoseconds=" <<
+                        report.projection->wall_time_nanoseconds
+                  << " platform_profile=" << platform_profile
+                  << " artifact_digest=" << report.bake.artifact->artifact_digest.hex()
+                  << " payload_digest=" << receipt.output_digest.hex()
+                  << " receipt_digest=" << receipt.receipt_digest.hex()
+                  << " output=" << std::quoted(output_root.string()) << '\n';
+    } catch (const std::exception& error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            std::string("D3D12 bake publication failed: ") + error.what()));
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+int inspect_tangent_normal_map_d3d12(
+    const std::filesystem::path& project_path,
+    std::string_view source_id_text,
+    std::string_view target_id_text,
+    const std::filesystem::path& output_root) {
+    using namespace carto;
+    const auto source_asset = parse_mesh_asset_id_argument(source_id_text);
+    const auto target_asset = parse_mesh_asset_id_argument(target_id_text);
+    if (!source_asset || !target_asset) {
+        print_error(!source_asset ? source_asset.error() : target_asset.error());
+        return EXIT_FAILURE;
+    }
+    const auto document = project::ProjectDocument::load(project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto source = document.value().meshes().find(source_asset.value());
+    const auto target = document.value().meshes().find(target_asset.value());
+    if (source == document.value().meshes().end() ||
+        target == document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::not_found,
+            "normal bake source or target mesh does not exist in the project"));
+        return EXIT_FAILURE;
+    }
+    const auto ledger_text = read_bounded_text(
+        output_root / "receipts.carto-production-receipts",
+        production::ProductionReceiptLedger::max_serialized_bytes,
+        "D3D12 bake receipt ledger");
+    if (!ledger_text) {
+        print_error(ledger_text.error());
+        return EXIT_FAILURE;
+    }
+    const auto ledger = production::ProductionReceiptLedger::deserialize(ledger_text.value());
+    if (!ledger || ledger.value().size() != 1U) {
+        print_error(ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+            "D3D12 bake receipt ledger must contain exactly one record") : ledger.error());
+        return EXIT_FAILURE;
+    }
+    const production::ProductionArtifactReceipt& receipt = ledger.value().records().front();
+    if (receipt.status != production::ReceiptStatus::admitted ||
+        receipt.key.kind != production::ArtifactKind::baked_texture ||
+        receipt.key.algorithm != production::kBakeNormalAlgorithm ||
+        receipt.key.platform_profile.rfind("carto.d3d12.", 0U) != 0U) {
+        print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+            "receipt ledger does not contain one admitted D3D12 tangent-normal artifact"));
+        return EXIT_FAILURE;
+    }
+
+    try {
+        assets::BlobStore blobs(output_root / "blobs");
+        const auto payload = blobs.read(receipt.output_digest);
+        if (!payload || payload.value().size() != receipt.output_bytes ||
+            assets::sha256(payload.value()) != receipt.output_digest) {
+            print_error(payload ? core::Diagnostic(core::ErrorCode::validation_failed,
+                "D3D12 bake payload disagrees with its production receipt")
+                : payload.error());
+            return EXIT_FAILURE;
+        }
+        const auto artifact = production::NormalMapArtifact::deserialize(payload.value());
+        if (!artifact) {
+            print_error(artifact.error());
+            return EXIT_FAILURE;
+        }
+        const std::string expected_source = document.value().source_namespace() +
+            "/mesh/" + std::to_string(source_asset.value());
+        const std::string expected_target = document.value().source_namespace() +
+            "/mesh/" + std::to_string(target_asset.value());
+        if (artifact.value().normal_space != production::BakeNormalSpace::tangent ||
+            artifact.value().recipe.source.identity != expected_source ||
+            artifact.value().recipe.target.identity != expected_target) {
+            print_error(core::Diagnostic(core::ErrorCode::stale_data,
+                "D3D12 bake source or target identity differs from the current project"));
+            return EXIT_FAILURE;
+        }
+        if (auto result = production::validate_bake_sources(
+                artifact.value().recipe, source->second, target->second); !result) {
+            print_error(result.error());
+            return EXIT_FAILURE;
+        }
+        const auto expected_key = production::bake_production_cook_key(
+            artifact.value().recipe, production::BakeNormalSpace::tangent,
+            receipt.key.platform_profile);
+        if (!expected_key || expected_key.value() != receipt.key) {
+            print_error(expected_key ? core::Diagnostic(core::ErrorCode::stale_data,
+                "D3D12 bake receipt key differs from its current source or recipe")
+                : expected_key.error());
+            return EXIT_FAILURE;
+        }
+        std::cout << "verified"
+                  << " kind=tangent-normal"
+                  << " evidence=carto.d3d12.cpu-reference-parity"
+                  << " source=" << std::quoted(receipt.key.source.identity)
+                  << " source_revision=" << receipt.key.source.revision.value()
+                  << " source_digest=" << receipt.key.source.content_digest.hex()
+                  << " target=" << std::quoted(artifact.value().recipe.target.identity)
+                  << " target_revision=" << artifact.value().recipe.target.revision.value()
+                  << " target_digest=" << artifact.value().recipe.target.content_digest.hex()
+                  << " uv_set=" << artifact.value().recipe.target_uv_set
+                  << " covered_texels=" << artifact.value().covered_texels
+                  << " projected_texels=" << artifact.value().projected_texels
+                  << " artifact_digest=" << artifact.value().artifact_digest.hex()
+                  << " platform_profile=" << receipt.key.platform_profile
+                  << " payload_digest=" << receipt.output_digest.hex()
+                  << " receipt_digest=" << receipt.receipt_digest.hex() << '\n';
+    } catch (const std::exception& error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            std::string("D3D12 bake verification failed: ") + error.what()));
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+#endif
+
+int inspect_prepared(const std::filesystem::path& output_root) {
+    const auto selected = carto::production::read_selected_prepared_scene(output_root);
+    if (!selected) {
+        print_error(selected.error());
+        return EXIT_FAILURE;
+    }
+    if (!selected.value().has_value()) {
+        std::cerr << "error: no prepared revision is selected\n";
+        return EXIT_FAILURE;
+    }
+    const auto& revision = selected.value().value();
+    std::cout << "prepared revision=" << revision.prepared_scene_digest.hex()
+              << " source=" << revision.envelope.source_namespace
+              << " source_revision=" << revision.envelope.source_revision.value()
+              << " profile=" << revision.envelope.profile_identity
+              << " assets=" << revision.envelope.assets.size()
+              << " nodes=" << revision.envelope.nodes.size()
+              << " products=" << revision.envelope.products.size()
+              << " bindings=" << revision.envelope.material_bindings.size() << '\n';
+    for (const auto& capability : revision.envelope.capabilities) {
+        std::cout << "capability feature=" << capability.feature
+                  << " evidence=" << static_cast<unsigned>(capability.evidence)
+                  << " required=" << (capability.required ? "true" : "false")
+                  << " detail=" << std::quoted(capability.detail) << '\n';
+    }
+    for (const auto& product : revision.envelope.products) {
+        std::cout << "product identity=" << product.identity
+                  << " kind=" << static_cast<unsigned>(product.kind)
+                  << " version=" << product.format_version
+                  << " digest=" << product.content_digest.hex()
+                  << " path=" << std::quoted(product.relative_path) << '\n';
+    }
+    return EXIT_SUCCESS;
+}
+
 void usage(std::ostream& output) {
     output << "Cartographer " << CARTOGRAPHER_VERSION << "\n"
            << "Usage:\n"
@@ -2668,11 +4360,28 @@ void usage(std::ostream& output) {
            << "  cartographer_cli import-functional-genome-exchange <exchange.carto-genome> <project.carto>\n"
            << "  cartographer_cli inspect-anatomy-provider-candidate <candidate.carto-anatomy>\n"
            << "  cartographer_cli export-anatomy-provider-candidate <project.carto> <candidate.carto-anatomy>\n"
-           << "  cartographer_cli export-obj <project.carto> <mesh.obj>\n"
-           << "  cartographer_cli export-ply <project.carto> <mesh.ply>\n"
-           << "  cartographer_cli export-stl <project.carto> <mesh.stl>\n"
+           << "  cartographer_cli export-obj <project.carto> [mesh-asset-id] <mesh.obj>\n"
+           << "  cartographer_cli export-ply <project.carto> [mesh-asset-id] <mesh.ply>\n"
+           << "  cartographer_cli export-stl <project.carto> [mesh-asset-id] <mesh.stl>\n"
            << "  cartographer_cli export-gltf <project.carto> <scene.gltf>\n"
-           << "  cartographer_cli import-obj <mesh.obj> <project.carto>\n"
+           << "  cartographer_cli write-default-preparation-profile <profile.carto-prep>\n"
+           << "  cartographer_cli inspect-preparation-profile <profile.carto-prep>\n"
+           << "  cartographer_cli prepare <project.carto> <output-directory> scene\n"
+           << "  cartographer_cli prepare <project.carto> <output-directory> --profile <profile.carto-prep> scene\n"
+           << "  cartographer_cli prepare <project.carto> <output-directory> asset <mesh-asset-id>\n"
+           << "  cartographer_cli prepare <project.carto> <output-directory> assembly <node-id>\n"
+           << "  cartographer_cli prepare <project.carto> <output-directory> selection <node-id>...\n"
+           << "  cartographer_cli inspect-prepared <output-directory>\n"
+           << "  cartographer_cli bake-ao <project.carto> <mesh-id> <uv-set-id> <width> <height> <tile-u> <tile-v> <samples> <max-distance> <seed> <output-directory> (mesh is both source and UV target; origin bias is 1e-4)\n"
+           << "  cartographer_cli inspect-bake-ao <project.carto> <mesh-id> <output-directory>\n"
+           << "  cartographer_cli bake-cloth-rest-pose <project.carto> <mesh-id> <frames> <substeps> <iterations> <settle-window> <settle-tolerance> <output-directory> (requires an authored GarmentAsset; gravity and frame time step use CPU-reference defaults)\n"
+           << "  cartographer_cli inspect-cloth-rest-pose <output-directory>\n";
+#if CARTO_CLI_HAS_D3D12_BAKE
+    output << "  cartographer_cli bake-ao-d3d12 <project.carto> <mesh-id> <uv-set-id> <width> <height> <tile-u> <tile-v> <samples> <max-distance> <seed> <output-directory> (mesh is both source and UV target; origin bias is 1e-4)\n"
+           << "  cartographer_cli bake-normal-d3d12 <project.carto> <source-mesh-id> <target-mesh-id> <uv-set-id> <width> <height> <tile-u> <tile-v> <projection-half-extent> <reject-misses:0|1> <output-directory>\n"
+           << "  cartographer_cli inspect-bake-normal-d3d12 <project.carto> <source-mesh-id> <target-mesh-id> <output-directory>\n";
+#endif
+    output << "  cartographer_cli import-obj <mesh.obj> <project.carto>\n"
            << "  cartographer_cli import-ply <mesh.ply> <project.carto>\n"
            << "  cartographer_cli import-stl <mesh.stl> <project.carto>\n";
 }
@@ -2774,18 +4483,71 @@ int main(int argc, char** argv) {
     if (command == "export-anatomy-provider-candidate" && argc == 4) {
         return export_anatomy_provider_candidate(argv[2], argv[3]);
     }
-    if (command == "export-obj" && argc == 4) {
-        return export_obj(argv[2], argv[3]);
+    if (command == "export-obj" && (argc == 4 || argc == 5)) {
+        if (argc == 4) return export_obj(argv[2], argv[3], std::nullopt);
+        const auto mesh_asset = parse_mesh_asset_id_argument(argv[3]);
+        if (!mesh_asset) {
+            print_error(mesh_asset.error());
+            return EXIT_FAILURE;
+        }
+        return export_obj(argv[2], argv[4], mesh_asset.value());
     }
-    if (command == "export-ply" && argc == 4) {
-        return export_ply(argv[2], argv[3]);
+    if (command == "export-ply" && (argc == 4 || argc == 5)) {
+        if (argc == 4) return export_ply(argv[2], argv[3], std::nullopt);
+        const auto mesh_asset = parse_mesh_asset_id_argument(argv[3]);
+        if (!mesh_asset) {
+            print_error(mesh_asset.error());
+            return EXIT_FAILURE;
+        }
+        return export_ply(argv[2], argv[4], mesh_asset.value());
     }
-    if (command == "export-stl" && argc == 4) {
-        return export_stl(argv[2], argv[3]);
+    if (command == "export-stl" && (argc == 4 || argc == 5)) {
+        if (argc == 4) return export_stl(argv[2], argv[3], std::nullopt);
+        const auto mesh_asset = parse_mesh_asset_id_argument(argv[3]);
+        if (!mesh_asset) {
+            print_error(mesh_asset.error());
+            return EXIT_FAILURE;
+        }
+        return export_stl(argv[2], argv[4], mesh_asset.value());
     }
     if (command == "export-gltf" && argc == 4) {
         return export_gltf(argv[2], argv[3]);
     }
+    if (command == "write-default-preparation-profile" && argc == 3) {
+        return write_default_preparation_profile(argv[2]);
+    }
+    if (command == "inspect-preparation-profile" && argc == 3) {
+        return inspect_preparation_profile(argv[2]);
+    }
+    if (command == "prepare" && argc >= 5) {
+        return prepare_project(argc, argv);
+    }
+    if (command == "inspect-prepared" && argc == 3) {
+        return inspect_prepared(argv[2]);
+    }
+    if (command == "bake-ao" && argc == 13) {
+        return bake_ambient_occlusion(argv);
+    }
+    if (command == "inspect-bake-ao" && argc == 5) {
+        return inspect_ambient_occlusion_bake(argv[2], argv[3], argv[4]);
+    }
+    if (command == "bake-cloth-rest-pose" && argc == 10) {
+        return bake_cloth_rest_pose(argv);
+    }
+    if (command == "inspect-cloth-rest-pose" && argc == 3) {
+        return inspect_cloth_rest_pose(argv[2]);
+    }
+#if CARTO_CLI_HAS_D3D12_BAKE
+    if (command == "bake-ao-d3d12" && argc == 13) {
+        return bake_ambient_occlusion(argv, true);
+    }
+    if (command == "bake-normal-d3d12" && argc == 13) {
+        return bake_tangent_normal_map_d3d12(argv);
+    }
+    if (command == "inspect-bake-normal-d3d12" && argc == 6) {
+        return inspect_tangent_normal_map_d3d12(argv[2], argv[3], argv[4], argv[5]);
+    }
+#endif
     if (command == "import-obj" && argc == 4) {
         return import_obj(argv[2], argv[3]);
     }

@@ -19,6 +19,10 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] content-addressed derived-byte publish/read binding with stale-read rejection
 - [x] versioned project format with atomic save/load
 - [x] v6 project format with v1/v2/v3/v4/v5 compatibility, explicit meters/right-handed/Y-up contract, optional graph reference, bounded project-bound topology receipt lineage, generic scientific model records, and validated per-mesh attribute/UV persistence
+- [x] v7 project format with v1-v6 readability, five provider-neutral world primitives, deterministic nested persistence, journaled replacement, and dangling authoring-binding rejection
+- [x] v8 project format with v1-v7 readability and durable material, texture, sampler, variant, and material-region assignment authoring truth
+- [x] v9 project format with v1-v8 migration and a durable source namespace that prevents same-name projects from colliding at destination mappings
+- [x] neutral preparation v1 with saved profiles, explicit asset/selection/assembly/scene scope, scoped material and texture closure, deterministic envelopes, cancellation, atomic compare-and-swap publication, CLI/desktop routing, and last-valid recovery
 - [x] OBJ import/export with explicit feature-loss warnings
 - [x] bounded ASCII PLY and binary/ASCII STL interchange with explicit feature-loss warnings
 - [x] bounded glTF export profile with explicit feature-loss warnings
@@ -199,6 +203,29 @@ workflows are independently tested. The staged transaction boundary now carries
 an optional graph reference through document, journal, and checkpoint state, but
 does not make the package manifest and document database one atomic multi-file
 commit.
+
+## Cartographer as VANTA world compiler
+
+The compiler tranche turns Cartographer from a scene authoring tool into the
+durable authoring truth and neutral prepared-product compiler for a VANTA
+world: Cartographer owns durable authoring truth and neutral, versioned,
+digest-bound prepared products; VANTA owns runtime embodiment; games own
+domain truth. Every product below is a headless, serialization-ready record
+with fail-closed validation — no engine types, runtime handles, or mutation
+authority — and each tranche is implemented with tests. VANTA lowering and
+game adapters live outside this repository; native-evidence and full-game
+acceptance tiers are deferred to VANTA/game integration.
+
+- [x] prepared intermediate representation: neutral preparation with saved v1 profiles now extended by [preparation profile v2](format/preparation-profile-v2.md) per-product-class inclusion toggles and approximation error budgets with v1 read compatibility, explicit stable-ID scope, destination-neutral [prepared scene envelopes](architecture/prepared-scene-envelope.md), atomic compare-and-swap publication with dependency-closure digests, and last-valid recovery
+- [x] semantic ABI tranche ([semantic extension](architecture/semantic-extension.md)): digest-bound `SemanticSidecar` with donor-owned opaque payloads, per-field native-lowerable versus game-owned ownership manifests, a fail-closed cross-game schema registry, digest-bound tag lowering maps, explicit game-owned-preserving migration plans, read-only inspection/query, and v10 project format persistence that stores sidecar bytes verbatim and never parses them
+- [x] ports tranche ([connection ports](architecture/connection-ports.md)): neutral `ConnectionPort` records with reference frames and namespaced compatibility vocabularies, capability contracts, pure fail-closed compatibility checks, acyclic typed connection graphs, and strict never-promoted acceptance tiers with runtime attachment state fenced out of authoring truth
+- [x] physical twin tranche ([physical twin](architecture/physical-twin.md)): derived geometry evidence, VANTA catalog identity-only material intent, construction profiles, deterministic mass derivation receipts, the physical surface ledger, ground-pressure evidence, and conservation-checking twin acceptance receipts, with game-owned condition state fenced out of canonical digests
+- [x] collision tranche ([collision representations](architecture/collision-representations.md)): primitive/compound/convex/triangle candidate fits over compiled authoring meshes, measured error metrics and digest-bound threshold policies, per-game collision profiles, per-node motion policies, and certified-variant selection receipts that never certify a fallback
+- [x] navigation and representation tranche ([navigation products](architecture/navigation-products.md), [representation federation](architecture/representation-federation.md)): regions, routes, corridors, structure access points, off-mesh link candidates, agent profiles, and a digest-bound prepared navigation envelope with compile-time fences against dynamic cost or knowledge fields; representation families with error envelopes, continuity-preserving variant replacement, certifications, hard-bound deterministic hardware-profile selection, and an append-only runtime evidence ledger
+- [x] kinematic/temporal/archetype tranche ([kinematic graph](architecture/kinematic-graph.md), [temporal products](architecture/temporal-products.md), [archetype inference](architecture/archetype-inference.md)): rooted-tree kinematic graphs with authored joint limits, skin bindings content-addressed against mesh and graph digests, skeletal/archetype lowering descriptors with fail-closed capability admission; digest-bound channels, clips, sequences, explicit event bindings, root-motion proposals, and deterministic CPU sample references; canonical structural digests, repetition-economy archetype candidates with deterministic receipts, and persistent content-derived instance identity that survives reimport without resurrecting dead instances
+- [x] reimport and cooking tranche: three-way reimport reconciliation over runtime snapshots, prepared deltas, and authored sources with digest-bound plans and receipts, `DestinationCapabilityProfile` demand answering with exact unsupported results, declarative digest-bound `ProductionRecipe` expansion that fails closed on unsupported required capabilities, world-primitive correspondences and extension bindings, and dependency-closure digests on publication receipts
+- [x] verification tranche ([verification evidence](architecture/verification-evidence.md)): append-only capability claim and explicit non-claim ledgers bound to admission receipts, deterministic regression gates over prepared digests and correspondence counts, named failure injection between planning and publishing, and whole-pipeline deterministic digest-bound evidence reports
+- [ ] VANTA lowering of every product above, native-evidence and full-game acceptance tiers, and destination/game adapters remain out-of-repo work owned by the VANTA and game repositories
 
 ## 0.2 - non-destructive DCC maturity
 
