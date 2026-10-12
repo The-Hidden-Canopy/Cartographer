@@ -1,10 +1,12 @@
 #include <carto/representation/continuity.hpp>
 #include <carto/representation/error_envelope.hpp>
 #include <carto/representation/family.hpp>
+#include <carto/representation/perceptual.hpp>
 #include <carto/representation/runtime_evidence.hpp>
 #include <carto/representation/selection.hpp>
 #include <carto/web_geometry/types.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <span>
@@ -680,6 +682,284 @@ void evidence_ledger_hostile_inputs_fail_closed() {
         "unknown evidence status names are rejected");
 }
 
+representation::VisualFeatureRecallMetrics perceptual_features(
+    const representation::AuthoredSourceIdentity& source,
+    std::uint64_t candidate_id,
+    std::string_view observation) {
+    representation::VisualFeatureRecallMetrics metrics;
+    metrics.source = source;
+    metrics.candidate = representation::RepresentationVariantId{candidate_id};
+    metrics.observation_digest = digest(observation);
+    metrics.observation_count = 4U;
+    metrics.features = {
+        {1U, representation::PerceptualRole::silhouette, 0.8, 0.96, 0.02},
+        {2U, representation::PerceptualRole::contact, 0.2, 0.84, 0.04},
+    };
+    return metrics;
+}
+
+representation::MeasuredSurfaceCost perceptual_cost(
+    std::uint64_t candidate_id,
+    std::uint64_t gpu_time_ns,
+    std::uint64_t resident_bytes) {
+    representation::MeasuredSurfaceCost cost;
+    cost.candidate = representation::RepresentationVariantId{candidate_id};
+    cost.source_namespace = "docuseries/federation-fixture";
+    cost.source_digest = digest("source-v3");
+    cost.hardware_profile = "test/gpu-profile";
+    cost.profile_digest = digest("test-gpu-profile");
+    cost.source_revision = core::Revision{3U};
+    cost.status = representation::EvidenceStatus::admitted;
+    cost.gpu_time_ns = gpu_time_ns;
+    cost.host_time_ns = std::max<std::uint64_t>(1U, gpu_time_ns / 2U);
+    cost.resident_bytes = resident_bytes;
+    cost.bandwidth_bytes = resident_bytes / 2U;
+    cost.overdraw = 1.0;
+    return cost;
+}
+
+representation::PerceptualFrontierCandidate perceptual_candidate(
+    const representation::AuthoredSourceIdentity& source,
+    std::uint64_t candidate_id,
+    RepresentationErrorEnvelope error,
+    std::uint64_t gpu_time_ns,
+    std::uint64_t resident_bytes,
+    representation::RepresentationPromotionState promotion) {
+    representation::PerceptualFrontierCandidate candidate;
+    candidate.source = source;
+    candidate.candidate = representation::RepresentationVariantId{candidate_id};
+    candidate.purpose = representation::RepresentationPurpose::render;
+    candidate.error = error;
+    candidate.feature_recall = perceptual_features(source, candidate_id,
+                                                   "observation-" + std::to_string(candidate_id));
+    candidate.cost = perceptual_cost(candidate_id, gpu_time_ns, resident_bytes);
+    candidate.promotion = promotion;
+    if (promotion == representation::RepresentationPromotionState::certified) {
+        candidate.promotion_evidence_digest =
+            digest("certification-" + std::to_string(candidate_id));
+    }
+    return candidate;
+}
+
+void perceptual_contracts_are_source_anchored() {
+    const auto family = fixture_family();
+    const auto& source = family.source();
+
+    representation::ResidualSurfaceCodecRecord residual;
+    residual.source = source;
+    residual.candidate = representation::RepresentationVariantId{2U};
+    residual.base_digest = digest("cheap-base");
+    residual.residual_mode = representation::ResidualMode::normal;
+    residual.residual_digest = digest("normal-residual");
+    residual.base_bytes = 4096U;
+    residual.residual_bytes = 512U;
+    residual.reconstruction_error = 0.02;
+    require(static_cast<bool>(residual.validate()),
+        "residual codec record validates against source identity");
+    require(static_cast<bool>(residual.canonical_digest()),
+        "residual codec record receives a stable public digest");
+
+    representation::PerceptualRoleMap roles;
+    roles.source = source;
+    roles.regions = {
+        {10U, representation::PerceptualRole::silhouette, 1.0, true},
+        {10U, representation::PerceptualRole::shading, 0.4, false},
+        {20U, representation::PerceptualRole::contact, 0.9, true},
+    };
+    require(static_cast<bool>(roles.validate()),
+        "perceptual role map validates sorted protected regions");
+    require(static_cast<bool>(roles.canonical_digest()),
+        "perceptual role map digest is source-bound");
+
+    auto candidate_one = perceptual_candidate(
+        source, 1U, envelope(0.05, 0.05, 0.04, 0.08),
+        4U, 32U * 1024U * 1024U,
+        representation::RepresentationPromotionState::certified);
+    auto candidate_two = perceptual_candidate(
+        source, 2U, envelope(0.10, 0.10, 0.08, 0.16),
+        8U, 64U * 1024U * 1024U,
+        representation::RepresentationPromotionState::certified);
+    auto candidate_three = perceptual_candidate(
+        source, 3U, envelope(0.02, 0.02, 0.02, 0.03),
+        12U, 80U * 1024U * 1024U,
+        representation::RepresentationPromotionState::certified);
+    const std::vector<representation::PerceptualFrontierCandidate> candidates{
+        candidate_one, candidate_two, candidate_three};
+    const auto frontier = representation::RepresentationFrontier::build(candidates);
+    require(static_cast<bool>(frontier),
+        "representation frontier builds only from admitted measured candidates");
+    require(frontier.value().candidates().size() == 2U,
+        "dominated cost-quality candidate is removed from the frontier");
+    require(frontier.value().candidates().front().candidate.value == 1U &&
+                frontier.value().candidates().back().candidate.value == 3U,
+        "frontier ordering is deterministic by candidate identity");
+
+    representation::PerceptualBudget budget;
+    budget.max_error = envelope(0.06, 0.06, 0.05, 0.10);
+    budget.min_feature_recall = 0.90;
+    budget.max_false_suppression = 0.10;
+    budget.max_gpu_time_ns = 5U;
+    budget.max_resident_bytes = 40U * 1024U * 1024U;
+    const auto decision = representation::MeasuredCostGovernor::select(
+        frontier.value(), budget);
+    require(static_cast<bool>(decision),
+        "measured cost governor selects a certified satisfying candidate");
+    require(decision.value().selected_candidate.value == 1U,
+        "governor uses measured cost and perceptual bounds together");
+    require(static_cast<bool>(decision.value().validate()),
+        "governor decision binds its input digests");
+    auto drifted_decision = decision.value();
+    drifted_decision.source_digest = digest("other-source");
+    require(!drifted_decision.validate(),
+        "a decision receipt with a drifted source digest is rejected");
+
+    auto permuted = candidates;
+    std::reverse(permuted.begin(), permuted.end());
+    const auto permuted_frontier = representation::RepresentationFrontier::build(permuted);
+    require(static_cast<bool>(permuted_frontier),
+        "permuted representation frontier builds");
+    const auto original_digest = frontier.value().canonical_digest();
+    const auto permuted_digest = permuted_frontier.value().canonical_digest();
+    require(static_cast<bool>(original_digest) && static_cast<bool>(permuted_digest) &&
+                permuted_digest.value() == original_digest.value(),
+        "frontier digest is independent of candidate insertion order");
+}
+
+void perceptual_contracts_fail_closed_on_stale_or_unanchored_inputs() {
+    const auto family = fixture_family();
+    const auto& source = family.source();
+    auto candidate = perceptual_candidate(
+        source, 1U, envelope(0.05, 0.05, 0.04, 0.08), 4U,
+        32U * 1024U * 1024U,
+        representation::RepresentationPromotionState::experimental);
+
+    auto missing_device_measurement = candidate;
+    missing_device_measurement.cost.gpu_time_ns.reset();
+    missing_device_measurement.cost.host_time_ns.reset();
+    require(!missing_device_measurement.validate(),
+        "admitted cost evidence without a measured time fails closed");
+
+    auto stale = candidate;
+    stale.cost.status = representation::EvidenceStatus::stale;
+    require(!stale.validate(),
+        "stale cost evidence cannot enter a promotion frontier");
+
+    auto drifted = candidate;
+    drifted.feature_recall.source.source_revision = core::Revision{2U};
+    require(!drifted.validate(),
+        "feature evidence from a different source revision is rejected");
+
+    auto cost_namespace_drift = candidate;
+    cost_namespace_drift.cost.source_namespace = "other/source";
+    require(!cost_namespace_drift.validate(),
+        "cost evidence from a different source namespace is rejected");
+
+    auto cost_digest_drift = candidate;
+    cost_digest_drift.cost.source_digest = digest("other-source");
+    require(!cost_digest_drift.validate(),
+        "cost evidence from a different source digest is rejected");
+
+    auto unweighted_features = candidate;
+    unweighted_features.feature_recall.features[0].importance = 0.0;
+    unweighted_features.feature_recall.features[1].importance = 0.0;
+    require(!unweighted_features.feature_recall.validate(),
+        "feature evidence without any positive importance is rejected");
+
+    representation::PerceptualRoleMap unweighted_roles;
+    unweighted_roles.source = source;
+    unweighted_roles.regions = {
+        {1U, representation::PerceptualRole::silhouette, 0.0, false},
+    };
+    require(!unweighted_roles.validate(),
+        "role maps without any positive importance are rejected");
+
+    auto uncertified = perceptual_candidate(
+        source, 4U, envelope(0.05, 0.05, 0.04, 0.08), 4U,
+        32U * 1024U * 1024U,
+        representation::RepresentationPromotionState::certified);
+    uncertified.promotion_evidence_digest = {};
+    require(!uncertified.validate(),
+        "certified candidates without a promotion evidence digest are rejected");
+
+    const std::vector<representation::PerceptualFrontierCandidate> only_experimental{
+        candidate};
+    const auto frontier = representation::RepresentationFrontier::build(
+        only_experimental);
+    require(static_cast<bool>(frontier), "experimental measured candidate enters frontier");
+    representation::PerceptualBudget budget;
+    budget.max_error = envelope(1.0, 1.0, 1.0, 1.0);
+    budget.min_feature_recall = 0.0;
+    require(!representation::MeasuredCostGovernor::select(frontier.value(), budget),
+        "governor refuses experimental evidence when certification is required");
+
+    auto rejected = candidate;
+    rejected.promotion = representation::RepresentationPromotionState::rejected;
+    const std::vector<representation::PerceptualFrontierCandidate> rejected_only{rejected};
+    const auto rejected_frontier = representation::RepresentationFrontier::build(rejected_only);
+    require(static_cast<bool>(rejected_frontier),
+        "rejected evidence may remain inspectable in a frontier");
+    budget.require_certified = false;
+    require(!representation::MeasuredCostGovernor::select(rejected_frontier.value(), budget),
+        "rejected evidence is never selectable even when certification is optional");
+
+    auto experimental_better = perceptual_candidate(
+        source, 5U, envelope(0.01, 0.01, 0.01, 0.01), 1U,
+        8U * 1024U * 1024U,
+        representation::RepresentationPromotionState::experimental);
+    auto certified_worse = perceptual_candidate(
+        source, 6U, envelope(0.30, 0.30, 0.30, 0.30), 20U,
+        128U * 1024U * 1024U,
+        representation::RepresentationPromotionState::certified);
+    const std::vector<representation::PerceptualFrontierCandidate> mixed{
+        experimental_better, certified_worse};
+    const auto mixed_frontier = representation::RepresentationFrontier::build(mixed);
+    require(static_cast<bool>(mixed_frontier) && mixed_frontier.value().candidates().size() == 2U,
+        "experimental evidence cannot prune a certified candidate from the frontier");
+    budget.require_certified = true;
+    budget.max_error = envelope(1.0, 1.0, 1.0, 1.0);
+    budget.max_gpu_time_ns.reset();
+    budget.max_resident_bytes.reset();
+    const auto certified_decision = representation::MeasuredCostGovernor::select(
+        mixed_frontier.value(), budget);
+    require(static_cast<bool>(certified_decision) &&
+                certified_decision.value().selected_candidate.value == 6U,
+        "certification gating still selects the retained certified candidate");
+
+    auto host_only = candidate;
+    host_only.promotion = representation::RepresentationPromotionState::certified;
+    host_only.promotion_evidence_digest = digest("host-only-certification");
+    host_only.cost.gpu_time_ns.reset();
+    const auto host_only_frontier = representation::RepresentationFrontier::build(
+        std::vector<representation::PerceptualFrontierCandidate>{host_only});
+    require(static_cast<bool>(host_only_frontier),
+        "host-only measured evidence remains valid when no GPU budget is requested");
+    budget.max_gpu_time_ns = 5U;
+    require(!representation::MeasuredCostGovernor::select(host_only_frontier.value(), budget),
+        "a GPU budget never treats missing GPU timing as zero cost");
+
+    auto cpu_a = perceptual_candidate(
+        source, 7U, envelope(0.05, 0.05, 0.04, 0.08), 1U,
+        32U * 1024U * 1024U,
+        representation::RepresentationPromotionState::certified);
+    cpu_a.cost.host_time_ns = 100U;
+    auto cpu_b = perceptual_candidate(
+        source, 8U, envelope(0.05, 0.05, 0.04, 0.08), 2U,
+        32U * 1024U * 1024U,
+        representation::RepresentationPromotionState::certified);
+    cpu_b.cost.host_time_ns = 1U;
+    const auto host_frontier = representation::RepresentationFrontier::build(
+        std::vector<representation::PerceptualFrontierCandidate>{cpu_a, cpu_b});
+    require(static_cast<bool>(host_frontier),
+        "incomparable GPU and host cost observations remain on the frontier");
+    budget.max_gpu_time_ns.reset();
+    budget.max_host_time_ns = 200U;
+    const auto host_decision = representation::MeasuredCostGovernor::select(
+        host_frontier.value(), budget);
+    require(static_cast<bool>(host_decision) &&
+                host_decision.value().selected_candidate.value == 8U,
+        "the governor prefers the active host-cost axis when the budget is CPU-bound");
+}
+
 } // namespace
 
 int main() {
@@ -700,6 +980,8 @@ int main() {
     evidence_ledger_append_query_and_no_fallback();
     evidence_ledger_round_trip_and_digest_stability();
     evidence_ledger_hostile_inputs_fail_closed();
+    perceptual_contracts_are_source_anchored();
+    perceptual_contracts_fail_closed_on_stale_or_unanchored_inputs();
     std::cout << "representation tests passed\n";
     return EXIT_SUCCESS;
 }

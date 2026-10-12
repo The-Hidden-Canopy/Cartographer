@@ -2,6 +2,7 @@ add_library(carto_representation STATIC
     src/continuity.cpp
     src/error_envelope.cpp
     src/family.cpp
+    src/perceptual.cpp
     src/runtime_evidence.cpp
     src/selection.cpp
 )
