@@ -254,6 +254,14 @@ void runoff_partition_is_source_bound_and_graph_admissible() {
         "runoff plan digest is deterministic");
     require(!hydro::HydroRunoffPlan::deserialize(planned.value().serialize() + "trailing"),
         "runoff plan rejects trailing data");
+    std::string noncanonical = planned.value().serialize();
+    const std::string area_token = "AREA 100";
+    const std::size_t area_position = noncanonical.find(area_token);
+    require(area_position != std::string::npos,
+        "runoff plan fixture contains its canonical area token");
+    noncanonical.replace(area_position, area_token.size(), "AREA 1e2");
+    require(!hydro::HydroRunoffPlan::deserialize(noncanonical),
+        "runoff plan rejects alternate numeric encodings");
     std::string future = planned.value().serialize();
     future.replace(0U, std::string{"CARTOGRAPHER_HYDRO_RUNOFF_PLAN 1"}.size(),
         "CARTOGRAPHER_HYDRO_RUNOFF_PLAN 99");
