@@ -24,6 +24,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
     LPARAM l_param);
 
 #include <carto/application/application.hpp>
+#include <carto/editor/viewport_interaction.hpp>
 #include <carto/io/builtin_provider.hpp>
 #include <carto/io/gltf_export.hpp>
 #include <carto/io/obj.hpp>
@@ -33,6 +34,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 #include <carto/production/preparation_operation.hpp>
 #include <carto/production/preparation_scope.hpp>
 #include <carto/providers/registry.hpp>
+#include <carto/terrain/terrain_tile.hpp>
 #include <carto/ui/ui.hpp>
 #include <carto/vulkan/runtime.hpp>
 
@@ -810,6 +812,26 @@ struct ViewportEdgeHit {
     ImVec2 second;
 };
 
+struct NativeTranslateGizmo {
+    carto::scene::ObjectId object;
+    ImVec2 origin;
+    ImVec2 x_tip;
+    ImVec2 z_tip;
+    double pixels_per_world_x = 0.0;
+    double pixels_per_world_z = 0.0;
+    carto::core::Transform transform = carto::core::Transform::identity();
+    carto::core::Revision project_revision;
+};
+
+struct NativeTransformDragCapture {
+    carto::editor::ViewportTransformSession session;
+    carto::editor::ViewportTranslateAxis axis =
+        carto::editor::ViewportTranslateAxis::world_x;
+    ImRect viewport;
+    carto::core::Transform initial_transform = carto::core::Transform::identity();
+    carto::core::Transform preview_transform = carto::core::Transform::identity();
+};
+
 constexpr std::size_t kMaxNativeSculptTriangles = 65'536U;
 constexpr std::size_t kMaxNativeSculptCursorPoints = 8'192U;
 
@@ -825,6 +847,7 @@ struct NativeViewportHitCache {
     std::vector<ViewportVertexHit> vertices;
     std::vector<ViewportEdgeHit> edges;
     std::vector<std::pair<carto::scene::ObjectId, ImRect>> objects;
+    std::optional<NativeTranslateGizmo> translate_gizmo;
 
     void reset() {
         project_revision = {};
@@ -838,6 +861,7 @@ struct NativeViewportHitCache {
         vertices.clear();
         edges.clear();
         objects.clear();
+        translate_gizmo.reset();
     }
 };
 
@@ -1005,7 +1029,12 @@ struct DesktopState {
     ImVec2 workbench_extent{};
     bool workbench_bounds_valid = false;
     NativeViewportHitCache native_viewport_hits;
+    carto::editor::WorkSurfaceCamera work_surface_camera;
+    bool work_surface_camera_framed = false;
+    bool work_surface_camera_panning = false;
+    ImVec2 work_surface_camera_last_pointer{};
     std::optional<NativeSculptStrokeCapture> native_sculpt_stroke;
+    std::optional<NativeTransformDragCapture> native_transform_drag;
     carto::scene::ObjectId inspector_object{};
     carto::core::Transform inspector_transform = carto::core::Transform::identity();
     carto::geometry::VertexId inspector_vertex{};
@@ -1032,6 +1061,10 @@ struct DesktopState {
     std::optional<carto::ai::Proposal> ai_proposal;
     std::optional<carto::editor::AuthoringPreview> ai_preview;
     std::string ai_feedback;
+    std::string agent_goal;
+    std::string agent_step;
+    std::string agent_feedback;
+    int agent_preview_mode = 0;
     std::optional<carto::ui::Workspace> previous_workspace_kind;
     std::string action_feedback;
     bool action_feedback_error = false;
@@ -1041,6 +1074,40 @@ struct DesktopState {
     std::optional<std::uint64_t> condition_source_update_id;
     std::array<char, 129> condition_source_revision{};
     std::array<char, 65> condition_source_digest{};
+    std::array<char, 129> spatial_field_identity{'f','i','e','l','d','.','m','o','i','s','t','u','r','e'};
+    std::string selected_spatial_field;
+    double spatial_field_origin_u = 0.0;
+    double spatial_field_origin_v = 0.0;
+    double spatial_field_cell_size = 1.0;
+    double spatial_field_minimum = 0.0;
+    double spatial_field_maximum = 1.0;
+    double spatial_field_initial = 0.0;
+    double spatial_brush_u = 0.0;
+    double spatial_brush_v = 0.0;
+    double spatial_brush_radius = 2.0;
+    double spatial_brush_value = 0.75;
+    double spatial_brush_strength = 0.5;
+    int spatial_field_semantic = 1;
+    int spatial_field_tile_x = 0;
+    int spatial_field_tile_z = 0;
+    int spatial_brush_mode = 0;
+    std::array<char, 129> road_centerline_identity{
+        'r','o','a','d','.','p','i','n','e','-','r','i','d','g','e','.','c','e','n','t','e','r','l','i','n','e'};
+    std::array<char, 129> road_source_identity{
+        'r','o','a','d','.','p','i','n','e','-','r','i','d','g','e','.','a','p','p','r','o','a','c','h'};
+    std::string selected_curve_path;
+    std::string selected_road_source;
+    std::array<double, 12> road_control_points{
+        0.0, 0.0, 0.0, 3.0, 0.0, 0.0,
+        7.0, 0.0, 2.0, 10.0, 0.0, 2.0};
+    double road_width_meters = 6.0;
+    double road_shoulder_meters = 1.0;
+    double road_maximum_grade = 0.12;
+    double road_minimum_curve_radius = 20.0;
+    int road_surface_class = 0;
+    int road_function_class = 0;
+    int road_access_state = 0;
+    int road_drainage_intent = 0;
     std::optional<std::uint64_t> selected_operation_id;
     std::unique_ptr<carto::production::PreparationJob> preparation_job;
 
@@ -1617,6 +1684,169 @@ struct DesktopState {
         return position.finite();
     }
 
+    carto::core::Result<carto::core::Transform> snap_native_transform_preview(
+        carto::core::Transform transform,
+        carto::editor::ViewportTranslateAxis axis,
+        bool enabled) const {
+        if (!enabled) return carto::core::Result<carto::core::Transform>::success(transform);
+        carto::editor::SnapSettings settings;
+        settings.enabled = true;
+        settings.kind = carto::editor::SnapKind::increment;
+        settings.increment = 0.25;
+        const double value = axis == carto::editor::ViewportTranslateAxis::world_x
+            ? transform.translation.x : transform.translation.z;
+        const auto snapped = carto::editor::snap_scalar(value, settings);
+        if (!snapped) {
+            return carto::core::Result<carto::core::Transform>::failure(snapped.error());
+        }
+        if (axis == carto::editor::ViewportTranslateAxis::world_x) {
+            transform.translation.x = snapped.value();
+        } else {
+            transform.translation.z = snapped.value();
+        }
+        return carto::core::Result<carto::core::Transform>::success(transform);
+    }
+
+    void cancel_native_transform_drag(std::string reason, bool release_capture = true) {
+        if (!native_transform_drag.has_value()) return;
+        native_transform_drag.reset();
+        if (release_capture && window != nullptr && GetCapture() == window) {
+            ReleaseCapture();
+        }
+        action_feedback = std::move(reason);
+        action_feedback_error = true;
+    }
+
+    bool begin_native_transform_drag(
+        const carto::ui::NativePointerEvent& event,
+        const UiSnapshot& snapshot,
+        ImVec2 screen_point) {
+        if (!event.pressed || event.button != carto::ui::NativePointerButton::primary ||
+            surface != ShellSurface::workspace ||
+            snapshot.workspace_kind != carto::ui::Workspace::model ||
+            snapshot.selection.mode != carto::editor::SelectionMode::object ||
+            snapshot.selection.objects.size() != 1U ||
+            !native_viewport_hits.translate_gizmo.has_value() ||
+            native_transform_drag.has_value()) {
+            return false;
+        }
+        const auto& gizmo = *native_viewport_hits.translate_gizmo;
+        if (snapshot.project_revision != gizmo.project_revision ||
+            snapshot.project_revision != native_viewport_hits.project_revision ||
+            snapshot.selection.objects.front() != gizmo.object) {
+            return false;
+        }
+        const float x_distance = point_segment_distance_squared(
+            screen_point, gizmo.origin + ImVec2(8.0F, 0.0F), gizmo.x_tip);
+        const float z_distance = point_segment_distance_squared(
+            screen_point, gizmo.origin + ImVec2(0.0F, -8.0F), gizmo.z_tip);
+        constexpr float kHandleRadiusSquared = 9.0F * 9.0F;
+        if (x_distance > kHandleRadiusSquared && z_distance > kHandleRadiusSquared) {
+            return false;
+        }
+        const auto object = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
+            [&gizmo](const auto& value) { return value.object.id == gizmo.object; });
+        if (object == snapshot.objects.end() || object->object.parent.has_value() ||
+            object->object.locked) {
+            return false;
+        }
+        const auto axis = x_distance <= z_distance
+            ? carto::editor::ViewportTranslateAxis::world_x
+            : carto::editor::ViewportTranslateAxis::world_z;
+        const double pixels_per_world_unit = axis ==
+                carto::editor::ViewportTranslateAxis::world_x
+            ? gizmo.pixels_per_world_x : gizmo.pixels_per_world_z;
+        carto::core::Vec2d pointer{
+            static_cast<double>(screen_point.x), static_cast<double>(screen_point.y)};
+        NativeTransformDragCapture capture;
+        if (auto result = capture.session.begin(gizmo.object, object->object.local_transform,
+                snapshot.project_revision, axis, pointer, pixels_per_world_unit); !result) {
+            action_feedback = result.error().message;
+            action_feedback_error = true;
+            return true;
+        }
+        capture.axis = axis;
+        capture.viewport = ImRect(
+            native_viewport_hits.screen_origin,
+            native_viewport_hits.screen_origin + native_viewport_hits.extent);
+        capture.initial_transform = object->object.local_transform;
+        capture.preview_transform = capture.initial_transform;
+        native_transform_drag = std::move(capture);
+        if (window != nullptr) SetCapture(window);
+        return true;
+    }
+
+    bool route_native_transform_drag(const carto::ui::NativePointerEvent& event) {
+        if (!native_transform_drag.has_value()) return false;
+        const auto snapshot = ui.snapshot();
+        if (snapshot.project_revision != native_transform_drag->session.source_revision()) {
+            cancel_native_transform_drag(
+                "Transform cancelled because the project revision changed.");
+            return true;
+        }
+        carto::core::Vec2d pointer;
+        if (!native_pointer_screen_position(event, pointer)) {
+            cancel_native_transform_drag("Transform cancelled because pointer position is unavailable.");
+            return true;
+        }
+        if (!native_transform_drag->viewport.Contains(ImVec2(
+                static_cast<float>(pointer.x), static_cast<float>(pointer.y)))) {
+            cancel_native_transform_drag("Transform cancelled after the pointer left the viewport.");
+            return true;
+        }
+        auto preview = native_transform_drag->session.preview(
+            pointer, snapshot.project_revision);
+        if (!preview) {
+            cancel_native_transform_drag(preview.error().message);
+            return true;
+        }
+        const bool grid_snap =
+            (event.modifiers & carto::ui::kNativeModifierControl) != 0U;
+        preview = snap_native_transform_preview(
+            std::move(preview.value()), native_transform_drag->axis, grid_snap);
+        if (!preview) {
+            cancel_native_transform_drag(preview.error().message);
+            return true;
+        }
+        native_transform_drag->preview_transform = preview.value();
+        if (event.pressed) {
+            action_feedback = grid_snap
+                ? "Translate preview · 0.25 m grid snap"
+                : "Translate preview · X/Z axis constrained";
+            action_feedback_error = false;
+            return true;
+        }
+
+        const auto object = native_transform_drag->session.object();
+        const auto source_revision = native_transform_drag->session.source_revision();
+        const auto initial = native_transform_drag->initial_transform;
+        auto capture = std::move(*native_transform_drag);
+        const auto committed_transform = capture.session.complete(
+            pointer, snapshot.project_revision);
+        native_transform_drag.reset();
+        if (window != nullptr && GetCapture() == window) ReleaseCapture();
+        if (!committed_transform) {
+            action_feedback = committed_transform.error().message;
+            action_feedback_error = true;
+            return true;
+        }
+        auto final_transform = snap_native_transform_preview(
+            committed_transform.value(), capture.axis, grid_snap);
+        if (!final_transform) {
+            action_feedback = final_transform.error().message;
+            action_feedback_error = true;
+            return true;
+        }
+        const bool changed = capture.axis == carto::editor::ViewportTranslateAxis::world_x
+            ? final_transform.value().translation.x != initial.translation.x
+            : final_transform.value().translation.z != initial.translation.z;
+        if (changed) {
+            static_cast<void>(dispatch(SetObjectTransformAction{
+                object, final_transform.value(), source_revision}));
+        }
+        return true;
+    }
+
     void cancel_native_sculpt_stroke(std::string reason, bool release_capture = true) {
         if (!native_sculpt_stroke.has_value()) return;
         native_sculpt_stroke.reset();
@@ -1813,6 +2043,8 @@ struct DesktopState {
             native_viewport_hits.screen_origin,
             native_viewport_hits.screen_origin + native_viewport_hits.extent);
         if (!viewport.Contains(point)) return false;
+
+        if (begin_native_transform_drag(event, snapshot, point)) return true;
 
         if (snapshot.selection.mode == carto::editor::SelectionMode::edge) {
             float best = 12.0F * 12.0F;
@@ -3187,14 +3419,32 @@ struct DesktopState {
 
     void draw_viewport(const UiSnapshot& snapshot, ImVec2 size = ImVec2(0, 0)) {
         native_viewport_hits.reset();
+        const bool showing_agent_preview = snapshot.agent_task.has_value() &&
+            agent_preview_mode != 0;
+        const bool showing_agent_after = showing_agent_preview && agent_preview_mode == 2;
+        const auto& rendered_scene = !showing_agent_preview
+            ? snapshot.viewport.scene
+            : (showing_agent_after ? snapshot.agent_task->after_scene
+                                   : snapshot.agent_task->before_scene);
+        const auto& rendered_error = !showing_agent_preview
+            ? snapshot.viewport.error
+            : (showing_agent_after ? snapshot.agent_task->after_viewport_error
+                                   : snapshot.agent_task->before_viewport_error);
         ImGui::BeginChild("WorkSurfaceViewport", size, true, ImGuiWindowFlags_NoScrollbar);
-        heading_text("Work surface · compiled snapshot");
+        heading_text(showing_agent_preview
+            ? (showing_agent_after ? "Speculative after · review only"
+                                   : "Task base · review only")
+            : "Work surface · compiled snapshot");
+        ImGui::SameLine();
+        const bool request_camera_frame = ImGui::SmallButton("Frame all");
+        ImGui::SameLine();
+        ImGui::TextDisabled("View %.3f m", work_surface_camera.view_height());
         ImGui::Dummy(ImVec2(0, 4));
-        if (snapshot.viewport.error.has_value()) {
+        if (rendered_error.has_value()) {
             ImGui::TextColored(
                 color(snapshot.colors.semantic_error),
                 "Render unavailable: %s",
-                snapshot.viewport.error->message.c_str());
+                rendered_error->message.c_str());
             ImGui::EndChild();
             return;
         }
@@ -3204,7 +3454,7 @@ struct DesktopState {
         native_viewport_hits.screen_origin = origin;
         native_viewport_hits.extent = extent;
         native_viewport_hits.valid = extent.x > 0.0F && extent.y > 0.0F;
-        native_viewport_hits.interactive = ImGui::IsWindowHovered();
+        native_viewport_hits.interactive = !showing_agent_preview && ImGui::IsWindowHovered();
         ImDrawList* draw = ImGui::GetWindowDrawList();
         const auto rgba = [](carto::ui::UiColor token, float alpha) {
             token.alpha *= alpha;
@@ -3225,7 +3475,7 @@ struct DesktopState {
         draw->AddLine(ImVec2(origin.x, origin.y + extent.y * 0.5F),
                       ImVec2(origin.x + extent.x, origin.y + extent.y * 0.5F),
                       rgba(snapshot.colors.accent_primary, 0.12F), 1.0F);
-        const auto instances = snapshot.viewport.scene.instances();
+        auto instances = rendered_scene.instances();
         bool invalid_render_snapshot = false;
         Vec3d minimum{std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
                       std::numeric_limits<double>::infinity()};
@@ -3246,15 +3496,93 @@ struct DesktopState {
                 maximum.z = std::max(maximum.z, world.z);
             }
         }
-        const double width = std::max(1e-6, maximum.x - minimum.x);
-        const double height = std::max(1e-6, maximum.z - minimum.z);
-        const double scale = std::max(width, height);
+        const double measured_width = maximum.x - minimum.x;
+        const double measured_height = maximum.z - minimum.z;
+        const double width = std::isfinite(measured_width)
+            ? std::max(1e-6, measured_width) : 1.0;
+        const double height = std::isfinite(measured_height)
+            ? std::max(1e-6, measured_height) : 1.0;
+        const carto::core::Vec2d viewport_origin{origin.x, origin.y};
+        const carto::core::Vec2d viewport_extent{
+            std::max(1.0, static_cast<double>(extent.x)),
+            std::max(1.0, static_cast<double>(extent.y))};
+        bool camera_frame_failed = false;
+        const bool should_frame_camera = !work_surface_camera_framed || request_camera_frame;
+        if (should_frame_camera && !instances.empty() && !invalid_render_snapshot &&
+            std::isfinite(minimum.x) && std::isfinite(maximum.x) &&
+            std::isfinite(minimum.z) && std::isfinite(maximum.z)) {
+            const carto::core::Vec2d centre{
+                minimum.x + (maximum.x - minimum.x) * 0.5,
+                minimum.z + (maximum.z - minimum.z) * 0.5};
+            if (work_surface_camera.frame(centre, {width, height}, viewport_extent)) {
+                work_surface_camera_framed = true;
+            } else {
+                camera_frame_failed = true;
+            }
+        }
+
+        const bool canvas_hovered = ImGui::IsMouseHoveringRect(
+            origin, origin + extent, true);
+        const bool camera_input_enabled = canvas_hovered && !showing_agent_preview &&
+            !native_transform_drag.has_value() && !native_sculpt_stroke.has_value();
+        const ImGuiIO& camera_io = ImGui::GetIO();
+        const ImVec2 mouse_position = ImGui::GetMousePos();
+        if (camera_input_enabled && camera_io.MouseWheel != 0.0F) {
+            if (work_surface_camera.zoom_at(
+                    camera_io.MouseWheel,
+                    {mouse_position.x, mouse_position.y},
+                    viewport_origin,
+                    viewport_extent)) {
+                work_surface_camera_framed = true;
+            }
+        }
+        if (camera_input_enabled && ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) {
+            work_surface_camera_panning = true;
+            work_surface_camera_last_pointer = mouse_position;
+        }
+        if (work_surface_camera_panning) {
+            if (ImGui::IsMouseDown(ImGuiMouseButton_Middle)) {
+                const carto::core::Vec2d delta{
+                    static_cast<double>(mouse_position.x - work_surface_camera_last_pointer.x),
+                    static_cast<double>(mouse_position.y - work_surface_camera_last_pointer.y)};
+                if (work_surface_camera.pan_pixels(delta, viewport_extent.y)) {
+                    work_surface_camera_framed = true;
+                    work_surface_camera_last_pointer = mouse_position;
+                }
+            } else {
+                work_surface_camera_panning = false;
+            }
+        }
         const auto project = [&](Vec3d point) {
             const auto world = world_point(carto::core::Transform::identity(), point);
+            const auto projected = work_surface_camera.world_to_screen(
+                {world.x, world.z}, viewport_origin, viewport_extent);
+            if (!projected) {
+                invalid_render_snapshot = true;
+                native_viewport_hits.interactive = false;
+                return origin;
+            }
             return ImVec2(
-                origin.x + static_cast<float>((world.x - minimum.x) / scale * std::max(1.0F, extent.x - 24.0F)) + 12.0F,
-                origin.y + static_cast<float>((maximum.z - world.z) / scale * std::max(1.0F, extent.y - 24.0F)) + 12.0F);
+                static_cast<float>(projected.value().x),
+                static_cast<float>(projected.value().y));
         };
+
+        if (native_transform_drag.has_value()) {
+            if (showing_agent_preview || snapshot.project_revision !=
+                    native_transform_drag->session.source_revision()) {
+                cancel_native_transform_drag(
+                    "Transform preview cancelled because its source snapshot is no longer current.");
+            } else {
+                for (auto& instance : instances) {
+                    if (instance.object == native_transform_drag->session.object()) {
+                        instance.world_transform.translation.x =
+                            native_transform_drag->preview_transform.translation.x;
+                        instance.world_transform.translation.z =
+                            native_transform_drag->preview_transform.translation.z;
+                    }
+                }
+            }
+        }
 
         auto& faces = native_viewport_hits.faces;
         auto& vertices = native_viewport_hits.vertices;
@@ -3346,6 +3674,37 @@ struct DesktopState {
                 }
             }
         }
+        if (!showing_agent_preview && snapshot.workspace_kind == carto::ui::Workspace::model &&
+            snapshot.selection.mode == carto::editor::SelectionMode::object &&
+            snapshot.selection.objects.size() == 1U) {
+            const auto selected_id = snapshot.selection.objects.front();
+            const auto selected = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
+                [selected_id](const auto& object) { return object.object.id == selected_id; });
+            const auto instance = std::find_if(instances.begin(), instances.end(),
+                [selected_id](const auto& value) { return value.object == selected_id; });
+            if (selected != snapshot.objects.end() && !selected->object.parent.has_value() &&
+                !selected->object.locked && instance != instances.end()) {
+                const ImVec2 center = project(instance->world_transform.translation);
+                constexpr float kGizmoLength = 44.0F;
+                const ImVec2 x_tip = center + ImVec2(kGizmoLength, 0.0F);
+                const ImVec2 z_tip = center + ImVec2(0.0F, -kGizmoLength);
+                const double pixels_per_world =
+                    viewport_extent.y / work_surface_camera.view_height();
+                const ImU32 x_color = rgba(snapshot.colors.accent_primary, 1.0F);
+                const ImU32 z_color = rgba(snapshot.colors.accent_secondary, 1.0F);
+                draw->AddCircleFilled(center, 4.0F, rgba(snapshot.colors.text_primary, 1.0F));
+                draw->AddLine(center, x_tip, x_color, 3.0F);
+                draw->AddLine(center, z_tip, z_color, 3.0F);
+                draw->AddCircleFilled(x_tip, 4.0F, x_color);
+                draw->AddCircleFilled(z_tip, 4.0F, z_color);
+                draw->AddText(x_tip + ImVec2(6.0F, -7.0F), x_color, "X");
+                draw->AddText(z_tip + ImVec2(-4.0F, -17.0F), z_color, "Z");
+                native_viewport_hits.translate_gizmo = NativeTranslateGizmo{
+                    selected_id, center, x_tip, z_tip,
+                    pixels_per_world, pixels_per_world,
+                    selected->object.local_transform, snapshot.project_revision};
+            }
+        }
         const auto& fidelity = snapshot.surface_fidelity;
         if ((fidelity.status == carto::ui::SurfaceFidelityStatus::ready ||
              fidelity.status == carto::ui::SurfaceFidelityStatus::rejected) &&
@@ -3400,6 +3759,11 @@ struct DesktopState {
             ImGui::TextColored(
                 color(snapshot.colors.semantic_warning),
                 "Render snapshot contains invalid geometry; selection disabled.");
+        }
+        if (camera_frame_failed) {
+            ImGui::TextColored(
+                color(snapshot.colors.semantic_warning),
+                "Frame all could not fit this scene within the supported view range.");
         }
         if (instances.empty()) ImGui::TextDisabled("No compiled geometry");
 
@@ -3777,7 +4141,8 @@ struct DesktopState {
         ImGui::InputDouble("Y", &inspector_transform.translation.y);
         ImGui::InputDouble("Z", &inspector_transform.translation.z);
         if (ImGui::Button("Apply", ImVec2(112, 30))) {
-            static_cast<void>(dispatch(SetObjectTransformAction{selected_id, inspector_transform}));
+            static_cast<void>(dispatch(SetObjectTransformAction{
+                selected_id, inspector_transform, snapshot.project_revision}));
         }
         ImGui::SameLine();
         if (ImGui::Button("Reset", ImVec2(112, 30))) {
@@ -4030,8 +4395,8 @@ struct DesktopState {
 
     void draw_draft_instrument(const UiSnapshot& snapshot) {
         if (!begin_instrument(snapshot, carto::ui::WorkbenchInstrument::draft,
-                              "Drafting Board", workbench.draft, ImVec2(180, 150),
-                              ImVec2(320, 260), snapshot.colors.provisional)) return;
+                              "Agent Workbench", workbench.draft, ImVec2(360, 430),
+                              ImVec2(500, 680), snapshot.colors.provisional)) return;
         ImGui::TextDisabled("AI study · non-authoritative");
         std::array<char, 4097> intent{};
         const std::size_t copy_bytes = std::min(ai_intent.size(), intent.size() - 1U);
@@ -4100,6 +4465,179 @@ struct DesktopState {
         }
         if (!ai_feedback.empty()) {
             ImGui::TextWrapped("%s", ai_feedback.c_str());
+        }
+
+        ImGui::Separator();
+        heading_text("Speculative task");
+        ImGui::TextDisabled(
+            "Queue native steps from selected faces or vertices. The source stays unchanged until acceptance.");
+        std::array<char, 1025> goal{};
+        const std::size_t goal_bytes = std::min(agent_goal.size(), goal.size() - 1U);
+        std::copy_n(agent_goal.data(), goal_bytes, goal.data());
+        if (ImGui::InputText("Goal", goal.data(), goal.size())) {
+            agent_goal.assign(goal.data());
+        }
+        std::array<char, 1025> step{};
+        const std::size_t step_bytes = std::min(agent_step.size(), step.size() - 1U);
+        std::copy_n(agent_step.data(), step_bytes, step.data());
+        if (ImGui::InputText("Native step", step.data(), step.size())) {
+            agent_step.assign(step.data());
+        }
+        const bool selected_component =
+            (snapshot.selection.mode == carto::editor::SelectionMode::face &&
+                snapshot.selection.component_object.has_value() &&
+                snapshot.selection.faces.size() == 1U) ||
+            (snapshot.selection.mode == carto::editor::SelectionMode::vertex &&
+                snapshot.selection.component_object.has_value() &&
+                snapshot.selection.vertices.size() == 1U);
+        if (snapshot.selection.mode == carto::editor::SelectionMode::face &&
+            snapshot.selection.component_object.has_value() &&
+            snapshot.selection.faces.size() == 1U) {
+            ImGui::TextDisabled("Target: object %llu · face %llu",
+                static_cast<unsigned long long>(snapshot.selection.component_object->value),
+                static_cast<unsigned long long>(snapshot.selection.faces.front().value));
+        } else if (snapshot.selection.mode == carto::editor::SelectionMode::vertex &&
+            snapshot.selection.component_object.has_value() &&
+            snapshot.selection.vertices.size() == 1U) {
+            ImGui::TextDisabled("Target: object %llu · vertex %llu",
+                static_cast<unsigned long long>(snapshot.selection.component_object->value),
+                static_cast<unsigned long long>(snapshot.selection.vertices.front().value));
+        } else {
+            ImGui::TextDisabled("Select exactly one face or vertex to capture a plan step.");
+        }
+        const bool unresolved_task = snapshot.agent_task.has_value() &&
+            snapshot.agent_task->status != carto::agent::TaskStatus::accepted &&
+            snapshot.agent_task->status != carto::agent::TaskStatus::rejected;
+        ImGui::BeginDisabled(!selected_component || agent_step.empty() || unresolved_task);
+        if (ImGui::Button("Queue selected target", ImVec2(-1, 28))) {
+            const auto queued = ui.queue_agent_step(agent_step);
+            if (queued) {
+                agent_feedback = "Step captured against revision " +
+                    std::to_string(snapshot.project_revision.value()) + ".";
+                agent_step.clear();
+            } else {
+                agent_feedback = queued.error().message;
+            }
+        }
+        ImGui::EndDisabled();
+        if (!snapshot.agent_plan_draft.empty()) {
+            ImGui::Text("Plan · %llu step(s)", static_cast<unsigned long long>(
+                snapshot.agent_plan_draft.size()));
+            for (const auto& planned : snapshot.agent_plan_draft) {
+                ImGui::BulletText("%s · object %llu · %s", planned.id.c_str(),
+                    static_cast<unsigned long long>(planned.target.object.value),
+                    planned.intent.c_str());
+            }
+        }
+        const bool task_present = snapshot.agent_task.has_value();
+        const bool task_active = task_present &&
+            snapshot.agent_task->status != carto::agent::TaskStatus::accepted &&
+            snapshot.agent_task->status != carto::agent::TaskStatus::rejected;
+        ImGui::BeginDisabled(task_present || snapshot.agent_plan_draft.empty() || agent_goal.empty());
+        if (ImGui::Button("Run speculative plan", ImVec2(-1, 30))) {
+            const auto run = ui.run_agent_plan(agent_goal);
+            if (run) {
+                agent_feedback = run.value().status == carto::agent::TaskStatus::review
+                    ? "Speculative result is ready for review; the source is unchanged."
+                    : (run.value().diagnostic.has_value()
+                        ? run.value().diagnostic->message
+                        : "Plan is blocked by an acceptance gate.");
+            } else {
+                agent_feedback = run.error().message;
+            }
+        }
+        ImGui::EndDisabled();
+        if (task_present) {
+            const auto& task = *snapshot.agent_task;
+            ImGui::Text("Task %s · %s", task.task_id.c_str(),
+                        carto::agent::task_status_name(task.status));
+            ImGui::TextWrapped("%s", task.goal.c_str());
+            if (ImGui::SmallButton("Show source")) agent_preview_mode = 0;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Show before")) agent_preview_mode = 1;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Show after")) agent_preview_mode = 2;
+            ImGui::TextDisabled(
+                "Accept keeps one undo step for this result and replaces the previous command history.");
+            ImGui::Text("Diff · %llu objects · %llu meshes",
+                static_cast<unsigned long long>(task.diff.changed_object_count()),
+                static_cast<unsigned long long>(task.diff.changed_mesh_count()));
+            for (const auto& object_change : task.diff.objects) {
+                if (object_change.mesh_content_changed || object_change.transform_changed ||
+                    object_change.mesh_binding_changed || object_change.name_changed) {
+                    ImGui::BulletText("Object %llu ·%s%s%s%s",
+                        static_cast<unsigned long long>(object_change.id.value),
+                        object_change.mesh_content_changed ? " mesh" : "",
+                        object_change.transform_changed ? " transform" : "",
+                        object_change.mesh_binding_changed ? " binding" : "",
+                        object_change.name_changed ? " name" : "");
+                }
+            }
+            for (const auto& mesh_change : task.diff.meshes) {
+                ImGui::Text("Mesh %llu · vertices %llu → %llu · faces %llu → %llu",
+                    static_cast<unsigned long long>(mesh_change.asset_id),
+                    static_cast<unsigned long long>(mesh_change.before_vertices),
+                    static_cast<unsigned long long>(mesh_change.after_vertices),
+                    static_cast<unsigned long long>(mesh_change.before_faces),
+                    static_cast<unsigned long long>(mesh_change.after_faces));
+                ImGui::TextDisabled("%llu vertex changes · %llu face changes",
+                    static_cast<unsigned long long>(mesh_change.vertices.size()),
+                    static_cast<unsigned long long>(mesh_change.faces.size()));
+                const std::size_t vertex_limit = std::min<std::size_t>(
+                    mesh_change.vertices.size(), 8U);
+                for (std::size_t i = 0U; i < vertex_limit; ++i) {
+                    const auto& vertex = mesh_change.vertices[i];
+                    ImGui::TextDisabled("Vertex %llu · (%.4f, %.4f, %.4f) → (%.4f, %.4f, %.4f)",
+                        static_cast<unsigned long long>(vertex.id.value),
+                        vertex.before_position.x, vertex.before_position.y,
+                        vertex.before_position.z, vertex.after_position.x,
+                        vertex.after_position.y, vertex.after_position.z);
+                }
+            }
+            const std::string diff_digest = task.diff.digest.hex();
+            ImGui::TextDisabled("Diff digest %.12s · R%llu → R%llu",
+                diff_digest.c_str(),
+                static_cast<unsigned long long>(task.base_revision.value()),
+                static_cast<unsigned long long>(task.speculative_revision.value()));
+            for (const auto& gate : task.gates) {
+                ImGui::BulletText("%s · %s · %s", gate.passed ? "PASS" : "FAIL",
+                    gate.id.c_str(), gate.evidence.c_str());
+            }
+            for (const auto& receipt : task.steps) {
+                ImGui::TextWrapped("%s · %s · %s", receipt.step_id.c_str(),
+                    receipt.tool_id.c_str(), receipt.intent.c_str());
+                if (receipt.diagnostic.has_value()) {
+                    ImGui::TextColored(color(snapshot.colors.semantic_warning), "%s",
+                                       receipt.diagnostic->message.c_str());
+                }
+            }
+            if (task.diagnostic.has_value()) {
+                ImGui::TextColored(color(snapshot.colors.semantic_warning), "%s",
+                                   task.diagnostic->message.c_str());
+            }
+            if (task.can_accept) {
+                if (ImGui::Button("Accept result", ImVec2(-1, 30))) {
+                    const auto accepted = ui.accept_agent_plan();
+                    agent_feedback = accepted
+                        ? "Accepted through the application journal boundary."
+                        : accepted.error().message;
+                }
+            }
+            if (task.status != carto::agent::TaskStatus::accepted &&
+                task.status != carto::agent::TaskStatus::rejected) {
+                if (ImGui::Button("Reject result", ImVec2(-1, 28))) {
+                    const auto rejected = ui.reject_agent_plan();
+                    agent_feedback = rejected
+                        ? "Speculative branch rejected; the source is unchanged."
+                        : rejected.error().message;
+                }
+            }
+        }
+        if (!agent_feedback.empty()) ImGui::TextWrapped("%s", agent_feedback.c_str());
+        if (!task_active && !snapshot.agent_plan_draft.empty() &&
+            ImGui::SmallButton("Clear queued steps")) {
+            const auto cleared = ui.clear_agent_plan();
+            agent_feedback = cleared ? "Queued steps cleared." : cleared.error().message;
         }
         end_instrument(carto::ui::WorkbenchInstrument::draft, workbench.draft);
     }
@@ -4318,11 +4856,418 @@ struct DesktopState {
                 }
             }
         }
+        ImGui::Separator();
+        heading_text("Spatial source field");
+        ImGui::TextWrapped(
+            "Author a project-local scalar source. Edits are revision checked, journaled, "
+            "and undoable; no CONDITION runtime state is stored here.");
+        ImGui::Combo("Semantic", &spatial_field_semantic,
+            "Generic\0Moisture\0Sunlight\0Shade\0Disturbance\0Wind U\0Wind V\0"
+            "Drainage flow\0Acoustic dampening\0Fog tendency\0Vegetation suitability\0"
+            "Terrain elevation\0Ridge\0Basin\0Drainage\0Low ground\0Elevation band\0");
+        const bool terrain_source = spatial_field_semantic == static_cast<int>(
+            carto::spatial_field::FieldSemantic::terrain_elevation);
+        if (terrain_source) {
+            ImGui::InputInt("Tile X", &spatial_field_tile_x);
+            ImGui::InputInt("Tile Z", &spatial_field_tile_z);
+            const std::string tile_identity = carto::terrain::terrain_tile_identity({
+                static_cast<std::int32_t>(spatial_field_tile_x),
+                static_cast<std::int32_t>(spatial_field_tile_z)});
+            ImGui::TextDisabled("Stable source: %s", tile_identity.c_str());
+        } else {
+            ImGui::InputText("Field identity", spatial_field_identity.data(),
+                             spatial_field_identity.size());
+        }
+        ImGui::InputDouble("Origin U", &spatial_field_origin_u, 0.1, 1.0, "%.3f");
+        ImGui::InputDouble("Origin V", &spatial_field_origin_v, 0.1, 1.0, "%.3f");
+        ImGui::InputDouble("Cell size", &spatial_field_cell_size, 0.1, 1.0, "%.3f");
+        ImGui::InputDouble("Minimum", &spatial_field_minimum, 0.1, 1.0, "%.3f");
+        ImGui::InputDouble("Maximum", &spatial_field_maximum, 0.1, 1.0, "%.3f");
+        ImGui::InputDouble("Initial value", &spatial_field_initial, 0.1, 1.0, "%.3f");
+        const std::string terrain_identity = carto::terrain::terrain_tile_identity({
+            static_cast<std::int32_t>(spatial_field_tile_x),
+            static_cast<std::int32_t>(spatial_field_tile_z)});
+        if (ImGui::Button(terrain_source ? "Create 32 × 32 terrain tile" :
+                "Create 32 × 32 field", ImVec2(-1, 30))) {
+            static_cast<void>(dispatch(carto::application::CreateSpatialFieldAction{
+                terrain_source ? terrain_identity : spatial_field_identity.data(),
+                static_cast<carto::spatial_field::FieldSemantic>(spatial_field_semantic),
+                {spatial_field_origin_u, spatial_field_origin_v},
+                spatial_field_cell_size, 32U, 32U, spatial_field_minimum,
+                spatial_field_maximum, spatial_field_initial}));
+        }
+        if (!snapshot.spatial_fields.empty()) {
+            auto selected = std::find_if(
+                snapshot.spatial_fields.begin(), snapshot.spatial_fields.end(),
+                [this](const auto& field) { return field.identity == selected_spatial_field; });
+            if (selected == snapshot.spatial_fields.end()) {
+                selected = snapshot.spatial_fields.begin();
+                selected_spatial_field = selected->identity;
+            }
+            if (ImGui::BeginCombo("Active field", selected->identity.c_str())) {
+                for (const auto& field : snapshot.spatial_fields) {
+                    const bool is_selected = field.identity == selected_spatial_field;
+                    if (ImGui::Selectable(field.identity.c_str(), is_selected)) {
+                        selected_spatial_field = field.identity;
+                    }
+                    if (is_selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            selected = std::find_if(
+                snapshot.spatial_fields.begin(), snapshot.spatial_fields.end(),
+                [this](const auto& field) { return field.identity == selected_spatial_field; });
+            if (selected != snapshot.spatial_fields.end()) {
+                const std::string semantic(
+                    carto::spatial_field::field_semantic_name(selected->semantic));
+                ImGui::Text("%s · %u × %u · source r%llu", semantic.c_str(),
+                    selected->width, selected->height,
+                    static_cast<unsigned long long>(selected->source_revision.value()));
+                if (selected->semantic ==
+                    carto::spatial_field::FieldSemantic::terrain_elevation &&
+                    ImGui::Button("Analyze terrain source", ImVec2(-1, 28))) {
+                    const auto product = session.terrain_tile_preview(selected->identity);
+                    if (product) {
+                        const auto passable = static_cast<std::size_t>(std::count(
+                            product.value().navigation_passable().begin(),
+                            product.value().navigation_passable().end(), 1U));
+                        action_feedback = "Terrain analysis · r" +
+                            std::to_string(product.value().source_revision().value()) + " · " +
+                            std::to_string(product.value().vertices().size()) + " vertices · " +
+                            std::to_string(product.value().indices().size() / 3U) +
+                            " triangles · " + std::to_string(passable) + "/" +
+                            std::to_string(product.value().navigation_passable().size()) +
+                            " passable cells";
+                        action_feedback_error = false;
+                    } else {
+                        action_feedback = product.error().message;
+                        action_feedback_error = true;
+                    }
+                }
+                const auto preview = session.spatial_field_preview(selected->identity);
+                if (preview) {
+                    draw_spatial_field_canvas(snapshot, preview.value());
+                } else {
+                    ImGui::TextColored(color(snapshot.colors.semantic_error), "%s",
+                                       preview.error().message.c_str());
+                }
+                ImGui::InputDouble("Brush U", &spatial_brush_u, 0.1, 1.0, "%.3f");
+                ImGui::InputDouble("Brush V", &spatial_brush_v, 0.1, 1.0, "%.3f");
+                ImGui::InputDouble("Radius", &spatial_brush_radius, 0.1, 1.0, "%.3f");
+                ImGui::InputDouble("Value", &spatial_brush_value, 0.1, 1.0, "%.3f");
+                ImGui::InputDouble("Strength", &spatial_brush_strength, 0.05, 0.2, "%.3f");
+                ImGui::Combo("Brush mode", &spatial_brush_mode,
+                             "Replace\0Add\0Erase\0Smooth\0");
+                if (ImGui::Button("Apply field brush", ImVec2(-1, 30))) {
+                    carto::spatial_field::FieldBrush brush;
+                    brush.expected_revision = selected->source_revision;
+                    brush.center_uv = {spatial_brush_u, spatial_brush_v};
+                    brush.radius = spatial_brush_radius;
+                    brush.value = spatial_brush_value;
+                    brush.strength = spatial_brush_strength;
+                    brush.mode = static_cast<carto::spatial_field::BrushMode>(spatial_brush_mode);
+                    static_cast<void>(dispatch(carto::application::PaintSpatialFieldAction{
+                        selected->identity, brush}));
+                }
+                mono_text_disabled(selected->digest.hex().c_str());
+            }
+        }
+        ImGui::Separator();
+        heading_text("Road / centerline source");
+        ImGui::TextWrapped(
+            "Author one cubic centerline and bind road design intent to its exact source revision. "
+            "This stores source geometry only; it does not generate a road mesh or runtime state.");
+        if (!snapshot.curve_paths.empty()) {
+            if (selected_curve_path.empty() || std::none_of(
+                    snapshot.curve_paths.begin(), snapshot.curve_paths.end(),
+                    [this](const auto& source) {
+                        return source.identity == selected_curve_path;
+                    })) {
+                selected_curve_path = snapshot.curve_paths.front().identity;
+            }
+            if (ImGui::BeginCombo("Existing centerline", selected_curve_path.c_str())) {
+                for (const auto& source : snapshot.curve_paths) {
+                    const bool selected = source.identity == selected_curve_path;
+                    if (ImGui::Selectable(source.identity.c_str(), selected)) {
+                        selected_curve_path = source.identity;
+                    }
+                    if (selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            if (ImGui::SmallButton("Load selected centerline for editing")) {
+                const auto source = session.curve_path_source(selected_curve_path);
+                if (!source) {
+                    action_feedback = source.error().message;
+                    action_feedback_error = true;
+                } else if (source.value().segments.size() != 1U) {
+                    action_feedback =
+                        "The native editor currently edits one-segment cubic sources only.";
+                    action_feedback_error = true;
+                } else {
+                    const auto& segment = source.value().segments.front();
+                    road_centerline_identity.fill('\0');
+                    std::copy(source.value().source_identity.begin(),
+                        source.value().source_identity.end(), road_centerline_identity.begin());
+                    const std::array<carto::core::Vec3d, 4> points{
+                        segment.p0, segment.p1, segment.p2, segment.p3};
+                    for (std::size_t point = 0U; point < points.size(); ++point) {
+                        road_control_points[point * 3U] = points[point].x;
+                        road_control_points[point * 3U + 1U] = points[point].y;
+                        road_control_points[point * 3U + 2U] = points[point].z;
+                    }
+                    action_feedback = "Loaded centerline source for revisioned editing.";
+                    action_feedback_error = false;
+                }
+            }
+        } else {
+            ImGui::TextDisabled("No centerline sources are present yet.");
+        }
+        if (!snapshot.road_sources.empty()) {
+            if (selected_road_source.empty() || std::none_of(
+                    snapshot.road_sources.begin(), snapshot.road_sources.end(),
+                    [this](const auto& source) {
+                        return source.identity == selected_road_source;
+                    })) {
+                selected_road_source = snapshot.road_sources.front().identity;
+            }
+            if (ImGui::BeginCombo("Existing road source", selected_road_source.c_str())) {
+                for (const auto& source : snapshot.road_sources) {
+                    const bool selected = source.identity == selected_road_source;
+                    if (ImGui::Selectable(source.identity.c_str(), selected)) {
+                        selected_road_source = source.identity;
+                    }
+                    if (selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            if (ImGui::SmallButton("Load road and centerline for editing")) {
+                const auto road = std::find_if(
+                    snapshot.road_sources.begin(), snapshot.road_sources.end(),
+                    [this](const auto& source) {
+                        return source.identity == selected_road_source;
+                    });
+                if (road == snapshot.road_sources.end()) {
+                    action_feedback = "Selected road source is no longer in the project.";
+                    action_feedback_error = true;
+                } else {
+                    const auto centerline = session.curve_path_source(
+                        road->centerline_identity);
+                    if (!centerline) {
+                        action_feedback = centerline.error().message;
+                        action_feedback_error = true;
+                    } else if (centerline.value().segments.size() != 1U) {
+                        action_feedback =
+                            "The native editor currently edits one-segment cubic sources only.";
+                        action_feedback_error = true;
+                    } else {
+                        const auto& segment = centerline.value().segments.front();
+                        const std::array<carto::core::Vec3d, 4> points{
+                            segment.p0, segment.p1, segment.p2, segment.p3};
+                        for (std::size_t point = 0U; point < points.size(); ++point) {
+                            road_control_points[point * 3U] = points[point].x;
+                            road_control_points[point * 3U + 1U] = points[point].y;
+                            road_control_points[point * 3U + 2U] = points[point].z;
+                        }
+                        const auto copy_identity = [](std::string_view value, auto& target) {
+                            target.fill('\0');
+                            const std::size_t length = std::min(
+                                value.size(), target.size() - 1U);
+                            std::copy_n(value.begin(), length, target.begin());
+                        };
+                        copy_identity(centerline.value().source_identity,
+                                      road_centerline_identity);
+                        copy_identity(road->identity, road_source_identity);
+                        selected_curve_path = centerline.value().source_identity;
+                        road_width_meters = road->width_meters;
+                        road_shoulder_meters = road->shoulder_meters;
+                        road_maximum_grade = road->maximum_grade_ratio;
+                        road_minimum_curve_radius = road->minimum_curve_radius_meters;
+                        road_surface_class = static_cast<int>(road->surface_class);
+                        road_function_class = static_cast<int>(road->function_class);
+                        road_access_state = static_cast<int>(road->access_state);
+                        road_drainage_intent = static_cast<int>(road->drainage_intent);
+                        action_feedback = "Loaded the exact road / centerline source pair for editing.";
+                        action_feedback_error = false;
+                    }
+                }
+            }
+        }
+        ImGui::InputText("Centerline identity", road_centerline_identity.data(),
+                         road_centerline_identity.size());
+        ImGui::InputText("Road source identity", road_source_identity.data(),
+                         road_source_identity.size());
+        static constexpr std::array<const char*, 4> point_names{"P0", "P1", "P2", "P3"};
+        for (std::size_t point = 0U; point < point_names.size(); ++point) {
+            ImGui::PushID(static_cast<int>(point));
+            ImGui::TextDisabled("%s", point_names[point]);
+            ImGui::SameLine(42.0F);
+            ImGui::SetNextItemWidth(74.0F);
+            ImGui::InputDouble("X", &road_control_points[point * 3U], 0.25, 1.0, "%.2f");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(74.0F);
+            ImGui::InputDouble("Y", &road_control_points[point * 3U + 1U], 0.25, 1.0, "%.2f");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(74.0F);
+            ImGui::InputDouble("Z", &road_control_points[point * 3U + 2U], 0.25, 1.0, "%.2f");
+            ImGui::PopID();
+        }
+        ImGui::InputDouble("Road width (m)", &road_width_meters, 0.25, 1.0, "%.2f");
+        ImGui::InputDouble("Shoulder (m)", &road_shoulder_meters, 0.1, 0.5, "%.2f");
+        ImGui::InputDouble("Maximum grade", &road_maximum_grade, 0.02, 0.05, "%.3f");
+        ImGui::InputDouble("Minimum curve radius (m)", &road_minimum_curve_radius, 1.0, 5.0, "%.2f");
+        ImGui::Combo("Surface", &road_surface_class,
+                     "Asphalt\0Concrete\0Gravel\0Dirt\0Trail\0");
+        ImGui::Combo("Function", &road_function_class,
+                     "Local\0Collector\0Arterial\0Service\0Driveway\0Pedestrian\0");
+        ImGui::Combo("Access", &road_access_state, "Open\0Restricted\0Closed\0");
+        ImGui::Combo("Drainage intent", &road_drainage_intent,
+                     "None\0Roadside ditch\0Culvert\0Swale crossing\0");
+        if (ImGui::Button("Commit road / centerline source", ImVec2(-1, 30))) {
+            const std::string centerline_id(road_centerline_identity.data());
+            const std::string road_id(road_source_identity.data());
+            const auto next_centerline = session.next_curve_path_revision(centerline_id);
+            const auto next_road = session.next_road_source_revision(road_id);
+            if (!next_centerline || !next_road) {
+                action_feedback = !next_centerline
+                    ? next_centerline.error().message : next_road.error().message;
+                action_feedback_error = true;
+            } else {
+                carto::geometry::CurvePath centerline;
+                centerline.source_identity = centerline_id;
+                centerline.source_revision = next_centerline.value();
+                centerline.segments.push_back({
+                    {road_control_points[0], road_control_points[1], road_control_points[2]},
+                    {road_control_points[3], road_control_points[4], road_control_points[5]},
+                    {road_control_points[6], road_control_points[7], road_control_points[8]},
+                    {road_control_points[9], road_control_points[10], road_control_points[11]}});
+                carto::project::RoadSource road;
+                road.source_identity = road_id;
+                road.source_revision = next_road.value();
+                road.centerline_identity = centerline_id;
+                road.centerline_revision = next_centerline.value();
+                road.width_meters = road_width_meters;
+                road.shoulder_meters = road_shoulder_meters;
+                road.maximum_grade_ratio = road_maximum_grade;
+                road.minimum_curve_radius_meters = road_minimum_curve_radius;
+                road.surface_class = static_cast<carto::project::RoadSurfaceClass>(
+                    road_surface_class);
+                road.function_class = static_cast<carto::project::RoadFunctionClass>(
+                    road_function_class);
+                road.access_state = static_cast<carto::project::RoadAccessState>(
+                    road_access_state);
+                road.drainage_intent = static_cast<carto::project::RoadDrainageIntent>(
+                    road_drainage_intent);
+                const auto committed = dispatch(carto::application::SetRoadAuthoringAction{
+                    snapshot.project_revision, std::move(centerline), std::move(road)});
+                if (committed) selected_curve_path = centerline_id;
+            }
+        }
+        for (const auto& road : snapshot.road_sources) {
+            ImGui::Text("%s · r%llu · %s@r%llu · %.2f m",
+                road.identity.c_str(),
+                static_cast<unsigned long long>(road.source_revision.value()),
+                road.centerline_identity.c_str(),
+                static_cast<unsigned long long>(road.centerline_revision.value()),
+                road.width_meters);
+        }
         if (!action_feedback.empty()) {
             ImGui::Separator();
             draw_action_feedback(snapshot);
         }
         end_instrument(carto::ui::WorkbenchInstrument::references, workbench.references);
+    }
+
+    void draw_spatial_field_canvas(
+        const UiSnapshot& snapshot,
+        const carto::application::SpatialFieldPreview& preview) {
+        ImGui::TextDisabled(preview.semantic ==
+                carto::spatial_field::FieldSemantic::terrain_elevation
+            ? "Elevation relief · click the source map to edit this terrain tile."
+            : "Click the source map to apply the selected brush.");
+        const float width = std::max(120.0F, ImGui::GetContentRegionAvail().x);
+        const ImVec2 canvas_size(width, 184.0F);
+        const ImVec2 origin = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton("Spatial field map", canvas_size);
+        const bool hovered = ImGui::IsItemHovered();
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        draw->AddRectFilled(origin,
+            ImVec2(origin.x + canvas_size.x, origin.y + canvas_size.y),
+            ImGui::ColorConvertFloat4ToU32(color(snapshot.colors.panel_0)));
+
+        const float cell_width = canvas_size.x / static_cast<float>(preview.preview_width);
+        const float cell_height = canvas_size.y / static_cast<float>(preview.preview_height);
+        const double value_span = preview.maximum_value - preview.minimum_value;
+        for (std::uint32_t display_v = 0U; display_v < preview.preview_height; ++display_v) {
+            const std::uint32_t source_v = preview.preview_height - 1U - display_v;
+            for (std::uint32_t u = 0U; u < preview.preview_width; ++u) {
+                const std::size_t index = static_cast<std::size_t>(source_v) *
+                    preview.preview_width + u;
+                if (index >= preview.values.size()) continue;
+                const double normalized = value_span > 0.0
+                    ? std::clamp((preview.values[index] - preview.minimum_value) / value_span,
+                                 0.0, 1.0)
+                    : 0.0;
+                const float t = static_cast<float>(normalized);
+                ImVec4 heat;
+                if (preview.semantic == carto::spatial_field::FieldSemantic::terrain_elevation) {
+                    const ImVec4 low{0.035F, 0.16F, 0.22F, 1.0F};
+                    const ImVec4 middle{0.13F, 0.32F, 0.25F, 1.0F};
+                    const ImVec4 high{0.48F, 0.40F, 0.23F, 1.0F};
+                    const ImVec4 summit{0.76F, 0.81F, 0.82F, 1.0F};
+                    const auto blend = [](ImVec4 a, ImVec4 b, float factor) {
+                        return ImVec4(a.x + (b.x - a.x) * factor,
+                            a.y + (b.y - a.y) * factor,
+                            a.z + (b.z - a.z) * factor, 1.0F);
+                    };
+                    heat = t < 0.4F ? blend(low, middle, t / 0.4F)
+                        : t < 0.8F ? blend(middle, high, (t - 0.4F) / 0.4F)
+                                   : blend(high, summit, (t - 0.8F) / 0.2F);
+                } else {
+                    heat = {0.055F + 0.82F * t,
+                            0.11F + 0.56F * t,
+                            0.24F + 0.08F * (1.0F - t), 1.0F};
+                }
+                const ImVec2 cell_min{origin.x + static_cast<float>(u) * cell_width + 0.5F,
+                    origin.y + static_cast<float>(display_v) * cell_height + 0.5F};
+                const ImVec2 cell_max{origin.x + static_cast<float>(u + 1U) * cell_width - 0.5F,
+                    origin.y + static_cast<float>(display_v + 1U) * cell_height - 0.5F};
+                draw->AddRectFilled(cell_min, cell_max,
+                                    ImGui::ColorConvertFloat4ToU32(heat));
+            }
+        }
+        draw->AddRect(origin,
+            ImVec2(origin.x + canvas_size.x, origin.y + canvas_size.y),
+            ImGui::ColorConvertFloat4ToU32(color(snapshot.colors.border_soft)));
+
+        if (hovered) {
+            const ImVec2 mouse = ImGui::GetIO().MousePos;
+            const double u_fraction = std::clamp(
+                static_cast<double>(mouse.x - origin.x) / canvas_size.x, 0.0, 1.0);
+            const double v_fraction = 1.0 - std::clamp(
+                static_cast<double>(mouse.y - origin.y) / canvas_size.y, 0.0, 1.0);
+            spatial_brush_u = preview.origin_uv.x + u_fraction *
+                static_cast<double>(preview.source_width - 1U) * preview.cell_size;
+            spatial_brush_v = preview.origin_uv.y + v_fraction *
+                static_cast<double>(preview.source_height - 1U) * preview.cell_size;
+            const float radius_pixels = static_cast<float>(spatial_brush_radius /
+                preview.cell_size * cell_width);
+            draw->AddCircle(ImGui::GetIO().MousePos,
+                std::clamp(radius_pixels, 2.0F, canvas_size.x),
+                ImGui::ColorConvertFloat4ToU32(color(snapshot.colors.accent_primary)),
+                0, 1.5F);
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                carto::spatial_field::FieldBrush brush;
+                brush.expected_revision = preview.source_revision;
+                brush.center_uv = {spatial_brush_u, spatial_brush_v};
+                brush.radius = spatial_brush_radius;
+                brush.value = spatial_brush_value;
+                brush.strength = spatial_brush_strength;
+                brush.mode = static_cast<carto::spatial_field::BrushMode>(spatial_brush_mode);
+                static_cast<void>(dispatch(carto::application::PaintSpatialFieldAction{
+                    preview.identity, brush}));
+            }
+        }
     }
 
     void draw_workbench_instruments(const UiSnapshot& snapshot) {
@@ -4840,7 +5785,10 @@ struct DesktopState {
     }
 
     void draw() {
-        if (surface != ShellSurface::workspace) native_viewport_hits.reset();
+        if (surface != ShellSurface::workspace) {
+            native_viewport_hits.reset();
+            work_surface_camera_panning = false;
+        }
         poll_preparation_job();
         process_close_request();
         route_shortcuts();
@@ -4970,6 +5918,20 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             (w_param & MK_LBUTTON) != 0U};
         if (g_state->continue_native_sculpt_stroke(event)) return 0;
     }
+    if (message == WM_MOUSEMOVE && g_state != nullptr &&
+        g_state->native_transform_drag.has_value()) {
+        std::uint8_t modifiers = 0U;
+        if ((w_param & MK_CONTROL) != 0U) modifiers |= carto::ui::kNativeModifierControl;
+        if ((w_param & MK_SHIFT) != 0U) modifiers |= carto::ui::kNativeModifierShift;
+        if ((GetKeyState(VK_MENU) & 0x8000) != 0) modifiers |= carto::ui::kNativeModifierAlt;
+        const carto::ui::NativePointerEvent event{
+            carto::ui::NativePointerButton::primary,
+            static_cast<std::int32_t>(static_cast<SHORT>(LOWORD(l_param))),
+            static_cast<std::int32_t>(static_cast<SHORT>(HIWORD(l_param))),
+            modifiers,
+            (w_param & MK_LBUTTON) != 0U};
+        if (g_state->route_native_transform_drag(event)) return 0;
+    }
     if (message == WM_LBUTTONUP && g_state != nullptr &&
         g_state->native_sculpt_stroke.has_value()) {
         const carto::ui::NativePointerEvent event{
@@ -4980,14 +5942,37 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
             false};
         if (g_state->finish_native_sculpt_stroke(event)) return 0;
     }
+    if (message == WM_LBUTTONUP && g_state != nullptr &&
+        g_state->native_transform_drag.has_value()) {
+        std::uint8_t modifiers = 0U;
+        if ((w_param & MK_CONTROL) != 0U) modifiers |= carto::ui::kNativeModifierControl;
+        if ((w_param & MK_SHIFT) != 0U) modifiers |= carto::ui::kNativeModifierShift;
+        if ((GetKeyState(VK_MENU) & 0x8000) != 0) modifiers |= carto::ui::kNativeModifierAlt;
+        const carto::ui::NativePointerEvent event{
+            carto::ui::NativePointerButton::primary,
+            static_cast<std::int32_t>(static_cast<SHORT>(LOWORD(l_param))),
+            static_cast<std::int32_t>(static_cast<SHORT>(HIWORD(l_param))),
+            modifiers,
+            false};
+        if (g_state->route_native_transform_drag(event)) return 0;
+    }
     if (message == WM_CANCELMODE && g_state != nullptr &&
         g_state->native_sculpt_stroke.has_value()) {
         g_state->cancel_native_sculpt_stroke("Sculpt stroke cancelled by the window system.");
+    }
+    if (message == WM_CANCELMODE && g_state != nullptr &&
+        g_state->native_transform_drag.has_value()) {
+        g_state->cancel_native_transform_drag("Transform cancelled by the window system.");
     }
     if (message == WM_CAPTURECHANGED && g_state != nullptr &&
         g_state->native_sculpt_stroke.has_value()) {
         g_state->cancel_native_sculpt_stroke(
             "Sculpt stroke cancelled because pointer capture changed.", false);
+    }
+    if (message == WM_CAPTURECHANGED && g_state != nullptr &&
+        g_state->native_transform_drag.has_value()) {
+        g_state->cancel_native_transform_drag(
+            "Transform cancelled because pointer capture changed.", false);
     }
     if (ImGui_ImplWin32_WndProcHandler(window, message, w_param, l_param)) return 1;
     if (message == WM_SIZE && g_state != nullptr && w_param != SIZE_MINIMIZED) {

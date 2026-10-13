@@ -16,11 +16,11 @@ hardware behavior. Those checks remain with the consuming runtime.
 
 ## Persistence and failure behavior
 
-Project schema 14 stores a digest-bound `ENGINEERING_AUTHORING` record when
+Project schema 16 stores a digest-bound `ENGINEERING_AUTHORING` record when
 present. Mutations pass through editor commands and can be undone or redone.
 Source invalidation preserves authored identity while marking dependent
 products stale; stale authoring cannot be published as admitted. Project
-formats 1 through 13 remain readable.
+formats 1 through 14 remain readable.
 
 The acceptance tests cover deterministic fixture round-trip, provenance,
 tamper rejection, stale-source invalidation, schema-version fencing, project

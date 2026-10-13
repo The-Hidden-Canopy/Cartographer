@@ -129,4 +129,93 @@ private:
     ViewportInteractionSnapshot state_;
 };
 
+enum class ViewportTranslateAxis {
+    world_x,
+    world_z,
+};
+
+// Revision-bound preview for the native 2D work-surface translation handles.
+// Until parent-local axis conversion exists, callers restrict it to root
+// objects. It computes a candidate only; callers commit through the application
+// command/journal path after rechecking the captured revision.
+class ViewportTransformSession final {
+public:
+    [[nodiscard]] core::Result<void> begin(
+        scene::ObjectId object,
+        core::Transform source_transform,
+        core::Revision source_revision,
+        ViewportTranslateAxis axis,
+        core::Vec2d pointer_start,
+        double pixels_per_world_unit);
+    [[nodiscard]] core::Result<core::Transform> preview(
+        core::Vec2d pointer,
+        core::Revision current_revision) const;
+    [[nodiscard]] core::Result<core::Transform> complete(
+        core::Vec2d pointer,
+        core::Revision current_revision);
+    [[nodiscard]] core::Result<void> cancel();
+
+    [[nodiscard]] bool active() const noexcept { return state_.has_value(); }
+    [[nodiscard]] scene::ObjectId object() const noexcept {
+        return state_.has_value() ? state_->object : scene::ObjectId{};
+    }
+    [[nodiscard]] core::Revision source_revision() const noexcept {
+        return state_.has_value() ? state_->source_revision : core::Revision{};
+    }
+
+private:
+    struct State final {
+        scene::ObjectId object;
+        core::Transform source_transform;
+        core::Revision source_revision;
+        ViewportTranslateAxis axis = ViewportTranslateAxis::world_x;
+        core::Vec2d pointer_start;
+        double pixels_per_world_unit = 0.0;
+    };
+
+    std::optional<State> state_;
+};
+
+// UI-only orthographic camera for Cartographer's current X/Z plan view. It
+// does not represent a scene camera and cannot mutate project state.
+class WorkSurfaceCamera final {
+public:
+    static constexpr double kMinViewHeight = 1.0e-6;
+    static constexpr double kMaxViewHeight = 1.0e9;
+
+    [[nodiscard]] core::Vec2d target() const noexcept { return target_; }
+    [[nodiscard]] double view_height() const noexcept { return view_height_; }
+    [[nodiscard]] bool valid() const noexcept;
+
+    // Fits world extents into a viewport with bounded padding. Invalid input
+    // leaves the current view unchanged.
+    [[nodiscard]] bool frame(
+        core::Vec2d centre,
+        core::Vec2d world_extent,
+        core::Vec2d viewport_extent,
+        double padding = 1.12) noexcept;
+    // A canvas drag moves the view with the pointer, not the model.
+    [[nodiscard]] bool pan_pixels(
+        core::Vec2d delta_pixels, double viewport_height_pixels) noexcept;
+    // Positive steps zoom in while preserving the world point under the
+    // pointer. Pointer and viewport coordinates are in the same screen space.
+    [[nodiscard]] bool zoom_at(
+        double steps,
+        core::Vec2d pointer,
+        core::Vec2d viewport_origin,
+        core::Vec2d viewport_extent) noexcept;
+    [[nodiscard]] core::Result<core::Vec2d> world_to_screen(
+        core::Vec2d world,
+        core::Vec2d viewport_origin,
+        core::Vec2d viewport_extent) const;
+    [[nodiscard]] core::Result<core::Vec2d> screen_to_world(
+        core::Vec2d screen,
+        core::Vec2d viewport_origin,
+        core::Vec2d viewport_extent) const;
+
+private:
+    core::Vec2d target_{}; // X/Z represented as x/y.
+    double view_height_ = 10.0;
+};
+
 } // namespace carto::editor

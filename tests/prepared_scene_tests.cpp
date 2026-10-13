@@ -664,6 +664,9 @@ void world_position_product_composes_and_publishes_for_exact_instance() {
     TempDirectory output;
     const auto published = production::publish_prepared_scene(
         output.path() / "published", prepared.value(), payloads, std::nullopt);
+    if (!published) {
+        std::cerr << "prepared publication diagnostic: " << published.error().message << '\n';
+    }
     require(static_cast<bool>(published), "full prepared closure publishes atomically");
     auto corrupted_payloads = payloads;
     const auto position_payload = std::find_if(corrupted_payloads.begin(),

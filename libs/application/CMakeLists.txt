@@ -19,6 +19,7 @@ target_link_libraries(carto_application
         carto_editor
         carto_production
         carto_render
+        carto_terrain
 )
 
 carto_target(carto_application)

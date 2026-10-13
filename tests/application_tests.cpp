@@ -36,7 +36,7 @@ class TempDirectory final {
 public:
     TempDirectory() {
         const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-        path_ = std::filesystem::temp_directory_path() /
+        path_ = std::filesystem::current_path() /
                 ("cartographer-application-tests-" + std::to_string(stamp));
         std::filesystem::create_directories(path_);
     }
@@ -97,7 +97,17 @@ void application_routes_authoring_through_snapshot_and_history() {
     const auto object = snapshot.objects.front().object.id;
     carto::core::Transform moved = snapshot.objects.front().object.local_transform;
     moved.translation = {1.0, 2.0, 3.0};
-    REQUIRE(carto::application::testing::dispatch(session, carto::application::SetObjectTransformAction{object, moved}));
+    const auto transform_source_revision = snapshot.project_revision;
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SetObjectTransformAction{
+            object, moved, transform_source_revision}));
+    REQUIRE(session.snapshot().objects.front().world_transform.translation.x == 1.0);
+    moved.translation.x = 9.0;
+    const auto stale_transform = carto::application::testing::dispatch(session,
+        carto::application::SetObjectTransformAction{
+            object, moved, transform_source_revision});
+    REQUIRE(!stale_transform &&
+        stale_transform.error().code == carto::core::ErrorCode::stale_data);
     REQUIRE(session.snapshot().objects.front().world_transform.translation.x == 1.0);
     REQUIRE(carto::application::testing::dispatch(session, carto::application::UndoAction{}));
     REQUIRE(session.snapshot().objects.front().world_transform.translation.x == 0.0);
@@ -139,7 +149,7 @@ void application_reuses_revision_keyed_viewport_meshes_without_cross_project_sta
     carto::core::Transform moved = first.objects.front().object.local_transform;
     moved.translation.x = 3.0;
     REQUIRE(carto::application::testing::dispatch(
-        session, carto::application::SetObjectTransformAction{object, moved}));
+        session, carto::application::SetObjectTransformAction{object, moved, std::nullopt}));
     const auto transformed = session.snapshot();
     REQUIRE(transformed.viewport.scene.instances().front().mesh.get() == first_mesh.get());
 
@@ -1396,12 +1406,241 @@ void application_mutation_serializes_with_project_recovery_writer_lease() {
     REQUIRE(journal.verify());
 }
 
+void application_routes_spatial_field_creation_and_paint_through_revisioned_history() {
+    TempDirectory temp;
+    carto::application::ApplicationSession session;
+    const auto initial_path = temp.path() / "field-application.carto";
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::NewProjectAction{"Field authoring"}));
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SaveProjectAction{initial_path}));
+    const carto::application::CreateSpatialFieldAction create{
+        "field.workflow.moisture", carto::spatial_field::FieldSemantic::moisture,
+        {0.0, 0.0}, 1.0, 8U, 8U, 0.0, 1.0, 0.0};
+    REQUIRE(carto::application::testing::dispatch(session, create));
+    auto snapshot = session.snapshot();
+    REQUIRE(snapshot.spatial_fields.size() == 1U);
+    REQUIRE(snapshot.spatial_fields.front().source_revision == carto::core::Revision{1U});
+    const auto initial_preview = session.spatial_field_preview("field.workflow.moisture");
+    REQUIRE(initial_preview && initial_preview.value().preview_width == 8U &&
+            initial_preview.value().preview_height == 8U &&
+            initial_preview.value().values.size() == 64U &&
+            initial_preview.value().source_revision == carto::core::Revision{1U});
+    REQUIRE(!session.spatial_field_preview("field.workflow.missing"));
+
+    carto::spatial_field::FieldBrush brush;
+    brush.expected_revision = carto::core::Revision{1U};
+    brush.center_uv = {3.5, 3.5};
+    brush.radius = 3.0;
+    brush.value = 0.8;
+    brush.strength = 1.0;
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::PaintSpatialFieldAction{
+            "field.workflow.moisture", brush}));
+    snapshot = session.snapshot();
+    REQUIRE(snapshot.spatial_fields.front().source_revision == carto::core::Revision{2U});
+    const auto painted_preview = session.spatial_field_preview("field.workflow.moisture");
+    REQUIRE(painted_preview &&
+            painted_preview.value().source_revision == carto::core::Revision{2U} &&
+            std::any_of(painted_preview.value().values.begin(),
+                        painted_preview.value().values.end(),
+                        [](double value) { return value > 0.0; }));
+    const auto after_paint_revision = snapshot.project_revision;
+    carto::journal::Journal initial_journal(
+        std::filesystem::path(initial_path.string() + ".journal"));
+    const auto mutation_events = initial_journal.read_all();
+    REQUIRE(mutation_events && mutation_events.value().size() == 3U);
+    REQUIRE(std::string(mutation_events.value()[1U].payload.begin(),
+                        mutation_events.value()[1U].payload.end()).find(
+                            "Create Spatial Field") != std::string::npos);
+    REQUIRE(std::string(mutation_events.value()[2U].payload.begin(),
+                        mutation_events.value()[2U].payload.end()).find(
+                            "Paint Spatial Field") != std::string::npos);
+
+    REQUIRE(!carto::application::testing::dispatch(
+        session, carto::application::PaintSpatialFieldAction{
+            "field.workflow.moisture", brush}));
+    REQUIRE(session.snapshot().project_revision == after_paint_revision);
+    const auto events_after_stale_paint = initial_journal.read_all();
+    REQUIRE(events_after_stale_paint && events_after_stale_paint.value().size() == 3U);
+
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::UndoAction{}));
+    snapshot = session.snapshot();
+    REQUIRE(snapshot.spatial_fields.front().source_revision == carto::core::Revision{3U});
+    const auto restored_path = temp.path() / "field-undo.carto";
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SaveProjectAction{restored_path}));
+    auto restored_project = carto::project::ProjectDocument::load(restored_path);
+    REQUIRE(restored_project);
+    const auto& restored_values = restored_project.value().spatial_fields().at(
+        "field.workflow.moisture").values();
+    REQUIRE(std::all_of(restored_values.begin(), restored_values.end(),
+        [](double value) { return value == 0.0; }));
+
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::RedoAction{}));
+    snapshot = session.snapshot();
+    REQUIRE(snapshot.spatial_fields.front().source_revision == carto::core::Revision{4U});
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::UndoAction{}));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::UndoAction{}));
+    REQUIRE(session.snapshot().spatial_fields.empty());
+    const auto deleted_path = temp.path() / "field-deleted.carto";
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SaveProjectAction{deleted_path}));
+    const auto deleted_project = carto::project::ProjectDocument::load(deleted_path);
+    REQUIRE(deleted_project);
+    REQUIRE(deleted_project.value().serialize().find(
+        "SPATIAL_FIELD_LINEAGE_RECORD \"field.workflow.moisture\" 5") !=
+            std::string::npos);
+
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::RedoAction{}));
+    REQUIRE(session.snapshot().spatial_fields.front().source_revision == carto::core::Revision{6U});
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::RedoAction{}));
+    REQUIRE(session.snapshot().spatial_fields.front().source_revision == carto::core::Revision{7U});
+}
+
+void application_builds_read_only_terrain_previews_from_current_project_sources() {
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::NewProjectAction{"Terrain preview"}));
+    const std::string identity = carto::terrain::terrain_tile_identity({-1, 2});
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::CreateSpatialFieldAction{
+            identity, carto::spatial_field::FieldSemantic::terrain_elevation,
+            {-12.0, 24.0}, 1.0, 7U, 7U, -10.0, 10.0, 0.0}));
+    const auto before = session.snapshot();
+    const auto product = session.terrain_tile_preview(identity, 2U, 25.0, 0.5);
+    REQUIRE(product && product.value().validate());
+    REQUIRE(product.value().source_revision() == carto::core::Revision{1U});
+    REQUIRE(product.value().vertices().size() == 16U);
+    REQUIRE(product.value().indices().size() / 3U == 18U);
+    REQUIRE(std::all_of(product.value().wet().begin(), product.value().wet().end(),
+        [](std::uint8_t value) { return value == 1U; }));
+    const auto after = session.snapshot();
+    REQUIRE(after.project_revision == before.project_revision);
+    REQUIRE(after.spatial_fields.front().source_revision ==
+        before.spatial_fields.front().source_revision);
+    REQUIRE(!session.terrain_tile_preview("terrain.tile.x-9.z-9"));
+    REQUIRE(!session.terrain_tile_preview("not-a-terrain-tile"));
+}
+
+void application_authors_revision_bound_roads_through_history_and_journal() {
+    TempDirectory temp;
+    const auto path = temp.path() / "road-authoring.carto";
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::NewProjectAction{"Road authoring"}));
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SaveProjectAction{path}));
+
+    constexpr std::string_view centerline_identity = "road.test.centerline";
+    constexpr std::string_view road_identity = "road.test.source";
+    const auto build_action = [&](carto::core::Revision expected_project_revision,
+                                  carto::core::Revision centerline_revision,
+                                  carto::core::Revision road_revision,
+                                  double offset) {
+        carto::geometry::CurvePath centerline;
+        centerline.source_identity = std::string(centerline_identity);
+        centerline.source_revision = centerline_revision;
+        centerline.segments.push_back({
+            {0.0, offset, 0.0}, {1.0, offset, 0.0},
+            {2.0, offset, 1.0}, {3.0, offset, 1.0}});
+        carto::project::RoadSource road;
+        road.source_identity = std::string(road_identity);
+        road.source_revision = road_revision;
+        road.centerline_identity = std::string(centerline_identity);
+        road.centerline_revision = centerline_revision;
+        road.width_meters = 5.0;
+        road.shoulder_meters = 0.5;
+        road.drainage_intent = carto::project::RoadDrainageIntent::swale_crossing;
+        return carto::application::SetRoadAuthoringAction{
+            expected_project_revision, std::move(centerline), std::move(road)};
+    };
+
+    auto snapshot = session.snapshot();
+    const auto centerline_revision = session.next_curve_path_revision(centerline_identity);
+    const auto road_revision = session.next_road_source_revision(road_identity);
+    REQUIRE(centerline_revision && road_revision);
+    const auto created = carto::application::testing::dispatch(session, build_action(
+        snapshot.project_revision, centerline_revision.value(), road_revision.value(), 0.0));
+    REQUIRE(created && created.value().revision_after == snapshot.project_revision.next());
+    snapshot = session.snapshot();
+    REQUIRE(snapshot.curve_paths.size() == 1U && snapshot.road_sources.size() == 1U);
+    REQUIRE(snapshot.curve_paths.front().source_revision == carto::core::Revision{1U});
+    REQUIRE(snapshot.road_sources.front().source_revision == carto::core::Revision{1U});
+    REQUIRE(snapshot.road_sources.front().centerline_revision ==
+        snapshot.curve_paths.front().source_revision);
+
+    const auto before_stale = session.snapshot();
+    const auto stale = carto::application::testing::dispatch(session, build_action(
+        carto::core::Revision{}, carto::core::Revision{2U},
+        carto::core::Revision{2U}, 2.0));
+    REQUIRE(!stale);
+    REQUIRE(session.snapshot().project_revision == before_stale.project_revision);
+    REQUIRE(session.snapshot().undo_count == before_stale.undo_count);
+
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::UndoAction{}));
+    REQUIRE(session.snapshot().curve_paths.empty() && session.snapshot().road_sources.empty());
+    REQUIRE(session.next_curve_path_revision(centerline_identity).value() ==
+        carto::core::Revision{2U});
+    REQUIRE(session.next_road_source_revision(road_identity).value() ==
+        carto::core::Revision{2U});
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::RedoAction{}));
+    snapshot = session.snapshot();
+    REQUIRE(snapshot.curve_paths.front().source_revision == carto::core::Revision{2U});
+    REQUIRE(snapshot.road_sources.front().source_revision == carto::core::Revision{2U});
+
+    const auto next_curve = session.next_curve_path_revision(centerline_identity);
+    const auto next_road = session.next_road_source_revision(road_identity);
+    REQUIRE(next_curve && next_road);
+    REQUIRE(carto::application::testing::dispatch(session, build_action(
+        snapshot.project_revision, next_curve.value(), next_road.value(), 2.0)));
+    auto updated_path = session.curve_path_source(centerline_identity);
+    REQUIRE(updated_path && updated_path.value().source_revision == carto::core::Revision{3U});
+    REQUIRE(updated_path.value().segments.front().p0.y == 2.0);
+
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::UndoAction{}));
+    updated_path = session.curve_path_source(centerline_identity);
+    REQUIRE(updated_path && updated_path.value().source_revision == carto::core::Revision{4U});
+    REQUIRE(updated_path.value().segments.front().p0.y == 0.0);
+    REQUIRE(session.snapshot().road_sources.front().source_revision ==
+        carto::core::Revision{4U});
+    REQUIRE(session.snapshot().road_sources.front().centerline_revision ==
+        updated_path.value().source_revision);
+
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::RedoAction{}));
+    updated_path = session.curve_path_source(centerline_identity);
+    REQUIRE(updated_path && updated_path.value().source_revision == carto::core::Revision{5U});
+    REQUIRE(updated_path.value().segments.front().p0.y == 2.0);
+    REQUIRE(session.snapshot().road_sources.front().source_revision ==
+        carto::core::Revision{5U});
+
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SaveProjectAction{path}));
+    const auto reopened = carto::project::ProjectDocument::load(path);
+    REQUIRE(reopened && reopened.value().curve_paths().at(
+        std::string(centerline_identity)).source_revision == carto::core::Revision{5U});
+    REQUIRE(reopened.value().road_sources().at(std::string(road_identity)).
+        centerline_revision == carto::core::Revision{5U});
+    carto::journal::Journal journal(std::filesystem::path(path.string() + ".journal"));
+    const auto events = journal.read_all();
+    REQUIRE(events && events.value().size() >= 7U);
+    REQUIRE(std::any_of(events.value().begin(), events.value().end(), [](const auto& event) {
+        return std::string(event.payload.begin(), event.payload.end()).find(
+            "Set Road Authoring") != std::string::npos;
+    }));
+}
+
 } // namespace
 
 int main() {
     try {
         application_routes_authoring_through_snapshot_and_history();
         application_reuses_revision_keyed_viewport_meshes_without_cross_project_staleness();
+        application_builds_read_only_terrain_previews_from_current_project_sources();
         application_persists_project_topology_receipts_through_save_and_reopen();
         application_persists_vertex_merge_lineage_through_save_and_reopen();
         application_routes_face_poke_through_history_and_persists_lineage();
@@ -1433,6 +1672,8 @@ int main() {
         application_requires_explicit_recovery_and_rebinds_saved_state();
         application_recovery_fails_closed_without_mutating_session_or_evidence();
         application_mutation_serializes_with_project_recovery_writer_lease();
+        application_routes_spatial_field_creation_and_paint_through_revisioned_history();
+        application_authors_revision_bound_roads_through_history_and_journal();
     } catch (const std::exception& error) {
         return (void(std::cerr << "FAIL " << error.what() << '\n'), 1);
     }

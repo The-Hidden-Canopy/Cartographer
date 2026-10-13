@@ -272,6 +272,13 @@ void project_transaction_round_trip_and_compare_swap_are_preserved() {
     const std::size_t condition_record = legacy_v11.find(condition_authoring_record);
     REQUIRE(condition_record != std::string::npos);
     legacy_v11.erase(condition_record, condition_authoring_record.size());
+    constexpr std::string_view presentation_record_prefix = "PRESENTATION_CATALOG ";
+    const std::size_t presentation_record = legacy_v11.find(presentation_record_prefix);
+    REQUIRE(presentation_record != std::string::npos);
+    const std::size_t project_end = legacy_v11.rfind("\nEND\n");
+    REQUIRE(project_end != std::string::npos && project_end > presentation_record);
+    legacy_v11.erase(presentation_record,
+        project_end + 1U - presentation_record);
     const std::string current_header = "CARTOGRAPHER_PROJECT " +
         std::to_string(project::ProjectDocument::kSchemaVersion);
     const std::size_t header = legacy_v11.find(current_header);

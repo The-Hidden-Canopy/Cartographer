@@ -170,7 +170,7 @@ acceptance remains a separate gate.
 ## Deliberate non-claims
 
 This layer does not implement the complete UI specification. Concave inset,
-general-purpose viewport projection, visual target markers beyond the
+render projection/ray generation, visual target markers beyond the
 revision-bound fidelity overlay, broad surface/normal snapping, broader persistent edge authoring/traversal, gizmos, numeric
 transform editing, full modal numeric confirmation/axis locks, full direct-modeling interaction, CAD/BUILD/material/
 animation subsystems, model-backed AI planning, full docking/tab stacks,

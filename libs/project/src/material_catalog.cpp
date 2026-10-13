@@ -528,9 +528,16 @@ core::Result<void> MaterialCatalog::insert_assignment(MaterialRegionAssignment a
         "material-region assignment");
 }
 
+core::Result<void> MaterialCatalog::insert_material_graph(MaterialGraph graph) {
+    if (auto result = graph.validate(); !result) return result;
+    auto identity = graph.identity;
+    return insert_unique(material_graphs_, std::move(identity), std::move(graph),
+        "material graph");
+}
+
 bool MaterialCatalog::empty() const noexcept {
     return textures_.empty() && samplers_.empty() && materials_.empty() &&
-        variants_.empty() && assignments_.empty();
+        variants_.empty() && assignments_.empty() && material_graphs_.empty();
 }
 
 core::Result<render::StandardMaterial> MaterialCatalog::resolve_material(
@@ -560,7 +567,8 @@ core::Result<render::StandardMaterial> MaterialCatalog::resolve_material(
 core::Result<void> MaterialCatalog::validate() const {
     if (textures_.size() > kMaxRecordsPerKind || samplers_.size() > kMaxRecordsPerKind ||
         materials_.size() > kMaxRecordsPerKind || variants_.size() > kMaxRecordsPerKind ||
-        assignments_.size() > kMaxRecordsPerKind) {
+        assignments_.size() > kMaxRecordsPerKind ||
+        material_graphs_.size() > kMaxRecordsPerKind) {
         return core::Result<void>::failure(validation(
             "material catalog exceeds a bounded collection size"));
     }
@@ -640,6 +648,20 @@ core::Result<void> MaterialCatalog::validate() const {
             }
         }
     }
+    for (const auto& [identity, graph] : material_graphs_) {
+        if (identity != graph.identity) {
+            return core::Result<void>::failure(validation(
+                "material graph map identity does not match its record"));
+        }
+        if (auto result = graph.validate(); !result) return result;
+        for (const auto& node : graph.nodes) {
+            if (node.kind == MaterialGraphNodeKind::texture_sample &&
+                !textures_.contains(node.texture_asset)) {
+                return core::Result<void>::failure(validation(
+                    "material graph texture sample references a missing texture source"));
+            }
+        }
+    }
     return core::Result<void>::success();
 }
 
@@ -696,6 +718,13 @@ std::string MaterialCatalog::serialize() const {
                << assignment.key.region_id << ' ' << assignment.material << ' '
                << assignment.variant.value_or(0U) << '\n';
     }
+    output << "MATERIAL_GRAPHS " << material_graphs_.size() << '\n';
+    for (const auto& [identity, graph] : material_graphs_) {
+        static_cast<void>(identity);
+        const auto encoded = graph.serialize();
+        output << "MATERIAL_GRAPH " << std::quoted(encoded ? encoded.value() : std::string{})
+               << '\n';
+    }
     output << "END\n";
     return output.str();
 }
@@ -721,7 +750,7 @@ core::Result<MaterialCatalog> MaterialCatalog::deserialize(std::string_view text
         return core::Result<MaterialCatalog>::failure(parse_error(
             "material catalog header is invalid"));
     }
-    if (version != kSchemaVersion) {
+    if (version != 1U && version != kSchemaVersion) {
         return core::Result<MaterialCatalog>::failure(core::Diagnostic(
             core::ErrorCode::version_mismatch,
             "material catalog schema version is unsupported"));
@@ -860,6 +889,26 @@ core::Result<MaterialCatalog> MaterialCatalog::deserialize(std::string_view text
         if (variant != 0U) assignment.variant = variant;
         if (auto result = catalog.insert_assignment(std::move(assignment)); !result) {
             return core::Result<MaterialCatalog>::failure(result.error());
+        }
+    }
+    if (version >= 2U) {
+        if (!require_token(input, "MATERIAL_GRAPHS") ||
+            !read_count(input, kMaxRecordsPerKind, count)) {
+            return core::Result<MaterialCatalog>::failure(parse_error(
+                "material catalog graph count is invalid"));
+        }
+        for (std::size_t index = 0U; index < count; ++index) {
+            std::string encoded;
+            if (!require_token(input, "MATERIAL_GRAPH") ||
+                !(input >> std::quoted(encoded))) {
+                return core::Result<MaterialCatalog>::failure(parse_error(
+                    "material catalog graph record is invalid"));
+            }
+            auto graph = MaterialGraph::deserialize(encoded);
+            if (!graph) return core::Result<MaterialCatalog>::failure(graph.error());
+            if (auto result = catalog.insert_material_graph(std::move(graph).value()); !result) {
+                return core::Result<MaterialCatalog>::failure(result.error());
+            }
         }
     }
     if (!require_token(input, "END")) {

@@ -4,6 +4,7 @@
 #include <carto/assets/texture_source.hpp>
 #include <carto/core/result.hpp>
 #include <carto/core/revision.hpp>
+#include <carto/project/material_graph.hpp>
 #include <carto/render/material.hpp>
 
 #include <compare>
@@ -122,7 +123,7 @@ struct MaterialRegionAssignment {
 // derived products and cannot replace this catalog.
 class MaterialCatalog final {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 1U;
+    static constexpr std::uint32_t kSchemaVersion = 2U;
     static constexpr std::size_t kMaxSerializedBytes = 32U * 1024U * 1024U;
     static constexpr std::size_t kMaxRecordsPerKind = 65'536U;
     static constexpr std::size_t kMaxVariantMeshScope = 65'536U;
@@ -132,6 +133,7 @@ public:
     [[nodiscard]] core::Result<void> insert_material(render::MaterialAsset material);
     [[nodiscard]] core::Result<void> insert_variant(MaterialVariant variant);
     [[nodiscard]] core::Result<void> insert_assignment(MaterialRegionAssignment assignment);
+    [[nodiscard]] core::Result<void> insert_material_graph(MaterialGraph graph);
 
     [[nodiscard]] const std::map<assets::TextureAssetId, TextureSourceRecord>&
     textures() const noexcept {
@@ -153,6 +155,10 @@ public:
     assignments() const noexcept {
         return assignments_;
     }
+    [[nodiscard]] const std::map<std::string, MaterialGraph>&
+    material_graphs() const noexcept {
+        return material_graphs_;
+    }
 
     [[nodiscard]] bool empty() const noexcept;
     [[nodiscard]] core::Result<void> validate() const;
@@ -169,6 +175,7 @@ private:
     std::map<render::MaterialId, render::MaterialAsset> materials_;
     std::map<MaterialVariantId, MaterialVariant> variants_;
     std::map<MaterialRegionKey, MaterialRegionAssignment> assignments_;
+    std::map<std::string, MaterialGraph> material_graphs_;
 };
 
 } // namespace carto::project

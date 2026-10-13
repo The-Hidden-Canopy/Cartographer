@@ -6,8 +6,12 @@
 #include <carto/engineering/authoring.hpp>
 #include <carto/core/result.hpp>
 #include <carto/geometry/mesh.hpp>
+#include <carto/geometry/curve_path.hpp>
 #include <carto/project/file_lock.hpp>
 #include <carto/project/material_catalog.hpp>
+#include <carto/project/presentation_catalog.hpp>
+#include <carto/project/road_source.hpp>
+#include <carto/spatial_field/scalar_field.hpp>
 #include <carto/scientific/model.hpp>
 #include <carto/scene/scene.hpp>
 #include <carto/world/model.hpp>
@@ -43,6 +47,9 @@ class SplitProjectSelectedEdgeCommand;
 class TriToQuadProjectSelectedFacesCommand;
 class SetProjectEngineeringAuthoringCommand;
 class SetProjectConditionAuthoringCommand;
+class SetProjectSpatialFieldCommand;
+class SetProjectRoadAuthoringCommand;
+class ReplaceProjectDocumentCommand;
 }
 
 namespace carto::project {
@@ -123,7 +130,7 @@ struct SerializedConditionAuthoring {
 
 class ProjectDocument {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 14;
+    static constexpr std::uint32_t kSchemaVersion = 20;
     static constexpr std::uint32_t kMinimumReadableSchemaVersion = 1;
     static constexpr std::string_view kMagic = "CARTOGRAPHER_PROJECT";
     static constexpr std::string_view kAuthoringFormat = "cartographer.authoring";
@@ -150,6 +157,14 @@ public:
     [[nodiscard]] const std::map<std::uint64_t, geometry::EditableMesh>& meshes() const noexcept {
         return meshes_;
     }
+    [[nodiscard]] const std::map<std::string, geometry::CurvePath>& curve_paths() const noexcept {
+        return curve_paths_;
+    }
+    [[nodiscard]] const std::map<std::string, RoadSource>& road_sources() const noexcept {
+        return road_sources_;
+    }
+    [[nodiscard]] const std::map<std::string, spatial_field::ScalarField2D>&
+    spatial_fields() const noexcept { return spatial_fields_; }
     [[nodiscard]] const std::optional<assets::Sha256Digest>& evaluation_graph_digest() const noexcept {
         return evaluation_graph_digest_;
     }
@@ -164,6 +179,9 @@ public:
     }
     [[nodiscard]] const MaterialCatalog& material_catalog() const noexcept {
         return material_catalog_;
+    }
+    [[nodiscard]] const PresentationCatalog& presentation_catalog() const noexcept {
+        return presentation_catalog_;
     }
     // Opaque serialized semantic sidecar bytes and the digest that binds
     // them. ProjectDocument stores the bytes verbatim and never parses them;
@@ -215,6 +233,9 @@ private:
     friend class ::carto::editor::TriToQuadProjectSelectedFacesCommand;
     friend class ::carto::editor::SetProjectEngineeringAuthoringCommand;
     friend class ::carto::editor::SetProjectConditionAuthoringCommand;
+    friend class ::carto::editor::SetProjectSpatialFieldCommand;
+    friend class ::carto::editor::SetProjectRoadAuthoringCommand;
+    friend class ::carto::editor::ReplaceProjectDocumentCommand;
     friend class ::carto::project::ProjectTransaction;
 
     ProjectDocument& operator=(const ProjectDocument&) = default;
@@ -251,6 +272,20 @@ private:
         scientific::ScientificModel model);
     [[nodiscard]] core::Result<void> set_world_model(world::WorldModel model);
     [[nodiscard]] core::Result<void> set_material_catalog(MaterialCatalog catalog);
+    [[nodiscard]] core::Result<void> set_presentation_catalog(PresentationCatalog catalog);
+    [[nodiscard]] core::Result<void> set_curve_path(geometry::CurvePath path);
+    [[nodiscard]] core::Result<void> erase_curve_path_if_revision(
+        std::string_view identity,
+        core::Revision expected_source_revision);
+    [[nodiscard]] core::Result<void> set_road_source(RoadSource road);
+    [[nodiscard]] core::Result<void> erase_road_source_if_revision(
+        std::string_view identity,
+        core::Revision expected_source_revision);
+    [[nodiscard]] core::Result<void> set_spatial_field(
+        spatial_field::ScalarField2D field);
+    [[nodiscard]] core::Result<void> erase_spatial_field_if_revision(
+        std::string_view identity,
+        core::Revision expected_source_revision);
     // Binds one opaque serialized semantic sidecar and its digest. The digest
     // must equal the SHA-256 of the exact bytes; mismatches fail closed.
     [[nodiscard]] core::Result<void> set_semantic_sidecar(
@@ -303,10 +338,21 @@ private:
     std::string source_namespace_;
     scene::Scene scene_;
     std::map<std::uint64_t, geometry::EditableMesh> meshes_;
+    std::map<std::string, geometry::CurvePath> curve_paths_;
+    // Retained through deletion so undo/redo cannot reuse a stale revision.
+    std::map<std::string, core::Revision> curve_path_lineage_;
+    std::map<std::string, RoadSource> road_sources_;
+    // Road intent has an independent lineage from its centerline source.
+    std::map<std::string, core::Revision> road_source_lineage_;
+    std::map<std::string, spatial_field::ScalarField2D> spatial_fields_;
+    // Includes active fields and tombstones, preventing identity reuse from
+    // resetting source lineage after a governed undo/delete.
+    std::map<std::string, core::Revision> spatial_field_lineage_;
     std::vector<TopologyReceiptRecord> topology_receipts_;
     scientific::ScientificModel scientific_model_;
     world::WorldModel world_model_;
     MaterialCatalog material_catalog_;
+    PresentationCatalog presentation_catalog_;
     std::optional<std::string> semantic_sidecar_bytes_;
     std::optional<assets::Sha256Digest> semantic_sidecar_digest_;
     std::map<std::uint64_t, SerializedSculptStack> sculpt_stacks_;

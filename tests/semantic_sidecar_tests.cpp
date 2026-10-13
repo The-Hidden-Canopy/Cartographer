@@ -248,6 +248,15 @@ void project_current_schema_sidecar_round_trips() {
     require(condition_record != std::string::npos,
         "empty current document emits its CONDITION authoring record");
     legacy_v10.erase(condition_record, condition_authoring_record.size());
+    constexpr std::string_view presentation_record_prefix = "PRESENTATION_CATALOG ";
+    const auto presentation_record = legacy_v10.find(presentation_record_prefix);
+    require(presentation_record != std::string::npos,
+        "current document emits its presentation catalog record");
+    const auto project_end = legacy_v10.rfind("\nEND\n");
+    require(project_end != std::string::npos && project_end > presentation_record,
+        "project ending follows its presentation catalog record");
+    legacy_v10.erase(presentation_record,
+        project_end + 1U - presentation_record);
     const auto reopened_v10 = project::ProjectDocument::deserialize(legacy_v10);
     require(static_cast<bool>(reopened_v10) &&
                 reopened_v10.value().semantic_sidecar_bytes() ==

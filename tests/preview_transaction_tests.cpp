@@ -79,7 +79,8 @@ void stale_preview_is_refused_without_a_second_mutation() {
         session,
         carto::application::SetObjectTransformAction{
             object,
-            carto::core::Transform{{0.0, 3.0, 0.0}, carto::core::Quaternion::identity(), {1.0, 1.0, 1.0}}}));
+            carto::core::Transform{{0.0, 3.0, 0.0}, carto::core::Quaternion::identity(), {1.0, 1.0, 1.0}},
+            std::nullopt}));
     const auto before_rejected_commit = session.snapshot();
     const auto rejected = carto::application::HumanApplicationAccess::commit_preview(
         session, preview.value());

@@ -155,6 +155,34 @@ private:
 
 // Binds the validated public CONDITION source-authoring sidecar through the
 // same governed command boundary as all other project mutations.
+// Replaces a complete project snapshot as one admitted application command.
+// Used for an explicitly accepted speculative result; undo restores the prior
+// source content while keeping project revisions monotonic.
+class ReplaceProjectDocumentCommand final : public EditorCommand {
+public:
+    ReplaceProjectDocumentCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        project::ProjectDocument candidate);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override {
+        return "Accept Speculative Project Result";
+    }
+
+private:
+    [[nodiscard]] bool matches_snapshot_ignoring_revision(
+        const project::ProjectDocument& expected) const;
+
+    project::ProjectDocument* document_;
+    project::ProjectDocument before_;
+    project::ProjectDocument after_;
+    core::Revision expected_project_revision_;
+    bool initialized_ = false;
+    bool applied_ = false;
+};
+
 class SetProjectConditionAuthoringCommand final : public EditorCommand {
 public:
     SetProjectConditionAuthoringCommand(
@@ -174,6 +202,50 @@ private:
     std::optional<project::SerializedConditionAuthoring> before_;
     project::SerializedConditionAuthoring after_;
     core::Revision expected_project_revision_;
+    bool applied_ = false;
+};
+
+class SetProjectSpatialFieldCommand final : public EditorCommand {
+public:
+    SetProjectSpatialFieldCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        std::optional<spatial_field::ScalarField2D> before,
+        spatial_field::ScalarField2D after);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Set Spatial Field"; }
+
+private:
+    project::ProjectDocument* document_;
+    std::optional<spatial_field::ScalarField2D> before_;
+    spatial_field::ScalarField2D after_;
+    bool applied_ = false;
+};
+
+class SetProjectRoadAuthoringCommand final : public EditorCommand {
+public:
+    SetProjectRoadAuthoringCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        geometry::CurvePath centerline,
+        project::RoadSource road);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Set Road Authoring"; }
+
+private:
+    project::ProjectDocument* document_;
+    geometry::CurvePath authored_centerline_;
+    project::RoadSource authored_road_;
+    std::optional<geometry::CurvePath> expected_centerline_;
+    std::optional<project::RoadSource> expected_road_;
+    std::optional<geometry::CurvePath> previous_centerline_;
+    std::optional<project::RoadSource> previous_road_;
+    core::Revision expected_project_revision_;
+    bool initialized_ = false;
     bool applied_ = false;
 };
 

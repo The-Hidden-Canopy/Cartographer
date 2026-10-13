@@ -129,6 +129,41 @@ carto::render::MaterialAsset material_fixture(
     return material;
 }
 
+carto::project::MaterialGraph material_graph_fixture() {
+    using namespace carto;
+    project::MaterialGraph graph;
+    graph.identity = "materials/workshop/paint";
+    graph.revision = core::Revision{3U};
+    const auto scalar = [](std::uint64_t id, double value) {
+        project::MaterialGraphNode node;
+        node.id = id;
+        node.kind = project::MaterialGraphNodeKind::constant_scalar;
+        node.value_type = project::MaterialGraphValueType::scalar;
+        node.constants[0] = value;
+        return node;
+    };
+    project::MaterialGraphNode texture_sample;
+    texture_sample.id = 3U;
+    texture_sample.kind = project::MaterialGraphNodeKind::texture_sample;
+    texture_sample.value_type = project::MaterialGraphValueType::color;
+    texture_sample.texture_asset = 501U;
+    texture_sample.inputs = {1U, 2U};
+    project::MaterialGraphNode unknown;
+    unknown.id = 7U;
+    unknown.kind = project::MaterialGraphNodeKind::unsupported;
+    unknown.value_type = project::MaterialGraphValueType::scalar;
+    unknown.unsupported_identity = "unmapped-noise";
+    graph.nodes = {
+        std::move(unknown), scalar(6U, 0.15), scalar(5U, 0.45), scalar(4U, 1.0),
+        std::move(texture_sample), scalar(2U, 0.25), scalar(1U, 0.75),
+    };
+    graph.outputs.base_color = 3U;
+    graph.outputs.alpha = 4U;
+    graph.outputs.roughness = 5U;
+    graph.outputs.metallic = 6U;
+    return graph;
+}
+
 carto::project::MaterialCatalog catalog_fixture(std::uint64_t mesh_asset) {
     using namespace carto;
     project::MaterialCatalog catalog;
@@ -184,6 +219,8 @@ carto::project::MaterialCatalog catalog_fixture(std::uint64_t mesh_asset) {
                 .variant = std::nullopt,
             })),
         "rubber region assignment enters catalog");
+    require(static_cast<bool>(catalog.insert_material_graph(material_graph_fixture())),
+        "provider-neutral material graph enters the authoring catalog");
     require(static_cast<bool>(catalog.validate()), "complete source catalog validates");
     return catalog;
 }
@@ -203,6 +240,10 @@ void catalog_round_trips_and_resolves_variants_deterministically() {
     require(resolved && resolved.value().roughness == 0.84 &&
             resolved.value().base_color.asset == 501U,
         "variant changes only its explicit field and preserves base texture intent");
+    require(reopened.value().material_graphs().size() == 1U &&
+            reopened.value().material_graphs().at("materials/workshop/paint").revision ==
+                core::Revision{3U},
+        "graph authoring identity and revision persist with material truth");
 }
 
 void hostile_catalog_inputs_fail_closed() {
@@ -265,6 +306,25 @@ void hostile_catalog_inputs_fail_closed() {
     require(!missing_material.validate(),
         "assignment to a missing material fails aggregate validation");
 
+    project::MaterialCatalog missing_graph_texture;
+    require(static_cast<bool>(missing_graph_texture.insert_material_graph(
+                material_graph_fixture())),
+        "locally valid graph can be staged before aggregate validation");
+    require(!missing_graph_texture.validate(),
+        "graph texture samples cannot resolve to absent source texture records");
+
+    const auto v2 = project::MaterialCatalog{}.serialize();
+    const auto graph_section = v2.find("MATERIAL_GRAPHS ");
+    require(graph_section != std::string::npos,
+        "current material catalog explicitly frames its graph collection");
+    auto legacy_v1 = v2;
+    legacy_v1.replace(0U, std::string("CARTOGRAPHER_MATERIAL_CATALOG 2").size(),
+        "CARTOGRAPHER_MATERIAL_CATALOG 1");
+    legacy_v1.erase(graph_section, legacy_v1.find("END\n", graph_section) - graph_section);
+    const auto reopened_v1 = project::MaterialCatalog::deserialize(legacy_v1);
+    require(reopened_v1 && reopened_v1.value().empty(),
+        "v1 catalogs migrate as an explicit empty graph collection");
+
     project::MaterialVariant unsorted;
     unsorted.id = 1001U;
     unsorted.name = "Bad scope";
@@ -309,8 +369,12 @@ void project_save_reopen_and_journal_preserve_authoring_truth() {
         "catalog mutation emits exactly one approved audit event");
 
     const auto path = temp.path() / "workshop.carto";
-    require(static_cast<bool>(document.save_atomic(path)),
-        "schema-v9 project saves durable material authoring truth");
+    const auto saved = document.save_atomic(path);
+    if (!saved) {
+        std::cerr << "project save diagnostic: " << saved.error().message << '\n';
+    }
+    require(static_cast<bool>(saved),
+        "schema-v16 project saves durable material authoring truth");
     const auto cache = temp.path() / "derived-cache";
     std::filesystem::create_directories(cache);
     std::ofstream(cache / "compiled-material.bin", std::ios::binary) << "derived";

@@ -197,7 +197,9 @@ bool is_operation_action(const application::ApplicationAction& action) {
             std::is_same_v<Action, application::InvalidateEngineeringSourceAction> ||
             std::is_same_v<Action, application::ImportConditionFixtureAction> ||
             std::is_same_v<Action, application::ImportConditionAuthoringAction> ||
-            std::is_same_v<Action, application::InvalidateConditionSourceAction>;
+            std::is_same_v<Action, application::InvalidateConditionSourceAction> ||
+            std::is_same_v<Action, application::CreateSpatialFieldAction> ||
+            std::is_same_v<Action, application::PaintSpatialFieldAction>;
     }, action);
 }
 
@@ -1430,6 +1432,151 @@ core::Result<application::DispatchReceipt> UiController::submit_ai_proposal(
     return core::Result<application::DispatchReceipt>::failure(diagnostic);
 }
 
+core::Result<void> UiController::queue_agent_step(std::string intent) {
+    if (agent_task_.has_value()) {
+        const auto status = agent_task_->snapshot().status;
+        if (status != agent::TaskStatus::accepted && status != agent::TaskStatus::rejected) {
+            return core::Result<void>::failure(invalid_state(
+                "accept or reject the current speculative task before editing its plan"));
+        }
+        agent_task_.reset();
+        agent_plan_draft_.clear();
+        agent_plan_base_revision_.reset();
+        agent_goal_.clear();
+    }
+    if (agent_plan_draft_.size() >= 16U) {
+        return core::Result<void>::failure(invalid_state(
+            "agent plan reached the local 16-command work budget"));
+    }
+    const auto snapshot = session_.snapshot();
+    if (agent_plan_base_revision_.has_value() &&
+        *agent_plan_base_revision_ != snapshot.project_revision) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "project changed after the first agent plan target was captured"));
+    }
+    const auto authoring = session_.authoring_context();
+    if (!authoring) return core::Result<void>::failure(authoring.error());
+
+    agent::TargetRef target;
+    if (authoring.value().selection_mode == editor::SelectionMode::face &&
+        authoring.value().component_object.has_value() &&
+        authoring.value().faces.size() == 1U) {
+        target.object = *authoring.value().component_object;
+        target.component = authoring.value().faces.front();
+    } else if (authoring.value().selection_mode == editor::SelectionMode::vertex &&
+        authoring.value().component_object.has_value() &&
+        authoring.value().vertices.size() == 1U) {
+        target.object = *authoring.value().component_object;
+        target.component = authoring.value().vertices.front();
+    } else {
+        return core::Result<void>::failure(invalid_state(
+            "capture one selected face or vertex for each agent plan step"));
+    }
+
+    agent::AgentPlanStep step{
+        "step-" + std::to_string(agent_plan_draft_.size() + 1U),
+        std::move(target),
+        std::move(intent)};
+    if (auto result = step.validate(); !result) {
+        return core::Result<void>::failure(result.error());
+    }
+    if (!agent_plan_base_revision_.has_value()) {
+        agent_plan_base_revision_ = snapshot.project_revision;
+    }
+    agent_plan_draft_.push_back(std::move(step));
+    return core::Result<void>::success();
+}
+
+core::Result<agent::AgentTaskSnapshot> UiController::run_agent_plan(std::string goal) {
+    if (agent_plan_draft_.empty() || !agent_plan_base_revision_.has_value()) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "capture at least one selected face or vertex before running an agent plan"));
+    }
+    if (agent_task_.has_value()) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "a speculative task is already active"));
+    }
+    const auto snapshot = session_.snapshot();
+    if (snapshot.project_revision != *agent_plan_base_revision_) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "agent plan targets were captured against an older project revision"));
+    }
+    if (next_agent_task_id_ == std::numeric_limits<std::uint64_t>::max()) {
+        next_agent_task_id_ = 1U;
+    }
+    const std::string task_id = "agent-task-" + std::to_string(next_agent_task_id_++);
+    std::vector<scene::ObjectId> scope;
+    for (const auto& step : agent_plan_draft_) {
+        if (std::find(scope.begin(), scope.end(), step.target.object) == scope.end()) {
+            scope.push_back(step.target.object);
+        }
+    }
+    agent::AgentPlan plan{
+        task_id,
+        agent::AuthoringObjective{
+            task_id, std::move(goal), *agent_plan_base_revision_, scope, {}},
+        agent_plan_draft_};
+    const std::string task_goal = plan.objective.goal;
+    agent::AgentWorkEnvelope envelope;
+    envelope.scope_objects = scope;
+    envelope.max_commands = 16U;
+    envelope.max_objects_touched = scope.size();
+    auto task = agent::AgentTask::begin(session_, std::move(plan), std::move(envelope));
+    if (!task) {
+        record_ui_problem(task.error().with_context("agent workbench plan"));
+        return core::Result<agent::AgentTaskSnapshot>::failure(task.error());
+    }
+    agent_goal_ = task_goal;
+    agent_task_.emplace(std::move(task.value()));
+    auto result = agent_task_->run();
+    if (!result) {
+        record_ui_problem(result.error().with_context("agent workbench execution"));
+        return result;
+    }
+    return result;
+}
+
+core::Result<application::DispatchReceipt> UiController::accept_agent_plan() {
+    if (!agent_task_.has_value()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "there is no speculative agent result to accept"));
+    }
+    auto result = application::HumanApplicationAccess::accept_agent_task(*agent_task_);
+    if (result) record_operation(result.value(), OperationCategory::provider);
+    else record_ui_problem(result.error().with_context("agent result acceptance"));
+    return result;
+}
+
+core::Result<void> UiController::reject_agent_plan() {
+    if (!agent_task_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "there is no speculative agent result to reject"));
+    }
+    auto result = agent_task_->reject();
+    if (!result) record_ui_problem(result.error().with_context("agent result rejection"));
+    return result;
+}
+
+core::Result<void> UiController::clear_agent_plan() {
+    if (agent_task_.has_value()) {
+        const auto status = agent_task_->snapshot().status;
+        if (status == agent::TaskStatus::review || status == agent::TaskStatus::blocked ||
+            status == agent::TaskStatus::prepared) {
+            if (auto result = agent_task_->reject(); !result) return result;
+        } else if (status == agent::TaskStatus::running) {
+            return core::Result<void>::failure(invalid_state(
+                "a running agent task cannot be cleared"));
+        }
+        agent_task_.reset();
+    }
+    agent_plan_draft_.clear();
+    agent_plan_base_revision_.reset();
+    agent_goal_.clear();
+    return core::Result<void>::success();
+}
+
 core::Result<MeshImportReceipt> UiController::import_mesh(
     const std::filesystem::path& path,
     MeshImportFormat format) {
@@ -2238,6 +2385,9 @@ UiSnapshot UiController::snapshot() const {
     result.ai_status = preferences_.ai_auto_approve
         ? "Native planner ready. Safe proposals auto-apply through the revision-bound command path."
         : "Native planner ready. Proposals require explicit Apply through the revision-bound command path.";
+    result.agent_goal = agent_goal_;
+    result.agent_plan_draft = agent_plan_draft_;
+    if (agent_task_.has_value()) result.agent_task = agent_task_->snapshot();
     result.market = market_view_;
     if (surface_fidelity_.has_value()) {
         result.surface_fidelity = *surface_fidelity_;

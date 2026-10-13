@@ -15,6 +15,7 @@ target_link_libraries(cartographer_package_consumer
         Cartographer::carto_project
         Cartographer::carto_production
         Cartographer::carto_hydro
+        Cartographer::carto_terrain
         Cartographer::carto_ui
 )
 

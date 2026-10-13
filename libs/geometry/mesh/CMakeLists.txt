@@ -1,4 +1,5 @@
 add_library(carto_geometry STATIC
+    src/curve_path.cpp
     src/mesh.cpp
     src/primitives.cpp
     src/topology_edit.cpp

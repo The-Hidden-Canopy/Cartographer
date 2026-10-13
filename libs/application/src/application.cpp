@@ -197,6 +197,17 @@ ApplicationSession::ApplicationSession() {
     saved_revision_ = document_.revision();
 }
 
+ApplicationSession::ApplicationSession(
+    const ApplicationSession& source,
+    SpeculativeCopyTag)
+    : document_(source.document_),
+      saved_revision_(source.document_.revision()),
+      project_generation_(source.project_generation_),
+      selection_(source.selection_),
+      workspace_(source.workspace_) {
+    static_cast<void>(tools_.register_builtin_tools());
+}
+
 core::Result<RecoveryInspection> ApplicationSession::inspect_recovery(
     const std::filesystem::path& project_path) {
     if (project_path.empty() || project_path.filename().empty()) {
@@ -449,6 +460,64 @@ core::Result<void> ApplicationSession::append_mutation_event(
     return append();
 }
 
+core::Result<DispatchReceipt> ApplicationSession::accept_speculative_result(
+    const project::ProjectDocument& candidate,
+    core::Revision expected_revision,
+    std::string_view task_id,
+    std::string_view diff_digest) {
+    const auto parsed_digest = assets::Sha256Digest::from_hex(diff_digest);
+    if (active_source_ != OperationSource::human || task_id.empty() ||
+        task_id.size() > 64U || task_id.find_first_of("\r\n") != std::string_view::npos ||
+        !parsed_digest) {
+        return core::Result<DispatchReceipt>::failure(invalid_state(
+            "speculative result acceptance requires a valid human task boundary"));
+    }
+    if (document_.revision() != expected_revision) {
+        return core::Result<DispatchReceipt>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "project changed after the speculative task began"));
+    }
+    if (expected_revision.exhausted() || candidate.revision() <= expected_revision) {
+        return core::Result<DispatchReceipt>::failure(invalid_state(
+            "speculative result is empty or its base revision cannot advance"));
+    }
+    if (auto result = candidate.validate(); !result) {
+        return core::Result<DispatchReceipt>::failure(
+            result.error().with_context("speculative result acceptance"));
+    }
+
+    editor::CommandBus prior_history = std::move(history_);
+    history_ = editor::CommandBus{};
+    editor::ProjectCommandAdmission admission;
+    const OperationSource previous_source = active_source_;
+    std::string previous_provenance = std::move(active_provenance_id_);
+    active_source_ = OperationSource::ai_proposal;
+    active_provenance_id_ = std::string(task_id);
+    const std::string operation = "Accept Agent Speculative Result " +
+        std::string(task_id) + " diff=" + std::string(diff_digest);
+    auto result = execute_command(
+        std::make_unique<editor::ReplaceProjectDocumentCommand>(
+            admission, document_, candidate),
+        operation);
+    active_source_ = previous_source;
+    active_provenance_id_ = std::move(previous_provenance);
+    if (!result) {
+        history_ = std::move(prior_history);
+        return result;
+    }
+
+    selection_.clear();
+    last_tool_action_.reset();
+    last_tool_context_.reset();
+    viewport_mesh_cache_.clear();
+    if (project_generation_ == std::numeric_limits<std::uint64_t>::max()) {
+        project_generation_ = 0U;
+    } else {
+        ++project_generation_;
+    }
+    return result;
+}
+
 core::Result<DispatchReceipt> ApplicationSession::dispatch(
     HumanActionAdmission,
     const ApplicationAction& action,
@@ -505,6 +574,12 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
             } else if constexpr (std::is_same_v<Action, SelectEdgeAction>) {
                 return select_edge(value);
             } else if constexpr (std::is_same_v<Action, SetObjectTransformAction>) {
+                if (value.expected_project_revision.has_value() &&
+                    *value.expected_project_revision != document_.revision()) {
+                    return failure(core::Diagnostic(
+                        core::ErrorCode::stale_data,
+                        "object transform was authored against a stale project revision"));
+                }
                 const auto* object = document_.scene().find(value.object);
                 if (!object) {
                     return failure(core::Diagnostic(
@@ -556,6 +631,12 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return import_condition_authoring(value);
             } else if constexpr (std::is_same_v<Action, InvalidateConditionSourceAction>) {
                 return invalidate_condition_source(value);
+            } else if constexpr (std::is_same_v<Action, CreateSpatialFieldAction>) {
+                return create_spatial_field(value);
+            } else if constexpr (std::is_same_v<Action, PaintSpatialFieldAction>) {
+                return paint_spatial_field(value);
+            } else if constexpr (std::is_same_v<Action, SetRoadAuthoringAction>) {
+                return set_road_authoring(value);
             } else if constexpr (std::is_same_v<Action, UndoAction>) {
                 return undo();
             } else {
@@ -638,6 +719,112 @@ core::Result<condition::AuthoringDocument> ApplicationSession::condition_authori
     return decoded;
 }
 
+core::Result<SpatialFieldPreview> ApplicationSession::spatial_field_preview(
+    std::string_view identity) const {
+    const auto found = document_.spatial_fields().find(std::string(identity));
+    if (found == document_.spatial_fields().end()) {
+        return core::Result<SpatialFieldPreview>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "spatial field preview requires a field present in this project"));
+    }
+    const auto& field = found->second;
+    SpatialFieldPreview preview;
+    preview.identity = field.identity();
+    preview.semantic = field.semantic();
+    preview.source_revision = field.source_revision();
+    preview.origin_uv = field.origin_uv();
+    preview.cell_size = field.cell_size();
+    preview.minimum_value = field.minimum_value();
+    preview.maximum_value = field.maximum_value();
+    preview.source_width = field.width();
+    preview.source_height = field.height();
+    preview.preview_width = std::min(
+        field.width(), SpatialFieldPreview::kMaxPreviewAxis);
+    preview.preview_height = std::min(
+        field.height(), SpatialFieldPreview::kMaxPreviewAxis);
+    preview.values.reserve(static_cast<std::size_t>(preview.preview_width) *
+                           preview.preview_height);
+    for (std::uint32_t v = 0U; v < preview.preview_height; ++v) {
+        const std::uint32_t source_v = preview.preview_height == 1U
+            ? 0U
+            : static_cast<std::uint32_t>(
+                (static_cast<std::uint64_t>(v) * (field.height() - 1U)) /
+                (preview.preview_height - 1U));
+        for (std::uint32_t u = 0U; u < preview.preview_width; ++u) {
+            const std::uint32_t source_u = preview.preview_width == 1U
+                ? 0U
+                : static_cast<std::uint32_t>(
+                    (static_cast<std::uint64_t>(u) * (field.width() - 1U)) /
+                    (preview.preview_width - 1U));
+            const std::size_t index = static_cast<std::size_t>(source_v) *
+                field.width() + source_u;
+            if (index >= field.values().size()) {
+                return core::Result<SpatialFieldPreview>::failure(core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "spatial field preview index exceeds the validated source"));
+            }
+            preview.values.push_back(field.values()[index]);
+        }
+    }
+    return core::Result<SpatialFieldPreview>::success(std::move(preview));
+}
+
+core::Result<terrain::TerrainTileProduct> ApplicationSession::terrain_tile_preview(
+    std::string_view identity,
+    std::uint32_t lod_step,
+    double max_navigation_slope_degrees,
+    std::optional<double> water_level) const {
+    const auto found = document_.spatial_fields().find(std::string(identity));
+    if (found == document_.spatial_fields().end()) {
+        return core::Result<terrain::TerrainTileProduct>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "terrain preview requires a source field present in this project"));
+    }
+    const auto key = terrain::parse_terrain_tile_identity(identity);
+    if (!key) return core::Result<terrain::TerrainTileProduct>::failure(key.error());
+    return terrain::build_terrain_tile(found->second, key.value(), lod_step,
+        max_navigation_slope_degrees, water_level);
+}
+
+core::Result<geometry::CurvePath> ApplicationSession::curve_path_source(
+    std::string_view identity) const {
+    const auto found = document_.curve_paths().find(std::string(identity));
+    if (found == document_.curve_paths().end()) {
+        return core::Result<geometry::CurvePath>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "curve source is not present in this project"));
+    }
+    return core::Result<geometry::CurvePath>::success(found->second);
+}
+
+core::Result<core::Revision> ApplicationSession::next_curve_path_revision(
+    std::string_view identity) const {
+    const auto lineage = document_.curve_path_lineage_.find(std::string(identity));
+    if (lineage == document_.curve_path_lineage_.end()) {
+        return core::Result<core::Revision>::success(core::Revision{1U});
+    }
+    if (lineage->second.exhausted()) {
+        return core::Result<core::Revision>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "curve source revision space is exhausted"));
+    }
+    return core::Result<core::Revision>::success(lineage->second.next());
+}
+
+core::Result<core::Revision> ApplicationSession::next_road_source_revision(
+    std::string_view identity) const {
+    const auto lineage = document_.road_source_lineage_.find(std::string(identity));
+    if (lineage == document_.road_source_lineage_.end()) {
+        return core::Result<core::Revision>::success(core::Revision{1U});
+    }
+    if (lineage->second.exhausted()) {
+        return core::Result<core::Revision>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "road source revision space is exhausted"));
+    }
+    return core::Result<core::Revision>::success(lineage->second.next());
+}
+
 core::Result<editor::AuthoringPreview> ApplicationSession::begin_preview(
     editor::PreviewKind kind) const {
     auto context = authoring_context();
@@ -657,7 +844,7 @@ core::Result<ApplicationAction> ApplicationSession::preview_action(
                 "object transform preview has no complete action payload"));
         }
         return core::Result<ApplicationAction>::success(SetObjectTransformAction{
-            context.objects.front(), *parameters.transform});
+            context.objects.front(), *parameters.transform, context.project_revision});
     }
     if (preview.kind() == editor::PreviewKind::extrude_face) {
         if (!parameters.distance.has_value()) {
@@ -1916,6 +2103,87 @@ core::Result<DispatchReceipt> ApplicationSession::invalidate_condition_source(
         "Invalidate CONDITION Source");
 }
 
+core::Result<DispatchReceipt> ApplicationSession::create_spatial_field(
+    const CreateSpatialFieldAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "spatial field creation requires the human authoring boundary"));
+    }
+    if (document_.spatial_fields().contains(action.identity)) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "spatial field identity is already active"));
+    }
+    auto field = spatial_field::ScalarField2D::create(
+        action.identity, action.semantic, action.origin_uv, action.cell_size,
+        action.width, action.height, action.minimum_value, action.maximum_value,
+        action.initial_value);
+    if (!field) return failure(field.error().with_context("create spatial field"));
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectSpatialFieldCommand>(
+            admission, document_, std::nullopt, std::move(field.value())),
+        "Create Spatial Field");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::paint_spatial_field(
+    const PaintSpatialFieldAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "spatial field paint requires the human authoring boundary"));
+    }
+    const auto found = document_.spatial_fields().find(action.identity);
+    if (found == document_.spatial_fields().end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "spatial field identity is not present in this project"));
+    }
+    auto updated = found->second;
+    auto receipt = updated.paint(action.brush);
+    if (!receipt) return failure(receipt.error().with_context("paint spatial field"));
+    if (!receipt.value().changed) {
+        return accepted("Paint Spatial Field (No Change)", document_.revision());
+    }
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectSpatialFieldCommand>(
+            admission, document_, found->second, std::move(updated)),
+        "Paint Spatial Field");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::set_road_authoring(
+    const SetRoadAuthoringAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "road authoring requires the human authoring boundary"));
+    }
+    if (document_.revision() != action.expected_project_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "road authoring snapshot no longer matches the project revision"));
+    }
+    if (auto result = action.centerline.validate(); !result) {
+        return failure(result.error().with_context("road centerline authoring"));
+    }
+    if (auto result = action.road.validate(); !result) {
+        return failure(result.error().with_context("road source authoring"));
+    }
+    if (action.road.centerline_identity != action.centerline.source_identity ||
+        action.road.centerline_revision != action.centerline.source_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "road source must bind the exact authored centerline identity and revision"));
+    }
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectRoadAuthoringCommand>(
+            admission, document_, action.centerline, action.road),
+        "Set Road Authoring");
+}
+
 core::Result<DispatchReceipt> ApplicationSession::undo() {
     const core::Revision before = document_.revision();
     project::ProjectDocument before_document = document_;
@@ -2008,6 +2276,35 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
         }
         result.problems.push_back(std::move(diagnostic));
     };
+
+    result.spatial_fields.reserve(document_.spatial_fields().size());
+    for (const auto& [identity, field] : document_.spatial_fields()) {
+        const auto digest = field.canonical_digest();
+        if (!digest) {
+            append_problem(digest.error().with_context("spatial field snapshot"));
+            continue;
+        }
+        result.spatial_fields.push_back(SpatialFieldView{
+            identity, field.semantic(), field.source_revision(),
+            field.width(), field.height(), digest.value()});
+    }
+    result.curve_paths.reserve(document_.curve_paths().size());
+    for (const auto& [identity, path] : document_.curve_paths()) {
+        const std::string encoded = path.serialize();
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(encoded.data());
+        const auto digest = assets::sha256(std::span<const std::uint8_t>(bytes, encoded.size()));
+        result.curve_paths.push_back(CurvePathSourceView{
+            identity, path.source_revision, path.segments.size(), digest});
+    }
+    result.road_sources.reserve(document_.road_sources().size());
+    for (const auto& [identity, road] : document_.road_sources()) {
+        result.road_sources.push_back(RoadSourceView{
+            identity, road.source_revision, road.centerline_identity,
+            road.centerline_revision, road.width_meters, road.shoulder_meters,
+            road.maximum_grade_ratio, road.minimum_curve_radius_meters,
+            road.surface_class, road.function_class, road.access_state,
+            road.drainage_intent});
+    }
 
     if (!document_.engineering_authoring().has_value()) {
         result.engineering.status = "No engineering authoring is bound to this project.";

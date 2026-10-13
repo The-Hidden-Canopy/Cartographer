@@ -463,6 +463,14 @@ void settled_rest_pose_bake_is_bound_reconstructible_and_persistable() {
     const std::size_t condition_record = serialized_v12_compat.find(condition_authoring_record);
     REQUIRE(condition_record != std::string::npos);
     serialized_v12_compat.erase(condition_record, condition_authoring_record.size());
+    constexpr std::string_view presentation_record_prefix = "PRESENTATION_CATALOG ";
+    const std::size_t presentation_record =
+        serialized_v12_compat.find(presentation_record_prefix);
+    REQUIRE(presentation_record != std::string::npos);
+    const std::size_t project_end = serialized_v12_compat.rfind("\nEND\n");
+    REQUIRE(project_end != std::string::npos && project_end > presentation_record);
+    serialized_v12_compat.erase(presentation_record,
+        project_end + 1U - presentation_record);
     const geometry::EditableMesh& source = document.meshes().at(mesh_asset);
     const core::Revision source_revision = source.revision();
     production::GarmentAsset garment = make_garment(document, mesh_asset);

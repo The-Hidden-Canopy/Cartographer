@@ -270,7 +270,8 @@ void stale_ai_preview_is_rejected_without_mutation() {
 
     REQUIRE(ui.dispatch(carto::application::SetObjectTransformAction{
         object,
-        carto::core::Transform{{0.5, 0.0, 0.0}, carto::core::Quaternion::identity(), {1.0, 1.0, 1.0}}}));
+        carto::core::Transform{{0.5, 0.0, 0.0}, carto::core::Quaternion::identity(), {1.0, 1.0, 1.0}},
+        std::nullopt}));
     const auto before_rejected_commit = session.snapshot();
     REQUIRE(!ui.commit_ai_preview(preview.value(), proposal.value()));
     REQUIRE(session.snapshot().project_revision == before_rejected_commit.project_revision);

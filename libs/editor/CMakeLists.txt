@@ -1,9 +1,11 @@
 add_library(carto_editor STATIC
     src/authoring_context.cpp
     src/command_bus.cpp
+    src/editor_camera.cpp
     src/numeric_entry.cpp
     src/preview_transaction.cpp
     src/snap_candidates.cpp
+    src/snap_service.cpp
     src/selection.cpp
     src/tools.cpp
     src/viewport_interaction.cpp

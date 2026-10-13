@@ -320,4 +320,206 @@ core::Result<void> ViewportInteractionSession::cancel() {
     return core::Result<void>::success();
 }
 
+core::Result<void> ViewportTransformSession::begin(
+    scene::ObjectId object,
+    core::Transform source_transform,
+    core::Revision source_revision,
+    ViewportTranslateAxis axis,
+    core::Vec2d pointer_start,
+    double pixels_per_world_unit) {
+    if (state_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "viewport transform already owns a pointer capture"));
+    }
+    if (!object || !source_transform.finite() || !pointer_start.finite() ||
+        !std::isfinite(pixels_per_world_unit) || pixels_per_world_unit <= 0.0 ||
+        (axis != ViewportTranslateAxis::world_x &&
+            axis != ViewportTranslateAxis::world_z)) {
+        return core::Result<void>::failure(invalid(
+            "viewport transform source, axis, or pointer scale is invalid"));
+    }
+    state_ = State{object, source_transform, source_revision, axis,
+        pointer_start, pixels_per_world_unit};
+    return core::Result<void>::success();
+}
+
+core::Result<core::Transform> ViewportTransformSession::preview(
+    core::Vec2d pointer,
+    core::Revision current_revision) const {
+    if (!state_.has_value()) {
+        return core::Result<core::Transform>::failure(invalid_state(
+            "viewport transform has no active pointer capture"));
+    }
+    if (current_revision != state_->source_revision) {
+        return core::Result<core::Transform>::failure(stale(
+            "viewport transform source revision changed during capture"));
+    }
+    if (!pointer.finite()) {
+        return core::Result<core::Transform>::failure(invalid(
+            "viewport transform pointer position is invalid"));
+    }
+
+    core::Transform result = state_->source_transform;
+    if (state_->axis == ViewportTranslateAxis::world_x) {
+        result.translation.x +=
+            (pointer.x - state_->pointer_start.x) / state_->pixels_per_world_unit;
+    } else {
+        result.translation.z -=
+            (pointer.y - state_->pointer_start.y) / state_->pixels_per_world_unit;
+    }
+    if (!result.finite()) {
+        return core::Result<core::Transform>::failure(invalid(
+            "viewport transform preview produced a non-finite transform"));
+    }
+    return core::Result<core::Transform>::success(result);
+}
+
+core::Result<core::Transform> ViewportTransformSession::complete(
+    core::Vec2d pointer,
+    core::Revision current_revision) {
+    auto result = preview(pointer, current_revision);
+    if (!result) return result;
+    state_.reset();
+    return result;
+}
+
+core::Result<void> ViewportTransformSession::cancel() {
+    if (!state_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "viewport transform has no active pointer capture"));
+    }
+    state_.reset();
+    return core::Result<void>::success();
+}
+
+bool WorkSurfaceCamera::valid() const noexcept {
+    return target_.finite() && std::isfinite(view_height_) &&
+        view_height_ >= kMinViewHeight && view_height_ <= kMaxViewHeight;
+}
+
+bool WorkSurfaceCamera::frame(
+    core::Vec2d centre,
+    core::Vec2d world_extent,
+    core::Vec2d viewport_extent,
+    double padding) noexcept {
+    if (!valid() || !centre.finite() || !world_extent.finite() ||
+        !viewport_extent.finite() || world_extent.x <= 0.0 ||
+        world_extent.y <= 0.0 || viewport_extent.x <= 0.0 ||
+        viewport_extent.y <= 0.0 || viewport_extent.x > 1.0e7 ||
+        viewport_extent.y > 1.0e7 || !std::isfinite(padding) ||
+        padding < 1.0 || padding > 4.0) {
+        return false;
+    }
+    const double aspect = viewport_extent.x / viewport_extent.y;
+    const double required_height =
+        std::max(world_extent.y, world_extent.x / aspect) * padding;
+    if (!std::isfinite(required_height) || required_height > kMaxViewHeight) {
+        return false;
+    }
+    target_ = centre;
+    view_height_ = std::clamp(required_height, kMinViewHeight, kMaxViewHeight);
+    return true;
+}
+
+bool WorkSurfaceCamera::pan_pixels(
+    core::Vec2d delta_pixels, double viewport_height_pixels) noexcept {
+    if (!valid() || !delta_pixels.finite() ||
+        std::abs(delta_pixels.x) > 1.0e7 || std::abs(delta_pixels.y) > 1.0e7 ||
+        !std::isfinite(viewport_height_pixels) || viewport_height_pixels <= 0.0 ||
+        viewport_height_pixels > 1.0e7) {
+        return false;
+    }
+    const double world_per_pixel = view_height_ / viewport_height_pixels;
+    const core::Vec2d next{
+        target_.x - delta_pixels.x * world_per_pixel,
+        target_.y + delta_pixels.y * world_per_pixel};
+    if (!next.finite()) return false;
+    target_ = next;
+    return true;
+}
+
+bool WorkSurfaceCamera::zoom_at(
+    double steps,
+    core::Vec2d pointer,
+    core::Vec2d viewport_origin,
+    core::Vec2d viewport_extent) noexcept {
+    if (!valid() || !std::isfinite(steps) || std::abs(steps) > 1.0e4 ||
+        !pointer.finite() || !viewport_origin.finite() ||
+        !viewport_extent.finite() || viewport_extent.x <= 0.0 ||
+        viewport_extent.y <= 0.0 || viewport_extent.x > 1.0e7 ||
+        viewport_extent.y > 1.0e7 ||
+        pointer.x < viewport_origin.x || pointer.y < viewport_origin.y ||
+        pointer.x > viewport_origin.x + viewport_extent.x ||
+        pointer.y > viewport_origin.y + viewport_extent.y) {
+        return false;
+    }
+    auto anchor = screen_to_world(pointer, viewport_origin, viewport_extent);
+    if (!anchor) return false;
+    const double exponent = std::clamp(-steps * 0.1, -60.0, 60.0);
+    const double next_height = view_height_ * std::exp(exponent);
+    if (!std::isfinite(next_height) || next_height <= 0.0) return false;
+    const double bounded_height = std::clamp(
+        next_height, kMinViewHeight, kMaxViewHeight);
+    const double next_world_per_pixel = bounded_height / viewport_extent.y;
+    const double offset_x = pointer.x - (viewport_origin.x + viewport_extent.x * 0.5);
+    const double offset_y = pointer.y - (viewport_origin.y + viewport_extent.y * 0.5);
+    const core::Vec2d next_target{
+        anchor.value().x - offset_x * next_world_per_pixel,
+        anchor.value().y + offset_y * next_world_per_pixel};
+    if (!next_target.finite()) return false;
+    target_ = next_target;
+    view_height_ = bounded_height;
+    return true;
+}
+
+core::Result<core::Vec2d> WorkSurfaceCamera::world_to_screen(
+    core::Vec2d world,
+    core::Vec2d viewport_origin,
+    core::Vec2d viewport_extent) const {
+    if (!valid() || !world.finite() || !viewport_origin.finite() ||
+        !viewport_extent.finite() || viewport_extent.x <= 0.0 ||
+        viewport_extent.y <= 0.0 || viewport_extent.x > 1.0e7 ||
+        viewport_extent.y > 1.0e7) {
+        return core::Result<core::Vec2d>::failure(invalid(
+            "work-surface projection input is invalid"));
+    }
+    const double world_per_pixel = view_height_ / viewport_extent.y;
+    const core::Vec2d result{
+        viewport_origin.x + viewport_extent.x * 0.5 +
+            (world.x - target_.x) / world_per_pixel,
+        viewport_origin.y + viewport_extent.y * 0.5 -
+            (world.y - target_.y) / world_per_pixel};
+    if (!result.finite() ||
+        std::abs(result.x) > static_cast<double>(std::numeric_limits<float>::max()) ||
+        std::abs(result.y) > static_cast<double>(std::numeric_limits<float>::max())) {
+        return core::Result<core::Vec2d>::failure(invalid(
+            "work-surface projection exceeds finite screen coordinates"));
+    }
+    return core::Result<core::Vec2d>::success(result);
+}
+
+core::Result<core::Vec2d> WorkSurfaceCamera::screen_to_world(
+    core::Vec2d screen,
+    core::Vec2d viewport_origin,
+    core::Vec2d viewport_extent) const {
+    if (!valid() || !screen.finite() || !viewport_origin.finite() ||
+        !viewport_extent.finite() || viewport_extent.x <= 0.0 ||
+        viewport_extent.y <= 0.0 || viewport_extent.x > 1.0e7 ||
+        viewport_extent.y > 1.0e7) {
+        return core::Result<core::Vec2d>::failure(invalid(
+            "work-surface unprojection input is invalid"));
+    }
+    const double world_per_pixel = view_height_ / viewport_extent.y;
+    const core::Vec2d result{
+        target_.x + (screen.x - viewport_origin.x - viewport_extent.x * 0.5) *
+            world_per_pixel,
+        target_.y - (screen.y - viewport_origin.y - viewport_extent.y * 0.5) *
+            world_per_pixel};
+    if (!result.finite()) {
+        return core::Result<core::Vec2d>::failure(invalid(
+            "work-surface unprojection produced a non-finite point"));
+    }
+    return core::Result<core::Vec2d>::success(result);
+}
+
 } // namespace carto::editor

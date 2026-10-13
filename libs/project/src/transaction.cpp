@@ -180,6 +180,49 @@ core::Result<void> ProjectTransaction::set_material_catalog(MaterialCatalog cata
     return staged_.set_material_catalog(std::move(catalog));
 }
 
+core::Result<void> ProjectTransaction::set_presentation_catalog(
+    PresentationCatalog catalog) {
+    if (auto result = ensure_active(); !result) return result;
+    return staged_.set_presentation_catalog(std::move(catalog));
+}
+
+core::Result<void> ProjectTransaction::set_curve_path(geometry::CurvePath path) {
+    if (auto result = ensure_active(); !result) return result;
+    return staged_.set_curve_path(std::move(path));
+}
+
+core::Result<void> ProjectTransaction::erase_curve_path(
+    std::string identity,
+    core::Revision expected_source_revision) {
+    if (auto result = ensure_active(); !result) return result;
+    return staged_.erase_curve_path_if_revision(identity, expected_source_revision);
+}
+
+core::Result<void> ProjectTransaction::set_road_source(RoadSource road) {
+    if (auto result = ensure_active(); !result) return result;
+    return staged_.set_road_source(std::move(road));
+}
+
+core::Result<void> ProjectTransaction::erase_road_source(
+    std::string identity,
+    core::Revision expected_source_revision) {
+    if (auto result = ensure_active(); !result) return result;
+    return staged_.erase_road_source_if_revision(identity, expected_source_revision);
+}
+
+core::Result<void> ProjectTransaction::set_spatial_field(
+    spatial_field::ScalarField2D field) {
+    if (auto result = ensure_active(); !result) return result;
+    return staged_.set_spatial_field(std::move(field));
+}
+
+core::Result<void> ProjectTransaction::erase_spatial_field(
+    std::string identity,
+    core::Revision expected_source_revision) {
+    if (auto result = ensure_active(); !result) return result;
+    return staged_.erase_spatial_field_if_revision(identity, expected_source_revision);
+}
+
 core::Result<void> ProjectTransaction::set_semantic_sidecar(
     std::string serialized_sidecar,
     assets::Sha256Digest digest) {

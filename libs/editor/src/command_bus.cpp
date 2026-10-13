@@ -252,6 +252,68 @@ core::Result<void> SetProjectEngineeringAuthoringCommand::undo() {
     return core::Result<void>::success();
 }
 
+ReplaceProjectDocumentCommand::ReplaceProjectDocumentCommand(
+    ProjectCommandAdmission,
+    project::ProjectDocument& document,
+    project::ProjectDocument candidate)
+    : document_(&document),
+      before_(document),
+      after_(std::move(candidate)),
+      expected_project_revision_(document.revision()) {}
+
+bool ReplaceProjectDocumentCommand::matches_snapshot_ignoring_revision(
+    const project::ProjectDocument& expected) const {
+    if (!document_) return false;
+    project::ProjectDocument normalized(*document_);
+    normalized.revision_ = expected.revision();
+    return normalized.serialize() == expected.serialize();
+}
+
+core::Result<void> ReplaceProjectDocumentCommand::execute() {
+    if (!document_ || applied_ || expected_project_revision_.exhausted()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "speculative project replacement is unavailable in the current state"));
+    }
+    if (!initialized_) {
+        if (document_->revision() != expected_project_revision_) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "project changed before speculative acceptance"));
+        }
+    } else if (!matches_snapshot_ignoring_revision(before_)) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "project no longer matches the source snapshot for redo"));
+    }
+    if (auto result = after_.validate(); !result) return result;
+
+    project::ProjectDocument replacement(after_);
+    replacement.revision_ = document_->revision();
+    replacement.bump_revision();
+    document_->swap(replacement);
+    expected_project_revision_ = document_->revision();
+    initialized_ = true;
+    applied_ = true;
+    return core::Result<void>::success();
+}
+
+core::Result<void> ReplaceProjectDocumentCommand::undo() {
+    if (!document_ || !applied_ || expected_project_revision_.exhausted() ||
+        !matches_snapshot_ignoring_revision(after_)) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "speculative result no longer matches the project and cannot be undone"));
+    }
+    project::ProjectDocument replacement(before_);
+    replacement.revision_ = document_->revision();
+    replacement.bump_revision();
+    document_->swap(replacement);
+    expected_project_revision_ = document_->revision();
+    applied_ = false;
+    return core::Result<void>::success();
+}
+
 SetProjectConditionAuthoringCommand::SetProjectConditionAuthoringCommand(
     ProjectCommandAdmission,
     project::ProjectDocument& document,
@@ -307,6 +369,310 @@ core::Result<void> SetProjectConditionAuthoringCommand::undo() {
         ? document_->set_condition_authoring(before_->bytes, before_->digest)
         : document_->erase_condition_authoring_if_revision(expected_project_revision_);
     if (!result) return result;
+    expected_project_revision_ = document_->revision();
+    applied_ = false;
+    return core::Result<void>::success();
+}
+
+SetProjectSpatialFieldCommand::SetProjectSpatialFieldCommand(
+    ProjectCommandAdmission,
+    project::ProjectDocument& document,
+    std::optional<spatial_field::ScalarField2D> before,
+    spatial_field::ScalarField2D after)
+    : document_(&document), before_(std::move(before)), after_(std::move(after)) {}
+
+core::Result<void> SetProjectSpatialFieldCommand::execute() {
+    if (!document_ || applied_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "spatial field command has incomplete or already-applied state"));
+    }
+    const auto current = document_->spatial_fields().find(after_.identity());
+    if (before_.has_value()) {
+        if (current == document_->spatial_fields().end() ||
+            !current->second.same_content(*before_)) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "spatial field changed before the command was applied"));
+        }
+    } else if (current != document_->spatial_fields().end()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "spatial field identity is already active"));
+    }
+
+    spatial_field::ScalarField2D target = after_;
+    if (current != document_->spatial_fields().end()) {
+        auto revised = after_.at_next_revision(current->second.source_revision());
+        if (!revised) return core::Result<void>::failure(revised.error());
+        target = std::move(revised.value());
+    } else {
+        const auto lineage = document_->spatial_field_lineage_.find(after_.identity());
+        if (lineage != document_->spatial_field_lineage_.end()) {
+            auto revised = after_.at_next_revision(lineage->second);
+            if (!revised) return core::Result<void>::failure(revised.error());
+            target = std::move(revised.value());
+        } else if (after_.source_revision() != core::Revision{1U}) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "new spatial field does not begin at source revision one"));
+        }
+    }
+    if (auto result = document_->set_spatial_field(target); !result) return result;
+    after_ = std::move(target);
+    applied_ = true;
+    return core::Result<void>::success();
+}
+
+core::Result<void> SetProjectSpatialFieldCommand::undo() {
+    if (!document_ || !applied_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "spatial field command cannot be undone in the current project revision"));
+    }
+    const auto current = document_->spatial_fields().find(after_.identity());
+    if (current == document_->spatial_fields().end() ||
+        (before_.has_value()
+            ? current->second.serialize() != after_.serialize()
+            : !current->second.same_content(after_))) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "spatial field no longer matches the command being undone"));
+    }
+    if (before_.has_value()) {
+        auto restored = before_->at_next_revision(current->second.source_revision());
+        if (!restored) return core::Result<void>::failure(restored.error());
+        if (auto result = document_->set_spatial_field(restored.value()); !result) return result;
+        before_ = std::move(restored.value());
+    } else {
+        if (auto result = document_->erase_spatial_field_if_revision(
+                after_.identity(), current->second.source_revision()); !result) {
+            return result;
+        }
+    }
+    applied_ = false;
+    return core::Result<void>::success();
+}
+
+SetProjectRoadAuthoringCommand::SetProjectRoadAuthoringCommand(
+    ProjectCommandAdmission,
+    project::ProjectDocument& document,
+    geometry::CurvePath centerline,
+    project::RoadSource road)
+    : document_(&document),
+      authored_centerline_(std::move(centerline)),
+      authored_road_(std::move(road)),
+      expected_project_revision_(document.revision()) {
+    const auto path = document.curve_paths().find(authored_centerline_.source_identity);
+    if (path != document.curve_paths().end()) expected_centerline_ = path->second;
+    const auto source = document.road_sources().find(authored_road_.source_identity);
+    if (source != document.road_sources().end()) expected_road_ = source->second;
+}
+
+core::Result<void> SetProjectRoadAuthoringCommand::execute() {
+    if (!document_ || applied_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "road authoring command has incomplete or already-applied state"));
+    }
+    if (document_->revision() != expected_project_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "road authoring command project revision is stale"));
+    }
+    const auto same_path = [](const auto& left, const auto& right) {
+        return left.has_value() == right.has_value() &&
+            (!left.has_value() || left->serialize() == right->serialize());
+    };
+    const auto same_road = [](const auto& left, const auto& right) {
+        return left.has_value() == right.has_value() &&
+            (!left.has_value() || left->serialize() == right->serialize());
+    };
+    const auto current_path = document_->curve_paths().find(authored_centerline_.source_identity);
+    const auto current_road = document_->road_sources().find(authored_road_.source_identity);
+    const std::optional<geometry::CurvePath> observed_path =
+        current_path == document_->curve_paths().end()
+            ? std::nullopt : std::optional<geometry::CurvePath>{current_path->second};
+    const std::optional<project::RoadSource> observed_road =
+        current_road == document_->road_sources().end()
+            ? std::nullopt : std::optional<project::RoadSource>{current_road->second};
+    if (!same_path(observed_path, expected_centerline_) ||
+        !same_road(observed_road, expected_road_)) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "road or centerline source changed before the command was applied"));
+    }
+    if (authored_road_.centerline_identity != authored_centerline_.source_identity ||
+        (authored_road_.centerline_revision != authored_centerline_.source_revision &&
+            !initialized_)) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "road authoring must bind the supplied centerline identity and revision"));
+    }
+    if (expected_road_.has_value() &&
+        expected_road_->centerline_identity != authored_centerline_.source_identity) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "editing a road centerline association is not supported by this authoring action"));
+    }
+    for (const auto& [identity, road] : document_->road_sources()) {
+        if (road.centerline_identity == authored_centerline_.source_identity &&
+            identity != authored_road_.source_identity) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::unsupported,
+                "centerline editing requires one road source per centerline in this authoring slice"));
+        }
+    }
+
+    project::ProjectDocument candidate(*document_);
+    auto next_revision = [](const auto& lineage, const std::string& identity)
+        -> core::Result<core::Revision> {
+        const auto found = lineage.find(identity);
+        if (found == lineage.end()) {
+            return core::Result<core::Revision>::success(core::Revision{1U});
+        }
+        if (found->second.exhausted()) {
+            return core::Result<core::Revision>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state, "source revision space is exhausted"));
+        }
+        return core::Result<core::Revision>::success(found->second.next());
+    };
+    auto centerline_revision = next_revision(
+        candidate.curve_path_lineage_, authored_centerline_.source_identity);
+    auto road_revision = next_revision(
+        candidate.road_source_lineage_, authored_road_.source_identity);
+    if (!centerline_revision) return core::Result<void>::failure(centerline_revision.error());
+    if (!road_revision) return core::Result<void>::failure(road_revision.error());
+    if (!initialized_ &&
+        (authored_centerline_.source_revision != centerline_revision.value() ||
+         authored_road_.source_revision != road_revision.value())) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "authored curve or road source revision does not match retained lineage"));
+    }
+
+    previous_centerline_ = expected_centerline_;
+    previous_road_ = expected_road_;
+    geometry::CurvePath centerline = authored_centerline_;
+    centerline.source_revision = centerline_revision.value();
+    project::RoadSource road = authored_road_;
+    road.source_revision = road_revision.value();
+    road.centerline_revision = centerline_revision.value();
+    if (auto result = candidate.set_curve_path(centerline); !result) {
+        return core::Result<void>::failure(result.error());
+    }
+    if (auto result = candidate.set_road_source(road); !result) {
+        return core::Result<void>::failure(result.error());
+    }
+    if (document_->revision().exhausted()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state, "project revision space is exhausted"));
+    }
+    candidate.revision_ = document_->revision();
+    candidate.bump_revision();
+    if (auto result = candidate.validate(); !result) return result;
+
+    expected_project_revision_ = candidate.revision();
+    expected_centerline_ = centerline;
+    expected_road_ = road;
+    document_->swap(candidate);
+    initialized_ = true;
+    applied_ = true;
+    return core::Result<void>::success();
+}
+
+core::Result<void> SetProjectRoadAuthoringCommand::undo() {
+    if (!document_ || !applied_ ||
+        document_->revision() != expected_project_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "road authoring command cannot be undone in the current project revision"));
+    }
+    if (!expected_centerline_.has_value() || !expected_road_.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "applied road authoring is missing its current source pair"));
+    }
+    const auto current_path = document_->curve_paths().find(authored_centerline_.source_identity);
+    const auto current_road = document_->road_sources().find(authored_road_.source_identity);
+    if (current_path == document_->curve_paths().end() ||
+        current_road == document_->road_sources().end() ||
+        current_path->second.serialize() != expected_centerline_->serialize() ||
+        current_road->second.serialize() != expected_road_->serialize()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "road authoring sources no longer match the command being undone"));
+    }
+    project::ProjectDocument candidate(*document_);
+    const core::Revision current_centerline_revision = current_path->second.source_revision;
+    const core::Revision current_road_revision = current_road->second.source_revision;
+    if (previous_road_.has_value()) {
+        if (previous_centerline_.has_value()) {
+            const auto curve_lineage = candidate.curve_path_lineage_.find(
+                previous_centerline_->source_identity);
+            if (curve_lineage == candidate.curve_path_lineage_.end() ||
+                curve_lineage->second.exhausted()) {
+                return core::Result<void>::failure(core::Diagnostic(
+                    core::ErrorCode::invalid_state, "curve source revision space is exhausted"));
+            }
+            geometry::CurvePath restored_centerline = *previous_centerline_;
+            restored_centerline.source_revision = curve_lineage->second.next();
+            if (auto result = candidate.set_curve_path(restored_centerline); !result) {
+                return result;
+            }
+            const auto road_lineage = candidate.road_source_lineage_.find(
+                previous_road_->source_identity);
+            if (road_lineage == candidate.road_source_lineage_.end() ||
+                road_lineage->second.exhausted()) {
+                return core::Result<void>::failure(core::Diagnostic(
+                    core::ErrorCode::invalid_state, "road source revision space is exhausted"));
+            }
+            project::RoadSource restored_road = *previous_road_;
+            restored_road.source_revision = road_lineage->second.next();
+            restored_road.centerline_revision = restored_centerline.source_revision;
+            if (auto result = candidate.set_road_source(restored_road); !result) return result;
+            previous_centerline_ = restored_centerline;
+            previous_road_ = restored_road;
+            expected_centerline_ = restored_centerline;
+            expected_road_ = restored_road;
+        } else {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "a road source cannot predate its bound centerline"));
+        }
+    } else {
+        if (auto result = candidate.erase_road_source_if_revision(
+                authored_road_.source_identity, current_road_revision); !result) return result;
+        expected_road_.reset();
+        if (previous_centerline_.has_value()) {
+            const auto curve_lineage = candidate.curve_path_lineage_.find(
+                previous_centerline_->source_identity);
+            if (curve_lineage == candidate.curve_path_lineage_.end() ||
+                curve_lineage->second.exhausted()) {
+                return core::Result<void>::failure(core::Diagnostic(
+                    core::ErrorCode::invalid_state, "curve source revision space is exhausted"));
+            }
+            geometry::CurvePath restored_centerline = *previous_centerline_;
+            restored_centerline.source_revision = curve_lineage->second.next();
+            if (auto result = candidate.set_curve_path(restored_centerline); !result) return result;
+            previous_centerline_ = restored_centerline;
+            expected_centerline_ = restored_centerline;
+        } else {
+            if (auto result = candidate.erase_curve_path_if_revision(
+                    authored_centerline_.source_identity, current_centerline_revision); !result) {
+                return result;
+            }
+            expected_centerline_.reset();
+        }
+    }
+    if (document_->revision().exhausted()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state, "project revision space is exhausted"));
+    }
+    candidate.revision_ = document_->revision();
+    candidate.bump_revision();
+    if (auto result = candidate.validate(); !result) return result;
+    document_->swap(candidate);
     expected_project_revision_ = document_->revision();
     applied_ = false;
     return core::Result<void>::success();

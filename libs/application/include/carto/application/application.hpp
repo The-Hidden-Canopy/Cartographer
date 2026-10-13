@@ -15,6 +15,7 @@
 #include <carto/project/project.hpp>
 #include <carto/production/sculpt_stack.hpp>
 #include <carto/render/render_scene.hpp>
+#include <carto/terrain/terrain_tile.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -30,6 +31,10 @@
 
 namespace carto::ui {
 class UiController;
+}
+
+namespace carto::agent {
+class AgentTask;
 }
 
 namespace carto::application {
@@ -94,6 +99,53 @@ struct SculptLayerView {
     bool visible = true;
     double weight = 1.0;
     std::size_t stroke_count = 0U;
+};
+
+struct SpatialFieldView {
+    std::string identity;
+    spatial_field::FieldSemantic semantic = spatial_field::FieldSemantic::generic;
+    core::Revision source_revision;
+    std::uint32_t width = 0U;
+    std::uint32_t height = 0U;
+    assets::Sha256Digest digest;
+};
+
+struct CurvePathSourceView {
+    std::string identity;
+    core::Revision source_revision;
+    std::size_t segment_count = 0U;
+    assets::Sha256Digest digest;
+};
+
+struct RoadSourceView {
+    std::string identity;
+    core::Revision source_revision;
+    std::string centerline_identity;
+    core::Revision centerline_revision;
+    double width_meters = 0.0;
+    double shoulder_meters = 0.0;
+    double maximum_grade_ratio = 0.0;
+    double minimum_curve_radius_meters = 0.0;
+    project::RoadSurfaceClass surface_class = project::RoadSurfaceClass::asphalt;
+    project::RoadFunctionClass function_class = project::RoadFunctionClass::local;
+    project::RoadAccessState access_state = project::RoadAccessState::open;
+    project::RoadDrainageIntent drainage_intent = project::RoadDrainageIntent::none;
+};
+
+struct SpatialFieldPreview {
+    static constexpr std::uint32_t kMaxPreviewAxis = 32U;
+    std::string identity;
+    spatial_field::FieldSemantic semantic = spatial_field::FieldSemantic::generic;
+    core::Revision source_revision;
+    core::Vec2d origin_uv{};
+    double cell_size = 1.0;
+    double minimum_value = 0.0;
+    double maximum_value = 1.0;
+    std::uint32_t source_width = 0U;
+    std::uint32_t source_height = 0U;
+    std::uint32_t preview_width = 0U;
+    std::uint32_t preview_height = 0U;
+    std::vector<double> values;
 };
 
 // Read-only projection of the DV012 engineering authoring sidecar. The
@@ -181,6 +233,9 @@ struct ApplicationSnapshot {
     ViewportState viewport;
     std::optional<std::uint64_t> sculpt_mesh_asset;
     std::vector<SculptLayerView> sculpt_layers;
+    std::vector<SpatialFieldView> spatial_fields;
+    std::vector<CurvePathSourceView> curve_paths;
+    std::vector<RoadSourceView> road_sources;
     EngineeringAuthoringView engineering;
     ConditionAuthoringView condition;
 };
@@ -321,6 +376,7 @@ struct SelectEdgeAction {
 struct SetObjectTransformAction {
     scene::ObjectId object;
     core::Transform transform;
+    std::optional<core::Revision> expected_project_revision;
 };
 
 struct InvokeToolAction {
@@ -409,6 +465,29 @@ struct InvalidateConditionSourceAction {
     assets::Sha256Digest new_digest;
 };
 
+struct CreateSpatialFieldAction {
+    std::string identity;
+    spatial_field::FieldSemantic semantic = spatial_field::FieldSemantic::generic;
+    core::Vec2d origin_uv{};
+    double cell_size = 1.0;
+    std::uint32_t width = 32U;
+    std::uint32_t height = 32U;
+    double minimum_value = 0.0;
+    double maximum_value = 1.0;
+    double initial_value = 0.0;
+};
+
+struct PaintSpatialFieldAction {
+    std::string identity;
+    spatial_field::FieldBrush brush;
+};
+
+struct SetRoadAuthoringAction {
+    core::Revision expected_project_revision;
+    geometry::CurvePath centerline;
+    project::RoadSource road;
+};
+
 struct UndoAction {};
 struct RedoAction {};
 
@@ -443,6 +522,9 @@ using ApplicationAction = std::variant<
     ImportConditionFixtureAction,
     ImportConditionAuthoringAction,
     InvalidateConditionSourceAction,
+    CreateSpatialFieldAction,
+    PaintSpatialFieldAction,
+    SetRoadAuthoringAction,
     UndoAction,
     RedoAction>;
 
@@ -458,9 +540,12 @@ public:
     [[nodiscard]] static core::Result<DispatchReceipt> commit_preview(
         ApplicationSession& session,
         editor::AuthoringPreview& preview);
+    [[nodiscard]] static core::Result<DispatchReceipt> accept_agent_task(
+        ::carto::agent::AgentTask& task);
 
 private:
     friend class ::carto::ui::UiController;
+    friend class ::carto::agent::AgentTask;
 
     [[nodiscard]] static core::Result<DispatchReceipt> commit_preview(
         ApplicationSession& session,
@@ -484,6 +569,19 @@ public:
     [[nodiscard]] core::Result<editor::AuthoringContext> authoring_context() const;
     [[nodiscard]] core::Result<engineering::AuthoringDocument> engineering_authoring() const;
     [[nodiscard]] core::Result<condition::AuthoringDocument> condition_authoring() const;
+    [[nodiscard]] core::Result<SpatialFieldPreview> spatial_field_preview(
+        std::string_view identity) const;
+    [[nodiscard]] core::Result<terrain::TerrainTileProduct> terrain_tile_preview(
+        std::string_view identity,
+        std::uint32_t lod_step = 1U,
+        double max_navigation_slope_degrees = 35.0,
+        std::optional<double> water_level = std::nullopt) const;
+    [[nodiscard]] core::Result<geometry::CurvePath> curve_path_source(
+        std::string_view identity) const;
+    [[nodiscard]] core::Result<core::Revision> next_curve_path_revision(
+        std::string_view identity) const;
+    [[nodiscard]] core::Result<core::Revision> next_road_source_revision(
+        std::string_view identity) const;
     [[nodiscard]] core::Result<editor::AuthoringPreview> begin_preview(
         editor::PreviewKind kind) const;
     [[nodiscard]] core::Result<DispatchReceipt> commit_preview(
@@ -497,6 +595,8 @@ public:
     [[nodiscard]] core::Result<void> can_close(bool discard_dirty = false) const;
 
 private:
+    friend class ::carto::agent::AgentTask;
+
     [[nodiscard]] core::Result<void> set_workspace(WorkspaceState workspace);
     [[nodiscard]] core::Result<DispatchReceipt> new_project(const NewProjectAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> open_project(const OpenProjectAction& action);
@@ -558,6 +658,12 @@ private:
         const ImportConditionAuthoringAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> invalidate_condition_source(
         const InvalidateConditionSourceAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> create_spatial_field(
+        const CreateSpatialFieldAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> paint_spatial_field(
+        const PaintSpatialFieldAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> set_road_authoring(
+        const SetRoadAuthoringAction& action);
     [[nodiscard]] core::Result<ApplicationAction> preview_action(
         const editor::AuthoringPreview& preview) const;
     [[nodiscard]] core::Result<DispatchReceipt> undo();
@@ -566,6 +672,13 @@ private:
         std::string_view action,
         core::Revision revision_before,
         core::Revision revision_after);
+    [[nodiscard]] core::Result<DispatchReceipt> accept_speculative_result(
+        const project::ProjectDocument& candidate,
+        core::Revision expected_revision,
+        std::string_view task_id,
+        std::string_view diff_digest);
+    struct SpeculativeCopyTag final {};
+    ApplicationSession(const ApplicationSession& source, SpeculativeCopyTag);
     struct PreparedJournal {
         journal::Journal journal;
         bool created_file = false;

@@ -1,4 +1,5 @@
 #include <carto/editor/snap_candidates.hpp>
+#include <carto/project/project.hpp>
 
 #include <cmath>
 #include <cstddef>
@@ -59,6 +60,36 @@ std::uint64_t candidate_id(const SnapCandidate& candidate) {
     return 0U;
 }
 
+core::Vec3d transform_point(const core::Transform& transform, core::Vec3d point) {
+    return transform.translation + transform.rotation.rotate(
+        core::componentwise_multiply(transform.scale, point));
+}
+
+core::Result<bool> effectively_visible(
+    const scene::Scene& source,
+    const scene::SceneObject& object) {
+    const scene::SceneObject* current = &object;
+    std::size_t visited = 0U;
+    while (current != nullptr) {
+        if (!current->visible) {
+            return core::Result<bool>::success(false);
+        }
+        if (!current->parent.has_value()) {
+            return core::Result<bool>::success(true);
+        }
+        if (++visited > source.size()) {
+            return core::Result<bool>::failure(invalid(
+                "scene hierarchy contains a cycle while collecting snap targets"));
+        }
+        current = source.find(*current->parent);
+        if (current == nullptr) {
+            return core::Result<bool>::failure(invalid(
+                "scene hierarchy contains a missing parent while collecting snap targets"));
+        }
+    }
+    return core::Result<bool>::success(true);
+}
+
 } // namespace
 
 core::Result<std::optional<SnapCandidate>> find_snap_candidate(
@@ -79,11 +110,17 @@ core::Result<std::optional<SnapCandidate>> find_snap_candidate(
     return find_snap_candidate(compiled.value(), origin, settings, radius);
 }
 
-core::Result<std::optional<SnapCandidate>> find_snap_candidate(
+namespace {
+
+core::Result<std::optional<SnapCandidate>> find_candidate(
     const geometry::CompiledMesh& mesh,
     core::Vec3d origin,
     const SnapSettings& settings,
-    double radius) {
+    double radius,
+    const core::Transform& transform,
+    std::optional<scene::ObjectId> object,
+    std::optional<std::uint64_t> mesh_asset,
+    core::Revision source_revision) {
     if (auto result = validate_request(origin, settings, radius); !result) {
         return core::Result<std::optional<SnapCandidate>>::failure(result.error());
     }
@@ -94,9 +131,15 @@ core::Result<std::optional<SnapCandidate>> find_snap_candidate(
         return core::Result<std::optional<SnapCandidate>>::failure(
             invalid("compiled snap source is invalid"));
     }
+    if (!transform.finite() || object.has_value() != mesh_asset.has_value() ||
+        (mesh_asset.has_value() && *mesh_asset == 0U)) {
+        return core::Result<std::optional<SnapCandidate>>::failure(
+            invalid("snap candidate transform or scene identity is invalid"));
+    }
 
     std::optional<SnapCandidate> best;
     const auto consider = [&](SnapCandidate candidate) -> core::Result<void> {
+        candidate.position = transform_point(transform, candidate.position);
         if (!candidate.position.finite()) {
             return core::Result<void>::failure(invalid(
                 "snap candidate position is non-finite"));
@@ -108,7 +151,10 @@ core::Result<std::optional<SnapCandidate>> find_snap_candidate(
         }
         if (distance > radius) return core::Result<void>::success();
         candidate.distance = distance;
-        candidate.source_revision = mesh.source_revision;
+        candidate.object = object;
+        candidate.mesh_asset = mesh_asset;
+        candidate.source_revision = source_revision;
+        candidate.mesh_revision = mesh.source_revision;
         const bool closer = !best.has_value() || distance < best->distance;
         const bool tied_and_stable = best.has_value() && distance == best->distance &&
             candidate_id(candidate) < candidate_id(*best);
@@ -181,6 +227,69 @@ core::Result<std::optional<SnapCandidate>> find_snap_candidate(
         }
     }
     return core::Result<std::optional<SnapCandidate>>::success(std::move(best));
+}
+
+} // namespace
+
+core::Result<std::optional<SnapCandidate>> find_snap_candidate(
+    const geometry::CompiledMesh& mesh,
+    core::Vec3d origin,
+    const SnapSettings& settings,
+    double radius) {
+    return find_candidate(mesh, origin, settings, radius, core::Transform::identity(),
+        std::nullopt, std::nullopt, mesh.source_revision);
+}
+
+core::Result<std::vector<SnapCandidate>> find_snap_candidates(
+    const project::ProjectDocument& project,
+    core::Vec3d origin,
+    const SnapSettings& settings,
+    double radius) {
+    if (auto result = validate_request(origin, settings, radius); !result) {
+        return core::Result<std::vector<SnapCandidate>>::failure(result.error());
+    }
+    if (!settings.enabled) {
+        return core::Result<std::vector<SnapCandidate>>::success({});
+    }
+
+    const auto& source_scene = project.scene();
+    const auto& meshes = project.meshes();
+    std::map<std::uint64_t, geometry::CompiledMesh> compiled_meshes;
+    std::vector<SnapCandidate> candidates;
+    for (const auto& object : source_scene.objects_sorted()) {
+        const auto visible = effectively_visible(source_scene, object);
+        if (!visible) {
+            return core::Result<std::vector<SnapCandidate>>::failure(visible.error());
+        }
+        if (!visible.value() || !object.mesh_asset.has_value()) continue;
+
+        const auto mesh = meshes.find(*object.mesh_asset);
+        if (mesh == meshes.end()) {
+            return core::Result<std::vector<SnapCandidate>>::failure(invalid(
+                "scene snap target references a missing mesh asset"));
+        }
+        auto compiled = compiled_meshes.find(*object.mesh_asset);
+        if (compiled == compiled_meshes.end()) {
+            const auto result = mesh->second.compile();
+            if (!result) {
+                return core::Result<std::vector<SnapCandidate>>::failure(result.error());
+            }
+            compiled = compiled_meshes.emplace(*object.mesh_asset, result.value()).first;
+        }
+        const auto transform = source_scene.world_transform(object.id);
+        if (!transform) {
+            return core::Result<std::vector<SnapCandidate>>::failure(transform.error());
+        }
+        auto candidate = find_candidate(compiled->second, origin, settings, radius,
+            transform.value(), object.id, *object.mesh_asset, project.revision());
+        if (!candidate) {
+            return core::Result<std::vector<SnapCandidate>>::failure(candidate.error());
+        }
+        if (candidate.value().has_value()) {
+            candidates.push_back(std::move(*candidate.value()));
+        }
+    }
+    return core::Result<std::vector<SnapCandidate>>::success(std::move(candidates));
 }
 
 } // namespace carto::editor

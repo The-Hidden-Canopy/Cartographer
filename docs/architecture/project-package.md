@@ -20,11 +20,14 @@ Project.carto/
 
 The current repository still treats the versioned text `.carto` file as the
 authoritative versioned save format. Current saves use [project format
-v14](../format/cartographer-project-v14.md), which retains the bounded
+v20](../format/cartographer-project-v20.md), which retains the bounded
 project-bound topology receipt ledger, scientific authoring substrate,
 validated per-mesh attribute/UV payloads, provider-neutral world model,
-material/texture catalog, and stable project source namespace, and adds
-digest-bound engineering and CONDITION source-authoring records.
+material/texture catalog, stable project source namespace, digest-bound
+engineering and CONDITION source-authoring records, authored camera/light
+presentation, revisioned curve/road sources, bounded spatial-field sources,
+and monotonic curve, road, and spatial-field identity lineages including
+deletion tombstones.
 `carto_project::ProjectPackage` now creates and
 validates the human-readable manifest and package directories, while
 `carto_assets` implements the portable content-addressed blob primitive that
@@ -60,7 +63,7 @@ They require a deliberately selected SQLite distribution and
 license/packaging decision; no
 network or private repository is a hidden prerequisite for the headless build.
 
-Until that tranche is accepted, deleting a build cache is safe, but the flat v9
-serializer remains the only supported authoring save format. A package
+Until that tranche is accepted, deleting a build cache is safe, but the flat
+versioned `.carto` serializer remains the only supported authoring save format. A package
 manifest/blob layout is inspectable groundwork, not a migration of existing
 projects and not a claim of SQLite integrity.

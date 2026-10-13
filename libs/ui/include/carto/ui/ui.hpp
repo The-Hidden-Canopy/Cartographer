@@ -2,6 +2,7 @@
 
 #include <carto/ai/ai.hpp>
 #include <carto/application/application.hpp>
+#include <carto/agent/workbench.hpp>
 #include <carto/condition/authoring.hpp>
 #include <carto/core/result.hpp>
 #include <carto/engineering/authoring.hpp>
@@ -413,6 +414,9 @@ struct UiSnapshot : application::ApplicationSnapshot {
     bool ai_available = false;
     bool ai_auto_approve = true;
     std::string ai_status;
+    std::string agent_goal;
+    std::vector<agent::AgentPlanStep> agent_plan_draft;
+    std::optional<agent::AgentTaskSnapshot> agent_task;
 };
 
 [[nodiscard]] UiColorTokens color_tokens(Theme theme) noexcept;
@@ -464,6 +468,11 @@ public:
         const ai::Proposal& proposal);
     [[nodiscard]] core::Result<application::DispatchReceipt> submit_ai_proposal(
         const application::ApplicationAction& action);
+    [[nodiscard]] core::Result<void> queue_agent_step(std::string intent);
+    [[nodiscard]] core::Result<agent::AgentTaskSnapshot> run_agent_plan(std::string goal);
+    [[nodiscard]] core::Result<application::DispatchReceipt> accept_agent_plan();
+    [[nodiscard]] core::Result<void> reject_agent_plan();
+    [[nodiscard]] core::Result<void> clear_agent_plan();
     // Resolves the built-in provider, parses bounded interchange input, and
     // admits the resulting mesh through the same human application boundary
     // used by native modelling controls. Failures never mutate the project.
@@ -559,6 +568,11 @@ private:
     std::unique_ptr<market::MarketLibrary> market_library_;
     MarketView market_view_;
     std::uint64_t next_operation_id_ = 1U;
+    std::vector<agent::AgentPlanStep> agent_plan_draft_;
+    std::optional<core::Revision> agent_plan_base_revision_;
+    std::optional<agent::AgentTask> agent_task_;
+    std::string agent_goal_;
+    std::uint64_t next_agent_task_id_ = 1U;
 };
 
 } // namespace carto::ui

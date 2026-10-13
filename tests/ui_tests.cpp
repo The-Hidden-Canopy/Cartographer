@@ -41,7 +41,7 @@ class TempDirectory final {
 public:
     TempDirectory() {
         const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-        path_ = std::filesystem::temp_directory_path() /
+        path_ = std::filesystem::current_path() /
             ("cartographer-ui-tests-" + std::to_string(stamp));
         std::filesystem::create_directories(path_);
     }
@@ -115,6 +115,40 @@ void ui_routes_authoritative_actions_and_operation_lineage() {
     REQUIRE(ui.handle_shortcut(carto::ui::Shortcut::undo));
     REQUIRE(ui.handle_shortcut(carto::ui::Shortcut::repeat_last_tool));
     REQUIRE(ui.snapshot().operations.back().action == "Invoke Tool: mesh.set-vertex-position");
+}
+
+void ui_routes_spatial_fields_through_the_human_command_boundary() {
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    const carto::application::CreateSpatialFieldAction create{
+        "field.ui.moisture", carto::spatial_field::FieldSemantic::moisture,
+        {0.0, 0.0}, 1.0, 4U, 4U, 0.0, 1.0, 0.0};
+    REQUIRE(!ui.submit_ai_proposal(create));
+    REQUIRE(session.snapshot().spatial_fields.empty());
+    REQUIRE(ui.dispatch(create));
+    auto snapshot = ui.snapshot();
+    REQUIRE(snapshot.spatial_fields.size() == 1U);
+    REQUIRE(snapshot.spatial_fields.front().semantic ==
+        carto::spatial_field::FieldSemantic::moisture);
+    REQUIRE(snapshot.operations.back().category ==
+        carto::ui::OperationCategory::committed_command);
+    REQUIRE(snapshot.operations.back().action == "Create Spatial Field");
+
+    carto::spatial_field::FieldBrush brush;
+    brush.expected_revision = snapshot.spatial_fields.front().source_revision;
+    brush.center_uv = {1.5, 1.5};
+    brush.radius = 2.0;
+    brush.value = 0.6;
+    brush.strength = 1.0;
+    REQUIRE(ui.dispatch(carto::application::PaintSpatialFieldAction{
+        "field.ui.moisture", brush}));
+    snapshot = ui.snapshot();
+    const auto painted_revision = snapshot.spatial_fields.front().source_revision;
+    if (painted_revision != carto::core::Revision{2U}) {
+        throw TestFailure("spatial field paint expected source revision 2, found " +
+            std::to_string(painted_revision.value()));
+    }
+    REQUIRE(snapshot.operations.back().action == "Paint Spatial Field");
 }
 
 void ui_distinguishes_unsaved_from_saved_state() {
@@ -434,7 +468,7 @@ void ui_connects_surface_fidelity_preview_without_authoring_mutation() {
 
     REQUIRE(ui.dispatch(carto::application::SetObjectTransformAction{
         object, carto::core::Transform{{1.0, 0.0, 0.0}, carto::core::Quaternion::identity(),
-                                       {1.0, 1.0, 1.0}}}));
+                                       {1.0, 1.0, 1.0}}, std::nullopt}));
     preview = ui.snapshot().surface_fidelity;
     REQUIRE(preview.status == carto::ui::SurfaceFidelityStatus::stale);
     REQUIRE(!preview.admitted);
@@ -1184,6 +1218,7 @@ int main() {
     try {
         preferences_validate_shell_invariants();
         ui_routes_authoritative_actions_and_operation_lineage();
+        ui_routes_spatial_fields_through_the_human_command_boundary();
         ui_distinguishes_unsaved_from_saved_state();
         ui_rejects_unadmitted_ai_proposals();
         ui_routes_edge_selection_without_authoring_mutation();

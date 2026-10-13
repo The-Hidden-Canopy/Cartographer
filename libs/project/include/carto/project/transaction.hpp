@@ -58,6 +58,20 @@ public:
         scientific::ScientificModel model);
     [[nodiscard]] core::Result<void> set_world_model(world::WorldModel model);
     [[nodiscard]] core::Result<void> set_material_catalog(MaterialCatalog catalog);
+    [[nodiscard]] core::Result<void> set_presentation_catalog(PresentationCatalog catalog);
+    [[nodiscard]] core::Result<void> set_curve_path(geometry::CurvePath path);
+    [[nodiscard]] core::Result<void> erase_curve_path(
+        std::string identity,
+        core::Revision expected_source_revision);
+    [[nodiscard]] core::Result<void> set_road_source(RoadSource road);
+    [[nodiscard]] core::Result<void> erase_road_source(
+        std::string identity,
+        core::Revision expected_source_revision);
+    [[nodiscard]] core::Result<void> set_spatial_field(
+        spatial_field::ScalarField2D field);
+    [[nodiscard]] core::Result<void> erase_spatial_field(
+        std::string identity,
+        core::Revision expected_source_revision);
     [[nodiscard]] core::Result<void> set_semantic_sidecar(
         std::string serialized_sidecar,
         assets::Sha256Digest digest);
