@@ -2,7 +2,9 @@
 
 #include <carto/ai/ai.hpp>
 #include <carto/application/application.hpp>
+#include <carto/condition/authoring.hpp>
 #include <carto/core/result.hpp>
+#include <carto/engineering/authoring.hpp>
 #include <carto/market/market.hpp>
 #include <carto/surface/core.hpp>
 
@@ -68,6 +70,8 @@ enum class OperatorMode {
 enum class Workspace {
     model,
     sculpt,
+    engineering,
+    condition,
     cad,
     build,
     material,
@@ -466,6 +470,26 @@ public:
     [[nodiscard]] core::Result<MeshImportReceipt> import_mesh(
         const std::filesystem::path& path,
         MeshImportFormat format);
+    [[nodiscard]] core::Result<application::DispatchReceipt> import_engineering_fixture();
+    [[nodiscard]] core::Result<application::DispatchReceipt> invalidate_engineering_source(
+        engineering::Id source_id,
+        std::string new_revision,
+        assets::Sha256Digest new_digest);
+    [[nodiscard]] core::Result<engineering::InspectionPackage>
+    build_engineering_package() const;
+    [[nodiscard]] core::Result<engineering::VantaAdmissionResult>
+    admit_engineering_package() const;
+    [[nodiscard]] core::Result<void> publish_engineering_package(
+        const std::filesystem::path& path) const;
+    [[nodiscard]] core::Result<application::DispatchReceipt> import_condition_fixture();
+    [[nodiscard]] core::Result<application::DispatchReceipt> invalidate_condition_source(
+        condition::Id source_id,
+        std::string new_revision,
+        assets::Sha256Digest new_digest);
+    [[nodiscard]] core::Result<condition::Package> build_condition_package() const;
+    [[nodiscard]] core::Result<condition::AdmissionResult> admit_condition_package() const;
+    [[nodiscard]] core::Result<void> publish_condition_package(
+        const std::filesystem::path& path) const;
     // Connects the native shell to a local, provider-neutral market library.
     // Refresh and install revalidate package contents and receipts; no network
     // or executable package path is reachable through this controller.

@@ -860,6 +860,8 @@ struct NativeSculptStrokeCapture {
 
 enum class FileDialogKind {
     project,
+    engineering,
+    condition,
     market_package,
     mesh_import,
     gltf,
@@ -916,6 +918,18 @@ enum class StandardMeshExport {
     case FileDialogKind::project:
         dialog.lpstrFilter = L"Cartographer Project (*.carto)\0*.carto\0All Files\0*.*\0";
         dialog.lpstrDefExt = L"carto";
+        break;
+    case FileDialogKind::engineering:
+        dialog.lpstrFilter =
+            L"Cartographer Inspection Package (*.carto-inspection)\0*.carto-inspection\0"
+            L"All Files\0*.*\0";
+        dialog.lpstrDefExt = L"carto-inspection";
+        break;
+    case FileDialogKind::condition:
+        dialog.lpstrFilter =
+            L"Cartographer CONDITION Package (*.carto-condition)\0*.carto-condition\0"
+            L"All Files\0*.*\0";
+        dialog.lpstrDefExt = L"carto-condition";
         break;
     }
     dialog.nFilterIndex = 1;
@@ -1399,6 +1413,38 @@ struct DesktopState {
             installed.value().listing_version_id + " into the local data-only library.";
         action_feedback_error = false;
         surface = ShellSurface::market;
+    }
+
+    void publish_engineering_package() {
+        const auto path = choose_file(true, FileDialogKind::engineering);
+        if (!path.has_value()) return;
+        const auto published = ui.publish_engineering_package(*path);
+        if (!published) {
+            action_feedback = published.error().message;
+            action_feedback_error = true;
+            return;
+        }
+        const auto package = ui.build_engineering_package();
+        action_feedback = "Published immutable inspection package " +
+            (package ? package.value().publication_digest.hex() : std::string{"unknown"}) +
+            " to " + path->filename().string() + ".";
+        action_feedback_error = false;
+    }
+
+    void publish_condition_package() {
+        const auto path = choose_file(true, FileDialogKind::condition);
+        if (!path.has_value()) return;
+        const auto published = ui.publish_condition_package(*path);
+        if (!published) {
+            action_feedback = published.error().message;
+            action_feedback_error = true;
+            return;
+        }
+        const auto package = ui.build_condition_package();
+        action_feedback = "Published admitted CONDITION source package " +
+            (package ? package.value().publication_digest.hex() : std::string{"unknown"}) +
+            " to " + path->filename().string() + ".";
+        action_feedback_error = false;
     }
 
     bool route_native_key(const carto::ui::NativeKeyEvent& event) {
@@ -2754,6 +2800,7 @@ struct DesktopState {
                     action_feedback = "Local market library refreshed.";
                     action_feedback_error = false;
                 }
+
             }
             const bool preparation_active = preparation_job != nullptr &&
                 !carto::production::preparation_job_state_is_terminal(
@@ -3917,6 +3964,118 @@ struct DesktopState {
         end_instrument(carto::ui::WorkbenchInstrument::draft, workbench.draft);
     }
 
+    void draw_engineering_instrument(const UiSnapshot& snapshot) {
+        if (!begin_instrument(snapshot, carto::ui::WorkbenchInstrument::references,
+                              "Engineering", workbench.references, ImVec2(250, 90),
+                              ImVec2(390, 430), snapshot.colors.accent_primary)) return;
+        ImGui::TextDisabled("DV012 authoring boundary");
+        ImGui::TextWrapped(
+            "Engineering records stay authoritative in the project. The panel exposes only "
+            "validated evidence and an immutable package handoff.");
+        ImGui::Separator();
+        if (!snapshot.engineering.present) {
+            ImGui::TextDisabled("No engineering authoring is loaded.");
+            if (ImGui::Button("Load DV012 fixture", ImVec2(-1, 30))) {
+                static_cast<void>(dispatch(
+                    carto::application::ImportEngineeringFixtureAction{}));
+            }
+        } else {
+            const auto& engineering = snapshot.engineering;
+            ImGui::Text("Sources %zu  ·  Parts %zu  ·  Occurrences %zu",
+                        engineering.source_count, engineering.part_count,
+                        engineering.occurrence_count);
+            ImGui::Text("Topology %zu  ·  BOM %zu  ·  Requirements %zu",
+                        engineering.topology_count, engineering.bom_count,
+                        engineering.requirement_count);
+            ImGui::Text("Characteristics %zu  ·  Targets %zu",
+                        engineering.characteristic_count, engineering.target_count);
+            ImGui::Text("Derived products %zu  ·  %s",
+                        engineering.derived_product_count,
+                        engineering.workcell_present ? "Workcell bound" : "Workcell missing");
+            if (engineering.path_present) ImGui::TextDisabled("Inspection path record present");
+            if (!engineering.digest.is_zero()) {
+                mono_text_disabled(("Authoring " + engineering.digest.hex()).c_str());
+            }
+            const ImVec4 status_color = engineering.vanta_admissible
+                ? color(snapshot.colors.semantic_success)
+                : engineering.publication_ready
+                    ? color(snapshot.colors.semantic_warning)
+                    : color(snapshot.colors.semantic_error);
+            ImGui::TextColored(status_color, "%s", engineering.status.c_str());
+            ImGui::Spacing();
+            if (ImGui::Button("Publish .carto-inspection...", ImVec2(-1, 30))) {
+                publish_engineering_package();
+            }
+            if (ImGui::Button("Re-import fixture", ImVec2(-1, 30))) {
+                static_cast<void>(dispatch(
+                    carto::application::ImportEngineeringFixtureAction{}));
+            }
+        }
+        if (!action_feedback.empty()) {
+            ImGui::Separator();
+            draw_action_feedback(snapshot);
+        }
+        end_instrument(carto::ui::WorkbenchInstrument::references, workbench.references);
+    }
+
+    void draw_condition_instrument(const UiSnapshot& snapshot) {
+        if (!begin_instrument(snapshot, carto::ui::WorkbenchInstrument::references,
+                              "CONDITION", workbench.references, ImVec2(250, 90),
+                              ImVec2(390, 430), snapshot.colors.accent_primary)) return;
+        ImGui::TextDisabled("Source authoring boundary");
+        ImGui::TextWrapped(
+            "The project stores source-derived CONDITION records. Runtime condition and "
+            "game-owned state remain outside this package.");
+        ImGui::Separator();
+        if (!snapshot.condition.present) {
+            ImGui::TextDisabled("No CONDITION source authoring is loaded.");
+            if (ImGui::Button("Load CONDITION fixture", ImVec2(-1, 30))) {
+                static_cast<void>(dispatch(
+                    carto::application::ImportConditionFixtureAction{}));
+            }
+        } else {
+            const auto& condition = snapshot.condition;
+            ImGui::Text("Sources %zu  ·  Assets %zu  ·  Safe places %zu",
+                        condition.source_count, condition.asset_count,
+                        condition.safe_place_count);
+            ImGui::Text("Familiarity %zu  ·  Views %zu  ·  Variants %zu",
+                        condition.familiarity_count, condition.view_condition_count,
+                        condition.variant_count);
+            ImGui::Text("Temporal packages %zu  ·  Surface states %zu",
+                        condition.temporal_package_count, condition.surface_state_count);
+            ImGui::Text("Anchors %zu  ·  Collections %zu  ·  Prefabs %zu",
+                        condition.interaction_anchor_count, condition.collection_count,
+                        condition.prefab_count);
+            ImGui::Text("Region kits %zu", condition.region_kit_count);
+            if (!condition.digest.is_zero()) {
+                mono_text_disabled(("Authoring " + condition.digest.hex()).c_str());
+            }
+            const ImVec4 status_color = condition.consumer_admissible
+                ? color(snapshot.colors.semantic_success)
+                : condition.publication_ready
+                    ? color(snapshot.colors.semantic_warning)
+                    : color(snapshot.colors.semantic_error);
+            ImGui::TextColored(status_color, "%s", condition.status.c_str());
+            if (condition.stale) {
+                ImGui::TextColored(color(snapshot.colors.semantic_error),
+                                   "Source drift is recorded; package publication is blocked.");
+            }
+            ImGui::Spacing();
+            if (ImGui::Button("Publish .carto-condition...", ImVec2(-1, 30))) {
+                publish_condition_package();
+            }
+            if (ImGui::Button("Re-import fixture", ImVec2(-1, 30))) {
+                static_cast<void>(dispatch(
+                    carto::application::ImportConditionFixtureAction{}));
+            }
+        }
+        if (!action_feedback.empty()) {
+            ImGui::Separator();
+            draw_action_feedback(snapshot);
+        }
+        end_instrument(carto::ui::WorkbenchInstrument::references, workbench.references);
+    }
+
     void draw_workbench_instruments(const UiSnapshot& snapshot) {
         if (workbench.scene) draw_scene_instrument(snapshot);
         if (workbench.tools) draw_tools_instrument(snapshot);
@@ -3936,7 +4095,11 @@ struct DesktopState {
             snapshot, carto::ui::WorkbenchInstrument::layers, "Layers", workbench.layers,
             ImVec2(135, 330), ImVec2(280, 190),
             "Layer rack", "Layer visibility and ordering are reserved for a future governed workspace layer.");
-        if (workbench.references) draw_placeholder_instrument(
+        if (snapshot.workspace_kind == carto::ui::Workspace::engineering) {
+            if (workbench.references) draw_engineering_instrument(snapshot);
+        } else if (snapshot.workspace_kind == carto::ui::Workspace::condition) {
+            if (workbench.references) draw_condition_instrument(snapshot);
+        } else if (workbench.references) draw_placeholder_instrument(
             snapshot, carto::ui::WorkbenchInstrument::references, "References", workbench.references,
             ImVec2(250, 430), ImVec2(300, 185),
             "Reference rack", "Reference drawings remain an explicit future input boundary.");
@@ -4437,6 +4600,16 @@ struct DesktopState {
             *previous_workspace_kind != snapshot.workspace_kind) {
             if (snapshot.workspace_kind == carto::ui::Workspace::sculpt) {
                 workbench.tools = true;
+            } else if (snapshot.workspace_kind == carto::ui::Workspace::engineering) {
+                workbench.scene = true;
+                workbench.references = true;
+                workbench.inspector = false;
+                workbench.tools = false;
+            } else if (snapshot.workspace_kind == carto::ui::Workspace::condition) {
+                workbench.scene = true;
+                workbench.references = true;
+                workbench.inspector = false;
+                workbench.tools = false;
             }
             previous_workspace_kind = snapshot.workspace_kind;
         }

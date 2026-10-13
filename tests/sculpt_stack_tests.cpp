@@ -335,7 +335,7 @@ void transaction_persists_stack_and_requires_expected_digest_for_updates() {
 
     const auto saved = document.save_atomic(directory.path() / "sculpt.carto");
     REQUIRE(saved);
-    REQUIRE(saved.value().schema_version == 13U);
+    REQUIRE(saved.value().schema_version == project::ProjectDocument::kSchemaVersion);
     const auto reopened = project::ProjectDocument::load(directory.path() / "sculpt.carto");
     REQUIRE(reopened);
     REQUIRE(reopened.value().sculpt_stacks().contains(mesh_asset));
@@ -357,10 +357,12 @@ void transaction_persists_stack_and_requires_expected_digest_for_updates() {
     REQUIRE(!project::ProjectDocument::deserialize(corrupt_project));
 
     std::string mislabeled_v10 = reopened.value().serialize();
-    constexpr std::string_view schema_v13 = "CARTOGRAPHER_PROJECT 13\n";
+    const std::string current_schema =
+        "CARTOGRAPHER_PROJECT " +
+        std::to_string(project::ProjectDocument::kSchemaVersion) + "\n";
     constexpr std::string_view schema_v10 = "CARTOGRAPHER_PROJECT 10\n";
-    REQUIRE(mislabeled_v10.starts_with(schema_v13));
-    mislabeled_v10.replace(0U, schema_v13.size(), schema_v10);
+    REQUIRE(mislabeled_v10.starts_with(current_schema));
+    mislabeled_v10.replace(0U, current_schema.size(), schema_v10);
     constexpr std::string_view cloth_receipt_table = "CLOTH_REST_POSE_RECEIPTS 0\n";
     const std::size_t cloth_receipts = mislabeled_v10.find(cloth_receipt_table);
     REQUIRE(cloth_receipts != std::string::npos);

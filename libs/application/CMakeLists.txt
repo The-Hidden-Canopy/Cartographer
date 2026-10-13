@@ -11,6 +11,8 @@ target_include_directories(carto_application
 target_link_libraries(carto_application
     PUBLIC
         carto_core
+        carto_condition_authoring
+        carto_engineering
         carto_geometry
         carto_journal
         carto_project

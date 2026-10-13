@@ -66,6 +66,10 @@ constexpr std::uint64_t kMaxSerializedSemanticSidecarBytes = 16ULL * 1024ULL * 1
 constexpr std::uint64_t kMaxSerializedSculptStackBytes = 16ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaxSerializedGarmentAssetBytes = 16ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaxSerializedClothRestPoseReceiptBytes = 16ULL * 1024ULL;
+constexpr std::uint64_t kMaxSerializedEngineeringAuthoringBytes =
+    32ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaxSerializedConditionAuthoringBytes =
+    32ULL * 1024ULL * 1024ULL;
 std::mutex g_project_save_mutex;
 std::atomic<std::uint64_t> g_project_temp_counter{0U};
 std::atomic<std::uint64_t> g_project_namespace_counter{0U};
@@ -946,6 +950,112 @@ core::Result<void> ProjectDocument::set_cloth_rest_pose_receipt(
     return core::Result<void>::success();
 }
 
+core::Result<void> ProjectDocument::set_engineering_authoring(
+    std::string serialized_authoring,
+    assets::Sha256Digest digest) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (serialized_authoring.empty() ||
+        serialized_authoring.size() > kMaxSerializedEngineeringAuthoringBytes ||
+        digest.is_zero()) {
+        return core::Result<void>::failure(invalid(
+            "engineering authoring bytes or digest are outside the supported bounds"));
+    }
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(serialized_authoring.data());
+    if (assets::sha256(std::span<const std::uint8_t>(bytes, serialized_authoring.size())) != digest) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::validation_failed,
+            "engineering authoring digest does not bind the serialized bytes"));
+    }
+    const auto decoded = engineering::AuthoringDocument::deserialize(serialized_authoring);
+    if (!decoded) {
+        return core::Result<void>::failure(decoded.error().with_context(
+            "engineering authoring admission"));
+    }
+    if (engineering_authoring_.has_value() &&
+        engineering_authoring_->bytes == serialized_authoring &&
+        engineering_authoring_->digest == digest) {
+        return core::Result<void>::success();
+    }
+    engineering_authoring_ = SerializedEngineeringAuthoring{
+        std::move(serialized_authoring), digest};
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::erase_engineering_authoring_if_revision(
+    core::Revision expected_revision) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (revision_ != expected_revision) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::stale_data,
+            "engineering authoring removal revision does not match the current project"));
+    }
+    if (!engineering_authoring_.has_value()) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::not_found, "project engineering authoring does not exist"));
+    }
+    engineering_authoring_.reset();
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::set_condition_authoring(
+    std::string serialized_authoring,
+    assets::Sha256Digest digest) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (serialized_authoring.empty() ||
+        serialized_authoring.size() > kMaxSerializedConditionAuthoringBytes ||
+        digest.is_zero()) {
+        return core::Result<void>::failure(invalid(
+            "CONDITION authoring bytes or digest are outside the supported bounds"));
+    }
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(serialized_authoring.data());
+    if (assets::sha256(std::span<const std::uint8_t>(bytes, serialized_authoring.size())) != digest) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::validation_failed,
+            "CONDITION authoring digest does not bind the serialized bytes"));
+    }
+    const auto decoded = condition::AuthoringDocument::deserialize(serialized_authoring);
+    if (!decoded) {
+        return core::Result<void>::failure(decoded.error().with_context(
+            "CONDITION authoring admission"));
+    }
+    if (condition_authoring_.has_value() &&
+        condition_authoring_->bytes == serialized_authoring &&
+        condition_authoring_->digest == digest) {
+        return core::Result<void>::success();
+    }
+    condition_authoring_ = SerializedConditionAuthoring{
+        std::move(serialized_authoring), digest};
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::erase_condition_authoring_if_revision(
+    core::Revision expected_revision) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (revision_ != expected_revision) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::stale_data,
+            "CONDITION authoring removal revision does not match the current project"));
+    }
+    if (!condition_authoring_.has_value()) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::not_found, "project CONDITION authoring does not exist"));
+    }
+    condition_authoring_.reset();
+    bump_revision();
+    return core::Result<void>::success();
+}
+
 core::Result<void> ProjectDocument::set_object_transform(
     scene::ObjectId object,
     core::Transform transform) {
@@ -1113,6 +1223,46 @@ core::Result<void> ProjectDocument::validate() const {
                 "cloth rest-pose receipt digest does not bind its serialized bytes"));
         }
     }
+    if (engineering_authoring_.has_value()) {
+        const auto& authoring = *engineering_authoring_;
+        if (authoring.bytes.empty() ||
+            authoring.bytes.size() > kMaxSerializedEngineeringAuthoringBytes ||
+            authoring.digest.is_zero()) {
+            return core::Result<void>::failure(parse_error(
+                "project engineering authoring bytes or digest are outside the serialized bounds"));
+        }
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(authoring.bytes.data());
+        if (assets::sha256(std::span<const std::uint8_t>(bytes, authoring.bytes.size())) !=
+            authoring.digest) {
+            return core::Result<void>::failure(parse_error(
+                "project engineering authoring digest does not bind its bytes"));
+        }
+        const auto decoded = engineering::AuthoringDocument::deserialize(authoring.bytes);
+        if (!decoded) {
+            return core::Result<void>::failure(decoded.error().with_context(
+                "project engineering authoring"));
+        }
+    }
+    if (condition_authoring_.has_value()) {
+        const auto& authoring = *condition_authoring_;
+        if (authoring.bytes.empty() ||
+            authoring.bytes.size() > kMaxSerializedConditionAuthoringBytes ||
+            authoring.digest.is_zero()) {
+            return core::Result<void>::failure(parse_error(
+                "project CONDITION authoring bytes or digest are outside the serialized bounds"));
+        }
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(authoring.bytes.data());
+        if (assets::sha256(std::span<const std::uint8_t>(bytes, authoring.bytes.size())) !=
+            authoring.digest) {
+            return core::Result<void>::failure(parse_error(
+                "project CONDITION authoring digest does not bind its bytes"));
+        }
+        const auto decoded = condition::AuthoringDocument::deserialize(authoring.bytes);
+        if (!decoded) {
+            return core::Result<void>::failure(decoded.error().with_context(
+                "project CONDITION authoring"));
+        }
+    }
     if (auto result = world_model_.validate(); !result) {
         return core::Result<void>::failure(result.error().with_context(
             "project world model"));
@@ -1191,6 +1341,8 @@ void ProjectDocument::swap(ProjectDocument& other) noexcept {
     sculpt_stacks_.swap(other.sculpt_stacks_);
     garment_assets_.swap(other.garment_assets_);
     cloth_rest_pose_receipts_.swap(other.cloth_rest_pose_receipts_);
+    std::swap(engineering_authoring_, other.engineering_authoring_);
+    std::swap(condition_authoring_, other.condition_authoring_);
     std::swap(evaluation_graph_digest_, other.evaluation_graph_digest_);
     std::swap(next_mesh_id_, other.next_mesh_id_);
     std::swap(revision_, other.revision_);
@@ -1303,6 +1455,16 @@ std::string ProjectDocument::serialize() const {
     for (const auto& [mesh_asset, receipt] : cloth_rest_pose_receipts_) {
         output << "CLOTH_REST_POSE_RECEIPT " << mesh_asset << ' '
                << receipt.digest.hex() << ' ' << std::quoted(receipt.bytes) << '\n';
+    }
+    if (engineering_authoring_.has_value()) {
+        output << "ENGINEERING_AUTHORING " << engineering_authoring_->digest.hex() << ' '
+               << std::quoted(engineering_authoring_->bytes) << '\n';
+    }
+    if (condition_authoring_.has_value()) {
+        output << "CONDITION_AUTHORING " << condition_authoring_->digest.hex() << ' '
+               << std::quoted(condition_authoring_->bytes) << '\n';
+    } else {
+        output << "CONDITION_AUTHORING NONE\n";
     }
     output << "END\n";
     return output.str();
@@ -2114,6 +2276,88 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
     if (version.value() >= 13U && !cloth_rest_pose_receipts_seen) {
         return core::Result<ProjectDocument>::failure(parse_error(
             "project schema v13 is missing its cloth rest-pose receipt record"));
+    }
+    if (terminal_record == "ENGINEERING_AUTHORING") {
+        if (version.value() < 14U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "engineering authoring records require project schema version 14"));
+        }
+        std::string encoded_digest;
+        std::string encoded_authoring;
+        if (!(input >> encoded_digest >> std::quoted(encoded_authoring))) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project engineering authoring record is invalid"));
+        }
+        if (encoded_authoring.empty() ||
+            encoded_authoring.size() > kMaxSerializedEngineeringAuthoringBytes) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project engineering authoring record exceeds its size limit"));
+        }
+        const auto digest = assets::Sha256Digest::from_hex(encoded_digest);
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(encoded_authoring.data());
+        if (!digest || digest.value().is_zero() ||
+            assets::sha256(std::span<const std::uint8_t>(
+                bytes, encoded_authoring.size())) != digest.value()) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project engineering authoring digest does not bind its bytes"));
+        }
+        const auto decoded = engineering::AuthoringDocument::deserialize(encoded_authoring);
+        if (!decoded) {
+            return core::Result<ProjectDocument>::failure(decoded.error().with_context(
+                "serialized engineering authoring"));
+        }
+        document.engineering_authoring_ = SerializedEngineeringAuthoring{
+            std::move(encoded_authoring), digest.value()};
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(
+                parse_error("project is missing its terminal record"));
+        }
+    }
+    bool condition_authoring_seen = false;
+    if (terminal_record == "CONDITION_AUTHORING") {
+        if (version.value() < 14U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "CONDITION authoring records require project schema version 14"));
+        }
+        condition_authoring_seen = true;
+        std::string encoded_digest;
+        if (!(input >> encoded_digest)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project CONDITION authoring record is invalid"));
+        }
+        if (encoded_digest != "NONE") {
+            std::string encoded_authoring;
+            if (!(input >> std::quoted(encoded_authoring)) || encoded_authoring.empty() ||
+                encoded_authoring.size() > kMaxSerializedConditionAuthoringBytes) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project CONDITION authoring record exceeds its size limit"));
+            }
+            const auto digest = assets::Sha256Digest::from_hex(encoded_digest);
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(encoded_authoring.data());
+            if (!digest || digest.value().is_zero() ||
+                assets::sha256(std::span<const std::uint8_t>(
+                    bytes, encoded_authoring.size())) != digest.value()) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project CONDITION authoring digest does not bind its bytes"));
+            }
+            const auto decoded = condition::AuthoringDocument::deserialize(encoded_authoring);
+            if (!decoded) {
+                return core::Result<ProjectDocument>::failure(decoded.error().with_context(
+                    "serialized CONDITION authoring"));
+            }
+            document.condition_authoring_ = SerializedConditionAuthoring{
+                std::move(encoded_authoring), digest.value()};
+        }
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(
+                parse_error("project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 14U && !condition_authoring_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v14 is missing its CONDITION authoring record"));
     }
     if (terminal_record != "END") {
         return core::Result<ProjectDocument>::failure(

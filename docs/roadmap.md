@@ -22,6 +22,8 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] v7 project format with v1-v6 readability, five provider-neutral world primitives, deterministic nested persistence, journaled replacement, and dangling authoring-binding rejection
 - [x] v8 project format with v1-v7 readability and durable material, texture, sampler, variant, and material-region assignment authoring truth
 - [x] v9 project format with v1-v8 migration and a durable source namespace that prevents same-name projects from colliding at destination mappings
+- [x] v14 project format with v1-v13 compatibility and digest-bound engineering and CONDITION source-authoring sidecars
+- [x] fixture-backed source-authoring vertical slices for CONDITION and DV012 engineering, with project-command history, native workspace projections, and admitted package handoffs
 - [x] neutral preparation v1 with saved profiles, explicit asset/selection/assembly/scene scope, scoped material and texture closure, deterministic envelopes, cancellation, atomic compare-and-swap publication, CLI/desktop routing, and last-valid recovery
 - [x] OBJ import/export with explicit feature-loss warnings
 - [x] bounded ASCII PLY and binary/ASCII STL interchange with explicit feature-loss warnings

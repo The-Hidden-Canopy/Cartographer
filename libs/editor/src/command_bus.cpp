@@ -190,6 +190,128 @@ core::Result<void> SetProjectSculptStackCommand::undo() {
     return core::Result<void>::success();
 }
 
+SetProjectEngineeringAuthoringCommand::SetProjectEngineeringAuthoringCommand(
+    ProjectCommandAdmission,
+    project::ProjectDocument& document,
+    std::optional<project::SerializedEngineeringAuthoring> before,
+    project::SerializedEngineeringAuthoring after)
+    : document_(&document),
+      before_(std::move(before)),
+      after_(std::move(after)),
+      expected_project_revision_(document.revision()) {}
+
+core::Result<void> SetProjectEngineeringAuthoringCommand::execute() {
+    if (!document_ || applied_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "engineering authoring command has incomplete or already-applied state"));
+    }
+    if (document_->revision() != expected_project_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "engineering authoring command revision no longer matches the project"));
+    }
+    const auto& current = document_->engineering_authoring();
+    if (current != before_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "engineering authoring changed before the command was applied"));
+    }
+    if (auto result = document_->set_engineering_authoring(after_.bytes, after_.digest);
+        !result) {
+        return result;
+    }
+    if (document_->revision() == expected_project_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "engineering authoring command did not change the project"));
+    }
+    expected_project_revision_ = document_->revision();
+    applied_ = true;
+    return core::Result<void>::success();
+}
+
+core::Result<void> SetProjectEngineeringAuthoringCommand::undo() {
+    if (!document_ || !applied_ || document_->revision() != expected_project_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "engineering authoring command cannot be undone in the current revision"));
+    }
+    const auto& current = document_->engineering_authoring();
+    if (!current.has_value() || *current != after_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "engineering authoring no longer matches the command being undone"));
+    }
+    core::Result<void> result = before_.has_value()
+        ? document_->set_engineering_authoring(before_->bytes, before_->digest)
+        : document_->erase_engineering_authoring_if_revision(expected_project_revision_);
+    if (!result) return result;
+    expected_project_revision_ = document_->revision();
+    applied_ = false;
+    return core::Result<void>::success();
+}
+
+SetProjectConditionAuthoringCommand::SetProjectConditionAuthoringCommand(
+    ProjectCommandAdmission,
+    project::ProjectDocument& document,
+    std::optional<project::SerializedConditionAuthoring> before,
+    project::SerializedConditionAuthoring after)
+    : document_(&document),
+      before_(std::move(before)),
+      after_(std::move(after)),
+      expected_project_revision_(document.revision()) {}
+
+core::Result<void> SetProjectConditionAuthoringCommand::execute() {
+    if (!document_ || applied_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "CONDITION authoring command has incomplete or already-applied state"));
+    }
+    if (document_->revision() != expected_project_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "CONDITION authoring command revision no longer matches the project"));
+    }
+    if (document_->condition_authoring() != before_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "CONDITION authoring changed before the command was applied"));
+    }
+    if (auto result = document_->set_condition_authoring(after_.bytes, after_.digest);
+        !result) {
+        return result;
+    }
+    if (document_->revision() == expected_project_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "CONDITION authoring command did not change the project"));
+    }
+    expected_project_revision_ = document_->revision();
+    applied_ = true;
+    return core::Result<void>::success();
+}
+
+core::Result<void> SetProjectConditionAuthoringCommand::undo() {
+    if (!document_ || !applied_ || document_->revision() != expected_project_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "CONDITION authoring command cannot be undone in the current revision"));
+    }
+    if (document_->condition_authoring() != std::optional<project::SerializedConditionAuthoring>{after_}) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "CONDITION authoring no longer matches the command being undone"));
+    }
+    core::Result<void> result = before_.has_value()
+        ? document_->set_condition_authoring(before_->bytes, before_->digest)
+        : document_->erase_condition_authoring_if_revision(expected_project_revision_);
+    if (!result) return result;
+    expected_project_revision_ = document_->revision();
+    applied_ = false;
+    return core::Result<void>::success();
+}
+
 SetVertexPositionCommand::SetVertexPositionCommand(
     geometry::EditableMesh& mesh,
     geometry::VertexId vertex,

@@ -1,6 +1,8 @@
 #include <carto/production/bake_graph.hpp>
 #include <carto/biological/authoring.hpp>
 #include <carto/production_authoring/authoring.hpp>
+#include <carto/condition/authoring.hpp>
+#include <carto/engineering/authoring.hpp>
 #include <carto/production/preparation_operation.hpp>
 #include <carto/production/preparation_job.hpp>
 #include <carto/project/project.hpp>
@@ -14,6 +16,18 @@
 #include <span>
 
 int main() {
+    const auto condition = carto::condition::make_condition_fixture();
+    if (!condition || !condition.value().validate()) {
+        std::cerr << "installed CONDITION target does not expose the public authoring boundary\n";
+        return EXIT_FAILURE;
+    }
+
+    const auto engineering = carto::engineering::make_dv012_fixture();
+    if (!engineering || !engineering.value().validate()) {
+        std::cerr << "installed engineering target does not expose the public authoring boundary\n";
+        return EXIT_FAILURE;
+    }
+
     carto::production::ProductionCookGraph bake_graph;
     if (!bake_graph.validate()) {
         std::cerr << "installed production BakeGraph target does not expose the public compiler boundary\n";

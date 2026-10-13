@@ -3,6 +3,8 @@
 #include <carto/core/diagnostic.hpp>
 #include <carto/core/math.hpp>
 #include <carto/core/result.hpp>
+#include <carto/condition/authoring.hpp>
+#include <carto/engineering/authoring.hpp>
 #include <carto/editor/authoring_context.hpp>
 #include <carto/editor/command_bus.hpp>
 #include <carto/editor/preview_transaction.hpp>
@@ -94,6 +96,56 @@ struct SculptLayerView {
     std::size_t stroke_count = 0U;
 };
 
+// Read-only projection of the DV012 engineering authoring sidecar. The
+// authoritative records remain owned by carto_engineering and are never
+// exposed as a mutable UI copy.
+struct EngineeringAuthoringView {
+    bool present = false;
+    assets::Sha256Digest digest;
+    std::string project_namespace;
+    core::Revision authored_revision;
+    std::size_t source_count = 0U;
+    std::size_t part_count = 0U;
+    std::size_t occurrence_count = 0U;
+    std::size_t topology_count = 0U;
+    std::size_t bom_count = 0U;
+    std::size_t requirement_count = 0U;
+    std::size_t characteristic_count = 0U;
+    std::size_t target_count = 0U;
+    std::size_t derived_product_count = 0U;
+    bool workcell_present = false;
+    bool path_present = false;
+    bool publication_ready = false;
+    bool vanta_admissible = false;
+    std::string status;
+};
+
+// Read-only projection of the public CONDITION source-authoring contract.
+// This contains authored counts and admission state only; it never exposes a
+// mutable runtime or behavioral model to the UI.
+struct ConditionAuthoringView {
+    bool present = false;
+    assets::Sha256Digest digest;
+    std::string project_namespace;
+    core::Revision authored_revision;
+    std::size_t source_count = 0U;
+    std::size_t asset_count = 0U;
+    std::size_t safe_place_count = 0U;
+    std::size_t familiarity_count = 0U;
+    std::size_t view_condition_count = 0U;
+    std::size_t variant_count = 0U;
+    std::size_t temporal_package_count = 0U;
+    std::size_t surface_state_count = 0U;
+    std::size_t interaction_anchor_count = 0U;
+    std::size_t collection_count = 0U;
+    std::size_t prefab_count = 0U;
+    std::size_t region_kit_count = 0U;
+    bool stale = false;
+    bool publication_ready = false;
+    bool consumer_admissible = false;
+    std::string status;
+};
+
 struct ApplicationSnapshot {
     std::string project_name;
     std::optional<std::filesystem::path> project_path;
@@ -110,6 +162,8 @@ struct ApplicationSnapshot {
     ViewportState viewport;
     std::optional<std::uint64_t> sculpt_mesh_asset;
     std::vector<SculptLayerView> sculpt_layers;
+    EngineeringAuthoringView engineering;
+    ConditionAuthoringView condition;
 };
 
 enum class RecoveryInspectionState {
@@ -318,6 +372,22 @@ struct DuplicateMeshInstanceAction {
     core::Vec3d local_translation_offset{};
 };
 
+struct ImportEngineeringFixtureAction {};
+
+struct InvalidateEngineeringSourceAction {
+    engineering::Id source_id = 0U;
+    std::string new_revision;
+    assets::Sha256Digest new_digest;
+};
+
+struct ImportConditionFixtureAction {};
+
+struct InvalidateConditionSourceAction {
+    condition::Id source_id = 0U;
+    std::string new_revision;
+    assets::Sha256Digest new_digest;
+};
+
 struct UndoAction {};
 struct RedoAction {};
 
@@ -346,6 +416,10 @@ using ApplicationAction = std::variant<
     AppendSculptSurfaceStrokeAction,
     SetSculptLayerVisibilityAction,
     DuplicateMeshInstanceAction,
+    ImportEngineeringFixtureAction,
+    InvalidateEngineeringSourceAction,
+    ImportConditionFixtureAction,
+    InvalidateConditionSourceAction,
     UndoAction,
     RedoAction>;
 
@@ -385,6 +459,8 @@ public:
         OperationSource source = OperationSource::human,
         std::string_view provenance_id = {});
     [[nodiscard]] core::Result<editor::AuthoringContext> authoring_context() const;
+    [[nodiscard]] core::Result<engineering::AuthoringDocument> engineering_authoring() const;
+    [[nodiscard]] core::Result<condition::AuthoringDocument> condition_authoring() const;
     [[nodiscard]] core::Result<editor::AuthoringPreview> begin_preview(
         editor::PreviewKind kind) const;
     [[nodiscard]] core::Result<DispatchReceipt> commit_preview(
@@ -449,6 +525,12 @@ private:
         const SetSculptLayerVisibilityAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> duplicate_mesh_instance(
         const DuplicateMeshInstanceAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> import_engineering_fixture();
+    [[nodiscard]] core::Result<DispatchReceipt> invalidate_engineering_source(
+        const InvalidateEngineeringSourceAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> import_condition_fixture();
+    [[nodiscard]] core::Result<DispatchReceipt> invalidate_condition_source(
+        const InvalidateConditionSourceAction& action);
     [[nodiscard]] core::Result<ApplicationAction> preview_action(
         const editor::AuthoringPreview& preview) const;
     [[nodiscard]] core::Result<DispatchReceipt> undo();

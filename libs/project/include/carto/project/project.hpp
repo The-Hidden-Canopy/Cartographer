@@ -2,6 +2,8 @@
 
 #include <carto/assets/blob_store.hpp>
 #include <carto/core/revision.hpp>
+#include <carto/condition/authoring.hpp>
+#include <carto/engineering/authoring.hpp>
 #include <carto/core/result.hpp>
 #include <carto/geometry/mesh.hpp>
 #include <carto/project/file_lock.hpp>
@@ -39,6 +41,8 @@ class BevelProjectSelectedEdgeCommand;
 class BevelProjectSelectedVertexCommand;
 class SplitProjectSelectedEdgeCommand;
 class TriToQuadProjectSelectedFacesCommand;
+class SetProjectEngineeringAuthoringCommand;
+class SetProjectConditionAuthoringCommand;
 }
 
 namespace carto::project {
@@ -97,9 +101,29 @@ struct SerializedClothRestPoseReceipt {
     [[nodiscard]] bool operator==(const SerializedClothRestPoseReceipt&) const noexcept = default;
 };
 
+// Opaque revision-bound DV012 engineering authoring bytes. The project layer
+// stores the exact validated authoring document and digest; engineering
+// semantics remain behind the carto_engineering boundary.
+struct SerializedEngineeringAuthoring {
+    std::string bytes;
+    assets::Sha256Digest digest;
+
+    [[nodiscard]] bool operator==(const SerializedEngineeringAuthoring&) const noexcept = default;
+};
+
+// Opaque revision-bound CONDITION source-authoring bytes. The project layer
+// preserves the validated public contract and digest; CONDITION runtime
+// behavior remains outside this checkout.
+struct SerializedConditionAuthoring {
+    std::string bytes;
+    assets::Sha256Digest digest;
+
+    [[nodiscard]] bool operator==(const SerializedConditionAuthoring&) const noexcept = default;
+};
+
 class ProjectDocument {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 13;
+    static constexpr std::uint32_t kSchemaVersion = 14;
     static constexpr std::uint32_t kMinimumReadableSchemaVersion = 1;
     static constexpr std::string_view kMagic = "CARTOGRAPHER_PROJECT";
     static constexpr std::string_view kAuthoringFormat = "cartographer.authoring";
@@ -160,6 +184,14 @@ public:
     cloth_rest_pose_receipts() const noexcept {
         return cloth_rest_pose_receipts_;
     }
+    [[nodiscard]] const std::optional<SerializedEngineeringAuthoring>&
+    engineering_authoring() const noexcept {
+        return engineering_authoring_;
+    }
+    [[nodiscard]] const std::optional<SerializedConditionAuthoring>&
+    condition_authoring() const noexcept {
+        return condition_authoring_;
+    }
     [[nodiscard]] core::Revision revision() const noexcept { return revision_; }
     [[nodiscard]] std::uint32_t schema_version() const noexcept { return kSchemaVersion; }
 
@@ -181,6 +213,8 @@ private:
     friend class ::carto::editor::BevelProjectSelectedVertexCommand;
     friend class ::carto::editor::SplitProjectSelectedEdgeCommand;
     friend class ::carto::editor::TriToQuadProjectSelectedFacesCommand;
+    friend class ::carto::editor::SetProjectEngineeringAuthoringCommand;
+    friend class ::carto::editor::SetProjectConditionAuthoringCommand;
     friend class ::carto::project::ProjectTransaction;
 
     ProjectDocument& operator=(const ProjectDocument&) = default;
@@ -237,6 +271,16 @@ private:
         std::uint64_t mesh_asset,
         std::string serialized_receipt,
         assets::Sha256Digest digest);
+    [[nodiscard]] core::Result<void> set_engineering_authoring(
+        std::string serialized_authoring,
+        assets::Sha256Digest digest);
+    [[nodiscard]] core::Result<void> erase_engineering_authoring_if_revision(
+        core::Revision expected_revision);
+    [[nodiscard]] core::Result<void> set_condition_authoring(
+        std::string serialized_authoring,
+        assets::Sha256Digest digest);
+    [[nodiscard]] core::Result<void> erase_condition_authoring_if_revision(
+        core::Revision expected_revision);
     [[nodiscard]] core::Result<void> set_object_transform(
         scene::ObjectId object,
         core::Transform transform);
@@ -268,6 +312,8 @@ private:
     std::map<std::uint64_t, SerializedSculptStack> sculpt_stacks_;
     std::map<std::uint64_t, SerializedGarmentAsset> garment_assets_;
     std::map<std::uint64_t, SerializedClothRestPoseReceipt> cloth_rest_pose_receipts_;
+    std::optional<SerializedEngineeringAuthoring> engineering_authoring_;
+    std::optional<SerializedConditionAuthoring> condition_authoring_;
     std::optional<assets::Sha256Digest> evaluation_graph_digest_;
     std::uint64_t next_mesh_id_ = 1;
     core::Revision revision_{};

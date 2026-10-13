@@ -13,7 +13,7 @@ target_include_directories(carto_project
         $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(carto_project PUBLIC carto_core carto_scene carto_geometry carto_assets carto_render carto_scientific carto_world carto_journal carto_eval)
+target_link_libraries(carto_project PUBLIC carto_core carto_scene carto_geometry carto_assets carto_condition_authoring carto_engineering carto_render carto_scientific carto_world carto_journal carto_eval)
 carto_target(carto_project)
 
 install(TARGETS carto_project EXPORT CartographerTargets)

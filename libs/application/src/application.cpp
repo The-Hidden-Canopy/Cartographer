@@ -544,6 +544,14 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return set_sculpt_layer_visibility(value);
             } else if constexpr (std::is_same_v<Action, DuplicateMeshInstanceAction>) {
                 return duplicate_mesh_instance(value);
+            } else if constexpr (std::is_same_v<Action, ImportEngineeringFixtureAction>) {
+                return import_engineering_fixture();
+            } else if constexpr (std::is_same_v<Action, InvalidateEngineeringSourceAction>) {
+                return invalidate_engineering_source(value);
+            } else if constexpr (std::is_same_v<Action, ImportConditionFixtureAction>) {
+                return import_condition_fixture();
+            } else if constexpr (std::is_same_v<Action, InvalidateConditionSourceAction>) {
+                return invalidate_condition_source(value);
             } else if constexpr (std::is_same_v<Action, UndoAction>) {
                 return undo();
             } else {
@@ -594,6 +602,36 @@ core::Result<editor::AuthoringContext> ApplicationSession::authoring_context() c
             "authoring selection"));
     }
     return context;
+}
+
+core::Result<engineering::AuthoringDocument> ApplicationSession::engineering_authoring() const {
+    if (!document_.engineering_authoring().has_value()) {
+        return core::Result<engineering::AuthoringDocument>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "the project has no engineering authoring document"));
+    }
+    const auto decoded = engineering::AuthoringDocument::deserialize(
+        document_.engineering_authoring()->bytes);
+    if (!decoded) {
+        return core::Result<engineering::AuthoringDocument>::failure(decoded.error().with_context(
+            "project engineering authoring"));
+    }
+    return decoded;
+}
+
+core::Result<condition::AuthoringDocument> ApplicationSession::condition_authoring() const {
+    if (!document_.condition_authoring().has_value()) {
+        return core::Result<condition::AuthoringDocument>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "the project has no CONDITION source-authoring document"));
+    }
+    const auto decoded = condition::AuthoringDocument::deserialize(
+        document_.condition_authoring()->bytes);
+    if (!decoded) {
+        return core::Result<condition::AuthoringDocument>::failure(decoded.error().with_context(
+            "project CONDITION authoring"));
+    }
+    return decoded;
 }
 
 core::Result<editor::AuthoringPreview> ApplicationSession::begin_preview(
@@ -1712,6 +1750,116 @@ core::Result<DispatchReceipt> ApplicationSession::duplicate_mesh_instance(
             std::nullopt});
 }
 
+core::Result<DispatchReceipt> ApplicationSession::import_engineering_fixture() {
+    auto fixture = engineering::make_dv012_fixture();
+    if (!fixture) return failure(fixture.error().with_context("DV012 engineering fixture"));
+    const auto serialized = fixture.value().serialize();
+    const auto digest = fixture.value().canonical_digest();
+    if (!digest) {
+        return failure(digest.error().with_context("DV012 engineering fixture digest"));
+    }
+    const auto current = document_.engineering_authoring();
+    if (current.has_value() && current->bytes == serialized && current->digest == digest.value()) {
+        return accepted("Import DV012 Engineering Authoring", document_.revision());
+    }
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectEngineeringAuthoringCommand>(
+            admission,
+            document_,
+            current,
+            project::SerializedEngineeringAuthoring{serialized, digest.value()}),
+        "Import DV012 Engineering Authoring");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::invalidate_engineering_source(
+    const InvalidateEngineeringSourceAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "engineering source invalidation requires the human command boundary"));
+    }
+    if (action.source_id == 0U || action.new_revision.empty() || action.new_digest.is_zero()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "engineering source invalidation requires a source, revision, and digest"));
+    }
+    const auto current = engineering_authoring();
+    if (!current) return failure(current.error());
+    auto updated = current.value();
+    if (auto result = updated.invalidate_source(
+            action.source_id, action.new_revision, action.new_digest); !result) {
+        return failure(result.error().with_context("engineering source invalidation"));
+    }
+    const auto serialized = updated.serialize();
+    const auto digest = updated.canonical_digest();
+    if (!digest) {
+        return failure(digest.error().with_context("engineering invalidation digest"));
+    }
+    const auto before = document_.engineering_authoring();
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectEngineeringAuthoringCommand>(
+            admission,
+            document_,
+            before,
+            project::SerializedEngineeringAuthoring{serialized, digest.value()}),
+        "Invalidate Engineering Source");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::import_condition_fixture() {
+    auto fixture = condition::make_condition_fixture();
+    if (!fixture) return failure(fixture.error().with_context("CONDITION source fixture"));
+    const auto serialized = fixture.value().serialize();
+    const auto digest = fixture.value().canonical_digest();
+    if (!digest) return failure(digest.error().with_context("CONDITION source fixture digest"));
+    const auto current = document_.condition_authoring();
+    if (current.has_value() && current->bytes == serialized && current->digest == digest.value()) {
+        return accepted("Import CONDITION Source Fixture", document_.revision());
+    }
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectConditionAuthoringCommand>(
+            admission,
+            document_,
+            current,
+            project::SerializedConditionAuthoring{serialized, digest.value()}),
+        "Import CONDITION Source Fixture");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::invalidate_condition_source(
+    const InvalidateConditionSourceAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "CONDITION source invalidation requires the human command boundary"));
+    }
+    if (action.source_id == 0U || action.new_revision.empty() || action.new_digest.is_zero()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "CONDITION source invalidation requires a source, revision, and digest"));
+    }
+    const auto current = condition_authoring();
+    if (!current) return failure(current.error());
+    auto updated = current.value();
+    if (auto result = updated.invalidate_source(
+            action.source_id, action.new_revision, action.new_digest); !result) {
+        return failure(result.error().with_context("CONDITION source invalidation"));
+    }
+    const auto serialized = updated.serialize();
+    const auto digest = updated.canonical_digest();
+    if (!digest) return failure(digest.error().with_context("CONDITION invalidation digest"));
+    const auto before = document_.condition_authoring();
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectConditionAuthoringCommand>(
+            admission,
+            document_,
+            before,
+            project::SerializedConditionAuthoring{serialized, digest.value()}),
+        "Invalidate CONDITION Source");
+}
+
 core::Result<DispatchReceipt> ApplicationSession::undo() {
     const core::Revision before = document_.revision();
     project::ProjectDocument before_document = document_;
@@ -1804,6 +1952,102 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
         }
         result.problems.push_back(std::move(diagnostic));
     };
+
+    if (!document_.engineering_authoring().has_value()) {
+        result.engineering.status = "No engineering authoring is bound to this project.";
+    } else {
+        result.engineering.present = true;
+        result.engineering.digest = document_.engineering_authoring()->digest;
+        const auto decoded = engineering::AuthoringDocument::deserialize(
+            document_.engineering_authoring()->bytes);
+        if (!decoded) {
+            result.engineering.status = "Engineering authoring is invalid; publication is blocked.";
+            append_problem(decoded.error().with_context("engineering authoring snapshot"));
+        } else {
+            const auto& authoring = decoded.value();
+            result.engineering.project_namespace = authoring.project_namespace;
+            result.engineering.authored_revision = authoring.project_revision;
+            result.engineering.source_count = authoring.sources.size();
+            result.engineering.part_count = authoring.parts.size();
+            result.engineering.occurrence_count = authoring.occurrences.size();
+            result.engineering.topology_count = authoring.topology.size();
+            result.engineering.bom_count = authoring.bom.size();
+            result.engineering.requirement_count = authoring.requirements.size();
+            result.engineering.characteristic_count = authoring.characteristics.size();
+            result.engineering.target_count = authoring.targets.size();
+            result.engineering.derived_product_count = authoring.derived_products.size();
+            result.engineering.workcell_present = authoring.workcell.has_value();
+            result.engineering.path_present = authoring.path.has_value();
+            const auto package = engineering::InspectionPackage::publish(
+                authoring, document_.revision(), authoring.project_namespace);
+            if (!package) {
+                result.engineering.status = "Authoring is present; publication is blocked: " +
+                    package.error().message;
+            } else {
+                result.engineering.publication_ready = true;
+                const auto admission = engineering::admit_for_vanta(package.value());
+                if (admission && admission.value().status ==
+                        engineering::VantaAdmissionStatus::admit) {
+                    result.engineering.vanta_admissible = true;
+                    result.engineering.status =
+                        "Publication package is current and admitted at the neutral runtime boundary.";
+                } else {
+                    result.engineering.status =
+                        "Publication package is current; runtime admission is refused.";
+                }
+            }
+        }
+    }
+
+    if (!document_.condition_authoring().has_value()) {
+        result.condition.status =
+            "No CONDITION source-authoring document is bound to this project.";
+    } else {
+        result.condition.present = true;
+        result.condition.digest = document_.condition_authoring()->digest;
+        const auto decoded = condition::AuthoringDocument::deserialize(
+            document_.condition_authoring()->bytes);
+        if (!decoded) {
+            result.condition.status =
+                "CONDITION source authoring is invalid; publication is blocked.";
+            append_problem(decoded.error().with_context("CONDITION authoring snapshot"));
+        } else {
+            const auto& authoring = decoded.value();
+            result.condition.project_namespace = authoring.project_namespace;
+            result.condition.authored_revision = authoring.project_revision;
+            result.condition.source_count = authoring.sources.size();
+            result.condition.asset_count = authoring.assets.size();
+            result.condition.safe_place_count = authoring.safe_places.size();
+            result.condition.familiarity_count = authoring.familiarity.size();
+            result.condition.view_condition_count = authoring.view_conditions.size();
+            result.condition.variant_count = authoring.variants.size();
+            result.condition.temporal_package_count = authoring.temporal_packages.size();
+            result.condition.surface_state_count = authoring.surface_states.size();
+            result.condition.interaction_anchor_count = authoring.interaction_anchors.size();
+            result.condition.collection_count = authoring.collections.size();
+            result.condition.prefab_count = authoring.prefabs.size();
+            result.condition.region_kit_count = authoring.region_kits.size();
+            result.condition.stale = authoring.has_stale_sources();
+            const auto package = condition::Package::publish(
+                authoring, document_.revision(), authoring.project_namespace);
+            if (!package) {
+                result.condition.status = "Source authoring is present; publication is blocked: " +
+                    package.error().message;
+            } else {
+                result.condition.publication_ready = true;
+                const auto admission = condition::admit_for_consumer(package.value());
+                if (admission && admission.value().status ==
+                        condition::PackageAdmissionStatus::admit) {
+                    result.condition.consumer_admissible = true;
+                    result.condition.status =
+                        "Source package is current and admitted at the public consumer boundary.";
+                } else {
+                    result.condition.status =
+                        "Source package is current; consumer admission is refused.";
+                }
+            }
+        }
+    }
 
     const auto scene_objects = document_.scene().objects_sorted();
     result.objects.reserve(scene_objects.size());

@@ -19,11 +19,12 @@ Project.carto/
 ```
 
 The current repository still treats the versioned text `.carto` file as the
-authoritative versioned save format. Current saves use project format v9,
-which includes the bounded project-bound topology receipt ledger, generic
-scientific authoring substrate, validated per-mesh attribute/UV payloads, and
-the provider-neutral five-primitive world model, and the durable source
-material/texture catalog plus stable project source namespace.
+authoritative versioned save format. Current saves use [project format
+v14](../format/cartographer-project-v14.md), which retains the bounded
+project-bound topology receipt ledger, scientific authoring substrate,
+validated per-mesh attribute/UV payloads, provider-neutral world model,
+material/texture catalog, and stable project source namespace, and adds
+digest-bound engineering and CONDITION source-authoring records.
 `carto_project::ProjectPackage` now creates and
 validates the human-readable manifest and package directories, while
 `carto_assets` implements the portable content-addressed blob primitive that

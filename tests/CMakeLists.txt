@@ -76,6 +76,31 @@ carto_target(cartographer_production_authoring_tests)
 add_test(NAME cartographer_production_authoring_tests
     COMMAND cartographer_production_authoring_tests)
 
+add_executable(cartographer_engineering_tests
+    engineering_tests.cpp
+)
+target_link_libraries(cartographer_engineering_tests
+    PRIVATE
+        carto_engineering
+        carto_application
+        carto_ui
+)
+carto_target(cartographer_engineering_tests)
+add_test(NAME cartographer_engineering_tests COMMAND cartographer_engineering_tests)
+
+add_executable(cartographer_condition_authoring_tests
+    condition_authoring_tests.cpp
+)
+target_link_libraries(cartographer_condition_authoring_tests
+    PRIVATE
+        carto_condition_authoring
+        carto_application
+        carto_ui
+)
+carto_target(cartographer_condition_authoring_tests)
+add_test(NAME cartographer_condition_authoring_tests
+    COMMAND cartographer_condition_authoring_tests)
+
 add_executable(cartographer_production_decision_tests
     production_decision_tests.cpp
 )

@@ -450,13 +450,19 @@ void settled_rest_pose_bake_is_bound_reconstructible_and_persistable() {
     std::uint64_t mesh_asset = 0U;
     project::ProjectDocument document = make_project(journal, make_mesh_with_uvs(), mesh_asset);
     std::string serialized_v12_compat = document.serialize();
-    constexpr std::string_view schema_v13 = "CARTOGRAPHER_PROJECT 13\n";
-    REQUIRE(serialized_v12_compat.starts_with(schema_v13));
-    serialized_v12_compat.replace(0U, schema_v13.size(), "CARTOGRAPHER_PROJECT 12\n");
+    const std::string current_schema =
+        "CARTOGRAPHER_PROJECT " +
+        std::to_string(project::ProjectDocument::kSchemaVersion) + "\n";
+    REQUIRE(serialized_v12_compat.starts_with(current_schema));
+    serialized_v12_compat.replace(0U, current_schema.size(), "CARTOGRAPHER_PROJECT 12\n");
     constexpr std::string_view empty_receipt_table = "CLOTH_REST_POSE_RECEIPTS 0\n";
     const std::size_t empty_receipts = serialized_v12_compat.find(empty_receipt_table);
     REQUIRE(empty_receipts != std::string::npos);
     serialized_v12_compat.erase(empty_receipts, empty_receipt_table.size());
+    constexpr std::string_view condition_authoring_record = "CONDITION_AUTHORING NONE\n";
+    const std::size_t condition_record = serialized_v12_compat.find(condition_authoring_record);
+    REQUIRE(condition_record != std::string::npos);
+    serialized_v12_compat.erase(condition_record, condition_authoring_record.size());
     const geometry::EditableMesh& source = document.meshes().at(mesh_asset);
     const core::Revision source_revision = source.revision();
     production::GarmentAsset garment = make_garment(document, mesh_asset);
@@ -649,10 +655,10 @@ void settled_rest_pose_bake_is_bound_reconstructible_and_persistable() {
     REQUIRE(transaction.value().commit("cloth.rest-pose.bake"));
     const auto reopened = project::ProjectDocument::deserialize(document.serialize());
     REQUIRE(reopened);
-    REQUIRE(reopened.value().schema_version() == 13U);
+    REQUIRE(reopened.value().schema_version() == project::ProjectDocument::kSchemaVersion);
     const auto saved_project = document.save_atomic(directory.path() / "cloth-rest-pose.carto");
     REQUIRE(saved_project);
-    REQUIRE(saved_project.value().schema_version == 13U);
+    REQUIRE(saved_project.value().schema_version == project::ProjectDocument::kSchemaVersion);
     const auto file_reopened = project::ProjectDocument::load(
         directory.path() / "cloth-rest-pose.carto");
     REQUIRE(file_reopened);

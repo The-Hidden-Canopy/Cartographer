@@ -89,6 +89,8 @@ bool valid(OperatorMode value) noexcept {
 
 bool valid(Workspace value) noexcept {
     return value == Workspace::model || value == Workspace::sculpt ||
+        value == Workspace::engineering ||
+        value == Workspace::condition ||
         value == Workspace::cad || value == Workspace::build ||
         value == Workspace::material || value == Workspace::animate ||
         value == Workspace::review || value == Workspace::ai;
@@ -113,6 +115,9 @@ std::vector<WorkspaceDefinition> make_workspace_registry() {
         Panel::scene, Panel::viewport, Panel::inspector, Panel::graph, Panel::problems};
     const std::vector<Panel> asset_panels{
         Panel::scene, Panel::viewport, Panel::assets, Panel::inspector, Panel::problems};
+    const std::vector<Panel> engineering_panels{
+        Panel::scene, Panel::viewport, Panel::assets, Panel::inspector,
+        Panel::operations, Panel::problems};
     const std::vector<Panel> timeline_panels{
         Panel::scene, Panel::viewport, Panel::inspector, Panel::timeline, Panel::problems};
     const auto future = [](Workspace workspace,
@@ -129,6 +134,10 @@ std::vector<WorkspaceDefinition> make_workspace_registry() {
         {Workspace::model, "model", "Model", model_panels, BottomPanel::operations, true, {}},
         {Workspace::sculpt, "sculpt", "Sculpt", model_panels, BottomPanel::operations,
          true, {}},
+        {Workspace::engineering, "engineering", "Engineering", engineering_panels,
+         BottomPanel::problems, true, {}},
+        {Workspace::condition, "condition", "CONDITION", engineering_panels,
+         BottomPanel::problems, true, {}},
         future(Workspace::cad, "cad", "CAD", graph_panels, BottomPanel::graph,
                "CAD sketch and constraint tools are not available in this build"),
         future(Workspace::build, "build", "Build", asset_panels, BottomPanel::assets,
@@ -182,7 +191,11 @@ bool is_operation_action(const application::ApplicationAction& action) {
             std::is_same_v<Action, application::AppendSculptStrokeAction> ||
             std::is_same_v<Action, application::AppendSculptSurfaceStrokeAction> ||
             std::is_same_v<Action, application::SetSculptLayerVisibilityAction> ||
-            std::is_same_v<Action, application::SetObjectTransformAction>;
+            std::is_same_v<Action, application::SetObjectTransformAction> ||
+            std::is_same_v<Action, application::ImportEngineeringFixtureAction> ||
+            std::is_same_v<Action, application::InvalidateEngineeringSourceAction> ||
+            std::is_same_v<Action, application::ImportConditionFixtureAction> ||
+            std::is_same_v<Action, application::InvalidateConditionSourceAction>;
     }, action);
 }
 
@@ -310,7 +323,9 @@ core::Result<UiPreferences> parse_preferences(std::string_view text) {
     const auto parsed_mode = parse_enum<OperatorMode>(mode.value(), {
         {"person-first", OperatorMode::person_first}, {"ai-first", OperatorMode::ai_first}});
     const auto parsed_workspace = parse_enum<Workspace>(workspace.value(), {
-        {"model", Workspace::model}, {"sculpt", Workspace::sculpt}, {"cad", Workspace::cad},
+        {"model", Workspace::model}, {"sculpt", Workspace::sculpt},
+        {"engineering", Workspace::engineering}, {"condition", Workspace::condition},
+        {"cad", Workspace::cad},
         {"build", Workspace::build}, {"material", Workspace::material},
         {"animate", Workspace::animate}, {"review", Workspace::review}, {"ai", Workspace::ai}});
     const auto parsed_density = parse_enum<Density>(density.value(), {
@@ -373,7 +388,7 @@ core::Result<void> atomic_replace(
 #ifdef _WIN32
     if (!MoveFileExW(temporary.wstring().c_str(), destination.wstring().c_str(),
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        return core::Result<void>::failure(io_error("unable to publish workspace preferences atomically"));
+        return core::Result<void>::failure(io_error("unable to publish file atomically"));
     }
     return core::Result<void>::success();
 #else
@@ -381,7 +396,7 @@ core::Result<void> atomic_replace(
     std::filesystem::rename(temporary, destination, error);
     if (error) {
         return core::Result<void>::failure(io_error(
-            "unable to publish workspace preferences atomically: " + error.message()));
+            "unable to publish file atomically: " + error.message()));
     }
     return core::Result<void>::success();
 #endif
@@ -778,6 +793,8 @@ const char* workspace_name(Workspace workspace) noexcept {
     switch (workspace) {
     case Workspace::model: return "model";
     case Workspace::sculpt: return "sculpt";
+    case Workspace::engineering: return "engineering";
+    case Workspace::condition: return "condition";
     case Workspace::cad: return "cad";
     case Workspace::build: return "build";
     case Workspace::material: return "material";
@@ -1419,6 +1436,167 @@ core::Result<MeshImportReceipt> UiController::import_mesh(
         std::move(report.warnings),
         std::move(admitted).value(),
     });
+}
+
+core::Result<application::DispatchReceipt> UiController::import_engineering_fixture() {
+    return dispatch_with_category(
+        application::ImportEngineeringFixtureAction{},
+        OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::invalidate_engineering_source(
+    engineering::Id source_id,
+    std::string new_revision,
+    assets::Sha256Digest new_digest) {
+    return dispatch_with_category(
+        application::InvalidateEngineeringSourceAction{
+            source_id, std::move(new_revision), new_digest},
+        OperationCategory::provider);
+}
+
+core::Result<engineering::InspectionPackage> UiController::build_engineering_package() const {
+    const auto authoring = session_.engineering_authoring();
+    if (!authoring) {
+        return core::Result<engineering::InspectionPackage>::failure(authoring.error().with_context(
+            "engineering publication"));
+    }
+    const auto snapshot = session_.snapshot();
+    return engineering::InspectionPackage::publish(
+        authoring.value(), snapshot.project_revision, authoring.value().project_namespace);
+}
+
+core::Result<engineering::VantaAdmissionResult> UiController::admit_engineering_package() const {
+    const auto package = build_engineering_package();
+    if (!package) {
+        return core::Result<engineering::VantaAdmissionResult>::failure(package.error());
+    }
+    return engineering::admit_for_vanta(package.value());
+}
+
+core::Result<void> UiController::publish_engineering_package(
+    const std::filesystem::path& path) const {
+    if (path.empty() || path.filename().empty()) {
+        return core::Result<void>::failure(invalid(
+            "engineering publication path must name a file"));
+    }
+    const auto package = build_engineering_package();
+    if (!package) return core::Result<void>::failure(package.error());
+    const auto admission = engineering::admit_for_vanta(package.value());
+    if (!admission) return core::Result<void>::failure(admission.error().with_context(
+        "engineering publication admission"));
+    if (admission.value().status != engineering::VantaAdmissionStatus::admit) {
+        return core::Result<void>::failure(validation(
+            "engineering publication was refused at the runtime boundary"));
+    }
+    const auto parent = path.parent_path();
+    if (!parent.empty()) {
+        std::error_code error;
+        const bool exists = std::filesystem::exists(parent, error);
+        if (error || !exists || !std::filesystem::is_directory(parent, error) || error) {
+            return core::Result<void>::failure(io_error(
+                "engineering publication parent is unavailable"));
+        }
+    }
+    const auto temporary = preference_temporary_path(path);
+    const std::string bytes = package.value().serialize();
+    std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
+    if (!stream) return core::Result<void>::failure(io_error(
+        "unable to create engineering publication package"));
+    stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    stream.flush();
+    stream.close();
+    if (!stream) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        return core::Result<void>::failure(io_error(
+            "unable to write engineering publication package"));
+    }
+    const auto replaced = atomic_replace(temporary, path);
+    if (!replaced) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        return replaced;
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<application::DispatchReceipt> UiController::import_condition_fixture() {
+    return dispatch_with_category(
+        application::ImportConditionFixtureAction{}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::invalidate_condition_source(
+    condition::Id source_id,
+    std::string new_revision,
+    assets::Sha256Digest new_digest) {
+    return dispatch_with_category(
+        application::InvalidateConditionSourceAction{
+            source_id, std::move(new_revision), new_digest},
+        OperationCategory::provider);
+}
+
+core::Result<condition::Package> UiController::build_condition_package() const {
+    const auto authoring = session_.condition_authoring();
+    if (!authoring) {
+        return core::Result<condition::Package>::failure(authoring.error().with_context(
+            "CONDITION source publication"));
+    }
+    const auto snapshot = session_.snapshot();
+    return condition::Package::publish(
+        authoring.value(), snapshot.project_revision, authoring.value().project_namespace);
+}
+
+core::Result<condition::AdmissionResult> UiController::admit_condition_package() const {
+    const auto package = build_condition_package();
+    if (!package) return core::Result<condition::AdmissionResult>::failure(package.error());
+    return condition::admit_for_consumer(package.value());
+}
+
+core::Result<void> UiController::publish_condition_package(
+    const std::filesystem::path& path) const {
+    if (path.empty() || path.filename().empty()) {
+        return core::Result<void>::failure(invalid(
+            "CONDITION publication path must name a file"));
+    }
+    const auto package = build_condition_package();
+    if (!package) return core::Result<void>::failure(package.error());
+    const auto admission = condition::admit_for_consumer(package.value());
+    if (!admission) return core::Result<void>::failure(admission.error().with_context(
+        "CONDITION publication admission"));
+    if (admission.value().status != condition::PackageAdmissionStatus::admit) {
+        return core::Result<void>::failure(validation(
+            "CONDITION source publication was refused at the public consumer boundary"));
+    }
+    const auto parent = path.parent_path();
+    if (!parent.empty()) {
+        std::error_code error;
+        const bool exists = std::filesystem::exists(parent, error);
+        if (error || !exists || !std::filesystem::is_directory(parent, error) || error) {
+            return core::Result<void>::failure(io_error(
+                "CONDITION publication parent is unavailable"));
+        }
+    }
+    const auto temporary = preference_temporary_path(path);
+    const std::string bytes = package.value().serialize();
+    std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
+    if (!stream) return core::Result<void>::failure(io_error(
+        "unable to create CONDITION source package"));
+    stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    stream.flush();
+    stream.close();
+    if (!stream) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        return core::Result<void>::failure(io_error(
+            "unable to write CONDITION source package"));
+    }
+    const auto replaced = atomic_replace(temporary, path);
+    if (!replaced) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        return replaced;
+    }
+    return core::Result<void>::success();
 }
 
 core::Result<void> UiController::configure_market_library(

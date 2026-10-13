@@ -725,7 +725,7 @@ void native_key_contract_maps_core_control_without_imgui() {
 
 void workspace_registry_is_canonical_and_fail_closed() {
     const auto& registry = carto::ui::workspace_registry();
-    REQUIRE(registry.size() == 8U);
+    REQUIRE(registry.size() == 10U);
     std::vector<carto::ui::Workspace> seen;
     for (const auto& definition : registry) {
         REQUIRE(definition.validate());
@@ -744,6 +744,12 @@ void workspace_registry_is_canonical_and_fail_closed() {
     REQUIRE(ai && ai.value().available);
     const auto sculpt = carto::ui::workspace_definition(carto::ui::Workspace::sculpt);
     REQUIRE(sculpt && sculpt.value().available);
+    const auto engineering = carto::ui::workspace_definition(
+        carto::ui::Workspace::engineering);
+    REQUIRE(engineering && engineering.value().available);
+    const auto condition = carto::ui::workspace_definition(
+        carto::ui::Workspace::condition);
+    REQUIRE(condition && condition.value().available);
     const auto future = carto::ui::workspace_definition(carto::ui::Workspace::cad);
     REQUIRE(future && !future.value().available);
     REQUIRE(!future.value().unavailable_reason.empty());
@@ -770,6 +776,22 @@ void workspace_registry_is_canonical_and_fail_closed() {
     const auto sculpt_snapshot = ui.snapshot();
     REQUIRE(sculpt_snapshot.workspace_kind == carto::ui::Workspace::sculpt);
     REQUIRE(sculpt_snapshot.bottom_panel == carto::ui::BottomPanel::operations);
+
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::engineering));
+    const auto engineering_snapshot = ui.snapshot();
+    REQUIRE(engineering_snapshot.workspace_kind == carto::ui::Workspace::engineering);
+    REQUIRE(engineering_snapshot.bottom_panel == carto::ui::BottomPanel::problems);
+    REQUIRE(std::find(engineering_snapshot.visible_panels.begin(),
+                      engineering_snapshot.visible_panels.end(),
+                      carto::ui::Panel::operations) != engineering_snapshot.visible_panels.end());
+
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::condition));
+    const auto condition_snapshot = ui.snapshot();
+    REQUIRE(condition_snapshot.workspace_kind == carto::ui::Workspace::condition);
+    REQUIRE(condition_snapshot.bottom_panel == carto::ui::BottomPanel::problems);
+    REQUIRE(std::find(condition_snapshot.visible_panels.begin(),
+                      condition_snapshot.visible_panels.end(),
+                      carto::ui::Panel::operations) != condition_snapshot.visible_panels.end());
 }
 
 void sculpt_viewport_sampling_preserves_frontmost_surface_and_path_spacing() {

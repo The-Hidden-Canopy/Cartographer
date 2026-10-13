@@ -128,6 +128,55 @@ private:
     bool applied_ = false;
 };
 
+// Binds the validated engineering authoring sidecar through the project
+// command boundary so import, invalidation, undo, and redo share the same
+// revision and journal semantics as ordinary authoring commands.
+class SetProjectEngineeringAuthoringCommand final : public EditorCommand {
+public:
+    SetProjectEngineeringAuthoringCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        std::optional<project::SerializedEngineeringAuthoring> before,
+        project::SerializedEngineeringAuthoring after);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override {
+        return "Set Project Engineering Authoring";
+    }
+
+private:
+    project::ProjectDocument* document_;
+    std::optional<project::SerializedEngineeringAuthoring> before_;
+    project::SerializedEngineeringAuthoring after_;
+    core::Revision expected_project_revision_;
+    bool applied_ = false;
+};
+
+// Binds the validated public CONDITION source-authoring sidecar through the
+// same governed command boundary as all other project mutations.
+class SetProjectConditionAuthoringCommand final : public EditorCommand {
+public:
+    SetProjectConditionAuthoringCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        std::optional<project::SerializedConditionAuthoring> before,
+        project::SerializedConditionAuthoring after);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override {
+        return "Set Project CONDITION Authoring";
+    }
+
+private:
+    project::ProjectDocument* document_;
+    std::optional<project::SerializedConditionAuthoring> before_;
+    project::SerializedConditionAuthoring after_;
+    core::Revision expected_project_revision_;
+    bool applied_ = false;
+};
+
 class SetVertexPositionCommand final : public EditorCommand {
 public:
     SetVertexPositionCommand(
