@@ -347,6 +347,20 @@ carto_target(cartographer_prepared_publication_tests)
 add_test(NAME cartographer_prepared_publication_tests
     COMMAND cartographer_prepared_publication_tests)
 
+add_executable(cartographer_prepared_publication_compatibility_tests
+    prepared_publication_compatibility_tests.cpp
+)
+target_link_libraries(cartographer_prepared_publication_compatibility_tests
+    PRIVATE
+        carto_production
+)
+carto_target(cartographer_prepared_publication_compatibility_tests)
+add_test(
+    NAME cartographer_prepared_publication_compatibility_tests
+    COMMAND cartographer_prepared_publication_compatibility_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/cartographer-destination-prepared-v1
+)
+
 add_executable(cartographer_preparation_operation_tests
     preparation_operation_tests.cpp
 )
@@ -550,6 +564,10 @@ add_executable(cartographer_ui_tests
     ui_tests.cpp
 )
 
+add_executable(cartographer_viewport_interaction_tests
+    viewport_interaction_tests.cpp
+)
+
 add_executable(cartographer_public_api_tests
     public_api_tests.cpp
 )
@@ -716,6 +734,14 @@ target_link_libraries(cartographer_ui_tests
 
 carto_target(cartographer_ui_tests)
 add_test(NAME cartographer_ui_tests COMMAND cartographer_ui_tests)
+
+target_link_libraries(cartographer_viewport_interaction_tests
+    PRIVATE
+        carto_editor
+)
+carto_target(cartographer_viewport_interaction_tests)
+add_test(NAME cartographer_viewport_interaction_tests
+    COMMAND cartographer_viewport_interaction_tests)
 
 target_link_libraries(cartographer_public_api_tests
     PRIVATE

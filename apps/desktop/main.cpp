@@ -13,6 +13,8 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 
+#include "branding.hpp"
+
 // Dear ImGui intentionally keeps the Win32 message handler declaration behind
 // a disabled block in its public backend header to avoid pulling in windows.h.
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
@@ -1050,6 +1052,36 @@ struct DesktopState {
         if (heading_font != nullptr) ImGui::PushFont(heading_font);
         ImGui::TextColored(color(accent), "%s", text);
         if (heading_font != nullptr) ImGui::PopFont();
+    }
+
+    void draw_brand_mark(const UiSnapshot& snapshot, float size) const {
+        ImGui::Dummy(ImVec2(size, size));
+        const ImVec2 min = ImGui::GetItemRectMin();
+        const ImVec2 center{min.x + size * 0.5F, min.y + size * 0.5F};
+        const auto brand_color = [](carto::ui::UiColor value) {
+            return ImGui::ColorConvertFloat4ToU32(
+                ImVec4(value.red, value.green, value.blue, value.alpha));
+        };
+        carto::desktop_branding::draw_mark(
+            ImGui::GetWindowDrawList(), center, size,
+            brand_color(snapshot.colors.border_soft),
+            brand_color(snapshot.colors.text_secondary),
+            brand_color(snapshot.colors.text_primary),
+            brand_color(snapshot.colors.accent_primary),
+            brand_color(snapshot.colors.accent_secondary));
+    }
+
+    void draw_brand_lockup(const UiSnapshot& snapshot) {
+        ImGui::BeginGroup();
+        draw_brand_mark(snapshot, 42.0F);
+        ImGui::SameLine(0.0F, 10.0F);
+        ImGui::BeginGroup();
+        heading_text_colored(snapshot.colors.text_primary, "CARTOGRAPHER");
+        ImGui::TextColored(
+            color(snapshot.colors.accent_secondary),
+            "S P A T I A L   I N T E L L I G E N C E   B Y   D E S I G N");
+        ImGui::EndGroup();
+        ImGui::EndGroup();
     }
 
     void mono_text_disabled(const char* text) const {
@@ -2169,10 +2201,10 @@ struct DesktopState {
 
     void draw_shell_header(const UiSnapshot& snapshot) {
         const bool compact_header = ImGui::GetWindowWidth() < 900.0F;
-        ImGui::BeginChild("ShellHeader", ImVec2(0, compact_header ? 112.0F : 84.0F),
+        ImGui::BeginChild("ShellHeader", ImVec2(0, compact_header ? 124.0F : 96.0F),
                           true, ImGuiWindowFlags_NoScrollbar);
         ImGui::BeginGroup();
-        heading_text_colored(snapshot.colors.accent_primary, "CARTOGRAPHER");
+        draw_brand_lockup(snapshot);
         ImGui::SameLine();
         ImGui::TextDisabled("/");
         ImGui::SameLine();
@@ -2263,13 +2295,15 @@ struct DesktopState {
         const float rail_width = narrow ? 72.0F : available_width < 980.0F ? 184.0F : 232.0F;
         ImGui::BeginChild("ProductRail", ImVec2(rail_width, 0), true);
         if (narrow) {
-            heading_text_colored(snapshot.colors.accent_primary, "C");
+            draw_brand_mark(snapshot, 34.0F);
             ImGui::TextDisabled("Carto");
         } else {
-            ImGui::TextColored(color(snapshot.colors.accent_primary), "C");
+            draw_brand_mark(snapshot, 42.0F);
             ImGui::SameLine();
+            ImGui::BeginGroup();
             heading_text("Spatial authoring");
-            ImGui::TextDisabled("A truthful workspace for geometry, history, and evidence.");
+            ImGui::TextDisabled("Geometry, history, and evidence.");
+            ImGui::EndGroup();
         }
         ImGui::Dummy(ImVec2(0, 6));
 
@@ -4553,7 +4587,9 @@ HWND create_window(HINSTANCE instance) {
     window_class.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
     if (RegisterClassW(&window_class) == 0) throw std::runtime_error("could not register Cartographer window class");
     HWND window = CreateWindowExW(
-        0, window_class.lpszClassName, L"Cartographer", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        0, window_class.lpszClassName,
+        L"Cartographer | Spatial Intelligence by Design",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, 1440, 900, nullptr, nullptr, instance, nullptr);
     if (window == nullptr) throw std::runtime_error("could not create Cartographer window");
     return window;

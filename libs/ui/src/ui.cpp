@@ -704,18 +704,18 @@ core::Result<void> SurfaceFidelityView::validate() const {
 UiColorTokens color_tokens(Theme theme) noexcept {
     if (theme == Theme::light) {
         return {
-            // HAVEN-derived light surfaces: cool canvas, white cards, and a
-            // restrained blue interaction layer keep the workbench readable.
-            {0.961F, 0.969F, 0.984F, 1.0F}, {0.969F, 0.976F, 0.992F, 1.0F},
-            {1.0F, 1.0F, 1.0F, 1.0F}, {0.941F, 0.953F, 0.973F, 1.0F},
-            {0.145F, 0.388F, 0.922F, 0.10F}, {0.145F, 0.388F, 0.922F, 0.20F},
-            {0.090F, 0.125F, 0.200F, 1.0F}, {0.361F, 0.400F, 0.471F, 1.0F},
-            {0.463F, 0.502F, 0.573F, 1.0F}, {0.847F, 0.875F, 0.918F, 1.0F},
-            {0.145F, 0.388F, 0.922F, 1.0F}, {0.145F, 0.388F, 0.922F, 1.0F},
-            {0.486F, 0.227F, 0.929F, 1.0F}, {0.133F, 0.773F, 0.369F, 1.0F},
+            // Cartographer light: ice canvas, white instruments, slate
+            // structure, and the registered blue/bronze identity accents.
+            {0.941F, 0.953F, 0.965F, 1.0F}, {0.965F, 0.973F, 0.980F, 1.0F},
+            {0.980F, 0.984F, 0.988F, 1.0F}, {1.0F, 1.0F, 1.0F, 1.0F},
+            {0.890F, 0.914F, 0.941F, 1.0F}, {0.184F, 0.510F, 0.965F, 0.16F},
+            {0.031F, 0.059F, 0.078F, 1.0F}, {0.322F, 0.376F, 0.435F, 1.0F},
+            {0.486F, 0.537F, 0.600F, 1.0F}, {0.796F, 0.831F, 0.867F, 1.0F},
+            {0.184F, 0.510F, 0.965F, 1.0F}, {0.184F, 0.510F, 0.965F, 1.0F},
+            {0.831F, 0.651F, 0.471F, 1.0F}, {0.133F, 0.773F, 0.369F, 1.0F},
             {0.961F, 0.620F, 0.043F, 1.0F}, {0.937F, 0.267F, 0.267F, 1.0F},
             {0.008F, 0.518F, 0.780F, 1.0F}, {0.486F, 0.227F, 0.929F, 0.20F},
-            {0.918F, 0.345F, 0.047F, 0.75F}, {0.918F, 0.345F, 0.047F, 1.0F},
+            {0.831F, 0.651F, 0.471F, 0.75F}, {0.831F, 0.651F, 0.471F, 1.0F},
         };
     }
     if (theme == Theme::high_contrast) {
@@ -733,18 +733,18 @@ UiColorTokens color_tokens(Theme theme) noexcept {
         };
     }
     return {
-        // HAVEN-derived dark surfaces: navy depth, blue focus, and violet for
-        // secondary instruments. The high-contrast branch above stays strict.
-        {0.043F, 0.071F, 0.125F, 1.0F}, {0.055F, 0.102F, 0.180F, 1.0F},
-        {0.067F, 0.102F, 0.173F, 1.0F}, {0.090F, 0.133F, 0.220F, 1.0F},
-        {1.0F, 1.0F, 1.0F, 0.133F}, {0.231F, 0.510F, 0.965F, 0.20F},
-        {0.953F, 0.965F, 0.988F, 1.0F}, {0.557F, 0.608F, 0.706F, 1.0F},
-        {0.400F, 0.450F, 0.530F, 1.0F}, {0.153F, 0.208F, 0.310F, 1.0F},
-        {0.231F, 0.510F, 0.965F, 1.0F}, {0.231F, 0.510F, 0.965F, 1.0F},
-        {0.545F, 0.361F, 0.965F, 1.0F}, {0.133F, 0.773F, 0.369F, 1.0F},
+        // Cartographer dark: deep earth canvas, slate instruments, ice text,
+        // Carto blue interaction, and bronze navigation detail.
+        {0.031F, 0.059F, 0.078F, 1.0F}, {0.043F, 0.090F, 0.129F, 1.0F},
+        {0.075F, 0.106F, 0.149F, 1.0F}, {0.118F, 0.161F, 0.220F, 1.0F},
+        {0.153F, 0.208F, 0.282F, 1.0F}, {0.184F, 0.510F, 0.965F, 0.20F},
+        {0.898F, 0.906F, 0.922F, 1.0F}, {0.612F, 0.639F, 0.686F, 1.0F},
+        {0.420F, 0.463F, 0.525F, 1.0F}, {0.118F, 0.161F, 0.220F, 1.0F},
+        {0.184F, 0.510F, 0.965F, 1.0F}, {0.184F, 0.510F, 0.965F, 1.0F},
+        {0.831F, 0.651F, 0.471F, 1.0F}, {0.133F, 0.773F, 0.369F, 1.0F},
         {0.961F, 0.620F, 0.043F, 1.0F}, {0.937F, 0.267F, 0.267F, 1.0F},
         {0.008F, 0.518F, 0.780F, 1.0F}, {0.545F, 0.361F, 0.965F, 0.20F},
-        {1.0F, 0.541F, 0.239F, 0.75F}, {0.961F, 0.620F, 0.043F, 1.0F},
+        {0.831F, 0.651F, 0.471F, 0.75F}, {0.831F, 0.651F, 0.471F, 1.0F},
     };
 }
 
