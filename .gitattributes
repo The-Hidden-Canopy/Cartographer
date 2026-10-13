@@ -1,0 +1,3 @@
+# Prepared-publication fixtures are byte-addressed artifacts. Preserve their
+# canonical LF bytes across Windows checkouts so manifest digests remain valid.
+tests/fixtures/cartographer-destination-prepared-v1/** -text
