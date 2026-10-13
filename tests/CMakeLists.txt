@@ -550,6 +550,10 @@ add_executable(cartographer_ui_tests
     ui_tests.cpp
 )
 
+add_executable(cartographer_viewport_interaction_tests
+    viewport_interaction_tests.cpp
+)
+
 add_executable(cartographer_public_api_tests
     public_api_tests.cpp
 )
@@ -716,6 +720,15 @@ target_link_libraries(cartographer_ui_tests
 
 carto_target(cartographer_ui_tests)
 add_test(NAME cartographer_ui_tests COMMAND cartographer_ui_tests)
+
+target_link_libraries(cartographer_viewport_interaction_tests
+    PRIVATE
+        carto_editor
+)
+
+carto_target(cartographer_viewport_interaction_tests)
+add_test(NAME cartographer_viewport_interaction_tests
+    COMMAND cartographer_viewport_interaction_tests)
 
 target_link_libraries(cartographer_public_api_tests
     PRIVATE
