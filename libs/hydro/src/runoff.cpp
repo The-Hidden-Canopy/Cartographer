@@ -259,6 +259,10 @@ core::Result<HydroRunoffPlan> HydroRunoffPlan::deserialize(std::string_view text
     if (auto result = plan.validate(); !result) {
         return core::Result<HydroRunoffPlan>::failure(result.error());
     }
+    if (plan.serialize() != text) {
+        return core::Result<HydroRunoffPlan>::failure(detail::validation(
+            "hydro runoff plan is not in canonical form"));
+    }
     return core::Result<HydroRunoffPlan>::success(std::move(plan));
 }
 
