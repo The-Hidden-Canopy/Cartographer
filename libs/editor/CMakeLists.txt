@@ -6,6 +6,7 @@ add_library(carto_editor STATIC
     src/snap_candidates.cpp
     src/selection.cpp
     src/tools.cpp
+    src/viewport_interaction.cpp
 )
 
 target_include_directories(carto_editor

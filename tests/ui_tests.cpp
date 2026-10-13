@@ -233,6 +233,26 @@ void ui_preserves_required_viewport_and_supports_mode_theme_density() {
                       carto::ui::Panel::viewport) != snapshot.visible_panels.end());
 }
 
+void cartographer_brand_palette_is_stable() {
+    const auto dark = carto::ui::color_tokens(carto::ui::Theme::dark);
+    REQUIRE(dark.canvas_0.red == 0.031F);
+    REQUIRE(dark.canvas_0.green == 0.059F);
+    REQUIRE(dark.canvas_0.blue == 0.078F);
+    REQUIRE(dark.accent_primary.red == 0.184F);
+    REQUIRE(dark.accent_primary.green == 0.510F);
+    REQUIRE(dark.accent_primary.blue == 0.965F);
+    REQUIRE(dark.accent_secondary.red == 0.831F);
+    REQUIRE(dark.accent_secondary.green == 0.651F);
+    REQUIRE(dark.accent_secondary.blue == 0.471F);
+
+    const auto light = carto::ui::color_tokens(carto::ui::Theme::light);
+    REQUIRE(light.canvas_0.red == 0.941F);
+    REQUIRE(light.canvas_0.green == 0.953F);
+    REQUIRE(light.canvas_0.blue == 0.965F);
+    REQUIRE(light.accent_primary.blue > light.accent_primary.red);
+    REQUIRE(light.accent_secondary.red > light.accent_secondary.blue);
+}
+
 void ui_persists_preferences_and_resets_corrupt_state() {
     TempDirectory temp;
     carto::application::ApplicationSession session;
@@ -1146,6 +1166,7 @@ int main() {
         ui_rejects_unadmitted_ai_proposals();
         ui_routes_edge_selection_without_authoring_mutation();
         ui_preserves_required_viewport_and_supports_mode_theme_density();
+        cartographer_brand_palette_is_stable();
         ui_persists_preferences_and_resets_corrupt_state();
         workbench_preferences_round_trip_and_fail_closed();
         ui_connects_surface_fidelity_preview_without_authoring_mutation();
