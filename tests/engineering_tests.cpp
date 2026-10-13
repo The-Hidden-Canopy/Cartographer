@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <iostream>
 #include <span>
 #include <stdexcept>
@@ -175,6 +176,96 @@ void ui_exposes_engineering_workspace_and_immutable_publication() {
     std::filesystem::remove_all(root, ignored);
 }
 
+void ui_imports_exports_and_reconciles_engineering_authoring_files() {
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto root = std::filesystem::temp_directory_path() /
+        ("cartographer-engineering-authoring-io-" + std::to_string(stamp));
+    std::filesystem::create_directories(root);
+
+    auto fixture = carto::engineering::make_dv012_fixture();
+    REQUIRE(fixture);
+    const auto source_path = root / "source.carto-engineering-authoring";
+    {
+        std::ofstream stream(source_path, std::ios::binary);
+        REQUIRE(stream.good());
+        stream << fixture.value().serialize();
+        REQUIRE(stream.good());
+    }
+
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.dispatch(carto::application::NewProjectAction{"Engineering file import"}));
+    const auto imported = ui.import_engineering_authoring(source_path);
+    REQUIRE(imported);
+    REQUIRE(imported.value().document_changed);
+    REQUIRE(ui.snapshot().engineering.digest == fixture.value().canonical_digest().value());
+    REQUIRE(ui.snapshot().engineering.sources.size() == fixture.value().sources.size());
+    REQUIRE(ui.snapshot().operations.back().category == carto::ui::OperationCategory::provider);
+    REQUIRE(ui.snapshot().undo_count > 0U);
+
+    REQUIRE(ui.dispatch(carto::application::UndoAction{}));
+    REQUIRE(!ui.snapshot().engineering.present);
+    REQUIRE(ui.dispatch(carto::application::RedoAction{}));
+    REQUIRE(ui.snapshot().engineering.present);
+
+    const auto exported_path = root / "exported.carto-engineering-authoring";
+    REQUIRE(ui.export_engineering_authoring(exported_path));
+    std::ifstream exported_stream(exported_path, std::ios::binary);
+    REQUIRE(exported_stream.good());
+    const std::string exported_bytes((std::istreambuf_iterator<char>(exported_stream)), {});
+    REQUIRE(carto::engineering::AuthoringDocument::deserialize(exported_bytes));
+    REQUIRE(exported_bytes == fixture.value().serialize());
+
+    const auto invalid_path = root / "invalid.carto-engineering-authoring";
+    {
+        std::ofstream stream(invalid_path, std::ios::binary);
+        REQUIRE(stream.good());
+        stream << "not an engineering authoring document";
+    }
+    const auto revision_before_invalid_import = ui.snapshot().project_revision;
+    const auto digest_before_invalid_import = ui.snapshot().engineering.digest;
+    REQUIRE(!ui.import_engineering_authoring(invalid_path));
+    REQUIRE(ui.snapshot().project_revision == revision_before_invalid_import);
+    REQUIRE(ui.snapshot().engineering.digest == digest_before_invalid_import);
+    REQUIRE(!ui.submit_ai_proposal(carto::application::ImportEngineeringAuthoringAction{
+        fixture.value().serialize()}));
+    REQUIRE(ui.snapshot().project_revision == revision_before_invalid_import);
+
+    const auto oversized_path = root / "oversized.carto-engineering-authoring";
+    {
+        std::ofstream stream(oversized_path, std::ios::binary);
+        REQUIRE(stream.good());
+    }
+    std::filesystem::resize_file(
+        oversized_path, carto::engineering::AuthoringDocument::kMaxSerializedBytes + 1U);
+    REQUIRE(!ui.import_engineering_authoring(oversized_path));
+    REQUIRE(ui.snapshot().project_revision == revision_before_invalid_import);
+
+    const auto source = ui.snapshot().engineering.sources.front();
+    REQUIRE(ui.invalidate_engineering_source(
+        source.id, "revision-d", digest("revision-d-bytes")));
+    REQUIRE(ui.snapshot().engineering.stale);
+    REQUIRE(ui.snapshot().engineering.sources.front().revision == "revision-d");
+    REQUIRE(ui.snapshot().engineering.sources.front().digest == digest("revision-d-bytes"));
+    REQUIRE(!ui.snapshot().engineering.publication_ready);
+    REQUIRE(!ui.publish_engineering_package(root / "blocked.carto-inspection"));
+
+    auto reconciled = fixture.value();
+    reconciled.project_revision = reconciled.project_revision.next();
+    {
+        std::ofstream stream(source_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(stream.good());
+        stream << reconciled.serialize();
+        REQUIRE(stream.good());
+    }
+    REQUIRE(ui.import_engineering_authoring(source_path));
+    REQUIRE(!ui.snapshot().engineering.stale);
+    REQUIRE(ui.snapshot().engineering.vanta_admissible);
+
+    std::error_code ignored;
+    std::filesystem::remove_all(root, ignored);
+}
+
 void source_invalidation_preserves_authored_records_and_stales_products() {
     auto fixture = carto::engineering::make_dv012_fixture();
     REQUIRE(fixture);
@@ -214,6 +305,7 @@ int main() {
         step_boundary_never_fakes_a_cad_import();
         application_wires_engineering_authoring_through_persistence_and_history();
         ui_exposes_engineering_workspace_and_immutable_publication();
+        ui_imports_exports_and_reconciles_engineering_authoring_files();
         std::cout << "engineering tests passed\n";
         return 0;
     } catch (const std::exception& error) {

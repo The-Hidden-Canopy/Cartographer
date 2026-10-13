@@ -193,8 +193,10 @@ bool is_operation_action(const application::ApplicationAction& action) {
             std::is_same_v<Action, application::SetSculptLayerVisibilityAction> ||
             std::is_same_v<Action, application::SetObjectTransformAction> ||
             std::is_same_v<Action, application::ImportEngineeringFixtureAction> ||
+            std::is_same_v<Action, application::ImportEngineeringAuthoringAction> ||
             std::is_same_v<Action, application::InvalidateEngineeringSourceAction> ||
             std::is_same_v<Action, application::ImportConditionFixtureAction> ||
+            std::is_same_v<Action, application::ImportConditionAuthoringAction> ||
             std::is_same_v<Action, application::InvalidateConditionSourceAction>;
     }, action);
 }
@@ -408,6 +410,82 @@ std::filesystem::path preference_temporary_path(const std::filesystem::path& pat
     return std::filesystem::path(
         path.string() + ".tmp-" + std::to_string(static_cast<unsigned long long>(ticks)) +
         "-" + std::to_string(static_cast<unsigned long long>(counter)));
+}
+
+core::Result<std::string> read_bounded_file(
+    const std::filesystem::path& path,
+    std::size_t maximum_bytes,
+    std::string_view description) {
+    if (path.empty() || path.filename().empty()) {
+        return core::Result<std::string>::failure(invalid(
+            std::string(description) + " path must name a file"));
+    }
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(path, error)) {
+        return core::Result<std::string>::failure(error
+            ? io_error(std::string(description) + " file is unavailable")
+            : core::Diagnostic(core::ErrorCode::not_found,
+                std::string(description) + " file does not exist"));
+    }
+    const auto size = std::filesystem::file_size(path, error);
+    if (error) return core::Result<std::string>::failure(io_error(
+        "unable to inspect " + std::string(description) + " size"));
+    if (size > maximum_bytes || size > std::numeric_limits<std::size_t>::max() ||
+        size > static_cast<std::uintmax_t>(std::numeric_limits<std::streamsize>::max())) {
+        return core::Result<std::string>::failure(validation(
+            std::string(description) + " file exceeds the supported size"));
+    }
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) return core::Result<std::string>::failure(io_error(
+        "unable to open " + std::string(description) + " file"));
+    std::string bytes(static_cast<std::size_t>(size), '\0');
+    if (!bytes.empty()) stream.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (stream.gcount() != static_cast<std::streamsize>(bytes.size()) || stream.bad()) {
+        return core::Result<std::string>::failure(io_error(
+            "unable to read complete " + std::string(description) + " file"));
+    }
+    if (stream.peek() != std::char_traits<char>::eof()) {
+        return core::Result<std::string>::failure(stale(
+            std::string(description) + " file changed while it was being read"));
+    }
+    return core::Result<std::string>::success(std::move(bytes));
+}
+
+core::Result<void> write_atomic_file(
+    const std::filesystem::path& path,
+    std::string_view bytes,
+    std::string_view description) {
+    if (path.empty() || path.filename().empty()) {
+        return core::Result<void>::failure(invalid(
+            std::string(description) + " path must name a file"));
+    }
+    const auto parent = path.parent_path();
+    if (!parent.empty()) {
+        std::error_code error;
+        if (!std::filesystem::is_directory(parent, error) || error) {
+            return core::Result<void>::failure(io_error(
+                std::string(description) + " parent directory is unavailable"));
+        }
+    }
+    const auto temporary = preference_temporary_path(path);
+    std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
+    if (!stream) return core::Result<void>::failure(io_error(
+        "unable to create " + std::string(description) + " file"));
+    stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    stream.flush();
+    stream.close();
+    if (!stream) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        return core::Result<void>::failure(io_error(
+            "unable to write " + std::string(description) + " file"));
+    }
+    const auto replaced = atomic_replace(temporary, path);
+    if (!replaced) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+    }
+    return replaced;
 }
 
 constexpr std::array<WorkbenchInstrument, kWorkbenchInstrumentCount>
@@ -1444,6 +1522,25 @@ core::Result<application::DispatchReceipt> UiController::import_engineering_fixt
         OperationCategory::provider);
 }
 
+core::Result<application::DispatchReceipt> UiController::import_engineering_authoring(
+    const std::filesystem::path& path) {
+    auto bytes = read_bounded_file(
+        path, engineering::AuthoringDocument::kMaxSerializedBytes,
+        "engineering authoring document");
+    if (!bytes) return core::Result<application::DispatchReceipt>::failure(bytes.error());
+    return dispatch_with_category(
+        application::ImportEngineeringAuthoringAction{std::move(bytes).value()},
+        OperationCategory::provider);
+}
+
+core::Result<void> UiController::export_engineering_authoring(
+    const std::filesystem::path& path) const {
+    const auto authoring = session_.engineering_authoring();
+    if (!authoring) return core::Result<void>::failure(authoring.error());
+    return write_atomic_file(
+        path, authoring.value().serialize(), "engineering authoring document");
+}
+
 core::Result<application::DispatchReceipt> UiController::invalidate_engineering_source(
     engineering::Id source_id,
     std::string new_revision,
@@ -1523,6 +1620,25 @@ core::Result<void> UiController::publish_engineering_package(
 core::Result<application::DispatchReceipt> UiController::import_condition_fixture() {
     return dispatch_with_category(
         application::ImportConditionFixtureAction{}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::import_condition_authoring(
+    const std::filesystem::path& path) {
+    auto bytes = read_bounded_file(
+        path, condition::AuthoringDocument::kMaxSerializedBytes,
+        "CONDITION authoring document");
+    if (!bytes) return core::Result<application::DispatchReceipt>::failure(bytes.error());
+    return dispatch_with_category(
+        application::ImportConditionAuthoringAction{std::move(bytes).value()},
+        OperationCategory::provider);
+}
+
+core::Result<void> UiController::export_condition_authoring(
+    const std::filesystem::path& path) const {
+    const auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<void>::failure(authoring.error());
+    return write_atomic_file(
+        path, authoring.value().serialize(), "CONDITION authoring document");
 }
 
 core::Result<application::DispatchReceipt> UiController::invalidate_condition_source(

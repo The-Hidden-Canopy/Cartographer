@@ -113,6 +113,15 @@ struct EngineeringAuthoringView {
     std::size_t characteristic_count = 0U;
     std::size_t target_count = 0U;
     std::size_t derived_product_count = 0U;
+    struct Source {
+        std::uint64_t id = 0U;
+        std::string kind;
+        std::string locator;
+        std::string revision;
+        assets::Sha256Digest digest;
+    };
+    std::vector<Source> sources;
+    bool stale = false;
     bool workcell_present = false;
     bool path_present = false;
     bool publication_ready = false;
@@ -140,6 +149,16 @@ struct ConditionAuthoringView {
     std::size_t collection_count = 0U;
     std::size_t prefab_count = 0U;
     std::size_t region_kit_count = 0U;
+    struct Source {
+        std::uint64_t id = 0U;
+        std::string kind;
+        std::string label;
+        std::string locator;
+        std::string revision;
+        assets::Sha256Digest digest;
+        bool current = true;
+    };
+    std::vector<Source> sources;
     bool stale = false;
     bool publication_ready = false;
     bool consumer_admissible = false;
@@ -373,6 +392,7 @@ struct DuplicateMeshInstanceAction {
 };
 
 struct ImportEngineeringFixtureAction {};
+struct ImportEngineeringAuthoringAction { std::string serialized_document; };
 
 struct InvalidateEngineeringSourceAction {
     engineering::Id source_id = 0U;
@@ -381,6 +401,7 @@ struct InvalidateEngineeringSourceAction {
 };
 
 struct ImportConditionFixtureAction {};
+struct ImportConditionAuthoringAction { std::string serialized_document; };
 
 struct InvalidateConditionSourceAction {
     condition::Id source_id = 0U;
@@ -417,8 +438,10 @@ using ApplicationAction = std::variant<
     SetSculptLayerVisibilityAction,
     DuplicateMeshInstanceAction,
     ImportEngineeringFixtureAction,
+    ImportEngineeringAuthoringAction,
     InvalidateEngineeringSourceAction,
     ImportConditionFixtureAction,
+    ImportConditionAuthoringAction,
     InvalidateConditionSourceAction,
     UndoAction,
     RedoAction>;
@@ -526,9 +549,13 @@ private:
     [[nodiscard]] core::Result<DispatchReceipt> duplicate_mesh_instance(
         const DuplicateMeshInstanceAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> import_engineering_fixture();
+    [[nodiscard]] core::Result<DispatchReceipt> import_engineering_authoring(
+        const ImportEngineeringAuthoringAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> invalidate_engineering_source(
         const InvalidateEngineeringSourceAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> import_condition_fixture();
+    [[nodiscard]] core::Result<DispatchReceipt> import_condition_authoring(
+        const ImportConditionAuthoringAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> invalidate_condition_source(
         const InvalidateConditionSourceAction& action);
     [[nodiscard]] core::Result<ApplicationAction> preview_action(

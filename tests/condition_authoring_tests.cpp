@@ -153,6 +153,96 @@ void ui_publishes_only_admitted_source_packages() {
     std::filesystem::remove_all(root, ignored);
 }
 
+void ui_imports_exports_and_reconciles_condition_authoring_files() {
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto root = std::filesystem::temp_directory_path() /
+        ("cartographer-condition-authoring-io-" + std::to_string(stamp));
+    std::filesystem::create_directories(root);
+
+    auto fixture = carto::condition::make_condition_fixture();
+    REQUIRE(fixture);
+    const auto source_path = root / "source.carto-condition-authoring";
+    {
+        std::ofstream stream(source_path, std::ios::binary);
+        REQUIRE(stream.good());
+        stream << fixture.value().serialize();
+        REQUIRE(stream.good());
+    }
+
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.dispatch(carto::application::NewProjectAction{"CONDITION file import"}));
+    const auto imported = ui.import_condition_authoring(source_path);
+    REQUIRE(imported);
+    REQUIRE(imported.value().document_changed);
+    REQUIRE(ui.snapshot().condition.digest == fixture.value().canonical_digest().value());
+    REQUIRE(ui.snapshot().condition.sources.size() == fixture.value().sources.size());
+    REQUIRE(ui.snapshot().operations.back().category == carto::ui::OperationCategory::provider);
+    REQUIRE(ui.snapshot().undo_count > 0U);
+
+    REQUIRE(ui.dispatch(carto::application::UndoAction{}));
+    REQUIRE(!ui.snapshot().condition.present);
+    REQUIRE(ui.dispatch(carto::application::RedoAction{}));
+    REQUIRE(ui.snapshot().condition.present);
+
+    const auto exported_path = root / "exported.carto-condition-authoring";
+    REQUIRE(ui.export_condition_authoring(exported_path));
+    std::ifstream exported_stream(exported_path, std::ios::binary);
+    REQUIRE(exported_stream.good());
+    const std::string exported_bytes((std::istreambuf_iterator<char>(exported_stream)), {});
+    REQUIRE(carto::condition::AuthoringDocument::deserialize(exported_bytes));
+    REQUIRE(exported_bytes == fixture.value().serialize());
+
+    const auto invalid_path = root / "invalid.carto-condition-authoring";
+    {
+        std::ofstream stream(invalid_path, std::ios::binary);
+        REQUIRE(stream.good());
+        stream << "not a CONDITION authoring document";
+    }
+    const auto revision_before_invalid_import = ui.snapshot().project_revision;
+    const auto digest_before_invalid_import = ui.snapshot().condition.digest;
+    REQUIRE(!ui.import_condition_authoring(invalid_path));
+    REQUIRE(ui.snapshot().project_revision == revision_before_invalid_import);
+    REQUIRE(ui.snapshot().condition.digest == digest_before_invalid_import);
+    REQUIRE(!ui.submit_ai_proposal(carto::application::ImportConditionAuthoringAction{
+        fixture.value().serialize()}));
+    REQUIRE(ui.snapshot().project_revision == revision_before_invalid_import);
+
+    const auto oversized_path = root / "oversized.carto-condition-authoring";
+    {
+        std::ofstream stream(oversized_path, std::ios::binary);
+        REQUIRE(stream.good());
+    }
+    std::filesystem::resize_file(
+        oversized_path, carto::condition::AuthoringDocument::kMaxSerializedBytes + 1U);
+    REQUIRE(!ui.import_condition_authoring(oversized_path));
+    REQUIRE(ui.snapshot().project_revision == revision_before_invalid_import);
+
+    const auto source = ui.snapshot().condition.sources.front();
+    REQUIRE(ui.invalidate_condition_source(
+        source.id, "fixture-revision-2", digest("condition-revision-2-bytes")));
+    REQUIRE(ui.snapshot().condition.stale);
+    REQUIRE(!ui.snapshot().condition.sources.front().current);
+    REQUIRE(!ui.snapshot().condition.publication_ready);
+    REQUIRE(!ui.publish_condition_package(root / "blocked.carto-condition"));
+
+    auto reconciled = fixture.value();
+    reconciled.project_revision = reconciled.project_revision.next();
+    {
+        std::ofstream stream(source_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(stream.good());
+        stream << reconciled.serialize();
+        REQUIRE(stream.good());
+    }
+    REQUIRE(ui.import_condition_authoring(source_path));
+    REQUIRE(!ui.snapshot().condition.stale);
+    REQUIRE(ui.snapshot().condition.sources.front().current);
+    REQUIRE(ui.snapshot().condition.consumer_admissible);
+
+    std::error_code ignored;
+    std::filesystem::remove_all(root, ignored);
+}
+
 } // namespace
 
 int main() {
@@ -162,6 +252,7 @@ int main() {
         invalidation_preserves_source_identity_and_blocks_publication();
         application_persists_and_undoes_condition_authoring();
         ui_publishes_only_admitted_source_packages();
+        ui_imports_exports_and_reconciles_condition_authoring_files();
         return 0;
     } catch (const std::exception& error) {
         return (static_cast<void>(std::fprintf(stderr, "%s\n", error.what())), 1);

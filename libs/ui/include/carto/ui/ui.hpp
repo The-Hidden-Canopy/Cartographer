@@ -471,6 +471,10 @@ public:
         const std::filesystem::path& path,
         MeshImportFormat format);
     [[nodiscard]] core::Result<application::DispatchReceipt> import_engineering_fixture();
+    [[nodiscard]] core::Result<application::DispatchReceipt> import_engineering_authoring(
+        const std::filesystem::path& path);
+    [[nodiscard]] core::Result<void> export_engineering_authoring(
+        const std::filesystem::path& path) const;
     [[nodiscard]] core::Result<application::DispatchReceipt> invalidate_engineering_source(
         engineering::Id source_id,
         std::string new_revision,
@@ -482,6 +486,10 @@ public:
     [[nodiscard]] core::Result<void> publish_engineering_package(
         const std::filesystem::path& path) const;
     [[nodiscard]] core::Result<application::DispatchReceipt> import_condition_fixture();
+    [[nodiscard]] core::Result<application::DispatchReceipt> import_condition_authoring(
+        const std::filesystem::path& path);
+    [[nodiscard]] core::Result<void> export_condition_authoring(
+        const std::filesystem::path& path) const;
     [[nodiscard]] core::Result<application::DispatchReceipt> invalidate_condition_source(
         condition::Id source_id,
         std::string new_revision,

@@ -861,7 +861,9 @@ struct NativeSculptStrokeCapture {
 enum class FileDialogKind {
     project,
     engineering,
+    engineering_authoring,
     condition,
+    condition_authoring,
     market_package,
     mesh_import,
     gltf,
@@ -925,11 +927,23 @@ enum class StandardMeshExport {
             L"All Files\0*.*\0";
         dialog.lpstrDefExt = L"carto-inspection";
         break;
+    case FileDialogKind::engineering_authoring:
+        dialog.lpstrFilter =
+            L"Cartographer Engineering Authoring (*.carto-engineering-authoring)\0"
+            L"*.carto-engineering-authoring\0All Files\0*.*\0";
+        dialog.lpstrDefExt = L"carto-engineering-authoring";
+        break;
     case FileDialogKind::condition:
         dialog.lpstrFilter =
             L"Cartographer CONDITION Package (*.carto-condition)\0*.carto-condition\0"
             L"All Files\0*.*\0";
         dialog.lpstrDefExt = L"carto-condition";
+        break;
+    case FileDialogKind::condition_authoring:
+        dialog.lpstrFilter =
+            L"Cartographer CONDITION Authoring (*.carto-condition-authoring)\0"
+            L"*.carto-condition-authoring\0All Files\0*.*\0";
+        dialog.lpstrDefExt = L"carto-condition-authoring";
         break;
     }
     dialog.nFilterIndex = 1;
@@ -1021,6 +1035,12 @@ struct DesktopState {
     std::optional<carto::ui::Workspace> previous_workspace_kind;
     std::string action_feedback;
     bool action_feedback_error = false;
+    std::optional<std::uint64_t> engineering_source_update_id;
+    std::array<char, 129> engineering_source_revision{};
+    std::array<char, 65> engineering_source_digest{};
+    std::optional<std::uint64_t> condition_source_update_id;
+    std::array<char, 129> condition_source_revision{};
+    std::array<char, 65> condition_source_digest{};
     std::optional<std::uint64_t> selected_operation_id;
     std::unique_ptr<carto::production::PreparationJob> preparation_job;
 
@@ -1431,6 +1451,66 @@ struct DesktopState {
         action_feedback_error = false;
     }
 
+    void import_engineering_authoring() {
+        const auto path = choose_file(false, FileDialogKind::engineering_authoring);
+        if (!path.has_value()) return;
+        const auto imported = ui.import_engineering_authoring(*path);
+        if (!imported) {
+            action_feedback = imported.error().message;
+            action_feedback_error = true;
+            return;
+        }
+        engineering_source_update_id.reset();
+        engineering_source_revision.fill('\0');
+        engineering_source_digest.fill('\0');
+        const auto snapshot = ui.snapshot();
+        action_feedback = "Imported validated engineering authoring from " +
+            path->filename().string() + " (" +
+            std::to_string(snapshot.engineering.source_count) + " sources).";
+        action_feedback_error = false;
+    }
+
+    void export_engineering_authoring() {
+        const auto path = choose_file(true, FileDialogKind::engineering_authoring);
+        if (!path.has_value()) return;
+        const auto exported = ui.export_engineering_authoring(*path);
+        if (!exported) {
+            action_feedback = exported.error().message;
+            action_feedback_error = true;
+            return;
+        }
+        action_feedback = "Exported the validated engineering authoring document to " +
+            path->filename().string() + ".";
+        action_feedback_error = false;
+    }
+
+    void record_engineering_source_change() {
+        if (!engineering_source_update_id.has_value()) return;
+        const std::string revision(engineering_source_revision.data());
+        const auto digest = carto::assets::Sha256Digest::from_hex(
+            std::string_view(engineering_source_digest.data()));
+        if (revision.empty() || !digest) {
+            action_feedback = revision.empty()
+                ? "Enter the source revision before recording drift."
+                : digest.error().message;
+            action_feedback_error = true;
+            return;
+        }
+        const auto updated = ui.invalidate_engineering_source(
+            *engineering_source_update_id, revision, digest.value());
+        if (!updated) {
+            action_feedback = updated.error().message;
+            action_feedback_error = true;
+            return;
+        }
+        action_feedback = "Recorded the new engineering source evidence. Dependent authored "
+            "records are stale until reconciled in an updated authoring document.";
+        action_feedback_error = false;
+        engineering_source_update_id.reset();
+        engineering_source_revision.fill('\0');
+        engineering_source_digest.fill('\0');
+    }
+
     void publish_condition_package() {
         const auto path = choose_file(true, FileDialogKind::condition);
         if (!path.has_value()) return;
@@ -1445,6 +1525,66 @@ struct DesktopState {
             (package ? package.value().publication_digest.hex() : std::string{"unknown"}) +
             " to " + path->filename().string() + ".";
         action_feedback_error = false;
+    }
+
+    void import_condition_authoring() {
+        const auto path = choose_file(false, FileDialogKind::condition_authoring);
+        if (!path.has_value()) return;
+        const auto imported = ui.import_condition_authoring(*path);
+        if (!imported) {
+            action_feedback = imported.error().message;
+            action_feedback_error = true;
+            return;
+        }
+        condition_source_update_id.reset();
+        condition_source_revision.fill('\0');
+        condition_source_digest.fill('\0');
+        const auto snapshot = ui.snapshot();
+        action_feedback = "Imported validated CONDITION authoring from " +
+            path->filename().string() + " (" +
+            std::to_string(snapshot.condition.source_count) + " sources).";
+        action_feedback_error = false;
+    }
+
+    void export_condition_authoring() {
+        const auto path = choose_file(true, FileDialogKind::condition_authoring);
+        if (!path.has_value()) return;
+        const auto exported = ui.export_condition_authoring(*path);
+        if (!exported) {
+            action_feedback = exported.error().message;
+            action_feedback_error = true;
+            return;
+        }
+        action_feedback = "Exported the validated CONDITION authoring document to " +
+            path->filename().string() + ".";
+        action_feedback_error = false;
+    }
+
+    void record_condition_source_change() {
+        if (!condition_source_update_id.has_value()) return;
+        const std::string revision(condition_source_revision.data());
+        const auto digest = carto::assets::Sha256Digest::from_hex(
+            std::string_view(condition_source_digest.data()));
+        if (revision.empty() || !digest) {
+            action_feedback = revision.empty()
+                ? "Enter the source revision before recording drift."
+                : digest.error().message;
+            action_feedback_error = true;
+            return;
+        }
+        const auto updated = ui.invalidate_condition_source(
+            *condition_source_update_id, revision, digest.value());
+        if (!updated) {
+            action_feedback = updated.error().message;
+            action_feedback_error = true;
+            return;
+        }
+        action_feedback = "Recorded the new CONDITION source evidence. Dependent authored "
+            "records are stale until reconciled in an updated authoring document.";
+        action_feedback_error = false;
+        condition_source_update_id.reset();
+        condition_source_revision.fill('\0');
+        condition_source_digest.fill('\0');
     }
 
     bool route_native_key(const carto::ui::NativeKeyEvent& event) {
@@ -3975,7 +4115,10 @@ struct DesktopState {
         ImGui::Separator();
         if (!snapshot.engineering.present) {
             ImGui::TextDisabled("No engineering authoring is loaded.");
-            if (ImGui::Button("Load DV012 fixture", ImVec2(-1, 30))) {
+            if (ImGui::Button("Import authoring document...", ImVec2(-1, 30))) {
+                import_engineering_authoring();
+            }
+            if (ImGui::Button("Load DV012 demo fixture", ImVec2(-1, 30))) {
                 static_cast<void>(dispatch(
                     carto::application::ImportEngineeringFixtureAction{}));
             }
@@ -3996,6 +4139,47 @@ struct DesktopState {
             if (!engineering.digest.is_zero()) {
                 mono_text_disabled(("Authoring " + engineering.digest.hex()).c_str());
             }
+            if (ImGui::BeginChild("Engineering source records", ImVec2(0, 92), true)) {
+                ImGuiListClipper clipper;
+                clipper.Begin(static_cast<int>(engineering.sources.size()), 70.0F);
+                while (clipper.Step()) {
+                    for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
+                        const auto& source = engineering.sources[static_cast<std::size_t>(index)];
+                        const std::string source_id = std::to_string(source.id);
+                        ImGui::PushID(source_id.c_str());
+                        ImGui::Text("Source %s · %s", source_id.c_str(), source.kind.c_str());
+                        ImGui::TextDisabled("%s · revision %s", source.locator.c_str(),
+                                            source.revision.c_str());
+                        mono_text_disabled(source.digest.hex().c_str());
+                        if (ImGui::SmallButton("Record changed source...")) {
+                            engineering_source_update_id = source.id;
+                            engineering_source_revision.fill('\0');
+                            engineering_source_digest.fill('\0');
+                        }
+                        ImGui::PopID();
+                    }
+                }
+            }
+            ImGui::EndChild();
+            if (engineering_source_update_id.has_value()) {
+                ImGui::InputText("New source revision", engineering_source_revision.data(),
+                                 engineering_source_revision.size());
+                ImGui::InputText("New source SHA-256", engineering_source_digest.data(),
+                                 engineering_source_digest.size());
+                if (ImGui::Button("Record drift and stale dependent evidence")) {
+                    record_engineering_source_change();
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Cancel source update")) {
+                    engineering_source_update_id.reset();
+                    engineering_source_revision.fill('\0');
+                    engineering_source_digest.fill('\0');
+                }
+            }
+            if (engineering.stale) {
+                ImGui::TextColored(color(snapshot.colors.semantic_error),
+                    "Source drift is recorded; import reconciled authoring to restore admission.");
+            }
             const ImVec4 status_color = engineering.vanta_admissible
                 ? color(snapshot.colors.semantic_success)
                 : engineering.publication_ready
@@ -4003,12 +4187,23 @@ struct DesktopState {
                     : color(snapshot.colors.semantic_error);
             ImGui::TextColored(status_color, "%s", engineering.status.c_str());
             ImGui::Spacing();
+            if (ImGui::Button("Import replacement authoring...", ImVec2(-1, 30))) {
+                import_engineering_authoring();
+            }
+            if (ImGui::Button("Export authoring document...", ImVec2(-1, 30))) {
+                export_engineering_authoring();
+            }
+            ImGui::BeginDisabled(!engineering.publication_ready || engineering.stale);
             if (ImGui::Button("Publish .carto-inspection...", ImVec2(-1, 30))) {
                 publish_engineering_package();
             }
-            if (ImGui::Button("Re-import fixture", ImVec2(-1, 30))) {
-                static_cast<void>(dispatch(
-                    carto::application::ImportEngineeringFixtureAction{}));
+            ImGui::EndDisabled();
+            if (ImGui::Button("Replace with DV012 demo fixture", ImVec2(-1, 30))) {
+                if (dispatch(carto::application::ImportEngineeringFixtureAction{})) {
+                    engineering_source_update_id.reset();
+                    engineering_source_revision.fill('\0');
+                    engineering_source_digest.fill('\0');
+                }
             }
         }
         if (!action_feedback.empty()) {
@@ -4029,7 +4224,10 @@ struct DesktopState {
         ImGui::Separator();
         if (!snapshot.condition.present) {
             ImGui::TextDisabled("No CONDITION source authoring is loaded.");
-            if (ImGui::Button("Load CONDITION fixture", ImVec2(-1, 30))) {
+            if (ImGui::Button("Import authoring document...", ImVec2(-1, 30))) {
+                import_condition_authoring();
+            }
+            if (ImGui::Button("Load CONDITION demo fixture", ImVec2(-1, 30))) {
                 static_cast<void>(dispatch(
                     carto::application::ImportConditionFixtureAction{}));
             }
@@ -4050,6 +4248,46 @@ struct DesktopState {
             if (!condition.digest.is_zero()) {
                 mono_text_disabled(("Authoring " + condition.digest.hex()).c_str());
             }
+            if (ImGui::BeginChild("CONDITION source records", ImVec2(0, 92), true)) {
+                ImGuiListClipper clipper;
+                clipper.Begin(static_cast<int>(condition.sources.size()), 70.0F);
+                while (clipper.Step()) {
+                    for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
+                        const auto& source = condition.sources[static_cast<std::size_t>(index)];
+                        const std::string source_id = std::to_string(source.id);
+                        ImGui::PushID(source_id.c_str());
+                        ImGui::Text("Source %s · %s%s", source_id.c_str(), source.kind.c_str(),
+                                    source.current ? "" : " · stale");
+                        ImGui::TextDisabled("%s · revision %s",
+                                            source.label.empty() ? source.locator.c_str()
+                                                                 : source.label.c_str(),
+                                            source.revision.c_str());
+                        mono_text_disabled(source.digest.hex().c_str());
+                        if (ImGui::SmallButton("Record changed source...")) {
+                            condition_source_update_id = source.id;
+                            condition_source_revision.fill('\0');
+                            condition_source_digest.fill('\0');
+                        }
+                        ImGui::PopID();
+                    }
+                }
+            }
+            ImGui::EndChild();
+            if (condition_source_update_id.has_value()) {
+                ImGui::InputText("New source revision", condition_source_revision.data(),
+                                 condition_source_revision.size());
+                ImGui::InputText("New source SHA-256", condition_source_digest.data(),
+                                 condition_source_digest.size());
+                if (ImGui::Button("Record drift and stale dependent evidence")) {
+                    record_condition_source_change();
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Cancel source update")) {
+                    condition_source_update_id.reset();
+                    condition_source_revision.fill('\0');
+                    condition_source_digest.fill('\0');
+                }
+            }
             const ImVec4 status_color = condition.consumer_admissible
                 ? color(snapshot.colors.semantic_success)
                 : condition.publication_ready
@@ -4061,12 +4299,23 @@ struct DesktopState {
                                    "Source drift is recorded; package publication is blocked.");
             }
             ImGui::Spacing();
+            if (ImGui::Button("Import replacement authoring...", ImVec2(-1, 30))) {
+                import_condition_authoring();
+            }
+            if (ImGui::Button("Export authoring document...", ImVec2(-1, 30))) {
+                export_condition_authoring();
+            }
+            ImGui::BeginDisabled(!condition.publication_ready || condition.stale);
             if (ImGui::Button("Publish .carto-condition...", ImVec2(-1, 30))) {
                 publish_condition_package();
             }
-            if (ImGui::Button("Re-import fixture", ImVec2(-1, 30))) {
-                static_cast<void>(dispatch(
-                    carto::application::ImportConditionFixtureAction{}));
+            ImGui::EndDisabled();
+            if (ImGui::Button("Replace with CONDITION demo fixture", ImVec2(-1, 30))) {
+                if (dispatch(carto::application::ImportConditionFixtureAction{})) {
+                    condition_source_update_id.reset();
+                    condition_source_revision.fill('\0');
+                    condition_source_digest.fill('\0');
+                }
             }
         }
         if (!action_feedback.empty()) {
