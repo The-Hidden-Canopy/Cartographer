@@ -118,12 +118,18 @@ struct MaterialRegionAssignment {
     [[nodiscard]] core::Result<void> validate() const;
 };
 
+struct MaterialGraphBinding {
+    std::string graph_identity;
+    core::Revision source_revision;
+    assets::Sha256Digest source_digest;
+};
+
 // Provider-neutral authoring truth owned by ProjectDocument. Compiled
 // materials, generated mips, native engine materials, and cache entries are
 // derived products and cannot replace this catalog.
 class MaterialCatalog final {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 2U;
+    static constexpr std::uint32_t kSchemaVersion = 3U;
     static constexpr std::size_t kMaxSerializedBytes = 32U * 1024U * 1024U;
     static constexpr std::size_t kMaxRecordsPerKind = 65'536U;
     static constexpr std::size_t kMaxVariantMeshScope = 65'536U;
@@ -131,9 +137,16 @@ public:
     [[nodiscard]] core::Result<void> insert_texture(TextureSourceRecord texture);
     [[nodiscard]] core::Result<void> insert_sampler(SamplerIntent sampler);
     [[nodiscard]] core::Result<void> insert_material(render::MaterialAsset material);
+    [[nodiscard]] core::Result<void> replace_material(render::MaterialAsset material);
     [[nodiscard]] core::Result<void> insert_variant(MaterialVariant variant);
     [[nodiscard]] core::Result<void> insert_assignment(MaterialRegionAssignment assignment);
+    [[nodiscard]] core::Result<void> replace_assignment(MaterialRegionAssignment assignment);
+    [[nodiscard]] core::Result<void> erase_assignment(MaterialRegionKey key);
     [[nodiscard]] core::Result<void> insert_material_graph(MaterialGraph graph);
+    [[nodiscard]] core::Result<void> replace_material_graph(MaterialGraph graph);
+    [[nodiscard]] core::Result<void> bind_material_graph(
+        render::MaterialId material, std::string graph_identity);
+    [[nodiscard]] core::Result<void> unbind_material_graph(render::MaterialId material);
 
     [[nodiscard]] const std::map<assets::TextureAssetId, TextureSourceRecord>&
     textures() const noexcept {
@@ -159,6 +172,10 @@ public:
     material_graphs() const noexcept {
         return material_graphs_;
     }
+    [[nodiscard]] const std::map<render::MaterialId, MaterialGraphBinding>&
+    material_graph_bindings() const noexcept {
+        return material_graph_bindings_;
+    }
 
     [[nodiscard]] bool empty() const noexcept;
     [[nodiscard]] core::Result<void> validate() const;
@@ -176,6 +193,7 @@ private:
     std::map<MaterialVariantId, MaterialVariant> variants_;
     std::map<MaterialRegionKey, MaterialRegionAssignment> assignments_;
     std::map<std::string, MaterialGraph> material_graphs_;
+    std::map<render::MaterialId, MaterialGraphBinding> material_graph_bindings_;
 };
 
 } // namespace carto::project

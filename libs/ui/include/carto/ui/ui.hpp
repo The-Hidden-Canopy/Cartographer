@@ -258,6 +258,9 @@ struct MeshImportReceipt {
     std::size_t triangles = 0U;
     std::vector<std::string> warnings;
     application::DispatchReceipt dispatch;
+    bool source_linked = false;
+    std::string source_identity;
+    std::string relative_source_path;
 };
 
 enum class MarketStatus {
@@ -427,7 +430,9 @@ struct UiSnapshot : application::ApplicationSnapshot {
     bool ai_auto_approve = true;
     std::string ai_status;
     std::string agent_goal;
+    std::string agent_recipe_id;
     std::vector<agent::AgentPlanStep> agent_plan_draft;
+    std::vector<agent::HardConstraint> agent_hard_constraints_draft;
     std::vector<agent::ClarificationQuestion> agent_clarifications_draft;
     bool agent_repair_ready = false;
     bool agent_checkpoint_loaded = false;
@@ -436,6 +441,7 @@ struct UiSnapshot : application::ApplicationSnapshot {
     core::Revision agent_checkpoint_base_revision;
     core::Revision agent_checkpoint_rebase_revision;
     std::optional<agent::AgentTaskSnapshot> agent_task;
+    std::optional<agent::AgentDemonstration> agent_demonstration;
 };
 
 [[nodiscard]] UiColorTokens color_tokens(Theme theme) noexcept;
@@ -470,6 +476,8 @@ public:
 
     [[nodiscard]] core::Result<application::DispatchReceipt> dispatch(
         const application::ApplicationAction& action);
+    [[nodiscard]] core::Result<project::MaterialGraph> material_graph_source(
+        std::string_view identity) const;
     [[nodiscard]] core::Result<editor::AuthoringPreview> begin_preview(
         editor::PreviewKind kind) const;
     [[nodiscard]] core::Result<application::DispatchReceipt> commit_preview(
@@ -490,6 +498,9 @@ public:
     [[nodiscard]] core::Result<void> queue_agent_step(
         std::string intent,
         std::vector<std::string> dependencies = {});
+    [[nodiscard]] core::Result<void> set_agent_hard_constraints(
+        std::vector<agent::HardConstraint> constraints);
+    [[nodiscard]] core::Result<void> set_agent_recipe(std::string recipe_id);
     [[nodiscard]] core::Result<void> queue_agent_clarification(
         std::string prompt,
         agent::ClarificationImpact impact);
@@ -497,7 +508,9 @@ public:
         std::string goal,
         std::string_view question_id,
         std::string answer);
-    [[nodiscard]] core::Result<agent::AgentTaskSnapshot> run_agent_plan(std::string goal);
+    [[nodiscard]] core::Result<agent::AgentTaskSnapshot> run_agent_plan(
+        std::string goal,
+        std::optional<agent::AgentWorkEnvelope> requested_envelope = std::nullopt);
     [[nodiscard]] core::Result<void> revise_agent_plan_step(
         agent::AgentPlanStep revised_step);
     [[nodiscard]] core::Result<agent::AgentTaskSnapshot> repair_agent_plan(
@@ -506,6 +519,11 @@ public:
         const std::filesystem::path& path) const;
     [[nodiscard]] core::Result<void> load_agent_checkpoint(
         const std::filesystem::path& path);
+    [[nodiscard]] core::Result<void> save_agent_demonstration(
+        const std::filesystem::path& path) const;
+    [[nodiscard]] core::Result<void> load_agent_demonstration(
+        const std::filesystem::path& path);
+    [[nodiscard]] core::Result<void> clear_agent_demonstration();
     [[nodiscard]] core::Result<void> rebase_agent_checkpoint();
     [[nodiscard]] core::Result<agent::AgentTaskSnapshot> resume_agent_checkpoint();
     [[nodiscard]] core::Result<agent::AgentTaskSnapshot> correct_agent_ghost_transform(
@@ -545,6 +563,11 @@ public:
         const std::filesystem::path& path);
     [[nodiscard]] core::Result<application::DispatchReceipt> import_condition_audio_clip(
         const std::filesystem::path& path);
+    [[nodiscard]] core::Result<application::DispatchReceipt> bind_condition_asset_to_object(
+        condition::Id asset_id,
+        scene::ObjectId object_id,
+        core::Revision expected_project_revision,
+        core::Revision expected_authoring_revision);
     [[nodiscard]] core::Result<application::DispatchReceipt> set_condition_source_reviewed(
         condition::Id source_id, bool reviewed);
     [[nodiscard]] core::Result<void> export_condition_authoring(
@@ -656,9 +679,12 @@ private:
     MarketView market_view_;
     std::uint64_t next_operation_id_ = 1U;
     std::vector<agent::AgentPlanStep> agent_plan_draft_;
+    std::vector<agent::HardConstraint> agent_hard_constraints_draft_;
     std::vector<agent::ClarificationQuestion> agent_clarifications_draft_;
+    std::string agent_recipe_id_;
     std::optional<core::Revision> agent_plan_base_revision_;
     std::optional<agent::AgentTask> agent_task_;
+    std::optional<agent::AgentDemonstration> agent_demonstration_;
     std::optional<agent::AgentTaskCheckpoint> agent_checkpoint_pending_;
     bool agent_checkpoint_rebased_ = false;
     std::string agent_goal_;

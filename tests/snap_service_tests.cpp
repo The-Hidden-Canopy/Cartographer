@@ -4,11 +4,13 @@
 #include <carto/project/transaction.hpp>
 
 #include <chrono>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <vector>
 
 namespace {
@@ -171,6 +173,38 @@ void disabled_profile_does_not_leave_a_lock() {
         "disabled snap profile clears transient state without authoring mutation");
 }
 
+void axis_constraint_preserves_the_active_transform_handle() {
+    const Revision revision{18U};
+    SnapProfile profile;
+    SnapSession session;
+    const std::vector<SnapCandidate> candidates{
+        vertex(1U, {0.20, 4.0, 0.02}, revision),
+        vertex(2U, {0.05, -3.0, 0.20}, revision),
+    };
+    const auto result = carto::editor::acquire_snap(
+        candidates, {}, revision, profile, session,
+        {carto::editor::SnapConstraintAxis::world_x, 0.05});
+    require(result && result.value().candidate.has_value() &&
+            result.value().candidate->vertex == carto::geometry::VertexId{1U} &&
+            result.value().candidate->distance == 0.20,
+        "axis snapping retains only candidates aligned with the active handle");
+
+    const std::vector<SnapCandidate> off_axis{
+        vertex(3U, {0.01, 100.0, 0.20}, revision),
+    };
+    const auto rejected = carto::editor::acquire_snap(
+        off_axis, {}, revision, profile, session,
+        {carto::editor::SnapConstraintAxis::world_x, 0.05});
+    require(rejected && !rejected.value().candidate.has_value() && !session.locked(),
+        "axis snapping releases a target that cannot be reached by the active handle");
+
+    const auto stale = carto::editor::acquire_snap(
+        candidates, {}, Revision{19U}, profile, session,
+        {carto::editor::SnapConstraintAxis::world_x, 0.05});
+    require(!stale && stale.error().code == carto::core::ErrorCode::stale_data,
+        "axis-constrained snapping preserves source-revision refusal");
+}
+
 void scene_query_is_world_space_instance_aware_and_revision_bound() {
     TempDirectory directory;
     carto::journal::Journal journal(directory.path() / "snap-events.log");
@@ -269,6 +303,136 @@ void scene_query_is_world_space_instance_aware_and_revision_bound() {
         "scene candidates cannot survive a later transform revision");
 }
 
+void compiled_viewport_query_reuses_source_and_mesh_identity() {
+    carto::geometry::EditableMesh source_mesh;
+    const auto first = source_mesh.add_vertex({0.0, 0.0, 0.0});
+    const auto second = source_mesh.add_vertex({0.2, 0.0, 0.0});
+    const auto third = source_mesh.add_vertex({0.0, 1.0, 1.0});
+    require(first && second && third && source_mesh.add_face({
+            first.value(), second.value(), third.value()}),
+        "compiled snap fixture mesh is valid");
+    const auto compiled_result = source_mesh.compile();
+    require(static_cast<bool>(compiled_result), "compiled snap fixture mesh builds");
+    const auto compiled = std::make_shared<const carto::geometry::CompiledMesh>(
+        compiled_result.value());
+
+    carto::render::RenderScene scene;
+    carto::core::Transform transform;
+    transform.translation = {0.25, 0.0, 0.0};
+    const auto object = carto::scene::ObjectId{77U};
+    constexpr std::uint64_t kMeshAsset = 42U;
+    require(static_cast<bool>(scene.upsert({
+            object, compiled, transform, compiled->source_revision, kMeshAsset})),
+        "compiled viewport scene accepts a revision-bound mesh instance");
+
+    constexpr std::array<SnapKind, 3> kinds{
+        SnapKind::vertex, SnapKind::edge_midpoint, SnapKind::face_center};
+    const Revision project_revision{23U};
+    const auto queried = carto::editor::find_snap_candidates(
+        scene, {0.25, 0.0, 0.0}, kinds, project_revision, 2.0);
+    require(queried && queried.value().size() == 7U,
+        "compiled viewport query returns every nearby candidate in each requested class");
+    std::size_t vertex_count = 0U;
+    std::size_t edge_count = 0U;
+    std::size_t face_count = 0U;
+    for (const auto& candidate : queried.value()) {
+        require(candidate.object == object && candidate.mesh_asset == kMeshAsset &&
+                candidate.source_revision == project_revision &&
+                candidate.mesh_revision == compiled->source_revision,
+            "compiled viewport candidates retain object, asset, project, and mesh provenance");
+        vertex_count += candidate.kind == SnapKind::vertex ? 1U : 0U;
+        edge_count += candidate.kind == SnapKind::edge_midpoint ? 1U : 0U;
+        face_count += candidate.kind == SnapKind::face_center ? 1U : 0U;
+    }
+    require(vertex_count == 3U && edge_count == 3U && face_count == 1U,
+        "compiled viewport query preserves stable identities for neighboring snap features");
+
+    SnapProfile profile;
+    SnapSession session;
+    const auto acquired = carto::editor::acquire_snap(
+        queried.value(), {0.25, 0.0, 0.0}, project_revision, profile, session);
+    require(acquired && acquired.value().candidate.has_value() &&
+            acquired.value().candidate->kind == SnapKind::vertex,
+        "compiled viewport candidates use the same deterministic snap policy");
+    const auto stale = carto::editor::acquire_snap(
+        queried.value(), {0.25, 0.0, 0.0}, project_revision.next(), profile, session);
+    require(!stale && stale.error().code == carto::core::ErrorCode::stale_data,
+        "compiled viewport candidates are refused after a project revision change");
+
+    constexpr std::array<SnapKind, 1> vertices_only{SnapKind::vertex};
+    const auto near_vertices = carto::editor::find_snap_candidates(
+        scene, {0.34, 900.0, 0.0}, vertices_only, project_revision, 0.25);
+    require(near_vertices && near_vertices.value().size() == 2U,
+        "top-down candidate radius includes nearby plan positions regardless of elevation");
+    SnapProfile stable_profile;
+    SnapSession stable_session;
+    const auto first_pick = carto::editor::acquire_snap(
+        near_vertices.value(), {0.34, 0.0, 0.0}, project_revision,
+        stable_profile, stable_session,
+        {carto::editor::SnapConstraintAxis::world_x, 0.05});
+    require(first_pick && first_pick.value().candidate.has_value(),
+        "viewport candidates acquire under the X-axis plan constraint");
+
+    const auto all_near_vertices = carto::editor::find_snap_candidates(
+        scene, {0.35, -900.0, 0.0}, vertices_only, project_revision, 0.25);
+    require(all_near_vertices && all_near_vertices.value().size() == 2U,
+        "neighboring viewport candidates remain available as the pointer moves");
+    const auto retained = carto::editor::acquire_snap(
+        all_near_vertices.value(), {0.35, 0.0, 0.0}, project_revision,
+        stable_profile, stable_session,
+        {carto::editor::SnapConstraintAxis::world_x, 0.05});
+    require(retained && retained.value().candidate.has_value() &&
+            retained.value().retained,
+        "hysteresis can retain the same identity while neighboring features remain nearby");
+}
+
+void compiled_viewport_query_ignores_polygon_triangulation_diagonals() {
+    carto::geometry::EditableMesh source_mesh;
+    const auto first = source_mesh.add_vertex({0.0, 0.0, 0.0});
+    const auto second = source_mesh.add_vertex({1.0, 0.0, 0.0});
+    const auto third = source_mesh.add_vertex({1.0, 0.0, 1.0});
+    const auto fourth = source_mesh.add_vertex({0.0, 0.0, 1.0});
+    require(first && second && third && fourth && source_mesh.add_face({
+        first.value(), second.value(), third.value(), fourth.value()}),
+        "quad snap fixture is valid");
+    const auto compiled_result = source_mesh.compile();
+    require(static_cast<bool>(compiled_result), "quad snap fixture compiles");
+    const auto compiled = std::make_shared<const carto::geometry::CompiledMesh>(
+        compiled_result.value());
+    bool has_unidentified_diagonal = false;
+    for (const auto& triangle : compiled->triangle_edges) {
+        for (const auto& edge : triangle) {
+            has_unidentified_diagonal = has_unidentified_diagonal || !edge.has_value();
+        }
+    }
+    require(has_unidentified_diagonal,
+        "compiled quad distinguishes triangulation diagonals from authored edges");
+
+    carto::render::RenderScene scene;
+    constexpr std::uint64_t kMeshAsset = 43U;
+    const auto object = carto::scene::ObjectId{78U};
+    require(static_cast<bool>(scene.upsert({object, compiled,
+        carto::core::Transform::identity(), compiled->source_revision, kMeshAsset})),
+        "quad render instance has stable source identity");
+    constexpr std::array<SnapKind, 1> edges_only{SnapKind::edge_midpoint};
+    const auto candidates = carto::editor::find_snap_candidates(
+        scene, {}, edges_only, Revision{24U}, 2.0);
+    require(candidates && candidates.value().size() == 4U,
+        "query returns four authored quad-edge midpoints and no diagonal");
+    for (const auto& candidate : candidates.value()) {
+        require(candidate.kind == SnapKind::edge_midpoint && candidate.edge.has_value(),
+            "every returned edge midpoint retains an authored EdgeId");
+    }
+
+    carto::editor::SnapSettings settings;
+    settings.enabled = true;
+    settings.kind = SnapKind::edge_midpoint;
+    const auto nearest = carto::editor::find_snap_candidate(
+        *compiled, {0.5, 0.0, 0.5}, settings, 2.0);
+    require(nearest && nearest.value().has_value(),
+        "single-mesh edge query also skips unidentified triangulation diagonals");
+}
+
 } // namespace
 
 int main() {
@@ -276,7 +440,10 @@ int main() {
     hysteresis_retains_and_switches_deterministically();
     stale_and_malformed_inputs_fail_closed();
     disabled_profile_does_not_leave_a_lock();
+    axis_constraint_preserves_the_active_transform_handle();
     scene_query_is_world_space_instance_aware_and_revision_bound();
+    compiled_viewport_query_reuses_source_and_mesh_identity();
+    compiled_viewport_query_ignores_polygon_triangulation_diagonals();
     std::cout << "snap service tests passed\n";
     return EXIT_SUCCESS;
 }

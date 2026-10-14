@@ -48,6 +48,39 @@ void tile_identities_are_canonical_and_bounded() {
         "non-canonical, overflowing, and malformed tile identities fail closed");
 }
 
+void terrain_viewport_lod_respects_a_deterministic_triangle_budget() {
+    constexpr std::uint64_t triangle_budget = 16'384U;
+    const auto fine = terrain::lod_step_for_triangle_budget(32U, 32U, triangle_budget);
+    require(fine && fine.value() == 1U,
+        "small terrain previews keep the finest source sampling");
+    const auto coarse = terrain::lod_step_for_triangle_budget(256U, 256U, triangle_budget);
+    require(coarse && coarse.value() == 3U,
+        "large terrain previews select the finest step under the triangle cap");
+    require(!terrain::lod_step_for_triangle_budget(1U, 32U, triangle_budget) &&
+            !terrain::lod_step_for_triangle_budget(32U, 32U, 1U) &&
+            !terrain::lod_step_for_triangle_budget(2U, 256U, 2U) &&
+            !terrain::lod_step_for_triangle_budget(
+                spatial_field::ScalarField2D::kMaxAxisSamples + 1U, 32U,
+                triangle_budget),
+        "invalid source dimensions and impossible triangle budgets fail closed");
+
+    auto source = spatial_field::ScalarField2D::create(
+        terrain::terrain_tile_identity({0, 0}),
+        spatial_field::FieldSemantic::terrain_elevation,
+        {0.0, 0.0}, 1.0, 256U, 256U, 0.0, 1.0, 0.5);
+    require(static_cast<bool>(source), "maximum supported terrain preview source creates");
+    const auto digest_before = source.value().canonical_digest();
+    const auto product = terrain::build_terrain_tile(
+        source.value(), {0, 0}, coarse.value());
+    require(product && product.value().validate() &&
+            product.value().lod_step() == coarse.value() &&
+            product.value().indices().size() / 3U <= triangle_budget,
+        "derived viewport mesh obeys the deterministic draw budget");
+    require(source.value().source_revision() == core::Revision{1U} &&
+            source.value().canonical_digest().value() == digest_before.value(),
+        "LOD selection and preview generation do not mutate the source field");
+}
+
 void terrain_derivation_and_local_rebuild_preserve_provenance() {
     auto source = flat_tile();
     const auto encoded = source.serialize();
@@ -195,6 +228,7 @@ void terrain_derivation_and_local_rebuild_preserve_provenance() {
 
 int main() {
     tile_identities_are_canonical_and_bounded();
+    terrain_viewport_lod_respects_a_deterministic_triangle_budget();
     terrain_derivation_and_local_rebuild_preserve_provenance();
     std::cout << "terrain tests passed\n";
     return EXIT_SUCCESS;

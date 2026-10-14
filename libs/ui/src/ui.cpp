@@ -1,5 +1,6 @@
 #include <carto/ui/ui.hpp>
 
+#include <carto/assets/blob_store.hpp>
 #include <carto/io/builtin_provider.hpp>
 #include <carto/io/obj.hpp>
 #include <carto/io/ply.hpp>
@@ -167,8 +168,8 @@ std::vector<WorkspaceDefinition> make_workspace_registry() {
                "CAD sketch and constraint tools are not available in this build"),
         future(Workspace::build, "build", "Build", asset_panels, BottomPanel::assets,
                "build and assembly tools are not available in this build"),
-        future(Workspace::material, "material", "Material", asset_panels, BottomPanel::assets,
-               "material authoring tools are not available in this build"),
+        {Workspace::material, "material", "Material", asset_panels,
+         BottomPanel::assets, true, {}},
         future(Workspace::animate, "animate", "Animate", timeline_panels, BottomPanel::timeline,
                "animation tools are not available in this build"),
         future(Workspace::review, "review", "Review", model_panels, BottomPanel::problems,
@@ -212,6 +213,11 @@ bool is_operation_action(const application::ApplicationAction& action) {
             std::is_same_v<Action, application::AdjustLastToolAction> ||
             std::is_same_v<Action, application::CreateBoxAction> ||
             std::is_same_v<Action, application::CreatePlaneAction> ||
+            std::is_same_v<Action, application::CreateMaterialAction> ||
+            std::is_same_v<Action, application::UpdateMaterialAction> ||
+            std::is_same_v<Action, application::SetMaterialRegionAssignmentAction> ||
+            std::is_same_v<Action, application::SetMaterialGraphAction> ||
+            std::is_same_v<Action, application::SetMaterialGraphBindingAction> ||
             std::is_same_v<Action, application::CreateMeshObjectAction> ||
             std::is_same_v<Action, application::AppendSculptStrokeAction> ||
             std::is_same_v<Action, application::AppendSculptSurfaceStrokeAction> ||
@@ -222,6 +228,7 @@ bool is_operation_action(const application::ApplicationAction& action) {
             std::is_same_v<Action, application::InvalidateEngineeringSourceAction> ||
             std::is_same_v<Action, application::ImportConditionFixtureAction> ||
             std::is_same_v<Action, application::ImportConditionAuthoringAction> ||
+            std::is_same_v<Action, application::BindConditionAssetObjectAction> ||
             std::is_same_v<Action, application::InvalidateConditionSourceAction> ||
             std::is_same_v<Action, application::CreateSpatialFieldAction> ||
             std::is_same_v<Action, application::PaintSpatialFieldAction>;
@@ -230,11 +237,15 @@ bool is_operation_action(const application::ApplicationAction& action) {
 
 ai::Context make_ai_context(
     const application::ApplicationSnapshot& snapshot,
-    const editor::AuthoringContext& authoring) {
+    const editor::AuthoringContext& authoring,
+    std::uint32_t permitted_effects =
+        ai::effect_mask(ai::CapabilityEffect::geometry) |
+        ai::effect_mask(ai::CapabilityEffect::topology)) {
+    const auto ontology = ai::build_operation_ontology(snapshot.tools);
     return ai::Context{
         snapshot.project_revision,
         authoring,
-        ai::build_operation_ontology(snapshot.tools)};
+        ai::project_capabilities(ontology, permitted_effects)};
 }
 
 bool same_ai_preview(
@@ -476,6 +487,180 @@ core::Result<std::string> read_bounded_file(
             std::string(description) + " file changed while it was being read"));
     }
     return core::Result<std::string>::success(std::move(bytes));
+}
+
+struct PendingMeshSource {
+    std::filesystem::path project_root;
+    std::filesystem::path staged_path;
+    std::string identity;
+    std::string bytes;
+    assets::Sha256Digest digest;
+};
+
+struct StagedMeshSource {
+    std::string relative_path;
+    assets::Sha256Digest digest;
+};
+
+bool is_within_directory(
+    const std::filesystem::path& directory,
+    const std::filesystem::path& candidate) {
+    const auto relative = candidate.lexically_relative(directory);
+    if (relative.empty() || relative.is_absolute()) return false;
+    for (const auto& component : relative) {
+        if (component == "..") return false;
+    }
+    return true;
+}
+
+core::Result<void> validate_managed_directory_chain(
+    const std::filesystem::path& project_root,
+    const std::filesystem::path& directory) {
+    if (!is_within_directory(project_root, directory)) {
+        return core::Result<void>::failure(validation(
+            "managed mesh directory escaped the saved project directory"));
+    }
+    const auto relative = directory.lexically_relative(project_root);
+    auto cursor = project_root;
+    std::error_code error;
+    for (const auto& component : relative) {
+        cursor /= component;
+        const auto status = std::filesystem::symlink_status(cursor, error);
+        if (error && error != std::errc::no_such_file_or_directory) {
+            return core::Result<void>::failure(io_error(
+                "unable to inspect managed mesh directory"));
+        }
+        error.clear();
+        if (std::filesystem::is_symlink(status) ||
+            (std::filesystem::exists(status) && !std::filesystem::is_directory(status))) {
+            return core::Result<void>::failure(validation(
+                "managed mesh directory contains a link or non-directory component"));
+        }
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<PendingMeshSource> stage_mesh_source(
+    const std::filesystem::path& source_path,
+    const std::filesystem::path& project_path) {
+    constexpr std::size_t kMaxMeshSourceBytes = 128U * 1024U * 1024U;
+    std::error_code error;
+    const auto canonical_source = std::filesystem::canonical(source_path, error);
+    if (error || !std::filesystem::is_regular_file(canonical_source, error) || error) {
+        return core::Result<PendingMeshSource>::failure(io_error(
+            "mesh source is not a readable regular file"));
+    }
+    auto bytes = read_bounded_file(
+        canonical_source, kMaxMeshSourceBytes, "mesh source");
+    if (!bytes) return core::Result<PendingMeshSource>::failure(bytes.error());
+
+    const std::filesystem::path requested_root = project_path.parent_path().empty()
+        ? std::filesystem::current_path(error)
+        : project_path.parent_path();
+    if (error) return core::Result<PendingMeshSource>::failure(io_error(
+        "unable to resolve the saved project directory"));
+    const auto project_root = std::filesystem::weakly_canonical(requested_root, error);
+    if (error || project_root.empty()) return core::Result<PendingMeshSource>::failure(io_error(
+        "unable to resolve the saved project directory"));
+
+    const auto* source_data = reinterpret_cast<const std::uint8_t*>(bytes.value().data());
+    const std::span<const std::uint8_t> source_span(source_data, bytes.value().size());
+    const auto digest = assets::sha256(source_span);
+    const std::string canonical_locator = canonical_source.generic_string();
+    const auto* locator_data = reinterpret_cast<const std::uint8_t*>(canonical_locator.data());
+    const auto identity_digest = assets::sha256(std::span<const std::uint8_t>(
+        locator_data, canonical_locator.size()));
+    const std::string identity = "mesh.source." + identity_digest.hex().substr(0U, 32U);
+
+    const auto staging_root = project_root / ".carto-assets" / "import-staging";
+    if (auto checked = validate_managed_directory_chain(project_root, staging_root); !checked) {
+        return core::Result<PendingMeshSource>::failure(checked.error());
+    }
+    std::filesystem::create_directories(staging_root, error);
+    if (error) return core::Result<PendingMeshSource>::failure(io_error(
+        "unable to create the private mesh import staging directory"));
+    const auto staged_path = preference_temporary_path(staging_root / (digest.hex() + ".snapshot"));
+    std::ofstream staged_file(staged_path, std::ios::binary | std::ios::trunc);
+    if (!staged_file) return core::Result<PendingMeshSource>::failure(io_error(
+        "unable to create a private mesh import snapshot"));
+    staged_file.write(bytes.value().data(), static_cast<std::streamsize>(bytes.value().size()));
+    staged_file.flush();
+    staged_file.close();
+    if (!staged_file) {
+        std::filesystem::remove(staged_path, error);
+        return core::Result<PendingMeshSource>::failure(io_error(
+            "unable to write the private mesh import snapshot"));
+    }
+    return core::Result<PendingMeshSource>::success(PendingMeshSource{
+        project_root, staged_path, identity, std::move(bytes.value()), digest});
+}
+
+void remove_pending_mesh_source(const PendingMeshSource& pending) {
+    std::error_code error;
+    const auto parent = std::filesystem::weakly_canonical(
+        pending.staged_path.parent_path(), error);
+    if (error || !is_within_directory(pending.project_root, parent)) return;
+    std::filesystem::remove(pending.staged_path, error);
+}
+
+core::Result<StagedMeshSource> persist_mesh_source(
+    const PendingMeshSource& pending,
+    MeshImportFormat format) {
+    constexpr std::size_t kMaxMeshSourceBytes = 128U * 1024U * 1024U;
+    const auto staged_bytes = read_bounded_file(
+        pending.staged_path, kMaxMeshSourceBytes, "staged mesh source");
+    if (!staged_bytes) return core::Result<StagedMeshSource>::failure(staged_bytes.error());
+    const auto* staged_data = reinterpret_cast<const std::uint8_t*>(staged_bytes.value().data());
+    if (assets::sha256(std::span<const std::uint8_t>(
+            staged_data, staged_bytes.value().size())) != pending.digest) {
+        return core::Result<StagedMeshSource>::failure(stale(
+            "staged mesh source changed while the importer was reading it"));
+    }
+    const auto* source_data = reinterpret_cast<const std::uint8_t*>(pending.bytes.data());
+    const std::span<const std::uint8_t> source_span(source_data, pending.bytes.size());
+    const auto store_root = pending.project_root / ".carto-assets" / "source-blobs";
+    assets::BlobStore store(store_root);
+    const auto destination = store.path_for(pending.digest);
+    if (auto checked = validate_managed_directory_chain(
+            pending.project_root, destination.parent_path()); !checked) {
+        return core::Result<StagedMeshSource>::failure(checked.error());
+    }
+    std::error_code error;
+    const auto destination_status = std::filesystem::symlink_status(destination, error);
+    if (error && error != std::errc::no_such_file_or_directory) {
+        return core::Result<StagedMeshSource>::failure(io_error(
+            "unable to inspect managed mesh source file"));
+    }
+    error.clear();
+    if (std::filesystem::is_symlink(destination_status)) {
+        return core::Result<StagedMeshSource>::failure(validation(
+            "managed mesh source destination cannot be a symbolic link"));
+    }
+    std::string media_type;
+    switch (format) {
+    case MeshImportFormat::obj: media_type = "model/obj"; break;
+    case MeshImportFormat::ply: media_type = "model/ply"; break;
+    case MeshImportFormat::stl: media_type = "model/stl"; break;
+    }
+    const auto stored = store.put(source_span, std::move(media_type));
+    if (!stored) return core::Result<StagedMeshSource>::failure(stored.error());
+    if (stored.value().digest != pending.digest) {
+        return core::Result<StagedMeshSource>::failure(validation(
+            "managed mesh source digest changed during persistence"));
+    }
+    const auto canonical_destination = std::filesystem::canonical(destination, error);
+    if (error || !is_within_directory(pending.project_root, canonical_destination)) {
+        return core::Result<StagedMeshSource>::failure(validation(
+            "managed mesh source resolved outside the saved project directory"));
+    }
+    const auto relative =
+        canonical_destination.lexically_relative(pending.project_root).generic_string();
+    if (relative.empty() || relative.starts_with("../")) {
+        return core::Result<StagedMeshSource>::failure(validation(
+            "managed mesh source has no safe project-relative path"));
+    }
+    return core::Result<StagedMeshSource>::success(StagedMeshSource{
+        relative, pending.digest});
 }
 
 core::Result<void> write_atomic_file(
@@ -1347,6 +1532,11 @@ core::Result<WorkbenchPreferences> load_workbench_preferences(
 UiController::UiController(application::ApplicationSession& session)
     : session_(session) {}
 
+core::Result<project::MaterialGraph> UiController::material_graph_source(
+    std::string_view identity) const {
+    return session_.material_graph_source(identity);
+}
+
 core::Result<application::DispatchReceipt> UiController::dispatch(
     const application::ApplicationAction& action) {
     return dispatch_with_category(action, OperationCategory::committed_command);
@@ -1472,6 +1662,7 @@ core::Result<void> UiController::queue_agent_step(
         }
         agent_task_.reset();
         agent_plan_draft_.clear();
+        agent_hard_constraints_draft_.clear();
         agent_clarifications_draft_.clear();
         agent_plan_base_revision_.reset();
         agent_goal_.clear();
@@ -1508,7 +1699,11 @@ core::Result<void> UiController::queue_agent_step(
     if (!authoring) return core::Result<void>::failure(authoring.error());
 
     agent::TargetRef target;
-    if (authoring.value().selection_mode == editor::SelectionMode::face &&
+    if (authoring.value().selection_mode == editor::SelectionMode::object &&
+        authoring.value().objects.size() == 1U) {
+        target.object = authoring.value().objects.front();
+        target.component = std::monostate{};
+    } else if (authoring.value().selection_mode == editor::SelectionMode::face &&
         authoring.value().component_object.has_value() &&
         authoring.value().faces.size() == 1U) {
         target.object = *authoring.value().component_object;
@@ -1520,7 +1715,7 @@ core::Result<void> UiController::queue_agent_step(
         target.component = authoring.value().vertices.front();
     } else {
         return core::Result<void>::failure(invalid_state(
-            "capture one selected face or vertex for each agent plan step"));
+            "capture one selected object, face, or vertex for each agent plan step"));
     }
 
     agent::AgentPlanStep step{
@@ -1535,6 +1730,114 @@ core::Result<void> UiController::queue_agent_step(
         agent_plan_base_revision_ = snapshot.project_revision;
     }
     agent_plan_draft_.push_back(std::move(step));
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::set_agent_recipe(std::string recipe_id) {
+    if (agent_checkpoint_pending_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "a loaded checkpoint recipe cannot be edited; resume or clear it first"));
+    }
+    if (!recipe_id.empty() && agent::find_agent_recipe(recipe_id) == nullptr) {
+        return core::Result<void>::failure(invalid_state(
+            "selected agent recipe is not registered"));
+    }
+    if (recipe_id == agent_recipe_id_) return core::Result<void>::success();
+    if (std::any_of(agent_clarifications_draft_.begin(),
+            agent_clarifications_draft_.end(), [](const auto& question) {
+                return question.human_receipt.has_value();
+            })) {
+        return core::Result<void>::failure(invalid_state(
+            "clear and re-answer clarifications before changing the objective recipe"));
+    }
+    if (agent_task_.has_value()) {
+        const auto status = agent_task_->snapshot().status;
+        if (status != agent::TaskStatus::accepted && status != agent::TaskStatus::rejected) {
+            return core::Result<void>::failure(invalid_state(
+                "the recipe is locked while a speculative task is active"));
+        }
+        agent_task_.reset();
+        agent_plan_draft_.clear();
+        agent_hard_constraints_draft_.clear();
+        agent_clarifications_draft_.clear();
+        agent_plan_base_revision_.reset();
+        agent_goal_.clear();
+        agent_plan_id_.clear();
+        agent_objective_id_.clear();
+        agent_repair_mode_ = false;
+    }
+    agent_recipe_id_ = std::move(recipe_id);
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::set_agent_hard_constraints(
+    std::vector<agent::HardConstraint> constraints) {
+    if (agent_checkpoint_pending_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "a loaded checkpoint objective cannot be edited; resume or clear it first"));
+    }
+    if (agent_task_.has_value()) {
+        const auto status = agent_task_->snapshot().status;
+        if (status != agent::TaskStatus::accepted && status != agent::TaskStatus::rejected) {
+            return core::Result<void>::failure(invalid_state(
+                "objective constraints are locked while a speculative task is active"));
+        }
+        agent_task_.reset();
+        agent_plan_draft_.clear();
+        agent_hard_constraints_draft_.clear();
+        agent_clarifications_draft_.clear();
+        agent_plan_base_revision_.reset();
+        agent_goal_.clear();
+        agent_plan_id_.clear();
+        agent_objective_id_.clear();
+        agent_repair_mode_ = false;
+    }
+    if (agent_plan_draft_.empty() || !agent_plan_base_revision_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "capture at least one plan target before setting objective constraints"));
+    }
+    if (session_.snapshot().project_revision != *agent_plan_base_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "project changed after the first agent plan target was captured"));
+    }
+    if (std::any_of(agent_clarifications_draft_.begin(),
+            agent_clarifications_draft_.end(), [](const auto& question) {
+                return question.human_receipt.has_value();
+            })) {
+        return core::Result<void>::failure(invalid_state(
+            "clear and re-answer clarifications before changing objective constraints"));
+    }
+    if (constraints.size() > 256U) {
+        return core::Result<void>::failure(invalid_state(
+            "objective exceeds the 256-constraint safety limit"));
+    }
+
+    std::vector<scene::ObjectId> scope;
+    for (const auto& step : agent_plan_draft_) {
+        if (std::find(scope.begin(), scope.end(), step.target.object) == scope.end()) {
+            scope.push_back(step.target.object);
+        }
+    }
+    std::set<std::string> constraint_ids;
+    for (const auto& constraint : constraints) {
+        if (auto result = constraint.validate(); !result) {
+            return result;
+        }
+        if (!constraint_ids.insert(constraint.id).second) {
+            return core::Result<void>::failure(invalid(
+                "objective constraints contain a duplicate identity"));
+        }
+        if (constraint.object.has_value() &&
+            std::find(scope.begin(), scope.end(), *constraint.object) == scope.end()) {
+            return core::Result<void>::failure(invalid_state(
+                "objective constraint target is outside the captured plan scope"));
+        }
+    }
+    for (const auto& question : agent_clarifications_draft_) {
+        if (auto result = question.validate(scope, constraints); !result) return result;
+    }
+    agent_hard_constraints_draft_ = std::move(constraints);
     return core::Result<void>::success();
 }
 
@@ -1553,6 +1856,7 @@ core::Result<void> UiController::queue_agent_clarification(
         }
         agent_task_.reset();
         agent_plan_draft_.clear();
+        agent_hard_constraints_draft_.clear();
         agent_clarifications_draft_.clear();
         agent_plan_base_revision_.reset();
         agent_goal_.clear();
@@ -1640,7 +1944,8 @@ core::Result<void> UiController::answer_agent_clarification(
         ? task_id : agent_objective_id_;
     agent::AuthoringObjective objective{
         objective_id, std::move(goal),
-        *agent_plan_base_revision_, std::move(scope), {}, {}, agent_clarifications_draft_};
+        *agent_plan_base_revision_, std::move(scope), {},
+        agent_hard_constraints_draft_, agent_clarifications_draft_, agent_recipe_id_};
     agent::AgentPlan plan{task_id, std::move(objective), agent_plan_draft_};
     const auto answered = application::HumanApplicationAccess::answer_agent_clarification(
         plan, question_id, std::nullopt, std::move(answer));
@@ -1650,14 +1955,16 @@ core::Result<void> UiController::answer_agent_clarification(
     return core::Result<void>::success();
 }
 
-core::Result<agent::AgentTaskSnapshot> UiController::run_agent_plan(std::string goal) {
+core::Result<agent::AgentTaskSnapshot> UiController::run_agent_plan(
+    std::string goal,
+    std::optional<agent::AgentWorkEnvelope> requested_envelope) {
     if (agent_checkpoint_pending_.has_value()) {
         return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
             "resume the loaded checkpoint through its revalidation boundary"));
     }
     if (agent_plan_draft_.empty() || !agent_plan_base_revision_.has_value()) {
         return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
-            "capture at least one selected face or vertex before running an agent plan"));
+            "capture at least one selected object, face, or vertex before running an agent plan"));
     }
     if (agent_task_.has_value()) {
         return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
@@ -1683,18 +1990,58 @@ core::Result<agent::AgentTaskSnapshot> UiController::run_agent_plan(std::string 
             scope.push_back(step.target.object);
         }
     }
+    const bool permits_transform = requested_envelope.has_value() &&
+        (requested_envelope->permitted_effects &
+            agent::effect_mask(agent::Effect::transform)) != 0U;
+    if (permits_transform) {
+        std::vector<scene::ObjectId> transform_roots;
+        for (const auto& step : agent_plan_draft_) {
+            if (std::holds_alternative<std::monostate>(step.target.component) &&
+                std::find(transform_roots.begin(), transform_roots.end(),
+                    step.target.object) == transform_roots.end()) {
+                transform_roots.push_back(step.target.object);
+            }
+        }
+        if (transform_roots.empty()) {
+            return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+                "transform permission requires at least one captured object target"));
+        }
+        for (std::size_t cursor = 0U; cursor < transform_roots.size(); ++cursor) {
+            const scene::ObjectId parent = transform_roots[cursor];
+            for (const auto& object : snapshot.objects) {
+                if (object.object.parent.has_value() && *object.object.parent == parent &&
+                    std::find(scope.begin(), scope.end(), object.object.id) == scope.end()) {
+                    scope.push_back(object.object.id);
+                    transform_roots.push_back(object.object.id);
+                }
+            }
+        }
+    }
+    if (requested_envelope.has_value() &&
+        !requested_envelope->scope_objects.empty()) {
+        auto requested_scope = requested_envelope->scope_objects;
+        auto captured_scope = scope;
+        std::sort(requested_scope.begin(), requested_scope.end());
+        std::sort(captured_scope.begin(), captured_scope.end());
+        if (requested_scope != captured_scope) {
+            return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+                "requested work envelope scope must match the captured target subtree"));
+        }
+    }
     agent::AgentPlan plan{
         task_id,
         agent::AuthoringObjective{
             agent_objective_id_.empty() ? task_id : agent_objective_id_,
-            std::move(goal), *agent_plan_base_revision_, scope, {}, {},
-            agent_clarifications_draft_},
+            std::move(goal), *agent_plan_base_revision_, scope, {},
+            agent_hard_constraints_draft_,
+            agent_clarifications_draft_, agent_recipe_id_},
         agent_plan_draft_};
     const std::string task_goal = plan.objective.goal;
-    agent::AgentWorkEnvelope envelope;
+    agent::AgentWorkEnvelope envelope = requested_envelope.value_or(
+        agent::AgentWorkEnvelope{});
     envelope.scope_objects = scope;
-    envelope.max_commands = 16U;
-    envelope.max_objects_touched = scope.size();
+    envelope.max_commands = std::min<std::size_t>(envelope.max_commands, 16U);
+    if (!requested_envelope.has_value()) envelope.max_objects_touched = scope.size();
     auto task = agent::AgentTask::begin(session_, std::move(plan), std::move(envelope));
     if (!task) {
         record_ui_problem(task.error().with_context("agent workbench plan"));
@@ -1717,12 +2064,19 @@ core::Result<agent::AgentTaskSnapshot> UiController::run_agent_plan(std::string 
 
 core::Result<void> UiController::revise_agent_plan_step(
     agent::AgentPlanStep revised_step) {
-    if (!agent_task_.has_value() ||
-        agent_task_->snapshot().status != agent::TaskStatus::blocked) {
+    if (!agent_task_.has_value()) {
         return core::Result<void>::failure(invalid_state(
-            "only a blocked speculative task can be revised for repair"));
+            "there is no speculative task to revise for repair"));
     }
     const auto task_snapshot = agent_task_->snapshot();
+    const bool failed_required_gate = std::any_of(
+        task_snapshot.gates.begin(), task_snapshot.gates.end(),
+        [](const auto& gate) { return gate.required && !gate.passed; });
+    if (task_snapshot.status != agent::TaskStatus::blocked &&
+        !(task_snapshot.status == agent::TaskStatus::review && failed_required_gate)) {
+        return core::Result<void>::failure(invalid_state(
+            "repair requires a blocked task or a review whose required gate failed"));
+    }
     if (task_snapshot.repair_attempts_remaining == 0U) {
         return core::Result<void>::failure(invalid_state(
             "the task repair-attempt budget is exhausted"));
@@ -1761,10 +2115,18 @@ core::Result<void> UiController::revise_agent_plan_step(
 
 core::Result<agent::AgentTaskSnapshot> UiController::repair_agent_plan(
     std::string justification) {
-    if (!agent_task_.has_value() || !agent_repair_mode_ ||
-        agent_task_->snapshot().status != agent::TaskStatus::blocked) {
+    if (!agent_task_.has_value() || !agent_repair_mode_) {
         return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
             "revise a failed plan step before requesting bounded repair"));
+    }
+    const auto task_snapshot = agent_task_->snapshot();
+    const bool failed_required_gate = std::any_of(
+        task_snapshot.gates.begin(), task_snapshot.gates.end(),
+        [](const auto& gate) { return gate.required && !gate.passed; });
+    if (task_snapshot.status != agent::TaskStatus::blocked &&
+        !(task_snapshot.status == agent::TaskStatus::review && failed_required_gate)) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "repair requires a blocked task or a review whose required gate failed"));
     }
     if (!agent_plan_base_revision_.has_value() ||
         session_.snapshot().project_revision != *agent_plan_base_revision_) {
@@ -1791,7 +2153,7 @@ core::Result<agent::AgentTaskSnapshot> UiController::repair_agent_plan(
         task_id,
         agent::AuthoringObjective{
             agent_objective_id_, agent_goal_, *agent_plan_base_revision_, scope, {},
-            previous.hard_constraints, agent_clarifications_draft_},
+            previous.hard_constraints, agent_clarifications_draft_, agent_recipe_id_},
         agent_plan_draft_};
     agent::AgentWorkEnvelope envelope;
     envelope.scope_objects = scope;
@@ -1827,6 +2189,36 @@ core::Result<void> UiController::save_agent_checkpoint(
     return agent_task_->save_checkpoint(path);
 }
 
+
+core::Result<void> UiController::save_agent_demonstration(
+    const std::filesystem::path& path) const {
+    if (!agent_task_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "there is no agent task to record as a demonstration"));
+    }
+    const auto demonstration = agent_task_->create_demonstration();
+    if (!demonstration) {
+        return core::Result<void>::failure(demonstration.error());
+    }
+    return demonstration.value().save(path);
+}
+
+core::Result<void> UiController::load_agent_demonstration(
+    const std::filesystem::path& path) {
+    auto demonstration = agent::AgentDemonstration::load(path);
+    if (!demonstration) {
+        record_ui_problem(demonstration.error().with_context("agent demonstration"));
+        return core::Result<void>::failure(demonstration.error());
+    }
+    agent_demonstration_.emplace(std::move(demonstration.value()));
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::clear_agent_demonstration() {
+    agent_demonstration_.reset();
+    return core::Result<void>::success();
+}
+
 core::Result<void> UiController::load_agent_checkpoint(
     const std::filesystem::path& path) {
     if (agent_checkpoint_pending_.has_value()) {
@@ -1852,9 +2244,11 @@ core::Result<void> UiController::load_agent_checkpoint(
     }
     agent_task_.reset();
     agent_plan_draft_ = checkpoint.value().plan.steps;
+    agent_hard_constraints_draft_ = checkpoint.value().plan.objective.hard_constraints;
     agent_clarifications_draft_ = checkpoint.value().plan.objective.clarifications;
     agent_plan_base_revision_ = checkpoint.value().source_revision;
     agent_goal_ = checkpoint.value().plan.objective.goal;
+    agent_recipe_id_ = checkpoint.value().plan.objective.recipe_id;
     agent_plan_id_ = checkpoint.value().plan.id;
     agent_objective_id_ = checkpoint.value().plan.objective.id;
     agent_repair_mode_ = false;
@@ -1914,6 +2308,7 @@ core::Result<agent::AgentTaskSnapshot> UiController::resume_agent_checkpoint() {
     auto plan = agent_checkpoint_pending_->plan;
     plan.steps = agent_plan_draft_;
     plan.objective.goal = agent_goal_;
+    plan.objective.hard_constraints = agent_hard_constraints_draft_;
     plan.objective.clarifications = agent_clarifications_draft_;
     if (agent_checkpoint_rebased_ && agent_plan_base_revision_.has_value()) {
         plan.objective.base_revision = *agent_plan_base_revision_;
@@ -1986,6 +2381,7 @@ core::Result<void> UiController::clear_agent_plan() {
         agent_task_.reset();
     }
     agent_plan_draft_.clear();
+    agent_hard_constraints_draft_.clear();
     agent_clarifications_draft_.clear();
     agent_checkpoint_pending_.reset();
     agent_checkpoint_rebased_ = false;
@@ -1993,6 +2389,7 @@ core::Result<void> UiController::clear_agent_plan() {
     agent_goal_.clear();
     agent_plan_id_.clear();
     agent_objective_id_.clear();
+    agent_recipe_id_.clear();
     agent_repair_mode_ = false;
     return core::Result<void>::success();
 }
@@ -2038,37 +2435,112 @@ core::Result<MeshImportReceipt> UiController::import_mesh(
         return fail(resolved.error());
     }
 
+    const auto application_snapshot = session_.snapshot();
+    std::optional<PendingMeshSource> pending_source;
+    std::filesystem::path importer_path = path;
+    if (application_snapshot.project_path.has_value()) {
+        auto staged = stage_mesh_source(
+            path, *application_snapshot.project_path);
+        if (!staged) return fail(staged.error());
+        importer_path = staged.value().staged_path;
+        pending_source = std::move(staged.value());
+    }
+    const auto cleanup_pending_source = [&pending_source]() {
+        if (pending_source.has_value()) remove_pending_mesh_source(*pending_source);
+    };
+
     geometry::EditableMesh mesh;
     io::IoReport report;
     switch (format) {
     case MeshImportFormat::obj: {
-        auto imported = io::import_obj(path);
-        if (!imported) return fail(imported.error());
+        auto imported = io::import_obj(importer_path);
+        if (!imported) {
+            cleanup_pending_source();
+            return fail(imported.error());
+        }
         mesh = std::move(imported.value().mesh);
         report = std::move(imported.value().report);
         break;
     }
     case MeshImportFormat::ply: {
-        auto imported = io::import_ply(path);
-        if (!imported) return fail(imported.error());
+        auto imported = io::import_ply(importer_path);
+        if (!imported) {
+            cleanup_pending_source();
+            return fail(imported.error());
+        }
         mesh = std::move(imported.value().mesh);
         report = std::move(imported.value().report);
         break;
     }
     case MeshImportFormat::stl: {
-        auto imported = io::import_stl(path);
-        if (!imported) return fail(imported.error());
+        auto imported = io::import_stl(importer_path);
+        if (!imported) {
+            cleanup_pending_source();
+            return fail(imported.error());
+        }
         mesh = std::move(imported.value().mesh);
         report = std::move(imported.value().report);
         break;
     }
     default:
+        cleanup_pending_source();
         return fail(unsupported("mesh import format is unsupported"));
+    }
+
+    std::optional<StagedMeshSource> staged_source;
+    if (pending_source.has_value()) {
+        auto persisted = persist_mesh_source(*pending_source, format);
+        cleanup_pending_source();
+        if (!persisted) return fail(persisted.error());
+        staged_source = std::move(persisted.value());
     }
 
     std::string object_name = path.stem().string();
     if (object_name.empty()) object_name = "Imported Mesh";
-    auto admitted = dispatch(application::CreateMeshObjectAction{object_name, std::move(mesh)});
+    std::optional<assets::SourceImportRecord> source_record;
+    if (staged_source.has_value()) {
+        assets::SourceImportRecord record;
+        record.identity = pending_source->identity;
+        record.relative_source_path = staged_source->relative_path;
+        record.source_generation = core::Revision{1U};
+        record.kind = assets::SourceAssetKind::mesh;
+        record.source_digest = staged_source->digest;
+        switch (format) {
+        case MeshImportFormat::obj: record.importer_identity = "carto.import.obj"; break;
+        case MeshImportFormat::ply: record.importer_identity = "carto.import.ply"; break;
+        case MeshImportFormat::stl: record.importer_identity = "carto.import.stl"; break;
+        }
+        record.importer_version = 1U;
+        record.options.import_hierarchy = false;
+        record.options.import_materials = false;
+        record.options.import_normals = false;
+        record.artifact_identity = "pending.mesh";
+        record.artifact_digest = application::canonical_mesh_geometry_digest(mesh);
+        record.domain_digests.push_back(assets::SourceDomainDigest{
+            assets::SourceAssetDomain::geometry, record.artifact_digest});
+        const auto active = std::find_if(
+            application_snapshot.source_assets.begin(),
+            application_snapshot.source_assets.end(),
+            [&record](const application::SourceAssetView& item) {
+                return item.identity == record.identity;
+            });
+        if (active != application_snapshot.source_assets.end()) {
+            record.artifact_identity = active->artifact_identity;
+        }
+        if (auto result = record.validate(); !result) {
+            return fail(result.error());
+        }
+        report.warnings.push_back(
+            "Source bytes were verified and stored as a project-relative content-addressed snapshot.");
+        source_record = std::move(record);
+    } else {
+        report.warnings.push_back(
+            "This import is not source-linked because the workspace has not been saved; "
+            "save the project and import again to bind it.");
+    }
+
+    auto admitted = dispatch(application::CreateMeshObjectAction{
+        object_name, std::move(mesh), std::move(source_record)});
     if (!admitted) {
         return core::Result<MeshImportReceipt>::failure(admitted.error());
     }
@@ -2080,7 +2552,20 @@ core::Result<MeshImportReceipt> UiController::import_mesh(
         report.triangles,
         std::move(report.warnings),
         std::move(admitted).value(),
+        staged_source.has_value(),
+        staged_source.has_value() ? pending_source->identity : std::string{},
+        staged_source.has_value() ? staged_source->relative_path : std::string{},
     });
+}
+
+core::Result<assets::SourceReimportPlan> UiController::preview_source_reimport(
+    std::vector<assets::SourceImportRecord> incoming) const {
+    return session_.preview_source_reimport(std::move(incoming));
+}
+
+core::Result<application::DispatchReceipt> UiController::apply_source_reimport_plan(
+    assets::SourceReimportPlan plan) {
+    return dispatch(application::ApplySourceReimportPlanAction{std::move(plan)});
 }
 
 core::Result<application::DispatchReceipt> UiController::import_engineering_fixture() {
@@ -2265,6 +2750,18 @@ core::Result<application::DispatchReceipt> UiController::import_condition_audio_
     }
     return dispatch_with_category(application::ImportConditionAuthoringAction{
         authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::bind_condition_asset_to_object(
+    condition::Id asset_id,
+    scene::ObjectId object_id,
+    core::Revision expected_project_revision,
+    core::Revision expected_authoring_revision) {
+    return dispatch_with_category(application::BindConditionAssetObjectAction{
+        expected_project_revision,
+        expected_authoring_revision,
+        asset_id,
+        object_id}, OperationCategory::provider);
 }
 
 core::Result<application::DispatchReceipt> UiController::set_condition_source_reviewed(
@@ -3184,7 +3681,9 @@ UiSnapshot UiController::snapshot() const {
         ? "Native planner ready. Safe proposals auto-apply through the revision-bound command path."
         : "Native planner ready. Proposals require explicit Apply through the revision-bound command path.";
     result.agent_goal = agent_goal_;
+    result.agent_recipe_id = agent_recipe_id_;
     result.agent_plan_draft = agent_plan_draft_;
+    result.agent_hard_constraints_draft = agent_hard_constraints_draft_;
     result.agent_clarifications_draft = agent_clarifications_draft_;
     result.agent_repair_ready = agent_repair_mode_;
     result.agent_checkpoint_loaded = agent_checkpoint_pending_.has_value();
@@ -3256,6 +3755,7 @@ UiSnapshot UiController::snapshot() const {
         result.project_status = ProjectStatus::saved;
         result.project_status_text = "Saved";
     }
+    result.agent_demonstration = agent_demonstration_;
     return result;
 }
 

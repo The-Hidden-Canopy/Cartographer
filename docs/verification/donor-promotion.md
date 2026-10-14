@@ -61,20 +61,34 @@ candidate binds both the project revision and mesh revision, and carries the
 scene-object/mesh-asset identity pair so instanced topology IDs cannot collide.
 The native model workspace now draws X/Z translation handles for one selected,
 unlocked root object. Pointer capture computes a preview only; Ctrl applies a
-0.25 m increment snap, and release submits one project-revision-bound transform
-action through normal application history/journaling. Stale snapshots cancel
-the drag. The current X/Z work surface has a separate bounded, process-local
-orthographic camera: initial fit, explicit Frame all, pointer-anchored wheel
-zoom, and middle-button pan. It is view state only, is not serialized into the
-project, and cannot mutate scene truth. Parent-local gizmos, perspective
-navigation wiring, rotate/scale handles, geometry-target snap
-markers/application, occlusion-aware ray construction, and
-edge/face/surface/normal projection remain unclaimed.
+0.25 m increment snap, while Shift queries nearby compiled vertices, edge
+midpoints, and face centers with object, mesh-asset, project-revision, and
+mesh-revision provenance. A transient acquire/retain/break lock stabilizes
+feature identity as the pointer moves. The top-down X/Z gizmo snaps only its
+active plan coordinate, preserves elevation, and draws a revision-checked
+target marker. Release submits one project-revision-bound transform action
+through normal application history/journaling; Ctrl grid snapping takes
+precedence and stale snapshots cancel the drag. Candidate enumeration is
+bounded and walks compiled geometry during drag; it does not imply ray-based
+or perspective target construction. The current X/Z work surface has a
+separate bounded, process-local orthographic camera: initial fit, explicit
+Frame all, pointer-anchored wheel zoom, and middle-button pan. It is view state
+only, is not serialized into the project, and cannot mutate scene truth.
+Parent-local gizmos, perspective navigation wiring, rotate/scale handles,
+occlusion-aware ray construction, and edge/face/surface/normal projection
+remain unclaimed.
 
 The material graph and presentation catalog also have focused adversarial
 round-trip and project-transaction tests. They validate typed graph topology,
 unsupported-node reporting, texture-source references, camera/light records,
 schema migration, dangling source references, and journal behavior.
+
+CONDITION assets can now be explicitly bound to existing scene objects from
+the native authoring instrument. The human-only action checks project and
+authoring revisions, rejects missing assets/objects, and uses the project
+command journal with undo/redo. It supplies the native link needed for source
+attenuation and acoustic-zone guides without adding runtime ownership or
+simulation.
 
 CONDITION's embedded authoring codec has schema-3 audio-source and
 acoustic-zone records. They bind a source to an owner asset and reviewed/current
@@ -96,8 +110,12 @@ absolute path are not persisted. Native min/max distance rings, sphere/box zone
 volume handles, and per-zone priority labels now edit through revision-checked
 project commands; the authoring panel shows bounded conservative overlap
 candidates and stored priorities without simulating runtime precedence.
-Pointer-drag visual acceptance and production acoustic-fixture validation
-remain open.
+The generated synthetic acoustic QA fixture now exercises WAVE metadata and
+digest binding, `.carto` save/reopen, scene-object mapping, and consumer
+admission. It is explicitly synthetic and does not validate production audio
+or runtime acoustics. Pointer-drag visual acceptance and production-fixture
+audio validation remain open; the Windows file-picker capture helper failed
+during this turn's native smoke attempt.
 
 Schema 3 also persists effect-source intent, bounded deterministic particle
 emitters, and field-influence bindings. Every influence captures the exact
@@ -121,11 +139,13 @@ scene instances or invoke donor/runtime code. Schema-3 documents reopen with no
 scatter recipes. Schema 5 adds typed branchable Safe Place and surface-state
 deltas with explicit source before-values, parent-branch identity, and
 applicability notes. The native workbench creates nested Safe Place alternatives
-and compares branches against their common ancestor; sibling edits to the same
-property are marked contested, stale before-values fail comparison, and source
-records are never overwritten. Branches are authored review data, not runtime
-state selection or automatic reconciliation. Schema-4 documents reopen with no
-state branches.
+and surface-state alternatives for occupancy, maintenance, damage, and wetness.
+It projects exact source-state values, compares branches against their common
+ancestor, marks sibling edits to the same property as contested, and refuses
+stale before-values. Application snapshots expose authored surface-state values
+to the panel without granting it direct mutation access. Source records are
+never overwritten: branches are review data, not runtime state selection or
+automatic reconciliation. Schema-4 documents reopen with no state branches.
 
 Terrain source authoring now builds on the persisted spatial-field contract.
 `terrain_elevation` and related terrain-analysis semantics were appended
@@ -144,9 +164,21 @@ mask matches the terrain cell mask, and edits invalidate previously derived
 hydro products. This is a deterministic source adapter, not runoff simulation,
 water-surface authoring, or runtime integration. `ApplicationSession` exposes
 a read-only terrain-preview operation; the native CONDITION workbench displays
-terrain relief and can report derived mesh/analysis counts without advancing
-project or field revisions. It does not yet insert the generated mesh into the
-model viewport.
+terrain relief and overlays the derived, source-bound triangle mesh on the
+central plan work surface without advancing project or field revisions. The
+overlay binds exact field identity/revision/digest, chooses the finest mesh
+under a 16,384-triangle draw budget, and is suppressed when source evidence is
+stale. It creates no scene object, selectable face, collision, navigation, or
+runtime authority; this is not committed terrain placement or rendered 3D
+visual acceptance.
+
+Wind `wind_u` and `wind_v` scalar sources can also be paired into a derived
+vector visualization when both fields have identical dimensions, origin, and
+cell spacing. The product binds each exact source revision and digest, samples
+at most a 16 × 16 grid, and is drawn as U/V arrows over the native X/Z plan
+surface. Either changed or missing source suppresses the overlay. This is a
+read-only visualization only; there is no field composition, vector solver,
+wind simulation, or persisted derivative.
 
 ## Acceptance gates
 
@@ -173,9 +205,10 @@ model viewport.
    density and candidate caps, disabled recipes, stale-field invalidation, and
    journaled add/undo/redo through the application/UI path.
    State branch acceptance covers schema-1 through schema-4 migration, parent
-   ancestry and cycle rejection, exact target/before-value checks, baseline and
-   sibling comparison, contested conflict marking, stale-source refusal,
-   save/reopen parity, and project-command undo/redo.
+   ancestry and cycle rejection, exact Safe Place and surface-state targets,
+   numeric and categorical before-values, baseline and sibling comparison,
+   contested conflict marking, stale-source refusal, save/reopen parity, and
+   project-command undo/redo.
 7. The existing public-boundary audit remains the release gate for tracked
    archives, specifications, credentials, workstation paths, and reachable
    history.
@@ -207,19 +240,53 @@ Cartographer receipt cannot be used to bypass them.
 - Provenance/extraction ledger: complete for the public-safe contract.
 - Donor implementation promotion: editor camera and bounded snap policy slices
   implemented independently; scene-wide visible-object candidate collection
-  is implemented for vertices, edge midpoints, and face centers. Ray-based
-  surface targets and most of the interaction surface are not claimed. The
-  native work surface supports revision-bound root-object X/Z translation
-  preview/commit and optional 0.25 m Ctrl snapping; no perspective or
-  parent-local gizmo is claimed. Plan-view framing, zoom, and pan are covered
-  by a pure bounded camera contract and are connected to the native viewport;
-  the rebuilt native shell and empty-workspace camera zoom have been smoke
-  verified, while geometry-fixture visual captures and broader interaction
-  acceptance remain open.
-- Material authoring: a typed, bounded, deterministic graph is now persisted
+  is implemented for vertices, edge midpoints, and face centers. The native
+  work surface supports revision-bound root-object X/Z translation
+  preview/commit, 0.25 m Ctrl grid snapping, and Shift geometry snapping with
+  stable nearby feature identities and a visual target marker. A synthetic
+  Synthetic room gesture fixture runs the same shared transform-snap policy,
+  commits through the application command path, verifies undo/redo, and proves
+  that source-revision drift blocks an active drag. Quad-mesh tests prove that
+  compiler triangulation diagonals never gain editable snap identities. The
+  snap-service, viewport-interaction, and application suites pass; the desktop
+  target builds, and the full 107-test CTest suite passes with these acceptance
+  additions. Native pixel-level drag acceptance remains open because
+  Windows capture failed twice in this environment; production source geometry
+  and visual captures, and orthographic/perspective UI acceptance, are not
+  claimed. No perspective or parent-local gizmo is claimed. Plan-view
+  framing, zoom, and pan remain covered by a bounded camera contract and
+  connected to the native viewport. Ray-based surface targets and most of the
+  interaction surface remain open.
+- Material authoring: a typed, bounded, deterministic graph is persisted
   inside the governed material catalog; unknown nodes remain explicit and are
   not claimed as shader lowering. Texture samples must resolve to source
-  texture records. Shader compilation and runtime admission remain unclaimed.
+  texture records. The Material workspace is now available, with a native
+  movable instrument for creating and editing base color, metallic, roughness,
+  and clearcoat source factors. Changes require a human command, exact project
+  and material revisions, and use normal journal/undo/redo semantics. The
+  native instrument can also assign, replace, and clear a material binding on
+  an authored face region, with project-revision checks and the same command
+  journal. A region must already exist in the mesh's
+  `condition.material_region` or `cartographer.material_slot` face attribute;
+  the UI accepts its non-zero ID and the project validates it before commit.
+  Bindings are keyed by mesh asset and therefore apply to every scene instance
+  sharing that asset. The instrument's swatch is a source-color display, not a
+  rendered material preview. The native graph editor can create starter graphs
+  from selected PBR factors, add typed constant/parameter/surface/operator
+  nodes, edit constant and parameter source values, rewire matching input
+  sockets, and route typed graph outputs through a project-revision,
+  graph-revision, and canonical-digest guarded human command. Proposed topology
+  changes are validated before draft replacement; cycle and type errors fail
+  without mutating the source. Save, reopen, undo, and redo preserve exact graph
+  source. Materials can be explicitly bound to a graph identity, revision, and
+  canonical digest; editing the graph makes the old binding visibly stale until
+  a human rebinds it. Unsupported nodes remain visible as diagnostics and are
+  retained. The support check is structural only, not GPU shader compilation.
+  Safe deletion of disconnected supported nodes now records bounded tombstones;
+  unsupported donor payloads remain undeletable until understood. Texture
+  picking/intake, shader lowering, live viewport shading, automatic region
+  authoring/discovery, and production material-board acceptance
+  remain open.
 - Audio/acoustic authoring: bounded source and zone intent records are persisted
   in CONDITION authoring schema 3 and can be added through native project
   transactions. Bounded WAVE metadata inspection creates pathless,
@@ -228,8 +295,14 @@ Cartographer receipt cannot be used to bypass them.
   and stale evidence blocks publication. The native work surface projects
   attenuation rings and box/sphere zone outlines only when their authored owner
   asset maps to an existing scene object; these are visual guides, not runtime
-  occlusion or acoustic simulation. Sample decoding, editable radius/volume
-  handles, audition, overlap preview, and runtime playback remain open.
+  occlusion or acoustic simulation. Bounded transient sample decoding and
+  audition, revision-bound radius/volume handles, and conservative overlap
+  candidate preview are implemented. A generated synthetic acoustic fixture
+  now binds an initially unbound asset through the native UI command, checks
+  project/authoring revision advancement, and verifies save/reopen plus package
+  admission without embedding the WAVE bytes or workstation path. Native
+  pointer-drag visual acceptance and production-recording audio validation
+  remain open; runtime playback is intentionally out of scope.
 - Effect authoring: native effect sources, bounded particle emitters, and
   exact field-influence bindings are persisted in CONDITION schema 3. The UI
   generates deterministic local-space previews for exact normal/disabled
@@ -238,17 +311,43 @@ Cartographer receipt cannot be used to bypass them.
   integration is claimed; full gas-station VFX acceptance remains open.
 - Terrain, procedural, state, and remaining greenfield gaps: separate
   reviewable tranches; terrain has the source/derived-product slice below but
-  is not yet a full world-authoring workflow.
+  is not yet a full world-authoring workflow. A first independently authored
+  generic sweep source now preserves a convex profile, explicit reference
+  frame, taper/cap policy, and exact centerline identity/revision; bounded
+  deterministic generation allocates native `EditableMesh` IDs. Project schema
+  22 persists the recipe and monotonic source lineage through journaled
+  transactions, validates the centerline binding, and blocks deletion of a
+  referenced path. The native Condition instrument authors regular radial
+  profiles, preserves custom profiles without flattening, and provides a
+  source-bound, preview-only wireframe. Synthetic pipe, railing-part, and
+  branch fixtures cover the primitive; project/application tests cover
+  save/reopen, stale bindings, deletion/recreation, undo, and redo. This is not
+  yet an accepted CONDITION kit promotion: material/UV transfer, reviewed
+  donor-family parity, any governed derived-mesh placement workflow, and
+  desktop visual acceptance remain open (see
+  `docs/verification/procedural-sweep.md`).
 - Greenfield geometry: a standalone bounded cubic path source/evaluator now
   supplies a shared curve primitive persisted in project schema v20. The
-  native CONDITION workbench creates and edits one cubic segment paired with
-  road intent through an atomic, revision-bound, undoable application command.
+  native CONDITION workbench creates and edits up to 16 exactly joined cubic
+  segments paired with road intent through an atomic, revision-bound, undoable
+  application command. New segments extend the previous endpoint along its
+  final tangent; loaded joined sources preserve all segment control points.
   Curve and road source lineages persist deletion tombstones, so undo/redo and
   recreation advance rather than reuse source revisions. The editor refuses
   stale project snapshots, stale road/centerline bindings, and multiple road
-  consumers of one centerline in this slice. Multi-segment editing,
-  frames/offsets, terrain mesh placement into the scene, road mesh/frontage
-  generation, asset registry/reimport, and runoff/flow coupling remain open.
+  consumers of one centerline in this slice. Native editing is capped at 16
+  segments although the source contract is more permissive. It now derives an
+  ephemeral road/shoulder ribbon for the central work surface, bound to exact
+  road and centerline digests, with bounded sampled-grade, sampled-curvature,
+  and miter-join rejection. This is not an engineering certificate. Committed
+  road mesh placement, terrain draping, frontage/driveway/sign generation,
+  drainage geometry, moved-source relinking, orphan source-blob cleanup,
+  side-by-side reimport review, and runoff/flow coupling remain open. Saved
+  project OBJ/PLY/STL imports now bind their content-addressed source snapshot
+  to the mesh asset and reimport changed geometry in place; the project source
+  registry and reviewed plan-adoption core are implemented in schema 21, with
+  limits recorded in [source asset registry](source-asset-registry.md) and
+  [road surface preview](road-surface-preview.md).
   Terrain elevation source tiles, source-bound mesh,
   slope, passability, wet/dry derivations, and the explicit-frame hydro
   bathymetry adapter now have focused tests.
@@ -261,9 +360,11 @@ Cartographer receipt cannot be used to bypass them.
   revision-checked radial paint/erase/smooth operations. Dirty receipts bind
   both parent and resulting digests for safe incremental derivatives. The
   native CONDITION workbench supports additional fields, terrain tile
-  identities, an editable heatmap, revision-bound brushes, and read-only
-  terrain analysis. Field graphs,
-  vector composition, runoff/hydrology simulation, and a world viewport overlay
-  remain unclaimed.
+  identities, an editable heatmap, revision-bound brushes, read-only terrain
+  analysis, a source-bound terrain-mesh overlay, and a capped wind U/V vector
+  overlay on the central work surface. Vector preview requires exact matching
+  source grids and suppresses stale receipts without persisting or mutating.
+  General field graphs/composition, vector solving, runoff/hydrology simulation,
+  and other non-terrain field overlays remain unclaimed.
 - Public/private boundary: preserved; no attached archive or private runtime
   payload is included in the source tree.

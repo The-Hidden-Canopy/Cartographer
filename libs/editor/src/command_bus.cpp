@@ -1,5 +1,6 @@
 #include <carto/editor/command_bus.hpp>
 
+#include <limits>
 #include <utility>
 
 namespace carto::editor {
@@ -375,6 +376,160 @@ core::Result<void> SetProjectConditionAuthoringCommand::undo() {
     return core::Result<void>::success();
 }
 
+SetProjectMaterialCatalogCommand::SetProjectMaterialCatalogCommand(
+    ProjectCommandAdmission,
+    project::ProjectDocument& document,
+    project::MaterialCatalog before,
+    project::MaterialCatalog after)
+    : document_(&document),
+      before_(std::move(before)),
+      after_(std::move(after)),
+      expected_project_revision_(document.revision()) {}
+
+core::Result<void> SetProjectMaterialCatalogCommand::execute() {
+    if (!document_ || applied_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "material catalog command has incomplete or already-applied state"));
+    }
+    const core::Revision expected =
+        current_project_revision_.value_or(expected_project_revision_);
+    if (document_->revision() != expected) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "material catalog command revision no longer matches the project"));
+    }
+    if (document_->material_catalog().serialize() != before_.serialize()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "material catalog changed before the command was applied"));
+    }
+    if (auto result = document_->set_material_catalog(after_); !result) return result;
+    if (document_->revision() == expected) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "material catalog command did not change the project"));
+    }
+    current_project_revision_ = document_->revision();
+    applied_ = true;
+    return core::Result<void>::success();
+}
+
+core::Result<void> SetProjectMaterialCatalogCommand::undo() {
+    if (!document_ || !applied_ || !current_project_revision_.has_value() ||
+        document_->revision() != *current_project_revision_ ||
+        document_->material_catalog().serialize() != after_.serialize()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "material catalog no longer matches the command being undone"));
+    }
+    if (auto result = document_->set_material_catalog(before_); !result) return result;
+    current_project_revision_ = document_->revision();
+    applied_ = false;
+    return core::Result<void>::success();
+}
+
+ApplySourceReimportPlanCommand::ApplySourceReimportPlanCommand(
+    ProjectCommandAdmission,
+    project::ProjectDocument& document,
+    assets::SourceReimportPlan reviewed_plan)
+    : document_(&document),
+      reviewed_plan_(std::move(reviewed_plan)),
+      expected_project_revision_(document.revision()) {}
+
+core::Result<assets::SourceReimportPlan>
+ApplySourceReimportPlanCommand::plan_for_records(
+    const std::vector<assets::SourceImportRecord>& records) const {
+    if (!document_) {
+        return core::Result<assets::SourceReimportPlan>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "source reimport command has no project document"));
+    }
+    std::vector<assets::SourceImportRecord> incoming = records;
+    const auto& registry = document_->source_asset_registry();
+    for (auto& record : incoming) {
+        const auto active = registry.records().find(record.identity);
+        const auto lineage = registry.lineage().find(record.identity);
+        if (active != registry.records().end()) {
+            const auto original_generation = record.source_generation;
+            record.source_generation = active->second.source_generation;
+            if (record.serialize() == active->second.serialize()) continue;
+            record.source_generation = original_generation;
+        }
+        if (lineage == registry.lineage().end()) {
+            record.source_generation = core::Revision{1U};
+            continue;
+        }
+        if (lineage->second.exhausted()) {
+            return core::Result<assets::SourceReimportPlan>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "source asset generation space is exhausted during command replay"));
+        }
+        record.source_generation = lineage->second.next();
+    }
+    return assets::plan_source_reimport(registry, std::move(incoming));
+}
+
+core::Result<void> ApplySourceReimportPlanCommand::execute() {
+    if (!document_ || applied_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "source reimport command has incomplete or already-applied state"));
+    }
+    if (document_->revision() != expected_project_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "source reimport command revision no longer matches the project"));
+    }
+    if (!initialized_) {
+        const auto updated = assets::apply_source_reimport_plan(
+            document_->source_asset_registry(), reviewed_plan_);
+        if (!updated) return core::Result<void>::failure(updated.error());
+        if (updated.value().serialize() == document_->source_asset_registry().serialize()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "unchanged source reimport plan cannot enter command history"));
+        }
+        for (const auto& [identity, record] : document_->source_asset_registry().records()) {
+            static_cast<void>(identity);
+            before_records_.push_back(record);
+        }
+        for (const auto& entry : reviewed_plan_.entries) {
+            if (entry.incoming.has_value()) after_records_.push_back(*entry.incoming);
+        }
+        if (auto result = document_->apply_source_reimport_plan(reviewed_plan_); !result) {
+            return result;
+        }
+        initialized_ = true;
+    } else {
+        const auto redo_plan = plan_for_records(after_records_);
+        if (!redo_plan) return core::Result<void>::failure(redo_plan.error());
+        if (auto result = document_->apply_source_reimport_plan(redo_plan.value()); !result) {
+            return result;
+        }
+    }
+    expected_project_revision_ = document_->revision();
+    applied_ = true;
+    return core::Result<void>::success();
+}
+
+core::Result<void> ApplySourceReimportPlanCommand::undo() {
+    if (!document_ || !initialized_ || !applied_ ||
+        document_->revision() != expected_project_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "source reimport command is no longer current and cannot be undone"));
+    }
+    const auto undo_plan = plan_for_records(before_records_);
+    if (!undo_plan) return core::Result<void>::failure(undo_plan.error());
+    if (auto result = document_->apply_source_reimport_plan(undo_plan.value()); !result) {
+        return result;
+    }
+    expected_project_revision_ = document_->revision();
+    applied_ = false;
+    return core::Result<void>::success();
+}
+
 SetProjectSpatialFieldCommand::SetProjectSpatialFieldCommand(
     ProjectCommandAdmission,
     project::ProjectDocument& document,
@@ -672,6 +827,116 @@ core::Result<void> SetProjectRoadAuthoringCommand::undo() {
     }
     candidate.revision_ = document_->revision();
     candidate.bump_revision();
+    if (auto result = candidate.validate(); !result) return result;
+    document_->swap(candidate);
+    expected_project_revision_ = document_->revision();
+    applied_ = false;
+    return core::Result<void>::success();
+}
+
+SetProjectSweepSourceCommand::SetProjectSweepSourceCommand(
+    ProjectCommandAdmission,
+    project::ProjectDocument& document,
+    geometry::SweepSource source)
+    : document_(&document),
+      authored_source_(std::move(source)),
+      expected_project_revision_(document.revision()) {
+    const auto existing = document.sweep_sources().find(authored_source_.source_identity);
+    if (existing != document.sweep_sources().end()) {
+        previous_source_ = existing->second;
+        expected_current_source_ = existing->second;
+    }
+}
+
+core::Result<void> SetProjectSweepSourceCommand::execute() {
+    if (!document_ || applied_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "sweep source command has incomplete or already-applied state"));
+    }
+    if (document_->revision() != expected_project_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "sweep source command project revision is stale"));
+    }
+    const auto current = document_->sweep_sources().find(authored_source_.source_identity);
+    const std::optional<geometry::SweepSource> observed =
+        current == document_->sweep_sources().end()
+            ? std::nullopt : std::optional<geometry::SweepSource>{current->second};
+    const auto same_source = [](const auto& left, const auto& right) {
+        return left.has_value() == right.has_value() &&
+            (!left.has_value() || left->serialize() == right->serialize());
+    };
+    if (!same_source(observed, expected_current_source_)) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "sweep source changed before the command was applied"));
+    }
+
+    project::ProjectDocument candidate(*document_);
+    const auto lineage = candidate.sweep_source_lineage_.find(
+        authored_source_.source_identity);
+    if (lineage != candidate.sweep_source_lineage_.end() && lineage->second.exhausted()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state, "sweep source revision space is exhausted"));
+    }
+    const core::Revision next_revision = lineage == candidate.sweep_source_lineage_.end()
+        ? core::Revision{1U} : lineage->second.next();
+    if (!initialized_ && authored_source_.source_revision != next_revision) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "sweep source revision does not match retained project lineage"));
+    }
+    geometry::SweepSource authored = authored_source_;
+    authored.source_revision = next_revision;
+    if (auto result = candidate.set_sweep_source(authored); !result) return result;
+    if (auto result = candidate.validate(); !result) return result;
+
+    document_->swap(candidate);
+    expected_project_revision_ = document_->revision();
+    expected_current_source_ = std::move(authored);
+    initialized_ = true;
+    applied_ = true;
+    return core::Result<void>::success();
+}
+
+core::Result<void> SetProjectSweepSourceCommand::undo() {
+    if (!document_ || !applied_ ||
+        document_->revision() != expected_project_revision_ ||
+        !expected_current_source_.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "sweep source command cannot be undone in the current project revision"));
+    }
+    const auto current = document_->sweep_sources().find(
+        expected_current_source_->source_identity);
+    if (current == document_->sweep_sources().end() ||
+        current->second.serialize() != expected_current_source_->serialize()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "sweep source no longer matches the command being undone"));
+    }
+
+    project::ProjectDocument candidate(*document_);
+    if (previous_source_.has_value()) {
+        const auto lineage = candidate.sweep_source_lineage_.find(
+            previous_source_->source_identity);
+        if (lineage == candidate.sweep_source_lineage_.end() || lineage->second.exhausted()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state, "sweep source revision space is exhausted"));
+        }
+        geometry::SweepSource restored = *previous_source_;
+        restored.source_revision = lineage->second.next();
+        if (auto result = candidate.set_sweep_source(restored); !result) return result;
+        expected_current_source_ = std::move(restored);
+    } else {
+        if (auto result = candidate.erase_sweep_source_if_revision(
+                expected_current_source_->source_identity,
+                expected_current_source_->source_revision); !result) {
+            return result;
+        }
+        expected_current_source_.reset();
+    }
     if (auto result = candidate.validate(); !result) return result;
     document_->swap(candidate);
     expected_project_revision_ = document_->revision();
@@ -2988,6 +3253,251 @@ core::Result<void> CreateMeshObjectCommand::remove_instance() {
         *document_ = before;
         return result;
     }
+    return core::Result<void>::success();
+}
+
+ImportSourceMeshCommand::ImportSourceMeshCommand(
+    ProjectCommandAdmission,
+    project::ProjectDocument& document,
+    std::string object_name,
+    geometry::EditableMesh mesh,
+    assets::SourceImportRecord source_record)
+    : document_(&document),
+      object_name_(std::move(object_name)),
+      imported_mesh_(std::move(mesh)),
+      imported_record_(std::move(source_record)),
+      expected_project_revision_(document.revision()) {}
+
+core::Result<void> ImportSourceMeshCommand::apply_registry_record(
+    std::optional<assets::SourceImportRecord> desired) {
+    if (!document_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "source mesh command has no project document"));
+    }
+    const auto& registry = document_->source_asset_registry();
+    const std::string identity = desired.has_value()
+        ? desired->identity
+        : imported_record_.identity;
+    std::vector<assets::SourceImportRecord> records;
+    records.reserve(registry.records().size() + (desired.has_value() ? 1U : 0U));
+    for (const auto& [active_identity, record] : registry.records()) {
+        if (active_identity != identity) records.push_back(record);
+    }
+    if (desired.has_value()) {
+        const auto active = registry.records().find(identity);
+        const auto lineage = registry.lineage().find(identity);
+        if (active != registry.records().end()) {
+            if (active->second.kind != desired->kind ||
+                active->second.artifact_identity != desired->artifact_identity) {
+                return core::Result<void>::failure(core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "source reimport cannot change the bound artifact identity"));
+            }
+            desired->source_generation = active->second.source_generation;
+            if (desired->serialize() != active->second.serialize()) {
+                if (lineage->second.exhausted()) {
+                    return core::Result<void>::failure(core::Diagnostic(
+                        core::ErrorCode::invalid_state,
+                        "source asset generation space is exhausted"));
+                }
+                desired->source_generation = lineage->second.next();
+            }
+        } else if (lineage == registry.lineage().end()) {
+            desired->source_generation = core::Revision{1U};
+        } else {
+            if (lineage->second.exhausted()) {
+                return core::Result<void>::failure(core::Diagnostic(
+                    core::ErrorCode::invalid_state,
+                    "source asset generation space is exhausted"));
+            }
+            desired->source_generation = lineage->second.next();
+        }
+        if (auto result = desired->validate(); !result) return result;
+        records.push_back(std::move(*desired));
+    }
+    const auto plan = assets::plan_source_reimport(registry, std::move(records));
+    if (!plan) return core::Result<void>::failure(plan.error());
+    return document_->apply_source_reimport_plan(plan.value());
+}
+
+core::Result<void> ImportSourceMeshCommand::apply_imported_mesh() {
+    if (!document_ || !mesh_asset_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "source mesh command has no bound mesh asset"));
+    }
+    const auto current = document_->meshes().find(*mesh_asset_);
+    if (current == document_->meshes().end()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "source mesh artifact is no longer present in the project"));
+    }
+    const auto replaced = document_->replace_mesh_if_revision(
+        *mesh_asset_, current->second.revision(), imported_mesh_);
+    return replaced
+        ? core::Result<void>::success()
+        : core::Result<void>::failure(replaced.error());
+}
+
+core::Result<void> ImportSourceMeshCommand::apply_previous_mesh() {
+    if (!document_ || !mesh_asset_ || !previous_mesh_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "source mesh command has no prior mesh snapshot"));
+    }
+    const auto current = document_->meshes().find(*mesh_asset_);
+    if (current == document_->meshes().end()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "source mesh artifact is no longer present in the project"));
+    }
+    const auto replaced = document_->replace_mesh_if_revision(
+        *mesh_asset_, current->second.revision(), *previous_mesh_);
+    return replaced
+        ? core::Result<void>::success()
+        : core::Result<void>::failure(replaced.error());
+}
+
+core::Result<void> ImportSourceMeshCommand::restore_created_instance() {
+    if (!document_ || !mesh_asset_ || !object_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "source mesh command has incomplete instance restoration state"));
+    }
+    if (auto result = document_->insert_mesh(*mesh_asset_, imported_mesh_); !result) {
+        return result;
+    }
+    if (auto result = document_->insert_object(*object_); !result) return result;
+    return core::Result<void>::success();
+}
+
+core::Result<void> ImportSourceMeshCommand::remove_created_instance() {
+    if (!document_ || !mesh_asset_ || !object_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "source mesh command has incomplete instance removal state"));
+    }
+    if (auto result = document_->remove_object(object_->id); !result) return result;
+    return document_->remove_mesh(*mesh_asset_);
+}
+
+core::Result<void> ImportSourceMeshCommand::execute() {
+    if (!document_ || applied_ || document_->revision() != expected_project_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "source mesh command is stale, incomplete, or already applied"));
+    }
+    const project::ProjectDocument before = *document_;
+    const auto rollback = [this, &before](core::Diagnostic diagnostic) {
+        *document_ = before;
+        return core::Result<void>::failure(std::move(diagnostic));
+    };
+
+    if (!initialized_) {
+        const auto active = document_->source_asset_registry().records().find(
+            imported_record_.identity);
+        if (active != document_->source_asset_registry().records().end()) {
+            if (active->second.kind != assets::SourceAssetKind::mesh ||
+                active->second.artifact_identity != imported_record_.artifact_identity) {
+                return core::Result<void>::failure(core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "source identity is bound to a different mesh artifact"));
+            }
+            std::optional<std::uint64_t> bound_asset;
+            for (const auto& [asset, mesh] : document_->meshes()) {
+                static_cast<void>(mesh);
+                if (active->second.artifact_identity ==
+                    "mesh.asset." + std::to_string(asset)) {
+                    bound_asset = asset;
+                    break;
+                }
+            }
+            if (!bound_asset) {
+                return core::Result<void>::failure(core::Diagnostic(
+                    core::ErrorCode::stale_data,
+                    "source registry points to a missing mesh artifact"));
+            }
+            const auto current_mesh = document_->meshes().find(*bound_asset);
+            mesh_asset_ = *bound_asset;
+            previous_mesh_ = current_mesh->second;
+            previous_record_ = active->second;
+            imported_record_.artifact_identity = active->second.artifact_identity;
+            mesh_changed_ = active->second.artifact_digest !=
+                imported_record_.artifact_digest;
+            if (mesh_changed_) {
+                if (auto result = apply_imported_mesh(); !result) return rollback(result.error());
+            }
+            if (auto result = apply_registry_record(imported_record_); !result) {
+                return rollback(result.error());
+            }
+            created_instance_ = false;
+        } else {
+            const auto mesh = document_->add_mesh(imported_mesh_);
+            if (!mesh) return rollback(mesh.error());
+            mesh_asset_ = mesh.value();
+            auto object = document_->create_object(object_name_);
+            if (!object) return rollback(object.error());
+            if (auto result = document_->attach_mesh(object.value(), *mesh_asset_); !result) {
+                return rollback(result.error());
+            }
+            const auto* inserted = document_->scene().find(object.value());
+            if (!inserted) {
+                return rollback(core::Diagnostic(
+                    core::ErrorCode::invalid_state,
+                    "source mesh object disappeared before command capture"));
+            }
+            object_ = *inserted;
+            imported_record_.artifact_identity =
+                "mesh.asset." + std::to_string(*mesh_asset_);
+            if (auto result = apply_registry_record(imported_record_); !result) {
+                return rollback(result.error());
+            }
+            created_instance_ = true;
+        }
+        initialized_ = true;
+    } else {
+        if (created_instance_) {
+            if (auto result = restore_created_instance(); !result) return rollback(result.error());
+        } else if (mesh_changed_) {
+            if (auto result = apply_imported_mesh(); !result) return rollback(result.error());
+        }
+        if (auto result = apply_registry_record(imported_record_); !result) {
+            return rollback(result.error());
+        }
+    }
+    expected_project_revision_ = document_->revision();
+    applied_ = true;
+    return core::Result<void>::success();
+}
+
+core::Result<void> ImportSourceMeshCommand::undo() {
+    if (!document_ || !initialized_ || !applied_ ||
+        document_->revision() != expected_project_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "source mesh command is no longer current and cannot be undone"));
+    }
+    const project::ProjectDocument before = *document_;
+    const auto rollback = [this, &before](core::Diagnostic diagnostic) {
+        *document_ = before;
+        return core::Result<void>::failure(std::move(diagnostic));
+    };
+    if (created_instance_) {
+        if (auto result = remove_created_instance(); !result) return rollback(result.error());
+        if (auto result = apply_registry_record(std::nullopt); !result) {
+            return rollback(result.error());
+        }
+    } else {
+        if (mesh_changed_) {
+            if (auto result = apply_previous_mesh(); !result) return rollback(result.error());
+        }
+        if (auto result = apply_registry_record(previous_record_); !result) {
+            return rollback(result.error());
+        }
+    }
+    expected_project_revision_ = document_->revision();
+    applied_ = false;
     return core::Result<void>::success();
 }
 

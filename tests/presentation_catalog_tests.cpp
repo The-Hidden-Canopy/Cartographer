@@ -209,8 +209,12 @@ void schema_v17_migrates_and_current_schema_requires_spatial_field_table() {
     require(spatial_table != std::string::npos,
         "schema migration fixture can isolate current spatial-field records");
     v17 = v17.substr(0U, spatial_table) + "END\n";
-    const std::string current_header = "CARTOGRAPHER_PROJECT 20";
-    require(v17.starts_with(current_header), "schema migration fixture finds v20 header");
+    const auto sweep_table = v17.find("SWEEP_SOURCES 0\n");
+    require(sweep_table != std::string::npos,
+        "schema v17 fixture removes the v22 sweep-source table");
+    v17.erase(sweep_table, std::string("SWEEP_SOURCES 0\n").size());
+    const std::string current_header = "CARTOGRAPHER_PROJECT 22";
+    require(v17.starts_with(current_header), "schema migration fixture finds v22 header");
     v17.replace(0U, current_header.size(), "CARTOGRAPHER_PROJECT 17");
     const auto migrated_v17 = project::ProjectDocument::deserialize(v17);
     require(migrated_v17 && migrated_v17.value().spatial_fields().empty() &&

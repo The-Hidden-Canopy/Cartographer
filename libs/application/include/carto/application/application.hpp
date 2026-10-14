@@ -14,6 +14,7 @@
 #include <carto/editor/selection.hpp>
 #include <carto/editor/tools.hpp>
 #include <carto/geometry/primitives.hpp>
+#include <carto/geometry/road_surface.hpp>
 #include <carto/journal/journal.hpp>
 #include <carto/project/project.hpp>
 #include <carto/production/sculpt_stack.hpp>
@@ -135,6 +136,69 @@ struct RoadSourceView {
     project::RoadFunctionClass function_class = project::RoadFunctionClass::local;
     project::RoadAccessState access_state = project::RoadAccessState::open;
     project::RoadDrainageIntent drainage_intent = project::RoadDrainageIntent::none;
+    assets::Sha256Digest digest;
+};
+
+struct SweepSourceView {
+    geometry::SweepSource source;
+    assets::Sha256Digest digest;
+};
+
+struct SourceAssetView {
+    std::string identity;
+    std::string relative_source_path;
+    assets::SourceAssetKind kind = assets::SourceAssetKind::other;
+    core::Revision source_generation;
+    assets::Sha256Digest source_digest;
+    std::string importer_identity;
+    std::uint32_t importer_version = 0U;
+    std::string artifact_identity;
+    assets::Sha256Digest artifact_digest;
+};
+
+struct MaterialGraphView {
+    std::string identity;
+    core::Revision source_revision;
+    std::size_t node_count = 0U;
+};
+
+struct MaterialGraphBindingView {
+    render::MaterialId material = 0U;
+    std::string graph_identity;
+    core::Revision source_revision;
+    assets::Sha256Digest source_digest;
+    bool source_current = false;
+};
+
+// Ephemeral road authoring output. Both source receipts are required before a
+// consumer may display the derived ribbon; the mesh is never persisted here.
+struct RoadSurfacePreview {
+    std::string road_identity;
+    core::Revision road_revision;
+    std::uint64_t project_generation = 0U;
+    assets::Sha256Digest road_digest;
+    assets::Sha256Digest centerline_digest;
+    project::RoadSurfaceClass surface_class = project::RoadSurfaceClass::asphalt;
+    geometry::RoadSurfaceMesh mesh;
+
+    [[nodiscard]] bool matches(
+        std::uint64_t current_project_generation,
+        const RoadSourceView& road,
+        const CurvePathSourceView& centerline) const {
+        return project_generation == current_project_generation &&
+            road.identity == road_identity && road.source_revision == road_revision &&
+            road.digest == road_digest && road.surface_class == surface_class &&
+            road.centerline_identity == mesh.centerline_identity &&
+            road.centerline_revision == mesh.centerline_revision &&
+            road.width_meters == mesh.road_width_meters &&
+            road.shoulder_meters == mesh.shoulder_width_meters &&
+            road.maximum_grade_ratio == mesh.maximum_grade_ratio &&
+            road.minimum_curve_radius_meters == mesh.minimum_curve_radius_meters &&
+            centerline.identity == mesh.centerline_identity &&
+            centerline.source_revision == mesh.centerline_revision &&
+            centerline.digest == centerline_digest &&
+            static_cast<bool>(mesh.validate());
+    }
 };
 
 struct SpatialFieldPreview {
@@ -269,6 +333,14 @@ struct ConditionAuthoringView {
         std::uint64_t asset_id = 0U;
         std::array<double, 8> values{};
     };
+    struct SurfaceState {
+        std::uint64_t id = 0U;
+        std::uint64_t asset_id = 0U;
+        std::string occupancy;
+        std::string maintenance;
+        std::string damage;
+        double wetness = 0.0;
+    };
     struct StateBranch {
         std::uint64_t id = 0U;
         std::uint64_t parent_branch_id = 0U;
@@ -278,6 +350,7 @@ struct ConditionAuthoringView {
     };
     std::vector<Asset> assets;
     std::vector<SafePlace> safe_places;
+    std::vector<SurfaceState> surface_states;
     std::vector<StateBranch> state_branches;
     std::vector<AudioSource> audio_sources;
     std::vector<AcousticZone> acoustic_zones;
@@ -307,6 +380,14 @@ struct ApplicationSnapshot {
     std::vector<SpatialFieldView> spatial_fields;
     std::vector<CurvePathSourceView> curve_paths;
     std::vector<RoadSourceView> road_sources;
+    std::vector<SweepSourceView> sweep_sources;
+    std::vector<SourceAssetView> source_assets;
+    std::size_t source_asset_tombstone_count = 0U;
+    std::vector<render::MaterialAsset> materials;
+    std::vector<MaterialGraphView> material_graphs;
+    std::vector<MaterialGraphBindingView> material_graph_bindings;
+    std::vector<project::MaterialRegionKey> material_regions;
+    std::vector<project::MaterialRegionAssignment> material_assignments;
     EngineeringAuthoringView engineering;
     ConditionAuthoringView condition;
 };
@@ -477,7 +558,14 @@ struct CreatePlaneAction {
 struct CreateMeshObjectAction {
     std::string object_name;
     geometry::EditableMesh mesh;
+    std::optional<assets::SourceImportRecord> source_record = std::nullopt;
 };
+
+// Canonical digest for the geometry domain imported by Cartographer's native
+// OBJ/PLY/STL providers. Attributes and presentation data are intentionally
+// excluded until those importers preserve them.
+[[nodiscard]] assets::Sha256Digest canonical_mesh_geometry_digest(
+    const geometry::EditableMesh& mesh);
 
 // Appends one deterministic point stroke to the currently selected vertex's
 // project-bound SculptStack. The UI snapshot revision is rechecked before
@@ -529,11 +617,21 @@ struct InvalidateEngineeringSourceAction {
 
 struct ImportConditionFixtureAction {};
 struct ImportConditionAuthoringAction { std::string serialized_document; };
+struct BindConditionAssetObjectAction {
+    core::Revision expected_project_revision;
+    core::Revision expected_authoring_revision;
+    condition::Id asset_id = 0U;
+    scene::ObjectId object_id{};
+};
 
 struct InvalidateConditionSourceAction {
     condition::Id source_id = 0U;
     std::string new_revision;
     assets::Sha256Digest new_digest;
+};
+
+struct ApplySourceReimportPlanAction {
+    assets::SourceReimportPlan plan;
 };
 
 struct CreateSpatialFieldAction {
@@ -553,10 +651,51 @@ struct PaintSpatialFieldAction {
     spatial_field::FieldBrush brush;
 };
 
+struct CreateMaterialAction {
+    core::Revision expected_project_revision;
+    std::string name;
+    render::StandardMaterial definition;
+};
+
+struct UpdateMaterialAction {
+    core::Revision expected_project_revision;
+    render::MaterialId material_id = 0U;
+    core::Revision expected_material_revision;
+    render::StandardMaterial definition;
+};
+
+struct SetMaterialRegionAssignmentAction {
+    core::Revision expected_project_revision;
+    project::MaterialRegionKey key;
+    std::optional<render::MaterialId> material;
+    std::optional<project::MaterialVariantId> variant;
+};
+
+struct SetMaterialGraphAction {
+    core::Revision expected_project_revision;
+    std::optional<core::Revision> expected_graph_revision;
+    std::optional<assets::Sha256Digest> expected_graph_digest;
+    project::MaterialGraph graph;
+};
+
+struct SetMaterialGraphBindingAction {
+    core::Revision expected_project_revision;
+    render::MaterialId material_id = 0U;
+    core::Revision expected_material_revision;
+    std::optional<std::string> graph_identity;
+    std::optional<core::Revision> expected_graph_revision;
+    std::optional<assets::Sha256Digest> expected_graph_digest;
+};
+
 struct SetRoadAuthoringAction {
     core::Revision expected_project_revision;
     geometry::CurvePath centerline;
     project::RoadSource road;
+};
+
+struct SetSweepSourceAction {
+    core::Revision expected_project_revision;
+    geometry::SweepSource source;
 };
 
 struct UndoAction {};
@@ -592,10 +731,18 @@ using ApplicationAction = std::variant<
     InvalidateEngineeringSourceAction,
     ImportConditionFixtureAction,
     ImportConditionAuthoringAction,
+    BindConditionAssetObjectAction,
     InvalidateConditionSourceAction,
+    ApplySourceReimportPlanAction,
     CreateSpatialFieldAction,
     PaintSpatialFieldAction,
+    CreateMaterialAction,
+    UpdateMaterialAction,
+    SetMaterialRegionAssignmentAction,
+    SetMaterialGraphAction,
+    SetMaterialGraphBindingAction,
     SetRoadAuthoringAction,
+    SetSweepSourceAction,
     UndoAction,
     RedoAction>;
 
@@ -651,6 +798,8 @@ public:
     [[nodiscard]] core::Result<editor::AuthoringContext> authoring_context() const;
     [[nodiscard]] core::Result<engineering::AuthoringDocument> engineering_authoring() const;
     [[nodiscard]] core::Result<condition::AuthoringDocument> condition_authoring() const;
+    [[nodiscard]] core::Result<assets::SourceReimportPlan> preview_source_reimport(
+        std::vector<assets::SourceImportRecord> incoming) const;
     [[nodiscard]] core::Result<condition::EffectPreviewResult> condition_effect_preview(
         condition::Id effect_source_id,
         std::string_view operating_state,
@@ -661,16 +810,31 @@ public:
     condition_state_comparison(condition::Id left_branch_id, condition::Id right_branch_id) const;
     [[nodiscard]] core::Result<SpatialFieldPreview> spatial_field_preview(
         std::string_view identity) const;
+    [[nodiscard]] core::Result<spatial_field::VectorFieldPreview>
+    spatial_vector_field_preview(
+        std::string_view u_component_identity,
+        std::string_view v_component_identity,
+        std::uint32_t max_preview_axis =
+            spatial_field::VectorFieldPreview::kMaxPreviewAxis) const;
     [[nodiscard]] core::Result<terrain::TerrainTileProduct> terrain_tile_preview(
         std::string_view identity,
         std::uint32_t lod_step = 1U,
         double max_navigation_slope_degrees = 35.0,
         std::optional<double> water_level = std::nullopt) const;
+    [[nodiscard]] core::Result<RoadSurfacePreview> road_surface_preview(
+        std::string_view identity,
+        std::uint32_t samples_per_segment = 32U) const;
+    [[nodiscard]] core::Result<geometry::SweptMeshProduct> sweep_source_preview(
+        std::string_view identity) const;
     [[nodiscard]] core::Result<geometry::CurvePath> curve_path_source(
         std::string_view identity) const;
     [[nodiscard]] core::Result<core::Revision> next_curve_path_revision(
         std::string_view identity) const;
     [[nodiscard]] core::Result<core::Revision> next_road_source_revision(
+        std::string_view identity) const;
+    [[nodiscard]] core::Result<core::Revision> next_sweep_source_revision(
+        std::string_view identity) const;
+    [[nodiscard]] core::Result<project::MaterialGraph> material_graph_source(
         std::string_view identity) const;
     [[nodiscard]] core::Result<editor::AuthoringPreview> begin_preview(
         editor::PreviewKind kind) const;
@@ -746,14 +910,34 @@ private:
     [[nodiscard]] core::Result<DispatchReceipt> import_condition_fixture();
     [[nodiscard]] core::Result<DispatchReceipt> import_condition_authoring(
         const ImportConditionAuthoringAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> bind_condition_asset_object(
+        const BindConditionAssetObjectAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> invalidate_condition_source(
         const InvalidateConditionSourceAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> apply_source_reimport_plan(
+        const ApplySourceReimportPlanAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_spatial_field(
         const CreateSpatialFieldAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> paint_spatial_field(
         const PaintSpatialFieldAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> create_material(
+        const CreateMaterialAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> update_material(
+        const UpdateMaterialAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> set_material_region_assignment(
+        const SetMaterialRegionAssignmentAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> set_material_graph(
+        const SetMaterialGraphAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> set_material_graph_binding(
+        const SetMaterialGraphBindingAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> commit_material_catalog(
+        project::MaterialCatalog catalog,
+        core::Revision expected_project_revision,
+        std::string action);
     [[nodiscard]] core::Result<DispatchReceipt> set_road_authoring(
         const SetRoadAuthoringAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> set_sweep_source(
+        const SetSweepSourceAction& action);
     [[nodiscard]] core::Result<ApplicationAction> preview_action(
         const editor::AuthoringPreview& preview) const;
     [[nodiscard]] core::Result<DispatchReceipt> undo();

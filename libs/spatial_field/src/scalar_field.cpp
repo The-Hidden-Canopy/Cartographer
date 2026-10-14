@@ -411,4 +411,141 @@ core::Result<ScalarField2D> ScalarField2D::deserialize(std::string_view text) {
     return core::Result<ScalarField2D>::success(std::move(field));
 }
 
+core::Result<void> VectorFieldPreview::validate() const {
+    const auto valid_source = [](const VectorFieldSourceReceipt& source) {
+        if (!safe_identity(source.identity) || source.source_revision.value() == 0U ||
+            source.source_revision.exhausted() || source.digest.is_zero() ||
+            !std::isfinite(source.origin_uv.x) || !std::isfinite(source.origin_uv.y) ||
+            std::abs(source.origin_uv.x) > kMaxCoordinate ||
+            std::abs(source.origin_uv.y) > kMaxCoordinate ||
+            !std::isfinite(source.cell_size) || source.cell_size < kMinimumCellSize ||
+            source.cell_size > kMaxCoordinate || source.width < 2U ||
+            source.width > ScalarField2D::kMaxAxisSamples || source.height < 2U ||
+            source.height > ScalarField2D::kMaxAxisSamples ||
+            static_cast<std::uint64_t>(source.width) * source.height >
+                ScalarField2D::kMaxSamples) {
+            return false;
+        }
+        const double extent_u = source.cell_size * static_cast<double>(source.width - 1U);
+        const double extent_v = source.cell_size * static_cast<double>(source.height - 1U);
+        return std::isfinite(extent_u) && std::isfinite(extent_v) &&
+            std::abs(source.origin_uv.x + extent_u) <= kMaxCoordinate &&
+            std::abs(source.origin_uv.y + extent_v) <= kMaxCoordinate;
+    };
+    if (!valid_source(u_component) || !valid_source(v_component) ||
+        u_component.identity == v_component.identity ||
+        u_component.semantic != FieldSemantic::wind_u ||
+        v_component.semantic != FieldSemantic::wind_v ||
+        u_component.origin_uv.x != v_component.origin_uv.x ||
+        u_component.origin_uv.y != v_component.origin_uv.y ||
+        u_component.cell_size != v_component.cell_size ||
+        u_component.width != v_component.width ||
+        u_component.height != v_component.height ||
+        preview_width < 2U || preview_width > kMaxPreviewAxis ||
+        preview_width > u_component.width || preview_height < 2U ||
+        preview_height > kMaxPreviewAxis || preview_height > u_component.height ||
+        samples.size() != static_cast<std::size_t>(preview_width) * preview_height ||
+        samples.size() > kMaxSamples) {
+        return core::Result<void>::failure(validation(
+            "vector field preview has invalid, mismatched, or unbounded source evidence"));
+    }
+    const double max_u = u_component.origin_uv.x +
+        u_component.cell_size * static_cast<double>(u_component.width - 1U);
+    const double max_v = u_component.origin_uv.y +
+        u_component.cell_size * static_cast<double>(u_component.height - 1U);
+    for (const auto& sample : samples) {
+        if (!std::isfinite(sample.position_uv.x) ||
+            !std::isfinite(sample.position_uv.y) ||
+            sample.position_uv.x < u_component.origin_uv.x || sample.position_uv.x > max_u ||
+            sample.position_uv.y < u_component.origin_uv.y || sample.position_uv.y > max_v ||
+            !std::isfinite(sample.vector_uv.x) || !std::isfinite(sample.vector_uv.y) ||
+            std::abs(sample.vector_uv.x) > kMaxValueMagnitude ||
+            std::abs(sample.vector_uv.y) > kMaxValueMagnitude) {
+            return core::Result<void>::failure(validation(
+                "vector field preview contains a non-finite or out-of-coverage sample"));
+        }
+    }
+    return core::Result<void>::success();
+}
+
+bool VectorFieldPreview::sources_match(
+    std::string_view u_identity,
+    core::Revision u_revision,
+    const assets::Sha256Digest& u_digest,
+    std::string_view v_identity,
+    core::Revision v_revision,
+    const assets::Sha256Digest& v_digest) const noexcept {
+    return u_component.identity == u_identity &&
+        u_component.source_revision == u_revision && u_component.digest == u_digest &&
+        v_component.identity == v_identity &&
+        v_component.source_revision == v_revision && v_component.digest == v_digest;
+}
+
+core::Result<VectorFieldPreview> build_vector_field_preview(
+    const ScalarField2D& u_component,
+    const ScalarField2D& v_component,
+    std::uint32_t max_preview_axis) {
+    if (auto result = u_component.validate(); !result) {
+        return core::Result<VectorFieldPreview>::failure(
+            result.error().with_context("wind U source"));
+    }
+    if (auto result = v_component.validate(); !result) {
+        return core::Result<VectorFieldPreview>::failure(
+            result.error().with_context("wind V source"));
+    }
+    if (u_component.semantic() != FieldSemantic::wind_u ||
+        v_component.semantic() != FieldSemantic::wind_v ||
+        u_component.identity() == v_component.identity() ||
+        u_component.origin_uv().x != v_component.origin_uv().x ||
+        u_component.origin_uv().y != v_component.origin_uv().y ||
+        u_component.cell_size() != v_component.cell_size() ||
+        u_component.width() != v_component.width() ||
+        u_component.height() != v_component.height() || max_preview_axis < 2U ||
+        max_preview_axis > VectorFieldPreview::kMaxPreviewAxis) {
+        return core::Result<VectorFieldPreview>::failure(invalid(
+            "wind vector preview requires aligned U/V sources and a bounded preview axis"));
+    }
+    const auto u_digest = u_component.canonical_digest();
+    const auto v_digest = v_component.canonical_digest();
+    if (!u_digest) return core::Result<VectorFieldPreview>::failure(u_digest.error());
+    if (!v_digest) return core::Result<VectorFieldPreview>::failure(v_digest.error());
+
+    VectorFieldPreview preview;
+    preview.u_component = VectorFieldSourceReceipt{
+        u_component.identity(), u_component.semantic(), u_component.source_revision(),
+        u_digest.value(), u_component.origin_uv(), u_component.cell_size(),
+        u_component.width(), u_component.height()};
+    preview.v_component = VectorFieldSourceReceipt{
+        v_component.identity(), v_component.semantic(), v_component.source_revision(),
+        v_digest.value(), v_component.origin_uv(), v_component.cell_size(),
+        v_component.width(), v_component.height()};
+    preview.preview_width = std::min(u_component.width(), max_preview_axis);
+    preview.preview_height = std::min(u_component.height(), max_preview_axis);
+    preview.samples.reserve(
+        static_cast<std::size_t>(preview.preview_width) * preview.preview_height);
+    for (std::uint32_t v = 0U; v < preview.preview_height; ++v) {
+        const auto source_v = static_cast<std::uint32_t>(
+            (static_cast<std::uint64_t>(v) * (u_component.height() - 1U)) /
+            (preview.preview_height - 1U));
+        for (std::uint32_t u = 0U; u < preview.preview_width; ++u) {
+            const auto source_u = static_cast<std::uint32_t>(
+                (static_cast<std::uint64_t>(u) * (u_component.width() - 1U)) /
+                (preview.preview_width - 1U));
+            const auto index = index_of(source_u, source_v, u_component.width());
+            if (index >= u_component.values().size() || index >= v_component.values().size()) {
+                return core::Result<VectorFieldPreview>::failure(validation(
+                    "wind vector preview index exceeds its validated sources"));
+            }
+            preview.samples.push_back(VectorFieldSample{
+                {u_component.origin_uv().x + u_component.cell_size() * source_u,
+                 u_component.origin_uv().y + u_component.cell_size() * source_v},
+                {u_component.values()[index], v_component.values()[index]}});
+        }
+    }
+    if (auto result = preview.validate(); !result) {
+        return core::Result<VectorFieldPreview>::failure(result.error());
+    }
+    return core::Result<VectorFieldPreview>::success(std::move(preview));
+}
+
 } // namespace carto::spatial_field

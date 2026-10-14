@@ -28,7 +28,8 @@ constexpr std::size_t kMaxScopeObjects = 512U;
 constexpr std::size_t kMaxPlanSteps = 256U;
 constexpr std::size_t kMaxRepairAttempts = 4U;
 constexpr std::uint32_t kKnownEffects = ::carto::agent::effect_mask(Effect::geometry) |
-    ::carto::agent::effect_mask(Effect::topology);
+    ::carto::agent::effect_mask(Effect::topology) |
+    ::carto::agent::effect_mask(Effect::transform);
 
 core::Diagnostic invalid(std::string message) {
     return core::Diagnostic(core::ErrorCode::invalid_argument, std::move(message));
@@ -129,6 +130,10 @@ assets::Sha256Digest clarification_context_digest(
     std::string canonical = "cartographer.clarification-context.v1|";
     append_field(canonical, objective.id);
     append_field(canonical, objective.goal);
+    if (!objective.recipe_id.empty()) {
+        append_field(canonical, "recipe");
+        append_field(canonical, objective.recipe_id);
+    }
     append_number(canonical, objective.base_revision.value());
     append_object_ids(canonical, objective.scope_objects);
     append_object_ids(canonical, objective.protected_objects);
@@ -204,8 +209,8 @@ assets::Sha256Digest clarification_plan_context_digest(const AgentPlan& plan) {
         append_number(canonical, step.target.component.index());
         if (const auto* face = std::get_if<geometry::FaceId>(&step.target.component)) {
             append_number(canonical, face->value);
-        } else {
-            append_number(canonical, std::get<geometry::VertexId>(step.target.component).value);
+        } else if (const auto* vertex = std::get_if<geometry::VertexId>(&step.target.component)) {
+            append_number(canonical, vertex->value);
         }
         append_field(canonical, step.intent);
         auto dependencies = step.dependencies;
@@ -358,22 +363,58 @@ assets::Sha256Digest ghost_correction_chain_digest(
 }
 
 std::string effect_names(std::uint32_t effects) {
-    if ((effects & (::carto::agent::effect_mask(Effect::geometry) |
-                    ::carto::agent::effect_mask(Effect::topology))) ==
-        (::carto::agent::effect_mask(Effect::geometry) |
-         ::carto::agent::effect_mask(Effect::topology))) {
-        return "geometry and topology";
-    }
-    if ((effects & ::carto::agent::effect_mask(Effect::topology)) != 0U) return "topology";
-    if ((effects & ::carto::agent::effect_mask(Effect::geometry)) != 0U) return "geometry";
-    return "no declared effect";
+    std::string result;
+    const auto append = [&result](std::string_view name) {
+        if (!result.empty()) result += ", ";
+        result += name;
+    };
+    if ((effects & ::carto::agent::effect_mask(Effect::geometry)) != 0U) append("geometry");
+    if ((effects & ::carto::agent::effect_mask(Effect::topology)) != 0U) append("topology");
+    if ((effects & ::carto::agent::effect_mask(Effect::transform)) != 0U) append("transform");
+    return result.empty() ? "no declared effect" : result;
 }
 
 } // namespace
 
+const std::vector<AgentRecipeDefinition>& agent_recipe_catalog() noexcept {
+    static const std::vector<AgentRecipeDefinition> recipes{
+        {
+            "bounded-mesh-edit",
+            "Bounded mesh edit",
+            "Uses the operator-authored plan, caps topology changes at 512 operations, "
+                "and requires scene-object identity and transforms to remain unchanged.",
+            512U,
+            ::carto::agent::effect_mask(Effect::geometry) |
+                ::carto::agent::effect_mask(Effect::topology),
+            false,
+        },
+        {
+            "bounded-vertex-edit",
+            "Topology-preserving vertex edit",
+            "Uses the operator-authored plan, permits vertex geometry only, and requires mesh topology and scene-object identity to remain unchanged.",
+            0U,
+            ::carto::agent::effect_mask(Effect::geometry),
+            true,
+        },
+    };
+    return recipes;
+}
+
+const AgentRecipeDefinition* find_agent_recipe(std::string_view id) noexcept {
+    const auto& recipes = agent_recipe_catalog();
+    const auto found = std::find_if(recipes.begin(), recipes.end(), [id](const auto& recipe) {
+        return recipe.id == id;
+    });
+    return found == recipes.end() ? nullptr : &*found;
+}
+
 core::Result<void> TargetRef::validate() const {
     if (!object) return core::Result<void>::failure(invalid("plan target object is zero"));
-    const bool valid_component = std::visit([](const auto id) { return static_cast<bool>(id); }, component);
+    const bool valid_component = std::visit([](const auto value) {
+        using Value = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<Value, std::monostate>) return true;
+        else return static_cast<bool>(value);
+    }, component);
     if (!valid_component) {
         return core::Result<void>::failure(invalid("plan target component is zero"));
     }
@@ -451,6 +492,9 @@ core::Result<void> HardConstraint::validate() const {
                 "vertex-displacement constraint requires one object and a finite positive bound"));
         }
         break;
+    default:
+        return core::Result<void>::failure(invalid(
+            "objective hard constraint uses an unknown constraint kind"));
     }
     return core::Result<void>::success();
 }
@@ -536,6 +580,10 @@ core::Result<void> AuthoringObjective::validate() const {
     if (!safe_text(id, kMaxTaskIdBytes) || !safe_text(goal, kMaxGoalBytes)) {
         return core::Result<void>::failure(invalid("objective identity or goal is invalid"));
     }
+    if (!recipe_id.empty() && find_agent_recipe(recipe_id) == nullptr) {
+        return core::Result<void>::failure(invalid(
+            "objective references an unknown agent recipe"));
+    }
     if (base_revision.exhausted()) {
         return core::Result<void>::failure(invalid("objective base revision is exhausted"));
     }
@@ -592,6 +640,10 @@ core::Result<assets::Sha256Digest> AuthoringObjective::digest() const {
     std::string canonical = "cartographer.authoring-objective.v1|";
     append_field(canonical, id);
     append_field(canonical, goal);
+    if (!recipe_id.empty()) {
+        append_field(canonical, "recipe");
+        append_field(canonical, recipe_id);
+    }
     append_number(canonical, base_revision.value());
     append_object_ids(canonical, scope_objects);
     append_object_ids(canonical, protected_objects);
@@ -878,6 +930,15 @@ core::Result<void> AgentWorkEnvelope::validate() const {
         return core::Result<void>::failure(invalid(
             "work envelope repair budget exceeds its supported bound"));
     }
+    const bool permits_transform =
+        (permitted_effects & ::carto::agent::effect_mask(Effect::transform)) != 0U;
+    if (!std::isfinite(max_transform_distance_meters) ||
+        max_transform_distance_meters < 0.0 || max_transform_distance_meters > 1'000'000.0 ||
+        (permits_transform && max_transform_distance_meters <= 0.0) ||
+        (!permits_transform && max_transform_distance_meters != 0.0)) {
+        return core::Result<void>::failure(invalid(
+            "work envelope transform permission requires a finite positive distance bound"));
+    }
     SceneQueryBudget query_budget;
     query_budget.max_queries = max_scene_queries;
     query_budget.max_objects_examined = max_objects_examined;
@@ -987,6 +1048,19 @@ core::Result<AgentTask> AgentTask::begin(
     if (auto result = envelope.validate(); !result) {
         return core::Result<AgentTask>::failure(result.error());
     }
+    if (const auto* recipe = find_agent_recipe(plan.objective.recipe_id);
+        recipe != nullptr) {
+        if ((envelope.permitted_effects & agent::effect_mask(Effect::transform)) != 0U) {
+            return core::Result<AgentTask>::failure(policy(
+                "selected agent recipe does not permit object transforms"));
+        }
+        envelope.permitted_effects &= recipe->permitted_effects;
+        envelope.max_topology_operations = std::min(
+            envelope.max_topology_operations, recipe->max_topology_operations);
+        if (auto result = envelope.validate(); !result) {
+            return core::Result<AgentTask>::failure(result.error());
+        }
+    }
     auto source_snapshot = source.snapshot();
     if (plan.objective.base_revision != source_snapshot.project_revision) {
         return core::Result<AgentTask>::failure(stale(
@@ -1040,6 +1114,19 @@ core::Result<AgentTask> AgentTask::repair(
         return core::Result<AgentTask>::failure(invalid(
             "repair requires a bounded non-empty operator justification"));
     }
+    if (const auto* recipe = find_agent_recipe(revised_plan.objective.recipe_id);
+        recipe != nullptr) {
+        if ((envelope.permitted_effects & agent::effect_mask(Effect::transform)) != 0U) {
+            return core::Result<AgentTask>::failure(policy(
+                "selected agent recipe does not permit object transforms"));
+        }
+        envelope.permitted_effects &= recipe->permitted_effects;
+        envelope.max_topology_operations = std::min(
+            envelope.max_topology_operations, recipe->max_topology_operations);
+        if (auto result = envelope.validate(); !result) {
+            return core::Result<AgentTask>::failure(result.error());
+        }
+    }
     if (failed_attempt.repairs_.size() >= envelope.max_repair_attempts) {
         return core::Result<AgentTask>::failure(policy(
             "work envelope repair-attempt budget is exhausted"));
@@ -1063,7 +1150,9 @@ core::Result<AgentTask> AgentTask::repair(
         envelope.max_query_result_bytes > failed_attempt.envelope_.max_query_result_bytes ||
         envelope.max_repair_attempts > failed_attempt.envelope_.max_repair_attempts ||
         envelope.max_additional_operations >
-            failed_attempt.envelope_.max_additional_operations) {
+            failed_attempt.envelope_.max_additional_operations ||
+        envelope.max_transform_distance_meters >
+            failed_attempt.envelope_.max_transform_distance_meters) {
         return core::Result<AgentTask>::failure(policy(
             "repair cannot expand the previous work envelope"));
     }
@@ -1389,6 +1478,7 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
     receipt.revision_before = speculative_->document_.revision();
     const auto fail = [this, &receipt](core::Diagnostic diagnostic) {
         receipt.status = StepStatus::failed;
+        receipt.revision_after = speculative_->document_.revision();
         receipt.diagnostic = diagnostic;
         receipts_.push_back(std::move(receipt));
         return core::Result<void>::failure(std::move(diagnostic));
@@ -1398,21 +1488,72 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
         return fail(policy("plan step target is outside the work envelope"));
     }
     const auto* target_object = speculative_->document_.scene().find(step.target.object);
-    if (target_object == nullptr || !target_object->mesh_asset.has_value()) {
-        return fail(policy("plan target does not resolve to an authored mesh asset"));
+    if (target_object == nullptr) {
+        return fail(policy("plan target object no longer exists in the speculative branch"));
+    }
+    const bool object_translation =
+        std::holds_alternative<std::monostate>(step.target.component);
+    if (object_translation &&
+        (envelope_.permitted_effects & ::carto::agent::effect_mask(Effect::transform)) == 0U) {
+        return fail(policy("work envelope forbids the transform effect"));
     }
     std::set<scene::ObjectId> affected_objects;
-    for (const auto& object : speculative_->document_.scene().objects_sorted()) {
-        if (object.mesh_asset != target_object->mesh_asset) continue;
-        if (!scope_contains(object.id)) {
-            return fail(policy(
-                "plan target mesh is shared by an object outside the work envelope"));
+    if (object_translation) {
+        if (target_object->parent.has_value()) {
+            return fail(policy("object translation requires a root object target"));
         }
-        if (contains(plan_.objective.protected_objects, object.id)) {
-            return fail(policy(
-                "plan target mesh is shared by an object protected by the objective"));
+        const auto scene_objects = speculative_->document_.scene().objects_sorted();
+        for (const auto& object : scene_objects) {
+            bool in_target_subtree = object.id == step.target.object;
+            const scene::SceneObject* ancestor = &object;
+            std::set<scene::ObjectId> visited;
+            for (std::size_t depth = 0U; !in_target_subtree &&
+                 ancestor != nullptr && ancestor->parent.has_value(); ++depth) {
+                if (depth >= 4096U || !visited.insert(*ancestor->parent).second) {
+                    return fail(policy("object translation encountered an invalid hierarchy"));
+                }
+                if (*ancestor->parent == step.target.object) {
+                    in_target_subtree = true;
+                    break;
+                }
+                ancestor = speculative_->document_.scene().find(*ancestor->parent);
+                if (ancestor == nullptr) {
+                    return fail(policy("object translation hierarchy has a missing parent"));
+                }
+            }
+            if (!in_target_subtree) continue;
+            if (!scope_contains(object.id)) {
+                return fail(policy(
+                    "object translation would affect a descendant outside the work envelope"));
+            }
+            if (contains(plan_.objective.protected_objects, object.id)) {
+                return fail(policy(
+                    "object translation would affect a protected descendant"));
+            }
+            if (object.locked) {
+                return fail(policy("object translation would affect a locked descendant"));
+            }
+            affected_objects.insert(object.id);
         }
-        affected_objects.insert(object.id);
+    } else {
+        if (!target_object->mesh_asset.has_value()) {
+            return fail(policy("mesh operation target has no authored mesh asset"));
+        }
+        for (const auto& object : speculative_->document_.scene().objects_sorted()) {
+            if (object.mesh_asset != target_object->mesh_asset) continue;
+            if (!scope_contains(object.id)) {
+                return fail(policy(
+                    "plan target mesh is shared by an object outside the work envelope"));
+            }
+            if (contains(plan_.objective.protected_objects, object.id)) {
+                return fail(policy(
+                    "plan target mesh is shared by an object protected by the objective"));
+            }
+            affected_objects.insert(object.id);
+        }
+    }
+    if (!affected_objects.contains(step.target.object)) {
+        return fail(policy("plan target has no admitted affected object"));
     }
     const auto newly_touched = static_cast<std::size_t>(std::count_if(
         affected_objects.begin(), affected_objects.end(), [this](scene::ObjectId object) {
@@ -1424,13 +1565,18 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
 
     application::ApplicationAction select_mode;
     application::ApplicationAction select_component;
-    if (const auto* face = std::get_if<geometry::FaceId>(&step.target.component)) {
+    if (object_translation) {
+        select_mode = application::SetSelectionModeAction{editor::SelectionMode::object};
+        select_component = application::SelectObjectAction{step.target.object};
+    } else if (const auto* face = std::get_if<geometry::FaceId>(&step.target.component)) {
         select_mode = application::SetSelectionModeAction{editor::SelectionMode::face};
         select_component = application::SelectFaceAction{step.target.object, *face};
-    } else {
-        const auto vertex = std::get<geometry::VertexId>(step.target.component);
+    } else if (const auto* vertex =
+                   std::get_if<geometry::VertexId>(&step.target.component)) {
         select_mode = application::SetSelectionModeAction{editor::SelectionMode::vertex};
-        select_component = application::SelectVertexAction{step.target.object, vertex};
+        select_component = application::SelectVertexAction{step.target.object, *vertex};
+    } else {
+        return fail(invalid("plan target component is not a supported native operation target"));
     }
     auto selected = application::HumanApplicationAccess::dispatch(*speculative_, select_mode);
     if (!selected) return fail(selected.error().with_context("speculative plan selection mode"));
@@ -1466,6 +1612,33 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
         return fail(policy(
             "work envelope forbids the " + effect_names(capability->effects) + " effect"));
     }
+    double transform_step_distance = 0.0;
+    if (object_translation) {
+        if (!proposal.value().parameters.position.has_value()) {
+            return fail(invalid_state("object translation proposal omitted its displacement"));
+        }
+        const auto displacement = *proposal.value().parameters.position;
+        transform_step_distance = std::hypot(
+            displacement.x, displacement.y, displacement.z);
+        if (!std::isfinite(transform_step_distance) ||
+            transform_distance_used_meters_ > envelope_.max_transform_distance_meters ||
+            transform_step_distance >
+                envelope_.max_transform_distance_meters - transform_distance_used_meters_) {
+            return fail(policy("plan exceeds the work envelope transform-distance budget"));
+        }
+        const auto protected_transform = std::find_if(
+            plan_.objective.hard_constraints.begin(),
+            plan_.objective.hard_constraints.end(), [&](const HardConstraint& constraint) {
+                return constraint.kind == ObjectiveConstraintKind::preserve_transform &&
+                    (!constraint.object.has_value() ||
+                     *constraint.object == step.target.object);
+            });
+        if (protected_transform != plan_.objective.hard_constraints.end()) {
+            return fail(policy(
+                "objective hard constraint " + protected_transform->id +
+                " forbids object translation for this target"));
+        }
+    }
     if ((capability->effects & ::carto::agent::effect_mask(Effect::topology)) != 0U) {
         const auto topology_constraint = std::find_if(
             plan_.objective.hard_constraints.begin(),
@@ -1495,6 +1668,7 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
     }
 
     touched_objects_.insert(affected_objects.begin(), affected_objects.end());
+    transform_distance_used_meters_ += transform_step_distance;
     receipt.status = StepStatus::passed;
     receipt.revision_after = speculative_->document_.revision();
     receipts_.push_back(std::move(receipt));
@@ -1907,6 +2081,53 @@ std::vector<AcceptanceGateResult> AgentTask::evaluate_gates() const {
         all_affected_objects, all_affected_assets,
         topology_budget_passed ? std::nullopt : std::optional<core::Diagnostic>(
             policy("agent result exceeds the work envelope topology-operation budget"))));
+    if (!plan_.objective.recipe_id.empty()) {
+        const auto* recipe = find_agent_recipe(plan_.objective.recipe_id);
+        const bool identity_preserved = recipe != nullptr &&
+            std::all_of(diff.objects.begin(), diff.objects.end(), [](const ObjectChange& change) {
+                return !change.added && !change.removed && !change.name_changed &&
+                    !change.transform_changed && !change.parent_changed &&
+                    !change.mesh_binding_changed && !change.visibility_changed &&
+                    !change.lock_changed;
+            });
+        const std::string recipe_gate_id = recipe == nullptr
+            ? "recipe.unknown.scene-identity"
+            : "recipe." + std::string(recipe->id) + ".scene-identity";
+        gates.push_back(make_gate(
+            recipe_gate_id,
+            identity_preserved,
+            identity_preserved
+                ? "scene object identity, transforms, and bindings remained unchanged"
+                : "scene object identity, transforms, or bindings changed",
+            all_affected_objects,
+            all_affected_assets,
+            identity_preserved ? std::nullopt : std::optional<core::Diagnostic>(policy(
+                "selected recipe requires scene-object identity and transforms to remain unchanged"))));
+        if (recipe != nullptr && recipe->preserve_topology) {
+            const bool topology_preserved = std::all_of(
+                diff.meshes.begin(), diff.meshes.end(), [](const MeshChange& mesh) {
+                    return !mesh.added && !mesh.removed &&
+                        std::none_of(mesh.vertices.begin(), mesh.vertices.end(),
+                            [](const VertexValueChange& vertex) {
+                                return vertex.added || vertex.removed;
+                            }) &&
+                        std::none_of(mesh.faces.begin(), mesh.faces.end(),
+                            [](const FaceTopologyChange& face) {
+                                return face.added || face.removed || face.connectivity_changed;
+                            });
+                });
+            gates.push_back(make_gate(
+                "recipe." + std::string(recipe->id) + ".topology-preservation",
+                topology_preserved,
+                topology_preserved
+                    ? "mesh vertex and face topology remained unchanged"
+                    : "mesh vertex or face topology changed",
+                all_affected_objects,
+                all_affected_assets,
+                topology_preserved ? std::nullopt : std::optional<core::Diagnostic>(policy(
+                    "selected recipe requires mesh topology to remain unchanged"))));
+        }
+    }
     for (const auto& constraint : plan_.objective.hard_constraints) {
         bool passed = true;
         std::string evidence;
@@ -2034,6 +2255,7 @@ AgentTaskSnapshot AgentTask::build_snapshot() const {
     view.status = status_;
     view.task_id = plan_.id;
     view.goal = plan_.objective.goal;
+    view.recipe_id = plan_.objective.recipe_id;
     if (const auto objective_digest = plan_.objective.digest(); objective_digest) {
         view.objective_digest = objective_digest.value();
     }
@@ -2099,6 +2321,110 @@ core::Result<void> AgentTask::reject() {
     return core::Result<void>::success();
 }
 
+core::Result<AgentDemonstration> AgentTask::create_demonstration() const {
+    return AgentDemonstration::capture(snapshot());
+}
+
+core::Result<void> AgentDemonstration::save(const std::filesystem::path& path) const {
+    if (path.empty() || path.filename().empty()) {
+        return core::Result<void>::failure(invalid(
+            "demonstration destination must name a file"));
+    }
+    const auto encoded = serialize();
+    if (!encoded) return core::Result<void>::failure(encoded.error());
+
+    std::error_code error;
+    const auto destination_status = std::filesystem::symlink_status(path, error);
+    if (error == std::errc::no_such_file_or_directory) error.clear();
+    if (error) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::io_error, "unable to inspect demonstration destination"));
+    }
+    if (std::filesystem::exists(destination_status)) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::io_error,
+            "demonstration records are immutable; choose a new destination path"));
+    }
+    const auto parent = path.parent_path();
+    if (!parent.empty()) {
+        const auto parent_status = std::filesystem::status(parent, error);
+        if (error || !std::filesystem::is_directory(parent_status)) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::io_error,
+                "demonstration destination directory does not exist"));
+        }
+    }
+
+    auto lock_path = path;
+    lock_path += ".lock";
+    if (!std::filesystem::create_directory(lock_path, error)) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::io_error,
+            "demonstration destination is already being written"));
+    }
+    struct LockCleanup final {
+        std::filesystem::path path;
+        ~LockCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove(path, ignored);
+        }
+    } lock_cleanup{lock_path};
+
+    auto temporary_path = path;
+    temporary_path += ".tmp-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    {
+        std::ofstream output(temporary_path, std::ios::binary | std::ios::out | std::ios::trunc);
+        if (!output) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::io_error, "unable to create demonstration temporary file"));
+        }
+        output.write(encoded.value().data(),
+            static_cast<std::streamsize>(encoded.value().size()));
+        output.flush();
+        if (!output) {
+            output.close();
+            std::filesystem::remove(temporary_path, error);
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::io_error, "unable to flush demonstration temporary file"));
+        }
+    }
+    std::filesystem::rename(temporary_path, path, error);
+    if (error) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary_path, ignored);
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::io_error, "unable to publish immutable demonstration file"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<AgentDemonstration> AgentDemonstration::load(
+    const std::filesystem::path& path) {
+    if (path.empty() || path.filename().empty()) {
+        return core::Result<AgentDemonstration>::failure(invalid(
+            "demonstration source must name a file"));
+    }
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error || size > 2U * 1024U * 1024U) {
+        return core::Result<AgentDemonstration>::failure(core::Diagnostic(
+            core::ErrorCode::io_error,
+            "demonstration is unavailable or exceeds its size bound"));
+    }
+    std::ifstream input(path, std::ios::binary | std::ios::in);
+    if (!input) {
+        return core::Result<AgentDemonstration>::failure(core::Diagnostic(
+            core::ErrorCode::io_error, "unable to open demonstration file"));
+    }
+    std::string bytes(static_cast<std::size_t>(size), '\0');
+    input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (static_cast<std::size_t>(input.gcount()) != bytes.size()) {
+        return core::Result<AgentDemonstration>::failure(core::Diagnostic(
+            core::ErrorCode::io_error, "unable to read complete demonstration file"));
+    }
+    return AgentDemonstration::deserialize(bytes);
+}
 core::Result<void> AgentTask::save_checkpoint(
     const std::filesystem::path& path,
     std::string provider_identity) const {
@@ -2378,7 +2704,35 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
     for (const auto& step : checkpoint.plan.steps) {
         write_objects.insert(step.target.object);
         const auto* target = base.scene().find(step.target.object);
-        if (target == nullptr || !target->mesh_asset.has_value()) {
+        if (target == nullptr) {
+            add_blocker("checkpoint write target " + std::to_string(step.target.object.value) +
+                " is absent from its saved source");
+            continue;
+        }
+        if (std::holds_alternative<std::monostate>(step.target.component)) {
+            for (const auto& object : base.scene().objects_sorted()) {
+                const scene::SceneObject* ancestor = &object;
+                std::set<scene::ObjectId> visited;
+                for (std::size_t depth = 0U; ancestor != nullptr &&
+                     ancestor->parent.has_value(); ++depth) {
+                    const scene::ObjectId parent = *ancestor->parent;
+                    if (depth >= 4096U || !visited.insert(parent).second) {
+                        add_blocker("checkpoint object-transform hierarchy is invalid");
+                        break;
+                    }
+                    if (parent == step.target.object) {
+                        write_objects.insert(object.id);
+                        break;
+                    }
+                    ancestor = base.scene().find(parent);
+                    if (ancestor == nullptr) {
+                        add_blocker("checkpoint object-transform hierarchy has a missing parent");
+                    }
+                }
+            }
+            continue;
+        }
+        if (!target->mesh_asset.has_value()) {
             add_blocker("checkpoint write target " + std::to_string(step.target.object.value) +
                 " has no saved mesh binding");
             continue;

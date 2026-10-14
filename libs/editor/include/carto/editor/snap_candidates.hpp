@@ -2,10 +2,12 @@
 
 #include <carto/editor/authoring_context.hpp>
 #include <carto/geometry/mesh.hpp>
+#include <carto/render/render_scene.hpp>
 #include <carto/scene/scene.hpp>
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace carto::project {
@@ -60,6 +62,17 @@ struct SnapCandidate {
     const project::ProjectDocument& project,
     core::Vec3d origin,
     const SnapSettings& settings,
+    double radius);
+
+// Queries an already-compiled viewport snapshot. Results bind the snapshot's
+// project revision and each compiled mesh revision, avoiding per-pointer-move
+// mesh recompilation in native transform interactions. Missing mesh-asset
+// identities are not eligible snap targets.
+[[nodiscard]] core::Result<std::vector<SnapCandidate>> find_snap_candidates(
+    const render::RenderScene& scene,
+    core::Vec3d origin,
+    std::span<const SnapKind> kinds,
+    core::Revision source_revision,
     double radius);
 
 } // namespace carto::editor

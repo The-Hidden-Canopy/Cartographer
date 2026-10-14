@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <charconv>
 #include <filesystem>
 #include <limits>
 #include <fstream>
@@ -62,7 +63,7 @@ carto::agent::AgentPlan plan_for(
         "agent-task-test",
         carto::agent::AuthoringObjective{
             "objective-test", "Prepare the selected faces", snapshot.project_revision,
-            std::move(scope), std::move(protected_objects), {}, {}},
+            std::move(scope), std::move(protected_objects), {}, {}, {}},
         std::move(steps)};
 }
 
@@ -73,6 +74,391 @@ carto::agent::AgentWorkEnvelope envelope_for(
     envelope.max_commands = 16U;
     envelope.max_objects_touched = std::max<std::size_t>(scope.size(), 1U);
     return envelope;
+}
+
+carto::agent::AgentWorkEnvelope translation_envelope(
+    const std::vector<carto::scene::ObjectId>& scope,
+    double max_distance) {
+    auto envelope = envelope_for(scope);
+    envelope.permitted_effects |= carto::agent::effect_mask(carto::agent::Effect::transform);
+    envelope.max_transform_distance_meters = max_distance;
+    return envelope;
+}
+
+std::vector<std::string> checkpoint_fields(std::string_view bytes) {
+    std::vector<std::string> fields;
+    std::size_t cursor = 0U;
+    while (cursor < bytes.size()) {
+        const std::size_t length_end = bytes.find(':', cursor);
+        REQUIRE(length_end != std::string_view::npos);
+        std::size_t length = 0U;
+        const auto parsed = std::from_chars(
+            bytes.data() + cursor, bytes.data() + length_end, length);
+        REQUIRE(parsed.ec == std::errc{} && parsed.ptr == bytes.data() + length_end);
+        cursor = length_end + 1U;
+        REQUIRE(length <= bytes.size() - cursor);
+        fields.emplace_back(bytes.substr(cursor, length));
+        cursor += length;
+        REQUIRE(cursor < bytes.size() && bytes[cursor] == '|');
+        ++cursor;
+    }
+    return fields;
+}
+
+std::string checkpoint_body(const std::vector<std::string>& fields) {
+    std::string body;
+    for (const auto& value : fields) {
+        body += std::to_string(value.size()) + ":" + value + "|";
+    }
+    return body;
+}
+
+std::uint64_t checkpoint_number(const std::vector<std::string>& fields, std::size_t& cursor) {
+    REQUIRE(cursor < fields.size());
+    std::uint64_t value = 0U;
+    const auto& field = fields[cursor++];
+    const auto parsed = std::from_chars(
+        field.data(), field.data() + field.size(), value);
+    REQUIRE(!field.empty() && parsed.ec == std::errc{} &&
+        parsed.ptr == field.data() + field.size());
+    return value;
+}
+
+void skip_checkpoint_object_ids(const std::vector<std::string>& fields, std::size_t& cursor) {
+    const auto count = checkpoint_number(fields, cursor);
+    REQUIRE(count <= fields.size() - cursor);
+    cursor += static_cast<std::size_t>(count);
+}
+
+void skip_checkpoint_strings(const std::vector<std::string>& fields, std::size_t& cursor) {
+    const auto count = checkpoint_number(fields, cursor);
+    REQUIRE(count <= fields.size() - cursor);
+    cursor += static_cast<std::size_t>(count);
+}
+
+std::vector<std::string> legacy_v3_fields_from_v5(std::vector<std::string> fields) {
+    REQUIRE(fields.size() > 10U && fields[0] == "5");
+    fields[0] = "3";
+    fields.erase(fields.begin() + 13); // Version 4 has no recipe field.
+    std::size_t cursor = 10U;
+    cursor += 4U; // Plan, objective, goal, and base revision.
+    skip_checkpoint_object_ids(fields, cursor);
+    skip_checkpoint_object_ids(fields, cursor);
+
+    const auto constraint_count = checkpoint_number(fields, cursor);
+    for (std::size_t index = 0U; index < constraint_count; ++index) {
+        cursor += 2U; // Constraint ID and kind.
+        if (checkpoint_number(fields, cursor) != 0U) ++cursor;
+        cursor += 2U; // Maximum displacement and rationale.
+    }
+
+    const auto question_count = checkpoint_number(fields, cursor);
+    for (std::size_t index = 0U; index < question_count; ++index) {
+        cursor += 3U; // ID, prompt, rationale.
+        const auto impact_count = checkpoint_number(fields, cursor);
+        cursor += static_cast<std::size_t>(impact_count);
+        skip_checkpoint_object_ids(fields, cursor);
+        skip_checkpoint_strings(fields, cursor);
+        ++cursor; // Downstream branch count.
+        const auto candidate_count = checkpoint_number(fields, cursor);
+        for (std::size_t candidate = 0U; candidate < candidate_count; ++candidate) {
+            cursor += 2U; // Candidate ID and label.
+            skip_checkpoint_object_ids(fields, cursor);
+        }
+        ++cursor; // Explicit-answer flag.
+    }
+
+    const auto step_count = checkpoint_number(fields, cursor);
+    for (std::size_t index = 0U; index < step_count; ++index) {
+        cursor += 2U; // Step ID and target object.
+        const auto target_kind = checkpoint_number(fields, cursor);
+        REQUIRE(target_kind <= 1U); // Object targets have no v3 representation.
+        fields[cursor - 1U] = target_kind == 0U ? "1" : "0";
+        ++cursor; // Legacy face or vertex ID.
+        ++cursor; // Intent.
+        skip_checkpoint_strings(fields, cursor);
+    }
+
+    skip_checkpoint_object_ids(fields, cursor); // Work envelope scope.
+    REQUIRE(cursor + 11U < fields.size());
+    fields.erase(fields.begin() + static_cast<std::ptrdiff_t>(cursor + 11U));
+    return fields;
+}
+
+void root_object_translation_is_explicit_bounded_and_checkpointed() {
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 1U);
+    const auto object = objects.front();
+    carto::core::Transform initial{
+        {2.0, -1.0, 0.5}, {0.0, 0.0, 0.3826834323650898, 0.9238795325112867},
+        {1.5, 0.75, 2.0}};
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        source, carto::application::SetObjectTransformAction{object, initial, std::nullopt}));
+    const auto before = source.snapshot();
+
+    auto plan = plan_for(before, objects, {
+        {"step-1", {object, std::monostate{}}, "translate object by 0.25 0 -0.5"},
+    });
+    auto unapproved = carto::agent::AgentTask::begin(
+        source, plan, envelope_for(objects));
+    REQUIRE(unapproved);
+    const auto blocked = unapproved.value().run();
+    REQUIRE(blocked);
+    REQUIRE(blocked.value().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(blocked.value().diagnostic->message.find("forbids the transform") !=
+        std::string::npos);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+
+    auto invalid_envelope = translation_envelope(objects, 0.0);
+    REQUIRE(!invalid_envelope.validate());
+
+    auto task = carto::agent::AgentTask::begin(
+        source, plan, translation_envelope(objects, 1.0));
+    REQUIRE(task);
+    REQUIRE(!carto::application::HumanApplicationAccess::accept_agent_task(task.value()));
+    const auto run = task.value().run();
+    REQUIRE(run);
+    REQUIRE(run.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(run.value().can_accept);
+    REQUIRE(run.value().diff.changed_object_count() == 1U);
+    REQUIRE(run.value().diff.changed_mesh_count() == 0U);
+    REQUIRE(run.value().diff.objects.front().transform_changed);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+    REQUIRE(source.snapshot().objects.front().object.local_transform.translation.x ==
+        initial.translation.x);
+
+    const auto ghost = run.value().after_scene.find(object);
+    REQUIRE(ghost != nullptr);
+    REQUIRE(ghost->world_transform.translation.x == 2.25);
+    REQUIRE(ghost->world_transform.translation.y == -1.0);
+    REQUIRE(ghost->world_transform.translation.z == 0.0);
+    REQUIRE(ghost->world_transform.rotation.x == initial.rotation.x);
+    REQUIRE(ghost->world_transform.rotation.y == initial.rotation.y);
+    REQUIRE(ghost->world_transform.rotation.z == initial.rotation.z);
+    REQUIRE(ghost->world_transform.rotation.w == initial.rotation.w);
+    REQUIRE(ghost->world_transform.scale.x == initial.scale.x);
+    REQUIRE(ghost->world_transform.scale.y == initial.scale.y);
+    REQUIRE(ghost->world_transform.scale.z == initial.scale.z);
+
+    TempDirectory directory;
+    const auto checkpoint_path = directory.path() / "translation.carto-agent-task";
+    REQUIRE(task.value().save_checkpoint(checkpoint_path));
+    const auto checkpoint = carto::agent::AgentTask::load_checkpoint(checkpoint_path);
+    REQUIRE(checkpoint);
+    REQUIRE(checkpoint.value().envelope.max_transform_distance_meters == 1.0);
+    REQUIRE(std::holds_alternative<std::monostate>(
+        checkpoint.value().plan.steps.front().target.component));
+
+    REQUIRE(carto::application::HumanApplicationAccess::accept_agent_task(task.value()));
+    const auto after = source.snapshot();
+    REQUIRE(after.project_revision == before.project_revision.next());
+    const auto accepted = std::find_if(after.objects.begin(), after.objects.end(),
+        [object](const auto& candidate) { return candidate.object.id == object; });
+    REQUIRE(accepted != after.objects.end());
+    REQUIRE(accepted->object.local_transform.translation.x == 2.25);
+    REQUIRE(accepted->object.local_transform.translation.y == -1.0);
+    REQUIRE(accepted->object.local_transform.translation.z == 0.0);
+    REQUIRE(accepted->object.local_transform.rotation.x == initial.rotation.x);
+    REQUIRE(accepted->object.local_transform.rotation.y == initial.rotation.y);
+    REQUIRE(accepted->object.local_transform.rotation.z == initial.rotation.z);
+    REQUIRE(accepted->object.local_transform.rotation.w == initial.rotation.w);
+    REQUIRE(accepted->object.local_transform.scale.x == initial.scale.x);
+    REQUIRE(accepted->object.local_transform.scale.y == initial.scale.y);
+    REQUIRE(accepted->object.local_transform.scale.z == initial.scale.z);
+}
+
+void root_object_translation_rejects_distance_overrun_and_preserve_constraint() {
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 1U);
+    const auto before = source.snapshot();
+    auto plan = plan_for(before, objects, {
+        {"step-1", {objects.front(), std::monostate{}}, "translate object by 0.75 0 0"},
+        {"step-2", {objects.front(), std::monostate{}}, "translate object by 0.75 0 0",
+            {"step-1"}},
+    });
+    auto task = carto::agent::AgentTask::begin(
+        source, plan, translation_envelope(objects, 1.0));
+    REQUIRE(task);
+    const auto run = task.value().run();
+    REQUIRE(run);
+    REQUIRE(run.value().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(run.value().steps.size() == 2U);
+    REQUIRE(run.value().steps[0].status == carto::agent::StepStatus::passed);
+    REQUIRE(run.value().steps[1].status == carto::agent::StepStatus::failed);
+    REQUIRE(run.value().diagnostic->message.find("transform-distance budget") !=
+        std::string::npos);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+    REQUIRE(source.snapshot().objects.front().object.local_transform.translation.x == 0.0);
+
+    carto::application::ApplicationSession constrained_source;
+    const auto constrained_objects = create_boxes(constrained_source, 1U);
+    auto constrained_plan = plan_for(constrained_source.snapshot(), constrained_objects, {
+        {"step-1", {constrained_objects.front(), std::monostate{}},
+            "translate object by 0.25 0 0"},
+    });
+    constrained_plan.objective.hard_constraints.push_back({
+        "preserve-transform", carto::agent::ObjectiveConstraintKind::preserve_transform,
+        constrained_objects.front(), 0.0, "Keep this object's transform unchanged."});
+    const auto constrained_revision = constrained_source.snapshot().project_revision;
+    auto constrained_task = carto::agent::AgentTask::begin(
+        constrained_source, std::move(constrained_plan),
+        translation_envelope(constrained_objects, 1.0));
+    REQUIRE(constrained_task);
+    const auto constrained_run = constrained_task.value().run();
+    REQUIRE(constrained_run);
+    REQUIRE(constrained_run.value().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(constrained_run.value().diagnostic->message.find("preserve-transform") !=
+        std::string::npos);
+    REQUIRE(constrained_source.snapshot().project_revision == constrained_revision);
+}
+
+void object_translation_checkpoint_rebase_tracks_transform_write_set() {
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 2U);
+    const auto target = objects.front();
+    const auto unrelated = objects.back();
+    auto plan = plan_for(source.snapshot(), {target}, {
+        {"step-1", {target, std::monostate{}}, "translate object by 0.4 0 0"},
+    });
+    auto task = carto::agent::AgentTask::begin(
+        source, plan, translation_envelope({target}, 1.0));
+    REQUIRE(task);
+    const auto run = task.value().run();
+    REQUIRE(run && run.value().status == carto::agent::TaskStatus::review);
+
+    TempDirectory directory;
+    const auto path = directory.path() / "transform-rebase.carto-agent-task";
+    REQUIRE(task.value().save_checkpoint(path));
+    const auto checkpoint = carto::agent::AgentTask::load_checkpoint(path);
+    REQUIRE(checkpoint);
+
+    carto::core::Transform unrelated_transform =
+        source.snapshot().objects.back().object.local_transform;
+    unrelated_transform.translation.y = 3.0;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        source, carto::application::SetObjectTransformAction{
+            unrelated, unrelated_transform, std::nullopt}));
+    auto analysis = carto::agent::AgentTask::analyze_checkpoint_rebase(
+        source, checkpoint.value());
+    REQUIRE(analysis && analysis.value().can_rebase());
+    REQUIRE(std::find(analysis.value().write_objects.begin(),
+        analysis.value().write_objects.end(), target) != analysis.value().write_objects.end());
+    REQUIRE(std::find(analysis.value().write_objects.begin(),
+        analysis.value().write_objects.end(), unrelated) == analysis.value().write_objects.end());
+    REQUIRE(analysis.value().write_mesh_assets.empty());
+
+    auto reauthorized_plan = checkpoint.value().plan;
+    reauthorized_plan.objective.base_revision = source.snapshot().project_revision;
+    auto rebased = carto::agent::AgentTask::rebase_checkpoint(
+        source, checkpoint.value(), std::move(reauthorized_plan));
+    REQUIRE(rebased);
+    const auto rebased_snapshot = rebased.value().snapshot();
+    REQUIRE(rebased_snapshot.status == carto::agent::TaskStatus::review);
+    REQUIRE(rebased_snapshot.rebases.size() == 1U);
+    REQUIRE(rebased_snapshot.rebases.front().write_mesh_assets.empty());
+    REQUIRE(source.snapshot().objects.back().object.local_transform.translation.y == 3.0);
+    REQUIRE(carto::application::HumanApplicationAccess::accept_agent_task(rebased.value()));
+    const auto accepted = source.snapshot();
+    const auto accepted_target = std::find_if(accepted.objects.begin(), accepted.objects.end(),
+        [target](const auto& candidate) { return candidate.object.id == target; });
+    REQUIRE(accepted_target != accepted.objects.end());
+    REQUIRE(accepted_target->object.local_transform.translation.x == 0.4);
+    REQUIRE(accepted.objects.back().object.local_transform.translation.y == 3.0);
+}
+
+void ui_objective_constraints_are_scoped_persisted_and_bound_to_answers() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Constraint target", {1.0, 1.0, 1.0}}));
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Outside target", {1.0, 1.0, 1.0}}));
+    const auto objects = source.snapshot().objects;
+    const auto target = objects.front().object.id;
+    const auto outside = objects.back().object.id;
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        target, carto::geometry::FaceId{1U}}));
+    REQUIRE(ui.queue_agent_step("inset face 0.1"));
+
+    REQUIRE(!ui.set_agent_hard_constraints({{
+        "outside", carto::agent::ObjectiveConstraintKind::preserve_transform,
+        outside, 0.0, "This target is outside the captured scope."}}));
+    REQUIRE(!ui.set_agent_hard_constraints({{
+        "missing-rationale", carto::agent::ObjectiveConstraintKind::preserve_topology,
+        std::nullopt, 0.0, ""}}));
+    REQUIRE(!ui.set_agent_hard_constraints({{
+        "unknown-kind", static_cast<carto::agent::ObjectiveConstraintKind>(255U),
+        std::nullopt, 0.0, "Reject unknown constraint kinds."}}));
+    REQUIRE(!ui.set_agent_hard_constraints({
+        {"duplicate", carto::agent::ObjectiveConstraintKind::preserve_topology,
+            std::nullopt, 0.0, "Keep topology unchanged."},
+        {"duplicate", carto::agent::ObjectiveConstraintKind::preserve_topology,
+            std::nullopt, 0.0, "Keep topology unchanged."}}));
+
+    const std::vector<carto::agent::HardConstraint> constraints{{
+        "keep-topology", carto::agent::ObjectiveConstraintKind::preserve_topology,
+        std::nullopt, 0.0, "Do not change the captured mesh topology."}};
+    REQUIRE(ui.set_agent_hard_constraints(constraints));
+    REQUIRE(ui.snapshot().agent_hard_constraints_draft.size() == 1U);
+    REQUIRE(ui.snapshot().agent_hard_constraints_draft.front().id == "keep-topology");
+    REQUIRE(ui.queue_agent_clarification(
+        "Confirm that the captured target is the intended object.",
+        carto::agent::ClarificationImpact::object_scope));
+    const std::string goal = "Prepare only the captured target";
+    REQUIRE(ui.answer_agent_clarification(
+        goal, "question-1", "The selected object is the intended target."));
+    REQUIRE(!ui.set_agent_hard_constraints({}));
+
+    const auto base_revision = source.snapshot().project_revision;
+    const auto run = ui.run_agent_plan(goal);
+    REQUIRE(run);
+    REQUIRE(run.value().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(run.value().diagnostic->message.find("keep-topology") != std::string::npos);
+    REQUIRE(source.snapshot().project_revision == base_revision);
+    TempDirectory checkpoint_directory;
+    const auto checkpoint_path = checkpoint_directory.path() / "hard-constraints.json";
+    const auto saved_checkpoint = ui.save_agent_checkpoint(checkpoint_path);
+    if (!saved_checkpoint) {
+        throw TestFailure("hard-constraint checkpoint save failed: " +
+            saved_checkpoint.error().message);
+    }
+    const auto checkpoint = carto::agent::AgentTask::load_checkpoint(checkpoint_path);
+    REQUIRE(checkpoint);
+    REQUIRE(checkpoint.value().plan.objective.hard_constraints.size() == 1U);
+    REQUIRE(checkpoint.value().plan.objective.hard_constraints.front().id == "keep-topology");
+    REQUIRE(ui.clear_agent_plan());
+    REQUIRE(ui.snapshot().agent_hard_constraints_draft.empty());
+}
+
+void ui_workbench_captures_object_target_and_requires_explicit_transform_envelope() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{"UI root", {1.0, 1.0, 1.0}}));
+    const auto object = source.snapshot().objects.front().object.id;
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{object}));
+    REQUIRE(ui.queue_agent_step("translate object by 0.2 0.1 0"));
+    const auto queued = ui.snapshot();
+    REQUIRE(queued.agent_plan_draft.size() == 1U);
+    REQUIRE(std::holds_alternative<std::monostate>(
+        queued.agent_plan_draft.front().target.component));
+
+    auto envelope = translation_envelope({}, 0.5);
+    envelope.scope_objects.clear();
+    const auto before = source.snapshot();
+    const auto run = ui.run_agent_plan("Move the selected root a small distance", envelope);
+    REQUIRE(run);
+    REQUIRE(run.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+    REQUIRE(ui.accept_agent_plan());
+    REQUIRE(source.snapshot().project_revision == before.project_revision.next());
+    const auto accepted = source.snapshot().viewport.scene.find(object);
+    REQUIRE(accepted != nullptr);
+    REQUIRE(accepted->world_transform.translation.x == 0.2);
+    REQUIRE(accepted->world_transform.translation.y == 0.1);
 }
 
 void multi_step_branch_isolated_until_reviewed_acceptance() {
@@ -127,6 +513,120 @@ void multi_step_branch_isolated_until_reviewed_acceptance() {
             before.viewport.scene.instances()[0].mesh->source_revision);
 }
 
+
+void accepted_task_demonstration_is_redacted_read_only_and_checksummed() {
+    TempDirectory directory;
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 2U);
+    const std::string private_goal = "PRIVATE_GOAL_CANARY";
+    const std::string private_intent = "inset face 0.1";
+    auto plan = plan_for(source.snapshot(), objects, {
+        {"PRIVATE_STEP_ID_A", {objects[0], carto::geometry::FaceId{1U}}, private_intent},
+        {"PRIVATE_STEP_ID_B", {objects[1], carto::geometry::FaceId{2U}}, "extrude face 0.1"},
+    });
+    plan.id = "PRIVATE_PLAN_ID_CANARY";
+    plan.objective.goal = private_goal;
+    auto task = carto::agent::AgentTask::begin(
+        source, std::move(plan), envelope_for(objects));
+    REQUIRE(task);
+    const auto run = task.value().run();
+    REQUIRE(run);
+    REQUIRE(run.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(!task.value().create_demonstration());
+
+    const auto accepted = carto::application::HumanApplicationAccess::accept_agent_task(
+        task.value());
+    REQUIRE(accepted);
+    const auto demonstration = task.value().create_demonstration();
+    REQUIRE(demonstration);
+    REQUIRE(demonstration.value().steps.size() == 2U);
+    REQUIRE(demonstration.value().steps[0].target_alias == 1U);
+    REQUIRE(demonstration.value().steps[1].target_alias == 2U);
+    REQUIRE(demonstration.value().gates.size() >= 4U);
+    REQUIRE(demonstration.value().validate());
+
+    const auto encoded = demonstration.value().serialize();
+    REQUIRE(encoded);
+    REQUIRE(encoded.value().find(private_goal) == std::string::npos);
+    REQUIRE(encoded.value().find(private_intent) == std::string::npos);
+    REQUIRE(encoded.value().find("PRIVATE_STEP_ID_A") == std::string::npos);
+    REQUIRE(encoded.value().find("PRIVATE_PLAN_ID_CANARY") == std::string::npos);
+
+    const auto decoded = carto::agent::AgentDemonstration::deserialize(encoded.value());
+    REQUIRE(decoded);
+    REQUIRE(decoded.value().steps.size() == 2U);
+    REQUIRE(decoded.value().steps[0].target_alias == 1U);
+    REQUIRE(decoded.value().steps[1].target_alias == 2U);
+    REQUIRE(decoded.value().objective_digest.hex() ==
+        demonstration.value().objective_digest.hex());
+    REQUIRE(decoded.value().diff_digest.hex() ==
+        demonstration.value().diff_digest.hex());
+
+    std::string corrupted = encoded.value();
+    const std::string magic = "CARTOGRAPHER_AGENT_DEMONSTRATION_V1\n";
+    const auto body_length_end = corrupted.find(':', magic.size());
+    REQUIRE(body_length_end != std::string::npos);
+    const auto body_start = body_length_end + 1U;
+    REQUIRE(body_start < corrupted.size());
+    corrupted[body_start] = corrupted[body_start] == '1' ? '2' : '1';
+    REQUIRE(!carto::agent::AgentDemonstration::deserialize(corrupted));
+    const auto length_end = encoded.value().find(':', magic.size());
+    REQUIRE(length_end != std::string::npos);
+    std::size_t body_length = 0U;
+    const auto parsed_length = std::from_chars(
+        encoded.value().data() + magic.size(),
+        encoded.value().data() + length_end, body_length);
+    REQUIRE(parsed_length.ec == std::errc{} &&
+        parsed_length.ptr == encoded.value().data() + length_end);
+    const auto body_begin = length_end + 1U;
+    REQUIRE(body_length <= encoded.value().size() - body_begin);
+    auto fields = checkpoint_fields(
+        std::string_view(encoded.value()).substr(body_begin, body_length));
+    REQUIRE(fields.size() > 11U);
+    fields[11] = "4294967297";
+    const auto malicious_body = checkpoint_body(fields);
+    const auto malicious_digest = carto::assets::sha256(
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(malicious_body.data()),
+            malicious_body.size())).hex();
+    const auto checksummed_alias_overflow = magic +
+        std::to_string(malicious_body.size()) + ":" + malicious_body + "|" +
+        std::to_string(malicious_digest.size()) + ":" + malicious_digest + "|";
+    REQUIRE(!carto::agent::AgentDemonstration::deserialize(
+        checksummed_alias_overflow));
+
+
+    auto failed_gate = demonstration.value();
+    auto required_gate = std::find_if(
+        failed_gate.gates.begin(), failed_gate.gates.end(),
+        [](const auto& gate) { return gate.required; });
+    REQUIRE(required_gate != failed_gate.gates.end());
+    required_gate->passed = false;
+    REQUIRE(!failed_gate.serialize());
+
+    auto invalid_alias = demonstration.value();
+    invalid_alias.steps.front().target_alias = 0U;
+    REQUIRE(!invalid_alias.serialize());
+
+    const auto path = directory.path() / "accepted-run.carto-agent-demo";
+    REQUIRE(demonstration.value().save(path));
+    REQUIRE(!demonstration.value().save(path));
+    const auto loaded = carto::agent::AgentDemonstration::load(path);
+    REQUIRE(loaded);
+    REQUIRE(loaded.value().gates.size() == demonstration.value().gates.size());
+
+    carto::application::ApplicationSession viewer_source;
+    carto::ui::UiController viewer(viewer_source);
+    const auto viewer_revision = viewer_source.snapshot().project_revision;
+    REQUIRE(viewer.load_agent_demonstration(path));
+    const auto view = viewer.snapshot();
+    REQUIRE(view.agent_demonstration.has_value());
+    REQUIRE(!view.agent_task.has_value());
+    REQUIRE(viewer_source.snapshot().project_revision == viewer_revision);
+    REQUIRE(!viewer.accept_agent_plan());
+    REQUIRE(viewer.clear_agent_demonstration());
+    REQUIRE(!viewer.snapshot().agent_demonstration.has_value());
+}
 void plan_dag_orders_dependencies_and_rejects_invalid_graphs() {
     carto::application::ApplicationSession source;
     const auto objects = create_boxes(source, 3U);
@@ -647,15 +1147,40 @@ void persistent_checkpoint_v1_format_remains_readable() {
     const auto body_length = static_cast<std::size_t>(std::stoull(
         encoded.value().substr(magic.size(), body_length_end - magic.size())));
     const std::size_t body_begin = body_length_end + 1U;
-    std::string body = encoded.value().substr(body_begin, body_length);
-    REQUIRE(body.starts_with("1:3|"));
-    REQUIRE(body.ends_with("1:0|1:0|1:0|0:|"));
+    const std::string current_body = encoded.value().substr(body_begin, body_length);
     const auto field = [](std::string_view value) {
         return std::to_string(value.size()) + ":" + std::string(value) + "|";
     };
-    auto v2_body = body;
-    v2_body[2] = '2';
-    v2_body.erase(v2_body.size() - 11U, 4U); // Version 2 has no ghost-correction count.
+    auto v4_fields = checkpoint_fields(current_body);
+    REQUIRE(v4_fields.size() > 13U && v4_fields[0] == "5");
+    v4_fields[0] = "4";
+    v4_fields.erase(v4_fields.begin() + 13); // Version 4 has no recipe field.
+    const std::string v4_body = checkpoint_body(v4_fields);
+    const auto v4_checksum = carto::assets::sha256(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(v4_body.data()), v4_body.size()));
+    const std::string v4 = std::string(magic) + field(v4_body) + field(v4_checksum.hex());
+    const auto decoded_v4 = carto::agent::AgentTaskCheckpoint::deserialize(v4);
+    REQUIRE(decoded_v4);
+    REQUIRE(decoded_v4.value().plan.objective.recipe_id.empty());
+
+    const auto v3_fields = legacy_v3_fields_from_v5(checkpoint_fields(current_body));
+    const std::string v3_body = checkpoint_body(v3_fields);
+    REQUIRE(v3_body.starts_with("1:3|"));
+    REQUIRE(v3_body.ends_with("1:0|1:0|1:0|0:|"));
+    const auto v3_checksum = carto::assets::sha256(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(v3_body.data()), v3_body.size()));
+    const std::string v3 = std::string(magic) + field(v3_body) + field(v3_checksum.hex());
+    const auto decoded_v3 = carto::agent::AgentTaskCheckpoint::deserialize(v3);
+    REQUIRE(decoded_v3);
+    const auto* legacy_face = std::get_if<carto::geometry::FaceId>(
+        &decoded_v3.value().plan.steps.front().target.component);
+    REQUIRE(legacy_face != nullptr && *legacy_face == carto::geometry::FaceId{1U});
+
+    auto v2_fields = v3_fields;
+    v2_fields[0] = "2";
+    REQUIRE(v2_fields.size() >= 2U);
+    v2_fields.erase(v2_fields.end() - 2); // Version 2 has no ghost-correction count.
+    const std::string v2_body = checkpoint_body(v2_fields);
     const auto v2_checksum = carto::assets::sha256(std::span<const std::uint8_t>(
         reinterpret_cast<const std::uint8_t*>(v2_body.data()), v2_body.size()));
     const std::string v2 = std::string(magic) + field(v2_body) + field(v2_checksum.hex());
@@ -664,9 +1189,11 @@ void persistent_checkpoint_v1_format_remains_readable() {
     REQUIRE(decoded_v2.value().rebase_lineage.empty());
     REQUIRE(decoded_v2.value().ghost_corrections.empty());
 
-    auto v1_body = std::move(v2_body);
-    v1_body[2] = '1';
-    v1_body.erase(v1_body.size() - 7U, 4U); // Version 1 has no rebase-lineage count.
+    auto v1_fields = std::move(v2_fields);
+    v1_fields[0] = "1";
+    REQUIRE(v1_fields.size() >= 2U);
+    v1_fields.erase(v1_fields.end() - 2); // Version 1 has no rebase-lineage count.
+    const std::string v1_body = checkpoint_body(v1_fields);
     const auto v1_checksum = carto::assets::sha256(std::span<const std::uint8_t>(
         reinterpret_cast<const std::uint8_t*>(v1_body.data()), v1_body.size()));
     const std::string v1 = std::string(magic) + field(v1_body) + field(v1_checksum.hex());
@@ -728,6 +1255,28 @@ void ui_persistent_checkpoint_round_trip_preserves_human_boundary() {
     REQUIRE(source.snapshot().project_revision == source_revision);
     REQUIRE(reopened_ui.accept_agent_plan());
     REQUIRE(source.snapshot().project_revision == source_revision.next());
+    const auto demonstration_path =
+        directory.path() / "accepted-ui-run.carto-agent-demo";
+    REQUIRE(reopened_ui.save_agent_demonstration(demonstration_path));
+    const auto saved_demonstration =
+        carto::agent::AgentDemonstration::load(demonstration_path);
+    REQUIRE(saved_demonstration);
+    const auto demonstration_bytes = saved_demonstration.value().serialize();
+    REQUIRE(demonstration_bytes);
+    REQUIRE(demonstration_bytes.value().find(goal) == std::string::npos);
+    REQUIRE(demonstration_bytes.value().find(
+        "I reapprove this exact target scope after reopening.") == std::string::npos);
+    REQUIRE(demonstration_bytes.value().find(
+        "I reapprove the bounded topology edit after reopening.") == std::string::npos);
+
+    carto::ui::UiController demonstration_view(source);
+    REQUIRE(demonstration_view.load_agent_demonstration(demonstration_path));
+    const auto demonstration_snapshot = demonstration_view.snapshot();
+    REQUIRE(demonstration_snapshot.agent_demonstration.has_value());
+    REQUIRE(!demonstration_snapshot.agent_task.has_value());
+    REQUIRE(source.snapshot().project_revision == source_revision.next());
+    REQUIRE(!demonstration_view.accept_agent_plan());
+
 }
 
 void ui_rebases_disjoint_source_edits_and_reauthorizes_clarifications() {
@@ -1115,6 +1664,153 @@ void shared_mesh_instances_must_be_in_scope_and_within_touch_budget() {
     REQUIRE(source.snapshot().project_revision == before.project_revision);
 }
 
+void bounded_mesh_recipe_caps_execution_and_binds_its_acceptance_gate() {
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 1U);
+    const auto before = source.snapshot();
+    auto plain_plan = plan_for(before, objects, {
+        {"step-1", {objects[0], carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    auto recipe_plan = plain_plan;
+    recipe_plan.objective.recipe_id = "bounded-mesh-edit";
+    const auto plain_digest = plain_plan.objective.digest();
+    const auto recipe_digest = recipe_plan.objective.digest();
+    REQUIRE(plain_digest);
+    REQUIRE(recipe_digest);
+    REQUIRE(plain_digest.value() != recipe_digest.value());
+
+    auto envelope = envelope_for(objects);
+    envelope.max_topology_operations = 900U;
+    auto task = carto::agent::AgentTask::begin(
+        source, recipe_plan, envelope);
+    REQUIRE(task);
+    const auto run = task.value().run();
+    REQUIRE(run);
+    REQUIRE(run.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(run.value().can_accept);
+    REQUIRE(run.value().recipe_id == "bounded-mesh-edit");
+    const auto recipe_gate = std::find_if(
+        run.value().gates.begin(), run.value().gates.end(), [](const auto& gate) {
+            return gate.id == "recipe.bounded-mesh-edit.scene-identity";
+        });
+    REQUIRE(recipe_gate != run.value().gates.end());
+    REQUIRE(recipe_gate->required);
+    REQUIRE(recipe_gate->passed);
+    const auto topology_gate = std::find_if(
+        run.value().gates.begin(), run.value().gates.end(), [](const auto& gate) {
+            return gate.id == "envelope.topology_operations";
+        });
+    REQUIRE(topology_gate != run.value().gates.end());
+    REQUIRE(topology_gate->evidence.find("/ 512 permitted") != std::string::npos);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+
+    TempDirectory directory;
+    const auto checkpoint_path = directory.path() / "bounded-recipe.carto-agent-task";
+    REQUIRE(task.value().save_checkpoint(checkpoint_path));
+    auto checkpoint = carto::agent::AgentTask::load_checkpoint(checkpoint_path);
+    REQUIRE(checkpoint);
+    REQUIRE(checkpoint.value().plan.objective.recipe_id == "bounded-mesh-edit");
+    REQUIRE(checkpoint.value().envelope.max_topology_operations == 512U);
+    checkpoint.value().envelope.max_topology_operations = 513U;
+    REQUIRE(!checkpoint.value().serialize());
+
+    auto transform_plan = plain_plan;
+    transform_plan.objective.recipe_id = "bounded-mesh-edit";
+    auto transform_envelope = envelope_for(objects);
+    transform_envelope.permitted_effects |=
+        carto::agent::effect_mask(carto::agent::Effect::transform);
+    transform_envelope.max_transform_distance_meters = 2.0;
+    REQUIRE(!carto::agent::AgentTask::begin(
+        source, std::move(transform_plan), std::move(transform_envelope)));
+
+    auto unknown_recipe_plan = plain_plan;
+    unknown_recipe_plan.objective.recipe_id = "unregistered-recipe";
+    REQUIRE(!unknown_recipe_plan.validate());
+}
+
+void bounded_vertex_recipe_preserves_topology_and_repair_authority() {
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 1U);
+    const auto before = source.snapshot();
+    const auto vertex = before.viewport.scene.instances().front().mesh->vertex_ids.front();
+
+    auto vertex_plan = plan_for(before, objects, {
+        {"step-1", {objects.front(), vertex}, "move vertex to 4 0 0"},
+    });
+    vertex_plan.objective.recipe_id = "bounded-vertex-edit";
+    auto vertex_envelope = envelope_for(objects);
+    vertex_envelope.max_topology_operations = 64U;
+    auto vertex_task = carto::agent::AgentTask::begin(
+        source, vertex_plan, vertex_envelope);
+    REQUIRE(vertex_task);
+    const auto vertex_run = vertex_task.value().run();
+    REQUIRE(vertex_run);
+    REQUIRE(vertex_run.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(vertex_run.value().can_accept);
+    const auto topology_gate = std::find_if(
+        vertex_run.value().gates.begin(), vertex_run.value().gates.end(), [](const auto& gate) {
+            return gate.id == "recipe.bounded-vertex-edit.topology-preservation";
+        });
+    REQUIRE(topology_gate != vertex_run.value().gates.end());
+    REQUIRE(topology_gate->required);
+    REQUIRE(topology_gate->passed);
+    REQUIRE(topology_gate->evidence.find("topology remained unchanged") != std::string::npos);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+
+    TempDirectory directory;
+    const auto checkpoint_path = directory.path() / "bounded-vertex-recipe.carto-agent-task";
+    REQUIRE(vertex_task.value().save_checkpoint(checkpoint_path));
+    auto checkpoint = carto::agent::AgentTask::load_checkpoint(checkpoint_path);
+    REQUIRE(checkpoint);
+    REQUIRE(checkpoint.value().envelope.max_topology_operations == 0U);
+    REQUIRE(checkpoint.value().envelope.permitted_effects ==
+        carto::agent::effect_mask(carto::agent::Effect::geometry));
+    checkpoint.value().envelope.permitted_effects |=
+        carto::agent::effect_mask(carto::agent::Effect::topology);
+    REQUIRE(!checkpoint.value().serialize());
+
+    auto topology_plan = plan_for(before, objects, {
+        {"step-1", {objects.front(), carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    topology_plan.objective.recipe_id = "bounded-vertex-edit";
+    auto topology_task = carto::agent::AgentTask::begin(
+        source, topology_plan, envelope_for(objects));
+    REQUIRE(topology_task);
+    const auto topology_run = topology_task.value().run();
+    REQUIRE(topology_run);
+    REQUIRE(topology_run.value().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(!topology_run.value().can_accept);
+    REQUIRE(topology_run.value().steps.front().status == carto::agent::StepStatus::failed);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+
+    auto revised_plan = topology_plan;
+    revised_plan.id = "agent-task-vertex-repair";
+    revised_plan.steps.front().target.component = vertex;
+    revised_plan.steps.front().intent = "move vertex to 4 0 0";
+    auto repaired = carto::agent::AgentTask::repair(
+        source, topology_task.value(), revised_plan, envelope_for(objects),
+        "Use the topology-preserving vertex operation permitted by this recipe.");
+    REQUIRE(repaired);
+    const auto repaired_run = repaired.value().run();
+    REQUIRE(repaired_run);
+    REQUIRE(repaired_run.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(repaired_run.value().can_accept);
+    const auto repaired_topology_gate = std::find_if(
+        repaired_run.value().gates.begin(), repaired_run.value().gates.end(), [](const auto& gate) {
+            return gate.id == "recipe.bounded-vertex-edit.topology-preservation";
+        });
+    REQUIRE(repaired_topology_gate != repaired_run.value().gates.end());
+    REQUIRE(repaired_topology_gate->passed);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+
+    auto transform_envelope = envelope_for(objects);
+    transform_envelope.permitted_effects |=
+        carto::agent::effect_mask(carto::agent::Effect::transform);
+    transform_envelope.max_transform_distance_meters = 1.0;
+    REQUIRE(!carto::agent::AgentTask::begin(
+        source, vertex_plan, std::move(transform_envelope)));
+}
+
 void scope_protection_and_stale_revision_fail_closed() {
     carto::application::ApplicationSession source;
     const auto objects = create_boxes(source, 2U);
@@ -1484,6 +2180,43 @@ void ui_workbench_captures_selection_and_exposes_accept_reject_flow() {
     REQUIRE(ui.snapshot().project_revision == source_revision.next());
 }
 
+void ui_recipe_selection_round_trips_and_locks_with_checkpoint() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Recipe checkpoint box", {1.0, 1.0, 1.0}}));
+    const auto target = source.snapshot().objects.front().object.id;
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        target, carto::geometry::FaceId{1U}}));
+    REQUIRE(ui.queue_agent_step("inset face 0.1"));
+    REQUIRE(ui.set_agent_recipe("bounded-mesh-edit"));
+    const auto source_revision = source.snapshot().project_revision;
+    const auto run = ui.run_agent_plan("Apply a bounded face edit");
+    REQUIRE(run);
+    REQUIRE(run.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(run.value().recipe_id == "bounded-mesh-edit");
+    REQUIRE(!ui.set_agent_recipe(""));
+
+    TempDirectory directory;
+    const auto path = directory.path() / "recipe-ui.carto-agent-task";
+    REQUIRE(ui.save_agent_checkpoint(path));
+    carto::ui::UiController loaded(source);
+    REQUIRE(loaded.load_agent_checkpoint(path));
+    REQUIRE(loaded.snapshot().agent_recipe_id == "bounded-mesh-edit");
+    REQUIRE(!loaded.set_agent_recipe(""));
+    const auto resumed = loaded.resume_agent_checkpoint();
+    REQUIRE(resumed);
+    REQUIRE(resumed.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(resumed.value().recipe_id == "bounded-mesh-edit");
+    REQUIRE(!loaded.set_agent_recipe(""));
+    REQUIRE(source.snapshot().project_revision == source_revision);
+    REQUIRE(loaded.reject_agent_plan());
+    REQUIRE(ui.accept_agent_plan());
+    REQUIRE(source.snapshot().project_revision == source_revision.next());
+}
+
 void ui_clarification_requires_an_operator_answer_before_review() {
     carto::application::ApplicationSession source;
     carto::ui::UiController ui(source);
@@ -1494,6 +2227,7 @@ void ui_clarification_requires_an_operator_answer_before_review() {
     REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
         object, carto::geometry::FaceId{1U}}));
     REQUIRE(ui.queue_agent_step("inset face 0.1"));
+    REQUIRE(ui.set_agent_recipe("bounded-mesh-edit"));
     REQUIRE(ui.queue_agent_clarification(
         "Confirm the original entry geometry remains the reference.",
         carto::agent::ClarificationImpact::publication_readiness));
@@ -1510,11 +2244,14 @@ void ui_clarification_requires_an_operator_answer_before_review() {
     REQUIRE(ui.answer_agent_clarification(
         "Prepare the selected face", "question-1",
         "Keep the existing entry geometry as the reference."));
+    REQUIRE(!ui.set_agent_recipe(""));
+    REQUIRE(ui.snapshot().agent_recipe_id == "bounded-mesh-edit");
     REQUIRE(!ui.run_agent_plan("A changed goal must not reuse the answer"));
     REQUIRE(!ui.queue_agent_step("inset face 0.2"));
 
     const auto run = ui.run_agent_plan("Prepare the selected face");
     REQUIRE(run);
+    REQUIRE(run.value().recipe_id == "bounded-mesh-edit");
     REQUIRE(run.value().status == carto::agent::TaskStatus::review);
     REQUIRE(run.value().clarifications.size() == 1U);
     REQUIRE(run.value().clarifications.front().human_receipt.has_value());
@@ -1819,7 +2556,13 @@ void ui_ghost_corrections_remain_locked_through_repair() {
 
 int main() {
     try {
+        root_object_translation_is_explicit_bounded_and_checkpointed();
+        root_object_translation_rejects_distance_overrun_and_preserve_constraint();
+        object_translation_checkpoint_rebase_tracks_transform_write_set();
+        ui_objective_constraints_are_scoped_persisted_and_bound_to_answers();
+        ui_workbench_captures_object_target_and_requires_explicit_transform_envelope();
         multi_step_branch_isolated_until_reviewed_acceptance();
+        accepted_task_demonstration_is_redacted_read_only_and_checksummed();
         plan_dag_orders_dependencies_and_rejects_invalid_graphs();
         failed_dag_node_invalidates_only_dependent_steps();
         bounded_repair_restarts_from_source_and_preserves_attempt_lineage();
@@ -1828,6 +2571,8 @@ int main() {
         work_envelope_blocks_topology_effect_before_live_mutation();
         work_envelope_blocks_topology_churn_over_budget();
         diff_digest_tracks_geometry_values_not_only_change_shape();
+        bounded_mesh_recipe_caps_execution_and_binds_its_acceptance_gate();
+        bounded_vertex_recipe_preserves_topology_and_repair_authority();
         shared_mesh_instances_must_be_in_scope_and_within_touch_budget();
         scope_protection_and_stale_revision_fail_closed();
         failed_native_step_and_invalid_task_transitions_do_not_commit();
@@ -1837,6 +2582,7 @@ int main() {
         objective_hard_constraints_block_topology_and_excess_displacement();
         acceptance_evidence_binds_validator_revision_assets_and_result();
         ui_workbench_captures_selection_and_exposes_accept_reject_flow();
+        ui_recipe_selection_round_trips_and_locks_with_checkpoint();
         ui_clarification_requires_an_operator_answer_before_review();
         ui_repairs_failed_step_with_operator_justification_and_scope_checks();
         ui_repair_invalidates_plan_bound_human_receipts_until_reanswered();

@@ -121,10 +121,18 @@ core::Result<SnapDecision> acquire_snap(
     core::Vec3d origin,
     core::Revision source_revision,
     const SnapProfile& profile,
-    SnapSession& session) {
+    SnapSession& session,
+    SnapConstraint constraint) {
     if (!origin.finite()) {
         return core::Result<SnapDecision>::failure(invalid(
             "snap service origin must be finite"));
+    }
+    if (!std::isfinite(constraint.perpendicular_tolerance) ||
+        constraint.perpendicular_tolerance < 0.0 ||
+        static_cast<std::uint8_t>(constraint.axis) >
+            static_cast<std::uint8_t>(SnapConstraintAxis::world_z)) {
+        return core::Result<SnapDecision>::failure(invalid(
+            "snap axis constraint or perpendicular tolerance is invalid"));
     }
     if (auto result = profile.validate(); !result) {
         return core::Result<SnapDecision>::failure(result.error());
@@ -153,7 +161,19 @@ core::Result<SnapDecision> acquire_snap(
             return core::Result<SnapDecision>::failure(stale(
                 "snap candidate belongs to a different source revision"));
         }
-        const double distance = (candidate.position - origin).length();
+        const core::Vec3d delta = candidate.position - origin;
+        double distance = delta.length();
+        if (constraint.axis == SnapConstraintAxis::world_x) {
+            if (std::abs(delta.z) > constraint.perpendicular_tolerance) {
+                continue;
+            }
+            distance = std::abs(delta.x);
+        } else if (constraint.axis == SnapConstraintAxis::world_z) {
+            if (std::abs(delta.x) > constraint.perpendicular_tolerance) {
+                continue;
+            }
+            distance = std::abs(delta.z);
+        }
         if (!std::isfinite(distance)) {
             return core::Result<SnapDecision>::failure(invalid(
                 "snap candidate distance is non-finite"));

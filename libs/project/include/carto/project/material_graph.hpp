@@ -77,16 +77,18 @@ struct MaterialGraphCompileReport {
 
 class MaterialGraph final {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 1U;
+    static constexpr std::uint32_t kSchemaVersion = 2U;
     static constexpr std::size_t kMaxSerializedBytes = 2U * 1024U * 1024U;
     static constexpr std::size_t kMaxIdentityBytes = 256U;
     static constexpr std::size_t kMaxNodes = 4'096U;
+    static constexpr std::size_t kMaxRetiredNodeIds = 65'536U;
     static constexpr std::size_t kMaxInputsPerNode = 4U;
     static constexpr std::size_t kMaxParameterBytes = 128U;
 
     std::string identity;
     core::Revision revision;
     std::vector<MaterialGraphNode> nodes;
+    std::vector<std::uint64_t> retired_node_ids;
     MaterialGraphOutputs outputs;
 
     [[nodiscard]] const MaterialGraphNode* find(std::uint64_t id) const noexcept;

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
+#include <span>
 #include <string>
 #include <utility>
 
@@ -80,6 +81,35 @@ void deterministic_round_trip_and_compilation_report() {
     require(reopened && reopened.value().serialize().value() == encoded.value(),
         "graph survives digest-checked serialization and reopen");
 
+    auto with_tombstone = graph_fixture(false);
+    with_tombstone.retired_node_ids = {9U, 12U};
+    const auto tombstone_encoded = with_tombstone.serialize();
+    require(static_cast<bool>(tombstone_encoded), "tombstone graph serializes");
+    const auto tombstone_reopened = MaterialGraph::deserialize(tombstone_encoded.value());
+    require(tombstone_reopened &&
+            tombstone_reopened.value().retired_node_ids ==
+                std::vector<std::uint64_t>{9U, 12U},
+        "retired node identities persist in canonical graph data");
+
+    auto legacy_v1 = encoded.value();
+    const auto retired_section = legacy_v1.find("RETIRED_NODES 0\n");
+    const auto digest_marker = legacy_v1.find("DIGEST ");
+    require(retired_section != std::string::npos && digest_marker != std::string::npos,
+        "current graph fixture exposes schema-2 lineage and digest sections");
+    legacy_v1.erase(retired_section, std::string("RETIRED_NODES 0\n").size());
+    legacy_v1.replace(0U, std::string("CARTOGRAPHER_MATERIAL_GRAPH 2").size(),
+        "CARTOGRAPHER_MATERIAL_GRAPH 1");
+    const auto legacy_digest_marker = legacy_v1.find("DIGEST ");
+    const auto legacy_digest = carto::assets::sha256(std::span<const std::uint8_t>{
+        reinterpret_cast<const std::uint8_t*>(legacy_v1.data()), legacy_digest_marker});
+    legacy_v1.replace(legacy_digest_marker + std::string("DIGEST ").size(),
+        std::string::npos, legacy_digest.hex() + "\n");
+    const auto migrated_v1 = MaterialGraph::deserialize(legacy_v1);
+    require(migrated_v1 && migrated_v1.value().retired_node_ids.empty() &&
+            migrated_v1.value().serialize().value().find(
+                "CARTOGRAPHER_MATERIAL_GRAPH 2") == 0U,
+        "schema-1 graphs migrate to schema 2 with an explicit empty tombstone set");
+
     const auto unsupported = carto::project::compile_material_graph(graph);
     require(unsupported && !unsupported.value().supported &&
             unsupported.value().diagnostics.size() == 1U &&
@@ -122,6 +152,16 @@ void hostile_graph_boundaries_fail_closed() {
     auto duplicate = graph;
     duplicate.nodes.push_back(duplicate.nodes.front());
     require(!duplicate.validate(), "duplicate node identities are rejected");
+
+    auto active_retired = graph;
+    active_retired.retired_node_ids = {1U};
+    require(!active_retired.validate(), "retired IDs cannot collide with active nodes");
+    auto unsorted_retired = graph;
+    unsorted_retired.retired_node_ids = {12U, 9U};
+    require(!unsorted_retired.validate(), "retired node IDs must be canonically sorted");
+    auto duplicate_retired = graph;
+    duplicate_retired.retired_node_ids = {9U, 9U};
+    require(!duplicate_retired.validate(), "retired node IDs cannot be duplicated");
 
     auto missing_input = graph;
     missing_input.nodes.back().inputs = {999U};

@@ -17,6 +17,7 @@ namespace carto::ai {
 enum class CapabilityEffect : std::uint32_t {
     geometry = 1U,
     topology = 2U,
+    transform = 4U,
 };
 
 [[nodiscard]] constexpr std::uint32_t effect_mask(CapabilityEffect effect) noexcept {
@@ -37,6 +38,7 @@ enum class ParameterUnit : std::uint8_t {
     world_length,
     unit_interval,
     world_position,
+    world_displacement,
 };
 
 struct ParameterDefinition {
@@ -55,6 +57,7 @@ struct ParameterDefinition {
 };
 
 enum class CapabilityTarget : std::uint8_t {
+    selected_object,
     selected_face,
     selected_faces,
     selected_vertex,
@@ -63,17 +66,22 @@ enum class CapabilityTarget : std::uint8_t {
 };
 
 enum class CapabilityData : std::uint8_t {
+    object_transform,
+    object_hierarchy,
     selected_component,
     target_mesh,
     incident_topology,
 };
 
 enum class CapabilityWrite : std::uint8_t {
+    object_transform,
     vertex_positions,
     mesh_topology,
 };
 
 enum class CapabilityInvalidation : std::uint8_t {
+    world_transforms,
+    spatial_queries,
     render_mesh,
     topology_cache,
     surface_normals,
@@ -85,6 +93,8 @@ enum class CapabilityInvalidation : std::uint8_t {
 
 enum class CapabilityValidator : std::uint8_t {
     target_exists,
+    root_object,
+    unlocked_subtree,
     finite_parameters,
     mesh_valid,
     face_planar,
@@ -94,6 +104,7 @@ enum class CapabilityValidator : std::uint8_t {
 };
 
 enum class CapabilityRisk : std::uint8_t {
+    reversible_transform,
     reversible_geometry,
     reversible_topology,
     destructive_topology,

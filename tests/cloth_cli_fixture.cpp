@@ -128,7 +128,9 @@ int verify_output(
     auto source = project::ProjectDocument::load(source_path);
     auto output = project::ProjectDocument::load(output_root / "project.carto");
     require(static_cast<bool>(source), "input project no longer loads");
-    require(static_cast<bool>(output), "published project does not load");
+    if (!output) {
+        throw std::runtime_error("published project does not load: " + output.error().message);
+    }
     require(source.value().cloth_rest_pose_receipts().empty(),
         "cloth CLI mutated the input project");
     require(source.value().meshes().size() == 1U, "input project mesh count changed");

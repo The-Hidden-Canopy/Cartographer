@@ -26,6 +26,11 @@ core::Result<void> RenderScene::upsert(RenderInstance instance) {
         return core::Result<void>::failure(
             core::Diagnostic(core::ErrorCode::validation_failed, "render instance mesh is invalid"));
     }
+    if (instance.mesh_asset.has_value() && *instance.mesh_asset == 0U) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "render instance mesh asset identity must be nonzero"));
+    }
     for (const auto point : instance.mesh->positions) {
         if (!transform_point(instance.world_transform, point).finite()) {
             return core::Result<void>::failure(core::Diagnostic(

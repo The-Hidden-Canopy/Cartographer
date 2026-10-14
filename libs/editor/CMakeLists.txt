@@ -17,7 +17,7 @@ target_include_directories(carto_editor
         $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(carto_editor PUBLIC carto_core carto_scene carto_geometry carto_project)
+target_link_libraries(carto_editor PUBLIC carto_core carto_scene carto_geometry carto_project carto_render)
 carto_target(carto_editor)
 
 install(TARGETS carto_editor EXPORT CartographerTargets)

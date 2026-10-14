@@ -144,6 +144,33 @@ core::Result<TileKey> parse_terrain_tile_identity(std::string_view identity) {
     return core::Result<TileKey>::success(key);
 }
 
+core::Result<std::uint32_t> lod_step_for_triangle_budget(
+    std::uint32_t source_width,
+    std::uint32_t source_height,
+    std::uint64_t maximum_triangles) {
+    if (source_width < 2U || source_height < 2U ||
+        source_width > spatial_field::ScalarField2D::kMaxAxisSamples ||
+        source_height > spatial_field::ScalarField2D::kMaxAxisSamples ||
+        maximum_triangles < 2U) {
+        return core::Result<std::uint32_t>::failure(invalid(
+            "terrain LOD budget requires valid dimensions and room for at least one cell"));
+    }
+    const auto triangle_count = [source_width, source_height](std::uint32_t step) {
+        const std::uint64_t columns = (source_width - 2U) / step + 1U;
+        const std::uint64_t rows = (source_height - 2U) / step + 1U;
+        return 2U * columns * rows;
+    };
+    const std::uint32_t maximum_step = std::min(source_width, source_height) - 1U;
+    for (std::uint32_t step = 1U; step <= maximum_step; ++step) {
+        if (triangle_count(step) <= maximum_triangles) {
+            return core::Result<std::uint32_t>::success(step);
+        }
+    }
+    return core::Result<std::uint32_t>::failure(core::Diagnostic(
+        core::ErrorCode::validation_failed,
+        "terrain triangle budget cannot fit the coarsest valid terrain step"));
+}
+
 core::Result<hydro::BathymetryField> to_bathymetry_field(
     const spatial_field::ScalarField2D& source,
     std::string coordinate_frame) {

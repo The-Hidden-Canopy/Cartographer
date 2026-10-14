@@ -38,7 +38,7 @@ public:
 private:
     friend core::Result<struct SnapDecision> acquire_snap(
         std::span<const SnapCandidate>, core::Vec3d, core::Revision,
-        const SnapProfile&, SnapSession&);
+        const SnapProfile&, SnapSession&, struct SnapConstraint);
     std::optional<SnapCandidate> lock_;
 };
 
@@ -46,6 +46,20 @@ struct SnapDecision final {
     std::optional<SnapCandidate> candidate;
     bool retained = false;
     bool switched = false;
+};
+
+enum class SnapConstraintAxis : std::uint8_t {
+    none,
+    world_x,
+    world_z,
+};
+
+struct SnapConstraint final {
+    SnapConstraintAxis axis = SnapConstraintAxis::none;
+    // For X/Z work-surface moves, candidates must remain within this tolerance
+    // on the other screen-plane axis. Elevation is intentionally ignored by
+    // the top-down viewport; it remains unchanged by the active gizmo handle.
+    double perpendicular_tolerance = 0.05;
 };
 
 // Applies a revision-bound priority/hysteresis policy to already compiled
@@ -56,6 +70,7 @@ struct SnapDecision final {
     core::Vec3d origin,
     core::Revision source_revision,
     const SnapProfile& profile,
-    SnapSession& session);
+    SnapSession& session,
+    SnapConstraint constraint = {});
 
 } // namespace carto::editor

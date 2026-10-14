@@ -133,10 +133,12 @@ std::vector<MaterialGraphNode> canonical_nodes(const MaterialGraph& graph) {
     return nodes;
 }
 
-std::string canonical_payload(const MaterialGraph& graph) {
+std::string canonical_payload(
+    const MaterialGraph& graph,
+    std::uint32_t schema_version = MaterialGraph::kSchemaVersion) {
     std::ostringstream out;
     out << std::setprecision(std::numeric_limits<double>::max_digits10);
-    out << kMagic << ' ' << MaterialGraph::kSchemaVersion << '\n';
+    out << kMagic << ' ' << schema_version << '\n';
     out << "IDENTITY " << std::quoted(graph.identity) << '\n';
     out << "REVISION " << graph.revision.value() << '\n';
     const auto nodes = canonical_nodes(graph);
@@ -151,6 +153,12 @@ std::string canonical_payload(const MaterialGraph& graph) {
             << std::quoted(node.unsupported_identity) << ' ' << node.inputs.size();
         for (const auto input : node.inputs) out << ' ' << input;
         out << '\n';
+    }
+    if (schema_version >= 2U) {
+        out << "RETIRED_NODES " << graph.retired_node_ids.size() << '\n';
+        for (const auto id : graph.retired_node_ids) {
+            out << "RETIRED_NODE " << id << '\n';
+        }
     }
     const auto& o = graph.outputs;
     out << "OUTPUTS " << o.base_color << ' ' << o.alpha << ' ' << o.roughness << ' '
@@ -301,7 +309,8 @@ core::Result<void> MaterialGraph::validate() const {
     if (!safe_graph_identity(identity) || revision.exhausted()) {
         return core::Result<void>::failure(invalid("material graph identity or revision is invalid"));
     }
-    if (nodes.empty() || nodes.size() > kMaxNodes) {
+    if (nodes.empty() || nodes.size() > kMaxNodes ||
+        retired_node_ids.size() > kMaxRetiredNodeIds) {
         return core::Result<void>::failure(validation("material graph node count is outside its bound"));
     }
     std::set<std::uint64_t> ids;
@@ -310,6 +319,14 @@ core::Result<void> MaterialGraph::validate() const {
         if (!ids.insert(node.id).second) {
             return core::Result<void>::failure(validation("material graph node identity is duplicated"));
         }
+    }
+    if (!std::is_sorted(retired_node_ids.begin(), retired_node_ids.end()) ||
+        std::adjacent_find(retired_node_ids.begin(), retired_node_ids.end()) !=
+            retired_node_ids.end() ||
+        std::any_of(retired_node_ids.begin(), retired_node_ids.end(),
+            [&ids](std::uint64_t id) { return id == 0U || ids.contains(id); })) {
+        return core::Result<void>::failure(validation(
+            "retired material graph node IDs must be sorted, unique, non-zero, and inactive"));
     }
     for (const auto& node : nodes) {
         for (const auto input : node.inputs) {
@@ -380,7 +397,7 @@ core::Result<MaterialGraph> MaterialGraph::deserialize(std::string_view text) {
     std::istringstream input{std::string{text}};
     if (!expect(input, kMagic)) return core::Result<MaterialGraph>::failure(validation("material graph magic is invalid"));
     unsigned version = 0U;
-    if (!read_unsigned(input, version) || version != kSchemaVersion) {
+    if (!read_unsigned(input, version) || (version != 1U && version != kSchemaVersion)) {
         return core::Result<MaterialGraph>::failure({core::ErrorCode::version_mismatch, "material graph version is unsupported"});
     }
     MaterialGraph graph;
@@ -424,6 +441,23 @@ core::Result<MaterialGraph> MaterialGraph::deserialize(std::string_view text) {
         }
         graph.nodes.push_back(std::move(node));
     }
+    if (version >= 2U) {
+        std::size_t retired_count = 0U;
+        if (!expect(input, "RETIRED_NODES") ||
+            !read_count(input, kMaxRetiredNodeIds, retired_count)) {
+            return core::Result<MaterialGraph>::failure(validation(
+                "material graph retired-node count is malformed"));
+        }
+        graph.retired_node_ids.reserve(retired_count);
+        for (std::size_t index = 0U; index < retired_count; ++index) {
+            std::uint64_t id = 0U;
+            if (!expect(input, "RETIRED_NODE") || !read_unsigned(input, id)) {
+                return core::Result<MaterialGraph>::failure(validation(
+                    "material graph retired-node identity is malformed"));
+            }
+            graph.retired_node_ids.push_back(id);
+        }
+    }
     auto& o = graph.outputs;
     if (!expect(input, "OUTPUTS")) return core::Result<MaterialGraph>::failure(validation("material graph outputs are missing"));
     for (auto* value : {&o.base_color, &o.alpha, &o.roughness, &o.metallic, &o.normal,
@@ -441,8 +475,8 @@ core::Result<MaterialGraph> MaterialGraph::deserialize(std::string_view text) {
     const auto expected = assets::Sha256Digest::from_hex(encoded_digest);
     if (!expected || expected.value().is_zero()) return core::Result<MaterialGraph>::failure(validation("material graph digest is invalid"));
     if (auto result = graph.validate(); !result) return core::Result<MaterialGraph>::failure(result.error());
-    const auto actual = graph.canonical_digest();
-    if (!actual || actual.value() != expected.value()) {
+    const auto actual = digest_text(canonical_payload(graph, version));
+    if (actual != expected.value()) {
         return core::Result<MaterialGraph>::failure(validation("material graph content digest does not match"));
     }
     return core::Result<MaterialGraph>::success(std::move(graph));

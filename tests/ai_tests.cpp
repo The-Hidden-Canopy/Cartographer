@@ -41,6 +41,8 @@ void ontology_is_derived_from_native_tools() {
         [](const auto& operation) { return operation.id == "mesh.extrude-face"; });
     const auto inset = std::find_if(context.operations.begin(), context.operations.end(),
         [](const auto& operation) { return operation.id == "mesh.inset-face"; });
+    const auto translate = std::find_if(context.operations.begin(), context.operations.end(),
+        [](const auto& operation) { return operation.id == "object.translate"; });
     const auto poke = std::find_if(context.operations.begin(), context.operations.end(),
         [](const auto& operation) { return operation.id == "mesh.poke-face"; });
     const auto delete_face = std::find_if(context.operations.begin(), context.operations.end(),
@@ -59,6 +61,15 @@ void ontology_is_derived_from_native_tools() {
         [](const auto& operation) { return operation.id == "mesh.bevel-vertex"; });
     REQUIRE(extrude != context.operations.end() && extrude->preview_supported);
     REQUIRE(inset != context.operations.end() && inset->preview_supported);
+    REQUIRE(translate != context.operations.end() && translate->preview_supported);
+    REQUIRE(!translate->auto_approvable);
+    REQUIRE(translate->effects == carto::ai::effect_mask(
+        carto::ai::CapabilityEffect::transform));
+    REQUIRE(translate->writes == std::vector<carto::ai::CapabilityWrite>{
+        carto::ai::CapabilityWrite::object_transform});
+    REQUIRE(translate->validators.size() == 5U);
+    REQUIRE(translate->validators[1] == carto::ai::CapabilityValidator::root_object);
+    REQUIRE(translate->validators[2] == carto::ai::CapabilityValidator::unlocked_subtree);
     REQUIRE(poke != context.operations.end() && !poke->preview_supported);
     REQUIRE(delete_face != context.operations.end() && !delete_face->preview_supported);
     REQUIRE(merge_vertices != context.operations.end() && !merge_vertices->preview_supported);
@@ -100,7 +111,7 @@ void ontology_is_derived_from_native_tools() {
                 !operation.writes.empty() && !operation.validators.empty();
         }));
     REQUIRE(std::count_if(context.operations.begin(), context.operations.end(),
-        [](const auto& operation) { return operation.provider_requestable; }) == 3);
+        [](const auto& operation) { return operation.provider_requestable; }) == 4);
     REQUIRE(inset->parameter_schema.size() == 1U);
     REQUIRE(inset->parameter_schema.front().type == carto::ai::ParameterType::length);
     REQUIRE(inset->parameter_schema.front().unit == carto::ai::ParameterUnit::world_length);
@@ -133,6 +144,10 @@ void capability_projection_filters_by_preview_and_work_envelope() {
     REQUIRE(geometry_only.front().provider_requestable);
     REQUIRE(carto::ai::project_capabilities(registry, 0U).empty());
     REQUIRE(carto::ai::project_capabilities(registry, 0x80000000U).empty());
+    const auto transforms = carto::ai::project_capabilities(
+        registry, carto::ai::effect_mask(carto::ai::CapabilityEffect::transform));
+    REQUIRE(transforms.size() == 1U);
+    REQUIRE(transforms.front().id == "object.translate");
 
     auto invalid = geometry_only.front();
     invalid.parameter_schema.front().minimum = std::numeric_limits<double>::quiet_NaN();
@@ -226,6 +241,65 @@ void native_planner_rejects_ambiguous_or_wrong_scope_intents() {
     context = context_for(session);
     REQUIRE(!planner.propose("extrude face by 0.25 and 0.50", context));
     REQUIRE(!planner.propose("move vertex to 1 2 3", context));
+}
+
+void native_planner_compiles_translation_only_for_one_selected_object() {
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::CreateBoxAction{"Root", {1.0, 1.0, 1.0}}));
+    const auto object = session.snapshot().objects.front().object.id;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::SetSelectionModeAction{
+            carto::editor::SelectionMode::object}));
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::SelectObjectAction{object}));
+
+    carto::ai::NativePlanner planner;
+    auto context = context_for(session);
+    const auto proposal = planner.propose("translate object by 0.25 0 -0.5", context);
+    REQUIRE(proposal);
+    REQUIRE(proposal.value().tool_id == "object.translate");
+    REQUIRE(proposal.value().preview_kind ==
+        carto::editor::PreviewKind::object_translation_delta);
+    REQUIRE(proposal.value().parameters.position.has_value());
+    REQUIRE(proposal.value().parameters.position->x == 0.25);
+    REQUIRE(proposal.value().parameters.position->y == 0.0);
+    REQUIRE(proposal.value().parameters.position->z == -0.5);
+    REQUIRE(proposal.value().validate(context));
+
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::CreateBoxAction{"Second root", {1.0, 1.0, 1.0}}));
+    const auto second = session.snapshot().objects.back().object.id;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::SelectObjectAction{
+            object, carto::editor::SelectionOperation::replace}));
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::SelectObjectAction{
+            second, carto::editor::SelectionOperation::add}));
+    context = context_for(session);
+    REQUIRE(!planner.propose("translate object by 0.25 0 0", context));
+    REQUIRE(!planner.propose("translate object by 1 2", context));
+}
+
+void generic_ai_proposals_cannot_bypass_agent_transform_envelope() {
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{"Root", {1.0, 1.0, 1.0}}));
+    const auto object = session.snapshot().objects.front().object.id;
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{object}));
+    const auto before = session.snapshot();
+
+    REQUIRE(!ui.propose_ai("translate object by 0.25 0 0"));
+    auto full_context = context_for(session);
+    carto::ai::NativePlanner planner;
+    const auto external_proposal = planner.propose(
+        "translate object by 0.25 0 0", full_context);
+    REQUIRE(external_proposal);
+    REQUIRE(!ui.begin_ai_preview(external_proposal.value()));
+    REQUIRE(session.snapshot().project_revision == before.project_revision);
+    REQUIRE(session.snapshot().objects.front().object.local_transform.translation.x == 0.0);
 }
 
 void ui_ai_flow_is_preview_only_until_explicit_commit() {
@@ -380,6 +454,8 @@ int main() {
         ontology_fails_closed_on_tool_kernel_contract_drift();
         native_planner_compiles_a_face_intent_without_mutating_state();
         native_planner_rejects_ambiguous_or_wrong_scope_intents();
+        native_planner_compiles_translation_only_for_one_selected_object();
+        generic_ai_proposals_cannot_bypass_agent_transform_envelope();
         ui_ai_flow_is_preview_only_until_explicit_commit();
         native_ai_can_press_auto_apply_through_typed_boundary();
         disabled_native_ai_auto_apply_requires_explicit_review();

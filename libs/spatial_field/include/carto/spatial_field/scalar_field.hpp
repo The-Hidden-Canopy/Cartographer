@@ -121,6 +121,50 @@ private:
     std::vector<double> values_;
 };
 
+struct VectorFieldSourceReceipt {
+    std::string identity;
+    FieldSemantic semantic = FieldSemantic::generic;
+    core::Revision source_revision;
+    assets::Sha256Digest digest;
+    core::Vec2d origin_uv{};
+    double cell_size = 1.0;
+    std::uint32_t width = 0U;
+    std::uint32_t height = 0U;
+};
+
+struct VectorFieldSample {
+    core::Vec2d position_uv{};
+    core::Vec2d vector_uv{};
+};
+
+// Ephemeral, source-bound visualization product. It deliberately has no
+// project persistence or mutation API.
+struct VectorFieldPreview {
+    static constexpr std::uint32_t kMaxPreviewAxis = 16U;
+    static constexpr std::size_t kMaxSamples =
+        static_cast<std::size_t>(kMaxPreviewAxis) * kMaxPreviewAxis;
+
+    VectorFieldSourceReceipt u_component;
+    VectorFieldSourceReceipt v_component;
+    std::uint32_t preview_width = 0U;
+    std::uint32_t preview_height = 0U;
+    std::vector<VectorFieldSample> samples;
+
+    [[nodiscard]] core::Result<void> validate() const;
+    [[nodiscard]] bool sources_match(
+        std::string_view u_identity,
+        core::Revision u_revision,
+        const assets::Sha256Digest& u_digest,
+        std::string_view v_identity,
+        core::Revision v_revision,
+        const assets::Sha256Digest& v_digest) const noexcept;
+};
+
+[[nodiscard]] core::Result<VectorFieldPreview> build_vector_field_preview(
+    const ScalarField2D& u_component,
+    const ScalarField2D& v_component,
+    std::uint32_t max_preview_axis = VectorFieldPreview::kMaxPreviewAxis);
+
 [[nodiscard]] std::string_view field_semantic_name(FieldSemantic semantic) noexcept;
 
 } // namespace carto::spatial_field

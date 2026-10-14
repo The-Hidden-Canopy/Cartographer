@@ -515,6 +515,26 @@ core::Result<void> MaterialCatalog::insert_material(render::MaterialAsset materi
     return insert_unique(materials_, identity, std::move(material), "material source");
 }
 
+core::Result<void> MaterialCatalog::replace_material(render::MaterialAsset material) {
+    if (auto result = material.validate(); !result) return result;
+    if (!safe_text(material.name, kMaxNameBytes) || material.revision.exhausted()) {
+        return core::Result<void>::failure(invalid(
+            "material display name or revision is invalid"));
+    }
+    const auto found = materials_.find(material.id);
+    if (found == materials_.end()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::not_found, "cannot replace a missing material source"));
+    }
+    if (material.revision <= found->second.revision) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "replacement material revision must advance its source revision"));
+    }
+    found->second = std::move(material);
+    return core::Result<void>::success();
+}
+
 core::Result<void> MaterialCatalog::insert_variant(MaterialVariant variant) {
     if (auto result = variant.validate(); !result) return result;
     const auto identity = variant.id;
@@ -528,6 +548,32 @@ core::Result<void> MaterialCatalog::insert_assignment(MaterialRegionAssignment a
         "material-region assignment");
 }
 
+core::Result<void> MaterialCatalog::replace_assignment(
+    MaterialRegionAssignment assignment) {
+    if (auto result = assignment.validate(); !result) return result;
+    const auto found = assignments_.find(assignment.key);
+    if (found == assignments_.end()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "cannot replace a missing material-region assignment"));
+    }
+    found->second = std::move(assignment);
+    return core::Result<void>::success();
+}
+
+core::Result<void> MaterialCatalog::erase_assignment(MaterialRegionKey key) {
+    if (key.mesh_asset == 0U || key.region_id == 0U) {
+        return core::Result<void>::failure(invalid(
+            "material-region assignment identity must be non-zero"));
+    }
+    if (assignments_.erase(key) == 0U) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "cannot erase a missing material-region assignment"));
+    }
+    return core::Result<void>::success();
+}
+
 core::Result<void> MaterialCatalog::insert_material_graph(MaterialGraph graph) {
     if (auto result = graph.validate(); !result) return result;
     auto identity = graph.identity;
@@ -535,9 +581,70 @@ core::Result<void> MaterialCatalog::insert_material_graph(MaterialGraph graph) {
         "material graph");
 }
 
+core::Result<void> MaterialCatalog::replace_material_graph(MaterialGraph graph) {
+    if (auto result = graph.validate(); !result) return result;
+    const auto found = material_graphs_.find(graph.identity);
+    if (found == material_graphs_.end()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::not_found, "cannot replace a missing material graph"));
+    }
+    found->second = std::move(graph);
+    return core::Result<void>::success();
+}
+
+core::Result<void> MaterialCatalog::bind_material_graph(
+    render::MaterialId material,
+    std::string graph_identity) {
+    if (material == 0U || !safe_text(graph_identity, MaterialGraph::kMaxIdentityBytes)) {
+        return core::Result<void>::failure(invalid(
+            "material graph binding requires a material and a safe graph identity"));
+    }
+    if (!materials_.contains(material)) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "material graph binding references a missing material"));
+    }
+    if (!material_graphs_.contains(graph_identity)) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "material graph binding references a missing graph source"));
+    }
+    const auto& graph = material_graphs_.at(graph_identity);
+    const auto graph_digest = graph.canonical_digest();
+    if (!graph_digest) {
+        return core::Result<void>::failure(graph_digest.error().with_context(
+            "material graph binding source digest"));
+    }
+    const auto found = material_graph_bindings_.find(material);
+    if (found != material_graph_bindings_.end() &&
+        found->second.graph_identity == graph_identity &&
+        found->second.source_revision == graph.revision &&
+        found->second.source_digest == graph_digest.value()) {
+        return core::Result<void>::failure(invalid(
+            "material is already bound to this graph source"));
+    }
+    material_graph_bindings_.insert_or_assign(material, MaterialGraphBinding{
+        std::move(graph_identity), graph.revision, graph_digest.value()});
+    return core::Result<void>::success();
+}
+
+core::Result<void> MaterialCatalog::unbind_material_graph(render::MaterialId material) {
+    if (material == 0U) {
+        return core::Result<void>::failure(invalid(
+            "material graph unbinding requires a non-zero material identity"));
+    }
+    if (material_graph_bindings_.erase(material) == 0U) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "material has no graph source binding to remove"));
+    }
+    return core::Result<void>::success();
+}
+
 bool MaterialCatalog::empty() const noexcept {
     return textures_.empty() && samplers_.empty() && materials_.empty() &&
-        variants_.empty() && assignments_.empty() && material_graphs_.empty();
+        variants_.empty() && assignments_.empty() && material_graphs_.empty() &&
+        material_graph_bindings_.empty();
 }
 
 core::Result<render::StandardMaterial> MaterialCatalog::resolve_material(
@@ -568,7 +675,8 @@ core::Result<void> MaterialCatalog::validate() const {
     if (textures_.size() > kMaxRecordsPerKind || samplers_.size() > kMaxRecordsPerKind ||
         materials_.size() > kMaxRecordsPerKind || variants_.size() > kMaxRecordsPerKind ||
         assignments_.size() > kMaxRecordsPerKind ||
-        material_graphs_.size() > kMaxRecordsPerKind) {
+        material_graphs_.size() > kMaxRecordsPerKind ||
+        material_graph_bindings_.size() > kMaxRecordsPerKind) {
         return core::Result<void>::failure(validation(
             "material catalog exceeds a bounded collection size"));
     }
@@ -662,6 +770,15 @@ core::Result<void> MaterialCatalog::validate() const {
             }
         }
     }
+    for (const auto& [material, binding] : material_graph_bindings_) {
+        if (!materials_.contains(material) ||
+            !material_graphs_.contains(binding.graph_identity) ||
+            !safe_text(binding.graph_identity, MaterialGraph::kMaxIdentityBytes) ||
+            binding.source_revision.exhausted() || binding.source_digest.is_zero()) {
+            return core::Result<void>::failure(validation(
+                "material graph binding identity, revision, digest, or source is invalid"));
+        }
+    }
     return core::Result<void>::success();
 }
 
@@ -725,6 +842,13 @@ std::string MaterialCatalog::serialize() const {
         output << "MATERIAL_GRAPH " << std::quoted(encoded ? encoded.value() : std::string{})
                << '\n';
     }
+    output << "MATERIAL_GRAPH_BINDINGS " << material_graph_bindings_.size() << '\n';
+    for (const auto& [material, binding] : material_graph_bindings_) {
+        output << "MATERIAL_GRAPH_BINDING " << material << ' '
+               << binding.source_revision.value() << ' '
+               << binding.source_digest.hex() << ' '
+               << std::quoted(binding.graph_identity) << '\n';
+    }
     output << "END\n";
     return output.str();
 }
@@ -750,7 +874,7 @@ core::Result<MaterialCatalog> MaterialCatalog::deserialize(std::string_view text
         return core::Result<MaterialCatalog>::failure(parse_error(
             "material catalog header is invalid"));
     }
-    if (version != 1U && version != kSchemaVersion) {
+    if (version != 1U && version != 2U && version != kSchemaVersion) {
         return core::Result<MaterialCatalog>::failure(core::Diagnostic(
             core::ErrorCode::version_mismatch,
             "material catalog schema version is unsupported"));
@@ -909,6 +1033,37 @@ core::Result<MaterialCatalog> MaterialCatalog::deserialize(std::string_view text
             if (auto result = catalog.insert_material_graph(std::move(graph).value()); !result) {
                 return core::Result<MaterialCatalog>::failure(result.error());
             }
+        }
+    }
+    if (version >= 3U) {
+        if (!require_token(input, "MATERIAL_GRAPH_BINDINGS") ||
+            !read_count(input, kMaxRecordsPerKind, count)) {
+            return core::Result<MaterialCatalog>::failure(parse_error(
+                "material graph binding count is invalid"));
+        }
+        for (std::size_t index = 0U; index < count; ++index) {
+            render::MaterialId material = 0U;
+            std::uint64_t graph_revision = 0U;
+            std::string graph_digest_text;
+            std::string graph_identity;
+            if (!require_token(input, "MATERIAL_GRAPH_BINDING") ||
+                !read_unsigned(input, material) || !read_unsigned(input, graph_revision) ||
+                !(input >> graph_digest_text >> std::quoted(graph_identity))) {
+                return core::Result<MaterialCatalog>::failure(parse_error(
+                    "material graph binding record is invalid"));
+            }
+            const auto graph_digest = assets::Sha256Digest::from_hex(graph_digest_text);
+            if (!graph_digest) {
+                return core::Result<MaterialCatalog>::failure(
+                    graph_digest.error().with_context("material graph binding digest"));
+            }
+            if (auto result = catalog.bind_material_graph(
+                    material, std::move(graph_identity)); !result) {
+                return core::Result<MaterialCatalog>::failure(result.error());
+            }
+            auto& binding = catalog.material_graph_bindings_.at(material);
+            binding.source_revision = core::Revision{graph_revision};
+            binding.source_digest = graph_digest.value();
         }
     }
     if (!require_token(input, "END")) {

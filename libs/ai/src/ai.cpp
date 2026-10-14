@@ -125,6 +125,7 @@ std::string json_escape(std::string_view value) {
 std::string preview_name(editor::PreviewKind kind) {
     switch (kind) {
     case editor::PreviewKind::object_transform: return "object_transform";
+    case editor::PreviewKind::object_translation_delta: return "object_translation_delta";
     case editor::PreviewKind::extrude_face: return "extrude_face";
     case editor::PreviewKind::inset_face: return "inset_face";
     case editor::PreviewKind::set_vertex_position: return "set_vertex_position";
@@ -160,6 +161,7 @@ std::string_view parameter_unit_name(ParameterUnit unit) noexcept {
     case ParameterUnit::world_length: return "world_length";
     case ParameterUnit::unit_interval: return "unit_interval";
     case ParameterUnit::world_position: return "world_position";
+    case ParameterUnit::world_displacement: return "world_displacement";
     }
     return "unknown";
 }
@@ -168,12 +170,14 @@ std::string_view effect_name(CapabilityEffect effect) noexcept {
     switch (effect) {
     case CapabilityEffect::geometry: return "geometry";
     case CapabilityEffect::topology: return "topology";
+    case CapabilityEffect::transform: return "transform";
     }
     return "unknown";
 }
 
 std::string_view target_name(CapabilityTarget target) noexcept {
     switch (target) {
+    case CapabilityTarget::selected_object: return "selected_object";
     case CapabilityTarget::selected_face: return "selected_face";
     case CapabilityTarget::selected_faces: return "selected_faces";
     case CapabilityTarget::selected_vertex: return "selected_vertex";
@@ -185,6 +189,8 @@ std::string_view target_name(CapabilityTarget target) noexcept {
 
 std::string_view data_name(CapabilityData data) noexcept {
     switch (data) {
+    case CapabilityData::object_transform: return "object_transform";
+    case CapabilityData::object_hierarchy: return "object_hierarchy";
     case CapabilityData::selected_component: return "selected_component";
     case CapabilityData::target_mesh: return "target_mesh";
     case CapabilityData::incident_topology: return "incident_topology";
@@ -194,6 +200,7 @@ std::string_view data_name(CapabilityData data) noexcept {
 
 std::string_view write_name(CapabilityWrite write) noexcept {
     switch (write) {
+    case CapabilityWrite::object_transform: return "object_transform";
     case CapabilityWrite::vertex_positions: return "vertex_positions";
     case CapabilityWrite::mesh_topology: return "mesh_topology";
     }
@@ -202,6 +209,8 @@ std::string_view write_name(CapabilityWrite write) noexcept {
 
 std::string_view invalidation_name(CapabilityInvalidation value) noexcept {
     switch (value) {
+    case CapabilityInvalidation::world_transforms: return "world_transforms";
+    case CapabilityInvalidation::spatial_queries: return "spatial_queries";
     case CapabilityInvalidation::render_mesh: return "render_mesh";
     case CapabilityInvalidation::topology_cache: return "topology_cache";
     case CapabilityInvalidation::surface_normals: return "surface_normals";
@@ -216,6 +225,8 @@ std::string_view invalidation_name(CapabilityInvalidation value) noexcept {
 std::string_view validator_name(CapabilityValidator value) noexcept {
     switch (value) {
     case CapabilityValidator::target_exists: return "target_exists";
+    case CapabilityValidator::root_object: return "root_object";
+    case CapabilityValidator::unlocked_subtree: return "unlocked_subtree";
     case CapabilityValidator::finite_parameters: return "finite_parameters";
     case CapabilityValidator::mesh_valid: return "mesh_valid";
     case CapabilityValidator::face_planar: return "face_planar";
@@ -228,6 +239,7 @@ std::string_view validator_name(CapabilityValidator value) noexcept {
 
 std::string_view risk_name(CapabilityRisk risk) noexcept {
     switch (risk) {
+    case CapabilityRisk::reversible_transform: return "reversible_transform";
     case CapabilityRisk::reversible_geometry: return "reversible_geometry";
     case CapabilityRisk::reversible_topology: return "reversible_topology";
     case CapabilityRisk::destructive_topology: return "destructive_topology";
@@ -414,6 +426,23 @@ core::Result<Proposal> make_face_proposal(
     return core::Result<Proposal>::success(std::move(proposal));
 }
 
+core::Result<Proposal> make_object_translation_proposal(
+    std::string request_id,
+    std::string intent,
+    const Context& context,
+    core::Vec3d delta) {
+    Proposal proposal{
+        std::move(request_id), context.project_revision, context.authoring,
+        editor::PreviewKind::object_translation_delta,
+        editor::PreviewParameters{std::nullopt, std::nullopt, delta},
+        "object.translate", std::move(intent),
+        "Native planner produced a bounded root-object translation delta."};
+    if (auto result = proposal.validate(context); !result) {
+        return core::Result<Proposal>::failure(result.error());
+    }
+    return core::Result<Proposal>::success(std::move(proposal));
+}
+
 } // namespace
 
 core::Result<void> OperationDescriptor::validate() const {
@@ -442,7 +471,8 @@ core::Result<void> OperationDescriptor::validate() const {
             "AI operation capability contract omits a typed native parameter"));
     }
     const std::uint32_t known_effects =
-        effect_mask(CapabilityEffect::geometry) | effect_mask(CapabilityEffect::topology);
+        effect_mask(CapabilityEffect::geometry) | effect_mask(CapabilityEffect::topology) |
+        effect_mask(CapabilityEffect::transform);
     if ((effects & ~known_effects) != 0U) {
         return core::Result<void>::failure(invalid(
             "AI operation declares an unknown capability effect"));
@@ -528,9 +558,10 @@ core::Result<void> ParameterDefinition::validate() const {
         }
         break;
     case ParameterType::vector3:
-        if (unit != ParameterUnit::world_position) {
+        if (unit != ParameterUnit::world_position &&
+            unit != ParameterUnit::world_displacement) {
             return core::Result<void>::failure(invalid(
-                "vector parameter must declare world-position units"));
+                "vector parameter must declare world-position or displacement units"));
         }
         break;
     }
@@ -577,7 +608,13 @@ core::Result<void> Proposal::validate(const Context& expected) const {
         return core::Result<void>::failure(invalid_state(
             "AI proposal references an operation without a matching native preview"));
     }
-    if (preview_kind == editor::PreviewKind::extrude_face ||
+    if (preview_kind == editor::PreviewKind::object_translation_delta) {
+        if (expected.authoring.selection_mode != editor::SelectionMode::object ||
+            expected.authoring.objects.size() != 1U) {
+            return core::Result<void>::failure(invalid_state(
+                "object translation requires exactly one selected object"));
+        }
+    } else if (preview_kind == editor::PreviewKind::extrude_face ||
         preview_kind == editor::PreviewKind::inset_face) {
         if (expected.authoring.selection_mode != editor::SelectionMode::face ||
             expected.authoring.faces.size() != 1U ||
@@ -718,6 +755,44 @@ std::vector<OperationDescriptor> build_operation_ontology(
         add_capability_contract(tool, descriptor);
         result.push_back(std::move(descriptor));
     }
+    OperationDescriptor translation;
+    translation.id = "object.translate";
+    translation.display_name = "Translate Root Object";
+    translation.kernel_operation = "scene.SceneObject.translate_root";
+    translation.parameters = {"delta"};
+    translation.parameter_schema = {parameter(
+        "delta", ParameterType::vector3, ParameterUnit::world_displacement,
+        std::nullopt, std::nullopt, true, true,
+        "Root-object translation delta in meters")};
+    translation.precondition =
+        "exactly one root object selected; finite displacement within the work envelope; "
+        "the complete descendant subtree is scoped, unprotected, and unlocked";
+    translation.preview_supported = true;
+    translation.auto_approvable = false;
+    translation.preview_kind = editor::PreviewKind::object_translation_delta;
+    translation.contract_complete = true;
+    translation.provider_requestable = true;
+    translation.effects = effect_mask(CapabilityEffect::transform);
+    translation.targets = {CapabilityTarget::selected_object};
+    translation.reads = {
+        CapabilityData::object_transform,
+        CapabilityData::object_hierarchy};
+    translation.writes = {CapabilityWrite::object_transform};
+    translation.invalidates = {
+        CapabilityInvalidation::world_transforms,
+        CapabilityInvalidation::spatial_queries,
+        CapabilityInvalidation::collision_candidates,
+        CapabilityInvalidation::bakes,
+        CapabilityInvalidation::navigation};
+    translation.validators = {
+        CapabilityValidator::target_exists,
+        CapabilityValidator::root_object,
+        CapabilityValidator::unlocked_subtree,
+        CapabilityValidator::finite_parameters,
+        CapabilityValidator::operation_preconditions};
+    translation.risk = CapabilityRisk::reversible_transform;
+    translation.cost.objects_read = 1U;
+    result.push_back(std::move(translation));
     return result;
 }
 
@@ -725,7 +800,8 @@ std::vector<OperationDescriptor> project_capabilities(
     std::span<const OperationDescriptor> capabilities,
     std::uint32_t permitted_effects) {
     const std::uint32_t known_effects =
-        effect_mask(CapabilityEffect::geometry) | effect_mask(CapabilityEffect::topology);
+        effect_mask(CapabilityEffect::geometry) | effect_mask(CapabilityEffect::topology) |
+        effect_mask(CapabilityEffect::transform);
     if (permitted_effects == 0U || (permitted_effects & ~known_effects) != 0U) return {};
 
     std::vector<OperationDescriptor> result;
@@ -787,7 +863,8 @@ std::string context_json(const Context& context) {
         };
         result += ",\"effects\":[";
         bool has_effect = false;
-        for (const auto effect : {CapabilityEffect::geometry, CapabilityEffect::topology}) {
+        for (const auto effect : {CapabilityEffect::geometry, CapabilityEffect::topology,
+                CapabilityEffect::transform}) {
             if ((operation.effects & effect_mask(effect)) == 0U) continue;
             if (has_effect) result.push_back(',');
             result += "\"" + std::string(effect_name(effect)) + "\"";
@@ -879,6 +956,19 @@ core::Result<Proposal> NativePlanner::propose(
     if (!parsed_numbers) return core::Result<Proposal>::failure(parsed_numbers.error());
     const std::string request_id = make_request_id(next_request_id_++);
 
+    if (words.size() == 6U && words[0] == "translate" && words[1] == "object" &&
+        words[2] == "by") {
+        if (parsed_numbers.value().size() != 3U) {
+            return core::Result<Proposal>::failure(invalid(
+                "translate object by requires exactly three displacement values"));
+        }
+        return make_object_translation_proposal(
+            request_id, std::string(intent), context,
+            core::Vec3d{
+                parsed_numbers.value()[0], parsed_numbers.value()[1],
+                parsed_numbers.value()[2]});
+    }
+
     if (words.front() == "extrude" || words.front() == "extrude-face") {
         if (parsed_numbers.value().size() != 1U) {
             return core::Result<Proposal>::failure(invalid(
@@ -918,7 +1008,7 @@ core::Result<Proposal> NativePlanner::propose(
         return core::Result<Proposal>::success(std::move(proposal));
     }
     return core::Result<Proposal>::failure(invalid(
-        "native planner supports extrude, inset, and move vertex intents"));
+        "native planner supports translate object, extrude, inset, and move vertex intents"));
 }
 
 } // namespace carto::ai

@@ -3,6 +3,7 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -202,6 +203,63 @@ void transform_preview_is_axis_constrained_and_revision_bound() {
         editor::ViewportTranslateAxis::world_x, {}, 0.0));
 }
 
+void viewport_transform_snap_policy_is_shared_and_source_bound() {
+    using namespace carto;
+    geometry::EditableMesh mesh;
+    const auto first = mesh.add_vertex({0.0, 0.0, 0.0});
+    const auto second = mesh.add_vertex({1.0, 0.0, 0.0});
+    const auto third = mesh.add_vertex({0.0, 1.0, 1.0});
+    REQUIRE(first && second && third && mesh.add_face({
+        first.value(), second.value(), third.value()}));
+    const auto compiled_result = mesh.compile();
+    REQUIRE(compiled_result);
+    const auto compiled = std::make_shared<const geometry::CompiledMesh>(
+        compiled_result.value());
+    render::RenderScene scene;
+    core::Transform target_transform;
+    target_transform.translation = {1.2, 4.0, 0.0};
+    const scene::ObjectId target_object{31U};
+    REQUIRE(scene.upsert({target_object, compiled, target_transform,
+        compiled->source_revision, 9U}));
+
+    const core::Revision revision{8U};
+    editor::SnapSession snap_session;
+    core::Transform preview;
+    preview.translation = {1.15, 20.0, 0.0};
+    const auto geometry = editor::snap_viewport_transform_preview(
+        preview, editor::ViewportTranslateAxis::world_x, scene, revision,
+        false, true, snap_session, scene::ObjectId{32U});
+    REQUIRE(geometry && geometry.value().candidate.has_value());
+    REQUIRE(geometry.value().candidate->kind == editor::SnapKind::vertex);
+    REQUIRE(geometry.value().candidate->object == target_object);
+    REQUIRE(std::abs(geometry.value().transform.translation.x - 1.2) < 1e-12);
+    REQUIRE(geometry.value().transform.translation.y == 20.0);
+    REQUIRE(geometry.value().transform.translation.z == 0.0);
+    REQUIRE(snap_session.locked());
+
+    const auto precedence = editor::snap_viewport_transform_preview(
+        preview, editor::ViewportTranslateAxis::world_x, scene, revision,
+        true, true, snap_session, scene::ObjectId{32U});
+    REQUIRE(precedence && !precedence.value().candidate.has_value());
+    REQUIRE(std::abs(precedence.value().transform.translation.x - 1.25) < 1e-12);
+    REQUIRE(!snap_session.locked());
+
+    const auto reacquired = editor::snap_viewport_transform_preview(
+        preview, editor::ViewportTranslateAxis::world_x, scene, revision,
+        false, true, snap_session, scene::ObjectId{32U});
+    REQUIRE(reacquired && reacquired.value().candidate.has_value());
+    const auto stale = editor::snap_viewport_transform_preview(
+        preview, editor::ViewportTranslateAxis::world_x, scene, revision.next(),
+        false, true, snap_session, scene::ObjectId{32U});
+    REQUIRE(!stale && stale.error().code == core::ErrorCode::stale_data);
+
+    const auto excluded = editor::snap_viewport_transform_preview(
+        preview, editor::ViewportTranslateAxis::world_x, scene, revision,
+        false, true, snap_session, target_object);
+    REQUIRE(excluded && !excluded.value().candidate.has_value());
+    REQUIRE(!snap_session.locked());
+}
+
 void work_surface_camera_fits_projects_and_preserves_zoom_anchor() {
     using namespace carto;
     editor::WorkSurfaceCamera camera;
@@ -262,6 +320,7 @@ int main() {
         box_selection_deduplicates_objects_and_preserves_components();
         interaction_session_captures_cancels_and_rejects_revision_changes();
         transform_preview_is_axis_constrained_and_revision_bound();
+        viewport_transform_snap_policy_is_shared_and_source_bound();
         work_surface_camera_fits_projects_and_preserves_zoom_anchor();
         work_surface_camera_rejects_invalid_fit_and_pointer_inputs();
     } catch (const std::exception& error) {

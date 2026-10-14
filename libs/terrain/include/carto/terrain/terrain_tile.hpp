@@ -95,6 +95,13 @@ private:
 [[nodiscard]] std::string terrain_tile_identity(TileKey key);
 [[nodiscard]] core::Result<TileKey> parse_terrain_tile_identity(std::string_view identity);
 
+// Chooses the finest uniform terrain LOD whose deterministic triangulation
+// stays within the caller's preview budget. The source remains unchanged.
+[[nodiscard]] core::Result<std::uint32_t> lod_step_for_triangle_budget(
+    std::uint32_t source_width,
+    std::uint32_t source_height,
+    std::uint64_t maximum_triangles);
+
 // Converts only an authored elevation source to the existing hydro
 // bathymetry contract. The coordinate-frame label is mandatory because the
 // U/V axes are caller-defined and must not be guessed as world XY.

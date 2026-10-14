@@ -392,6 +392,86 @@ core::Result<void> ViewportTransformSession::cancel() {
     return core::Result<void>::success();
 }
 
+core::Result<ViewportTransformSnapResult> snap_viewport_transform_preview(
+    core::Transform preview,
+    ViewportTranslateAxis axis,
+    const render::RenderScene& scene,
+    core::Revision source_revision,
+    bool grid_snap,
+    bool geometry_snap,
+    SnapSession& session,
+    std::optional<scene::ObjectId> excluded_object) {
+    if (!preview.finite() || (axis != ViewportTranslateAxis::world_x &&
+            axis != ViewportTranslateAxis::world_z) ||
+        (excluded_object.has_value() && !static_cast<bool>(*excluded_object))) {
+        return core::Result<ViewportTransformSnapResult>::failure(invalid(
+            "viewport transform snap source or axis is invalid"));
+    }
+
+    ViewportTransformSnapResult result;
+    result.transform = preview;
+    if (grid_snap) {
+        session.reset();
+        SnapSettings settings;
+        settings.enabled = true;
+        settings.kind = SnapKind::increment;
+        settings.increment = 0.25;
+        const double value = axis == ViewportTranslateAxis::world_x
+            ? preview.translation.x : preview.translation.z;
+        const auto snapped = snap_scalar(value, settings);
+        if (!snapped) {
+            return core::Result<ViewportTransformSnapResult>::failure(snapped.error());
+        }
+        if (axis == ViewportTranslateAxis::world_x) {
+            result.transform.translation.x = snapped.value();
+        } else {
+            result.transform.translation.z = snapped.value();
+        }
+        return core::Result<ViewportTransformSnapResult>::success(std::move(result));
+    }
+
+    if (!geometry_snap) {
+        session.reset();
+        return core::Result<ViewportTransformSnapResult>::success(std::move(result));
+    }
+
+    constexpr std::array<SnapKind, 3> kSnapKinds{
+        SnapKind::vertex, SnapKind::edge_midpoint, SnapKind::face_center};
+    SnapProfile profile;
+    auto candidates = find_snap_candidates(scene, preview.translation, kSnapKinds,
+        source_revision, profile.break_radius);
+    if (!candidates) {
+        return core::Result<ViewportTransformSnapResult>::failure(candidates.error());
+    }
+    if (excluded_object.has_value()) {
+        std::erase_if(candidates.value(), [excluded_object](const auto& candidate) {
+            return candidate.object == excluded_object;
+        });
+    }
+    const auto constraint = axis == ViewportTranslateAxis::world_x
+        ? SnapConstraintAxis::world_x : SnapConstraintAxis::world_z;
+    const auto decision = acquire_snap(candidates.value(), preview.translation,
+        source_revision, profile, session, {constraint, 0.05});
+    if (!decision) {
+        return core::Result<ViewportTransformSnapResult>::failure(decision.error());
+    }
+    result.candidate = decision.value().candidate;
+    if (result.candidate.has_value()) {
+        if (!result.candidate->object.has_value() ||
+            !result.candidate->mesh_asset.has_value()) {
+            session.reset();
+            return core::Result<ViewportTransformSnapResult>::failure(invalid(
+                "viewport geometry snap target has incomplete source identity"));
+        }
+        if (axis == ViewportTranslateAxis::world_x) {
+            result.transform.translation.x = result.candidate->position.x;
+        } else {
+            result.transform.translation.z = result.candidate->position.z;
+        }
+    }
+    return core::Result<ViewportTransformSnapResult>::success(std::move(result));
+}
+
 bool WorkSurfaceCamera::valid() const noexcept {
     return target_.finite() && std::isfinite(view_height_) &&
         view_height_ >= kMinViewHeight && view_height_ <= kMaxViewHeight;

@@ -20,7 +20,9 @@
 - A missing goal cannot start a task, and a source edit after speculative execution prevents acceptance without overwriting the newer source.
 - An invalid native operation blocks the task without changing the source.
 - Acceptance before gates pass, repeated execution, or rejection after acceptance is invalid.
-- The UI captures only a single exact face or vertex per step and exposes explicit accept/reject actions.
+- The UI captures only a single exact object, face, or vertex per step and exposes explicit accept/reject actions.
+- Object translation is absent from the generic AI proposal path, requires an explicit Agent Workbench transform permission and positive cumulative meter bound, and cannot change the source before human acceptance.
+- Translation rejects multiple selected objects, missing transform permission, an invalid or exceeded distance bound, and an objective `preserve_transform` constraint; a successful root translation changes the object transform while preserving rotation, scale, and mesh content.
 - Distinct geometry results produce distinct digests even when their mesh counts and revision shape match.
 
 ## SceneQuery coverage
@@ -37,6 +39,7 @@
 - Every known native mesh tool has a complete typed contract; kernel/ID drift remains unclassified and cannot be provider-requestable.
 - Parameter names match the native tool, numeric bounds are finite and coherent, and length/factor/count units are explicit.
 - Geometry-only envelopes expose vertex positioning while excluding topology-changing previews; unsupported registered tools never appear in the planner projection.
+- Transform-only projection exposes the typed root-object operation, while the generic AI context remains geometry/topology-only; the translation contract is never auto-approvable.
 - The projected context contains no command callback, project document, or direct mutation handle.
 
 ## Objective and clarification coverage
@@ -48,6 +51,8 @@
 - Changing the goal or source revision after an answer invalidates the workflow; a failed unresolved attempt does not consume the next task identity.
 - Reordering identity lists does not change the canonical objective digest, while changing an answer or hard constraint does.
 - Topology-preservation constraints reject a topology capability before speculative execution, and displacement gates block an over-limit result.
+- UI constraint drafts reject out-of-scope targets, missing rationale, duplicate identities, and unknown constraint kinds; answered objectives cannot be silently weakened, and checkpoint round-trip preserves the accepted constraints.
+- A policy-rejected step records the unchanged speculative revision as its after-revision, allowing blocked-task checkpoint validation without inventing a project mutation.
 - Acceptance journal evidence records both the objective digest and the result diff digest.
 
 ## Plan DAG coverage
@@ -76,19 +81,19 @@
 - A correction mutates only the speculative session, refreshes the ProjectDiff and rendered after-scene, and re-runs acceptance gates. Acceptance remains blocked when any required gate fails.
 - Each correction receipt binds the task identity, object, before/after transforms, source and branch revisions, plan context, parent evidence digest, and operator reason.
 - Repair, same-source resume, and disjoint-source rebase replay the latest locked transform only when the replayed branch still has the recorded before transform. Repair lineage binds the inherited correction chain; replay drift blocks acceptance.
-- Checkpoint format version 3 persists correction evidence and reads version 1 and 2 files without correction evidence. Loading remains non-mutating until explicit replay and acceptance.
+- Checkpoint format version 5 persists object targets, transform-distance authority, correction evidence, and recipe identity; it reads versions 1 through 4 while preserving legacy target encoding. Loading remains non-mutating until explicit replay and acceptance.
 
 ## Persistent task checkpoint coverage
 
-- Checkpoints are immutable, versioned files with a checksum, source and speculative project digests, objective/plan context digest, work envelope, step progress, failure receipts, repair lineage, last diff digest, validation report, and provider identity.
+- Checkpoints are immutable, versioned files with a checksum, source and speculative project digests, objective/plan context digest, work envelope, step progress, failure receipts, repair lineage, last diff digest, validation report, and provider identity. Version 5 round-trips recipe identity; versions 1 through 4 remain readable.
 - Checkpoint loading validates size bounds, schema version, project documents, source revision, scope equality, enum values, progress, and digest bindings before exposing workflow state.
 - A checkpoint is workflow state. Loading it does not replace or mutate the live project document.
 - Human clarification answers and their private receipts are removed from checkpoint plans; consequential questions must be answered again through the human application boundary.
 - Same-source resume requires the unchanged source revision and complete serialized source digest, then replays the native plan in a new speculative session. The resulting artifact and diff digests must match before a prior review task can remain acceptable.
-- An explicit rebase analysis derives object and mesh read/write sets from objective scope, target objects, mesh bindings, and target ancestry. Disjoint object or mesh edits can be rebased; changed scope/ancestor objects, scoped meshes, target write meshes, or a new out-of-scope instance of a written shared mesh block.
+- An explicit rebase analysis derives object and mesh read/write sets from objective scope, target objects, mesh bindings, and target ancestry. Object-transform targets do not require a mesh binding, and the transform write set includes the root and every descendant. Disjoint object or mesh edits can be rebased; changed scope/ancestor objects, scoped meshes, target write meshes, or a new out-of-scope instance of a written shared mesh block.
 - CONDITION or engineering sidecar changes block rebase while field-level query provenance is unavailable. Rebase requires a plan bound to the exact current revision, unchanged intent/scope/dependencies, and renewed human clarification answers.
 - A conflict-free rebase replays the complete native plan against the current source and compares the saved and replayed task write-set objects/meshes. Replay drift blocks acceptance. The accepted result includes all unrelated source edits because the speculative branch starts from the current source.
-- Rebase lineage records the previous/current source revisions and digests, canonical read/write set digests, and bounded identities. Checkpoint format version 3 reads version 1 and 2 checkpoints without newer correction evidence.
+- Rebase lineage records the previous/current source revisions and digests, canonical read/write set digests, and bounded identities. Checkpoint format version 5 reads versions 1 through 4 without fields introduced by later versions.
 - Rebase currently replays the full plan conservatively; per-step invalidation and re-execution from a minimal affected DAG frontier are not implemented.
 - Accepted and rejected checkpoints remain inspectable history and cannot be resumed. Checkpoint writes do not replace an existing file, preserving prior task history.
 - Corrupted files, attempts to overwrite a checkpoint, conflicting source changes, missing reapproval, and replayed write-set drift are blocked without changing the live project.
@@ -101,6 +106,24 @@
 - The strip is hidden in the Agent workspace, after acceptance/rejection, and when no task exists.
 - Native-shell smoke coverage should click the global “Ask Cartographer” entry from Project, Market, and Model surfaces, then confirm Agent workspace navigation and goal-field focus without changing task or project state.
 
+## Recipe contract coverage
+
+- `Bounded mesh edit` keeps the operator-authored plan and binds its recipe ID into objective and clarification digests; changing a recipe after a human answer is rejected until the objective is reauthorized.
+- The recipe clamps topology work to 512 operations, rejects transform authority, and adds a required scene-identity gate that blocks object add/remove, renaming, transform, hierarchy, visibility, lock, and mesh-binding changes.
+- Checkpoint format v5 round-trips the recipe; older versions remain readable with no recipe selected. A forged checkpoint that expands the recipe envelope is rejected.
+- `Topology-preserving vertex edit` limits the work envelope to geometry effects and zero topology operations. It adds a required gate over mesh, vertex, and face topology changes while allowing vertex-position edits; topology-changing operations and transform authority fail closed, and repair reapplies the recipe limits.
+- A forged checkpoint that adds topology permission to the vertex recipe is rejected, while a geometry-only edit and a repaired geometry-only plan remain reviewable without mutating the source project.
+- Recipes constrain validation and envelope policy; they do not generate steps or infer an objective.
+
+
+## Recorded demonstration coverage
+
+- Only a human-accepted task with passed steps and all required gates can be captured; review-ready and blocked tasks are rejected.
+- Serialization round-trips bounded step/gate evidence, checksums, and relative revision offsets; corrupted content, invalid aliases, and failed required gates are rejected.
+- The record excludes project bytes, real object IDs, object names, goal/step text, prompts, answers, and paths; step object aliases preserve only within-record relationships.
+- Saving is immutable and size-bounded. Opening a record does not create an AgentTask, mutate a project, or cross the human acceptance boundary.
+- The format checksum detects accidental edits only; it is not a signature or proof that the trace came from a trusted Cartographer process.
+
 ## Follow-up coverage
 
-Add failure injection for durable journal append rollback, unrelated and conflicting source edits during a future rebase flow, bounded repair exhaustion, semantic-sidecar size pressure, and provider timeouts as those tranches are implemented. Clarification questions and answers are reviewable evidence, not natural-language commands; the workbench still does not compile free-form goals or infer questions automatically.
+Add failure injection for durable journal append rollback, additional unrelated and conflicting source edits during safe rebase, bounded repair exhaustion, semantic-sidecar size pressure, and provider timeouts as those tranches are implemented. Clarification questions and answers are reviewable evidence, not natural-language commands; the workbench still does not compile free-form goals or infer questions automatically.

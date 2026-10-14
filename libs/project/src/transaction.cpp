@@ -210,6 +210,18 @@ core::Result<void> ProjectTransaction::erase_road_source(
     return staged_.erase_road_source_if_revision(identity, expected_source_revision);
 }
 
+core::Result<void> ProjectTransaction::set_sweep_source(geometry::SweepSource source) {
+    if (auto result = ensure_active(); !result) return result;
+    return staged_.set_sweep_source(std::move(source));
+}
+
+core::Result<void> ProjectTransaction::erase_sweep_source(
+    std::string identity,
+    core::Revision expected_source_revision) {
+    if (auto result = ensure_active(); !result) return result;
+    return staged_.erase_sweep_source_if_revision(identity, expected_source_revision);
+}
+
 core::Result<void> ProjectTransaction::set_spatial_field(
     spatial_field::ScalarField2D field) {
     if (auto result = ensure_active(); !result) return result;
@@ -253,6 +265,12 @@ core::Result<void> ProjectTransaction::set_cloth_rest_pose_receipt(
     if (auto result = ensure_active(); !result) return result;
     return staged_.set_cloth_rest_pose_receipt(
         mesh_asset, std::move(serialized_receipt), digest);
+}
+
+core::Result<void> ProjectTransaction::apply_source_reimport_plan(
+    const assets::SourceReimportPlan& plan) {
+    if (auto result = ensure_active(); !result) return result;
+    return staged_.apply_source_reimport_plan(plan);
 }
 
 core::Result<void> ProjectTransaction::set_object_transform(

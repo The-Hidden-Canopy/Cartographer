@@ -200,12 +200,18 @@ void project_field_mutations_are_journaled_and_migrate_v17() {
                 core::Revision{2U},
         "project save/reopen preserves field source identity and revision");
     std::string legacy_v18 = document.serialize();
+    const auto sweep_table = legacy_v18.find("SWEEP_SOURCES 0\n");
+    require(sweep_table != std::string::npos,
+        "schema v18 fixture removes the v22 sweep-source table");
+    legacy_v18.erase(sweep_table, std::string("SWEEP_SOURCES 0\n").size());
     const auto lineage_table = legacy_v18.find("SPATIAL_FIELD_LINEAGE ");
     require(lineage_table != std::string::npos,
         "current project includes retained spatial-field lineage");
     legacy_v18 = legacy_v18.substr(0U, lineage_table) + "END\n";
-    legacy_v18.replace(0U, std::string("CARTOGRAPHER_PROJECT 19").size(),
-        "CARTOGRAPHER_PROJECT 18");
+    const std::string current_header = "CARTOGRAPHER_PROJECT 22";
+    require(legacy_v18.starts_with(current_header),
+        "schema v18 fixture starts with the current project header");
+    legacy_v18.replace(0U, current_header.size(), "CARTOGRAPHER_PROJECT 18");
     const auto migrated_v18 = project::ProjectDocument::deserialize(legacy_v18);
     require(migrated_v18 && migrated_v18.value().spatial_fields().size() == 1U &&
             migrated_v18.value().spatial_fields().at("field.pine-ridge.moisture")
@@ -270,9 +276,16 @@ void project_field_mutations_are_journaled_and_migrate_v17() {
     auto no_lineage = current.substr(0U, lineage) + "END\n";
     require(!project::ProjectDocument::deserialize(no_lineage),
         "schema v19 project cannot omit the mandatory field-lineage table");
-    current.replace(0U, std::string("CARTOGRAPHER_PROJECT 19").size(),
-        "CARTOGRAPHER_PROJECT 17");
-    current = current.substr(0U, table) + "END\n";
+    const auto v17_sweep_table = current.find("SWEEP_SOURCES 0\n");
+    require(v17_sweep_table != std::string::npos,
+        "schema v17 fixture removes the v22 sweep-source table");
+    current.erase(v17_sweep_table, std::string("SWEEP_SOURCES 0\n").size());
+    const std::string v17_current_header = "CARTOGRAPHER_PROJECT 22";
+    current.replace(0U, v17_current_header.size(), "CARTOGRAPHER_PROJECT 17");
+    const auto legacy_spatial_table = current.find("SPATIAL_FIELDS ");
+    require(legacy_spatial_table != std::string::npos,
+        "schema v17 fixture contains the current spatial-field table");
+    current = current.substr(0U, legacy_spatial_table) + "END\n";
     const auto migrated = project::ProjectDocument::deserialize(current);
     require(migrated && migrated.value().spatial_fields().empty(),
         "schema v17 migration introduces no fabricated spatial fields");
@@ -308,12 +321,98 @@ void project_save_reopen_preserves_extended_terrain_field_schema() {
         "project persistence does not bypass the domain journal event");
 }
 
+void wind_vector_preview_is_aligned_bounded_and_source_bound() {
+    auto u = spatial_field::ScalarField2D::create(
+        "field.wind.u", spatial_field::FieldSemantic::wind_u,
+        {10.0, -4.0}, 0.5, 40U, 24U, -5.0, 5.0, 3.0);
+    auto v = spatial_field::ScalarField2D::create(
+        "field.wind.v", spatial_field::FieldSemantic::wind_v,
+        {10.0, -4.0}, 0.5, 40U, 24U, -5.0, 5.0, -4.0);
+    require(u && v, "aligned wind component sources are valid");
+    const auto u_digest = u.value().canonical_digest();
+    const auto v_digest = v.value().canonical_digest();
+    require(u_digest && v_digest, "wind sources provide exact canonical digests");
+
+    const auto preview = spatial_field::build_vector_field_preview(u.value(), v.value());
+    require(preview && preview.value().validate(),
+        "aligned wind sources produce a valid derived vector preview");
+    require(preview.value().preview_width == 16U && preview.value().preview_height == 16U &&
+            preview.value().samples.size() == spatial_field::VectorFieldPreview::kMaxSamples,
+        "vector visualization decimates deterministically to a hard sample cap");
+    require(preview.value().u_component.identity == "field.wind.u" &&
+            preview.value().u_component.source_revision == core::Revision{1U} &&
+            preview.value().u_component.digest == u_digest.value() &&
+            preview.value().v_component.identity == "field.wind.v" &&
+            preview.value().v_component.source_revision == core::Revision{1U} &&
+            preview.value().v_component.digest == v_digest.value(),
+        "preview binds both exact source identities, revisions, and digests");
+    require(preview.value().sources_match("field.wind.u", core::Revision{1U},
+                u_digest.value(), "field.wind.v", core::Revision{1U}, v_digest.value()),
+        "current paired-source receipts match the generated preview");
+    require(preview.value().samples.front().position_uv.x == 10.0 &&
+            preview.value().samples.front().position_uv.y == -4.0 &&
+            preview.value().samples.front().vector_uv.x == 3.0 &&
+            preview.value().samples.front().vector_uv.y == -4.0 &&
+            preview.value().samples.back().position_uv.x == 29.5 &&
+            preview.value().samples.back().position_uv.y == 7.5,
+        "sample vectors and decimated positions retain the source U/V frame");
+    const auto repeated = spatial_field::build_vector_field_preview(u.value(), v.value());
+    require(repeated && repeated.value().samples.size() == preview.value().samples.size() &&
+            repeated.value().samples.front().vector_uv.x ==
+                preview.value().samples.front().vector_uv.x &&
+            repeated.value().samples.back().position_uv.y ==
+                preview.value().samples.back().position_uv.y,
+        "vector preview generation is deterministic");
+
+    auto wrong_semantic = spatial_field::ScalarField2D::create(
+        "field.wind.wrong", spatial_field::FieldSemantic::moisture,
+        {10.0, -4.0}, 0.5, 40U, 24U, -5.0, 5.0, 0.0);
+    auto shifted = spatial_field::ScalarField2D::create(
+        "field.wind.shifted", spatial_field::FieldSemantic::wind_v,
+        {10.25, -4.0}, 0.5, 40U, 24U, -5.0, 5.0, 0.0);
+    auto different_grid = spatial_field::ScalarField2D::create(
+        "field.wind.different-grid", spatial_field::FieldSemantic::wind_v,
+        {10.0, -4.0}, 0.5, 39U, 24U, -5.0, 5.0, 0.0);
+    require(wrong_semantic && shifted && different_grid,
+        "adversarial vector source fixtures are individually valid scalar fields");
+    require(!spatial_field::build_vector_field_preview(wrong_semantic.value(), v.value()) &&
+            !spatial_field::build_vector_field_preview(u.value(), shifted.value()) &&
+            !spatial_field::build_vector_field_preview(u.value(), different_grid.value()) &&
+            !spatial_field::build_vector_field_preview(u.value(), v.value(), 1U) &&
+            !spatial_field::build_vector_field_preview(u.value(), v.value(), 17U),
+        "wrong semantics, mismatched grids, and invalid caps fail closed");
+
+    auto edited_u = u.value();
+    spatial_field::FieldBrush brush;
+    brush.expected_revision = core::Revision{1U};
+    brush.center_uv = {10.0, -4.0};
+    brush.radius = 0.5;
+    brush.value = 4.0;
+    brush.mode = spatial_field::BrushMode::replace;
+    require(static_cast<bool>(edited_u.paint(brush)),
+        "source edit advances the wind component before rebuilding the preview");
+    const auto refreshed = spatial_field::build_vector_field_preview(edited_u, v.value());
+    require(refreshed &&
+            refreshed.value().u_component.source_revision == core::Revision{2U} &&
+            refreshed.value().u_component.digest != preview.value().u_component.digest &&
+            preview.value().u_component.source_revision == core::Revision{1U} &&
+            !preview.value().sources_match("field.wind.u", core::Revision{2U},
+                refreshed.value().u_component.digest, "field.wind.v", core::Revision{1U},
+                refreshed.value().v_component.digest),
+        "later source edits do not mutate old preview receipts and alter new receipts");
+
+    auto forged = preview.value();
+    forged.samples.push_back({});
+    require(!forged.validate(), "forged over-cap preview sample payload is rejected");
+}
+
 } // namespace
 
 int main() {
     scalar_field_is_canonical_bounded_and_revision_checked();
     project_field_mutations_are_journaled_and_migrate_v17();
     project_save_reopen_preserves_extended_terrain_field_schema();
+    wind_vector_preview_is_aligned_bounded_and_source_bound();
     std::cout << "spatial field tests passed\n";
     return EXIT_SUCCESS;
 }

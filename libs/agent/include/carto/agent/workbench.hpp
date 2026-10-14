@@ -15,6 +15,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -29,7 +30,7 @@ using Effect = ai::CapabilityEffect;
 
 struct TargetRef {
     scene::ObjectId object;
-    std::variant<geometry::FaceId, geometry::VertexId> component;
+    std::variant<geometry::FaceId, geometry::VertexId, std::monostate> component;
 
     [[nodiscard]] core::Result<void> validate() const;
 };
@@ -130,6 +131,19 @@ struct ClarificationFrontier {
     [[nodiscard]] bool requires_user_input() const noexcept;
 };
 
+struct AgentRecipeDefinition {
+    std::string_view id;
+    std::string_view label;
+    std::string_view description;
+    std::size_t max_topology_operations = 0U;
+    std::uint32_t permitted_effects = 0U;
+    bool preserve_topology = false;
+};
+
+[[nodiscard]] const std::vector<AgentRecipeDefinition>& agent_recipe_catalog() noexcept;
+[[nodiscard]] const AgentRecipeDefinition* find_agent_recipe(
+    std::string_view id) noexcept;
+
 struct AuthoringObjective {
     std::string id;
     std::string goal;
@@ -138,6 +152,7 @@ struct AuthoringObjective {
     std::vector<scene::ObjectId> protected_objects;
     std::vector<HardConstraint> hard_constraints;
     std::vector<ClarificationQuestion> clarifications;
+    std::string recipe_id;
 
     [[nodiscard]] core::Result<void> validate() const;
     [[nodiscard]] core::Result<assets::Sha256Digest> digest() const;
@@ -182,6 +197,7 @@ struct AgentWorkEnvelope {
     std::size_t max_query_result_bytes = 1U * 1024U * 1024U;
     std::size_t max_repair_attempts = 2U;
     std::size_t max_additional_operations = 4U;
+    double max_transform_distance_meters = 0.0;
 
     [[nodiscard]] core::Result<void> validate() const;
 };
@@ -356,6 +372,7 @@ struct AgentTaskSnapshot {
     TaskStatus status = TaskStatus::prepared;
     std::string task_id;
     std::string goal;
+    std::string recipe_id;
     assets::Sha256Digest objective_digest;
     std::vector<HardConstraint> hard_constraints;
     std::vector<ClarificationQuestion> clarifications;
@@ -380,12 +397,66 @@ struct AgentTaskSnapshot {
     bool can_accept = false;
 };
 
+
+// A demonstration is a redacted, read-only trace of an accepted task. It omits
+// project bytes, prompts, freeform goals and answers, filesystem paths, and
+// source object IDs. Digests detect accidental corruption but do not prove
+// authorship; loading a record never creates or authorizes a task.
+struct AgentDemonstrationStep {
+    assets::Sha256Digest intent_digest;
+    std::string tool_id;
+    std::uint32_t target_alias = 0U;
+    std::uint64_t revision_before_offset = 0U;
+    std::uint64_t revision_after_offset = 0U;
+    StepStatus status = StepStatus::failed;
+};
+
+struct AgentDemonstrationGate {
+    std::string id;
+    bool required = true;
+    bool passed = false;
+    std::string validator_version;
+    std::uint64_t source_revision_offset = 0U;
+    std::uint64_t evaluated_revision_offset = 0U;
+    std::size_t affected_object_count = 0U;
+    std::size_t affected_asset_count = 0U;
+    assets::Sha256Digest result_digest;
+    assets::Sha256Digest evidence_digest;
+};
+
+struct AgentDemonstration {
+    static constexpr std::uint32_t kFormatVersion = 1U;
+
+    std::string recipe_id;
+    assets::Sha256Digest objective_digest;
+    assets::Sha256Digest diff_digest;
+    std::uint64_t result_revision_span = 0U;
+    std::vector<AgentDemonstrationStep> steps;
+    std::vector<AgentDemonstrationGate> gates;
+    std::size_t repair_count = 0U;
+    std::size_t rebase_count = 0U;
+    std::size_t ghost_correction_count = 0U;
+
+    [[nodiscard]] core::Result<void> validate() const;
+    [[nodiscard]] core::Result<std::string> serialize() const;
+    [[nodiscard]] static core::Result<AgentDemonstration> deserialize(
+        std::string_view bytes);
+    [[nodiscard]] core::Result<void> save(const std::filesystem::path& path) const;
+    [[nodiscard]] static core::Result<AgentDemonstration> load(
+        const std::filesystem::path& path);
+
+private:
+    [[nodiscard]] static core::Result<AgentDemonstration> capture(
+        const AgentTaskSnapshot& snapshot);
+
+    friend class AgentTask;
+};
 // Immutable, checksummed workflow state. Human clarification answers are
 // deliberately removed from the persisted plan and must be reissued before a
 // resumed task can run. Project bytes remain artifacts owned by this record;
 // they are never applied to the live source by loading a checkpoint.
 struct AgentTaskCheckpoint {
-    static constexpr std::uint32_t kFormatVersion = 3U;
+    static constexpr std::uint32_t kFormatVersion = 5U;
 
     TaskStatus status = TaskStatus::prepared;
     AgentPlan plan;
@@ -455,6 +526,7 @@ public:
     [[nodiscard]] core::Result<void> save_checkpoint(
         const std::filesystem::path& path,
         std::string provider_identity = "cartographer.native-planner") const;
+    [[nodiscard]] core::Result<AgentDemonstration> create_demonstration() const;
     [[nodiscard]] static core::Result<AgentTaskCheckpoint> load_checkpoint(
         const std::filesystem::path& path);
     [[nodiscard]] static core::Result<AgentTask> resume_checkpoint(
@@ -512,6 +584,7 @@ private:
     std::vector<AcceptanceGateResult> gates_;
     SceneQueryBudget query_budget_;
     std::set<scene::ObjectId> touched_objects_;
+    double transform_distance_used_meters_ = 0.0;
     TaskStatus status_ = TaskStatus::prepared;
     std::optional<core::Diagnostic> diagnostic_;
     mutable std::optional<AgentTaskSnapshot> cached_snapshot_;

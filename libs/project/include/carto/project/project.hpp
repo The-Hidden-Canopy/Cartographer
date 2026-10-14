@@ -1,12 +1,14 @@
 #pragma once
 
 #include <carto/assets/blob_store.hpp>
+#include <carto/assets/source_registry.hpp>
 #include <carto/core/revision.hpp>
 #include <carto/condition/authoring.hpp>
 #include <carto/engineering/authoring.hpp>
 #include <carto/core/result.hpp>
 #include <carto/geometry/mesh.hpp>
 #include <carto/geometry/curve_path.hpp>
+#include <carto/geometry/sweep.hpp>
 #include <carto/project/file_lock.hpp>
 #include <carto/project/material_catalog.hpp>
 #include <carto/project/presentation_catalog.hpp>
@@ -47,8 +49,12 @@ class SplitProjectSelectedEdgeCommand;
 class TriToQuadProjectSelectedFacesCommand;
 class SetProjectEngineeringAuthoringCommand;
 class SetProjectConditionAuthoringCommand;
+class SetProjectMaterialCatalogCommand;
 class SetProjectSpatialFieldCommand;
 class SetProjectRoadAuthoringCommand;
+class SetProjectSweepSourceCommand;
+class ApplySourceReimportPlanCommand;
+class ImportSourceMeshCommand;
 class ReplaceProjectDocumentCommand;
 }
 
@@ -130,7 +136,7 @@ struct SerializedConditionAuthoring {
 
 class ProjectDocument {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 20;
+    static constexpr std::uint32_t kSchemaVersion = 22;
     static constexpr std::uint32_t kMinimumReadableSchemaVersion = 1;
     static constexpr std::string_view kMagic = "CARTOGRAPHER_PROJECT";
     static constexpr std::string_view kAuthoringFormat = "cartographer.authoring";
@@ -163,6 +169,8 @@ public:
     [[nodiscard]] const std::map<std::string, RoadSource>& road_sources() const noexcept {
         return road_sources_;
     }
+    [[nodiscard]] const std::map<std::string, geometry::SweepSource>&
+    sweep_sources() const noexcept { return sweep_sources_; }
     [[nodiscard]] const std::map<std::string, spatial_field::ScalarField2D>&
     spatial_fields() const noexcept { return spatial_fields_; }
     [[nodiscard]] const std::optional<assets::Sha256Digest>& evaluation_graph_digest() const noexcept {
@@ -210,6 +218,9 @@ public:
     condition_authoring() const noexcept {
         return condition_authoring_;
     }
+    [[nodiscard]] const assets::ProjectAssetRegistry& source_asset_registry() const noexcept {
+        return source_asset_registry_;
+    }
     [[nodiscard]] core::Revision revision() const noexcept { return revision_; }
     [[nodiscard]] std::uint32_t schema_version() const noexcept { return kSchemaVersion; }
 
@@ -233,8 +244,12 @@ private:
     friend class ::carto::editor::TriToQuadProjectSelectedFacesCommand;
     friend class ::carto::editor::SetProjectEngineeringAuthoringCommand;
     friend class ::carto::editor::SetProjectConditionAuthoringCommand;
+    friend class ::carto::editor::SetProjectMaterialCatalogCommand;
     friend class ::carto::editor::SetProjectSpatialFieldCommand;
     friend class ::carto::editor::SetProjectRoadAuthoringCommand;
+    friend class ::carto::editor::SetProjectSweepSourceCommand;
+    friend class ::carto::editor::ApplySourceReimportPlanCommand;
+    friend class ::carto::editor::ImportSourceMeshCommand;
     friend class ::carto::editor::ReplaceProjectDocumentCommand;
     friend class ::carto::project::ProjectTransaction;
 
@@ -281,6 +296,10 @@ private:
     [[nodiscard]] core::Result<void> erase_road_source_if_revision(
         std::string_view identity,
         core::Revision expected_source_revision);
+    [[nodiscard]] core::Result<void> set_sweep_source(geometry::SweepSource source);
+    [[nodiscard]] core::Result<void> erase_sweep_source_if_revision(
+        std::string_view identity,
+        core::Revision expected_source_revision);
     [[nodiscard]] core::Result<void> set_spatial_field(
         spatial_field::ScalarField2D field);
     [[nodiscard]] core::Result<void> erase_spatial_field_if_revision(
@@ -316,6 +335,8 @@ private:
         assets::Sha256Digest digest);
     [[nodiscard]] core::Result<void> erase_condition_authoring_if_revision(
         core::Revision expected_revision);
+    [[nodiscard]] core::Result<void> apply_source_reimport_plan(
+        const assets::SourceReimportPlan& plan);
     [[nodiscard]] core::Result<void> set_object_transform(
         scene::ObjectId object,
         core::Transform transform);
@@ -344,6 +365,9 @@ private:
     std::map<std::string, RoadSource> road_sources_;
     // Road intent has an independent lineage from its centerline source.
     std::map<std::string, core::Revision> road_source_lineage_;
+    std::map<std::string, geometry::SweepSource> sweep_sources_;
+    // Retained through deletion so sweep recipe IDs cannot reset their lineage.
+    std::map<std::string, core::Revision> sweep_source_lineage_;
     std::map<std::string, spatial_field::ScalarField2D> spatial_fields_;
     // Includes active fields and tombstones, preventing identity reuse from
     // resetting source lineage after a governed undo/delete.
@@ -360,6 +384,7 @@ private:
     std::map<std::uint64_t, SerializedClothRestPoseReceipt> cloth_rest_pose_receipts_;
     std::optional<SerializedEngineeringAuthoring> engineering_authoring_;
     std::optional<SerializedConditionAuthoring> condition_authoring_;
+    assets::ProjectAssetRegistry source_asset_registry_;
     std::optional<assets::Sha256Digest> evaluation_graph_digest_;
     std::uint64_t next_mesh_id_ = 1;
     core::Revision revision_{};

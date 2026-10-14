@@ -55,6 +55,7 @@ _deps/
 *.carto.lock
 *.journal.lock
 *.log
+.carto-assets/
 
 # Local credentials and environment (never commit workstation secrets)
 .env

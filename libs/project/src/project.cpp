@@ -78,6 +78,11 @@ constexpr std::uint64_t kMaxSerializedRoadSourceBytes = RoadSource::kMaxSerializ
 constexpr std::uint64_t kMaxSerializedRoadSourceAggregateBytes = 16ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaxSerializedCurvePathLineage = kMaxSerializedCurvePaths;
 constexpr std::uint64_t kMaxSerializedRoadSourceLineage = kMaxSerializedRoadSources;
+constexpr std::uint64_t kMaxSerializedSweepSources = 4'096U;
+constexpr std::uint64_t kMaxSerializedSweepSourceBytes =
+    geometry::SweepSource::kMaxSerializedBytes;
+constexpr std::uint64_t kMaxSerializedSweepSourceAggregateBytes = 16ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaxSerializedSweepSourceLineage = kMaxSerializedSweepSources;
 constexpr std::uint64_t kMaxSerializedSpatialFields = 512U;
 constexpr std::uint64_t kMaxSerializedSpatialFieldLineage = 4096U;
 constexpr std::uint64_t kMaxSerializedSpatialFieldBytes =
@@ -154,6 +159,41 @@ core::Result<void> validate_serialized_count(
             std::to_string(limit)));
     }
     return core::Result<void>::success();
+}
+
+std::string encode_hex_bytes(std::string_view bytes) {
+    constexpr char digits[] = "0123456789abcdef";
+    std::string encoded;
+    encoded.reserve(bytes.size() * 2U);
+    for (const char character : bytes) {
+        const auto byte = static_cast<unsigned char>(character);
+        encoded.push_back(digits[byte >> 4U]);
+        encoded.push_back(digits[byte & 0x0fU]);
+    }
+    return encoded;
+}
+
+std::optional<std::string> decode_hex_bytes(
+    std::string_view encoded,
+    std::size_t maximum_bytes) {
+    if ((encoded.size() % 2U) != 0U || encoded.size() / 2U > maximum_bytes) {
+        return std::nullopt;
+    }
+    const auto nibble = [](char value) -> int {
+        if (value >= '0' && value <= '9') return value - '0';
+        if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+        if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+        return -1;
+    };
+    std::string decoded;
+    decoded.reserve(encoded.size() / 2U);
+    for (std::size_t index = 0U; index < encoded.size(); index += 2U) {
+        const int high = nibble(encoded[index]);
+        const int low = nibble(encoded[index + 1U]);
+        if (high < 0 || low < 0) return std::nullopt;
+        decoded.push_back(static_cast<char>((high << 4) | low));
+    }
+    return decoded;
 }
 
 core::Result<void> require_line(std::istream& input, std::string_view expected) {
@@ -348,8 +388,10 @@ core::Result<void> atomic_replace(
             temporary.wstring().c_str(),
             target.wstring().c_str(),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const auto win32_error = static_cast<unsigned long>(GetLastError());
         return core::Result<void>::failure(
-            Diagnostic(ErrorCode::io_error, "atomic project replacement failed on Windows"));
+            Diagnostic(ErrorCode::io_error, "atomic project replacement failed on Windows (error " +
+                std::to_string(win32_error) + ")"));
     }
     return core::Result<void>::success();
 #else
@@ -943,6 +985,14 @@ core::Result<void> ProjectDocument::erase_curve_path_if_revision(
             ErrorCode::invalid_state,
             "curve source cannot be removed while a road source references it"));
     }
+    if (std::any_of(sweep_sources_.begin(), sweep_sources_.end(),
+            [&key](const auto& entry) {
+                return entry.second.centerline_identity == key;
+            })) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::invalid_state,
+            "curve source cannot be removed while a sweep source references it"));
+    }
     curve_paths_.erase(existing);
     bump_revision();
     return core::Result<void>::success();
@@ -1043,6 +1093,103 @@ core::Result<void> ProjectDocument::erase_road_source_if_revision(
             "road source no longer matches the requested source revision"));
     }
     road_sources_.erase(existing);
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::set_sweep_source(geometry::SweepSource source) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (auto result = source.validate(); !result) {
+        return core::Result<void>::failure(result.error().with_context(
+            "sweep source admission"));
+    }
+    const auto centerline = curve_paths_.find(source.centerline_identity);
+    if (centerline == curve_paths_.end()) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::not_found, "sweep source references a missing centerline"));
+    }
+    if (centerline->second.source_revision != source.centerline_revision) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::stale_data, "sweep source centerline revision is stale"));
+    }
+
+    const std::string identity = source.source_identity;
+    const auto existing = sweep_sources_.find(identity);
+    const auto lineage = sweep_source_lineage_.find(identity);
+    if (existing == sweep_sources_.end()) {
+        if (lineage != sweep_source_lineage_.end() && lineage->second.exhausted()) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::invalid_state, "sweep source revision space is exhausted"));
+        }
+        const core::Revision expected = lineage == sweep_source_lineage_.end()
+            ? core::Revision{1U} : lineage->second.next();
+        if (source.source_revision != expected) {
+            return core::Result<void>::failure(invalid(
+                "new sweep source must advance its retained identity lineage"));
+        }
+        if (sweep_sources_.size() >= kMaxSerializedSweepSources) {
+            return core::Result<void>::failure(parse_error(
+                "project sweep source count exceeds its limit"));
+        }
+    } else if (lineage == sweep_source_lineage_.end() ||
+        lineage->second != existing->second.source_revision ||
+        existing->second.source_revision.exhausted() ||
+        source.source_revision != existing->second.source_revision.next()) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::stale_data,
+            "sweep source update must advance exactly one source revision"));
+    }
+
+    const std::string encoded = source.serialize();
+    if (encoded.size() > kMaxSerializedSweepSourceBytes) {
+        return core::Result<void>::failure(parse_error(
+            "sweep source payload exceeds its project byte limit"));
+    }
+    std::uint64_t aggregate_bytes = encoded.size();
+    for (const auto& [stored_identity, stored_source] : sweep_sources_) {
+        if (stored_identity != identity) {
+            const std::size_t stored_size = stored_source.serialize().size();
+            if (stored_size > kMaxSerializedSweepSourceAggregateBytes - aggregate_bytes) {
+                return core::Result<void>::failure(parse_error(
+                    "project sweep sources exceed their aggregate byte limit"));
+            }
+            aggregate_bytes += static_cast<std::uint64_t>(stored_size);
+        }
+    }
+    if (aggregate_bytes > kMaxSerializedSweepSourceAggregateBytes) {
+        return core::Result<void>::failure(parse_error(
+            "project sweep sources exceed their aggregate byte limit"));
+    }
+    if (lineage == sweep_source_lineage_.end() &&
+        sweep_source_lineage_.size() >= kMaxSerializedSweepSourceLineage) {
+        return core::Result<void>::failure(parse_error(
+            "project sweep-source lineage count exceeds its limit"));
+    }
+    sweep_source_lineage_.insert_or_assign(identity, source.source_revision);
+    sweep_sources_.insert_or_assign(identity, std::move(source));
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::erase_sweep_source_if_revision(
+    std::string_view identity,
+    core::Revision expected_source_revision) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    const std::string key(identity);
+    const auto existing = sweep_sources_.find(key);
+    const auto lineage = sweep_source_lineage_.find(key);
+    if (existing == sweep_sources_.end() || lineage == sweep_source_lineage_.end() ||
+        existing->second.source_revision != expected_source_revision ||
+        lineage->second != expected_source_revision) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::stale_data,
+            "sweep source no longer matches the requested source revision"));
+    }
+    sweep_sources_.erase(existing);
     bump_revision();
     return core::Result<void>::success();
 }
@@ -1410,6 +1557,21 @@ core::Result<void> ProjectDocument::erase_condition_authoring_if_revision(
     return core::Result<void>::success();
 }
 
+core::Result<void> ProjectDocument::apply_source_reimport_plan(
+    const assets::SourceReimportPlan& plan) {
+    const auto updated = assets::apply_source_reimport_plan(source_asset_registry_, plan);
+    if (!updated) return core::Result<void>::failure(updated.error());
+    if (updated.value().serialize() == source_asset_registry_.serialize()) {
+        return core::Result<void>::success();
+    }
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    source_asset_registry_ = std::move(updated.value());
+    bump_revision();
+    return core::Result<void>::success();
+}
+
 core::Result<void> ProjectDocument::set_object_transform(
     scene::ObjectId object,
     core::Transform transform) {
@@ -1449,6 +1611,10 @@ core::Result<void> ProjectDocument::validate() const {
     if (!valid_source_namespace(source_namespace_)) {
         return core::Result<void>::failure(parse_error(
             "project source namespace is invalid"));
+    }
+    if (auto result = source_asset_registry_.validate(); !result) {
+        return core::Result<void>::failure(result.error().with_context(
+            "project source asset registry"));
     }
     if (auto result = scene_.validate(); !result) {
         return result;
@@ -1747,6 +1913,55 @@ core::Result<void> ProjectDocument::validate() const {
         }
         road_source_bytes += encoded_size;
     }
+    if (sweep_sources_.size() > kMaxSerializedSweepSources) {
+        return core::Result<void>::failure(parse_error(
+            "project sweep source count exceeds its limit"));
+    }
+    if (sweep_source_lineage_.size() > kMaxSerializedSweepSourceLineage) {
+        return core::Result<void>::failure(parse_error(
+            "project sweep-source lineage count exceeds its limit"));
+    }
+    for (const auto& [identity, revision] : sweep_source_lineage_) {
+        if (!valid_curve_or_road_identity(identity) || revision.value() == 0U) {
+            return core::Result<void>::failure(parse_error(
+                "project sweep-source lineage record is invalid"));
+        }
+        const auto active = sweep_sources_.find(identity);
+        if (active != sweep_sources_.end() && active->second.source_revision != revision) {
+            return core::Result<void>::failure(parse_error(
+                "active sweep source disagrees with retained source lineage"));
+        }
+    }
+    std::uint64_t sweep_source_bytes = 0U;
+    for (const auto& [identity, source] : sweep_sources_) {
+        if (identity != source.source_identity) {
+            return core::Result<void>::failure(parse_error(
+                "project sweep source key does not match its embedded identity"));
+        }
+        if (auto result = source.validate(); !result) {
+            return core::Result<void>::failure(result.error().with_context(
+                "project sweep source"));
+        }
+        const auto lineage = sweep_source_lineage_.find(identity);
+        if (lineage == sweep_source_lineage_.end() ||
+            lineage->second != source.source_revision) {
+            return core::Result<void>::failure(parse_error(
+                "active sweep source lacks its matching source lineage"));
+        }
+        const auto centerline = curve_paths_.find(source.centerline_identity);
+        if (centerline == curve_paths_.end() ||
+            centerline->second.source_revision != source.centerline_revision) {
+            return core::Result<void>::failure(parse_error(
+                "project sweep source has a missing or stale centerline binding"));
+        }
+        const std::uint64_t encoded_size = source.serialize().size();
+        if (encoded_size > kMaxSerializedSweepSourceBytes ||
+            encoded_size > kMaxSerializedSweepSourceAggregateBytes - sweep_source_bytes) {
+            return core::Result<void>::failure(parse_error(
+                "project sweep source bytes exceed their bounded storage limit"));
+        }
+        sweep_source_bytes += encoded_size;
+    }
     if (spatial_fields_.size() > kMaxSerializedSpatialFields) {
         return core::Result<void>::failure(parse_error(
             "project spatial-field count exceeds its limit"));
@@ -1848,6 +2063,8 @@ void ProjectDocument::swap(ProjectDocument& other) noexcept {
     curve_path_lineage_.swap(other.curve_path_lineage_);
     road_sources_.swap(other.road_sources_);
     road_source_lineage_.swap(other.road_source_lineage_);
+    sweep_sources_.swap(other.sweep_sources_);
+    sweep_source_lineage_.swap(other.sweep_source_lineage_);
     spatial_fields_.swap(other.spatial_fields_);
     spatial_field_lineage_.swap(other.spatial_field_lineage_);
     std::swap(semantic_sidecar_bytes_, other.semantic_sidecar_bytes_);
@@ -1857,6 +2074,7 @@ void ProjectDocument::swap(ProjectDocument& other) noexcept {
     cloth_rest_pose_receipts_.swap(other.cloth_rest_pose_receipts_);
     std::swap(engineering_authoring_, other.engineering_authoring_);
     std::swap(condition_authoring_, other.condition_authoring_);
+    std::swap(source_asset_registry_, other.source_asset_registry_);
     std::swap(evaluation_graph_digest_, other.evaluation_graph_digest_);
     std::swap(next_mesh_id_, other.next_mesh_id_);
     std::swap(revision_, other.revision_);
@@ -1992,6 +2210,11 @@ std::string ProjectDocument::serialize() const {
         output << "ROAD_SOURCE " << std::quoted(identity) << ' '
                << std::quoted(road.serialize()) << '\n';
     }
+    output << "SWEEP_SOURCES " << sweep_sources_.size() << '\n';
+    for (const auto& [identity, source] : sweep_sources_) {
+        output << "SWEEP_SOURCE " << std::quoted(identity) << ' '
+               << std::quoted(source.serialize()) << '\n';
+    }
     output << "SPATIAL_FIELDS " << spatial_fields_.size() << '\n';
     for (const auto& [identity, field] : spatial_fields_) {
         output << "SPATIAL_FIELD " << std::quoted(identity) << ' '
@@ -2012,6 +2235,13 @@ std::string ProjectDocument::serialize() const {
         output << "ROAD_SOURCE_LINEAGE_RECORD " << std::quoted(identity) << ' '
                << revision.value() << '\n';
     }
+    output << "SWEEP_SOURCE_LINEAGE " << sweep_source_lineage_.size() << '\n';
+    for (const auto& [identity, revision] : sweep_source_lineage_) {
+        output << "SWEEP_SOURCE_LINEAGE_RECORD " << std::quoted(identity) << ' '
+               << revision.value() << '\n';
+    }
+    output << "SOURCE_ASSET_REGISTRY_HEX "
+           << encode_hex_bytes(source_asset_registry_.serialize()) << '\n';
     output << "END\n";
     return output.str();
 }
@@ -3045,6 +3275,62 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
         return core::Result<ProjectDocument>::failure(parse_error(
             "project schema v17 is missing its road source table"));
     }
+    bool sweep_sources_seen = false;
+    if (terminal_record == "SWEEP_SOURCES") {
+        if (version.value() < 22U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "sweep source records require project schema version 22"));
+        }
+        sweep_sources_seen = true;
+        auto source_count = read_uint(input, "sweep source count");
+        if (!source_count) {
+            return core::Result<ProjectDocument>::failure(source_count.error());
+        }
+        if (auto result = validate_serialized_count(
+                source_count.value(), kMaxSerializedSweepSources,
+                "project sweep-source count"); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+        std::uint64_t aggregate_bytes = 0U;
+        for (std::uint64_t index = 0U; index < source_count.value(); ++index) {
+            if (auto result = require_line(input, "SWEEP_SOURCE"); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            std::string identity;
+            std::string encoded_source;
+            if (!(input >> std::quoted(identity) >> std::quoted(encoded_source)) ||
+                encoded_source.empty() ||
+                encoded_source.size() > kMaxSerializedSweepSourceBytes) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project sweep source record is invalid or oversized"));
+            }
+            if (encoded_source.size() >
+                kMaxSerializedSweepSourceAggregateBytes - aggregate_bytes) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project sweep sources exceed their aggregate byte limit"));
+            }
+            aggregate_bytes += static_cast<std::uint64_t>(encoded_source.size());
+            auto source = geometry::SweepSource::deserialize(encoded_source);
+            if (!source) {
+                return core::Result<ProjectDocument>::failure(source.error().with_context(
+                    "serialized project sweep source"));
+            }
+            if (source.value().source_identity != identity ||
+                !document.sweep_sources_.emplace(identity, std::move(source.value())).second) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project sweep source identity is duplicate or unbound"));
+            }
+        }
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 22U && !sweep_sources_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v22 is missing its sweep-source table"));
+    }
     bool spatial_fields_seen = false;
     if (terminal_record == "SPATIAL_FIELDS") {
         if (version.value() < 18U) {
@@ -3243,6 +3529,84 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
         for (const auto& [identity, road] : document.road_sources_) {
             document.road_source_lineage_.emplace(identity, road.source_revision);
         }
+    }
+    bool sweep_source_lineage_seen = false;
+    if (terminal_record == "SWEEP_SOURCE_LINEAGE") {
+        if (version.value() < 22U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "sweep-source lineage records require project schema version 22"));
+        }
+        sweep_source_lineage_seen = true;
+        auto lineage_count = read_uint(input, "sweep-source lineage count");
+        if (!lineage_count) {
+            return core::Result<ProjectDocument>::failure(lineage_count.error());
+        }
+        if (auto result = validate_serialized_count(
+                lineage_count.value(), kMaxSerializedSweepSourceLineage,
+                "project sweep-source lineage count"); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+        for (std::uint64_t index = 0U; index < lineage_count.value(); ++index) {
+            if (auto result = require_line(input, "SWEEP_SOURCE_LINEAGE_RECORD"); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            std::string identity;
+            if (!(input >> std::quoted(identity)) ||
+                !valid_curve_or_road_identity(identity)) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project sweep-source lineage identity is malformed"));
+            }
+            auto lineage_revision = read_uint(input, "sweep-source lineage revision");
+            if (!lineage_revision || lineage_revision.value() == 0U ||
+                !document.sweep_source_lineage_.emplace(
+                    std::move(identity), core::Revision{lineage_revision.value()}).second) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project sweep-source lineage record is invalid or duplicated"));
+            }
+        }
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 22U && !sweep_source_lineage_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v22 is missing its sweep-source lineage table"));
+    }
+    bool source_asset_registry_seen = false;
+    if (terminal_record == "SOURCE_ASSET_REGISTRY_HEX") {
+        if (version.value() < 21U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "source asset registry records require project schema version 21"));
+        }
+        source_asset_registry_seen = true;
+        std::string encoded_registry;
+        if (!(input >> encoded_registry)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project source asset registry is malformed or oversized"));
+        }
+        const auto decoded_registry = decode_hex_bytes(
+            encoded_registry, assets::ProjectAssetRegistry::kMaxSerializedBytes);
+        if (!decoded_registry.has_value()) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project source asset registry encoding is invalid or oversized"));
+        }
+        auto registry = assets::ProjectAssetRegistry::deserialize(*decoded_registry);
+        if (!registry) {
+            return core::Result<ProjectDocument>::failure(registry.error().with_context(
+                "serialized project source asset registry"));
+        }
+        document.source_asset_registry_ = std::move(registry.value());
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 21U && !source_asset_registry_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v21 is missing its source asset registry"));
     }
     if (terminal_record != "END") {
         return core::Result<ProjectDocument>::failure(

@@ -2,21 +2,97 @@
 #include <carto/project/recovery.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <charconv>
+#include <iomanip>
+#include <locale>
 #include <memory>
 #include <limits>
 #include <set>
 #include <span>
+#include <sstream>
 #include <string_view>
 #include <type_traits>
 #include <utility>
 
 namespace carto::application {
 
+assets::Sha256Digest canonical_mesh_geometry_digest(
+    const geometry::EditableMesh& mesh) {
+    std::ostringstream canonical;
+    canonical.imbue(std::locale::classic());
+    canonical << "CARTOGRAPHER_MESH_GEOMETRY 1\n";
+    const auto vertices = mesh.vertices_sorted();
+    canonical << "VERTICES " << vertices.size() << '\n' << std::hex << std::setfill('0');
+    for (const auto& vertex : vertices) {
+        canonical << vertex.id.value << ' '
+            << std::setw(16) << std::bit_cast<std::uint64_t>(vertex.position.x) << ' '
+            << std::setw(16) << std::bit_cast<std::uint64_t>(vertex.position.y) << ' '
+            << std::setw(16) << std::bit_cast<std::uint64_t>(vertex.position.z) << '\n';
+    }
+    const auto faces = mesh.faces_sorted();
+    canonical << "FACES " << std::dec << faces.size() << '\n';
+    for (const auto& face : faces) {
+        canonical << face.id.value << ' ' << face.vertices.size();
+        for (const auto vertex : face.vertices) canonical << ' ' << vertex.value;
+        canonical << '\n';
+    }
+    const std::string bytes = canonical.str();
+    return assets::sha256(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()));
+}
+
 namespace {
 
 core::Diagnostic invalid_state(std::string message) {
     return core::Diagnostic(core::ErrorCode::invalid_state, std::move(message));
+}
+
+core::Result<void> verify_source_blob(
+    const std::filesystem::path& project_path,
+    const assets::SourceImportRecord& record) {
+    if (record.kind != assets::SourceAssetKind::mesh ||
+        record.importer_version != 1U ||
+        (record.importer_identity != "carto.import.obj" &&
+         record.importer_identity != "carto.import.ply" &&
+         record.importer_identity != "carto.import.stl")) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "source-backed mesh import requires a supported built-in importer"));
+    }
+    constexpr std::uintmax_t kMaxMeshSourceBytes = 128ULL * 1024ULL * 1024ULL;
+    std::error_code error;
+    const auto requested_root = project_path.parent_path().empty()
+        ? std::filesystem::current_path(error)
+        : project_path.parent_path();
+    if (error) return core::Result<void>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the saved project directory"));
+    const auto project_root = std::filesystem::weakly_canonical(requested_root, error);
+    if (error || project_root.empty()) return core::Result<void>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the saved project directory"));
+
+    assets::BlobStore store(project_root / ".carto-assets" / "source-blobs");
+    const auto expected_path = store.path_for(record.source_digest);
+    const auto stored_path = std::filesystem::canonical(expected_path, error);
+    if (error) return core::Result<void>::failure(core::Diagnostic(
+        core::ErrorCode::not_found, "source-backed mesh bytes are missing"));
+    const auto relative_path = stored_path.lexically_relative(project_root);
+    if (relative_path.empty() || relative_path.is_absolute() ||
+        relative_path.generic_string() != record.relative_source_path ||
+        std::any_of(relative_path.begin(), relative_path.end(), [](const auto& component) {
+            return component == "..";
+        })) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::validation_failed,
+            "source-backed mesh path is not the project-local content-addressed blob"));
+    }
+    const auto size = std::filesystem::file_size(stored_path, error);
+    if (error || size > kMaxMeshSourceBytes) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::validation_failed,
+            "source-backed mesh blob is unavailable or exceeds the importer limit"));
+    }
+    return store.verify(record.source_digest);
 }
 
 constexpr std::size_t kMaxProblems = 128U;
@@ -632,14 +708,30 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return import_condition_fixture();
             } else if constexpr (std::is_same_v<Action, ImportConditionAuthoringAction>) {
                 return import_condition_authoring(value);
+            } else if constexpr (std::is_same_v<Action, BindConditionAssetObjectAction>) {
+                return bind_condition_asset_object(value);
             } else if constexpr (std::is_same_v<Action, InvalidateConditionSourceAction>) {
                 return invalidate_condition_source(value);
+            } else if constexpr (std::is_same_v<Action, ApplySourceReimportPlanAction>) {
+                return apply_source_reimport_plan(value);
             } else if constexpr (std::is_same_v<Action, CreateSpatialFieldAction>) {
                 return create_spatial_field(value);
             } else if constexpr (std::is_same_v<Action, PaintSpatialFieldAction>) {
                 return paint_spatial_field(value);
+            } else if constexpr (std::is_same_v<Action, CreateMaterialAction>) {
+                return create_material(value);
+            } else if constexpr (std::is_same_v<Action, UpdateMaterialAction>) {
+                return update_material(value);
+            } else if constexpr (std::is_same_v<Action, SetMaterialRegionAssignmentAction>) {
+                return set_material_region_assignment(value);
+            } else if constexpr (std::is_same_v<Action, SetMaterialGraphAction>) {
+                return set_material_graph(value);
+            } else if constexpr (std::is_same_v<Action, SetMaterialGraphBindingAction>) {
+                return set_material_graph_binding(value);
             } else if constexpr (std::is_same_v<Action, SetRoadAuthoringAction>) {
                 return set_road_authoring(value);
+            } else if constexpr (std::is_same_v<Action, SetSweepSourceAction>) {
+                return set_sweep_source(value);
             } else if constexpr (std::is_same_v<Action, UndoAction>) {
                 return undo();
             } else {
@@ -720,6 +812,11 @@ core::Result<condition::AuthoringDocument> ApplicationSession::condition_authori
             "project CONDITION authoring"));
     }
     return decoded;
+}
+
+core::Result<assets::SourceReimportPlan> ApplicationSession::preview_source_reimport(
+    std::vector<assets::SourceImportRecord> incoming) const {
+    return assets::plan_source_reimport(document_.source_asset_registry(), std::move(incoming));
 }
 
 core::Result<condition::EffectPreviewResult> ApplicationSession::condition_effect_preview(
@@ -809,6 +906,23 @@ core::Result<SpatialFieldPreview> ApplicationSession::spatial_field_preview(
     return core::Result<SpatialFieldPreview>::success(std::move(preview));
 }
 
+core::Result<spatial_field::VectorFieldPreview>
+ApplicationSession::spatial_vector_field_preview(
+    std::string_view u_component_identity,
+    std::string_view v_component_identity,
+    std::uint32_t max_preview_axis) const {
+    const auto& fields = document_.spatial_fields();
+    const auto u_component = fields.find(std::string(u_component_identity));
+    const auto v_component = fields.find(std::string(v_component_identity));
+    if (u_component == fields.end() || v_component == fields.end()) {
+        return core::Result<spatial_field::VectorFieldPreview>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "vector preview requires both component sources in this project"));
+    }
+    return spatial_field::build_vector_field_preview(
+        u_component->second, v_component->second, max_preview_axis);
+}
+
 core::Result<terrain::TerrainTileProduct> ApplicationSession::terrain_tile_preview(
     std::string_view identity,
     std::uint32_t lod_step,
@@ -835,6 +949,79 @@ core::Result<geometry::CurvePath> ApplicationSession::curve_path_source(
             "curve source is not present in this project"));
     }
     return core::Result<geometry::CurvePath>::success(found->second);
+}
+
+core::Result<project::MaterialGraph> ApplicationSession::material_graph_source(
+    std::string_view identity) const {
+    const auto found = document_.material_catalog().material_graphs().find(
+        std::string(identity));
+    if (found == document_.material_catalog().material_graphs().end()) {
+        return core::Result<project::MaterialGraph>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "material graph source is not present in this project"));
+    }
+    return core::Result<project::MaterialGraph>::success(found->second);
+}
+
+core::Result<RoadSurfacePreview> ApplicationSession::road_surface_preview(
+    std::string_view identity,
+    std::uint32_t samples_per_segment) const {
+    const auto road = document_.road_sources().find(std::string(identity));
+    if (road == document_.road_sources().end()) {
+        return core::Result<RoadSurfacePreview>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "road surface preview requires a road source present in this project"));
+    }
+    if (auto result = road->second.validate(); !result) {
+        return core::Result<RoadSurfacePreview>::failure(
+            result.error().with_context("road surface preview source"));
+    }
+    const auto centerline = document_.curve_paths().find(road->second.centerline_identity);
+    if (centerline == document_.curve_paths().end()) {
+        return core::Result<RoadSurfacePreview>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "road surface preview centerline is no longer present"));
+    }
+    if (centerline->second.source_identity != road->second.centerline_identity ||
+        centerline->second.source_revision != road->second.centerline_revision) {
+        return core::Result<RoadSurfacePreview>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "road surface preview requires the exact authored centerline revision"));
+    }
+    const auto surface = geometry::build_road_surface(centerline->second,
+        road->second.width_meters, road->second.shoulder_meters,
+        road->second.maximum_grade_ratio, road->second.minimum_curve_radius_meters,
+        samples_per_segment);
+    if (!surface) {
+        return core::Result<RoadSurfacePreview>::failure(
+            surface.error().with_context("road surface design preview"));
+    }
+    const std::string encoded_centerline = centerline->second.serialize();
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(encoded_centerline.data());
+    const auto centerline_digest = assets::sha256(
+        std::span<const std::uint8_t>(bytes, encoded_centerline.size()));
+    return core::Result<RoadSurfacePreview>::success(RoadSurfacePreview{
+        road->first, road->second.source_revision, project_generation_,
+        road->second.source_digest(), centerline_digest,
+        road->second.surface_class, std::move(surface).value()});
+}
+
+core::Result<geometry::SweptMeshProduct> ApplicationSession::sweep_source_preview(
+    std::string_view identity) const {
+    const auto source = document_.sweep_sources().find(std::string(identity));
+    if (source == document_.sweep_sources().end()) {
+        return core::Result<geometry::SweptMeshProduct>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "sweep preview requires a source present in this project"));
+    }
+    const auto centerline = document_.curve_paths().find(source->second.centerline_identity);
+    if (centerline == document_.curve_paths().end() ||
+        centerline->second.source_revision != source->second.centerline_revision) {
+        return core::Result<geometry::SweptMeshProduct>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "sweep preview requires the exact authored centerline revision"));
+    }
+    return geometry::build_sweep_mesh(source->second, centerline->second);
 }
 
 core::Result<core::Revision> ApplicationSession::next_curve_path_revision(
@@ -865,6 +1052,20 @@ core::Result<core::Revision> ApplicationSession::next_road_source_revision(
     return core::Result<core::Revision>::success(lineage->second.next());
 }
 
+core::Result<core::Revision> ApplicationSession::next_sweep_source_revision(
+    std::string_view identity) const {
+    const auto lineage = document_.sweep_source_lineage_.find(std::string(identity));
+    if (lineage == document_.sweep_source_lineage_.end()) {
+        return core::Result<core::Revision>::success(core::Revision{1U});
+    }
+    if (lineage->second.exhausted()) {
+        return core::Result<core::Revision>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "sweep source revision space is exhausted"));
+    }
+    return core::Result<core::Revision>::success(lineage->second.next());
+}
+
 core::Result<editor::AuthoringPreview> ApplicationSession::begin_preview(
     editor::PreviewKind kind) const {
     auto context = authoring_context();
@@ -885,6 +1086,26 @@ core::Result<ApplicationAction> ApplicationSession::preview_action(
         }
         return core::Result<ApplicationAction>::success(SetObjectTransformAction{
             context.objects.front(), *parameters.transform, context.project_revision});
+    }
+    if (preview.kind() == editor::PreviewKind::object_translation_delta) {
+        if (!parameters.position.has_value() || context.objects.size() != 1U) {
+            return core::Result<ApplicationAction>::failure(invalid_state(
+                "object translation preview has no complete action payload"));
+        }
+        const auto* object = document_.scene().find(context.objects.front());
+        if (object == nullptr) {
+            return core::Result<ApplicationAction>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "object translation preview target no longer exists"));
+        }
+        core::Transform translated = object->local_transform;
+        translated.translation = translated.translation + *parameters.position;
+        if (!translated.finite()) {
+            return core::Result<ApplicationAction>::failure(invalid_state(
+                "object translation preview produced a non-finite transform"));
+        }
+        return core::Result<ApplicationAction>::success(SetObjectTransformAction{
+            context.objects.front(), translated, context.project_revision});
     }
     if (preview.kind() == editor::PreviewKind::extrude_face) {
         if (!parameters.distance.has_value()) {
@@ -1596,6 +1817,57 @@ core::Result<DispatchReceipt> ApplicationSession::create_plane(const CreatePlane
 
 core::Result<DispatchReceipt> ApplicationSession::create_mesh_object(
     const CreateMeshObjectAction& action) {
+    if (action.source_record.has_value()) {
+        if (active_source_ != OperationSource::human) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::unsupported,
+                "source-backed mesh import requires explicit human review"));
+        }
+        if (auto result = action.source_record->validate(); !result) {
+            return failure(result.error().with_context("source-backed mesh import"));
+        }
+        if (!project_path_.has_value()) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "source-linked mesh imports require a saved project"));
+        }
+        if (auto result = verify_source_blob(*project_path_, *action.source_record); !result) {
+            return failure(result.error().with_context("source-backed mesh bytes"));
+        }
+        if (auto result = action.mesh.validate(); !result) {
+            return failure(result.error().with_context("source-backed mesh geometry"));
+        }
+        if (canonical_mesh_geometry_digest(action.mesh) !=
+            action.source_record->artifact_digest) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::validation_failed,
+                "source mesh artifact digest does not match the imported geometry"));
+        }
+        const auto active = document_.source_asset_registry().records().find(
+            action.source_record->identity);
+        if (active != document_.source_asset_registry().records().end()) {
+            if (active->second.kind != assets::SourceAssetKind::mesh ||
+                active->second.artifact_identity != action.source_record->artifact_identity) {
+                return failure(core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "source reimport cannot change its bound mesh artifact"));
+            }
+            auto candidate = *action.source_record;
+            candidate.source_generation = active->second.source_generation;
+            if (candidate.serialize() == active->second.serialize()) {
+                return accepted("Import Source Mesh · No Changes", document_.revision());
+            }
+        }
+        editor::ProjectCommandAdmission admission;
+        return execute_command(
+            std::make_unique<editor::ImportSourceMeshCommand>(
+                admission,
+                document_,
+                action.object_name,
+                action.mesh,
+                *action.source_record),
+            "Import Source Mesh");
+    }
     editor::ProjectCommandAdmission admission;
     return execute_command(
         std::make_unique<editor::CreateMeshObjectCommand>(
@@ -2123,6 +2395,72 @@ core::Result<DispatchReceipt> ApplicationSession::import_condition_authoring(
         "Import CONDITION Authoring Document");
 }
 
+core::Result<DispatchReceipt> ApplicationSession::bind_condition_asset_object(
+    const BindConditionAssetObjectAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "CONDITION scene-object binding requires the explicit human authoring boundary"));
+    }
+    if (action.expected_project_revision != document_.revision()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "CONDITION scene-object binding was based on a stale project revision"));
+    }
+    if (action.asset_id == 0U || action.object_id.value == 0U) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "CONDITION scene-object binding requires an asset and object identity"));
+    }
+    if (document_.scene().find(action.object_id) == nullptr) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "CONDITION scene-object binding target does not exist in this project"));
+    }
+    auto authoring = condition_authoring();
+    if (!authoring) return failure(authoring.error().with_context(
+        "CONDITION scene-object binding"));
+    if (authoring.value().project_revision != action.expected_authoring_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "CONDITION scene-object binding was based on a stale authoring revision"));
+    }
+    if (authoring.value().project_revision.exhausted()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "CONDITION authoring revision space is exhausted"));
+    }
+    const auto asset = std::find_if(authoring.value().assets.begin(),
+        authoring.value().assets.end(), [&action](const auto& candidate) {
+            return candidate.id == action.asset_id;
+        });
+    if (asset == authoring.value().assets.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "CONDITION scene-object binding asset does not exist"));
+    }
+    if (asset->authored_object_id == action.object_id.value) {
+        return accepted("Bind CONDITION Asset · No Changes", document_.revision());
+    }
+    asset->authored_object_id = action.object_id.value;
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid = authoring.value().validate(); !valid) {
+        return failure(valid.error().with_context("CONDITION scene-object binding"));
+    }
+    const std::string serialized = authoring.value().serialize();
+    const auto digest = authoring.value().canonical_digest();
+    if (!digest) return failure(digest.error().with_context(
+        "CONDITION scene-object binding digest"));
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectConditionAuthoringCommand>(
+            admission,
+            document_,
+            document_.condition_authoring(),
+            project::SerializedConditionAuthoring{serialized, digest.value()}),
+        "Bind CONDITION Asset to Scene Object");
+}
+
 core::Result<DispatchReceipt> ApplicationSession::invalidate_condition_source(
     const InvalidateConditionSourceAction& action) {
     if (active_source_ != OperationSource::human) {
@@ -2154,6 +2492,36 @@ core::Result<DispatchReceipt> ApplicationSession::invalidate_condition_source(
             before,
             project::SerializedConditionAuthoring{serialized, digest.value()}),
         "Invalidate CONDITION Source");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::apply_source_reimport_plan(
+    const ApplySourceReimportPlanAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "source reimport adoption requires explicit human review"));
+    }
+    if (auto result = action.plan.validate(); !result) {
+        return failure(result.error().with_context("source reimport review"));
+    }
+    const bool has_changes = std::any_of(
+        action.plan.entries.begin(), action.plan.entries.end(), [](const auto& entry) {
+            return entry.change != assets::SourceReimportChange::unchanged;
+        });
+    if (!has_changes) {
+        const auto verified = assets::apply_source_reimport_plan(
+            document_.source_asset_registry(), action.plan);
+        if (!verified) return failure(verified.error().with_context(
+            "source reimport no-change review"));
+        return accepted("Review Source Reimport · No Changes", document_.revision());
+    }
+    const auto digest = action.plan.canonical_digest();
+    if (!digest) return failure(digest.error().with_context("source reimport review digest"));
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::ApplySourceReimportPlanCommand>(
+            admission, document_, action.plan),
+        "Apply Source Reimport " + digest.value().hex().substr(0U, 16U));
 }
 
 core::Result<DispatchReceipt> ApplicationSession::create_spatial_field(
@@ -2206,6 +2574,352 @@ core::Result<DispatchReceipt> ApplicationSession::paint_spatial_field(
         "Paint Spatial Field");
 }
 
+core::Result<DispatchReceipt> ApplicationSession::create_material(
+    const CreateMaterialAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "material creation requires the human authoring boundary"));
+    }
+    if (document_.revision() != action.expected_project_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "material creation snapshot no longer matches the project revision"));
+    }
+    if (action.name.empty() || action.name.size() > 128U ||
+        action.name.find('\0') != std::string::npos) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "material name is empty, too long, or contains a null byte"));
+    }
+    if (auto result = action.definition.validate(); !result) {
+        return failure(result.error().with_context("material definition"));
+    }
+    const auto& existing = document_.material_catalog().materials();
+    if (existing.size() >= project::MaterialCatalog::kMaxRecordsPerKind) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported, "project material catalog reached its record limit"));
+    }
+    render::MaterialId next_id = 1U;
+    if (!existing.empty()) {
+        const render::MaterialId last_id = existing.rbegin()->first;
+        if (last_id == std::numeric_limits<render::MaterialId>::max()) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::invalid_state, "material identity space is exhausted"));
+        }
+        next_id = last_id + 1U;
+    }
+    render::MaterialAsset material;
+    material.id = next_id;
+    material.name = action.name;
+    material.definition = action.definition;
+    material.revision = core::Revision{1U};
+    auto catalog = document_.material_catalog();
+    if (auto result = catalog.insert_material(std::move(material)); !result) {
+        return failure(result.error().with_context("create material"));
+    }
+    return commit_material_catalog(
+        std::move(catalog), action.expected_project_revision, "Create Material");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::update_material(
+    const UpdateMaterialAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "material editing requires the human authoring boundary"));
+    }
+    if (document_.revision() != action.expected_project_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "material edit snapshot no longer matches the project revision"));
+    }
+    const auto& existing = document_.material_catalog().materials();
+    const auto found = existing.find(action.material_id);
+    if (found == existing.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::not_found, "material edit references a missing material"));
+    }
+    if (found->second.revision != action.expected_material_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "material edit snapshot no longer matches the material source revision"));
+    }
+    if (found->second.revision.exhausted()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state, "material source revision space is exhausted"));
+    }
+    if (auto result = action.definition.validate(); !result) {
+        return failure(result.error().with_context("material definition"));
+    }
+    auto updated = found->second;
+    updated.definition = action.definition;
+    updated.revision = found->second.revision.next();
+    auto catalog = document_.material_catalog();
+    if (auto result = catalog.replace_material(std::move(updated)); !result) {
+        return failure(result.error().with_context("update material"));
+    }
+    return commit_material_catalog(
+        std::move(catalog), action.expected_project_revision, "Update Material");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::set_material_region_assignment(
+    const SetMaterialRegionAssignmentAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "material-region assignment requires the human authoring boundary"));
+    }
+    if (document_.revision() != action.expected_project_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "material-region assignment snapshot no longer matches the project revision"));
+    }
+    if (action.key.mesh_asset == 0U || action.key.region_id == 0U ||
+        (!action.material.has_value() && action.variant.has_value()) ||
+        (action.material.has_value() && action.material.value() == 0U)) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "material-region assignment requires non-zero identities and a material for variants"));
+    }
+
+    auto catalog = document_.material_catalog();
+    const auto current = catalog.assignments().find(action.key);
+    if (!action.material.has_value()) {
+        if (current == catalog.assignments().end()) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::not_found,
+                "material-region assignment to clear does not exist"));
+        }
+        if (auto result = catalog.erase_assignment(action.key); !result) {
+            return failure(result.error().with_context("clear material-region assignment"));
+        }
+    } else {
+        if (!catalog.materials().contains(action.material.value())) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::not_found,
+                "material-region assignment references a missing material"));
+        }
+        if (action.variant.has_value() &&
+            !catalog.variants().contains(action.variant.value())) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::not_found,
+                "material-region assignment references a missing material variant"));
+        }
+        const project::MaterialRegionAssignment assignment{
+            action.key, action.material.value(), action.variant};
+        if (current != catalog.assignments().end()) {
+            if (current->second.material == assignment.material &&
+                current->second.variant == assignment.variant) {
+                return failure(invalid_state(
+                    "material region already uses the selected material"));
+            }
+            if (auto result = catalog.replace_assignment(assignment); !result) {
+                return failure(result.error().with_context("replace material-region assignment"));
+            }
+        } else if (auto result = catalog.insert_assignment(assignment); !result) {
+            return failure(result.error().with_context("assign material region"));
+        }
+    }
+    return commit_material_catalog(
+        std::move(catalog), action.expected_project_revision,
+        "Set Material Region Assignment");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::set_material_graph(
+    const SetMaterialGraphAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "material graph authoring requires the human authoring boundary"));
+    }
+    if (document_.revision() != action.expected_project_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "material graph edit snapshot no longer matches the project revision"));
+    }
+    if (action.expected_graph_revision.has_value() !=
+        action.expected_graph_digest.has_value()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "material graph edits require both an expected source revision and digest"));
+    }
+    if (auto result = action.graph.validate(); !result) {
+        return failure(result.error().with_context("material graph source"));
+    }
+
+    auto catalog = document_.material_catalog();
+    const auto found = catalog.material_graphs().find(action.graph.identity);
+    if (!action.expected_graph_revision.has_value()) {
+        if (found != catalog.material_graphs().end()) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "material graph identity already exists; update its exact source instead"));
+        }
+        if (action.graph.revision != core::Revision{1U}) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::invalid_argument,
+                "new material graph source must begin at revision one"));
+        }
+        if (!action.graph.retired_node_ids.empty()) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::invalid_argument,
+                "new material graph sources cannot invent retired node lineage"));
+        }
+        if (auto result = catalog.insert_material_graph(action.graph); !result) {
+            return failure(result.error().with_context("create material graph"));
+        }
+    } else {
+        if (found == catalog.material_graphs().end()) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::not_found,
+                "material graph update references a missing source"));
+        }
+        if (found->second.revision != *action.expected_graph_revision) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "material graph source revision no longer matches the edit snapshot"));
+        }
+        const auto current_digest = found->second.canonical_digest();
+        if (!current_digest || current_digest.value() != *action.expected_graph_digest) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "material graph source digest no longer matches the edit snapshot"));
+        }
+        if (found->second.revision.exhausted()) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "material graph source revision space is exhausted"));
+        }
+        if (action.graph.revision != found->second.revision.next()) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::invalid_argument,
+                "updated material graph must advance exactly one source revision"));
+        }
+        std::set<std::uint64_t> expected_retired(
+            found->second.retired_node_ids.begin(),
+            found->second.retired_node_ids.end());
+        for (const auto& previous_node : found->second.nodes) {
+            const bool retained = std::any_of(
+                action.graph.nodes.begin(), action.graph.nodes.end(),
+                [&previous_node](const auto& candidate) {
+                    return candidate.id == previous_node.id;
+                });
+            if (!retained) expected_retired.insert(previous_node.id);
+        }
+        const std::vector<std::uint64_t> expected_retired_ids(
+            expected_retired.begin(), expected_retired.end());
+        if (action.graph.retired_node_ids != expected_retired_ids) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::invalid_argument,
+                "graph edits must preserve prior node tombstones and record each removed node exactly once"));
+        }
+        if (auto result = catalog.replace_material_graph(action.graph); !result) {
+            return failure(result.error().with_context("update material graph"));
+        }
+    }
+    return commit_material_catalog(
+        std::move(catalog), action.expected_project_revision,
+        "Set Material Graph");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::set_material_graph_binding(
+    const SetMaterialGraphBindingAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "material graph binding requires the human authoring boundary"));
+    }
+    if (document_.revision() != action.expected_project_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "material graph binding snapshot no longer matches the project revision"));
+    }
+    const auto& existing = document_.material_catalog().materials();
+    const auto material = existing.find(action.material_id);
+    if (material == existing.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "material graph binding references a missing material"));
+    }
+    if (material->second.revision != action.expected_material_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "material graph binding snapshot no longer matches the material source revision"));
+    }
+    if (material->second.revision.exhausted()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "material source revision space is exhausted"));
+    }
+    if (action.graph_identity.has_value() != action.expected_graph_revision.has_value() ||
+        action.graph_identity.has_value() != action.expected_graph_digest.has_value()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "graph binding requires the exact graph identity, revision, and digest"));
+    }
+
+    auto catalog = document_.material_catalog();
+    if (action.graph_identity.has_value()) {
+        const auto graph = catalog.material_graphs().find(*action.graph_identity);
+        if (graph == catalog.material_graphs().end()) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::not_found,
+                "material graph binding references a missing graph source"));
+        }
+        const auto digest = graph->second.canonical_digest();
+        if (!digest || graph->second.revision != *action.expected_graph_revision ||
+            digest.value() != *action.expected_graph_digest) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "material graph source revision or digest no longer matches the binding snapshot"));
+        }
+        if (auto result = catalog.bind_material_graph(
+                action.material_id, *action.graph_identity); !result) {
+            return failure(result.error().with_context("bind material graph source"));
+        }
+    } else if (auto result = catalog.unbind_material_graph(action.material_id); !result) {
+        return failure(result.error().with_context("unbind material graph source"));
+    }
+
+    auto updated_material = material->second;
+    updated_material.revision = material->second.revision.next();
+    if (auto result = catalog.replace_material(std::move(updated_material)); !result) {
+        return failure(result.error().with_context("advance material graph binding revision"));
+    }
+    return commit_material_catalog(
+        std::move(catalog), action.expected_project_revision,
+        action.graph_identity.has_value() ? "Bind Material Graph" : "Unbind Material Graph");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::commit_material_catalog(
+    project::MaterialCatalog catalog,
+    core::Revision expected_project_revision,
+    std::string action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "material catalog changes require the human authoring boundary"));
+    }
+    if (document_.revision() != expected_project_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "material catalog snapshot no longer matches the project revision"));
+    }
+    if (auto result = catalog.validate(); !result) {
+        return failure(result.error().with_context("material catalog validation"));
+    }
+    if (catalog.serialize() == document_.material_catalog().serialize()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument, "material catalog edit contains no changes"));
+    }
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectMaterialCatalogCommand>(
+            admission, document_, document_.material_catalog(), std::move(catalog)),
+        std::move(action));
+}
+
 core::Result<DispatchReceipt> ApplicationSession::set_road_authoring(
     const SetRoadAuthoringAction& action) {
     if (active_source_ != OperationSource::human) {
@@ -2235,6 +2949,35 @@ core::Result<DispatchReceipt> ApplicationSession::set_road_authoring(
         std::make_unique<editor::SetProjectRoadAuthoringCommand>(
             admission, document_, action.centerline, action.road),
         "Set Road Authoring");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::set_sweep_source(
+    const SetSweepSourceAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "procedural sweep authoring requires the human command boundary"));
+    }
+    if (document_.revision() != action.expected_project_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "procedural sweep authoring snapshot no longer matches the project revision"));
+    }
+    if (auto result = action.source.validate(); !result) {
+        return failure(result.error().with_context("procedural sweep source authoring"));
+    }
+    const auto centerline = document_.curve_paths().find(action.source.centerline_identity);
+    if (centerline == document_.curve_paths().end() ||
+        centerline->second.source_revision != action.source.centerline_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "procedural sweep must bind an exact current centerline source"));
+    }
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectSweepSourceCommand>(
+            admission, document_, action.source),
+        "Set Procedural Sweep Source");
 }
 
 core::Result<DispatchReceipt> ApplicationSession::undo() {
@@ -2356,7 +3099,58 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
             road.centerline_revision, road.width_meters, road.shoulder_meters,
             road.maximum_grade_ratio, road.minimum_curve_radius_meters,
             road.surface_class, road.function_class, road.access_state,
-            road.drainage_intent});
+            road.drainage_intent, road.source_digest()});
+    }
+    result.sweep_sources.reserve(document_.sweep_sources().size());
+    for (const auto& [identity, source] : document_.sweep_sources()) {
+        static_cast<void>(identity);
+        const std::string encoded = source.serialize();
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(encoded.data());
+        result.sweep_sources.push_back(SweepSourceView{
+            source, assets::sha256(std::span<const std::uint8_t>(bytes, encoded.size()))});
+    }
+    result.source_assets.reserve(document_.source_asset_registry().records().size());
+    for (const auto& [identity, record] : document_.source_asset_registry().records()) {
+        result.source_assets.push_back(SourceAssetView{
+            identity, record.relative_source_path, record.kind, record.source_generation,
+            record.source_digest, record.importer_identity, record.importer_version,
+            record.artifact_identity, record.artifact_digest});
+    }
+    result.source_asset_tombstone_count =
+        document_.source_asset_registry().lineage().size() -
+        document_.source_asset_registry().records().size();
+    result.materials.reserve(document_.material_catalog().materials().size());
+    for (const auto& [identity, material] : document_.material_catalog().materials()) {
+        static_cast<void>(identity);
+        result.materials.push_back(material);
+    }
+    result.material_graphs.reserve(
+        document_.material_catalog().material_graphs().size());
+    for (const auto& [identity, graph] : document_.material_catalog().material_graphs()) {
+        result.material_graphs.push_back(MaterialGraphView{
+            identity, graph.revision, graph.nodes.size()});
+    }
+    result.material_graph_bindings.reserve(
+        document_.material_catalog().material_graph_bindings().size());
+    for (const auto& [material, graph_identity] :
+            document_.material_catalog().material_graph_bindings()) {
+        const auto graph = document_.material_catalog().material_graphs().find(
+            graph_identity.graph_identity);
+        bool source_current = false;
+        if (graph != document_.material_catalog().material_graphs().end()) {
+            const auto digest = graph->second.canonical_digest();
+            source_current = digest && graph->second.revision == graph_identity.source_revision &&
+                digest.value() == graph_identity.source_digest;
+        }
+        result.material_graph_bindings.push_back(MaterialGraphBindingView{
+            material, graph_identity.graph_identity, graph_identity.source_revision,
+            graph_identity.source_digest, source_current});
+    }
+    result.material_assignments.reserve(
+        document_.material_catalog().assignments().size());
+    for (const auto& [key, assignment] : document_.material_catalog().assignments()) {
+        static_cast<void>(key);
+        result.material_assignments.push_back(assignment);
     }
 
     if (!document_.engineering_authoring().has_value()) {
@@ -2483,6 +3277,16 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
                      profile.controllable_entries, profile.supply_access,
                      profile.ambient_noise, profile.visibility_outward,
                      profile.visibility_inward, profile.isolation}});
+            }
+            result.condition.surface_states.reserve(authoring.surface_states.size());
+            for (const auto& surface : authoring.surface_states) {
+                result.condition.surface_states.push_back(
+                    ConditionAuthoringView::SurfaceState{
+                        surface.id, surface.asset_id,
+                        std::string(condition::occupancy_state_name(surface.occupancy)),
+                        std::string(condition::maintenance_state_name(surface.maintenance)),
+                        std::string(condition::damage_state_name(surface.damage)),
+                        surface.wetness});
             }
             result.condition.state_branches.reserve(authoring.state_branches.size());
             result.condition.state_branch_count = authoring.state_branches.size();
@@ -2698,7 +3502,7 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
         }
         if (auto inserted = viewport_scene.upsert({
                 object.id, compiled_mesh, object_view.world_transform,
-                compiled_mesh->source_revision});
+                compiled_mesh->source_revision, object.mesh_asset});
             !inserted) {
             result.viewport.error = inserted.error().with_context("viewport snapshot");
             break;

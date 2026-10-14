@@ -971,6 +971,80 @@ void ui_acoustic_geometry_edits_are_revision_bound_and_undoable() {
     std::filesystem::remove_all(root, ignored);
 }
 
+void ui_condition_asset_binding_is_revision_checked_and_undoable() {
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.dispatch(carto::application::NewProjectAction{
+        "CONDITION scene-object binding"}));
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Bound CONDITION object", {2.0, 2.0, 2.0}}));
+    REQUIRE(ui.import_condition_fixture());
+
+    const auto before = ui.snapshot();
+    REQUIRE(before.condition.assets.size() == 3U);
+    REQUIRE(before.selection.objects.empty());
+    const auto object = session.snapshot().objects.front().object.id;
+    const auto bound = ui.bind_condition_asset_to_object(
+        2U, object, before.project_revision,
+        before.condition.authored_revision);
+    REQUIRE(bound);
+
+    const auto after = ui.snapshot();
+    const auto asset = std::find_if(after.condition.assets.begin(),
+        after.condition.assets.end(), [](const auto& value) { return value.id == 2U; });
+    REQUIRE(asset != after.condition.assets.end());
+    REQUIRE(asset->authored_object_id == object.value);
+    REQUIRE(after.condition.authored_revision ==
+        before.condition.authored_revision.next());
+    REQUIRE(after.project_revision > before.project_revision);
+    REQUIRE(!after.operations.empty());
+    REQUIRE(after.operations.back().action ==
+        "Bind CONDITION Asset to Scene Object");
+
+    const auto unchanged = ui.bind_condition_asset_to_object(
+        2U, object, after.project_revision,
+        after.condition.authored_revision);
+    REQUIRE(unchanged);
+    REQUIRE(!unchanged.value().document_changed);
+    REQUIRE(ui.snapshot().project_revision == after.project_revision);
+
+    const auto stale_project = ui.bind_condition_asset_to_object(
+        2U, object, before.project_revision,
+        before.condition.authored_revision);
+    REQUIRE(!stale_project);
+    const auto stale_authoring = ui.bind_condition_asset_to_object(
+        2U, object, after.project_revision,
+        before.condition.authored_revision);
+    REQUIRE(!stale_authoring);
+    const auto missing_asset = ui.bind_condition_asset_to_object(
+        999U, object, after.project_revision,
+        after.condition.authored_revision);
+    REQUIRE(!missing_asset);
+    const auto missing_object = ui.bind_condition_asset_to_object(
+        2U, carto::scene::ObjectId{999U}, after.project_revision,
+        after.condition.authored_revision);
+    REQUIRE(!missing_object);
+    REQUIRE(ui.snapshot().condition.assets[1].authored_object_id == object.value);
+    REQUIRE(ui.snapshot().project_revision == after.project_revision);
+
+    const auto ai_attempt = ui.apply_ai_intent(
+        "bind condition asset 2 to object 1");
+    REQUIRE(!ai_attempt);
+    REQUIRE(ui.snapshot().condition.assets[1].authored_object_id == object.value);
+    REQUIRE(ui.dispatch(carto::application::UndoAction{}));
+    const auto undone = ui.snapshot();
+    const auto restored_asset = std::find_if(undone.condition.assets.begin(),
+        undone.condition.assets.end(), [](const auto& value) { return value.id == 2U; });
+    REQUIRE(restored_asset != undone.condition.assets.end());
+    REQUIRE(restored_asset->authored_object_id == 2U);
+    REQUIRE(ui.dispatch(carto::application::RedoAction{}));
+    const auto redone = ui.snapshot();
+    const auto rebound_asset = std::find_if(redone.condition.assets.begin(),
+        redone.condition.assets.end(), [](const auto& value) { return value.id == 2U; });
+    REQUIRE(rebound_asset != redone.condition.assets.end());
+    REQUIRE(rebound_asset->authored_object_id == object.value);
+}
+
 void ui_effect_preview_uses_project_fields_and_is_non_mutating_across_history() {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto root = std::filesystem::current_path() / "build" / "test-temp" /
@@ -1127,6 +1201,9 @@ void ui_safe_place_branch_is_journaled_comparable_and_recoverable() {
     REQUIRE(ui.add_condition_state_branch(branch));
     REQUIRE(ui.snapshot().condition.state_branch_count == 1U);
     REQUIRE(ui.snapshot().condition.state_branches.front().name == branch.name);
+    REQUIRE(ui.snapshot().condition.surface_states.size() == before.value().surface_states.size());
+    REQUIRE(ui.snapshot().condition.surface_states.front().wetness ==
+        before.value().surface_states.front().wetness);
     REQUIRE(ui.snapshot().operations.back().category == carto::ui::OperationCategory::provider);
     const auto comparison = ui.compare_condition_state_branches(0U, 1U);
     REQUIRE(comparison);
@@ -1137,22 +1214,52 @@ void ui_safe_place_branch_is_journaled_comparable_and_recoverable() {
     REQUIRE(ui.compare_condition_state_branches(0U, 1U));
     REQUIRE(ui.snapshot().project_revision == revision_after_add);
 
+    carto::condition::AuthoredStateDelta wetness_delta;
+    wetness_delta.id = 1U;
+    wetness_delta.target_record_id = before.value().surface_states.front().id;
+    wetness_delta.target_asset_id = before.value().surface_states.front().asset_id;
+    wetness_delta.target_kind = carto::condition::StateTargetKind::surface_state;
+    wetness_delta.property = carto::condition::StateProperty::wetness;
+    wetness_delta.before.numeric_value = before.value().surface_states.front().wetness;
+    wetness_delta.after.numeric_value = 0.9;
+    carto::condition::AuthoredStateBranch wetness_branch;
+    wetness_branch.id = 2U;
+    wetness_branch.parent_branch_id = branch.id;
+    wetness_branch.name = "rain-on-sign";
+    wetness_branch.applicability = "after-heavy-rain";
+    wetness_branch.deltas.push_back(wetness_delta);
+    REQUIRE(ui.add_condition_state_branch(wetness_branch));
+    REQUIRE(ui.snapshot().condition.state_branch_count == 2U);
+    const auto wetness_comparison = ui.compare_condition_state_branches(1U, 2U);
+    REQUIRE(wetness_comparison);
+    REQUIRE(wetness_comparison.value().differences.size() == 1U);
+    REQUIRE(wetness_comparison.value().differences.front().property ==
+        carto::condition::StateProperty::wetness);
+    REQUIRE(wetness_comparison.value().differences.front().right_value.numeric_value == 0.9);
+    const auto final_privacy_comparison = ui.compare_condition_state_branches(0U, 1U);
+    REQUIRE(final_privacy_comparison);
+
     const auto path = root / "safe-place-states.carto";
     REQUIRE(ui.dispatch(carto::application::SaveProjectAction{path}));
     carto::application::ApplicationSession reopened_session;
     carto::ui::UiController reopened_ui(reopened_session);
     REQUIRE(reopened_ui.dispatch(carto::application::OpenProjectAction{path}));
-    REQUIRE(reopened_ui.snapshot().condition.state_branch_count == 1U);
+    REQUIRE(reopened_ui.snapshot().condition.state_branch_count == 2U);
     const auto reopened_comparison = reopened_ui.compare_condition_state_branches(0U, 1U);
     REQUIRE(reopened_comparison);
     REQUIRE(reopened_comparison.value().comparison_digest ==
-        comparison.value().comparison_digest);
+        final_privacy_comparison.value().comparison_digest);
 
+    REQUIRE(ui.dispatch(carto::application::UndoAction{}));
+    REQUIRE(ui.snapshot().condition.state_branch_count == 1U);
+    REQUIRE(ui.compare_condition_state_branches(0U, 1U));
     REQUIRE(ui.dispatch(carto::application::UndoAction{}));
     REQUIRE(ui.snapshot().condition.state_branch_count == 0U);
     REQUIRE(!ui.compare_condition_state_branches(0U, 1U));
     REQUIRE(ui.dispatch(carto::application::RedoAction{}));
     REQUIRE(ui.snapshot().condition.state_branch_count == 1U);
+    REQUIRE(ui.dispatch(carto::application::RedoAction{}));
+    REQUIRE(ui.snapshot().condition.state_branch_count == 2U);
 
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);
@@ -1577,6 +1684,7 @@ int main() {
         effect_preview_is_deterministic_state_bound_and_read_only();
         effect_preview_rejects_stale_revision_and_out_of_coverage_field();
         ui_acoustic_geometry_edits_are_revision_bound_and_undoable();
+        ui_condition_asset_binding_is_revision_checked_and_undoable();
         ui_effect_preview_uses_project_fields_and_is_non_mutating_across_history();
         ui_vegetation_recipe_commits_reopens_undoes_and_rejects_stale_fields();
         ui_safe_place_branch_is_journaled_comparable_and_recoverable();

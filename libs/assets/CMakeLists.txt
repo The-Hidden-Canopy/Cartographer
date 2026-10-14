@@ -3,6 +3,7 @@ add_library(carto_assets STATIC
     src/texture.cpp
     src/texture_mip.cpp
     src/texture_source.cpp
+    src/source_registry.cpp
 )
 
 target_include_directories(carto_assets

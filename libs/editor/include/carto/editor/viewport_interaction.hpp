@@ -3,7 +3,9 @@
 #include <carto/core/math.hpp>
 #include <carto/core/result.hpp>
 #include <carto/core/revision.hpp>
+#include <carto/editor/snap_service.hpp>
 #include <carto/geometry/mesh.hpp>
+#include <carto/render/render_scene.hpp>
 #include <carto/scene/scene.hpp>
 
 #include <cstddef>
@@ -175,6 +177,27 @@ private:
 
     std::optional<State> state_;
 };
+
+struct ViewportTransformSnapResult final {
+    core::Transform transform = core::Transform::identity();
+    std::optional<SnapCandidate> candidate;
+};
+
+// Applies the native plan-view snapping policy to a revision-bound preview.
+// Ctrl/grid has precedence over Shift/geometry. Geometry targets are queried
+// from the compiled viewport scene and may exclude the object being moved.
+// This is still preview state; the caller must submit the final transform
+// through the application command path.
+[[nodiscard]] core::Result<ViewportTransformSnapResult>
+snap_viewport_transform_preview(
+    core::Transform preview,
+    ViewportTranslateAxis axis,
+    const render::RenderScene& scene,
+    core::Revision source_revision,
+    bool grid_snap,
+    bool geometry_snap,
+    SnapSession& session,
+    std::optional<scene::ObjectId> excluded_object = std::nullopt);
 
 // UI-only orthographic camera for Cartographer's current X/Z plan view. It
 // does not represent a scene camera and cannot mutate project state.

@@ -1,7 +1,10 @@
 #include "application_access.hpp"
 
+#include <carto/attributes/set.hpp>
 #include <carto/geometry/primitives.hpp>
+#include <carto/assets/source_registry.hpp>
 #include <carto/journal/journal.hpp>
+#include <carto/editor/viewport_interaction.hpp>
 
 #include <algorithm>
 #include <array>
@@ -76,6 +79,21 @@ carto::core::Result<carto::geometry::EditableMesh> make_application_tetrahedron(
     return carto::core::Result<carto::geometry::EditableMesh>::success(std::move(mesh));
 }
 
+void application_mesh_geometry_digest_is_canonical_and_revision_independent() {
+    auto mesh = make_application_tetrahedron();
+    REQUIRE(mesh);
+    const auto original_digest =
+        carto::application::canonical_mesh_geometry_digest(mesh.value());
+    auto edited = mesh.value();
+    const auto vertex = edited.vertices_sorted().front();
+    REQUIRE(edited.set_vertex_position(vertex.id, {vertex.position.x + 0.25,
+        vertex.position.y, vertex.position.z}));
+    REQUIRE(carto::application::canonical_mesh_geometry_digest(edited) != original_digest);
+    REQUIRE(edited.set_vertex_position(vertex.id, vertex.position));
+    REQUIRE(edited.revision() != mesh.value().revision());
+    REQUIRE(carto::application::canonical_mesh_geometry_digest(edited) == original_digest);
+}
+
 void application_routes_authoring_through_snapshot_and_history() {
     carto::application::ApplicationSession session;
     REQUIRE(carto::application::testing::dispatch(session, carto::application::NewProjectAction{"Authoring"}));
@@ -89,6 +107,7 @@ void application_routes_authoring_through_snapshot_and_history() {
     REQUIRE(snapshot.viewport.scene.size() == 1U);
     const auto instances = snapshot.viewport.scene.instances();
     REQUIRE(instances.size() == 1U);
+    REQUIRE(instances.front().mesh_asset == snapshot.objects.front().object.mesh_asset);
     REQUIRE(instances.front().mesh->vertex_ids.size() == 8U);
     REQUIRE(instances.front().mesh->triangle_faces.size() == 12U);
     REQUIRE(instances.front().mesh->vertex_ids.front() == carto::geometry::VertexId{1});
@@ -133,6 +152,121 @@ void application_routes_authoring_through_snapshot_and_history() {
     REQUIRE(session.snapshot().redo_count == 1U);
     REQUIRE(carto::application::testing::dispatch(session, carto::application::RedoAction{}));
     REQUIRE(session.snapshot().redo_count == 0U);
+}
+
+void application_synthetic_room_snap_gesture_commits_undoes_and_rejects_stale_source() {
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::NewProjectAction{"Synthetic Room Snap Fixture"}));
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::CreateBoxAction{"Room prop", {1.0, 1.0, 1.0}}));
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::CreateBoxAction{"Thin wall target", {1.0, 2.0, 0.1}}));
+
+    auto snapshot = session.snapshot();
+    const auto find_object = [&snapshot](std::string_view name) {
+        const auto found = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
+            [name](const auto& object) { return object.object.name == name; });
+        return found == snapshot.objects.end()
+            ? carto::scene::ObjectId{} : found->object.id;
+    };
+    const auto moving_object = find_object("Room prop");
+    const auto target_object = find_object("Thin wall target");
+    REQUIRE(moving_object && target_object && moving_object != target_object);
+
+    const auto target_view = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
+        [target_object](const auto& object) { return object.object.id == target_object; });
+    REQUIRE(target_view != snapshot.objects.end());
+    auto target_transform = target_view->object.local_transform;
+    target_transform.translation = {3.0, 0.0, 0.0};
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SetObjectTransformAction{
+            target_object, target_transform, snapshot.project_revision}));
+    snapshot = session.snapshot();
+
+    const auto moving_view = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
+        [moving_object](const auto& object) { return object.object.id == moving_object; });
+    REQUIRE(moving_view != snapshot.objects.end());
+    constexpr double kPixelsPerMeter = 100.0;
+    const carto::core::Vec2d pointer_start{100.0, 100.0};
+    const carto::core::Vec2d pointer_end{345.0, 100.0};
+    carto::editor::ViewportTransformSession gesture;
+    REQUIRE(gesture.begin(moving_object, moving_view->object.local_transform,
+        snapshot.project_revision, carto::editor::ViewportTranslateAxis::world_x,
+        pointer_start, kPixelsPerMeter));
+    const auto raw_preview = gesture.preview(pointer_end, snapshot.project_revision);
+    REQUIRE(raw_preview && std::abs(raw_preview.value().translation.x - 2.45) < 1e-12);
+
+    constexpr std::array<carto::editor::SnapKind, 3> snap_kinds{
+        carto::editor::SnapKind::vertex,
+        carto::editor::SnapKind::edge_midpoint,
+        carto::editor::SnapKind::face_center};
+    const auto candidate_probe = carto::editor::find_snap_candidates(
+        snapshot.viewport.scene, raw_preview.value().translation, snap_kinds,
+        snapshot.project_revision, 0.75);
+    REQUIRE(candidate_probe);
+
+    carto::editor::SnapSession snap_session;
+    const auto snapped_preview = carto::editor::snap_viewport_transform_preview(
+        raw_preview.value(), carto::editor::ViewportTranslateAxis::world_x,
+        snapshot.viewport.scene, snapshot.project_revision, false, true, snap_session,
+        moving_object);
+    REQUIRE(snapped_preview && snapped_preview.value().candidate.has_value());
+    REQUIRE(snapped_preview.value().candidate->object == target_object);
+    REQUIRE(std::abs(snapped_preview.value().transform.translation.x - 2.5) < 1e-12);
+    REQUIRE(snapped_preview.value().transform.translation.y ==
+        moving_view->object.local_transform.translation.y);
+    REQUIRE(snapped_preview.value().transform.translation.z ==
+        moving_view->object.local_transform.translation.z);
+
+    const auto completed = gesture.complete(pointer_end, snapshot.project_revision);
+    REQUIRE(completed);
+    const auto confirmed = carto::editor::snap_viewport_transform_preview(
+        completed.value(), carto::editor::ViewportTranslateAxis::world_x,
+        snapshot.viewport.scene, snapshot.project_revision, false, true, snap_session,
+        moving_object);
+    REQUIRE(confirmed && confirmed.value().candidate.has_value());
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SetObjectTransformAction{
+            moving_object, confirmed.value().transform, snapshot.project_revision}));
+    snapshot = session.snapshot();
+    const auto moved = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
+        [moving_object](const auto& object) { return object.object.id == moving_object; });
+    REQUIRE(moved != snapshot.objects.end());
+    REQUIRE(std::abs(moved->object.local_transform.translation.x - 2.5) < 1e-12);
+
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::UndoAction{}));
+    auto after_undo = session.snapshot();
+    const auto undone = std::find_if(after_undo.objects.begin(), after_undo.objects.end(),
+        [moving_object](const auto& object) { return object.object.id == moving_object; });
+    REQUIRE(undone != after_undo.objects.end());
+    REQUIRE(undone->object.local_transform.translation.x == 0.0);
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::RedoAction{}));
+    snapshot = session.snapshot();
+    const auto redone = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
+        [moving_object](const auto& object) { return object.object.id == moving_object; });
+    REQUIRE(redone != snapshot.objects.end());
+    REQUIRE(std::abs(redone->object.local_transform.translation.x - 2.5) < 1e-12);
+
+    carto::editor::ViewportTransformSession stale_gesture;
+    REQUIRE(stale_gesture.begin(moving_object, redone->object.local_transform,
+        snapshot.project_revision, carto::editor::ViewportTranslateAxis::world_x,
+        pointer_start, kPixelsPerMeter));
+    target_transform.translation.x = 4.0;
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SetObjectTransformAction{
+            target_object, target_transform, snapshot.project_revision}));
+    const auto current_revision = session.snapshot().project_revision;
+    const auto stale_preview = stale_gesture.preview(pointer_end, current_revision);
+    REQUIRE(!stale_preview && stale_preview.error().code ==
+        carto::core::ErrorCode::stale_data);
+    const auto after_stale = session.snapshot();
+    const auto unchanged = std::find_if(after_stale.objects.begin(), after_stale.objects.end(),
+        [moving_object](const auto& object) { return object.object.id == moving_object; });
+    REQUIRE(unchanged != after_stale.objects.end());
+    REQUIRE(std::abs(unchanged->object.local_transform.translation.x - 2.5) < 1e-12);
 }
 
 void application_reuses_revision_keyed_viewport_meshes_without_cross_project_staleness() {
@@ -1523,6 +1657,60 @@ void application_builds_read_only_terrain_previews_from_current_project_sources(
     REQUIRE(!session.terrain_tile_preview("not-a-terrain-tile"));
 }
 
+void application_builds_read_only_source_bound_wind_vector_previews() {
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::NewProjectAction{"Wind vector preview"}));
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::CreateSpatialFieldAction{
+            "field.wind.u", carto::spatial_field::FieldSemantic::wind_u,
+            {-8.0, 12.0}, 2.0, 20U, 12U, -10.0, 10.0, 2.5}));
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::CreateSpatialFieldAction{
+            "field.wind.v", carto::spatial_field::FieldSemantic::wind_v,
+            {-8.0, 12.0}, 2.0, 20U, 12U, -10.0, 10.0, -1.25}));
+    const auto before = session.snapshot();
+    const auto preview = session.spatial_vector_field_preview("field.wind.u", "field.wind.v");
+    REQUIRE(preview && preview.value().validate() &&
+            preview.value().samples.size() == 16U * 12U);
+    REQUIRE(preview.value().u_component.digest == before.spatial_fields[0U].digest &&
+            preview.value().v_component.digest == before.spatial_fields[1U].digest);
+    REQUIRE(preview.value().samples.front().vector_uv.x == 2.5 &&
+            preview.value().samples.front().vector_uv.y == -1.25);
+    const auto after = session.snapshot();
+    REQUIRE(after.project_revision == before.project_revision &&
+            after.spatial_fields[0U].source_revision == before.spatial_fields[0U].source_revision &&
+            after.spatial_fields[1U].source_revision == before.spatial_fields[1U].source_revision);
+    REQUIRE(!session.spatial_vector_field_preview("field.wind.missing", "field.wind.v"));
+    REQUIRE(!session.spatial_vector_field_preview("field.wind.u", "field.wind.u"));
+    REQUIRE(!session.spatial_vector_field_preview("field.wind.u", "field.wind.v", 1U));
+
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::CreateSpatialFieldAction{
+            "field.wind.misaligned", carto::spatial_field::FieldSemantic::wind_v,
+            {-6.0, 12.0}, 2.0, 20U, 12U, -10.0, 10.0, 0.0}));
+    REQUIRE(!session.spatial_vector_field_preview("field.wind.u", "field.wind.misaligned"));
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::CreateSpatialFieldAction{
+            "field.wind.wrong", carto::spatial_field::FieldSemantic::moisture,
+            {-8.0, 12.0}, 2.0, 20U, 12U, -10.0, 10.0, 0.0}));
+    REQUIRE(!session.spatial_vector_field_preview("field.wind.wrong", "field.wind.v"));
+
+    auto paint = carto::spatial_field::FieldBrush{};
+    paint.expected_revision = carto::core::Revision{1U};
+    paint.center_uv = {-8.0, 12.0};
+    paint.radius = 2.0;
+    paint.value = 3.0;
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::PaintSpatialFieldAction{"field.wind.u", paint}));
+    const auto refreshed = session.spatial_vector_field_preview(
+        "field.wind.u", "field.wind.v");
+    REQUIRE(refreshed && refreshed.value().u_component.source_revision ==
+            carto::core::Revision{2U} &&
+            refreshed.value().u_component.digest != preview.value().u_component.digest &&
+            preview.value().u_component.source_revision == carto::core::Revision{1U});
+}
+
 void application_authors_revision_bound_roads_through_history_and_journal() {
     TempDirectory temp;
     const auto path = temp.path() / "road-authoring.carto";
@@ -1544,6 +1732,9 @@ void application_authors_revision_bound_roads_through_history_and_journal() {
         centerline.segments.push_back({
             {0.0, offset, 0.0}, {1.0, offset, 0.0},
             {2.0, offset, 1.0}, {3.0, offset, 1.0}});
+        centerline.segments.push_back({
+            {3.0, offset, 1.0}, {4.0, offset, 1.0},
+            {5.0, offset, 2.0}, {6.0, offset, 2.0}});
         carto::project::RoadSource road;
         road.source_identity = std::string(road_identity);
         road.source_revision = road_revision;
@@ -1566,6 +1757,7 @@ void application_authors_revision_bound_roads_through_history_and_journal() {
     snapshot = session.snapshot();
     REQUIRE(snapshot.curve_paths.size() == 1U && snapshot.road_sources.size() == 1U);
     REQUIRE(snapshot.curve_paths.front().source_revision == carto::core::Revision{1U});
+    REQUIRE(snapshot.curve_paths.front().segment_count == 2U);
     REQUIRE(snapshot.road_sources.front().source_revision == carto::core::Revision{1U});
     REQUIRE(snapshot.road_sources.front().centerline_revision ==
         snapshot.curve_paths.front().source_revision);
@@ -1598,6 +1790,7 @@ void application_authors_revision_bound_roads_through_history_and_journal() {
         snapshot.project_revision, next_curve.value(), next_road.value(), 2.0)));
     auto updated_path = session.curve_path_source(centerline_identity);
     REQUIRE(updated_path && updated_path.value().source_revision == carto::core::Revision{3U});
+    REQUIRE(updated_path.value().segments.size() == 2U);
     REQUIRE(updated_path.value().segments.front().p0.y == 2.0);
 
     REQUIRE(carto::application::testing::dispatch(session,
@@ -1623,6 +1816,8 @@ void application_authors_revision_bound_roads_through_history_and_journal() {
     const auto reopened = carto::project::ProjectDocument::load(path);
     REQUIRE(reopened && reopened.value().curve_paths().at(
         std::string(centerline_identity)).source_revision == carto::core::Revision{5U});
+    REQUIRE(reopened.value().curve_paths().at(
+        std::string(centerline_identity)).segments.size() == 2U);
     REQUIRE(reopened.value().road_sources().at(std::string(road_identity)).
         centerline_revision == carto::core::Revision{5U});
     carto::journal::Journal journal(std::filesystem::path(path.string() + ".journal"));
@@ -1634,13 +1829,782 @@ void application_authors_revision_bound_roads_through_history_and_journal() {
     }));
 }
 
+void application_builds_read_only_revision_bound_road_surface_previews() {
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::NewProjectAction{"Road surface preview"}));
+    carto::geometry::CurvePath centerline;
+    centerline.source_identity = "road.preview.centerline";
+    centerline.source_revision = carto::core::Revision{1U};
+    centerline.segments.push_back({
+        {0.0, 0.0, 0.0}, {10.0 / 3.0, 0.0, 0.0},
+        {20.0 / 3.0, 0.0, 0.0}, {10.0, 0.0, 0.0}});
+    carto::project::RoadSource road;
+    road.source_identity = "road.preview.source";
+    road.source_revision = carto::core::Revision{1U};
+    road.centerline_identity = centerline.source_identity;
+    road.centerline_revision = centerline.source_revision;
+    road.width_meters = 6.0;
+    road.shoulder_meters = 1.0;
+    road.minimum_curve_radius_meters = 20.0;
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SetRoadAuthoringAction{
+            session.snapshot().project_revision, centerline, road}));
+
+    const auto before = session.snapshot();
+    REQUIRE(before.road_sources.size() == 1U && before.curve_paths.size() == 1U);
+    const auto preview = session.road_surface_preview(road.source_identity, 8U);
+    REQUIRE(preview && preview.value().mesh.validate());
+    REQUIRE(preview.value().road_revision == before.road_sources.front().source_revision &&
+            preview.value().road_digest == before.road_sources.front().digest &&
+            preview.value().centerline_digest == before.curve_paths.front().digest &&
+            preview.value().project_generation == before.project_generation);
+    REQUIRE(preview.value().matches(before.project_generation,
+            before.road_sources.front(), before.curve_paths.front()));
+    REQUIRE(!preview.value().matches(before.project_generation + 1U,
+            before.road_sources.front(), before.curve_paths.front()));
+    REQUIRE(preview.value().mesh.centerline_identity == centerline.source_identity &&
+            preview.value().mesh.centerline_revision == centerline.source_revision &&
+            preview.value().mesh.road_triangle_count() == 16U);
+    const auto after_preview = session.snapshot();
+    REQUIRE(after_preview.project_revision == before.project_revision &&
+            after_preview.undo_count == before.undo_count &&
+            after_preview.redo_count == before.redo_count &&
+            after_preview.dirty == before.dirty);
+    REQUIRE(!session.road_surface_preview("road.preview.missing"));
+
+    centerline.source_revision = carto::core::Revision{2U};
+    road.source_revision = carto::core::Revision{2U};
+    road.centerline_revision = centerline.source_revision;
+    road.width_meters = 8.0;
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SetRoadAuthoringAction{
+            after_preview.project_revision, centerline, road}));
+    const auto updated = session.snapshot();
+    REQUIRE(updated.road_sources.front().digest != preview.value().road_digest &&
+            updated.curve_paths.front().digest != preview.value().centerline_digest &&
+            updated.road_sources.front().source_revision != preview.value().road_revision);
+    REQUIRE(!preview.value().matches(updated.project_generation,
+            updated.road_sources.front(), updated.curve_paths.front()));
+    const auto refreshed = session.road_surface_preview(road.source_identity, 8U);
+    REQUIRE(refreshed && refreshed.value().road_digest == updated.road_sources.front().digest &&
+            refreshed.value().centerline_digest == updated.curve_paths.front().digest &&
+            refreshed.value().mesh.road_width_meters == 8.0 &&
+            refreshed.value().matches(updated.project_generation,
+                updated.road_sources.front(), updated.curve_paths.front()));
+}
+
+void application_authors_revision_bound_sweeps_through_history() {
+    TempDirectory temp;
+    const auto project_path = temp.path() / "sweep-authoring.carto";
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::NewProjectAction{"Sweep authoring"}));
+
+    carto::geometry::CurvePath centerline;
+    centerline.source_identity = "sweep.authoring.centerline";
+    centerline.source_revision = carto::core::Revision{1U};
+    centerline.segments.push_back({
+        {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0},
+        {2.0, 0.0, 0.0}, {3.0, 0.0, 0.0}});
+    carto::project::RoadSource road;
+    road.source_identity = "sweep.authoring.path-owner";
+    road.source_revision = carto::core::Revision{1U};
+    road.centerline_identity = centerline.source_identity;
+    road.centerline_revision = centerline.source_revision;
+    road.width_meters = 4.0;
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SetRoadAuthoringAction{
+            session.snapshot().project_revision, centerline, road}));
+
+    carto::geometry::SweepSource source;
+    source.source_identity = "sweep.authoring.pipe";
+    source.centerline_identity = centerline.source_identity;
+    source.centerline_revision = centerline.source_revision;
+    source.reference_up = {0.0, 1.0, 0.0};
+    source.samples_per_segment = 4U;
+    source.profile.reserve(8U);
+    constexpr double kTau = 6.283185307179586476925286766559;
+    for (std::size_t index = 0U; index < 8U; ++index) {
+        const double angle = kTau * static_cast<double>(index) / 8.0;
+        source.profile.push_back({0.1 * std::cos(angle), 0.1 * std::sin(angle)});
+    }
+    const auto next_source_revision = session.next_sweep_source_revision(
+        source.source_identity);
+    REQUIRE(next_source_revision);
+    source.source_revision = next_source_revision.value();
+    const auto before_create = session.snapshot();
+    const auto created = carto::application::testing::dispatch(session,
+        carto::application::SetSweepSourceAction{
+            before_create.project_revision, source});
+    REQUIRE(created);
+    auto snapshot = session.snapshot();
+    REQUIRE(snapshot.sweep_sources.size() == 1U &&
+            snapshot.sweep_sources.front().source.source_revision ==
+                carto::core::Revision{1U});
+
+    const auto preview = session.sweep_source_preview(source.source_identity);
+    REQUIRE(preview && preview.value().mesh.validate());
+    REQUIRE(preview.value().source_identity == source.source_identity &&
+            preview.value().source_revision == carto::core::Revision{1U} &&
+            preview.value().centerline_identity == centerline.source_identity &&
+            preview.value().centerline_revision == centerline.source_revision);
+    const auto after_preview = session.snapshot();
+    REQUIRE(after_preview.project_revision == snapshot.project_revision &&
+            after_preview.undo_count == snapshot.undo_count &&
+            after_preview.dirty == snapshot.dirty);
+    REQUIRE(!session.sweep_source_preview("sweep.authoring.missing"));
+
+    const auto stale = carto::application::testing::dispatch(session,
+        carto::application::SetSweepSourceAction{before_create.project_revision, source});
+    REQUIRE(!stale && session.snapshot().project_revision == snapshot.project_revision);
+
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::UndoAction{}));
+    REQUIRE(session.snapshot().sweep_sources.empty() &&
+            session.next_sweep_source_revision(source.source_identity).value() ==
+                carto::core::Revision{2U});
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::RedoAction{}));
+    snapshot = session.snapshot();
+    REQUIRE(snapshot.sweep_sources.size() == 1U &&
+            snapshot.sweep_sources.front().source.source_revision ==
+                carto::core::Revision{2U});
+
+    auto edited_source = snapshot.sweep_sources.front().source;
+    edited_source.end_scale = 0.5;
+    edited_source.source_revision = session.next_sweep_source_revision(
+        edited_source.source_identity).value();
+    const auto old_digest = snapshot.sweep_sources.front().digest;
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SetSweepSourceAction{
+            snapshot.project_revision, edited_source}));
+    snapshot = session.snapshot();
+    REQUIRE(snapshot.sweep_sources.front().digest != old_digest);
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::UndoAction{}));
+    snapshot = session.snapshot();
+    REQUIRE(snapshot.sweep_sources.front().source.end_scale == 1.0 &&
+            snapshot.sweep_sources.front().source.source_revision ==
+                carto::core::Revision{4U});
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::RedoAction{}));
+    snapshot = session.snapshot();
+    REQUIRE(snapshot.sweep_sources.front().source.end_scale == 0.5 &&
+            snapshot.sweep_sources.front().source.source_revision ==
+                carto::core::Revision{5U});
+
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SaveProjectAction{project_path}));
+    const auto reopened = carto::project::ProjectDocument::load(project_path);
+    REQUIRE(reopened && reopened.value().sweep_sources().at(source.source_identity).
+            source_revision == carto::core::Revision{5U});
+}
+
+void application_routes_source_reimport_through_human_history() {
+    carto::application::ApplicationSession session;
+    TempDirectory directory;
+    const auto project_path = directory.path() / "source-assets.carto";
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SaveProjectAction{project_path}));
+    const auto bytes_digest = [](std::string_view value) {
+        return carto::assets::sha256(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
+    };
+    carto::assets::SourceImportRecord source;
+    source.identity = "asset.oak";
+    source.relative_source_path = "Assets/trees/oak.obj";
+    source.source_generation = carto::core::Revision{1U};
+    source.kind = carto::assets::SourceAssetKind::mesh;
+    source.source_digest = bytes_digest("source-v1");
+    source.importer_identity = "carto.import.obj";
+    source.importer_version = 1U;
+    source.artifact_identity = "mesh.oak";
+    source.artifact_digest = bytes_digest("mesh-v1");
+    source.domain_digests = {{
+        carto::assets::SourceAssetDomain::geometry, bytes_digest("mesh-v1")}};
+
+    const auto plan = session.preview_source_reimport({source});
+    REQUIRE(static_cast<bool>(plan));
+    const auto imported = carto::application::testing::dispatch(session,
+        carto::application::ApplySourceReimportPlanAction{plan.value()});
+    REQUIRE(imported && imported.value().document_changed);
+    const auto after_import = session.snapshot();
+    REQUIRE(after_import.source_assets.size() == 1U &&
+        after_import.source_assets.front().identity == source.identity &&
+        after_import.source_assets.front().relative_source_path == source.relative_source_path &&
+        after_import.source_assets.front().source_generation == carto::core::Revision{1U});
+    const auto no_change_plan = session.preview_source_reimport({source});
+    REQUIRE(no_change_plan && no_change_plan.value().entries.front().change ==
+        carto::assets::SourceReimportChange::unchanged);
+    const auto recovery = carto::application::ApplicationSession::inspect_recovery(project_path);
+    REQUIRE(recovery && recovery.value().state ==
+        carto::application::RecoveryInspectionState::pending);
+    carto::journal::Journal journal(std::filesystem::path(project_path.string() + ".journal"));
+    const auto journal_entries = journal.read_all();
+    REQUIRE(journal_entries && !journal_entries.value().empty());
+    const std::string journal_payload(journal_entries.value().back().payload.begin(),
+        journal_entries.value().back().payload.end());
+    REQUIRE(journal_payload.find("Apply Source Reimport ") != std::string::npos &&
+        journal_payload.find("SOURCE_ASSET_REGISTRY_HEX") != std::string::npos);
+
+    const auto stale_plan = carto::application::testing::dispatch(session,
+        carto::application::ApplySourceReimportPlanAction{plan.value()});
+    REQUIRE(!stale_plan && stale_plan.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(session.snapshot().source_assets.size() == 1U);
+
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::UndoAction{}));
+    const auto after_undo = session.snapshot();
+    REQUIRE(after_undo.source_assets.empty() && after_undo.source_asset_tombstone_count == 1U);
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::RedoAction{}));
+    const auto after_redo = session.snapshot();
+    REQUIRE(after_redo.source_assets.size() == 1U &&
+        after_redo.source_assets.front().source_generation == carto::core::Revision{2U});
+    const auto stale_no_change = carto::application::testing::dispatch(session,
+        carto::application::ApplySourceReimportPlanAction{no_change_plan.value()});
+    REQUIRE(!stale_no_change &&
+        stale_no_change.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SaveProjectAction{project_path}));
+    const auto reopened = carto::project::ProjectDocument::load(project_path);
+    REQUIRE(reopened && reopened.value().source_asset_registry().records().at(source.identity)
+        .source_generation == carto::core::Revision{2U});
+}
+
+void application_authors_pbr_materials_through_revisioned_journaled_history() {
+    TempDirectory temp;
+    carto::application::ApplicationSession session;
+    const auto project_path = temp.path() / "materials.carto";
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SaveProjectAction{project_path}));
+
+    carto::render::StandardMaterial initial;
+    initial.base_color_factor = {0.18, 0.22, 0.25, 1.0};
+    initial.metallic = 0.62;
+    initial.roughness = 0.71;
+    const auto before_create = session.snapshot();
+    const auto created = carto::application::testing::dispatch(session,
+        carto::application::CreateMaterialAction{
+            before_create.project_revision, "Galvanized steel", initial});
+    REQUIRE(created && created.value().document_changed &&
+        created.value().action == "Create Material");
+    auto after_create = session.snapshot();
+    REQUIRE(after_create.materials.size() == 1U);
+    REQUIRE(after_create.materials.front().id == 1U);
+    REQUIRE(after_create.materials.front().revision == carto::core::Revision{1U});
+    REQUIRE(after_create.materials.front().definition.roughness == 0.71);
+
+    const auto stale_create = carto::application::testing::dispatch(session,
+        carto::application::CreateMaterialAction{
+            before_create.project_revision, "Stale material", {}});
+    REQUIRE(!stale_create && stale_create.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(session.snapshot().materials.size() == 1U);
+
+    auto edited = after_create.materials.front().definition;
+    edited.base_color_factor = {0.42, 0.45, 0.48, 1.0};
+    edited.metallic = 0.92;
+    edited.roughness = 0.3;
+    const auto updated = carto::application::testing::dispatch(session,
+        carto::application::UpdateMaterialAction{
+            after_create.project_revision, 1U, carto::core::Revision{1U}, edited});
+    REQUIRE(updated && updated.value().document_changed &&
+        updated.value().action == "Update Material");
+    auto after_update = session.snapshot();
+    REQUIRE(after_update.materials.front().revision == carto::core::Revision{2U});
+    REQUIRE(after_update.materials.front().definition.metallic == 0.92);
+    REQUIRE(after_update.materials.front().definition.roughness == 0.3);
+
+    const auto stale_material = carto::application::testing::dispatch(session,
+        carto::application::UpdateMaterialAction{
+            after_update.project_revision, 1U, carto::core::Revision{1U}, initial});
+    REQUIRE(!stale_material &&
+        stale_material.error().code == carto::core::ErrorCode::stale_data);
+    auto invalid = edited;
+    invalid.roughness = 1.5;
+    const auto invalid_edit = carto::application::testing::dispatch(session,
+        carto::application::UpdateMaterialAction{
+            after_update.project_revision, 1U, carto::core::Revision{2U}, invalid});
+    REQUIRE(!invalid_edit);
+    REQUIRE(session.snapshot().materials.front().revision == carto::core::Revision{2U});
+
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::UndoAction{}));
+    auto after_undo = session.snapshot();
+    REQUIRE(after_undo.materials.front().revision == carto::core::Revision{1U});
+    REQUIRE(after_undo.materials.front().definition.roughness == 0.71);
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::RedoAction{}));
+    auto after_redo = session.snapshot();
+    REQUIRE(after_redo.materials.front().revision == carto::core::Revision{2U});
+    REQUIRE(after_redo.materials.front().definition.roughness == 0.3);
+
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SaveProjectAction{std::nullopt}));
+    const auto reopened = carto::project::ProjectDocument::load(project_path);
+    REQUIRE(reopened && reopened.value().material_catalog().materials().size() == 1U);
+    REQUIRE(reopened.value().material_catalog().materials().at(1U).revision ==
+        carto::core::Revision{2U});
+    REQUIRE(reopened.value().material_catalog().materials().at(1U).definition.roughness == 0.3);
+
+    carto::journal::Journal journal(std::filesystem::path(project_path.string() + ".journal"));
+    const auto entries = journal.read_all();
+    REQUIRE(entries && entries.value().size() >= 4U);
+    const auto contains_payload = [&entries](std::string_view needle) {
+        return std::any_of(entries.value().begin(), entries.value().end(),
+            [needle](const auto& entry) {
+                const std::string payload(entry.payload.begin(), entry.payload.end());
+                return payload.find(needle) != std::string::npos;
+            });
+    };
+    REQUIRE(contains_payload("Create Material"));
+    REQUIRE(contains_payload("Update Material"));
+    REQUIRE(contains_payload("Undo"));
+    REQUIRE(contains_payload("Redo"));
+}
+
+void application_authors_material_graphs_through_digest_guarded_history() {
+    TempDirectory temp;
+    carto::application::ApplicationSession session;
+    const auto project_path = temp.path() / "material-graphs.carto";
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SaveProjectAction{project_path}));
+
+    carto::project::MaterialGraph graph;
+    graph.identity = "materials/pine-ridge/painted-metal";
+    graph.revision = carto::core::Revision{1U};
+    carto::project::MaterialGraphNode color;
+    color.id = 1U;
+    color.kind = carto::project::MaterialGraphNodeKind::constant_color;
+    color.value_type = carto::project::MaterialGraphValueType::color;
+    color.constants = {0.28, 0.32, 0.36, 1.0};
+    carto::project::MaterialGraphNode alpha;
+    alpha.id = 2U;
+    alpha.kind = carto::project::MaterialGraphNodeKind::constant_scalar;
+    alpha.value_type = carto::project::MaterialGraphValueType::scalar;
+    alpha.constants[0] = 1.0;
+    carto::project::MaterialGraphNode roughness;
+    roughness.id = 3U;
+    roughness.kind = carto::project::MaterialGraphNodeKind::constant_scalar;
+    roughness.value_type = carto::project::MaterialGraphValueType::scalar;
+    roughness.constants[0] = 0.63;
+    carto::project::MaterialGraphNode metallic;
+    metallic.id = 4U;
+    metallic.kind = carto::project::MaterialGraphNodeKind::constant_scalar;
+    metallic.value_type = carto::project::MaterialGraphValueType::scalar;
+    metallic.constants[0] = 0.78;
+    carto::project::MaterialGraphNode unsupported;
+    unsupported.id = 5U;
+    unsupported.kind = carto::project::MaterialGraphNodeKind::unsupported;
+    unsupported.value_type = carto::project::MaterialGraphValueType::scalar;
+    unsupported.unsupported_identity = "donor-noise-node";
+    graph.nodes = {color, alpha, roughness, metallic, unsupported};
+    graph.outputs.base_color = color.id;
+    graph.outputs.alpha = alpha.id;
+    graph.outputs.roughness = roughness.id;
+    graph.outputs.metallic = metallic.id;
+
+    const auto before_create = session.snapshot();
+    const auto created = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialGraphAction{
+            before_create.project_revision, std::nullopt, std::nullopt, graph});
+    REQUIRE(created && created.value().document_changed &&
+        created.value().action == "Set Material Graph");
+    auto after_create = session.snapshot();
+    REQUIRE(after_create.material_graphs.size() == 1U);
+    REQUIRE(after_create.material_graphs.front().identity == graph.identity);
+    REQUIRE(after_create.material_graphs.front().node_count == graph.nodes.size());
+    auto source = session.material_graph_source(graph.identity);
+    REQUIRE(source && source.value().revision == carto::core::Revision{1U});
+    auto compile_report = carto::project::compile_material_graph(source.value());
+    REQUIRE(compile_report && !compile_report.value().supported &&
+        compile_report.value().diagnostics.size() == 1U &&
+        compile_report.value().diagnostics.front().node_id == unsupported.id);
+
+    carto::render::StandardMaterial material_definition;
+    const auto material_created = carto::application::testing::dispatch(session,
+        carto::application::CreateMaterialAction{
+            after_create.project_revision, "Paint source", material_definition});
+    REQUIRE(material_created);
+    after_create = session.snapshot();
+    REQUIRE(after_create.materials.size() == 1U &&
+        after_create.materials.front().revision == carto::core::Revision{1U});
+
+    const auto original_digest = source.value().canonical_digest();
+    REQUIRE(original_digest);
+    auto stale_binding_digest = original_digest.value();
+    stale_binding_digest.bytes[0] ^= 0xffU;
+    const auto stale_binding = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialGraphBindingAction{
+            after_create.project_revision, after_create.materials.front().id,
+            after_create.materials.front().revision, graph.identity, source.value().revision,
+            stale_binding_digest});
+    REQUIRE(!stale_binding &&
+        stale_binding.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(session.snapshot().material_graph_bindings.empty());
+    const auto bound = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialGraphBindingAction{
+            after_create.project_revision, after_create.materials.front().id,
+            after_create.materials.front().revision, graph.identity, source.value().revision,
+            original_digest.value()});
+    REQUIRE(bound && bound.value().action == "Bind Material Graph");
+    after_create = session.snapshot();
+    REQUIRE(after_create.material_graph_bindings.size() == 1U &&
+        after_create.material_graph_bindings.front().source_current &&
+        after_create.material_graph_bindings.front().source_revision ==
+            source.value().revision &&
+        after_create.materials.front().revision == carto::core::Revision{2U});
+
+    auto updated = source.value();
+    const auto color_node = std::find_if(updated.nodes.begin(), updated.nodes.end(),
+        [](const auto& node) { return node.id == 1U; });
+    REQUIRE(color_node != updated.nodes.end());
+    color_node->constants[0] = 0.44;
+    updated.revision = updated.revision.next();
+
+    const auto stale_project = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialGraphAction{
+            before_create.project_revision, source.value().revision,
+            original_digest.value(), updated});
+    REQUIRE(!stale_project &&
+        stale_project.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(session.snapshot().material_graphs.front().source_revision ==
+        carto::core::Revision{1U});
+
+    auto stale_source_digest = original_digest.value();
+    stale_source_digest.bytes[0] ^= 0xffU;
+    const auto stale_source = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialGraphAction{
+            after_create.project_revision, source.value().revision,
+            stale_source_digest, updated});
+    REQUIRE(!stale_source &&
+        stale_source.error().code == carto::core::ErrorCode::stale_data);
+
+    auto wrong_revision = updated;
+    wrong_revision.revision = carto::core::Revision{9U};
+    const auto invalid_revision = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialGraphAction{
+            after_create.project_revision, source.value().revision,
+            original_digest.value(), wrong_revision});
+    REQUIRE(!invalid_revision &&
+        invalid_revision.error().code == carto::core::ErrorCode::invalid_argument);
+
+    const auto applied = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialGraphAction{
+            after_create.project_revision, source.value().revision,
+            original_digest.value(), updated});
+    REQUIRE(applied && applied.value().document_changed);
+    auto after_update = session.snapshot();
+    REQUIRE(after_update.material_graphs.front().source_revision ==
+        carto::core::Revision{2U});
+    REQUIRE(after_update.material_graph_bindings.size() == 1U &&
+        !after_update.material_graph_bindings.front().source_current &&
+        after_update.material_graph_bindings.front().source_revision ==
+            carto::core::Revision{1U});
+    source = session.material_graph_source(graph.identity);
+    REQUIRE(source && source.value().nodes.front().constants[0] == 0.44);
+    compile_report = carto::project::compile_material_graph(source.value());
+    REQUIRE(compile_report && !compile_report.value().supported &&
+        compile_report.value().diagnostics.size() == 1U);
+
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SaveProjectAction{std::nullopt}));
+    const auto reopened = carto::project::ProjectDocument::load(project_path);
+    REQUIRE(reopened);
+    const auto& reopened_graph = reopened.value().material_catalog().material_graphs().at(
+        graph.identity);
+    REQUIRE(reopened_graph.revision == carto::core::Revision{2U});
+    REQUIRE(reopened_graph.nodes.front().constants[0] == 0.44);
+    REQUIRE(reopened_graph.nodes.back().unsupported_identity == "donor-noise-node");
+
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::UndoAction{}));
+    source = session.material_graph_source(graph.identity);
+    REQUIRE(source && source.value().revision == carto::core::Revision{1U} &&
+        source.value().nodes.front().constants[0] == 0.28);
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::RedoAction{}));
+    source = session.material_graph_source(graph.identity);
+    REQUIRE(source && source.value().revision == carto::core::Revision{2U} &&
+        source.value().nodes.front().constants[0] == 0.44);
+
+    const auto topology_base_digest = source.value().canonical_digest();
+    REQUIRE(topology_base_digest);
+    auto topology_graph = source.value();
+    carto::project::MaterialGraphNode color_add;
+    color_add.id = 6U;
+    color_add.kind = carto::project::MaterialGraphNodeKind::add;
+    color_add.value_type = carto::project::MaterialGraphValueType::color;
+    color_add.inputs = {1U, 1U};
+    topology_graph.nodes.push_back(color_add);
+    topology_graph.outputs.base_color = color_add.id;
+    topology_graph.revision = topology_graph.revision.next();
+    const auto before_topology_commit = session.snapshot();
+    const auto topology_applied = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialGraphAction{
+            before_topology_commit.project_revision, source.value().revision,
+            topology_base_digest.value(), topology_graph});
+    REQUIRE(topology_applied);
+    source = session.material_graph_source(graph.identity);
+    REQUIRE((source && source.value().revision == carto::core::Revision{3U} &&
+        source.value().outputs.base_color == color_add.id &&
+        source.value().nodes.back().inputs == std::vector<std::uint64_t>{1U, 1U}));
+
+    const auto latest_graph_digest = source.value().canonical_digest();
+    REQUIRE(latest_graph_digest);
+    const auto before_rebind = session.snapshot();
+    const auto rebound = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialGraphBindingAction{
+            before_rebind.project_revision, before_rebind.materials.front().id,
+            before_rebind.materials.front().revision, graph.identity, source.value().revision,
+            latest_graph_digest.value()});
+    REQUIRE(rebound && rebound.value().action == "Bind Material Graph");
+    auto after_rebind = session.snapshot();
+    REQUIRE(after_rebind.material_graph_bindings.front().source_current);
+    const auto unbound = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialGraphBindingAction{
+            after_rebind.project_revision, after_rebind.materials.front().id,
+            after_rebind.materials.front().revision, std::nullopt, std::nullopt,
+            std::nullopt});
+    REQUIRE(unbound && unbound.value().action == "Unbind Material Graph");
+    const auto after_unbind = session.snapshot();
+    REQUIRE(after_unbind.material_graph_bindings.empty());
+    const auto rebound_again = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialGraphBindingAction{
+            after_unbind.project_revision, after_unbind.materials.front().id,
+            after_unbind.materials.front().revision, graph.identity, source.value().revision,
+            latest_graph_digest.value()});
+    REQUIRE(rebound_again && session.snapshot().material_graph_bindings.front().source_current);
+
+    const auto topology_digest = source.value().canonical_digest();
+    REQUIRE(topology_digest);
+    auto cyclic_graph = source.value();
+    const auto cycle_node = std::find_if(cyclic_graph.nodes.begin(), cyclic_graph.nodes.end(),
+        [color_add](const auto& node) { return node.id == color_add.id; });
+    REQUIRE(cycle_node != cyclic_graph.nodes.end());
+    cycle_node->inputs = {color_add.id, 1U};
+    cyclic_graph.revision = cyclic_graph.revision.next();
+    const auto before_cycle_rejection = session.snapshot();
+    const auto rejected_cycle = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialGraphAction{
+            before_cycle_rejection.project_revision, source.value().revision,
+            topology_digest.value(), cyclic_graph});
+    REQUIRE(!rejected_cycle &&
+        rejected_cycle.error().code == carto::core::ErrorCode::cycle_detected);
+    REQUIRE(session.snapshot().project_revision == before_cycle_rejection.project_revision);
+    REQUIRE(session.material_graph_source(graph.identity).value().revision ==
+        carto::core::Revision{3U});
+
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SaveProjectAction{std::nullopt}));
+    const auto reopened_topology = carto::project::ProjectDocument::load(project_path);
+    REQUIRE(reopened_topology);
+    const auto& topology_reopened_graph =
+        reopened_topology.value().material_catalog().material_graphs().at(graph.identity);
+    REQUIRE(topology_reopened_graph.revision == carto::core::Revision{3U});
+    REQUIRE(topology_reopened_graph.outputs.base_color == color_add.id);
+    REQUIRE((topology_reopened_graph.nodes.back().inputs ==
+        std::vector<std::uint64_t>{1U, 1U}));
+    REQUIRE(reopened_topology.value().material_catalog().material_graph_bindings().at(1U)
+        .source_revision == carto::core::Revision{3U});
+
+    auto untracked_deletion = source.value();
+    untracked_deletion.outputs.base_color = 1U;
+    untracked_deletion.nodes.erase(std::remove_if(
+        untracked_deletion.nodes.begin(), untracked_deletion.nodes.end(),
+        [color_add](const auto& node) { return node.id == color_add.id; }),
+        untracked_deletion.nodes.end());
+    untracked_deletion.revision = untracked_deletion.revision.next();
+    const auto before_untracked_delete = session.snapshot();
+    const auto rejected_untracked_delete = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialGraphAction{
+            before_untracked_delete.project_revision, source.value().revision,
+            topology_digest.value(), untracked_deletion});
+    REQUIRE(!rejected_untracked_delete &&
+        rejected_untracked_delete.error().code == carto::core::ErrorCode::invalid_argument);
+    REQUIRE(session.snapshot().project_revision == before_untracked_delete.project_revision);
+
+    auto deleted_graph = untracked_deletion;
+    deleted_graph.retired_node_ids.push_back(color_add.id);
+    const auto tracked_delete = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialGraphAction{
+            before_untracked_delete.project_revision, source.value().revision,
+            topology_digest.value(), deleted_graph});
+    REQUIRE(tracked_delete);
+    source = session.material_graph_source(graph.identity);
+    REQUIRE(source && source.value().retired_node_ids ==
+        std::vector<std::uint64_t>{color_add.id});
+
+    auto reused_identity = source.value();
+    carto::project::MaterialGraphNode reused_node;
+    reused_node.id = color_add.id;
+    reused_node.kind = carto::project::MaterialGraphNodeKind::add;
+    reused_node.value_type = carto::project::MaterialGraphValueType::color;
+    reused_node.inputs = {1U, 1U};
+    reused_identity.nodes.push_back(reused_node);
+    reused_identity.outputs.base_color = reused_node.id;
+    reused_identity.revision = reused_identity.revision.next();
+    REQUIRE(!reused_identity.validate());
+
+    auto fresh_identity = source.value();
+    auto fresh_node = reused_node;
+    fresh_node.id = color_add.id + 1U;
+    fresh_identity.nodes.push_back(fresh_node);
+    fresh_identity.outputs.base_color = fresh_node.id;
+    fresh_identity.revision = fresh_identity.revision.next();
+    const auto current_graph_digest = source.value().canonical_digest();
+    REQUIRE(current_graph_digest);
+    const auto before_fresh_add = session.snapshot();
+    const auto fresh_added = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialGraphAction{
+            before_fresh_add.project_revision, source.value().revision,
+            current_graph_digest.value(), fresh_identity});
+    REQUIRE(fresh_added);
+    REQUIRE(session.material_graph_source(graph.identity).value().retired_node_ids ==
+        std::vector<std::uint64_t>{color_add.id});
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SaveProjectAction{std::nullopt}));
+    const auto reopened_lineage = carto::project::ProjectDocument::load(project_path);
+    REQUIRE(reopened_lineage);
+    const auto& lineage_graph = reopened_lineage.value().material_catalog()
+        .material_graphs().at(graph.identity);
+    REQUIRE(lineage_graph.revision == carto::core::Revision{5U});
+    REQUIRE(lineage_graph.retired_node_ids == std::vector<std::uint64_t>{color_add.id});
+    REQUIRE(std::any_of(lineage_graph.nodes.begin(), lineage_graph.nodes.end(),
+        [fresh_node](const auto& node) { return node.id == fresh_node.id; }));
+
+    carto::journal::Journal journal(std::filesystem::path(project_path.string() + ".journal"));
+    const auto entries = journal.read_all();
+    REQUIRE(entries);
+    const bool has_graph_receipt = std::any_of(
+        entries.value().begin(), entries.value().end(), [](const auto& entry) {
+            const std::string payload(entry.payload.begin(), entry.payload.end());
+            return payload.find("Set Material Graph") != std::string::npos;
+        });
+    REQUIRE(has_graph_receipt);
+}
+
+void application_assigns_material_regions_through_revisioned_history() {
+    TempDirectory temp;
+    carto::application::ApplicationSession session;
+    const auto project_path = temp.path() / "material-regions.carto";
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SaveProjectAction{project_path}));
+
+    auto mesh = carto::geometry::make_box({1.0, 1.0, 1.0});
+    REQUIRE(mesh);
+    const auto faces = mesh.value().faces_sorted();
+    carto::attributes::AttributeSet attributes({
+        {carto::attributes::AttributeDomain::face, faces.size()}});
+    std::vector<carto::attributes::AttributeValue> regions(
+        faces.size(), std::uint32_t{7U});
+    REQUIRE(attributes.add_layer(carto::attributes::AttributeLayer{
+        {"cartographer.material_slot", carto::attributes::AttributeDomain::face,
+         carto::attributes::AttributeType::uint32}, std::move(regions)}));
+    REQUIRE(mesh.value().set_attribute_payload(std::move(attributes), {}));
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::CreateMeshObjectAction{
+            "Authored regions", std::move(mesh.value())}));
+    const auto mesh_snapshot = session.snapshot();
+    REQUIRE(mesh_snapshot.objects.size() == 1U);
+    REQUIRE(mesh_snapshot.objects.front().object.mesh_asset.has_value());
+    const auto mesh_asset = *mesh_snapshot.objects.front().object.mesh_asset;
+
+    auto first_source = carto::application::testing::dispatch(session,
+        carto::application::CreateMaterialAction{
+            mesh_snapshot.project_revision, "Stone", {}});
+    REQUIRE(first_source);
+    const auto after_first_source = session.snapshot();
+    auto second_source = carto::application::testing::dispatch(session,
+        carto::application::CreateMaterialAction{
+            after_first_source.project_revision, "Metal", {}});
+    REQUIRE(second_source);
+    const auto before_assignment = session.snapshot();
+    const carto::project::MaterialRegionKey region{mesh_asset, 7U};
+
+    const auto missing_material = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialRegionAssignmentAction{
+            before_assignment.project_revision, region, 999U, std::nullopt});
+    REQUIRE(!missing_material &&
+        missing_material.error().code == carto::core::ErrorCode::not_found);
+    const auto missing_region = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialRegionAssignmentAction{
+            before_assignment.project_revision,
+            {mesh_asset, 999U}, 1U, std::nullopt});
+    REQUIRE(!missing_region &&
+        missing_region.error().code == carto::core::ErrorCode::not_found);
+    REQUIRE(session.snapshot().material_assignments.empty());
+    REQUIRE(session.snapshot().project_revision == before_assignment.project_revision);
+
+    const auto assigned = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialRegionAssignmentAction{
+            before_assignment.project_revision, region, 1U, std::nullopt});
+    REQUIRE(assigned && assigned.value().document_changed &&
+        assigned.value().action == "Set Material Region Assignment");
+    const auto after_assignment = session.snapshot();
+    REQUIRE(after_assignment.material_assignments.size() == 1U);
+    REQUIRE(after_assignment.material_assignments.front().key == region);
+    REQUIRE(after_assignment.material_assignments.front().material == 1U);
+
+    const auto stale_assignment = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialRegionAssignmentAction{
+            before_assignment.project_revision, region, 2U, std::nullopt});
+    REQUIRE(!stale_assignment &&
+        stale_assignment.error().code == carto::core::ErrorCode::stale_data);
+
+    const auto reassigned = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialRegionAssignmentAction{
+            after_assignment.project_revision, region, 2U, std::nullopt});
+    REQUIRE(reassigned);
+    const auto after_reassignment = session.snapshot();
+    REQUIRE(after_reassignment.material_assignments.front().material == 2U);
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SaveProjectAction{std::nullopt}));
+    const auto reopened = carto::project::ProjectDocument::load(project_path);
+    REQUIRE(reopened);
+    REQUIRE(reopened.value().material_catalog().assignments().at(region).material == 2U);
+
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::UndoAction{}));
+    REQUIRE(session.snapshot().material_assignments.front().material == 1U);
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::RedoAction{}));
+    REQUIRE(session.snapshot().material_assignments.front().material == 2U);
+
+    const auto before_clear = session.snapshot();
+    const auto cleared = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialRegionAssignmentAction{
+            before_clear.project_revision, region, std::nullopt, std::nullopt});
+    REQUIRE(cleared && session.snapshot().material_assignments.empty());
+    const auto duplicate_clear = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialRegionAssignmentAction{
+            session.snapshot().project_revision, region, std::nullopt, std::nullopt});
+    REQUIRE(!duplicate_clear &&
+        duplicate_clear.error().code == carto::core::ErrorCode::not_found);
+    REQUIRE(session.snapshot().material_assignments.empty());
+
+    carto::journal::Journal journal(std::filesystem::path(project_path.string() + ".journal"));
+    const auto entries = journal.read_all();
+    REQUIRE(entries);
+    const bool has_assignment_receipt = std::any_of(
+        entries.value().begin(), entries.value().end(), [](const auto& entry) {
+            const std::string payload(entry.payload.begin(), entry.payload.end());
+            return payload.find("Set Material Region Assignment") != std::string::npos;
+        });
+    REQUIRE(has_assignment_receipt);
+}
+
 } // namespace
 
 int main() {
     try {
+        application_mesh_geometry_digest_is_canonical_and_revision_independent();
         application_routes_authoring_through_snapshot_and_history();
+        application_synthetic_room_snap_gesture_commits_undoes_and_rejects_stale_source();
         application_reuses_revision_keyed_viewport_meshes_without_cross_project_staleness();
         application_builds_read_only_terrain_previews_from_current_project_sources();
+        application_builds_read_only_source_bound_wind_vector_previews();
+        application_builds_read_only_revision_bound_road_surface_previews();
+        application_authors_revision_bound_sweeps_through_history();
         application_persists_project_topology_receipts_through_save_and_reopen();
         application_persists_vertex_merge_lineage_through_save_and_reopen();
         application_routes_face_poke_through_history_and_persists_lineage();
@@ -1674,6 +2638,10 @@ int main() {
         application_mutation_serializes_with_project_recovery_writer_lease();
         application_routes_spatial_field_creation_and_paint_through_revisioned_history();
         application_authors_revision_bound_roads_through_history_and_journal();
+        application_routes_source_reimport_through_human_history();
+        application_authors_pbr_materials_through_revisioned_journaled_history();
+        application_authors_material_graphs_through_digest_guarded_history();
+        application_assigns_material_regions_through_revisioned_history();
     } catch (const std::exception& error) {
         return (void(std::cerr << "FAIL " << error.what() << '\n'), 1);
     }

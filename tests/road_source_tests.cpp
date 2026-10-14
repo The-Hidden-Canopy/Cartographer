@@ -1,4 +1,5 @@
 #include <carto/journal/journal.hpp>
+#include <carto/geometry/road_surface.hpp>
 #include <carto/project/project.hpp>
 #include <carto/project/road_source.hpp>
 #include <carto/project/transaction.hpp>
@@ -68,6 +69,72 @@ project::RoadSource make_road(
     road.access_state = project::RoadAccessState::open;
     road.drainage_intent = project::RoadDrainageIntent::roadside_ditch;
     return road;
+}
+
+geometry::CurvePath straight_centerline() {
+    geometry::CurvePath path;
+    path.source_identity = "road.test.straight";
+    path.source_revision = core::Revision{1U};
+    path.segments.push_back({
+        {0.0, 0.0, 0.0}, {10.0 / 3.0, 0.0, 0.0},
+        {20.0 / 3.0, 0.0, 0.0}, {10.0, 0.0, 0.0}});
+    return path;
+}
+
+void derived_road_surface_is_bounded_and_fails_closed() {
+    const auto centerline = straight_centerline();
+    const auto preview = geometry::build_road_surface(
+        centerline, 6.0, 1.0, 0.12, 20.0, 8U);
+    require(preview && preview.value().validate(),
+        "valid source centerline produces a validated disposable road ribbon");
+    require(preview.value().stations.size() == 9U &&
+            preview.value().road_triangle_count() == 16U &&
+            preview.value().shoulder_triangle_count() == 32U,
+        "ribbon station and triangle counts are deterministic and bounded");
+    require(preview.value().stations.front().road_left.z == 3.0 &&
+            preview.value().stations.front().road_right.z == -3.0 &&
+            preview.value().stations.front().shoulder_left.z == 4.0 &&
+            preview.value().stations.front().shoulder_right.z == -4.0,
+        "road and shoulder widths are applied symmetrically around the source");
+    const auto repeated = geometry::build_road_surface(
+        centerline, 6.0, 1.0, 0.12, 20.0, 8U);
+    require(repeated && repeated.value().stations.size() == preview.value().stations.size() &&
+            repeated.value().stations.back().center.x == preview.value().stations.back().center.x,
+        "identical source and sampling inputs yield a deterministic preview");
+
+    auto steep = centerline;
+    steep.segments.front().p1.y = 2.0;
+    steep.segments.front().p2.y = 8.0;
+    steep.segments.front().p3.y = 10.0;
+    require(!geometry::build_road_surface(steep, 6.0, 1.0, 0.1, 20.0, 8U),
+        "sampled grade above the road design limit is rejected");
+
+    auto tight_curve = centerline;
+    tight_curve.segments.front() = {
+        {0.0, 0.0, 0.0}, {0.0, 0.0, 4.0},
+        {4.0, 0.0, 8.0}, {8.0, 0.0, 8.0}};
+    require(!geometry::build_road_surface(tight_curve, 6.0, 1.0, 0.12, 20.0, 32U),
+        "sampled curvature tighter than the minimum radius is rejected");
+
+    auto reversing = centerline;
+    reversing.segments = {
+        {{0.0, 0.0, 0.0}, {3.0, 0.0, 0.0},
+         {7.0, 0.0, 0.0}, {10.0, 0.0, 0.0}},
+        {{10.0, 0.0, 0.0}, {7.0, 0.0, 0.0},
+         {3.0, 0.0, 0.0}, {0.0, 0.0, 0.0}}};
+    require(!geometry::build_road_surface(reversing, 6.0, 1.0, 0.12, 20.0, 8U),
+        "a reversing centerline that would fold the ribbon is rejected");
+    require(!geometry::build_road_surface(centerline, 100.0, 25.0, 0.12, 20.0, 8U),
+        "a road envelope wider than its minimum radius is rejected");
+    require(!geometry::build_road_surface(centerline, 6.0, 1.0, 0.12, 20.0, 0U),
+        "zero-density sampling is rejected before geometry allocation");
+    require(!geometry::build_road_surface(centerline, 6.0, 1.0, 0.12, 20.0, 4097U),
+        "oversized sampling requests are rejected");
+
+    auto corrupted = preview.value();
+    corrupted.stations.back().road_left.x = std::numeric_limits<double>::quiet_NaN();
+    require(!corrupted.validate(),
+        "non-finite derived station data cannot pass product validation");
 }
 
 void road_source_contract_is_bounded_and_canonical() {
@@ -179,8 +246,10 @@ void project_transactions_bind_road_to_exact_curve_revision() {
         "only valid road source transitions emit journal events");
 
     const std::string encoded = document.serialize();
-    require(encoded.starts_with("CARTOGRAPHER_PROJECT 20\n"),
-        "road and spatial-field persistence uses project schema v20");
+    const std::string current_project_header = "CARTOGRAPHER_PROJECT " +
+        std::to_string(project::ProjectDocument::kSchemaVersion) + "\n";
+    require(encoded.starts_with(current_project_header),
+        "road and spatial-field persistence uses the current project schema");
     const auto reopened = project::ProjectDocument::deserialize(encoded);
     require(reopened && reopened.value().road_sources().size() == 1U &&
             reopened.value().road_sources().at("road.pine-ridge.approach").serialize() ==
@@ -217,6 +286,11 @@ void project_transactions_bind_road_to_exact_curve_revision() {
         "schema-v20 refuses a missing mandatory road-source table");
 
     std::string legacy_v19 = encoded;
+    const auto sweep_table = legacy_v19.find("SWEEP_SOURCES ");
+    const auto legacy_spatial_table = legacy_v19.find("SPATIAL_FIELDS ", sweep_table);
+    require(sweep_table != std::string::npos && legacy_spatial_table != std::string::npos,
+        "v19 migration fixture can isolate the later sweep-source table");
+    legacy_v19.erase(sweep_table, legacy_spatial_table - sweep_table);
     const auto curve_lineage = legacy_v19.find("CURVE_PATH_LINEAGE ");
     const auto terminal = legacy_v19.rfind("END\n");
     require(curve_lineage != std::string::npos && terminal != std::string::npos,
@@ -322,6 +396,7 @@ void curve_and_road_tombstones_prevent_source_revision_reuse() {
 } // namespace
 
 int main() {
+    derived_road_surface_is_bounded_and_fails_closed();
     road_source_contract_is_bounded_and_canonical();
     project_transactions_bind_road_to_exact_curve_revision();
     curve_and_road_tombstones_prevent_source_revision_reuse();

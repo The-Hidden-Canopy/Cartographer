@@ -244,6 +244,42 @@ void catalog_round_trips_and_resolves_variants_deterministically() {
             reopened.value().material_graphs().at("materials/workshop/paint").revision ==
                 core::Revision{3U},
         "graph authoring identity and revision persist with material truth");
+
+    auto bound = catalog;
+    require(static_cast<bool>(bound.bind_material_graph(
+                71U, "materials/workshop/paint")),
+        "material source can bind an existing graph source");
+    const auto bound_encoded = bound.serialize();
+    const auto reopened_bound = project::MaterialCatalog::deserialize(bound_encoded);
+    require(reopened_bound && reopened_bound.value().serialize() == bound_encoded &&
+            reopened_bound.value().material_graph_bindings().at(71U).graph_identity ==
+                "materials/workshop/paint" &&
+            reopened_bound.value().material_graph_bindings().at(71U).source_revision ==
+                core::Revision{3U} &&
+            reopened_bound.value().material_graph_bindings().at(71U).source_digest ==
+                catalog.material_graphs().at("materials/workshop/paint").canonical_digest().value(),
+        "material-to-graph association pins and persists an exact source revision and digest");
+    const auto pinned_binding = bound.material_graph_bindings().at(71U);
+    auto edited_graph = bound.material_graphs().at("materials/workshop/paint");
+    edited_graph.revision = edited_graph.revision.next();
+    const auto source_node = std::find_if(edited_graph.nodes.begin(), edited_graph.nodes.end(),
+        [](const auto& node) { return node.id == 1U; });
+    require(source_node != edited_graph.nodes.end(), "graph fixture has its scalar source node");
+    source_node->constants[0] += 0.01;
+    require(static_cast<bool>(bound.replace_material_graph(edited_graph)),
+        "graph source can advance without silently retargeting its material binding");
+    const auto stale_reopened = project::MaterialCatalog::deserialize(bound.serialize());
+    require(stale_reopened &&
+            stale_reopened.value().material_graph_bindings().at(71U).source_revision ==
+                pinned_binding.source_revision &&
+            stale_reopened.value().material_graph_bindings().at(71U).source_digest ==
+                pinned_binding.source_digest &&
+            stale_reopened.value().material_graphs().at("materials/workshop/paint")
+                .revision != pinned_binding.source_revision,
+        "stale graph binding preserves its original pinned evidence across save and reopen");
+    require(static_cast<bool>(bound.unbind_material_graph(71U)) &&
+            bound.material_graph_bindings().empty(),
+        "material graph association can be removed without deleting either source");
 }
 
 void hostile_catalog_inputs_fail_closed() {
@@ -313,17 +349,61 @@ void hostile_catalog_inputs_fail_closed() {
     require(!missing_graph_texture.validate(),
         "graph texture samples cannot resolve to absent source texture records");
 
-    const auto v2 = project::MaterialCatalog{}.serialize();
+    auto bad_material_binding = catalog_fixture(1U);
+    require(!bad_material_binding.bind_material_graph(
+                999U, "materials/workshop/paint"),
+        "graph binding cannot target a missing material");
+    require(!bad_material_binding.bind_material_graph(71U, "missing/graph"),
+        "graph binding cannot target a missing graph source");
+    require(static_cast<bool>(bad_material_binding.bind_material_graph(
+                71U, "materials/workshop/paint")),
+        "valid graph binding is accepted");
+    require(!bad_material_binding.bind_material_graph(
+                71U, "materials/workshop/paint"),
+        "duplicate graph binding is rejected as a no-op");
+    auto dangling_binding = bad_material_binding.serialize();
+    const auto binding_record = dangling_binding.find("MATERIAL_GRAPH_BINDING 71 ");
+    require(binding_record != std::string::npos,
+        "serialized graph binding has an explicit material identity");
+    dangling_binding.replace(binding_record, std::string("MATERIAL_GRAPH_BINDING 71 ").size(),
+        "MATERIAL_GRAPH_BINDING 999 ");
+    require(!project::MaterialCatalog::deserialize(dangling_binding),
+        "serialized graph binding to an absent material fails closed");
+
+    const auto legacy_catalog = catalog_fixture(1U);
+    auto v2 = legacy_catalog.serialize();
+    const auto bindings_section = v2.find("MATERIAL_GRAPH_BINDINGS ");
+    require(bindings_section != std::string::npos,
+        "current material catalog explicitly frames graph bindings");
+    v2.erase(bindings_section, v2.find("END\n", bindings_section) - bindings_section);
+    v2.replace(0U, std::string("CARTOGRAPHER_MATERIAL_CATALOG 3").size(),
+        "CARTOGRAPHER_MATERIAL_CATALOG 2");
+    const auto reopened_v2 = project::MaterialCatalog::deserialize(v2);
+    require(reopened_v2 &&
+            reopened_v2.value().materials().size() == legacy_catalog.materials().size() &&
+            reopened_v2.value().material_graphs().size() == 1U &&
+            reopened_v2.value().material_graph_bindings().empty(),
+        "v2 catalogs preserve materials and graph sources with an empty binding collection");
     const auto graph_section = v2.find("MATERIAL_GRAPHS ");
     require(graph_section != std::string::npos,
-        "current material catalog explicitly frames its graph collection");
+        "legacy v2 catalog preserves its graph collection");
     auto legacy_v1 = v2;
     legacy_v1.replace(0U, std::string("CARTOGRAPHER_MATERIAL_CATALOG 2").size(),
         "CARTOGRAPHER_MATERIAL_CATALOG 1");
-    legacy_v1.erase(graph_section, legacy_v1.find("END\n", graph_section) - graph_section);
+    const auto terminal_record = legacy_v1.rfind("END\n");
+    require(terminal_record != std::string::npos && terminal_record > graph_section,
+        "legacy v2 fixture has an outer terminal record after embedded graph data");
+    legacy_v1.erase(graph_section, terminal_record - graph_section);
     const auto reopened_v1 = project::MaterialCatalog::deserialize(legacy_v1);
-    require(reopened_v1 && reopened_v1.value().empty(),
-        "v1 catalogs migrate as an explicit empty graph collection");
+    if (!reopened_v1) {
+        std::cerr << "legacy v1 catalog diagnostic: "
+                  << reopened_v1.error().message << '\n';
+    }
+    require(reopened_v1 &&
+            reopened_v1.value().materials().size() == legacy_catalog.materials().size() &&
+            reopened_v1.value().material_graphs().empty() &&
+            reopened_v1.value().material_graph_bindings().empty(),
+        "v1 catalogs preserve material records and migrate without graph records");
 
     project::MaterialVariant unsorted;
     unsorted.id = 1001U;

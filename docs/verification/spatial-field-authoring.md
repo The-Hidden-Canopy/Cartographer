@@ -21,6 +21,15 @@ values while advancing the field revision; deleted identities retain lineage
 tombstones so a recreated field cannot reuse an old source revision. Raw AI
 actions cannot invoke this mutation path.
 
+Wind U/V scalar sources can be paired into a read-only vector visualization.
+The pair must use the exact same grid frame and dimensions and the respective
+`wind_u`/`wind_v` semantics. The derived preview records each component's
+identity, revision, and canonical digest, and is capped at 16 × 16 samples.
+The native CONDITION work surface maps this explicit U/V plane onto its X/Z
+plan view, draws direction arrows, and hides the overlay as soon as either
+source receipt is stale. Preview generation does not create a composed field,
+persist data, or change source/project revisions.
+
 `cartographer_spatial_field_tests`, `cartographer_application_tests`, and
 `cartographer_ui_tests` cover canonical round trip and digest, bounded
 sampling, brush falloff/clamping, stale-brush immutability, transaction
@@ -28,15 +37,17 @@ journaling, command undo/redo across create/delete, retained identity
 tombstones, save/reopen, mandatory schema-v19 lineage enforcement, v18
 migration, and v17 migration without invented field data.
 
-This remains a source-authoring slice, not a simulation. Vector fields, field
-composition/procedural derivation, hydro coupling, a world viewport overlay,
-portable field interchange, and visual acceptance fixtures remain open. The
-terrain module derives a source-bound LOD mesh, normals, per-cell slope,
-navigation passability, and optional wet/dry mask; it does not yet place terrain
-into the scene or create collision/nav runtime objects. The native CONDITION
-workbench has an elevation relief map and a read-only analysis action; it
-reports product counts without mutating project state. An explicit-frame
-adapter converts cell-centered elevations into Cartographer's bathymetry
-contract, with hydro wet/dry output checked against the terrain mask and stale
-source rejection. It does not claim runoff simulation or a solver. No sibling
-runtime or private field implementation is linked.
+This remains a source-authoring slice, not a simulation. General vector-field
+solving, field graph/composition and procedural derivation, runoff coupling,
+portable field interchange, and screenshot-backed visual acceptance remain
+open. The terrain module derives a
+source-bound LOD mesh, normals, per-cell slope, navigation passability, and
+optional wet/dry mask. The native CONDITION workbench overlays that derived
+mesh on the central plan work surface with exact source identity/revision/digest
+validation and a deterministic 16,384-triangle draw budget. Stale previews are
+not drawn; the overlay creates no scene object, collision, or navigation runtime
+authority. An explicit-frame adapter converts cell-centered elevations into
+Cartographer's bathymetry contract, with hydro wet/dry output checked against
+the terrain mask and stale-source rejection. It does not claim runoff
+simulation or a solver. No sibling runtime or private field implementation is
+linked.

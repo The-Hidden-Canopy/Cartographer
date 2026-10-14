@@ -21,7 +21,9 @@ core::Diagnostic stale(std::string message) {
 }
 
 bool valid_kind(PreviewKind kind) noexcept {
-    return kind == PreviewKind::object_transform || kind == PreviewKind::extrude_face ||
+    return kind == PreviewKind::object_transform ||
+        kind == PreviewKind::object_translation_delta ||
+        kind == PreviewKind::extrude_face ||
         kind == PreviewKind::inset_face || kind == PreviewKind::set_vertex_position;
 }
 
@@ -39,6 +41,17 @@ core::Result<void> PreviewParameters::validate(PreviewKind kind) const {
         if (!transform->finite()) {
             return core::Result<void>::failure(
                 invalid("object transform preview requires a finite transform"));
+        }
+        return core::Result<void>::success();
+    }
+    if (kind == PreviewKind::object_translation_delta) {
+        if (!position.has_value() || transform.has_value() || distance.has_value()) {
+            return core::Result<void>::failure(invalid(
+                "object translation preview requires only a displacement"));
+        }
+        if (!position->finite()) {
+            return core::Result<void>::failure(invalid(
+                "object translation preview requires a finite displacement"));
         }
         return core::Result<void>::success();
     }
@@ -75,7 +88,8 @@ core::Result<AuthoringPreview> AuthoringPreview::begin(
     if (!valid_kind(kind)) {
         return core::Result<AuthoringPreview>::failure(invalid("preview kind is invalid"));
     }
-    if (kind == PreviewKind::object_transform &&
+    if ((kind == PreviewKind::object_transform ||
+         kind == PreviewKind::object_translation_delta) &&
         (context.selection_mode != SelectionMode::object || context.objects.size() != 1U)) {
         return core::Result<AuthoringPreview>::failure(invalid(
             "object transform preview requires exactly one selected object"));

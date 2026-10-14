@@ -5,6 +5,9 @@
 #include <algorithm>
 #include <bit>
 #include <charconv>
+#include <chrono>
+#include <fstream>
+#include <iterator>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -22,9 +25,21 @@ constexpr std::string_view kMagic = "CARTOGRAPHER_AGENT_TASK_CHECKPOINT_V1\n";
 constexpr std::size_t kMaxCheckpointBytes = 512U * 1024U * 1024U;
 constexpr std::size_t kMaxProjectBytes = 240U * 1024U * 1024U;
 constexpr std::size_t kMaxTextBytes = 1U * 1024U * 1024U;
+constexpr std::string_view kDemonstrationMagic =
+    "CARTOGRAPHER_AGENT_DEMONSTRATION_V1\n";
+constexpr std::size_t kMaxDemonstrationBytes = 2U * 1024U * 1024U;
+constexpr std::size_t kMaxDemonstrationSteps = 4096U;
+constexpr std::size_t kMaxDemonstrationGates = 256U;
 
 core::Diagnostic malformed(std::string message) {
     return core::Diagnostic(core::ErrorCode::validation_failed, std::move(message));
+}
+
+bool safe_demonstration_text(std::string_view value, std::size_t maximum) noexcept {
+    return !value.empty() && value.size() <= maximum &&
+        std::all_of(value.begin(), value.end(), [](unsigned char character) {
+            return character >= 0x20U && character != 0x7fU;
+        });
 }
 
 assets::Sha256Digest digest_text(std::string_view value) {
@@ -257,6 +272,7 @@ void write_plan(Writer& writer, const AgentPlan& plan) {
     writer.field(plan.id);
     writer.field(plan.objective.id);
     writer.field(plan.objective.goal);
+    writer.field(plan.objective.recipe_id);
     writer.number(plan.objective.base_revision.value());
     write_object_ids(writer, plan.objective.scope_objects);
     write_object_ids(writer, plan.objective.protected_objects);
@@ -294,22 +310,24 @@ void write_plan(Writer& writer, const AgentPlan& plan) {
     for (const auto& step : plan.steps) {
         writer.field(step.id);
         writer.number(step.target.object.value);
-        writer.boolean(std::holds_alternative<geometry::FaceId>(step.target.component));
+        writer.number(step.target.component.index());
         if (const auto* face = std::get_if<geometry::FaceId>(&step.target.component)) {
             writer.number(face->value);
-        } else {
-            writer.number(std::get<geometry::VertexId>(step.target.component).value);
+        } else if (const auto* vertex =
+                       std::get_if<geometry::VertexId>(&step.target.component)) {
+            writer.number(vertex->value);
         }
         writer.field(step.intent);
         write_strings(writer, step.dependencies);
     }
 }
 
-AgentPlan read_plan(Reader& reader) {
+AgentPlan read_plan(Reader& reader, std::uint64_t version) {
     AgentPlan plan;
     plan.id = reader.field(64U);
     plan.objective.id = reader.field(64U);
     plan.objective.goal = reader.field(1024U);
+    if (version >= 5U) plan.objective.recipe_id = reader.field(64U);
     plan.objective.base_revision = core::Revision(reader.number());
     plan.objective.scope_objects = read_object_ids(reader);
     plan.objective.protected_objects = read_object_ids(reader);
@@ -370,9 +388,22 @@ AgentPlan read_plan(Reader& reader) {
         AgentPlanStep step;
         step.id = reader.field(64U);
         step.target.object = scene::ObjectId{reader.number()};
-        const bool is_face = reader.boolean();
-        if (is_face) step.target.component = geometry::FaceId{reader.number()};
-        else step.target.component = geometry::VertexId{reader.number()};
+        if (version >= 4U) {
+            const auto target_kind = reader.number();
+            if (target_kind == 0U) {
+                step.target.component = geometry::FaceId{reader.number()};
+            } else if (target_kind == 1U) {
+                step.target.component = geometry::VertexId{reader.number()};
+            } else if (target_kind == 2U) {
+                step.target.component = std::monostate{};
+            } else {
+                reader.fail("checkpoint plan target kind is unknown");
+            }
+        } else {
+            const bool is_face = reader.boolean();
+            if (is_face) step.target.component = geometry::FaceId{reader.number()};
+            else step.target.component = geometry::VertexId{reader.number()};
+        }
         step.intent = reader.field(1024U);
         step.dependencies = read_strings(reader, 256U);
         plan.steps.push_back(std::move(step));
@@ -393,9 +424,10 @@ void write_envelope(Writer& writer, const AgentWorkEnvelope& envelope) {
     writer.number(envelope.max_query_result_bytes);
     writer.number(envelope.max_repair_attempts);
     writer.number(envelope.max_additional_operations);
+    writer.real(envelope.max_transform_distance_meters);
 }
 
-AgentWorkEnvelope read_envelope(Reader& reader) {
+AgentWorkEnvelope read_envelope(Reader& reader, std::uint64_t version) {
     AgentWorkEnvelope envelope;
     envelope.scope_objects = read_object_ids(reader);
     const auto effects = reader.number();
@@ -413,6 +445,7 @@ AgentWorkEnvelope read_envelope(Reader& reader) {
     envelope.max_query_result_bytes = reader.count(64U * 1024U * 1024U);
     envelope.max_repair_attempts = reader.count(4U);
     envelope.max_additional_operations = reader.count(256U);
+    if (version >= 4U) envelope.max_transform_distance_meters = reader.real();
     return envelope;
 }
 
@@ -641,6 +674,13 @@ core::Result<void> AgentTaskCheckpoint::validate() const {
     }
     if (auto result = plan.validate(); !result) return result;
     if (auto result = envelope.validate(); !result) return result;
+    if (const auto* recipe = find_agent_recipe(plan.objective.recipe_id);
+        recipe != nullptr &&
+        (envelope.max_topology_operations > recipe->max_topology_operations ||
+         (envelope.permitted_effects & ~recipe->permitted_effects) != 0U)) {
+        return core::Result<void>::failure(malformed(
+            "checkpoint work envelope exceeds its selected recipe policy"));
+    }
     if (envelope.scope_objects.size() != plan.objective.scope_objects.size() ||
         !std::all_of(plan.objective.scope_objects.begin(), plan.objective.scope_objects.end(),
             [this](scene::ObjectId object) {
@@ -895,7 +935,7 @@ core::Result<AgentTaskCheckpoint> AgentTaskCheckpoint::deserialize(std::string_v
 
     Reader reader(body);
     const auto version = reader.number();
-    if (version != 1U && version != 2U && version != kFormatVersion) {
+    if (version < 1U || version > kFormatVersion) {
         return core::Result<AgentTaskCheckpoint>::failure(core::Diagnostic(
             core::ErrorCode::version_mismatch, "agent task checkpoint version is unsupported"));
     }
@@ -909,8 +949,8 @@ core::Result<AgentTaskCheckpoint> AgentTaskCheckpoint::deserialize(std::string_v
     checkpoint.diff_digest = reader.digest();
     checkpoint.source_project = reader.field(kMaxProjectBytes);
     checkpoint.speculative_project = reader.field(kMaxProjectBytes);
-    checkpoint.plan = read_plan(reader);
-    checkpoint.envelope = read_envelope(reader);
+    checkpoint.plan = read_plan(reader, version);
+    checkpoint.envelope = read_envelope(reader, version);
     const auto progress_count = reader.count(256U);
     checkpoint.plan_progress.reserve(progress_count);
     for (std::size_t index = 0U; index < progress_count; ++index) {
@@ -955,4 +995,267 @@ core::Result<AgentTaskCheckpoint> AgentTaskCheckpoint::deserialize(std::string_v
     return core::Result<AgentTaskCheckpoint>::success(std::move(checkpoint));
 }
 
+
+// Redacted demonstration codec and capture path. This record is intentionally
+// not an AgentPlan and has no loader path back into task execution.
+core::Result<AgentDemonstration> AgentDemonstration::capture(
+    const AgentTaskSnapshot& snapshot) {
+    if (snapshot.status != TaskStatus::accepted) {
+        return core::Result<AgentDemonstration>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "only a human-accepted agent task can be recorded as a demonstration"));
+    }
+    const std::uint64_t base_revision = snapshot.base_revision.value();
+    const std::uint64_t result_revision = snapshot.speculative_revision.value();
+    if (result_revision < base_revision) {
+        return core::Result<AgentDemonstration>::failure(malformed(
+            "accepted task revision moved behind its source revision"));
+    }
+
+    AgentDemonstration demonstration;
+    demonstration.recipe_id = snapshot.recipe_id;
+    demonstration.objective_digest = snapshot.objective_digest;
+    demonstration.diff_digest = snapshot.diff.digest;
+    demonstration.result_revision_span = result_revision - base_revision;
+    demonstration.repair_count = snapshot.repairs.size();
+    demonstration.rebase_count = snapshot.rebases.size();
+    demonstration.ghost_correction_count = snapshot.ghost_corrections.size();
+
+    std::vector<scene::ObjectId> object_aliases;
+    object_aliases.reserve(std::min<std::size_t>(snapshot.steps.size(), 512U));
+    const auto revision_offset = [base_revision, result_revision](
+        core::Revision revision, std::uint64_t& offset) {
+        const auto value = revision.value();
+        if (value < base_revision || value > result_revision) return false;
+        offset = value - base_revision;
+        return true;
+    };
+    for (const auto& receipt : snapshot.steps) {
+        if (receipt.status != StepStatus::passed) {
+            return core::Result<AgentDemonstration>::failure(malformed(
+                "accepted task contains a step that did not pass"));
+        }
+        auto alias = std::find(
+            object_aliases.begin(), object_aliases.end(), receipt.target_object);
+        if (alias == object_aliases.end()) {
+            if (object_aliases.size() >= 512U) {
+                return core::Result<AgentDemonstration>::failure(malformed(
+                    "accepted task exceeds the demonstration object alias bound"));
+            }
+            object_aliases.push_back(receipt.target_object);
+            alias = object_aliases.end() - 1;
+        }
+        std::uint64_t before_offset = 0U;
+        std::uint64_t after_offset = 0U;
+        if (!revision_offset(receipt.revision_before, before_offset) ||
+            !revision_offset(receipt.revision_after, after_offset)) {
+            return core::Result<AgentDemonstration>::failure(malformed(
+                "accepted task step revision is outside its source and result span"));
+        }
+        demonstration.steps.push_back(AgentDemonstrationStep{
+            digest_text(receipt.intent),
+            receipt.tool_id,
+            static_cast<std::uint32_t>(
+                std::distance(object_aliases.begin(), alias) + 1),
+            before_offset,
+            after_offset,
+            receipt.status});
+    }
+    for (const auto& gate : snapshot.gates) {
+        std::uint64_t source_offset = 0U;
+        std::uint64_t evaluated_offset = 0U;
+        if (!revision_offset(gate.source_revision, source_offset) ||
+            !revision_offset(gate.evaluated_revision, evaluated_offset)) {
+            return core::Result<AgentDemonstration>::failure(malformed(
+                "acceptance gate revision is outside its source and result span"));
+        }
+        demonstration.gates.push_back(AgentDemonstrationGate{
+            gate.id,
+            gate.required,
+            gate.passed,
+            gate.validator_version,
+            source_offset,
+            evaluated_offset,
+            gate.affected_objects.size(),
+            gate.affected_asset_ids.size(),
+            gate.result_digest,
+            gate.evidence_digest});
+    }
+    if (auto result = demonstration.validate(); !result) {
+        return core::Result<AgentDemonstration>::failure(result.error());
+    }
+    return core::Result<AgentDemonstration>::success(std::move(demonstration));
+}
+
+core::Result<void> AgentDemonstration::validate() const {
+    if ((!recipe_id.empty() && !safe_demonstration_text(recipe_id, 256U)) ||
+        steps.empty() || steps.size() > kMaxDemonstrationSteps ||
+        gates.empty() || gates.size() > kMaxDemonstrationGates ||
+        repair_count > 4U || rebase_count > 16U ||
+        ghost_correction_count > 256U) {
+        return core::Result<void>::failure(malformed(
+            "demonstration metadata exceeds its bounds"));
+    }
+
+    std::set<std::string> gate_ids;
+    bool has_required_gate = false;
+    for (const auto& step : steps) {
+        if (!safe_demonstration_text(step.tool_id, 256U) ||
+            step.target_alias == 0U || step.target_alias > 512U ||
+            step.status != StepStatus::passed ||
+            step.revision_before_offset > step.revision_after_offset ||
+            step.revision_after_offset > result_revision_span) {
+            return core::Result<void>::failure(malformed(
+                "demonstration step is invalid or exceeds its revision span"));
+        }
+    }
+    for (const auto& gate : gates) {
+        if (!safe_demonstration_text(gate.id, 256U) ||
+            !safe_demonstration_text(gate.validator_version, 128U) ||
+            gate.source_revision_offset > gate.evaluated_revision_offset ||
+            gate.evaluated_revision_offset > result_revision_span ||
+            !gate_ids.insert(gate.id).second) {
+            return core::Result<void>::failure(malformed(
+                "demonstration gate metadata is invalid"));
+        }
+        if (gate.required) {
+            has_required_gate = true;
+            if (!gate.passed) {
+                return core::Result<void>::failure(malformed(
+                    "demonstration contains a failed required acceptance gate"));
+            }
+        }
+    }
+    if (!has_required_gate) {
+        return core::Result<void>::failure(malformed(
+            "demonstration has no required acceptance gate"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<std::string> AgentDemonstration::serialize() const {
+    if (auto result = validate(); !result) {
+        return core::Result<std::string>::failure(result.error());
+    }
+    Writer payload;
+    payload.number(kFormatVersion);
+    payload.field(recipe_id);
+    payload.digest(objective_digest);
+    payload.digest(diff_digest);
+    payload.number(result_revision_span);
+    payload.number(repair_count);
+    payload.number(rebase_count);
+    payload.number(ghost_correction_count);
+    payload.number(steps.size());
+    for (const auto& step : steps) {
+        payload.digest(step.intent_digest);
+        payload.field(step.tool_id);
+        payload.number(step.target_alias);
+        payload.number(step.revision_before_offset);
+        payload.number(step.revision_after_offset);
+        payload.number(static_cast<std::uint64_t>(step.status));
+    }
+    payload.number(gates.size());
+    for (const auto& gate : gates) {
+        payload.field(gate.id);
+        payload.boolean(gate.required);
+        payload.boolean(gate.passed);
+        payload.field(gate.validator_version);
+        payload.number(gate.source_revision_offset);
+        payload.number(gate.evaluated_revision_offset);
+        payload.number(gate.affected_object_count);
+        payload.number(gate.affected_asset_count);
+        payload.digest(gate.result_digest);
+        payload.digest(gate.evidence_digest);
+    }
+    const std::string body = std::move(payload).take();
+    Writer outer;
+    outer.field(body);
+    outer.digest(digest_text(body));
+    std::string result(kDemonstrationMagic);
+    result += std::move(outer).take();
+    if (result.size() > kMaxDemonstrationBytes) {
+        return core::Result<std::string>::failure(malformed(
+            "serialized demonstration exceeds its file size bound"));
+    }
+    return core::Result<std::string>::success(std::move(result));
+}
+
+core::Result<AgentDemonstration> AgentDemonstration::deserialize(
+    std::string_view bytes) {
+    if (bytes.size() > kMaxDemonstrationBytes ||
+        !bytes.starts_with(kDemonstrationMagic)) {
+        return core::Result<AgentDemonstration>::failure(malformed(
+            "demonstration header is unknown or file exceeds its size bound"));
+    }
+    Reader outer(bytes.substr(kDemonstrationMagic.size()));
+    const std::string body = outer.field(kMaxDemonstrationBytes);
+    const auto supplied_digest = outer.digest();
+    if (!outer.finished()) {
+        return core::Result<AgentDemonstration>::failure(outer.error());
+    }
+    if (digest_text(body) != supplied_digest) {
+        return core::Result<AgentDemonstration>::failure(malformed(
+            "demonstration checksum does not match its contents"));
+    }
+
+    Reader reader(body);
+    if (reader.number() != kFormatVersion) {
+        return core::Result<AgentDemonstration>::failure(core::Diagnostic(
+            core::ErrorCode::version_mismatch,
+            "agent demonstration version is unsupported"));
+    }
+    AgentDemonstration demonstration;
+    demonstration.recipe_id = reader.field(256U);
+    demonstration.objective_digest = reader.digest();
+    demonstration.diff_digest = reader.digest();
+    demonstration.result_revision_span = reader.number();
+    demonstration.repair_count = reader.count(4U);
+    demonstration.rebase_count = reader.count(16U);
+    demonstration.ghost_correction_count = reader.count(256U);
+    const auto step_count = reader.count(kMaxDemonstrationSteps);
+    demonstration.steps.reserve(step_count);
+    for (std::size_t index = 0U; index < step_count; ++index) {
+        AgentDemonstrationStep step;
+        step.intent_digest = reader.digest();
+        step.tool_id = reader.field(256U);
+        const auto target_alias = reader.number();
+        if (target_alias > 512U) {
+            reader.fail("demonstration target alias exceeds its bound");
+        }
+        step.target_alias = target_alias <= 512U
+            ? static_cast<std::uint32_t>(target_alias) : 0U;
+        step.revision_before_offset = reader.number();
+        step.revision_after_offset = reader.number();
+        const auto status = reader.number();
+        if (status > static_cast<std::uint64_t>(StepStatus::invalidated)) {
+            reader.fail("demonstration step status is unknown");
+        }
+        step.status = static_cast<StepStatus>(status);
+        demonstration.steps.push_back(std::move(step));
+    }
+    const auto gate_count = reader.count(kMaxDemonstrationGates);
+    demonstration.gates.reserve(gate_count);
+    for (std::size_t index = 0U; index < gate_count; ++index) {
+        AgentDemonstrationGate gate;
+        gate.id = reader.field(256U);
+        gate.required = reader.boolean();
+        gate.passed = reader.boolean();
+        gate.validator_version = reader.field(128U);
+        gate.source_revision_offset = reader.number();
+        gate.evaluated_revision_offset = reader.number();
+        gate.affected_object_count = reader.count(512U);
+        gate.affected_asset_count = reader.count(4096U);
+        gate.result_digest = reader.digest();
+        gate.evidence_digest = reader.digest();
+        demonstration.gates.push_back(std::move(gate));
+    }
+    if (!reader.finished()) {
+        return core::Result<AgentDemonstration>::failure(reader.error());
+    }
+    if (auto result = demonstration.validate(); !result) {
+        return core::Result<AgentDemonstration>::failure(result.error());
+    }
+    return core::Result<AgentDemonstration>::success(std::move(demonstration));
+}
 } // namespace carto::agent
