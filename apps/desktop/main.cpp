@@ -5359,6 +5359,15 @@ struct DesktopState {
                         object_change.name_changed ? " name" : "");
                 }
             }
+            const auto format_vertex_ids = [](
+                const std::vector<carto::geometry::VertexId>& vertex_ids) {
+                std::string result;
+                for (std::size_t index = 0U; index < vertex_ids.size(); ++index) {
+                    if (index != 0U) result += ", ";
+                    result += std::to_string(vertex_ids[index].value);
+                }
+                return result.empty() ? std::string("none") : result;
+            };
             for (const auto& mesh_change : task.diff.meshes) {
                 ImGui::Text("Mesh %llu · vertices %llu → %llu · faces %llu → %llu",
                     static_cast<unsigned long long>(mesh_change.asset_id),
@@ -5369,16 +5378,64 @@ struct DesktopState {
                 ImGui::TextDisabled("%llu vertex changes · %llu face changes",
                     static_cast<unsigned long long>(mesh_change.vertices.size()),
                     static_cast<unsigned long long>(mesh_change.faces.size()));
-                const std::size_t vertex_limit = std::min<std::size_t>(
-                    mesh_change.vertices.size(), 8U);
-                for (std::size_t i = 0U; i < vertex_limit; ++i) {
-                    const auto& vertex = mesh_change.vertices[i];
-                    ImGui::TextDisabled("Vertex %llu · (%.4f, %.4f, %.4f) → (%.4f, %.4f, %.4f)",
-                        static_cast<unsigned long long>(vertex.id.value),
-                        vertex.before_position.x, vertex.before_position.y,
-                        vertex.before_position.z, vertex.after_position.x,
-                        vertex.after_position.y, vertex.after_position.z);
+                const std::string mesh_id = "mesh-" +
+                    std::to_string(mesh_change.asset_id);
+                ImGui::PushID(mesh_id.c_str());
+                if (!mesh_change.vertices.empty()) {
+                    const std::string label = "Changed vertex positions (" +
+                        std::to_string(mesh_change.vertices.size()) + ")";
+                    if (ImGui::TreeNode(label.c_str())) {
+                        ImGuiListClipper clipper;
+                        clipper.Begin(static_cast<int>(mesh_change.vertices.size()));
+                        while (clipper.Step()) {
+                            for (int row = clipper.DisplayStart;
+                                 row < clipper.DisplayEnd; ++row) {
+                                const auto& vertex = mesh_change.vertices[
+                                    static_cast<std::size_t>(row)];
+                                ImGui::TextDisabled(
+                                    "Vertex %llu · (%.9g, %.9g, %.9g) → (%.9g, %.9g, %.9g)",
+                                    static_cast<unsigned long long>(vertex.id.value),
+                                    vertex.before_position.x, vertex.before_position.y,
+                                    vertex.before_position.z, vertex.after_position.x,
+                                    vertex.after_position.y, vertex.after_position.z);
+                            }
+                        }
+                        ImGui::TreePop();
+                    }
                 }
+                if (!mesh_change.faces.empty()) {
+                    const std::string label = "Changed face connectivity (" +
+                        std::to_string(mesh_change.faces.size()) + ")";
+                    if (ImGui::TreeNode(label.c_str())) {
+                        ImGuiListClipper clipper;
+                        clipper.Begin(static_cast<int>(mesh_change.faces.size()));
+                        while (clipper.Step()) {
+                            for (int row = clipper.DisplayStart;
+                                 row < clipper.DisplayEnd; ++row) {
+                                const auto& face = mesh_change.faces[
+                                    static_cast<std::size_t>(row)];
+                                const char* change = face.added ? "added" :
+                                    face.removed ? "removed" : "connectivity changed";
+                                ImGui::TextDisabled(
+                                    "Face %llu · %s · vertices %zu → %zu · hover for IDs",
+                                    static_cast<unsigned long long>(face.id.value), change,
+                                    face.before_vertices.size(), face.after_vertices.size());
+                                if (ImGui::IsItemHovered()) {
+                                    ImGui::BeginTooltip();
+                                    const std::string before = format_vertex_ids(
+                                        face.before_vertices);
+                                    const std::string after = format_vertex_ids(
+                                        face.after_vertices);
+                                    ImGui::TextWrapped("Before vertex IDs: %s", before.c_str());
+                                    ImGui::TextWrapped("After vertex IDs: %s", after.c_str());
+                                    ImGui::EndTooltip();
+                                }
+                            }
+                        }
+                        ImGui::TreePop();
+                    }
+                }
+                ImGui::PopID();
             }
             const std::string diff_digest = task.diff.digest.hex();
             ImGui::TextDisabled("Diff digest %.12s · R%llu → R%llu",

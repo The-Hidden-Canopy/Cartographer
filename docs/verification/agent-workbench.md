@@ -7,6 +7,7 @@
 - Run the plan on the speculative session.
 - Confirm the source revision and geometry remain unchanged before review.
 - Confirm per-step receipts, project/viewport gates, and structured mesh diffs.
+- Expand changed meshes and inspect all changed vertex positions and face-connectivity identities, including added/removed faces; large lists must remain scrollable without silently truncating evidence.
 - Accept the result and confirm the source advances once and the saved-project journal contains one application mutation event.
 
 ## Adversarial boundaries

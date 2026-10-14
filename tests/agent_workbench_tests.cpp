@@ -1024,12 +1024,26 @@ void diff_digest_tracks_geometry_values_not_only_change_shape() {
         const auto result = task.value().run();
         REQUIRE(result);
         REQUIRE(result.value().can_accept);
-        return result.value().diff.digest.hex();
+        return result.value().diff;
     };
 
-    const std::string shallow = run_with_intent("inset face 0.1");
-    const std::string deep = run_with_intent("inset face 0.2");
-    REQUIRE(shallow != deep);
+    const auto shallow = run_with_intent("inset face 0.1");
+    const auto deep = run_with_intent("inset face 0.2");
+    REQUIRE(shallow.digest != deep.digest);
+    const auto changed_mesh = std::find_if(shallow.meshes.begin(), shallow.meshes.end(),
+        [](const auto& mesh) { return !mesh.faces.empty(); });
+    REQUIRE(changed_mesh != shallow.meshes.end());
+    const auto changed_face = std::find_if(
+        changed_mesh->faces.begin(), changed_mesh->faces.end(), [](const auto& face) {
+            return face.added || face.removed || face.connectivity_changed;
+        });
+    REQUIRE(changed_face != changed_mesh->faces.end());
+    REQUIRE(changed_face->added
+        ? (changed_face->before_vertices.empty() && !changed_face->after_vertices.empty())
+        : changed_face->removed
+            ? (!changed_face->before_vertices.empty() && changed_face->after_vertices.empty())
+            : (!changed_face->before_vertices.empty() &&
+                !changed_face->after_vertices.empty()));
 }
 
 void shared_mesh_instances_must_be_in_scope_and_within_touch_budget() {
