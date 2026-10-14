@@ -69,6 +69,15 @@
 - Editing a step invalidates plan-bound human clarification receipts; execution remains blocked until the operator answers again for the revised plan.
 - The repaired happy path can pass gates and still requires the existing explicit source-acceptance boundary.
 
+## Human ghost correction coverage
+
+- A correction is admitted only through the human UI boundary for an executed review or blocked branch; the source revision must still match the task base.
+- Corrections require an in-scope, unprotected, unlocked root object, a finite changed transform, and a non-empty bounded operator reason. Out-of-scope, non-finite, empty-reason, and stale-source attempts leave the speculative revision unchanged.
+- A correction mutates only the speculative session, refreshes the ProjectDiff and rendered after-scene, and re-runs acceptance gates. Acceptance remains blocked when any required gate fails.
+- Each correction receipt binds the task identity, object, before/after transforms, source and branch revisions, plan context, parent evidence digest, and operator reason.
+- Repair, same-source resume, and disjoint-source rebase replay the latest locked transform only when the replayed branch still has the recorded before transform. Repair lineage binds the inherited correction chain; replay drift blocks acceptance.
+- Checkpoint format version 3 persists correction evidence and reads version 1 and 2 files without correction evidence. Loading remains non-mutating until explicit replay and acceptance.
+
 ## Persistent task checkpoint coverage
 
 - Checkpoints are immutable, versioned files with a checksum, source and speculative project digests, objective/plan context digest, work envelope, step progress, failure receipts, repair lineage, last diff digest, validation report, and provider identity.
@@ -79,7 +88,7 @@
 - An explicit rebase analysis derives object and mesh read/write sets from objective scope, target objects, mesh bindings, and target ancestry. Disjoint object or mesh edits can be rebased; changed scope/ancestor objects, scoped meshes, target write meshes, or a new out-of-scope instance of a written shared mesh block.
 - CONDITION or engineering sidecar changes block rebase while field-level query provenance is unavailable. Rebase requires a plan bound to the exact current revision, unchanged intent/scope/dependencies, and renewed human clarification answers.
 - A conflict-free rebase replays the complete native plan against the current source and compares the saved and replayed task write-set objects/meshes. Replay drift blocks acceptance. The accepted result includes all unrelated source edits because the speculative branch starts from the current source.
-- Rebase lineage records the previous/current source revisions and digests, canonical read/write set digests, and bounded identities. Checkpoint format version 2 reads version 1 checkpoints without rebase lineage.
+- Rebase lineage records the previous/current source revisions and digests, canonical read/write set digests, and bounded identities. Checkpoint format version 3 reads version 1 and 2 checkpoints without newer correction evidence.
 - Rebase currently replays the full plan conservatively; per-step invalidation and re-execution from a minimal affected DAG frontier are not implemented.
 - Accepted and rejected checkpoints remain inspectable history and cannot be resumed. Checkpoint writes do not replace an existing file, preserving prior task history.
 - Corrupted files, attempts to overwrite a checkpoint, conflicting source changes, missing reapproval, and replayed write-set drift are blocked without changing the live project.

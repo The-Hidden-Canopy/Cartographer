@@ -508,6 +508,10 @@ public:
         const std::filesystem::path& path);
     [[nodiscard]] core::Result<void> rebase_agent_checkpoint();
     [[nodiscard]] core::Result<agent::AgentTaskSnapshot> resume_agent_checkpoint();
+    [[nodiscard]] core::Result<agent::AgentTaskSnapshot> correct_agent_ghost_transform(
+        scene::ObjectId object,
+        core::Transform transform,
+        std::string justification);
     [[nodiscard]] core::Result<application::DispatchReceipt> accept_agent_plan();
     [[nodiscard]] core::Result<void> reject_agent_plan();
     [[nodiscard]] core::Result<void> clear_agent_plan();

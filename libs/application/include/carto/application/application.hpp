@@ -623,6 +623,12 @@ private:
     friend class ::carto::ui::UiController;
     friend class ::carto::agent::AgentTask;
 
+    [[nodiscard]] static core::Result<void> correct_agent_ghost_transform(
+        ::carto::agent::AgentTask& task,
+        scene::ObjectId object,
+        core::Transform transform,
+        std::string justification);
+
     [[nodiscard]] static core::Result<DispatchReceipt> commit_preview(
         ApplicationSession& session,
         editor::AuthoringPreview& preview,

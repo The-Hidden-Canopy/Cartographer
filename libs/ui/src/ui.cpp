@@ -1935,6 +1935,23 @@ core::Result<agent::AgentTaskSnapshot> UiController::resume_agent_checkpoint() {
     return core::Result<agent::AgentTaskSnapshot>::success(result);
 }
 
+core::Result<agent::AgentTaskSnapshot> UiController::correct_agent_ghost_transform(
+    scene::ObjectId object,
+    core::Transform transform,
+    std::string justification) {
+    if (!agent_task_.has_value()) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "there is no speculative ghost to correct"));
+    }
+    const auto corrected = application::HumanApplicationAccess::correct_agent_ghost_transform(
+        *agent_task_, object, transform, std::move(justification));
+    if (!corrected) {
+        record_ui_problem(corrected.error().with_context("agent ghost correction"));
+        return core::Result<agent::AgentTaskSnapshot>::failure(corrected.error());
+    }
+    return core::Result<agent::AgentTaskSnapshot>::success(agent_task_->snapshot());
+}
+
 core::Result<application::DispatchReceipt> UiController::accept_agent_plan() {
     if (!agent_task_.has_value()) {
         return core::Result<application::DispatchReceipt>::failure(invalid_state(

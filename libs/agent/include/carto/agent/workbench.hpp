@@ -242,12 +242,35 @@ struct AgentRepairReceipt {
     assets::Sha256Digest repaired_objective_digest;
     assets::Sha256Digest failure_evidence_digest;
     assets::Sha256Digest repair_evidence_digest;
+    std::size_t previous_ghost_correction_count = 0U;
+    assets::Sha256Digest previous_ghost_correction_digest;
     std::vector<StepReceipt> previous_step_receipts;
     std::vector<AcceptanceGateResult> previous_gate_results;
 };
 
+// Immutable evidence for an operator-authored transform on the speculative
+// branch. The task may replay this correction during resume, rebase, or repair,
+// but the receipt never grants authority to mutate the live source project.
+struct GhostCorrectionReceipt {
+    std::string task_id;
+    scene::ObjectId object;
+    core::Transform before_transform = core::Transform::identity();
+    core::Transform after_transform = core::Transform::identity();
+    core::Revision source_revision;
+    core::Revision branch_revision_before;
+    core::Revision branch_revision_after;
+    assets::Sha256Digest plan_context_digest;
+    assets::Sha256Digest parent_evidence_digest;
+    std::string justification;
+    assets::Sha256Digest evidence_digest;
+
+    [[nodiscard]] core::Result<assets::Sha256Digest> computed_evidence_digest() const;
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
 struct AgentRebaseReceipt {
     std::string checkpoint_task_id;
+    assets::Sha256Digest checkpoint_plan_context_digest;
     core::Revision previous_source_revision;
     core::Revision rebased_source_revision;
     assets::Sha256Digest checkpoint_source_digest;
@@ -336,12 +359,15 @@ struct AgentTaskSnapshot {
     assets::Sha256Digest objective_digest;
     std::vector<HardConstraint> hard_constraints;
     std::vector<ClarificationQuestion> clarifications;
+    std::vector<scene::ObjectId> scope_objects;
+    std::vector<scene::ObjectId> protected_objects;
     core::Revision base_revision;
     core::Revision speculative_revision;
     std::vector<PlanStepProgress> plan_steps;
     std::vector<StepReceipt> steps;
     std::vector<AgentRepairReceipt> repairs;
     std::vector<AgentRebaseReceipt> rebases;
+    std::vector<GhostCorrectionReceipt> ghost_corrections;
     std::size_t repair_attempts_remaining = 0U;
     std::vector<AcceptanceGateResult> gates;
     ProjectDiff diff;
@@ -359,7 +385,7 @@ struct AgentTaskSnapshot {
 // resumed task can run. Project bytes remain artifacts owned by this record;
 // they are never applied to the live source by loading a checkpoint.
 struct AgentTaskCheckpoint {
-    static constexpr std::uint32_t kFormatVersion = 2U;
+    static constexpr std::uint32_t kFormatVersion = 3U;
 
     TaskStatus status = TaskStatus::prepared;
     AgentPlan plan;
@@ -376,6 +402,7 @@ struct AgentTaskCheckpoint {
     std::vector<StepReceipt> step_receipts;
     std::vector<AgentRepairReceipt> repair_lineage;
     std::vector<AgentRebaseReceipt> rebase_lineage;
+    std::vector<GhostCorrectionReceipt> ghost_corrections;
     std::string last_validation_report;
 
     [[nodiscard]] core::Result<void> validate() const;
@@ -457,6 +484,11 @@ private:
         std::vector<AgentRebaseReceipt> rebases = {});
 
     [[nodiscard]] core::Result<void> execute_step(const AgentPlanStep& step);
+    [[nodiscard]] core::Result<void> correct_ghost_transform(
+        scene::ObjectId object,
+        core::Transform transform,
+        std::string justification);
+    [[nodiscard]] core::Result<void> apply_ghost_corrections();
     [[nodiscard]] const project::ProjectDocument& scene_query_document() const;
     [[nodiscard]] AgentTaskSnapshot build_snapshot() const;
     [[nodiscard]] ProjectDiff build_diff() const;
@@ -474,6 +506,8 @@ private:
     std::vector<StepReceipt> receipts_;
     std::vector<AgentRepairReceipt> repairs_;
     std::vector<AgentRebaseReceipt> rebases_;
+    std::vector<GhostCorrectionReceipt> ghost_corrections_;
+    bool replay_ghost_corrections_ = false;
     std::vector<PlanStepProgress> plan_progress_;
     std::vector<AcceptanceGateResult> gates_;
     SceneQueryBudget query_budget_;

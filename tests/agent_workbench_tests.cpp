@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <limits>
 #include <fstream>
 #include <iostream>
 #include <span>
@@ -633,7 +634,7 @@ void persistent_checkpoint_v1_format_remains_readable() {
     auto task = carto::agent::AgentTask::begin(source, plan, envelope_for(objects));
     REQUIRE(task);
     TempDirectory directory;
-    const auto path = directory.path() / "v2-prepared.carto-agent-task";
+    const auto path = directory.path() / "v3-prepared.carto-agent-task";
     REQUIRE(task.value().save_checkpoint(path));
     const auto checkpoint = carto::agent::AgentTask::load_checkpoint(path);
     REQUIRE(checkpoint);
@@ -647,16 +648,28 @@ void persistent_checkpoint_v1_format_remains_readable() {
         encoded.value().substr(magic.size(), body_length_end - magic.size())));
     const std::size_t body_begin = body_length_end + 1U;
     std::string body = encoded.value().substr(body_begin, body_length);
-    REQUIRE(body.starts_with("1:2|"));
-    REQUIRE(body.ends_with("1:0|0:|"));
-    body[2] = '1';
-    body.erase(body.size() - 7U, 4U); // Version 1 has no rebase-lineage count.
-    const auto checksum = carto::assets::sha256(std::span<const std::uint8_t>(
-        reinterpret_cast<const std::uint8_t*>(body.data()), body.size()));
+    REQUIRE(body.starts_with("1:3|"));
+    REQUIRE(body.ends_with("1:0|1:0|1:0|0:|"));
     const auto field = [](std::string_view value) {
         return std::to_string(value.size()) + ":" + std::string(value) + "|";
     };
-    const std::string v1 = std::string(magic) + field(body) + field(checksum.hex());
+    auto v2_body = body;
+    v2_body[2] = '2';
+    v2_body.erase(v2_body.size() - 11U, 4U); // Version 2 has no ghost-correction count.
+    const auto v2_checksum = carto::assets::sha256(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(v2_body.data()), v2_body.size()));
+    const std::string v2 = std::string(magic) + field(v2_body) + field(v2_checksum.hex());
+    const auto decoded_v2 = carto::agent::AgentTaskCheckpoint::deserialize(v2);
+    REQUIRE(decoded_v2);
+    REQUIRE(decoded_v2.value().rebase_lineage.empty());
+    REQUIRE(decoded_v2.value().ghost_corrections.empty());
+
+    auto v1_body = std::move(v2_body);
+    v1_body[2] = '1';
+    v1_body.erase(v1_body.size() - 7U, 4U); // Version 1 has no rebase-lineage count.
+    const auto v1_checksum = carto::assets::sha256(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(v1_body.data()), v1_body.size()));
+    const std::string v1 = std::string(magic) + field(v1_body) + field(v1_checksum.hex());
     const auto decoded = carto::agent::AgentTaskCheckpoint::deserialize(v1);
     REQUIRE(decoded);
     REQUIRE(decoded.value().rebase_lineage.empty());
@@ -1622,6 +1635,186 @@ void ui_repair_invalidates_plan_bound_human_receipts_until_reanswered() {
     REQUIRE(source.snapshot().project_revision == before);
 }
 
+void ui_ghost_corrections_are_scoped_revalidated_and_checkpointed() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Ghost target", {1.0, 1.0, 1.0}}));
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Outside ghost scope", {1.0, 1.0, 1.0}}));
+    const auto base = source.snapshot();
+    const auto target = base.objects[0].object.id;
+    const auto out_of_scope = base.objects[1].object.id;
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        target, carto::geometry::FaceId{1U}}));
+    REQUIRE(ui.queue_agent_step("inset face 0.1"));
+    const auto run = ui.run_agent_plan("Prepare the selected face");
+    REQUIRE(run);
+    REQUIRE(run.value().status == carto::agent::TaskStatus::review);
+    const auto before_correction = ui.snapshot().agent_task.value();
+    const auto source_revision = source.snapshot().project_revision;
+
+    auto moved = base.objects[0].object.local_transform;
+    moved.translation.x += 0.75;
+    REQUIRE(!ui.correct_agent_ghost_transform(target, moved, ""));
+    auto non_finite = moved;
+    non_finite.translation.x = std::numeric_limits<double>::quiet_NaN();
+    REQUIRE(!ui.correct_agent_ghost_transform(
+        target, non_finite, "Reject a non-finite ghost transform."));
+    REQUIRE(!ui.correct_agent_ghost_transform(
+        out_of_scope, moved, "Reject a target outside the declared scope."));
+    REQUIRE(ui.snapshot().agent_task->speculative_revision ==
+        before_correction.speculative_revision);
+    REQUIRE(source.snapshot().project_revision == source_revision);
+
+    const auto corrected = ui.correct_agent_ghost_transform(
+        target, moved, "Move the ghost clear of the adjacent object before review.");
+    REQUIRE(corrected);
+    REQUIRE(corrected.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(corrected.value().can_accept);
+    REQUIRE(corrected.value().ghost_corrections.size() == 1U);
+    REQUIRE(corrected.value().ghost_corrections.front().object == target);
+    REQUIRE(corrected.value().ghost_corrections.front().justification.find(
+        "adjacent object") != std::string::npos);
+    REQUIRE(corrected.value().ghost_corrections.front().validate());
+    REQUIRE(corrected.value().speculative_revision ==
+        before_correction.speculative_revision.next());
+    REQUIRE(source.snapshot().project_revision == source_revision);
+    const auto changed_object = std::find_if(
+        corrected.value().diff.objects.begin(), corrected.value().diff.objects.end(),
+        [target](const auto& change) { return change.id == target; });
+    REQUIRE(changed_object != corrected.value().diff.objects.end());
+    REQUIRE(changed_object->transform_changed);
+    const auto gate = std::find_if(
+        corrected.value().gates.begin(), corrected.value().gates.end(),
+        [](const auto& value) { return value.id == "project.valid"; });
+    REQUIRE(gate != corrected.value().gates.end());
+    REQUIRE(gate->passed);
+    REQUIRE(gate->evaluated_revision == corrected.value().speculative_revision);
+    REQUIRE(gate->result_digest == corrected.value().diff.digest);
+
+    TempDirectory directory;
+    const auto checkpoint_path = directory.path() / "ghost-correction.carto-agent-task";
+    REQUIRE(ui.save_agent_checkpoint(checkpoint_path));
+    carto::ui::UiController resumed_ui(source);
+    REQUIRE(resumed_ui.load_agent_checkpoint(checkpoint_path));
+    const auto resumed = resumed_ui.resume_agent_checkpoint();
+    REQUIRE(resumed);
+    REQUIRE(resumed.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(resumed.value().can_accept);
+    REQUIRE(resumed.value().ghost_corrections.size() == 1U);
+    REQUIRE(resumed.value().ghost_corrections.front().evidence_digest ==
+        corrected.value().ghost_corrections.front().evidence_digest);
+    REQUIRE(resumed.value().diff.digest == corrected.value().diff.digest);
+    REQUIRE(source.snapshot().project_revision == source_revision);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Unrelated edit before ghost rebase", {0.5, 0.5, 0.5}}));
+    const auto rebased_source_revision = source.snapshot().project_revision;
+    carto::ui::UiController rebased_ui(source);
+    REQUIRE(rebased_ui.load_agent_checkpoint(checkpoint_path));
+    REQUIRE(rebased_ui.rebase_agent_checkpoint());
+    const auto rebased = rebased_ui.resume_agent_checkpoint();
+    REQUIRE(rebased);
+    REQUIRE(rebased.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(rebased.value().can_accept);
+    REQUIRE(rebased.value().rebases.size() == 1U);
+    REQUIRE(rebased.value().ghost_corrections.size() == 1U);
+    REQUIRE(source.snapshot().project_revision == rebased_source_revision);
+    REQUIRE(rebased_ui.accept_agent_plan());
+    REQUIRE(source.snapshot().project_revision == rebased_source_revision.next());
+    const auto accepted_snapshot = source.snapshot();
+    const auto accepted = std::find_if(accepted_snapshot.objects.begin(),
+        accepted_snapshot.objects.end(), [target](const auto& value) {
+            return value.object.id == target;
+        });
+    REQUIRE(accepted != accepted_snapshot.objects.end());
+    REQUIRE(accepted->object.local_transform.translation.x == moved.translation.x);
+
+    carto::application::ApplicationSession stale_source;
+    carto::ui::UiController stale_ui(stale_source);
+    REQUIRE(stale_ui.dispatch(carto::application::CreateBoxAction{
+        "Stale ghost target", {1.0, 1.0, 1.0}}));
+    const auto stale_target = stale_source.snapshot().objects.front().object.id;
+    REQUIRE(stale_ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(stale_ui.dispatch(carto::application::SelectFaceAction{
+        stale_target, carto::geometry::FaceId{1U}}));
+    REQUIRE(stale_ui.queue_agent_step("inset face 0.1"));
+    const auto stale_run = stale_ui.run_agent_plan("Prepare stale ghost target");
+    REQUIRE(stale_run);
+    const auto stale_branch_revision = stale_run.value().speculative_revision;
+    auto stale_transform = stale_source.snapshot().objects.front().object.local_transform;
+    stale_transform.translation.z += 0.5;
+    REQUIRE(stale_ui.dispatch(carto::application::CreateBoxAction{
+        "Concurrent source edit", {0.5, 0.5, 0.5}}));
+    REQUIRE(!stale_ui.correct_agent_ghost_transform(
+        stale_target, stale_transform, "Reject a correction based on a stale source."));
+    REQUIRE(stale_ui.snapshot().agent_task->speculative_revision == stale_branch_revision);
+}
+
+void ui_ghost_corrections_remain_locked_through_repair() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Repair ghost target", {1.0, 1.0, 1.0}}));
+    const auto target = source.snapshot().objects.front().object.id;
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        target, carto::geometry::FaceId{1U}}));
+    REQUIRE(ui.queue_agent_step("inset face 1000"));
+    const auto base_revision = source.snapshot().project_revision;
+    const auto failed = ui.run_agent_plan("Correct the failed branch by hand and repair it");
+    REQUIRE(failed);
+    REQUIRE(failed.value().status == carto::agent::TaskStatus::blocked);
+
+    auto corrected_transform = source.snapshot().objects.front().object.local_transform;
+    corrected_transform.translation.z = 1.25;
+    const auto corrected = ui.correct_agent_ghost_transform(
+        target, corrected_transform,
+        "Keep the edited ghost clear of the lower support during repair.");
+    REQUIRE(corrected);
+    REQUIRE(corrected.value().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(corrected.value().ghost_corrections.size() == 1U);
+    REQUIRE(source.snapshot().project_revision == base_revision);
+
+    auto revised_step = ui.snapshot().agent_plan_draft.front();
+    revised_step.intent = "inset face 0.1";
+    REQUIRE(ui.revise_agent_plan_step(revised_step));
+    const auto repaired = ui.repair_agent_plan(
+        "Retry the face with a bounded inset while preserving the operator ghost correction.");
+    REQUIRE(repaired);
+    REQUIRE(repaired.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(repaired.value().can_accept);
+    REQUIRE(repaired.value().ghost_corrections.size() == 1U);
+    REQUIRE(repaired.value().ghost_corrections.front().evidence_digest ==
+        corrected.value().ghost_corrections.front().evidence_digest);
+    REQUIRE(repaired.value().repairs.size() == 1U);
+    REQUIRE(repaired.value().repairs.front().previous_ghost_correction_count == 1U);
+    REQUIRE(!repaired.value().repairs.front().previous_ghost_correction_digest.is_zero());
+    REQUIRE(source.snapshot().project_revision == base_revision);
+
+    TempDirectory directory;
+    const auto checkpoint_path = directory.path() / "repaired-ghost.carto-agent-task";
+    REQUIRE(ui.save_agent_checkpoint(checkpoint_path));
+    const auto checkpoint = carto::agent::AgentTask::load_checkpoint(checkpoint_path);
+    REQUIRE(checkpoint);
+    REQUIRE(checkpoint.value().ghost_corrections.size() == 1U);
+    REQUIRE(checkpoint.value().repair_lineage.front().previous_ghost_correction_count == 1U);
+    REQUIRE(ui.accept_agent_plan());
+    REQUIRE(source.snapshot().project_revision == base_revision.next());
+    const auto accepted_snapshot = source.snapshot();
+    const auto accepted = std::find_if(accepted_snapshot.objects.begin(),
+        accepted_snapshot.objects.end(), [target](const auto& value) {
+            return value.object.id == target;
+        });
+    REQUIRE(accepted != accepted_snapshot.objects.end());
+    REQUIRE(accepted->object.local_transform.translation.z ==
+        corrected_transform.translation.z);
+}
+
 } // namespace
 
 int main() {
@@ -1647,6 +1840,8 @@ int main() {
         ui_clarification_requires_an_operator_answer_before_review();
         ui_repairs_failed_step_with_operator_justification_and_scope_checks();
         ui_repair_invalidates_plan_bound_human_receipts_until_reanswered();
+        ui_ghost_corrections_are_scoped_revalidated_and_checkpointed();
+        ui_ghost_corrections_remain_locked_through_repair();
         persistent_checkpoint_replays_review_and_blocks_artifact_drift();
         persistent_checkpoint_reauthorization_and_stale_source_are_fail_closed();
         prepared_checkpoint_requires_explicit_resume_before_native_execution();

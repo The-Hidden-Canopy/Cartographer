@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <span>
 #include <set>
 #include <string>
@@ -29,6 +30,36 @@ core::Diagnostic malformed(std::string message) {
 assets::Sha256Digest digest_text(std::string_view value) {
     return assets::sha256(std::span<const std::uint8_t>(
         reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
+}
+
+bool same_transform(const core::Transform& left, const core::Transform& right) noexcept {
+    return left.translation.x == right.translation.x &&
+        left.translation.y == right.translation.y &&
+        left.translation.z == right.translation.z &&
+        left.rotation.x == right.rotation.x && left.rotation.y == right.rotation.y &&
+        left.rotation.z == right.rotation.z && left.rotation.w == right.rotation.w &&
+        left.scale.x == right.scale.x && left.scale.y == right.scale.y &&
+        left.scale.z == right.scale.z;
+}
+
+assets::Sha256Digest ghost_correction_chain_digest(
+    const std::vector<GhostCorrectionReceipt>& corrections,
+    std::size_t count) {
+    std::string canonical = "cartographer.agent.ghost-correction-chain.v1|";
+    count = std::min(count, corrections.size());
+    const std::string count_text = std::to_string(count);
+    canonical += std::to_string(count_text.size());
+    canonical.push_back(':');
+    canonical += count_text;
+    canonical.push_back('|');
+    for (std::size_t index = 0U; index < count; ++index) {
+        const std::string digest = corrections[index].evidence_digest.hex();
+        canonical += std::to_string(digest.size());
+        canonical.push_back(':');
+        canonical += digest;
+        canonical.push_back('|');
+    }
+    return digest_text(canonical);
 }
 
 class Writer final {
@@ -198,6 +229,28 @@ std::optional<core::Diagnostic> read_diagnostic(Reader& reader) {
         diagnostic.context.push_back(reader.field(4096U));
     }
     return diagnostic;
+}
+
+void write_transform(Writer& writer, const core::Transform& transform) {
+    writer.real(transform.translation.x);
+    writer.real(transform.translation.y);
+    writer.real(transform.translation.z);
+    writer.real(transform.rotation.x);
+    writer.real(transform.rotation.y);
+    writer.real(transform.rotation.z);
+    writer.real(transform.rotation.w);
+    writer.real(transform.scale.x);
+    writer.real(transform.scale.y);
+    writer.real(transform.scale.z);
+}
+
+core::Transform read_transform(Reader& reader) {
+    core::Transform transform;
+    transform.translation = {reader.real(), reader.real(), reader.real()};
+    transform.rotation = {
+        reader.real(), reader.real(), reader.real(), reader.real()};
+    transform.scale = {reader.real(), reader.real(), reader.real()};
+    return transform;
 }
 
 void write_plan(Writer& writer, const AgentPlan& plan) {
@@ -438,13 +491,15 @@ void write_repair(Writer& writer, const AgentRepairReceipt& repair) {
     writer.digest(repair.repaired_objective_digest);
     writer.digest(repair.failure_evidence_digest);
     writer.digest(repair.repair_evidence_digest);
+    writer.number(repair.previous_ghost_correction_count);
+    writer.digest(repair.previous_ghost_correction_digest);
     writer.number(repair.previous_step_receipts.size());
     for (const auto& receipt : repair.previous_step_receipts) write_step_receipt(writer, receipt);
     writer.number(repair.previous_gate_results.size());
     for (const auto& gate : repair.previous_gate_results) write_gate(writer, gate);
 }
 
-AgentRepairReceipt read_repair(Reader& reader) {
+AgentRepairReceipt read_repair(Reader& reader, std::uint64_t version) {
     AgentRepairReceipt repair;
     repair.attempt = reader.count(4U);
     repair.previous_task_id = reader.field(64U);
@@ -459,6 +514,10 @@ AgentRepairReceipt read_repair(Reader& reader) {
     repair.repaired_objective_digest = reader.digest();
     repair.failure_evidence_digest = reader.digest();
     repair.repair_evidence_digest = reader.digest();
+    if (version >= 3U) {
+        repair.previous_ghost_correction_count = reader.count(256U);
+        repair.previous_ghost_correction_digest = reader.digest();
+    }
     const auto receipt_count = reader.count(4096U);
     repair.previous_step_receipts.reserve(receipt_count);
     for (std::size_t index = 0U; index < receipt_count; ++index) {
@@ -472,8 +531,39 @@ AgentRepairReceipt read_repair(Reader& reader) {
     return repair;
 }
 
+void write_ghost_correction(Writer& writer, const GhostCorrectionReceipt& correction) {
+    writer.field(correction.task_id);
+    writer.number(correction.object.value);
+    write_transform(writer, correction.before_transform);
+    write_transform(writer, correction.after_transform);
+    writer.number(correction.source_revision.value());
+    writer.number(correction.branch_revision_before.value());
+    writer.number(correction.branch_revision_after.value());
+    writer.digest(correction.plan_context_digest);
+    writer.digest(correction.parent_evidence_digest);
+    writer.field(correction.justification);
+    writer.digest(correction.evidence_digest);
+}
+
+GhostCorrectionReceipt read_ghost_correction(Reader& reader) {
+    GhostCorrectionReceipt correction;
+    correction.task_id = reader.field(64U);
+    correction.object = scene::ObjectId{reader.number()};
+    correction.before_transform = read_transform(reader);
+    correction.after_transform = read_transform(reader);
+    correction.source_revision = core::Revision(reader.number());
+    correction.branch_revision_before = core::Revision(reader.number());
+    correction.branch_revision_after = core::Revision(reader.number());
+    correction.plan_context_digest = reader.digest();
+    correction.parent_evidence_digest = reader.digest();
+    correction.justification = reader.field(1024U);
+    correction.evidence_digest = reader.digest();
+    return correction;
+}
+
 void write_rebase(Writer& writer, const AgentRebaseReceipt& rebase) {
     writer.field(rebase.checkpoint_task_id);
+    writer.digest(rebase.checkpoint_plan_context_digest);
     writer.number(rebase.previous_source_revision.value());
     writer.number(rebase.rebased_source_revision.value());
     writer.digest(rebase.checkpoint_source_digest);
@@ -488,9 +578,10 @@ void write_rebase(Writer& writer, const AgentRebaseReceipt& rebase) {
     for (const auto asset : rebase.write_mesh_assets) writer.number(asset);
 }
 
-AgentRebaseReceipt read_rebase(Reader& reader) {
+AgentRebaseReceipt read_rebase(Reader& reader, std::uint64_t version) {
     AgentRebaseReceipt rebase;
     rebase.checkpoint_task_id = reader.field(64U);
+    if (version >= 3U) rebase.checkpoint_plan_context_digest = reader.digest();
     rebase.previous_source_revision = core::Revision(reader.number());
     rebase.rebased_source_revision = core::Revision(reader.number());
     rebase.checkpoint_source_digest = reader.digest();
@@ -593,7 +684,7 @@ core::Result<void> AgentTaskCheckpoint::validate() const {
     }
     if (plan_progress.size() != plan.steps.size() || plan_progress.size() > 256U ||
         step_receipts.size() > 4096U || repair_lineage.size() > 4U ||
-        rebase_lineage.size() > 16U ||
+        rebase_lineage.size() > 16U || ghost_corrections.size() > 256U ||
         repair_lineage.size() > envelope.max_repair_attempts) {
         return core::Result<void>::failure(malformed(
             "checkpoint progress or lineage count is invalid"));
@@ -640,6 +731,19 @@ core::Result<void> AgentTaskCheckpoint::validate() const {
             return core::Result<void>::failure(malformed(
                 "checkpoint repair lineage is invalid"));
         }
+        if (!repair.previous_ghost_correction_digest.is_zero() &&
+            (repair.previous_ghost_correction_count > ghost_corrections.size() ||
+             ghost_correction_chain_digest(
+                 ghost_corrections, repair.previous_ghost_correction_count) !=
+                 repair.previous_ghost_correction_digest)) {
+            return core::Result<void>::failure(malformed(
+                "checkpoint repair does not bind its inherited ghost corrections"));
+        }
+        if (repair.previous_ghost_correction_digest.is_zero() &&
+            repair.previous_ghost_correction_count != 0U) {
+            return core::Result<void>::failure(malformed(
+                "checkpoint repair ghost-correction count has no evidence digest"));
+        }
     }
     for (std::size_t index = 0U; index < rebase_lineage.size(); ++index) {
         const auto& rebase = rebase_lineage[index];
@@ -654,6 +758,77 @@ core::Result<void> AgentTaskCheckpoint::validate() const {
                 rebase.rebased_source_revision != source_revision)) {
             return core::Result<void>::failure(malformed(
                 "checkpoint rebase lineage does not bind its source revision chain"));
+        }
+    }
+
+    std::set<std::string> known_task_ids{plan.id};
+    for (const auto& repair : repair_lineage) {
+        known_task_ids.insert(repair.previous_task_id);
+        known_task_ids.insert(repair.repaired_task_id);
+    }
+    for (const auto& rebase : rebase_lineage) {
+        known_task_ids.insert(rebase.checkpoint_task_id);
+    }
+    const auto plan_context_digest_value = plan.context_digest();
+    assets::Sha256Digest expected_correction_parent;
+    std::map<scene::ObjectId, core::Transform> correction_final_transforms;
+    for (const auto& correction : ghost_corrections) {
+        if (auto result = correction.validate(); !result) {
+            return core::Result<void>::failure(result.error().with_context(
+                "checkpoint ghost correction"));
+        }
+        const bool correction_context_matches =
+            (correction.task_id == plan.id && plan_context_digest_value &&
+                correction.plan_context_digest == plan_context_digest_value.value()) ||
+            std::any_of(repair_lineage.begin(), repair_lineage.end(),
+                [&correction](const auto& repair) {
+                    return (correction.task_id == repair.previous_task_id &&
+                            correction.plan_context_digest == repair.previous_plan_digest) ||
+                        (correction.task_id == repair.repaired_task_id &&
+                            correction.plan_context_digest == repair.repaired_plan_digest);
+                }) ||
+            std::any_of(rebase_lineage.begin(), rebase_lineage.end(),
+                [&correction](const auto& rebase) {
+                    return correction.task_id == rebase.checkpoint_task_id &&
+                        correction.plan_context_digest ==
+                            rebase.checkpoint_plan_context_digest;
+                });
+        const bool correction_source_matches = correction.source_revision == source_revision ||
+            std::any_of(rebase_lineage.begin(), rebase_lineage.end(),
+                [&correction](const auto& rebase) {
+                    return correction.source_revision == rebase.previous_source_revision ||
+                        correction.source_revision == rebase.rebased_source_revision;
+                });
+        if (!known_task_ids.contains(correction.task_id) ||
+            !correction_source_matches ||
+            !plan_context_digest_value ||
+            !correction_context_matches ||
+            correction.parent_evidence_digest != expected_correction_parent ||
+            std::find(plan.objective.scope_objects.begin(),
+                plan.objective.scope_objects.end(), correction.object) ==
+                plan.objective.scope_objects.end() ||
+            std::find(plan.objective.protected_objects.begin(),
+                plan.objective.protected_objects.end(), correction.object) !=
+                plan.objective.protected_objects.end()) {
+            return core::Result<void>::failure(malformed(
+                "checkpoint ghost correction is outside its plan, scope, or lineage"));
+        }
+        const auto previous = correction_final_transforms.find(correction.object);
+        if (previous != correction_final_transforms.end() &&
+            !same_transform(previous->second, correction.before_transform)) {
+            return core::Result<void>::failure(malformed(
+                "checkpoint ghost correction transform chain is discontinuous"));
+        }
+        correction_final_transforms[correction.object] = correction.after_transform;
+        expected_correction_parent = correction.evidence_digest;
+    }
+    if (status == TaskStatus::review) {
+        for (const auto& [object, expected_transform] : correction_final_transforms) {
+            const auto* actual = speculative.value().scene().find(object);
+            if (actual == nullptr || !same_transform(actual->local_transform, expected_transform)) {
+                return core::Result<void>::failure(malformed(
+                    "review checkpoint does not contain its locked ghost correction"));
+            }
         }
     }
     return core::Result<void>::success();
@@ -684,6 +859,10 @@ core::Result<std::string> AgentTaskCheckpoint::serialize() const {
     for (const auto& repair : repair_lineage) write_repair(payload, repair);
     payload.number(rebase_lineage.size());
     for (const auto& rebase : rebase_lineage) write_rebase(payload, rebase);
+    payload.number(ghost_corrections.size());
+    for (const auto& correction : ghost_corrections) {
+        write_ghost_correction(payload, correction);
+    }
     payload.field(last_validation_report);
     auto body = std::move(payload).take();
     Writer outer;
@@ -716,7 +895,7 @@ core::Result<AgentTaskCheckpoint> AgentTaskCheckpoint::deserialize(std::string_v
 
     Reader reader(body);
     const auto version = reader.number();
-    if (version != 1U && version != kFormatVersion) {
+    if (version != 1U && version != 2U && version != kFormatVersion) {
         return core::Result<AgentTaskCheckpoint>::failure(core::Diagnostic(
             core::ErrorCode::version_mismatch, "agent task checkpoint version is unsupported"));
     }
@@ -745,13 +924,20 @@ core::Result<AgentTaskCheckpoint> AgentTaskCheckpoint::deserialize(std::string_v
     const auto repair_count = reader.count(4U);
     checkpoint.repair_lineage.reserve(repair_count);
     for (std::size_t index = 0U; index < repair_count; ++index) {
-        checkpoint.repair_lineage.push_back(read_repair(reader));
+        checkpoint.repair_lineage.push_back(read_repair(reader, version));
     }
     if (version >= 2U) {
         const auto rebase_count = reader.count(16U);
         checkpoint.rebase_lineage.reserve(rebase_count);
         for (std::size_t index = 0U; index < rebase_count; ++index) {
-            checkpoint.rebase_lineage.push_back(read_rebase(reader));
+            checkpoint.rebase_lineage.push_back(read_rebase(reader, version));
+        }
+    }
+    if (version >= 3U) {
+        const auto correction_count = reader.count(256U);
+        checkpoint.ghost_corrections.reserve(correction_count);
+        for (std::size_t index = 0U; index < correction_count; ++index) {
+            checkpoint.ghost_corrections.push_back(read_ghost_correction(reader));
         }
     }
     checkpoint.last_validation_report = reader.field(kMaxTextBytes);

@@ -834,6 +834,9 @@ struct NativeTransformDragCapture {
     ImRect viewport;
     carto::core::Transform initial_transform = carto::core::Transform::identity();
     carto::core::Transform preview_transform = carto::core::Transform::identity();
+    bool agent_ghost = false;
+    std::string agent_task_id;
+    carto::core::Revision agent_branch_revision;
 };
 
 enum class NativeConditionGizmoKind {
@@ -1121,6 +1124,9 @@ struct DesktopState {
     std::string agent_repair_step_id;
     std::string agent_repair_intent;
     std::string agent_repair_justification;
+    std::string agent_ghost_justification;
+    carto::scene::ObjectId agent_ghost_selected_object{};
+    bool agent_ghost_edit_mode = false;
     int agent_clarification_impact = 0;
     int agent_step_dependency = 0;
     int agent_repair_step_index = 0;
@@ -2135,11 +2141,16 @@ struct DesktopState {
         const carto::ui::NativePointerEvent& event,
         const UiSnapshot& snapshot,
         ImVec2 screen_point) {
+        const bool ghost_edit = agent_ghost_edit_mode &&
+            agent_preview_mode == 2 && snapshot.agent_task.has_value() &&
+            snapshot.project_revision == snapshot.agent_task->base_revision &&
+            snapshot.agent_task->status != carto::agent::TaskStatus::accepted &&
+            snapshot.agent_task->status != carto::agent::TaskStatus::rejected;
         if (!event.pressed || event.button != carto::ui::NativePointerButton::primary ||
             surface != ShellSurface::workspace ||
-            snapshot.workspace_kind != carto::ui::Workspace::model ||
-            snapshot.selection.mode != carto::editor::SelectionMode::object ||
-            snapshot.selection.objects.size() != 1U ||
+            (!ghost_edit && snapshot.workspace_kind != carto::ui::Workspace::model) ||
+            (!ghost_edit && snapshot.selection.mode != carto::editor::SelectionMode::object) ||
+            (!ghost_edit && snapshot.selection.objects.size() != 1U) ||
             !native_viewport_hits.translate_gizmo.has_value() ||
             native_transform_drag.has_value()) {
             return false;
@@ -2147,7 +2158,8 @@ struct DesktopState {
         const auto& gizmo = *native_viewport_hits.translate_gizmo;
         if (snapshot.project_revision != gizmo.project_revision ||
             snapshot.project_revision != native_viewport_hits.project_revision ||
-            snapshot.selection.objects.front() != gizmo.object) {
+            (ghost_edit && agent_ghost_selected_object != gizmo.object) ||
+            (!ghost_edit && snapshot.selection.objects.front() != gizmo.object)) {
             return false;
         }
         const float x_distance = point_segment_distance_squared(
@@ -2164,16 +2176,38 @@ struct DesktopState {
             object->object.locked) {
             return false;
         }
+        carto::core::Transform initial_transform = object->object.local_transform;
+        if (ghost_edit) {
+            const auto branch_instances = snapshot.agent_task->after_scene.instances();
+            const auto branch_instance = std::find_if(
+                branch_instances.begin(), branch_instances.end(),
+                [&gizmo](const auto& instance) { return instance.object == gizmo.object; });
+            if (branch_instance == branch_instances.end() ||
+                std::find(snapshot.agent_task->scope_objects.begin(),
+                    snapshot.agent_task->scope_objects.end(), gizmo.object) ==
+                    snapshot.agent_task->scope_objects.end() ||
+                std::find(snapshot.agent_task->protected_objects.begin(),
+                    snapshot.agent_task->protected_objects.end(), gizmo.object) !=
+                    snapshot.agent_task->protected_objects.end()) {
+                return false;
+            }
+            initial_transform = branch_instance->world_transform;
+        }
         const auto axis = x_distance <= z_distance
             ? carto::editor::ViewportTranslateAxis::world_x
             : carto::editor::ViewportTranslateAxis::world_z;
         const double pixels_per_world_unit = axis ==
                 carto::editor::ViewportTranslateAxis::world_x
             ? gizmo.pixels_per_world_x : gizmo.pixels_per_world_z;
+        if (ghost_edit && agent_ghost_justification.empty()) {
+            action_feedback = "Enter a correction justification before editing the ghost.";
+            action_feedback_error = true;
+            return true;
+        }
         carto::core::Vec2d pointer{
             static_cast<double>(screen_point.x), static_cast<double>(screen_point.y)};
         NativeTransformDragCapture capture;
-        if (auto result = capture.session.begin(gizmo.object, object->object.local_transform,
+        if (auto result = capture.session.begin(gizmo.object, initial_transform,
                 snapshot.project_revision, axis, pointer, pixels_per_world_unit); !result) {
             action_feedback = result.error().message;
             action_feedback_error = true;
@@ -2183,8 +2217,13 @@ struct DesktopState {
         capture.viewport = ImRect(
             native_viewport_hits.screen_origin,
             native_viewport_hits.screen_origin + native_viewport_hits.extent);
-        capture.initial_transform = object->object.local_transform;
+        capture.initial_transform = initial_transform;
         capture.preview_transform = capture.initial_transform;
+        capture.agent_ghost = ghost_edit;
+        if (ghost_edit) {
+            capture.agent_task_id = snapshot.agent_task->task_id;
+            capture.agent_branch_revision = snapshot.agent_task->speculative_revision;
+        }
         native_transform_drag = std::move(capture);
         if (window != nullptr) SetCapture(window);
         return true;
@@ -2196,6 +2235,16 @@ struct DesktopState {
         if (snapshot.project_revision != native_transform_drag->session.source_revision()) {
             cancel_native_transform_drag(
                 "Transform cancelled because the project revision changed.");
+            return true;
+        }
+        if (native_transform_drag->agent_ghost &&
+            (!snapshot.agent_task.has_value() ||
+             snapshot.agent_task->task_id != native_transform_drag->agent_task_id ||
+             snapshot.agent_task->speculative_revision !=
+                native_transform_drag->agent_branch_revision ||
+             snapshot.project_revision != snapshot.agent_task->base_revision)) {
+            cancel_native_transform_drag(
+                "Ghost transform cancelled because the task branch changed.");
             return true;
         }
         carto::core::Vec2d pointer;
@@ -2255,8 +2304,21 @@ struct DesktopState {
             ? final_transform.value().translation.x != initial.translation.x
             : final_transform.value().translation.z != initial.translation.z;
         if (changed) {
-            static_cast<void>(dispatch(SetObjectTransformAction{
-                object, final_transform.value(), source_revision}));
+            if (capture.agent_ghost) {
+                const auto corrected = ui.correct_agent_ghost_transform(
+                    object, final_transform.value(), agent_ghost_justification);
+                if (corrected) {
+                    agent_ghost_justification.clear();
+                    action_feedback = "Human correction locked into the speculative branch; gates rechecked.";
+                    action_feedback_error = false;
+                } else {
+                    action_feedback = corrected.error().message;
+                    action_feedback_error = true;
+                }
+            } else {
+                static_cast<void>(dispatch(SetObjectTransformAction{
+                    object, final_transform.value(), source_revision}));
+            }
         }
         return true;
     }
@@ -2460,6 +2522,27 @@ struct DesktopState {
 
         if (begin_native_condition_gizmo_drag(event, snapshot, point)) return true;
         if (begin_native_transform_drag(event, snapshot, point)) return true;
+
+        if (agent_ghost_edit_mode && agent_preview_mode == 2 &&
+            snapshot.agent_task.has_value() &&
+            snapshot.project_revision == snapshot.agent_task->base_revision) {
+            agent_ghost_selected_object = {};
+            for (auto iterator = native_viewport_hits.objects.rbegin();
+                 iterator != native_viewport_hits.objects.rend(); ++iterator) {
+                if (!iterator->second.Contains(point)) continue;
+                const auto& task = *snapshot.agent_task;
+                const bool in_scope = std::find(task.scope_objects.begin(),
+                    task.scope_objects.end(), iterator->first) != task.scope_objects.end();
+                const bool protected_object = std::find(task.protected_objects.begin(),
+                    task.protected_objects.end(), iterator->first) !=
+                    task.protected_objects.end();
+                if (in_scope && !protected_object) {
+                    agent_ghost_selected_object = iterator->first;
+                }
+                return true;
+            }
+            return true;
+        }
 
         if (snapshot.selection.mode == carto::editor::SelectionMode::edge) {
             float best = 12.0F * 12.0F;
@@ -3858,7 +3941,10 @@ struct DesktopState {
                                    : snapshot.agent_task->before_viewport_error);
         ImGui::BeginChild("WorkSurfaceViewport", size, true, ImGuiWindowFlags_NoScrollbar);
         heading_text(showing_agent_preview
-            ? (showing_agent_after ? "Speculative after · review only"
+            ? (showing_agent_after
+                ? (agent_ghost_edit_mode
+                    ? "Speculative after · human ghost correction"
+                    : "Speculative after · review only")
                                    : "Task base · review only")
             : "Work surface · compiled snapshot");
         ImGui::SameLine();
@@ -3880,7 +3966,13 @@ struct DesktopState {
         native_viewport_hits.screen_origin = origin;
         native_viewport_hits.extent = extent;
         native_viewport_hits.valid = extent.x > 0.0F && extent.y > 0.0F;
-        native_viewport_hits.interactive = !showing_agent_preview && ImGui::IsWindowHovered();
+        const bool ghost_edit_available = showing_agent_after && agent_ghost_edit_mode &&
+            snapshot.agent_task.has_value() &&
+            snapshot.project_revision == snapshot.agent_task->base_revision &&
+            snapshot.agent_task->status != carto::agent::TaskStatus::accepted &&
+            snapshot.agent_task->status != carto::agent::TaskStatus::rejected;
+        native_viewport_hits.interactive =
+            (!showing_agent_preview || ghost_edit_available) && ImGui::IsWindowHovered();
         ImDrawList* draw = ImGui::GetWindowDrawList();
         const auto rgba = [](carto::ui::UiColor token, float alpha) {
             token.alpha *= alpha;
@@ -4240,10 +4332,21 @@ struct DesktopState {
                     snapshot.condition.authored_revision});
             }
         }
-        if (!showing_agent_preview && snapshot.workspace_kind == carto::ui::Workspace::model &&
+        const bool ghost_object_selected = ghost_edit_available &&
+            static_cast<bool>(agent_ghost_selected_object) &&
+            std::find(snapshot.agent_task->scope_objects.begin(),
+                snapshot.agent_task->scope_objects.end(), agent_ghost_selected_object) !=
+                snapshot.agent_task->scope_objects.end() &&
+            std::find(snapshot.agent_task->protected_objects.begin(),
+                snapshot.agent_task->protected_objects.end(), agent_ghost_selected_object) ==
+                snapshot.agent_task->protected_objects.end();
+        const bool source_object_selected = !showing_agent_preview &&
+            snapshot.workspace_kind == carto::ui::Workspace::model &&
             snapshot.selection.mode == carto::editor::SelectionMode::object &&
-            snapshot.selection.objects.size() == 1U) {
-            const auto selected_id = snapshot.selection.objects.front();
+            snapshot.selection.objects.size() == 1U;
+        if (ghost_object_selected || source_object_selected) {
+            const auto selected_id = ghost_object_selected
+                ? agent_ghost_selected_object : snapshot.selection.objects.front();
             const auto selected = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
                 [selected_id](const auto& object) { return object.object.id == selected_id; });
             const auto instance = std::find_if(instances.begin(), instances.end(),
@@ -4258,6 +4361,8 @@ struct DesktopState {
                     viewport_extent.y / work_surface_camera.view_height();
                 const ImU32 x_color = rgba(snapshot.colors.accent_primary, 1.0F);
                 const ImU32 z_color = rgba(snapshot.colors.accent_secondary, 1.0F);
+                const auto gizmo_transform = ghost_object_selected
+                    ? instance->world_transform : selected->object.local_transform;
                 draw->AddCircleFilled(center, 4.0F, rgba(snapshot.colors.text_primary, 1.0F));
                 draw->AddLine(center, x_tip, x_color, 3.0F);
                 draw->AddLine(center, z_tip, z_color, 3.0F);
@@ -4268,7 +4373,7 @@ struct DesktopState {
                 native_viewport_hits.translate_gizmo = NativeTranslateGizmo{
                     selected_id, center, x_tip, z_tip,
                     pixels_per_world, pixels_per_world,
-                    selected->object.local_transform, snapshot.project_revision};
+                    gizmo_transform, snapshot.project_revision};
             }
         }
         const auto& fidelity = snapshot.surface_fidelity;
@@ -5300,11 +5405,61 @@ struct DesktopState {
                         question.selected_candidate_id->c_str());
                 }
             }
-            if (ImGui::SmallButton("Show source")) agent_preview_mode = 0;
+            if (ImGui::SmallButton("Show source")) {
+                agent_preview_mode = 0;
+                agent_ghost_edit_mode = false;
+                agent_ghost_selected_object = {};
+            }
             ImGui::SameLine();
-            if (ImGui::SmallButton("Show before")) agent_preview_mode = 1;
+            if (ImGui::SmallButton("Show before")) {
+                agent_preview_mode = 1;
+                agent_ghost_edit_mode = false;
+                agent_ghost_selected_object = {};
+            }
             ImGui::SameLine();
             if (ImGui::SmallButton("Show after")) agent_preview_mode = 2;
+            const bool ghost_task_editable = task.status == carto::agent::TaskStatus::review ||
+                task.status == carto::agent::TaskStatus::blocked;
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!ghost_task_editable ||
+                snapshot.project_revision != task.base_revision);
+            if (ImGui::SmallButton(agent_ghost_edit_mode ? "Stop ghost editing" : "Edit ghost")) {
+                agent_ghost_edit_mode = !agent_ghost_edit_mode;
+                agent_preview_mode = 2;
+                agent_ghost_selected_object = {};
+                if (!agent_ghost_edit_mode) agent_ghost_justification.clear();
+            }
+            ImGui::EndDisabled();
+            if (agent_ghost_edit_mode) {
+                if (snapshot.project_revision != task.base_revision) {
+                    ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                        "Source advanced. Ghost editing is locked until a safe rebase is prepared.");
+                }
+                ImGui::TextDisabled(
+                    "Click an in-scope root object, then drag its X or Z handle. "
+                    "Each change stays on the speculative branch and reruns gates.");
+                std::array<char, 1025> correction_reason{};
+                const std::size_t correction_reason_bytes = std::min(
+                    agent_ghost_justification.size(), correction_reason.size() - 1U);
+                std::copy_n(agent_ghost_justification.data(), correction_reason_bytes,
+                    correction_reason.data());
+                if (ImGui::InputTextMultiline("Ghost correction reason",
+                        correction_reason.data(), correction_reason.size(), ImVec2(-1, 54))) {
+                    agent_ghost_justification.assign(correction_reason.data());
+                }
+                if (agent_ghost_selected_object) {
+                    ImGui::TextDisabled("Selected ghost object %llu",
+                        static_cast<unsigned long long>(agent_ghost_selected_object.value));
+                }
+            }
+            if (!task.ghost_corrections.empty()) {
+                ImGui::Text("Locked human corrections · %zu", task.ghost_corrections.size());
+                for (const auto& correction : task.ghost_corrections) {
+                    ImGui::BulletText("%s · object %llu · %s", correction.task_id.c_str(),
+                        static_cast<unsigned long long>(correction.object.value),
+                        correction.justification.c_str());
+                }
+            }
             ImGui::TextDisabled(
                 "Accept keeps one undo step for this result and replaces the previous command history.");
             for (const auto& planned : task.plan_steps) {
