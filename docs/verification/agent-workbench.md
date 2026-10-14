@@ -51,6 +51,8 @@
 - Changing the goal or source revision after an answer invalidates the workflow; a failed unresolved attempt does not consume the next task identity.
 - Reordering identity lists does not change the canonical objective digest, while changing an answer or hard constraint does.
 - Topology-preservation constraints reject a topology capability before speculative execution, and displacement gates block an over-limit result.
+- A bounded goal compiler recognizes explicit topology-preservation phrases, adds the hard constraint before clarification receipts, and rejects plans that omit the compiled constraint even when constructed directly.
+- Unsupported restrictions, conditional exceptions, and conflicting topology requirements fail before task creation; the desktop goal editor previews supported limits and disables Run when the goal cannot be enforced.
 - UI constraint drafts reject out-of-scope targets, missing rationale, duplicate identities, and unknown constraint kinds; answered objectives cannot be silently weakened, and checkpoint round-trip preserves the accepted constraints.
 - A policy-rejected step records the unchanged speculative revision as its after-revision, allowing blocked-task checkpoint validation without inventing a project mutation.
 - Acceptance journal evidence records both the objective digest and the result diff digest.
@@ -126,4 +128,4 @@
 
 ## Follow-up coverage
 
-Add failure injection for durable journal append rollback, additional unrelated and conflicting source edits during safe rebase, bounded repair exhaustion, semantic-sidecar size pressure, and provider timeouts as those tranches are implemented. Clarification questions and answers are reviewable evidence, not natural-language commands; the workbench still does not compile free-form goals or infer questions automatically.
+Add failure injection for durable journal append rollback, additional unrelated and conflicting source edits during safe rebase, bounded repair exhaustion, semantic-sidecar size pressure, and provider timeouts as those tranches are implemented. Clarification questions and answers are reviewable evidence, not natural-language commands; the workbench compiles only a bounded set of explicit topology-preservation phrases and does not infer questions automatically.
