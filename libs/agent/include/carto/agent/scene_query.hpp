@@ -116,6 +116,11 @@ struct ConditionAssetTagFact {
     scene::ObjectId authored_object;
     condition::AssetClass asset_class{};
     condition::FidelityClass fidelity{};
+    std::uint64_t source_id = 0U;
+    std::string source_revision;
+    bool source_current = false;
+    bool source_reviewed = false;
+    std::vector<std::string> protected_features;
 };
 
 struct FamiliarityRecordFact {
@@ -125,6 +130,10 @@ struct FamiliarityRecordFact {
     std::string semantic_id;
     double importance = 0.0;
     bool may_change_physically = false;
+    std::uint64_t source_id = 0U;
+    std::string source_revision;
+    bool source_current = false;
+    bool source_reviewed = false;
 };
 
 using SceneQueryRow = std::variant<

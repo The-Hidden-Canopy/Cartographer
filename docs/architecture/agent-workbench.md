@@ -2,7 +2,7 @@
 
 ## Capability
 
-Cartographer can capture a goal and a bounded sequence of exact object, face, or vertex operations, execute the native proposals on a private copy of the current project, validate the branch, and present a structured object/mesh diff for review. The source project stays unchanged until a user accepts the result. The task also exposes bounded read-only queries over the branch for scoped object identity, exact names, mesh instances, object-origin proximity, face orientation, boundary edges, CONDITION tags, and familiarity records.
+Cartographer can capture a goal and a bounded sequence of exact object, face, or vertex operations, execute the native proposals on a private copy of the current project, validate the branch, and present a structured object/mesh diff for review. The source project stays unchanged until a user accepts the result. The task also exposes bounded read-only queries over the branch for scoped object identity, exact names, mesh instances, object-origin proximity, face orientation, boundary edges, CONDITION tags, and familiarity records. CONDITION facts carry source identity, source revision, current/reviewed state, and protected features where applicable; stale or unreviewed evidence is returned as such, not presented as current.
 
 The native planner supports face inset, face extrusion, vertex positioning, and bounded root-object translation. It does not call an external model or infer targets. The user captures each target from the normal viewport selection path.
 

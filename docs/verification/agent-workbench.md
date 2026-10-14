@@ -29,9 +29,11 @@
 
 - Exact object ID, stable name, and mesh-asset queries return copied identities at the source revision.
 - Name, spatial, topology, and CONDITION results are limited to the task scope; an explicit out-of-scope identity request fails closed.
+- CONDITION tag and familiarity facts include their source ID, revision, current/reviewed flags, and protected features where applicable; stale or unreviewed source evidence is never projected as current.
 - Proximity results report world object-origin distance; orientation results report computed world-space normals; boundary-edge results come from validated mesh topology.
 - Missing CONDITION sidecars return an explicit unavailable diagnostic, and CONDITION data with a stale project revision is rejected instead of being shown as current.
 - Query count, object scans, topology elements, semantic records, result count, and result-byte limits truncate or reject deterministically without mutating the source.
+- CONDITION source lineage and protected-feature strings count toward semantic-record and result-byte budgets.
 - Invalid query parameters fail before consuming query budget.
 
 ## Capability registry coverage

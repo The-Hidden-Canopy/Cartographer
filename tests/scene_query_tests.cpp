@@ -241,6 +241,12 @@ void condition_semantics_require_current_explicit_source_data() {
     REQUIRE(tag_fact != nullptr);
     REQUIRE(tag_fact->asset == 1U);
     REQUIRE(tag_fact->authored_object == current_objects.front());
+    REQUIRE(tag_fact->source_id == 1U);
+    REQUIRE(tag_fact->source_revision == "fixture-1");
+    REQUIRE(tag_fact->source_current);
+    REQUIRE(tag_fact->source_reviewed);
+    REQUIRE(tag_fact->protected_features ==
+        std::vector<std::string>({"entry-door", "silhouette"}));
 
     auto familiar = carto::agent::SceneQuery::execute(current_task, {
         carto::agent::FamiliarityRecordsQuery{
@@ -253,6 +259,10 @@ void condition_semantics_require_current_explicit_source_data() {
     REQUIRE(familiarity->asset == 2U);
     REQUIRE(familiarity->authored_object == current_objects[1U]);
     REQUIRE(!familiarity->may_change_physically);
+    REQUIRE(familiarity->source_id == 1U);
+    REQUIRE(familiarity->source_revision == "fixture-1");
+    REQUIRE(familiarity->source_current);
+    REQUIRE(familiarity->source_reviewed);
 
     auto out_of_scope_task = begin_task(current_session, {current_objects[2U]});
     auto out_of_scope_semantic = carto::agent::SceneQuery::execute(out_of_scope_task, {
@@ -273,6 +283,39 @@ void condition_semantics_require_current_explicit_source_data() {
         carto::agent::FamiliarityRecordsQuery{std::nullopt}, 8U});
     REQUIRE(!stale_query);
     REQUIRE(stale_query.error().code == carto::core::ErrorCode::stale_data);
+
+    carto::application::ApplicationSession unreviewed_session;
+    const auto unreviewed_objects = create_boxes(unreviewed_session, {"A", "B", "C"});
+    auto unreviewed_fixture = carto::condition::make_condition_fixture();
+    REQUIRE(unreviewed_fixture);
+    unreviewed_fixture.value().project_revision =
+        unreviewed_session.snapshot().project_revision.next();
+    unreviewed_fixture.value().sources.front().current = false;
+    unreviewed_fixture.value().sources.front().reviewed = false;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        unreviewed_session, carto::application::ImportConditionAuthoringAction{
+            unreviewed_fixture.value().serialize()}));
+    auto unreviewed_task = begin_task(unreviewed_session, unreviewed_objects);
+    auto unreviewed_tag = carto::agent::SceneQuery::execute(unreviewed_task, {
+        carto::agent::ConditionAssetsByTagQuery{"safe-place"}, 8U});
+    REQUIRE(unreviewed_tag);
+    REQUIRE(unreviewed_tag.value().rows.size() == 1U);
+    const auto* unreviewed_fact = std::get_if<carto::agent::ConditionAssetTagFact>(
+        &unreviewed_tag.value().rows.front());
+    REQUIRE(unreviewed_fact != nullptr);
+    REQUIRE(!unreviewed_fact->source_current);
+    REQUIRE(!unreviewed_fact->source_reviewed);
+    REQUIRE(unreviewed_fact->source_revision == "fixture-1");
+
+    carto::agent::AgentWorkEnvelope small_semantic_result;
+    small_semantic_result.max_query_result_bytes = 1U;
+    auto bounded_tag_task = begin_task(
+        current_session, current_objects, small_semantic_result);
+    auto bounded_tag = carto::agent::SceneQuery::execute(bounded_tag_task, {
+        carto::agent::ConditionAssetsByTagQuery{"safe-place"}, 8U});
+    REQUIRE(bounded_tag);
+    REQUIRE(bounded_tag.value().truncated);
+    REQUIRE(bounded_tag.value().rows.empty());
 
     carto::application::ApplicationSession bounded_semantics_session;
     const auto bounded_objects = create_boxes(bounded_semantics_session, {"A", "B", "C"});

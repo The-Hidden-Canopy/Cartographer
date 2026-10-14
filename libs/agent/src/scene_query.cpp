@@ -74,8 +74,12 @@ std::size_t encoded_size(const SceneQueryRow& row) noexcept {
         using Fact = std::decay_t<decltype(fact)>;
         if constexpr (std::is_same_v<Fact, SceneNamedObjectFact>) {
             return fact.stable_name.size();
+        } else if constexpr (std::is_same_v<Fact, ConditionAssetTagFact>) {
+            std::size_t bytes = fact.source_revision.size();
+            for (const auto& feature : fact.protected_features) bytes += feature.size();
+            return bytes;
         } else if constexpr (std::is_same_v<Fact, FamiliarityRecordFact>) {
-            return fact.semantic_id.size();
+            return fact.semantic_id.size() + fact.source_revision.size();
         }
         return 0U;
     }, row);
@@ -520,8 +524,27 @@ core::Result<SceneQueryResult> SceneQuery::execute(
                             asset.tags.end()) continue;
                     const scene::ObjectId object{asset.authored_object_id};
                     if (!in_scope(object, allowed_scope)) continue;
+                    if (budget.semantic_records_examined >=
+                        budget.max_semantic_records_examined) {
+                        result.truncated = true;
+                        break;
+                    }
+                    const auto source = std::lower_bound(
+                        authoring.value().sources.begin(), authoring.value().sources.end(),
+                        asset.source_id, [](const auto& candidate, condition::Id id) {
+                            return candidate.id < id;
+                        });
+                    if (source == authoring.value().sources.end() ||
+                        source->id != asset.source_id) {
+                        return core::Result<void>::failure(invalid(
+                            "CONDITION asset references a missing source evidence record"));
+                    }
+                    ++budget.semantic_records_examined;
+                    ++result.semantic_records_examined;
                     if (!append_row(result, budget, request.limit, ConditionAssetTagFact{
-                            asset.id, object, asset.asset_class, asset.fidelity})) break;
+                            asset.id, object, asset.asset_class, asset.fidelity,
+                            source->id, source->revision, source->current, source->reviewed,
+                            asset.protected_features})) break;
                 }
                 if (examine < count) result.truncated = true;
             } else {
@@ -555,9 +578,28 @@ core::Result<SceneQueryResult> SceneQuery::execute(
                     }
                     const scene::ObjectId object{asset->second->authored_object_id};
                     if (!in_scope(object, allowed_scope)) continue;
+                    if (budget.semantic_records_examined >=
+                        budget.max_semantic_records_examined) {
+                        result.truncated = true;
+                        break;
+                    }
+                    const auto source = std::lower_bound(
+                        authoring.value().sources.begin(), authoring.value().sources.end(),
+                        asset->second->source_id,
+                        [](const auto& candidate, condition::Id id) {
+                            return candidate.id < id;
+                        });
+                    if (source == authoring.value().sources.end() ||
+                        source->id != asset->second->source_id) {
+                        return core::Result<void>::failure(invalid(
+                            "CONDITION asset references a missing source evidence record"));
+                    }
+                    ++budget.semantic_records_examined;
+                    ++result.semantic_records_examined;
                     if (!append_row(result, budget, request.limit, FamiliarityRecordFact{
                             record.id, record.asset_id, object, record.semantic_id,
-                            record.importance, record.may_change_physically})) break;
+                            record.importance, record.may_change_physically,
+                            source->id, source->revision, source->current, source->reviewed})) break;
                 }
                 if (examine < count) result.truncated = true;
             }
