@@ -6958,6 +6958,24 @@ struct DesktopState {
             snapshot.agent_plan_draft.empty() ||
             agent_goal.empty() || !clarifications_answered ||
             !objective_constraints_valid);
+        if (ImGui::Button("Prepare task for preflight", ImVec2(-1, 30))) {
+            std::optional<carto::agent::AgentWorkEnvelope> requested_envelope;
+            if (agent_allow_root_translation) {
+                requested_envelope.emplace();
+                requested_envelope->permitted_effects |=
+                    carto::agent::effect_mask(carto::agent::Effect::transform);
+                requested_envelope->max_transform_distance_meters =
+                    agent_translation_distance_meters;
+            }
+            const auto prepared = ui.prepare_agent_plan(
+                agent_goal, std::move(requested_envelope));
+            agent_feedback = prepared
+                ? "Task prepared at the captured revision. Inspect scoped CONDITION data before running."
+                : prepared.error().message;
+        }
+        ImGui::TextDisabled(
+            "Preparation locks the objective and envelope. You can inspect read-only CONDITION facts "
+            "before native commands run.");
         if (ImGui::Button("Run speculative plan", ImVec2(-1, 30))) {
             std::optional<carto::agent::AgentWorkEnvelope> requested_envelope;
             if (agent_allow_root_translation) {
@@ -7119,6 +7137,41 @@ struct DesktopState {
                     ImGui::Text("Recorded choice · %s",
                         question.selected_candidate_id->c_str());
                 }
+            }
+            if (task.status == carto::agent::TaskStatus::prepared) {
+                ImGui::TextDisabled(
+                    "Prepared at R%llu. Query inventory before running if CONDITION source context matters.",
+                    static_cast<unsigned long long>(task.base_revision.value()));
+                if (ImGui::Button("Run prepared plan", ImVec2(-1, 30))) {
+                    const auto run = ui.run_prepared_agent_plan();
+                    if (run) {
+                        agent_feedback = run.value().status == carto::agent::TaskStatus::review
+                            ? "Speculative result is ready for review; the source is unchanged."
+                            : (run.value().diagnostic.has_value()
+                                ? run.value().diagnostic->message
+                                : "Prepared plan is blocked by an acceptance gate.");
+                    } else {
+                        agent_feedback = run.error().message;
+                    }
+                }
+            }
+            ImGui::BeginDisabled(task.status == carto::agent::TaskStatus::accepted ||
+                task.status == carto::agent::TaskStatus::rejected);
+            if (ImGui::SmallButton("Inspect scoped CONDITION inventory")) {
+                const auto inventory = ui.query_agent_condition_inventory();
+                agent_feedback = inventory
+                    ? (inventory.value().truncated
+                        ? "Scoped inventory is partial; inspect truncation and per-asset completeness."
+                        : "CONDITION inventory read at the task revision; project data is unchanged.")
+                    : inventory.error().message;
+            }
+            ImGui::EndDisabled();
+            ImGui::TextDisabled(
+                "Inventory is read-only, limited to this task's object scope, and uses its query budget. "
+                "Counts do not certify production readiness.");
+            if (snapshot.agent_condition_inventory.has_value()) {
+                draw_agent_condition_inventory(
+                    snapshot, *snapshot.agent_condition_inventory);
             }
             if (ImGui::SmallButton("Show source")) {
                 agent_preview_mode = 0;
@@ -7422,6 +7475,28 @@ struct DesktopState {
                 }
             }
         }
+        if (!unresolved_task) {
+            ImGui::Separator();
+            ImGui::TextDisabled(
+                "Read-only inspection uses the selected object scope and does not create a task.");
+            const bool has_inspection_scope =
+                !snapshot.selection.objects.empty() ||
+                snapshot.selection.component_object.has_value();
+            ImGui::BeginDisabled(!has_inspection_scope);
+            if (ImGui::Button("Inspect selected CONDITION inventory", ImVec2(-1, 28))) {
+                const auto inventory = ui.query_agent_condition_inventory();
+                agent_feedback = inventory
+                    ? (inventory.value().truncated
+                        ? "Selected-scope inventory is partial; inspect its diagnostics and completeness."
+                        : "Selected-scope CONDITION inventory loaded at the current project revision.")
+                    : inventory.error().message;
+            }
+            ImGui::EndDisabled();
+            if (snapshot.agent_condition_inventory.has_value()) {
+                draw_agent_condition_inventory(
+                    snapshot, *snapshot.agent_condition_inventory);
+            }
+        }
         if (!agent_feedback.empty()) ImGui::TextWrapped("%s", agent_feedback.c_str());
         if (!task_active && !snapshot.agent_plan_draft.empty() &&
             ImGui::SmallButton("Clear queued steps")) {
@@ -7549,6 +7624,39 @@ struct DesktopState {
             "The project stores source-derived CONDITION records. Runtime condition and "
             "game-owned state remain outside this package.");
         ImGui::Separator();
+        const bool active_agent_task = snapshot.agent_task.has_value() &&
+            snapshot.agent_task->status != carto::agent::TaskStatus::accepted &&
+            snapshot.agent_task->status != carto::agent::TaskStatus::rejected;
+        const bool has_condition_scope = !snapshot.selection.objects.empty() ||
+            snapshot.selection.component_object.has_value();
+        ImGui::TextDisabled("Agent inspection");
+        ImGui::BeginDisabled(!snapshot.condition.present ||
+            (!active_agent_task && !has_condition_scope));
+        if (ImGui::Button(active_agent_task
+                ? "Inspect task scope with Cartographer"
+                : "Inspect selected asset with Cartographer",
+                ImVec2(-1, 28))) {
+            const auto inventory = ui.query_agent_condition_inventory();
+            if (!inventory) {
+                action_feedback = inventory.error().message;
+                action_feedback_error = true;
+            } else {
+                action_feedback = inventory.value().truncated
+                    ? "Read-only inventory is partial; inspect diagnostics and completeness in Agent."
+                    : "Read-only scoped inventory loaded in Agent at its source revision.";
+                action_feedback_error = false;
+                const auto opened = ui.set_workspace(carto::ui::Workspace::ai);
+                if (opened) {
+                    surface = ShellSurface::workspace;
+                } else {
+                    action_feedback = opened.error().message;
+                    action_feedback_error = true;
+                }
+            }
+        }
+        ImGui::EndDisabled();
+        ImGui::TextDisabled(
+            "This reads scoped source facts only; it does not certify readiness or change project data.");
         if (!snapshot.condition.present) {
             ImGui::TextDisabled("No CONDITION source authoring is loaded.");
             if (ImGui::Button("Import authoring document...", ImVec2(-1, 30))) {
@@ -9991,6 +10099,69 @@ struct DesktopState {
         ImGui::TextDisabled("The viewport and machine frame remain fixed.\nRack instruments can be reopened at any time.");
         ImGui::EndChild();
         ImGui::EndChild();
+    }
+
+    void draw_agent_condition_inventory(
+        const UiSnapshot& snapshot,
+        const carto::agent::SceneQueryResult& inventory) {
+        const bool active_task = snapshot.agent_task.has_value() &&
+            snapshot.agent_task->status != carto::agent::TaskStatus::accepted &&
+            snapshot.agent_task->status != carto::agent::TaskStatus::rejected;
+        const char* scope_label = active_task ? "task scope" : "selected scope";
+        ImGui::Text("CONDITION inventory · %s · R%llu · %zu asset fact(s)%s",
+            scope_label,
+            static_cast<unsigned long long>(inventory.source_revision.value()),
+            inventory.rows.size(), inventory.truncated ? " · partial" : "");
+        for (const auto& diagnostic : inventory.diagnostics) {
+            ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                "%s", diagnostic.message.c_str());
+        }
+        for (const auto& row : inventory.rows) {
+            const auto* fact = std::get_if<
+                carto::agent::ConditionAssetInventoryFact>(&row);
+            if (fact == nullptr) continue;
+            const std::string asset_id_text = std::to_string(fact->asset);
+            ImGui::PushID(asset_id_text.c_str());
+            const auto asset_class =
+                carto::condition::asset_class_name(fact->asset_class);
+            const auto fidelity =
+                carto::condition::fidelity_class_name(fact->fidelity);
+            ImGui::Text("Asset %llu · object %llu · %.*s · %.*s",
+                static_cast<unsigned long long>(fact->asset),
+                static_cast<unsigned long long>(fact->authored_object.value),
+                static_cast<int>(asset_class.size()), asset_class.data(),
+                static_cast<int>(fidelity.size()), fidelity.data());
+            ImGui::TextDisabled("Source %llu · %s · %s · revision %s",
+                static_cast<unsigned long long>(fact->source_id),
+                fact->source_current ? "current" : "stale",
+                fact->source_reviewed ? "reviewed" : "unreviewed",
+                fact->source_revision.c_str());
+            ImGui::BulletText(
+                "Safe Place %llu · familiarity %llu · views %llu · variants %llu · temporal %llu",
+                static_cast<unsigned long long>(fact->safe_place_profiles),
+                static_cast<unsigned long long>(fact->familiarity_records),
+                static_cast<unsigned long long>(fact->view_conditions),
+                static_cast<unsigned long long>(fact->variant_candidates),
+                static_cast<unsigned long long>(fact->temporal_packages));
+            ImGui::BulletText(
+                "Surface %llu · anchors %llu · collections %llu · prefabs %llu · kits %llu · related counts %s",
+                static_cast<unsigned long long>(fact->surface_states),
+                static_cast<unsigned long long>(fact->interaction_anchors),
+                static_cast<unsigned long long>(fact->collection_memberships),
+                static_cast<unsigned long long>(fact->prefab_memberships),
+                static_cast<unsigned long long>(fact->region_kit_memberships),
+                fact->related_records_complete ? "complete" : "incomplete");
+            if (!fact->protected_features.empty()) {
+                std::string protected_features = "Protected features: ";
+                for (std::size_t index = 0U;
+                     index < fact->protected_features.size(); ++index) {
+                    if (index != 0U) protected_features += ", ";
+                    protected_features += fact->protected_features[index];
+                }
+                ImGui::TextWrapped("%s", protected_features.c_str());
+            }
+            ImGui::PopID();
+        }
     }
 
     void draw_agent_task_strip(const UiSnapshot& snapshot) {

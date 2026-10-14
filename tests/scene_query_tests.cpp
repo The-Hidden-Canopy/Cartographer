@@ -336,6 +336,257 @@ void condition_semantics_require_current_explicit_source_data() {
     REQUIRE(bounded_semantics.value().truncated);
     REQUIRE(bounded_semantics.value().rows.empty());
     REQUIRE(bounded_semantics.value().semantic_records_examined == 2U);
+
+    carto::application::ApplicationSession bounded_tag_session;
+    const auto bounded_tag_objects = create_boxes(bounded_tag_session, {"A", "B", "C"});
+    auto bounded_tag_fixture = carto::condition::make_condition_fixture();
+    REQUIRE(bounded_tag_fixture);
+    bounded_tag_fixture.value().project_revision =
+        bounded_tag_session.snapshot().project_revision.next();
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        bounded_tag_session, carto::application::ImportConditionAuthoringAction{
+            bounded_tag_fixture.value().serialize()}));
+    carto::agent::AgentWorkEnvelope bounded_tag_envelope;
+    bounded_tag_envelope.max_semantic_records_examined = 2U;
+    auto bounded_tag_budget_task = begin_task(
+        bounded_tag_session, bounded_tag_objects, bounded_tag_envelope);
+    auto bounded_tag_query = carto::agent::SceneQuery::execute(bounded_tag_budget_task, {
+        carto::agent::ConditionAssetsByTagQuery{"safe-place"}, 8U});
+    REQUIRE(bounded_tag_query);
+    REQUIRE(bounded_tag_query.value().truncated);
+    REQUIRE(bounded_tag_query.value().rows.size() == 1U);
+    REQUIRE(bounded_tag_query.value().semantic_records_examined == 2U);
+    REQUIRE(bounded_tag_budget_task.snapshot().query_budget.semantic_records_examined == 2U);
+
+    carto::application::ApplicationSession bounded_familiarity_session;
+    const auto bounded_familiarity_objects = create_boxes(
+        bounded_familiarity_session, {"A", "B", "C"});
+    auto bounded_familiarity_fixture = carto::condition::make_condition_fixture();
+    REQUIRE(bounded_familiarity_fixture);
+    bounded_familiarity_fixture.value().project_revision =
+        bounded_familiarity_session.snapshot().project_revision.next();
+    auto second_familiarity = bounded_familiarity_fixture.value().familiarity.front();
+    second_familiarity.id = 2U;
+    second_familiarity.semantic_id = "SAFEPLACE.MOTEL8.SIGN.ALTERNATE";
+    bounded_familiarity_fixture.value().familiarity.push_back(second_familiarity);
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        bounded_familiarity_session, carto::application::ImportConditionAuthoringAction{
+            bounded_familiarity_fixture.value().serialize()}));
+    carto::agent::AgentWorkEnvelope bounded_familiarity_envelope;
+    bounded_familiarity_envelope.max_semantic_records_examined = 5U;
+    auto bounded_familiarity_task = begin_task(
+        bounded_familiarity_session, bounded_familiarity_objects,
+        bounded_familiarity_envelope);
+    auto bounded_familiarity_query = carto::agent::SceneQuery::execute(
+        bounded_familiarity_task, {
+            carto::agent::FamiliarityRecordsQuery{std::nullopt}, 8U});
+    REQUIRE(bounded_familiarity_query);
+    REQUIRE(bounded_familiarity_query.value().truncated);
+    REQUIRE(bounded_familiarity_query.value().rows.size() == 1U);
+    REQUIRE(bounded_familiarity_query.value().semantic_records_examined == 5U);
+    REQUIRE(bounded_familiarity_task.snapshot().query_budget.semantic_records_examined == 5U);
+}
+
+void condition_inventory_is_scoped_factual_and_budgeted() {
+    carto::application::ApplicationSession session;
+    const auto objects = create_boxes(session, {"Exterior", "Sign", "Room"});
+    auto fixture = carto::condition::make_condition_fixture();
+    REQUIRE(fixture);
+    fixture.value().project_revision = session.snapshot().project_revision.next();
+    fixture.value().region_kits.front().asset_ids = {1U, 2U};
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::ImportConditionAuthoringAction{
+            fixture.value().serialize()}));
+    const auto imported_revision = session.snapshot().project_revision;
+    auto task = begin_task(session, objects);
+
+    auto inventory = carto::agent::SceneQuery::execute(task, {
+        carto::agent::ConditionAssetInventoryQuery{std::nullopt}, 8U});
+    REQUIRE(inventory);
+    REQUIRE(inventory.value().rows.size() == 3U);
+    REQUIRE(inventory.value().source_revision == imported_revision);
+    REQUIRE(!inventory.value().truncated);
+    const auto fact_for = [&](std::uint64_t asset_id)
+            -> const carto::agent::ConditionAssetInventoryFact* {
+        for (const auto& row : inventory.value().rows) {
+            const auto* fact = std::get_if<carto::agent::ConditionAssetInventoryFact>(&row);
+            if (fact != nullptr && fact->asset == asset_id) return fact;
+        }
+        return nullptr;
+    };
+    const auto* exterior = fact_for(1U);
+    const auto* sign = fact_for(2U);
+    const auto* room = fact_for(3U);
+    REQUIRE(exterior != nullptr);
+    REQUIRE(sign != nullptr);
+    REQUIRE(room != nullptr);
+    REQUIRE(exterior->authored_object == objects[0U]);
+    REQUIRE(exterior->source_id == 1U);
+    REQUIRE(exterior->source_revision == "fixture-1");
+    REQUIRE(exterior->source_current);
+    REQUIRE(exterior->source_reviewed);
+    REQUIRE(exterior->asset_class == carto::condition::AssetClass::architecture);
+    REQUIRE(exterior->fidelity == carto::condition::FidelityClass::familiarity_critical);
+    REQUIRE(exterior->protected_features ==
+        std::vector<std::string>({"entry-door", "silhouette"}));
+    REQUIRE(exterior->safe_place_profiles == 1U);
+    REQUIRE(exterior->familiarity_records == 0U);
+    REQUIRE(exterior->view_conditions == 0U);
+    REQUIRE(exterior->variant_candidates == 1U);
+    REQUIRE(exterior->temporal_packages == 2U);
+    REQUIRE(exterior->surface_states == 1U);
+    REQUIRE(exterior->interaction_anchors == 1U);
+    REQUIRE(exterior->collection_memberships == 1U);
+    REQUIRE(exterior->prefab_memberships == 0U);
+    REQUIRE(exterior->region_kit_memberships == 1U);
+    REQUIRE(exterior->related_records_complete);
+    REQUIRE(sign->authored_object == objects[1U]);
+    REQUIRE(sign->asset_class == carto::condition::AssetClass::prop);
+    REQUIRE(sign->familiarity_records == 1U);
+    REQUIRE(sign->view_conditions == 1U);
+    REQUIRE(sign->variant_candidates == 1U);
+    REQUIRE(sign->collection_memberships == 1U);
+    REQUIRE(sign->region_kit_memberships == 1U);
+    REQUIRE(sign->related_records_complete);
+    REQUIRE(room->authored_object == objects[2U]);
+    REQUIRE(room->interaction_anchors == 1U);
+    REQUIRE(room->collection_memberships == 1U);
+    REQUIRE(room->prefab_memberships == 1U);
+    REQUIRE(room->region_kit_memberships == 1U);
+    REQUIRE(room->related_records_complete);
+
+    auto targeted = carto::agent::SceneQuery::execute(task, {
+        carto::agent::ConditionAssetInventoryQuery{objects[1U]}, 8U});
+    REQUIRE(targeted);
+    REQUIRE(targeted.value().rows.size() == 1U);
+    const auto* targeted_fact = std::get_if<carto::agent::ConditionAssetInventoryFact>(
+        &targeted.value().rows.front());
+    REQUIRE(targeted_fact != nullptr);
+    REQUIRE(targeted_fact->asset == 2U);
+    REQUIRE(session.snapshot().project_revision == imported_revision);
+
+    auto outside_task = begin_task(session, {objects[2U]});
+    auto outside = carto::agent::SceneQuery::execute(outside_task, {
+        carto::agent::ConditionAssetInventoryQuery{objects[0U]}, 8U});
+    REQUIRE(!outside);
+    REQUIRE(outside.error().code == carto::core::ErrorCode::invalid_state);
+
+    auto zero_object_task = begin_task(session, objects);
+    auto zero_object = carto::agent::SceneQuery::execute(zero_object_task, {
+        carto::agent::ConditionAssetInventoryQuery{carto::scene::ObjectId{}}, 8U});
+    REQUIRE(!zero_object);
+    REQUIRE(zero_object.error().code == carto::core::ErrorCode::invalid_argument);
+    REQUIRE(zero_object_task.snapshot().query_budget.queries_used == 0U);
+
+    carto::application::ApplicationSession stale_lineage_session;
+    const auto stale_lineage_objects = create_boxes(
+        stale_lineage_session, {"Exterior", "Sign", "Room"});
+    auto stale_lineage_fixture = carto::condition::make_condition_fixture();
+    REQUIRE(stale_lineage_fixture);
+    stale_lineage_fixture.value().project_revision =
+        stale_lineage_session.snapshot().project_revision.next();
+    stale_lineage_fixture.value().assets.front().source_revision = "fixture-old";
+    stale_lineage_fixture.value().assets[1U].source_digest =
+        stale_lineage_fixture.value().sources.front().import_settings_digest;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        stale_lineage_session, carto::application::ImportConditionAuthoringAction{
+            stale_lineage_fixture.value().serialize()}));
+    auto stale_lineage_task = begin_task(stale_lineage_session, stale_lineage_objects);
+    auto stale_lineage = carto::agent::SceneQuery::execute(stale_lineage_task, {
+        carto::agent::ConditionAssetInventoryQuery{std::nullopt}, 8U});
+    REQUIRE(stale_lineage);
+    REQUIRE(stale_lineage.value().rows.size() == 3U);
+    const auto stale_fact_for = [&](std::uint64_t asset_id)
+            -> const carto::agent::ConditionAssetInventoryFact* {
+        for (const auto& row : stale_lineage.value().rows) {
+            const auto* fact = std::get_if<carto::agent::ConditionAssetInventoryFact>(&row);
+            if (fact != nullptr && fact->asset == asset_id) return fact;
+        }
+        return nullptr;
+    };
+    REQUIRE(stale_fact_for(1U) != nullptr);
+    REQUIRE(!stale_fact_for(1U)->source_current);
+    REQUIRE(stale_fact_for(1U)->source_reviewed);
+    REQUIRE(stale_fact_for(2U) != nullptr);
+    REQUIRE(!stale_fact_for(2U)->source_current);
+    REQUIRE(stale_fact_for(2U)->source_reviewed);
+    REQUIRE(stale_fact_for(3U) != nullptr);
+    REQUIRE(stale_fact_for(3U)->source_current);
+
+    carto::application::ApplicationSession stale_revision_session;
+    const auto stale_revision_objects = create_boxes(
+        stale_revision_session, {"Exterior", "Sign", "Room"});
+    auto stale_revision_fixture = carto::condition::make_condition_fixture();
+    REQUIRE(stale_revision_fixture);
+    stale_revision_fixture.value().project_revision =
+        stale_revision_session.snapshot().project_revision;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        stale_revision_session, carto::application::ImportConditionAuthoringAction{
+            stale_revision_fixture.value().serialize()}));
+    auto stale_revision_task = begin_task(stale_revision_session, stale_revision_objects);
+    auto stale_revision = carto::agent::SceneQuery::execute(stale_revision_task, {
+        carto::agent::ConditionAssetInventoryQuery{std::nullopt}, 8U});
+    REQUIRE(!stale_revision);
+    REQUIRE(stale_revision.error().code == carto::core::ErrorCode::stale_data);
+
+    carto::application::ApplicationSession bounded_session;
+    const auto bounded_objects = create_boxes(bounded_session, {"Exterior", "Sign", "Room"});
+    auto bounded_fixture = carto::condition::make_condition_fixture();
+    REQUIRE(bounded_fixture);
+    bounded_fixture.value().project_revision = bounded_session.snapshot().project_revision.next();
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        bounded_session, carto::application::ImportConditionAuthoringAction{
+            bounded_fixture.value().serialize()}));
+    carto::agent::AgentWorkEnvelope envelope;
+    envelope.max_semantic_records_examined = 2U;
+    auto bounded_task = begin_task(bounded_session, bounded_objects, envelope);
+    auto bounded = carto::agent::SceneQuery::execute(bounded_task, {
+        carto::agent::ConditionAssetInventoryQuery{std::nullopt}, 8U});
+    REQUIRE(bounded);
+    REQUIRE(bounded.value().truncated);
+    REQUIRE(bounded.value().semantic_records_examined == 2U);
+    REQUIRE(bounded_task.snapshot().query_budget.semantic_records_examined == 2U);
+    REQUIRE(bounded.value().rows.size() == 1U);
+    const auto* bounded_fact = std::get_if<carto::agent::ConditionAssetInventoryFact>(
+        &bounded.value().rows.front());
+    REQUIRE(bounded_fact != nullptr);
+    REQUIRE(bounded_fact->asset == 1U);
+    REQUIRE(!bounded_fact->related_records_complete);
+    REQUIRE(bounded_session.snapshot().project_revision == bounded_task.snapshot().base_revision);
+}
+
+void live_condition_inventory_is_revision_bound_and_read_only() {
+    carto::application::ApplicationSession session;
+    const auto objects = create_boxes(session, {"Selected", "Unselected"});
+    auto fixture = carto::condition::make_condition_fixture();
+    REQUIRE(fixture);
+    fixture.value().project_revision = session.snapshot().project_revision.next();
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::ImportConditionAuthoringAction{
+            fixture.value().serialize()}));
+
+    const auto captured_revision = session.snapshot().project_revision;
+    carto::agent::SceneQueryBudget budget;
+    auto inventory = carto::agent::SceneQuery::execute(session, {
+        carto::agent::ConditionAssetInventoryQuery{std::nullopt}, 8U},
+        budget, {objects.front()}, captured_revision);
+    REQUIRE(inventory);
+    REQUIRE(inventory.value().source_revision == captured_revision);
+    REQUIRE(inventory.value().rows.size() == 1U);
+    REQUIRE(budget.queries_used == 1U);
+    REQUIRE(session.snapshot().project_revision == captured_revision);
+
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::CreateBoxAction{
+            "Concurrent edit", {1.0, 1.0, 1.0}}));
+    const auto changed_revision = session.snapshot().project_revision;
+    auto stale = carto::agent::SceneQuery::execute(session, {
+        carto::agent::ConditionAssetInventoryQuery{std::nullopt}, 8U},
+        budget, {objects.front()}, captured_revision);
+    REQUIRE(!stale);
+    REQUIRE(stale.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(budget.queries_used == 1U);
+    REQUIRE(session.snapshot().project_revision == changed_revision);
 }
 
 } // namespace
@@ -346,6 +597,8 @@ int main() {
         spatial_orientation_and_boundary_queries_return_measured_facts();
         query_and_scan_budgets_truncate_or_fail_closed();
         condition_semantics_require_current_explicit_source_data();
+        condition_inventory_is_scoped_factual_and_budgeted();
+        live_condition_inventory_is_revision_bound_and_read_only();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';

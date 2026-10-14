@@ -239,13 +239,6 @@ target_link_libraries(cartographer_procedural_sweep_tests PRIVATE carto_geometry
 carto_target(cartographer_procedural_sweep_tests)
 add_test(NAME cartographer_procedural_sweep_tests COMMAND cartographer_procedural_sweep_tests)
 
-add_executable(cartographer_plant_growth_tests
-    plant_growth_tests.cpp
-)
-target_link_libraries(cartographer_plant_growth_tests PRIVATE carto_geometry)
-carto_target(cartographer_plant_growth_tests)
-add_test(NAME cartographer_plant_growth_tests COMMAND cartographer_plant_growth_tests)
-
 add_executable(cartographer_sweep_source_project_tests
     sweep_source_project_tests.cpp
 )

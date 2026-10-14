@@ -1,4 +1,5 @@
 #include <carto/agent/workbench.hpp>
+#include <carto/condition/authoring.hpp>
 #include <carto/ui/ui.hpp>
 
 #include <algorithm>
@@ -2296,6 +2297,80 @@ void ui_workbench_captures_selection_and_exposes_accept_reject_flow() {
     REQUIRE(ui.snapshot().project_revision == source_revision.next());
 }
 
+void ui_prepared_task_supports_condition_preflight_and_rechecks_source_revision() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    const auto objects = create_boxes(source, 3U);
+    auto condition = carto::condition::make_condition_fixture();
+    REQUIRE(condition);
+    condition.value().project_revision = source.snapshot().project_revision.next();
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        source, carto::application::ImportConditionAuthoringAction{
+            condition.value().serialize()}));
+
+    REQUIRE(!ui.query_agent_condition_inventory());
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        objects.front(), carto::geometry::FaceId{1U}}));
+    const auto direct_query_revision = source.snapshot().project_revision;
+    auto direct_inventory = ui.query_agent_condition_inventory();
+    REQUIRE(direct_inventory);
+    REQUIRE(direct_inventory.value().source_revision == direct_query_revision);
+    REQUIRE(direct_inventory.value().rows.size() == 1U);
+    REQUIRE(!ui.snapshot().agent_task.has_value());
+    REQUIRE(ui.snapshot().agent_condition_inventory.has_value());
+    REQUIRE(source.snapshot().project_revision == direct_query_revision);
+    REQUIRE(ui.queue_agent_step("inset face 0.1"));
+
+    const auto base_revision = source.snapshot().project_revision;
+    const auto prepared = ui.prepare_agent_plan("Prepare the selected asset for CONDITION");
+    REQUIRE(prepared);
+    REQUIRE(prepared.value().status == carto::agent::TaskStatus::prepared);
+    auto inventory = ui.query_agent_condition_inventory();
+    REQUIRE(inventory);
+    REQUIRE(inventory.value().source_revision == base_revision);
+    REQUIRE(inventory.value().rows.size() == 1U);
+    const auto* fact = std::get_if<carto::agent::ConditionAssetInventoryFact>(
+        &inventory.value().rows.front());
+    REQUIRE(fact != nullptr);
+    REQUIRE(fact->asset == 1U);
+    REQUIRE(fact->authored_object == objects.front());
+    const auto preflight_snapshot = ui.snapshot();
+    REQUIRE(preflight_snapshot.agent_condition_inventory.has_value());
+    REQUIRE(preflight_snapshot.agent_task->status == carto::agent::TaskStatus::prepared);
+    REQUIRE(preflight_snapshot.project_revision == base_revision);
+    REQUIRE(source.condition_authoring().value().project_revision == base_revision);
+
+    const auto run = ui.run_prepared_agent_plan();
+    REQUIRE(run);
+    REQUIRE(run.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(source.snapshot().project_revision == base_revision);
+
+    carto::application::ApplicationSession stale_source;
+    carto::ui::UiController stale_ui(stale_source);
+    REQUIRE(stale_ui.dispatch(carto::application::CreateBoxAction{
+        "Prepared target", {1.0, 1.0, 1.0}}));
+    const auto target = stale_source.snapshot().objects.front().object.id;
+    REQUIRE(stale_ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(stale_ui.dispatch(carto::application::SelectFaceAction{
+        target, carto::geometry::FaceId{1U}}));
+    REQUIRE(stale_ui.queue_agent_step("inset face 0.1"));
+    REQUIRE(stale_ui.prepare_agent_plan("Prepare the selected face"));
+    const auto prepared_revision = stale_source.snapshot().project_revision;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        stale_source, carto::application::CreateBoxAction{
+            "Concurrent human edit", {1.0, 1.0, 1.0}}));
+    const auto concurrent_revision = stale_source.snapshot().project_revision;
+    REQUIRE(concurrent_revision > prepared_revision);
+    const auto stale_run = stale_ui.run_prepared_agent_plan();
+    REQUIRE(!stale_run);
+    REQUIRE(stale_run.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(stale_ui.snapshot().agent_task->status == carto::agent::TaskStatus::prepared);
+    REQUIRE(stale_source.snapshot().project_revision == concurrent_revision);
+}
+
 void ui_recipe_selection_round_trips_and_locks_with_checkpoint() {
     carto::application::ApplicationSession source;
     carto::ui::UiController ui(source);
@@ -2700,6 +2775,7 @@ int main() {
         ui_compiled_constraints_are_bound_to_clarification_and_gate_execution();
         acceptance_evidence_binds_validator_revision_assets_and_result();
         ui_workbench_captures_selection_and_exposes_accept_reject_flow();
+        ui_prepared_task_supports_condition_preflight_and_rechecks_source_revision();
         ui_recipe_selection_round_trips_and_locks_with_checkpoint();
         ui_clarification_requires_an_operator_answer_before_review();
         ui_repairs_failed_step_with_operator_justification_and_scope_checks();

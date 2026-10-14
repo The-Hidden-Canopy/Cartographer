@@ -30,11 +30,19 @@
 - Exact object ID, stable name, and mesh-asset queries return copied identities at the source revision.
 - Name, spatial, topology, and CONDITION results are limited to the task scope; an explicit out-of-scope identity request fails closed.
 - CONDITION tag and familiarity facts include their source ID, revision, current/reviewed flags, and protected features where applicable; stale or unreviewed source evidence is never projected as current.
+- CONDITION inventory returns scoped asset class/fidelity/source/protected-feature facts and exact counts for profiles, familiarity, views, variants, temporal packages, surface states, anchors, and collection/prefab/kit membership, including kit membership through referenced prefabs.
+- Inventory counts expose no collection, prefab, or kit names and do not imply geometry, UV, material, or production readiness.
+- A targeted inventory request outside the task scope is rejected; a zero object identity is rejected before consuming query budget.
+- A current project sidecar with stale per-asset source revision or digest reports `source_current=false`; stale project revisions fail closed, while unreviewed evidence remains explicitly unreviewed.
+- CONDITION tag, familiarity, and inventory asset/source/relationship scans respect the semantic-record budget without overrun; truncation is explicit and inventory rows mark related counts incomplete when the metadata scan did not finish.
 - Proximity results report world object-origin distance; orientation results report computed world-space normals; boundary-edge results come from validated mesh topology.
 - Missing CONDITION sidecars return an explicit unavailable diagnostic, and CONDITION data with a stale project revision is rejected instead of being shown as current.
 - Query count, object scans, topology elements, semantic records, result count, and result-byte limits truncate or reject deterministically without mutating the source.
 - CONDITION source lineage and protected-feature strings count toward semantic-record and result-byte budgets.
 - Invalid query parameters fail before consuming query budget.
+- The UI rejects inventory inspection without a selection; with a selection and no task it runs at the captured live project revision and reports copied facts in `UiSnapshot` without changing project revision or sidecar revision.
+- The CONDITION workspace routes selected-asset inspection into Agent, and cached facts disappear from the snapshot when their source revision or selection scope changes.
+- After task preparation the UI exposes only the captured task scope; execution rechecks that source revision, and a concurrent human edit rejects execution while leaving the task prepared.
 
 ## Capability registry coverage
 

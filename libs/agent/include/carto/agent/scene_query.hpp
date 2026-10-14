@@ -23,6 +23,10 @@ namespace carto::project {
 class ProjectDocument;
 }
 
+namespace carto::application {
+class ApplicationSession;
+}
+
 namespace carto::agent {
 
 class AgentTask;
@@ -58,6 +62,10 @@ struct ConditionAssetsByTagQuery {
     std::string exact_tag;
 };
 
+struct ConditionAssetInventoryQuery {
+    std::optional<scene::ObjectId> object;
+};
+
 struct FamiliarityRecordsQuery {
     std::optional<std::string> exact_semantic_id;
 };
@@ -70,6 +78,7 @@ using SceneQueryPredicate = std::variant<
     FacesByOrientationQuery,
     BoundaryEdgesQuery,
     ConditionAssetsByTagQuery,
+    ConditionAssetInventoryQuery,
     FamiliarityRecordsQuery>;
 
 struct SceneQueryRequest {
@@ -123,6 +132,29 @@ struct ConditionAssetTagFact {
     std::vector<std::string> protected_features;
 };
 
+struct ConditionAssetInventoryFact {
+    std::uint64_t asset = 0U;
+    scene::ObjectId authored_object;
+    condition::AssetClass asset_class{};
+    condition::FidelityClass fidelity{};
+    std::uint64_t source_id = 0U;
+    std::string source_revision;
+    bool source_current = false;
+    bool source_reviewed = false;
+    std::vector<std::string> protected_features;
+    std::size_t safe_place_profiles = 0U;
+    std::size_t familiarity_records = 0U;
+    std::size_t view_conditions = 0U;
+    std::size_t variant_candidates = 0U;
+    std::size_t temporal_packages = 0U;
+    std::size_t surface_states = 0U;
+    std::size_t interaction_anchors = 0U;
+    std::size_t collection_memberships = 0U;
+    std::size_t prefab_memberships = 0U;
+    std::size_t region_kit_memberships = 0U;
+    bool related_records_complete = false;
+};
+
 struct FamiliarityRecordFact {
     std::uint64_t record = 0U;
     std::uint64_t asset = 0U;
@@ -143,6 +175,7 @@ using SceneQueryRow = std::variant<
     SceneFaceOrientationFact,
     SceneBoundaryEdgeFact,
     ConditionAssetTagFact,
+    ConditionAssetInventoryFact,
     FamiliarityRecordFact>;
 
 struct SceneQueryResult {
@@ -163,6 +196,12 @@ public:
     [[nodiscard]] static core::Result<SceneQueryResult> execute(
         AgentTask& task,
         const SceneQueryRequest& request);
+    [[nodiscard]] static core::Result<SceneQueryResult> execute(
+        const ::carto::application::ApplicationSession& source,
+        const SceneQueryRequest& request,
+        SceneQueryBudget& budget,
+        const std::vector<scene::ObjectId>& allowed_scope,
+        core::Revision expected_source_revision);
     [[nodiscard]] static core::Result<SceneQueryResult> execute(
         const project::ProjectDocument& document,
         const SceneQueryRequest& request,

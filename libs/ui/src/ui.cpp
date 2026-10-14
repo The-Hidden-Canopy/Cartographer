@@ -1692,6 +1692,7 @@ core::Result<void> UiController::queue_agent_step(
                 "accept or reject the current speculative task before editing its plan"));
         }
         agent_task_.reset();
+        agent_condition_inventory_.reset();
         agent_plan_draft_.clear();
         agent_hard_constraints_draft_.clear();
         agent_clarifications_draft_.clear();
@@ -1788,6 +1789,7 @@ core::Result<void> UiController::set_agent_recipe(std::string recipe_id) {
                 "the recipe is locked while a speculative task is active"));
         }
         agent_task_.reset();
+        agent_condition_inventory_.reset();
         agent_plan_draft_.clear();
         agent_hard_constraints_draft_.clear();
         agent_clarifications_draft_.clear();
@@ -1814,6 +1816,7 @@ core::Result<void> UiController::set_agent_hard_constraints(
                 "objective constraints are locked while a speculative task is active"));
         }
         agent_task_.reset();
+        agent_condition_inventory_.reset();
         agent_plan_draft_.clear();
         agent_hard_constraints_draft_.clear();
         agent_clarifications_draft_.clear();
@@ -1886,6 +1889,7 @@ core::Result<void> UiController::queue_agent_clarification(
                 "accept or reject the current speculative task before editing its objective"));
         }
         agent_task_.reset();
+        agent_condition_inventory_.reset();
         agent_plan_draft_.clear();
         agent_hard_constraints_draft_.clear();
         agent_clarifications_draft_.clear();
@@ -1990,7 +1994,7 @@ core::Result<void> UiController::answer_agent_clarification(
     return core::Result<void>::success();
 }
 
-core::Result<agent::AgentTaskSnapshot> UiController::run_agent_plan(
+core::Result<agent::AgentTaskSnapshot> UiController::prepare_agent_plan(
     std::string goal,
     std::optional<agent::AgentWorkEnvelope> requested_envelope) {
     if (agent_checkpoint_pending_.has_value()) {
@@ -2092,13 +2096,112 @@ core::Result<agent::AgentTaskSnapshot> UiController::run_agent_plan(
     agent_plan_id_ = task_id;
     if (agent_objective_id_.empty()) agent_objective_id_ = task_id;
     agent_repair_mode_ = false;
+    agent_condition_inventory_.reset();
     agent_task_.emplace(std::move(task.value()));
+    return core::Result<agent::AgentTaskSnapshot>::success(agent_task_->snapshot());
+}
+
+core::Result<agent::AgentTaskSnapshot> UiController::run_agent_plan(
+    std::string goal,
+    std::optional<agent::AgentWorkEnvelope> requested_envelope) {
+    if (agent_task_.has_value()) {
+        const auto task = agent_task_->snapshot();
+        if (task.status != agent::TaskStatus::prepared) {
+            return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+                "a speculative task is already active"));
+        }
+        if (goal != agent_goal_) {
+            return core::Result<agent::AgentTaskSnapshot>::failure(stale(
+                "prepared task goal changed; clear and prepare the objective again"));
+        }
+        if (requested_envelope.has_value()) {
+            return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+                "the work envelope is locked after task preparation"));
+        }
+        return run_prepared_agent_plan();
+    }
+    auto prepared = prepare_agent_plan(std::move(goal), std::move(requested_envelope));
+    if (!prepared) return prepared;
+    return run_prepared_agent_plan();
+}
+
+core::Result<agent::AgentTaskSnapshot> UiController::run_prepared_agent_plan() {
+    if (!agent_task_.has_value()) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "there is no prepared speculative agent task to run"));
+    }
+    const auto task = agent_task_->snapshot();
+    if (task.status != agent::TaskStatus::prepared) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "only a prepared agent task can start execution"));
+    }
+    if (session_.snapshot().project_revision != task.base_revision) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(stale(
+            "project changed after task preparation; discard and prepare against the current revision"));
+    }
     auto result = agent_task_->run();
     if (!result) {
         record_ui_problem(result.error().with_context("agent workbench execution"));
         return result;
     }
     return result;
+}
+
+core::Result<agent::SceneQueryResult> UiController::query_agent_condition_inventory() {
+    core::Result<agent::SceneQueryResult> queried =
+        core::Result<agent::SceneQueryResult>::failure(invalid_state(
+            "CONDITION inventory query was not initialized"));
+    const std::optional<agent::AgentTaskSnapshot> current_task =
+        agent_task_.has_value()
+            ? std::optional<agent::AgentTaskSnapshot>(agent_task_->snapshot())
+            : std::nullopt;
+    const bool active_task = current_task.has_value() &&
+        current_task->status != agent::TaskStatus::accepted &&
+        current_task->status != agent::TaskStatus::rejected;
+    if (active_task) {
+        agent_condition_inventory_scope_ = current_task->scope_objects;
+        queried = agent::SceneQuery::execute(*agent_task_, {
+            agent::ConditionAssetInventoryQuery{std::nullopt}, 512U});
+    } else {
+        const auto source_snapshot = session_.snapshot();
+        agent_condition_inventory_scope_ = source_snapshot.selection.objects;
+        if (source_snapshot.selection.component_object.has_value() &&
+            std::find(agent_condition_inventory_scope_.begin(),
+                agent_condition_inventory_scope_.end(),
+                *source_snapshot.selection.component_object) ==
+                agent_condition_inventory_scope_.end()) {
+            agent_condition_inventory_scope_.push_back(
+                *source_snapshot.selection.component_object);
+        }
+        std::sort(agent_condition_inventory_scope_.begin(),
+            agent_condition_inventory_scope_.end());
+        agent_condition_inventory_scope_.erase(std::unique(
+            agent_condition_inventory_scope_.begin(),
+            agent_condition_inventory_scope_.end()),
+            agent_condition_inventory_scope_.end());
+        if (agent_condition_inventory_scope_.empty()) {
+            return core::Result<agent::SceneQueryResult>::failure(invalid_state(
+                "select one or more objects before inspecting CONDITION inventory"));
+        }
+        if (!agent_condition_inventory_query_revision_.has_value() ||
+            *agent_condition_inventory_query_revision_ !=
+                source_snapshot.project_revision) {
+            agent_condition_inventory_query_budget_ = {};
+            agent_condition_inventory_query_revision_ =
+                source_snapshot.project_revision;
+        }
+        queried = agent::SceneQuery::execute(session_, {
+            agent::ConditionAssetInventoryQuery{std::nullopt}, 512U},
+            agent_condition_inventory_query_budget_,
+            agent_condition_inventory_scope_, source_snapshot.project_revision);
+    }
+    if (!queried) {
+        record_ui_problem(queried.error().with_context(
+            "agent CONDITION inventory query"));
+        return core::Result<agent::SceneQueryResult>::failure(queried.error());
+    }
+    agent_condition_inventory_ = queried.value();
+    return queried;
 }
 
 core::Result<void> UiController::revise_agent_plan_step(
@@ -2206,6 +2309,7 @@ core::Result<agent::AgentTaskSnapshot> UiController::repair_agent_plan(
         return core::Result<agent::AgentTaskSnapshot>::failure(repaired.error());
     }
     agent_task_.reset();
+    agent_condition_inventory_.reset();
     agent_task_.emplace(std::move(repaired.value()));
     next_agent_task_id_ = task_sequence == std::numeric_limits<std::uint64_t>::max()
         ? 1U : task_sequence + 1U;
@@ -2282,6 +2386,7 @@ core::Result<void> UiController::load_agent_checkpoint(
             "accepted and rejected checkpoints are history records and cannot resume"));
     }
     agent_task_.reset();
+    agent_condition_inventory_.reset();
     agent_plan_draft_ = checkpoint.value().plan.steps;
     agent_hard_constraints_draft_ = checkpoint.value().plan.objective.hard_constraints;
     agent_clarifications_draft_ = checkpoint.value().plan.objective.clarifications;
@@ -2361,6 +2466,7 @@ core::Result<agent::AgentTaskSnapshot> UiController::resume_agent_checkpoint() {
         record_ui_problem(resumed.error().with_context("agent task checkpoint resume"));
         return core::Result<agent::AgentTaskSnapshot>::failure(resumed.error());
     }
+    agent_condition_inventory_.reset();
     agent_task_.emplace(std::move(resumed.value()));
     agent_checkpoint_pending_.reset();
     agent_checkpoint_rebased_ = false;
@@ -2418,7 +2524,9 @@ core::Result<void> UiController::clear_agent_plan() {
                 "a running agent task cannot be cleared"));
         }
         agent_task_.reset();
+        agent_condition_inventory_.reset();
     }
+    agent_condition_inventory_.reset();
     agent_plan_draft_.clear();
     agent_hard_constraints_draft_.clear();
     agent_clarifications_draft_.clear();
@@ -3753,6 +3861,32 @@ UiSnapshot UiController::snapshot() const {
                 if (gate.passed) ++strip.passed_required_gates;
             }
             result.agent_task_strip = std::move(strip);
+        }
+    }
+    if (agent_condition_inventory_.has_value()) {
+        const bool active_task = result.agent_task.has_value() &&
+            result.agent_task->status != agent::TaskStatus::accepted &&
+            result.agent_task->status != agent::TaskStatus::rejected;
+        if (active_task) {
+            if (agent_condition_inventory_->source_revision ==
+                    result.agent_task->speculative_revision &&
+                agent_condition_inventory_scope_ == result.agent_task->scope_objects) {
+                result.agent_condition_inventory = agent_condition_inventory_;
+            }
+        } else {
+            std::vector<scene::ObjectId> current_scope = result.selection.objects;
+            if (result.selection.component_object.has_value() &&
+                std::find(current_scope.begin(), current_scope.end(),
+                    *result.selection.component_object) == current_scope.end()) {
+                current_scope.push_back(*result.selection.component_object);
+            }
+            std::sort(current_scope.begin(), current_scope.end());
+            current_scope.erase(std::unique(current_scope.begin(), current_scope.end()),
+                current_scope.end());
+            if (agent_condition_inventory_->source_revision == result.project_revision &&
+                agent_condition_inventory_scope_ == current_scope) {
+                result.agent_condition_inventory = agent_condition_inventory_;
+            }
         }
     }
     result.market = market_view_;

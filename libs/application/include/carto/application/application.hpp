@@ -40,6 +40,7 @@ class UiController;
 
 namespace carto::agent {
 class AgentTask;
+class SceneQuery;
 struct AgentPlan;
 }
 
@@ -850,6 +851,7 @@ public:
 
 private:
     friend class ::carto::agent::AgentTask;
+    friend class ::carto::agent::SceneQuery;
 
     [[nodiscard]] core::Result<void> set_workspace(WorkspaceState workspace);
     [[nodiscard]] core::Result<DispatchReceipt> new_project(const NewProjectAction& action);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <carto/ai/ai.hpp>
+#include <carto/agent/scene_query.hpp>
 #include <carto/application/application.hpp>
 #include <carto/agent/workbench.hpp>
 #include <carto/condition/authoring.hpp>
@@ -441,6 +442,7 @@ struct UiSnapshot : application::ApplicationSnapshot {
     core::Revision agent_checkpoint_base_revision;
     core::Revision agent_checkpoint_rebase_revision;
     std::optional<agent::AgentTaskSnapshot> agent_task;
+    std::optional<agent::SceneQueryResult> agent_condition_inventory;
     std::optional<agent::AgentDemonstration> agent_demonstration;
 };
 
@@ -508,9 +510,14 @@ public:
         std::string goal,
         std::string_view question_id,
         std::string answer);
+    [[nodiscard]] core::Result<agent::AgentTaskSnapshot> prepare_agent_plan(
+        std::string goal,
+        std::optional<agent::AgentWorkEnvelope> requested_envelope = std::nullopt);
     [[nodiscard]] core::Result<agent::AgentTaskSnapshot> run_agent_plan(
         std::string goal,
         std::optional<agent::AgentWorkEnvelope> requested_envelope = std::nullopt);
+    [[nodiscard]] core::Result<agent::AgentTaskSnapshot> run_prepared_agent_plan();
+    [[nodiscard]] core::Result<agent::SceneQueryResult> query_agent_condition_inventory();
     [[nodiscard]] core::Result<void> revise_agent_plan_step(
         agent::AgentPlanStep revised_step);
     [[nodiscard]] core::Result<agent::AgentTaskSnapshot> repair_agent_plan(
@@ -684,6 +691,10 @@ private:
     std::string agent_recipe_id_;
     std::optional<core::Revision> agent_plan_base_revision_;
     std::optional<agent::AgentTask> agent_task_;
+    std::optional<agent::SceneQueryResult> agent_condition_inventory_;
+    std::vector<scene::ObjectId> agent_condition_inventory_scope_;
+    agent::SceneQueryBudget agent_condition_inventory_query_budget_;
+    std::optional<core::Revision> agent_condition_inventory_query_revision_;
     std::optional<agent::AgentDemonstration> agent_demonstration_;
     std::optional<agent::AgentTaskCheckpoint> agent_checkpoint_pending_;
     bool agent_checkpoint_rebased_ = false;

@@ -39,6 +39,13 @@ core::Diagnostic stale(std::string message) {
     return core::Diagnostic(core::ErrorCode::stale_data, std::move(message));
 }
 
+bool source_is_current_for_asset(
+    const condition::SourceAsset& asset,
+    const condition::SourceEvidence& source) noexcept {
+    return source.current && source.revision == asset.source_revision &&
+        source.digest == asset.source_digest;
+}
+
 bool in_scope(
     scene::ObjectId object,
     const std::vector<scene::ObjectId>& allowed_scope) noexcept {
@@ -75,6 +82,10 @@ std::size_t encoded_size(const SceneQueryRow& row) noexcept {
         if constexpr (std::is_same_v<Fact, SceneNamedObjectFact>) {
             return fact.stable_name.size();
         } else if constexpr (std::is_same_v<Fact, ConditionAssetTagFact>) {
+            std::size_t bytes = fact.source_revision.size();
+            for (const auto& feature : fact.protected_features) bytes += feature.size();
+            return bytes;
+        } else if constexpr (std::is_same_v<Fact, ConditionAssetInventoryFact>) {
             std::size_t bytes = fact.source_revision.size();
             for (const auto& feature : fact.protected_features) bytes += feature.size();
             return bytes;
@@ -230,6 +241,20 @@ core::Result<SceneQueryResult> SceneQuery::execute(
         task.plan_.objective.scope_objects);
 }
 
+core::Result<SceneQueryResult> SceneQuery::execute(
+    const ::carto::application::ApplicationSession& source,
+    const SceneQueryRequest& request,
+    SceneQueryBudget& budget,
+    const std::vector<scene::ObjectId>& allowed_scope,
+    core::Revision expected_source_revision) {
+    if (source.document_.revision() != expected_source_revision) {
+        return core::Result<SceneQueryResult>::failure(stale(
+            "source project changed after the read-only query scope was captured"));
+    }
+    return SceneQuery::execute(
+        source.document_, request, budget, allowed_scope);
+}
+
 core::Result<void> SceneQueryRequest::validate() const {
     if (limit == 0U || limit > kMaximumQueryResults) {
         return core::Result<void>::failure(invalid("scene query result limit is invalid"));
@@ -280,6 +305,11 @@ core::Result<void> SceneQueryRequest::validate() const {
             if (query.exact_tag.empty() || query.exact_tag.size() > 256U) {
                 return core::Result<void>::failure(invalid(
                     "CONDITION tag query must contain 1 to 256 bytes"));
+            }
+        } else if constexpr (std::is_same_v<Query, ConditionAssetInventoryQuery>) {
+            if (query.object.has_value() && !*query.object) {
+                return core::Result<void>::failure(invalid(
+                    "CONDITION inventory object identity is zero"));
             }
         } else if constexpr (std::is_same_v<Query, FamiliarityRecordsQuery>) {
             if (query.exact_semantic_id.has_value() &&
@@ -336,6 +366,15 @@ core::Result<SceneQueryResult> SceneQuery::execute(
     const auto fail = [&result](core::Diagnostic diagnostic) {
         static_cast<void>(result);
         return core::Result<SceneQueryResult>::failure(std::move(diagnostic));
+    };
+    const auto spend_semantic_record = [&]() {
+        if (budget.semantic_records_examined >= budget.max_semantic_records_examined) {
+            result.truncated = true;
+            return false;
+        }
+        ++budget.semantic_records_examined;
+        ++result.semantic_records_examined;
+        return true;
     };
 
     const auto executed = std::visit([&](const auto& query) -> core::Result<void> {
@@ -494,7 +533,14 @@ core::Result<SceneQueryResult> SceneQuery::execute(
                 }
             }
         } else if constexpr (std::is_same_v<Query, ConditionAssetsByTagQuery> ||
+                             std::is_same_v<Query, ConditionAssetInventoryQuery> ||
                              std::is_same_v<Query, FamiliarityRecordsQuery>) {
+            if constexpr (std::is_same_v<Query, ConditionAssetInventoryQuery>) {
+                if (query.object.has_value() && !in_scope(*query.object, allowed_scope)) {
+                    return core::Result<void>::failure(denied(
+                        "CONDITION inventory object is outside the declared task scope"));
+                }
+            }
             const auto& serialized = document.condition_authoring();
             if (!serialized.has_value()) {
                 result.diagnostics.push_back(core::Diagnostic(
@@ -511,24 +557,14 @@ core::Result<SceneQueryResult> SceneQuery::execute(
                 return core::Result<void>::failure(stale(
                     "CONDITION semantic source revision is stale for the project"));
             }
-            std::size_t remaining = budget.max_semantic_records_examined -
-                budget.semantic_records_examined;
             if constexpr (std::is_same_v<Query, ConditionAssetsByTagQuery>) {
-                const std::size_t count = authoring.value().assets.size();
-                const std::size_t examine = std::min(count, remaining);
-                for (std::size_t index = 0U; index < examine; ++index) {
-                    const auto& asset = authoring.value().assets[index];
-                    ++budget.semantic_records_examined;
-                    ++result.semantic_records_examined;
+                for (const auto& asset : authoring.value().assets) {
+                    if (!spend_semantic_record()) break;
                     if (std::find(asset.tags.begin(), asset.tags.end(), query.exact_tag) ==
                             asset.tags.end()) continue;
                     const scene::ObjectId object{asset.authored_object_id};
                     if (!in_scope(object, allowed_scope)) continue;
-                    if (budget.semantic_records_examined >=
-                        budget.max_semantic_records_examined) {
-                        result.truncated = true;
-                        break;
-                    }
+                    if (!spend_semantic_record()) break;
                     const auto source = std::lower_bound(
                         authoring.value().sources.begin(), authoring.value().sources.end(),
                         asset.source_id, [](const auto& candidate, condition::Id id) {
@@ -539,36 +575,137 @@ core::Result<SceneQueryResult> SceneQuery::execute(
                         return core::Result<void>::failure(invalid(
                             "CONDITION asset references a missing source evidence record"));
                     }
-                    ++budget.semantic_records_examined;
-                    ++result.semantic_records_examined;
                     if (!append_row(result, budget, request.limit, ConditionAssetTagFact{
                             asset.id, object, asset.asset_class, asset.fidelity,
-                            source->id, source->revision, source->current, source->reviewed,
+                            source->id, source->revision,
+                            source_is_current_for_asset(asset, *source), source->reviewed,
                             asset.protected_features})) break;
                 }
-                if (examine < count) result.truncated = true;
+            } else if constexpr (std::is_same_v<Query, ConditionAssetInventoryQuery>) {
+                std::vector<ConditionAssetInventoryFact> facts;
+                std::map<condition::Id, std::size_t> fact_indices;
+                for (const auto& asset : authoring.value().assets) {
+                    if (!spend_semantic_record()) break;
+                    const scene::ObjectId object{asset.authored_object_id};
+                    if (!in_scope(object, allowed_scope) ||
+                        (query.object.has_value() && *query.object != object)) continue;
+                    if (facts.size() >= request.limit) {
+                        result.truncated = true;
+                        break;
+                    }
+                    if (!spend_semantic_record()) break;
+                    const auto source = std::lower_bound(
+                        authoring.value().sources.begin(), authoring.value().sources.end(),
+                        asset.source_id, [](const auto& candidate, condition::Id id) {
+                            return candidate.id < id;
+                        });
+                    if (source == authoring.value().sources.end() ||
+                        source->id != asset.source_id) {
+                        return core::Result<void>::failure(invalid(
+                            "CONDITION asset references a missing source evidence record"));
+                    }
+                    fact_indices.emplace(asset.id, facts.size());
+                    facts.push_back(ConditionAssetInventoryFact{
+                        asset.id, object, asset.asset_class, asset.fidelity,
+                        source->id, source->revision,
+                        source_is_current_for_asset(asset, *source), source->reviewed,
+                        asset.protected_features});
+                }
+                bool related_records_complete = true;
+                const auto count_records = [&](const auto& records,
+                                               std::size_t ConditionAssetInventoryFact::*field) {
+                    for (const auto& record : records) {
+                        if (!spend_semantic_record()) return false;
+                        const auto found = fact_indices.find(record.asset_id);
+                        if (found != fact_indices.end()) {
+                            ++(facts[found->second].*field);
+                        }
+                    }
+                    return true;
+                };
+                const auto count_memberships = [&](const auto& records,
+                                                   std::size_t ConditionAssetInventoryFact::*field) {
+                    for (const auto& record : records) {
+                        if (!spend_semantic_record()) return false;
+                        for (const auto asset_id : record.asset_ids) {
+                            if (!spend_semantic_record()) return false;
+                            const auto found = fact_indices.find(asset_id);
+                            if (found != fact_indices.end()) {
+                                ++(facts[found->second].*field);
+                            }
+                        }
+                    }
+                    return true;
+                };
+                const auto count_region_kit_memberships = [&]() {
+                    for (const auto& kit : authoring.value().region_kits) {
+                        if (!spend_semantic_record()) return false;
+                        std::set<condition::Id> kit_assets;
+                        for (const auto asset_id : kit.asset_ids) {
+                            if (!spend_semantic_record()) return false;
+                            kit_assets.insert(asset_id);
+                        }
+                        for (const auto prefab_id : kit.prefab_ids) {
+                            if (!spend_semantic_record()) return false;
+                            const auto prefab = std::lower_bound(
+                                authoring.value().prefabs.begin(),
+                                authoring.value().prefabs.end(), prefab_id,
+                                [](const auto& candidate, condition::Id id) {
+                                    return candidate.id < id;
+                                });
+                            if (prefab == authoring.value().prefabs.end() ||
+                                prefab->id != prefab_id) return false;
+                            for (const auto asset_id : prefab->asset_ids) {
+                                if (!spend_semantic_record()) return false;
+                                kit_assets.insert(asset_id);
+                            }
+                        }
+                        for (const auto asset_id : kit_assets) {
+                            const auto found = fact_indices.find(asset_id);
+                            if (found != fact_indices.end()) {
+                                ++facts[found->second].region_kit_memberships;
+                            }
+                        }
+                    }
+                    return true;
+                };
+                if (!facts.empty()) {
+                    related_records_complete =
+                        count_records(authoring.value().safe_places,
+                            &ConditionAssetInventoryFact::safe_place_profiles) &&
+                        count_records(authoring.value().familiarity,
+                            &ConditionAssetInventoryFact::familiarity_records) &&
+                        count_records(authoring.value().view_conditions,
+                            &ConditionAssetInventoryFact::view_conditions) &&
+                        count_records(authoring.value().variants,
+                            &ConditionAssetInventoryFact::variant_candidates) &&
+                        count_records(authoring.value().temporal_packages,
+                            &ConditionAssetInventoryFact::temporal_packages) &&
+                        count_records(authoring.value().surface_states,
+                            &ConditionAssetInventoryFact::surface_states) &&
+                        count_records(authoring.value().interaction_anchors,
+                            &ConditionAssetInventoryFact::interaction_anchors) &&
+                        count_memberships(authoring.value().collections,
+                            &ConditionAssetInventoryFact::collection_memberships) &&
+                        count_memberships(authoring.value().prefabs,
+                            &ConditionAssetInventoryFact::prefab_memberships) &&
+                        count_region_kit_memberships();
+                }
+                if (!related_records_complete) result.truncated = true;
+                for (auto& fact : facts) {
+                    fact.related_records_complete = related_records_complete;
+                    if (!append_row(result, budget, request.limit, std::move(fact))) break;
+                }
             } else {
                 std::map<condition::Id, const condition::SourceAsset*> assets_by_id;
-                const std::size_t asset_count = authoring.value().assets.size();
-                const std::size_t assets_to_index = std::min(asset_count, remaining);
-                for (std::size_t index = 0U; index < assets_to_index; ++index) {
-                    const auto& asset = authoring.value().assets[index];
+                for (const auto& asset : authoring.value().assets) {
+                    if (!spend_semantic_record()) {
+                        return core::Result<void>::success();
+                    }
                     assets_by_id.emplace(asset.id, &asset);
-                    ++budget.semantic_records_examined;
-                    ++result.semantic_records_examined;
                 }
-                if (assets_to_index < asset_count) {
-                    result.truncated = true;
-                    return core::Result<void>::success();
-                }
-                remaining = budget.max_semantic_records_examined -
-                    budget.semantic_records_examined;
-                const std::size_t count = authoring.value().familiarity.size();
-                const std::size_t examine = std::min(count, remaining);
-                for (std::size_t index = 0U; index < examine; ++index) {
-                    const auto& record = authoring.value().familiarity[index];
-                    ++budget.semantic_records_examined;
-                    ++result.semantic_records_examined;
+                for (const auto& record : authoring.value().familiarity) {
+                    if (!spend_semantic_record()) break;
                     if (query.exact_semantic_id.has_value() &&
                         record.semantic_id != *query.exact_semantic_id) continue;
                     const auto asset = assets_by_id.find(record.asset_id);
@@ -578,11 +715,7 @@ core::Result<SceneQueryResult> SceneQuery::execute(
                     }
                     const scene::ObjectId object{asset->second->authored_object_id};
                     if (!in_scope(object, allowed_scope)) continue;
-                    if (budget.semantic_records_examined >=
-                        budget.max_semantic_records_examined) {
-                        result.truncated = true;
-                        break;
-                    }
+                    if (!spend_semantic_record()) break;
                     const auto source = std::lower_bound(
                         authoring.value().sources.begin(), authoring.value().sources.end(),
                         asset->second->source_id,
@@ -594,14 +727,13 @@ core::Result<SceneQueryResult> SceneQuery::execute(
                         return core::Result<void>::failure(invalid(
                             "CONDITION asset references a missing source evidence record"));
                     }
-                    ++budget.semantic_records_examined;
-                    ++result.semantic_records_examined;
                     if (!append_row(result, budget, request.limit, FamiliarityRecordFact{
                             record.id, record.asset_id, object, record.semantic_id,
                             record.importance, record.may_change_physically,
-                            source->id, source->revision, source->current, source->reviewed})) break;
+                            source->id, source->revision,
+                            source_is_current_for_asset(*asset->second, *source),
+                            source->reviewed})) break;
                 }
-                if (examine < count) result.truncated = true;
             }
         }
         return core::Result<void>::success();
