@@ -14,6 +14,7 @@
 #include <set>
 #include <span>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 namespace carto::agent {
@@ -241,6 +242,109 @@ assets::Sha256Digest project_result_digest(const project::ProjectDocument& after
     const std::string identity = after.serialize();
     return assets::sha256(std::span<const std::uint8_t>(
         reinterpret_cast<const std::uint8_t*>(identity.data()), identity.size()));
+}
+
+bool same_scene_object(
+    const scene::SceneObject* left,
+    const scene::SceneObject* right) noexcept {
+    if (left == nullptr || right == nullptr) return left == right;
+    return left->id == right->id && left->name == right->name &&
+        same_transform(left->local_transform, right->local_transform) &&
+        left->parent == right->parent && left->mesh_asset == right->mesh_asset &&
+        left->visible == right->visible && left->locked == right->locked;
+}
+
+bool same_mesh_state(
+    const geometry::EditableMesh* left,
+    const geometry::EditableMesh* right) {
+    if (left == nullptr || right == nullptr) return left == right;
+    if (left->revision() != right->revision() ||
+        left->vertex_count() != right->vertex_count() ||
+        left->face_count() != right->face_count() ||
+        left->has_attribute_payload() != right->has_attribute_payload()) {
+        return false;
+    }
+    const auto left_vertices = left->vertices_sorted();
+    const auto right_vertices = right->vertices_sorted();
+    for (std::size_t index = 0U; index < left_vertices.size(); ++index) {
+        if (left_vertices[index].id != right_vertices[index].id ||
+            left_vertices[index].position.x != right_vertices[index].position.x ||
+            left_vertices[index].position.y != right_vertices[index].position.y ||
+            left_vertices[index].position.z != right_vertices[index].position.z) {
+            return false;
+        }
+    }
+    const auto left_faces = left->faces_sorted();
+    const auto right_faces = right->faces_sorted();
+    for (std::size_t index = 0U; index < left_faces.size(); ++index) {
+        if (left_faces[index].id != right_faces[index].id ||
+            left_faces[index].vertices != right_faces[index].vertices) {
+            return false;
+        }
+    }
+    if (left->attributes().domain_counts() != right->attributes().domain_counts() ||
+        left->attributes().layers().size() != right->attributes().layers().size() ||
+        left->uv_sets().descriptors().size() != right->uv_sets().descriptors().size()) {
+        return false;
+    }
+    for (const auto& [id, layer] : left->attributes().layers()) {
+        const auto found = right->attributes().layers().find(id);
+        if (found == right->attributes().layers().end() ||
+            layer.descriptor.id != found->second.descriptor.id ||
+            layer.descriptor.domain != found->second.descriptor.domain ||
+            layer.descriptor.type != found->second.descriptor.type ||
+            layer.values.size() != found->second.values.size()) {
+            return false;
+        }
+        for (std::size_t index = 0U; index < layer.values.size(); ++index) {
+            const auto& a = layer.values[index];
+            const auto& b = found->second.values[index];
+            if (a.index() != b.index()) return false;
+            const bool equal = std::visit([](const auto& first, const auto& second) {
+                using First = std::decay_t<decltype(first)>;
+                using Second = std::decay_t<decltype(second)>;
+                if constexpr (!std::is_same_v<First, Second>) {
+                    return false;
+                } else if constexpr (std::is_same_v<First, core::Vec2d>) {
+                    return first.x == second.x && first.y == second.y;
+                } else if constexpr (std::is_same_v<First, core::Vec3d>) {
+                    return first.x == second.x && first.y == second.y && first.z == second.z;
+                } else if constexpr (std::is_same_v<First, core::Vec4d>) {
+                    return first.x == second.x && first.y == second.y &&
+                        first.z == second.z && first.w == second.w;
+                } else {
+                    return first == second;
+                }
+            }, a, b);
+            if (!equal) return false;
+        }
+    }
+    for (const auto& [id, descriptor] : left->uv_sets().descriptors()) {
+        const auto found = right->uv_sets().descriptors().find(id);
+        if (found == right->uv_sets().descriptors().end() ||
+            descriptor.id != found->second.id || descriptor.name != found->second.name ||
+            descriptor.layer_id != found->second.layer_id ||
+            descriptor.active_for_editing != found->second.active_for_editing ||
+            descriptor.active_for_render != found->second.active_for_render ||
+            descriptor.lightmap_candidate != found->second.lightmap_candidate ||
+            descriptor.tile_policy_version != found->second.tile_policy_version) {
+            return false;
+        }
+    }
+    return true;
+}
+
+assets::Sha256Digest rebase_set_digest(
+    std::string_view label,
+    const std::vector<scene::ObjectId>& objects,
+    const std::vector<std::uint64_t>& mesh_assets) {
+    std::string canonical = "cartographer.agent.rebase-set.v1|";
+    append_field(canonical, label);
+    append_number(canonical, objects.size());
+    for (const auto object : objects) append_number(canonical, object.value);
+    append_number(canonical, mesh_assets.size());
+    for (const auto mesh_asset : mesh_assets) append_number(canonical, mesh_asset);
+    return digest_text(canonical);
 }
 
 std::string effect_names(std::uint32_t effects) {
@@ -737,13 +841,51 @@ std::size_t ProjectDiff::changed_mesh_count() const noexcept {
     return meshes.size();
 }
 
+core::Result<void> AgentRebaseReceipt::validate() const {
+    const auto ordered_objects = [](const std::vector<scene::ObjectId>& values) {
+        return std::all_of(values.begin(), values.end(), [](scene::ObjectId value) {
+                return static_cast<bool>(value);
+            }) && std::is_sorted(values.begin(), values.end()) &&
+            std::adjacent_find(values.begin(), values.end()) == values.end();
+    };
+    const auto ordered_assets = [](const std::vector<std::uint64_t>& values) {
+        return std::all_of(values.begin(), values.end(), [](std::uint64_t value) {
+                return value != 0U;
+            }) && std::is_sorted(values.begin(), values.end()) &&
+            std::adjacent_find(values.begin(), values.end()) == values.end();
+    };
+    const auto subset = [](const auto& smaller, const auto& larger) {
+        return std::all_of(smaller.begin(), smaller.end(), [&larger](const auto value) {
+            return std::binary_search(larger.begin(), larger.end(), value);
+        });
+    };
+    if (!safe_text(checkpoint_task_id, kMaxTaskIdBytes) ||
+        previous_source_revision.exhausted() ||
+        rebased_source_revision <= previous_source_revision ||
+        checkpoint_source_digest.is_zero() || rebased_source_digest.is_zero() ||
+        read_set_digest.is_zero() || write_set_digest.is_zero() ||
+        read_objects.size() > kMaxScopeObjects || write_objects.size() > kMaxScopeObjects ||
+        read_mesh_assets.size() > kMaxScopeObjects ||
+        write_mesh_assets.size() > kMaxScopeObjects ||
+        !ordered_objects(read_objects) || !ordered_objects(write_objects) ||
+        !ordered_assets(read_mesh_assets) || !ordered_assets(write_mesh_assets) ||
+        !subset(write_objects, read_objects) || !subset(write_mesh_assets, read_mesh_assets) ||
+        rebase_set_digest("read", read_objects, read_mesh_assets) != read_set_digest ||
+        rebase_set_digest("write", write_objects, write_mesh_assets) != write_set_digest) {
+        return core::Result<void>::failure(invalid(
+            "agent rebase receipt is malformed or its read/write sets are not bound"));
+    }
+    return core::Result<void>::success();
+}
+
 AgentTask::AgentTask(
     application::ApplicationSession& source,
     AgentPlan plan,
     AgentWorkEnvelope envelope,
     std::unique_ptr<application::ApplicationSession> speculative,
     application::ApplicationSnapshot source_snapshot,
-    std::vector<AgentRepairReceipt> repairs)
+    std::vector<AgentRepairReceipt> repairs,
+    std::vector<AgentRebaseReceipt> rebases)
     : source_(&source),
       plan_(std::move(plan)),
       envelope_(std::move(envelope)),
@@ -751,7 +893,8 @@ AgentTask::AgentTask(
       base_scene_(std::move(source_snapshot.viewport.scene)),
       base_viewport_error_(std::move(source_snapshot.viewport.error)),
       speculative_(std::move(speculative)),
-      repairs_(std::move(repairs)) {
+      repairs_(std::move(repairs)),
+      rebases_(std::move(rebases)) {
     plan_progress_.reserve(plan_.steps.size());
     for (const auto& step : plan_.steps) {
         plan_progress_.push_back(PlanStepProgress{
@@ -976,6 +1119,7 @@ core::Result<AgentTask> AgentTask::repair(
     auto next_attempt = begin(source, std::move(revised_plan), std::move(envelope));
     if (!next_attempt) return next_attempt;
     next_attempt.value().repairs_ = failed_attempt.repairs_;
+    next_attempt.value().rebases_ = failed_attempt.rebases_;
     next_attempt.value().repairs_.push_back(std::move(repair_receipt));
     return core::Result<AgentTask>::success(std::move(next_attempt.value()));
 }
@@ -1642,6 +1786,7 @@ AgentTaskSnapshot AgentTask::build_snapshot() const {
     view.plan_steps = plan_progress_;
     view.steps = receipts_;
     view.repairs = repairs_;
+    view.rebases = rebases_;
     view.repair_attempts_remaining = envelope_.max_repair_attempts > repairs_.size()
         ? envelope_.max_repair_attempts - repairs_.size() : 0U;
     view.gates = gates_;
@@ -1726,6 +1871,7 @@ core::Result<void> AgentTask::save_checkpoint(
     checkpoint.plan_progress = plan_progress_;
     checkpoint.step_receipts = receipts_;
     checkpoint.repair_lineage = repairs_;
+    checkpoint.rebase_lineage = rebases_;
     for (const auto& gate : gates_) {
         if (!checkpoint.last_validation_report.empty()) {
             checkpoint.last_validation_report.push_back('\n');
@@ -1867,6 +2013,7 @@ core::Result<AgentTask> AgentTask::resume_checkpoint(
     auto resumed = begin(source, std::move(reauthorized_plan), checkpoint.envelope);
     if (!resumed) return resumed;
     resumed.value().repairs_ = checkpoint.repair_lineage;
+    resumed.value().rebases_ = checkpoint.rebase_lineage;
     const auto replayed = resumed.value().run();
     if (!replayed) return core::Result<AgentTask>::failure(replayed.error());
     if (checkpoint.status != TaskStatus::prepared) {
@@ -1882,6 +2029,269 @@ core::Result<AgentTask> AgentTask::resume_checkpoint(
         }
     }
     return resumed;
+}
+
+core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
+    const application::ApplicationSession& source,
+    const AgentTaskCheckpoint& checkpoint) {
+    if (auto result = checkpoint.validate(); !result) {
+        return core::Result<AgentRebaseAnalysis>::failure(result.error());
+    }
+    auto base_result = project::ProjectDocument::deserialize(checkpoint.source_project);
+    if (!base_result) {
+        return core::Result<AgentRebaseAnalysis>::failure(base_result.error());
+    }
+    const auto& base = base_result.value();
+    const auto& current = source.document_;
+    AgentRebaseAnalysis analysis;
+    analysis.checkpoint_revision = checkpoint.source_revision;
+    analysis.current_revision = current.revision();
+    analysis.current_source_digest = project_result_digest(current);
+
+    std::set<scene::ObjectId> read_objects;
+    std::set<scene::ObjectId> write_objects;
+    std::set<std::uint64_t> read_mesh_assets;
+    std::set<std::uint64_t> write_mesh_assets;
+    const auto add_blocker = [&analysis](std::string message) {
+        if (analysis.blockers.size() < 512U &&
+            std::find(analysis.blockers.begin(), analysis.blockers.end(), message) ==
+                analysis.blockers.end()) {
+            analysis.blockers.push_back(std::move(message));
+        }
+    };
+    const auto add_mesh_ref = [&read_mesh_assets](
+        const project::ProjectDocument& document, scene::ObjectId object) {
+        const auto* found = document.scene().find(object);
+        if (found != nullptr && found->mesh_asset.has_value()) {
+            read_mesh_assets.insert(*found->mesh_asset);
+        }
+    };
+    const auto add_read_ancestry = [&read_objects, &add_blocker](
+        const project::ProjectDocument& document, scene::ObjectId object) {
+        std::set<scene::ObjectId> visited;
+        const scene::SceneObject* current_object = document.scene().find(object);
+        std::size_t depth = 0U;
+        while (current_object != nullptr && current_object->parent.has_value()) {
+            const scene::ObjectId parent = *current_object->parent;
+            if (!visited.insert(parent).second || ++depth > 4096U) {
+                add_blocker("checkpoint scope ancestry is cyclic or exceeds its analysis bound");
+                return;
+            }
+            read_objects.insert(parent);
+            current_object = document.scene().find(parent);
+            if (current_object == nullptr) {
+                add_blocker("checkpoint scope ancestry references a missing parent object");
+                return;
+            }
+        }
+    };
+
+    if (checkpoint.status == TaskStatus::accepted || checkpoint.status == TaskStatus::rejected) {
+        add_blocker("accepted and rejected task checkpoints are historical and cannot rebase");
+    }
+    if (analysis.current_revision < checkpoint.source_revision) {
+        add_blocker("current source revision predates the checkpoint revision");
+    } else if (analysis.current_revision == checkpoint.source_revision &&
+        analysis.current_source_digest != checkpoint.source_digest) {
+        add_blocker("source content changed without advancing its revision");
+    }
+    if (auto valid = current.validate(); !valid) {
+        add_blocker("current source project no longer passes document validation");
+    }
+
+    for (const scene::ObjectId object : checkpoint.plan.objective.scope_objects) {
+        read_objects.insert(object);
+        if (base.scene().find(object) == nullptr) {
+            add_blocker("checkpoint scope object " + std::to_string(object.value) +
+                " is absent from its saved source");
+            continue;
+        }
+        add_mesh_ref(base, object);
+        add_read_ancestry(base, object);
+    }
+    for (const auto& step : checkpoint.plan.steps) {
+        write_objects.insert(step.target.object);
+        const auto* target = base.scene().find(step.target.object);
+        if (target == nullptr || !target->mesh_asset.has_value()) {
+            add_blocker("checkpoint write target " + std::to_string(step.target.object.value) +
+                " has no saved mesh binding");
+            continue;
+        }
+        read_mesh_assets.insert(*target->mesh_asset);
+        write_mesh_assets.insert(*target->mesh_asset);
+    }
+    for (const auto object : write_objects) add_read_ancestry(base, object);
+
+    std::set<scene::ObjectId> object_ids;
+    for (const auto& object : base.scene().objects_sorted()) object_ids.insert(object.id);
+    for (const auto& object : current.scene().objects_sorted()) object_ids.insert(object.id);
+    for (const scene::ObjectId object : object_ids) {
+        const auto* before = base.scene().find(object);
+        const auto* after = current.scene().find(object);
+        if (same_scene_object(before, after)) continue;
+        const bool read_conflict = read_objects.contains(object);
+        const bool asset_membership_changed = before == nullptr || after == nullptr ||
+            before->mesh_asset != after->mesh_asset;
+        const bool shared_write_asset = asset_membership_changed &&
+            ((before != nullptr && before->mesh_asset.has_value() &&
+                write_mesh_assets.contains(*before->mesh_asset)) ||
+             (after != nullptr && after->mesh_asset.has_value() &&
+                write_mesh_assets.contains(*after->mesh_asset)));
+        if (read_conflict || shared_write_asset) {
+            analysis.conflicting_objects.push_back(object);
+            if (shared_write_asset) {
+                const auto add_conflicting_asset = [&analysis](std::uint64_t asset) {
+                    analysis.conflicting_mesh_assets.push_back(asset);
+                };
+                if (before != nullptr && before->mesh_asset.has_value() &&
+                    write_mesh_assets.contains(*before->mesh_asset)) {
+                    add_conflicting_asset(*before->mesh_asset);
+                }
+                if (after != nullptr && after->mesh_asset.has_value() &&
+                    write_mesh_assets.contains(*after->mesh_asset)) {
+                    add_conflicting_asset(*after->mesh_asset);
+                }
+                add_blocker("object " + std::to_string(object.value) +
+                    " changed its membership in a mesh asset written by the task");
+            }
+            if (read_conflict) {
+                add_blocker("read object " + std::to_string(object.value) +
+                    " changed since the checkpoint source");
+            }
+        }
+    }
+
+    std::set<std::uint64_t> mesh_ids;
+    for (const auto& [id, mesh] : base.meshes()) {
+        static_cast<void>(mesh);
+        mesh_ids.insert(id);
+    }
+    for (const auto& [id, mesh] : current.meshes()) {
+        static_cast<void>(mesh);
+        mesh_ids.insert(id);
+    }
+    for (const std::uint64_t asset : mesh_ids) {
+        const auto before = base.meshes().find(asset);
+        const auto after = current.meshes().find(asset);
+        const auto* before_mesh = before == base.meshes().end() ? nullptr : &before->second;
+        const auto* after_mesh = after == current.meshes().end() ? nullptr : &after->second;
+        if (same_mesh_state(before_mesh, after_mesh) || !read_mesh_assets.contains(asset)) continue;
+        analysis.conflicting_mesh_assets.push_back(asset);
+        add_blocker("read mesh asset " + std::to_string(asset) +
+            " changed since the checkpoint source");
+    }
+    if (base.condition_authoring() != current.condition_authoring() ||
+        base.engineering_authoring() != current.engineering_authoring()) {
+        add_blocker("CONDITION or engineering sidecar changed; checkpoint has no field-level semantic read provenance");
+    }
+
+    analysis.read_objects.assign(read_objects.begin(), read_objects.end());
+    analysis.write_objects.assign(write_objects.begin(), write_objects.end());
+    analysis.read_mesh_assets.assign(read_mesh_assets.begin(), read_mesh_assets.end());
+    analysis.write_mesh_assets.assign(write_mesh_assets.begin(), write_mesh_assets.end());
+    std::sort(analysis.conflicting_objects.begin(), analysis.conflicting_objects.end());
+    analysis.conflicting_objects.erase(std::unique(
+        analysis.conflicting_objects.begin(), analysis.conflicting_objects.end()),
+        analysis.conflicting_objects.end());
+    std::sort(analysis.conflicting_mesh_assets.begin(), analysis.conflicting_mesh_assets.end());
+    analysis.conflicting_mesh_assets.erase(std::unique(
+        analysis.conflicting_mesh_assets.begin(), analysis.conflicting_mesh_assets.end()),
+        analysis.conflicting_mesh_assets.end());
+    analysis.read_set_digest = rebase_set_digest(
+        "read", analysis.read_objects, analysis.read_mesh_assets);
+    analysis.write_set_digest = rebase_set_digest(
+        "write", analysis.write_objects, analysis.write_mesh_assets);
+    return core::Result<AgentRebaseAnalysis>::success(std::move(analysis));
+}
+
+core::Result<AgentTask> AgentTask::rebase_checkpoint(
+    application::ApplicationSession& source,
+    const AgentTaskCheckpoint& checkpoint,
+    AgentPlan reauthorized_plan) {
+    const auto analysis = analyze_checkpoint_rebase(source, checkpoint);
+    if (!analysis) return core::Result<AgentTask>::failure(analysis.error());
+    if (!analysis.value().can_rebase()) {
+        return core::Result<AgentTask>::failure(stale(
+            "checkpoint rebase is blocked: " + analysis.value().blockers.front()));
+    }
+    if (analysis.value().current_revision == checkpoint.source_revision &&
+        analysis.value().current_source_digest == checkpoint.source_digest) {
+        return resume_checkpoint(source, checkpoint, std::move(reauthorized_plan));
+    }
+    if (reauthorized_plan.objective.base_revision != analysis.value().current_revision) {
+        return core::Result<AgentTask>::failure(stale(
+            "rebase plan must be bound to the exact current source revision"));
+    }
+    auto normalized_plan = reauthorized_plan;
+    normalized_plan.objective.base_revision = checkpoint.source_revision;
+    if (clarification_plan_context_digest(normalized_plan) != checkpoint.plan_context_digest) {
+        return core::Result<AgentTask>::failure(stale(
+            "rebase plan changed beyond its source revision; replan and review before rebasing"));
+    }
+    if (auto valid = reauthorized_plan.validate(); !valid) {
+        return core::Result<AgentTask>::failure(valid.error());
+    }
+
+    auto saved_speculative = project::ProjectDocument::deserialize(
+        checkpoint.speculative_project);
+    if (!saved_speculative) return core::Result<AgentTask>::failure(saved_speculative.error());
+    auto rebased = begin(source, std::move(reauthorized_plan), checkpoint.envelope);
+    if (!rebased) return rebased;
+    rebased.value().repairs_ = checkpoint.repair_lineage;
+    rebased.value().rebases_ = checkpoint.rebase_lineage;
+    const auto replayed = rebased.value().run();
+    if (!replayed) return core::Result<AgentTask>::failure(replayed.error());
+
+    AgentRebaseReceipt receipt;
+    receipt.checkpoint_task_id = checkpoint.plan.id;
+    receipt.previous_source_revision = checkpoint.source_revision;
+    receipt.rebased_source_revision = analysis.value().current_revision;
+    receipt.checkpoint_source_digest = checkpoint.source_digest;
+    receipt.rebased_source_digest = analysis.value().current_source_digest;
+    receipt.read_set_digest = analysis.value().read_set_digest;
+    receipt.write_set_digest = analysis.value().write_set_digest;
+    receipt.read_objects = analysis.value().read_objects;
+    receipt.write_objects = analysis.value().write_objects;
+    receipt.read_mesh_assets = analysis.value().read_mesh_assets;
+    receipt.write_mesh_assets = analysis.value().write_mesh_assets;
+    if (auto valid = receipt.validate(); !valid) {
+        return core::Result<AgentTask>::failure(valid.error());
+    }
+    rebased.value().rebases_.push_back(std::move(receipt));
+    rebased.value().cached_snapshot_.reset();
+
+    if (checkpoint.status != TaskStatus::prepared) {
+        bool write_result_matches = true;
+        for (const scene::ObjectId object : analysis.value().write_objects) {
+            if (!same_scene_object(
+                    saved_speculative.value().scene().find(object),
+                    rebased.value().speculative_->document_.scene().find(object))) {
+                write_result_matches = false;
+                break;
+            }
+        }
+        for (const std::uint64_t asset : analysis.value().write_mesh_assets) {
+            const auto old_mesh = saved_speculative.value().meshes().find(asset);
+            const auto new_mesh = rebased.value().speculative_->document_.meshes().find(asset);
+            const auto* old_value = old_mesh == saved_speculative.value().meshes().end()
+                ? nullptr : &old_mesh->second;
+            const auto* new_value = new_mesh ==
+                    rebased.value().speculative_->document_.meshes().end()
+                ? nullptr : &new_mesh->second;
+            if (!same_mesh_state(old_value, new_value)) {
+                write_result_matches = false;
+                break;
+            }
+        }
+        if (!write_result_matches) {
+            rebased.value().status_ = TaskStatus::blocked;
+            rebased.value().diagnostic_ = stale(
+                "checkpoint rebase replay changed a task write-set result; acceptance is blocked");
+            rebased.value().gates_ = rebased.value().evaluate_gates();
+            rebased.value().cached_snapshot_.reset();
+        }
+    }
+    return rebased;
 }
 
 const char* task_status_name(TaskStatus status) noexcept {

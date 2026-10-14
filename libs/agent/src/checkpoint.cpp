@@ -472,6 +472,46 @@ AgentRepairReceipt read_repair(Reader& reader) {
     return repair;
 }
 
+void write_rebase(Writer& writer, const AgentRebaseReceipt& rebase) {
+    writer.field(rebase.checkpoint_task_id);
+    writer.number(rebase.previous_source_revision.value());
+    writer.number(rebase.rebased_source_revision.value());
+    writer.digest(rebase.checkpoint_source_digest);
+    writer.digest(rebase.rebased_source_digest);
+    writer.digest(rebase.read_set_digest);
+    writer.digest(rebase.write_set_digest);
+    write_object_ids(writer, rebase.read_objects);
+    write_object_ids(writer, rebase.write_objects);
+    writer.number(rebase.read_mesh_assets.size());
+    for (const auto asset : rebase.read_mesh_assets) writer.number(asset);
+    writer.number(rebase.write_mesh_assets.size());
+    for (const auto asset : rebase.write_mesh_assets) writer.number(asset);
+}
+
+AgentRebaseReceipt read_rebase(Reader& reader) {
+    AgentRebaseReceipt rebase;
+    rebase.checkpoint_task_id = reader.field(64U);
+    rebase.previous_source_revision = core::Revision(reader.number());
+    rebase.rebased_source_revision = core::Revision(reader.number());
+    rebase.checkpoint_source_digest = reader.digest();
+    rebase.rebased_source_digest = reader.digest();
+    rebase.read_set_digest = reader.digest();
+    rebase.write_set_digest = reader.digest();
+    rebase.read_objects = read_object_ids(reader);
+    rebase.write_objects = read_object_ids(reader);
+    const auto read_asset_count = reader.count(512U);
+    rebase.read_mesh_assets.reserve(read_asset_count);
+    for (std::size_t index = 0U; index < read_asset_count; ++index) {
+        rebase.read_mesh_assets.push_back(reader.number());
+    }
+    const auto write_asset_count = reader.count(512U);
+    rebase.write_mesh_assets.reserve(write_asset_count);
+    for (std::size_t index = 0U; index < write_asset_count; ++index) {
+        rebase.write_mesh_assets.push_back(reader.number());
+    }
+    return rebase;
+}
+
 void write_progress(Writer& writer, const PlanStepProgress& progress) {
     writer.field(progress.step_id);
     write_strings(writer, progress.dependencies);
@@ -553,6 +593,7 @@ core::Result<void> AgentTaskCheckpoint::validate() const {
     }
     if (plan_progress.size() != plan.steps.size() || plan_progress.size() > 256U ||
         step_receipts.size() > 4096U || repair_lineage.size() > 4U ||
+        rebase_lineage.size() > 16U ||
         repair_lineage.size() > envelope.max_repair_attempts) {
         return core::Result<void>::failure(malformed(
             "checkpoint progress or lineage count is invalid"));
@@ -600,6 +641,21 @@ core::Result<void> AgentTaskCheckpoint::validate() const {
                 "checkpoint repair lineage is invalid"));
         }
     }
+    for (std::size_t index = 0U; index < rebase_lineage.size(); ++index) {
+        const auto& rebase = rebase_lineage[index];
+        if (auto result = rebase.validate(); !result) {
+            return core::Result<void>::failure(result.error().with_context(
+                "checkpoint rebase lineage"));
+        }
+        if ((index > 0U && rebase_lineage[index - 1U].rebased_source_revision !=
+                rebase.previous_source_revision) ||
+            (index == 0U && rebase.previous_source_revision >= source_revision) ||
+            (index + 1U == rebase_lineage.size() &&
+                rebase.rebased_source_revision != source_revision)) {
+            return core::Result<void>::failure(malformed(
+                "checkpoint rebase lineage does not bind its source revision chain"));
+        }
+    }
     return core::Result<void>::success();
 }
 
@@ -626,6 +682,8 @@ core::Result<std::string> AgentTaskCheckpoint::serialize() const {
     for (const auto& receipt : step_receipts) write_step_receipt(payload, receipt);
     payload.number(repair_lineage.size());
     for (const auto& repair : repair_lineage) write_repair(payload, repair);
+    payload.number(rebase_lineage.size());
+    for (const auto& rebase : rebase_lineage) write_rebase(payload, rebase);
     payload.field(last_validation_report);
     auto body = std::move(payload).take();
     Writer outer;
@@ -658,7 +716,7 @@ core::Result<AgentTaskCheckpoint> AgentTaskCheckpoint::deserialize(std::string_v
 
     Reader reader(body);
     const auto version = reader.number();
-    if (version != kFormatVersion) {
+    if (version != 1U && version != kFormatVersion) {
         return core::Result<AgentTaskCheckpoint>::failure(core::Diagnostic(
             core::ErrorCode::version_mismatch, "agent task checkpoint version is unsupported"));
     }
@@ -688,6 +746,13 @@ core::Result<AgentTaskCheckpoint> AgentTaskCheckpoint::deserialize(std::string_v
     checkpoint.repair_lineage.reserve(repair_count);
     for (std::size_t index = 0U; index < repair_count; ++index) {
         checkpoint.repair_lineage.push_back(read_repair(reader));
+    }
+    if (version >= 2U) {
+        const auto rebase_count = reader.count(16U);
+        checkpoint.rebase_lineage.reserve(rebase_count);
+        for (std::size_t index = 0U; index < rebase_count; ++index) {
+            checkpoint.rebase_lineage.push_back(read_rebase(reader));
+        }
     }
     checkpoint.last_validation_report = reader.field(kMaxTextBytes);
     if (!reader.finished()) {

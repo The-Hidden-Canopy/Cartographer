@@ -246,6 +246,22 @@ struct AgentRepairReceipt {
     std::vector<AcceptanceGateResult> previous_gate_results;
 };
 
+struct AgentRebaseReceipt {
+    std::string checkpoint_task_id;
+    core::Revision previous_source_revision;
+    core::Revision rebased_source_revision;
+    assets::Sha256Digest checkpoint_source_digest;
+    assets::Sha256Digest rebased_source_digest;
+    assets::Sha256Digest read_set_digest;
+    assets::Sha256Digest write_set_digest;
+    std::vector<scene::ObjectId> read_objects;
+    std::vector<scene::ObjectId> write_objects;
+    std::vector<std::uint64_t> read_mesh_assets;
+    std::vector<std::uint64_t> write_mesh_assets;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
 struct ObjectChange {
     scene::ObjectId id;
     bool added = false;
@@ -325,6 +341,7 @@ struct AgentTaskSnapshot {
     std::vector<PlanStepProgress> plan_steps;
     std::vector<StepReceipt> steps;
     std::vector<AgentRepairReceipt> repairs;
+    std::vector<AgentRebaseReceipt> rebases;
     std::size_t repair_attempts_remaining = 0U;
     std::vector<AcceptanceGateResult> gates;
     ProjectDiff diff;
@@ -342,7 +359,7 @@ struct AgentTaskSnapshot {
 // resumed task can run. Project bytes remain artifacts owned by this record;
 // they are never applied to the live source by loading a checkpoint.
 struct AgentTaskCheckpoint {
-    static constexpr std::uint32_t kFormatVersion = 1U;
+    static constexpr std::uint32_t kFormatVersion = 2U;
 
     TaskStatus status = TaskStatus::prepared;
     AgentPlan plan;
@@ -358,12 +375,30 @@ struct AgentTaskCheckpoint {
     std::vector<PlanStepProgress> plan_progress;
     std::vector<StepReceipt> step_receipts;
     std::vector<AgentRepairReceipt> repair_lineage;
+    std::vector<AgentRebaseReceipt> rebase_lineage;
     std::string last_validation_report;
 
     [[nodiscard]] core::Result<void> validate() const;
     [[nodiscard]] core::Result<std::string> serialize() const;
     [[nodiscard]] static core::Result<AgentTaskCheckpoint> deserialize(
         std::string_view bytes);
+};
+
+struct AgentRebaseAnalysis {
+    core::Revision checkpoint_revision;
+    core::Revision current_revision;
+    assets::Sha256Digest current_source_digest;
+    assets::Sha256Digest read_set_digest;
+    assets::Sha256Digest write_set_digest;
+    std::vector<scene::ObjectId> read_objects;
+    std::vector<scene::ObjectId> write_objects;
+    std::vector<std::uint64_t> read_mesh_assets;
+    std::vector<std::uint64_t> write_mesh_assets;
+    std::vector<scene::ObjectId> conflicting_objects;
+    std::vector<std::uint64_t> conflicting_mesh_assets;
+    std::vector<std::string> blockers;
+
+    [[nodiscard]] bool can_rebase() const noexcept { return blockers.empty(); }
 };
 
 // Executes revision-bound native proposals on a private ApplicationSession
@@ -399,6 +434,13 @@ public:
         application::ApplicationSession& source,
         const AgentTaskCheckpoint& checkpoint,
         AgentPlan reauthorized_plan);
+    [[nodiscard]] static core::Result<AgentRebaseAnalysis> analyze_checkpoint_rebase(
+        const application::ApplicationSession& source,
+        const AgentTaskCheckpoint& checkpoint);
+    [[nodiscard]] static core::Result<AgentTask> rebase_checkpoint(
+        application::ApplicationSession& source,
+        const AgentTaskCheckpoint& checkpoint,
+        AgentPlan reauthorized_plan);
 
 private:
     friend class SceneQuery;
@@ -411,7 +453,8 @@ private:
         AgentWorkEnvelope envelope,
         std::unique_ptr<application::ApplicationSession> speculative,
         application::ApplicationSnapshot source_snapshot,
-        std::vector<AgentRepairReceipt> repairs = {});
+        std::vector<AgentRepairReceipt> repairs = {},
+        std::vector<AgentRebaseReceipt> rebases = {});
 
     [[nodiscard]] core::Result<void> execute_step(const AgentPlanStep& step);
     [[nodiscard]] const project::ProjectDocument& scene_query_document() const;
@@ -430,6 +473,7 @@ private:
     ai::NativePlanner planner_;
     std::vector<StepReceipt> receipts_;
     std::vector<AgentRepairReceipt> repairs_;
+    std::vector<AgentRebaseReceipt> rebases_;
     std::vector<PlanStepProgress> plan_progress_;
     std::vector<AcceptanceGateResult> gates_;
     SceneQueryBudget query_budget_;

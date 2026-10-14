@@ -1858,7 +1858,51 @@ core::Result<void> UiController::load_agent_checkpoint(
     agent_plan_id_ = checkpoint.value().plan.id;
     agent_objective_id_ = checkpoint.value().plan.objective.id;
     agent_repair_mode_ = false;
+    agent_checkpoint_rebased_ = false;
     agent_checkpoint_pending_.emplace(std::move(checkpoint.value()));
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::rebase_agent_checkpoint() {
+    if (!agent_checkpoint_pending_.has_value() || agent_task_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "load one saved checkpoint before requesting a rebase"));
+    }
+    const auto analysis = agent::AgentTask::analyze_checkpoint_rebase(
+        session_, *agent_checkpoint_pending_);
+    if (!analysis) {
+        record_ui_problem(analysis.error().with_context("agent task rebase analysis"));
+        return core::Result<void>::failure(analysis.error());
+    }
+    if (!analysis.value().can_rebase()) {
+        std::string message = "checkpoint rebase is blocked";
+        for (std::size_t index = 0U;
+             index < analysis.value().blockers.size() && index < 3U; ++index) {
+            message += index == 0U ? ": " : "; ";
+            message += analysis.value().blockers[index];
+        }
+        const auto diagnostic = core::Diagnostic(
+            core::ErrorCode::stale_data, std::move(message));
+        record_ui_problem(diagnostic.with_context("agent task rebase analysis"));
+        return core::Result<void>::failure(diagnostic);
+    }
+    if (analysis.value().current_revision ==
+            analysis.value().checkpoint_revision &&
+        analysis.value().current_source_digest == agent_checkpoint_pending_->source_digest) {
+        agent_checkpoint_rebased_ = false;
+        agent_plan_base_revision_ = analysis.value().current_revision;
+        return core::Result<void>::success();
+    }
+    if (!agent_plan_base_revision_.has_value() ||
+        *agent_plan_base_revision_ != analysis.value().current_revision) {
+        for (auto& question : agent_clarifications_draft_) {
+            question.selected_candidate_id.reset();
+            question.freeform_answer.reset();
+            question.human_receipt.reset();
+        }
+    }
+    agent_checkpoint_rebased_ = true;
+    agent_plan_base_revision_ = analysis.value().current_revision;
     return core::Result<void>::success();
 }
 
@@ -1871,14 +1915,21 @@ core::Result<agent::AgentTaskSnapshot> UiController::resume_agent_checkpoint() {
     plan.steps = agent_plan_draft_;
     plan.objective.goal = agent_goal_;
     plan.objective.clarifications = agent_clarifications_draft_;
-    auto resumed = agent::AgentTask::resume_checkpoint(
-        session_, *agent_checkpoint_pending_, std::move(plan));
+    if (agent_checkpoint_rebased_ && agent_plan_base_revision_.has_value()) {
+        plan.objective.base_revision = *agent_plan_base_revision_;
+    }
+    auto resumed = agent_checkpoint_rebased_
+        ? agent::AgentTask::rebase_checkpoint(
+            session_, *agent_checkpoint_pending_, std::move(plan))
+        : agent::AgentTask::resume_checkpoint(
+            session_, *agent_checkpoint_pending_, std::move(plan));
     if (!resumed) {
         record_ui_problem(resumed.error().with_context("agent task checkpoint resume"));
         return core::Result<agent::AgentTaskSnapshot>::failure(resumed.error());
     }
     agent_task_.emplace(std::move(resumed.value()));
     agent_checkpoint_pending_.reset();
+    agent_checkpoint_rebased_ = false;
     agent_repair_mode_ = false;
     const auto result = agent_task_->snapshot();
     return core::Result<agent::AgentTaskSnapshot>::success(result);
@@ -1920,6 +1971,7 @@ core::Result<void> UiController::clear_agent_plan() {
     agent_plan_draft_.clear();
     agent_clarifications_draft_.clear();
     agent_checkpoint_pending_.reset();
+    agent_checkpoint_rebased_ = false;
     agent_plan_base_revision_.reset();
     agent_goal_.clear();
     agent_plan_id_.clear();
@@ -3119,9 +3171,12 @@ UiSnapshot UiController::snapshot() const {
     result.agent_clarifications_draft = agent_clarifications_draft_;
     result.agent_repair_ready = agent_repair_mode_;
     result.agent_checkpoint_loaded = agent_checkpoint_pending_.has_value();
+    result.agent_checkpoint_rebased = agent_checkpoint_rebased_;
     if (agent_checkpoint_pending_.has_value()) {
         result.agent_checkpoint_task_id = agent_checkpoint_pending_->plan.id;
         result.agent_checkpoint_base_revision = agent_checkpoint_pending_->source_revision;
+        result.agent_checkpoint_rebase_revision = agent_plan_base_revision_.value_or(
+            agent_checkpoint_pending_->source_revision);
     }
     if (agent_task_.has_value()) result.agent_task = agent_task_->snapshot();
     result.market = market_view_;

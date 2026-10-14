@@ -5135,7 +5135,7 @@ struct DesktopState {
             clarification_impact_names.data(),
             static_cast<int>(clarification_impact_names.size()));
         ImGui::BeginDisabled(agent_question.empty() || snapshot.agent_plan_draft.empty() ||
-            snapshot.agent_task.has_value());
+            snapshot.agent_task.has_value() || snapshot.agent_checkpoint_loaded);
         if (ImGui::Button("Require an answer", ImVec2(-1, 26))) {
             const auto queued = ui.queue_agent_clarification(
                 agent_question, clarification_impacts[static_cast<std::size_t>(
@@ -5201,18 +5201,44 @@ struct DesktopState {
         }
         ImGui::EndDisabled();
         if (snapshot.agent_checkpoint_loaded) {
+            const bool checkpoint_source_advanced = snapshot.project_revision !=
+                snapshot.agent_checkpoint_base_revision;
+            const bool checkpoint_rebase_stale = snapshot.agent_checkpoint_rebased &&
+                snapshot.project_revision != snapshot.agent_checkpoint_rebase_revision;
             ImGui::Text("Saved task %s · source R%llu", snapshot.agent_checkpoint_task_id.c_str(),
                 static_cast<unsigned long long>(
                     snapshot.agent_checkpoint_base_revision.value()));
             ImGui::TextDisabled(
                 "The saved speculative branch is re-created and checked before review. "
                 "Any consequential clarification must be answered again.");
-            ImGui::BeginDisabled(task_present || !clarifications_answered);
+            if (checkpoint_source_advanced &&
+                (!snapshot.agent_checkpoint_rebased || checkpoint_rebase_stale)) {
+                ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                    "Source advanced. Analyze read/write conflicts before resuming.");
+                if (ImGui::SmallButton(snapshot.agent_checkpoint_rebased
+                        ? "Reanalyze source changes" : "Analyze and prepare safe rebase")) {
+                    const auto rebase = ui.rebase_agent_checkpoint();
+                    agent_feedback = rebase
+                        ? "Read/write sets are disjoint. The plan will replay against the current source; "
+                          "answer consequential questions again."
+                        : rebase.error().message;
+                }
+            } else if (snapshot.agent_checkpoint_rebased) {
+                ImGui::TextDisabled(
+                    "Conflict-free rebase prepared for source R%llu; the complete native plan will replay.",
+                    static_cast<unsigned long long>(
+                        snapshot.agent_checkpoint_rebase_revision.value()));
+            }
+            ImGui::BeginDisabled(task_present || !clarifications_answered ||
+                (checkpoint_source_advanced &&
+                    (!snapshot.agent_checkpoint_rebased || checkpoint_rebase_stale)));
             if (ImGui::Button("Resume and revalidate saved task", ImVec2(-1, 30))) {
                 const auto resumed = ui.resume_agent_checkpoint();
                 agent_feedback = resumed
                     ? (resumed.value().status == carto::agent::TaskStatus::review
-                        ? "Saved task replayed and validated; the source is unchanged."
+                        ? (snapshot.agent_checkpoint_rebased
+                            ? "Saved task safely rebased and replayed; the source is unchanged."
+                            : "Saved task replayed and validated; the source is unchanged.")
                         : (resumed.value().diagnostic.has_value()
                             ? resumed.value().diagnostic->message
                             : "Saved task replay is blocked."))

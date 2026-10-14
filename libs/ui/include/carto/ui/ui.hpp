@@ -420,8 +420,10 @@ struct UiSnapshot : application::ApplicationSnapshot {
     std::vector<agent::ClarificationQuestion> agent_clarifications_draft;
     bool agent_repair_ready = false;
     bool agent_checkpoint_loaded = false;
+    bool agent_checkpoint_rebased = false;
     std::string agent_checkpoint_task_id;
     core::Revision agent_checkpoint_base_revision;
+    core::Revision agent_checkpoint_rebase_revision;
     std::optional<agent::AgentTaskSnapshot> agent_task;
 };
 
@@ -493,6 +495,7 @@ public:
         const std::filesystem::path& path) const;
     [[nodiscard]] core::Result<void> load_agent_checkpoint(
         const std::filesystem::path& path);
+    [[nodiscard]] core::Result<void> rebase_agent_checkpoint();
     [[nodiscard]] core::Result<agent::AgentTaskSnapshot> resume_agent_checkpoint();
     [[nodiscard]] core::Result<application::DispatchReceipt> accept_agent_plan();
     [[nodiscard]] core::Result<void> reject_agent_plan();
@@ -503,6 +506,10 @@ public:
     [[nodiscard]] core::Result<MeshImportReceipt> import_mesh(
         const std::filesystem::path& path,
         MeshImportFormat format);
+    [[nodiscard]] core::Result<assets::SourceReimportPlan> preview_source_reimport(
+        std::vector<assets::SourceImportRecord> incoming) const;
+    [[nodiscard]] core::Result<application::DispatchReceipt> apply_source_reimport_plan(
+        assets::SourceReimportPlan plan);
     [[nodiscard]] core::Result<application::DispatchReceipt> import_engineering_fixture();
     [[nodiscard]] core::Result<application::DispatchReceipt> import_engineering_authoring(
         const std::filesystem::path& path);
@@ -638,6 +645,7 @@ private:
     std::optional<core::Revision> agent_plan_base_revision_;
     std::optional<agent::AgentTask> agent_task_;
     std::optional<agent::AgentTaskCheckpoint> agent_checkpoint_pending_;
+    bool agent_checkpoint_rebased_ = false;
     std::string agent_goal_;
     std::string agent_plan_id_;
     std::string agent_objective_id_;

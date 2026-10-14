@@ -406,11 +406,174 @@ void persistent_checkpoint_reauthorization_and_stale_source_are_fail_closed() {
     REQUIRE(stale_checkpoint);
     REQUIRE(carto::application::HumanApplicationAccess::dispatch(
         stale_source, carto::application::CreateBoxAction{"Outside checkpoint", {1.0, 1.0, 1.0}}));
-    const auto blocked_resume = carto::agent::AgentTask::resume_checkpoint(
-        stale_source, stale_checkpoint.value(), stale_checkpoint.value().plan);
-    REQUIRE(!blocked_resume);
-    REQUIRE(blocked_resume.error().code == carto::core::ErrorCode::stale_data);
-    REQUIRE(blocked_resume.error().message.find("source advanced") != std::string::npos);
+    const auto current_revision = stale_source.snapshot().project_revision;
+    const auto analysis = carto::agent::AgentTask::analyze_checkpoint_rebase(
+        stale_source, stale_checkpoint.value());
+    REQUIRE(analysis);
+    REQUIRE(analysis.value().can_rebase());
+    REQUIRE(analysis.value().checkpoint_revision == stale_checkpoint.value().source_revision);
+    REQUIRE(analysis.value().current_revision == current_revision);
+    REQUIRE(analysis.value().read_objects == stale_objects);
+    REQUIRE(analysis.value().write_objects == stale_objects);
+    REQUIRE(analysis.value().read_mesh_assets.size() == 1U);
+    REQUIRE(analysis.value().write_mesh_assets == analysis.value().read_mesh_assets);
+
+    auto rebased_plan = stale_checkpoint.value().plan;
+    rebased_plan.objective.base_revision = current_revision;
+    auto rebased = carto::agent::AgentTask::rebase_checkpoint(
+        stale_source, stale_checkpoint.value(), rebased_plan);
+    REQUIRE(rebased);
+    const auto rebased_snapshot = rebased.value().snapshot();
+    REQUIRE(rebased_snapshot.status == carto::agent::TaskStatus::review);
+    REQUIRE(rebased_snapshot.can_accept);
+    REQUIRE(rebased_snapshot.base_revision == current_revision);
+    REQUIRE(rebased_snapshot.rebases.size() == 1U);
+    REQUIRE(rebased_snapshot.rebases.front().previous_source_revision ==
+        stale_checkpoint.value().source_revision);
+    REQUIRE(rebased_snapshot.rebases.front().rebased_source_revision == current_revision);
+    REQUIRE(stale_source.snapshot().project_revision == current_revision);
+
+    auto changed_intent = stale_checkpoint.value().plan;
+    changed_intent.objective.base_revision = current_revision;
+    changed_intent.steps.front().intent = "inset face 0.2";
+    const auto unauthorized_replan = carto::agent::AgentTask::rebase_checkpoint(
+        stale_source, stale_checkpoint.value(), changed_intent);
+    REQUIRE(!unauthorized_replan);
+    REQUIRE(unauthorized_replan.error().message.find("changed beyond its source revision") !=
+        std::string::npos);
+
+    REQUIRE(carto::application::HumanApplicationAccess::accept_agent_task(rebased.value()));
+    REQUIRE(stale_source.snapshot().project_revision == current_revision.next());
+    REQUIRE(stale_source.snapshot().objects.size() == 2U);
+
+    carto::application::ApplicationSession conflict_source;
+    const auto conflict_objects = create_boxes(conflict_source, 1U);
+    auto conflict_plan = plan_for(conflict_source.snapshot(), conflict_objects, {
+        {"step-1", {conflict_objects.front(), carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    auto conflict_task = carto::agent::AgentTask::begin(
+        conflict_source, conflict_plan, envelope_for(conflict_objects));
+    REQUIRE(conflict_task);
+    REQUIRE(conflict_task.value().run());
+    TempDirectory conflict_directory;
+    const auto conflict_path = conflict_directory.path() / "target-conflict.carto-agent-task";
+    REQUIRE(conflict_task.value().save_checkpoint(conflict_path));
+    const auto conflict_checkpoint = carto::agent::AgentTask::load_checkpoint(conflict_path);
+    REQUIRE(conflict_checkpoint);
+    const auto before_transform = conflict_source.snapshot().objects.front().object.local_transform;
+    auto changed_transform = before_transform;
+    changed_transform.translation.x += 0.5;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        conflict_source, carto::application::SetObjectTransformAction{
+            conflict_objects.front(), changed_transform, std::nullopt}));
+    const auto conflict_analysis = carto::agent::AgentTask::analyze_checkpoint_rebase(
+        conflict_source, conflict_checkpoint.value());
+    REQUIRE(conflict_analysis);
+    REQUIRE(!conflict_analysis.value().can_rebase());
+    REQUIRE(conflict_analysis.value().conflicting_objects == conflict_objects);
+    auto conflict_reauthorized_plan = conflict_checkpoint.value().plan;
+    conflict_reauthorized_plan.objective.base_revision =
+        conflict_source.snapshot().project_revision;
+    const auto blocked_rebase = carto::agent::AgentTask::rebase_checkpoint(
+        conflict_source, conflict_checkpoint.value(), conflict_reauthorized_plan);
+    REQUIRE(!blocked_rebase);
+    REQUIRE(blocked_rebase.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(blocked_rebase.error().message.find("read object") != std::string::npos);
+    REQUIRE(conflict_source.snapshot().objects.front().object.local_transform.translation.x ==
+        changed_transform.translation.x);
+
+    carto::application::ApplicationSession shared_asset_source;
+    const auto shared_asset_objects = create_boxes(shared_asset_source, 1U);
+    auto shared_asset_plan = plan_for(shared_asset_source.snapshot(), shared_asset_objects, {
+        {"step-1", {shared_asset_objects.front(), carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    auto shared_asset_task = carto::agent::AgentTask::begin(
+        shared_asset_source, shared_asset_plan, envelope_for(shared_asset_objects));
+    REQUIRE(shared_asset_task);
+    REQUIRE(shared_asset_task.value().run());
+    TempDirectory shared_asset_directory;
+    const auto shared_asset_path =
+        shared_asset_directory.path() / "shared-asset.carto-agent-task";
+    REQUIRE(shared_asset_task.value().save_checkpoint(shared_asset_path));
+    const auto shared_asset_checkpoint =
+        carto::agent::AgentTask::load_checkpoint(shared_asset_path);
+    REQUIRE(shared_asset_checkpoint);
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        shared_asset_source, carto::application::DuplicateMeshInstanceAction{
+            shared_asset_objects.front(), "Out of scope shared instance", {2.0, 0.0, 0.0}}));
+    const auto shared_asset_analysis = carto::agent::AgentTask::analyze_checkpoint_rebase(
+        shared_asset_source, shared_asset_checkpoint.value());
+    REQUIRE(shared_asset_analysis);
+    REQUIRE(!shared_asset_analysis.value().can_rebase());
+    REQUIRE(shared_asset_analysis.value().conflicting_mesh_assets.size() == 1U);
+    REQUIRE(shared_asset_analysis.value().blockers.front().find("membership") !=
+        std::string::npos);
+
+    carto::application::ApplicationSession mesh_conflict_source;
+    const auto mesh_conflict_objects = create_boxes(mesh_conflict_source, 1U);
+    auto mesh_conflict_plan = plan_for(mesh_conflict_source.snapshot(), mesh_conflict_objects, {
+        {"step-1", {mesh_conflict_objects.front(), carto::geometry::FaceId{1U}},
+            "inset face 0.1"},
+    });
+    auto mesh_conflict_task = carto::agent::AgentTask::begin(
+        mesh_conflict_source, mesh_conflict_plan, envelope_for(mesh_conflict_objects));
+    REQUIRE(mesh_conflict_task);
+    REQUIRE(mesh_conflict_task.value().run());
+    TempDirectory mesh_conflict_directory;
+    const auto mesh_conflict_path =
+        mesh_conflict_directory.path() / "target-mesh-conflict.carto-agent-task";
+    REQUIRE(mesh_conflict_task.value().save_checkpoint(mesh_conflict_path));
+    const auto mesh_conflict_checkpoint =
+        carto::agent::AgentTask::load_checkpoint(mesh_conflict_path);
+    REQUIRE(mesh_conflict_checkpoint);
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        mesh_conflict_source, carto::application::SetSelectionModeAction{
+            carto::editor::SelectionMode::face}));
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        mesh_conflict_source, carto::application::SelectFaceAction{
+            mesh_conflict_objects.front(), carto::geometry::FaceId{1U}}));
+    carto::editor::ToolArguments inset_arguments;
+    inset_arguments.distance = 0.05;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        mesh_conflict_source, carto::application::InvokeToolAction{
+            "mesh.inset-face", inset_arguments}));
+    const auto mesh_conflict_analysis = carto::agent::AgentTask::analyze_checkpoint_rebase(
+        mesh_conflict_source, mesh_conflict_checkpoint.value());
+    REQUIRE(mesh_conflict_analysis);
+    REQUIRE(!mesh_conflict_analysis.value().can_rebase());
+    REQUIRE(mesh_conflict_analysis.value().conflicting_mesh_assets.size() == 1U);
+    REQUIRE(mesh_conflict_analysis.value().blockers.front().find("mesh asset") !=
+        std::string::npos);
+
+    carto::application::ApplicationSession sidecar_conflict_source;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        sidecar_conflict_source,
+        carto::application::NewProjectAction{"Checkpoint sidecar rebase"}));
+    const auto sidecar_objects = create_boxes(sidecar_conflict_source, 1U);
+    auto sidecar_plan = plan_for(sidecar_conflict_source.snapshot(), sidecar_objects, {
+        {"step-1", {sidecar_objects.front(), carto::geometry::FaceId{1U}},
+            "inset face 0.1"},
+    });
+    auto sidecar_task = carto::agent::AgentTask::begin(
+        sidecar_conflict_source, sidecar_plan, envelope_for(sidecar_objects));
+    REQUIRE(sidecar_task);
+    REQUIRE(sidecar_task.value().run());
+    TempDirectory sidecar_directory;
+    const auto sidecar_path =
+        sidecar_directory.path() / "sidecar-conflict.carto-agent-task";
+    REQUIRE(sidecar_task.value().save_checkpoint(sidecar_path));
+    const auto sidecar_checkpoint = carto::agent::AgentTask::load_checkpoint(sidecar_path);
+    REQUIRE(sidecar_checkpoint);
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        sidecar_conflict_source, carto::application::ImportConditionFixtureAction{}));
+    const auto sidecar_analysis = carto::agent::AgentTask::analyze_checkpoint_rebase(
+        sidecar_conflict_source, sidecar_checkpoint.value());
+    REQUIRE(sidecar_analysis);
+    REQUIRE(!sidecar_analysis.value().can_rebase());
+    REQUIRE(std::any_of(sidecar_analysis.value().blockers.begin(),
+        sidecar_analysis.value().blockers.end(), [](const std::string& blocker) {
+            return blocker.find("sidecar") != std::string::npos;
+        }));
 }
 
 void prepared_checkpoint_requires_explicit_resume_before_native_execution() {
@@ -459,6 +622,45 @@ void persistent_checkpoint_rejects_corruption_and_overwrite() {
     corrupted.back() = corrupted.back() == '0' ? '1' : '0';
     REQUIRE(!carto::agent::AgentTaskCheckpoint::deserialize(corrupted));
     REQUIRE(carto::agent::AgentTask::load_checkpoint(path));
+}
+
+void persistent_checkpoint_v1_format_remains_readable() {
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 1U);
+    auto plan = plan_for(source.snapshot(), objects, {
+        {"step-1", {objects.front(), carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    auto task = carto::agent::AgentTask::begin(source, plan, envelope_for(objects));
+    REQUIRE(task);
+    TempDirectory directory;
+    const auto path = directory.path() / "v2-prepared.carto-agent-task";
+    REQUIRE(task.value().save_checkpoint(path));
+    const auto checkpoint = carto::agent::AgentTask::load_checkpoint(path);
+    REQUIRE(checkpoint);
+    const auto encoded = checkpoint.value().serialize();
+    REQUIRE(encoded);
+
+    constexpr std::string_view magic = "CARTOGRAPHER_AGENT_TASK_CHECKPOINT_V1\n";
+    const std::size_t body_length_end = encoded.value().find(':', magic.size());
+    REQUIRE(body_length_end != std::string::npos);
+    const auto body_length = static_cast<std::size_t>(std::stoull(
+        encoded.value().substr(magic.size(), body_length_end - magic.size())));
+    const std::size_t body_begin = body_length_end + 1U;
+    std::string body = encoded.value().substr(body_begin, body_length);
+    REQUIRE(body.starts_with("1:2|"));
+    REQUIRE(body.ends_with("1:0|0:|"));
+    body[2] = '1';
+    body.erase(body.size() - 7U, 4U); // Version 1 has no rebase-lineage count.
+    const auto checksum = carto::assets::sha256(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(body.data()), body.size()));
+    const auto field = [](std::string_view value) {
+        return std::to_string(value.size()) + ":" + std::string(value) + "|";
+    };
+    const std::string v1 = std::string(magic) + field(body) + field(checksum.hex());
+    const auto decoded = carto::agent::AgentTaskCheckpoint::deserialize(v1);
+    REQUIRE(decoded);
+    REQUIRE(decoded.value().rebase_lineage.empty());
+    REQUIRE(decoded.value().source_revision == checkpoint.value().source_revision);
 }
 
 void ui_persistent_checkpoint_round_trip_preserves_human_boundary() {
@@ -513,6 +715,86 @@ void ui_persistent_checkpoint_round_trip_preserves_human_boundary() {
     REQUIRE(source.snapshot().project_revision == source_revision);
     REQUIRE(reopened_ui.accept_agent_plan());
     REQUIRE(source.snapshot().project_revision == source_revision.next());
+}
+
+void ui_rebases_disjoint_source_edits_and_reauthorizes_clarifications() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController authoring_ui(source);
+    REQUIRE(authoring_ui.dispatch(carto::application::CreateBoxAction{
+        "Rebase target", {1.0, 1.0, 1.0}}));
+    const auto target = source.snapshot().objects.front().object.id;
+    REQUIRE(authoring_ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(authoring_ui.dispatch(carto::application::SelectFaceAction{
+        target, carto::geometry::FaceId{1U}}));
+    REQUIRE(authoring_ui.queue_agent_step("inset face 0.1"));
+    REQUIRE(authoring_ui.queue_agent_clarification(
+        "Confirm the topology change.",
+        carto::agent::ClarificationImpact::topology_deletion));
+    const std::string goal = "Prepare the target while preserving other project edits";
+    REQUIRE(authoring_ui.answer_agent_clarification(
+        goal, "question-1", "I approve the bounded target edit."));
+    REQUIRE(authoring_ui.run_agent_plan(goal));
+
+    TempDirectory directory;
+    const auto checkpoint_path = directory.path() / "before-rebase.carto-agent-task";
+    REQUIRE(authoring_ui.save_agent_checkpoint(checkpoint_path));
+    const auto checkpoint = carto::agent::AgentTask::load_checkpoint(checkpoint_path);
+    REQUIRE(checkpoint);
+    const auto checkpoint_revision = checkpoint.value().source_revision;
+
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        source, carto::application::CreateBoxAction{
+            "Unrelated human edit", {2.0, 2.0, 2.0}}));
+    auto current_revision = source.snapshot().project_revision;
+    carto::ui::UiController reopened_ui(source);
+    REQUIRE(reopened_ui.load_agent_checkpoint(checkpoint_path));
+    auto loaded = reopened_ui.snapshot();
+    REQUIRE(loaded.agent_checkpoint_loaded);
+    REQUIRE(!loaded.agent_checkpoint_rebased);
+    REQUIRE(loaded.project_revision == current_revision);
+    REQUIRE(!reopened_ui.resume_agent_checkpoint());
+
+    REQUIRE(reopened_ui.rebase_agent_checkpoint());
+    loaded = reopened_ui.snapshot();
+    REQUIRE(loaded.agent_checkpoint_rebased);
+    REQUIRE(loaded.agent_checkpoint_rebase_revision == current_revision);
+    REQUIRE(!reopened_ui.resume_agent_checkpoint());
+    REQUIRE(reopened_ui.answer_agent_clarification(
+        goal, "question-1", "I reapprove after the unrelated source edit."));
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        source, carto::application::CreateBoxAction{
+            "Second unrelated human edit", {3.0, 3.0, 3.0}}));
+    current_revision = source.snapshot().project_revision;
+    REQUIRE(reopened_ui.rebase_agent_checkpoint());
+    loaded = reopened_ui.snapshot();
+    REQUIRE(loaded.agent_checkpoint_rebased);
+    REQUIRE(loaded.agent_checkpoint_rebase_revision == current_revision);
+    REQUIRE(!loaded.agent_clarifications_draft.front().freeform_answer);
+    REQUIRE(!loaded.agent_clarifications_draft.front().human_receipt);
+    REQUIRE(!reopened_ui.resume_agent_checkpoint());
+    REQUIRE(reopened_ui.answer_agent_clarification(
+        goal, "question-1", "I reapprove again after the next source revision."));
+    const auto resumed = reopened_ui.resume_agent_checkpoint();
+    REQUIRE(resumed);
+    REQUIRE(resumed.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(resumed.value().can_accept);
+    REQUIRE(resumed.value().base_revision == current_revision);
+    REQUIRE(resumed.value().rebases.size() == 1U);
+    REQUIRE(resumed.value().rebases.front().previous_source_revision == checkpoint_revision);
+    REQUIRE(resumed.value().rebases.front().rebased_source_revision == current_revision);
+    REQUIRE(source.snapshot().project_revision == current_revision);
+
+    const auto rebased_checkpoint_path = directory.path() / "after-rebase.carto-agent-task";
+    REQUIRE(reopened_ui.save_agent_checkpoint(rebased_checkpoint_path));
+    const auto rebased_checkpoint =
+        carto::agent::AgentTask::load_checkpoint(rebased_checkpoint_path);
+    REQUIRE(rebased_checkpoint);
+    REQUIRE(rebased_checkpoint.value().rebase_lineage.size() == 1U);
+    REQUIRE(rebased_checkpoint.value().rebase_lineage.front().validate());
+    REQUIRE(reopened_ui.accept_agent_plan());
+    REQUIRE(source.snapshot().project_revision == current_revision.next());
+    REQUIRE(source.snapshot().objects.size() == 3U);
 }
 
 void repair_rejects_expansion_stale_source_empty_justification_and_exhaustion() {
@@ -1334,7 +1616,9 @@ int main() {
         persistent_checkpoint_reauthorization_and_stale_source_are_fail_closed();
         prepared_checkpoint_requires_explicit_resume_before_native_execution();
         persistent_checkpoint_rejects_corruption_and_overwrite();
+        persistent_checkpoint_v1_format_remains_readable();
         ui_persistent_checkpoint_round_trip_preserves_human_boundary();
+        ui_rebases_disjoint_source_edits_and_reauthorizes_clarifications();
         std::cout << "Cartographer agent workbench invariants passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -74,10 +74,15 @@
 - Checkpoint loading validates size bounds, schema version, project documents, source revision, scope equality, enum values, progress, and digest bindings before exposing workflow state.
 - A checkpoint is workflow state. Loading it does not replace or mutate the live project document.
 - Human clarification answers and their private receipts are removed from checkpoint plans; consequential questions must be answered again through the human application boundary.
-- Resume requires the unchanged source revision and complete serialized source digest, then replays the native plan in a new speculative session. The resulting artifact and diff digests must match before a prior review task can remain acceptable.
-- Changed-source resume fails closed and requires source-change analysis before rebase. Read/write-set rebase and automatic step invalidation are not implemented yet.
+- Same-source resume requires the unchanged source revision and complete serialized source digest, then replays the native plan in a new speculative session. The resulting artifact and diff digests must match before a prior review task can remain acceptable.
+- An explicit rebase analysis derives object and mesh read/write sets from objective scope, target objects, mesh bindings, and target ancestry. Disjoint object or mesh edits can be rebased; changed scope/ancestor objects, scoped meshes, target write meshes, or a new out-of-scope instance of a written shared mesh block.
+- CONDITION or engineering sidecar changes block rebase while field-level query provenance is unavailable. Rebase requires a plan bound to the exact current revision, unchanged intent/scope/dependencies, and renewed human clarification answers.
+- A conflict-free rebase replays the complete native plan against the current source and compares the saved and replayed task write-set objects/meshes. Replay drift blocks acceptance. The accepted result includes all unrelated source edits because the speculative branch starts from the current source.
+- Rebase lineage records the previous/current source revisions and digests, canonical read/write set digests, and bounded identities. Checkpoint format version 2 reads version 1 checkpoints without rebase lineage.
+- Rebase currently replays the full plan conservatively; per-step invalidation and re-execution from a minimal affected DAG frontier are not implemented.
 - Accepted and rejected checkpoints remain inspectable history and cannot be resumed. Checkpoint writes do not replace an existing file, preserving prior task history.
-- Corrupted files, attempts to overwrite a checkpoint, changed source, missing reapproval, and replayed artifact drift are blocked without changing the live project.
+- Corrupted files, attempts to overwrite a checkpoint, conflicting source changes, missing reapproval, and replayed write-set drift are blocked without changing the live project.
+- A disjoint source edit can be explicitly rebased, retained in the resulting source, and accepted only after the plan is reauthorized for the new revision.
 
 ## Follow-up coverage
 
