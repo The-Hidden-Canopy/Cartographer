@@ -22,6 +22,7 @@ constexpr std::size_t kMaxStepIdBytes = 64U;
 constexpr std::size_t kMaxTaskIdBytes = 64U;
 constexpr std::size_t kMaxScopeObjects = 512U;
 constexpr std::size_t kMaxPlanSteps = 256U;
+constexpr std::size_t kMaxRepairAttempts = 4U;
 constexpr std::uint32_t kKnownEffects = ::carto::agent::effect_mask(Effect::geometry) |
     ::carto::agent::effect_mask(Effect::topology);
 
@@ -700,6 +701,11 @@ core::Result<void> AgentWorkEnvelope::validate() const {
         max_objects_touched == 0U || max_objects_touched > kMaxScopeObjects) {
         return core::Result<void>::failure(invalid("work envelope budget is invalid"));
     }
+    if (max_repair_attempts > kMaxRepairAttempts ||
+        max_additional_operations > kMaxPlanSteps) {
+        return core::Result<void>::failure(invalid(
+            "work envelope repair budget exceeds its supported bound"));
+    }
     SceneQueryBudget query_budget;
     query_budget.max_queries = max_scene_queries;
     query_budget.max_objects_examined = max_objects_examined;
@@ -724,14 +730,16 @@ AgentTask::AgentTask(
     AgentPlan plan,
     AgentWorkEnvelope envelope,
     std::unique_ptr<application::ApplicationSession> speculative,
-    application::ApplicationSnapshot source_snapshot)
+    application::ApplicationSnapshot source_snapshot,
+    std::vector<AgentRepairReceipt> repairs)
     : source_(&source),
       plan_(std::move(plan)),
       envelope_(std::move(envelope)),
       base_document_(source.document_),
       base_scene_(std::move(source_snapshot.viewport.scene)),
       base_viewport_error_(std::move(source_snapshot.viewport.error)),
-      speculative_(std::move(speculative)) {
+      speculative_(std::move(speculative)),
+      repairs_(std::move(repairs)) {
     plan_progress_.reserve(plan_.steps.size());
     for (const auto& step : plan_.steps) {
         plan_progress_.push_back(PlanStepProgress{
@@ -795,6 +803,167 @@ core::Result<AgentTask> AgentTask::begin(
     return core::Result<AgentTask>::success(AgentTask(
         source, std::move(plan), std::move(envelope), std::move(speculative),
         std::move(source_snapshot)));
+}
+
+core::Result<AgentTask> AgentTask::repair(
+    application::ApplicationSession& source,
+    const AgentTask& failed_attempt,
+    AgentPlan revised_plan,
+    AgentWorkEnvelope envelope,
+    std::string justification) {
+    if (failed_attempt.source_ != &source || failed_attempt.status_ != TaskStatus::blocked) {
+        return core::Result<AgentTask>::failure(invalid_state(
+            "repair requires a blocked attempt from the same source session"));
+    }
+    if (source.snapshot().project_revision !=
+        failed_attempt.plan_.objective.base_revision) {
+        return core::Result<AgentTask>::failure(stale(
+            "repair source changed after the original task was prepared"));
+    }
+    if (!safe_text(justification, kMaxGoalBytes)) {
+        return core::Result<AgentTask>::failure(invalid(
+            "repair requires a bounded non-empty operator justification"));
+    }
+    if (failed_attempt.repairs_.size() >= envelope.max_repair_attempts) {
+        return core::Result<AgentTask>::failure(policy(
+            "work envelope repair-attempt budget is exhausted"));
+    }
+    if (envelope.scope_objects.size() > failed_attempt.envelope_.scope_objects.size() ||
+        !std::all_of(envelope.scope_objects.begin(), envelope.scope_objects.end(),
+            [&failed_attempt](scene::ObjectId object) {
+                return contains(failed_attempt.envelope_.scope_objects, object);
+            }) ||
+        (envelope.permitted_effects & ~failed_attempt.envelope_.permitted_effects) != 0U ||
+        envelope.max_commands > failed_attempt.envelope_.max_commands ||
+        envelope.max_objects_touched > failed_attempt.envelope_.max_objects_touched ||
+        envelope.max_scene_queries > failed_attempt.envelope_.max_scene_queries ||
+        envelope.max_objects_examined > failed_attempt.envelope_.max_objects_examined ||
+        envelope.max_topology_elements_examined >
+            failed_attempt.envelope_.max_topology_elements_examined ||
+        envelope.max_semantic_records_examined >
+            failed_attempt.envelope_.max_semantic_records_examined ||
+        envelope.max_query_result_bytes > failed_attempt.envelope_.max_query_result_bytes ||
+        envelope.max_repair_attempts > failed_attempt.envelope_.max_repair_attempts ||
+        envelope.max_additional_operations >
+            failed_attempt.envelope_.max_additional_operations) {
+        return core::Result<AgentTask>::failure(policy(
+            "repair cannot expand the previous work envelope"));
+    }
+    if (revised_plan.id == failed_attempt.plan_.id) {
+        return core::Result<AgentTask>::failure(invalid(
+            "repaired plan must receive a new task identity"));
+    }
+    for (const auto& repair : failed_attempt.repairs_) {
+        if (revised_plan.id == repair.previous_task_id ||
+            revised_plan.id == repair.repaired_task_id) {
+            return core::Result<AgentTask>::failure(invalid(
+                "repaired plan task identity was already used in this repair chain"));
+        }
+    }
+    const auto previous_objective_digest = failed_attempt.plan_.objective.digest();
+    const auto revised_objective_digest = revised_plan.objective.digest();
+    if (!previous_objective_digest || !revised_objective_digest ||
+        clarification_context_digest(failed_attempt.plan_.objective) !=
+            clarification_context_digest(revised_plan.objective)) {
+        return core::Result<AgentTask>::failure(policy(
+            "repair must preserve the original objective, scope, constraints, and question context"));
+    }
+    if (revised_plan.objective.base_revision != failed_attempt.plan_.objective.base_revision) {
+        return core::Result<AgentTask>::failure(stale(
+            "repair cannot change the source revision of the failed attempt"));
+    }
+    auto revised_steps_only = revised_plan;
+    revised_steps_only.id = failed_attempt.plan_.id;
+    const auto previous_plan_digest = clarification_plan_context_digest(failed_attempt.plan_);
+    const auto revised_plan_digest = clarification_plan_context_digest(revised_steps_only);
+    if (previous_plan_digest == revised_plan_digest) {
+        return core::Result<AgentTask>::failure(invalid(
+            "repair must revise at least one plan step or dependency"));
+    }
+
+    const std::size_t added_operations = revised_plan.steps.size() >
+        failed_attempt.plan_.steps.size()
+        ? revised_plan.steps.size() - failed_attempt.plan_.steps.size() : 0U;
+    std::size_t total_additional_operations = added_operations;
+    for (const auto& repair : failed_attempt.repairs_) {
+        if (repair.repaired_plan_steps > repair.previous_plan_steps) {
+            const auto added = repair.repaired_plan_steps - repair.previous_plan_steps;
+            if (added > kMaxPlanSteps - total_additional_operations) {
+                return core::Result<AgentTask>::failure(policy(
+                    "work envelope additional-operation budget is exhausted"));
+            }
+            total_additional_operations += added;
+        }
+    }
+    if (total_additional_operations > envelope.max_additional_operations) {
+        return core::Result<AgentTask>::failure(policy(
+            "work envelope additional-operation budget is exhausted"));
+    }
+
+    std::string failure_canonical = "cartographer.agent-repair-failure.v1|";
+    append_field(failure_canonical, failed_attempt.plan_.id);
+    append_field(failure_canonical, previous_plan_digest.hex());
+    append_number(failure_canonical, failed_attempt.plan_.objective.base_revision.value());
+    append_number(failure_canonical, failed_attempt.receipts_.size());
+    for (const auto& receipt : failed_attempt.receipts_) {
+        append_field(failure_canonical, receipt.step_id);
+        append_number(failure_canonical, static_cast<std::uint64_t>(receipt.status));
+        append_number(failure_canonical, receipt.revision_before.value());
+        append_number(failure_canonical, receipt.revision_after.value());
+        append_number(failure_canonical, receipt.diagnostic.has_value() ? 1U : 0U);
+        if (receipt.diagnostic.has_value()) {
+            append_number(failure_canonical, static_cast<std::uint64_t>(receipt.diagnostic->code));
+            append_field(failure_canonical, receipt.diagnostic->message);
+        }
+    }
+    append_number(failure_canonical, failed_attempt.gates_.size());
+    for (const auto& gate : failed_attempt.gates_) {
+        append_field(failure_canonical, gate.id);
+        append_number(failure_canonical, gate.passed ? 1U : 0U);
+        append_field(failure_canonical, gate.evidence_digest.hex());
+    }
+    append_number(failure_canonical, failed_attempt.diagnostic_.has_value() ? 1U : 0U);
+    if (failed_attempt.diagnostic_.has_value()) {
+        append_number(failure_canonical,
+            static_cast<std::uint64_t>(failed_attempt.diagnostic_->code));
+        append_field(failure_canonical, failed_attempt.diagnostic_->message);
+    }
+    const auto failure_digest = digest_text(failure_canonical);
+
+    std::string repair_canonical = "cartographer.agent-repair-evidence.v1|";
+    append_number(repair_canonical, failed_attempt.repairs_.size() + 1U);
+    append_field(repair_canonical, failed_attempt.plan_.id);
+    append_field(repair_canonical, revised_plan.id);
+    append_field(repair_canonical, justification);
+    append_number(repair_canonical, failed_attempt.plan_.objective.base_revision.value());
+    append_field(repair_canonical, previous_plan_digest.hex());
+    append_field(repair_canonical, revised_plan_digest.hex());
+    append_field(repair_canonical, previous_objective_digest.value().hex());
+    append_field(repair_canonical, revised_objective_digest.value().hex());
+    append_field(repair_canonical, failure_digest.hex());
+
+    AgentRepairReceipt repair_receipt;
+    repair_receipt.attempt = failed_attempt.repairs_.size() + 1U;
+    repair_receipt.previous_task_id = failed_attempt.plan_.id;
+    repair_receipt.repaired_task_id = revised_plan.id;
+    repair_receipt.justification = std::move(justification);
+    repair_receipt.previous_plan_steps = failed_attempt.plan_.steps.size();
+    repair_receipt.repaired_plan_steps = revised_plan.steps.size();
+    repair_receipt.source_revision = failed_attempt.plan_.objective.base_revision;
+    repair_receipt.previous_plan_digest = previous_plan_digest;
+    repair_receipt.repaired_plan_digest = clarification_plan_context_digest(revised_plan);
+    repair_receipt.previous_objective_digest = previous_objective_digest.value();
+    repair_receipt.repaired_objective_digest = revised_objective_digest.value();
+    repair_receipt.failure_evidence_digest = failure_digest;
+    repair_receipt.repair_evidence_digest = digest_text(repair_canonical);
+    repair_receipt.previous_step_receipts = failed_attempt.receipts_;
+    repair_receipt.previous_gate_results = failed_attempt.gates_;
+
+    auto next_attempt = begin(source, std::move(revised_plan), std::move(envelope));
+    if (!next_attempt) return next_attempt;
+    next_attempt.value().repairs_ = failed_attempt.repairs_;
+    next_attempt.value().repairs_.push_back(std::move(repair_receipt));
+    return core::Result<AgentTask>::success(std::move(next_attempt.value()));
 }
 
 bool AgentTask::scope_contains(scene::ObjectId object) const noexcept {
@@ -1432,6 +1601,9 @@ AgentTaskSnapshot AgentTask::build_snapshot() const {
     view.speculative_revision = speculative_snapshot.project_revision;
     view.plan_steps = plan_progress_;
     view.steps = receipts_;
+    view.repairs = repairs_;
+    view.repair_attempts_remaining = envelope_.max_repair_attempts > repairs_.size()
+        ? envelope_.max_repair_attempts - repairs_.size() : 0U;
     view.gates = gates_;
     view.diff = build_diff();
     view.query_budget = query_budget_;

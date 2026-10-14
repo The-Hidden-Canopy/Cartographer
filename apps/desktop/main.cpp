@@ -1108,8 +1108,12 @@ struct DesktopState {
     std::string agent_step;
     std::string agent_question;
     std::string agent_answer;
+    std::string agent_repair_step_id;
+    std::string agent_repair_intent;
+    std::string agent_repair_justification;
     int agent_clarification_impact = 0;
     int agent_step_dependency = 0;
+    int agent_repair_step_index = 0;
     std::string agent_feedback;
     int agent_preview_mode = 0;
     std::optional<carto::ui::Workspace> previous_workspace_kind;
@@ -5227,6 +5231,29 @@ struct DesktopState {
                     ImGui::TextDisabled("  %s", planned.diagnostic->message.c_str());
                 }
             }
+            if (!task.repairs.empty()) {
+                ImGui::Separator();
+                ImGui::Text("Repair lineage · %llu attempt(s)",
+                    static_cast<unsigned long long>(task.repairs.size()));
+                for (const auto& repair : task.repairs) {
+                    ImGui::TextWrapped("%s → %s · %s", repair.previous_task_id.c_str(),
+                        repair.repaired_task_id.c_str(), repair.justification.c_str());
+                    const std::string failure_digest = repair.failure_evidence_digest.hex();
+                    ImGui::TextDisabled("Prior failure evidence %.12s · %llu retained step receipt(s)",
+                        failure_digest.c_str(), static_cast<unsigned long long>(
+                            repair.previous_step_receipts.size()));
+                    for (const auto& prior_receipt : repair.previous_step_receipts) {
+                        ImGui::BulletText("Prior %s · %s · %s",
+                            prior_receipt.step_id.c_str(),
+                            carto::agent::step_status_name(prior_receipt.status),
+                            prior_receipt.intent.c_str());
+                        if (prior_receipt.diagnostic.has_value()) {
+                            ImGui::TextDisabled("  %s",
+                                prior_receipt.diagnostic->message.c_str());
+                        }
+                    }
+                }
+            }
             ImGui::Text("Diff · %llu objects · %llu meshes",
                 static_cast<unsigned long long>(task.diff.changed_object_count()),
                 static_cast<unsigned long long>(task.diff.changed_mesh_count()));
@@ -5270,6 +5297,16 @@ struct DesktopState {
             for (const auto& gate : task.gates) {
                 ImGui::BulletText("%s · %s · %s", gate.passed ? "PASS" : "FAIL",
                     gate.id.c_str(), gate.evidence.c_str());
+                const std::string evidence_digest = gate.evidence_digest.hex();
+                ImGui::TextDisabled("  %s · R%llu → R%llu · evidence %.12s",
+                    gate.validator_version.c_str(),
+                    static_cast<unsigned long long>(gate.source_revision.value()),
+                    static_cast<unsigned long long>(gate.evaluated_revision.value()),
+                    evidence_digest.c_str());
+                if (gate.diagnostic.has_value()) {
+                    ImGui::TextColored(color(snapshot.colors.semantic_warning), "  %s",
+                        gate.diagnostic->message.c_str());
+                }
             }
             for (const auto& receipt : task.steps) {
                 ImGui::TextWrapped("%s · %s · %s", receipt.step_id.c_str(),
@@ -5282,6 +5319,72 @@ struct DesktopState {
             if (task.diagnostic.has_value()) {
                 ImGui::TextColored(color(snapshot.colors.semantic_warning), "%s",
                                    task.diagnostic->message.c_str());
+            }
+            if (task.status == carto::agent::TaskStatus::blocked &&
+                task.repair_attempts_remaining > 0U && !snapshot.agent_plan_draft.empty()) {
+                ImGui::Separator();
+                ImGui::Text("Bounded repair · %llu attempt(s) remain",
+                    static_cast<unsigned long long>(task.repair_attempts_remaining));
+                std::vector<const char*> repair_step_labels;
+                repair_step_labels.reserve(snapshot.agent_plan_draft.size());
+                for (const auto& planned : snapshot.agent_plan_draft) {
+                    repair_step_labels.push_back(planned.id.c_str());
+                }
+                if (agent_repair_step_index < 0 ||
+                    agent_repair_step_index >= static_cast<int>(repair_step_labels.size())) {
+                    agent_repair_step_index = 0;
+                }
+                ImGui::Combo("Step to revise", &agent_repair_step_index,
+                    repair_step_labels.data(), static_cast<int>(repair_step_labels.size()));
+                const auto& selected_step = snapshot.agent_plan_draft[
+                    static_cast<std::size_t>(agent_repair_step_index)];
+                if (agent_repair_step_id != selected_step.id) {
+                    agent_repair_step_id = selected_step.id;
+                    agent_repair_intent = selected_step.intent;
+                }
+                std::array<char, 1025> revised_intent{};
+                const std::size_t revised_intent_bytes = std::min(
+                    agent_repair_intent.size(), revised_intent.size() - 1U);
+                std::copy_n(agent_repair_intent.data(), revised_intent_bytes,
+                    revised_intent.data());
+                if (ImGui::InputText("Revised native intent", revised_intent.data(),
+                        revised_intent.size())) {
+                    agent_repair_intent.assign(revised_intent.data());
+                }
+                std::array<char, 1025> repair_reason{};
+                const std::size_t repair_reason_bytes = std::min(
+                    agent_repair_justification.size(), repair_reason.size() - 1U);
+                std::copy_n(agent_repair_justification.data(), repair_reason_bytes,
+                    repair_reason.data());
+                if (ImGui::InputTextMultiline("Repair justification", repair_reason.data(),
+                        repair_reason.size(), ImVec2(-1, 54))) {
+                    agent_repair_justification.assign(repair_reason.data());
+                }
+                ImGui::BeginDisabled(agent_repair_intent.empty());
+                if (ImGui::Button("Revise selected step", ImVec2(-1, 26))) {
+                    auto revised_step = selected_step;
+                    revised_step.intent = agent_repair_intent;
+                    const auto revised = ui.revise_agent_plan_step(std::move(revised_step));
+                    agent_feedback = revised
+                        ? "Plan changed. Review and re-answer any invalidated operator questions before repair."
+                        : revised.error().message;
+                }
+                ImGui::EndDisabled();
+                if (snapshot.agent_repair_ready) {
+                    ImGui::BeginDisabled(!clarifications_answered ||
+                        agent_repair_justification.empty());
+                    if (ImGui::Button("Run bounded repair", ImVec2(-1, 30))) {
+                        const auto repaired = ui.repair_agent_plan(agent_repair_justification);
+                        agent_feedback = repaired
+                            ? (repaired.value().status == carto::agent::TaskStatus::review
+                                ? "Repair passed validation and is ready for review; the source is unchanged."
+                                : (repaired.value().diagnostic.has_value()
+                                    ? repaired.value().diagnostic->message
+                                    : "Repair is blocked by an acceptance gate."))
+                            : repaired.error().message;
+                    }
+                    ImGui::EndDisabled();
+                }
             }
             if (task.can_accept) {
                 if (ImGui::Button("Accept result", ImVec2(-1, 30))) {

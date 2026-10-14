@@ -177,6 +177,8 @@ struct AgentWorkEnvelope {
     std::size_t max_topology_elements_examined = 16384U;
     std::size_t max_semantic_records_examined = 8192U;
     std::size_t max_query_result_bytes = 1U * 1024U * 1024U;
+    std::size_t max_repair_attempts = 2U;
+    std::size_t max_additional_operations = 4U;
 
     [[nodiscard]] core::Result<void> validate() const;
 };
@@ -221,6 +223,24 @@ struct AcceptanceGateResult {
     assets::Sha256Digest result_digest;
     assets::Sha256Digest evidence_digest;
     std::optional<core::Diagnostic> diagnostic;
+};
+
+struct AgentRepairReceipt {
+    std::size_t attempt = 0U;
+    std::string previous_task_id;
+    std::string repaired_task_id;
+    std::string justification;
+    std::size_t previous_plan_steps = 0U;
+    std::size_t repaired_plan_steps = 0U;
+    core::Revision source_revision;
+    assets::Sha256Digest previous_plan_digest;
+    assets::Sha256Digest repaired_plan_digest;
+    assets::Sha256Digest previous_objective_digest;
+    assets::Sha256Digest repaired_objective_digest;
+    assets::Sha256Digest failure_evidence_digest;
+    assets::Sha256Digest repair_evidence_digest;
+    std::vector<StepReceipt> previous_step_receipts;
+    std::vector<AcceptanceGateResult> previous_gate_results;
 };
 
 struct ObjectChange {
@@ -301,6 +321,8 @@ struct AgentTaskSnapshot {
     core::Revision speculative_revision;
     std::vector<PlanStepProgress> plan_steps;
     std::vector<StepReceipt> steps;
+    std::vector<AgentRepairReceipt> repairs;
+    std::size_t repair_attempts_remaining = 0U;
     std::vector<AcceptanceGateResult> gates;
     ProjectDiff diff;
     SceneQueryBudget query_budget;
@@ -321,6 +343,12 @@ public:
         application::ApplicationSession& source,
         AgentPlan plan,
         AgentWorkEnvelope envelope);
+    [[nodiscard]] static core::Result<AgentTask> repair(
+        application::ApplicationSession& source,
+        const AgentTask& failed_attempt,
+        AgentPlan revised_plan,
+        AgentWorkEnvelope envelope,
+        std::string justification);
 
     AgentTask(AgentTask&&) noexcept = default;
     AgentTask& operator=(AgentTask&&) noexcept = delete;
@@ -341,7 +369,8 @@ private:
         AgentPlan plan,
         AgentWorkEnvelope envelope,
         std::unique_ptr<application::ApplicationSession> speculative,
-        application::ApplicationSnapshot source_snapshot);
+        application::ApplicationSnapshot source_snapshot,
+        std::vector<AgentRepairReceipt> repairs = {});
 
     [[nodiscard]] core::Result<void> execute_step(const AgentPlanStep& step);
     [[nodiscard]] const project::ProjectDocument& scene_query_document() const;
@@ -359,6 +388,7 @@ private:
     std::unique_ptr<application::ApplicationSession> speculative_;
     ai::NativePlanner planner_;
     std::vector<StepReceipt> receipts_;
+    std::vector<AgentRepairReceipt> repairs_;
     std::vector<PlanStepProgress> plan_progress_;
     std::vector<AcceptanceGateResult> gates_;
     SceneQueryBudget query_budget_;

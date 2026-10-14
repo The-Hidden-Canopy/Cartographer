@@ -57,6 +57,16 @@
 - Any failed or invalidated step keeps acceptance blocked, even when an independent branch produced a valid diff.
 - The UI captures explicit dependencies and displays each branch's final status and failure evidence.
 
+## Bounded repair coverage
+
+- Repair starts only from a blocked task on the same, unchanged source session; a stale source revision cannot be reused.
+- Repair requires a non-empty operator justification, a new task identity, and a changed step/dependency graph.
+- The objective question context, object scope, hard constraints, protected objects, and permitted effects cannot be expanded or weakened.
+- Every numeric work/query/retry limit stays the same or narrows; additional operations and repair attempts are bounded across the chain.
+- A repaired task starts from the original source state, not the failed speculative branch, and preserves earlier step receipts, failed gate results, and evidence digests.
+- Editing a step invalidates plan-bound human clarification receipts; execution remains blocked until the operator answers again for the revised plan.
+- The repaired happy path can pass gates and still requires the existing explicit source-acceptance boundary.
+
 ## Follow-up coverage
 
 Add failure injection for durable journal append rollback, saved/reopened task state, unrelated and conflicting source edits, bounded repair exhaustion, semantic-sidecar size pressure, and provider timeouts as those tranches are implemented. Clarification questions and answers are reviewable evidence, not natural-language commands; the workbench still does not compile free-form goals or infer questions automatically.

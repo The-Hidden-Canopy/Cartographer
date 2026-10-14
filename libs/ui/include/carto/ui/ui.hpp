@@ -418,6 +418,7 @@ struct UiSnapshot : application::ApplicationSnapshot {
     std::string agent_goal;
     std::vector<agent::AgentPlanStep> agent_plan_draft;
     std::vector<agent::ClarificationQuestion> agent_clarifications_draft;
+    bool agent_repair_ready = false;
     std::optional<agent::AgentTaskSnapshot> agent_task;
 };
 
@@ -481,6 +482,10 @@ public:
         std::string_view question_id,
         std::string answer);
     [[nodiscard]] core::Result<agent::AgentTaskSnapshot> run_agent_plan(std::string goal);
+    [[nodiscard]] core::Result<void> revise_agent_plan_step(
+        agent::AgentPlanStep revised_step);
+    [[nodiscard]] core::Result<agent::AgentTaskSnapshot> repair_agent_plan(
+        std::string justification);
     [[nodiscard]] core::Result<application::DispatchReceipt> accept_agent_plan();
     [[nodiscard]] core::Result<void> reject_agent_plan();
     [[nodiscard]] core::Result<void> clear_agent_plan();
@@ -625,6 +630,9 @@ private:
     std::optional<core::Revision> agent_plan_base_revision_;
     std::optional<agent::AgentTask> agent_task_;
     std::string agent_goal_;
+    std::string agent_plan_id_;
+    std::string agent_objective_id_;
+    bool agent_repair_mode_ = false;
     std::uint64_t next_agent_task_id_ = 1U;
 };
 

@@ -1471,6 +1471,9 @@ core::Result<void> UiController::queue_agent_step(
         agent_clarifications_draft_.clear();
         agent_plan_base_revision_.reset();
         agent_goal_.clear();
+        agent_plan_id_.clear();
+        agent_objective_id_.clear();
+        agent_repair_mode_ = false;
     }
     if (std::any_of(agent_clarifications_draft_.begin(), agent_clarifications_draft_.end(),
             [](const auto& question) { return question.human_receipt.has_value(); })) {
@@ -1545,6 +1548,9 @@ core::Result<void> UiController::queue_agent_clarification(
         agent_clarifications_draft_.clear();
         agent_plan_base_revision_.reset();
         agent_goal_.clear();
+        agent_plan_id_.clear();
+        agent_objective_id_.clear();
+        agent_repair_mode_ = false;
     }
     if (agent_plan_draft_.empty() || !agent_plan_base_revision_.has_value()) {
         return core::Result<void>::failure(invalid_state(
@@ -1592,6 +1598,12 @@ core::Result<void> UiController::answer_agent_clarification(
     std::string goal,
     std::string_view question_id,
     std::string answer) {
+    if (agent_task_.has_value() &&
+        (!agent_repair_mode_ ||
+         agent_task_->snapshot().status != agent::TaskStatus::blocked)) {
+        return core::Result<void>::failure(invalid_state(
+            "clarification answers can be changed only while reviewing a blocked-plan repair"));
+    }
     if (agent_plan_draft_.empty() || !agent_plan_base_revision_.has_value()) {
         return core::Result<void>::failure(invalid_state(
             "capture at least one plan target before answering an objective clarification"));
@@ -1614,10 +1626,14 @@ core::Result<void> UiController::answer_agent_clarification(
     }
     const std::uint64_t task_sequence = next_agent_task_id_ ==
         std::numeric_limits<std::uint64_t>::max() ? 1U : next_agent_task_id_;
+    const std::string task_id = agent_plan_id_.empty()
+        ? "agent-task-" + std::to_string(task_sequence) : agent_plan_id_;
+    const std::string objective_id = agent_objective_id_.empty()
+        ? task_id : agent_objective_id_;
     agent::AuthoringObjective objective{
-        "agent-task-" + std::to_string(task_sequence), std::move(goal),
+        objective_id, std::move(goal),
         *agent_plan_base_revision_, std::move(scope), {}, {}, agent_clarifications_draft_};
-    agent::AgentPlan plan{objective.id, std::move(objective), agent_plan_draft_};
+    agent::AgentPlan plan{task_id, std::move(objective), agent_plan_draft_};
     const auto answered = application::HumanApplicationAccess::answer_agent_clarification(
         plan, question_id, std::nullopt, std::move(answer));
     if (!answered) return answered;
@@ -1658,7 +1674,8 @@ core::Result<agent::AgentTaskSnapshot> UiController::run_agent_plan(std::string 
     agent::AgentPlan plan{
         task_id,
         agent::AuthoringObjective{
-            task_id, std::move(goal), *agent_plan_base_revision_, scope, {}, {},
+            agent_objective_id_.empty() ? task_id : agent_objective_id_,
+            std::move(goal), *agent_plan_base_revision_, scope, {}, {},
             agent_clarifications_draft_},
         agent_plan_draft_};
     const std::string task_goal = plan.objective.goal;
@@ -1674,10 +1691,116 @@ core::Result<agent::AgentTaskSnapshot> UiController::run_agent_plan(std::string 
     next_agent_task_id_ = task_sequence == std::numeric_limits<std::uint64_t>::max()
         ? 1U : task_sequence + 1U;
     agent_goal_ = task_goal;
+    agent_plan_id_ = task_id;
+    if (agent_objective_id_.empty()) agent_objective_id_ = task_id;
+    agent_repair_mode_ = false;
     agent_task_.emplace(std::move(task.value()));
     auto result = agent_task_->run();
     if (!result) {
         record_ui_problem(result.error().with_context("agent workbench execution"));
+        return result;
+    }
+    return result;
+}
+
+core::Result<void> UiController::revise_agent_plan_step(
+    agent::AgentPlanStep revised_step) {
+    if (!agent_task_.has_value() ||
+        agent_task_->snapshot().status != agent::TaskStatus::blocked) {
+        return core::Result<void>::failure(invalid_state(
+            "only a blocked speculative task can be revised for repair"));
+    }
+    const auto task_snapshot = agent_task_->snapshot();
+    if (task_snapshot.repair_attempts_remaining == 0U) {
+        return core::Result<void>::failure(invalid_state(
+            "the task repair-attempt budget is exhausted"));
+    }
+    if (auto valid = revised_step.validate(); !valid) return valid;
+    const auto existing = std::find_if(agent_plan_draft_.begin(), agent_plan_draft_.end(),
+        [&revised_step](const agent::AgentPlanStep& step) {
+            return step.id == revised_step.id;
+        });
+    if (existing == agent_plan_draft_.end()) {
+        return core::Result<void>::failure(invalid(
+            "repair can revise only an existing plan step"));
+    }
+    if (existing->target.object != revised_step.target.object) {
+        return core::Result<void>::failure(invalid_state(
+            "repair cannot expand the target object scope"));
+    }
+    if (existing->intent == revised_step.intent &&
+        existing->target.component == revised_step.target.component &&
+        existing->dependencies == revised_step.dependencies) {
+        return core::Result<void>::failure(invalid(
+            "repair revision must change the step intent, component, or dependencies"));
+    }
+    *existing = std::move(revised_step);
+    agent_repair_mode_ = true;
+    const std::uint64_t task_sequence = next_agent_task_id_ ==
+        std::numeric_limits<std::uint64_t>::max() ? 1U : next_agent_task_id_;
+    agent_plan_id_ = "agent-task-" + std::to_string(task_sequence);
+    for (auto& question : agent_clarifications_draft_) {
+        question.selected_candidate_id.reset();
+        question.freeform_answer.reset();
+        question.human_receipt.reset();
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<agent::AgentTaskSnapshot> UiController::repair_agent_plan(
+    std::string justification) {
+    if (!agent_task_.has_value() || !agent_repair_mode_ ||
+        agent_task_->snapshot().status != agent::TaskStatus::blocked) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "revise a failed plan step before requesting bounded repair"));
+    }
+    if (!agent_plan_base_revision_.has_value() ||
+        session_.snapshot().project_revision != *agent_plan_base_revision_) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "repair cannot use a source project that changed after the failed task"));
+    }
+    const std::uint64_t task_sequence = next_agent_task_id_ ==
+        std::numeric_limits<std::uint64_t>::max() ? 1U : next_agent_task_id_;
+    const std::string task_id = "agent-task-" + std::to_string(task_sequence);
+    if (agent_plan_id_ != task_id) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "repair plan identity changed while its operator review was open"));
+    }
+    std::vector<scene::ObjectId> scope;
+    for (const auto& step : agent_plan_draft_) {
+        if (std::find(scope.begin(), scope.end(), step.target.object) == scope.end()) {
+            scope.push_back(step.target.object);
+        }
+    }
+    const auto previous = agent_task_->snapshot();
+    agent::AgentPlan revised_plan{
+        task_id,
+        agent::AuthoringObjective{
+            agent_objective_id_, agent_goal_, *agent_plan_base_revision_, scope, {},
+            previous.hard_constraints, agent_clarifications_draft_},
+        agent_plan_draft_};
+    agent::AgentWorkEnvelope envelope;
+    envelope.scope_objects = scope;
+    envelope.max_commands = 16U;
+    envelope.max_objects_touched = std::max<std::size_t>(scope.size(), 1U);
+    auto repaired = agent::AgentTask::repair(
+        session_, *agent_task_, std::move(revised_plan), std::move(envelope),
+        justification);
+    if (!repaired) {
+        record_ui_problem(repaired.error().with_context("agent plan repair"));
+        return core::Result<agent::AgentTaskSnapshot>::failure(repaired.error());
+    }
+    agent_task_.reset();
+    agent_task_.emplace(std::move(repaired.value()));
+    next_agent_task_id_ = task_sequence == std::numeric_limits<std::uint64_t>::max()
+        ? 1U : task_sequence + 1U;
+    agent_plan_id_ = task_id;
+    agent_repair_mode_ = false;
+    auto result = agent_task_->run();
+    if (!result) {
+        record_ui_problem(result.error().with_context("agent repair execution"));
         return result;
     }
     return result;
@@ -1720,6 +1843,9 @@ core::Result<void> UiController::clear_agent_plan() {
     agent_clarifications_draft_.clear();
     agent_plan_base_revision_.reset();
     agent_goal_.clear();
+    agent_plan_id_.clear();
+    agent_objective_id_.clear();
+    agent_repair_mode_ = false;
     return core::Result<void>::success();
 }
 
@@ -2912,6 +3038,7 @@ UiSnapshot UiController::snapshot() const {
     result.agent_goal = agent_goal_;
     result.agent_plan_draft = agent_plan_draft_;
     result.agent_clarifications_draft = agent_clarifications_draft_;
+    result.agent_repair_ready = agent_repair_mode_;
     if (agent_task_.has_value()) result.agent_task = agent_task_->snapshot();
     result.market = market_view_;
     if (surface_fidelity_.has_value()) {

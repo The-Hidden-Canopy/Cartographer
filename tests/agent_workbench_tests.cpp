@@ -205,6 +205,161 @@ void failed_dag_node_invalidates_only_dependent_steps() {
     REQUIRE(source.snapshot().project_revision == before.project_revision);
 }
 
+void bounded_repair_restarts_from_source_and_preserves_attempt_lineage() {
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 2U);
+    const auto before = source.snapshot();
+    auto plan = plan_for(before, objects, {
+        {"step-failed", {objects[0], carto::geometry::FaceId{999U}}, "inset face 0.1"},
+        {"step-dependent", {objects[1], carto::geometry::FaceId{1U}},
+            "inset face 0.1", {"step-failed"}},
+    });
+    auto envelope = envelope_for(objects);
+    envelope.max_repair_attempts = 2U;
+    envelope.max_additional_operations = 1U;
+    auto initial = carto::agent::AgentTask::begin(source, plan, envelope);
+    REQUIRE(initial);
+    const auto failed = initial.value().run();
+    REQUIRE(failed);
+    REQUIRE(failed.value().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(failed.value().plan_steps[0].status == carto::agent::StepStatus::failed);
+    REQUIRE(failed.value().plan_steps[1].status == carto::agent::StepStatus::invalidated);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+
+    auto revised = plan;
+    revised.id = "agent-task-repair-1";
+    revised.steps[0].target.component = carto::geometry::FaceId{1U};
+    auto repaired = carto::agent::AgentTask::repair(
+        source, initial.value(), revised, envelope,
+        "The captured face identity was stale; use the verified face on the same object.");
+    REQUIRE(repaired);
+    const auto pending = repaired.value().snapshot();
+    REQUIRE(pending.status == carto::agent::TaskStatus::prepared);
+    REQUIRE(pending.repairs.size() == 1U);
+    REQUIRE(pending.repairs.front().attempt == 1U);
+    REQUIRE(pending.repairs.front().previous_task_id == plan.id);
+    REQUIRE(pending.repairs.front().repaired_task_id == revised.id);
+    REQUIRE(pending.repairs.front().justification.find("captured face identity") !=
+        std::string::npos);
+    REQUIRE(pending.repairs.front().previous_step_receipts.size() == 1U);
+    REQUIRE(pending.repairs.front().previous_step_receipts.front().status ==
+        carto::agent::StepStatus::failed);
+    REQUIRE(pending.repairs.front().previous_gate_results.size() > 0U);
+    REQUIRE(!pending.repairs.front().failure_evidence_digest.hex().empty());
+    REQUIRE(!pending.repairs.front().repair_evidence_digest.hex().empty());
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+
+    const auto repaired_run = repaired.value().run();
+    REQUIRE(repaired_run);
+    REQUIRE(repaired_run.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(repaired_run.value().can_accept);
+    REQUIRE(repaired_run.value().steps.size() == 2U);
+    REQUIRE(std::all_of(repaired_run.value().steps.begin(), repaired_run.value().steps.end(),
+        [](const auto& receipt) { return receipt.status == carto::agent::StepStatus::passed; }));
+    REQUIRE(repaired_run.value().repairs.size() == 1U);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+    REQUIRE(carto::application::HumanApplicationAccess::accept_agent_task(repaired.value()));
+    REQUIRE(source.snapshot().project_revision == before.project_revision.next());
+}
+
+void repair_rejects_expansion_stale_source_empty_justification_and_exhaustion() {
+    const auto make_failed_attempt = [](
+        carto::application::ApplicationSession& source,
+        const std::vector<carto::scene::ObjectId>& objects,
+        carto::agent::AgentWorkEnvelope envelope) {
+        auto plan = plan_for(source.snapshot(), {objects.front()}, {
+            {"step-1", {objects.front(), carto::geometry::FaceId{999U}}, "inset face 0.1"},
+        });
+        auto task = carto::agent::AgentTask::begin(source, std::move(plan), envelope);
+        REQUIRE(task);
+        REQUIRE(task.value().run());
+        REQUIRE(task.value().snapshot().status == carto::agent::TaskStatus::blocked);
+        return std::pair{std::move(task.value()), std::move(envelope)};
+    };
+
+    carto::application::ApplicationSession bounded_source;
+    const auto bounded_objects = create_boxes(bounded_source, 2U);
+    auto bounded_envelope = envelope_for({bounded_objects.front()});
+    bounded_envelope.max_additional_operations = 1U;
+    auto bounded_attempt = make_failed_attempt(
+        bounded_source, bounded_objects, bounded_envelope);
+    auto expanded_plan = plan_for(bounded_source.snapshot(), {bounded_objects.front()}, {
+        {"step-1", {bounded_objects.front(), carto::geometry::FaceId{1U}}, "inset face 0.1"},
+        {"step-2", {bounded_objects.front(), carto::geometry::FaceId{2U}}, "inset face 0.1"},
+        {"step-3", {bounded_objects.front(), carto::geometry::FaceId{3U}}, "inset face 0.1"},
+    });
+    expanded_plan.id = "agent-task-expanded-repair";
+    REQUIRE(!carto::agent::AgentTask::repair(
+        bounded_source, bounded_attempt.first, std::move(expanded_plan),
+        bounded_attempt.second,
+        "Add two operations to repair the failed task."));
+
+    auto changed_scope = plan_for(bounded_source.snapshot(), bounded_objects, {
+        {"step-1", {bounded_objects.front(), carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    changed_scope.id = "agent-task-scope-repair";
+    REQUIRE(!carto::agent::AgentTask::repair(
+        bounded_source, bounded_attempt.first, std::move(changed_scope),
+        bounded_attempt.second, "Try another object."));
+    auto revised_same_object = plan_for(bounded_source.snapshot(), {bounded_objects.front()}, {
+        {"step-1", {bounded_objects.front(), carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    revised_same_object.id = "agent-task-empty-justification";
+    REQUIRE(!carto::agent::AgentTask::repair(
+        bounded_source, bounded_attempt.first, revised_same_object,
+        bounded_attempt.second, ""));
+
+    carto::application::ApplicationSession effect_source;
+    const auto effect_objects = create_boxes(effect_source, 1U);
+    auto geometry_only = envelope_for(effect_objects);
+    geometry_only.permitted_effects =
+        carto::agent::effect_mask(carto::agent::Effect::geometry);
+    auto effect_attempt = make_failed_attempt(
+        effect_source, effect_objects, geometry_only);
+    auto effect_plan = plan_for(effect_source.snapshot(), effect_objects, {
+        {"step-1", {effect_objects.front(), carto::geometry::FaceId{1U}}, "inset face 0.2"},
+    });
+    effect_plan.id = "agent-task-effect-expansion";
+    auto expanded_effects = geometry_only;
+    expanded_effects.permitted_effects |=
+        carto::agent::effect_mask(carto::agent::Effect::topology);
+    const auto effect_repair = carto::agent::AgentTask::repair(
+        effect_source, effect_attempt.first, std::move(effect_plan),
+        std::move(expanded_effects), "Request the topology effect required by inset.");
+    REQUIRE(!effect_repair);
+    REQUIRE(effect_repair.error().message.find("cannot expand") != std::string::npos);
+
+    carto::application::ApplicationSession no_retry_source;
+    const auto no_retry_objects = create_boxes(no_retry_source, 1U);
+    auto no_retry_envelope = envelope_for(no_retry_objects);
+    no_retry_envelope.max_repair_attempts = 0U;
+    auto no_retry_attempt = make_failed_attempt(
+        no_retry_source, no_retry_objects, no_retry_envelope);
+    auto no_retry_plan = plan_for(no_retry_source.snapshot(), no_retry_objects, {
+        {"step-1", {no_retry_objects.front(), carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    no_retry_plan.id = "agent-task-no-retry";
+    REQUIRE(!carto::agent::AgentTask::repair(
+        no_retry_source, no_retry_attempt.first, std::move(no_retry_plan),
+        no_retry_attempt.second, "The local retry budget is intentionally zero."));
+
+    carto::application::ApplicationSession stale_source;
+    const auto stale_objects = create_boxes(stale_source, 1U);
+    auto stale_envelope = envelope_for(stale_objects);
+    auto stale_attempt = make_failed_attempt(stale_source, stale_objects, stale_envelope);
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        stale_source, carto::application::CreateBoxAction{"Concurrent edit", {1.0, 1.0, 1.0}}));
+    auto stale_plan = plan_for(stale_source.snapshot(), stale_objects, {
+        {"step-1", {stale_objects.front(), carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    stale_plan.id = "agent-task-stale-repair";
+    const auto stale_repair = carto::agent::AgentTask::repair(
+        stale_source, stale_attempt.first, std::move(stale_plan), stale_envelope,
+        "The source changed while the failed plan was under review.");
+    REQUIRE(!stale_repair);
+    REQUIRE(stale_repair.error().code == carto::core::ErrorCode::stale_data);
+}
+
 void saved_acceptance_is_one_durable_application_event() {
     TempDirectory temp;
     const auto path = temp.path() / "agent-result.carto";
@@ -758,6 +913,85 @@ void ui_clarification_requires_an_operator_answer_before_review() {
     REQUIRE(stale_source.snapshot().project_revision == edited_revision);
 }
 
+void ui_repairs_failed_step_with_operator_justification_and_scope_checks() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{"Repair box", {1.0, 1.0, 1.0}}));
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{"Protected box", {1.0, 1.0, 1.0}}));
+    const auto snapshot = source.snapshot();
+    const auto target = snapshot.objects[0].object.id;
+    const auto outside_scope = snapshot.objects[1].object.id;
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        target, carto::geometry::FaceId{1U}}));
+    REQUIRE(ui.queue_agent_step("inset face 1000"));
+    const auto base_revision = source.snapshot().project_revision;
+    const auto failed = ui.run_agent_plan("Repair only the captured face");
+    REQUIRE(failed);
+    REQUIRE(failed.value().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(source.snapshot().project_revision == base_revision);
+
+    auto revised_step = ui.snapshot().agent_plan_draft.front();
+    revised_step.target.object = outside_scope;
+    REQUIRE(!ui.revise_agent_plan_step(revised_step));
+    revised_step.target.object = target;
+    revised_step.intent = "inset face 0.1";
+    REQUIRE(ui.revise_agent_plan_step(revised_step));
+    REQUIRE(!ui.repair_agent_plan(""));
+    const auto repaired = ui.repair_agent_plan(
+        "The requested face index was invalid; retry the captured object with a bounded inset.");
+    REQUIRE(repaired);
+    REQUIRE(repaired.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(repaired.value().can_accept);
+    REQUIRE(repaired.value().repairs.size() == 1U);
+    REQUIRE(repaired.value().repairs.front().previous_step_receipts.front().status ==
+        carto::agent::StepStatus::failed);
+    REQUIRE(source.snapshot().project_revision == base_revision);
+    REQUIRE(ui.accept_agent_plan());
+    REQUIRE(source.snapshot().project_revision == base_revision.next());
+}
+
+void ui_repair_invalidates_plan_bound_human_receipts_until_reanswered() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{"Clarified repair box", {1.0, 1.0, 1.0}}));
+    const auto object = source.snapshot().objects.front().object.id;
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        object, carto::geometry::FaceId{1U}}));
+    REQUIRE(ui.queue_agent_step("inset face 1000"));
+    REQUIRE(ui.queue_agent_clarification(
+        "Confirm the exact face edit before repair.",
+        carto::agent::ClarificationImpact::publication_readiness));
+    const std::string goal = "Prepare the selected face";
+    REQUIRE(ui.answer_agent_clarification(
+        goal, "question-1", "I approved the originally captured face edit."));
+    const auto before = source.snapshot().project_revision;
+    const auto failed = ui.run_agent_plan(goal);
+    REQUIRE(failed);
+    REQUIRE(failed.value().status == carto::agent::TaskStatus::blocked);
+
+    auto revised_step = ui.snapshot().agent_plan_draft.front();
+    revised_step.intent = "inset face 0.1";
+    REQUIRE(ui.revise_agent_plan_step(revised_step));
+    REQUIRE(!ui.repair_agent_plan(
+        "The invalid face index is corrected, subject to renewed human approval."));
+    REQUIRE(ui.answer_agent_clarification(
+        goal, "question-1", "I approve this corrected bounded inset on the same object."));
+    const auto repaired = ui.repair_agent_plan(
+        "The invalid face index is corrected, subject to renewed human approval.");
+    REQUIRE(repaired);
+    REQUIRE(repaired.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(repaired.value().clarifications.front().human_receipt.has_value());
+    REQUIRE(repaired.value().clarifications.front().freeform_answer ==
+        std::optional<std::string>(
+            "I approve this corrected bounded inset on the same object."));
+    REQUIRE(repaired.value().repairs.size() == 1U);
+    REQUIRE(source.snapshot().project_revision == before);
+}
+
 } // namespace
 
 int main() {
@@ -765,6 +999,8 @@ int main() {
         multi_step_branch_isolated_until_reviewed_acceptance();
         plan_dag_orders_dependencies_and_rejects_invalid_graphs();
         failed_dag_node_invalidates_only_dependent_steps();
+        bounded_repair_restarts_from_source_and_preserves_attempt_lineage();
+        repair_rejects_expansion_stale_source_empty_justification_and_exhaustion();
         saved_acceptance_is_one_durable_application_event();
         work_envelope_blocks_topology_effect_before_live_mutation();
         diff_digest_tracks_geometry_values_not_only_change_shape();
@@ -778,6 +1014,8 @@ int main() {
         acceptance_evidence_binds_validator_revision_assets_and_result();
         ui_workbench_captures_selection_and_exposes_accept_reject_flow();
         ui_clarification_requires_an_operator_answer_before_review();
+        ui_repairs_failed_step_with_operator_justification_and_scope_checks();
+        ui_repair_invalidates_plan_bound_human_receipts_until_reanswered();
         std::cout << "Cartographer agent workbench invariants passed\n";
         return 0;
     } catch (const std::exception& error) {
