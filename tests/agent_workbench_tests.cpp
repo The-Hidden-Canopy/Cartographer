@@ -605,6 +605,71 @@ void objective_hard_constraints_block_topology_and_excess_displacement() {
         std::string::npos);
 }
 
+void acceptance_evidence_binds_validator_revision_assets_and_result() {
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 1U);
+    const auto before = source.snapshot();
+    const auto asset_id = before.objects.front().object.mesh_asset;
+    REQUIRE(asset_id.has_value());
+
+    const auto run_with_intent = [&](std::string intent) {
+        auto plan = plan_for(before, objects, {
+            {"step-1", {objects[0], carto::geometry::FaceId{1U}}, std::move(intent)},
+        });
+        auto task = carto::agent::AgentTask::begin(
+            source, std::move(plan), envelope_for(objects));
+        REQUIRE(task);
+        const auto run = task.value().run();
+        REQUIRE(run);
+        REQUIRE(run.value().can_accept);
+        const auto gate = std::find_if(run.value().gates.begin(), run.value().gates.end(),
+            [](const auto& candidate) { return candidate.id == "project.valid"; });
+        REQUIRE(gate != run.value().gates.end());
+        REQUIRE(gate->passed);
+        REQUIRE(gate->validator_version == "cartographer.agent.acceptance.v1");
+        REQUIRE(gate->source_revision == before.project_revision);
+        REQUIRE(gate->evaluated_revision == run.value().speculative_revision);
+        REQUIRE(gate->result_digest == run.value().diff.digest);
+        REQUIRE(std::find(gate->affected_objects.begin(), gate->affected_objects.end(),
+            objects[0]) != gate->affected_objects.end());
+        REQUIRE(std::find(gate->affected_asset_ids.begin(), gate->affected_asset_ids.end(),
+            *asset_id) != gate->affected_asset_ids.end());
+        REQUIRE(gate->evidence_digest.hex().size() == 64U);
+        REQUIRE(!gate->diagnostic.has_value());
+        return gate->evidence_digest;
+    };
+
+    const auto shallow_evidence = run_with_intent("inset face 0.1");
+    const auto deep_evidence = run_with_intent("inset face 0.2");
+    REQUIRE(shallow_evidence != deep_evidence);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+
+    const auto vertex = before.viewport.scene.instances().front().mesh->vertex_ids.front();
+    auto constrained_plan = plan_for(before, objects, {
+        {"step-1", {objects[0], vertex}, "move vertex to 4 0 0"},
+    });
+    constrained_plan.objective.hard_constraints.push_back({
+        "bounded-displacement",
+        carto::agent::ObjectiveConstraintKind::maximum_vertex_displacement,
+        objects[0], 0.5, "Original vertices must remain within half a world unit."});
+    auto constrained_task = carto::agent::AgentTask::begin(
+        source, std::move(constrained_plan), envelope_for(objects));
+    REQUIRE(constrained_task);
+    const auto constrained_run = constrained_task.value().run();
+    REQUIRE(constrained_run);
+    const auto failed_gate = std::find_if(
+        constrained_run.value().gates.begin(), constrained_run.value().gates.end(),
+        [](const auto& candidate) { return candidate.id == "constraint.bounded-displacement"; });
+    REQUIRE(failed_gate != constrained_run.value().gates.end());
+    REQUIRE(!failed_gate->passed);
+    REQUIRE(failed_gate->diagnostic.has_value());
+    REQUIRE(failed_gate->diagnostic->message.find("could not be proven") != std::string::npos);
+    REQUIRE(failed_gate->source_revision == before.project_revision);
+    REQUIRE(failed_gate->result_digest == constrained_run.value().diff.digest);
+    REQUIRE(failed_gate->evidence_digest.hex().size() == 64U);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+}
+
 void ui_workbench_captures_selection_and_exposes_accept_reject_flow() {
     carto::application::ApplicationSession source;
     carto::ui::UiController ui(source);
@@ -710,6 +775,7 @@ int main() {
         clarification_frontier_blocks_consequential_ambiguity_and_binds_answers();
         clarification_receipt_rejects_changed_plan_graph();
         objective_hard_constraints_block_topology_and_excess_displacement();
+        acceptance_evidence_binds_validator_revision_assets_and_result();
         ui_workbench_captures_selection_and_exposes_accept_reject_flow();
         ui_clarification_requires_an_operator_answer_before_review();
         std::cout << "Cartographer agent workbench invariants passed\n";

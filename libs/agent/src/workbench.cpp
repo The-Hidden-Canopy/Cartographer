@@ -1175,32 +1175,139 @@ ProjectDiff AgentTask::build_diff() const {
 
 std::vector<AcceptanceGateResult> AgentTask::evaluate_gates() const {
     std::vector<AcceptanceGateResult> gates;
+    const ProjectDiff diff = build_diff();
+    const auto source_revision = base_document_.revision();
+    const auto evaluated_revision = speculative_->document_.revision();
+    constexpr std::string_view validator_version = "cartographer.agent.acceptance.v1";
+
+    std::vector<scene::ObjectId> all_affected_objects;
+    std::vector<std::uint64_t> all_affected_assets;
+    for (const auto& change : diff.objects) all_affected_objects.push_back(change.id);
+    for (const auto& step : plan_.steps) all_affected_objects.push_back(step.target.object);
+    for (const auto& mesh : diff.meshes) all_affected_assets.push_back(mesh.asset_id);
+    for (const auto& step : plan_.steps) {
+        const auto* object = base_document_.scene().find(step.target.object);
+        if (object != nullptr && object->mesh_asset.has_value()) {
+            all_affected_assets.push_back(*object->mesh_asset);
+        }
+    }
+    std::sort(all_affected_objects.begin(), all_affected_objects.end());
+    all_affected_objects.erase(
+        std::unique(all_affected_objects.begin(), all_affected_objects.end()),
+        all_affected_objects.end());
+    std::sort(all_affected_assets.begin(), all_affected_assets.end());
+    all_affected_assets.erase(
+        std::unique(all_affected_assets.begin(), all_affected_assets.end()),
+        all_affected_assets.end());
+
+    const auto make_gate = [&](
+        std::string id,
+        bool passed,
+        std::string evidence,
+        std::vector<scene::ObjectId> affected_objects,
+        std::vector<std::uint64_t> affected_assets,
+        std::optional<core::Diagnostic> diagnostic = std::nullopt) {
+        std::sort(affected_objects.begin(), affected_objects.end());
+        affected_objects.erase(
+            std::unique(affected_objects.begin(), affected_objects.end()),
+            affected_objects.end());
+        std::sort(affected_assets.begin(), affected_assets.end());
+        affected_assets.erase(
+            std::unique(affected_assets.begin(), affected_assets.end()),
+            affected_assets.end());
+        const assets::Sha256Digest result_digest = diff.digest;
+        evidence += " [result=" + result_digest.hex() + "]";
+
+        std::string canonical = "cartographer.acceptance-evidence.v1|";
+        append_field(canonical, id);
+        append_field(canonical, validator_version);
+        append_number(canonical, source_revision.value());
+        append_number(canonical, evaluated_revision.value());
+        append_number(canonical, passed ? 1U : 0U);
+        append_field(canonical, evidence);
+        append_field(canonical, result_digest.hex());
+        append_number(canonical, affected_objects.size());
+        for (const auto object : affected_objects) append_number(canonical, object.value);
+        append_number(canonical, affected_assets.size());
+        for (const auto asset_id : affected_assets) append_number(canonical, asset_id);
+        append_number(canonical, diagnostic.has_value() ? 1U : 0U);
+        if (diagnostic.has_value()) {
+            append_number(canonical, static_cast<std::uint64_t>(diagnostic->code));
+            append_field(canonical, diagnostic->message);
+            append_number(canonical, diagnostic->context.size());
+            for (const auto& context : diagnostic->context) append_field(canonical, context);
+        }
+
+        AcceptanceGateResult gate;
+        gate.id = std::move(id);
+        gate.passed = passed;
+        gate.evidence = std::move(evidence);
+        gate.validator_version = validator_version;
+        gate.source_revision = source_revision;
+        gate.evaluated_revision = evaluated_revision;
+        gate.affected_objects = std::move(affected_objects);
+        gate.affected_asset_ids = std::move(affected_assets);
+        gate.result_digest = result_digest;
+        gate.evidence_digest = digest_text(canonical);
+        gate.diagnostic = std::move(diagnostic);
+        return gate;
+    };
+
     const auto project_validation = speculative_->document_.validate();
-    gates.push_back(AcceptanceGateResult{
-        "project.valid", true, static_cast<bool>(project_validation),
+    gates.push_back(make_gate(
+        "project.valid", static_cast<bool>(project_validation),
         project_validation ? "shadow ProjectDocument validation passed"
-                           : project_validation.error().message});
+                           : project_validation.error().message,
+        all_affected_objects, all_affected_assets,
+        project_validation ? std::nullopt
+                           : std::optional<core::Diagnostic>(project_validation.error())));
     const auto viewport = speculative_->snapshot().viewport;
-    gates.push_back(AcceptanceGateResult{
-        "viewport.compiles", true, !viewport.error.has_value(),
-        viewport.error ? viewport.error->message : "shadow viewport compiled"});
+    gates.push_back(make_gate(
+        "viewport.compiles", !viewport.error.has_value(),
+        viewport.error ? viewport.error->message : "shadow viewport compiled",
+        all_affected_objects, all_affected_assets, viewport.error));
     const bool all_steps_passed = receipts_.size() == plan_.steps.size() &&
         std::all_of(receipts_.begin(), receipts_.end(), [](const StepReceipt& receipt) {
             return receipt.status == StepStatus::passed;
         });
-    gates.push_back(AcceptanceGateResult{
-        "plan.steps", true, all_steps_passed,
+    std::optional<core::Diagnostic> step_diagnostic;
+    if (!all_steps_passed) {
+        const auto failed = std::find_if(receipts_.begin(), receipts_.end(),
+            [](const StepReceipt& receipt) {
+                return receipt.status != StepStatus::passed;
+            });
+        if (failed != receipts_.end() && failed->diagnostic.has_value()) {
+            step_diagnostic = failed->diagnostic;
+        } else {
+            step_diagnostic = invalid_state("one or more native plan steps did not pass");
+        }
+    }
+    gates.push_back(make_gate(
+        "plan.steps", all_steps_passed,
         std::to_string(receipts_.size()) + " of " + std::to_string(plan_.steps.size()) +
-            " native steps passed"});
-    const ProjectDiff diff = build_diff();
+            " native steps passed",
+        all_affected_objects, all_affected_assets, std::move(step_diagnostic)));
     const bool changed = diff.changed_object_count() != 0U ||
         diff.changed_mesh_count() != 0U || diff.engineering_changed || diff.condition_changed;
-    gates.push_back(AcceptanceGateResult{
-        "diff.non_empty", true, changed,
-        changed ? "structured source diff contains changes" : "no source changes were produced"});
+    gates.push_back(make_gate(
+        "diff.non_empty", changed,
+        changed ? "structured source diff contains changes" : "no source changes were produced",
+        all_affected_objects, all_affected_assets,
+        changed ? std::nullopt : std::optional<core::Diagnostic>(
+            invalid_state("agent plan produced no source changes"))));
     for (const auto& constraint : plan_.objective.hard_constraints) {
         bool passed = true;
         std::string evidence;
+        std::vector<scene::ObjectId> constraint_objects = all_affected_objects;
+        std::vector<std::uint64_t> constraint_assets = all_affected_assets;
+        if (constraint.object.has_value()) {
+            constraint_objects = {*constraint.object};
+            const auto* object = base_document_.scene().find(*constraint.object);
+            constraint_assets.clear();
+            if (object != nullptr && object->mesh_asset.has_value()) {
+                constraint_assets.push_back(*object->mesh_asset);
+            }
+        }
         if (constraint.kind == ObjectiveConstraintKind::preserve_topology) {
             for (const auto& mesh : diff.meshes) {
                 if (constraint.object.has_value()) {
@@ -1287,8 +1394,13 @@ std::vector<AcceptanceGateResult> AgentTask::evaluate_gates() const {
                 evidence += "; complete correspondence unavailable or measurement budget exceeded";
             }
         }
-        gates.push_back(AcceptanceGateResult{
-            "constraint." + constraint.id, true, passed, std::move(evidence)});
+        auto constraint_diagnostic = passed ? std::nullopt :
+            std::optional<core::Diagnostic>(invalid_state(
+                "hard constraint " + constraint.id + " could not be proven"));
+        gates.push_back(make_gate(
+            "constraint." + constraint.id, passed, std::move(evidence),
+            std::move(constraint_objects), std::move(constraint_assets),
+            std::move(constraint_diagnostic)));
     }
     return gates;
 }

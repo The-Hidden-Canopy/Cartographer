@@ -213,6 +213,14 @@ struct AcceptanceGateResult {
     bool required = true;
     bool passed = false;
     std::string evidence;
+    std::string validator_version;
+    core::Revision source_revision;
+    core::Revision evaluated_revision;
+    std::vector<scene::ObjectId> affected_objects;
+    std::vector<std::uint64_t> affected_asset_ids;
+    assets::Sha256Digest result_digest;
+    assets::Sha256Digest evidence_digest;
+    std::optional<core::Diagnostic> diagnostic;
 };
 
 struct ObjectChange {
