@@ -614,8 +614,7 @@ core::Result<std::vector<HardConstraint>> compile_explicit_hard_constraints(
     }
     if (has_uncompiled_restriction(tokens, consumed)) {
         return core::Result<std::vector<HardConstraint>>::failure(invalid(
-            "objective contains a restriction that this compiler cannot enforce; "
-            "add a structured hard constraint before running the plan"));
+            "objective contains a restriction this compiler cannot enforce; revise the goal"));
     }
 
     std::vector<HardConstraint> constraints;

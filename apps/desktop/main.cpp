@@ -6619,6 +6619,24 @@ struct DesktopState {
         if (ImGui::InputText("Goal", goal.data(), goal.size())) {
             agent_goal.assign(goal.data());
         }
+        const auto compiled_goal_constraints =
+            carto::agent::compile_explicit_hard_constraints(agent_goal);
+        const bool objective_constraints_valid =
+            agent_goal.empty() || static_cast<bool>(compiled_goal_constraints);
+        const bool goal_preserves_topology = compiled_goal_constraints && std::any_of(
+            compiled_goal_constraints.value().begin(), compiled_goal_constraints.value().end(),
+            [](const auto& constraint) {
+                return constraint.kind ==
+                    carto::agent::ObjectiveConstraintKind::preserve_topology;
+            });
+        if (!agent_goal.empty() && !compiled_goal_constraints) {
+            ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                "Goal restriction is not enforceable: %s",
+                compiled_goal_constraints.error().message.c_str());
+        } else if (goal_preserves_topology) {
+            ImGui::TextDisabled(
+                "Goal-derived hard limit: topology must remain unchanged.");
+        }
         const auto& agent_recipes = carto::agent::agent_recipe_catalog();
         std::vector<std::string> recipe_labels{"No recipe"};
         recipe_labels.reserve(agent_recipes.size() + 1U);
@@ -6825,7 +6843,7 @@ struct DesktopState {
                     return constraint.kind == kind;
                 });
         };
-        bool preserve_topology = has_constraint(
+        bool preserve_topology = goal_preserves_topology || has_constraint(
             carto::agent::ObjectiveConstraintKind::preserve_topology);
         bool preserve_transform = has_constraint(
             carto::agent::ObjectiveConstraintKind::preserve_transform);
@@ -6852,8 +6870,10 @@ struct DesktopState {
         bool constraints_changed = false;
         ImGui::BeginDisabled(task_active || snapshot.agent_checkpoint_loaded ||
             snapshot.agent_plan_draft.empty());
+        ImGui::BeginDisabled(goal_preserves_topology);
         constraints_changed |= ImGui::Checkbox(
             "Preserve topology", &preserve_topology);
+        ImGui::EndDisabled();
         constraints_changed |= ImGui::Checkbox(
             "Preserve object transforms", &preserve_transform);
         ImGui::BeginDisabled(!has_mesh_target);
@@ -6876,7 +6896,7 @@ struct DesktopState {
                     constraint.id.starts_with("ui.preserve-transform.") ||
                     constraint.id.starts_with("ui.vertex-displacement.");
             });
-            if (preserve_topology) {
+            if (preserve_topology && !goal_preserves_topology) {
                 constraints.push_back({
                     "ui.preserve-topology",
                     carto::agent::ObjectiveConstraintKind::preserve_topology,
@@ -6936,7 +6956,8 @@ struct DesktopState {
         }
         ImGui::BeginDisabled(task_present || snapshot.agent_checkpoint_loaded ||
             snapshot.agent_plan_draft.empty() ||
-            agent_goal.empty() || !clarifications_answered);
+            agent_goal.empty() || !clarifications_answered ||
+            !objective_constraints_valid);
         if (ImGui::Button("Run speculative plan", ImVec2(-1, 30))) {
             std::optional<carto::agent::AgentWorkEnvelope> requested_envelope;
             if (agent_allow_root_translation) {
