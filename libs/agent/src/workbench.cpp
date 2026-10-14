@@ -701,7 +701,8 @@ core::Result<void> AgentWorkEnvelope::validate() const {
         max_objects_touched == 0U || max_objects_touched > kMaxScopeObjects) {
         return core::Result<void>::failure(invalid("work envelope budget is invalid"));
     }
-    if (max_repair_attempts > kMaxRepairAttempts ||
+    if (max_topology_operations > 1'000'000U ||
+        max_repair_attempts > kMaxRepairAttempts ||
         max_additional_operations > kMaxPlanSteps) {
         return core::Result<void>::failure(invalid(
             "work envelope repair budget exceeds its supported bound"));
@@ -836,6 +837,8 @@ core::Result<AgentTask> AgentTask::repair(
         (envelope.permitted_effects & ~failed_attempt.envelope_.permitted_effects) != 0U ||
         envelope.max_commands > failed_attempt.envelope_.max_commands ||
         envelope.max_objects_touched > failed_attempt.envelope_.max_objects_touched ||
+        envelope.max_topology_operations >
+            failed_attempt.envelope_.max_topology_operations ||
         envelope.max_scene_queries > failed_attempt.envelope_.max_scene_queries ||
         envelope.max_objects_examined > failed_attempt.envelope_.max_objects_examined ||
         envelope.max_topology_elements_examined >
@@ -1464,6 +1467,32 @@ std::vector<AcceptanceGateResult> AgentTask::evaluate_gates() const {
         all_affected_objects, all_affected_assets,
         changed ? std::nullopt : std::optional<core::Diagnostic>(
             invalid_state("agent plan produced no source changes"))));
+    std::size_t topology_operations = 0U;
+    const auto add_topology_operation = [&topology_operations](std::size_t count) {
+        const std::size_t max_value = std::numeric_limits<std::size_t>::max();
+        topology_operations = count > max_value - topology_operations
+            ? max_value : topology_operations + count;
+    };
+    for (const auto& mesh : diff.meshes) {
+        if (mesh.added || mesh.removed) add_topology_operation(1U);
+        for (const auto& vertex : mesh.vertices) {
+            if (vertex.added || vertex.removed) add_topology_operation(1U);
+        }
+        for (const auto& face : mesh.faces) {
+            if (face.added || face.removed || face.connectivity_changed) {
+                add_topology_operation(1U);
+            }
+        }
+    }
+    const bool topology_budget_passed =
+        topology_operations <= envelope_.max_topology_operations;
+    gates.push_back(make_gate(
+        "envelope.topology_operations", topology_budget_passed,
+        std::to_string(topology_operations) + " topology operations / " +
+            std::to_string(envelope_.max_topology_operations) + " permitted",
+        all_affected_objects, all_affected_assets,
+        topology_budget_passed ? std::nullopt : std::optional<core::Diagnostic>(
+            policy("agent result exceeds the work envelope topology-operation budget"))));
     for (const auto& constraint : plan_.objective.hard_constraints) {
         bool passed = true;
         std::string evidence;

@@ -63,6 +63,7 @@
 - Repair requires a non-empty operator justification, a new task identity, and a changed step/dependency graph.
 - The objective question context, object scope, hard constraints, protected objects, and permitted effects cannot be expanded or weakened.
 - Every numeric work/query/retry limit stays the same or narrows; additional operations and repair attempts are bounded across the chain.
+- Topology churn counts added/removed mesh assets, vertices, faces, and face connectivity changes; exceeding its envelope blocks acceptance with a bound diagnostic.
 - A repaired task starts from the original source state, not the failed speculative branch, and preserves earlier step receipts, failed gate results, and evidence digests.
 - Editing a step invalidates plan-bound human clarification receipts; execution remains blocked until the operator answers again for the revised plan.
 - The repaired happy path can pass gates and still requires the existing explicit source-acceptance boundary.

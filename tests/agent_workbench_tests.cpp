@@ -329,6 +329,34 @@ void repair_rejects_expansion_stale_source_empty_justification_and_exhaustion() 
     REQUIRE(!effect_repair);
     REQUIRE(effect_repair.error().message.find("cannot expand") != std::string::npos);
 
+    carto::application::ApplicationSession topology_source;
+    const auto topology_objects = create_boxes(topology_source, 1U);
+    auto topology_envelope = envelope_for(topology_objects);
+    topology_envelope.max_topology_operations = 0U;
+    auto topology_plan = plan_for(topology_source.snapshot(), topology_objects, {
+        {"step-1", {topology_objects.front(), carto::geometry::FaceId{1U}},
+            "inset face 0.1"},
+    });
+    auto topology_attempt = carto::agent::AgentTask::begin(
+        topology_source, std::move(topology_plan), topology_envelope);
+    REQUIRE(topology_attempt);
+    const auto topology_run = topology_attempt.value().run();
+    REQUIRE(topology_run);
+    REQUIRE(topology_run.value().status == carto::agent::TaskStatus::blocked);
+    auto topology_repair_plan = plan_for(topology_source.snapshot(), topology_objects, {
+        {"step-1", {topology_objects.front(), carto::geometry::FaceId{1U}},
+            "inset face 0.2"},
+    });
+    topology_repair_plan.id = "agent-task-topology-expansion";
+    auto expanded_topology_envelope = topology_envelope;
+    expanded_topology_envelope.max_topology_operations = 1U;
+    const auto topology_repair = carto::agent::AgentTask::repair(
+        topology_source, topology_attempt.value(), std::move(topology_repair_plan),
+        expanded_topology_envelope,
+        "Request additional topology operations to pass the failed gate.");
+    REQUIRE(!topology_repair);
+    REQUIRE(topology_repair.error().message.find("cannot expand") != std::string::npos);
+
     carto::application::ApplicationSession no_retry_source;
     const auto no_retry_objects = create_boxes(no_retry_source, 1U);
     auto no_retry_envelope = envelope_for(no_retry_objects);
@@ -414,6 +442,38 @@ void work_envelope_blocks_topology_effect_before_live_mutation() {
     REQUIRE(run.value().steps.front().diagnostic->message.find(
         "outside the native ontology") != std::string::npos);
     REQUIRE(source.snapshot().project_revision == before.project_revision);
+}
+
+void work_envelope_blocks_topology_churn_over_budget() {
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 1U);
+    const auto before = source.snapshot();
+    auto plan = plan_for(before, objects, {
+        {"step-1", {objects[0], carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    auto envelope = envelope_for(objects);
+    envelope.max_topology_operations = 0U;
+    auto task = carto::agent::AgentTask::begin(source, std::move(plan), envelope);
+    REQUIRE(task);
+    const auto run = task.value().run();
+    REQUIRE(run);
+    REQUIRE(run.value().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(!run.value().can_accept);
+    const auto topology_gate = std::find_if(
+        run.value().gates.begin(), run.value().gates.end(), [](const auto& gate) {
+            return gate.id == "envelope.topology_operations";
+        });
+    REQUIRE(topology_gate != run.value().gates.end());
+    REQUIRE(!topology_gate->passed);
+    REQUIRE(topology_gate->evidence.find("/ 0 permitted") != std::string::npos);
+    REQUIRE(topology_gate->diagnostic.has_value());
+    REQUIRE(topology_gate->diagnostic->message.find("topology-operation budget") !=
+        std::string::npos);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+
+    auto invalid_budget = envelope_for(objects);
+    invalid_budget.max_topology_operations = 1'000'001U;
+    REQUIRE(!invalid_budget.validate());
 }
 
 void diff_digest_tracks_geometry_values_not_only_change_shape() {
@@ -1003,6 +1063,7 @@ int main() {
         repair_rejects_expansion_stale_source_empty_justification_and_exhaustion();
         saved_acceptance_is_one_durable_application_event();
         work_envelope_blocks_topology_effect_before_live_mutation();
+        work_envelope_blocks_topology_churn_over_budget();
         diff_digest_tracks_geometry_values_not_only_change_shape();
         shared_mesh_instances_must_be_in_scope_and_within_touch_budget();
         scope_protection_and_stale_revision_fail_closed();

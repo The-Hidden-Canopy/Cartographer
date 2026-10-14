@@ -172,6 +172,7 @@ struct AgentWorkEnvelope {
         ::carto::agent::effect_mask(Effect::topology);
     std::size_t max_commands = 16U;
     std::size_t max_objects_touched = 16U;
+    std::size_t max_topology_operations = 16384U;
     std::size_t max_scene_queries = 64U;
     std::size_t max_objects_examined = 4096U;
     std::size_t max_topology_elements_examined = 16384U;
