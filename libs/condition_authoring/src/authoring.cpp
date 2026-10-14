@@ -1,6 +1,7 @@
 #include <carto/condition/authoring.hpp>
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <iomanip>
@@ -61,6 +62,19 @@ bool safe_namespace(std::string_view value) {
             return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
                 (byte >= '0' && byte <= '9') || byte == '.' || byte == '_' || byte == '-';
         });
+}
+
+bool safe_field_identity(std::string_view value) {
+    return !value.empty() && value.size() <= 128U && value != "." && value != ".." &&
+        std::all_of(value.begin(), value.end(), [](unsigned char byte) {
+            return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+                (byte >= '0' && byte <= '9') || byte == '.' || byte == '_' || byte == '-';
+        });
+}
+
+bool finite_bounded_vec(core::Vec3d value, double limit) {
+    return value.finite() && std::abs(value.x) <= limit &&
+        std::abs(value.y) <= limit && std::abs(value.z) <= limit;
 }
 
 assets::Sha256Digest digest_text(std::string_view text) {
@@ -359,6 +373,90 @@ std::string_view anchor_kind_name(AnchorKind value) noexcept {
     return "unknown";
 }
 
+std::string_view audio_bus_class_name(AudioBusClass value) noexcept {
+    switch (value) {
+    case AudioBusClass::ambient: return "ambient";
+    case AudioBusClass::machinery: return "machinery";
+    case AudioBusClass::vehicle: return "vehicle";
+    case AudioBusClass::radio: return "radio";
+    case AudioBusClass::speech: return "speech";
+    case AudioBusClass::music: return "music";
+    case AudioBusClass::effects: return "effects";
+    }
+    return "unknown";
+}
+
+std::string_view audio_occlusion_intent_name(AudioOcclusionIntent value) noexcept {
+    switch (value) {
+    case AudioOcclusionIntent::none: return "none";
+    case AudioOcclusionIntent::static_geometry: return "static-geometry";
+    case AudioOcclusionIntent::authored_geometry: return "authored-geometry";
+    }
+    return "unknown";
+}
+
+std::string_view acoustic_zone_shape_name(AcousticZoneShape value) noexcept {
+    switch (value) {
+    case AcousticZoneShape::box: return "box";
+    case AcousticZoneShape::sphere: return "sphere";
+    }
+    return "unknown";
+}
+
+std::string_view effect_emission_shape_name(EffectEmissionShape value) noexcept {
+    switch (value) {
+    case EffectEmissionShape::point: return "point";
+    case EffectEmissionShape::box: return "box";
+    case EffectEmissionShape::sphere: return "sphere";
+    }
+    return "unknown";
+}
+
+std::string_view effect_intent_class_name(EffectIntentClass value) noexcept {
+    switch (value) {
+    case EffectIntentClass::physical_state: return "physical-state";
+    case EffectIntentClass::presentation_only: return "presentation-only";
+    }
+    return "unknown";
+}
+
+std::string_view effect_influence_kind_name(EffectInfluenceKind value) noexcept {
+    switch (value) {
+    case EffectInfluenceKind::wind: return "wind";
+    case EffectInfluenceKind::thermal_lift: return "thermal-lift";
+    case EffectInfluenceKind::drainage: return "drainage";
+    case EffectInfluenceKind::avoidance: return "avoidance";
+    case EffectInfluenceKind::turbulence: return "turbulence";
+    }
+    return "unknown";
+}
+
+std::string_view state_target_kind_name(StateTargetKind value) noexcept {
+    switch (value) {
+    case StateTargetKind::safe_place_profile: return "safe-place-profile";
+    case StateTargetKind::surface_state: return "surface-state";
+    }
+    return "unknown";
+}
+
+std::string_view state_property_name(StateProperty value) noexcept {
+    switch (value) {
+    case StateProperty::privacy: return "privacy";
+    case StateProperty::human_proximity: return "human-proximity";
+    case StateProperty::controllable_entries: return "controllable-entries";
+    case StateProperty::supply_access: return "supply-access";
+    case StateProperty::ambient_noise: return "ambient-noise";
+    case StateProperty::visibility_outward: return "visibility-outward";
+    case StateProperty::visibility_inward: return "visibility-inward";
+    case StateProperty::isolation: return "isolation";
+    case StateProperty::occupancy: return "occupancy";
+    case StateProperty::maintenance: return "maintenance";
+    case StateProperty::damage: return "damage";
+    case StateProperty::wetness: return "wetness";
+    }
+    return "unknown";
+}
+
 core::Result<void> SourceEvidence::validate() const {
     if (id == 0U || !valid_enum(kind, source_kind_name) || !safe_text(label, 256U) ||
         !safe_locator(logical_locator) || !safe_text(revision, 128U) || digest.is_zero() ||
@@ -490,6 +588,218 @@ core::Result<void> InteractionAnchor::validate() const {
     return core::Result<void>::success();
 }
 
+core::Result<void> AuthoredAudioSource::validate() const {
+    if (id == 0U || asset_id == 0U || clip_source_id == 0U ||
+        !local_transform.finite() || !finite_positive_vec(local_transform.scale) ||
+        !finite_between(gain, 0.0, 4.0) || !finite_between(pitch, 0.25, 4.0) ||
+        !finite_between(minimum_distance, 0.0, 1.0e6) ||
+        !finite_between(maximum_distance, minimum_distance, 1.0e6) ||
+        maximum_distance <= minimum_distance ||
+        !valid_enum(bus, audio_bus_class_name) ||
+        !valid_enum(occlusion, audio_occlusion_intent_name) ||
+        !finite_between(reverb_send, 0.0, 1.0) ||
+        !safe_text(normal_operating_state, 128U) ||
+        !safe_text(familiarity_role, 128U, true)) {
+        return core::Result<void>::failure(validation(
+            "authored audio source identity, transform, clip, or bounded controls are invalid"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> AuthoredAcousticZone::validate() const {
+    if (id == 0U || asset_id == 0U || !valid_enum(shape, acoustic_zone_shape_name) ||
+        !local_transform.finite() || !finite_positive_vec(local_transform.scale) ||
+        !safe_text(acoustic_class, 128U) ||
+        !finite_between(gain_modifier, 0.0, 4.0) ||
+        !safe_text(reverb_intent, 128U, true) ||
+        !safe_text(semantic_region, 256U)) {
+        return core::Result<void>::failure(validation(
+            "authored acoustic-zone identity, transform, or bounded intent is invalid"));
+    }
+    if (shape == AcousticZoneShape::box &&
+        (!finite_positive_vec(half_extents) || radius != 0.0)) {
+        return core::Result<void>::failure(validation(
+            "box acoustic zone requires positive half-extents and a zero sphere radius"));
+    }
+    if (shape == AcousticZoneShape::sphere &&
+        (!finite_between(radius, 0.0, 1.0e6) || radius <= 0.0 ||
+         half_extents.x != 0.0 || half_extents.y != 0.0 || half_extents.z != 0.0)) {
+        return core::Result<void>::failure(validation(
+            "sphere acoustic zone requires a positive radius and zero box extents"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> EffectSource::validate() const {
+    if (id == 0U || asset_id == 0U || !safe_text(semantic_owner, 256U) ||
+        !valid_enum(shape, effect_emission_shape_name) ||
+        !valid_enum(intent_class, effect_intent_class_name) ||
+        !local_transform.finite() || !finite_positive_vec(local_transform.scale) ||
+        !safe_text(normal_operating_state, 128U) ||
+        !safe_text(disabled_operating_state, 128U) ||
+        normal_operating_state == disabled_operating_state) {
+        return core::Result<void>::failure(validation(
+            "effect source identity, owner, transform, or state intent is invalid"));
+    }
+    if (shape == EffectEmissionShape::point &&
+        (!finite_bounded_vec(half_extents, 0.0) || radius != 0.0)) {
+        return core::Result<void>::failure(validation(
+            "point effect source requires zero volume parameters"));
+    }
+    if (shape == EffectEmissionShape::box &&
+        (!finite_positive_vec(half_extents) || radius != 0.0)) {
+        return core::Result<void>::failure(validation(
+            "box effect source requires positive half-extents and zero radius"));
+    }
+    if (shape == EffectEmissionShape::sphere &&
+        (!finite_between(radius, 0.0, 1.0e6) || radius <= 0.0 ||
+         !finite_bounded_vec(half_extents, 0.0))) {
+        return core::Result<void>::failure(validation(
+            "sphere effect source requires positive radius and zero half-extents"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> ParticleEmitterSource::validate() const {
+    if (id == 0U || effect_source_id == 0U ||
+        !finite_between(emission_rate_per_second, 0.0, 5000.0) ||
+        !finite_between(particle_lifetime_seconds, 0.001, 600.0) ||
+        !finite_between(start_seconds, 0.0, 600.0) ||
+        !finite_between(duration_seconds, 0.0, 600.0) ||
+        burst_count > 2048U || !finite_between(burst_time_seconds, 0.0, 600.0) ||
+        !finite_bounded_vec(initial_velocity, 1.0e6) ||
+        !finite_bounded_vec(velocity_spread, 1.0e6) ||
+        velocity_spread.x < 0.0 || velocity_spread.y < 0.0 || velocity_spread.z < 0.0 ||
+        !finite_bounded_vec(acceleration, 1.0e6) ||
+        !finite_between(fixed_timestep_seconds, 1.0 / 240.0, 1.0 / 15.0) ||
+        total_particle_bound == 0U || total_particle_bound > 2048U ||
+        start_seconds + duration_seconds > 600.0 ||
+        (burst_count > 0U && (duration_seconds == 0.0 ||
+            burst_time_seconds < start_seconds ||
+            burst_time_seconds > start_seconds + duration_seconds)) ||
+        (emission_rate_per_second == 0.0 && burst_count == 0U)) {
+        return core::Result<void>::failure(validation(
+            "particle emitter rate, timing, vectors, or particle bound is invalid"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> FieldInfluenceBinding::validate() const {
+    const double direction_length = direction.length();
+    if (id == 0U || effect_source_id == 0U ||
+        !valid_enum(kind, effect_influence_kind_name) ||
+        !safe_field_identity(field_identity) || expected_field_revision.value() == 0U ||
+        expected_field_revision.exhausted() || expected_field_digest.is_zero() ||
+        !direction.finite() || !finite_between(direction_length, 0.999, 1.001) ||
+        !finite_between(strength, -10000.0, 10000.0)) {
+        return core::Result<void>::failure(validation(
+            "effect field binding identity, provenance, direction, or strength is invalid"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> FieldSourceBinding::validate() const {
+    if (!safe_field_identity(field_identity) || expected_field_revision.value() == 0U ||
+        expected_field_revision.exhausted() || expected_field_digest.is_zero()) {
+        return core::Result<void>::failure(validation(
+            "vegetation field binding requires exact field identity, revision, and digest"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> VegetationScatterRecipe::validate() const {
+    if (id == 0U || species_asset_id == 0U ||
+        !moisture.validate() || !shade.validate() || !disturbance.validate() ||
+        !suitability.validate() || !elevation.validate() ||
+        !finite_between(cell_spacing, 0.1, 1024.0) ||
+        !finite_between(density_per_square_meter, 0.0, 10.0) ||
+        !finite_between(minimum_suitability, 0.0, 1.0) ||
+        !finite_between(minimum_scale, 0.1, 100.0) ||
+        !finite_between(maximum_scale, minimum_scale, 100.0) ||
+        maximum_instances == 0U || maximum_instances > 8192U) {
+        return core::Result<void>::failure(validation(
+            "vegetation scatter recipe has invalid identity, field evidence, or bounded placement controls"));
+    }
+    const std::array<std::string_view, 5> identities{
+        moisture.field_identity, shade.field_identity, disturbance.field_identity,
+        suitability.field_identity, elevation.field_identity};
+    for (std::size_t index = 0U; index < identities.size(); ++index) {
+        if (std::find(identities.begin(), identities.begin() +
+                static_cast<std::ptrdiff_t>(index), identities[index]) !=
+            identities.begin() + static_cast<std::ptrdiff_t>(index)) {
+            return core::Result<void>::failure(validation(
+                "vegetation scatter semantic inputs must use distinct source fields"));
+        }
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> AuthoredStateDelta::validate() const {
+    if (id == 0U || target_record_id == 0U || target_asset_id == 0U ||
+        !valid_enum(target_kind, state_target_kind_name) ||
+        !valid_enum(property, state_property_name)) {
+        return core::Result<void>::failure(validation(
+            "authored state delta identity or property is invalid"));
+    }
+    const bool safe_place_property = property >= StateProperty::privacy &&
+        property <= StateProperty::isolation;
+    const bool surface_property = property >= StateProperty::occupancy &&
+        property <= StateProperty::wetness;
+    if ((target_kind == StateTargetKind::safe_place_profile && !safe_place_property) ||
+        (target_kind == StateTargetKind::surface_state && !surface_property)) {
+        return core::Result<void>::failure(validation(
+            "authored state property does not match its target record kind"));
+    }
+    const auto validate_value = [this](const StateValue& value) {
+        if (property <= StateProperty::isolation || property == StateProperty::wetness) {
+            return finite_between(value.numeric_value, 0.0, 1.0) && value.text_value.empty();
+        }
+        if (value.numeric_value != 0.0) return false;
+        if (property == StateProperty::occupancy) {
+            return value.text_value == "empty" || value.text_value == "recently-used" ||
+                value.text_value == "actively-occupied" ||
+                value.text_value == "long-term-occupied" || value.text_value == "abandoned";
+        }
+        if (property == StateProperty::maintenance) {
+            return value.text_value == "maintained" || value.text_value == "aging" ||
+                value.text_value == "neglected" || value.text_value == "improvised-repair" ||
+                value.text_value == "partially-renovated" || value.text_value == "condemned";
+        }
+        return value.text_value == "intact" || value.text_value == "broken-window" ||
+            value.text_value == "damaged-door" || value.text_value == "dented-sign" ||
+            value.text_value == "collapsed-shelf" || value.text_value == "cracked-wall" ||
+            value.text_value == "damaged-railing" || value.text_value == "roof-damage" ||
+            value.text_value == "collision-damage" || value.text_value == "burned";
+    };
+    if (!validate_value(before) || !validate_value(after) ||
+        (before.numeric_value == after.numeric_value &&
+         before.text_value == after.text_value)) {
+        return core::Result<void>::failure(validation(
+            "authored state delta values are invalid or do not change the source state"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> AuthoredStateBranch::validate() const {
+    if (id == 0U || parent_branch_id == id || !safe_text(name, 128U) ||
+        !safe_text(applicability, 256U, true) ||
+        deltas.size() > AuthoringDocument::kMaxStateDeltasPerBranch) {
+        return core::Result<void>::failure(validation(
+            "authored state branch identity, applicability, or delta count is invalid"));
+    }
+    std::set<Id> delta_ids;
+    std::set<std::pair<Id, StateProperty>> targets;
+    for (const auto& delta : deltas) {
+        if (auto result = delta.validate(); !result) return result;
+        if (!delta_ids.insert(delta.id).second ||
+            !targets.emplace(delta.target_record_id, delta.property).second) {
+            return core::Result<void>::failure(validation(
+                "authored state branch contains duplicate delta identity or target property"));
+        }
+    }
+    return core::Result<void>::success();
+}
+
 core::Result<void> CollectionRecord::validate() const {
     if (id == 0U || !safe_text(name, 256U) || !sorted_unique_ids(asset_ids) ||
         !sorted_unique_ids(child_collection_ids) || child_collection_ids.size() > 4096U ||
@@ -550,6 +860,32 @@ core::Result<void> AuthoringDocument::validate() const {
     if (auto result = validate_count(collections.size(), "condition collections"); !result) return result;
     if (auto result = validate_count(prefabs.size(), "condition prefabs"); !result) return result;
     if (auto result = validate_count(region_kits.size(), "condition region kits"); !result) return result;
+    if (auto result = validate_count(audio_sources.size(), "condition audio sources"); !result) return result;
+    if (auto result = validate_count(acoustic_zones.size(), "condition acoustic zones"); !result) return result;
+    if (auto result = validate_count(effect_sources.size(), "condition effect sources"); !result) return result;
+    if (auto result = validate_count(particle_emitters.size(), "condition particle emitters"); !result) return result;
+    if (auto result = validate_count(field_influences.size(), "condition effect field influences"); !result) return result;
+    if (auto result = validate_count(vegetation_scatters.size(), "condition vegetation scatter recipes"); !result) return result;
+    if (auto result = validate_count(state_branches.size(), "condition authored state branches"); !result) return result;
+    if (audio_sources.size() > kMaxAudioRecordsPerKind ||
+        acoustic_zones.size() > kMaxAudioRecordsPerKind) {
+        return core::Result<void>::failure(validation(
+            "condition audio sources or acoustic zones exceed the bounded record limit"));
+    }
+    if (effect_sources.size() > kMaxEffectRecordsPerKind ||
+        particle_emitters.size() > kMaxEffectRecordsPerKind ||
+        field_influences.size() > kMaxEffectRecordsPerKind) {
+        return core::Result<void>::failure(validation(
+            "condition effects exceed the bounded record limit"));
+    }
+    if (vegetation_scatters.size() > kMaxVegetationRecipes) {
+        return core::Result<void>::failure(validation(
+            "condition vegetation scatter recipes exceed the bounded record limit"));
+    }
+    if (state_branches.size() > kMaxStateBranches) {
+        return core::Result<void>::failure(validation(
+            "condition authored state branches exceed the bounded record limit"));
+    }
 
     if (auto result = validate_record_vector(sources, "condition source evidence"); !result) return result;
     if (auto result = validate_record_vector(assets, "condition source assets"); !result) return result;
@@ -563,17 +899,32 @@ core::Result<void> AuthoringDocument::validate() const {
     if (auto result = validate_record_vector(collections, "condition collections"); !result) return result;
     if (auto result = validate_record_vector(prefabs, "condition prefabs"); !result) return result;
     if (auto result = validate_record_vector(region_kits, "condition region kits"); !result) return result;
+    if (auto result = validate_record_vector(audio_sources, "condition audio sources"); !result) return result;
+    if (auto result = validate_record_vector(acoustic_zones, "condition acoustic zones"); !result) return result;
+    if (auto result = validate_record_vector(effect_sources, "condition effect sources"); !result) return result;
+    if (auto result = validate_record_vector(particle_emitters, "condition particle emitters"); !result) return result;
+    if (auto result = validate_record_vector(field_influences, "condition effect field influences"); !result) return result;
+    if (auto result = validate_record_vector(vegetation_scatters, "condition vegetation scatter recipes"); !result) return result;
+    if (auto result = validate_record_vector(state_branches, "condition authored state branches"); !result) return result;
 
     std::map<Id, const SourceEvidence*> source_by_id;
     std::map<Id, const SourceAsset*> asset_by_id;
     std::map<Id, const VariantCandidate*> variant_by_id;
     std::map<Id, const PrefabRecord*> prefab_by_id;
     std::map<Id, const CollectionRecord*> collection_by_id;
+    std::map<Id, const EffectSource*> effect_by_id;
+    std::map<Id, const AuthoredStateBranch*> state_branch_by_id;
+    std::map<Id, const SafePlaceProfile*> safe_place_by_id;
+    std::map<Id, const SurfaceStateRecord*> surface_state_by_id;
     for (const auto& source : sources) source_by_id.emplace(source.id, &source);
     for (const auto& asset : assets) asset_by_id.emplace(asset.id, &asset);
     for (const auto& variant : variants) variant_by_id.emplace(variant.id, &variant);
     for (const auto& prefab : prefabs) prefab_by_id.emplace(prefab.id, &prefab);
     for (const auto& collection : collections) collection_by_id.emplace(collection.id, &collection);
+    for (const auto& effect : effect_sources) effect_by_id.emplace(effect.id, &effect);
+    for (const auto& branch : state_branches) state_branch_by_id.emplace(branch.id, &branch);
+    for (const auto& profile : safe_places) safe_place_by_id.emplace(profile.id, &profile);
+    for (const auto& state : surface_states) surface_state_by_id.emplace(state.id, &state);
 
     for (const auto& asset : assets) {
         const auto source = source_by_id.find(asset.source_id);
@@ -588,6 +939,83 @@ core::Result<void> AuthoringDocument::validate() const {
         }
         return core::Result<void>::success();
     };
+    for (const auto& source : audio_sources) {
+        if (auto result = require_asset(source.asset_id, "audio source"); !result) return result;
+        const auto clip = source_by_id.find(source.clip_source_id);
+        if (clip == source_by_id.end() || clip->second->kind != SourceKind::imported_asset) {
+            return core::Result<void>::failure(validation(
+                "condition audio source must reference imported clip source evidence"));
+        }
+    }
+    for (const auto& zone : acoustic_zones) {
+        if (auto result = require_asset(zone.asset_id, "acoustic zone"); !result) return result;
+    }
+    for (const auto& effect : effect_sources) {
+        if (auto result = require_asset(effect.asset_id, "effect source"); !result) return result;
+    }
+    for (const auto& emitter : particle_emitters) {
+        if (!effect_by_id.contains(emitter.effect_source_id)) {
+            return core::Result<void>::failure(validation(
+                "particle emitter references a missing effect source"));
+        }
+    }
+    for (const auto& influence : field_influences) {
+        if (!effect_by_id.contains(influence.effect_source_id)) {
+            return core::Result<void>::failure(validation(
+                "effect field influence references a missing effect source"));
+        }
+    }
+    for (const auto& recipe : vegetation_scatters) {
+        const auto species = asset_by_id.find(recipe.species_asset_id);
+        if (species == asset_by_id.end() ||
+            species->second->asset_class != AssetClass::vegetation) {
+            return core::Result<void>::failure(validation(
+                "vegetation scatter recipe must reference a vegetation-class source asset"));
+        }
+    }
+    std::set<std::string> state_branch_names;
+    for (const auto& branch : state_branches) {
+        if (!state_branch_names.insert(branch.name).second) {
+            return core::Result<void>::failure(validation(
+                "condition authored state branch names must be unique"));
+        }
+        if (branch.parent_branch_id != 0U &&
+            !state_branch_by_id.contains(branch.parent_branch_id)) {
+            return core::Result<void>::failure(validation(
+                "condition authored state branch references a missing parent"));
+        }
+        for (const auto& delta : branch.deltas) {
+            if (delta.target_kind == StateTargetKind::safe_place_profile) {
+                const auto target = safe_place_by_id.find(delta.target_record_id);
+                if (target == safe_place_by_id.end() ||
+                    target->second->asset_id != delta.target_asset_id) {
+                    return core::Result<void>::failure(validation(
+                        "condition state delta references a missing or mismatched Safe Place profile"));
+                }
+            } else {
+                const auto target = surface_state_by_id.find(delta.target_record_id);
+                if (target == surface_state_by_id.end() ||
+                    target->second->asset_id != delta.target_asset_id) {
+                    return core::Result<void>::failure(validation(
+                        "condition state delta references a missing or mismatched surface state"));
+                }
+            }
+        }
+        std::set<Id> ancestry;
+        Id ancestor_id = branch.id;
+        while (ancestor_id != 0U) {
+            if (!ancestry.insert(ancestor_id).second) {
+                return core::Result<void>::failure(validation(
+                    "condition authored state branch hierarchy contains a cycle"));
+            }
+            const auto ancestor = state_branch_by_id.find(ancestor_id);
+            if (ancestor == state_branch_by_id.end()) {
+                return core::Result<void>::failure(validation(
+                    "condition authored state branch ancestry is incomplete"));
+            }
+            ancestor_id = ancestor->second->parent_branch_id;
+        }
+    }
     for (const auto& profile : safe_places) if (auto result = require_asset(profile.asset_id, "Safe Place"); !result) return result;
     for (const auto& record : familiarity) {
         if (auto result = require_asset(record.asset_id, "familiarity record"); !result) return result;
@@ -773,6 +1201,104 @@ std::string AuthoringDocument::serialize() const {
                << (kit.collision_validation_required ? 1U : 0U) << ' '
                << (kit.semantic_validation_required ? 1U : 0U) << '\n';
     }
+    output << "AUDIO_SOURCES " << audio_sources.size() << '\n';
+    for (const auto& source : audio_sources) {
+        output << "AUDIO_SOURCE " << source.id << ' ' << source.asset_id << ' '
+               << source.clip_source_id << ' ';
+        write_transform(output, source.local_transform);
+        output << ' ' << source.gain << ' ' << source.pitch << ' '
+               << (source.loop ? 1U : 0U) << ' ' << (source.spatial ? 1U : 0U) << ' '
+               << source.minimum_distance << ' ' << source.maximum_distance << ' '
+               << source.priority << ' ' << audio_bus_class_name(source.bus) << ' '
+               << audio_occlusion_intent_name(source.occlusion) << ' ' << source.reverb_send
+               << ' ' << std::quoted(source.normal_operating_state) << ' '
+               << std::quoted(source.familiarity_role) << ' '
+               << (source.enabled ? 1U : 0U) << '\n';
+    }
+    output << "ACOUSTIC_ZONES " << acoustic_zones.size() << '\n';
+    for (const auto& zone : acoustic_zones) {
+        output << "ACOUSTIC_ZONE " << zone.id << ' ' << zone.asset_id << ' '
+               << acoustic_zone_shape_name(zone.shape) << ' ';
+        write_transform(output, zone.local_transform);
+        output << ' ' << zone.half_extents.x << ' ' << zone.half_extents.y << ' '
+               << zone.half_extents.z << ' ' << zone.radius << ' '
+               << std::quoted(zone.acoustic_class) << ' ' << zone.gain_modifier << ' '
+               << std::quoted(zone.reverb_intent) << ' ' << zone.priority << ' '
+               << std::quoted(zone.semantic_region) << ' '
+               << (zone.enabled ? 1U : 0U) << '\n';
+    }
+    output << "EFFECT_SOURCES " << effect_sources.size() << '\n';
+    for (const auto& effect : effect_sources) {
+        output << "EFFECT_SOURCE " << effect.id << ' ' << effect.asset_id << ' '
+               << std::quoted(effect.semantic_owner) << ' '
+               << effect_emission_shape_name(effect.shape) << ' ';
+        write_transform(output, effect.local_transform);
+        output << ' ' << effect.half_extents.x << ' ' << effect.half_extents.y << ' '
+               << effect.half_extents.z << ' ' << effect.radius << ' '
+               << effect_intent_class_name(effect.intent_class) << ' '
+               << std::quoted(effect.normal_operating_state) << ' '
+               << std::quoted(effect.disabled_operating_state) << ' '
+               << (effect.enabled ? 1U : 0U) << '\n';
+    }
+    output << "PARTICLE_EMITTERS " << particle_emitters.size() << '\n';
+    for (const auto& emitter : particle_emitters) {
+        output << "PARTICLE_EMITTER " << emitter.id << ' ' << emitter.effect_source_id << ' '
+               << emitter.emission_rate_per_second << ' ' << emitter.particle_lifetime_seconds
+               << ' ' << emitter.start_seconds << ' ' << emitter.duration_seconds << ' '
+               << emitter.burst_count << ' ' << emitter.burst_time_seconds << ' '
+               << emitter.initial_velocity.x << ' ' << emitter.initial_velocity.y << ' '
+               << emitter.initial_velocity.z << ' ' << emitter.velocity_spread.x << ' '
+               << emitter.velocity_spread.y << ' ' << emitter.velocity_spread.z << ' '
+               << emitter.acceleration.x << ' ' << emitter.acceleration.y << ' '
+               << emitter.acceleration.z << ' ' << emitter.fixed_timestep_seconds << ' '
+               << emitter.total_particle_bound << ' ' << emitter.deterministic_seed << ' '
+               << (emitter.enabled ? 1U : 0U) << '\n';
+    }
+    output << "FIELD_INFLUENCES " << field_influences.size() << '\n';
+    for (const auto& influence : field_influences) {
+        output << "FIELD_INFLUENCE " << influence.id << ' ' << influence.effect_source_id << ' '
+               << effect_influence_kind_name(influence.kind) << ' '
+               << std::quoted(influence.field_identity) << ' '
+               << influence.expected_field_revision.value() << ' '
+               << influence.expected_field_digest.hex() << ' '
+               << influence.direction.x << ' ' << influence.direction.y << ' '
+               << influence.direction.z << ' ' << influence.strength << '\n';
+    }
+    output << "VEGETATION_SCATTERS " << vegetation_scatters.size() << '\n';
+    const auto write_field_binding = [&output](const FieldSourceBinding& binding) {
+        output << ' ' << std::quoted(binding.field_identity) << ' '
+               << binding.expected_field_revision.value() << ' '
+               << binding.expected_field_digest.hex();
+    };
+    for (const auto& recipe : vegetation_scatters) {
+        output << "VEGETATION_SCATTER " << recipe.id << ' '
+               << recipe.species_asset_id;
+        write_field_binding(recipe.moisture);
+        write_field_binding(recipe.shade);
+        write_field_binding(recipe.disturbance);
+        write_field_binding(recipe.suitability);
+        write_field_binding(recipe.elevation);
+        output << ' ' << recipe.cell_spacing << ' '
+               << recipe.density_per_square_meter << ' '
+               << recipe.minimum_suitability << ' ' << recipe.minimum_scale << ' '
+               << recipe.maximum_scale << ' ' << recipe.maximum_instances << ' '
+               << recipe.deterministic_seed << ' ' << (recipe.enabled ? 1U : 0U)
+               << '\n';
+    }
+    output << "STATE_BRANCHES " << state_branches.size() << '\n';
+    for (const auto& branch : state_branches) {
+        output << "STATE_BRANCH " << branch.id << ' ' << std::quoted(branch.name) << ' '
+               << branch.parent_branch_id << ' ' << std::quoted(branch.applicability) << ' '
+               << branch.deltas.size() << '\n';
+        for (const auto& delta : branch.deltas) {
+            output << "STATE_DELTA " << delta.id << ' ' << delta.target_record_id << ' '
+                   << delta.target_asset_id << ' ' << state_target_kind_name(delta.target_kind)
+                   << ' ' << state_property_name(delta.property) << ' '
+                   << delta.before.numeric_value << ' ' << std::quoted(delta.before.text_value)
+                   << ' ' << delta.after.numeric_value << ' '
+                   << std::quoted(delta.after.text_value) << '\n';
+        }
+    }
     output << "END\n";
     return output.str();
 }
@@ -784,18 +1310,20 @@ core::Result<AuthoringDocument> AuthoringDocument::deserialize(std::string_view 
     }
     std::istringstream input{std::string(text)};
     std::string magic;
-    std::uint32_t version = 0U;
-    if (!(input >> magic >> version) || magic != kAuthoringMagic || version != kSchemaVersion ||
+    std::uint32_t schema_version = 0U;
+    if (!(input >> magic >> schema_version) || magic != kAuthoringMagic ||
+        schema_version == 0U || schema_version > kSchemaVersion ||
         !require_token(input, "PROJECT")) {
         return core::Result<AuthoringDocument>::failure(parse_error(
             "condition authoring header is invalid"));
     }
     AuthoringDocument result;
-    if (!(input >> std::quoted(result.project_namespace)) || !read_unsigned(input, version)) {
+    std::uint64_t project_revision = 0U;
+    if (!(input >> std::quoted(result.project_namespace)) || !read_unsigned(input, project_revision)) {
         return core::Result<AuthoringDocument>::failure(parse_error(
             "condition authoring project record is invalid"));
     }
-    result.project_revision = core::Revision(version);
+    result.project_revision = core::Revision(project_revision);
     const auto read_header_count = [&input](std::string_view token, std::size_t& count) {
         return require_token(input, token) && read_count(input, AuthoringDocument::kMaxRecordsPerKind, count);
     };
@@ -987,6 +1515,264 @@ core::Result<AuthoringDocument> AuthoringDocument::deserialize(std::string_view 
         kit.semantic_validation_required = semantic != 0U;
         result.region_kits.push_back(std::move(kit));
     }
+    if (schema_version >= 2U) {
+        if (!require_token(input, "AUDIO_SOURCES") ||
+            !read_count(input, AuthoringDocument::kMaxAudioRecordsPerKind, count)) {
+            return core::Result<AuthoringDocument>::failure(parse_error(
+                "condition audio-source count is invalid"));
+        }
+        result.audio_sources.reserve(count);
+        for (std::size_t index = 0U; index < count; ++index) {
+            AuthoredAudioSource source;
+            std::uint64_t loop = 0U;
+            std::uint64_t spatial = 0U;
+            std::uint64_t priority = 0U;
+            std::uint64_t enabled = 0U;
+            if (!require_token(input, "AUDIO_SOURCE") ||
+                !read_unsigned(input, source.id) || !read_unsigned(input, source.asset_id) ||
+                !read_unsigned(input, source.clip_source_id) ||
+                !read_transform(input, source.local_transform) ||
+                !(input >> source.gain >> source.pitch) ||
+                !read_unsigned(input, loop) || !read_unsigned(input, spatial) ||
+                !(input >> source.minimum_distance >> source.maximum_distance) ||
+                !read_unsigned(input, priority) || priority > std::numeric_limits<std::uint16_t>::max() ||
+                !read_named(input, {{AudioBusClass::ambient, "ambient"},
+                    {AudioBusClass::machinery, "machinery"}, {AudioBusClass::vehicle, "vehicle"},
+                    {AudioBusClass::radio, "radio"}, {AudioBusClass::speech, "speech"},
+                    {AudioBusClass::music, "music"}, {AudioBusClass::effects, "effects"}}, source.bus) ||
+                !read_named(input, {{AudioOcclusionIntent::none, "none"},
+                    {AudioOcclusionIntent::static_geometry, "static-geometry"},
+                    {AudioOcclusionIntent::authored_geometry, "authored-geometry"}}, source.occlusion) ||
+                !(input >> source.reverb_send >> std::quoted(source.normal_operating_state) >>
+                  std::quoted(source.familiarity_role)) ||
+                !read_unsigned(input, enabled) || loop > 1U || spatial > 1U || enabled > 1U) {
+                return core::Result<AuthoringDocument>::failure(parse_error(
+                    "condition audio-source record is invalid"));
+            }
+            source.loop = loop != 0U;
+            source.spatial = spatial != 0U;
+            source.priority = static_cast<std::uint16_t>(priority);
+            source.enabled = enabled != 0U;
+            result.audio_sources.push_back(std::move(source));
+        }
+        if (!require_token(input, "ACOUSTIC_ZONES") ||
+            !read_count(input, AuthoringDocument::kMaxAudioRecordsPerKind, count)) {
+            return core::Result<AuthoringDocument>::failure(parse_error(
+                "condition acoustic-zone count is invalid"));
+        }
+        result.acoustic_zones.reserve(count);
+        for (std::size_t index = 0U; index < count; ++index) {
+            AuthoredAcousticZone zone;
+            std::uint64_t priority = 0U;
+            std::uint64_t enabled = 0U;
+            if (!require_token(input, "ACOUSTIC_ZONE") ||
+                !read_unsigned(input, zone.id) || !read_unsigned(input, zone.asset_id) ||
+                !read_named(input, {{AcousticZoneShape::box, "box"},
+                    {AcousticZoneShape::sphere, "sphere"}}, zone.shape) ||
+                !read_transform(input, zone.local_transform) ||
+                !(input >> zone.half_extents.x >> zone.half_extents.y >> zone.half_extents.z >>
+                  zone.radius >> std::quoted(zone.acoustic_class) >> zone.gain_modifier >>
+                  std::quoted(zone.reverb_intent)) ||
+                !read_unsigned(input, priority) || priority > std::numeric_limits<std::uint16_t>::max() ||
+                !(input >> std::quoted(zone.semantic_region)) ||
+                !read_unsigned(input, enabled) || enabled > 1U) {
+                return core::Result<AuthoringDocument>::failure(parse_error(
+                    "condition acoustic-zone record is invalid"));
+            }
+            zone.priority = static_cast<std::uint16_t>(priority);
+            zone.enabled = enabled != 0U;
+            result.acoustic_zones.push_back(std::move(zone));
+        }
+    }
+    if (schema_version >= 3U) {
+        if (!require_token(input, "EFFECT_SOURCES") ||
+            !read_count(input, AuthoringDocument::kMaxEffectRecordsPerKind, count)) {
+            return core::Result<AuthoringDocument>::failure(parse_error(
+                "condition effect-source count is invalid"));
+        }
+        result.effect_sources.reserve(count);
+        for (std::size_t index = 0U; index < count; ++index) {
+            EffectSource effect;
+            std::uint64_t enabled = 0U;
+            if (!require_token(input, "EFFECT_SOURCE") ||
+                !read_unsigned(input, effect.id) || !read_unsigned(input, effect.asset_id) ||
+                !(input >> std::quoted(effect.semantic_owner)) ||
+                !read_named(input, {{EffectEmissionShape::point, "point"},
+                    {EffectEmissionShape::box, "box"},
+                    {EffectEmissionShape::sphere, "sphere"}}, effect.shape) ||
+                !read_transform(input, effect.local_transform) ||
+                !(input >> effect.half_extents.x >> effect.half_extents.y >>
+                  effect.half_extents.z >> effect.radius) ||
+                !read_named(input, {{EffectIntentClass::physical_state, "physical-state"},
+                    {EffectIntentClass::presentation_only, "presentation-only"}},
+                    effect.intent_class) ||
+                !(input >> std::quoted(effect.normal_operating_state) >>
+                  std::quoted(effect.disabled_operating_state)) ||
+                !read_unsigned(input, enabled) || enabled > 1U) {
+                return core::Result<AuthoringDocument>::failure(parse_error(
+                    "condition effect-source record is invalid"));
+            }
+            effect.enabled = enabled != 0U;
+            result.effect_sources.push_back(std::move(effect));
+        }
+        if (!require_token(input, "PARTICLE_EMITTERS") ||
+            !read_count(input, AuthoringDocument::kMaxEffectRecordsPerKind, count)) {
+            return core::Result<AuthoringDocument>::failure(parse_error(
+                "condition particle-emitter count is invalid"));
+        }
+        result.particle_emitters.reserve(count);
+        for (std::size_t index = 0U; index < count; ++index) {
+            ParticleEmitterSource emitter;
+            std::uint64_t enabled = 0U;
+            if (!require_token(input, "PARTICLE_EMITTER") ||
+                !read_unsigned(input, emitter.id) ||
+                !read_unsigned(input, emitter.effect_source_id) ||
+                !(input >> emitter.emission_rate_per_second >>
+                  emitter.particle_lifetime_seconds >> emitter.start_seconds >>
+                  emitter.duration_seconds) ||
+                !read_unsigned(input, emitter.burst_count) ||
+                !(input >> emitter.burst_time_seconds >> emitter.initial_velocity.x >>
+                  emitter.initial_velocity.y >> emitter.initial_velocity.z >>
+                  emitter.velocity_spread.x >> emitter.velocity_spread.y >>
+                  emitter.velocity_spread.z >> emitter.acceleration.x >>
+                  emitter.acceleration.y >> emitter.acceleration.z >>
+                  emitter.fixed_timestep_seconds) ||
+                !read_unsigned(input, emitter.total_particle_bound) ||
+                !read_unsigned(input, emitter.deterministic_seed) ||
+                !read_unsigned(input, enabled) || enabled > 1U) {
+                return core::Result<AuthoringDocument>::failure(parse_error(
+                    "condition particle-emitter record is invalid"));
+            }
+            emitter.enabled = enabled != 0U;
+            result.particle_emitters.push_back(std::move(emitter));
+        }
+        if (!require_token(input, "FIELD_INFLUENCES") ||
+            !read_count(input, AuthoringDocument::kMaxEffectRecordsPerKind, count)) {
+            return core::Result<AuthoringDocument>::failure(parse_error(
+                "condition effect field-influence count is invalid"));
+        }
+        result.field_influences.reserve(count);
+        for (std::size_t index = 0U; index < count; ++index) {
+            FieldInfluenceBinding influence;
+            std::uint64_t revision = 0U;
+            if (!require_token(input, "FIELD_INFLUENCE") ||
+                !read_unsigned(input, influence.id) ||
+                !read_unsigned(input, influence.effect_source_id) ||
+                !read_named(input, {{EffectInfluenceKind::wind, "wind"},
+                    {EffectInfluenceKind::thermal_lift, "thermal-lift"},
+                    {EffectInfluenceKind::drainage, "drainage"},
+                    {EffectInfluenceKind::avoidance, "avoidance"},
+                    {EffectInfluenceKind::turbulence, "turbulence"}}, influence.kind) ||
+                !(input >> std::quoted(influence.field_identity)) ||
+                !read_unsigned(input, revision) ||
+                !read_digest(input, influence.expected_field_digest) ||
+                !(input >> influence.direction.x >> influence.direction.y >>
+                  influence.direction.z >> influence.strength)) {
+                return core::Result<AuthoringDocument>::failure(parse_error(
+                    "condition effect field-influence record is invalid"));
+            }
+            influence.expected_field_revision = core::Revision(revision);
+            result.field_influences.push_back(std::move(influence));
+        }
+    }
+    if (schema_version >= 4U) {
+        if (!require_token(input, "VEGETATION_SCATTERS") ||
+            !read_count(input, AuthoringDocument::kMaxVegetationRecipes, count)) {
+            return core::Result<AuthoringDocument>::failure(parse_error(
+                "condition vegetation-scatter count is invalid"));
+        }
+        result.vegetation_scatters.reserve(count);
+        const auto read_field_binding = [&input](FieldSourceBinding& binding) {
+            std::uint64_t revision = 0U;
+            if (!(input >> std::quoted(binding.field_identity)) ||
+                !read_unsigned(input, revision) ||
+                !read_digest(input, binding.expected_field_digest)) {
+                return false;
+            }
+            binding.expected_field_revision = core::Revision(revision);
+            return true;
+        };
+        for (std::size_t index = 0U; index < count; ++index) {
+            VegetationScatterRecipe recipe;
+            std::uint64_t maximum_instances = 0U;
+            std::uint64_t enabled = 0U;
+            if (!require_token(input, "VEGETATION_SCATTER") ||
+                !read_unsigned(input, recipe.id) ||
+                !read_unsigned(input, recipe.species_asset_id) ||
+                !read_field_binding(recipe.moisture) ||
+                !read_field_binding(recipe.shade) ||
+                !read_field_binding(recipe.disturbance) ||
+                !read_field_binding(recipe.suitability) ||
+                !read_field_binding(recipe.elevation) ||
+                !(input >> recipe.cell_spacing >> recipe.density_per_square_meter >>
+                  recipe.minimum_suitability >> recipe.minimum_scale >> recipe.maximum_scale) ||
+                !read_unsigned(input, maximum_instances) ||
+                maximum_instances > std::numeric_limits<std::uint32_t>::max() ||
+                !read_unsigned(input, recipe.deterministic_seed) ||
+                !read_unsigned(input, enabled) || enabled > 1U) {
+                return core::Result<AuthoringDocument>::failure(parse_error(
+                    "condition vegetation-scatter record is invalid"));
+            }
+            recipe.maximum_instances = static_cast<std::uint32_t>(maximum_instances);
+            recipe.enabled = enabled != 0U;
+            result.vegetation_scatters.push_back(std::move(recipe));
+        }
+    }
+    if (schema_version >= 5U) {
+        if (!require_token(input, "STATE_BRANCHES") ||
+            !read_count(input, AuthoringDocument::kMaxStateBranches, count)) {
+            return core::Result<AuthoringDocument>::failure(parse_error(
+                "condition state-branch count is invalid"));
+        }
+        result.state_branches.reserve(count);
+        for (std::size_t branch_index = 0U; branch_index < count; ++branch_index) {
+            AuthoredStateBranch branch;
+            std::uint64_t parent_id = 0U;
+            std::size_t delta_count = 0U;
+            if (!require_token(input, "STATE_BRANCH") ||
+                !read_unsigned(input, branch.id) ||
+                !(input >> std::quoted(branch.name)) ||
+                !read_unsigned(input, parent_id) ||
+                !(input >> std::quoted(branch.applicability)) ||
+                !read_count(input, AuthoringDocument::kMaxStateDeltasPerBranch, delta_count)) {
+                return core::Result<AuthoringDocument>::failure(parse_error(
+                    "condition state-branch record is invalid"));
+            }
+            branch.parent_branch_id = parent_id;
+            branch.deltas.reserve(delta_count);
+            for (std::size_t delta_index = 0U; delta_index < delta_count; ++delta_index) {
+                AuthoredStateDelta delta;
+                if (!require_token(input, "STATE_DELTA") ||
+                    !read_unsigned(input, delta.id) ||
+                    !read_unsigned(input, delta.target_record_id) ||
+                    !read_unsigned(input, delta.target_asset_id) ||
+                    !read_named(input, {
+                        {StateTargetKind::safe_place_profile, "safe-place-profile"},
+                        {StateTargetKind::surface_state, "surface-state"}}, delta.target_kind) ||
+                    !read_named(input, {
+                        {StateProperty::privacy, "privacy"},
+                        {StateProperty::human_proximity, "human-proximity"},
+                        {StateProperty::controllable_entries, "controllable-entries"},
+                        {StateProperty::supply_access, "supply-access"},
+                        {StateProperty::ambient_noise, "ambient-noise"},
+                        {StateProperty::visibility_outward, "visibility-outward"},
+                        {StateProperty::visibility_inward, "visibility-inward"},
+                        {StateProperty::isolation, "isolation"},
+                        {StateProperty::occupancy, "occupancy"},
+                        {StateProperty::maintenance, "maintenance"},
+                        {StateProperty::damage, "damage"},
+                        {StateProperty::wetness, "wetness"}}, delta.property) ||
+                    !(input >> delta.before.numeric_value >>
+                      std::quoted(delta.before.text_value) >> delta.after.numeric_value >>
+                      std::quoted(delta.after.text_value))) {
+                    return core::Result<AuthoringDocument>::failure(parse_error(
+                        "condition state-delta record is invalid"));
+                }
+                branch.deltas.push_back(std::move(delta));
+            }
+            result.state_branches.push_back(std::move(branch));
+        }
+    }
     if (!require_end(input)) return core::Result<AuthoringDocument>::failure(parse_error("condition authoring END record is invalid"));
     if (auto valid_result = result.validate(); !valid_result) return core::Result<AuthoringDocument>::failure(valid_result.error());
     return core::Result<AuthoringDocument>::success(std::move(result));
@@ -1003,6 +1789,11 @@ core::Result<void> AuthoringDocument::invalidate_source(
         return core::Result<void>::failure(invalid("condition source invalidation requires a source, revision, and digest"));
     }
     if (auto result = validate(); !result) return result;
+    if (project_revision.next().exhausted()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "condition authoring revision space is exhausted"));
+    }
     const auto found = std::find_if(sources.begin(), sources.end(), [source_id](const SourceEvidence& source) {
         return source.id == source_id;
     });
@@ -1017,6 +1808,7 @@ core::Result<void> AuthoringDocument::invalidate_source(
         found->diagnostics.push_back(message);
         std::sort(found->diagnostics.begin(), found->diagnostics.end());
     }
+    project_revision = project_revision.next();
     return core::Result<void>::success();
 }
 

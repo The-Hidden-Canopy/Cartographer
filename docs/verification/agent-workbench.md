@@ -42,10 +42,21 @@
 
 - Constraint and question identities are unique, all referenced objects and constraints are in scope, and malformed bounds or candidate answers are rejected.
 - A consequential unresolved question blocks task creation without creating or mutating a speculative branch; only the explicit human application boundary can issue an answer receipt, and a selected candidate cannot contradict queued targets.
+- The native UI can queue an operator-required question, refuses to run while it is unanswered, and records the explicit answer in the same objective/revision context shown in review.
+- The answer receipt is invalidated by a changed plan intent, target, order, or dependency graph, even when the objective text is unchanged.
+- Changing the goal or source revision after an answer invalidates the workflow; a failed unresolved attempt does not consume the next task identity.
 - Reordering identity lists does not change the canonical objective digest, while changing an answer or hard constraint does.
 - Topology-preservation constraints reject a topology capability before speculative execution, and displacement gates block an over-limit result.
 - Acceptance journal evidence records both the objective digest and the result diff digest.
 
+## Plan DAG coverage
+
+- Dependencies may point forward or backward in the declared list; scheduling is stable and topological.
+- Missing, duplicate, self, and cyclic dependencies are rejected before the speculative session is created.
+- A failed step invalidates its dependent branch, while independent ready steps can complete on the isolated branch.
+- Any failed or invalidated step keeps acceptance blocked, even when an independent branch produced a valid diff.
+- The UI captures explicit dependencies and displays each branch's final status and failure evidence.
+
 ## Follow-up coverage
 
-Add failure injection for durable journal append rollback, saved/reopened task state, unrelated and conflicting source edits, bounded repair exhaustion, semantic-sidecar size pressure, and provider timeouts as those tranches are implemented. The current clarification frontier is deterministic input ranking; it does not compile free-form goals or provide an interactive answer panel.
+Add failure injection for durable journal append rollback, saved/reopened task state, unrelated and conflicting source edits, bounded repair exhaustion, semantic-sidecar size pressure, and provider timeouts as those tranches are implemented. Clarification questions and answers are reviewable evidence, not natural-language commands; the workbench still does not compile free-form goals or infer questions automatically.

@@ -4,6 +4,9 @@
 #include <carto/core/math.hpp>
 #include <carto/core/result.hpp>
 #include <carto/condition/authoring.hpp>
+#include <carto/condition/effect_preview.hpp>
+#include <carto/condition/vegetation_preview.hpp>
+#include <carto/condition/state_branch.hpp>
 #include <carto/engineering/authoring.hpp>
 #include <carto/editor/authoring_context.hpp>
 #include <carto/editor/command_bus.hpp>
@@ -19,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -35,7 +39,7 @@ class UiController;
 
 namespace carto::agent {
 class AgentTask;
-struct AuthoringObjective;
+struct AgentPlan;
 }
 
 namespace carto::application {
@@ -202,6 +206,14 @@ struct ConditionAuthoringView {
     std::size_t collection_count = 0U;
     std::size_t prefab_count = 0U;
     std::size_t region_kit_count = 0U;
+    std::size_t audio_source_count = 0U;
+    std::size_t acoustic_zone_count = 0U;
+    std::size_t effect_source_count = 0U;
+    std::size_t particle_emitter_count = 0U;
+    std::size_t field_influence_count = 0U;
+    std::size_t vegetation_scatter_count = 0U;
+    std::vector<std::uint64_t> vegetation_scatter_ids;
+    std::size_t state_branch_count = 0U;
     struct Source {
         std::uint64_t id = 0U;
         std::string kind;
@@ -210,8 +222,66 @@ struct ConditionAuthoringView {
         std::string revision;
         assets::Sha256Digest digest;
         bool current = true;
+        bool reviewed = false;
+        std::vector<std::string> diagnostics;
+    };
+    struct Asset {
+        std::uint64_t id = 0U;
+        std::string stable_name;
+        std::string asset_class;
+        std::uint64_t authored_object_id = 0U;
+    };
+    struct AudioSource {
+        std::uint64_t id = 0U;
+        std::uint64_t asset_id = 0U;
+        std::uint64_t clip_source_id = 0U;
+        core::Transform local_transform = core::Transform::identity();
+        std::string bus;
+        double gain = 1.0;
+        double minimum_distance = 0.0;
+        double maximum_distance = 0.0;
+        bool spatial = true;
+        bool enabled = true;
+    };
+    struct AcousticZone {
+        std::uint64_t id = 0U;
+        std::uint64_t asset_id = 0U;
+        core::Transform local_transform = core::Transform::identity();
+        std::string shape;
+        core::Vec3d half_extents{1.0, 1.0, 1.0};
+        double radius = 0.0;
+        std::string acoustic_class;
+        std::string semantic_region;
+        std::uint16_t priority = 0U;
+        bool enabled = true;
+    };
+    struct EffectSource {
+        std::uint64_t id = 0U;
+        std::uint64_t asset_id = 0U;
+        std::string semantic_owner;
+        std::string normal_state;
+        std::string disabled_state;
+        bool enabled = true;
     };
     std::vector<Source> sources;
+    struct SafePlace {
+        std::uint64_t id = 0U;
+        std::uint64_t asset_id = 0U;
+        std::array<double, 8> values{};
+    };
+    struct StateBranch {
+        std::uint64_t id = 0U;
+        std::uint64_t parent_branch_id = 0U;
+        std::string name;
+        std::string applicability;
+        std::size_t delta_count = 0U;
+    };
+    std::vector<Asset> assets;
+    std::vector<SafePlace> safe_places;
+    std::vector<StateBranch> state_branches;
+    std::vector<AudioSource> audio_sources;
+    std::vector<AcousticZone> acoustic_zones;
+    std::vector<EffectSource> effect_sources;
     bool stale = false;
     bool publication_ready = false;
     bool consumer_admissible = false;
@@ -544,7 +614,7 @@ public:
     [[nodiscard]] static core::Result<DispatchReceipt> accept_agent_task(
         ::carto::agent::AgentTask& task);
     [[nodiscard]] static core::Result<void> answer_agent_clarification(
-        ::carto::agent::AuthoringObjective& objective,
+        ::carto::agent::AgentPlan& plan,
         std::string_view question_id,
         std::optional<std::string> candidate_id,
         std::optional<std::string> freeform_answer);
@@ -575,6 +645,14 @@ public:
     [[nodiscard]] core::Result<editor::AuthoringContext> authoring_context() const;
     [[nodiscard]] core::Result<engineering::AuthoringDocument> engineering_authoring() const;
     [[nodiscard]] core::Result<condition::AuthoringDocument> condition_authoring() const;
+    [[nodiscard]] core::Result<condition::EffectPreviewResult> condition_effect_preview(
+        condition::Id effect_source_id,
+        std::string_view operating_state,
+        double elapsed_seconds) const;
+    [[nodiscard]] core::Result<condition::VegetationPreviewResult>
+    condition_vegetation_preview(condition::Id recipe_id) const;
+    [[nodiscard]] core::Result<condition::StateComparisonResult>
+    condition_state_comparison(condition::Id left_branch_id, condition::Id right_branch_id) const;
     [[nodiscard]] core::Result<SpatialFieldPreview> spatial_field_preview(
         std::string_view identity) const;
     [[nodiscard]] core::Result<terrain::TerrainTileProduct> terrain_tile_preview(

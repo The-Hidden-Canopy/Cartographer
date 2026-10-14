@@ -202,6 +202,7 @@ private:
     std::optional<project::SerializedConditionAuthoring> before_;
     project::SerializedConditionAuthoring after_;
     core::Revision expected_project_revision_;
+    bool has_executed_ = false;
     bool applied_ = false;
 };
 

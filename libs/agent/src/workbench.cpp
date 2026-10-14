@@ -4,7 +4,10 @@
 #include <array>
 #include <charconv>
 #include <cmath>
+#include <functional>
 #include <limits>
+#include <map>
+#include <queue>
 #include <set>
 #include <span>
 #include <string_view>
@@ -146,6 +149,7 @@ assets::Sha256Digest clarification_context_digest(
         append_field(canonical, context_question.id);
         append_field(canonical, context_question.prompt);
         append_field(canonical, context_question.rationale);
+        append_number(canonical, context_question.requires_explicit_answer ? 1U : 0U);
         auto impacts = context_question.impacts;
         std::sort(impacts.begin(), impacts.end());
         append_number(canonical, impacts.size());
@@ -181,6 +185,29 @@ assets::Sha256Digest clarification_answer_digest(const ClarificationQuestion& qu
     }
     append_number(canonical, question.freeform_answer.has_value() ? 1U : 0U);
     if (question.freeform_answer.has_value()) append_field(canonical, *question.freeform_answer);
+    return digest_text(canonical);
+}
+
+assets::Sha256Digest clarification_plan_context_digest(const AgentPlan& plan) {
+    std::string canonical = "cartographer.clarification-plan-context.v1|";
+    append_field(canonical, plan.id);
+    append_field(canonical, clarification_context_digest(plan.objective).hex());
+    append_number(canonical, plan.steps.size());
+    for (const auto& step : plan.steps) {
+        append_field(canonical, step.id);
+        append_number(canonical, step.target.object.value);
+        append_number(canonical, step.target.component.index());
+        if (const auto* face = std::get_if<geometry::FaceId>(&step.target.component)) {
+            append_number(canonical, face->value);
+        } else {
+            append_number(canonical, std::get<geometry::VertexId>(step.target.component).value);
+        }
+        append_field(canonical, step.intent);
+        auto dependencies = step.dependencies;
+        std::sort(dependencies.begin(), dependencies.end());
+        append_number(canonical, dependencies.size());
+        for (const auto& dependency : dependencies) append_field(canonical, dependency);
+    }
     return digest_text(canonical);
 }
 
@@ -428,6 +455,7 @@ core::Result<assets::Sha256Digest> AuthoringObjective::digest() const {
         append_field(canonical, question.id);
         append_field(canonical, question.prompt);
         append_field(canonical, question.rationale);
+        append_number(canonical, question.requires_explicit_answer ? 1U : 0U);
         auto impacts = question.impacts;
         std::sort(impacts.begin(), impacts.end());
         append_number(canonical, impacts.size());
@@ -461,6 +489,7 @@ core::Result<assets::Sha256Digest> AuthoringObjective::digest() const {
             append_field(canonical, question.human_receipt->question_id_);
             append_field(canonical, question.human_receipt->context_digest_.hex());
             append_field(canonical, question.human_receipt->answer_digest_.hex());
+            append_field(canonical, question.human_receipt->plan_context_digest_.hex());
         }
     }
     return core::Result<assets::Sha256Digest>::success(assets::sha256(std::span<const std::uint8_t>(
@@ -515,6 +544,7 @@ core::Result<ClarificationFrontier> AuthoringObjective::clarification_frontier(
         for (const auto impact : question.impacts) score += clarification_impact_weight(impact);
         score += static_cast<std::uint32_t>(std::min<std::size_t>(
             question.downstream_plan_branches, 4U) * 5U);
+        if (question.requires_explicit_answer) score = std::max(score, threshold);
         frontier.questions.push_back(RankedClarification{
             question, std::min(score, 100U)});
     }
@@ -529,7 +559,84 @@ core::Result<void> AgentPlanStep::validate() const {
     if (!safe_text(id, kMaxStepIdBytes) || !safe_text(intent, kMaxStepIntentBytes)) {
         return core::Result<void>::failure(invalid("plan step identity or intent is invalid"));
     }
+    if (dependencies.size() > kMaxPlanSteps) {
+        return core::Result<void>::failure(invalid(
+            "plan step dependency count exceeds its limit"));
+    }
+    std::set<std::string> unique_dependencies;
+    for (const auto& dependency : dependencies) {
+        if (!safe_text(dependency, kMaxStepIdBytes) ||
+            !unique_dependencies.insert(dependency).second) {
+            return core::Result<void>::failure(invalid(
+                "plan step contains an invalid or duplicate dependency"));
+        }
+    }
     return target.validate();
+}
+
+core::Result<std::vector<std::string>> AgentPlan::schedule_order() const {
+    if (steps.empty() || steps.size() > kMaxPlanSteps) {
+        return core::Result<std::vector<std::string>>::failure(invalid(
+            "plan step count is outside its supported range"));
+    }
+
+    std::map<std::string, std::size_t> indices;
+    for (std::size_t index = 0U; index < steps.size(); ++index) {
+        if (!safe_text(steps[index].id, kMaxStepIdBytes) ||
+            !indices.emplace(steps[index].id, index).second) {
+            return core::Result<std::vector<std::string>>::failure(invalid(
+                "plan contains an invalid or duplicate step identity"));
+        }
+    }
+
+    std::vector<std::size_t> indegree(steps.size(), 0U);
+    std::vector<std::vector<std::size_t>> dependents(steps.size());
+    for (std::size_t index = 0U; index < steps.size(); ++index) {
+        if (steps[index].dependencies.size() > kMaxPlanSteps) {
+            return core::Result<std::vector<std::string>>::failure(invalid(
+                "plan step dependency count exceeds its limit"));
+        }
+        std::set<std::string> unique_dependencies;
+        for (const auto& dependency : steps[index].dependencies) {
+            const auto found = indices.find(dependency);
+            if (!safe_text(dependency, kMaxStepIdBytes) ||
+                !unique_dependencies.insert(dependency).second) {
+                return core::Result<std::vector<std::string>>::failure(invalid(
+                    "plan contains an invalid or duplicate dependency"));
+            }
+            if (found == indices.end()) {
+                return core::Result<std::vector<std::string>>::failure(invalid(
+                    "plan dependency does not name a step in this plan"));
+            }
+            if (found->second == index) {
+                return core::Result<std::vector<std::string>>::failure(invalid(
+                    "plan step cannot depend on itself"));
+            }
+            ++indegree[index];
+            dependents[found->second].push_back(index);
+        }
+    }
+
+    std::priority_queue<
+        std::size_t, std::vector<std::size_t>, std::greater<std::size_t>> ready;
+    for (std::size_t index = 0U; index < indegree.size(); ++index) {
+        if (indegree[index] == 0U) ready.push(index);
+    }
+    std::vector<std::string> order;
+    order.reserve(steps.size());
+    while (!ready.empty()) {
+        const std::size_t current = ready.top();
+        ready.pop();
+        order.push_back(steps[current].id);
+        for (const std::size_t dependent : dependents[current]) {
+            if (--indegree[dependent] == 0U) ready.push(dependent);
+        }
+    }
+    if (order.size() != steps.size()) {
+        return core::Result<std::vector<std::string>>::failure(invalid(
+            "plan dependency graph contains a cycle"));
+    }
+    return core::Result<std::vector<std::string>>::success(std::move(order));
 }
 
 core::Result<void> AgentPlan::validate() const {
@@ -555,7 +662,16 @@ core::Result<void> AgentPlan::validate() const {
                 "plan target is protected by the objective"));
         }
     }
+    if (auto order = schedule_order(); !order) {
+        return core::Result<void>::failure(order.error());
+    }
+    const auto plan_context_digest = clarification_plan_context_digest(*this);
     for (const auto& question : objective.clarifications) {
+        if (question.human_receipt.has_value() &&
+            question.human_receipt->plan_context_digest_ != plan_context_digest) {
+            return core::Result<void>::failure(stale(
+                "human clarification receipt does not match the current plan steps"));
+        }
         if (!question.selected_candidate_id.has_value()) continue;
         const auto candidate = std::find_if(
             question.candidates.begin(), question.candidates.end(), [&](const auto& value) {
@@ -616,6 +732,11 @@ AgentTask::AgentTask(
       base_scene_(std::move(source_snapshot.viewport.scene)),
       base_viewport_error_(std::move(source_snapshot.viewport.error)),
       speculative_(std::move(speculative)) {
+    plan_progress_.reserve(plan_.steps.size());
+    for (const auto& step : plan_.steps) {
+        plan_progress_.push_back(PlanStepProgress{
+            step.id, step.dependencies, StepStatus::pending, std::nullopt});
+    }
     query_budget_.max_queries = envelope_.max_scene_queries;
     query_budget_.max_objects_examined = envelope_.max_objects_examined;
     query_budget_.max_topology_elements_examined =
@@ -807,12 +928,55 @@ core::Result<AgentTaskSnapshot> AgentTask::run() {
     }
     cached_snapshot_.reset();
     status_ = TaskStatus::running;
-    for (const auto& step : plan_.steps) {
-        auto result = execute_step(step);
-        if (!result) {
+    const auto scheduled = plan_.schedule_order();
+    if (!scheduled) {
+        status_ = TaskStatus::blocked;
+        diagnostic_ = scheduled.error();
+        gates_ = evaluate_gates();
+        return core::Result<AgentTaskSnapshot>::success(snapshot());
+    }
+    for (const auto& step_id : scheduled.value()) {
+        const auto step_it = std::find_if(plan_.steps.begin(), plan_.steps.end(),
+            [&step_id](const AgentPlanStep& step) { return step.id == step_id; });
+        const auto progress_it = std::find_if(plan_progress_.begin(), plan_progress_.end(),
+            [&step_id](const PlanStepProgress& progress) { return progress.step_id == step_id; });
+        if (step_it == plan_.steps.end() || progress_it == plan_progress_.end()) {
             status_ = TaskStatus::blocked;
-            diagnostic_ = result.error();
+            diagnostic_ = invalid_state("scheduler could not resolve a validated plan step");
             break;
+        }
+        const auto failed_dependency = std::find_if(
+            progress_it->dependencies.begin(), progress_it->dependencies.end(),
+            [this](const std::string& dependency) {
+                const auto state = std::find_if(
+                    plan_progress_.begin(), plan_progress_.end(),
+                    [&dependency](const PlanStepProgress& progress) {
+                        return progress.step_id == dependency;
+                    });
+                return state == plan_progress_.end() || state->status != StepStatus::passed;
+            });
+        if (failed_dependency != progress_it->dependencies.end()) {
+            progress_it->status = StepStatus::invalidated;
+            progress_it->diagnostic = policy(
+                "plan branch invalidated because dependency " + *failed_dependency +
+                " did not pass");
+            continue;
+        }
+        progress_it->status = StepStatus::ready;
+        progress_it->status = StepStatus::running;
+        const std::size_t receipt_count_before = receipts_.size();
+        auto result = execute_step(*step_it);
+        if (result) {
+            progress_it->status = StepStatus::passed;
+        } else {
+            progress_it->status = StepStatus::failed;
+            progress_it->diagnostic = result.error();
+            if (receipt_count_before == receipts_.size()) {
+                status_ = TaskStatus::blocked;
+                diagnostic_ = invalid_state("failed plan step did not produce a receipt");
+                break;
+            }
+            if (!diagnostic_.has_value()) diagnostic_ = result.error();
         }
     }
     gates_ = evaluate_gates();
@@ -824,7 +988,9 @@ core::Result<AgentTaskSnapshot> AgentTask::run() {
         status_ = TaskStatus::review;
     } else if (status_ == TaskStatus::running) {
         status_ = TaskStatus::blocked;
-        diagnostic_ = invalid_state("one or more required agent acceptance gates failed");
+        if (!diagnostic_.has_value()) {
+            diagnostic_ = invalid_state("one or more required agent acceptance gates failed");
+        }
     }
     return core::Result<AgentTaskSnapshot>::success(snapshot());
 }
@@ -1066,32 +1232,47 @@ std::vector<AcceptanceGateResult> AgentTask::evaluate_gates() const {
             const auto* before_object = base_document_.scene().find(*constraint.object);
             const auto* after_object = speculative_->document_.scene().find(*constraint.object);
             double maximum_observed = 0.0;
+            bool measurement_complete = true;
             if (before_object == nullptr || after_object == nullptr ||
                 before_object->mesh_asset != after_object->mesh_asset ||
                 !before_object->mesh_asset.has_value()) {
                 passed = false;
+                measurement_complete = false;
             } else {
                 const auto before_transform = base_document_.scene().world_transform(*constraint.object);
                 const auto after_transform = speculative_->document_.scene().world_transform(
                     *constraint.object);
-                const auto mesh = std::find_if(diff.meshes.begin(), diff.meshes.end(),
-                    [&](const MeshChange& change) {
-                        return change.asset_id == *before_object->mesh_asset;
-                    });
+                const auto before_mesh = base_document_.meshes().find(*before_object->mesh_asset);
+                const auto after_mesh = speculative_->document_.meshes().find(
+                    *after_object->mesh_asset);
                 if (!before_transform || !after_transform) {
                     passed = false;
-                } else if (mesh != diff.meshes.end()) {
-                    for (const auto& vertex : mesh->vertices) {
-                        if (vertex.added || vertex.removed) {
+                    measurement_complete = false;
+                } else if (before_mesh == base_document_.meshes().end() ||
+                    after_mesh == speculative_->document_.meshes().end()) {
+                    passed = false;
+                    measurement_complete = false;
+                } else if (before_mesh->second.vertex_count() != after_mesh->second.vertex_count()) {
+                    passed = false;
+                    measurement_complete = false;
+                } else if (before_mesh->second.vertex_count() >
+                    envelope_.max_topology_elements_examined) {
+                    passed = false;
+                    measurement_complete = false;
+                } else {
+                    for (const auto& vertex : before_mesh->second.vertices_sorted()) {
+                        const auto* after_vertex = after_mesh->second.find_vertex(vertex.id);
+                        if (after_vertex == nullptr) {
                             passed = false;
+                            measurement_complete = false;
                             break;
                         }
-                        if (!vertex.position_changed) continue;
                         const double displacement = (transform_point(
-                            after_transform.value(), vertex.after_position) - transform_point(
-                            before_transform.value(), vertex.before_position)).length();
+                            after_transform.value(), after_vertex->position) - transform_point(
+                            before_transform.value(), vertex.position)).length();
                         if (!std::isfinite(displacement)) {
                             passed = false;
+                            measurement_complete = false;
                             break;
                         }
                         maximum_observed = std::max(maximum_observed, displacement);
@@ -1102,6 +1283,9 @@ std::vector<AcceptanceGateResult> AgentTask::evaluate_gates() const {
             evidence = "maximum observed vertex displacement " +
                 std::to_string(maximum_observed) + " / " +
                 std::to_string(constraint.maximum_displacement) + " world units";
+            if (!measurement_complete) {
+                evidence += "; complete correspondence unavailable or measurement budget exceeded";
+            }
         }
         gates.push_back(AcceptanceGateResult{
             "constraint." + constraint.id, true, passed, std::move(evidence)});
@@ -1129,9 +1313,12 @@ AgentTaskSnapshot AgentTask::build_snapshot() const {
     if (const auto objective_digest = plan_.objective.digest(); objective_digest) {
         view.objective_digest = objective_digest.value();
     }
+    view.hard_constraints = plan_.objective.hard_constraints;
+    view.clarifications = plan_.objective.clarifications;
     view.base_revision = plan_.objective.base_revision;
     const auto speculative_snapshot = speculative_->snapshot();
     view.speculative_revision = speculative_snapshot.project_revision;
+    view.plan_steps = plan_progress_;
     view.steps = receipts_;
     view.gates = gates_;
     view.diff = build_diff();
@@ -1193,6 +1380,18 @@ const char* task_status_name(TaskStatus status) noexcept {
     return "unknown";
 }
 
+const char* step_status_name(StepStatus status) noexcept {
+    switch (status) {
+    case StepStatus::pending: return "pending";
+    case StepStatus::ready: return "ready";
+    case StepStatus::running: return "running";
+    case StepStatus::passed: return "passed";
+    case StepStatus::failed: return "failed";
+    case StepStatus::invalidated: return "invalidated";
+    }
+    return "unknown";
+}
+
 } // namespace carto::agent
 
 namespace carto::application {
@@ -1203,7 +1402,7 @@ core::Result<DispatchReceipt> HumanApplicationAccess::accept_agent_task(
 }
 
 core::Result<void> HumanApplicationAccess::answer_agent_clarification(
-    ::carto::agent::AuthoringObjective& objective,
+    ::carto::agent::AgentPlan& plan,
     std::string_view question_id,
     std::optional<std::string> candidate_id,
     std::optional<std::string> freeform_answer) {
@@ -1212,9 +1411,10 @@ core::Result<void> HumanApplicationAccess::answer_agent_clarification(
             core::ErrorCode::invalid_argument,
             "clarification answer must select one candidate or provide one freeform answer"));
     }
-    if (auto result = objective.validate(); !result) {
+    if (auto result = plan.validate(); !result) {
         return result;
     }
+    auto& objective = plan.objective;
     const auto question = std::find_if(
         objective.clarifications.begin(), objective.clarifications.end(),
         [question_id](const auto& value) { return value.id == question_id; });
@@ -1227,6 +1427,7 @@ core::Result<void> HumanApplicationAccess::answer_agent_clarification(
     }
     const auto context_digest = objective.clarification_context_digest(question_id);
     if (!context_digest) return core::Result<void>::failure(context_digest.error());
+    const auto plan_context_digest = ::carto::agent::clarification_plan_context_digest(plan);
     if (candidate_id.has_value()) question->selected_candidate_id = std::move(candidate_id);
     else question->freeform_answer = std::move(freeform_answer);
     const auto answer_digest = objective.clarification_answer_digest(question_id);
@@ -1236,8 +1437,8 @@ core::Result<void> HumanApplicationAccess::answer_agent_clarification(
         return core::Result<void>::failure(answer_digest.error());
     }
     question->human_receipt.emplace(::carto::agent::HumanClarificationReceipt(
-        question->id, context_digest.value(), answer_digest.value()));
-    if (auto result = objective.validate(); !result) {
+        question->id, context_digest.value(), answer_digest.value(), plan_context_digest));
+    if (auto result = plan.validate(); !result) {
         question->selected_candidate_id.reset();
         question->freeform_answer.reset();
         question->human_receipt.reset();

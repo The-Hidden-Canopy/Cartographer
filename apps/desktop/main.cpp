@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <commdlg.h>
 #include <dwmapi.h>
+#include <mmsystem.h>
 #include <vulkan/vulkan.h>
 
 #include <backends/imgui_impl_vulkan.h>
@@ -24,6 +25,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
     LPARAM l_param);
 
 #include <carto/application/application.hpp>
+#include <carto/condition/wave_import.hpp>
 #include <carto/editor/viewport_interaction.hpp>
 #include <carto/io/builtin_provider.hpp>
 #include <carto/io/gltf_export.hpp>
@@ -45,11 +47,13 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -832,6 +836,37 @@ struct NativeTransformDragCapture {
     carto::core::Transform preview_transform = carto::core::Transform::identity();
 };
 
+enum class NativeConditionGizmoKind {
+    audio_minimum_distance,
+    audio_maximum_distance,
+    acoustic_sphere_radius,
+    acoustic_box_corner,
+};
+
+struct NativeConditionGizmoHandle {
+    NativeConditionGizmoKind kind = NativeConditionGizmoKind::audio_maximum_distance;
+    std::uint64_t record_id = 0U;
+    ImVec2 center{};
+    ImVec2 handle{};
+    carto::core::Transform owner_world = carto::core::Transform::identity();
+    carto::core::Transform local_transform = carto::core::Transform::identity();
+    double minimum_distance = 0.0;
+    double maximum_distance = 0.0;
+    double radius = 0.0;
+    carto::core::Vec3d half_extents{};
+    carto::core::Revision authoring_revision;
+};
+
+struct NativeConditionGizmoDrag {
+    NativeConditionGizmoHandle handle;
+    carto::core::Revision project_revision;
+    ImRect viewport;
+    double preview_minimum = 0.0;
+    double preview_maximum = 0.0;
+    double preview_radius = 0.0;
+    carto::core::Vec3d preview_half_extents{};
+};
+
 constexpr std::size_t kMaxNativeSculptTriangles = 65'536U;
 constexpr std::size_t kMaxNativeSculptCursorPoints = 8'192U;
 
@@ -848,6 +883,7 @@ struct NativeViewportHitCache {
     std::vector<ViewportEdgeHit> edges;
     std::vector<std::pair<carto::scene::ObjectId, ImRect>> objects;
     std::optional<NativeTranslateGizmo> translate_gizmo;
+    std::vector<NativeConditionGizmoHandle> condition_gizmos;
 
     void reset() {
         project_revision = {};
@@ -862,6 +898,7 @@ struct NativeViewportHitCache {
         edges.clear();
         objects.clear();
         translate_gizmo.reset();
+        condition_gizmos.clear();
     }
 };
 
@@ -888,6 +925,7 @@ enum class FileDialogKind {
     engineering_authoring,
     condition,
     condition_authoring,
+    audio_clip,
     market_package,
     mesh_import,
     gltf,
@@ -969,6 +1007,9 @@ enum class StandardMeshExport {
             L"*.carto-condition-authoring\0All Files\0*.*\0";
         dialog.lpstrDefExt = L"carto-condition-authoring";
         break;
+    case FileDialogKind::audio_clip:
+        dialog.lpstrFilter = L"WAVE audio clip (*.wav;*.wave)\0*.wav;*.wave\0All Files\0*.*\0";
+        break;
     }
     dialog.nFilterIndex = 1;
     dialog.Flags = OFN_PATHMUSTEXIST | (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
@@ -1016,6 +1057,7 @@ struct DesktopState {
     ApplicationSession session;
     carto::ui::UiController ui;
     VulkanShell renderer;
+    ~DesktopState() { stop_condition_audio_audition(); }
     HWND window = nullptr;
     ShellSurface surface = ShellSurface::workspace;
     WorkbenchFlow workbench_flow = WorkbenchFlow::focus;
@@ -1035,6 +1077,7 @@ struct DesktopState {
     ImVec2 work_surface_camera_last_pointer{};
     std::optional<NativeSculptStrokeCapture> native_sculpt_stroke;
     std::optional<NativeTransformDragCapture> native_transform_drag;
+    std::optional<NativeConditionGizmoDrag> native_condition_gizmo_drag;
     carto::scene::ObjectId inspector_object{};
     carto::core::Transform inspector_transform = carto::core::Transform::identity();
     carto::geometry::VertexId inspector_vertex{};
@@ -1063,6 +1106,10 @@ struct DesktopState {
     std::string ai_feedback;
     std::string agent_goal;
     std::string agent_step;
+    std::string agent_question;
+    std::string agent_answer;
+    int agent_clarification_impact = 0;
+    int agent_step_dependency = 0;
     std::string agent_feedback;
     int agent_preview_mode = 0;
     std::optional<carto::ui::Workspace> previous_workspace_kind;
@@ -1074,6 +1121,85 @@ struct DesktopState {
     std::optional<std::uint64_t> condition_source_update_id;
     std::array<char, 129> condition_source_revision{};
     std::array<char, 65> condition_source_digest{};
+    int condition_audio_asset_index = 0;
+    int condition_audio_clip_index = 0;
+    int condition_audio_bus_index = 1;
+    int condition_audio_occlusion_index = 1;
+    double condition_audio_gain = 1.0;
+    double condition_audio_pitch = 1.0;
+    double condition_audio_x = 0.0;
+    double condition_audio_y = 0.0;
+    double condition_audio_z = 0.0;
+    double condition_audio_minimum_distance = 1.0;
+    double condition_audio_maximum_distance = 12.0;
+    double condition_audio_reverb_send = 0.0;
+    int condition_audio_priority = 128;
+    bool condition_audio_loop = false;
+    bool condition_audio_spatial = true;
+    bool condition_audio_enabled = true;
+    std::array<char, 129> condition_audio_state{'a','c','t','i','v','e'};
+    std::array<char, 129> condition_audio_familiarity_role{};
+    std::vector<std::uint8_t> condition_audio_preview_buffer;
+    int condition_zone_asset_index = 0;
+    int condition_zone_shape_index = 0;
+    double condition_zone_center_x = 0.0;
+    double condition_zone_center_y = 0.0;
+    double condition_zone_center_z = 0.0;
+    double condition_zone_half_x = 2.0;
+    double condition_zone_half_y = 1.5;
+    double condition_zone_half_z = 2.0;
+    double condition_zone_radius = 3.0;
+    double condition_zone_gain = 1.0;
+    int condition_zone_priority = 0;
+    std::array<char, 129> condition_zone_class{'i','n','t','e','r','i','o','r'};
+    std::array<char, 129> condition_zone_reverb{};
+    std::array<char, 257> condition_zone_semantic{};
+    int condition_effect_asset_index = 0;
+    int condition_effect_shape_index = 0;
+    int condition_effect_intent_index = 0;
+    int condition_effect_source_index = 0;
+    int condition_influence_field_index = 0;
+    int condition_influence_kind_index = 0;
+    int condition_effect_particle_bound = 128;
+    int condition_effect_seed = 1;
+    double condition_effect_x = 0.0;
+    double condition_effect_y = 0.0;
+    double condition_effect_z = 0.0;
+    double condition_effect_half_x = 0.5;
+    double condition_effect_half_y = 0.5;
+    double condition_effect_half_z = 0.5;
+    double condition_effect_radius = 0.5;
+    double condition_emitter_rate = 10.0;
+    double condition_emitter_lifetime = 2.0;
+    double condition_emitter_duration = 4.0;
+    double condition_emitter_velocity_y = 0.5;
+    double condition_influence_strength = 0.25;
+    double condition_preview_elapsed = 1.0;
+    std::array<char, 257> condition_effect_owner{'c','o','n','d','i','t','i','o','n','.','e','f','f','e','c','t'};
+    std::array<char, 129> condition_effect_normal_state{'a','c','t','i','v','e'};
+    std::array<char, 129> condition_effect_disabled_state{'d','i','s','a','b','l','e','d'};
+    std::optional<carto::condition::EffectPreviewResult> condition_effect_preview_result;
+    std::array<int, 5> condition_vegetation_field_indices{};
+    int condition_vegetation_asset_index = 0;
+    double condition_vegetation_spacing = 2.0;
+    double condition_vegetation_density = 0.05;
+    double condition_vegetation_threshold = 0.2;
+    double condition_vegetation_min_scale = 0.8;
+    double condition_vegetation_max_scale = 1.2;
+    int condition_vegetation_seed = 1;
+    std::optional<carto::condition::VegetationPreviewResult>
+        condition_vegetation_preview_result;
+    std::array<char, 129> condition_state_branch_name{
+        'm','a','i','n','t','e','n','a','n','c','e','-','a','l','t','e','r','n','a','t','e'};
+    std::array<char, 257> condition_state_branch_applicability{};
+    int condition_safe_place_profile_index = 0;
+    int condition_safe_place_property_index = 0;
+    int condition_state_parent_index = 0;
+    int condition_state_compare_left_index = 0;
+    int condition_state_compare_right_index = 1;
+    double condition_state_branch_value = 0.5;
+    std::optional<carto::condition::StateComparisonResult>
+        condition_state_comparison_result;
     std::array<char, 129> spatial_field_identity{'f','i','e','l','d','.','m','o','i','s','t','u','r','e'};
     std::string selected_spatial_field;
     double spatial_field_origin_u = 0.0;
@@ -1613,6 +1739,84 @@ struct DesktopState {
         action_feedback_error = false;
     }
 
+    void import_condition_audio_clip() {
+        const auto path = choose_file(false, FileDialogKind::audio_clip);
+        if (!path.has_value()) return;
+        const auto imported = ui.import_condition_audio_clip(*path);
+        if (!imported) {
+            action_feedback = imported.error().message;
+            action_feedback_error = true;
+            return;
+        }
+        const auto snapshot = ui.snapshot();
+        action_feedback = "Inspected WAVE clip metadata as unreviewed source evidence; " +
+            std::to_string(snapshot.condition.source_count) + " CONDITION sources now present. "
+            "Audio samples were not embedded.";
+        action_feedback_error = false;
+    }
+
+    void stop_condition_audio_audition() noexcept {
+        (void)PlaySoundA(nullptr, nullptr, 0U);
+        condition_audio_preview_buffer.clear();
+    }
+
+    void audition_condition_audio_clip(std::uint64_t source_id) {
+        const auto snapshot = ui.snapshot();
+        const auto source = std::find_if(snapshot.condition.sources.begin(),
+            snapshot.condition.sources.end(), [source_id](const auto& candidate) {
+                return candidate.id == source_id && candidate.kind == "imported-asset";
+            });
+        if (source == snapshot.condition.sources.end() || !source->current) {
+            action_feedback = "Audition requires current imported WAVE source evidence.";
+            action_feedback_error = true;
+            return;
+        }
+        const auto path = choose_file(false, FileDialogKind::audio_clip);
+        if (!path.has_value()) return;
+        std::error_code file_error;
+        const auto file_size = std::filesystem::file_size(*path, file_error);
+        if (file_error || file_size == 0U ||
+            file_size > carto::condition::kMaxWaveClipBytes) {
+            action_feedback = "Selected WAVE file is empty, unavailable, or exceeds the import bound.";
+            action_feedback_error = true;
+            return;
+        }
+        std::ifstream stream(*path, std::ios::binary);
+        std::vector<std::uint8_t> source_bytes(static_cast<std::size_t>(file_size));
+        stream.read(reinterpret_cast<char*>(source_bytes.data()),
+            static_cast<std::streamsize>(source_bytes.size()));
+        if (!stream) {
+            action_feedback = "Unable to read the selected WAVE source for audition.";
+            action_feedback_error = true;
+            return;
+        }
+        const auto source_digest = carto::assets::sha256(
+            std::span<const std::uint8_t>{source_bytes});
+        if (source_digest != source->digest) {
+            action_feedback = "Selected audio does not match the recorded source digest.";
+            action_feedback_error = true;
+            return;
+        }
+        auto excerpt = carto::condition::make_wave_audition_excerpt(source_bytes);
+        if (!excerpt) {
+            action_feedback = excerpt.error().message;
+            action_feedback_error = true;
+            return;
+        }
+        stop_condition_audio_audition();
+        condition_audio_preview_buffer = std::move(excerpt.value());
+        if (condition_audio_preview_buffer.empty() ||
+            PlaySoundA(reinterpret_cast<LPCSTR>(condition_audio_preview_buffer.data()),
+                nullptr, SND_ASYNC | SND_MEMORY | SND_NODEFAULT) == FALSE) {
+            condition_audio_preview_buffer.clear();
+            action_feedback = "Windows audio audition could not start this WAVE excerpt.";
+            action_feedback_error = true;
+            return;
+        }
+        action_feedback = "Auditioning a digest-verified, transient three-second WAVE excerpt.";
+        action_feedback_error = false;
+    }
+
     void export_condition_authoring() {
         const auto path = choose_file(true, FileDialogKind::condition_authoring);
         if (!path.has_value()) return;
@@ -1682,6 +1886,202 @@ struct DesktopState {
         if (ClientToScreen(window, &client_point) == FALSE) return false;
         position = {static_cast<double>(client_point.x), static_cast<double>(client_point.y)};
         return position.finite();
+    }
+
+    bool condition_gizmo_local_delta(
+        const NativeConditionGizmoHandle& handle,
+        carto::core::Vec2d screen_position,
+        carto::core::Vec3d& local_delta) const {
+        const auto world = work_surface_camera.screen_to_world(screen_position,
+            {static_cast<double>(native_viewport_hits.screen_origin.x),
+                static_cast<double>(native_viewport_hits.screen_origin.y)},
+            {static_cast<double>(native_viewport_hits.extent.x),
+                static_cast<double>(native_viewport_hits.extent.y)});
+        if (!world) return false;
+        const auto inverse_rotate = [](carto::core::Quaternion rotation,
+                                       carto::core::Vec3d value) {
+            const auto normalized = rotation.normalized();
+            return carto::core::Quaternion{
+                -normalized.x, -normalized.y, -normalized.z, normalized.w}.rotate(value);
+        };
+        const auto divide_scale = [](carto::core::Vec3d value,
+                                     carto::core::Vec3d scale) -> std::optional<carto::core::Vec3d> {
+            constexpr double kMinScale = 1.0e-9;
+            if (!scale.finite() || std::abs(scale.x) < kMinScale ||
+                std::abs(scale.y) < kMinScale || std::abs(scale.z) < kMinScale) {
+                return std::nullopt;
+            }
+            return carto::core::Vec3d{
+                value.x / scale.x, value.y / scale.y, value.z / scale.z};
+        };
+        const auto center = world_point(handle.owner_world,
+            handle.local_transform.translation);
+        const carto::core::Vec3d world_delta{
+            world.value().x - center.x, 0.0, world.value().y - center.z};
+        const auto parent_delta = divide_scale(
+            inverse_rotate(handle.owner_world.rotation, world_delta),
+            handle.owner_world.scale);
+        if (!parent_delta) return false;
+        const auto local_unscaled = inverse_rotate(handle.local_transform.rotation, *parent_delta);
+        const auto local = divide_scale(local_unscaled, handle.local_transform.scale);
+        if (!local || !local->finite()) return false;
+        local_delta = *local;
+        return true;
+    }
+
+    void cancel_native_condition_gizmo(
+        std::string reason, bool release_capture = true) {
+        if (!native_condition_gizmo_drag.has_value()) return;
+        native_condition_gizmo_drag.reset();
+        if (release_capture && window != nullptr && GetCapture() == window) {
+            ReleaseCapture();
+        }
+        action_feedback = std::move(reason);
+        action_feedback_error = true;
+    }
+
+    bool begin_native_condition_gizmo_drag(
+        const carto::ui::NativePointerEvent& event,
+        const UiSnapshot& snapshot,
+        ImVec2 pointer) {
+        if (!event.pressed || event.button != carto::ui::NativePointerButton::primary ||
+            snapshot.workspace_kind != carto::ui::Workspace::condition ||
+            carto::ui::selection_operation_for_native_pointer(event) !=
+                std::optional<carto::editor::SelectionOperation>{
+                    carto::editor::SelectionOperation::replace}) {
+            return false;
+        }
+        constexpr float kHandleRadiusSquared = 12.0F * 12.0F;
+        const NativeConditionGizmoHandle* hit = nullptr;
+        float best = kHandleRadiusSquared;
+        for (const auto& candidate : native_viewport_hits.condition_gizmos) {
+            const float dx = candidate.handle.x - pointer.x;
+            const float dy = candidate.handle.y - pointer.y;
+            const float distance = dx * dx + dy * dy;
+            if (distance < best) {
+                best = distance;
+                hit = &candidate;
+            }
+        }
+        if (hit == nullptr) return false;
+        const auto authoring = session.condition_authoring();
+        if (!authoring || authoring.value().project_revision != hit->authoring_revision ||
+            snapshot.project_revision != native_viewport_hits.project_revision) {
+            action_feedback = authoring
+                ? "Acoustic gizmo input is stale; rebuild the viewport and retry."
+                : authoring.error().message;
+            action_feedback_error = true;
+            return true;
+        }
+        NativeConditionGizmoDrag capture;
+        capture.handle = *hit;
+        capture.project_revision = snapshot.project_revision;
+        capture.viewport = ImRect(native_viewport_hits.screen_origin,
+            native_viewport_hits.screen_origin + native_viewport_hits.extent);
+        capture.preview_minimum = hit->minimum_distance;
+        capture.preview_maximum = hit->maximum_distance;
+        capture.preview_radius = hit->radius;
+        capture.preview_half_extents = hit->half_extents;
+        native_condition_gizmo_drag = std::move(capture);
+        if (window != nullptr) SetCapture(window);
+        action_feedback = "Drag the acoustic handle; release to commit a revision-bound edit.";
+        action_feedback_error = false;
+        return true;
+    }
+
+    bool route_native_condition_gizmo_drag(const carto::ui::NativePointerEvent& event) {
+        if (!native_condition_gizmo_drag.has_value()) return false;
+        const auto snapshot = ui.snapshot();
+        if (snapshot.workspace_kind != carto::ui::Workspace::condition ||
+            snapshot.project_revision != native_condition_gizmo_drag->project_revision) {
+            cancel_native_condition_gizmo(
+                "Acoustic gizmo cancelled because its project snapshot changed.");
+            return true;
+        }
+        carto::core::Vec2d pointer;
+        if (!native_pointer_screen_position(event, pointer)) {
+            cancel_native_condition_gizmo(
+                "Acoustic gizmo cancelled because pointer position is unavailable.");
+            return true;
+        }
+        if (!native_condition_gizmo_drag->viewport.Contains(ImVec2(
+                static_cast<float>(pointer.x), static_cast<float>(pointer.y)))) {
+            cancel_native_condition_gizmo(
+                "Acoustic gizmo cancelled after the pointer left the viewport.");
+            return true;
+        }
+        carto::core::Vec3d local_delta;
+        if (!condition_gizmo_local_delta(
+                native_condition_gizmo_drag->handle, pointer, local_delta)) {
+            cancel_native_condition_gizmo("Acoustic gizmo could not resolve local coordinates.");
+            return true;
+        }
+        auto& capture = *native_condition_gizmo_drag;
+        const double radius = std::hypot(local_delta.x, local_delta.z);
+        switch (capture.handle.kind) {
+        case NativeConditionGizmoKind::audio_minimum_distance:
+            capture.preview_minimum = std::clamp(radius, 0.0,
+                std::max(0.0, capture.handle.maximum_distance - 0.01));
+            break;
+        case NativeConditionGizmoKind::audio_maximum_distance:
+            capture.preview_maximum = std::clamp(radius,
+                capture.handle.minimum_distance + 0.01, 1.0e6);
+            break;
+        case NativeConditionGizmoKind::acoustic_sphere_radius:
+            capture.preview_radius = std::clamp(radius, 0.01, 1.0e6);
+            break;
+        case NativeConditionGizmoKind::acoustic_box_corner:
+            capture.preview_half_extents = {
+                std::clamp(std::abs(local_delta.x), 0.01, 1.0e6),
+                capture.handle.half_extents.y,
+                std::clamp(std::abs(local_delta.z), 0.01, 1.0e6)};
+            break;
+        }
+        if (event.pressed) return true;
+
+        const auto kind = capture.handle.kind;
+        const auto record_id = capture.handle.record_id;
+        const auto expected_revision = capture.handle.authoring_revision;
+        const auto minimum_distance = capture.preview_minimum;
+        const auto maximum_distance = capture.preview_maximum;
+        const auto preview_radius = capture.preview_radius;
+        const auto half_extents = capture.preview_half_extents;
+        const auto initial_minimum = capture.handle.minimum_distance;
+        const auto initial_maximum = capture.handle.maximum_distance;
+        const auto initial_radius = capture.handle.radius;
+        const auto initial_half_extents = capture.handle.half_extents;
+        native_condition_gizmo_drag.reset();
+        if (window != nullptr && GetCapture() == window) ReleaseCapture();
+
+        if (kind == NativeConditionGizmoKind::audio_minimum_distance ||
+            kind == NativeConditionGizmoKind::audio_maximum_distance) {
+            if (minimum_distance != initial_minimum || maximum_distance != initial_maximum) {
+                const auto updated = ui.update_condition_audio_source_distances(
+                    record_id, expected_revision, minimum_distance, maximum_distance);
+                action_feedback = updated
+                    ? "Committed acoustic source distance through project command history."
+                    : updated.error().message;
+                action_feedback_error = !updated;
+            } else {
+                action_feedback = "Acoustic source distance is unchanged.";
+                action_feedback_error = false;
+            }
+        } else if ((kind == NativeConditionGizmoKind::acoustic_sphere_radius &&
+                    preview_radius != initial_radius) ||
+                   (kind == NativeConditionGizmoKind::acoustic_box_corner &&
+                    (half_extents.x != initial_half_extents.x ||
+                     half_extents.z != initial_half_extents.z))) {
+            const auto updated = ui.update_condition_acoustic_zone_volume(
+                record_id, expected_revision, half_extents, preview_radius);
+            action_feedback = updated
+                ? "Committed acoustic-zone volume through project command history."
+                : updated.error().message;
+            action_feedback_error = !updated;
+        } else {
+            action_feedback = "Acoustic zone volume is unchanged.";
+            action_feedback_error = false;
+        }
+        return true;
     }
 
     carto::core::Result<carto::core::Transform> snap_native_transform_preview(
@@ -2044,6 +2444,7 @@ struct DesktopState {
             native_viewport_hits.screen_origin + native_viewport_hits.extent);
         if (!viewport.Contains(point)) return false;
 
+        if (begin_native_condition_gizmo_drag(event, snapshot, point)) return true;
         if (begin_native_transform_drag(event, snapshot, point)) return true;
 
         if (snapshot.selection.mode == carto::editor::SelectionMode::edge) {
@@ -3674,6 +4075,146 @@ struct DesktopState {
                 }
             }
         }
+        if (!showing_agent_preview && snapshot.workspace_kind == carto::ui::Workspace::condition) {
+            const auto owner_instance = [&](std::uint64_t asset_id) {
+                const auto asset = std::find_if(snapshot.condition.assets.begin(),
+                    snapshot.condition.assets.end(), [asset_id](const auto& value) {
+                        return value.id == asset_id && value.authored_object_id != 0U;
+                    });
+                if (asset == snapshot.condition.assets.end()) return instances.end();
+                return std::find_if(instances.begin(), instances.end(), [&](const auto& value) {
+                    return value.object.value == asset->authored_object_id;
+                });
+            };
+            const auto draw_ring = [&](const auto& owner, const carto::core::Transform& local,
+                                       double radius, double start_angle, ImU32 ring_color)
+                -> std::optional<ImVec2> {
+                if (!std::isfinite(radius) || radius <= 0.0) return std::nullopt;
+                constexpr std::size_t kRingSegments = 48U;
+                std::array<ImVec2, kRingSegments + 1U> points{};
+                constexpr double kTau = 6.2831853071795864769;
+                for (std::size_t index = 0U; index <= kRingSegments; ++index) {
+                    const double angle = start_angle + kTau * static_cast<double>(index) /
+                        static_cast<double>(kRingSegments);
+                    const Vec3d offset{std::cos(angle) * radius, 0.0,
+                                       std::sin(angle) * radius};
+                    const Vec3d asset_point = world_point(local, offset);
+                    points[index] = project(world_point(owner.world_transform, asset_point));
+                }
+                draw->AddPolyline(points.data(), static_cast<int>(points.size()),
+                    ring_color, 1.5F, ImDrawFlags_Closed);
+                draw->AddCircleFilled(points.front(), 3.5F, ring_color);
+                return points.front();
+            };
+            const ImU32 source_color = rgba(snapshot.colors.accent_primary, 0.76F);
+            const ImU32 source_inner_color = rgba(snapshot.colors.accent_primary, 0.42F);
+            const ImU32 zone_color = rgba(snapshot.colors.accent_secondary, 0.86F);
+            for (const auto& source : snapshot.condition.audio_sources) {
+                if (!source.enabled || !source.spatial) continue;
+                const auto owner = owner_instance(source.asset_id);
+                if (owner != instances.end()) {
+                    double preview_minimum_distance = source.minimum_distance;
+                    double preview_maximum_distance = source.maximum_distance;
+                    if (native_condition_gizmo_drag.has_value() &&
+                        native_condition_gizmo_drag->handle.record_id == source.id) {
+                        if (native_condition_gizmo_drag->handle.kind ==
+                                NativeConditionGizmoKind::audio_minimum_distance ||
+                            native_condition_gizmo_drag->handle.kind ==
+                                NativeConditionGizmoKind::audio_maximum_distance) {
+                            preview_minimum_distance =
+                                native_condition_gizmo_drag->preview_minimum;
+                            preview_maximum_distance =
+                                native_condition_gizmo_drag->preview_maximum;
+                        }
+                    }
+                    const ImVec2 center = project(world_point(
+                        owner->world_transform, source.local_transform.translation));
+                    const auto minimum_handle = draw_ring(*owner, source.local_transform,
+                        preview_minimum_distance, 1.5707963267948966, source_inner_color);
+                    const auto maximum_handle = draw_ring(*owner, source.local_transform,
+                        preview_maximum_distance, 0.0, source_color);
+                    if (minimum_handle.has_value()) {
+                        draw->AddText(*minimum_handle + ImVec2(5.0F, -13.0F),
+                            source_inner_color, "MIN");
+                        native_viewport_hits.condition_gizmos.push_back({
+                            NativeConditionGizmoKind::audio_minimum_distance, source.id,
+                            center, *minimum_handle, owner->world_transform,
+                            source.local_transform, source.minimum_distance,
+                            source.maximum_distance, 0.0, {},
+                            snapshot.condition.authored_revision});
+                    }
+                    if (maximum_handle.has_value()) {
+                        draw->AddText(*maximum_handle + ImVec2(5.0F, -13.0F),
+                            source_color, "MAX");
+                        native_viewport_hits.condition_gizmos.push_back({
+                            NativeConditionGizmoKind::audio_maximum_distance, source.id,
+                            center, *maximum_handle, owner->world_transform,
+                            source.local_transform, source.minimum_distance,
+                            source.maximum_distance, 0.0, {},
+                            snapshot.condition.authored_revision});
+                    }
+                }
+            }
+            for (const auto& zone : snapshot.condition.acoustic_zones) {
+                if (!zone.enabled) continue;
+                const auto owner = owner_instance(zone.asset_id);
+                if (owner == instances.end()) continue;
+                auto half_extents = zone.half_extents;
+                double radius = zone.radius;
+                if (native_condition_gizmo_drag.has_value() &&
+                    native_condition_gizmo_drag->handle.record_id == zone.id) {
+                    if (native_condition_gizmo_drag->handle.kind ==
+                            NativeConditionGizmoKind::acoustic_sphere_radius) {
+                        radius = native_condition_gizmo_drag->preview_radius;
+                    } else if (native_condition_gizmo_drag->handle.kind ==
+                            NativeConditionGizmoKind::acoustic_box_corner) {
+                        half_extents = native_condition_gizmo_drag->preview_half_extents;
+                    }
+                }
+                const ImVec2 center = project(world_point(
+                    owner->world_transform, zone.local_transform.translation));
+                if (zone.shape == "sphere") {
+                    const auto handle = draw_ring(*owner, zone.local_transform,
+                        radius, 0.0, zone_color);
+                    if (handle.has_value()) {
+                        native_viewport_hits.condition_gizmos.push_back({
+                            NativeConditionGizmoKind::acoustic_sphere_radius, zone.id,
+                            center, *handle, owner->world_transform, zone.local_transform,
+                            0.0, 0.0, zone.radius, zone.half_extents,
+                            snapshot.condition.authored_revision});
+                    }
+                    const std::string priority_label = "P" + std::to_string(zone.priority);
+                    draw->AddText(center + ImVec2(5.0F, 5.0F), zone_color,
+                        priority_label.c_str());
+                    continue;
+                }
+                const std::array<Vec3d, 5> local_corners{{
+                    {-half_extents.x, 0.0, -half_extents.z},
+                    { half_extents.x, 0.0, -half_extents.z},
+                    { half_extents.x, 0.0,  half_extents.z},
+                    {-half_extents.x, 0.0,  half_extents.z},
+                    {-half_extents.x, 0.0, -half_extents.z}}};
+                std::array<ImVec2, 5U> screen_corners{};
+                for (std::size_t index = 0U; index < local_corners.size(); ++index) {
+                    const Vec3d asset_point = world_point(zone.local_transform,
+                        local_corners[index]);
+                    screen_corners[index] = project(
+                        world_point(owner->world_transform, asset_point));
+                }
+                draw->AddPolyline(screen_corners.data(),
+                    static_cast<int>(screen_corners.size()), zone_color,
+                    1.5F, ImDrawFlags_Closed);
+                draw->AddCircleFilled(screen_corners[2], 4.0F, zone_color);
+                const std::string priority_label = "P" + std::to_string(zone.priority);
+                draw->AddText(center + ImVec2(5.0F, 5.0F), zone_color,
+                    priority_label.c_str());
+                native_viewport_hits.condition_gizmos.push_back({
+                    NativeConditionGizmoKind::acoustic_box_corner, zone.id, center,
+                    screen_corners[2], owner->world_transform, zone.local_transform,
+                    0.0, 0.0, zone.radius, zone.half_extents,
+                    snapshot.condition.authored_revision});
+            }
+        }
         if (!showing_agent_preview && snapshot.workspace_kind == carto::ui::Workspace::model &&
             snapshot.selection.mode == carto::editor::SelectionMode::object &&
             snapshot.selection.objects.size() == 1U) {
@@ -4483,6 +5024,17 @@ struct DesktopState {
         if (ImGui::InputText("Native step", step.data(), step.size())) {
             agent_step.assign(step.data());
         }
+        std::vector<const char*> dependency_labels{"Independent"};
+        dependency_labels.reserve(snapshot.agent_plan_draft.size() + 1U);
+        for (const auto& planned : snapshot.agent_plan_draft) {
+            dependency_labels.push_back(planned.id.c_str());
+        }
+        if (agent_step_dependency < 0 ||
+            agent_step_dependency >= static_cast<int>(dependency_labels.size())) {
+            agent_step_dependency = 0;
+        }
+        ImGui::Combo("Depends on", &agent_step_dependency,
+            dependency_labels.data(), static_cast<int>(dependency_labels.size()));
         const bool selected_component =
             (snapshot.selection.mode == carto::editor::SelectionMode::face &&
                 snapshot.selection.component_object.has_value() &&
@@ -4510,11 +5062,17 @@ struct DesktopState {
             snapshot.agent_task->status != carto::agent::TaskStatus::rejected;
         ImGui::BeginDisabled(!selected_component || agent_step.empty() || unresolved_task);
         if (ImGui::Button("Queue selected target", ImVec2(-1, 28))) {
-            const auto queued = ui.queue_agent_step(agent_step);
+            std::vector<std::string> dependencies;
+            if (agent_step_dependency > 0) {
+                dependencies.push_back(snapshot.agent_plan_draft[
+                    static_cast<std::size_t>(agent_step_dependency - 1)].id);
+            }
+            const auto queued = ui.queue_agent_step(agent_step, std::move(dependencies));
             if (queued) {
                 agent_feedback = "Step captured against revision " +
                     std::to_string(snapshot.project_revision.value()) + ".";
                 agent_step.clear();
+                agent_step_dependency = static_cast<int>(snapshot.agent_plan_draft.size());
             } else {
                 agent_feedback = queued.error().message;
             }
@@ -4524,16 +5082,97 @@ struct DesktopState {
             ImGui::Text("Plan · %llu step(s)", static_cast<unsigned long long>(
                 snapshot.agent_plan_draft.size()));
             for (const auto& planned : snapshot.agent_plan_draft) {
-                ImGui::BulletText("%s · object %llu · %s", planned.id.c_str(),
+                const std::string dependency_text = planned.dependencies.empty()
+                    ? "independent"
+                    : "after " + planned.dependencies.front();
+                ImGui::BulletText("%s · %s · object %llu · %s", planned.id.c_str(),
+                    dependency_text.c_str(),
                     static_cast<unsigned long long>(planned.target.object.value),
                     planned.intent.c_str());
             }
+        }
+        ImGui::Separator();
+        ImGui::TextDisabled("Operator clarification · blocks the plan until answered");
+        std::array<char, 1025> question_input{};
+        const std::size_t question_bytes = std::min(
+            agent_question.size(), question_input.size() - 1U);
+        std::copy_n(agent_question.data(), question_bytes, question_input.data());
+        if (ImGui::InputText("Decision question", question_input.data(), question_input.size())) {
+            agent_question.assign(question_input.data());
+        }
+        constexpr std::array<const char*, 9> clarification_impact_names{
+            "Object scope", "Topology deletion", "Familiarity-critical feature",
+            "Collision or navigation", "Interaction anchor", "Source hierarchy",
+            "Large spatial transform", "Imported source integrity", "Publication readiness"};
+        constexpr std::array<carto::agent::ClarificationImpact, 9> clarification_impacts{
+            carto::agent::ClarificationImpact::object_scope,
+            carto::agent::ClarificationImpact::topology_deletion,
+            carto::agent::ClarificationImpact::familiarity_critical_feature,
+            carto::agent::ClarificationImpact::collision_or_navigation,
+            carto::agent::ClarificationImpact::interaction_anchor,
+            carto::agent::ClarificationImpact::source_hierarchy,
+            carto::agent::ClarificationImpact::large_spatial_transform,
+            carto::agent::ClarificationImpact::imported_source_integrity,
+            carto::agent::ClarificationImpact::publication_readiness};
+        if (agent_clarification_impact < 0 ||
+            agent_clarification_impact >= static_cast<int>(clarification_impacts.size())) {
+            agent_clarification_impact = 0;
+        }
+        ImGui::Combo("Consequence", &agent_clarification_impact,
+            clarification_impact_names.data(),
+            static_cast<int>(clarification_impact_names.size()));
+        ImGui::BeginDisabled(agent_question.empty() || snapshot.agent_plan_draft.empty() ||
+            snapshot.agent_task.has_value());
+        if (ImGui::Button("Require an answer", ImVec2(-1, 26))) {
+            const auto queued = ui.queue_agent_clarification(
+                agent_question, clarification_impacts[static_cast<std::size_t>(
+                    agent_clarification_impact)]);
+            agent_feedback = queued
+                ? "Question bound to the current target scope; answer it before running."
+                : queued.error().message;
+            if (queued) agent_question.clear();
+        }
+        ImGui::EndDisabled();
+        bool clarifications_answered = true;
+        for (const auto& question : snapshot.agent_clarifications_draft) {
+            ImGui::PushID(question.id.c_str());
+            ImGui::TextWrapped("Question · %s", question.prompt.c_str());
+            if (question.freeform_answer.has_value()) {
+                ImGui::TextWrapped("Operator answer · %s", question.freeform_answer->c_str());
+            } else if (question.selected_candidate_id.has_value()) {
+                ImGui::Text("Operator choice · %s", question.selected_candidate_id->c_str());
+            } else {
+                clarifications_answered = false;
+                std::array<char, 1025> answer_input{};
+                const std::size_t answer_bytes = std::min(
+                    agent_answer.size(), answer_input.size() - 1U);
+                std::copy_n(agent_answer.data(), answer_bytes, answer_input.data());
+                if (ImGui::InputText("Answer", answer_input.data(), answer_input.size())) {
+                    agent_answer.assign(answer_input.data());
+                }
+                ImGui::BeginDisabled(agent_answer.empty() || agent_goal.empty());
+                if (ImGui::Button("Confirm operator answer", ImVec2(-1, 26))) {
+                    const auto answered = ui.answer_agent_clarification(
+                        agent_goal, question.id, agent_answer);
+                    agent_feedback = answered
+                        ? "Answer recorded against this exact objective and target revision."
+                        : answered.error().message;
+                    if (answered) agent_answer.clear();
+                }
+                ImGui::EndDisabled();
+            }
+            ImGui::PopID();
         }
         const bool task_present = snapshot.agent_task.has_value();
         const bool task_active = task_present &&
             snapshot.agent_task->status != carto::agent::TaskStatus::accepted &&
             snapshot.agent_task->status != carto::agent::TaskStatus::rejected;
-        ImGui::BeginDisabled(task_present || snapshot.agent_plan_draft.empty() || agent_goal.empty());
+        if (!clarifications_answered) {
+            ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                "Plan blocked until every required clarification has an operator answer.");
+        }
+        ImGui::BeginDisabled(task_present || snapshot.agent_plan_draft.empty() ||
+            agent_goal.empty() || !clarifications_answered);
         if (ImGui::Button("Run speculative plan", ImVec2(-1, 30))) {
             const auto run = ui.run_agent_plan(agent_goal);
             if (run) {
@@ -4556,6 +5195,16 @@ struct DesktopState {
             ImGui::TextDisabled("Objective %.12s · based on R%llu",
                 objective_digest.c_str(),
                 static_cast<unsigned long long>(task.base_revision.value()));
+            for (const auto& question : task.clarifications) {
+                ImGui::TextWrapped("Operator question · %s", question.prompt.c_str());
+                if (question.freeform_answer.has_value()) {
+                    ImGui::TextWrapped("Recorded answer · %s",
+                        question.freeform_answer->c_str());
+                } else if (question.selected_candidate_id.has_value()) {
+                    ImGui::Text("Recorded choice · %s",
+                        question.selected_candidate_id->c_str());
+                }
+            }
             if (ImGui::SmallButton("Show source")) agent_preview_mode = 0;
             ImGui::SameLine();
             if (ImGui::SmallButton("Show before")) agent_preview_mode = 1;
@@ -4563,6 +5212,21 @@ struct DesktopState {
             if (ImGui::SmallButton("Show after")) agent_preview_mode = 2;
             ImGui::TextDisabled(
                 "Accept keeps one undo step for this result and replaces the previous command history.");
+            for (const auto& planned : task.plan_steps) {
+                std::string dependencies = "ready";
+                if (!planned.dependencies.empty()) {
+                    dependencies = "after ";
+                    for (std::size_t index = 0U; index < planned.dependencies.size(); ++index) {
+                        if (index != 0U) dependencies += ", ";
+                        dependencies += planned.dependencies[index];
+                    }
+                }
+                ImGui::BulletText("%s · %s · %s", planned.step_id.c_str(),
+                    carto::agent::step_status_name(planned.status), dependencies.c_str());
+                if (planned.diagnostic.has_value()) {
+                    ImGui::TextDisabled("  %s", planned.diagnostic->message.c_str());
+                }
+            }
             ImGui::Text("Diff · %llu objects · %llu meshes",
                 static_cast<unsigned long long>(task.diff.changed_object_count()),
                 static_cast<unsigned long long>(task.diff.changed_mesh_count()));
@@ -4787,6 +5451,10 @@ struct DesktopState {
                         condition.interaction_anchor_count, condition.collection_count,
                         condition.prefab_count);
             ImGui::Text("Region kits %zu", condition.region_kit_count);
+            ImGui::Text("Audio sources %zu  ·  Acoustic zones %zu",
+                condition.audio_source_count, condition.acoustic_zone_count);
+            ImGui::TextDisabled("Authoring revision r%llu",
+                static_cast<unsigned long long>(condition.authored_revision.value()));
             if (!condition.digest.is_zero()) {
                 mono_text_disabled(("Authoring " + condition.digest.hex()).c_str());
             }
@@ -4815,6 +5483,1002 @@ struct DesktopState {
                 }
             }
             ImGui::EndChild();
+            heading_text("Audio source and acoustic-zone intent");
+            ImGui::TextWrapped(
+                "WAVE import validates bounded PCM/float metadata and records a content digest. "
+                "Samples are not embedded or played; source evidence requires explicit review.");
+            if (ImGui::Button("Import WAVE clip evidence...", ImVec2(-1, 28))) {
+                import_condition_audio_clip();
+            }
+            for (const auto& source : condition.sources) {
+                if (source.kind != "imported-asset") continue;
+                for (const auto& diagnostic : source.diagnostics) {
+                    if (diagnostic.starts_with("WAVE inspected:")) {
+                        ImGui::TextWrapped("%s", diagnostic.c_str());
+                        ImGui::TextDisabled("Clip evidence %llu · %s%s",
+                            static_cast<unsigned long long>(source.id),
+                            source.current ? "current" : "stale",
+                            source.reviewed ? " · reviewed" : " · not reviewed");
+                        if (!source.reviewed && source.current &&
+                            ImGui::SmallButton(("Review metadata##wave-" +
+                                std::to_string(source.id)).c_str())) {
+                            const auto reviewed = ui.set_condition_source_reviewed(source.id, true);
+                            action_feedback = reviewed
+                                ? "Marked current WAVE source metadata reviewed; no audio audition occurred."
+                                : reviewed.error().message;
+                            action_feedback_error = !reviewed;
+                        }
+                        if (source.current && ImGui::SmallButton(("Audition 3 s excerpt##wave-" +
+                                std::to_string(source.id)).c_str())) {
+                            audition_condition_audio_clip(source.id);
+                        }
+                    }
+                }
+            }
+            if (!condition_audio_preview_buffer.empty() &&
+                ImGui::SmallButton("Stop WAVE audition")) {
+                stop_condition_audio_audition();
+                action_feedback = "Stopped the transient WAVE audition.";
+                action_feedback_error = false;
+            }
+            std::vector<const char*> condition_asset_labels;
+            condition_asset_labels.reserve(condition.assets.size());
+            for (const auto& asset : condition.assets) {
+                condition_asset_labels.push_back(asset.stable_name.c_str());
+            }
+            if (!condition_asset_labels.empty()) {
+                condition_audio_asset_index = std::clamp(condition_audio_asset_index, 0,
+                    static_cast<int>(condition_asset_labels.size()) - 1);
+                ImGui::Combo("Audio owner asset", &condition_audio_asset_index,
+                    condition_asset_labels.data(),
+                    static_cast<int>(condition_asset_labels.size()));
+            }
+            std::vector<const carto::application::ConditionAuthoringView::Source*>
+                clip_sources;
+            std::vector<std::string> clip_labels;
+            for (const auto& source : condition.sources) {
+                if (source.kind != "imported-asset" || !source.current || !source.reviewed) continue;
+                clip_sources.push_back(&source);
+                clip_labels.push_back(std::to_string(source.id) + " · " +
+                    (source.label.empty() ? source.locator : source.label));
+            }
+            std::vector<const char*> clip_label_pointers;
+            clip_label_pointers.reserve(clip_labels.size());
+            for (const auto& label : clip_labels) clip_label_pointers.push_back(label.c_str());
+            if (!clip_label_pointers.empty()) {
+                condition_audio_clip_index = std::clamp(condition_audio_clip_index, 0,
+                    static_cast<int>(clip_label_pointers.size()) - 1);
+                ImGui::Combo("Reviewed clip source", &condition_audio_clip_index,
+                    clip_label_pointers.data(), static_cast<int>(clip_label_pointers.size()));
+                ImGui::InputDouble("Audio source X", &condition_audio_x, 0.1, 1.0, "%.3f");
+                ImGui::InputDouble("Audio source Y", &condition_audio_y, 0.1, 1.0, "%.3f");
+                ImGui::InputDouble("Audio source Z", &condition_audio_z, 0.1, 1.0, "%.3f");
+                ImGui::InputDouble("Audio gain", &condition_audio_gain, 0.05, 0.25, "%.3f");
+                ImGui::InputDouble("Audio pitch", &condition_audio_pitch, 0.05, 0.25, "%.3f");
+                ImGui::InputDouble("Minimum distance", &condition_audio_minimum_distance,
+                    0.1, 1.0, "%.3f");
+                ImGui::InputDouble("Maximum distance", &condition_audio_maximum_distance,
+                    0.1, 1.0, "%.3f");
+                ImGui::InputDouble("Reverb send", &condition_audio_reverb_send, 0.05, 0.25, "%.3f");
+                ImGui::InputInt("Audio priority", &condition_audio_priority);
+                condition_audio_priority = std::clamp(condition_audio_priority, 0, 65535);
+                constexpr std::array<const char*, 7> audio_bus_labels{
+                    "Ambient", "Machinery", "Vehicle", "Radio", "Speech", "Music", "Effects"};
+                constexpr std::array<carto::condition::AudioBusClass, 7> audio_bus_values{
+                    carto::condition::AudioBusClass::ambient,
+                    carto::condition::AudioBusClass::machinery,
+                    carto::condition::AudioBusClass::vehicle,
+                    carto::condition::AudioBusClass::radio,
+                    carto::condition::AudioBusClass::speech,
+                    carto::condition::AudioBusClass::music,
+                    carto::condition::AudioBusClass::effects};
+                condition_audio_bus_index = std::clamp(condition_audio_bus_index, 0, 6);
+                ImGui::Combo("Audio bus class", &condition_audio_bus_index,
+                    audio_bus_labels.data(), static_cast<int>(audio_bus_labels.size()));
+                constexpr std::array<const char*, 3> audio_occlusion_labels{
+                    "None", "Static geometry", "Authored geometry"};
+                constexpr std::array<carto::condition::AudioOcclusionIntent, 3>
+                    audio_occlusion_values{
+                        carto::condition::AudioOcclusionIntent::none,
+                        carto::condition::AudioOcclusionIntent::static_geometry,
+                        carto::condition::AudioOcclusionIntent::authored_geometry};
+                condition_audio_occlusion_index = std::clamp(
+                    condition_audio_occlusion_index, 0, 2);
+                ImGui::Combo("Occlusion intent", &condition_audio_occlusion_index,
+                    audio_occlusion_labels.data(),
+                    static_cast<int>(audio_occlusion_labels.size()));
+                ImGui::Checkbox("Loop intent", &condition_audio_loop);
+                ImGui::Checkbox("Spatial intent", &condition_audio_spatial);
+                ImGui::Checkbox("Source enabled", &condition_audio_enabled);
+                ImGui::InputText("Normal operating state", condition_audio_state.data(),
+                    condition_audio_state.size());
+                ImGui::InputText("Familiarity role", condition_audio_familiarity_role.data(),
+                    condition_audio_familiarity_role.size());
+                ImGui::BeginDisabled(condition.assets.empty());
+                if (ImGui::Button("Add audio source descriptor", ImVec2(-1, 28))) {
+                    carto::condition::AuthoredAudioSource source;
+                    source.asset_id = condition.assets[static_cast<std::size_t>(
+                        condition_audio_asset_index)].id;
+                    source.clip_source_id = clip_sources[static_cast<std::size_t>(
+                        condition_audio_clip_index)]->id;
+                    source.local_transform.translation = {
+                        condition_audio_x, condition_audio_y, condition_audio_z};
+                    source.gain = condition_audio_gain;
+                    source.pitch = condition_audio_pitch;
+                    source.loop = condition_audio_loop;
+                    source.spatial = condition_audio_spatial;
+                    source.enabled = condition_audio_enabled;
+                    source.minimum_distance = condition_audio_minimum_distance;
+                    source.maximum_distance = condition_audio_maximum_distance;
+                    source.priority = static_cast<std::uint16_t>(condition_audio_priority);
+                    source.bus = audio_bus_values[static_cast<std::size_t>(condition_audio_bus_index)];
+                    source.occlusion = audio_occlusion_values[
+                        static_cast<std::size_t>(condition_audio_occlusion_index)];
+                    source.reverb_send = condition_audio_reverb_send;
+                    source.normal_operating_state = condition_audio_state.data();
+                    source.familiarity_role = condition_audio_familiarity_role.data();
+                    const auto added = ui.add_condition_audio_source(std::move(source));
+                    action_feedback = added
+                        ? "Added revision-bound CONDITION audio-source intent."
+                        : added.error().message;
+                    action_feedback_error = !added;
+                }
+                ImGui::EndDisabled();
+            } else {
+                ImGui::TextDisabled(
+                    "No reviewed, current imported clip evidence is available; no placeholder clip is fabricated.");
+            }
+            for (const auto& source : condition.audio_sources) {
+                ImGui::BulletText("Audio %llu · asset %llu · clip source %llu · %s · %.2f · %.1f–%.1f m%s",
+                    static_cast<unsigned long long>(source.id),
+                    static_cast<unsigned long long>(source.asset_id),
+                    static_cast<unsigned long long>(source.clip_source_id), source.bus.c_str(),
+                    source.gain, source.minimum_distance, source.maximum_distance,
+                    source.enabled ? "" : " · disabled");
+                ImGui::SameLine();
+                const std::string toggle_id = "Audio source state##" +
+                    std::to_string(source.id);
+                if (ImGui::SmallButton(toggle_id.c_str())) {
+                    const auto toggled = ui.set_condition_audio_source_enabled(
+                        source.id, condition.authored_revision, !source.enabled);
+                    action_feedback = toggled
+                        ? (source.enabled
+                            ? "Disabled audio source; authored failure variant is active."
+                            : "Re-enabled audio source.")
+                        : toggled.error().message;
+                    action_feedback_error = !toggled;
+                }
+            }
+
+            ImGui::Separator();
+            ImGui::TextDisabled("Acoustic zone descriptor");
+            if (!condition_asset_labels.empty()) {
+                condition_zone_asset_index = std::clamp(condition_zone_asset_index, 0,
+                    static_cast<int>(condition_asset_labels.size()) - 1);
+                ImGui::Combo("Zone owner asset", &condition_zone_asset_index,
+                    condition_asset_labels.data(),
+                    static_cast<int>(condition_asset_labels.size()));
+            }
+            constexpr std::array<const char*, 2> zone_shape_labels{"Box", "Sphere"};
+            condition_zone_shape_index = std::clamp(condition_zone_shape_index, 0, 1);
+            ImGui::Combo("Zone shape", &condition_zone_shape_index,
+                zone_shape_labels.data(), static_cast<int>(zone_shape_labels.size()));
+            ImGui::InputDouble("Zone center X", &condition_zone_center_x, 0.1, 1.0, "%.3f");
+            ImGui::InputDouble("Zone center Y", &condition_zone_center_y, 0.1, 1.0, "%.3f");
+            ImGui::InputDouble("Zone center Z", &condition_zone_center_z, 0.1, 1.0, "%.3f");
+            if (condition_zone_shape_index == 0) {
+                ImGui::InputDouble("Zone half-width", &condition_zone_half_x, 0.1, 1.0, "%.3f");
+                ImGui::InputDouble("Zone half-height", &condition_zone_half_y, 0.1, 1.0, "%.3f");
+                ImGui::InputDouble("Zone half-depth", &condition_zone_half_z, 0.1, 1.0, "%.3f");
+            } else {
+                ImGui::InputDouble("Zone radius", &condition_zone_radius, 0.1, 1.0, "%.3f");
+            }
+            ImGui::InputText("Acoustic class", condition_zone_class.data(), condition_zone_class.size());
+            ImGui::InputText("Reverb intent", condition_zone_reverb.data(), condition_zone_reverb.size());
+            ImGui::InputDouble("Zone gain modifier", &condition_zone_gain, 0.05, 0.25, "%.3f");
+            ImGui::InputInt("Zone priority", &condition_zone_priority);
+            condition_zone_priority = std::clamp(condition_zone_priority, 0, 65535);
+            ImGui::InputText("Semantic room / region", condition_zone_semantic.data(),
+                condition_zone_semantic.size());
+            ImGui::BeginDisabled(condition.assets.empty());
+            if (ImGui::Button("Add acoustic zone descriptor", ImVec2(-1, 28))) {
+                carto::condition::AuthoredAcousticZone zone;
+                zone.asset_id = condition.assets[static_cast<std::size_t>(
+                    condition_zone_asset_index)].id;
+                zone.shape = condition_zone_shape_index == 0
+                    ? carto::condition::AcousticZoneShape::box
+                    : carto::condition::AcousticZoneShape::sphere;
+                zone.local_transform.translation = {
+                    condition_zone_center_x, condition_zone_center_y,
+                    condition_zone_center_z};
+                zone.half_extents = condition_zone_shape_index == 0
+                    ? carto::core::Vec3d{
+                        condition_zone_half_x, condition_zone_half_y,
+                        condition_zone_half_z}
+                    : carto::core::Vec3d{};
+                zone.radius = condition_zone_shape_index == 0 ? 0.0 : condition_zone_radius;
+                zone.acoustic_class = condition_zone_class.data();
+                zone.gain_modifier = condition_zone_gain;
+                zone.reverb_intent = condition_zone_reverb.data();
+                zone.priority = static_cast<std::uint16_t>(condition_zone_priority);
+                zone.semantic_region = condition_zone_semantic.data();
+                const auto added = ui.add_condition_acoustic_zone(std::move(zone));
+                action_feedback = added
+                    ? "Added revision-bound acoustic-zone intent."
+                    : added.error().message;
+                action_feedback_error = !added;
+            }
+            ImGui::EndDisabled();
+            for (const auto& zone : condition.acoustic_zones) {
+                ImGui::BulletText("Zone %llu · %s · %s · priority %u · %s%s",
+                    static_cast<unsigned long long>(zone.id), zone.shape.c_str(),
+                    zone.acoustic_class.c_str(), static_cast<unsigned>(zone.priority),
+                    zone.semantic_region.c_str(), zone.enabled ? "" : " · disabled");
+            }
+            if (!condition.acoustic_zones.empty()) {
+                constexpr std::size_t kOverlapCandidateLimit = 128U;
+                const auto zone_count = std::min(
+                    condition.acoustic_zones.size(), kOverlapCandidateLimit);
+                std::size_t overlap_count = 0U;
+                std::size_t overlap_rows = 0U;
+                for (std::size_t first = 0U; first < zone_count; ++first) {
+                    const auto& left = condition.acoustic_zones[first];
+                    if (!left.enabled) continue;
+                    const double left_radius = left.shape == "sphere"
+                        ? left.radius * std::max(left.local_transform.scale.x,
+                            left.local_transform.scale.z)
+                        : std::hypot(left.half_extents.x * left.local_transform.scale.x,
+                            left.half_extents.z * left.local_transform.scale.z);
+                    for (std::size_t second = first + 1U; second < zone_count; ++second) {
+                        const auto& right = condition.acoustic_zones[second];
+                        if (!right.enabled || left.asset_id != right.asset_id) continue;
+                        const double right_radius = right.shape == "sphere"
+                            ? right.radius * std::max(right.local_transform.scale.x,
+                                right.local_transform.scale.z)
+                            : std::hypot(right.half_extents.x * right.local_transform.scale.x,
+                                right.half_extents.z * right.local_transform.scale.z);
+                        const double dx = left.local_transform.translation.x -
+                            right.local_transform.translation.x;
+                        const double dz = left.local_transform.translation.z -
+                            right.local_transform.translation.z;
+                        if (std::hypot(dx, dz) > left_radius + right_radius) continue;
+                        ++overlap_count;
+                        if (overlap_rows < 12U) {
+                            const auto higher = left.priority > right.priority ? &left
+                                : right.priority > left.priority ? &right : nullptr;
+                            if (higher != nullptr) {
+                                ImGui::BulletText(
+                                    "Possible overlap · zones %llu / %llu · authored P%u has higher priority",
+                                    static_cast<unsigned long long>(left.id),
+                                    static_cast<unsigned long long>(right.id),
+                                    static_cast<unsigned>(higher->priority));
+                            } else {
+                                ImGui::BulletText(
+                                    "Possible overlap · zones %llu / %llu · equal priority",
+                                    static_cast<unsigned long long>(left.id),
+                                    static_cast<unsigned long long>(right.id));
+                            }
+                            ++overlap_rows;
+                        }
+                    }
+                }
+                if (overlap_count == 0U) {
+                    ImGui::TextDisabled("No broad-phase overlap candidates among enabled zones.");
+                } else if (overlap_count > overlap_rows) {
+                    ImGui::TextDisabled("%zu possible pairs total; showing the first %zu.",
+                        overlap_count, overlap_rows);
+                }
+                if (condition.acoustic_zones.size() > kOverlapCandidateLimit) {
+                    ImGui::TextDisabled(
+                        "Overlap check is bounded to the first %zu zone records.",
+                        kOverlapCandidateLimit);
+                }
+            }
+
+            ImGui::Separator();
+            heading_text("Effect source and deterministic preview");
+            ImGui::TextWrapped(
+                "Effect previews are ephemeral, deterministic authoring samples. They do not "
+                "create runtime pools or change the project; bound spatial fields must match "
+                "their recorded revision and digest.");
+            if (!condition_asset_labels.empty()) {
+                condition_effect_asset_index = std::clamp(condition_effect_asset_index, 0,
+                    static_cast<int>(condition_asset_labels.size()) - 1);
+                ImGui::Combo("Effect owner asset", &condition_effect_asset_index,
+                    condition_asset_labels.data(),
+                    static_cast<int>(condition_asset_labels.size()));
+            }
+            constexpr std::array<const char*, 3> effect_shape_labels{
+                "Point", "Box", "Sphere"};
+            constexpr std::array<carto::condition::EffectEmissionShape, 3> effect_shape_values{
+                carto::condition::EffectEmissionShape::point,
+                carto::condition::EffectEmissionShape::box,
+                carto::condition::EffectEmissionShape::sphere};
+            condition_effect_shape_index = std::clamp(condition_effect_shape_index, 0, 2);
+            ImGui::Combo("Emission volume", &condition_effect_shape_index,
+                effect_shape_labels.data(), static_cast<int>(effect_shape_labels.size()));
+            if (condition_effect_shape_index == 1) {
+                ImGui::InputDouble("Volume half-width", &condition_effect_half_x, 0.1, 1.0, "%.3f");
+                ImGui::InputDouble("Volume half-height", &condition_effect_half_y, 0.1, 1.0, "%.3f");
+                ImGui::InputDouble("Volume half-depth", &condition_effect_half_z, 0.1, 1.0, "%.3f");
+            } else if (condition_effect_shape_index == 2) {
+                ImGui::InputDouble("Volume radius", &condition_effect_radius, 0.1, 1.0, "%.3f");
+            }
+            ImGui::InputDouble("Effect origin X", &condition_effect_x, 0.1, 1.0, "%.3f");
+            ImGui::InputDouble("Effect origin Y", &condition_effect_y, 0.1, 1.0, "%.3f");
+            ImGui::InputDouble("Effect origin Z", &condition_effect_z, 0.1, 1.0, "%.3f");
+            ImGui::InputText("Effect semantic owner", condition_effect_owner.data(),
+                condition_effect_owner.size());
+            ImGui::InputText("Normal operating state", condition_effect_normal_state.data(),
+                condition_effect_normal_state.size());
+            ImGui::InputText("Disabled operating state", condition_effect_disabled_state.data(),
+                condition_effect_disabled_state.size());
+            constexpr std::array<const char*, 2> effect_intent_labels{
+                "Physical state", "Presentation only"};
+            condition_effect_intent_index = std::clamp(condition_effect_intent_index, 0, 1);
+            ImGui::Combo("Effect consequence", &condition_effect_intent_index,
+                effect_intent_labels.data(), static_cast<int>(effect_intent_labels.size()));
+            ImGui::BeginDisabled(condition.assets.empty());
+            if (ImGui::Button("Add effect source", ImVec2(-1, 28))) {
+                carto::condition::EffectSource source;
+                source.asset_id = condition.assets[static_cast<std::size_t>(
+                    condition_effect_asset_index)].id;
+                source.semantic_owner = condition_effect_owner.data();
+                source.shape = effect_shape_values[static_cast<std::size_t>(
+                    condition_effect_shape_index)];
+                source.local_transform.translation = {
+                    condition_effect_x, condition_effect_y, condition_effect_z};
+                source.half_extents = condition_effect_shape_index == 1
+                    ? carto::core::Vec3d{condition_effect_half_x, condition_effect_half_y,
+                        condition_effect_half_z}
+                    : carto::core::Vec3d{};
+                source.radius = condition_effect_shape_index == 2
+                    ? condition_effect_radius : 0.0;
+                source.intent_class = condition_effect_intent_index == 0
+                    ? carto::condition::EffectIntentClass::physical_state
+                    : carto::condition::EffectIntentClass::presentation_only;
+                source.normal_operating_state = condition_effect_normal_state.data();
+                source.disabled_operating_state = condition_effect_disabled_state.data();
+                const auto added = ui.add_condition_effect_source(std::move(source));
+                action_feedback = added
+                    ? "Added revision-bound CONDITION effect source."
+                    : added.error().message;
+                action_feedback_error = !added;
+            }
+            ImGui::EndDisabled();
+
+            std::vector<std::string> effect_labels;
+            std::vector<const char*> effect_label_pointers;
+            effect_labels.reserve(condition.effect_sources.size());
+            for (const auto& effect : condition.effect_sources) {
+                effect_labels.push_back(std::to_string(effect.id) + " · " +
+                    effect.semantic_owner + " · asset " + std::to_string(effect.asset_id));
+            }
+            effect_label_pointers.reserve(effect_labels.size());
+            for (const auto& label : effect_labels) effect_label_pointers.push_back(label.c_str());
+            if (!effect_label_pointers.empty()) {
+                condition_effect_source_index = std::clamp(condition_effect_source_index, 0,
+                    static_cast<int>(effect_label_pointers.size()) - 1);
+                ImGui::Combo("Emitter owner effect", &condition_effect_source_index,
+                    effect_label_pointers.data(), static_cast<int>(effect_label_pointers.size()));
+                ImGui::InputDouble("Emission rate / second", &condition_emitter_rate,
+                    0.5, 5.0, "%.3f");
+                ImGui::InputDouble("Particle lifetime seconds", &condition_emitter_lifetime,
+                    0.1, 1.0, "%.3f");
+                ImGui::InputDouble("Emission duration seconds", &condition_emitter_duration,
+                    0.1, 1.0, "%.3f");
+                ImGui::InputDouble("Initial velocity Y", &condition_emitter_velocity_y,
+                    0.1, 1.0, "%.3f");
+                ImGui::InputInt("Particle preview bound", &condition_effect_particle_bound);
+                condition_effect_particle_bound = std::clamp(condition_effect_particle_bound, 1, 2048);
+                ImGui::InputInt("Deterministic seed", &condition_effect_seed);
+                if (ImGui::Button("Add particle emitter", ImVec2(-1, 28))) {
+                    carto::condition::ParticleEmitterSource emitter;
+                    emitter.effect_source_id = condition.effect_sources[
+                        static_cast<std::size_t>(condition_effect_source_index)].id;
+                    emitter.emission_rate_per_second = condition_emitter_rate;
+                    emitter.particle_lifetime_seconds = condition_emitter_lifetime;
+                    emitter.duration_seconds = condition_emitter_duration;
+                    emitter.initial_velocity.y = condition_emitter_velocity_y;
+                    emitter.fixed_timestep_seconds = 1.0 / 60.0;
+                    emitter.total_particle_bound = static_cast<std::uint32_t>(
+                        condition_effect_particle_bound);
+                    emitter.deterministic_seed = condition_effect_seed <= 0
+                        ? 1U : static_cast<std::uint64_t>(condition_effect_seed);
+                    const auto added = ui.add_condition_particle_emitter(std::move(emitter));
+                    action_feedback = added
+                        ? "Added revision-bound deterministic particle emitter."
+                        : added.error().message;
+                    action_feedback_error = !added;
+                }
+
+                ImGui::Separator();
+                ImGui::TextDisabled("Bind an exact project field as authored influence");
+                std::vector<std::string> field_labels;
+                std::vector<const char*> field_label_pointers;
+                field_labels.reserve(snapshot.spatial_fields.size());
+                for (const auto& field : snapshot.spatial_fields) {
+                    field_labels.push_back(field.identity + " · " + std::string(
+                        carto::spatial_field::field_semantic_name(field.semantic)));
+                }
+                field_label_pointers.reserve(field_labels.size());
+                for (const auto& label : field_labels) field_label_pointers.push_back(label.c_str());
+                if (!field_label_pointers.empty()) {
+                    condition_influence_field_index = std::clamp(condition_influence_field_index, 0,
+                        static_cast<int>(field_label_pointers.size()) - 1);
+                    ImGui::Combo("Influence field", &condition_influence_field_index,
+                        field_label_pointers.data(), static_cast<int>(field_label_pointers.size()));
+                    constexpr std::array<const char*, 5> influence_kind_labels{
+                        "Wind", "Thermal lift", "Drainage", "Avoidance", "Turbulence"};
+                    constexpr std::array<carto::condition::EffectInfluenceKind, 5>
+                        influence_kind_values{
+                            carto::condition::EffectInfluenceKind::wind,
+                            carto::condition::EffectInfluenceKind::thermal_lift,
+                            carto::condition::EffectInfluenceKind::drainage,
+                            carto::condition::EffectInfluenceKind::avoidance,
+                            carto::condition::EffectInfluenceKind::turbulence};
+                    condition_influence_kind_index = std::clamp(
+                        condition_influence_kind_index, 0, 4);
+                    ImGui::Combo("Influence kind", &condition_influence_kind_index,
+                        influence_kind_labels.data(),
+                        static_cast<int>(influence_kind_labels.size()));
+                    ImGui::InputDouble("Influence strength", &condition_influence_strength,
+                        0.05, 0.25, "%.3f");
+                    if (ImGui::Button("Bind field to selected effect", ImVec2(-1, 28))) {
+                        const auto& field = snapshot.spatial_fields[
+                            static_cast<std::size_t>(condition_influence_field_index)];
+                        carto::condition::FieldInfluenceBinding binding;
+                        binding.effect_source_id = condition.effect_sources[
+                            static_cast<std::size_t>(condition_effect_source_index)].id;
+                        binding.kind = influence_kind_values[
+                            static_cast<std::size_t>(condition_influence_kind_index)];
+                        binding.field_identity = field.identity;
+                        binding.expected_field_revision = field.source_revision;
+                        binding.expected_field_digest = field.digest;
+                        binding.strength = condition_influence_strength;
+                        const auto added = ui.add_condition_field_influence(std::move(binding));
+                        action_feedback = added
+                            ? "Bound CONDITION effect to the exact project field revision and digest."
+                            : added.error().message;
+                        action_feedback_error = !added;
+                    }
+                } else {
+                    ImGui::TextDisabled("Create a project spatial field before binding influences.");
+                }
+
+                ImGui::InputDouble("Preview elapsed seconds", &condition_preview_elapsed,
+                    0.1, 1.0, "%.3f");
+                for (const auto& effect : condition.effect_sources) {
+                    const std::string id = std::to_string(effect.id);
+                    ImGui::PushID(id.c_str());
+                    ImGui::Text("Effect %s · %s · asset %llu", id.c_str(),
+                        effect.semantic_owner.c_str(),
+                        static_cast<unsigned long long>(effect.asset_id));
+                    if (ImGui::SmallButton("Preview normal state")) {
+                        const auto preview = ui.preview_condition_effect(
+                            effect.id, effect.normal_state, condition_preview_elapsed);
+                        if (preview) {
+                            condition_effect_preview_result = preview.value();
+                            action_feedback = "Deterministic effect preview ready: " +
+                                std::to_string(preview.value().particles.size()) +
+                                " ephemeral particles.";
+                            action_feedback_error = false;
+                        } else {
+                            condition_effect_preview_result.reset();
+                            action_feedback = preview.error().message;
+                            action_feedback_error = true;
+                        }
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Preview disabled state")) {
+                        const auto preview = ui.preview_condition_effect(
+                            effect.id, effect.disabled_state, condition_preview_elapsed);
+                        if (preview) {
+                            condition_effect_preview_result = preview.value();
+                            action_feedback = "Disabled-state preview ready; no particles emitted.";
+                            action_feedback_error = false;
+                        } else {
+                            condition_effect_preview_result.reset();
+                            action_feedback = preview.error().message;
+                            action_feedback_error = true;
+                        }
+                    }
+                    ImGui::PopID();
+                }
+                if (condition_effect_preview_result.has_value()) {
+                    const auto& preview = *condition_effect_preview_result;
+                    bool preview_current = preview.authoring_revision ==
+                        condition.authored_revision && preview.authoring_digest == condition.digest;
+                    for (const auto& receipt : preview.field_receipts) {
+                        const auto field = std::find_if(snapshot.spatial_fields.begin(),
+                            snapshot.spatial_fields.end(), [&receipt](const auto& candidate) {
+                                return candidate.identity == receipt.identity;
+                            });
+                        preview_current = preview_current && field != snapshot.spatial_fields.end() &&
+                            field->source_revision == receipt.revision && field->digest == receipt.digest;
+                    }
+                    if (!preview_current) {
+                        ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                            "Preview inputs changed; run the preview again.");
+                    } else {
+                        ImGui::TextDisabled("Preview %s · %zu points · r%llu",
+                            preview.operating_state.c_str(), preview.particles.size(),
+                            static_cast<unsigned long long>(preview.authoring_revision.value()));
+                        mono_text_disabled(preview.preview_digest.hex().c_str());
+                        const ImVec2 canvas_size{ImGui::GetContentRegionAvail().x, 126.0F};
+                        ImGui::InvisibleButton("CONDITION effect preview canvas", canvas_size);
+                        const ImVec2 canvas_min = ImGui::GetItemRectMin();
+                        const ImVec2 canvas_max = ImGui::GetItemRectMax();
+                        auto* draw_list = ImGui::GetWindowDrawList();
+                        draw_list->AddRectFilled(canvas_min, canvas_max,
+                            IM_COL32(9, 16, 26, 255), 3.0F);
+                        draw_list->AddRect(canvas_min, canvas_max,
+                            IM_COL32(82, 112, 145, 180), 3.0F);
+                        if (!preview.particles.empty()) {
+                            double min_x = preview.particles.front().position.x;
+                            double max_x = min_x;
+                            double min_z = preview.particles.front().position.z;
+                            double max_z = min_z;
+                            for (const auto& particle : preview.particles) {
+                                min_x = std::min(min_x, particle.position.x);
+                                max_x = std::max(max_x, particle.position.x);
+                                min_z = std::min(min_z, particle.position.z);
+                                max_z = std::max(max_z, particle.position.z);
+                            }
+                            const double range_x = std::max(0.01, max_x - min_x);
+                            const double range_z = std::max(0.01, max_z - min_z);
+                            for (const auto& particle : preview.particles) {
+                                const float x = static_cast<float>((particle.position.x - min_x) /
+                                    range_x) * (canvas_max.x - canvas_min.x - 16.0F) +
+                                    canvas_min.x + 8.0F;
+                                const float y = static_cast<float>((particle.position.z - min_z) /
+                                    range_z) * (canvas_max.y - canvas_min.y - 16.0F) +
+                                    canvas_min.y + 8.0F;
+                                draw_list->AddCircleFilled(ImVec2(x, y), 3.0F,
+                                    IM_COL32(77, 167, 255, 235));
+                            }
+                        } else {
+                            draw_list->AddText(ImVec2(canvas_min.x + 10.0F, canvas_min.y + 10.0F),
+                                IM_COL32(155, 170, 190, 255), "No particles in this authored state/time");
+                        }
+                    }
+                }
+            } else {
+                ImGui::TextDisabled("Add an effect source to author its deterministic emitter.");
+            }
+            ImGui::Separator();
+            heading_text("Field-driven vegetation placement");
+            ImGui::TextWrapped(
+                "A scatter recipe binds moisture, shade, disturbance, suitability, and elevation "
+                "sources exactly. Preview points are derived only; they are not placed into the scene.");
+            constexpr std::array<carto::spatial_field::FieldSemantic, 5> vegetation_semantics{
+                carto::spatial_field::FieldSemantic::moisture,
+                carto::spatial_field::FieldSemantic::shade,
+                carto::spatial_field::FieldSemantic::disturbance,
+                carto::spatial_field::FieldSemantic::vegetation_suitability,
+                carto::spatial_field::FieldSemantic::terrain_elevation};
+            constexpr std::array<const char*, 5> vegetation_field_labels{
+                "Moisture field", "Shade field", "Disturbance field",
+                "Species suitability field", "Terrain elevation field"};
+            std::array<std::vector<const carto::application::SpatialFieldView*>, 5>
+                vegetation_fields;
+            for (std::size_t semantic_index = 0U;
+                 semantic_index < vegetation_semantics.size(); ++semantic_index) {
+                for (const auto& field : snapshot.spatial_fields) {
+                    if (field.semantic == vegetation_semantics[semantic_index]) {
+                        vegetation_fields[semantic_index].push_back(&field);
+                    }
+                }
+            }
+            std::vector<std::size_t> vegetation_assets;
+            std::vector<std::string> vegetation_asset_names;
+            std::vector<const char*> vegetation_asset_labels;
+            for (std::size_t asset_index = 0U;
+                 asset_index < condition.assets.size(); ++asset_index) {
+                if (condition.assets[asset_index].asset_class == "vegetation") {
+                    vegetation_assets.push_back(asset_index);
+                    vegetation_asset_names.push_back(condition.assets[asset_index].stable_name +
+                        " · " + std::to_string(condition.assets[asset_index].id));
+                }
+            }
+            for (const auto& label : vegetation_asset_names) {
+                vegetation_asset_labels.push_back(label.c_str());
+            }
+            if (!vegetation_asset_labels.empty()) {
+                condition_vegetation_asset_index = std::clamp(
+                    condition_vegetation_asset_index, 0,
+                    static_cast<int>(vegetation_asset_labels.size()) - 1);
+                ImGui::Combo("Vegetation species", &condition_vegetation_asset_index,
+                    vegetation_asset_labels.data(),
+                    static_cast<int>(vegetation_asset_labels.size()));
+            } else {
+                ImGui::TextDisabled("Import or classify a source asset as vegetation first.");
+            }
+            bool all_vegetation_fields_available = true;
+            for (std::size_t field_index = 0U;
+                 field_index < vegetation_fields.size(); ++field_index) {
+                const auto& choices = vegetation_fields[field_index];
+                if (choices.empty()) {
+                    all_vegetation_fields_available = false;
+                    ImGui::TextDisabled("%s: no exact-semantic project field",
+                        vegetation_field_labels[field_index]);
+                    continue;
+                }
+                std::vector<std::string> labels;
+                std::vector<const char*> label_pointers;
+                labels.reserve(choices.size());
+                for (const auto* field : choices) {
+                    labels.push_back(field->identity + " · r" +
+                        std::to_string(field->source_revision.value()));
+                }
+                label_pointers.reserve(labels.size());
+                for (const auto& label : labels) label_pointers.push_back(label.c_str());
+                condition_vegetation_field_indices[field_index] = std::clamp(
+                    condition_vegetation_field_indices[field_index], 0,
+                    static_cast<int>(label_pointers.size()) - 1);
+                const std::string combo_id = std::string(vegetation_field_labels[field_index]) +
+                    "##vegetation-field-" + std::to_string(field_index);
+                ImGui::Combo(combo_id.c_str(),
+                    &condition_vegetation_field_indices[field_index],
+                    label_pointers.data(), static_cast<int>(label_pointers.size()));
+            }
+            ImGui::InputDouble("Cell spacing (m)", &condition_vegetation_spacing,
+                0.25, 1.0, "%.2f");
+            ImGui::InputDouble("Density / m²", &condition_vegetation_density,
+                0.01, 0.1, "%.3f");
+            ImGui::InputDouble("Minimum suitability", &condition_vegetation_threshold,
+                0.05, 0.1, "%.3f");
+            ImGui::InputDouble("Minimum scale", &condition_vegetation_min_scale,
+                0.05, 0.1, "%.3f");
+            ImGui::InputDouble("Maximum scale", &condition_vegetation_max_scale,
+                0.05, 0.1, "%.3f");
+            ImGui::InputInt("Scatter seed", &condition_vegetation_seed);
+            std::uint64_t next_vegetation_recipe_id = 1U;
+            bool vegetation_recipe_id_available = true;
+            if (!condition.vegetation_scatter_ids.empty()) {
+                const auto maximum_id = *std::max_element(
+                    condition.vegetation_scatter_ids.begin(),
+                    condition.vegetation_scatter_ids.end());
+                if (maximum_id == std::numeric_limits<std::uint64_t>::max()) {
+                    vegetation_recipe_id_available = false;
+                } else {
+                    next_vegetation_recipe_id = maximum_id + 1U;
+                }
+            }
+            const bool can_author_scatter = !vegetation_asset_labels.empty() &&
+                all_vegetation_fields_available && vegetation_recipe_id_available;
+            ImGui::BeginDisabled(!can_author_scatter);
+            if (ImGui::Button("Add field-bound scatter recipe", ImVec2(-1, 28))) {
+                carto::condition::VegetationScatterRecipe recipe;
+                recipe.id = next_vegetation_recipe_id;
+                const auto asset_index = vegetation_assets[
+                    static_cast<std::size_t>(condition_vegetation_asset_index)];
+                recipe.species_asset_id = condition.assets[asset_index].id;
+                const auto make_binding = [this, &vegetation_fields](std::size_t index) {
+                    const auto& field = *vegetation_fields[index][static_cast<std::size_t>(
+                        condition_vegetation_field_indices[index])];
+                    return carto::condition::FieldSourceBinding{
+                        field.identity, field.source_revision, field.digest};
+                };
+                recipe.moisture = make_binding(0U);
+                recipe.shade = make_binding(1U);
+                recipe.disturbance = make_binding(2U);
+                recipe.suitability = make_binding(3U);
+                recipe.elevation = make_binding(4U);
+                recipe.cell_spacing = condition_vegetation_spacing;
+                recipe.density_per_square_meter = condition_vegetation_density;
+                recipe.minimum_suitability = condition_vegetation_threshold;
+                recipe.minimum_scale = condition_vegetation_min_scale;
+                recipe.maximum_scale = condition_vegetation_max_scale;
+                recipe.deterministic_seed = condition_vegetation_seed <= 0
+                    ? 1U : static_cast<std::uint64_t>(condition_vegetation_seed);
+                const auto added = ui.add_condition_vegetation_scatter(std::move(recipe));
+                action_feedback = added
+                    ? "Added revision-bound field-driven vegetation scatter recipe."
+                    : added.error().message;
+                action_feedback_error = !added;
+            }
+            ImGui::EndDisabled();
+            if (!vegetation_recipe_id_available) {
+                ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                    "Recipe identity space is exhausted.");
+            }
+            for (const auto recipe_id : condition.vegetation_scatter_ids) {
+                const std::string recipe_id_text = std::to_string(recipe_id);
+                ImGui::PushID(recipe_id_text.c_str());
+                ImGui::Text("Scatter recipe %llu", static_cast<unsigned long long>(recipe_id));
+                if (ImGui::SmallButton("Preview placement")) {
+                    const auto preview = ui.preview_condition_vegetation(recipe_id);
+                    if (preview) {
+                        condition_vegetation_preview_result = preview.value();
+                        action_feedback = "Deterministic vegetation preview ready: " +
+                            std::to_string(preview.value().instances.size()) +
+                            " derived placements; scene unchanged.";
+                        action_feedback_error = false;
+                    } else {
+                        condition_vegetation_preview_result.reset();
+                        action_feedback = preview.error().message;
+                        action_feedback_error = true;
+                    }
+                }
+                ImGui::PopID();
+            }
+            if (condition_vegetation_preview_result.has_value()) {
+                const auto& preview = *condition_vegetation_preview_result;
+                bool preview_current = preview.project_revision == condition.authored_revision &&
+                    preview.authoring_digest == condition.digest;
+                for (const auto& receipt : preview.fields) {
+                    const auto field = std::find_if(snapshot.spatial_fields.begin(),
+                        snapshot.spatial_fields.end(), [&receipt](const auto& candidate) {
+                            return candidate.identity == receipt.identity;
+                        });
+                    preview_current = preview_current && field != snapshot.spatial_fields.end() &&
+                        field->semantic == receipt.semantic &&
+                        field->source_revision == receipt.source_revision &&
+                        field->digest == receipt.digest;
+                }
+                if (!preview_current) {
+                    ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                        "Scatter preview inputs changed; regenerate before relying on it.");
+                } else {
+                    ImGui::TextDisabled("%zu derived placements from %zu candidates · preview only",
+                        preview.instances.size(), preview.candidate_count);
+                    mono_text_disabled(preview.preview_digest.hex().c_str());
+                    const ImVec2 canvas_size{ImGui::GetContentRegionAvail().x, 126.0F};
+                    ImGui::InvisibleButton("CONDITION vegetation preview canvas", canvas_size);
+                    const ImVec2 canvas_min = ImGui::GetItemRectMin();
+                    const ImVec2 canvas_max = ImGui::GetItemRectMax();
+                    auto* draw_list = ImGui::GetWindowDrawList();
+                    draw_list->AddRectFilled(canvas_min, canvas_max,
+                        IM_COL32(9, 16, 26, 255), 3.0F);
+                    draw_list->AddRect(canvas_min, canvas_max,
+                        IM_COL32(82, 112, 145, 180), 3.0F);
+                    if (!preview.instances.empty()) {
+                        double min_x = preview.instances.front().position.x;
+                        double max_x = min_x;
+                        double min_z = preview.instances.front().position.z;
+                        double max_z = min_z;
+                        for (const auto& instance : preview.instances) {
+                            min_x = std::min(min_x, instance.position.x);
+                            max_x = std::max(max_x, instance.position.x);
+                            min_z = std::min(min_z, instance.position.z);
+                            max_z = std::max(max_z, instance.position.z);
+                        }
+                        const double range_x = std::max(0.01, max_x - min_x);
+                        const double range_z = std::max(0.01, max_z - min_z);
+                        for (const auto& instance : preview.instances) {
+                            const float x = static_cast<float>((instance.position.x - min_x) /
+                                range_x) * (canvas_max.x - canvas_min.x - 16.0F) +
+                                canvas_min.x + 8.0F;
+                            const float y = static_cast<float>((instance.position.z - min_z) /
+                                range_z) * (canvas_max.y - canvas_min.y - 16.0F) +
+                                canvas_min.y + 8.0F;
+                            draw_list->AddCircleFilled(ImVec2(x, y), 3.0F,
+                                IM_COL32(126, 190, 114, 235));
+                        }
+                    } else {
+                        draw_list->AddText(ImVec2(canvas_min.x + 10.0F, canvas_min.y + 10.0F),
+                            IM_COL32(155, 170, 190, 255),
+                            "No placements satisfy this exact field-bound recipe");
+                    }
+                }
+            }
+            ImGui::Separator();
+            heading_text("Safe Place state branches");
+            ImGui::TextWrapped(
+                "Branches preserve the source baseline. Compare alternatives before any explicit resolution; "
+                "contested edits remain visible and are never auto-merged.");
+            constexpr std::array<carto::condition::StateProperty, 8> safe_place_properties{
+                carto::condition::StateProperty::privacy,
+                carto::condition::StateProperty::human_proximity,
+                carto::condition::StateProperty::controllable_entries,
+                carto::condition::StateProperty::supply_access,
+                carto::condition::StateProperty::ambient_noise,
+                carto::condition::StateProperty::visibility_outward,
+                carto::condition::StateProperty::visibility_inward,
+                carto::condition::StateProperty::isolation};
+            constexpr std::array<const char*, 8> safe_place_property_labels{
+                "Privacy", "Human proximity", "Controllable entries", "Supply access",
+                "Ambient noise", "Visibility outward", "Visibility inward", "Isolation"};
+            if (!condition.safe_places.empty()) {
+                condition_safe_place_profile_index = std::clamp(
+                    condition_safe_place_profile_index, 0,
+                    static_cast<int>(condition.safe_places.size()) - 1);
+                std::vector<std::string> safe_place_labels;
+                std::vector<const char*> safe_place_label_pointers;
+                safe_place_labels.reserve(condition.safe_places.size());
+                for (const auto& profile : condition.safe_places) {
+                    const auto asset = std::find_if(condition.assets.begin(), condition.assets.end(),
+                        [&profile](const auto& item) { return item.id == profile.asset_id; });
+                    safe_place_labels.push_back("Profile " + std::to_string(profile.id) + " · " +
+                        (asset == condition.assets.end() ? std::to_string(profile.asset_id)
+                                                         : asset->stable_name));
+                }
+                safe_place_label_pointers.reserve(safe_place_labels.size());
+                for (const auto& label : safe_place_labels) {
+                    safe_place_label_pointers.push_back(label.c_str());
+                }
+                ImGui::Combo("Safe Place baseline",
+                    &condition_safe_place_profile_index,
+                    safe_place_label_pointers.data(),
+                    static_cast<int>(safe_place_label_pointers.size()));
+                condition_safe_place_property_index = std::clamp(
+                    condition_safe_place_property_index, 0, 7);
+                ImGui::Combo("State property", &condition_safe_place_property_index,
+                    safe_place_property_labels.data(),
+                    static_cast<int>(safe_place_property_labels.size()));
+                const auto& profile = condition.safe_places[static_cast<std::size_t>(
+                    condition_safe_place_profile_index)];
+                const double baseline_value = profile.values[
+                    static_cast<std::size_t>(condition_safe_place_property_index)];
+                ImGui::TextDisabled("Baseline value %.3f", baseline_value);
+                ImGui::InputDouble("Alternative value", &condition_state_branch_value,
+                    0.05, 0.1, "%.3f");
+            } else {
+                ImGui::TextDisabled("Import a Safe Place profile before creating place states.");
+            }
+            ImGui::InputText("Branch name", condition_state_branch_name.data(),
+                condition_state_branch_name.size());
+            ImGui::InputText("Applicability note", condition_state_branch_applicability.data(),
+                condition_state_branch_applicability.size());
+            std::vector<carto::condition::Id> branch_ids{0U};
+            std::vector<std::string> branch_labels{"Baseline"};
+            for (const auto& branch : condition.state_branches) {
+                branch_ids.push_back(branch.id);
+                branch_labels.push_back(branch.name + " · " + std::to_string(branch.id));
+            }
+            std::vector<const char*> branch_label_pointers;
+            branch_label_pointers.reserve(branch_labels.size());
+            for (const auto& label : branch_labels) branch_label_pointers.push_back(label.c_str());
+            condition_state_parent_index = std::clamp(condition_state_parent_index, 0,
+                static_cast<int>(branch_ids.size()) - 1);
+            ImGui::Combo("Parent branch", &condition_state_parent_index,
+                branch_label_pointers.data(), static_cast<int>(branch_label_pointers.size()));
+            double state_branch_before = 0.0;
+            bool state_branch_parent_current = !condition.safe_places.empty();
+            if (!condition.safe_places.empty()) {
+                const auto& profile = condition.safe_places[static_cast<std::size_t>(
+                    condition_safe_place_profile_index)];
+                const auto property_index = static_cast<std::size_t>(
+                    condition_safe_place_property_index);
+                state_branch_before = profile.values[property_index];
+                const auto parent_id = branch_ids[static_cast<std::size_t>(
+                    condition_state_parent_index)];
+                if (parent_id != 0U) {
+                    const auto parent_state = ui.compare_condition_state_branches(0U, parent_id);
+                    if (!parent_state) {
+                        state_branch_parent_current = false;
+                    } else {
+                        const auto inherited = std::find_if(
+                            parent_state.value().differences.begin(),
+                            parent_state.value().differences.end(),
+                            [&profile, &safe_place_properties, property_index](const auto& diff) {
+                                return diff.target_kind ==
+                                        carto::condition::StateTargetKind::safe_place_profile &&
+                                    diff.target_record_id == profile.id &&
+                                    diff.target_asset_id == profile.asset_id &&
+                                    diff.property == safe_place_properties[property_index];
+                            });
+                        if (inherited != parent_state.value().differences.end()) {
+                            state_branch_before = inherited->right_value.numeric_value;
+                        }
+                    }
+                }
+            }
+            ImGui::TextDisabled("Selected parent's value %.3f", state_branch_before);
+            std::uint64_t next_state_branch_id = 1U;
+            bool state_branch_id_available = true;
+            if (!condition.state_branches.empty()) {
+                const auto maximum_id = std::max_element(condition.state_branches.begin(),
+                    condition.state_branches.end(), [](const auto& left, const auto& right) {
+                        return left.id < right.id;
+                    })->id;
+                if (maximum_id == std::numeric_limits<std::uint64_t>::max()) {
+                    state_branch_id_available = false;
+                } else {
+                    next_state_branch_id = maximum_id + 1U;
+                }
+            }
+            ImGui::BeginDisabled(condition.safe_places.empty() || !state_branch_id_available ||
+                !state_branch_parent_current);
+            if (ImGui::Button("Create branch from selected state", ImVec2(-1, 28))) {
+                const auto& profile = condition.safe_places[static_cast<std::size_t>(
+                    condition_safe_place_profile_index)];
+                const auto property_index = static_cast<std::size_t>(
+                    condition_safe_place_property_index);
+                carto::condition::AuthoredStateDelta delta;
+                delta.id = 1U;
+                delta.target_record_id = profile.id;
+                delta.target_asset_id = profile.asset_id;
+                delta.target_kind = carto::condition::StateTargetKind::safe_place_profile;
+                delta.property = safe_place_properties[property_index];
+                delta.before.numeric_value = state_branch_before;
+                delta.after.numeric_value = condition_state_branch_value;
+                carto::condition::AuthoredStateBranch branch;
+                branch.id = next_state_branch_id;
+                branch.parent_branch_id = branch_ids[static_cast<std::size_t>(
+                    condition_state_parent_index)];
+                branch.name = condition_state_branch_name.data();
+                branch.applicability = condition_state_branch_applicability.data();
+                branch.deltas.push_back(std::move(delta));
+                const auto added = ui.add_condition_state_branch(std::move(branch));
+                action_feedback = added
+                    ? "Created a non-destructive Safe Place state branch."
+                    : added.error().message;
+                action_feedback_error = !added;
+            }
+            ImGui::EndDisabled();
+            if (state_branch_id_available && !condition.state_branches.empty()) {
+                condition_state_compare_left_index = std::clamp(
+                    condition_state_compare_left_index, 0,
+                    static_cast<int>(branch_ids.size()) - 1);
+                condition_state_compare_right_index = std::clamp(
+                    condition_state_compare_right_index, 0,
+                    static_cast<int>(branch_ids.size()) - 1);
+                ImGui::Combo("Compare left state", &condition_state_compare_left_index,
+                    branch_label_pointers.data(),
+                    static_cast<int>(branch_label_pointers.size()));
+                ImGui::Combo("Compare right state", &condition_state_compare_right_index,
+                    branch_label_pointers.data(),
+                    static_cast<int>(branch_label_pointers.size()));
+                if (ImGui::Button("Compare source states", ImVec2(-1, 28))) {
+                    const auto compared = ui.compare_condition_state_branches(
+                        branch_ids[static_cast<std::size_t>(condition_state_compare_left_index)],
+                        branch_ids[static_cast<std::size_t>(condition_state_compare_right_index)]);
+                    if (compared) {
+                        condition_state_comparison_result = compared.value();
+                        action_feedback = "State comparison ready; source baseline unchanged.";
+                        action_feedback_error = false;
+                    } else {
+                        condition_state_comparison_result.reset();
+                        action_feedback = compared.error().message;
+                        action_feedback_error = true;
+                    }
+                }
+                for (const auto& branch : condition.state_branches) {
+                    ImGui::BulletText("%s · parent %llu · %zu deltas%s",
+                        branch.name.c_str(),
+                        static_cast<unsigned long long>(branch.parent_branch_id),
+                        branch.delta_count,
+                        branch.parent_branch_id == 0U ? " · baseline branch" : "");
+                }
+            }
+            if (condition_state_comparison_result.has_value()) {
+                const auto& comparison = *condition_state_comparison_result;
+                if (comparison.project_revision != condition.authored_revision ||
+                    comparison.authoring_digest != condition.digest) {
+                    ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                        "State comparison is stale; compare again after source edits.");
+                } else {
+                    ImGui::TextDisabled("%zu explicit differences · common ancestor %llu",
+                        comparison.differences.size(),
+                        static_cast<unsigned long long>(comparison.common_ancestor_branch_id));
+                    mono_text_disabled(comparison.comparison_digest.hex().c_str());
+                    for (const auto& difference : comparison.differences) {
+                        if (difference.property <= carto::condition::StateProperty::isolation ||
+                            difference.property == carto::condition::StateProperty::wetness) {
+                            const auto property_name = carto::condition::state_property_name(
+                                difference.property);
+                            ImGui::BulletText("%.*s · %.3f → %.3f%s",
+                                static_cast<int>(property_name.size()), property_name.data(),
+                                difference.left_value.numeric_value,
+                                difference.right_value.numeric_value,
+                                difference.contested ? " · CONTESTED" : "");
+                        } else {
+                            const auto property_name = carto::condition::state_property_name(
+                                difference.property);
+                            ImGui::BulletText("%.*s · %s → %s%s",
+                                static_cast<int>(property_name.size()), property_name.data(),
+                                difference.left_value.text_value.c_str(),
+                                difference.right_value.text_value.c_str(),
+                                difference.contested ? " · CONTESTED" : "");
+                        }
+                    }
+                    if (comparison.differences.empty()) {
+                        ImGui::TextDisabled("These authored states resolve to the same source values.");
+                    }
+                }
+            }
             if (condition_source_update_id.has_value()) {
                 ImGui::InputText("New source revision", condition_source_revision.data(),
                                  condition_source_revision.size());
@@ -5923,6 +7587,20 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
         if (g_state->continue_native_sculpt_stroke(event)) return 0;
     }
     if (message == WM_MOUSEMOVE && g_state != nullptr &&
+        g_state->native_condition_gizmo_drag.has_value()) {
+        std::uint8_t modifiers = 0U;
+        if ((w_param & MK_CONTROL) != 0U) modifiers |= carto::ui::kNativeModifierControl;
+        if ((w_param & MK_SHIFT) != 0U) modifiers |= carto::ui::kNativeModifierShift;
+        if ((GetKeyState(VK_MENU) & 0x8000) != 0) modifiers |= carto::ui::kNativeModifierAlt;
+        const carto::ui::NativePointerEvent event{
+            carto::ui::NativePointerButton::primary,
+            static_cast<std::int32_t>(static_cast<SHORT>(LOWORD(l_param))),
+            static_cast<std::int32_t>(static_cast<SHORT>(HIWORD(l_param))),
+            modifiers,
+            (w_param & MK_LBUTTON) != 0U};
+        if (g_state->route_native_condition_gizmo_drag(event)) return 0;
+    }
+    if (message == WM_MOUSEMOVE && g_state != nullptr &&
         g_state->native_transform_drag.has_value()) {
         std::uint8_t modifiers = 0U;
         if ((w_param & MK_CONTROL) != 0U) modifiers |= carto::ui::kNativeModifierControl;
@@ -5947,6 +7625,20 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
         if (g_state->finish_native_sculpt_stroke(event)) return 0;
     }
     if (message == WM_LBUTTONUP && g_state != nullptr &&
+        g_state->native_condition_gizmo_drag.has_value()) {
+        std::uint8_t modifiers = 0U;
+        if ((w_param & MK_CONTROL) != 0U) modifiers |= carto::ui::kNativeModifierControl;
+        if ((w_param & MK_SHIFT) != 0U) modifiers |= carto::ui::kNativeModifierShift;
+        if ((GetKeyState(VK_MENU) & 0x8000) != 0) modifiers |= carto::ui::kNativeModifierAlt;
+        const carto::ui::NativePointerEvent event{
+            carto::ui::NativePointerButton::primary,
+            static_cast<std::int32_t>(static_cast<SHORT>(LOWORD(l_param))),
+            static_cast<std::int32_t>(static_cast<SHORT>(HIWORD(l_param))),
+            modifiers,
+            false};
+        if (g_state->route_native_condition_gizmo_drag(event)) return 0;
+    }
+    if (message == WM_LBUTTONUP && g_state != nullptr &&
         g_state->native_transform_drag.has_value()) {
         std::uint8_t modifiers = 0U;
         if ((w_param & MK_CONTROL) != 0U) modifiers |= carto::ui::kNativeModifierControl;
@@ -5968,6 +7660,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
         g_state->native_transform_drag.has_value()) {
         g_state->cancel_native_transform_drag("Transform cancelled by the window system.");
     }
+    if (message == WM_CANCELMODE && g_state != nullptr &&
+        g_state->native_condition_gizmo_drag.has_value()) {
+        g_state->cancel_native_condition_gizmo(
+            "Acoustic gizmo cancelled by the window system.");
+    }
     if (message == WM_CAPTURECHANGED && g_state != nullptr &&
         g_state->native_sculpt_stroke.has_value()) {
         g_state->cancel_native_sculpt_stroke(
@@ -5977,6 +7674,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
         g_state->native_transform_drag.has_value()) {
         g_state->cancel_native_transform_drag(
             "Transform cancelled because pointer capture changed.", false);
+    }
+    if (message == WM_CAPTURECHANGED && g_state != nullptr &&
+        g_state->native_condition_gizmo_drag.has_value()) {
+        g_state->cancel_native_condition_gizmo(
+            "Acoustic gizmo cancelled because pointer capture changed.", false);
     }
     if (ImGui_ImplWin32_WndProcHandler(window, message, w_param, l_param)) return 1;
     if (message == WM_SIZE && g_state != nullptr && w_param != SIZE_MINIMIZED) {

@@ -5,6 +5,7 @@
 #include <carto/io/ply.hpp>
 #include <carto/io/stl.hpp>
 #include <carto/providers/registry.hpp>
+#include <carto/condition/wave_import.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -17,6 +18,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <span>
 #include <string_view>
 #include <system_error>
 #include <type_traits>
@@ -64,6 +66,29 @@ core::Diagnostic validation(std::string message) {
 
 core::Diagnostic unsupported(std::string message) {
     return core::Diagnostic(core::ErrorCode::unsupported, std::move(message));
+}
+
+template <typename Record>
+core::Result<void> append_condition_record(
+    std::vector<Record>& records, Record record, std::string_view label) {
+    if (record.id == 0U) {
+        const auto maximum = std::max_element(records.begin(), records.end(),
+            [](const Record& left, const Record& right) { return left.id < right.id; });
+        if (maximum != records.end() && maximum->id == std::numeric_limits<condition::Id>::max()) {
+            return core::Result<void>::failure(invalid_state(
+                std::string(label) + " identity space is exhausted"));
+        }
+        record.id = maximum == records.end() ? 1U : maximum->id + 1U;
+    }
+    const auto insertion = std::lower_bound(records.begin(), records.end(), record.id,
+        [](const Record& existing, condition::Id id) { return existing.id < id; });
+    if (insertion != records.end() && insertion->id == record.id) {
+        return core::Result<void>::failure(invalid(
+            std::string(label) + " identity already exists"));
+    }
+    if (auto valid_record = record.validate(); !valid_record) return valid_record;
+    records.insert(insertion, std::move(record));
+    return core::Result<void>::success();
 }
 
 std::optional<scene::ObjectId> selected_surface_object(
@@ -1432,7 +1457,9 @@ core::Result<application::DispatchReceipt> UiController::submit_ai_proposal(
     return core::Result<application::DispatchReceipt>::failure(diagnostic);
 }
 
-core::Result<void> UiController::queue_agent_step(std::string intent) {
+core::Result<void> UiController::queue_agent_step(
+    std::string intent,
+    std::vector<std::string> dependencies) {
     if (agent_task_.has_value()) {
         const auto status = agent_task_->snapshot().status;
         if (status != agent::TaskStatus::accepted && status != agent::TaskStatus::rejected) {
@@ -1441,12 +1468,27 @@ core::Result<void> UiController::queue_agent_step(std::string intent) {
         }
         agent_task_.reset();
         agent_plan_draft_.clear();
+        agent_clarifications_draft_.clear();
         agent_plan_base_revision_.reset();
         agent_goal_.clear();
+    }
+    if (std::any_of(agent_clarifications_draft_.begin(), agent_clarifications_draft_.end(),
+            [](const auto& question) { return question.human_receipt.has_value(); })) {
+        return core::Result<void>::failure(invalid_state(
+            "clear the objective and re-capture clarification after changing its targets"));
     }
     if (agent_plan_draft_.size() >= 16U) {
         return core::Result<void>::failure(invalid_state(
             "agent plan reached the local 16-command work budget"));
+    }
+    for (const auto& dependency : dependencies) {
+        if (std::none_of(agent_plan_draft_.begin(), agent_plan_draft_.end(),
+                [&dependency](const agent::AgentPlanStep& candidate) {
+                    return candidate.id == dependency;
+                })) {
+            return core::Result<void>::failure(invalid_state(
+                "plan step dependency must name an already captured step"));
+        }
     }
     const auto snapshot = session_.snapshot();
     if (agent_plan_base_revision_.has_value() &&
@@ -1477,7 +1519,8 @@ core::Result<void> UiController::queue_agent_step(std::string intent) {
     agent::AgentPlanStep step{
         "step-" + std::to_string(agent_plan_draft_.size() + 1U),
         std::move(target),
-        std::move(intent)};
+        std::move(intent),
+        std::move(dependencies)};
     if (auto result = step.validate(); !result) {
         return core::Result<void>::failure(result.error());
     }
@@ -1485,6 +1528,101 @@ core::Result<void> UiController::queue_agent_step(std::string intent) {
         agent_plan_base_revision_ = snapshot.project_revision;
     }
     agent_plan_draft_.push_back(std::move(step));
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::queue_agent_clarification(
+    std::string prompt,
+    agent::ClarificationImpact impact) {
+    if (agent_task_.has_value()) {
+        const auto status = agent_task_->snapshot().status;
+        if (status != agent::TaskStatus::accepted && status != agent::TaskStatus::rejected) {
+            return core::Result<void>::failure(invalid_state(
+                "accept or reject the current speculative task before editing its objective"));
+        }
+        agent_task_.reset();
+        agent_plan_draft_.clear();
+        agent_clarifications_draft_.clear();
+        agent_plan_base_revision_.reset();
+        agent_goal_.clear();
+    }
+    if (agent_plan_draft_.empty() || !agent_plan_base_revision_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "capture at least one plan target before adding an objective clarification"));
+    }
+    const auto snapshot = session_.snapshot();
+    if (snapshot.project_revision != *agent_plan_base_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "project changed after the first agent plan target was captured"));
+    }
+    if (!agent_goal_.empty() || std::any_of(
+            agent_clarifications_draft_.begin(), agent_clarifications_draft_.end(),
+            [](const auto& question) { return question.human_receipt.has_value(); })) {
+        return core::Result<void>::failure(invalid_state(
+            "clarifications are fixed after the first human answer; clear and rebuild the objective"));
+    }
+    if (agent_clarifications_draft_.size() >= 128U) {
+        return core::Result<void>::failure(invalid_state(
+            "objective reached the 128-question safety limit"));
+    }
+
+    std::vector<scene::ObjectId> scope;
+    for (const auto& step : agent_plan_draft_) {
+        if (std::find(scope.begin(), scope.end(), step.target.object) == scope.end()) {
+            scope.push_back(step.target.object);
+        }
+    }
+    agent::ClarificationQuestion question;
+    question.id = "question-" + std::to_string(agent_clarifications_draft_.size() + 1U);
+    question.prompt = std::move(prompt);
+    question.rationale = "The operator requires an explicit answer before this plan may run.";
+    question.impacts = {impact};
+    question.affected_objects = std::move(scope);
+    question.downstream_plan_branches = agent_plan_draft_.size();
+    question.requires_explicit_answer = true;
+    if (auto result = question.validate(question.affected_objects, {}); !result) {
+        return result;
+    }
+    agent_clarifications_draft_.push_back(std::move(question));
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::answer_agent_clarification(
+    std::string goal,
+    std::string_view question_id,
+    std::string answer) {
+    if (agent_plan_draft_.empty() || !agent_plan_base_revision_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "capture at least one plan target before answering an objective clarification"));
+    }
+    if (session_.snapshot().project_revision != *agent_plan_base_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "project changed after the first agent plan target was captured"));
+    }
+    if (!agent_goal_.empty() && agent_goal_ != goal) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "goal changed after a human clarification was recorded; clear and answer again"));
+    }
+    std::vector<scene::ObjectId> scope;
+    for (const auto& step : agent_plan_draft_) {
+        if (std::find(scope.begin(), scope.end(), step.target.object) == scope.end()) {
+            scope.push_back(step.target.object);
+        }
+    }
+    const std::uint64_t task_sequence = next_agent_task_id_ ==
+        std::numeric_limits<std::uint64_t>::max() ? 1U : next_agent_task_id_;
+    agent::AuthoringObjective objective{
+        "agent-task-" + std::to_string(task_sequence), std::move(goal),
+        *agent_plan_base_revision_, std::move(scope), {}, {}, agent_clarifications_draft_};
+    agent::AgentPlan plan{objective.id, std::move(objective), agent_plan_draft_};
+    const auto answered = application::HumanApplicationAccess::answer_agent_clarification(
+        plan, question_id, std::nullopt, std::move(answer));
+    if (!answered) return answered;
+    agent_goal_ = plan.objective.goal;
+    agent_clarifications_draft_ = std::move(plan.objective.clarifications);
     return core::Result<void>::success();
 }
 
@@ -1503,10 +1641,14 @@ core::Result<agent::AgentTaskSnapshot> UiController::run_agent_plan(std::string 
             core::ErrorCode::stale_data,
             "agent plan targets were captured against an older project revision"));
     }
-    if (next_agent_task_id_ == std::numeric_limits<std::uint64_t>::max()) {
-        next_agent_task_id_ = 1U;
+    if (!agent_goal_.empty() && agent_goal_ != goal) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "goal changed after a human clarification was recorded; clear and answer again"));
     }
-    const std::string task_id = "agent-task-" + std::to_string(next_agent_task_id_++);
+    const std::uint64_t task_sequence = next_agent_task_id_ ==
+        std::numeric_limits<std::uint64_t>::max() ? 1U : next_agent_task_id_;
+    const std::string task_id = "agent-task-" + std::to_string(task_sequence);
     std::vector<scene::ObjectId> scope;
     for (const auto& step : agent_plan_draft_) {
         if (std::find(scope.begin(), scope.end(), step.target.object) == scope.end()) {
@@ -1516,7 +1658,8 @@ core::Result<agent::AgentTaskSnapshot> UiController::run_agent_plan(std::string 
     agent::AgentPlan plan{
         task_id,
         agent::AuthoringObjective{
-            task_id, std::move(goal), *agent_plan_base_revision_, scope, {}, {}, {}},
+            task_id, std::move(goal), *agent_plan_base_revision_, scope, {}, {},
+            agent_clarifications_draft_},
         agent_plan_draft_};
     const std::string task_goal = plan.objective.goal;
     agent::AgentWorkEnvelope envelope;
@@ -1528,6 +1671,8 @@ core::Result<agent::AgentTaskSnapshot> UiController::run_agent_plan(std::string 
         record_ui_problem(task.error().with_context("agent workbench plan"));
         return core::Result<agent::AgentTaskSnapshot>::failure(task.error());
     }
+    next_agent_task_id_ = task_sequence == std::numeric_limits<std::uint64_t>::max()
+        ? 1U : task_sequence + 1U;
     agent_goal_ = task_goal;
     agent_task_.emplace(std::move(task.value()));
     auto result = agent_task_->run();
@@ -1572,6 +1717,7 @@ core::Result<void> UiController::clear_agent_plan() {
         agent_task_.reset();
     }
     agent_plan_draft_.clear();
+    agent_clarifications_draft_.clear();
     agent_plan_base_revision_.reset();
     agent_goal_.clear();
     return core::Result<void>::success();
@@ -1780,6 +1926,113 @@ core::Result<application::DispatchReceipt> UiController::import_condition_author
         OperationCategory::provider);
 }
 
+core::Result<application::DispatchReceipt> UiController::import_condition_audio_clip(
+    const std::filesystem::path& path) {
+    auto bytes = read_bounded_file(path, condition::kMaxWaveClipBytes, "WAVE audio clip");
+    if (!bytes) return core::Result<application::DispatchReceipt>::failure(bytes.error());
+    const std::string& encoded = bytes.value();
+    const auto byte_span = std::span<const std::uint8_t>{
+        reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size()};
+    const auto inspection = condition::inspect_wave_clip(byte_span);
+    if (!inspection) return core::Result<application::DispatchReceipt>::failure(
+        inspection.error().with_context("WAVE audio clip inspection"));
+
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION audio clip import"));
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    if (authoring.value().sources.size() >=
+        condition::AuthoringDocument::kMaxRecordsPerKind) {
+        return core::Result<application::DispatchReceipt>::failure(validation(
+            "CONDITION source evidence count exceeds its limit"));
+    }
+    const auto maximum = std::max_element(authoring.value().sources.begin(),
+        authoring.value().sources.end(), [](const auto& left, const auto& right) {
+            return left.id < right.id;
+        });
+    if (maximum != authoring.value().sources.end() &&
+        maximum->id == std::numeric_limits<condition::Id>::max()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION source identity space is exhausted"));
+    }
+
+    const assets::Sha256Digest digest = assets::sha256(byte_span);
+    constexpr std::string_view import_settings =
+        "Cartographer.WaveImport/v1;RIFF-WAVE;PCM8-16-24-32-or-IEEE-F32-F64;metadata-only";
+    const auto settings_bytes = std::span<const std::uint8_t>{
+        reinterpret_cast<const std::uint8_t*>(import_settings.data()), import_settings.size()};
+    condition::SourceEvidence source;
+    source.id = maximum == authoring.value().sources.end() ? 1U : maximum->id + 1U;
+    source.kind = condition::SourceKind::imported_asset;
+    source.label = "WAVE clip " + digest.hex().substr(0U, 12U);
+    source.logical_locator = "audio/sha256/" + digest.hex() + ".wav";
+    source.revision = "sha256:" + digest.hex();
+    source.digest = digest;
+    source.producer_identity = "Cartographer.WaveImport";
+    source.producer_version = "1";
+    source.import_settings_digest = assets::sha256(settings_bytes);
+    source.reviewed = false;
+    source.current = true;
+    source.diagnostics.push_back("WAVE inspected: " +
+        std::string(inspection.value().encoding_name()) + ", " +
+        std::to_string(inspection.value().channels) + " channels, " +
+        std::to_string(inspection.value().sample_rate) + " Hz, " +
+        std::to_string(inspection.value().bits_per_sample) + " bit, " +
+        std::to_string(inspection.value().frame_count) + " frames");
+    authoring.value().sources.push_back(std::move(source));
+    std::sort(authoring.value().sources.begin(), authoring.value().sources.end(),
+        [](const auto& left, const auto& right) { return left.id < right.id; });
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::set_condition_source_reviewed(
+    condition::Id source_id,
+    bool reviewed) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION source review"));
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    const auto source = std::find_if(authoring.value().sources.begin(),
+        authoring.value().sources.end(), [source_id](const auto& value) {
+            return value.id == source_id;
+        });
+    if (source == authoring.value().sources.end()) {
+        return core::Result<application::DispatchReceipt>::failure(
+            core::Diagnostic(core::ErrorCode::not_found,
+                "CONDITION source evidence does not exist"));
+    }
+    if (source->kind != condition::SourceKind::imported_asset) {
+        return core::Result<application::DispatchReceipt>::failure(invalid(
+            "only imported asset evidence can be reviewed through the clip workflow"));
+    }
+    if (reviewed && !source->current) {
+        return core::Result<application::DispatchReceipt>::failure(stale(
+            "stale CONDITION source evidence must be reimported before review"));
+    }
+    if (source->reviewed == reviewed) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION source review state already matches the requested state"));
+    }
+    source->reviewed = reviewed;
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
 core::Result<void> UiController::export_condition_authoring(
     const std::filesystem::path& path) const {
     const auto authoring = session_.condition_authoring();
@@ -1796,6 +2049,277 @@ core::Result<application::DispatchReceipt> UiController::invalidate_condition_so
         application::InvalidateConditionSourceAction{
             source_id, std::move(new_revision), new_digest},
         OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::add_condition_audio_source(
+    condition::AuthoredAudioSource source) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION audio source authoring"));
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    if (auto appended = append_condition_record(
+            authoring.value().audio_sources, std::move(source), "audio source"); !appended) {
+        return core::Result<application::DispatchReceipt>::failure(appended.error());
+    }
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::add_condition_acoustic_zone(
+    condition::AuthoredAcousticZone zone) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION acoustic-zone authoring"));
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    if (auto appended = append_condition_record(
+            authoring.value().acoustic_zones, std::move(zone), "acoustic zone"); !appended) {
+        return core::Result<application::DispatchReceipt>::failure(appended.error());
+    }
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::update_condition_audio_source_distances(
+    condition::Id source_id,
+    core::Revision expected_authoring_revision,
+    double minimum_distance,
+    double maximum_distance) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION audio distance edit"));
+    if (authoring.value().project_revision != expected_authoring_revision) {
+        return core::Result<application::DispatchReceipt>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "CONDITION audio distance edit was based on a stale authoring revision"));
+    }
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    const auto found = std::find_if(authoring.value().audio_sources.begin(),
+        authoring.value().audio_sources.end(), [source_id](const auto& source) {
+            return source.id == source_id;
+        });
+    if (found == authoring.value().audio_sources.end()) {
+        return core::Result<application::DispatchReceipt>::failure(core::Diagnostic(
+            core::ErrorCode::not_found, "CONDITION audio source does not exist"));
+    }
+    found->minimum_distance = minimum_distance;
+    found->maximum_distance = maximum_distance;
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::set_condition_audio_source_enabled(
+    condition::Id source_id,
+    core::Revision expected_authoring_revision,
+    bool enabled) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION audio source state"));
+    if (authoring.value().project_revision != expected_authoring_revision) {
+        return core::Result<application::DispatchReceipt>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "CONDITION audio state edit was based on a stale authoring revision"));
+    }
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    const auto found = std::find_if(authoring.value().audio_sources.begin(),
+        authoring.value().audio_sources.end(), [source_id](const auto& source) {
+            return source.id == source_id;
+        });
+    if (found == authoring.value().audio_sources.end()) {
+        return core::Result<application::DispatchReceipt>::failure(core::Diagnostic(
+            core::ErrorCode::not_found, "CONDITION audio source does not exist"));
+    }
+    found->enabled = enabled;
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::update_condition_acoustic_zone_volume(
+    condition::Id zone_id,
+    core::Revision expected_authoring_revision,
+    core::Vec3d half_extents,
+    double radius) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION acoustic-zone volume edit"));
+    if (authoring.value().project_revision != expected_authoring_revision) {
+        return core::Result<application::DispatchReceipt>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "CONDITION acoustic-zone edit was based on a stale authoring revision"));
+    }
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    const auto found = std::find_if(authoring.value().acoustic_zones.begin(),
+        authoring.value().acoustic_zones.end(), [zone_id](const auto& zone) {
+            return zone.id == zone_id;
+        });
+    if (found == authoring.value().acoustic_zones.end()) {
+        return core::Result<application::DispatchReceipt>::failure(core::Diagnostic(
+            core::ErrorCode::not_found, "CONDITION acoustic zone does not exist"));
+    }
+    found->half_extents = half_extents;
+    found->radius = radius;
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::add_condition_effect_source(
+    condition::EffectSource source) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION effect source authoring"));
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    if (auto appended = append_condition_record(
+            authoring.value().effect_sources, std::move(source), "effect source"); !appended) {
+        return core::Result<application::DispatchReceipt>::failure(appended.error());
+    }
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::add_condition_particle_emitter(
+    condition::ParticleEmitterSource emitter) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION particle emitter authoring"));
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    if (auto appended = append_condition_record(
+            authoring.value().particle_emitters, std::move(emitter), "particle emitter"); !appended) {
+        return core::Result<application::DispatchReceipt>::failure(appended.error());
+    }
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::add_condition_field_influence(
+    condition::FieldInfluenceBinding influence) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION field influence authoring"));
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    if (auto appended = append_condition_record(
+            authoring.value().field_influences, std::move(influence), "field influence"); !appended) {
+        return core::Result<application::DispatchReceipt>::failure(appended.error());
+    }
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::add_condition_vegetation_scatter(
+    condition::VegetationScatterRecipe recipe) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION vegetation scatter authoring"));
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    if (auto appended = append_condition_record(
+            authoring.value().vegetation_scatters, std::move(recipe),
+            "vegetation scatter recipe"); !appended) {
+        return core::Result<application::DispatchReceipt>::failure(appended.error());
+    }
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::add_condition_state_branch(
+    condition::AuthoredStateBranch branch) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION state branch authoring"));
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    if (auto appended = append_condition_record(
+            authoring.value().state_branches, std::move(branch), "state branch"); !appended) {
+        return core::Result<application::DispatchReceipt>::failure(appended.error());
+    }
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<condition::EffectPreviewResult> UiController::preview_condition_effect(
+    condition::Id effect_source_id,
+    std::string_view operating_state,
+    double elapsed_seconds) const {
+    return session_.condition_effect_preview(
+        effect_source_id, operating_state, elapsed_seconds);
+}
+
+core::Result<condition::VegetationPreviewResult> UiController::preview_condition_vegetation(
+    condition::Id recipe_id) const {
+    return session_.condition_vegetation_preview(recipe_id);
+}
+
+core::Result<condition::StateComparisonResult>
+UiController::compare_condition_state_branches(
+    condition::Id left_branch_id,
+    condition::Id right_branch_id) const {
+    return session_.condition_state_comparison(left_branch_id, right_branch_id);
 }
 
 core::Result<condition::Package> UiController::build_condition_package() const {
@@ -2387,6 +2911,7 @@ UiSnapshot UiController::snapshot() const {
         : "Native planner ready. Proposals require explicit Apply through the revision-bound command path.";
     result.agent_goal = agent_goal_;
     result.agent_plan_draft = agent_plan_draft_;
+    result.agent_clarifications_draft = agent_clarifications_draft_;
     if (agent_task_.has_value()) result.agent_task = agent_task_->snapshot();
     result.market = market_view_;
     if (surface_fidelity_.has_value()) {

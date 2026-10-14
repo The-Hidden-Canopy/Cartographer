@@ -76,6 +76,57 @@ round-trip and project-transaction tests. They validate typed graph topology,
 unsupported-node reporting, texture-source references, camera/light records,
 schema migration, dangling source references, and journal behavior.
 
+CONDITION's embedded authoring codec has schema-3 audio-source and
+acoustic-zone records. They bind a source to an owner asset and reviewed/current
+imported clip evidence, preserve bounded gain/pitch/attenuation/bus/occlusion/
+reverb and normal-state/familiarity intent, and represent bounded box/sphere
+zones with semantic room identity. Native CONDITION controls append these
+records through the existing project command and journal path. WAVE intake now
+checks bounded RIFF framing, uncompressed PCM/IEEE-float formats, alignment,
+sample limits, and finite float samples; it records only a content digest,
+content-addressed logical locator, and inspected metadata. The absolute source
+path and sample bytes are not persisted or included in a `.carto-condition`
+package. Imported evidence remains unreviewed until an explicit authoring
+action; stale evidence cannot be reviewed or published. Audio descriptors
+support explicit enabled/disabled fixture state. Decoded samples and
+mixer/playback state remain outside authored project truth. The native
+Windows shell can transiently decode and audition a three-second excerpt after
+rechecking the selected file against the current source digest; the excerpt and
+absolute path are not persisted. Native min/max distance rings, sphere/box zone
+volume handles, and per-zone priority labels now edit through revision-checked
+project commands; the authoring panel shows bounded conservative overlap
+candidates and stored priorities without simulating runtime precedence.
+Pointer-drag visual acceptance and production acoustic-fixture validation
+remain open.
+
+Schema 3 also persists effect-source intent, bounded deterministic particle
+emitters, and field-influence bindings. Every influence captures the exact
+project field identity, revision, and digest; preview refuses stale or missing
+field inputs and out-of-coverage sampling rather than substituting values. The
+native CONDITION workspace can author these records and preview exact normal or
+disabled states as a bounded local-space 2D point display. Preview output is
+ephemeral and does not mutate the project or create a runtime pool. Wind,
+thermal, and drainage use authored directional acceleration; avoidance reverses
+that direction; turbulence adds bounded deterministic perturbation. This is not
+a full vector-field solver and does not claim collision, fluid coupling, volume
+rendering, or integration with CONDITION game runtime. Schema-1 and schema-2
+CONDITION documents migrate with empty new sections. Schema 4 adds source-only
+vegetation scatter recipes over exact moisture, shade, disturbance, species
+suitability, and elevation fields. The native CONDITION panel authors the
+recipe against vegetation-class assets, previews a bounded deterministic point
+set, and marks it stale when its authoring or any source field changes. Missing,
+wrong-semantic, stale, or uncovered field samples and candidate/output overflow
+fail closed. The preview is not persisted as placement data and does not create
+scene instances or invoke donor/runtime code. Schema-3 documents reopen with no
+scatter recipes. Schema 5 adds typed branchable Safe Place and surface-state
+deltas with explicit source before-values, parent-branch identity, and
+applicability notes. The native workbench creates nested Safe Place alternatives
+and compares branches against their common ancestor; sibling edits to the same
+property are marked contested, stale before-values fail comparison, and source
+records are never overwritten. Branches are authored review data, not runtime
+state selection or automatic reconciliation. Schema-4 documents reopen with no
+state branches.
+
 Terrain source authoring now builds on the persisted spatial-field contract.
 `terrain_elevation` and related terrain-analysis semantics were appended
 without renumbering existing semantic values. The native authoring panel can
@@ -112,7 +163,20 @@ model viewport.
    and stale-receipt refusal.
 5. `cartographer_application_tests` proves the native terrain-analysis query
    reads the current source and does not mutate project or field revisions.
-6. The existing public-boundary audit remains the release gate for tracked
+6. `cartographer_condition_authoring_tests` proves WAVE metadata bounds,
+   malformed/container/float-sample rejection, content provenance, no path or
+   sample persistence, explicit review gating, and journal undo/redo.
+   The same suite verifies effect schema migration, exact field provenance,
+   deterministic state previews, and non-mutation under preview. Vegetation
+   coverage includes schema-1/2/3 migration, exact semantic/revision/digest
+   bindings, deterministic preview/save-reopen parity, full-coverage refusal,
+   density and candidate caps, disabled recipes, stale-field invalidation, and
+   journaled add/undo/redo through the application/UI path.
+   State branch acceptance covers schema-1 through schema-4 migration, parent
+   ancestry and cycle rejection, exact target/before-value checks, baseline and
+   sibling comparison, contested conflict marking, stale-source refusal,
+   save/reopen parity, and project-command undo/redo.
+7. The existing public-boundary audit remains the release gate for tracked
    archives, specifications, credentials, workstation paths, and reachable
    history.
 
@@ -156,7 +220,23 @@ Cartographer receipt cannot be used to bypass them.
   inside the governed material catalog; unknown nodes remain explicit and are
   not claimed as shader lowering. Texture samples must resolve to source
   texture records. Shader compilation and runtime admission remain unclaimed.
-- Terrain, procedural, audio, state, and remaining greenfield gaps: separate
+- Audio/acoustic authoring: bounded source and zone intent records are persisted
+  in CONDITION authoring schema 3 and can be added through native project
+  transactions. Bounded WAVE metadata inspection creates pathless,
+  content-digest-bound source evidence, which remains unreviewed until an
+  explicit action. Current reviewed clip evidence and owner assets are required,
+  and stale evidence blocks publication. The native work surface projects
+  attenuation rings and box/sphere zone outlines only when their authored owner
+  asset maps to an existing scene object; these are visual guides, not runtime
+  occlusion or acoustic simulation. Sample decoding, editable radius/volume
+  handles, audition, overlap preview, and runtime playback remain open.
+- Effect authoring: native effect sources, bounded particle emitters, and
+  exact field-influence bindings are persisted in CONDITION schema 3. The UI
+  generates deterministic local-space previews for exact normal/disabled
+  states; stale/missing fields fail closed and preview leaves project revisions
+  unchanged. No runtime pool, field-vector solver, collision, or rendered world
+  integration is claimed; full gas-station VFX acceptance remains open.
+- Terrain, procedural, state, and remaining greenfield gaps: separate
   reviewable tranches; terrain has the source/derived-product slice below but
   is not yet a full world-authoring workflow.
 - Greenfield geometry: a standalone bounded cubic path source/evaluator now

@@ -4,6 +4,7 @@
 #include <carto/application/application.hpp>
 #include <carto/agent/workbench.hpp>
 #include <carto/condition/authoring.hpp>
+#include <carto/condition/vegetation_preview.hpp>
 #include <carto/core/result.hpp>
 #include <carto/engineering/authoring.hpp>
 #include <carto/market/market.hpp>
@@ -416,6 +417,7 @@ struct UiSnapshot : application::ApplicationSnapshot {
     std::string ai_status;
     std::string agent_goal;
     std::vector<agent::AgentPlanStep> agent_plan_draft;
+    std::vector<agent::ClarificationQuestion> agent_clarifications_draft;
     std::optional<agent::AgentTaskSnapshot> agent_task;
 };
 
@@ -468,7 +470,16 @@ public:
         const ai::Proposal& proposal);
     [[nodiscard]] core::Result<application::DispatchReceipt> submit_ai_proposal(
         const application::ApplicationAction& action);
-    [[nodiscard]] core::Result<void> queue_agent_step(std::string intent);
+    [[nodiscard]] core::Result<void> queue_agent_step(
+        std::string intent,
+        std::vector<std::string> dependencies = {});
+    [[nodiscard]] core::Result<void> queue_agent_clarification(
+        std::string prompt,
+        agent::ClarificationImpact impact);
+    [[nodiscard]] core::Result<void> answer_agent_clarification(
+        std::string goal,
+        std::string_view question_id,
+        std::string answer);
     [[nodiscard]] core::Result<agent::AgentTaskSnapshot> run_agent_plan(std::string goal);
     [[nodiscard]] core::Result<application::DispatchReceipt> accept_agent_plan();
     [[nodiscard]] core::Result<void> reject_agent_plan();
@@ -497,12 +508,53 @@ public:
     [[nodiscard]] core::Result<application::DispatchReceipt> import_condition_fixture();
     [[nodiscard]] core::Result<application::DispatchReceipt> import_condition_authoring(
         const std::filesystem::path& path);
+    [[nodiscard]] core::Result<application::DispatchReceipt> import_condition_audio_clip(
+        const std::filesystem::path& path);
+    [[nodiscard]] core::Result<application::DispatchReceipt> set_condition_source_reviewed(
+        condition::Id source_id, bool reviewed);
     [[nodiscard]] core::Result<void> export_condition_authoring(
         const std::filesystem::path& path) const;
     [[nodiscard]] core::Result<application::DispatchReceipt> invalidate_condition_source(
         condition::Id source_id,
         std::string new_revision,
         assets::Sha256Digest new_digest);
+    [[nodiscard]] core::Result<application::DispatchReceipt> add_condition_audio_source(
+        condition::AuthoredAudioSource source);
+    [[nodiscard]] core::Result<application::DispatchReceipt> add_condition_acoustic_zone(
+        condition::AuthoredAcousticZone zone);
+    [[nodiscard]] core::Result<application::DispatchReceipt> update_condition_audio_source_distances(
+        condition::Id source_id,
+        core::Revision expected_authoring_revision,
+        double minimum_distance,
+        double maximum_distance);
+    [[nodiscard]] core::Result<application::DispatchReceipt> set_condition_audio_source_enabled(
+        condition::Id source_id,
+        core::Revision expected_authoring_revision,
+        bool enabled);
+    [[nodiscard]] core::Result<application::DispatchReceipt> update_condition_acoustic_zone_volume(
+        condition::Id zone_id,
+        core::Revision expected_authoring_revision,
+        core::Vec3d half_extents,
+        double radius);
+    [[nodiscard]] core::Result<application::DispatchReceipt> add_condition_effect_source(
+        condition::EffectSource source);
+    [[nodiscard]] core::Result<application::DispatchReceipt> add_condition_particle_emitter(
+        condition::ParticleEmitterSource emitter);
+    [[nodiscard]] core::Result<application::DispatchReceipt> add_condition_field_influence(
+        condition::FieldInfluenceBinding influence);
+    [[nodiscard]] core::Result<application::DispatchReceipt> add_condition_vegetation_scatter(
+        condition::VegetationScatterRecipe recipe);
+    [[nodiscard]] core::Result<application::DispatchReceipt> add_condition_state_branch(
+        condition::AuthoredStateBranch branch);
+    [[nodiscard]] core::Result<condition::EffectPreviewResult> preview_condition_effect(
+        condition::Id effect_source_id,
+        std::string_view operating_state,
+        double elapsed_seconds) const;
+    [[nodiscard]] core::Result<condition::VegetationPreviewResult>
+    preview_condition_vegetation(condition::Id recipe_id) const;
+    [[nodiscard]] core::Result<condition::StateComparisonResult>
+    compare_condition_state_branches(condition::Id left_branch_id,
+        condition::Id right_branch_id) const;
     [[nodiscard]] core::Result<condition::Package> build_condition_package() const;
     [[nodiscard]] core::Result<condition::AdmissionResult> admit_condition_package() const;
     [[nodiscard]] core::Result<void> publish_condition_package(
@@ -569,6 +621,7 @@ private:
     MarketView market_view_;
     std::uint64_t next_operation_id_ = 1U;
     std::vector<agent::AgentPlanStep> agent_plan_draft_;
+    std::vector<agent::ClarificationQuestion> agent_clarifications_draft_;
     std::optional<core::Revision> agent_plan_base_revision_;
     std::optional<agent::AgentTask> agent_task_;
     std::string agent_goal_;

@@ -722,6 +722,43 @@ core::Result<condition::AuthoringDocument> ApplicationSession::condition_authori
     return decoded;
 }
 
+core::Result<condition::EffectPreviewResult> ApplicationSession::condition_effect_preview(
+    condition::Id effect_source_id,
+    std::string_view operating_state,
+    double elapsed_seconds) const {
+    const auto authoring = condition_authoring();
+    if (!authoring) {
+        return core::Result<condition::EffectPreviewResult>::failure(
+            authoring.error().with_context("CONDITION effect preview"));
+    }
+    return condition::preview_effect(authoring.value(), document_.spatial_fields(),
+        effect_source_id, operating_state, elapsed_seconds);
+}
+
+core::Result<condition::VegetationPreviewResult>
+ApplicationSession::condition_vegetation_preview(condition::Id recipe_id) const {
+    const auto authoring = condition_authoring();
+    if (!authoring) {
+        return core::Result<condition::VegetationPreviewResult>::failure(
+            authoring.error().with_context("CONDITION vegetation preview"));
+    }
+    return condition::preview_vegetation(authoring.value(), document_.spatial_fields(),
+        recipe_id);
+}
+
+core::Result<condition::StateComparisonResult>
+ApplicationSession::condition_state_comparison(
+    condition::Id left_branch_id,
+    condition::Id right_branch_id) const {
+    const auto authoring = condition_authoring();
+    if (!authoring) {
+        return core::Result<condition::StateComparisonResult>::failure(
+            authoring.error().with_context("CONDITION state comparison"));
+    }
+    return condition::compare_state_branches(
+        authoring.value(), left_branch_id, right_branch_id);
+}
+
 core::Result<SpatialFieldPreview> ApplicationSession::spatial_field_preview(
     std::string_view identity) const {
     const auto found = document_.spatial_fields().find(std::string(identity));
@@ -2060,6 +2097,19 @@ core::Result<DispatchReceipt> ApplicationSession::import_condition_authoring(
     const auto digest = decoded.value().canonical_digest();
     if (!digest) return failure(digest.error().with_context("CONDITION authoring import digest"));
     const auto current = document_.condition_authoring();
+    if (current.has_value() && current->bytes != serialized) {
+        const auto current_authoring = condition::AuthoringDocument::deserialize(current->bytes);
+        if (!current_authoring) {
+            return failure(current_authoring.error().with_context(
+                "current CONDITION authoring revision cannot be verified"));
+        }
+        if (current_authoring.value().project_namespace == decoded.value().project_namespace &&
+            decoded.value().project_revision != current_authoring.value().project_revision.next()) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "CONDITION authoring replacement must advance the current namespace by exactly one revision"));
+        }
+    }
     if (current.has_value() && current->bytes == serialized && current->digest == digest.value()) {
         return accepted("Import CONDITION Authoring Document", document_.revision());
     }
@@ -2412,10 +2462,36 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
                     source.logical_locator,
                     source.revision,
                     source.digest,
-                    source.current});
+                    source.current,
+                    source.reviewed,
+                    source.diagnostics});
             }
             result.condition.asset_count = authoring.assets.size();
+            result.condition.assets.reserve(authoring.assets.size());
+            for (const auto& asset : authoring.assets) {
+                result.condition.assets.push_back(ConditionAuthoringView::Asset{
+                    asset.id, asset.stable_name,
+                    std::string(condition::asset_class_name(asset.asset_class)),
+                    asset.authored_object_id});
+            }
             result.condition.safe_place_count = authoring.safe_places.size();
+            result.condition.safe_places.reserve(authoring.safe_places.size());
+            for (const auto& profile : authoring.safe_places) {
+                result.condition.safe_places.push_back(ConditionAuthoringView::SafePlace{
+                    profile.id, profile.asset_id,
+                    {profile.privacy, profile.human_proximity,
+                     profile.controllable_entries, profile.supply_access,
+                     profile.ambient_noise, profile.visibility_outward,
+                     profile.visibility_inward, profile.isolation}});
+            }
+            result.condition.state_branches.reserve(authoring.state_branches.size());
+            result.condition.state_branch_count = authoring.state_branches.size();
+            for (const auto& branch : authoring.state_branches) {
+                result.condition.state_branches.push_back(
+                    ConditionAuthoringView::StateBranch{
+                        branch.id, branch.parent_branch_id, branch.name,
+                        branch.applicability, branch.deltas.size()});
+            }
             result.condition.familiarity_count = authoring.familiarity.size();
             result.condition.view_condition_count = authoring.view_conditions.size();
             result.condition.variant_count = authoring.variants.size();
@@ -2425,6 +2501,39 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
             result.condition.collection_count = authoring.collections.size();
             result.condition.prefab_count = authoring.prefabs.size();
             result.condition.region_kit_count = authoring.region_kits.size();
+            result.condition.audio_source_count = authoring.audio_sources.size();
+            result.condition.acoustic_zone_count = authoring.acoustic_zones.size();
+            result.condition.effect_source_count = authoring.effect_sources.size();
+            result.condition.particle_emitter_count = authoring.particle_emitters.size();
+            result.condition.field_influence_count = authoring.field_influences.size();
+            result.condition.vegetation_scatter_count = authoring.vegetation_scatters.size();
+            result.condition.vegetation_scatter_ids.reserve(authoring.vegetation_scatters.size());
+            for (const auto& recipe : authoring.vegetation_scatters) {
+                result.condition.vegetation_scatter_ids.push_back(recipe.id);
+            }
+            result.condition.audio_sources.reserve(authoring.audio_sources.size());
+            for (const auto& source : authoring.audio_sources) {
+                result.condition.audio_sources.push_back(ConditionAuthoringView::AudioSource{
+                    source.id, source.asset_id, source.clip_source_id, source.local_transform,
+                    std::string(condition::audio_bus_class_name(source.bus)), source.gain,
+                    source.minimum_distance, source.maximum_distance,
+                    source.spatial, source.enabled});
+            }
+            result.condition.acoustic_zones.reserve(authoring.acoustic_zones.size());
+            for (const auto& zone : authoring.acoustic_zones) {
+                result.condition.acoustic_zones.push_back(ConditionAuthoringView::AcousticZone{
+                    zone.id, zone.asset_id, zone.local_transform,
+                    std::string(condition::acoustic_zone_shape_name(zone.shape)),
+                    zone.half_extents, zone.radius, zone.acoustic_class,
+                    zone.semantic_region, zone.priority, zone.enabled});
+            }
+            result.condition.effect_sources.reserve(authoring.effect_sources.size());
+            for (const auto& effect : authoring.effect_sources) {
+                result.condition.effect_sources.push_back(ConditionAuthoringView::EffectSource{
+                    effect.id, effect.asset_id, effect.semantic_owner,
+                    effect.normal_operating_state, effect.disabled_operating_state,
+                    effect.enabled});
+            }
             result.condition.stale = authoring.has_stale_sources();
             const auto package = condition::Package::publish(
                 authoring, document_.revision(), authoring.project_namespace);

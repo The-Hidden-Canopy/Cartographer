@@ -74,18 +74,22 @@ private:
     HumanClarificationReceipt(
         std::string question_id,
         assets::Sha256Digest context_digest,
-        assets::Sha256Digest answer_digest)
+        assets::Sha256Digest answer_digest,
+        assets::Sha256Digest plan_context_digest)
         : question_id_(std::move(question_id)),
           context_digest_(context_digest),
-          answer_digest_(answer_digest) {}
+          answer_digest_(answer_digest),
+          plan_context_digest_(plan_context_digest) {}
 
     std::string question_id_;
     assets::Sha256Digest context_digest_;
     assets::Sha256Digest answer_digest_;
+    assets::Sha256Digest plan_context_digest_;
 
     friend class ::carto::application::HumanApplicationAccess;
     friend struct ClarificationQuestion;
     friend struct AuthoringObjective;
+    friend struct AgentPlan;
 };
 
 struct ClarificationCandidate {
@@ -106,6 +110,7 @@ struct ClarificationQuestion {
     std::optional<std::string> selected_candidate_id;
     std::optional<std::string> freeform_answer;
     std::optional<HumanClarificationReceipt> human_receipt;
+    bool requires_explicit_answer = false;
 
     [[nodiscard]] core::Result<void> validate(
         const std::vector<scene::ObjectId>& scope,
@@ -147,6 +152,7 @@ struct AgentPlanStep {
     std::string id;
     TargetRef target;
     std::string intent;
+    std::vector<std::string> dependencies{};
 
     [[nodiscard]] core::Result<void> validate() const;
 };
@@ -157,6 +163,7 @@ struct AgentPlan {
     std::vector<AgentPlanStep> steps;
 
     [[nodiscard]] core::Result<void> validate() const;
+    [[nodiscard]] core::Result<std::vector<std::string>> schedule_order() const;
 };
 
 struct AgentWorkEnvelope {
@@ -175,8 +182,19 @@ struct AgentWorkEnvelope {
 };
 
 enum class StepStatus {
+    pending,
+    ready,
+    running,
     passed,
     failed,
+    invalidated,
+};
+
+struct PlanStepProgress {
+    std::string step_id;
+    std::vector<std::string> dependencies;
+    StepStatus status = StepStatus::pending;
+    std::optional<core::Diagnostic> diagnostic;
 };
 
 struct StepReceipt {
@@ -269,8 +287,11 @@ struct AgentTaskSnapshot {
     std::string task_id;
     std::string goal;
     assets::Sha256Digest objective_digest;
+    std::vector<HardConstraint> hard_constraints;
+    std::vector<ClarificationQuestion> clarifications;
     core::Revision base_revision;
     core::Revision speculative_revision;
+    std::vector<PlanStepProgress> plan_steps;
     std::vector<StepReceipt> steps;
     std::vector<AcceptanceGateResult> gates;
     ProjectDiff diff;
@@ -330,6 +351,7 @@ private:
     std::unique_ptr<application::ApplicationSession> speculative_;
     ai::NativePlanner planner_;
     std::vector<StepReceipt> receipts_;
+    std::vector<PlanStepProgress> plan_progress_;
     std::vector<AcceptanceGateResult> gates_;
     SceneQueryBudget query_budget_;
     std::set<scene::ObjectId> touched_objects_;
@@ -339,5 +361,6 @@ private:
 };
 
 [[nodiscard]] const char* task_status_name(TaskStatus status) noexcept;
+[[nodiscard]] const char* step_status_name(StepStatus status) noexcept;
 
 } // namespace carto::agent

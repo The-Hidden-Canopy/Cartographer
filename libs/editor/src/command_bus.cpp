@@ -330,7 +330,7 @@ core::Result<void> SetProjectConditionAuthoringCommand::execute() {
             core::ErrorCode::invalid_state,
             "CONDITION authoring command has incomplete or already-applied state"));
     }
-    if (document_->revision() != expected_project_revision_) {
+    if (!has_executed_ && document_->revision() != expected_project_revision_) {
         return core::Result<void>::failure(core::Diagnostic(
             core::ErrorCode::stale_data,
             "CONDITION authoring command revision no longer matches the project"));
@@ -350,15 +350,16 @@ core::Result<void> SetProjectConditionAuthoringCommand::execute() {
             "CONDITION authoring command did not change the project"));
     }
     expected_project_revision_ = document_->revision();
+    has_executed_ = true;
     applied_ = true;
     return core::Result<void>::success();
 }
 
 core::Result<void> SetProjectConditionAuthoringCommand::undo() {
-    if (!document_ || !applied_ || document_->revision() != expected_project_revision_) {
+    if (!document_ || !applied_) {
         return core::Result<void>::failure(core::Diagnostic(
             core::ErrorCode::stale_data,
-            "CONDITION authoring command cannot be undone in the current revision"));
+            "CONDITION authoring command is not in an applied state"));
     }
     if (document_->condition_authoring() != std::optional<project::SerializedConditionAuthoring>{after_}) {
         return core::Result<void>::failure(core::Diagnostic(
@@ -367,7 +368,7 @@ core::Result<void> SetProjectConditionAuthoringCommand::undo() {
     }
     core::Result<void> result = before_.has_value()
         ? document_->set_condition_authoring(before_->bytes, before_->digest)
-        : document_->erase_condition_authoring_if_revision(expected_project_revision_);
+        : document_->erase_condition_authoring_if_revision(document_->revision());
     if (!result) return result;
     expected_project_revision_ = document_->revision();
     applied_ = false;

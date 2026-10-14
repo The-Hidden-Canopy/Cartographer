@@ -95,6 +95,63 @@ enum class AnchorKind : std::uint8_t {
     audio_source,
 };
 
+enum class AudioBusClass : std::uint8_t {
+    ambient,
+    machinery,
+    vehicle,
+    radio,
+    speech,
+    music,
+    effects,
+};
+
+enum class AudioOcclusionIntent : std::uint8_t {
+    none,
+    static_geometry,
+    authored_geometry,
+};
+
+enum class AcousticZoneShape : std::uint8_t {
+    box,
+    sphere,
+};
+
+enum class EffectEmissionShape : std::uint8_t {
+    point,
+    box,
+    sphere,
+};
+
+enum class EffectIntentClass : std::uint8_t {
+    physical_state,
+    presentation_only,
+};
+
+enum class EffectInfluenceKind : std::uint8_t {
+    wind,
+    thermal_lift,
+    drainage,
+    avoidance,
+    turbulence,
+};
+
+enum class StateTargetKind : std::uint8_t { safe_place_profile, surface_state };
+
+enum class StateProperty : std::uint8_t {
+    privacy,
+    human_proximity,
+    controllable_entries,
+    supply_access,
+    ambient_noise,
+    visibility_outward,
+    visibility_inward,
+    isolation,
+    occupancy,
+    maintenance,
+    damage,
+    wetness,
+};
+
 enum class PackageAdmissionStatus : std::uint8_t { admit, refuse };
 
 [[nodiscard]] std::string_view source_kind_name(SourceKind value) noexcept;
@@ -106,6 +163,14 @@ enum class PackageAdmissionStatus : std::uint8_t { admit, refuse };
 [[nodiscard]] std::string_view maintenance_state_name(MaintenanceState value) noexcept;
 [[nodiscard]] std::string_view damage_state_name(DamageState value) noexcept;
 [[nodiscard]] std::string_view anchor_kind_name(AnchorKind value) noexcept;
+[[nodiscard]] std::string_view audio_bus_class_name(AudioBusClass value) noexcept;
+[[nodiscard]] std::string_view audio_occlusion_intent_name(AudioOcclusionIntent value) noexcept;
+[[nodiscard]] std::string_view acoustic_zone_shape_name(AcousticZoneShape value) noexcept;
+[[nodiscard]] std::string_view effect_emission_shape_name(EffectEmissionShape value) noexcept;
+[[nodiscard]] std::string_view effect_intent_class_name(EffectIntentClass value) noexcept;
+[[nodiscard]] std::string_view effect_influence_kind_name(EffectInfluenceKind value) noexcept;
+[[nodiscard]] std::string_view state_target_kind_name(StateTargetKind value) noexcept;
+[[nodiscard]] std::string_view state_property_name(StateProperty value) noexcept;
 
 // A source reference is deliberately a logical locator, never an absolute
 // machine path or a runtime handle. `current` is explicit so stale source
@@ -243,6 +308,155 @@ struct InteractionAnchor {
     [[nodiscard]] core::Result<void> validate() const;
 };
 
+// Authored audio intent references reviewed source evidence. It carries no
+// decoded samples, mixer handle, playback state, or runtime authority.
+struct AuthoredAudioSource {
+    Id id = 0U;
+    Id asset_id = 0U;
+    Id clip_source_id = 0U;
+    core::Transform local_transform = core::Transform::identity();
+    double gain = 1.0;
+    double pitch = 1.0;
+    bool loop = false;
+    bool spatial = true;
+    double minimum_distance = 1.0;
+    double maximum_distance = 10.0;
+    std::uint16_t priority = 128U;
+    AudioBusClass bus = AudioBusClass::ambient;
+    AudioOcclusionIntent occlusion = AudioOcclusionIntent::static_geometry;
+    double reverb_send = 0.0;
+    std::string normal_operating_state = "active";
+    std::string familiarity_role;
+    bool enabled = true;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+struct AuthoredAcousticZone {
+    Id id = 0U;
+    Id asset_id = 0U;
+    AcousticZoneShape shape = AcousticZoneShape::box;
+    core::Transform local_transform = core::Transform::identity();
+    core::Vec3d half_extents{1.0, 1.0, 1.0};
+    double radius = 0.0;
+    std::string acoustic_class;
+    double gain_modifier = 1.0;
+    std::string reverb_intent;
+    std::uint16_t priority = 0U;
+    std::string semantic_region;
+    bool enabled = true;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+struct EffectSource {
+    Id id = 0U;
+    Id asset_id = 0U;
+    std::string semantic_owner;
+    EffectEmissionShape shape = EffectEmissionShape::point;
+    core::Transform local_transform = core::Transform::identity();
+    core::Vec3d half_extents{};
+    double radius = 0.0;
+    EffectIntentClass intent_class = EffectIntentClass::physical_state;
+    std::string normal_operating_state = "active";
+    std::string disabled_operating_state = "disabled";
+    bool enabled = true;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+struct ParticleEmitterSource {
+    Id id = 0U;
+    Id effect_source_id = 0U;
+    double emission_rate_per_second = 1.0;
+    double particle_lifetime_seconds = 1.0;
+    double start_seconds = 0.0;
+    double duration_seconds = 1.0;
+    std::uint32_t burst_count = 0U;
+    double burst_time_seconds = 0.0;
+    core::Vec3d initial_velocity{};
+    core::Vec3d velocity_spread{};
+    core::Vec3d acceleration{};
+    double fixed_timestep_seconds = 1.0 / 60.0;
+    std::uint32_t total_particle_bound = 256U;
+    std::uint64_t deterministic_seed = 1U;
+    bool enabled = true;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+struct FieldInfluenceBinding {
+    Id id = 0U;
+    Id effect_source_id = 0U;
+    EffectInfluenceKind kind = EffectInfluenceKind::wind;
+    std::string field_identity;
+    core::Revision expected_field_revision;
+    assets::Sha256Digest expected_field_digest;
+    core::Vec3d direction{1.0, 0.0, 0.0};
+    double strength = 1.0;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+struct FieldSourceBinding {
+    std::string field_identity;
+    core::Revision expected_field_revision;
+    assets::Sha256Digest expected_field_digest;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+// Persisted source recipe for deterministic, field-driven plant placement.
+// Generated instances remain a derived preview and are not scene authority.
+struct VegetationScatterRecipe {
+    Id id = 0U;
+    Id species_asset_id = 0U;
+    FieldSourceBinding moisture;
+    FieldSourceBinding shade;
+    FieldSourceBinding disturbance;
+    FieldSourceBinding suitability;
+    FieldSourceBinding elevation;
+    double cell_spacing = 2.0;
+    double density_per_square_meter = 0.05;
+    double minimum_suitability = 0.2;
+    double minimum_scale = 0.8;
+    double maximum_scale = 1.2;
+    std::uint32_t maximum_instances = 2048U;
+    std::uint64_t deterministic_seed = 1U;
+    bool enabled = true;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+struct StateValue {
+    double numeric_value = 0.0;
+    std::string text_value;
+};
+
+struct AuthoredStateDelta {
+    Id id = 0U;
+    Id target_record_id = 0U;
+    Id target_asset_id = 0U;
+    StateTargetKind target_kind = StateTargetKind::safe_place_profile;
+    StateProperty property = StateProperty::privacy;
+    StateValue before;
+    StateValue after;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+// A branch stores explicit before/after source-state deltas. Branch id 0 is
+// the immutable baseline and is never serialized as an authored branch.
+struct AuthoredStateBranch {
+    Id id = 0U;
+    std::string name;
+    Id parent_branch_id = 0U;
+    std::string applicability;
+    std::vector<AuthoredStateDelta> deltas;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
 struct CollectionRecord {
     Id id = 0U;
     std::string name;
@@ -280,9 +494,14 @@ struct RegionKitManifest {
 
 class AuthoringDocument final {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 1U;
+    static constexpr std::uint32_t kSchemaVersion = 5U;
     static constexpr std::size_t kMaxSerializedBytes = 32U * 1024U * 1024U;
     static constexpr std::size_t kMaxRecordsPerKind = 65'536U;
+    static constexpr std::size_t kMaxAudioRecordsPerKind = 8'192U;
+    static constexpr std::size_t kMaxEffectRecordsPerKind = 8'192U;
+    static constexpr std::size_t kMaxVegetationRecipes = 1'024U;
+    static constexpr std::size_t kMaxStateBranches = 1'024U;
+    static constexpr std::size_t kMaxStateDeltasPerBranch = 4'096U;
 
     std::string project_namespace;
     core::Revision project_revision;
@@ -298,6 +517,13 @@ public:
     std::vector<CollectionRecord> collections;
     std::vector<PrefabRecord> prefabs;
     std::vector<RegionKitManifest> region_kits;
+    std::vector<AuthoredAudioSource> audio_sources;
+    std::vector<AuthoredAcousticZone> acoustic_zones;
+    std::vector<EffectSource> effect_sources;
+    std::vector<ParticleEmitterSource> particle_emitters;
+    std::vector<FieldInfluenceBinding> field_influences;
+    std::vector<VegetationScatterRecipe> vegetation_scatters;
+    std::vector<AuthoredStateBranch> state_branches;
 
     [[nodiscard]] core::Result<void> validate() const;
     [[nodiscard]] core::Result<void> validate_for_publication() const;
