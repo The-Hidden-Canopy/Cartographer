@@ -132,18 +132,27 @@ std::optional<scene::ObjectId> selected_surface_object(
     return std::nullopt;
 }
 
+constexpr std::size_t kMaxAgentDemonstrationTargetSets = 16U;
+constexpr std::size_t kMaxExpandedDemonstrationPlanSteps = 256U;
+
 std::vector<AgentDemonstrationTargetBindingView> demonstration_binding_requirements(
-    const agent::AgentDemonstrationTrace& trace) {
+    const agent::AgentDemonstrationTrace& trace,
+    std::size_t target_set_count) {
     std::vector<AgentDemonstrationTargetBindingView> requirements;
-    for (const auto& step : trace.steps) {
-        const auto existing = std::find_if(requirements.begin(), requirements.end(),
-            [&step](const auto& requirement) {
-                return requirement.target_alias == step.target_alias &&
-                    requirement.component_alias == step.component_alias;
-            });
-        if (existing == requirements.end()) {
-            requirements.push_back(AgentDemonstrationTargetBindingView{
-                step.target_alias, step.component_alias, step.target_kind, false});
+    for (std::size_t target_set_index = 0U;
+         target_set_index < target_set_count; ++target_set_index) {
+        for (const auto& step : trace.steps) {
+            const auto existing = std::find_if(requirements.begin(), requirements.end(),
+                [target_set_index, &step](const auto& requirement) {
+                    return requirement.target_set_index == target_set_index &&
+                        requirement.target_alias == step.target_alias &&
+                        requirement.component_alias == step.component_alias;
+                });
+            if (existing == requirements.end()) {
+                requirements.push_back(AgentDemonstrationTargetBindingView{
+                    target_set_index, step.target_alias, step.component_alias,
+                    step.target_kind, false});
+            }
         }
     }
     return requirements;
@@ -2530,18 +2539,53 @@ core::Result<void> UiController::capture_agent_demonstration_trace(
     agent_demonstration_trace_.emplace(std::move(trace.value()));
     agent_demonstration_bindings_.clear();
     agent_demonstration_binding_revision_.reset();
+    agent_demonstration_target_set_count_ = 1U;
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::set_agent_demonstration_target_set_count(
+    std::size_t target_set_count) {
+    if (!agent_demonstration_trace_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "load or capture a demonstration trace before configuring target sets"));
+    }
+    if (target_set_count == 0U ||
+        target_set_count > kMaxAgentDemonstrationTargetSets) {
+        return core::Result<void>::failure(invalid(
+            "demonstration target set count must be between 1 and 16"));
+    }
+    if (agent_demonstration_trace_->steps.size() >
+        kMaxExpandedDemonstrationPlanSteps / target_set_count) {
+        return core::Result<void>::failure(invalid(
+            "expanded demonstration plan exceeds the 256-step limit"));
+    }
+    if (target_set_count == agent_demonstration_target_set_count_) {
+        return core::Result<void>::success();
+    }
+    if (agent_task_.has_value() || agent_checkpoint_pending_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "clear the current task or checkpoint before changing demonstration target sets"));
+    }
+    agent_demonstration_target_set_count_ = target_set_count;
+    agent_demonstration_bindings_.clear();
+    agent_demonstration_binding_revision_.reset();
     return core::Result<void>::success();
 }
 
 core::Result<void> UiController::bind_agent_demonstration_target(
     std::uint32_t target_alias,
-    std::uint32_t component_alias) {
+    std::uint32_t component_alias,
+    std::size_t target_set_index) {
     if (!agent_demonstration_trace_.has_value()) {
         return core::Result<void>::failure(invalid_state(
             "load or capture a demonstration trace before binding targets"));
     }
     if (auto valid_trace = agent_demonstration_trace_->validate(); !valid_trace) {
         return valid_trace;
+    }
+    if (target_set_index >= agent_demonstration_target_set_count_) {
+        return core::Result<void>::failure(invalid(
+            "demonstration target set index is outside the configured selection"));
     }
     const auto snapshot = session_.snapshot();
     if (agent_demonstration_binding_revision_.has_value() &&
@@ -2551,10 +2595,11 @@ core::Result<void> UiController::bind_agent_demonstration_target(
     agent_demonstration_binding_revision_ = snapshot.project_revision;
 
     const auto requirements = demonstration_binding_requirements(
-        *agent_demonstration_trace_);
+        *agent_demonstration_trace_, agent_demonstration_target_set_count_);
     const auto requirement = std::find_if(requirements.begin(), requirements.end(),
-        [target_alias, component_alias](const auto& value) {
-            return value.target_alias == target_alias &&
+        [target_set_index, target_alias, component_alias](const auto& value) {
+            return value.target_set_index == target_set_index &&
+                value.target_alias == target_alias &&
                 value.component_alias == component_alias;
         });
     if (requirement == requirements.end()) {
@@ -2613,26 +2658,33 @@ core::Result<void> UiController::bind_agent_demonstration_target(
     }
 
     for (const auto& existing : agent_demonstration_bindings_) {
-        if (existing.target_alias == target_alias &&
-            existing.target.object != target.object) {
+        if (existing.target_set_index == target_set_index) {
+            if (existing.target_alias == target_alias &&
+                existing.target.object != target.object) {
+                return core::Result<void>::failure(invalid_state(
+                    "all components for one demonstration object alias must map to the same object within a target set"));
+            }
+            if (existing.target_alias != target_alias &&
+                existing.target.object == target.object) {
+                return core::Result<void>::failure(invalid_state(
+                    "different demonstration object aliases must map to different scene objects within a target set"));
+            }
+        } else if (existing.target.object == target.object) {
             return core::Result<void>::failure(invalid_state(
-                "all components for one demonstration object alias must map to the same object"));
-        }
-        if (existing.target_alias != target_alias &&
-            existing.target.object == target.object) {
-            return core::Result<void>::failure(invalid_state(
-                "different demonstration object aliases must map to different scene objects"));
+                "one scene object cannot be reused across demonstration target sets"));
         }
     }
 
     const auto existing = std::find_if(
         agent_demonstration_bindings_.begin(), agent_demonstration_bindings_.end(),
-        [target_alias, component_alias](const auto& value) {
-            return value.target_alias == target_alias &&
+        [target_set_index, target_alias, component_alias](const auto& value) {
+            return value.target_set_index == target_set_index &&
+                value.target_alias == target_alias &&
                 value.component_alias == component_alias;
         });
     if (existing == agent_demonstration_bindings_.end()) {
-        agent_demonstration_bindings_.push_back({target_alias, component_alias, target});
+        agent_demonstration_bindings_.push_back({
+            target_set_index, target_alias, component_alias, target});
     } else {
         existing->target = target;
     }
@@ -2670,12 +2722,24 @@ core::Result<agent::AgentTaskSnapshot> UiController::preview_agent_demonstration
             "project changed after target binding; bind the demonstration targets again"));
     }
 
+    if (agent_demonstration_target_set_count_ == 0U ||
+        agent_demonstration_target_set_count_ > kMaxAgentDemonstrationTargetSets ||
+        agent_demonstration_trace_->steps.size() >
+            kMaxExpandedDemonstrationPlanSteps / agent_demonstration_target_set_count_) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid(
+            "expanded demonstration target selection exceeds the supported bound"));
+    }
     const auto requirements = demonstration_binding_requirements(
-        *agent_demonstration_trace_);
+        *agent_demonstration_trace_, agent_demonstration_target_set_count_);
+    const std::size_t expanded_step_count =
+        agent_demonstration_trace_->steps.size() * agent_demonstration_target_set_count_;
     std::vector<scene::ObjectId> scope;
-    std::vector<scene::ObjectId> transform_roots;
+    std::vector<std::vector<scene::ObjectId>> target_set_scopes(
+        agent_demonstration_target_set_count_);
+    std::vector<std::vector<scene::ObjectId>> transform_roots(
+        agent_demonstration_target_set_count_);
     std::vector<agent::AgentPlanStep> steps;
-    steps.reserve(agent_demonstration_trace_->steps.size());
+    steps.reserve(expanded_step_count);
     std::set<std::uint64_t> changed_mesh_assets;
     std::uint32_t permitted_effects = 0U;
     double transform_distance_budget = 0.0;
@@ -2685,46 +2749,75 @@ core::Result<agent::AgentTaskSnapshot> UiController::preview_agent_demonstration
         const auto binding = std::find_if(
             agent_demonstration_bindings_.begin(), agent_demonstration_bindings_.end(),
             [&requirement](const auto& value) {
-                return value.target_alias == requirement.target_alias &&
+                return value.target_set_index == requirement.target_set_index &&
+                    value.target_alias == requirement.target_alias &&
                     value.component_alias == requirement.component_alias;
             });
         if (binding == agent_demonstration_bindings_.end()) {
             return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
                 "bind every object and component alias before previewing the trace"));
         }
-        if (std::find(scope.begin(), scope.end(), binding->target.object) == scope.end()) {
-            scope.push_back(binding->target.object);
+        auto& target_scope = target_set_scopes[requirement.target_set_index];
+        if (std::find(target_scope.begin(), target_scope.end(), binding->target.object) ==
+            target_scope.end()) {
+            target_scope.push_back(binding->target.object);
         }
         if (requirement.target_kind == agent::AgentDemonstrationTargetKind::object &&
-            std::find(transform_roots.begin(), transform_roots.end(),
-                binding->target.object) == transform_roots.end()) {
-            transform_roots.push_back(binding->target.object);
+            std::find(transform_roots[requirement.target_set_index].begin(),
+                transform_roots[requirement.target_set_index].end(),
+                binding->target.object) ==
+                transform_roots[requirement.target_set_index].end()) {
+            transform_roots[requirement.target_set_index].push_back(binding->target.object);
         }
     }
 
-    for (std::size_t cursor = 0U; cursor < transform_roots.size(); ++cursor) {
-        const scene::ObjectId parent = transform_roots[cursor];
-        const auto parent_view = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
-            [parent](const auto& value) { return value.object.id == parent; });
-        if (parent_view == snapshot.objects.end() || parent_view->object.parent.has_value()) {
-            return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
-                "object demonstration targets must bind to existing root objects"));
+    for (std::size_t target_set_index = 0U;
+         target_set_index < agent_demonstration_target_set_count_; ++target_set_index) {
+        auto& target_scope = target_set_scopes[target_set_index];
+        auto& roots = transform_roots[target_set_index];
+        for (std::size_t cursor = 0U; cursor < roots.size(); ++cursor) {
+            const scene::ObjectId parent = roots[cursor];
+            const auto parent_view = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
+                [parent](const auto& value) { return value.object.id == parent; });
+            if (parent_view == snapshot.objects.end() || parent_view->object.parent.has_value()) {
+                return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+                    "object demonstration targets must bind to existing root objects"));
+            }
+            for (const auto& object : snapshot.objects) {
+                if (!object.object.parent.has_value() || *object.object.parent != parent) continue;
+                if (std::find(target_scope.begin(), target_scope.end(), object.object.id) ==
+                    target_scope.end()) {
+                    target_scope.push_back(object.object.id);
+                    roots.push_back(object.object.id);
+                }
+            }
         }
-        for (const auto& object : snapshot.objects) {
-            if (!object.object.parent.has_value() || *object.object.parent != parent) continue;
-            if (std::find(scope.begin(), scope.end(), object.object.id) == scope.end()) {
-                scope.push_back(object.object.id);
-                transform_roots.push_back(object.object.id);
+        for (std::size_t prior_set = 0U; prior_set < target_set_index; ++prior_set) {
+            for (const auto object : target_scope) {
+                if (std::find(target_set_scopes[prior_set].begin(),
+                        target_set_scopes[prior_set].end(), object) !=
+                    target_set_scopes[prior_set].end()) {
+                    return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+                        "demonstration target sets cannot overlap through object hierarchy"));
+                }
+            }
+        }
+        for (const auto object : target_scope) {
+            if (std::find(scope.begin(), scope.end(), object) == scope.end()) {
+                scope.push_back(object);
             }
         }
     }
 
-    for (std::size_t index = 0U; index < agent_demonstration_trace_->steps.size(); ++index) {
+    for (std::size_t target_set_index = 0U;
+         target_set_index < agent_demonstration_target_set_count_; ++target_set_index) {
+      for (std::size_t index = 0U; index < agent_demonstration_trace_->steps.size(); ++index) {
         const auto& trace_step = agent_demonstration_trace_->steps[index];
         const auto binding = std::find_if(
             agent_demonstration_bindings_.begin(), agent_demonstration_bindings_.end(),
-            [&trace_step](const auto& value) {
-                return value.target_alias == trace_step.target_alias &&
+            [target_set_index, &trace_step](const auto& value) {
+                return value.target_set_index == target_set_index &&
+                    value.target_alias == trace_step.target_alias &&
                     value.component_alias == trace_step.component_alias;
             });
         if (binding == agent_demonstration_bindings_.end()) {
@@ -2763,12 +2856,20 @@ core::Result<agent::AgentTaskSnapshot> UiController::preview_agent_demonstration
             return core::Result<agent::AgentTaskSnapshot>::failure(intent.error());
         }
         std::vector<std::string> dependencies;
-        if (!steps.empty()) dependencies.push_back(steps.back().id);
+        const std::string step_id = "demonstration-set-" +
+            std::to_string(target_set_index + 1U) + "-step-" +
+            std::to_string(index + 1U);
+        if (index > 0U) {
+            dependencies.push_back("demonstration-set-" +
+                std::to_string(target_set_index + 1U) + "-step-" +
+                std::to_string(index));
+        }
         steps.push_back(agent::AgentPlanStep{
-            "demonstration-step-" + std::to_string(index + 1U),
+            step_id,
             binding->target,
             std::move(intent.value()),
             std::move(dependencies)});
+      }
     }
 
     if (!std::isfinite(transform_distance_budget) ||
@@ -2789,9 +2890,10 @@ core::Result<agent::AgentTaskSnapshot> UiController::preview_agent_demonstration
     agent::AgentWorkEnvelope envelope;
     envelope.scope_objects = scope;
     envelope.permitted_effects = permitted_effects;
-    envelope.max_commands = agent_demonstration_trace_->steps.size();
+    envelope.max_commands = expanded_step_count;
     envelope.max_objects_touched = scope.size();
-    envelope.max_topology_operations = has_topology_operation ? 512U : 0U;
+    envelope.max_topology_operations = has_topology_operation
+        ? 512U * agent_demonstration_target_set_count_ : 0U;
     envelope.max_repair_attempts = 0U;
     envelope.max_additional_operations = 0U;
     envelope.max_transform_distance_meters = transform_distance_budget;
@@ -2837,6 +2939,7 @@ core::Result<void> UiController::load_agent_demonstration_trace(
     agent_demonstration_trace_.emplace(std::move(trace.value()));
     agent_demonstration_bindings_.clear();
     agent_demonstration_binding_revision_.reset();
+    agent_demonstration_target_set_count_ = 1U;
     return core::Result<void>::success();
 }
 
@@ -2844,6 +2947,7 @@ core::Result<void> UiController::clear_agent_demonstration_trace() {
     agent_demonstration_trace_.reset();
     agent_demonstration_bindings_.clear();
     agent_demonstration_binding_revision_.reset();
+    agent_demonstration_target_set_count_ = 1U;
     return core::Result<void>::success();
 }
 
@@ -4415,11 +4519,13 @@ UiSnapshot UiController::snapshot() const {
     }
     result.agent_demonstration = agent_demonstration_;
     result.agent_demonstration_trace = agent_demonstration_trace_;
+    result.agent_demonstration_target_set_count =
+        agent_demonstration_target_set_count_;
     if (agent_demonstration_trace_.has_value()) {
         const bool bindings_current = agent_demonstration_binding_revision_.has_value() &&
             *agent_demonstration_binding_revision_ == result.project_revision;
         auto requirements = demonstration_binding_requirements(
-            *agent_demonstration_trace_);
+            *agent_demonstration_trace_, agent_demonstration_target_set_count_);
         result.agent_demonstration_ready_to_preview = !requirements.empty() &&
             bindings_current && !agent_task_.has_value() &&
             !agent_checkpoint_pending_.has_value();
@@ -4427,7 +4533,8 @@ UiSnapshot UiController::snapshot() const {
             requirement.bound = bindings_current && std::any_of(
                 agent_demonstration_bindings_.begin(),
                 agent_demonstration_bindings_.end(), [&requirement](const auto& binding) {
-                    return binding.target_alias == requirement.target_alias &&
+                    return binding.target_set_index == requirement.target_set_index &&
+                        binding.target_alias == requirement.target_alias &&
                         binding.component_alias == requirement.component_alias;
                 });
             result.agent_demonstration_ready_to_preview =

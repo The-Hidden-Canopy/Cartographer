@@ -407,6 +407,7 @@ struct AgentTaskStripView {
 };
 
 struct AgentDemonstrationTargetBindingView {
+    std::size_t target_set_index = 0U;
     std::uint32_t target_alias = 0U;
     std::uint32_t component_alias = 0U;
     agent::AgentDemonstrationTargetKind target_kind =
@@ -454,6 +455,7 @@ struct UiSnapshot : application::ApplicationSnapshot {
     std::optional<agent::AgentDemonstration> agent_demonstration;
     std::optional<agent::AgentDemonstrationTrace> agent_demonstration_trace;
     std::vector<AgentDemonstrationTargetBindingView> agent_demonstration_bindings;
+    std::size_t agent_demonstration_target_set_count = 1U;
     bool agent_demonstration_ready_to_preview = false;
 };
 
@@ -547,7 +549,10 @@ public:
         application::OperationId last_operation);
     [[nodiscard]] core::Result<void> bind_agent_demonstration_target(
         std::uint32_t target_alias,
-        std::uint32_t component_alias);
+        std::uint32_t component_alias,
+        std::size_t target_set_index = 0U);
+    [[nodiscard]] core::Result<void> set_agent_demonstration_target_set_count(
+        std::size_t target_set_count);
     [[nodiscard]] core::Result<void> clear_agent_demonstration_target_bindings();
     [[nodiscard]] core::Result<agent::AgentTaskSnapshot>
     preview_agent_demonstration_trace();
@@ -687,6 +692,7 @@ public:
 
 private:
     struct AgentDemonstrationTargetBinding {
+        std::size_t target_set_index = 0U;
         std::uint32_t target_alias = 0U;
         std::uint32_t component_alias = 0U;
         agent::TargetRef target;
@@ -730,6 +736,7 @@ private:
     std::optional<agent::AgentDemonstrationTrace> agent_demonstration_trace_;
     std::vector<AgentDemonstrationTargetBinding> agent_demonstration_bindings_;
     std::optional<core::Revision> agent_demonstration_binding_revision_;
+    std::size_t agent_demonstration_target_set_count_ = 1U;
     std::optional<agent::AgentTaskCheckpoint> agent_checkpoint_pending_;
     bool agent_checkpoint_rebased_ = false;
     std::string agent_goal_;

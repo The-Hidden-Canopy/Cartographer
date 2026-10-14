@@ -150,4 +150,11 @@
 
 ## Follow-up coverage
 
+Multi-target demonstration tranche:
+
+- “Apply to selection” creates 1–16 explicit target sets, requires every alias in every set to be bound, and clears all bindings when the set count changes.
+- A source object cannot be reused across sets, and preview rejects hierarchy-expanded scope overlap.
+- Multi-set preview expands each trace into an independent ordered dependency chain in one DAG, keeps the 256-step plan cap, scales command, topology, and transform budgets across sets, and rejects missing bindings without opening a task.
+- A two-set preview covers six expanded steps, applies accepted transforms to both target sets, and leaves the source revision unchanged until acceptance. Changing set count during a task is rejected.
+
 Add failure injection for durable journal append rollback, additional unrelated and conflicting source edits during safe rebase, bounded repair exhaustion, semantic-sidecar size pressure, and provider timeouts as those tranches are implemented. Clarification questions and answers are reviewable evidence, not natural-language commands; the workbench compiles only a bounded set of explicit topology-preservation phrases and does not infer questions automatically.

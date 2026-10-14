@@ -814,34 +814,119 @@ void human_native_command_range_captures_alias_only_trace() {
         "Transfer target alpha", {1.0, 1.0, 1.0}}));
     REQUIRE(viewer.dispatch(carto::application::CreateBoxAction{
         "Transfer target beta", {1.0, 1.0, 1.0}}));
+    REQUIRE(viewer.dispatch(carto::application::CreateBoxAction{
+        "Transfer target gamma", {1.0, 1.0, 1.0}}));
+    REQUIRE(viewer.dispatch(carto::application::CreateBoxAction{
+        "Transfer target delta", {1.0, 1.0, 1.0}}));
     const auto target_objects = viewer_source.snapshot().objects;
-    REQUIRE(target_objects.size() == 2U);
+    REQUIRE(target_objects.size() == 4U);
     REQUIRE(viewer.load_agent_demonstration_trace(path));
     REQUIRE(viewer.dispatch(carto::application::SetSelectionModeAction{
         carto::editor::SelectionMode::face}));
     REQUIRE(!viewer.bind_agent_demonstration_target(99U, 0U));
+    REQUIRE(!viewer.bind_agent_demonstration_target(1U, 1U, 1U));
     REQUIRE(!viewer.bind_agent_demonstration_target(1U, 0U));
+    REQUIRE(!viewer.set_agent_demonstration_target_set_count(0U));
+    REQUIRE(!viewer.set_agent_demonstration_target_set_count(17U));
+    REQUIRE(viewer.snapshot().agent_demonstration_target_set_count == 1U);
+    REQUIRE(viewer.set_agent_demonstration_target_set_count(2U));
+    REQUIRE(viewer.snapshot().agent_demonstration_bindings.size() == 6U);
+    REQUIRE(!viewer.preview_agent_demonstration_trace());
+    REQUIRE(!viewer.snapshot().agent_task.has_value());
     REQUIRE(viewer.dispatch(carto::application::SelectFaceAction{
         target_objects[0].object.id, carto::geometry::FaceId{1U}}));
-    REQUIRE(viewer.bind_agent_demonstration_target(1U, 1U));
-    REQUIRE(!viewer.bind_agent_demonstration_target(2U, 2U));
+    REQUIRE(viewer.bind_agent_demonstration_target(1U, 1U, 0U));
+    REQUIRE(viewer.set_agent_demonstration_target_set_count(3U));
+    const auto three_sets_unbound = viewer.snapshot();
+    REQUIRE(three_sets_unbound.agent_demonstration_bindings.size() == 9U);
+    REQUIRE(std::none_of(three_sets_unbound.agent_demonstration_bindings.begin(),
+        three_sets_unbound.agent_demonstration_bindings.end(),
+        [](const auto& binding) { return binding.bound; }));
+    REQUIRE(viewer.set_agent_demonstration_target_set_count(2U));
+    const auto two_sets_unbound = viewer.snapshot();
+    REQUIRE(std::none_of(two_sets_unbound.agent_demonstration_bindings.begin(),
+        two_sets_unbound.agent_demonstration_bindings.end(),
+        [](const auto& binding) { return binding.bound; }));
+    REQUIRE(viewer.bind_agent_demonstration_target(1U, 1U, 0U));
+    REQUIRE(!viewer.bind_agent_demonstration_target(2U, 2U, 1U));
+    REQUIRE(!viewer.bind_agent_demonstration_target(2U, 2U, 0U));
     REQUIRE(viewer.dispatch(carto::application::SelectFaceAction{
         target_objects[1].object.id, carto::geometry::FaceId{1U}}));
-    REQUIRE(viewer.bind_agent_demonstration_target(2U, 2U));
+    REQUIRE(viewer.bind_agent_demonstration_target(2U, 2U, 0U));
+    REQUIRE(viewer.dispatch(carto::application::SelectFaceAction{
+        target_objects[2].object.id, carto::geometry::FaceId{1U}}));
+    REQUIRE(viewer.bind_agent_demonstration_target(1U, 1U, 1U));
+    REQUIRE(viewer.dispatch(carto::application::SelectFaceAction{
+        target_objects[3].object.id, carto::geometry::FaceId{1U}}));
+    REQUIRE(viewer.bind_agent_demonstration_target(2U, 2U, 1U));
     REQUIRE(viewer.dispatch(carto::application::SetSelectionModeAction{
         carto::editor::SelectionMode::object}));
     REQUIRE(viewer.dispatch(carto::application::SelectObjectAction{
         target_objects[0].object.id}));
-    REQUIRE(viewer.bind_agent_demonstration_target(1U, 0U));
-    REQUIRE(viewer.snapshot().agent_demonstration_ready_to_preview);
+    REQUIRE(viewer.bind_agent_demonstration_target(1U, 0U, 0U));
+    REQUIRE(viewer.dispatch(carto::application::SelectObjectAction{
+        target_objects[2].object.id}));
+    REQUIRE(viewer.bind_agent_demonstration_target(1U, 0U, 1U));
+    const auto fully_bound = viewer.snapshot();
+    REQUIRE(fully_bound.agent_demonstration_ready_to_preview);
+    REQUIRE(std::all_of(fully_bound.agent_demonstration_bindings.begin(),
+        fully_bound.agent_demonstration_bindings.end(),
+        [](const auto& binding) { return binding.bound; }));
+    const auto target_baseline = viewer_source.snapshot();
+    std::vector<std::size_t> target_triangle_counts;
+    for (const auto& target : target_objects) {
+        const auto* instance = target_baseline.viewport.scene.find(target.object.id);
+        REQUIRE(instance != nullptr && instance->mesh != nullptr);
+        target_triangle_counts.push_back(instance->mesh->triangle_faces.size());
+    }
     const auto target_revision = viewer_source.snapshot().project_revision;
     const auto trace_preview = viewer.preview_agent_demonstration_trace();
     REQUIRE(trace_preview);
     REQUIRE(trace_preview.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(trace_preview.value().plan_steps.size() == 6U);
+    REQUIRE(trace_preview.value().scope_objects.size() == 4U);
+    const auto& expanded_steps = trace_preview.value().plan_steps;
+    const auto set_one_second = std::find_if(expanded_steps.begin(), expanded_steps.end(),
+        [](const auto& step) { return step.step_id == "demonstration-set-1-step-2"; });
+    const auto set_one_third = std::find_if(expanded_steps.begin(), expanded_steps.end(),
+        [](const auto& step) { return step.step_id == "demonstration-set-1-step-3"; });
+    const auto set_two_first = std::find_if(expanded_steps.begin(), expanded_steps.end(),
+        [](const auto& step) { return step.step_id == "demonstration-set-2-step-1"; });
+    const auto set_two_second = std::find_if(expanded_steps.begin(), expanded_steps.end(),
+        [](const auto& step) { return step.step_id == "demonstration-set-2-step-2"; });
+    REQUIRE(set_one_second != expanded_steps.end());
+    REQUIRE(set_one_third != expanded_steps.end());
+    REQUIRE(set_two_first != expanded_steps.end());
+    REQUIRE(set_two_second != expanded_steps.end());
+    REQUIRE(set_one_second->dependencies ==
+        std::vector<std::string>{"demonstration-set-1-step-1"});
+    REQUIRE(set_one_third->dependencies ==
+        std::vector<std::string>{"demonstration-set-1-step-2"});
+    REQUIRE(set_two_first->dependencies.empty());
+    REQUIRE(set_two_second->dependencies ==
+        std::vector<std::string>{"demonstration-set-2-step-1"});
+    REQUIRE(!viewer.set_agent_demonstration_target_set_count(1U));
     REQUIRE(viewer_source.snapshot().project_revision == target_revision);
     const auto accepted_trace = viewer.accept_agent_plan();
     REQUIRE(accepted_trace);
     REQUIRE(viewer_source.snapshot().project_revision > target_revision);
+    const auto accepted_snapshot = viewer_source.snapshot();
+    for (const std::size_t target_index : {0U, 2U}) {
+        const auto& before_object = target_objects[target_index];
+        const auto after_object = std::find_if(accepted_snapshot.objects.begin(),
+            accepted_snapshot.objects.end(), [&before_object](const auto& value) {
+                return value.object.id == before_object.object.id;
+            });
+        REQUIRE(after_object != accepted_snapshot.objects.end());
+        REQUIRE(after_object->object.local_transform.translation.x ==
+            before_object.object.local_transform.translation.x + 0.25);
+    }
+    for (std::size_t target_index = 0U; target_index < target_objects.size(); ++target_index) {
+        const auto* after_instance = accepted_snapshot.viewport.scene.find(
+            target_objects[target_index].object.id);
+        REQUIRE(after_instance != nullptr && after_instance->mesh != nullptr);
+        REQUIRE(after_instance->mesh->triangle_faces.size() != target_triangle_counts[target_index]);
+    }
     REQUIRE(viewer.clear_agent_plan());
     REQUIRE(!viewer.preview_agent_demonstration_trace());
     const auto stale_bindings = viewer.snapshot();

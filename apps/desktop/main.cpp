@@ -7170,26 +7170,45 @@ struct DesktopState {
                 }
                 ImGui::SeparatorText("Bind trace aliases to selected targets");
                 ImGui::TextDisabled(
-                    "Select exactly one object, face, or vertex matching each row, then bind it. This does not infer similarity.");
+                    "Each target set is mapped explicitly. Select one matching target per row; sets cannot overlap or infer similarity.");
+                int target_set_count = static_cast<int>(
+                    snapshot.agent_demonstration_target_set_count);
+                ImGui::SetNextItemWidth(120.0F);
+                if (ImGui::InputInt("Target sets for Apply to selection", &target_set_count)) {
+                    if (target_set_count < 0) {
+                        agent_feedback =
+                            "demonstration target set count must be between 1 and 16";
+                    } else {
+                        const auto configured = ui.set_agent_demonstration_target_set_count(
+                            static_cast<std::size_t>(target_set_count));
+                        agent_feedback = configured
+                            ? "Target set count changed; bind every row again."
+                            : configured.error().message;
+                    }
+                }
                 for (const auto& binding : snapshot.agent_demonstration_bindings) {
                     const char* target_kind =
                         binding.target_kind == carto::agent::AgentDemonstrationTargetKind::object
                             ? "object" :
                         binding.target_kind == carto::agent::AgentDemonstrationTargetKind::face
                             ? "face" : "vertex";
+                    ImGui::PushID(static_cast<int>(binding.target_set_index));
                     ImGui::PushID(static_cast<int>(binding.target_alias));
                     ImGui::PushID(static_cast<int>(binding.component_alias));
-                    ImGui::Text("Object %u / component %u · %s · %s",
-                        binding.target_alias, binding.component_alias, target_kind,
+                    ImGui::Text("Set %zu · object %u / component %u · %s · %s",
+                        binding.target_set_index + 1U, binding.target_alias,
+                        binding.component_alias, target_kind,
                         binding.bound ? "bound" : "unbound");
                     ImGui::SameLine();
                     if (ImGui::SmallButton("Bind current selection")) {
                         const auto bound = ui.bind_agent_demonstration_target(
-                            binding.target_alias, binding.component_alias);
+                            binding.target_alias, binding.component_alias,
+                            binding.target_set_index);
                         agent_feedback = bound
                             ? "Explicit demonstration target binding recorded for this project revision."
                             : bound.error().message;
                     }
+                    ImGui::PopID();
                     ImGui::PopID();
                     ImGui::PopID();
                 }
