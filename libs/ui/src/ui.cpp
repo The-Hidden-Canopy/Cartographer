@@ -1460,6 +1460,10 @@ core::Result<application::DispatchReceipt> UiController::submit_ai_proposal(
 core::Result<void> UiController::queue_agent_step(
     std::string intent,
     std::vector<std::string> dependencies) {
+    if (agent_checkpoint_pending_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "a loaded checkpoint plan cannot be edited; resume or clear it first"));
+    }
     if (agent_task_.has_value()) {
         const auto status = agent_task_->snapshot().status;
         if (status != agent::TaskStatus::accepted && status != agent::TaskStatus::rejected) {
@@ -1537,6 +1541,10 @@ core::Result<void> UiController::queue_agent_step(
 core::Result<void> UiController::queue_agent_clarification(
     std::string prompt,
     agent::ClarificationImpact impact) {
+    if (agent_checkpoint_pending_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "a loaded checkpoint objective cannot be edited; resume or clear it first"));
+    }
     if (agent_task_.has_value()) {
         const auto status = agent_task_->snapshot().status;
         if (status != agent::TaskStatus::accepted && status != agent::TaskStatus::rejected) {
@@ -1643,6 +1651,10 @@ core::Result<void> UiController::answer_agent_clarification(
 }
 
 core::Result<agent::AgentTaskSnapshot> UiController::run_agent_plan(std::string goal) {
+    if (agent_checkpoint_pending_.has_value()) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "resume the loaded checkpoint through its revalidation boundary"));
+    }
     if (agent_plan_draft_.empty() || !agent_plan_base_revision_.has_value()) {
         return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
             "capture at least one selected face or vertex before running an agent plan"));
@@ -1806,6 +1818,72 @@ core::Result<agent::AgentTaskSnapshot> UiController::repair_agent_plan(
     return result;
 }
 
+core::Result<void> UiController::save_agent_checkpoint(
+    const std::filesystem::path& path) const {
+    if (!agent_task_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "there is no agent task to checkpoint"));
+    }
+    return agent_task_->save_checkpoint(path);
+}
+
+core::Result<void> UiController::load_agent_checkpoint(
+    const std::filesystem::path& path) {
+    if (agent_checkpoint_pending_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "clear the currently loaded checkpoint before opening another"));
+    }
+    if (agent_task_.has_value()) {
+        const auto status = agent_task_->snapshot().status;
+        if (status != agent::TaskStatus::accepted && status != agent::TaskStatus::rejected) {
+            return core::Result<void>::failure(invalid_state(
+                "accept, reject, or clear the active speculative task before opening a checkpoint"));
+        }
+    }
+    auto checkpoint = agent::AgentTask::load_checkpoint(path);
+    if (!checkpoint) {
+        record_ui_problem(checkpoint.error().with_context("agent task checkpoint"));
+        return core::Result<void>::failure(checkpoint.error());
+    }
+    if (checkpoint.value().status == agent::TaskStatus::accepted ||
+        checkpoint.value().status == agent::TaskStatus::rejected) {
+        return core::Result<void>::failure(invalid_state(
+            "accepted and rejected checkpoints are history records and cannot resume"));
+    }
+    agent_task_.reset();
+    agent_plan_draft_ = checkpoint.value().plan.steps;
+    agent_clarifications_draft_ = checkpoint.value().plan.objective.clarifications;
+    agent_plan_base_revision_ = checkpoint.value().source_revision;
+    agent_goal_ = checkpoint.value().plan.objective.goal;
+    agent_plan_id_ = checkpoint.value().plan.id;
+    agent_objective_id_ = checkpoint.value().plan.objective.id;
+    agent_repair_mode_ = false;
+    agent_checkpoint_pending_.emplace(std::move(checkpoint.value()));
+    return core::Result<void>::success();
+}
+
+core::Result<agent::AgentTaskSnapshot> UiController::resume_agent_checkpoint() {
+    if (!agent_checkpoint_pending_.has_value() || agent_task_.has_value()) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "load one saved checkpoint before requesting resume"));
+    }
+    auto plan = agent_checkpoint_pending_->plan;
+    plan.steps = agent_plan_draft_;
+    plan.objective.goal = agent_goal_;
+    plan.objective.clarifications = agent_clarifications_draft_;
+    auto resumed = agent::AgentTask::resume_checkpoint(
+        session_, *agent_checkpoint_pending_, std::move(plan));
+    if (!resumed) {
+        record_ui_problem(resumed.error().with_context("agent task checkpoint resume"));
+        return core::Result<agent::AgentTaskSnapshot>::failure(resumed.error());
+    }
+    agent_task_.emplace(std::move(resumed.value()));
+    agent_checkpoint_pending_.reset();
+    agent_repair_mode_ = false;
+    const auto result = agent_task_->snapshot();
+    return core::Result<agent::AgentTaskSnapshot>::success(result);
+}
+
 core::Result<application::DispatchReceipt> UiController::accept_agent_plan() {
     if (!agent_task_.has_value()) {
         return core::Result<application::DispatchReceipt>::failure(invalid_state(
@@ -1841,6 +1919,7 @@ core::Result<void> UiController::clear_agent_plan() {
     }
     agent_plan_draft_.clear();
     agent_clarifications_draft_.clear();
+    agent_checkpoint_pending_.reset();
     agent_plan_base_revision_.reset();
     agent_goal_.clear();
     agent_plan_id_.clear();
@@ -3039,6 +3118,11 @@ UiSnapshot UiController::snapshot() const {
     result.agent_plan_draft = agent_plan_draft_;
     result.agent_clarifications_draft = agent_clarifications_draft_;
     result.agent_repair_ready = agent_repair_mode_;
+    result.agent_checkpoint_loaded = agent_checkpoint_pending_.has_value();
+    if (agent_checkpoint_pending_.has_value()) {
+        result.agent_checkpoint_task_id = agent_checkpoint_pending_->plan.id;
+        result.agent_checkpoint_base_revision = agent_checkpoint_pending_->source_revision;
+    }
     if (agent_task_.has_value()) result.agent_task = agent_task_->snapshot();
     result.market = market_view_;
     if (surface_fidelity_.has_value()) {

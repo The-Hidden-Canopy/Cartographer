@@ -419,6 +419,9 @@ struct UiSnapshot : application::ApplicationSnapshot {
     std::vector<agent::AgentPlanStep> agent_plan_draft;
     std::vector<agent::ClarificationQuestion> agent_clarifications_draft;
     bool agent_repair_ready = false;
+    bool agent_checkpoint_loaded = false;
+    std::string agent_checkpoint_task_id;
+    core::Revision agent_checkpoint_base_revision;
     std::optional<agent::AgentTaskSnapshot> agent_task;
 };
 
@@ -486,6 +489,11 @@ public:
         agent::AgentPlanStep revised_step);
     [[nodiscard]] core::Result<agent::AgentTaskSnapshot> repair_agent_plan(
         std::string justification);
+    [[nodiscard]] core::Result<void> save_agent_checkpoint(
+        const std::filesystem::path& path) const;
+    [[nodiscard]] core::Result<void> load_agent_checkpoint(
+        const std::filesystem::path& path);
+    [[nodiscard]] core::Result<agent::AgentTaskSnapshot> resume_agent_checkpoint();
     [[nodiscard]] core::Result<application::DispatchReceipt> accept_agent_plan();
     [[nodiscard]] core::Result<void> reject_agent_plan();
     [[nodiscard]] core::Result<void> clear_agent_plan();
@@ -629,6 +637,7 @@ private:
     std::vector<agent::ClarificationQuestion> agent_clarifications_draft_;
     std::optional<core::Revision> agent_plan_base_revision_;
     std::optional<agent::AgentTask> agent_task_;
+    std::optional<agent::AgentTaskCheckpoint> agent_checkpoint_pending_;
     std::string agent_goal_;
     std::string agent_plan_id_;
     std::string agent_objective_id_;

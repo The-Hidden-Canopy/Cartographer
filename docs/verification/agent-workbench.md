@@ -68,6 +68,17 @@
 - Editing a step invalidates plan-bound human clarification receipts; execution remains blocked until the operator answers again for the revised plan.
 - The repaired happy path can pass gates and still requires the existing explicit source-acceptance boundary.
 
+## Persistent task checkpoint coverage
+
+- Checkpoints are immutable, versioned files with a checksum, source and speculative project digests, objective/plan context digest, work envelope, step progress, failure receipts, repair lineage, last diff digest, validation report, and provider identity.
+- Checkpoint loading validates size bounds, schema version, project documents, source revision, scope equality, enum values, progress, and digest bindings before exposing workflow state.
+- A checkpoint is workflow state. Loading it does not replace or mutate the live project document.
+- Human clarification answers and their private receipts are removed from checkpoint plans; consequential questions must be answered again through the human application boundary.
+- Resume requires the unchanged source revision and complete serialized source digest, then replays the native plan in a new speculative session. The resulting artifact and diff digests must match before a prior review task can remain acceptable.
+- Changed-source resume fails closed and requires source-change analysis before rebase. Read/write-set rebase and automatic step invalidation are not implemented yet.
+- Accepted and rejected checkpoints remain inspectable history and cannot be resumed. Checkpoint writes do not replace an existing file, preserving prior task history.
+- Corrupted files, attempts to overwrite a checkpoint, changed source, missing reapproval, and replayed artifact drift are blocked without changing the live project.
+
 ## Follow-up coverage
 
-Add failure injection for durable journal append rollback, saved/reopened task state, unrelated and conflicting source edits, bounded repair exhaustion, semantic-sidecar size pressure, and provider timeouts as those tranches are implemented. Clarification questions and answers are reviewable evidence, not natural-language commands; the workbench still does not compile free-form goals or infer questions automatically.
+Add failure injection for durable journal append rollback, unrelated and conflicting source edits during a future rebase flow, bounded repair exhaustion, semantic-sidecar size pressure, and provider timeouts as those tranches are implemented. Clarification questions and answers are reviewable evidence, not natural-language commands; the workbench still does not compile free-form goals or infer questions automatically.

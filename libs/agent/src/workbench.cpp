@@ -4,6 +4,9 @@
 #include <array>
 #include <charconv>
 #include <cmath>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <map>
@@ -688,6 +691,14 @@ core::Result<void> AgentPlan::validate() const {
         }
     }
     return core::Result<void>::success();
+}
+
+core::Result<assets::Sha256Digest> AgentPlan::context_digest() const {
+    if (auto result = validate(); !result) {
+        return core::Result<assets::Sha256Digest>::failure(result.error());
+    }
+    return core::Result<assets::Sha256Digest>::success(
+        clarification_plan_context_digest(*this));
 }
 
 core::Result<void> AgentWorkEnvelope::validate() const {
@@ -1679,6 +1690,198 @@ core::Result<void> AgentTask::reject() {
     if (status_ == TaskStatus::rejected) return core::Result<void>::success();
     status_ = TaskStatus::rejected;
     return core::Result<void>::success();
+}
+
+core::Result<void> AgentTask::save_checkpoint(
+    const std::filesystem::path& path,
+    std::string provider_identity) const {
+    if (path.empty() || path.filename().empty()) {
+        return core::Result<void>::failure(invalid(
+            "checkpoint destination must name a file"));
+    }
+    if (status_ == TaskStatus::running) {
+        return core::Result<void>::failure(invalid_state(
+            "a running task cannot be checkpointed"));
+    }
+    const auto plan_context = plan_.context_digest();
+    if (!plan_context) return core::Result<void>::failure(plan_context.error());
+
+    AgentTaskCheckpoint checkpoint;
+    checkpoint.status = status_;
+    checkpoint.plan = plan_;
+    for (auto& question : checkpoint.plan.objective.clarifications) {
+        question.selected_candidate_id.reset();
+        question.freeform_answer.reset();
+        question.human_receipt.reset();
+    }
+    checkpoint.envelope = envelope_;
+    checkpoint.provider_identity = std::move(provider_identity);
+    checkpoint.source_revision = base_document_.revision();
+    checkpoint.plan_context_digest = plan_context.value();
+    checkpoint.source_project = base_document_.serialize();
+    checkpoint.speculative_project = speculative_->document_.serialize();
+    checkpoint.source_digest = digest_text(checkpoint.source_project);
+    checkpoint.speculative_digest = digest_text(checkpoint.speculative_project);
+    checkpoint.diff_digest = build_diff().digest;
+    checkpoint.plan_progress = plan_progress_;
+    checkpoint.step_receipts = receipts_;
+    checkpoint.repair_lineage = repairs_;
+    for (const auto& gate : gates_) {
+        if (!checkpoint.last_validation_report.empty()) {
+            checkpoint.last_validation_report.push_back('\n');
+        }
+        checkpoint.last_validation_report += gate.id;
+        checkpoint.last_validation_report += gate.passed ? ": passed — " : ": blocked — ";
+        checkpoint.last_validation_report += gate.evidence;
+        if (gate.diagnostic.has_value()) {
+            checkpoint.last_validation_report += " — ";
+            checkpoint.last_validation_report += gate.diagnostic->message;
+        }
+    }
+    if (diagnostic_.has_value()) {
+        if (!checkpoint.last_validation_report.empty()) {
+            checkpoint.last_validation_report.push_back('\n');
+        }
+        checkpoint.last_validation_report += "task: ";
+        checkpoint.last_validation_report += diagnostic_->message;
+    }
+    const auto encoded = checkpoint.serialize();
+    if (!encoded) return core::Result<void>::failure(encoded.error());
+
+    std::error_code error;
+    if (std::filesystem::exists(path, error)) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::io_error,
+            "checkpoint files are immutable; choose a new destination path"));
+    }
+    if (error) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::io_error, "unable to inspect checkpoint destination"));
+    }
+    const auto parent = path.parent_path();
+    if (!parent.empty() && !std::filesystem::exists(parent, error)) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::io_error, "checkpoint destination directory does not exist"));
+    }
+    if (error) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::io_error, "unable to inspect checkpoint directory"));
+    }
+
+    auto lock_path = path;
+    lock_path += ".lock";
+    if (!std::filesystem::create_directory(lock_path, error)) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::io_error, "checkpoint destination is already being written"));
+    }
+    struct LockCleanup final {
+        std::filesystem::path path;
+        ~LockCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove(path, ignored);
+        }
+    } lock_cleanup{lock_path};
+
+    auto temporary_path = path;
+    temporary_path += ".tmp-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    {
+        std::ofstream output(temporary_path, std::ios::binary | std::ios::out | std::ios::trunc);
+        if (!output) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::io_error, "unable to create checkpoint temporary file"));
+        }
+        output.write(encoded.value().data(), static_cast<std::streamsize>(encoded.value().size()));
+        output.flush();
+        if (!output) {
+            output.close();
+            std::filesystem::remove(temporary_path, error);
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::io_error, "unable to flush checkpoint temporary file"));
+        }
+    }
+    std::filesystem::rename(temporary_path, path, error);
+    if (error) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary_path, ignored);
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::io_error, "unable to publish immutable checkpoint file"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<AgentTaskCheckpoint> AgentTask::load_checkpoint(
+    const std::filesystem::path& path) {
+    if (path.empty() || path.filename().empty()) {
+        return core::Result<AgentTaskCheckpoint>::failure(invalid(
+            "checkpoint source must name a file"));
+    }
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error || size > 512U * 1024U * 1024U) {
+        return core::Result<AgentTaskCheckpoint>::failure(core::Diagnostic(
+            core::ErrorCode::io_error, "checkpoint is unavailable or exceeds its size bound"));
+    }
+    std::ifstream input(path, std::ios::binary | std::ios::in);
+    if (!input) {
+        return core::Result<AgentTaskCheckpoint>::failure(core::Diagnostic(
+            core::ErrorCode::io_error, "unable to open checkpoint file"));
+    }
+    std::string bytes(static_cast<std::size_t>(size), '\0');
+    input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (!input || input.peek() != std::char_traits<char>::eof()) {
+        return core::Result<AgentTaskCheckpoint>::failure(core::Diagnostic(
+            core::ErrorCode::io_error, "checkpoint file changed or was truncated while reading"));
+    }
+    return AgentTaskCheckpoint::deserialize(bytes);
+}
+
+core::Result<AgentTask> AgentTask::resume_checkpoint(
+    application::ApplicationSession& source,
+    const AgentTaskCheckpoint& checkpoint,
+    AgentPlan reauthorized_plan) {
+    if (auto result = checkpoint.validate(); !result) {
+        return core::Result<AgentTask>::failure(result.error());
+    }
+    if (checkpoint.status == TaskStatus::accepted ||
+        checkpoint.status == TaskStatus::rejected) {
+        return core::Result<AgentTask>::failure(invalid_state(
+            "accepted and rejected tasks are historical records and cannot resume"));
+    }
+    const auto source_revision = source.document_.revision();
+    if (source_revision != checkpoint.source_revision ||
+        digest_text(source.document_.serialize()) != checkpoint.source_digest) {
+        return core::Result<AgentTask>::failure(stale(
+            "checkpoint source advanced or changed; compute and review source changes before rebase"));
+    }
+    const auto resumed_context = reauthorized_plan.context_digest();
+    if (!resumed_context || resumed_context.value() != checkpoint.plan_context_digest) {
+        return core::Result<AgentTask>::failure(stale(
+            "resume plan differs from the checkpoint; replan and review before resuming"));
+    }
+    if (reauthorized_plan.objective.base_revision != source_revision) {
+        return core::Result<AgentTask>::failure(stale(
+            "resume objective is bound to a different source revision"));
+    }
+
+    auto resumed = begin(source, std::move(reauthorized_plan), checkpoint.envelope);
+    if (!resumed) return resumed;
+    resumed.value().repairs_ = checkpoint.repair_lineage;
+    const auto replayed = resumed.value().run();
+    if (!replayed) return core::Result<AgentTask>::failure(replayed.error());
+    if (checkpoint.status != TaskStatus::prepared) {
+        const auto replayed_project = resumed.value().speculative_->document_.serialize();
+        const auto replayed_diff = resumed.value().build_diff().digest;
+        if (digest_text(replayed_project) != checkpoint.speculative_digest ||
+            replayed_diff != checkpoint.diff_digest) {
+            resumed.value().status_ = TaskStatus::blocked;
+            resumed.value().diagnostic_ = stale(
+                "checkpoint replay differs from the saved speculative artifact or diff; acceptance is blocked");
+            resumed.value().gates_ = resumed.value().evaluate_gates();
+            resumed.value().cached_snapshot_.reset();
+        }
+    }
+    return resumed;
 }
 
 const char* task_status_name(TaskStatus status) noexcept {

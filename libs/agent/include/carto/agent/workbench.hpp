@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <set>
@@ -164,6 +165,7 @@ struct AgentPlan {
 
     [[nodiscard]] core::Result<void> validate() const;
     [[nodiscard]] core::Result<std::vector<std::string>> schedule_order() const;
+    [[nodiscard]] core::Result<assets::Sha256Digest> context_digest() const;
 };
 
 struct AgentWorkEnvelope {
@@ -335,6 +337,35 @@ struct AgentTaskSnapshot {
     bool can_accept = false;
 };
 
+// Immutable, checksummed workflow state. Human clarification answers are
+// deliberately removed from the persisted plan and must be reissued before a
+// resumed task can run. Project bytes remain artifacts owned by this record;
+// they are never applied to the live source by loading a checkpoint.
+struct AgentTaskCheckpoint {
+    static constexpr std::uint32_t kFormatVersion = 1U;
+
+    TaskStatus status = TaskStatus::prepared;
+    AgentPlan plan;
+    AgentWorkEnvelope envelope;
+    std::string provider_identity;
+    core::Revision source_revision;
+    assets::Sha256Digest plan_context_digest;
+    assets::Sha256Digest source_digest;
+    assets::Sha256Digest speculative_digest;
+    assets::Sha256Digest diff_digest;
+    std::string source_project;
+    std::string speculative_project;
+    std::vector<PlanStepProgress> plan_progress;
+    std::vector<StepReceipt> step_receipts;
+    std::vector<AgentRepairReceipt> repair_lineage;
+    std::string last_validation_report;
+
+    [[nodiscard]] core::Result<void> validate() const;
+    [[nodiscard]] core::Result<std::string> serialize() const;
+    [[nodiscard]] static core::Result<AgentTaskCheckpoint> deserialize(
+        std::string_view bytes);
+};
+
 // Executes revision-bound native proposals on a private ApplicationSession
 // copy. The source session is only changed through the human application
 // acceptance boundary after all local gates pass and the base revision matches.
@@ -359,6 +390,15 @@ public:
     [[nodiscard]] core::Result<AgentTaskSnapshot> run();
     [[nodiscard]] AgentTaskSnapshot snapshot() const;
     [[nodiscard]] core::Result<void> reject();
+    [[nodiscard]] core::Result<void> save_checkpoint(
+        const std::filesystem::path& path,
+        std::string provider_identity = "cartographer.native-planner") const;
+    [[nodiscard]] static core::Result<AgentTaskCheckpoint> load_checkpoint(
+        const std::filesystem::path& path);
+    [[nodiscard]] static core::Result<AgentTask> resume_checkpoint(
+        application::ApplicationSession& source,
+        const AgentTaskCheckpoint& checkpoint,
+        AgentPlan reauthorized_plan);
 
 private:
     friend class SceneQuery;

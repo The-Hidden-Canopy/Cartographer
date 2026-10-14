@@ -1,4 +1,5 @@
 add_library(carto_agent STATIC
+    src/checkpoint.cpp
     src/scene_query.cpp
     src/workbench.cpp
 )

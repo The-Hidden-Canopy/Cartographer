@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <span>
 #include <stdexcept>
 #include <string>
 
@@ -258,8 +260,259 @@ void bounded_repair_restarts_from_source_and_preserves_attempt_lineage() {
         [](const auto& receipt) { return receipt.status == carto::agent::StepStatus::passed; }));
     REQUIRE(repaired_run.value().repairs.size() == 1U);
     REQUIRE(source.snapshot().project_revision == before.project_revision);
+
+    TempDirectory checkpoint_directory;
+    const auto checkpoint_path = checkpoint_directory.path() / "repair.carto-agent-task";
+    REQUIRE(repaired.value().save_checkpoint(checkpoint_path));
+    const auto checkpoint = carto::agent::AgentTask::load_checkpoint(checkpoint_path);
+    REQUIRE(checkpoint);
+    REQUIRE(checkpoint.value().repair_lineage.size() == 1U);
+    REQUIRE(checkpoint.value().repair_lineage.front().previous_step_receipts.size() == 1U);
+    REQUIRE(checkpoint.value().repair_lineage.front().previous_step_receipts.front().status ==
+        carto::agent::StepStatus::failed);
     REQUIRE(carto::application::HumanApplicationAccess::accept_agent_task(repaired.value()));
     REQUIRE(source.snapshot().project_revision == before.project_revision.next());
+}
+
+void persistent_checkpoint_replays_review_and_blocks_artifact_drift() {
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 1U);
+    const auto before = source.snapshot();
+    auto plan = plan_for(before, objects, {
+        {"step-1", {objects.front(), carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    auto task = carto::agent::AgentTask::begin(source, plan, envelope_for(objects));
+    REQUIRE(task);
+    const auto run = task.value().run();
+    REQUIRE(run);
+    REQUIRE(run.value().status == carto::agent::TaskStatus::review);
+    const auto expected_diff = run.value().diff.digest;
+    const auto expected_revision = source.snapshot().project_revision;
+
+    TempDirectory directory;
+    const auto path = directory.path() / "review.carto-agent-task";
+    REQUIRE(task.value().save_checkpoint(path, "cartographer.native-test"));
+    const auto checkpoint = carto::agent::AgentTask::load_checkpoint(path);
+    REQUIRE(checkpoint);
+    REQUIRE(checkpoint.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(checkpoint.value().provider_identity == "cartographer.native-test");
+    REQUIRE(checkpoint.value().plan.id == plan.id);
+    REQUIRE(checkpoint.value().plan_progress.front().status == carto::agent::StepStatus::passed);
+    REQUIRE(checkpoint.value().step_receipts.size() == 1U);
+    REQUIRE(!checkpoint.value().source_project.empty());
+    REQUIRE(!checkpoint.value().speculative_project.empty());
+    REQUIRE(checkpoint.value().diff_digest == expected_diff);
+    REQUIRE(source.snapshot().project_revision == expected_revision);
+
+    auto resumed = carto::agent::AgentTask::resume_checkpoint(
+        source, checkpoint.value(), checkpoint.value().plan);
+    REQUIRE(resumed);
+    REQUIRE(resumed.value().snapshot().status == carto::agent::TaskStatus::review);
+    REQUIRE(resumed.value().snapshot().can_accept);
+    REQUIRE(resumed.value().snapshot().diff.digest == expected_diff);
+    REQUIRE(source.snapshot().project_revision == expected_revision);
+    REQUIRE(carto::application::HumanApplicationAccess::accept_agent_task(resumed.value()));
+    REQUIRE(source.snapshot().project_revision == expected_revision.next());
+
+    carto::application::ApplicationSession drift_source;
+    const auto drift_objects = create_boxes(drift_source, 1U);
+    auto drift_plan = plan_for(drift_source.snapshot(), drift_objects, {
+        {"step-1", {drift_objects.front(), carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    auto drift_task = carto::agent::AgentTask::begin(
+        drift_source, drift_plan, envelope_for(drift_objects));
+    REQUIRE(drift_task);
+    REQUIRE(drift_task.value().run());
+    TempDirectory drift_directory;
+    const auto drift_path = drift_directory.path() / "drift.carto-agent-task";
+    REQUIRE(drift_task.value().save_checkpoint(drift_path));
+    auto drift_checkpoint = carto::agent::AgentTask::load_checkpoint(drift_path);
+    REQUIRE(drift_checkpoint);
+    drift_checkpoint.value().speculative_project = drift_checkpoint.value().source_project;
+    drift_checkpoint.value().speculative_digest = carto::assets::sha256(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(
+            drift_checkpoint.value().speculative_project.data()),
+        drift_checkpoint.value().speculative_project.size()));
+    for (auto& receipt : drift_checkpoint.value().step_receipts) {
+        receipt.revision_after = drift_checkpoint.value().source_revision;
+    }
+    REQUIRE(drift_checkpoint.value().validate());
+    const auto replay = carto::agent::AgentTask::resume_checkpoint(
+        drift_source, drift_checkpoint.value(), drift_checkpoint.value().plan);
+    REQUIRE(replay);
+    REQUIRE(replay.value().snapshot().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(!replay.value().snapshot().can_accept);
+    REQUIRE(replay.value().snapshot().diagnostic.has_value());
+    REQUIRE(replay.value().snapshot().diagnostic->message.find("differs") != std::string::npos);
+    REQUIRE(drift_source.snapshot().project_revision ==
+        drift_checkpoint.value().source_revision);
+}
+
+void persistent_checkpoint_reauthorization_and_stale_source_are_fail_closed() {
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 1U);
+    auto plan = plan_for(source.snapshot(), objects, {
+        {"step-1", {objects.front(), carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    plan.objective.clarifications.push_back({
+        "confirm-plan", "Confirm the exact edit.", "This changes topology.",
+        {carto::agent::ClarificationImpact::object_scope,
+         carto::agent::ClarificationImpact::topology_deletion},
+        objects, {}, 1U, {}, std::nullopt, std::nullopt, std::nullopt});
+    REQUIRE(carto::application::HumanApplicationAccess::answer_agent_clarification(
+        plan, "confirm-plan", std::nullopt,
+        std::string("I approve the exact planned edit.")));
+    auto task = carto::agent::AgentTask::begin(source, plan, envelope_for(objects));
+    REQUIRE(task);
+    REQUIRE(task.value().run());
+    TempDirectory directory;
+    const auto path = directory.path() / "clarified.carto-agent-task";
+    REQUIRE(task.value().save_checkpoint(path));
+    auto checkpoint = carto::agent::AgentTask::load_checkpoint(path);
+    REQUIRE(checkpoint);
+    REQUIRE(!checkpoint.value().plan.objective.clarifications.front().selected_candidate_id);
+    REQUIRE(!checkpoint.value().plan.objective.clarifications.front().freeform_answer);
+    REQUIRE(!checkpoint.value().plan.objective.clarifications.front().human_receipt);
+
+    auto missing_reapproval = carto::agent::AgentTask::resume_checkpoint(
+        source, checkpoint.value(), checkpoint.value().plan);
+    REQUIRE(!missing_reapproval);
+    REQUIRE(missing_reapproval.error().message.find("requires clarification") !=
+        std::string::npos);
+
+    auto reauthorized = checkpoint.value().plan;
+    REQUIRE(carto::application::HumanApplicationAccess::answer_agent_clarification(
+        reauthorized, "confirm-plan", std::nullopt,
+        std::string("I reapprove the exact plan after reopening.")));
+    const auto resumed = carto::agent::AgentTask::resume_checkpoint(
+        source, checkpoint.value(), reauthorized);
+    REQUIRE(resumed);
+    REQUIRE(resumed.value().snapshot().status == carto::agent::TaskStatus::review);
+    REQUIRE(source.snapshot().project_revision == checkpoint.value().source_revision);
+
+    carto::application::ApplicationSession stale_source;
+    const auto stale_objects = create_boxes(stale_source, 1U);
+    auto stale_plan = plan_for(stale_source.snapshot(), stale_objects, {
+        {"step-1", {stale_objects.front(), carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    auto stale_task = carto::agent::AgentTask::begin(
+        stale_source, stale_plan, envelope_for(stale_objects));
+    REQUIRE(stale_task);
+    REQUIRE(stale_task.value().run());
+    TempDirectory stale_directory;
+    const auto stale_path = stale_directory.path() / "stale.carto-agent-task";
+    REQUIRE(stale_task.value().save_checkpoint(stale_path));
+    const auto stale_checkpoint = carto::agent::AgentTask::load_checkpoint(stale_path);
+    REQUIRE(stale_checkpoint);
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        stale_source, carto::application::CreateBoxAction{"Outside checkpoint", {1.0, 1.0, 1.0}}));
+    const auto blocked_resume = carto::agent::AgentTask::resume_checkpoint(
+        stale_source, stale_checkpoint.value(), stale_checkpoint.value().plan);
+    REQUIRE(!blocked_resume);
+    REQUIRE(blocked_resume.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(blocked_resume.error().message.find("source advanced") != std::string::npos);
+}
+
+void prepared_checkpoint_requires_explicit_resume_before_native_execution() {
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 1U);
+    auto plan = plan_for(source.snapshot(), objects, {
+        {"step-1", {objects.front(), carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    auto task = carto::agent::AgentTask::begin(source, plan, envelope_for(objects));
+    REQUIRE(task);
+    const auto base_revision = source.snapshot().project_revision;
+    TempDirectory directory;
+    const auto path = directory.path() / "prepared.carto-agent-task";
+    REQUIRE(task.value().save_checkpoint(path));
+    const auto checkpoint = carto::agent::AgentTask::load_checkpoint(path);
+    REQUIRE(checkpoint);
+    REQUIRE(checkpoint.value().status == carto::agent::TaskStatus::prepared);
+    REQUIRE(checkpoint.value().speculative_digest == checkpoint.value().source_digest);
+    const auto resumed = carto::agent::AgentTask::resume_checkpoint(
+        source, checkpoint.value(), checkpoint.value().plan);
+    REQUIRE(resumed);
+    REQUIRE(resumed.value().snapshot().status == carto::agent::TaskStatus::review);
+    REQUIRE(resumed.value().snapshot().can_accept);
+    REQUIRE(source.snapshot().project_revision == base_revision);
+}
+
+void persistent_checkpoint_rejects_corruption_and_overwrite() {
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 1U);
+    auto plan = plan_for(source.snapshot(), objects, {
+        {"step-1", {objects.front(), carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    auto task = carto::agent::AgentTask::begin(source, plan, envelope_for(objects));
+    REQUIRE(task);
+    REQUIRE(task.value().run());
+    TempDirectory directory;
+    const auto path = directory.path() / "immutable.carto-agent-task";
+    REQUIRE(task.value().save_checkpoint(path));
+    REQUIRE(!task.value().save_checkpoint(path));
+
+    std::ifstream input(path, std::ios::binary);
+    const std::string bytes{
+        std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    REQUIRE(!bytes.empty());
+    auto corrupted = bytes;
+    corrupted.back() = corrupted.back() == '0' ? '1' : '0';
+    REQUIRE(!carto::agent::AgentTaskCheckpoint::deserialize(corrupted));
+    REQUIRE(carto::agent::AgentTask::load_checkpoint(path));
+}
+
+void ui_persistent_checkpoint_round_trip_preserves_human_boundary() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController authoring_ui(source);
+    REQUIRE(authoring_ui.dispatch(carto::application::CreateBoxAction{
+        "Persistent UI task", {1.0, 1.0, 1.0}}));
+    const auto object = source.snapshot().objects.front().object.id;
+    REQUIRE(authoring_ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(authoring_ui.dispatch(carto::application::SelectFaceAction{
+        object, carto::geometry::FaceId{1U}}));
+    REQUIRE(authoring_ui.queue_agent_step("inset face 0.1"));
+    REQUIRE(authoring_ui.queue_agent_clarification(
+        "Confirm the exact target scope.",
+        carto::agent::ClarificationImpact::object_scope));
+    REQUIRE(authoring_ui.queue_agent_clarification(
+        "Confirm the topology change.",
+        carto::agent::ClarificationImpact::topology_deletion));
+    const std::string goal = "Prepare this persistent UI task";
+    REQUIRE(authoring_ui.answer_agent_clarification(
+        goal, "question-1", "I approve this exact target scope."));
+    REQUIRE(authoring_ui.answer_agent_clarification(
+        goal, "question-2", "I approve the bounded topology edit."));
+    const auto run = authoring_ui.run_agent_plan(goal);
+    REQUIRE(run);
+    REQUIRE(run.value().status == carto::agent::TaskStatus::review);
+    const auto source_revision = source.snapshot().project_revision;
+    TempDirectory directory;
+    const auto path = directory.path() / "ui-task.carto-agent-task";
+    REQUIRE(authoring_ui.save_agent_checkpoint(path));
+
+    carto::ui::UiController reopened_ui(source);
+    REQUIRE(reopened_ui.load_agent_checkpoint(path));
+    const auto loaded = reopened_ui.snapshot();
+    REQUIRE(loaded.agent_checkpoint_loaded);
+    REQUIRE(loaded.agent_checkpoint_task_id == "agent-task-1");
+    REQUIRE(loaded.agent_checkpoint_base_revision == source_revision);
+    REQUIRE(loaded.agent_clarifications_draft.size() == 2U);
+    REQUIRE(!loaded.agent_clarifications_draft.front().human_receipt);
+    REQUIRE(!reopened_ui.queue_agent_step("extrude face 0.2"));
+    REQUIRE(!reopened_ui.resume_agent_checkpoint());
+    REQUIRE(reopened_ui.answer_agent_clarification(
+        goal, "question-1", "I reapprove this exact target scope after reopening."));
+    REQUIRE(reopened_ui.answer_agent_clarification(
+        goal, "question-2", "I reapprove the bounded topology edit after reopening."));
+    const auto resumed = reopened_ui.resume_agent_checkpoint();
+    REQUIRE(resumed);
+    REQUIRE(resumed.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(resumed.value().can_accept);
+    REQUIRE(!reopened_ui.snapshot().agent_checkpoint_loaded);
+    REQUIRE(source.snapshot().project_revision == source_revision);
+    REQUIRE(reopened_ui.accept_agent_plan());
+    REQUIRE(source.snapshot().project_revision == source_revision.next());
 }
 
 void repair_rejects_expansion_stale_source_empty_justification_and_exhaustion() {
@@ -1077,6 +1330,11 @@ int main() {
         ui_clarification_requires_an_operator_answer_before_review();
         ui_repairs_failed_step_with_operator_justification_and_scope_checks();
         ui_repair_invalidates_plan_bound_human_receipts_until_reanswered();
+        persistent_checkpoint_replays_review_and_blocks_artifact_drift();
+        persistent_checkpoint_reauthorization_and_stale_source_are_fail_closed();
+        prepared_checkpoint_requires_explicit_resume_before_native_execution();
+        persistent_checkpoint_rejects_corruption_and_overwrite();
+        ui_persistent_checkpoint_round_trip_preserves_human_boundary();
         std::cout << "Cartographer agent workbench invariants passed\n";
         return 0;
     } catch (const std::exception& error) {

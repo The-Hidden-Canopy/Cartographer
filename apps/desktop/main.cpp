@@ -921,6 +921,7 @@ struct NativeSculptStrokeCapture {
 
 enum class FileDialogKind {
     project,
+    agent_checkpoint,
     engineering,
     engineering_authoring,
     condition,
@@ -983,6 +984,12 @@ enum class StandardMeshExport {
         dialog.lpstrFilter = L"Cartographer Project (*.carto)\0*.carto\0All Files\0*.*\0";
         dialog.lpstrDefExt = L"carto";
         break;
+    case FileDialogKind::agent_checkpoint:
+        dialog.lpstrFilter =
+            L"Cartographer Agent Task (*.carto-agent-task)\0*.carto-agent-task\0"
+            L"All Files\0*.*\0";
+        dialog.lpstrDefExt = L"carto-agent-task";
+        break;
     case FileDialogKind::engineering:
         dialog.lpstrFilter =
             L"Cartographer Inspection Package (*.carto-inspection)\0*.carto-inspection\0"
@@ -1012,7 +1019,9 @@ enum class StandardMeshExport {
         break;
     }
     dialog.nFilterIndex = 1;
-    dialog.Flags = OFN_PATHMUSTEXIST | (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
+    dialog.Flags = OFN_PATHMUSTEXIST | (save
+        ? (kind == FileDialogKind::agent_checkpoint ? 0U : OFN_OVERWRITEPROMPT)
+        : OFN_FILEMUSTEXIST);
     const BOOL selected = save ? GetSaveFileNameW(&dialog) : GetOpenFileNameW(&dialog);
     if (!selected) return std::nullopt;
     return std::filesystem::path(path);
@@ -5175,7 +5184,8 @@ struct DesktopState {
             ImGui::TextColored(color(snapshot.colors.semantic_warning),
                 "Plan blocked until every required clarification has an operator answer.");
         }
-        ImGui::BeginDisabled(task_present || snapshot.agent_plan_draft.empty() ||
+        ImGui::BeginDisabled(task_present || snapshot.agent_checkpoint_loaded ||
+            snapshot.agent_plan_draft.empty() ||
             agent_goal.empty() || !clarifications_answered);
         if (ImGui::Button("Run speculative plan", ImVec2(-1, 30))) {
             const auto run = ui.run_agent_plan(agent_goal);
@@ -5190,8 +5200,47 @@ struct DesktopState {
             }
         }
         ImGui::EndDisabled();
+        if (snapshot.agent_checkpoint_loaded) {
+            ImGui::Text("Saved task %s · source R%llu", snapshot.agent_checkpoint_task_id.c_str(),
+                static_cast<unsigned long long>(
+                    snapshot.agent_checkpoint_base_revision.value()));
+            ImGui::TextDisabled(
+                "The saved speculative branch is re-created and checked before review. "
+                "Any consequential clarification must be answered again.");
+            ImGui::BeginDisabled(task_present || !clarifications_answered);
+            if (ImGui::Button("Resume and revalidate saved task", ImVec2(-1, 30))) {
+                const auto resumed = ui.resume_agent_checkpoint();
+                agent_feedback = resumed
+                    ? (resumed.value().status == carto::agent::TaskStatus::review
+                        ? "Saved task replayed and validated; the source is unchanged."
+                        : (resumed.value().diagnostic.has_value()
+                            ? resumed.value().diagnostic->message
+                            : "Saved task replay is blocked."))
+                    : resumed.error().message;
+            }
+            ImGui::EndDisabled();
+        } else if (!task_present) {
+            if (ImGui::SmallButton("Open saved task checkpoint...")) {
+                const auto path = choose_file(false, FileDialogKind::agent_checkpoint);
+                if (path.has_value()) {
+                    const auto loaded = ui.load_agent_checkpoint(*path);
+                    agent_feedback = loaded
+                        ? "Checkpoint loaded. Review its objective and re-answer any required questions."
+                        : loaded.error().message;
+                }
+            }
+        }
         if (task_present) {
             const auto& task = *snapshot.agent_task;
+            if (ImGui::SmallButton("Save persistent task checkpoint...")) {
+                const auto path = choose_file(true, FileDialogKind::agent_checkpoint);
+                if (path.has_value()) {
+                    const auto saved = ui.save_agent_checkpoint(*path);
+                    agent_feedback = saved
+                        ? "Immutable task checkpoint saved with source, speculative artifact, and evidence digests."
+                        : saved.error().message;
+                }
+            }
             ImGui::Text("Task %s · %s", task.task_id.c_str(),
                         carto::agent::task_status_name(task.status));
             ImGui::TextWrapped("%s", task.goal.c_str());
