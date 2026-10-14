@@ -810,6 +810,46 @@ void human_native_command_range_captures_alias_only_trace() {
     REQUIRE(viewer.clear_agent_demonstration_trace());
     REQUIRE(!viewer.snapshot().agent_demonstration_trace.has_value());
 
+    REQUIRE(viewer.dispatch(carto::application::CreateBoxAction{
+        "Transfer target alpha", {1.0, 1.0, 1.0}}));
+    REQUIRE(viewer.dispatch(carto::application::CreateBoxAction{
+        "Transfer target beta", {1.0, 1.0, 1.0}}));
+    const auto target_objects = viewer_source.snapshot().objects;
+    REQUIRE(target_objects.size() == 2U);
+    REQUIRE(viewer.load_agent_demonstration_trace(path));
+    REQUIRE(viewer.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(!viewer.bind_agent_demonstration_target(99U, 0U));
+    REQUIRE(!viewer.bind_agent_demonstration_target(1U, 0U));
+    REQUIRE(viewer.dispatch(carto::application::SelectFaceAction{
+        target_objects[0].object.id, carto::geometry::FaceId{1U}}));
+    REQUIRE(viewer.bind_agent_demonstration_target(1U, 1U));
+    REQUIRE(!viewer.bind_agent_demonstration_target(2U, 2U));
+    REQUIRE(viewer.dispatch(carto::application::SelectFaceAction{
+        target_objects[1].object.id, carto::geometry::FaceId{1U}}));
+    REQUIRE(viewer.bind_agent_demonstration_target(2U, 2U));
+    REQUIRE(viewer.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(viewer.dispatch(carto::application::SelectObjectAction{
+        target_objects[0].object.id}));
+    REQUIRE(viewer.bind_agent_demonstration_target(1U, 0U));
+    REQUIRE(viewer.snapshot().agent_demonstration_ready_to_preview);
+    const auto target_revision = viewer_source.snapshot().project_revision;
+    const auto trace_preview = viewer.preview_agent_demonstration_trace();
+    REQUIRE(trace_preview);
+    REQUIRE(trace_preview.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(viewer_source.snapshot().project_revision == target_revision);
+    const auto accepted_trace = viewer.accept_agent_plan();
+    REQUIRE(accepted_trace);
+    REQUIRE(viewer_source.snapshot().project_revision > target_revision);
+    REQUIRE(viewer.clear_agent_plan());
+    REQUIRE(!viewer.preview_agent_demonstration_trace());
+    const auto stale_bindings = viewer.snapshot();
+    REQUIRE(!stale_bindings.agent_demonstration_ready_to_preview);
+    REQUIRE(std::none_of(stale_bindings.agent_demonstration_bindings.begin(),
+        stale_bindings.agent_demonstration_bindings.end(),
+        [](const auto& binding) { return binding.bound; }));
+
     carto::application::ApplicationSession ai_source;
     carto::ui::UiController ai_ui(ai_source);
     REQUIRE(ai_ui.dispatch(carto::application::CreateBoxAction{

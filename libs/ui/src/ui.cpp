@@ -132,6 +132,140 @@ std::optional<scene::ObjectId> selected_surface_object(
     return std::nullopt;
 }
 
+std::vector<AgentDemonstrationTargetBindingView> demonstration_binding_requirements(
+    const agent::AgentDemonstrationTrace& trace) {
+    std::vector<AgentDemonstrationTargetBindingView> requirements;
+    for (const auto& step : trace.steps) {
+        const auto existing = std::find_if(requirements.begin(), requirements.end(),
+            [&step](const auto& requirement) {
+                return requirement.target_alias == step.target_alias &&
+                    requirement.component_alias == step.component_alias;
+            });
+        if (existing == requirements.end()) {
+            requirements.push_back(AgentDemonstrationTargetBindingView{
+                step.target_alias, step.component_alias, step.target_kind, false});
+        }
+    }
+    return requirements;
+}
+
+core::Result<std::string> demonstration_number_text(double value) {
+    if (!std::isfinite(value)) {
+        return core::Result<std::string>::failure(invalid(
+            "demonstration parameter is not finite"));
+    }
+    std::array<char, 64U> buffer{};
+    const auto converted = std::to_chars(
+        buffer.data(), buffer.data() + buffer.size(), value, std::chars_format::general);
+    if (converted.ec != std::errc{}) {
+        return core::Result<std::string>::failure(invalid(
+            "demonstration parameter could not be formatted"));
+    }
+    return core::Result<std::string>::success(
+        std::string(buffer.data(), converted.ptr));
+}
+
+core::Result<std::string> demonstration_step_intent(
+    const agent::AgentDemonstrationTraceStep& step,
+    const agent::TargetRef& target,
+    const application::ApplicationSnapshot& snapshot) {
+    if (auto result = step.parameters.validate(step.tool_id); !result) {
+        return core::Result<std::string>::failure(result.error());
+    }
+    if (step.target_kind == agent::AgentDemonstrationTargetKind::object) {
+        if (!std::holds_alternative<std::monostate>(target.component) ||
+            step.tool_id != "object.translate") {
+            return core::Result<std::string>::failure(invalid(
+                "object demonstration binding does not match its native operation"));
+        }
+        const auto x = demonstration_number_text(step.parameters.relative_displacement.x);
+        const auto y = demonstration_number_text(step.parameters.relative_displacement.y);
+        const auto z = demonstration_number_text(step.parameters.relative_displacement.z);
+        if (!x) return core::Result<std::string>::failure(x.error());
+        if (!y) return core::Result<std::string>::failure(y.error());
+        if (!z) return core::Result<std::string>::failure(z.error());
+        return core::Result<std::string>::success(
+            "translate object by " + x.value() + " " + y.value() + " " + z.value());
+    }
+
+    const auto* instance = snapshot.viewport.scene.find(target.object);
+    if (instance == nullptr || instance->mesh == nullptr) {
+        return core::Result<std::string>::failure(stale(
+            "demonstration target has no current mesh in the viewport snapshot"));
+    }
+    if (step.target_kind == agent::AgentDemonstrationTargetKind::face) {
+        const auto* face_id = std::get_if<geometry::FaceId>(&target.component);
+        if (face_id == nullptr ||
+            (step.tool_id != "mesh.inset-face" && step.tool_id != "mesh.extrude-face")) {
+            return core::Result<std::string>::failure(invalid(
+                "face demonstration binding does not match its native operation"));
+        }
+        double longest_edge = 0.0;
+        std::size_t boundary_edge_count = 0U;
+        for (std::size_t triangle = 0U;
+             triangle < instance->mesh->triangle_faces.size(); ++triangle) {
+            if (instance->mesh->triangle_faces[triangle] != *face_id) continue;
+            for (std::size_t edge = 0U; edge < 3U; ++edge) {
+                if (!instance->mesh->triangle_edges[triangle][edge].has_value()) continue;
+                const std::size_t first_index = static_cast<std::size_t>(
+                    instance->mesh->indices[triangle * 3U + edge]);
+                const std::size_t second_index = static_cast<std::size_t>(
+                    instance->mesh->indices[triangle * 3U + (edge + 1U) % 3U]);
+                if (first_index >= instance->mesh->positions.size() ||
+                    second_index >= instance->mesh->positions.size()) {
+                    return core::Result<std::string>::failure(stale(
+                        "bound demonstration face has invalid compiled vertex data"));
+                }
+                ++boundary_edge_count;
+                longest_edge = std::max(longest_edge,
+                    (instance->mesh->positions[second_index] -
+                        instance->mesh->positions[first_index]).length());
+            }
+        }
+        if (boundary_edge_count < 3U) {
+            return core::Result<std::string>::failure(stale(
+                "bound demonstration face is missing or degenerate"));
+        }
+        const double distance = step.parameters.normalized_distance * longest_edge;
+        if (!std::isfinite(distance) || distance <= 0.0) {
+            return core::Result<std::string>::failure(invalid(
+                "normalized demonstration face distance is invalid for the selected target"));
+        }
+        const auto formatted = demonstration_number_text(distance);
+        if (!formatted) return core::Result<std::string>::failure(formatted.error());
+        const std::string operation = step.tool_id == "mesh.inset-face"
+            ? "inset face " : "extrude face ";
+        return core::Result<std::string>::success(operation + formatted.value());
+    }
+    if (step.target_kind == agent::AgentDemonstrationTargetKind::vertex) {
+        const auto* vertex_id = std::get_if<geometry::VertexId>(&target.component);
+        if (vertex_id == nullptr || step.tool_id != "mesh.set-vertex-position") {
+            return core::Result<std::string>::failure(invalid(
+                "vertex demonstration binding does not match its native operation"));
+        }
+        const auto vertex = std::find(
+            instance->mesh->vertex_ids.begin(), instance->mesh->vertex_ids.end(), *vertex_id);
+        if (vertex == instance->mesh->vertex_ids.end()) {
+            return core::Result<std::string>::failure(stale(
+                "bound demonstration vertex is missing"));
+        }
+        const auto vertex_index = static_cast<std::size_t>(std::distance(
+            instance->mesh->vertex_ids.begin(), vertex));
+        const auto position = instance->mesh->positions[vertex_index] +
+            step.parameters.relative_displacement;
+        const auto x = demonstration_number_text(position.x);
+        const auto y = demonstration_number_text(position.y);
+        const auto z = demonstration_number_text(position.z);
+        if (!x) return core::Result<std::string>::failure(x.error());
+        if (!y) return core::Result<std::string>::failure(y.error());
+        if (!z) return core::Result<std::string>::failure(z.error());
+        return core::Result<std::string>::success(
+            "move vertex to " + x.value() + " " + y.value() + " " + z.value());
+    }
+    return core::Result<std::string>::failure(invalid(
+        "demonstration trace target kind is unsupported"));
+}
+
 bool valid(Theme value) noexcept {
     return value == Theme::dark || value == Theme::light || value == Theme::high_contrast;
 }
@@ -2394,7 +2528,294 @@ core::Result<void> UiController::capture_agent_demonstration_trace(
         return core::Result<void>::failure(trace.error());
     }
     agent_demonstration_trace_.emplace(std::move(trace.value()));
+    agent_demonstration_bindings_.clear();
+    agent_demonstration_binding_revision_.reset();
     return core::Result<void>::success();
+}
+
+core::Result<void> UiController::bind_agent_demonstration_target(
+    std::uint32_t target_alias,
+    std::uint32_t component_alias) {
+    if (!agent_demonstration_trace_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "load or capture a demonstration trace before binding targets"));
+    }
+    if (auto valid_trace = agent_demonstration_trace_->validate(); !valid_trace) {
+        return valid_trace;
+    }
+    const auto snapshot = session_.snapshot();
+    if (agent_demonstration_binding_revision_.has_value() &&
+        *agent_demonstration_binding_revision_ != snapshot.project_revision) {
+        agent_demonstration_bindings_.clear();
+    }
+    agent_demonstration_binding_revision_ = snapshot.project_revision;
+
+    const auto requirements = demonstration_binding_requirements(
+        *agent_demonstration_trace_);
+    const auto requirement = std::find_if(requirements.begin(), requirements.end(),
+        [target_alias, component_alias](const auto& value) {
+            return value.target_alias == target_alias &&
+                value.component_alias == component_alias;
+        });
+    if (requirement == requirements.end()) {
+        return core::Result<void>::failure(invalid(
+            "selected target alias is not required by this demonstration trace"));
+    }
+
+    agent::TargetRef target;
+    if (requirement->target_kind == agent::AgentDemonstrationTargetKind::object) {
+        if (snapshot.selection.mode != editor::SelectionMode::object ||
+            snapshot.selection.objects.size() != 1U ||
+            snapshot.selection.component_object.has_value()) {
+            return core::Result<void>::failure(invalid_state(
+                "bind an object trace target by selecting exactly one scene object"));
+        }
+        target.object = snapshot.selection.objects.front();
+        target.component = std::monostate{};
+    } else if (requirement->target_kind == agent::AgentDemonstrationTargetKind::face) {
+        if (snapshot.selection.mode != editor::SelectionMode::face ||
+            !snapshot.selection.component_object.has_value() ||
+            snapshot.selection.faces.size() != 1U ||
+            !snapshot.selection.vertices.empty()) {
+            return core::Result<void>::failure(invalid_state(
+                "bind a face trace target by selecting exactly one face"));
+        }
+        target.object = *snapshot.selection.component_object;
+        target.component = snapshot.selection.faces.front();
+        const auto* instance = snapshot.viewport.scene.find(target.object);
+        if (instance == nullptr || instance->mesh == nullptr ||
+            std::find(instance->mesh->triangle_faces.begin(),
+                instance->mesh->triangle_faces.end(), snapshot.selection.faces.front()) ==
+                instance->mesh->triangle_faces.end()) {
+            return core::Result<void>::failure(stale(
+                "selected demonstration face is absent from the current viewport snapshot"));
+        }
+    } else if (requirement->target_kind == agent::AgentDemonstrationTargetKind::vertex) {
+        if (snapshot.selection.mode != editor::SelectionMode::vertex ||
+            !snapshot.selection.component_object.has_value() ||
+            snapshot.selection.vertices.size() != 1U ||
+            !snapshot.selection.faces.empty()) {
+            return core::Result<void>::failure(invalid_state(
+                "bind a vertex trace target by selecting exactly one vertex"));
+        }
+        target.object = *snapshot.selection.component_object;
+        target.component = snapshot.selection.vertices.front();
+        const auto* instance = snapshot.viewport.scene.find(target.object);
+        if (instance == nullptr || instance->mesh == nullptr ||
+            std::find(instance->mesh->vertex_ids.begin(), instance->mesh->vertex_ids.end(),
+                snapshot.selection.vertices.front()) == instance->mesh->vertex_ids.end()) {
+            return core::Result<void>::failure(stale(
+                "selected demonstration vertex is absent from the current viewport snapshot"));
+        }
+    } else {
+        return core::Result<void>::failure(invalid(
+            "demonstration target kind is unknown"));
+    }
+
+    for (const auto& existing : agent_demonstration_bindings_) {
+        if (existing.target_alias == target_alias &&
+            existing.target.object != target.object) {
+            return core::Result<void>::failure(invalid_state(
+                "all components for one demonstration object alias must map to the same object"));
+        }
+        if (existing.target_alias != target_alias &&
+            existing.target.object == target.object) {
+            return core::Result<void>::failure(invalid_state(
+                "different demonstration object aliases must map to different scene objects"));
+        }
+    }
+
+    const auto existing = std::find_if(
+        agent_demonstration_bindings_.begin(), agent_demonstration_bindings_.end(),
+        [target_alias, component_alias](const auto& value) {
+            return value.target_alias == target_alias &&
+                value.component_alias == component_alias;
+        });
+    if (existing == agent_demonstration_bindings_.end()) {
+        agent_demonstration_bindings_.push_back({target_alias, component_alias, target});
+    } else {
+        existing->target = target;
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::clear_agent_demonstration_target_bindings() {
+    agent_demonstration_bindings_.clear();
+    agent_demonstration_binding_revision_.reset();
+    return core::Result<void>::success();
+}
+
+core::Result<agent::AgentTaskSnapshot> UiController::preview_agent_demonstration_trace() {
+    if (!agent_demonstration_trace_.has_value()) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "load or capture a demonstration trace before previewing it"));
+    }
+    if (agent_task_.has_value()) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "clear the current AgentTask before previewing a demonstration trace"));
+    }
+    if (agent_checkpoint_pending_.has_value()) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "resume or clear the loaded checkpoint before previewing a demonstration trace"));
+    }
+    if (auto valid_trace = agent_demonstration_trace_->validate(); !valid_trace) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(valid_trace.error());
+    }
+    const auto snapshot = session_.snapshot();
+    if (!agent_demonstration_binding_revision_.has_value() ||
+        *agent_demonstration_binding_revision_ != snapshot.project_revision) {
+        agent_demonstration_bindings_.clear();
+        agent_demonstration_binding_revision_.reset();
+        return core::Result<agent::AgentTaskSnapshot>::failure(stale(
+            "project changed after target binding; bind the demonstration targets again"));
+    }
+
+    const auto requirements = demonstration_binding_requirements(
+        *agent_demonstration_trace_);
+    std::vector<scene::ObjectId> scope;
+    std::vector<scene::ObjectId> transform_roots;
+    std::vector<agent::AgentPlanStep> steps;
+    steps.reserve(agent_demonstration_trace_->steps.size());
+    std::set<std::uint64_t> changed_mesh_assets;
+    std::uint32_t permitted_effects = 0U;
+    double transform_distance_budget = 0.0;
+    bool has_topology_operation = false;
+
+    for (const auto& requirement : requirements) {
+        const auto binding = std::find_if(
+            agent_demonstration_bindings_.begin(), agent_demonstration_bindings_.end(),
+            [&requirement](const auto& value) {
+                return value.target_alias == requirement.target_alias &&
+                    value.component_alias == requirement.component_alias;
+            });
+        if (binding == agent_demonstration_bindings_.end()) {
+            return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+                "bind every object and component alias before previewing the trace"));
+        }
+        if (std::find(scope.begin(), scope.end(), binding->target.object) == scope.end()) {
+            scope.push_back(binding->target.object);
+        }
+        if (requirement.target_kind == agent::AgentDemonstrationTargetKind::object &&
+            std::find(transform_roots.begin(), transform_roots.end(),
+                binding->target.object) == transform_roots.end()) {
+            transform_roots.push_back(binding->target.object);
+        }
+    }
+
+    for (std::size_t cursor = 0U; cursor < transform_roots.size(); ++cursor) {
+        const scene::ObjectId parent = transform_roots[cursor];
+        const auto parent_view = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
+            [parent](const auto& value) { return value.object.id == parent; });
+        if (parent_view == snapshot.objects.end() || parent_view->object.parent.has_value()) {
+            return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+                "object demonstration targets must bind to existing root objects"));
+        }
+        for (const auto& object : snapshot.objects) {
+            if (!object.object.parent.has_value() || *object.object.parent != parent) continue;
+            if (std::find(scope.begin(), scope.end(), object.object.id) == scope.end()) {
+                scope.push_back(object.object.id);
+                transform_roots.push_back(object.object.id);
+            }
+        }
+    }
+
+    for (std::size_t index = 0U; index < agent_demonstration_trace_->steps.size(); ++index) {
+        const auto& trace_step = agent_demonstration_trace_->steps[index];
+        const auto binding = std::find_if(
+            agent_demonstration_bindings_.begin(), agent_demonstration_bindings_.end(),
+            [&trace_step](const auto& value) {
+                return value.target_alias == trace_step.target_alias &&
+                    value.component_alias == trace_step.component_alias;
+            });
+        if (binding == agent_demonstration_bindings_.end()) {
+            return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+                "demonstration trace target binding is missing"));
+        }
+
+        if (trace_step.target_kind == agent::AgentDemonstrationTargetKind::object) {
+            permitted_effects |= agent::effect_mask(agent::Effect::transform);
+            transform_distance_budget +=
+                trace_step.parameters.relative_displacement.length();
+        } else {
+            const auto object = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
+                [&binding](const auto& value) {
+                    return value.object.id == binding->target.object;
+                });
+            if (object == snapshot.objects.end() || !object->object.mesh_asset.has_value()) {
+                return core::Result<agent::AgentTaskSnapshot>::failure(stale(
+                    "bound mesh target has no current authored mesh asset"));
+            }
+            if (!changed_mesh_assets.insert(*object->object.mesh_asset).second) {
+                return core::Result<agent::AgentTaskSnapshot>::failure(unsupported(
+                    "trace preview requires one mesh edit per source mesh until sequential correspondence is available"));
+            }
+            if (trace_step.target_kind == agent::AgentDemonstrationTargetKind::face) {
+                permitted_effects |= agent::effect_mask(agent::Effect::geometry) |
+                    agent::effect_mask(agent::Effect::topology);
+                has_topology_operation = true;
+            } else {
+                permitted_effects |= agent::effect_mask(agent::Effect::geometry);
+            }
+        }
+
+        auto intent = demonstration_step_intent(trace_step, binding->target, snapshot);
+        if (!intent) {
+            return core::Result<agent::AgentTaskSnapshot>::failure(intent.error());
+        }
+        std::vector<std::string> dependencies;
+        if (!steps.empty()) dependencies.push_back(steps.back().id);
+        steps.push_back(agent::AgentPlanStep{
+            "demonstration-step-" + std::to_string(index + 1U),
+            binding->target,
+            std::move(intent.value()),
+            std::move(dependencies)});
+    }
+
+    if (!std::isfinite(transform_distance_budget) ||
+        transform_distance_budget > 1'000'000.0) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid(
+            "demonstration transform budget exceeds the supported limit"));
+    }
+    const std::uint64_t task_sequence = next_agent_task_id_ ==
+        std::numeric_limits<std::uint64_t>::max() ? 1U : next_agent_task_id_;
+    const std::string task_id = "agent-demonstration-" + std::to_string(task_sequence);
+    constexpr std::string_view goal =
+        "Preview a captured demonstration on explicitly bound targets";
+    agent::AgentPlan plan{
+        task_id,
+        agent::AuthoringObjective{
+            task_id, std::string(goal), snapshot.project_revision, scope, {}, {}, {}, {}},
+        std::move(steps)};
+    agent::AgentWorkEnvelope envelope;
+    envelope.scope_objects = scope;
+    envelope.permitted_effects = permitted_effects;
+    envelope.max_commands = agent_demonstration_trace_->steps.size();
+    envelope.max_objects_touched = scope.size();
+    envelope.max_topology_operations = has_topology_operation ? 512U : 0U;
+    envelope.max_repair_attempts = 0U;
+    envelope.max_additional_operations = 0U;
+    envelope.max_transform_distance_meters = transform_distance_budget;
+
+    auto plan_draft = plan.steps;
+    auto task = agent::AgentTask::begin(session_, std::move(plan), std::move(envelope));
+    if (!task) {
+        record_ui_problem(task.error().with_context("demonstration speculative preview"));
+        return core::Result<agent::AgentTaskSnapshot>::failure(task.error());
+    }
+    next_agent_task_id_ = task_sequence == std::numeric_limits<std::uint64_t>::max()
+        ? 1U : task_sequence + 1U;
+    agent_goal_ = std::string(goal);
+    agent_plan_id_ = task_id;
+    agent_objective_id_ = task_id;
+    agent_plan_base_revision_ = snapshot.project_revision;
+    agent_plan_draft_ = std::move(plan_draft);
+    agent_hard_constraints_draft_.clear();
+    agent_clarifications_draft_.clear();
+    agent_recipe_id_.clear();
+    agent_repair_mode_ = false;
+    agent_condition_inventory_.reset();
+    agent_task_.emplace(std::move(task.value()));
+    return run_prepared_agent_plan();
 }
 
 core::Result<void> UiController::save_agent_demonstration_trace(
@@ -2414,11 +2835,15 @@ core::Result<void> UiController::load_agent_demonstration_trace(
         return core::Result<void>::failure(trace.error());
     }
     agent_demonstration_trace_.emplace(std::move(trace.value()));
+    agent_demonstration_bindings_.clear();
+    agent_demonstration_binding_revision_.reset();
     return core::Result<void>::success();
 }
 
 core::Result<void> UiController::clear_agent_demonstration_trace() {
     agent_demonstration_trace_.reset();
+    agent_demonstration_bindings_.clear();
+    agent_demonstration_binding_revision_.reset();
     return core::Result<void>::success();
 }
 
@@ -3990,6 +4415,26 @@ UiSnapshot UiController::snapshot() const {
     }
     result.agent_demonstration = agent_demonstration_;
     result.agent_demonstration_trace = agent_demonstration_trace_;
+    if (agent_demonstration_trace_.has_value()) {
+        const bool bindings_current = agent_demonstration_binding_revision_.has_value() &&
+            *agent_demonstration_binding_revision_ == result.project_revision;
+        auto requirements = demonstration_binding_requirements(
+            *agent_demonstration_trace_);
+        result.agent_demonstration_ready_to_preview = !requirements.empty() &&
+            bindings_current && !agent_task_.has_value() &&
+            !agent_checkpoint_pending_.has_value();
+        for (auto& requirement : requirements) {
+            requirement.bound = bindings_current && std::any_of(
+                agent_demonstration_bindings_.begin(),
+                agent_demonstration_bindings_.end(), [&requirement](const auto& binding) {
+                    return binding.target_alias == requirement.target_alias &&
+                        binding.component_alias == requirement.component_alias;
+                });
+            result.agent_demonstration_ready_to_preview =
+                result.agent_demonstration_ready_to_preview && requirement.bound;
+            result.agent_demonstration_bindings.push_back(requirement);
+        }
+    }
     return result;
 }
 

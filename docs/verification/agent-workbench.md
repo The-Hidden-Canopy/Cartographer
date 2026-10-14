@@ -143,7 +143,10 @@
 - Human-authored trace capture accepts only a contiguous recent range of supported native operations (face inset/extrude, vertex-position change, and root-object translation); AI proposals and unsupported project-changing edits are not admitted as human trace steps.
 - The in-memory trace is bounded to 256 operations, revision-contiguous, and cleared by unsupported project changes. Export assigns object/component aliases and persists only normalized face distance or relative displacement parameters.
 - Manual trace serialization rejects malformed aliases, non-finite parameters, invalid ranges, oversized records, and checksum corruption; saving is immutable, loading is read-only, and capture/load do not change the source project revision.
-- Manual traces remain inspect-only. They do not inherit task validation gates, resolve cross-object correspondence, replay operations, claim transfer quality, or create reusable recipes.
+- The UI binds every trace alias to exactly one selected target of the recorded object/face/vertex kind. It rejects unknown aliases, wrong selection kinds, multiple source aliases mapped to one target object, inconsistent component bindings, and bindings made stale by a project revision change.
+- Preview scales normalized face distances by the selected target face's longest boundary edge and applies vertex deltas to the selected target vertex. Object, face, and vertex parameters become a sequential bounded AgentTask; repeated geometry edits against the same mesh asset fail closed until sequential correspondence is available.
+- A successful bound trace preview produces a review task and diff without changing the source revision. The existing explicit acceptance action is required to commit; acceptance then invalidates the old target bindings by revision.
+- Trace files still contain no target bindings, acceptance gates, or source authority. Automatic structural correspondence, “apply to similar,” transfer-quality claims, and reusable demonstration recipes remain unimplemented.
 
 ## Follow-up coverage
 

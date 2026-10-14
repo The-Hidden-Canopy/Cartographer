@@ -7150,7 +7150,7 @@ struct DesktopState {
                 if (path.has_value()) {
                     const auto loaded = ui.load_agent_demonstration_trace(*path);
                     agent_feedback = loaded
-                        ? "Alias-only native trace opened for inspection; it cannot run."
+                        ? "Alias-only trace opened. Bind targets explicitly before a speculative preview."
                         : loaded.error().message;
                 }
             }
@@ -7160,7 +7160,7 @@ struct DesktopState {
                     trace.steps.size(),
                     static_cast<unsigned long long>(trace.result_revision_span));
                 ImGui::TextDisabled(
-                    "The trace contains anonymized aliases and typed deltas. It has no target resolver, validation claim, or replay authority.");
+                    "The file has aliases and typed deltas only. Preview needs explicit target bindings and runs on a speculative branch.");
                 const auto visible_steps = std::min<std::size_t>(trace.steps.size(), 16U);
                 for (std::size_t index = 0U; index < visible_steps; ++index) {
                     const auto& trace_step = trace.steps[index];
@@ -7168,12 +7168,50 @@ struct DesktopState {
                         index + 1U, trace_step.tool_id.c_str(), trace_step.target_alias,
                         trace_step.component_alias);
                 }
+                ImGui::SeparatorText("Bind trace aliases to selected targets");
+                ImGui::TextDisabled(
+                    "Select exactly one object, face, or vertex matching each row, then bind it. This does not infer similarity.");
+                for (const auto& binding : snapshot.agent_demonstration_bindings) {
+                    const char* target_kind =
+                        binding.target_kind == carto::agent::AgentDemonstrationTargetKind::object
+                            ? "object" :
+                        binding.target_kind == carto::agent::AgentDemonstrationTargetKind::face
+                            ? "face" : "vertex";
+                    ImGui::PushID(static_cast<int>(binding.target_alias));
+                    ImGui::PushID(static_cast<int>(binding.component_alias));
+                    ImGui::Text("Object %u / component %u · %s · %s",
+                        binding.target_alias, binding.component_alias, target_kind,
+                        binding.bound ? "bound" : "unbound");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Bind current selection")) {
+                        const auto bound = ui.bind_agent_demonstration_target(
+                            binding.target_alias, binding.component_alias);
+                        agent_feedback = bound
+                            ? "Explicit demonstration target binding recorded for this project revision."
+                            : bound.error().message;
+                    }
+                    ImGui::PopID();
+                    ImGui::PopID();
+                }
+                if (ImGui::SmallButton("Clear target bindings")) {
+                    const auto cleared = ui.clear_agent_demonstration_target_bindings();
+                    if (!cleared) agent_feedback = cleared.error().message;
+                }
+                ImGui::SameLine();
+                ImGui::BeginDisabled(!snapshot.agent_demonstration_ready_to_preview);
+                if (ImGui::SmallButton("Preview bound trace")) {
+                    const auto preview = ui.preview_agent_demonstration_trace();
+                    agent_feedback = preview
+                        ? "Speculative trace preview ready. Review its diff and gates before acceptance."
+                        : preview.error().message;
+                }
+                ImGui::EndDisabled();
                 if (ImGui::SmallButton("Save captured native trace...")) {
                     const auto path = choose_file(true, FileDialogKind::agent_demonstration_trace);
                     if (path.has_value()) {
                         const auto saved = ui.save_agent_demonstration_trace(*path);
                         agent_feedback = saved
-                            ? "Immutable native trace saved; it cannot run or mutate a project."
+                            ? "Immutable trace saved. Applying it later requires explicit bindings and human acceptance."
                             : saved.error().message;
                     }
                 }

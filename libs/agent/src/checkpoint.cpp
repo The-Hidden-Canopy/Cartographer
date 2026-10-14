@@ -1434,6 +1434,10 @@ core::Result<void> AgentDemonstrationTrace::validate() const {
             "demonstration trace is empty or exceeds its step bound"));
     }
     std::uint64_t previous_after = 0U;
+    std::map<std::pair<std::uint32_t, std::uint32_t>, AgentDemonstrationTargetKind>
+        binding_kinds;
+    std::map<std::uint32_t,
+        std::pair<std::uint32_t, AgentDemonstrationTargetKind>> component_aliases;
     for (std::size_t index = 0U; index < steps.size(); ++index) {
         const auto& step = steps[index];
         if (!safe_demonstration_text(step.tool_id, 256U) ||
@@ -1444,6 +1448,14 @@ core::Result<void> AgentDemonstrationTrace::validate() const {
             !step.parameters.validate(step.tool_id)) {
             return core::Result<void>::failure(malformed(
                 "demonstration trace step is invalid or discontinuous"));
+        }
+        const auto binding_key = std::make_pair(
+            step.target_alias, step.component_alias);
+        const auto [binding, inserted_binding] = binding_kinds.emplace(
+            binding_key, step.target_kind);
+        if (!inserted_binding && binding->second != step.target_kind) {
+            return core::Result<void>::failure(malformed(
+                "demonstration trace reuses a target binding with a different kind"));
         }
         if (step.target_kind == AgentDemonstrationTargetKind::object) {
             if (step.tool_id != "object.translate" || step.component_alias != 0U ||
@@ -1460,6 +1472,14 @@ core::Result<void> AgentDemonstrationTrace::validate() const {
                 return core::Result<void>::failure(malformed(
                     "demonstration trace face target is invalid"));
             }
+            const auto [component, inserted_component] = component_aliases.emplace(
+                step.component_alias,
+                std::make_pair(step.target_alias, step.target_kind));
+            if (!inserted_component && component->second !=
+                    std::make_pair(step.target_alias, step.target_kind)) {
+                return core::Result<void>::failure(malformed(
+                    "demonstration component alias maps to conflicting targets"));
+            }
         } else if (step.target_kind == AgentDemonstrationTargetKind::vertex) {
             if (step.component_alias == 0U || step.component_alias > 4096U ||
                 step.tool_id != "mesh.set-vertex-position" ||
@@ -1467,6 +1487,14 @@ core::Result<void> AgentDemonstrationTrace::validate() const {
                     AgentDemonstrationParameterization::relative_displacement) {
                 return core::Result<void>::failure(malformed(
                     "demonstration trace vertex target is invalid"));
+            }
+            const auto [component, inserted_component] = component_aliases.emplace(
+                step.component_alias,
+                std::make_pair(step.target_alias, step.target_kind));
+            if (!inserted_component && component->second !=
+                    std::make_pair(step.target_alias, step.target_kind)) {
+                return core::Result<void>::failure(malformed(
+                    "demonstration component alias maps to conflicting targets"));
             }
         } else {
             return core::Result<void>::failure(malformed(

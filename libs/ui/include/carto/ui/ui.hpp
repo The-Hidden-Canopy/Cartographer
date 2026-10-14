@@ -406,6 +406,14 @@ struct AgentTaskStripView {
     std::optional<core::Diagnostic> blocker;
 };
 
+struct AgentDemonstrationTargetBindingView {
+    std::uint32_t target_alias = 0U;
+    std::uint32_t component_alias = 0U;
+    agent::AgentDemonstrationTargetKind target_kind =
+        agent::AgentDemonstrationTargetKind::object;
+    bool bound = false;
+};
+
 // A UI snapshot is a presentation projection. The inherited application
 // snapshot remains the only authoring data source; UI-only state is kept in
 // the additional fields below and is never serialized into a project.
@@ -445,6 +453,8 @@ struct UiSnapshot : application::ApplicationSnapshot {
     std::optional<agent::SceneQueryResult> agent_condition_inventory;
     std::optional<agent::AgentDemonstration> agent_demonstration;
     std::optional<agent::AgentDemonstrationTrace> agent_demonstration_trace;
+    std::vector<AgentDemonstrationTargetBindingView> agent_demonstration_bindings;
+    bool agent_demonstration_ready_to_preview = false;
 };
 
 [[nodiscard]] UiColorTokens color_tokens(Theme theme) noexcept;
@@ -535,6 +545,12 @@ public:
     [[nodiscard]] core::Result<void> capture_agent_demonstration_trace(
         application::OperationId first_operation,
         application::OperationId last_operation);
+    [[nodiscard]] core::Result<void> bind_agent_demonstration_target(
+        std::uint32_t target_alias,
+        std::uint32_t component_alias);
+    [[nodiscard]] core::Result<void> clear_agent_demonstration_target_bindings();
+    [[nodiscard]] core::Result<agent::AgentTaskSnapshot>
+    preview_agent_demonstration_trace();
     [[nodiscard]] core::Result<void> save_agent_demonstration_trace(
         const std::filesystem::path& path) const;
     [[nodiscard]] core::Result<void> load_agent_demonstration_trace(
@@ -670,6 +686,12 @@ public:
     [[nodiscard]] UiSnapshot snapshot() const;
 
 private:
+    struct AgentDemonstrationTargetBinding {
+        std::uint32_t target_alias = 0U;
+        std::uint32_t component_alias = 0U;
+        agent::TargetRef target;
+    };
+
     [[nodiscard]] core::Result<application::DispatchReceipt> dispatch_with_category(
         const application::ApplicationAction& action,
         OperationCategory category);
@@ -706,6 +728,8 @@ private:
     std::optional<core::Revision> agent_condition_inventory_query_revision_;
     std::optional<agent::AgentDemonstration> agent_demonstration_;
     std::optional<agent::AgentDemonstrationTrace> agent_demonstration_trace_;
+    std::vector<AgentDemonstrationTargetBinding> agent_demonstration_bindings_;
+    std::optional<core::Revision> agent_demonstration_binding_revision_;
     std::optional<agent::AgentTaskCheckpoint> agent_checkpoint_pending_;
     bool agent_checkpoint_rebased_ = false;
     std::string agent_goal_;
