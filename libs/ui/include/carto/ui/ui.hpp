@@ -392,6 +392,16 @@ struct SurfaceFidelityView {
     [[nodiscard]] core::Result<void> validate() const;
 };
 
+struct AgentTaskStripView {
+    std::string task_id;
+    agent::TaskStatus status = agent::TaskStatus::prepared;
+    std::size_t passed_steps = 0U;
+    std::size_t total_steps = 0U;
+    std::size_t passed_required_gates = 0U;
+    std::size_t required_gates = 0U;
+    std::optional<core::Diagnostic> blocker;
+};
+
 // A UI snapshot is a presentation projection. The inherited application
 // snapshot remains the only authoring data source; UI-only state is kept in
 // the additional fields below and is never serialized into a project.
@@ -411,6 +421,7 @@ struct UiSnapshot : application::ApplicationSnapshot {
     std::vector<core::Diagnostic> ui_problems;
     UiColorTokens colors;
     SurfaceFidelityView surface_fidelity;
+    std::optional<AgentTaskStripView> agent_task_strip;
     MarketView market;
     bool ai_available = false;
     bool ai_auto_approve = true;

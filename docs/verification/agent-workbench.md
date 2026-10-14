@@ -84,6 +84,12 @@
 - Corrupted files, attempts to overwrite a checkpoint, conflicting source changes, missing reapproval, and replayed write-set drift are blocked without changing the live project.
 - A disjoint source edit can be explicitly rebased, retained in the resulting source, and accepted only after the plan is reauthorized for the new revision.
 
+## Cross-workspace task status
+
+- A review-ready task remains available from other authoring workspaces with passed-step and required-gate counts derived from its current snapshot.
+- A blocked task remains visible, exposes its diagnostic on the task action tooltip, and routes back to the Agent workspace; the strip itself does not accept, repair, or mutate the task.
+- The strip is hidden in the Agent workspace, after acceptance/rejection, and when no task exists.
+
 ## Follow-up coverage
 
 Add failure injection for durable journal append rollback, unrelated and conflicting source edits during a future rebase flow, bounded repair exhaustion, semantic-sidecar size pressure, and provider timeouts as those tranches are implemented. Clarification questions and answers are reviewable evidence, not natural-language commands; the workbench still does not compile free-form goals or infer questions automatically.

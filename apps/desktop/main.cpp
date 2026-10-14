@@ -7448,8 +7448,40 @@ struct DesktopState {
         ImGui::EndChild();
     }
 
+    void draw_agent_task_strip(const UiSnapshot& snapshot) {
+        if (!snapshot.agent_task_strip.has_value()) return;
+        const auto& task = *snapshot.agent_task_strip;
+        const carto::ui::UiColor status_token =
+            task.status == carto::agent::TaskStatus::review
+                ? snapshot.colors.semantic_success
+                : task.status == carto::agent::TaskStatus::blocked
+                    ? snapshot.colors.semantic_warning
+                    : snapshot.colors.accent_primary;
+        ImGui::BeginChild("AgentTaskStrip", ImVec2(0, 48), true,
+            ImGuiWindowFlags_NoScrollbar);
+        ImGui::TextColored(color(status_token), "Agent task %s · %s",
+            task.task_id.c_str(), carto::agent::task_status_name(task.status));
+        ImGui::SameLine();
+        ImGui::TextDisabled("%zu/%zu steps · %zu/%zu required gates",
+            task.passed_steps, task.total_steps,
+            task.passed_required_gates, task.required_gates);
+        ImGui::SameLine();
+        const char* action_label = task.status == carto::agent::TaskStatus::review
+            ? "Review result" : task.status == carto::agent::TaskStatus::blocked
+                ? "Resolve task" : "Open task";
+        if (ImGui::SmallButton(action_label)) {
+            const auto opened = ui.set_workspace(carto::ui::Workspace::ai);
+            if (!opened) {
+                action_feedback = opened.error().message;
+                action_feedback_error = true;
+            }
+        }
+        ImGui::EndChild();
+    }
+
     void draw_workspace_surface(const UiSnapshot& snapshot) {
         draw_workspace_bar(snapshot);
+        draw_agent_task_strip(snapshot);
         draw_toolbar(snapshot);
         workbench_bounds_valid = false;
         ImGui::BeginChild("WorkbenchLayout", ImVec2(0, 0), false);

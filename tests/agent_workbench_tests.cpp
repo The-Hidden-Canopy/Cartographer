@@ -1439,6 +1439,19 @@ void ui_workbench_captures_selection_and_exposes_accept_reject_flow() {
     REQUIRE(ui.snapshot().project_revision == source_revision);
     REQUIRE(ui.snapshot().agent_task.has_value());
     REQUIRE(ui.snapshot().agent_task->can_accept);
+    REQUIRE(ui.snapshot().agent_task_strip.has_value());
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::sculpt));
+    const auto strip = ui.snapshot().agent_task_strip;
+    REQUIRE(strip.has_value());
+    REQUIRE(strip->task_id == ran.value().task_id);
+    REQUIRE(strip->status == carto::agent::TaskStatus::review);
+    REQUIRE(strip->passed_steps == 1U);
+    REQUIRE(strip->total_steps == 1U);
+    REQUIRE(strip->passed_required_gates == strip->required_gates);
+    REQUIRE(strip->required_gates > 0U);
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::ai));
+    REQUIRE(!ui.snapshot().agent_task_strip.has_value());
+    REQUIRE(ui.snapshot().agent_task->status == carto::agent::TaskStatus::review);
     REQUIRE(ui.accept_agent_plan());
     REQUIRE(ui.snapshot().agent_task->status == carto::agent::TaskStatus::accepted);
     REQUIRE(ui.snapshot().project_revision == source_revision.next());
@@ -1526,6 +1539,14 @@ void ui_repairs_failed_step_with_operator_justification_and_scope_checks() {
     REQUIRE(failed);
     REQUIRE(failed.value().status == carto::agent::TaskStatus::blocked);
     REQUIRE(source.snapshot().project_revision == base_revision);
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::condition));
+    const auto blocked_strip = ui.snapshot().agent_task_strip;
+    REQUIRE(blocked_strip.has_value());
+    REQUIRE(blocked_strip->status == carto::agent::TaskStatus::blocked);
+    REQUIRE(blocked_strip->blocker.has_value());
+    REQUIRE(blocked_strip->total_steps == 1U);
+    REQUIRE(blocked_strip->passed_steps == 0U);
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::ai));
 
     auto revised_step = ui.snapshot().agent_plan_draft.front();
     revised_step.target.object = outside_scope;

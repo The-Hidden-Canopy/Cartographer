@@ -3178,7 +3178,28 @@ UiSnapshot UiController::snapshot() const {
         result.agent_checkpoint_rebase_revision = agent_plan_base_revision_.value_or(
             agent_checkpoint_pending_->source_revision);
     }
-    if (agent_task_.has_value()) result.agent_task = agent_task_->snapshot();
+    if (agent_task_.has_value()) {
+        const auto task = agent_task_->snapshot();
+        result.agent_task = task;
+        if (preferences_.workspace != Workspace::ai &&
+            task.status != agent::TaskStatus::accepted &&
+            task.status != agent::TaskStatus::rejected) {
+            AgentTaskStripView strip;
+            strip.task_id = task.task_id;
+            strip.status = task.status;
+            strip.total_steps = task.plan_steps.size();
+            strip.blocker = task.diagnostic;
+            for (const auto& step : task.plan_steps) {
+                if (step.status == agent::StepStatus::passed) ++strip.passed_steps;
+            }
+            for (const auto& gate : task.gates) {
+                if (!gate.required) continue;
+                ++strip.required_gates;
+                if (gate.passed) ++strip.passed_required_gates;
+            }
+            result.agent_task_strip = std::move(strip);
+        }
+    }
     result.market = market_view_;
     if (surface_fidelity_.has_value()) {
         result.surface_fidelity = *surface_fidelity_;
