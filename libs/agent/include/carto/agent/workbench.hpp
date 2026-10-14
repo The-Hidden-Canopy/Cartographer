@@ -519,6 +519,25 @@ private:
 
     friend class ::carto::ui::UiController;
 };
+
+// A reusable name for a redacted demonstration trace. It carries no target
+// bindings or authority; loading it remains inspection-only until a human
+// explicitly binds current targets and reviews a speculative task.
+struct AgentDemonstrationRecipe {
+    static constexpr std::uint32_t kFormatVersion = 1U;
+
+    std::string name;
+    AgentDemonstrationTrace trace;
+
+    [[nodiscard]] core::Result<void> validate() const;
+    [[nodiscard]] core::Result<std::string> serialize() const;
+    [[nodiscard]] static core::Result<AgentDemonstrationRecipe> deserialize(
+        std::string_view bytes);
+    [[nodiscard]] core::Result<void> save(const std::filesystem::path& path) const;
+    [[nodiscard]] static core::Result<AgentDemonstrationRecipe> load(
+        const std::filesystem::path& path);
+};
+
 // Immutable, checksummed workflow state. Human clarification answers are
 // deliberately removed from the persisted plan and must be reissued before a
 // resumed task can run. Project bytes remain artifacts owned by this record;

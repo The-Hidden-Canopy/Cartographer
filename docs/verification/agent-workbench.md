@@ -156,5 +156,7 @@ Multi-target demonstration tranche:
 - A source object cannot be reused across sets, and preview rejects hierarchy-expanded scope overlap.
 - Multi-set preview expands each trace into an independent ordered dependency chain in one DAG, keeps the 256-step plan cap, scales command, topology, and transform budgets across sets, and rejects missing bindings without opening a task.
 - A two-set preview covers six expanded steps, applies accepted transforms to both target sets, and leaves the source revision unchanged until acceptance. Changing set count during a task is rejected.
+- A demonstration recipe round-trips its bounded user-selected name and redacted trace, detects corruption, and rejects control characters in the name. It omits object-name canaries from the trace payload.
+- Recipe files are immutable. Opening a recipe leaves the project revision unchanged, creates no task, carries no target bindings, and cannot preview until current targets are explicitly rebound.
 
 Add failure injection for durable journal append rollback, additional unrelated and conflicting source edits during safe rebase, bounded repair exhaustion, semantic-sidecar size pressure, and provider timeouts as those tranches are implemented. Clarification questions and answers are reviewable evidence, not natural-language commands; the workbench compiles only a bounded set of explicit topology-preservation phrases and does not infer questions automatically.

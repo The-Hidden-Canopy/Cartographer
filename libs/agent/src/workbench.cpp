@@ -595,6 +595,83 @@ bool has_uncompiled_topology_change(
     return false;
 }
 
+core::Result<void> save_immutable_artifact(
+    const std::filesystem::path& path,
+    std::string_view bytes,
+    std::string_view label) {
+    if (path.empty() || path.filename().empty()) {
+        return core::Result<void>::failure(invalid(
+            std::string(label) + " destination must name a file"));
+    }
+    std::error_code error;
+    const auto destination_status = std::filesystem::symlink_status(path, error);
+    if (error == std::errc::no_such_file_or_directory) error.clear();
+    if (error) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::io_error,
+            "unable to inspect " + std::string(label) + " destination"));
+    }
+    if (std::filesystem::exists(destination_status)) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::io_error,
+            std::string(label) + " artifacts are immutable; choose a new destination path"));
+    }
+    const auto parent = path.parent_path();
+    if (!parent.empty()) {
+        const auto parent_status = std::filesystem::status(parent, error);
+        if (error || !std::filesystem::is_directory(parent_status)) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::io_error,
+                std::string(label) + " destination directory does not exist"));
+        }
+    }
+
+    auto lock_path = path;
+    lock_path += ".lock";
+    if (!std::filesystem::create_directory(lock_path, error)) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::io_error,
+            std::string(label) + " destination is already being written"));
+    }
+    struct LockCleanup final {
+        std::filesystem::path path;
+        ~LockCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove(path, ignored);
+        }
+    } lock_cleanup{lock_path};
+
+    auto temporary_path = path;
+    temporary_path += ".tmp-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    {
+        std::ofstream output(temporary_path, std::ios::binary | std::ios::out | std::ios::trunc);
+        if (!output) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::io_error,
+                "unable to create " + std::string(label) + " temporary file"));
+        }
+        output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        output.flush();
+        if (!output) {
+            output.close();
+            std::filesystem::remove(temporary_path, error);
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::io_error,
+                "unable to flush " + std::string(label) + " temporary file"));
+        }
+    }
+    std::filesystem::rename(temporary_path, path, error);
+    if (error) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary_path, ignored);
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::io_error,
+            "unable to publish immutable " + std::string(label)));
+    }
+    return core::Result<void>::success();
+}
+
 } // namespace
 
 core::Result<void> AgentDemonstrationParameters::validate(std::string_view tool_id) const {
@@ -2891,6 +2968,40 @@ core::Result<AgentDemonstrationTrace> AgentDemonstrationTrace::load(
             core::ErrorCode::io_error, "unable to read complete demonstration trace"));
     }
     return AgentDemonstrationTrace::deserialize(bytes);
+}
+
+core::Result<void> AgentDemonstrationRecipe::save(
+    const std::filesystem::path& path) const {
+    const auto encoded = serialize();
+    if (!encoded) return core::Result<void>::failure(encoded.error());
+    return save_immutable_artifact(path, encoded.value(), "demonstration recipe");
+}
+
+core::Result<AgentDemonstrationRecipe> AgentDemonstrationRecipe::load(
+    const std::filesystem::path& path) {
+    if (path.empty() || path.filename().empty()) {
+        return core::Result<AgentDemonstrationRecipe>::failure(invalid(
+            "demonstration recipe source must name a file"));
+    }
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error || size > 2U * 1024U * 1024U) {
+        return core::Result<AgentDemonstrationRecipe>::failure(core::Diagnostic(
+            core::ErrorCode::io_error,
+            "demonstration recipe is unavailable or exceeds its size bound"));
+    }
+    std::ifstream input(path, std::ios::binary | std::ios::in);
+    if (!input) {
+        return core::Result<AgentDemonstrationRecipe>::failure(core::Diagnostic(
+            core::ErrorCode::io_error, "unable to open demonstration recipe file"));
+    }
+    std::string bytes(static_cast<std::size_t>(size), '\0');
+    input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (static_cast<std::size_t>(input.gcount()) != bytes.size()) {
+        return core::Result<AgentDemonstrationRecipe>::failure(core::Diagnostic(
+            core::ErrorCode::io_error, "unable to read complete demonstration recipe"));
+    }
+    return AgentDemonstrationRecipe::deserialize(bytes);
 }
 
 core::Result<void> AgentTask::save_checkpoint(

@@ -969,6 +969,7 @@ enum class FileDialogKind {
     agent_checkpoint,
     agent_demonstration,
     agent_demonstration_trace,
+    agent_demonstration_recipe,
     engineering,
     engineering_authoring,
     condition,
@@ -1048,6 +1049,12 @@ enum class StandardMeshExport {
             L"Cartographer Agent Demonstration Trace (*.carto-agent-trace)\0"
             L"*.carto-agent-trace\0All Files\0*.*\0";
         dialog.lpstrDefExt = L"carto-agent-trace";
+        break;
+    case FileDialogKind::agent_demonstration_recipe:
+        dialog.lpstrFilter =
+            L"Cartographer Demonstration Recipe (*.carto-agent-recipe)\0"
+            L"*.carto-agent-recipe\0All Files\0*.*\0";
+        dialog.lpstrDefExt = L"carto-agent-recipe";
         break;
     case FileDialogKind::engineering:
         dialog.lpstrFilter =
@@ -7154,11 +7161,25 @@ struct DesktopState {
                         : loaded.error().message;
                 }
             }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Open demonstration recipe...")) {
+                const auto path = choose_file(false, FileDialogKind::agent_demonstration_recipe);
+                if (path.has_value()) {
+                    const auto loaded = ui.load_agent_demonstration_recipe(*path);
+                    agent_feedback = loaded
+                        ? "Named demonstration recipe opened read-only. Bind targets and review a speculative preview before acceptance."
+                        : loaded.error().message;
+                }
+            }
             if (snapshot.agent_demonstration_trace.has_value()) {
                 const auto& trace = *snapshot.agent_demonstration_trace;
                 ImGui::Text("Captured range · %zu steps · revision span +%llu",
                     trace.steps.size(),
                     static_cast<unsigned long long>(trace.result_revision_span));
+                if (!snapshot.agent_demonstration_recipe_name.empty()) {
+                    ImGui::Text("Recipe: %s",
+                        snapshot.agent_demonstration_recipe_name.c_str());
+                }
                 ImGui::TextDisabled(
                     "The file has aliases and typed deltas only. Preview needs explicit target bindings and runs on a speculative branch.");
                 const auto visible_steps = std::min<std::size_t>(trace.steps.size(), 16U);
@@ -7225,6 +7246,16 @@ struct DesktopState {
                         : preview.error().message;
                 }
                 ImGui::EndDisabled();
+                if (ImGui::SmallButton("Save as reusable recipe...")) {
+                    const auto path = choose_file(true, FileDialogKind::agent_demonstration_recipe);
+                    if (path.has_value()) {
+                        const auto saved = ui.save_agent_demonstration_recipe(*path);
+                        agent_feedback = saved
+                            ? "Named alias-only recipe saved immutably; it carries no target bindings or task authority."
+                            : saved.error().message;
+                    }
+                }
+                ImGui::SameLine();
                 if (ImGui::SmallButton("Save captured native trace...")) {
                     const auto path = choose_file(true, FileDialogKind::agent_demonstration_trace);
                     if (path.has_value()) {

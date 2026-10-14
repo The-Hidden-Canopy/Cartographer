@@ -2537,6 +2537,7 @@ core::Result<void> UiController::capture_agent_demonstration_trace(
         return core::Result<void>::failure(trace.error());
     }
     agent_demonstration_trace_.emplace(std::move(trace.value()));
+    agent_demonstration_recipe_name_.clear();
     agent_demonstration_bindings_.clear();
     agent_demonstration_binding_revision_.reset();
     agent_demonstration_target_set_count_ = 1U;
@@ -2937,6 +2938,41 @@ core::Result<void> UiController::load_agent_demonstration_trace(
         return core::Result<void>::failure(trace.error());
     }
     agent_demonstration_trace_.emplace(std::move(trace.value()));
+    agent_demonstration_recipe_name_.clear();
+    agent_demonstration_bindings_.clear();
+    agent_demonstration_binding_revision_.reset();
+    agent_demonstration_target_set_count_ = 1U;
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::save_agent_demonstration_recipe(
+    const std::filesystem::path& path) {
+    if (!agent_demonstration_trace_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "there is no captured native command range to save as a recipe"));
+    }
+    const auto utf8_name = path.stem().u8string();
+    std::string name;
+    name.reserve(utf8_name.size());
+    for (const char8_t character : utf8_name) {
+        name.push_back(static_cast<char>(character));
+    }
+    agent::AgentDemonstrationRecipe recipe{
+        std::move(name), *agent_demonstration_trace_};
+    auto saved = recipe.save(path);
+    if (saved) agent_demonstration_recipe_name_ = recipe.name;
+    return saved;
+}
+
+core::Result<void> UiController::load_agent_demonstration_recipe(
+    const std::filesystem::path& path) {
+    auto recipe = agent::AgentDemonstrationRecipe::load(path);
+    if (!recipe) {
+        record_ui_problem(recipe.error().with_context("agent demonstration recipe"));
+        return core::Result<void>::failure(recipe.error());
+    }
+    agent_demonstration_recipe_name_ = recipe.value().name;
+    agent_demonstration_trace_.emplace(std::move(recipe.value().trace));
     agent_demonstration_bindings_.clear();
     agent_demonstration_binding_revision_.reset();
     agent_demonstration_target_set_count_ = 1U;
@@ -2945,6 +2981,7 @@ core::Result<void> UiController::load_agent_demonstration_trace(
 
 core::Result<void> UiController::clear_agent_demonstration_trace() {
     agent_demonstration_trace_.reset();
+    agent_demonstration_recipe_name_.clear();
     agent_demonstration_bindings_.clear();
     agent_demonstration_binding_revision_.reset();
     agent_demonstration_target_set_count_ = 1U;
@@ -4519,6 +4556,7 @@ UiSnapshot UiController::snapshot() const {
     }
     result.agent_demonstration = agent_demonstration_;
     result.agent_demonstration_trace = agent_demonstration_trace_;
+    result.agent_demonstration_recipe_name = agent_demonstration_recipe_name_;
     result.agent_demonstration_target_set_count =
         agent_demonstration_target_set_count_;
     if (agent_demonstration_trace_.has_value()) {

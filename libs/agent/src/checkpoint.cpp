@@ -32,11 +32,14 @@ constexpr std::string_view kDemonstrationMagicV2 =
     "CARTOGRAPHER_AGENT_DEMONSTRATION_V2\n";
 constexpr std::string_view kDemonstrationTraceMagic =
     "CARTOGRAPHER_AGENT_DEMONSTRATION_TRACE_V1\n";
+constexpr std::string_view kDemonstrationRecipeMagic =
+    "CARTOGRAPHER_AGENT_DEMONSTRATION_RECIPE_V1\n";
 constexpr std::size_t kMaxDemonstrationBytes = 2U * 1024U * 1024U;
 constexpr std::size_t kMaxDemonstrationSteps = 4096U;
 constexpr std::size_t kMaxDemonstrationGates = 256U;
 constexpr std::size_t kMaxDemonstrationTraceBytes = 1U * 1024U * 1024U;
 constexpr std::size_t kMaxDemonstrationTraceSteps = 256U;
+constexpr std::size_t kMaxDemonstrationRecipeBytes = 2U * 1024U * 1024U;
 
 core::Diagnostic malformed(std::string message) {
     return core::Diagnostic(core::ErrorCode::validation_failed, std::move(message));
@@ -1617,5 +1620,78 @@ core::Result<AgentDemonstrationTrace> AgentDemonstrationTrace::deserialize(
         return core::Result<AgentDemonstrationTrace>::failure(result.error());
     }
     return core::Result<AgentDemonstrationTrace>::success(std::move(trace));
+}
+
+core::Result<void> AgentDemonstrationRecipe::validate() const {
+    if (!safe_demonstration_text(name, 128U)) {
+        return core::Result<void>::failure(malformed(
+            "demonstration recipe name is empty, contains controls, or exceeds its bound"));
+    }
+    return trace.validate();
+}
+
+core::Result<std::string> AgentDemonstrationRecipe::serialize() const {
+    if (auto result = validate(); !result) {
+        return core::Result<std::string>::failure(result.error());
+    }
+    const auto encoded_trace = trace.serialize();
+    if (!encoded_trace) {
+        return core::Result<std::string>::failure(encoded_trace.error());
+    }
+    Writer payload;
+    payload.number(kFormatVersion);
+    payload.field(name);
+    payload.field(encoded_trace.value());
+    const std::string body = std::move(payload).take();
+    Writer outer;
+    outer.field(body);
+    outer.digest(digest_text(body));
+    std::string result(kDemonstrationRecipeMagic);
+    result += std::move(outer).take();
+    if (result.size() > kMaxDemonstrationRecipeBytes) {
+        return core::Result<std::string>::failure(malformed(
+            "serialized demonstration recipe exceeds its size bound"));
+    }
+    return core::Result<std::string>::success(std::move(result));
+}
+
+core::Result<AgentDemonstrationRecipe> AgentDemonstrationRecipe::deserialize(
+    std::string_view bytes) {
+    if (bytes.size() > kMaxDemonstrationRecipeBytes ||
+        !bytes.starts_with(kDemonstrationRecipeMagic)) {
+        return core::Result<AgentDemonstrationRecipe>::failure(malformed(
+            "demonstration recipe header is unknown or file exceeds its size bound"));
+    }
+    Reader outer(bytes.substr(kDemonstrationRecipeMagic.size()));
+    const std::string body = outer.field(kMaxDemonstrationRecipeBytes);
+    const auto supplied_digest = outer.digest();
+    if (!outer.finished()) {
+        return core::Result<AgentDemonstrationRecipe>::failure(outer.error());
+    }
+    if (digest_text(body) != supplied_digest) {
+        return core::Result<AgentDemonstrationRecipe>::failure(malformed(
+            "demonstration recipe checksum does not match its contents"));
+    }
+    Reader reader(body);
+    if (reader.number() != kFormatVersion) {
+        return core::Result<AgentDemonstrationRecipe>::failure(core::Diagnostic(
+            core::ErrorCode::version_mismatch,
+            "agent demonstration recipe version is unsupported"));
+    }
+    AgentDemonstrationRecipe recipe;
+    recipe.name = reader.field(128U);
+    const std::string encoded_trace = reader.field(kMaxDemonstrationTraceBytes);
+    if (!reader.finished()) {
+        return core::Result<AgentDemonstrationRecipe>::failure(reader.error());
+    }
+    auto trace = AgentDemonstrationTrace::deserialize(encoded_trace);
+    if (!trace) {
+        return core::Result<AgentDemonstrationRecipe>::failure(trace.error());
+    }
+    recipe.trace = std::move(trace.value());
+    if (auto result = recipe.validate(); !result) {
+        return core::Result<AgentDemonstrationRecipe>::failure(result.error());
+    }
+    return core::Result<AgentDemonstrationRecipe>::success(std::move(recipe));
 }
 } // namespace carto::agent

@@ -454,6 +454,7 @@ struct UiSnapshot : application::ApplicationSnapshot {
     std::optional<agent::SceneQueryResult> agent_condition_inventory;
     std::optional<agent::AgentDemonstration> agent_demonstration;
     std::optional<agent::AgentDemonstrationTrace> agent_demonstration_trace;
+    std::string agent_demonstration_recipe_name;
     std::vector<AgentDemonstrationTargetBindingView> agent_demonstration_bindings;
     std::size_t agent_demonstration_target_set_count = 1U;
     bool agent_demonstration_ready_to_preview = false;
@@ -559,6 +560,10 @@ public:
     [[nodiscard]] core::Result<void> save_agent_demonstration_trace(
         const std::filesystem::path& path) const;
     [[nodiscard]] core::Result<void> load_agent_demonstration_trace(
+        const std::filesystem::path& path);
+    [[nodiscard]] core::Result<void> save_agent_demonstration_recipe(
+        const std::filesystem::path& path);
+    [[nodiscard]] core::Result<void> load_agent_demonstration_recipe(
         const std::filesystem::path& path);
     [[nodiscard]] core::Result<void> clear_agent_demonstration_trace();
     [[nodiscard]] core::Result<void> rebase_agent_checkpoint();
@@ -734,6 +739,7 @@ private:
     std::optional<core::Revision> agent_condition_inventory_query_revision_;
     std::optional<agent::AgentDemonstration> agent_demonstration_;
     std::optional<agent::AgentDemonstrationTrace> agent_demonstration_trace_;
+    std::string agent_demonstration_recipe_name_;
     std::vector<AgentDemonstrationTargetBinding> agent_demonstration_bindings_;
     std::optional<core::Revision> agent_demonstration_binding_revision_;
     std::size_t agent_demonstration_target_set_count_ = 1U;

@@ -790,6 +790,24 @@ void human_native_command_range_captures_alias_only_trace() {
     REQUIRE(decoded.value().steps[1].target_alias == 2U);
     REQUIRE(decoded.value().steps.back().target_alias == 1U);
 
+    carto::agent::AgentDemonstrationRecipe recipe{
+        "Manual room finish", *captured.agent_demonstration_trace};
+    const auto encoded_recipe = recipe.serialize();
+    REQUIRE(encoded_recipe);
+    REQUIRE(encoded_recipe.value().find("CANARY_MANUAL_TRACE_ALPHA") == std::string::npos);
+    REQUIRE(encoded_recipe.value().find("CANARY_MANUAL_TRACE_BETA") == std::string::npos);
+    const auto decoded_recipe =
+        carto::agent::AgentDemonstrationRecipe::deserialize(encoded_recipe.value());
+    REQUIRE(decoded_recipe);
+    REQUIRE(decoded_recipe.value().name == "Manual room finish");
+    REQUIRE(decoded_recipe.value().trace.steps.size() == 3U);
+    auto invalid_recipe_name = recipe;
+    invalid_recipe_name.name = "invalid\nrecipe";
+    REQUIRE(!invalid_recipe_name.serialize());
+    std::string corrupted_recipe = encoded_recipe.value();
+    corrupted_recipe.back() = corrupted_recipe.back() == '1' ? '2' : '1';
+    REQUIRE(!carto::agent::AgentDemonstrationRecipe::deserialize(corrupted_recipe));
+
     auto invalid_parameters = decoded.value();
     invalid_parameters.steps.front().parameters.normalized_distance =
         std::numeric_limits<double>::infinity();
@@ -801,6 +819,25 @@ void human_native_command_range_captures_alias_only_trace() {
     const auto path = directory.path() / "manual-range.carto-agent-trace";
     REQUIRE(ui.save_agent_demonstration_trace(path));
     REQUIRE(!ui.save_agent_demonstration_trace(path));
+    const auto recipe_path = directory.path() / "manual-range.carto-agent-recipe";
+    REQUIRE(ui.save_agent_demonstration_recipe(recipe_path));
+    REQUIRE(!ui.save_agent_demonstration_recipe(recipe_path));
+    REQUIRE(ui.snapshot().agent_demonstration_recipe_name == "manual-range");
+    const auto saved_recipe = carto::agent::AgentDemonstrationRecipe::load(recipe_path);
+    REQUIRE(saved_recipe);
+    REQUIRE(saved_recipe.value().name == "manual-range");
+    REQUIRE(saved_recipe.value().trace.steps.size() == 3U);
+    carto::application::ApplicationSession recipe_viewer_source;
+    carto::ui::UiController recipe_viewer(recipe_viewer_source);
+    const auto recipe_viewer_revision = recipe_viewer_source.snapshot().project_revision;
+    REQUIRE(recipe_viewer.load_agent_demonstration_recipe(recipe_path));
+    const auto loaded_recipe = recipe_viewer.snapshot();
+    REQUIRE(loaded_recipe.agent_demonstration_recipe_name == "manual-range");
+    REQUIRE(loaded_recipe.agent_demonstration_trace->steps.size() == 3U);
+    REQUIRE(!loaded_recipe.agent_demonstration_ready_to_preview);
+    REQUIRE(!recipe_viewer.preview_agent_demonstration_trace());
+    REQUIRE(!recipe_viewer.snapshot().agent_task.has_value());
+    REQUIRE(recipe_viewer_source.snapshot().project_revision == recipe_viewer_revision);
     carto::application::ApplicationSession viewer_source;
     carto::ui::UiController viewer(viewer_source);
     const auto viewer_revision = viewer_source.snapshot().project_revision;
