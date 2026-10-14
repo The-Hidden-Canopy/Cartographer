@@ -35,6 +35,7 @@ class UiController;
 
 namespace carto::agent {
 class AgentTask;
+struct AuthoringObjective;
 }
 
 namespace carto::application {
@@ -542,6 +543,11 @@ public:
         editor::AuthoringPreview& preview);
     [[nodiscard]] static core::Result<DispatchReceipt> accept_agent_task(
         ::carto::agent::AgentTask& task);
+    [[nodiscard]] static core::Result<void> answer_agent_clarification(
+        ::carto::agent::AuthoringObjective& objective,
+        std::string_view question_id,
+        std::optional<std::string> candidate_id,
+        std::optional<std::string> freeform_answer);
 
 private:
     friend class ::carto::ui::UiController;
@@ -676,6 +682,7 @@ private:
         const project::ProjectDocument& candidate,
         core::Revision expected_revision,
         std::string_view task_id,
+        std::string_view objective_digest,
         std::string_view diff_digest);
     struct SpeculativeCopyTag final {};
     ApplicationSession(const ApplicationSession& source, SpeculativeCopyTag);

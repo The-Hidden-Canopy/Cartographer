@@ -464,11 +464,13 @@ core::Result<DispatchReceipt> ApplicationSession::accept_speculative_result(
     const project::ProjectDocument& candidate,
     core::Revision expected_revision,
     std::string_view task_id,
+    std::string_view objective_digest,
     std::string_view diff_digest) {
+    const auto parsed_objective_digest = assets::Sha256Digest::from_hex(objective_digest);
     const auto parsed_digest = assets::Sha256Digest::from_hex(diff_digest);
     if (active_source_ != OperationSource::human || task_id.empty() ||
         task_id.size() > 64U || task_id.find_first_of("\r\n") != std::string_view::npos ||
-        !parsed_digest) {
+        !parsed_objective_digest || !parsed_digest) {
         return core::Result<DispatchReceipt>::failure(invalid_state(
             "speculative result acceptance requires a valid human task boundary"));
     }
@@ -494,7 +496,8 @@ core::Result<DispatchReceipt> ApplicationSession::accept_speculative_result(
     active_source_ = OperationSource::ai_proposal;
     active_provenance_id_ = std::string(task_id);
     const std::string operation = "Accept Agent Speculative Result " +
-        std::string(task_id) + " diff=" + std::string(diff_digest);
+        std::string(task_id) + " objective=" + std::string(objective_digest) +
+        " diff=" + std::string(diff_digest);
     auto result = execute_command(
         std::make_unique<editor::ReplaceProjectDocumentCommand>(
             admission, document_, candidate),

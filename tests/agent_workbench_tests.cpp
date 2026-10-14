@@ -59,7 +59,7 @@ carto::agent::AgentPlan plan_for(
         "agent-task-test",
         carto::agent::AuthoringObjective{
             "objective-test", "Prepare the selected faces", snapshot.project_revision,
-            std::move(scope), std::move(protected_objects)},
+            std::move(scope), std::move(protected_objects), {}, {}},
         std::move(steps)};
 }
 
@@ -105,6 +105,8 @@ void multi_step_branch_isolated_until_reviewed_acceptance() {
     REQUIRE(accepted);
     REQUIRE(accepted.value().source == carto::application::OperationSource::ai_proposal);
     REQUIRE(accepted.value().provenance_id == "agent-task-test");
+    REQUIRE(accepted.value().action.find(
+        "objective=" + task.value().snapshot().objective_digest.hex()) != std::string::npos);
     REQUIRE(accepted.value().action.find("diff=" + task.value().snapshot().diff.digest.hex()) !=
             std::string::npos);
     const auto after = source.snapshot();
@@ -336,6 +338,124 @@ void missing_goal_and_source_change_after_run_fail_closed() {
             moved.translation.x);
 }
 
+void clarification_frontier_blocks_consequential_ambiguity_and_binds_answers() {
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 2U);
+    auto plan = plan_for(source.snapshot(), objects, {
+        {"step-1", {objects[0], carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    plan.objective.hard_constraints.push_back({
+        "preserve-entry", carto::agent::ObjectiveConstraintKind::preserve_transform,
+        objects[1], 0.0, "Keep the north entry transform fixed."});
+    plan.objective.clarifications.push_back({
+        "choose-exterior-wall",
+        "Which exterior wall should change?",
+        "The two choices affect separate room boundaries.",
+        {carto::agent::ClarificationImpact::object_scope,
+         carto::agent::ClarificationImpact::topology_deletion},
+        objects,
+        {"preserve-entry"},
+        2U,
+        {{"east", "East guest-room wall", {objects[0]}},
+         {"north", "North entry wall", {objects[1]}}},
+        std::nullopt,
+        std::nullopt,
+        std::nullopt});
+
+    auto frontier = plan.objective.clarification_frontier();
+    REQUIRE(frontier);
+    REQUIRE(frontier.value().questions.size() == 1U);
+    REQUIRE(frontier.value().questions.front().impact_score == 55U);
+    REQUIRE(frontier.value().requires_user_input());
+    const auto before_revision = source.snapshot().project_revision;
+    auto blocked = carto::agent::AgentTask::begin(
+        source, plan, envelope_for(objects));
+    REQUIRE(!blocked);
+    REQUIRE(blocked.error().message.find("choose-exterior-wall") != std::string::npos);
+    REQUIRE(source.snapshot().project_revision == before_revision);
+
+    REQUIRE(!carto::application::HumanApplicationAccess::answer_agent_clarification(
+        plan.objective, "choose-exterior-wall", std::string("missing"), std::nullopt));
+    plan.objective.clarifications.front().selected_candidate_id = "east";
+    REQUIRE(!plan.objective.validate());
+    plan.objective.clarifications.front().selected_candidate_id.reset();
+    REQUIRE(carto::application::HumanApplicationAccess::answer_agent_clarification(
+        plan.objective, "choose-exterior-wall", std::string("east"), std::nullopt));
+    frontier = plan.objective.clarification_frontier();
+    REQUIRE(frontier);
+    REQUIRE(frontier.value().questions.empty());
+    REQUIRE(!frontier.value().requires_user_input());
+    const auto objective_digest = plan.objective.digest();
+    REQUIRE(objective_digest);
+    auto altered_answer_context = plan.objective;
+    altered_answer_context.clarifications.front().prompt = "A different question?";
+    REQUIRE(!altered_answer_context.validate());
+    auto reordered = plan.objective;
+    std::reverse(reordered.scope_objects.begin(), reordered.scope_objects.end());
+    REQUIRE(reordered.digest().value() == objective_digest.value());
+
+    auto contradictory = plan;
+    contradictory.steps.front().target.object = objects[1];
+    REQUIRE(!contradictory.validate());
+    auto accepted_choice = carto::agent::AgentTask::begin(
+        source, std::move(plan), envelope_for(objects));
+    REQUIRE(accepted_choice);
+    const auto run = accepted_choice.value().run();
+    REQUIRE(run);
+    REQUIRE(run.value().status == carto::agent::TaskStatus::review);
+    const auto transform_gate = std::find_if(run.value().gates.begin(), run.value().gates.end(),
+        [](const auto& gate) { return gate.id == "constraint.preserve-entry"; });
+    REQUIRE(transform_gate != run.value().gates.end());
+    REQUIRE(transform_gate->passed);
+}
+
+void objective_hard_constraints_block_topology_and_excess_displacement() {
+    carto::application::ApplicationSession topology_source;
+    const auto topology_objects = create_boxes(topology_source, 1U);
+    auto topology_plan = plan_for(topology_source.snapshot(), topology_objects, {
+        {"step-1", {topology_objects[0], carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    topology_plan.objective.hard_constraints.push_back({
+        "preserve-topology", carto::agent::ObjectiveConstraintKind::preserve_topology,
+        std::nullopt, 0.0, "Do not change component connectivity."});
+    const auto topology_revision = topology_source.snapshot().project_revision;
+    auto topology_task = carto::agent::AgentTask::begin(
+        topology_source, std::move(topology_plan), envelope_for(topology_objects));
+    REQUIRE(topology_task);
+    const auto topology_run = topology_task.value().run();
+    REQUIRE(topology_run);
+    REQUIRE(topology_run.value().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(topology_run.value().diagnostic->message.find("preserve-topology") !=
+        std::string::npos);
+    REQUIRE(topology_source.snapshot().project_revision == topology_revision);
+
+    carto::application::ApplicationSession displacement_source;
+    const auto displacement_objects = create_boxes(displacement_source, 1U);
+    const auto vertex = displacement_source.snapshot().viewport.scene.instances().front().mesh->
+        vertex_ids.front();
+    auto displacement_plan = plan_for(displacement_source.snapshot(), displacement_objects, {
+        {"step-1", {displacement_objects[0], vertex}, "move vertex to 4 0 0"},
+    });
+    displacement_plan.objective.hard_constraints.push_back({
+        "vertex-delta", carto::agent::ObjectiveConstraintKind::maximum_vertex_displacement,
+        displacement_objects[0], 0.5, "Keep vertex movement below half a world unit."});
+    const auto displacement_revision = displacement_source.snapshot().project_revision;
+    auto displacement_task = carto::agent::AgentTask::begin(
+        displacement_source, std::move(displacement_plan), envelope_for(displacement_objects));
+    REQUIRE(displacement_task);
+    const auto displacement_run = displacement_task.value().run();
+    REQUIRE(displacement_run);
+    REQUIRE(displacement_run.value().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(!displacement_run.value().can_accept);
+    const auto displacement_gate = std::find_if(
+        displacement_run.value().gates.begin(), displacement_run.value().gates.end(),
+        [](const auto& gate) { return gate.id == "constraint.vertex-delta"; });
+    REQUIRE(displacement_gate != displacement_run.value().gates.end());
+    REQUIRE(!displacement_gate->passed);
+    REQUIRE(displacement_gate->evidence.find("0.500000") != std::string::npos);
+    REQUIRE(displacement_source.snapshot().project_revision == displacement_revision);
+}
+
 void ui_workbench_captures_selection_and_exposes_accept_reject_flow() {
     carto::application::ApplicationSession source;
     carto::ui::UiController ui(source);
@@ -372,6 +492,8 @@ int main() {
         scope_protection_and_stale_revision_fail_closed();
         failed_native_step_and_invalid_task_transitions_do_not_commit();
         missing_goal_and_source_change_after_run_fail_closed();
+        clarification_frontier_blocks_consequential_ambiguity_and_binds_answers();
+        objective_hard_constraints_block_topology_and_excess_displacement();
         ui_workbench_captures_selection_and_exposes_accept_reject_flow();
         std::cout << "Cartographer agent workbench invariants passed\n";
         return 0;

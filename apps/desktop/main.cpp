@@ -4552,6 +4552,10 @@ struct DesktopState {
             ImGui::Text("Task %s · %s", task.task_id.c_str(),
                         carto::agent::task_status_name(task.status));
             ImGui::TextWrapped("%s", task.goal.c_str());
+            const std::string objective_digest = task.objective_digest.hex();
+            ImGui::TextDisabled("Objective %.12s · based on R%llu",
+                objective_digest.c_str(),
+                static_cast<unsigned long long>(task.base_revision.value()));
             if (ImGui::SmallButton("Show source")) agent_preview_mode = 0;
             ImGui::SameLine();
             if (ImGui::SmallButton("Show before")) agent_preview_mode = 1;

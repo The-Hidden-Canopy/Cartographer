@@ -38,6 +38,14 @@
 - Geometry-only envelopes expose vertex positioning while excluding topology-changing previews; unsupported registered tools never appear in the planner projection.
 - The projected context contains no command callback, project document, or direct mutation handle.
 
+## Objective and clarification coverage
+
+- Constraint and question identities are unique, all referenced objects and constraints are in scope, and malformed bounds or candidate answers are rejected.
+- A consequential unresolved question blocks task creation without creating or mutating a speculative branch; only the explicit human application boundary can issue an answer receipt, and a selected candidate cannot contradict queued targets.
+- Reordering identity lists does not change the canonical objective digest, while changing an answer or hard constraint does.
+- Topology-preservation constraints reject a topology capability before speculative execution, and displacement gates block an over-limit result.
+- Acceptance journal evidence records both the objective digest and the result diff digest.
+
 ## Follow-up coverage
 
-Add failure injection for durable journal append rollback, saved/reopened task state, unrelated and conflicting source edits, bounded repair exhaustion, semantic-sidecar size pressure, and provider timeouts as those tranches are implemented. Do not report task persistence, automatic rebase, model planning, or viewport ghosting as supported by this slice.
+Add failure injection for durable journal append rollback, saved/reopened task state, unrelated and conflicting source edits, bounded repair exhaustion, semantic-sidecar size pressure, and provider timeouts as those tranches are implemented. The current clarification frontier is deterministic input ranking; it does not compile free-form goals or provide an interactive answer panel.

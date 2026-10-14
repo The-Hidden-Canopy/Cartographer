@@ -46,7 +46,8 @@ carto::agent::AgentTask begin_task(
     envelope.max_objects_touched = std::max<std::size_t>(scope.size(), 1U);
     carto::agent::AgentPlan plan{
         "scene-query-task",
-        {"scene-query-objective", "Find an authored target", snapshot.project_revision, scope, {}},
+        {"scene-query-objective", "Find an authored target", snapshot.project_revision,
+         scope, {}, {}, {}},
         {{"planned-edit", {scope.front(), carto::geometry::FaceId{1U}}, "inset face 0.1"}}};
     auto task = carto::agent::AgentTask::begin(session, std::move(plan), std::move(envelope));
     REQUIRE(task);

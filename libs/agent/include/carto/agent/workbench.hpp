@@ -14,6 +14,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -32,14 +33,114 @@ struct TargetRef {
     [[nodiscard]] core::Result<void> validate() const;
 };
 
+enum class ObjectiveConstraintKind : std::uint8_t {
+    preserve_topology,
+    preserve_transform,
+    maximum_vertex_displacement,
+};
+
+struct HardConstraint {
+    std::string id;
+    ObjectiveConstraintKind kind = ObjectiveConstraintKind::preserve_topology;
+    std::optional<scene::ObjectId> object;
+    double maximum_displacement = 0.0;
+    std::string rationale;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+enum class ClarificationImpact : std::uint8_t {
+    object_scope,
+    topology_deletion,
+    familiarity_critical_feature,
+    collision_or_navigation,
+    interaction_anchor,
+    source_hierarchy,
+    large_spatial_transform,
+    imported_source_integrity,
+    publication_readiness,
+};
+
+// A plan may carry an answer only after the explicit human application
+// boundary issued a receipt for this exact objective question and answer.
+class HumanClarificationReceipt final {
+public:
+    HumanClarificationReceipt(const HumanClarificationReceipt&) = default;
+    HumanClarificationReceipt& operator=(const HumanClarificationReceipt&) = default;
+    HumanClarificationReceipt(HumanClarificationReceipt&&) noexcept = default;
+    HumanClarificationReceipt& operator=(HumanClarificationReceipt&&) noexcept = default;
+
+private:
+    HumanClarificationReceipt(
+        std::string question_id,
+        assets::Sha256Digest context_digest,
+        assets::Sha256Digest answer_digest)
+        : question_id_(std::move(question_id)),
+          context_digest_(context_digest),
+          answer_digest_(answer_digest) {}
+
+    std::string question_id_;
+    assets::Sha256Digest context_digest_;
+    assets::Sha256Digest answer_digest_;
+
+    friend class ::carto::application::HumanApplicationAccess;
+    friend struct ClarificationQuestion;
+    friend struct AuthoringObjective;
+};
+
+struct ClarificationCandidate {
+    std::string id;
+    std::string label;
+    std::vector<scene::ObjectId> affected_objects;
+};
+
+struct ClarificationQuestion {
+    std::string id;
+    std::string prompt;
+    std::string rationale;
+    std::vector<ClarificationImpact> impacts;
+    std::vector<scene::ObjectId> affected_objects;
+    std::vector<std::string> affected_constraint_ids;
+    std::size_t downstream_plan_branches = 0U;
+    std::vector<ClarificationCandidate> candidates;
+    std::optional<std::string> selected_candidate_id;
+    std::optional<std::string> freeform_answer;
+    std::optional<HumanClarificationReceipt> human_receipt;
+
+    [[nodiscard]] core::Result<void> validate(
+        const std::vector<scene::ObjectId>& scope,
+        const std::vector<HardConstraint>& constraints) const;
+};
+
+struct RankedClarification {
+    ClarificationQuestion question;
+    std::uint32_t impact_score = 0U;
+};
+
+struct ClarificationFrontier {
+    std::uint32_t threshold = 40U;
+    std::vector<RankedClarification> questions;
+
+    [[nodiscard]] bool requires_user_input() const noexcept;
+};
+
 struct AuthoringObjective {
     std::string id;
     std::string goal;
     core::Revision base_revision;
     std::vector<scene::ObjectId> scope_objects;
     std::vector<scene::ObjectId> protected_objects;
+    std::vector<HardConstraint> hard_constraints;
+    std::vector<ClarificationQuestion> clarifications;
 
     [[nodiscard]] core::Result<void> validate() const;
+    [[nodiscard]] core::Result<assets::Sha256Digest> digest() const;
+    [[nodiscard]] core::Result<assets::Sha256Digest> clarification_context_digest(
+        std::string_view question_id) const;
+    [[nodiscard]] core::Result<assets::Sha256Digest> clarification_answer_digest(
+        std::string_view question_id) const;
+    [[nodiscard]] core::Result<ClarificationFrontier> clarification_frontier(
+        std::uint32_t threshold = 40U) const;
 };
 
 struct AgentPlanStep {
@@ -167,6 +268,7 @@ struct AgentTaskSnapshot {
     TaskStatus status = TaskStatus::prepared;
     std::string task_id;
     std::string goal;
+    assets::Sha256Digest objective_digest;
     core::Revision base_revision;
     core::Revision speculative_revision;
     std::vector<StepReceipt> steps;

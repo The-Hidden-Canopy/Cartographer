@@ -4,6 +4,7 @@
 #include <array>
 #include <charconv>
 #include <cmath>
+#include <limits>
 #include <set>
 #include <span>
 #include <string_view>
@@ -67,6 +68,127 @@ bool contains(const std::vector<scene::ObjectId>& objects, scene::ObjectId objec
     return std::find(objects.begin(), objects.end(), object) != objects.end();
 }
 
+std::uint32_t clarification_impact_weight(ClarificationImpact impact) noexcept {
+    switch (impact) {
+    case ClarificationImpact::object_scope: return 25U;
+    case ClarificationImpact::topology_deletion: return 20U;
+    case ClarificationImpact::familiarity_critical_feature: return 25U;
+    case ClarificationImpact::collision_or_navigation: return 15U;
+    case ClarificationImpact::interaction_anchor: return 12U;
+    case ClarificationImpact::source_hierarchy: return 15U;
+    case ClarificationImpact::large_spatial_transform: return 10U;
+    case ClarificationImpact::imported_source_integrity: return 20U;
+    case ClarificationImpact::publication_readiness: return 8U;
+    }
+    return 0U;
+}
+
+void append_field(std::string& output, std::string_view value) {
+    output += std::to_string(value.size());
+    output.push_back(':');
+    output.append(value);
+    output.push_back('|');
+}
+
+void append_number(std::string& output, std::uint64_t value) {
+    append_field(output, std::to_string(value));
+}
+
+void append_double(std::string& output, double value) {
+    char buffer[64]{};
+    const auto converted = std::to_chars(
+        buffer, buffer + sizeof(buffer), value, std::chars_format::general,
+        std::numeric_limits<double>::max_digits10);
+    if (converted.ec == std::errc{}) {
+        append_field(output, std::string_view(buffer,
+            static_cast<std::size_t>(converted.ptr - buffer)));
+    }
+}
+
+void append_object_ids(std::string& output, std::vector<scene::ObjectId> ids) {
+    std::sort(ids.begin(), ids.end());
+    append_number(output, ids.size());
+    for (const auto id : ids) append_number(output, id.value);
+}
+
+assets::Sha256Digest digest_text(std::string_view value) {
+    return assets::sha256(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
+}
+
+assets::Sha256Digest clarification_context_digest(
+    const AuthoringObjective& objective) {
+    std::string canonical = "cartographer.clarification-context.v1|";
+    append_field(canonical, objective.id);
+    append_field(canonical, objective.goal);
+    append_number(canonical, objective.base_revision.value());
+    append_object_ids(canonical, objective.scope_objects);
+    append_object_ids(canonical, objective.protected_objects);
+    auto constraints = objective.hard_constraints;
+    std::sort(constraints.begin(), constraints.end(), [](const auto& left, const auto& right) {
+        return left.id < right.id;
+    });
+    append_number(canonical, constraints.size());
+    for (const auto& constraint : constraints) {
+        append_field(canonical, constraint.id);
+        append_number(canonical, static_cast<std::uint64_t>(constraint.kind));
+        append_number(canonical, constraint.object.has_value() ? 1U : 0U);
+        if (constraint.object.has_value()) append_number(canonical, constraint.object->value);
+        append_double(canonical, constraint.maximum_displacement);
+        append_field(canonical, constraint.rationale);
+    }
+    auto questions = objective.clarifications;
+    std::sort(questions.begin(), questions.end(), [](const auto& left, const auto& right) {
+        return left.id < right.id;
+    });
+    append_number(canonical, questions.size());
+    for (const auto& context_question : questions) {
+        append_field(canonical, context_question.id);
+        append_field(canonical, context_question.prompt);
+        append_field(canonical, context_question.rationale);
+        auto impacts = context_question.impacts;
+        std::sort(impacts.begin(), impacts.end());
+        append_number(canonical, impacts.size());
+        for (const auto impact : impacts) {
+            append_number(canonical, static_cast<std::uint64_t>(impact));
+        }
+        append_object_ids(canonical, context_question.affected_objects);
+        auto constraint_ids = context_question.affected_constraint_ids;
+        std::sort(constraint_ids.begin(), constraint_ids.end());
+        append_number(canonical, constraint_ids.size());
+        for (const auto& id : constraint_ids) append_field(canonical, id);
+        append_number(canonical, context_question.downstream_plan_branches);
+        auto candidates = context_question.candidates;
+        std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
+            return left.id < right.id;
+        });
+        append_number(canonical, candidates.size());
+        for (const auto& candidate : candidates) {
+            append_field(canonical, candidate.id);
+            append_field(canonical, candidate.label);
+            append_object_ids(canonical, candidate.affected_objects);
+        }
+    }
+    return digest_text(canonical);
+}
+
+assets::Sha256Digest clarification_answer_digest(const ClarificationQuestion& question) {
+    std::string canonical = "cartographer.clarification-answer.v1|";
+    append_field(canonical, question.id);
+    append_number(canonical, question.selected_candidate_id.has_value() ? 1U : 0U);
+    if (question.selected_candidate_id.has_value()) {
+        append_field(canonical, *question.selected_candidate_id);
+    }
+    append_number(canonical, question.freeform_answer.has_value() ? 1U : 0U);
+    if (question.freeform_answer.has_value()) append_field(canonical, *question.freeform_answer);
+    return digest_text(canonical);
+}
+
+core::Vec3d transform_point(const core::Transform& transform, core::Vec3d point) noexcept {
+    return transform.translation + transform.rotation.rotate(
+        core::componentwise_multiply(transform.scale, point));
+}
+
 bool same_transform(const core::Transform& left, const core::Transform& right) noexcept {
     return left.translation.x == right.translation.x &&
         left.translation.y == right.translation.y &&
@@ -113,6 +235,112 @@ core::Result<void> TargetRef::validate() const {
     return core::Result<void>::success();
 }
 
+core::Result<void> HardConstraint::validate() const {
+    if (!safe_text(id, kMaxStepIdBytes) || !safe_text(rationale, 512U) ||
+        (object.has_value() && !*object)) {
+        return core::Result<void>::failure(invalid("objective hard constraint is invalid"));
+    }
+    switch (kind) {
+    case ObjectiveConstraintKind::preserve_topology:
+        if (maximum_displacement != 0.0) {
+            return core::Result<void>::failure(invalid(
+                "topology-preservation constraint cannot declare a displacement bound"));
+        }
+        break;
+    case ObjectiveConstraintKind::preserve_transform:
+        if (!object.has_value() || maximum_displacement != 0.0) {
+            return core::Result<void>::failure(invalid(
+                "transform-preservation constraint requires one object and no numeric bound"));
+        }
+        break;
+    case ObjectiveConstraintKind::maximum_vertex_displacement:
+        if (!object.has_value() || !std::isfinite(maximum_displacement) ||
+            maximum_displacement <= 0.0) {
+            return core::Result<void>::failure(invalid(
+                "vertex-displacement constraint requires one object and a finite positive bound"));
+        }
+        break;
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> ClarificationQuestion::validate(
+    const std::vector<scene::ObjectId>& scope,
+    const std::vector<HardConstraint>& constraints) const {
+    if (!safe_text(id, kMaxStepIdBytes) || !safe_text(prompt, 512U) ||
+        !safe_text(rationale, 512U) || impacts.empty() || impacts.size() > 9U ||
+        affected_objects.size() > kMaxScopeObjects ||
+        affected_constraint_ids.size() > 128U || downstream_plan_branches > kMaxPlanSteps ||
+        candidates.size() > 16U) {
+        return core::Result<void>::failure(invalid("clarification question is invalid"));
+    }
+    std::set<ClarificationImpact> unique_impacts;
+    for (const auto impact : impacts) {
+        if (clarification_impact_weight(impact) == 0U || !unique_impacts.insert(impact).second) {
+            return core::Result<void>::failure(invalid(
+                "clarification question contains an unknown or duplicate impact"));
+        }
+    }
+    const auto validate_scoped_ids = [&scope](
+        const std::vector<scene::ObjectId>& objects, std::string_view label) {
+        if (auto result = validate_object_ids(objects, label, true); !result) return result;
+        for (const auto object_id : objects) {
+            if (!contains(scope, object_id)) {
+                return core::Result<void>::failure(policy(
+                    std::string(label) + " contains an object outside the objective scope"));
+            }
+        }
+        return core::Result<void>::success();
+    };
+    if (auto result = validate_scoped_ids(affected_objects, "clarification affected objects");
+        !result) return result;
+
+    std::set<std::string> known_constraints;
+    for (const auto& constraint : constraints) known_constraints.insert(constraint.id);
+    std::set<std::string> unique_constraint_ids;
+    for (const auto& constraint_id : affected_constraint_ids) {
+        if (!safe_text(constraint_id, kMaxStepIdBytes) ||
+            !unique_constraint_ids.insert(constraint_id).second ||
+            !known_constraints.contains(constraint_id)) {
+            return core::Result<void>::failure(invalid(
+                "clarification question references an unknown or duplicate constraint"));
+        }
+    }
+
+    std::set<std::string> candidate_ids;
+    for (const auto& candidate : candidates) {
+        if (!safe_text(candidate.id, kMaxStepIdBytes) || !safe_text(candidate.label, 256U) ||
+            !candidate_ids.insert(candidate.id).second) {
+            return core::Result<void>::failure(invalid(
+                "clarification candidate identity or label is invalid"));
+        }
+        if (auto result = validate_scoped_ids(
+                candidate.affected_objects, "clarification candidate objects"); !result) {
+            return result;
+        }
+    }
+    if (selected_candidate_id.has_value() &&
+        (!candidate_ids.contains(*selected_candidate_id) || freeform_answer.has_value())) {
+        return core::Result<void>::failure(invalid(
+            "clarification answer does not match one candidate choice"));
+    }
+    if (freeform_answer.has_value() && !safe_text(*freeform_answer, 1024U)) {
+        return core::Result<void>::failure(invalid("clarification answer is invalid"));
+    }
+    if ((selected_candidate_id.has_value() || freeform_answer.has_value()) !=
+        human_receipt.has_value()) {
+        return core::Result<void>::failure(invalid(
+            "clarification answers require a receipt from the human application boundary"));
+    }
+    return core::Result<void>::success();
+}
+
+bool ClarificationFrontier::requires_user_input() const noexcept {
+    return std::any_of(questions.begin(), questions.end(), [this](const auto& question) {
+        return question.impact_score >= threshold;
+    });
+}
+
 core::Result<void> AuthoringObjective::validate() const {
     if (!safe_text(id, kMaxTaskIdBytes) || !safe_text(goal, kMaxGoalBytes)) {
         return core::Result<void>::failure(invalid("objective identity or goal is invalid"));
@@ -132,7 +360,169 @@ core::Result<void> AuthoringObjective::validate() const {
                 "protected objects must be inside the declared objective scope"));
         }
     }
+    if (hard_constraints.size() > 128U || clarifications.size() > 128U) {
+        return core::Result<void>::failure(invalid(
+            "objective constraint or clarification count exceeds its limit"));
+    }
+    std::set<std::string> constraint_ids;
+    for (const auto& constraint : hard_constraints) {
+        if (auto result = constraint.validate(); !result) return result;
+        if (!constraint_ids.insert(constraint.id).second ||
+            (constraint.object.has_value() && !contains(scope_objects, *constraint.object))) {
+            return core::Result<void>::failure(invalid(
+                "objective constraints contain duplicate identity or an out-of-scope target"));
+        }
+    }
+    std::set<std::string> clarification_ids;
+    for (const auto& question : clarifications) {
+        if (auto result = question.validate(scope_objects, hard_constraints); !result) return result;
+        if (!clarification_ids.insert(question.id).second) {
+            return core::Result<void>::failure(invalid(
+                "objective contains duplicate clarification identity"));
+        }
+        if (question.human_receipt.has_value()) {
+            const auto& receipt = *question.human_receipt;
+            if (receipt.question_id_ != question.id ||
+                receipt.context_digest_ != ::carto::agent::clarification_context_digest(
+                    *this) ||
+                receipt.answer_digest_ != ::carto::agent::clarification_answer_digest(question)) {
+                return core::Result<void>::failure(stale(
+                    "human clarification receipt does not match the current question or answer"));
+            }
+        }
+    }
     return core::Result<void>::success();
+}
+
+core::Result<assets::Sha256Digest> AuthoringObjective::digest() const {
+    if (auto result = validate(); !result) {
+        return core::Result<assets::Sha256Digest>::failure(result.error());
+    }
+    std::string canonical = "cartographer.authoring-objective.v1|";
+    append_field(canonical, id);
+    append_field(canonical, goal);
+    append_number(canonical, base_revision.value());
+    append_object_ids(canonical, scope_objects);
+    append_object_ids(canonical, protected_objects);
+
+    auto constraints = hard_constraints;
+    std::sort(constraints.begin(), constraints.end(), [](const auto& left, const auto& right) {
+        return left.id < right.id;
+    });
+    append_number(canonical, constraints.size());
+    for (const auto& constraint : constraints) {
+        append_field(canonical, constraint.id);
+        append_number(canonical, static_cast<std::uint64_t>(constraint.kind));
+        append_number(canonical, constraint.object.has_value() ? 1U : 0U);
+        if (constraint.object.has_value()) append_number(canonical, constraint.object->value);
+        append_double(canonical, constraint.maximum_displacement);
+        append_field(canonical, constraint.rationale);
+    }
+
+    auto questions = clarifications;
+    std::sort(questions.begin(), questions.end(), [](const auto& left, const auto& right) {
+        return left.id < right.id;
+    });
+    append_number(canonical, questions.size());
+    for (const auto& question : questions) {
+        append_field(canonical, question.id);
+        append_field(canonical, question.prompt);
+        append_field(canonical, question.rationale);
+        auto impacts = question.impacts;
+        std::sort(impacts.begin(), impacts.end());
+        append_number(canonical, impacts.size());
+        for (const auto impact : impacts) {
+            append_number(canonical, static_cast<std::uint64_t>(impact));
+        }
+        append_object_ids(canonical, question.affected_objects);
+        auto affected_constraints = question.affected_constraint_ids;
+        std::sort(affected_constraints.begin(), affected_constraints.end());
+        append_number(canonical, affected_constraints.size());
+        for (const auto& constraint_id : affected_constraints) append_field(canonical, constraint_id);
+        append_number(canonical, question.downstream_plan_branches);
+        auto candidates = question.candidates;
+        std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
+            return left.id < right.id;
+        });
+        append_number(canonical, candidates.size());
+        for (const auto& candidate : candidates) {
+            append_field(canonical, candidate.id);
+            append_field(canonical, candidate.label);
+            append_object_ids(canonical, candidate.affected_objects);
+        }
+        append_number(canonical, question.selected_candidate_id.has_value() ? 1U : 0U);
+        if (question.selected_candidate_id.has_value()) {
+            append_field(canonical, *question.selected_candidate_id);
+        }
+        append_number(canonical, question.freeform_answer.has_value() ? 1U : 0U);
+        if (question.freeform_answer.has_value()) append_field(canonical, *question.freeform_answer);
+        append_number(canonical, question.human_receipt.has_value() ? 1U : 0U);
+        if (question.human_receipt.has_value()) {
+            append_field(canonical, question.human_receipt->question_id_);
+            append_field(canonical, question.human_receipt->context_digest_.hex());
+            append_field(canonical, question.human_receipt->answer_digest_.hex());
+        }
+    }
+    return core::Result<assets::Sha256Digest>::success(assets::sha256(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(canonical.data()), canonical.size())));
+}
+
+core::Result<assets::Sha256Digest> AuthoringObjective::clarification_context_digest(
+    std::string_view question_id) const {
+    if (auto result = validate(); !result) {
+        return core::Result<assets::Sha256Digest>::failure(result.error());
+    }
+    const auto question = std::find_if(clarifications.begin(), clarifications.end(),
+        [question_id](const auto& value) { return value.id == question_id; });
+    if (question == clarifications.end()) {
+        return core::Result<assets::Sha256Digest>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "clarification identity is absent from the objective"));
+    }
+    return core::Result<assets::Sha256Digest>::success(
+        ::carto::agent::clarification_context_digest(*this));
+}
+
+core::Result<assets::Sha256Digest> AuthoringObjective::clarification_answer_digest(
+    std::string_view question_id) const {
+    const auto question = std::find_if(clarifications.begin(), clarifications.end(),
+        [question_id](const auto& value) { return value.id == question_id; });
+    if (question == clarifications.end() ||
+        (!question->selected_candidate_id.has_value() && !question->freeform_answer.has_value())) {
+        return core::Result<assets::Sha256Digest>::failure(invalid(
+            "clarification answer is absent from the objective"));
+    }
+    return core::Result<assets::Sha256Digest>::success(
+        ::carto::agent::clarification_answer_digest(*question));
+}
+
+core::Result<ClarificationFrontier> AuthoringObjective::clarification_frontier(
+    std::uint32_t threshold) const {
+    if (threshold == 0U || threshold > 100U) {
+        return core::Result<ClarificationFrontier>::failure(invalid(
+            "clarification threshold must be between one and one hundred"));
+    }
+    if (auto result = validate(); !result) {
+        return core::Result<ClarificationFrontier>::failure(result.error());
+    }
+    ClarificationFrontier frontier;
+    frontier.threshold = threshold;
+    for (const auto& question : clarifications) {
+        if (question.selected_candidate_id.has_value() || question.freeform_answer.has_value()) {
+            continue;
+        }
+        std::uint32_t score = 0U;
+        for (const auto impact : question.impacts) score += clarification_impact_weight(impact);
+        score += static_cast<std::uint32_t>(std::min<std::size_t>(
+            question.downstream_plan_branches, 4U) * 5U);
+        frontier.questions.push_back(RankedClarification{
+            question, std::min(score, 100U)});
+    }
+    std::sort(frontier.questions.begin(), frontier.questions.end(), [](const auto& left, const auto& right) {
+        if (left.impact_score != right.impact_score) return left.impact_score > right.impact_score;
+        return left.question.id < right.question.id;
+    });
+    return core::Result<ClarificationFrontier>::success(std::move(frontier));
 }
 
 core::Result<void> AgentPlanStep::validate() const {
@@ -163,6 +553,21 @@ core::Result<void> AgentPlan::validate() const {
         if (contains(objective.protected_objects, step.target.object)) {
             return core::Result<void>::failure(policy(
                 "plan target is protected by the objective"));
+        }
+    }
+    for (const auto& question : objective.clarifications) {
+        if (!question.selected_candidate_id.has_value()) continue;
+        const auto candidate = std::find_if(
+            question.candidates.begin(), question.candidates.end(), [&](const auto& value) {
+                return value.id == *question.selected_candidate_id;
+            });
+        if (candidate == question.candidates.end() || candidate->affected_objects.empty()) continue;
+        for (const auto& step : steps) {
+            if (contains(question.affected_objects, step.target.object) &&
+                !contains(candidate->affected_objects, step.target.object)) {
+                return core::Result<void>::failure(policy(
+                    "plan target contradicts the selected clarification candidate"));
+            }
         }
     }
     return core::Result<void>::success();
@@ -225,6 +630,19 @@ core::Result<AgentTask> AgentTask::begin(
     AgentWorkEnvelope envelope) {
     if (auto result = plan.validate(); !result) {
         return core::Result<AgentTask>::failure(result.error());
+    }
+    auto frontier = plan.objective.clarification_frontier();
+    if (!frontier) return core::Result<AgentTask>::failure(frontier.error());
+    const auto pending_question = std::find_if(
+        frontier.value().questions.begin(), frontier.value().questions.end(),
+        [&frontier](const RankedClarification& question) {
+            return question.impact_score >= frontier.value().threshold;
+        });
+    if (pending_question != frontier.value().questions.end()) {
+        return core::Result<AgentTask>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "objective requires clarification before planning: " +
+                pending_question->question.id + " — " + pending_question->question.prompt));
     }
     if (auto result = envelope.validate(); !result) {
         return core::Result<AgentTask>::failure(result.error());
@@ -346,6 +764,20 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
     if ((capability->effects & ~envelope_.permitted_effects) != 0U) {
         return fail(policy(
             "work envelope forbids the " + effect_names(capability->effects) + " effect"));
+    }
+    if ((capability->effects & ::carto::agent::effect_mask(Effect::topology)) != 0U) {
+        const auto topology_constraint = std::find_if(
+            plan_.objective.hard_constraints.begin(),
+            plan_.objective.hard_constraints.end(), [&](const HardConstraint& constraint) {
+                return constraint.kind == ObjectiveConstraintKind::preserve_topology &&
+                    (!constraint.object.has_value() ||
+                     *constraint.object == step.target.object);
+            });
+        if (topology_constraint != plan_.objective.hard_constraints.end()) {
+            return fail(policy(
+                "objective hard constraint " + topology_constraint->id +
+                " forbids topology changes for this target"));
+        }
     }
 
     auto preview = speculative_->begin_preview(proposal.value().preview_kind);
@@ -600,6 +1032,80 @@ std::vector<AcceptanceGateResult> AgentTask::evaluate_gates() const {
     gates.push_back(AcceptanceGateResult{
         "diff.non_empty", true, changed,
         changed ? "structured source diff contains changes" : "no source changes were produced"});
+    for (const auto& constraint : plan_.objective.hard_constraints) {
+        bool passed = true;
+        std::string evidence;
+        if (constraint.kind == ObjectiveConstraintKind::preserve_topology) {
+            for (const auto& mesh : diff.meshes) {
+                if (constraint.object.has_value()) {
+                    const auto* object = base_document_.scene().find(*constraint.object);
+                    if (object == nullptr || object->mesh_asset != mesh.asset_id) continue;
+                }
+                const bool topology_changed = mesh.added || mesh.removed ||
+                    std::any_of(mesh.vertices.begin(), mesh.vertices.end(), [](const auto& vertex) {
+                        return vertex.added || vertex.removed;
+                    }) || std::any_of(mesh.faces.begin(), mesh.faces.end(), [](const auto& face) {
+                        return face.added || face.removed || face.connectivity_changed;
+                    });
+                if (topology_changed) {
+                    passed = false;
+                    break;
+                }
+            }
+            evidence = passed ? "no vertex or face topology changed"
+                              : "a vertex or face topology record changed";
+        } else if (constraint.kind == ObjectiveConstraintKind::preserve_transform) {
+            const auto before_transform = base_document_.scene().world_transform(*constraint.object);
+            const auto after_transform = speculative_->document_.scene().world_transform(
+                *constraint.object);
+            passed = before_transform && after_transform &&
+                same_transform(before_transform.value(), after_transform.value());
+            evidence = passed ? "target world transform is unchanged"
+                : "target world transform changed or could not be resolved";
+        } else {
+            const auto* before_object = base_document_.scene().find(*constraint.object);
+            const auto* after_object = speculative_->document_.scene().find(*constraint.object);
+            double maximum_observed = 0.0;
+            if (before_object == nullptr || after_object == nullptr ||
+                before_object->mesh_asset != after_object->mesh_asset ||
+                !before_object->mesh_asset.has_value()) {
+                passed = false;
+            } else {
+                const auto before_transform = base_document_.scene().world_transform(*constraint.object);
+                const auto after_transform = speculative_->document_.scene().world_transform(
+                    *constraint.object);
+                const auto mesh = std::find_if(diff.meshes.begin(), diff.meshes.end(),
+                    [&](const MeshChange& change) {
+                        return change.asset_id == *before_object->mesh_asset;
+                    });
+                if (!before_transform || !after_transform) {
+                    passed = false;
+                } else if (mesh != diff.meshes.end()) {
+                    for (const auto& vertex : mesh->vertices) {
+                        if (vertex.added || vertex.removed) {
+                            passed = false;
+                            break;
+                        }
+                        if (!vertex.position_changed) continue;
+                        const double displacement = (transform_point(
+                            after_transform.value(), vertex.after_position) - transform_point(
+                            before_transform.value(), vertex.before_position)).length();
+                        if (!std::isfinite(displacement)) {
+                            passed = false;
+                            break;
+                        }
+                        maximum_observed = std::max(maximum_observed, displacement);
+                        if (displacement > constraint.maximum_displacement) passed = false;
+                    }
+                }
+            }
+            evidence = "maximum observed vertex displacement " +
+                std::to_string(maximum_observed) + " / " +
+                std::to_string(constraint.maximum_displacement) + " world units";
+        }
+        gates.push_back(AcceptanceGateResult{
+            "constraint." + constraint.id, true, passed, std::move(evidence)});
+    }
     return gates;
 }
 
@@ -620,6 +1126,9 @@ AgentTaskSnapshot AgentTask::build_snapshot() const {
     view.status = status_;
     view.task_id = plan_.id;
     view.goal = plan_.objective.goal;
+    if (const auto objective_digest = plan_.objective.digest(); objective_digest) {
+        view.objective_digest = objective_digest.value();
+    }
     view.base_revision = plan_.objective.base_revision;
     const auto speculative_snapshot = speculative_->snapshot();
     view.speculative_revision = speculative_snapshot.project_revision;
@@ -645,9 +1154,14 @@ core::Result<application::DispatchReceipt> AgentTask::accept(
         return core::Result<application::DispatchReceipt>::failure(invalid_state(
             "agent result can only be accepted after all required gates pass"));
     }
+    const auto objective_digest = plan_.objective.digest();
+    if (!objective_digest) {
+        return core::Result<application::DispatchReceipt>::failure(objective_digest.error());
+    }
     const std::string diff_digest = build_diff().digest.hex();
     const auto accepted = source_->accept_speculative_result(
-        speculative_->document_, plan_.objective.base_revision, plan_.id, diff_digest);
+        speculative_->document_, plan_.objective.base_revision, plan_.id,
+        objective_digest.value().hex(), diff_digest);
     if (!accepted) {
         status_ = TaskStatus::blocked;
         diagnostic_ = accepted.error();
@@ -686,6 +1200,50 @@ namespace carto::application {
 core::Result<DispatchReceipt> HumanApplicationAccess::accept_agent_task(
     ::carto::agent::AgentTask& task) {
     return task.accept(HumanActionAdmission{});
+}
+
+core::Result<void> HumanApplicationAccess::answer_agent_clarification(
+    ::carto::agent::AuthoringObjective& objective,
+    std::string_view question_id,
+    std::optional<std::string> candidate_id,
+    std::optional<std::string> freeform_answer) {
+    if (candidate_id.has_value() == freeform_answer.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "clarification answer must select one candidate or provide one freeform answer"));
+    }
+    if (auto result = objective.validate(); !result) {
+        return result;
+    }
+    const auto question = std::find_if(
+        objective.clarifications.begin(), objective.clarifications.end(),
+        [question_id](const auto& value) { return value.id == question_id; });
+    if (question == objective.clarifications.end() ||
+        question->selected_candidate_id.has_value() || question->freeform_answer.has_value() ||
+        question->human_receipt.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "clarification is missing or already has a human answer"));
+    }
+    const auto context_digest = objective.clarification_context_digest(question_id);
+    if (!context_digest) return core::Result<void>::failure(context_digest.error());
+    if (candidate_id.has_value()) question->selected_candidate_id = std::move(candidate_id);
+    else question->freeform_answer = std::move(freeform_answer);
+    const auto answer_digest = objective.clarification_answer_digest(question_id);
+    if (!answer_digest) {
+        question->selected_candidate_id.reset();
+        question->freeform_answer.reset();
+        return core::Result<void>::failure(answer_digest.error());
+    }
+    question->human_receipt.emplace(::carto::agent::HumanClarificationReceipt(
+        question->id, context_digest.value(), answer_digest.value()));
+    if (auto result = objective.validate(); !result) {
+        question->selected_candidate_id.reset();
+        question->freeform_answer.reset();
+        question->human_receipt.reset();
+        return result;
+    }
+    return core::Result<void>::success();
 }
 
 } // namespace carto::application

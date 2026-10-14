@@ -1516,7 +1516,7 @@ core::Result<agent::AgentTaskSnapshot> UiController::run_agent_plan(std::string 
     agent::AgentPlan plan{
         task_id,
         agent::AuthoringObjective{
-            task_id, std::move(goal), *agent_plan_base_revision_, scope, {}},
+            task_id, std::move(goal), *agent_plan_base_revision_, scope, {}, {}, {}},
         agent_plan_draft_};
     const std::string task_goal = plan.objective.goal;
     agent::AgentWorkEnvelope envelope;
