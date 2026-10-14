@@ -152,6 +152,9 @@ exact root is covered by the owner-reviewed
 `docs/verification/public-history-provenance.json` manifest. The manifest is
 machine-checked and cannot classify a forbidden path or an entry without
 explicit owner review, disposition, license basis, and commit identities.
+The audit also scans current text and reachable history for known protected
+field-growth implementation markers, so placing a private preview under a
+generic geometry directory does not bypass the path quarantine.
 `--fail-on-review` makes any unclassified review item blocking for an
 owner-approved release gate. Automatic hosted CI is currently disabled to
 avoid CI spend; if CI is re-enabled, it must invoke the same blocking mode so

@@ -61,7 +61,7 @@ def audit(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
 
 class PublicBoundaryAuditTests(unittest.TestCase):
     def make_repo(self) -> tempfile.TemporaryDirectory[str]:
-        temporary = tempfile.TemporaryDirectory()
+        temporary = tempfile.TemporaryDirectory(dir=ROOT / "tmp")
         repo = Path(temporary.name)
         git(repo, "init", "-q")
         git(repo, "config", "user.email", "boundary-test@example.invalid")
@@ -99,6 +99,47 @@ class PublicBoundaryAuditTests(unittest.TestCase):
             result = audit(repo)
             self.assertEqual(result.returncode, 1)
             self.assertIn("libs/polygon/src/polygon.cpp", result.stdout)
+
+    def test_protected_field_growth_content_fails_even_under_public_path(self) -> None:
+        with self.make_repo() as temporary:
+            repo = Path(temporary)
+            path = repo / "libs" / "geometry" / "plant.cpp"
+            path.parent.mkdir(parents=True)
+            marker = "Plant" + "Growth" + "Product"
+            path.write_text(f"struct {marker};\n", encoding="utf-8")
+            result = audit(repo)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("libs/geometry/plant.cpp", result.stdout)
+            self.assertIn("protected field-growth geometry preview", result.stdout)
+            self.assertNotIn(marker, result.stdout)
+
+    def test_protected_field_growth_history_is_detected_after_deletion(self) -> None:
+        with self.make_repo() as temporary:
+            repo = Path(temporary)
+            path = repo / "libs" / "geometry" / "growth.cpp"
+            path.parent.mkdir(parents=True)
+            marker = "build_plant_" + "growth"
+            path.write_text(f"void {marker}();\n", encoding="utf-8")
+            git(repo, "add", ".")
+            git(repo, "commit", "-q", "-m", "protected field-growth fixture")
+            path.unlink()
+            result = audit(repo)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("history content", result.stdout)
+            self.assertIn("protected field-growth geometry preview", result.stdout)
+            self.assertNotIn(marker, result.stdout)
+
+    def test_provider_neutral_vegetation_recipe_remains_public(self) -> None:
+        with self.make_repo() as temporary:
+            repo = Path(temporary)
+            path = repo / "libs" / "condition" / "vegetation_recipe.hpp"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "struct VegetationScatterRecipe { unsigned seed; };\n",
+                encoding="utf-8",
+            )
+            result = audit(repo)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_untracked_model_artifact_fails(self) -> None:
         with self.make_repo() as temporary:
