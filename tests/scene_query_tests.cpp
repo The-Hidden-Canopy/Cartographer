@@ -347,16 +347,16 @@ void condition_semantics_require_current_explicit_source_data() {
         bounded_tag_session, carto::application::ImportConditionAuthoringAction{
             bounded_tag_fixture.value().serialize()}));
     carto::agent::AgentWorkEnvelope bounded_tag_envelope;
-    bounded_tag_envelope.max_semantic_records_examined = 2U;
+    bounded_tag_envelope.max_semantic_records_examined = 3U;
     auto bounded_tag_budget_task = begin_task(
         bounded_tag_session, bounded_tag_objects, bounded_tag_envelope);
     auto bounded_tag_query = carto::agent::SceneQuery::execute(bounded_tag_budget_task, {
         carto::agent::ConditionAssetsByTagQuery{"safe-place"}, 8U});
     REQUIRE(bounded_tag_query);
     REQUIRE(bounded_tag_query.value().truncated);
-    REQUIRE(bounded_tag_query.value().rows.size() == 1U);
-    REQUIRE(bounded_tag_query.value().semantic_records_examined == 2U);
-    REQUIRE(bounded_tag_budget_task.snapshot().query_budget.semantic_records_examined == 2U);
+    REQUIRE(bounded_tag_query.value().rows.empty());
+    REQUIRE(bounded_tag_query.value().semantic_records_examined == 3U);
+    REQUIRE(bounded_tag_budget_task.snapshot().query_budget.semantic_records_examined == 3U);
 
     carto::application::ApplicationSession bounded_familiarity_session;
     const auto bounded_familiarity_objects = create_boxes(
@@ -538,20 +538,31 @@ void condition_inventory_is_scoped_factual_and_budgeted() {
         bounded_session, carto::application::ImportConditionAuthoringAction{
             bounded_fixture.value().serialize()}));
     carto::agent::AgentWorkEnvelope envelope;
-    envelope.max_semantic_records_examined = 2U;
+    envelope.max_semantic_records_examined = 3U;
     auto bounded_task = begin_task(bounded_session, bounded_objects, envelope);
     auto bounded = carto::agent::SceneQuery::execute(bounded_task, {
         carto::agent::ConditionAssetInventoryQuery{std::nullopt}, 8U});
     REQUIRE(bounded);
     REQUIRE(bounded.value().truncated);
-    REQUIRE(bounded.value().semantic_records_examined == 2U);
-    REQUIRE(bounded_task.snapshot().query_budget.semantic_records_examined == 2U);
-    REQUIRE(bounded.value().rows.size() == 1U);
-    const auto* bounded_fact = std::get_if<carto::agent::ConditionAssetInventoryFact>(
-        &bounded.value().rows.front());
-    REQUIRE(bounded_fact != nullptr);
-    REQUIRE(bounded_fact->asset == 1U);
-    REQUIRE(!bounded_fact->related_records_complete);
+    REQUIRE(bounded.value().semantic_records_examined == 3U);
+    REQUIRE(bounded_task.snapshot().query_budget.semantic_records_examined == 3U);
+    REQUIRE(bounded.value().rows.empty());
+
+    carto::agent::AgentWorkEnvelope related_envelope;
+    related_envelope.max_semantic_records_examined = 4U;
+    auto related_task = begin_task(bounded_session, bounded_objects, related_envelope);
+    auto related_limited = carto::agent::SceneQuery::execute(related_task, {
+        carto::agent::ConditionAssetInventoryQuery{std::nullopt}, 8U});
+    REQUIRE(related_limited);
+    REQUIRE(related_limited.value().truncated);
+    REQUIRE(related_limited.value().semantic_records_examined == 4U);
+    REQUIRE(related_task.snapshot().query_budget.semantic_records_examined == 4U);
+    REQUIRE(related_limited.value().rows.size() == 1U);
+    const auto* related_fact = std::get_if<carto::agent::ConditionAssetInventoryFact>(
+        &related_limited.value().rows.front());
+    REQUIRE(related_fact != nullptr);
+    REQUIRE(related_fact->asset == 1U);
+    REQUIRE(!related_fact->related_records_complete);
     REQUIRE(bounded_session.snapshot().project_revision == bounded_task.snapshot().base_revision);
 }
 

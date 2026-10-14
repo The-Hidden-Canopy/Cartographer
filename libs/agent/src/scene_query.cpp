@@ -575,6 +575,15 @@ core::Result<SceneQueryResult> SceneQuery::execute(
                         return core::Result<void>::failure(invalid(
                             "CONDITION asset references a missing source evidence record"));
                     }
+                    bool feature_strings_complete = true;
+                    for (const auto& feature : asset.protected_features) {
+                        static_cast<void>(feature);
+                        if (!spend_semantic_record()) {
+                            feature_strings_complete = false;
+                            break;
+                        }
+                    }
+                    if (!feature_strings_complete) break;
                     if (!append_row(result, budget, request.limit, ConditionAssetTagFact{
                             asset.id, object, asset.asset_class, asset.fidelity,
                             source->id, source->revision,
@@ -584,16 +593,24 @@ core::Result<SceneQueryResult> SceneQuery::execute(
             } else if constexpr (std::is_same_v<Query, ConditionAssetInventoryQuery>) {
                 std::vector<ConditionAssetInventoryFact> facts;
                 std::map<condition::Id, std::size_t> fact_indices;
+                bool asset_facts_complete = true;
                 for (const auto& asset : authoring.value().assets) {
-                    if (!spend_semantic_record()) break;
+                    if (!spend_semantic_record()) {
+                        asset_facts_complete = false;
+                        break;
+                    }
                     const scene::ObjectId object{asset.authored_object_id};
                     if (!in_scope(object, allowed_scope) ||
                         (query.object.has_value() && *query.object != object)) continue;
                     if (facts.size() >= request.limit) {
                         result.truncated = true;
+                        asset_facts_complete = false;
                         break;
                     }
-                    if (!spend_semantic_record()) break;
+                    if (!spend_semantic_record()) {
+                        asset_facts_complete = false;
+                        break;
+                    }
                     const auto source = std::lower_bound(
                         authoring.value().sources.begin(), authoring.value().sources.end(),
                         asset.source_id, [](const auto& candidate, condition::Id id) {
@@ -604,6 +621,18 @@ core::Result<SceneQueryResult> SceneQuery::execute(
                         return core::Result<void>::failure(invalid(
                             "CONDITION asset references a missing source evidence record"));
                     }
+                    bool feature_strings_complete = true;
+                    for (const auto& feature : asset.protected_features) {
+                        static_cast<void>(feature);
+                        if (!spend_semantic_record()) {
+                            feature_strings_complete = false;
+                            break;
+                        }
+                    }
+                    if (!feature_strings_complete) {
+                        asset_facts_complete = false;
+                        break;
+                    }
                     fact_indices.emplace(asset.id, facts.size());
                     facts.push_back(ConditionAssetInventoryFact{
                         asset.id, object, asset.asset_class, asset.fidelity,
@@ -611,7 +640,7 @@ core::Result<SceneQueryResult> SceneQuery::execute(
                         source_is_current_for_asset(asset, *source), source->reviewed,
                         asset.protected_features});
                 }
-                bool related_records_complete = true;
+                bool related_records_complete = asset_facts_complete;
                 const auto count_records = [&](const auto& records,
                                                std::size_t ConditionAssetInventoryFact::*field) {
                     for (const auto& record : records) {
@@ -669,7 +698,7 @@ core::Result<SceneQueryResult> SceneQuery::execute(
                     }
                     return true;
                 };
-                if (!facts.empty()) {
+                if (!facts.empty() && asset_facts_complete) {
                     related_records_complete =
                         count_records(authoring.value().safe_places,
                             &ConditionAssetInventoryFact::safe_place_profiles) &&
