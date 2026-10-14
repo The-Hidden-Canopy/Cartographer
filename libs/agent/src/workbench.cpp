@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <queue>
@@ -374,6 +375,138 @@ std::string effect_names(std::uint32_t effects) {
     return result.empty() ? "no declared effect" : result;
 }
 
+std::vector<std::string> objective_tokens(std::string_view text) {
+    const auto is_digit = [](unsigned char value) {
+        return value >= static_cast<unsigned char>('0') &&
+            value <= static_cast<unsigned char>('9');
+    };
+    const auto is_ascii_alphanumeric = [&is_digit](unsigned char value) {
+        return is_digit(value) ||
+            (value >= static_cast<unsigned char>('a') &&
+                value <= static_cast<unsigned char>('z')) ||
+            (value >= static_cast<unsigned char>('A') &&
+                value <= static_cast<unsigned char>('Z'));
+    };
+    std::vector<std::string> tokens;
+    std::string current;
+    for (std::size_t index = 0U; index < text.size(); ++index) {
+        const auto character = static_cast<unsigned char>(text[index]);
+        const bool decimal_point = text[index] == '.' && index > 0U &&
+            index + 1U < text.size() &&
+            is_digit(static_cast<unsigned char>(text[index - 1U])) &&
+            is_digit(static_cast<unsigned char>(text[index + 1U]));
+        if (is_ascii_alphanumeric(character) || decimal_point) {
+            const auto lowercase = character >= static_cast<unsigned char>('A') &&
+                character <= static_cast<unsigned char>('Z')
+                ? static_cast<unsigned char>(character + ('a' - 'A')) : character;
+            current.push_back(static_cast<char>(lowercase));
+        } else if (!current.empty()) {
+            tokens.push_back(std::move(current));
+            current.clear();
+        }
+    }
+    if (!current.empty()) tokens.push_back(std::move(current));
+    return tokens;
+}
+
+bool contains_objective_phrase(
+    const std::vector<std::string>& tokens,
+    std::initializer_list<std::string_view> phrase) {
+    if (phrase.size() == 0U || phrase.size() > tokens.size()) return false;
+    for (std::size_t start = 0U; start + phrase.size() <= tokens.size(); ++start) {
+        std::size_t offset = 0U;
+        bool matches = true;
+        for (const auto word : phrase) {
+            if (tokens[start + offset] != word) {
+                matches = false;
+                break;
+            }
+            ++offset;
+        }
+        if (matches) return true;
+    }
+    return false;
+}
+
+void consume_objective_phrase(
+    const std::vector<std::string>& tokens,
+    std::vector<bool>& consumed,
+    std::initializer_list<std::string_view> phrase) {
+    if (phrase.size() == 0U || phrase.size() > tokens.size()) return;
+    for (std::size_t start = 0U; start + phrase.size() <= tokens.size(); ++start) {
+        std::size_t offset = 0U;
+        bool matches = true;
+        for (const auto word : phrase) {
+            if (tokens[start + offset] != word) {
+                matches = false;
+                break;
+            }
+            ++offset;
+        }
+        if (!matches) continue;
+        for (std::size_t index = start; index < start + phrase.size(); ++index) {
+            consumed[index] = true;
+        }
+        start += phrase.size() - 1U;
+    }
+}
+
+bool has_uncompiled_restriction(
+    const std::vector<std::string>& tokens,
+    const std::vector<bool>& consumed) {
+    for (std::size_t index = 0U; index < tokens.size(); ++index) {
+        if (consumed[index]) continue;
+        const auto& token = tokens[index];
+        if (token == "do" && index + 1U < tokens.size() && tokens[index + 1U] == "not") {
+            return true;
+        }
+        if (token == "don" && index + 1U < tokens.size() && tokens[index + 1U] == "t") {
+            return true;
+        }
+        if (token == "must" && index + 1U < tokens.size() && tokens[index + 1U] == "not") {
+            return true;
+        }
+        if (token == "no" || token == "never" || token == "avoid" ||
+            token == "without" || token == "preserve" || token == "protect" ||
+            token == "protected" || token == "untouched" || token == "unchanged" ||
+            token == "keep" || token == "unless" || token == "except" ||
+            token == "if" || token == "not") {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool has_uncompiled_topology_change(
+    const std::vector<std::string>& tokens,
+    const std::vector<bool>& consumed) {
+    for (std::size_t start = 0U; start < tokens.size(); ++start) {
+        std::size_t end = start;
+        if (tokens[start] == "change" || tokens[start] == "changes") {
+            end = start + 1U;
+            if (end < tokens.size() &&
+                (tokens[end] == "the" || tokens[end] == "existing" ||
+                    tokens[end] == "current")) {
+                ++end;
+            }
+            if (end >= tokens.size() || tokens[end] != "topology") continue;
+            ++end;
+        } else if (tokens[start] == "topology" && start + 1U < tokens.size() &&
+            (tokens[start + 1U] == "change" || tokens[start + 1U] == "changes" ||
+                tokens[start + 1U] == "changed")) {
+            end = start + 2U;
+        } else {
+            continue;
+        }
+        if (std::any_of(consumed.begin() + static_cast<std::ptrdiff_t>(start),
+                consumed.begin() + static_cast<std::ptrdiff_t>(end),
+                [](bool is_consumed) { return !is_consumed; })) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 const std::vector<AgentRecipeDefinition>& agent_recipe_catalog() noexcept {
@@ -406,6 +539,100 @@ const AgentRecipeDefinition* find_agent_recipe(std::string_view id) noexcept {
         return recipe.id == id;
     });
     return found == recipes.end() ? nullptr : &*found;
+}
+
+core::Result<std::vector<HardConstraint>> compile_explicit_hard_constraints(
+    std::string_view goal) {
+    if (!safe_text(goal, kMaxGoalBytes)) {
+        return core::Result<std::vector<HardConstraint>>::failure(invalid(
+            "objective goal is empty, malformed, or exceeds its text bound"));
+    }
+    const auto tokens = objective_tokens(goal);
+    const bool preserves_topology =
+        contains_objective_phrase(tokens, {"do", "not", "change", "topology"}) ||
+        contains_objective_phrase(tokens, {"don", "t", "change", "topology"}) ||
+        contains_objective_phrase(tokens, {"no", "topology", "changes"}) ||
+        contains_objective_phrase(tokens, {"no", "changes", "to", "topology"}) ||
+        contains_objective_phrase(tokens, {"keep", "topology", "unchanged"}) ||
+        contains_objective_phrase(tokens, {"preserve", "topology"}) ||
+        contains_objective_phrase(tokens, {"preserve", "existing", "topology"}) ||
+        contains_objective_phrase(tokens, {"without", "changing", "topology"}) ||
+        contains_objective_phrase(tokens, {"topology", "must", "remain", "unchanged"}) ||
+        contains_objective_phrase(tokens, {"topology", "should", "not", "change"});
+    const bool permits_topology_change =
+        contains_objective_phrase(tokens, {"do", "not", "preserve", "topology"}) ||
+        contains_objective_phrase(tokens, {"don", "t", "preserve", "topology"}) ||
+        contains_objective_phrase(tokens, {"allow", "topology", "changes"}) ||
+        contains_objective_phrase(tokens,
+            {"allow", "topology", "changes", "if", "needed"}) ||
+        contains_objective_phrase(tokens, {"allow", "changes", "to", "topology"}) ||
+        contains_objective_phrase(tokens, {"permit", "topology", "change"}) ||
+        contains_objective_phrase(tokens, {"permit", "topology", "changes"}) ||
+        contains_objective_phrase(tokens, {"permit", "changes", "to", "topology"}) ||
+        contains_objective_phrase(tokens, {"topology", "may", "change"}) ||
+        contains_objective_phrase(tokens, {"topology", "can", "change"}) ||
+        contains_objective_phrase(tokens, {"topology", "could", "change"}) ||
+        contains_objective_phrase(tokens, {"topology", "might", "change"}) ||
+        contains_objective_phrase(tokens, {"topology", "is", "allowed", "to", "change"}) ||
+        contains_objective_phrase(tokens, {"change", "topology", "if", "needed"});
+    if (preserves_topology && permits_topology_change) {
+        return core::Result<std::vector<HardConstraint>>::failure(invalid(
+            "objective gives conflicting topology requirements"));
+    }
+
+    std::vector<bool> consumed(tokens.size(), false);
+    consume_objective_phrase(tokens, consumed, {"do", "not", "preserve", "topology"});
+    consume_objective_phrase(tokens, consumed, {"don", "t", "preserve", "topology"});
+    consume_objective_phrase(tokens, consumed, {"allow", "topology", "changes"});
+    consume_objective_phrase(tokens, consumed,
+        {"allow", "topology", "changes", "if", "needed"});
+    consume_objective_phrase(tokens, consumed, {"allow", "changes", "to", "topology"});
+    consume_objective_phrase(tokens, consumed, {"permit", "topology", "change"});
+    consume_objective_phrase(tokens, consumed, {"permit", "topology", "changes"});
+    consume_objective_phrase(tokens, consumed, {"permit", "changes", "to", "topology"});
+    consume_objective_phrase(tokens, consumed, {"topology", "may", "change"});
+    consume_objective_phrase(tokens, consumed, {"topology", "can", "change"});
+    consume_objective_phrase(tokens, consumed, {"topology", "could", "change"});
+    consume_objective_phrase(tokens, consumed, {"topology", "might", "change"});
+    consume_objective_phrase(tokens, consumed,
+        {"topology", "is", "allowed", "to", "change"});
+    consume_objective_phrase(tokens, consumed, {"change", "topology", "if", "needed"});
+    consume_objective_phrase(tokens, consumed, {"do", "not", "change", "topology"});
+    consume_objective_phrase(tokens, consumed, {"don", "t", "change", "topology"});
+    consume_objective_phrase(tokens, consumed, {"no", "topology", "changes"});
+    consume_objective_phrase(tokens, consumed, {"no", "changes", "to", "topology"});
+    consume_objective_phrase(tokens, consumed, {"keep", "topology", "unchanged"});
+    consume_objective_phrase(tokens, consumed, {"preserve", "topology"});
+    consume_objective_phrase(tokens, consumed, {"preserve", "existing", "topology"});
+    consume_objective_phrase(tokens, consumed, {"without", "changing", "topology"});
+    consume_objective_phrase(tokens, consumed, {"topology", "must", "remain", "unchanged"});
+    consume_objective_phrase(tokens, consumed, {"topology", "should", "not", "change"});
+
+    if (preserves_topology && has_uncompiled_topology_change(tokens, consumed)) {
+        return core::Result<std::vector<HardConstraint>>::failure(invalid(
+            "objective gives conflicting topology requirements"));
+    }
+    if (has_uncompiled_restriction(tokens, consumed)) {
+        return core::Result<std::vector<HardConstraint>>::failure(invalid(
+            "objective contains a restriction that this compiler cannot enforce; "
+            "add a structured hard constraint before running the plan"));
+    }
+
+    std::vector<HardConstraint> constraints;
+    if (preserves_topology) {
+        constraints.push_back(HardConstraint{
+            "compiled.preserve-topology",
+            ObjectiveConstraintKind::preserve_topology,
+            std::nullopt,
+            0.0,
+            "Compiled from explicit goal language requiring unchanged topology."});
+    }
+    for (const auto& constraint : constraints) {
+        if (auto result = constraint.validate(); !result) {
+            return core::Result<std::vector<HardConstraint>>::failure(result.error());
+        }
+    }
+    return core::Result<std::vector<HardConstraint>>::success(std::move(constraints));
 }
 
 core::Result<void> TargetRef::validate() const {
@@ -580,6 +807,10 @@ core::Result<void> AuthoringObjective::validate() const {
     if (!safe_text(id, kMaxTaskIdBytes) || !safe_text(goal, kMaxGoalBytes)) {
         return core::Result<void>::failure(invalid("objective identity or goal is invalid"));
     }
+    auto compiled_constraints = compile_explicit_hard_constraints(goal);
+    if (!compiled_constraints) {
+        return core::Result<void>::failure(compiled_constraints.error());
+    }
     if (!recipe_id.empty() && find_agent_recipe(recipe_id) == nullptr) {
         return core::Result<void>::failure(invalid(
             "objective references an unknown agent recipe"));
@@ -610,6 +841,18 @@ core::Result<void> AuthoringObjective::validate() const {
             (constraint.object.has_value() && !contains(scope_objects, *constraint.object))) {
             return core::Result<void>::failure(invalid(
                 "objective constraints contain duplicate identity or an out-of-scope target"));
+        }
+    }
+    for (const auto& required : compiled_constraints.value()) {
+        const bool represented = std::any_of(
+            hard_constraints.begin(), hard_constraints.end(), [&required](const auto& existing) {
+                return existing.kind == required.kind &&
+                    existing.object == required.object &&
+                    existing.maximum_displacement == required.maximum_displacement;
+            });
+        if (!represented) {
+            return core::Result<void>::failure(invalid(
+                "objective omits a hard constraint required by explicit goal language"));
         }
     }
     std::set<std::string> clarification_ids;

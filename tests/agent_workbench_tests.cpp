@@ -2078,6 +2078,121 @@ void objective_hard_constraints_block_topology_and_excess_displacement() {
         std::string::npos);
 }
 
+void explicit_objective_compilation_is_bounded_and_fails_closed() {
+    const auto preserved = carto::agent::compile_explicit_hard_constraints(
+        "Do not change topology.");
+    REQUIRE(preserved);
+    REQUIRE(preserved.value().size() == 1U);
+    REQUIRE(preserved.value().front().id == "compiled.preserve-topology");
+    REQUIRE(preserved.value().front().kind ==
+        carto::agent::ObjectiveConstraintKind::preserve_topology);
+
+    const auto apostrophe = carto::agent::compile_explicit_hard_constraints(
+        "Don't change topology");
+    REQUIRE(apostrophe);
+    REQUIRE(apostrophe.value().size() == 1U);
+
+    const auto ordinary = carto::agent::compile_explicit_hard_constraints(
+        "Prepare the selected face");
+    REQUIRE(ordinary);
+    REQUIRE(ordinary.value().empty());
+
+    const auto permissive = carto::agent::compile_explicit_hard_constraints(
+        "Allow topology changes if needed");
+    REQUIRE(permissive);
+    REQUIRE(permissive.value().empty());
+
+    const auto unsupported = carto::agent::compile_explicit_hard_constraints(
+        "Do not alter the bathroom");
+    REQUIRE(!unsupported);
+    REQUIRE(unsupported.error().message.find("restriction") != std::string::npos);
+
+    const auto conditional = carto::agent::compile_explicit_hard_constraints(
+        "Do not change topology except when necessary");
+    REQUIRE(!conditional);
+
+    const auto conflict = carto::agent::compile_explicit_hard_constraints(
+        "Preserve topology but allow topology changes");
+    REQUIRE(!conflict);
+    REQUIRE(conflict.error().message.find("conflicting topology") != std::string::npos);
+
+    const auto contradictory_tail = carto::agent::compile_explicit_hard_constraints(
+        "Do not change topology, but change the topology if required");
+    REQUIRE(!contradictory_tail);
+    REQUIRE(contradictory_tail.error().message.find("conflicting topology") !=
+        std::string::npos);
+
+    const auto permit_conflict = carto::agent::compile_explicit_hard_constraints(
+        "Preserve topology but permit changes to topology");
+    REQUIRE(!permit_conflict);
+
+    carto::application::ApplicationSession direct_source;
+    const auto direct_objects = create_boxes(direct_source, 1U);
+    auto direct_plan = plan_for(direct_source.snapshot(), direct_objects, {
+        {"step-1", {direct_objects.front(), carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    direct_plan.objective.goal = "Do not change topology";
+    REQUIRE(!direct_plan.validate());
+    direct_plan.objective.hard_constraints = preserved.value();
+    REQUIRE(direct_plan.validate());
+}
+
+void ui_compiled_constraints_are_bound_to_clarification_and_gate_execution() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Compiled constraint target", {1.0, 1.0, 1.0}}));
+    const auto target = source.snapshot().objects.front().object.id;
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        target, carto::geometry::FaceId{1U}}));
+    REQUIRE(ui.queue_agent_step("inset face 0.1"));
+    REQUIRE(ui.set_agent_hard_constraints({{
+        "operator-topology", carto::agent::ObjectiveConstraintKind::preserve_topology,
+        std::nullopt, 0.0, "The operator requires existing topology to remain unchanged."}}));
+    REQUIRE(ui.queue_agent_clarification(
+        "Confirm that the topology-preservation requirement is intentional.",
+        carto::agent::ClarificationImpact::topology_deletion));
+
+    const std::string goal = "Do not change topology";
+    REQUIRE(ui.answer_agent_clarification(
+        goal, "question-1", "I require the existing topology to remain unchanged."));
+    const auto source_revision = source.snapshot().project_revision;
+    const auto run = ui.run_agent_plan(goal);
+    REQUIRE(run);
+    REQUIRE(run.value().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(run.value().hard_constraints.size() == 1U);
+    REQUIRE(run.value().hard_constraints.front().id == "operator-topology");
+    REQUIRE(run.value().clarifications.front().human_receipt.has_value());
+    const auto gate = std::find_if(run.value().gates.begin(), run.value().gates.end(),
+        [](const auto& candidate) { return candidate.id == "constraint.operator-topology"; });
+    REQUIRE(gate != run.value().gates.end());
+    REQUIRE(run.value().diagnostic.has_value());
+    REQUIRE(run.value().diagnostic->message.find("operator-topology") != std::string::npos);
+    REQUIRE(run.value().steps.size() == 1U);
+    REQUIRE(run.value().steps.front().status == carto::agent::StepStatus::failed);
+    REQUIRE(gate->passed);
+    REQUIRE(gate->evidence.find("no vertex or face topology changed") != std::string::npos);
+    REQUIRE(source.snapshot().project_revision == source_revision);
+
+    carto::application::ApplicationSession unsupported_source;
+    carto::ui::UiController unsupported_ui(unsupported_source);
+    REQUIRE(unsupported_ui.dispatch(carto::application::CreateBoxAction{
+        "Unsupported restriction target", {1.0, 1.0, 1.0}}));
+    const auto unsupported_target = unsupported_source.snapshot().objects.front().object.id;
+    REQUIRE(unsupported_ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(unsupported_ui.dispatch(carto::application::SelectFaceAction{
+        unsupported_target, carto::geometry::FaceId{1U}}));
+    REQUIRE(unsupported_ui.queue_agent_step("inset face 0.1"));
+    const auto unsupported_revision = unsupported_source.snapshot().project_revision;
+    const auto rejected = unsupported_ui.run_agent_plan("Do not alter the bathroom");
+    REQUIRE(!rejected);
+    REQUIRE(!unsupported_ui.snapshot().agent_task.has_value());
+    REQUIRE(unsupported_source.snapshot().project_revision == unsupported_revision);
+}
+
 void acceptance_evidence_binds_validator_revision_assets_and_result() {
     carto::application::ApplicationSession source;
     const auto objects = create_boxes(source, 1U);
@@ -2159,6 +2274,7 @@ void ui_workbench_captures_selection_and_exposes_accept_reject_flow() {
     const auto ran = ui.run_agent_plan("Prepare selected face");
     REQUIRE(ran);
     REQUIRE(ran.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(ran.value().hard_constraints.empty());
     REQUIRE(ui.snapshot().project_revision == source_revision);
     REQUIRE(ui.snapshot().agent_task.has_value());
     REQUIRE(ui.snapshot().agent_task->can_accept);
@@ -2580,6 +2696,8 @@ int main() {
         clarification_frontier_blocks_consequential_ambiguity_and_binds_answers();
         clarification_receipt_rejects_changed_plan_graph();
         objective_hard_constraints_block_topology_and_excess_displacement();
+        explicit_objective_compilation_is_bounded_and_fails_closed();
+        ui_compiled_constraints_are_bound_to_clarification_and_gate_execution();
         acceptance_evidence_binds_validator_revision_assets_and_result();
         ui_workbench_captures_selection_and_exposes_accept_reject_flow();
         ui_recipe_selection_round_trips_and_locks_with_checkpoint();

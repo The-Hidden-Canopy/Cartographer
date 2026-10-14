@@ -69,6 +69,37 @@ core::Diagnostic unsupported(std::string message) {
     return core::Diagnostic(core::ErrorCode::unsupported, std::move(message));
 }
 
+core::Result<std::vector<agent::HardConstraint>> compile_objective_constraints(
+    std::string_view goal,
+    const std::vector<agent::HardConstraint>& authored_constraints) {
+    auto compiled = agent::compile_explicit_hard_constraints(goal);
+    if (!compiled) {
+        return core::Result<std::vector<agent::HardConstraint>>::failure(compiled.error());
+    }
+
+    auto constraints = authored_constraints;
+    for (const auto& generated : compiled.value()) {
+        const auto equivalent = std::find_if(
+            constraints.begin(), constraints.end(), [&generated](const auto& existing) {
+                return existing.kind == generated.kind &&
+                    existing.object == generated.object &&
+                    existing.maximum_displacement == generated.maximum_displacement;
+            });
+        if (equivalent != constraints.end()) continue;
+
+        const bool id_collision = std::any_of(
+            constraints.begin(), constraints.end(), [&generated](const auto& existing) {
+                return existing.id == generated.id;
+            });
+        if (id_collision) {
+            return core::Result<std::vector<agent::HardConstraint>>::failure(invalid(
+                "compiled objective constraint identity collides with an authored constraint"));
+        }
+        constraints.push_back(generated);
+    }
+    return core::Result<std::vector<agent::HardConstraint>>::success(std::move(constraints));
+}
+
 template <typename Record>
 core::Result<void> append_condition_record(
     std::vector<Record>& records, Record record, std::string_view label) {
@@ -1930,6 +1961,10 @@ core::Result<void> UiController::answer_agent_clarification(
             core::ErrorCode::stale_data,
             "goal changed after a human clarification was recorded; clear and answer again"));
     }
+    auto constraints = compile_objective_constraints(goal, agent_hard_constraints_draft_);
+    if (!constraints) {
+        return core::Result<void>::failure(constraints.error());
+    }
     std::vector<scene::ObjectId> scope;
     for (const auto& step : agent_plan_draft_) {
         if (std::find(scope.begin(), scope.end(), step.target.object) == scope.end()) {
@@ -1945,7 +1980,7 @@ core::Result<void> UiController::answer_agent_clarification(
     agent::AuthoringObjective objective{
         objective_id, std::move(goal),
         *agent_plan_base_revision_, std::move(scope), {},
-        agent_hard_constraints_draft_, agent_clarifications_draft_, agent_recipe_id_};
+        std::move(constraints.value()), agent_clarifications_draft_, agent_recipe_id_};
     agent::AgentPlan plan{task_id, std::move(objective), agent_plan_draft_};
     const auto answered = application::HumanApplicationAccess::answer_agent_clarification(
         plan, question_id, std::nullopt, std::move(answer));
@@ -1980,6 +2015,10 @@ core::Result<agent::AgentTaskSnapshot> UiController::run_agent_plan(
         return core::Result<agent::AgentTaskSnapshot>::failure(core::Diagnostic(
             core::ErrorCode::stale_data,
             "goal changed after a human clarification was recorded; clear and answer again"));
+    }
+    auto constraints = compile_objective_constraints(goal, agent_hard_constraints_draft_);
+    if (!constraints) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(constraints.error());
     }
     const std::uint64_t task_sequence = next_agent_task_id_ ==
         std::numeric_limits<std::uint64_t>::max() ? 1U : next_agent_task_id_;
@@ -2033,7 +2072,7 @@ core::Result<agent::AgentTaskSnapshot> UiController::run_agent_plan(
         agent::AuthoringObjective{
             agent_objective_id_.empty() ? task_id : agent_objective_id_,
             std::move(goal), *agent_plan_base_revision_, scope, {},
-            agent_hard_constraints_draft_,
+            std::move(constraints.value()),
             agent_clarifications_draft_, agent_recipe_id_},
         agent_plan_draft_};
     const std::string task_goal = plan.objective.goal;

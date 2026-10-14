@@ -51,6 +51,12 @@ struct HardConstraint {
     [[nodiscard]] core::Result<void> validate() const;
 };
 
+// Extracts only deterministic topology-preservation language from a goal.
+// Any other explicit restriction must be represented by a structured
+// constraint or the compiler fails closed instead of silently ignoring it.
+[[nodiscard]] core::Result<std::vector<HardConstraint>>
+compile_explicit_hard_constraints(std::string_view goal);
+
 enum class ClarificationImpact : std::uint8_t {
     object_scope,
     topology_deletion,
