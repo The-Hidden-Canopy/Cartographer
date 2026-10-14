@@ -444,6 +444,7 @@ struct UiSnapshot : application::ApplicationSnapshot {
     std::optional<agent::AgentTaskSnapshot> agent_task;
     std::optional<agent::SceneQueryResult> agent_condition_inventory;
     std::optional<agent::AgentDemonstration> agent_demonstration;
+    std::optional<agent::AgentDemonstrationTrace> agent_demonstration_trace;
 };
 
 [[nodiscard]] UiColorTokens color_tokens(Theme theme) noexcept;
@@ -531,6 +532,14 @@ public:
     [[nodiscard]] core::Result<void> load_agent_demonstration(
         const std::filesystem::path& path);
     [[nodiscard]] core::Result<void> clear_agent_demonstration();
+    [[nodiscard]] core::Result<void> capture_agent_demonstration_trace(
+        application::OperationId first_operation,
+        application::OperationId last_operation);
+    [[nodiscard]] core::Result<void> save_agent_demonstration_trace(
+        const std::filesystem::path& path) const;
+    [[nodiscard]] core::Result<void> load_agent_demonstration_trace(
+        const std::filesystem::path& path);
+    [[nodiscard]] core::Result<void> clear_agent_demonstration_trace();
     [[nodiscard]] core::Result<void> rebase_agent_checkpoint();
     [[nodiscard]] core::Result<agent::AgentTaskSnapshot> resume_agent_checkpoint();
     [[nodiscard]] core::Result<agent::AgentTaskSnapshot> correct_agent_ghost_transform(
@@ -696,6 +705,7 @@ private:
     agent::SceneQueryBudget agent_condition_inventory_query_budget_;
     std::optional<core::Revision> agent_condition_inventory_query_revision_;
     std::optional<agent::AgentDemonstration> agent_demonstration_;
+    std::optional<agent::AgentDemonstrationTrace> agent_demonstration_trace_;
     std::optional<agent::AgentTaskCheckpoint> agent_checkpoint_pending_;
     bool agent_checkpoint_rebased_ = false;
     std::string agent_goal_;

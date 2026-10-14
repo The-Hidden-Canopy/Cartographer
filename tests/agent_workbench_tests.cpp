@@ -714,6 +714,127 @@ void vertex_demonstration_stores_relative_displacement_only() {
     REQUIRE(encoded);
     REQUIRE(encoded.value().find("move vertex to 4 0 0") == std::string::npos);
 }
+
+void human_native_command_range_captures_alias_only_trace() {
+    TempDirectory directory;
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    const auto first_box = ui.dispatch(carto::application::CreateBoxAction{
+        "CANARY_MANUAL_TRACE_ALPHA", {1.0, 1.0, 1.0}});
+    const auto second_box = ui.dispatch(carto::application::CreateBoxAction{
+        "CANARY_MANUAL_TRACE_BETA", {1.0, 1.0, 1.0}});
+    REQUIRE(first_box);
+    REQUIRE(second_box);
+    const auto created_snapshot = source.snapshot();
+    REQUIRE(created_snapshot.objects.size() == 2U);
+    const std::vector<carto::scene::ObjectId> objects{
+        created_snapshot.objects[0].object.id,
+        created_snapshot.objects[1].object.id};
+
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        objects[0], carto::geometry::FaceId{1U}}));
+    REQUIRE(ui.dispatch(carto::application::InvokeToolAction{
+        "mesh.inset-face", carto::editor::ToolArguments{0.1, {}, true, 0.5, std::nullopt}}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        objects[1], carto::geometry::FaceId{1U}}));
+    REQUIRE(ui.dispatch(carto::application::InvokeToolAction{
+        "mesh.extrude-face", carto::editor::ToolArguments{0.2, {}, true, 0.5, std::nullopt}}));
+    auto moved_transform = source.snapshot().objects[0].object.local_transform;
+    moved_transform.translation.x += 0.25;
+    REQUIRE(ui.dispatch(carto::application::SetObjectTransformAction{
+        objects[0], moved_transform, std::nullopt}));
+
+    const auto before_capture = source.snapshot();
+    REQUIRE(before_capture.native_operation_trace.size() == 3U);
+    REQUIRE(before_capture.native_operation_trace[0].source ==
+        carto::application::OperationSource::human);
+    REQUIRE(before_capture.native_operation_trace[0].tool_id == "mesh.inset-face");
+    REQUIRE(before_capture.native_operation_trace[1].tool_id == "mesh.extrude-face");
+    REQUIRE(before_capture.native_operation_trace[2].tool_id == "object.translate");
+    REQUIRE(ui.capture_agent_demonstration_trace(
+        before_capture.native_operation_trace.front().operation_id,
+        before_capture.native_operation_trace.back().operation_id));
+    const auto captured = ui.snapshot();
+    REQUIRE(captured.agent_demonstration_trace.has_value());
+    REQUIRE(captured.agent_demonstration_trace->steps.size() == 3U);
+    REQUIRE(captured.agent_demonstration_trace->steps[0].target_alias == 1U);
+    REQUIRE(captured.agent_demonstration_trace->steps[1].target_alias == 2U);
+    REQUIRE(captured.agent_demonstration_trace->steps[0].component_alias == 1U);
+    REQUIRE(captured.agent_demonstration_trace->steps[1].component_alias == 2U);
+    REQUIRE(captured.agent_demonstration_trace->steps[0].parameters.parameterization ==
+        carto::agent::AgentDemonstrationParameterization::normalized_face_distance);
+    REQUIRE(captured.agent_demonstration_trace->steps[2].target_kind ==
+        carto::agent::AgentDemonstrationTargetKind::object);
+    REQUIRE(captured.agent_demonstration_trace->steps[2].target_alias == 1U);
+    REQUIRE(captured.agent_demonstration_trace->steps[2].component_alias == 0U);
+    REQUIRE(captured.agent_demonstration_trace->steps[2].parameters.relative_displacement.x ==
+        0.25);
+    REQUIRE(captured.agent_demonstration_trace->result_revision_span == 3U);
+    REQUIRE(source.snapshot().project_revision == before_capture.project_revision);
+    REQUIRE(!ui.capture_agent_demonstration_trace(
+        before_capture.native_operation_trace.back().operation_id,
+        before_capture.native_operation_trace.front().operation_id));
+    REQUIRE(!ui.capture_agent_demonstration_trace(
+        0U, before_capture.native_operation_trace.back().operation_id));
+
+    const auto encoded = captured.agent_demonstration_trace->serialize();
+    REQUIRE(encoded);
+    REQUIRE(encoded.value().find("CANARY_MANUAL_TRACE_ALPHA") == std::string::npos);
+    REQUIRE(encoded.value().find("CANARY_MANUAL_TRACE_BETA") == std::string::npos);
+    const auto decoded = carto::agent::AgentDemonstrationTrace::deserialize(encoded.value());
+    REQUIRE(decoded);
+    REQUIRE(decoded.value().steps.size() == 3U);
+    REQUIRE(decoded.value().steps.front().target_alias == 1U);
+    REQUIRE(decoded.value().steps[1].target_alias == 2U);
+    REQUIRE(decoded.value().steps.back().target_alias == 1U);
+
+    auto invalid_parameters = decoded.value();
+    invalid_parameters.steps.front().parameters.normalized_distance =
+        std::numeric_limits<double>::infinity();
+    REQUIRE(!invalid_parameters.serialize());
+    std::string corrupted = encoded.value();
+    corrupted.back() = corrupted.back() == '1' ? '2' : '1';
+    REQUIRE(!carto::agent::AgentDemonstrationTrace::deserialize(corrupted));
+
+    const auto path = directory.path() / "manual-range.carto-agent-trace";
+    REQUIRE(ui.save_agent_demonstration_trace(path));
+    REQUIRE(!ui.save_agent_demonstration_trace(path));
+    carto::application::ApplicationSession viewer_source;
+    carto::ui::UiController viewer(viewer_source);
+    const auto viewer_revision = viewer_source.snapshot().project_revision;
+    REQUIRE(viewer.load_agent_demonstration_trace(path));
+    REQUIRE(viewer.snapshot().agent_demonstration_trace->steps.size() == 3U);
+    REQUIRE(viewer_source.snapshot().project_revision == viewer_revision);
+    REQUIRE(viewer.clear_agent_demonstration_trace());
+    REQUIRE(!viewer.snapshot().agent_demonstration_trace.has_value());
+
+    carto::application::ApplicationSession ai_source;
+    carto::ui::UiController ai_ui(ai_source);
+    REQUIRE(ai_ui.dispatch(carto::application::CreateBoxAction{
+        "AI boundary target", {1.0, 1.0, 1.0}}));
+    const auto ai_object = ai_source.snapshot().objects.front().object.id;
+    const auto ai_face = ai_source.snapshot().viewport.scene.instances().front()
+        .mesh->triangle_faces.front();
+    REQUIRE(ai_ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ai_ui.dispatch(carto::application::SelectFaceAction{ai_object, ai_face}));
+
+    const auto proposal = ai_ui.propose_ai("inset face 0.10");
+    REQUIRE(proposal);
+    auto preview = ai_ui.begin_ai_preview(proposal.value());
+    REQUIRE(preview);
+    const auto committed = ai_ui.commit_ai_preview(preview.value(), proposal.value());
+    REQUIRE(committed);
+    REQUIRE(committed.value().source == carto::application::OperationSource::ai_proposal);
+    REQUIRE(ai_source.snapshot().native_operation_trace.empty());
+
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Unrelated edit clears recent trace", {1.0, 1.0, 1.0}}));
+    REQUIRE(source.snapshot().native_operation_trace.empty());
+}
+
 void plan_dag_orders_dependencies_and_rejects_invalid_graphs() {
     carto::application::ApplicationSession source;
     const auto objects = create_boxes(source, 3U);
@@ -2880,6 +3001,7 @@ int main() {
         multi_step_branch_isolated_until_reviewed_acceptance();
         accepted_task_demonstration_is_redacted_read_only_and_checksummed();
         vertex_demonstration_stores_relative_displacement_only();
+        human_native_command_range_captures_alias_only_trace();
         plan_dag_orders_dependencies_and_rejects_invalid_graphs();
         failed_dag_node_invalidates_only_dependent_steps();
         bounded_repair_restarts_from_source_and_preserves_attempt_lineage();

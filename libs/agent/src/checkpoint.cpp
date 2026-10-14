@@ -17,6 +17,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 
 namespace carto::agent {
 namespace {
@@ -29,9 +30,13 @@ constexpr std::string_view kDemonstrationMagicV1 =
     "CARTOGRAPHER_AGENT_DEMONSTRATION_V1\n";
 constexpr std::string_view kDemonstrationMagicV2 =
     "CARTOGRAPHER_AGENT_DEMONSTRATION_V2\n";
+constexpr std::string_view kDemonstrationTraceMagic =
+    "CARTOGRAPHER_AGENT_DEMONSTRATION_TRACE_V1\n";
 constexpr std::size_t kMaxDemonstrationBytes = 2U * 1024U * 1024U;
 constexpr std::size_t kMaxDemonstrationSteps = 4096U;
 constexpr std::size_t kMaxDemonstrationGates = 256U;
+constexpr std::size_t kMaxDemonstrationTraceBytes = 1U * 1024U * 1024U;
+constexpr std::size_t kMaxDemonstrationTraceSteps = 256U;
 
 core::Diagnostic malformed(std::string message) {
     return core::Diagnostic(core::ErrorCode::validation_failed, std::move(message));
@@ -1314,5 +1319,275 @@ core::Result<AgentDemonstration> AgentDemonstration::deserialize(
         return core::Result<AgentDemonstration>::failure(result.error());
     }
     return core::Result<AgentDemonstration>::success(std::move(demonstration));
+}
+
+core::Result<AgentDemonstrationTrace> AgentDemonstrationTrace::capture(
+    std::span<const application::NativeOperationTraceEntry> operations) {
+    if (operations.empty() || operations.size() > kMaxDemonstrationTraceSteps) {
+        return core::Result<AgentDemonstrationTrace>::failure(malformed(
+            "selected native command range is empty or exceeds its step bound"));
+    }
+    const std::uint64_t base_revision = operations.front().revision_before.value();
+    std::uint64_t previous_revision = base_revision;
+    std::map<scene::ObjectId, std::uint32_t> object_aliases;
+    std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>, std::uint32_t>
+        component_aliases;
+    AgentDemonstrationTrace trace;
+    trace.steps.reserve(operations.size());
+    for (const auto& operation : operations) {
+        if (operation.source != application::OperationSource::human ||
+            operation.operation_id == 0U || operation.tool_id.empty() ||
+            !operation.target_object ||
+            operation.revision_before.value() != previous_revision ||
+            operation.revision_after.value() <= operation.revision_before.value()) {
+            return core::Result<AgentDemonstrationTrace>::failure(malformed(
+                "selected native command range contains a non-human or discontinuous receipt"));
+        }
+        auto [object_alias, inserted_object] = object_aliases.emplace(
+            operation.target_object, static_cast<std::uint32_t>(object_aliases.size() + 1U));
+        (void)inserted_object;
+        if (object_aliases.size() > 512U) {
+            return core::Result<AgentDemonstrationTrace>::failure(malformed(
+                "selected native command range exceeds the object alias bound"));
+        }
+
+        AgentDemonstrationTargetKind target_kind = AgentDemonstrationTargetKind::object;
+        std::uint32_t component_alias = 0U;
+        if (const auto* face = std::get_if<geometry::FaceId>(&operation.target_component)) {
+            if (!*face) {
+                return core::Result<AgentDemonstrationTrace>::failure(malformed(
+                    "selected native command range contains a zero face identity"));
+            }
+            target_kind = AgentDemonstrationTargetKind::face;
+            const auto key = std::make_tuple(operation.target_object.value, 1U, face->value);
+            auto [alias, inserted] = component_aliases.emplace(
+                key, static_cast<std::uint32_t>(component_aliases.size() + 1U));
+            (void)inserted;
+            component_alias = alias->second;
+        } else if (const auto* vertex =
+                std::get_if<geometry::VertexId>(&operation.target_component)) {
+            if (!*vertex) {
+                return core::Result<AgentDemonstrationTrace>::failure(malformed(
+                    "selected native command range contains a zero vertex identity"));
+            }
+            target_kind = AgentDemonstrationTargetKind::vertex;
+            const auto key = std::make_tuple(operation.target_object.value, 2U, vertex->value);
+            auto [alias, inserted] = component_aliases.emplace(
+                key, static_cast<std::uint32_t>(component_aliases.size() + 1U));
+            (void)inserted;
+            component_alias = alias->second;
+        }
+
+        AgentDemonstrationParameters parameters;
+        switch (operation.parameterization) {
+        case application::NativeTraceParameterization::normalized_face_distance:
+            parameters.parameterization =
+                AgentDemonstrationParameterization::normalized_face_distance;
+            parameters.normalized_distance = operation.normalized_distance;
+            break;
+        case application::NativeTraceParameterization::relative_displacement:
+            parameters.parameterization =
+                AgentDemonstrationParameterization::relative_displacement;
+            parameters.relative_displacement = operation.relative_displacement;
+            break;
+        default:
+            return core::Result<AgentDemonstrationTrace>::failure(malformed(
+                "selected native command range has an unknown parameterization"));
+        }
+        if (auto result = parameters.validate(operation.tool_id); !result) {
+            return core::Result<AgentDemonstrationTrace>::failure(result.error());
+        }
+        if ((target_kind == AgentDemonstrationTargetKind::face &&
+                parameters.parameterization !=
+                    AgentDemonstrationParameterization::normalized_face_distance) ||
+            (target_kind == AgentDemonstrationTargetKind::vertex &&
+                parameters.parameterization !=
+                    AgentDemonstrationParameterization::relative_displacement) ||
+            (target_kind == AgentDemonstrationTargetKind::object &&
+                (operation.tool_id != "object.translate" ||
+                 parameters.parameterization !=
+                    AgentDemonstrationParameterization::relative_displacement))) {
+            return core::Result<AgentDemonstrationTrace>::failure(malformed(
+                "selected native command target does not match its typed operation"));
+        }
+
+        trace.steps.push_back(AgentDemonstrationTraceStep{
+            operation.tool_id,
+            target_kind,
+            object_alias->second,
+            component_alias,
+            operation.revision_before.value() - base_revision,
+            operation.revision_after.value() - base_revision,
+            parameters});
+        previous_revision = operation.revision_after.value();
+    }
+    trace.result_revision_span = previous_revision - base_revision;
+    if (auto result = trace.validate(); !result) {
+        return core::Result<AgentDemonstrationTrace>::failure(result.error());
+    }
+    return core::Result<AgentDemonstrationTrace>::success(std::move(trace));
+}
+
+core::Result<void> AgentDemonstrationTrace::validate() const {
+    if (steps.empty() || steps.size() > kMaxDemonstrationTraceSteps) {
+        return core::Result<void>::failure(malformed(
+            "demonstration trace is empty or exceeds its step bound"));
+    }
+    std::uint64_t previous_after = 0U;
+    for (std::size_t index = 0U; index < steps.size(); ++index) {
+        const auto& step = steps[index];
+        if (!safe_demonstration_text(step.tool_id, 256U) ||
+            step.target_alias == 0U || step.target_alias > 512U ||
+            step.revision_before_offset != previous_after ||
+            step.revision_after_offset <= step.revision_before_offset ||
+            step.revision_after_offset > result_revision_span ||
+            !step.parameters.validate(step.tool_id)) {
+            return core::Result<void>::failure(malformed(
+                "demonstration trace step is invalid or discontinuous"));
+        }
+        if (step.target_kind == AgentDemonstrationTargetKind::object) {
+            if (step.tool_id != "object.translate" || step.component_alias != 0U ||
+                step.parameters.parameterization !=
+                    AgentDemonstrationParameterization::relative_displacement) {
+                return core::Result<void>::failure(malformed(
+                    "demonstration trace object target is invalid"));
+            }
+        } else if (step.target_kind == AgentDemonstrationTargetKind::face) {
+            if (step.component_alias == 0U || step.component_alias > 4096U ||
+                (step.tool_id != "mesh.inset-face" && step.tool_id != "mesh.extrude-face") ||
+                step.parameters.parameterization !=
+                    AgentDemonstrationParameterization::normalized_face_distance) {
+                return core::Result<void>::failure(malformed(
+                    "demonstration trace face target is invalid"));
+            }
+        } else if (step.target_kind == AgentDemonstrationTargetKind::vertex) {
+            if (step.component_alias == 0U || step.component_alias > 4096U ||
+                step.tool_id != "mesh.set-vertex-position" ||
+                step.parameters.parameterization !=
+                    AgentDemonstrationParameterization::relative_displacement) {
+                return core::Result<void>::failure(malformed(
+                    "demonstration trace vertex target is invalid"));
+            }
+        } else {
+            return core::Result<void>::failure(malformed(
+                "demonstration trace target kind is unknown"));
+        }
+        previous_after = step.revision_after_offset;
+    }
+    if (previous_after != result_revision_span) {
+        return core::Result<void>::failure(malformed(
+            "demonstration trace revision span does not match its final step"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<std::string> AgentDemonstrationTrace::serialize() const {
+    if (auto result = validate(); !result) {
+        return core::Result<std::string>::failure(result.error());
+    }
+    Writer payload;
+    payload.number(kFormatVersion);
+    payload.number(result_revision_span);
+    payload.number(steps.size());
+    for (const auto& step : steps) {
+        payload.field(step.tool_id);
+        payload.number(static_cast<std::uint64_t>(step.target_kind));
+        payload.number(step.target_alias);
+        payload.number(step.component_alias);
+        payload.number(step.revision_before_offset);
+        payload.number(step.revision_after_offset);
+        payload.number(static_cast<std::uint64_t>(step.parameters.parameterization));
+        if (step.parameters.parameterization ==
+            AgentDemonstrationParameterization::normalized_face_distance) {
+            payload.real(step.parameters.normalized_distance);
+        } else {
+            payload.real(step.parameters.relative_displacement.x);
+            payload.real(step.parameters.relative_displacement.y);
+            payload.real(step.parameters.relative_displacement.z);
+        }
+    }
+    const std::string body = std::move(payload).take();
+    Writer outer;
+    outer.field(body);
+    outer.digest(digest_text(body));
+    std::string result(kDemonstrationTraceMagic);
+    result += std::move(outer).take();
+    if (result.size() > kMaxDemonstrationTraceBytes) {
+        return core::Result<std::string>::failure(malformed(
+            "serialized demonstration trace exceeds its size bound"));
+    }
+    return core::Result<std::string>::success(std::move(result));
+}
+
+core::Result<AgentDemonstrationTrace> AgentDemonstrationTrace::deserialize(
+    std::string_view bytes) {
+    if (bytes.size() > kMaxDemonstrationTraceBytes ||
+        !bytes.starts_with(kDemonstrationTraceMagic)) {
+        return core::Result<AgentDemonstrationTrace>::failure(malformed(
+            "demonstration trace header is unknown or file exceeds its size bound"));
+    }
+    Reader outer(bytes.substr(kDemonstrationTraceMagic.size()));
+    const std::string body = outer.field(kMaxDemonstrationTraceBytes);
+    const auto supplied_digest = outer.digest();
+    if (!outer.finished()) {
+        return core::Result<AgentDemonstrationTrace>::failure(outer.error());
+    }
+    if (digest_text(body) != supplied_digest) {
+        return core::Result<AgentDemonstrationTrace>::failure(malformed(
+            "demonstration trace checksum does not match its contents"));
+    }
+    Reader reader(body);
+    if (reader.number() != kFormatVersion) {
+        return core::Result<AgentDemonstrationTrace>::failure(core::Diagnostic(
+            core::ErrorCode::version_mismatch,
+            "agent demonstration trace version is unsupported"));
+    }
+    AgentDemonstrationTrace trace;
+    trace.result_revision_span = reader.number();
+    const auto step_count = reader.count(kMaxDemonstrationTraceSteps);
+    trace.steps.reserve(step_count);
+    for (std::size_t index = 0U; index < step_count; ++index) {
+        AgentDemonstrationTraceStep step;
+        step.tool_id = reader.field(256U);
+        const auto target_kind = reader.number();
+        if (target_kind > static_cast<std::uint64_t>(
+                AgentDemonstrationTargetKind::vertex)) {
+            reader.fail("demonstration trace target kind is unknown");
+        }
+        step.target_kind = static_cast<AgentDemonstrationTargetKind>(target_kind);
+        const auto target_alias = reader.number();
+        const auto component_alias = reader.number();
+        if (target_alias > 512U || component_alias > 4096U) {
+            reader.fail("demonstration trace alias exceeds its bound");
+        }
+        step.target_alias = static_cast<std::uint32_t>(target_alias <= 512U
+            ? target_alias : 0U);
+        step.component_alias = static_cast<std::uint32_t>(component_alias <= 4096U
+            ? component_alias : 0U);
+        step.revision_before_offset = reader.number();
+        step.revision_after_offset = reader.number();
+        const auto parameterization = reader.number();
+        if (parameterization > static_cast<std::uint64_t>(
+                AgentDemonstrationParameterization::relative_displacement)) {
+            reader.fail("demonstration trace parameterization is unknown");
+        }
+        step.parameters.parameterization = static_cast<
+            AgentDemonstrationParameterization>(parameterization);
+        if (step.parameters.parameterization ==
+            AgentDemonstrationParameterization::normalized_face_distance) {
+            step.parameters.normalized_distance = reader.real();
+        } else {
+            step.parameters.relative_displacement = {
+                reader.real(), reader.real(), reader.real()};
+        }
+        trace.steps.push_back(std::move(step));
+    }
+    if (!reader.finished()) {
+        return core::Result<AgentDemonstrationTrace>::failure(reader.error());
+    }
+    if (auto result = trace.validate(); !result) {
+        return core::Result<AgentDemonstrationTrace>::failure(result.error());
+    }
+    return core::Result<AgentDemonstrationTrace>::success(std::move(trace));
 }
 } // namespace carto::agent

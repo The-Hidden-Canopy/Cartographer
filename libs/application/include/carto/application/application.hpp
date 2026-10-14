@@ -100,6 +100,37 @@ struct ViewportState {
     std::optional<core::Diagnostic> error;
 };
 
+using OperationId = std::uint64_t;
+
+enum class OperationSource {
+    human,
+    ai_proposal,
+    plugin,
+    recovery,
+};
+
+enum class NativeTraceParameterization : std::uint8_t {
+    normalized_face_distance,
+    relative_displacement,
+};
+
+// Bounded, in-memory evidence for successful human native edits. The trace
+// retains source identities only for the current session so export can
+// replace them with aliases; it is never written into the project journal.
+struct NativeOperationTraceEntry {
+    OperationId operation_id = 0U;
+    std::string tool_id;
+    OperationSource source = OperationSource::human;
+    core::Revision revision_before;
+    core::Revision revision_after;
+    scene::ObjectId target_object;
+    std::variant<geometry::FaceId, geometry::VertexId, std::monostate> target_component;
+    NativeTraceParameterization parameterization =
+        NativeTraceParameterization::normalized_face_distance;
+    double normalized_distance = 0.0;
+    core::Vec3d relative_displacement;
+};
+
 struct SculptLayerView {
     std::string identity;
     std::string name;
@@ -374,6 +405,7 @@ struct ApplicationSnapshot {
     std::size_t undo_count = 0;
     std::size_t redo_count = 0;
     std::vector<core::Diagnostic> problems;
+    std::vector<NativeOperationTraceEntry> native_operation_trace;
     WorkspaceState workspace;
     ViewportState viewport;
     std::optional<std::uint64_t> sculpt_mesh_asset;
@@ -423,15 +455,6 @@ struct RecoveryInspection {
     std::optional<core::Diagnostic> diagnostic;
 
     [[nodiscard]] core::Result<void> validate() const;
-};
-
-using OperationId = std::uint64_t;
-
-enum class OperationSource {
-    human,
-    ai_proposal,
-    plugin,
-    recovery,
 };
 
 struct AffectedSet {
@@ -972,6 +995,7 @@ private:
         core::Revision revision_before,
         AffectedSet affected = {},
         std::optional<ParameterPayload> parameters = std::nullopt);
+    void append_native_operation_trace(NativeOperationTraceEntry entry);
     [[nodiscard]] core::Result<DispatchReceipt> failure(core::Diagnostic diagnostic);
     void reset_editor_state() noexcept;
 
@@ -997,6 +1021,7 @@ private:
     std::optional<journal::Journal> journal_;
     WorkspaceState workspace_;
     std::vector<core::Diagnostic> problems_;
+    std::vector<NativeOperationTraceEntry> native_operation_trace_;
     std::optional<InvokeToolAction> last_tool_action_;
     std::optional<editor::AuthoringContext> last_tool_context_;
     OperationId next_operation_id_ = 1U;

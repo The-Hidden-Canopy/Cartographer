@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <bit>
 #include <charconv>
+#include <cmath>
 #include <iomanip>
 #include <locale>
 #include <memory>
@@ -668,16 +669,49 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 if (object->locked) {
                     return failure(invalid_state("locked scene objects cannot be transformed"));
                 }
+                const auto before_transform = object->local_transform;
+                const bool is_root_object = !object->parent.has_value();
                 editor::ProjectCommandAdmission admission;
-                return execute_command(
+                auto result = execute_command(
                     std::make_unique<editor::SetProjectObjectTransformCommand>(
                         admission,
-                        document_, value.object, object->local_transform, value.transform),
+                        document_, value.object, before_transform, value.transform),
                     "Set Object Transform",
                     AffectedSet{{value.object}, {}, {}, {}},
                     ParameterPayload{
                         value.transform, std::nullopt, std::nullopt, std::nullopt,
                         std::nullopt, std::nullopt, std::nullopt});
+                const bool translation_only =
+                    before_transform.rotation.x == value.transform.rotation.x &&
+                    before_transform.rotation.y == value.transform.rotation.y &&
+                    before_transform.rotation.z == value.transform.rotation.z &&
+                    before_transform.rotation.w == value.transform.rotation.w &&
+                    before_transform.scale.x == value.transform.scale.x &&
+                    before_transform.scale.y == value.transform.scale.y &&
+                    before_transform.scale.z == value.transform.scale.z &&
+                    is_root_object;
+                if (result && result.value().document_changed) {
+                    const auto displacement = value.transform.translation -
+                        before_transform.translation;
+                    const double magnitude = displacement.length();
+                    if (active_source_ == OperationSource::human && translation_only &&
+                        displacement.finite() && std::isfinite(magnitude) && magnitude > 0.0) {
+                        append_native_operation_trace(NativeOperationTraceEntry{
+                            result.value().operation_id,
+                            "object.translate",
+                            result.value().source,
+                            result.value().revision_before,
+                            result.value().revision_after,
+                            value.object,
+                            std::monostate{},
+                            NativeTraceParameterization::relative_displacement,
+                            0.0,
+                            displacement});
+                    } else {
+                        native_operation_trace_.clear();
+                    }
+                }
+                return result;
             } else if constexpr (std::is_same_v<Action, InvokeToolAction>) {
                 return invoke_tool(value);
             } else if constexpr (std::is_same_v<Action, RepeatLastToolAction>) {
@@ -1633,6 +1667,83 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
             }
         }
     }
+    std::optional<NativeOperationTraceEntry> trace_candidate;
+    if (active_source_ == OperationSource::human && invocation_context.has_value() &&
+        invocation_context->component_object.has_value()) {
+        const scene::ObjectId target_object = *invocation_context->component_object;
+        const auto* object = before_document.scene().find(target_object);
+        if (object != nullptr && object->mesh_asset.has_value()) {
+            const auto mesh = before_document.meshes().find(*object->mesh_asset);
+            if (mesh != before_document.meshes().end() && action.tool_id == "mesh.inset-face" &&
+                invocation_context->faces.size() == 1U) {
+                const auto face_id = invocation_context->faces.front();
+                const auto* face = mesh->second.find_face(face_id);
+                double longest_edge = 0.0;
+                if (face != nullptr && face->vertices.size() >= 3U) {
+                    for (std::size_t index = 0U; index < face->vertices.size(); ++index) {
+                        const auto* first = mesh->second.find_vertex(face->vertices[index]);
+                        const auto* second = mesh->second.find_vertex(
+                            face->vertices[(index + 1U) % face->vertices.size()]);
+                        if (first == nullptr || second == nullptr) {
+                            longest_edge = 0.0;
+                            break;
+                        }
+                        longest_edge = std::max(longest_edge,
+                            (second->position - first->position).length());
+                    }
+                }
+                const double normalized_distance = longest_edge > 0.0
+                    ? action.arguments.distance / longest_edge : 0.0;
+                if (std::isfinite(normalized_distance) && normalized_distance > 0.0) {
+                    trace_candidate = NativeOperationTraceEntry{
+                        0U, action.tool_id, OperationSource::human, before, {}, target_object, face_id,
+                        NativeTraceParameterization::normalized_face_distance,
+                        normalized_distance, {}};
+                }
+            } else if (mesh != before_document.meshes().end() &&
+                action.tool_id == "mesh.extrude-face" &&
+                invocation_context->faces.size() == 1U) {
+                const auto face_id = invocation_context->faces.front();
+                const auto* face = mesh->second.find_face(face_id);
+                double longest_edge = 0.0;
+                if (face != nullptr && face->vertices.size() >= 3U) {
+                    for (std::size_t index = 0U; index < face->vertices.size(); ++index) {
+                        const auto* first = mesh->second.find_vertex(face->vertices[index]);
+                        const auto* second = mesh->second.find_vertex(
+                            face->vertices[(index + 1U) % face->vertices.size()]);
+                        if (first == nullptr || second == nullptr) {
+                            longest_edge = 0.0;
+                            break;
+                        }
+                        longest_edge = std::max(longest_edge,
+                            (second->position - first->position).length());
+                    }
+                }
+                const double normalized_distance = longest_edge > 0.0
+                    ? action.arguments.distance / longest_edge : 0.0;
+                if (std::isfinite(normalized_distance) && normalized_distance > 0.0) {
+                    trace_candidate = NativeOperationTraceEntry{
+                        0U, action.tool_id, OperationSource::human, before, {}, target_object, face_id,
+                        NativeTraceParameterization::normalized_face_distance,
+                        normalized_distance, {}};
+                }
+            } else if (action.tool_id == "mesh.set-vertex-position" &&
+                invocation_context->vertices.size() == 1U) {
+                const auto vertex_id = invocation_context->vertices.front();
+                const auto* vertex = mesh->second.find_vertex(vertex_id);
+                if (vertex != nullptr) {
+                    const auto displacement = action.arguments.position - vertex->position;
+                    const double magnitude = displacement.length();
+                    if (displacement.finite() && std::isfinite(magnitude) && magnitude > 0.0) {
+                        trace_candidate = NativeOperationTraceEntry{
+                            0U, action.tool_id, OperationSource::human, before, {}, target_object, vertex_id,
+                            NativeTraceParameterization::relative_displacement,
+                            0.0, displacement};
+                    }
+                }
+            }
+        }
+    }
     if (auto result = tools_.invoke(action.tool_id, context, action.arguments, history_); !result) {
         return failure(result.error().with_context("tool invocation"));
     }
@@ -1642,6 +1753,17 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
         std::move(before_document),
         std::move(affected),
         std::move(parameters));
+    if (result && result.value().document_changed) {
+        if (trace_candidate.has_value() && result.value().source == OperationSource::human) {
+            trace_candidate->operation_id = result.value().operation_id;
+            trace_candidate->revision_before = result.value().revision_before;
+            trace_candidate->revision_after = result.value().revision_after;
+            trace_candidate->source = result.value().source;
+            append_native_operation_trace(std::move(*trace_candidate));
+        } else {
+            native_operation_trace_.clear();
+        }
+    }
     if (result && (action.tool_id == "mesh.inset-face" ||
                    action.tool_id == "mesh.poke-face" ||
                    action.tool_id == "mesh.remove-face" ||
@@ -3027,6 +3149,14 @@ core::Result<DispatchReceipt> ApplicationSession::accepted(
     core::Revision revision_before,
     AffectedSet affected,
     std::optional<ParameterPayload> parameters) {
+    const bool supported_native_trace_action = active_source_ == OperationSource::human &&
+        (action == "Invoke Tool: mesh.inset-face" ||
+         action == "Invoke Tool: mesh.extrude-face" ||
+         action == "Invoke Tool: mesh.set-vertex-position" ||
+         action == "Set Object Transform");
+    if (revision_before != document_.revision() && !supported_native_trace_action) {
+        native_operation_trace_.clear();
+    }
     const OperationId operation_id = next_operation_id_;
     next_operation_id_ = next_operation_id_ == std::numeric_limits<OperationId>::max()
         ? OperationId{1U}
@@ -3036,6 +3166,23 @@ core::Result<DispatchReceipt> ApplicationSession::accepted(
         revision_before != document_.revision(), operation_id, active_source_,
         active_provenance_id_,
         std::move(affected), std::move(parameters), {}});
+}
+
+void ApplicationSession::append_native_operation_trace(NativeOperationTraceEntry entry) {
+    constexpr std::size_t kMaxNativeTraceEntries = 256U;
+    if (entry.source != OperationSource::human || entry.operation_id == 0U ||
+        !entry.target_object || entry.revision_after <= entry.revision_before) {
+        native_operation_trace_.clear();
+        return;
+    }
+    if (!native_operation_trace_.empty() &&
+        native_operation_trace_.back().revision_after != entry.revision_before) {
+        native_operation_trace_.clear();
+    }
+    if (native_operation_trace_.size() >= kMaxNativeTraceEntries) {
+        native_operation_trace_.erase(native_operation_trace_.begin());
+    }
+    native_operation_trace_.push_back(std::move(entry));
 }
 
 core::Result<DispatchReceipt> ApplicationSession::failure(core::Diagnostic diagnostic) {
@@ -3052,6 +3199,7 @@ void ApplicationSession::reset_editor_state() noexcept {
     problems_.clear();
     last_tool_action_.reset();
     last_tool_context_.reset();
+    native_operation_trace_.clear();
 }
 
 ApplicationSnapshot ApplicationSession::snapshot() const {
@@ -3066,6 +3214,7 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
     result.undo_count = history_.undo_count();
     result.redo_count = history_.redo_count();
     result.problems = problems_;
+    result.native_operation_trace = native_operation_trace_;
     const auto append_problem = [&result](core::Diagnostic diagnostic) {
         if (result.problems.size() >= kMaxProblems) {
             result.problems.erase(result.problems.begin());

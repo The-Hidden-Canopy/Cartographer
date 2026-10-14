@@ -2362,6 +2362,66 @@ core::Result<void> UiController::clear_agent_demonstration() {
     return core::Result<void>::success();
 }
 
+core::Result<void> UiController::capture_agent_demonstration_trace(
+    application::OperationId first_operation,
+    application::OperationId last_operation) {
+    if (first_operation == 0U || last_operation < first_operation) {
+        return core::Result<void>::failure(invalid_state(
+            "demonstration trace range identities are invalid"));
+    }
+    const auto snapshot = session_.snapshot();
+    const auto& available = snapshot.native_operation_trace;
+    const auto first = std::find_if(available.begin(), available.end(),
+        [first_operation](const auto& operation) {
+            return operation.operation_id == first_operation;
+        });
+    const auto last = std::find_if(available.begin(), available.end(),
+        [last_operation](const auto& operation) {
+            return operation.operation_id == last_operation;
+        });
+    if (first == available.end() || last == available.end() || last < first) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "selected demonstration trace range is no longer in recent native history"));
+    }
+    const auto first_index = static_cast<std::size_t>(std::distance(available.begin(), first));
+    const auto count = static_cast<std::size_t>(std::distance(first, last)) + 1U;
+    const auto selected = std::span<const application::NativeOperationTraceEntry>(
+        available.data() + first_index, count);
+    auto trace = agent::AgentDemonstrationTrace::capture(selected);
+    if (!trace) {
+        record_ui_problem(trace.error().with_context("capture native demonstration range"));
+        return core::Result<void>::failure(trace.error());
+    }
+    agent_demonstration_trace_.emplace(std::move(trace.value()));
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::save_agent_demonstration_trace(
+    const std::filesystem::path& path) const {
+    if (!agent_demonstration_trace_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "there is no captured native command range to save"));
+    }
+    return agent_demonstration_trace_->save(path);
+}
+
+core::Result<void> UiController::load_agent_demonstration_trace(
+    const std::filesystem::path& path) {
+    auto trace = agent::AgentDemonstrationTrace::load(path);
+    if (!trace) {
+        record_ui_problem(trace.error().with_context("agent demonstration trace"));
+        return core::Result<void>::failure(trace.error());
+    }
+    agent_demonstration_trace_.emplace(std::move(trace.value()));
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::clear_agent_demonstration_trace() {
+    agent_demonstration_trace_.reset();
+    return core::Result<void>::success();
+}
+
 core::Result<void> UiController::load_agent_checkpoint(
     const std::filesystem::path& path) {
     if (agent_checkpoint_pending_.has_value()) {
@@ -3929,6 +3989,7 @@ UiSnapshot UiController::snapshot() const {
         result.project_status_text = "Saved";
     }
     result.agent_demonstration = agent_demonstration_;
+    result.agent_demonstration_trace = agent_demonstration_trace_;
     return result;
 }
 

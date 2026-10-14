@@ -968,6 +968,7 @@ enum class FileDialogKind {
     project,
     agent_checkpoint,
     agent_demonstration,
+    agent_demonstration_trace,
     engineering,
     engineering_authoring,
     condition,
@@ -1041,6 +1042,12 @@ enum class StandardMeshExport {
             L"Cartographer Agent Demonstration (*.carto-agent-demo)\0*.carto-agent-demo\0"
             L"All Files\0*.*\0";
         dialog.lpstrDefExt = L"carto-agent-demo";
+        break;
+    case FileDialogKind::agent_demonstration_trace:
+        dialog.lpstrFilter =
+            L"Cartographer Agent Demonstration Trace (*.carto-agent-trace)\0"
+            L"*.carto-agent-trace\0All Files\0*.*\0";
+        dialog.lpstrDefExt = L"carto-agent-trace";
         break;
     case FileDialogKind::engineering:
         dialog.lpstrFilter =
@@ -1210,6 +1217,8 @@ struct DesktopState {
     int agent_repair_step_index = 0;
     std::string agent_feedback;
     int agent_preview_mode = 0;
+    int agent_trace_start_index = 0;
+    int agent_trace_end_index = 0;
     std::optional<carto::ui::Workspace> previous_workspace_kind;
     std::string action_feedback;
     bool action_feedback_error = false;
@@ -7094,8 +7103,89 @@ struct DesktopState {
             }
         }
 
-        if (!task_present &&
-            ImGui::SmallButton("Open demonstration record...")) {
+        if (!task_present) {
+            const auto& recent_trace = snapshot.native_operation_trace;
+            ImGui::Separator();
+            ImGui::Text("Teach by demonstration");
+            ImGui::TextDisabled(
+                "Capture a contiguous range of successful human native edits. Trace files are not executable.");
+            if (recent_trace.empty()) {
+                ImGui::TextDisabled("No recent native edits are available for trace capture.");
+            } else {
+                const int maximum_index = static_cast<int>(recent_trace.size() - 1U);
+                agent_trace_start_index = std::clamp(agent_trace_start_index, 0, maximum_index);
+                agent_trace_end_index = std::clamp(agent_trace_end_index, 0, maximum_index);
+                if (ImGui::BeginChild("AgentNativeTraceHistory", ImVec2(0, 96), true)) {
+                    const std::size_t first_visible = recent_trace.size() > 16U
+                        ? recent_trace.size() - 16U : 0U;
+                    for (std::size_t index = first_visible; index < recent_trace.size(); ++index) {
+                        const auto& operation = recent_trace[index];
+                        ImGui::BulletText("%llu · %s · revision %llu to %llu",
+                            static_cast<unsigned long long>(operation.operation_id),
+                            operation.tool_id.c_str(),
+                            static_cast<unsigned long long>(operation.revision_before.value()),
+                            static_cast<unsigned long long>(operation.revision_after.value()));
+                    }
+                }
+                ImGui::EndChild();
+                if (maximum_index > 0) {
+                    ImGui::SliderInt("Range start", &agent_trace_start_index, 0, maximum_index);
+                    ImGui::SliderInt("Range end", &agent_trace_end_index, 0, maximum_index);
+                } else {
+                    ImGui::TextDisabled("The range contains one recent operation.");
+                }
+                ImGui::BeginDisabled(agent_trace_start_index > agent_trace_end_index);
+                if (ImGui::Button("Capture selected command range", ImVec2(-1, 28))) {
+                    const auto captured = ui.capture_agent_demonstration_trace(
+                        recent_trace[static_cast<std::size_t>(agent_trace_start_index)].operation_id,
+                        recent_trace[static_cast<std::size_t>(agent_trace_end_index)].operation_id);
+                    agent_feedback = captured
+                        ? "Human command range captured as an alias-only offline trace."
+                        : captured.error().message;
+                }
+                ImGui::EndDisabled();
+            }
+            if (ImGui::SmallButton("Open saved native trace...")) {
+                const auto path = choose_file(false, FileDialogKind::agent_demonstration_trace);
+                if (path.has_value()) {
+                    const auto loaded = ui.load_agent_demonstration_trace(*path);
+                    agent_feedback = loaded
+                        ? "Alias-only native trace opened for inspection; it cannot run."
+                        : loaded.error().message;
+                }
+            }
+            if (snapshot.agent_demonstration_trace.has_value()) {
+                const auto& trace = *snapshot.agent_demonstration_trace;
+                ImGui::Text("Captured range · %zu steps · revision span +%llu",
+                    trace.steps.size(),
+                    static_cast<unsigned long long>(trace.result_revision_span));
+                ImGui::TextDisabled(
+                    "The trace contains anonymized aliases and typed deltas. It has no target resolver, validation claim, or replay authority.");
+                const auto visible_steps = std::min<std::size_t>(trace.steps.size(), 16U);
+                for (std::size_t index = 0U; index < visible_steps; ++index) {
+                    const auto& trace_step = trace.steps[index];
+                    ImGui::BulletText("%zu. %s · target %u / component %u",
+                        index + 1U, trace_step.tool_id.c_str(), trace_step.target_alias,
+                        trace_step.component_alias);
+                }
+                if (ImGui::SmallButton("Save captured native trace...")) {
+                    const auto path = choose_file(true, FileDialogKind::agent_demonstration_trace);
+                    if (path.has_value()) {
+                        const auto saved = ui.save_agent_demonstration_trace(*path);
+                        agent_feedback = saved
+                            ? "Immutable native trace saved; it cannot run or mutate a project."
+                            : saved.error().message;
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Clear native trace")) {
+                    const auto cleared = ui.clear_agent_demonstration_trace();
+                    if (!cleared) agent_feedback = cleared.error().message;
+                }
+            }
+        }
+
+        if (!task_present && ImGui::SmallButton("Open demonstration record...")) {
             const auto path = choose_file(false, FileDialogKind::agent_demonstration);
             if (path.has_value()) {
                 const auto loaded = ui.load_agent_demonstration(*path);

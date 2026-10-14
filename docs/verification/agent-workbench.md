@@ -140,6 +140,10 @@
 - The record excludes project bytes, real object IDs, object names, goal/step text, prompts, answers, and paths; step object aliases preserve only within-record relationships.
 - Saving is immutable and size-bounded. Opening a record does not create an AgentTask, mutate a project, or cross the human acceptance boundary.
 - The format checksum detects accidental edits only; it is not a signature or proof that the trace came from a trusted Cartographer process.
+- Human-authored trace capture accepts only a contiguous recent range of supported native operations (face inset/extrude, vertex-position change, and root-object translation); AI proposals and unsupported project-changing edits are not admitted as human trace steps.
+- The in-memory trace is bounded to 256 operations, revision-contiguous, and cleared by unsupported project changes. Export assigns object/component aliases and persists only normalized face distance or relative displacement parameters.
+- Manual trace serialization rejects malformed aliases, non-finite parameters, invalid ranges, oversized records, and checksum corruption; saving is immutable, loading is read-only, and capture/load do not change the source project revision.
+- Manual traces remain inspect-only. They do not inherit task validation gates, resolve cross-object correspondence, replay operations, claim transfer quality, or create reusable recipes.
 
 ## Follow-up coverage
 

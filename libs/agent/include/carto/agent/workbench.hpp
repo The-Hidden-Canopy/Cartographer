@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <span>
 #include <set>
 #include <string>
 #include <string_view>
@@ -477,6 +478,46 @@ private:
         const AgentTaskSnapshot& snapshot);
 
     friend class AgentTask;
+};
+
+enum class AgentDemonstrationTargetKind : std::uint8_t {
+    object,
+    face,
+    vertex,
+};
+
+struct AgentDemonstrationTraceStep {
+    std::string tool_id;
+    AgentDemonstrationTargetKind target_kind = AgentDemonstrationTargetKind::object;
+    std::uint32_t target_alias = 0U;
+    std::uint32_t component_alias = 0U;
+    std::uint64_t revision_before_offset = 0U;
+    std::uint64_t revision_after_offset = 0U;
+    AgentDemonstrationParameters parameters;
+};
+
+// An explicitly selected range of successful, human-authored native
+// operations. The serialized trace contains aliases and transferable typed
+// values only; it has no project, source identity, mutation, or replay path.
+struct AgentDemonstrationTrace {
+    static constexpr std::uint32_t kFormatVersion = 1U;
+
+    std::uint64_t result_revision_span = 0U;
+    std::vector<AgentDemonstrationTraceStep> steps;
+
+    [[nodiscard]] core::Result<void> validate() const;
+    [[nodiscard]] core::Result<std::string> serialize() const;
+    [[nodiscard]] static core::Result<AgentDemonstrationTrace> deserialize(
+        std::string_view bytes);
+    [[nodiscard]] core::Result<void> save(const std::filesystem::path& path) const;
+    [[nodiscard]] static core::Result<AgentDemonstrationTrace> load(
+        const std::filesystem::path& path);
+
+private:
+    [[nodiscard]] static core::Result<AgentDemonstrationTrace> capture(
+        std::span<const application::NativeOperationTraceEntry> operations);
+
+    friend class ::carto::ui::UiController;
 };
 // Immutable, checksummed workflow state. Human clarification answers are
 // deliberately removed from the persisted plan and must be reissued before a
