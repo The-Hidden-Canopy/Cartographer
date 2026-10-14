@@ -7108,6 +7108,7 @@ struct DesktopState {
             const auto& demonstration = *snapshot.agent_demonstration;
             ImGui::Separator();
             ImGui::Text("Redacted demonstration - offline trace");
+            ImGui::Text("Format v%u", demonstration.format_version);
             ImGui::Text("Recipe %s | %zu steps | %zu gates",
                 demonstration.recipe_id.empty() ? "(none)" : demonstration.recipe_id.c_str(),
                 demonstration.steps.size(), demonstration.gates.size());
@@ -7125,6 +7126,17 @@ struct DesktopState {
                     index + 1U, demo_step.tool_id.c_str(), demo_step.target_alias,
                     static_cast<unsigned long long>(demo_step.revision_before_offset),
                     static_cast<unsigned long long>(demo_step.revision_after_offset));
+                if (!demo_step.parameters.has_value()) {
+                    ImGui::TextDisabled("   No transferable typed parameters (legacy trace).");
+                } else if (demo_step.parameters->parameterization ==
+                    carto::agent::AgentDemonstrationParameterization::normalized_face_distance) {
+                    ImGui::TextDisabled("   Face distance: %.6g × source longest edge",
+                        demo_step.parameters->normalized_distance);
+                } else {
+                    const auto displacement = demo_step.parameters->relative_displacement;
+                    ImGui::TextDisabled("   Relative displacement: %.6g, %.6g, %.6g",
+                        displacement.x, displacement.y, displacement.z);
+                }
             }
             if (visible_steps < demonstration.steps.size()) {
                 ImGui::TextDisabled("Showing 64 of %zu steps.", demonstration.steps.size());

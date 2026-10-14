@@ -135,6 +135,8 @@
 
 - Only a human-accepted task with passed steps and all required gates can be captured; review-ready and blocked tasks are rejected.
 - Serialization round-trips bounded step/gate evidence, checksums, and relative revision offsets; corrupted content, invalid aliases, and failed required gates are rejected.
+- Format v2 records normalized face-operation distances and relative vertex/object displacements, rejects tool/parameter mismatches and invalid numeric values, and survives checkpoint replay; format v1 records remain readable as inspection-only evidence without typed parameters.
+- Vertex-position traces store the delta from the pre-step vertex instead of its absolute position; face distances are divided by the selected face's longest edge before they leave the branch.
 - The record excludes project bytes, real object IDs, object names, goal/step text, prompts, answers, and paths; step object aliases preserve only within-record relationships.
 - Saving is immutable and size-bounded. Opening a record does not create an AgentTask, mutate a project, or cross the human acceptance boundary.
 - The format checksum detects accidental edits only; it is not a signature or proof that the trace came from a trusted Cartographer process.

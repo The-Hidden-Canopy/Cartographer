@@ -25,8 +25,10 @@ constexpr std::string_view kMagic = "CARTOGRAPHER_AGENT_TASK_CHECKPOINT_V1\n";
 constexpr std::size_t kMaxCheckpointBytes = 512U * 1024U * 1024U;
 constexpr std::size_t kMaxProjectBytes = 240U * 1024U * 1024U;
 constexpr std::size_t kMaxTextBytes = 1U * 1024U * 1024U;
-constexpr std::string_view kDemonstrationMagic =
+constexpr std::string_view kDemonstrationMagicV1 =
     "CARTOGRAPHER_AGENT_DEMONSTRATION_V1\n";
+constexpr std::string_view kDemonstrationMagicV2 =
+    "CARTOGRAPHER_AGENT_DEMONSTRATION_V2\n";
 constexpr std::size_t kMaxDemonstrationBytes = 2U * 1024U * 1024U;
 constexpr std::size_t kMaxDemonstrationSteps = 4096U;
 constexpr std::size_t kMaxDemonstrationGates = 256U;
@@ -1052,6 +1054,11 @@ core::Result<AgentDemonstration> AgentDemonstration::capture(
             return core::Result<AgentDemonstration>::failure(malformed(
                 "accepted task step revision is outside its source and result span"));
         }
+        if (!receipt.demonstration_parameters ||
+            !receipt.demonstration_parameters->validate(receipt.tool_id)) {
+            return core::Result<AgentDemonstration>::failure(malformed(
+                "accepted task step has no safe typed demonstration parameterization"));
+        }
         demonstration.steps.push_back(AgentDemonstrationStep{
             digest_text(receipt.intent),
             receipt.tool_id,
@@ -1059,7 +1066,8 @@ core::Result<AgentDemonstration> AgentDemonstration::capture(
                 std::distance(object_aliases.begin(), alias) + 1),
             before_offset,
             after_offset,
-            receipt.status});
+            receipt.status,
+            receipt.demonstration_parameters});
     }
     for (const auto& gate : snapshot.gates) {
         std::uint64_t source_offset = 0U;
@@ -1088,7 +1096,8 @@ core::Result<AgentDemonstration> AgentDemonstration::capture(
 }
 
 core::Result<void> AgentDemonstration::validate() const {
-    if ((!recipe_id.empty() && !safe_demonstration_text(recipe_id, 256U)) ||
+    if ((format_version != 1U && format_version != kFormatVersion) ||
+        (!recipe_id.empty() && !safe_demonstration_text(recipe_id, 256U)) ||
         steps.empty() || steps.size() > kMaxDemonstrationSteps ||
         gates.empty() || gates.size() > kMaxDemonstrationGates ||
         repair_count > 4U || rebase_count > 16U ||
@@ -1107,6 +1116,15 @@ core::Result<void> AgentDemonstration::validate() const {
             step.revision_after_offset > result_revision_span) {
             return core::Result<void>::failure(malformed(
                 "demonstration step is invalid or exceeds its revision span"));
+        }
+        if (format_version >= 2U &&
+            (!step.parameters || !step.parameters->validate(step.tool_id))) {
+            return core::Result<void>::failure(malformed(
+                "demonstration step typed parameters do not match its native tool"));
+        }
+        if (format_version == 1U && step.parameters.has_value()) {
+            return core::Result<void>::failure(malformed(
+                "legacy demonstration format cannot contain typed parameters"));
         }
     }
     for (const auto& gate : gates) {
@@ -1138,7 +1156,7 @@ core::Result<std::string> AgentDemonstration::serialize() const {
         return core::Result<std::string>::failure(result.error());
     }
     Writer payload;
-    payload.number(kFormatVersion);
+    payload.number(format_version);
     payload.field(recipe_id);
     payload.digest(objective_digest);
     payload.digest(diff_digest);
@@ -1154,6 +1172,21 @@ core::Result<std::string> AgentDemonstration::serialize() const {
         payload.number(step.revision_before_offset);
         payload.number(step.revision_after_offset);
         payload.number(static_cast<std::uint64_t>(step.status));
+        if (format_version >= 2U) {
+            payload.boolean(step.parameters.has_value());
+            if (step.parameters.has_value()) {
+                payload.number(static_cast<std::uint64_t>(
+                    step.parameters->parameterization));
+                if (step.parameters->parameterization ==
+                    AgentDemonstrationParameterization::normalized_face_distance) {
+                    payload.real(step.parameters->normalized_distance);
+                } else {
+                    payload.real(step.parameters->relative_displacement.x);
+                    payload.real(step.parameters->relative_displacement.y);
+                    payload.real(step.parameters->relative_displacement.z);
+                }
+            }
+        }
     }
     payload.number(gates.size());
     for (const auto& gate : gates) {
@@ -1172,7 +1205,8 @@ core::Result<std::string> AgentDemonstration::serialize() const {
     Writer outer;
     outer.field(body);
     outer.digest(digest_text(body));
-    std::string result(kDemonstrationMagic);
+    std::string result(format_version == 1U
+        ? kDemonstrationMagicV1 : kDemonstrationMagicV2);
     result += std::move(outer).take();
     if (result.size() > kMaxDemonstrationBytes) {
         return core::Result<std::string>::failure(malformed(
@@ -1183,12 +1217,16 @@ core::Result<std::string> AgentDemonstration::serialize() const {
 
 core::Result<AgentDemonstration> AgentDemonstration::deserialize(
     std::string_view bytes) {
-    if (bytes.size() > kMaxDemonstrationBytes ||
-        !bytes.starts_with(kDemonstrationMagic)) {
+    const bool version_one = bytes.starts_with(kDemonstrationMagicV1);
+    const bool version_two = bytes.starts_with(kDemonstrationMagicV2);
+    if (bytes.size() > kMaxDemonstrationBytes || (!version_one && !version_two)) {
         return core::Result<AgentDemonstration>::failure(malformed(
             "demonstration header is unknown or file exceeds its size bound"));
     }
-    Reader outer(bytes.substr(kDemonstrationMagic.size()));
+    const std::string_view magic = version_one
+        ? kDemonstrationMagicV1 : kDemonstrationMagicV2;
+    const std::uint32_t expected_version = version_one ? 1U : 2U;
+    Reader outer(bytes.substr(magic.size()));
     const std::string body = outer.field(kMaxDemonstrationBytes);
     const auto supplied_digest = outer.digest();
     if (!outer.finished()) {
@@ -1200,12 +1238,13 @@ core::Result<AgentDemonstration> AgentDemonstration::deserialize(
     }
 
     Reader reader(body);
-    if (reader.number() != kFormatVersion) {
+    if (reader.number() != expected_version) {
         return core::Result<AgentDemonstration>::failure(core::Diagnostic(
             core::ErrorCode::version_mismatch,
             "agent demonstration version is unsupported"));
     }
     AgentDemonstration demonstration;
+    demonstration.format_version = expected_version;
     demonstration.recipe_id = reader.field(256U);
     demonstration.objective_digest = reader.digest();
     demonstration.diff_digest = reader.digest();
@@ -1232,6 +1271,24 @@ core::Result<AgentDemonstration> AgentDemonstration::deserialize(
             reader.fail("demonstration step status is unknown");
         }
         step.status = static_cast<StepStatus>(status);
+        if (expected_version >= 2U && reader.boolean()) {
+            AgentDemonstrationParameters parameters;
+            const auto parameterization = reader.number();
+            if (parameterization > static_cast<std::uint64_t>(
+                    AgentDemonstrationParameterization::relative_displacement)) {
+                reader.fail("demonstration parameterization kind is unknown");
+            }
+            parameters.parameterization = static_cast<
+                AgentDemonstrationParameterization>(parameterization);
+            if (parameters.parameterization ==
+                AgentDemonstrationParameterization::normalized_face_distance) {
+                parameters.normalized_distance = reader.real();
+            } else {
+                parameters.relative_displacement = {
+                    reader.real(), reader.real(), reader.real()};
+            }
+            step.parameters = parameters;
+        }
         demonstration.steps.push_back(std::move(step));
     }
     const auto gate_count = reader.count(kMaxDemonstrationGates);

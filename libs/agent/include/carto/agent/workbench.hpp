@@ -223,6 +223,23 @@ struct PlanStepProgress {
     std::optional<core::Diagnostic> diagnostic;
 };
 
+enum class AgentDemonstrationParameterization : std::uint8_t {
+    normalized_face_distance,
+    relative_displacement,
+};
+
+// Transferable typed values deliberately omit absolute object, vertex, and
+// world-position data. Face distances are normalized by the source face's
+// longest edge; vertex/object moves are stored as relative displacement.
+struct AgentDemonstrationParameters {
+    AgentDemonstrationParameterization parameterization =
+        AgentDemonstrationParameterization::normalized_face_distance;
+    double normalized_distance = 0.0;
+    core::Vec3d relative_displacement;
+
+    [[nodiscard]] core::Result<void> validate(std::string_view tool_id) const;
+};
+
 struct StepReceipt {
     std::string step_id;
     std::string intent;
@@ -232,6 +249,9 @@ struct StepReceipt {
     core::Revision revision_after;
     StepStatus status = StepStatus::failed;
     std::optional<core::Diagnostic> diagnostic;
+    // Derived from the validated native proposal and branch-before state.
+    // Checkpoints rederive this when a plan is replayed.
+    std::optional<AgentDemonstrationParameters> demonstration_parameters;
 };
 
 struct AcceptanceGateResult {
@@ -414,6 +434,7 @@ struct AgentDemonstrationStep {
     std::uint64_t revision_before_offset = 0U;
     std::uint64_t revision_after_offset = 0U;
     StepStatus status = StepStatus::failed;
+    std::optional<AgentDemonstrationParameters> parameters;
 };
 
 struct AgentDemonstrationGate {
@@ -430,8 +451,9 @@ struct AgentDemonstrationGate {
 };
 
 struct AgentDemonstration {
-    static constexpr std::uint32_t kFormatVersion = 1U;
+    static constexpr std::uint32_t kFormatVersion = 2U;
 
+    std::uint32_t format_version = kFormatVersion;
     std::string recipe_id;
     assets::Sha256Digest objective_digest;
     assets::Sha256Digest diff_digest;

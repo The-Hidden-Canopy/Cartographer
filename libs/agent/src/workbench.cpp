@@ -237,6 +237,94 @@ bool same_transform(const core::Transform& left, const core::Transform& right) n
         left.scale.z == right.scale.z;
 }
 
+core::Result<AgentDemonstrationParameters> parameterize_demo_step(
+    const ai::Proposal& proposal,
+    const project::ProjectDocument& document,
+    const TargetRef& target) {
+    AgentDemonstrationParameters parameters;
+    if (proposal.preview_kind == editor::PreviewKind::inset_face ||
+        proposal.preview_kind == editor::PreviewKind::extrude_face) {
+        const auto* face_id = std::get_if<geometry::FaceId>(&target.component);
+        const auto* object = document.scene().find(target.object);
+        if (face_id == nullptr || object == nullptr || !object->mesh_asset.has_value() ||
+            !proposal.parameters.distance.has_value()) {
+            return core::Result<AgentDemonstrationParameters>::failure(invalid_state(
+                "face demonstration parameters could not resolve the validated target"));
+        }
+        const auto mesh = document.meshes().find(*object->mesh_asset);
+        if (mesh == document.meshes().end()) {
+            return core::Result<AgentDemonstrationParameters>::failure(stale(
+                "face demonstration parameters could not resolve the source mesh"));
+        }
+        const auto* face = mesh->second.find_face(*face_id);
+        if (face == nullptr || face->vertices.size() < 3U) {
+            return core::Result<AgentDemonstrationParameters>::failure(stale(
+                "face demonstration parameters could not resolve the source face"));
+        }
+        double longest_edge = 0.0;
+        for (std::size_t index = 0U; index < face->vertices.size(); ++index) {
+            const auto* first = mesh->second.find_vertex(face->vertices[index]);
+            const auto* second = mesh->second.find_vertex(
+                face->vertices[(index + 1U) % face->vertices.size()]);
+            if (first == nullptr || second == nullptr) {
+                return core::Result<AgentDemonstrationParameters>::failure(stale(
+                    "face demonstration parameters found a missing source vertex"));
+            }
+            const double edge_length = (second->position - first->position).length();
+            if (!std::isfinite(edge_length)) {
+                return core::Result<AgentDemonstrationParameters>::failure(invalid_state(
+                    "face demonstration parameters found a non-finite source edge"));
+            }
+            longest_edge = std::max(longest_edge, edge_length);
+        }
+        if (!(longest_edge > 0.0)) {
+            return core::Result<AgentDemonstrationParameters>::failure(invalid_state(
+                "face demonstration parameters require a non-zero source edge"));
+        }
+        parameters.parameterization =
+            AgentDemonstrationParameterization::normalized_face_distance;
+        parameters.normalized_distance = *proposal.parameters.distance / longest_edge;
+    } else if (proposal.preview_kind == editor::PreviewKind::object_translation_delta) {
+        if (proposal.tool_id != "object.translate" ||
+            !std::holds_alternative<std::monostate>(target.component) ||
+            !proposal.parameters.position.has_value()) {
+            return core::Result<AgentDemonstrationParameters>::failure(invalid_state(
+                "translation demonstration parameters do not match the validated target"));
+        }
+        parameters.parameterization =
+            AgentDemonstrationParameterization::relative_displacement;
+        parameters.relative_displacement = *proposal.parameters.position;
+    } else if (proposal.preview_kind == editor::PreviewKind::set_vertex_position) {
+        const auto* vertex_id = std::get_if<geometry::VertexId>(&target.component);
+        const auto* object = document.scene().find(target.object);
+        if (vertex_id == nullptr || object == nullptr || !object->mesh_asset.has_value() ||
+            !proposal.parameters.position.has_value()) {
+            return core::Result<AgentDemonstrationParameters>::failure(invalid_state(
+                "vertex demonstration parameters could not resolve the validated target"));
+        }
+        const auto mesh = document.meshes().find(*object->mesh_asset);
+        if (mesh == document.meshes().end()) {
+            return core::Result<AgentDemonstrationParameters>::failure(stale(
+                "vertex demonstration parameters could not resolve the source mesh"));
+        }
+        const auto* vertex = mesh->second.find_vertex(*vertex_id);
+        if (vertex == nullptr) {
+            return core::Result<AgentDemonstrationParameters>::failure(stale(
+                "vertex demonstration parameters could not resolve the source vertex"));
+        }
+        parameters.parameterization =
+            AgentDemonstrationParameterization::relative_displacement;
+        parameters.relative_displacement = *proposal.parameters.position - vertex->position;
+    } else {
+        return core::Result<AgentDemonstrationParameters>::failure(invalid_state(
+            "native preview kind has no safe demonstration parameterization"));
+    }
+    if (auto result = parameters.validate(proposal.tool_id); !result) {
+        return core::Result<AgentDemonstrationParameters>::failure(result.error());
+    }
+    return core::Result<AgentDemonstrationParameters>::success(std::move(parameters));
+}
+
 bool has_changes(const ObjectChange& change) noexcept {
     return change.added || change.removed || change.name_changed ||
         change.transform_changed || change.parent_changed ||
@@ -508,6 +596,33 @@ bool has_uncompiled_topology_change(
 }
 
 } // namespace
+
+core::Result<void> AgentDemonstrationParameters::validate(std::string_view tool_id) const {
+    const bool displacement_is_zero = relative_displacement.x == 0.0 &&
+        relative_displacement.y == 0.0 && relative_displacement.z == 0.0;
+    switch (parameterization) {
+    case AgentDemonstrationParameterization::normalized_face_distance:
+        if ((tool_id != "mesh.inset-face" && tool_id != "mesh.extrude-face") ||
+            !std::isfinite(normalized_distance) || normalized_distance <= 0.0 ||
+            normalized_distance > 1'000'000.0 || !displacement_is_zero) {
+            return core::Result<void>::failure(invalid(
+                "demonstration face-distance parameter is invalid for its native tool"));
+        }
+        return core::Result<void>::success();
+    case AgentDemonstrationParameterization::relative_displacement: {
+        const double magnitude = relative_displacement.length();
+        if ((tool_id != "object.translate" && tool_id != "mesh.set-vertex-position") ||
+            !relative_displacement.finite() || !std::isfinite(magnitude) ||
+            !(magnitude > 0.0) || magnitude > 1'000'000.0 || normalized_distance != 0.0) {
+            return core::Result<void>::failure(invalid(
+                "demonstration displacement parameter is invalid for its native tool"));
+        }
+        return core::Result<void>::success();
+    }
+    }
+    return core::Result<void>::failure(invalid(
+        "demonstration parameterization kind is unknown"));
+}
 
 const std::vector<AgentRecipeDefinition>& agent_recipe_catalog() noexcept {
     static const std::vector<AgentRecipeDefinition> recipes{
@@ -1895,6 +2010,10 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
                 " forbids topology changes for this target"));
         }
     }
+
+    const auto parameterized = parameterize_demo_step(
+        proposal.value(), speculative_->document_, step.target);
+    if (parameterized) receipt.demonstration_parameters = parameterized.value();
 
     auto preview = speculative_->begin_preview(proposal.value().preview_kind);
     if (!preview) return fail(preview.error().with_context("speculative native preview"));

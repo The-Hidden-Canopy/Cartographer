@@ -543,6 +543,10 @@ void accepted_task_demonstration_is_redacted_read_only_and_checksummed() {
     REQUIRE(demonstration.value().steps.size() == 2U);
     REQUIRE(demonstration.value().steps[0].target_alias == 1U);
     REQUIRE(demonstration.value().steps[1].target_alias == 2U);
+    REQUIRE(demonstration.value().steps[0].parameters.has_value());
+    REQUIRE(demonstration.value().steps[0].parameters->parameterization ==
+        carto::agent::AgentDemonstrationParameterization::normalized_face_distance);
+    REQUIRE(demonstration.value().steps[0].parameters->normalized_distance > 0.0);
     REQUIRE(demonstration.value().gates.size() >= 4U);
     REQUIRE(demonstration.value().validate());
 
@@ -555,16 +559,20 @@ void accepted_task_demonstration_is_redacted_read_only_and_checksummed() {
 
     const auto decoded = carto::agent::AgentDemonstration::deserialize(encoded.value());
     REQUIRE(decoded);
+    REQUIRE(decoded.value().format_version == 2U);
     REQUIRE(decoded.value().steps.size() == 2U);
     REQUIRE(decoded.value().steps[0].target_alias == 1U);
     REQUIRE(decoded.value().steps[1].target_alias == 2U);
+    REQUIRE(decoded.value().steps[0].parameters.has_value());
+    REQUIRE(decoded.value().steps[0].parameters->parameterization ==
+        carto::agent::AgentDemonstrationParameterization::normalized_face_distance);
     REQUIRE(decoded.value().objective_digest.hex() ==
         demonstration.value().objective_digest.hex());
     REQUIRE(decoded.value().diff_digest.hex() ==
         demonstration.value().diff_digest.hex());
 
     std::string corrupted = encoded.value();
-    const std::string magic = "CARTOGRAPHER_AGENT_DEMONSTRATION_V1\n";
+    const std::string magic = "CARTOGRAPHER_AGENT_DEMONSTRATION_V2\n";
     const auto body_length_end = corrupted.find(':', magic.size());
     REQUIRE(body_length_end != std::string::npos);
     const auto body_start = body_length_end + 1U;
@@ -596,6 +604,46 @@ void accepted_task_demonstration_is_redacted_read_only_and_checksummed() {
     REQUIRE(!carto::agent::AgentDemonstration::deserialize(
         checksummed_alias_overflow));
 
+    auto malicious_parameters = fields;
+    REQUIRE(malicious_parameters.size() > 17U);
+    malicious_parameters[17] = "9218868437227405312"; // IEEE-754 positive infinity.
+    const auto malicious_parameter_body = checkpoint_body(malicious_parameters);
+    const auto malicious_parameter_digest = carto::assets::sha256(
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(malicious_parameter_body.data()),
+            malicious_parameter_body.size())).hex();
+    const auto checksummed_non_finite_parameter = magic +
+        std::to_string(malicious_parameter_body.size()) + ":" +
+        malicious_parameter_body + "|" +
+        std::to_string(malicious_parameter_digest.size()) + ":" +
+        malicious_parameter_digest + "|";
+    REQUIRE(!carto::agent::AgentDemonstration::deserialize(
+        checksummed_non_finite_parameter));
+
+    auto mismatched_parameter = demonstration.value();
+    mismatched_parameter.steps.front().parameters->parameterization =
+        carto::agent::AgentDemonstrationParameterization::relative_displacement;
+    mismatched_parameter.steps.front().parameters->relative_displacement = {0.2, 0.0, 0.0};
+    REQUIRE(!mismatched_parameter.serialize());
+
+    auto non_finite_parameter = demonstration.value();
+    non_finite_parameter.steps.front().parameters->normalized_distance =
+        std::numeric_limits<double>::infinity();
+    REQUIRE(!non_finite_parameter.serialize());
+
+    auto legacy = demonstration.value();
+    legacy.format_version = 1U;
+    for (auto& step : legacy.steps) step.parameters.reset();
+    const auto legacy_bytes = legacy.serialize();
+    REQUIRE(legacy_bytes);
+    REQUIRE(legacy_bytes.value().starts_with(
+        "CARTOGRAPHER_AGENT_DEMONSTRATION_V1\n"));
+    const auto decoded_legacy =
+        carto::agent::AgentDemonstration::deserialize(legacy_bytes.value());
+    REQUIRE(decoded_legacy);
+    REQUIRE(decoded_legacy.value().format_version == 1U);
+    REQUIRE(!decoded_legacy.value().steps.front().parameters.has_value());
+
 
     auto failed_gate = demonstration.value();
     auto required_gate = std::find_if(
@@ -622,11 +670,49 @@ void accepted_task_demonstration_is_redacted_read_only_and_checksummed() {
     REQUIRE(viewer.load_agent_demonstration(path));
     const auto view = viewer.snapshot();
     REQUIRE(view.agent_demonstration.has_value());
+    REQUIRE(view.agent_demonstration->format_version == 2U);
+    REQUIRE(view.agent_demonstration->steps.front().parameters.has_value());
     REQUIRE(!view.agent_task.has_value());
     REQUIRE(viewer_source.snapshot().project_revision == viewer_revision);
     REQUIRE(!viewer.accept_agent_plan());
     REQUIRE(viewer.clear_agent_demonstration());
     REQUIRE(!viewer.snapshot().agent_demonstration.has_value());
+}
+
+void vertex_demonstration_stores_relative_displacement_only() {
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 1U);
+    const auto before = source.snapshot();
+    const auto* instance = before.viewport.scene.find(objects.front());
+    REQUIRE(instance != nullptr && instance->mesh != nullptr);
+    const carto::geometry::VertexId target_vertex{1U};
+    const auto vertex_position = std::find(
+        instance->mesh->vertex_ids.begin(), instance->mesh->vertex_ids.end(), target_vertex);
+    REQUIRE(vertex_position != instance->mesh->vertex_ids.end());
+    const std::size_t vertex_index = static_cast<std::size_t>(
+        std::distance(instance->mesh->vertex_ids.begin(), vertex_position));
+    const auto original_position = instance->mesh->positions[vertex_index];
+
+    auto plan = plan_for(before, objects, {
+        {"step-vertex", {objects.front(), target_vertex}, "move vertex to 4 0 0"},
+    });
+    auto task = carto::agent::AgentTask::begin(source, std::move(plan), envelope_for(objects));
+    REQUIRE(task);
+    const auto run = task.value().run();
+    REQUIRE(run && run.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(carto::application::HumanApplicationAccess::accept_agent_task(task.value()));
+    const auto demonstration = task.value().create_demonstration();
+    REQUIRE(demonstration);
+    const auto& parameters = demonstration.value().steps.front().parameters;
+    REQUIRE(parameters.has_value());
+    REQUIRE(parameters->parameterization ==
+        carto::agent::AgentDemonstrationParameterization::relative_displacement);
+    REQUIRE(parameters->relative_displacement.x == 4.0 - original_position.x);
+    REQUIRE(parameters->relative_displacement.y == -original_position.y);
+    REQUIRE(parameters->relative_displacement.z == -original_position.z);
+    const auto encoded = demonstration.value().serialize();
+    REQUIRE(encoded);
+    REQUIRE(encoded.value().find("move vertex to 4 0 0") == std::string::npos);
 }
 void plan_dag_orders_dependencies_and_rejects_invalid_graphs() {
     carto::application::ApplicationSession source;
@@ -1099,6 +1185,7 @@ void prepared_checkpoint_requires_explicit_resume_before_native_execution() {
     REQUIRE(resumed);
     REQUIRE(resumed.value().snapshot().status == carto::agent::TaskStatus::review);
     REQUIRE(resumed.value().snapshot().can_accept);
+    REQUIRE(resumed.value().snapshot().steps.front().demonstration_parameters.has_value());
     REQUIRE(source.snapshot().project_revision == base_revision);
 }
 
@@ -1123,7 +1210,12 @@ void persistent_checkpoint_rejects_corruption_and_overwrite() {
     auto corrupted = bytes;
     corrupted.back() = corrupted.back() == '0' ? '1' : '0';
     REQUIRE(!carto::agent::AgentTaskCheckpoint::deserialize(corrupted));
-    REQUIRE(carto::agent::AgentTask::load_checkpoint(path));
+    const auto checkpoint = carto::agent::AgentTask::load_checkpoint(path);
+    REQUIRE(checkpoint);
+    auto resumed = carto::agent::AgentTask::resume_checkpoint(
+        source, checkpoint.value(), checkpoint.value().plan);
+    REQUIRE(resumed);
+    REQUIRE(resumed.value().snapshot().steps.front().demonstration_parameters.has_value());
 }
 
 void persistent_checkpoint_v1_format_remains_readable() {
@@ -2787,6 +2879,7 @@ int main() {
         ui_workbench_captures_object_target_and_requires_explicit_transform_envelope();
         multi_step_branch_isolated_until_reviewed_acceptance();
         accepted_task_demonstration_is_redacted_read_only_and_checksummed();
+        vertex_demonstration_stores_relative_displacement_only();
         plan_dag_orders_dependencies_and_rejects_invalid_graphs();
         failed_dag_node_invalidates_only_dependent_steps();
         bounded_repair_restarts_from_source_and_preserves_attempt_lineage();
