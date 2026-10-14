@@ -1114,6 +1114,7 @@ struct DesktopState {
     std::optional<carto::editor::AuthoringPreview> ai_preview;
     std::string ai_feedback;
     std::string agent_goal;
+    bool agent_goal_focus_requested = false;
     std::string agent_step;
     std::string agent_question;
     std::string agent_answer;
@@ -3078,6 +3079,17 @@ struct DesktopState {
             static_cast<void>(ui.handle_shortcut(carto::ui::Shortcut::toggle_command_palette));
         }
         ImGui::SameLine();
+        if (ImGui::Button(compact_header ? "Agent" : "Ask Cartographer…")) {
+            const auto opened = ui.set_workspace(carto::ui::Workspace::ai);
+            if (opened) {
+                surface = ShellSurface::workspace;
+                agent_goal_focus_requested = true;
+            } else {
+                action_feedback = opened.error().message;
+                action_feedback_error = true;
+            }
+        }
+        ImGui::SameLine();
         if (ImGui::Button(compact_header ? "Flow" : "Compose")) {
             ImGui::OpenPopup("Compose workbench");
         }
@@ -5028,6 +5040,10 @@ struct DesktopState {
         std::array<char, 1025> goal{};
         const std::size_t goal_bytes = std::min(agent_goal.size(), goal.size() - 1U);
         std::copy_n(agent_goal.data(), goal_bytes, goal.data());
+        if (agent_goal_focus_requested) {
+            ImGui::SetKeyboardFocusHere();
+            agent_goal_focus_requested = false;
+        }
         if (ImGui::InputText("Goal", goal.data(), goal.size())) {
             agent_goal.assign(goal.data());
         }

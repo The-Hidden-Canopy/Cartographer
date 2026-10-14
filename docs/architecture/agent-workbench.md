@@ -35,6 +35,8 @@ Plan steps may depend on earlier captured steps. Validation rejects missing, dup
 
 When a task is active, non-Agent authoring workspaces show a persistent status strip with task identity, step and required-gate counts derived from current receipts, and a route back to the Agent workspace. Blocked and review-ready tasks remain visible until accepted or rejected. The strip is a presentation projection; it does not add mutation or acceptance authority.
 
+The shell header also exposes an “Ask Cartographer” entry from the project surfaces. It opens the Agent workspace and focuses the goal field; it does not create a plan or start execution.
+
 ## Review evidence
 
 The review view includes source/before/after viewport modes, per-step receipts, required gates, changed object and mesh records with vertex positions and face connectivity, changed engineering/CONDITION sidecar flags, and a SHA-256 digest of the complete serialized branch result. Every gate also carries its validator version, source and evaluated revisions, affected objects and assets, result digest, canonical evidence digest, and any diagnostic. The digest binds the gate outcome and evidence to those identities and revisions. Branch viewport modes are read-only and disable source selection. Required gates are project validity, viewport compilation, all plan steps passing, and a non-empty diff. Whole-result acceptance is explicit.

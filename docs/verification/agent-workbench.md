@@ -89,6 +89,7 @@
 - A review-ready task remains available from other authoring workspaces with passed-step and required-gate counts derived from its current snapshot.
 - A blocked task remains visible, exposes its diagnostic on the task action tooltip, and routes back to the Agent workspace; the strip itself does not accept, repair, or mutate the task.
 - The strip is hidden in the Agent workspace, after acceptance/rejection, and when no task exists.
+- Native-shell smoke coverage should click the global “Ask Cartographer” entry from Project, Market, and Model surfaces, then confirm Agent workspace navigation and goal-field focus without changing task or project state.
 
 ## Follow-up coverage
 
