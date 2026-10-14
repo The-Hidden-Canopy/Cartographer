@@ -2297,6 +2297,39 @@ void ui_workbench_captures_selection_and_exposes_accept_reject_flow() {
     REQUIRE(ui.snapshot().project_revision == source_revision.next());
 }
 
+void ui_agent_entry_preserves_context_selection_across_workspaces() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Context target", {1.0, 1.0, 1.0}}));
+    const auto object = source.snapshot().objects.front().object.id;
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        object, carto::geometry::FaceId{1U}}));
+    const auto source_revision = source.snapshot().project_revision;
+
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::material));
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::ai));
+    const auto routed = ui.snapshot();
+    REQUIRE(routed.workspace_kind == carto::ui::Workspace::ai);
+    REQUIRE(routed.selection.mode == carto::editor::SelectionMode::face);
+    REQUIRE(routed.selection.component_object == object);
+    REQUIRE(routed.selection.faces ==
+        std::vector<carto::geometry::FaceId>{carto::geometry::FaceId{1U}});
+    REQUIRE(routed.project_revision == source_revision);
+    REQUIRE(!routed.agent_task.has_value());
+
+    REQUIRE(ui.queue_agent_step("inset face 0.1"));
+    const auto captured = ui.snapshot();
+    REQUIRE(captured.agent_plan_draft.size() == 1U);
+    REQUIRE(captured.agent_plan_draft.front().target.object == object);
+    const auto* captured_face = std::get_if<carto::geometry::FaceId>(
+        &captured.agent_plan_draft.front().target.component);
+    REQUIRE(captured_face != nullptr && *captured_face == carto::geometry::FaceId{1U});
+    REQUIRE(source.snapshot().project_revision == source_revision);
+}
+
 void ui_prepared_task_supports_condition_preflight_and_rechecks_source_revision() {
     carto::application::ApplicationSession source;
     carto::ui::UiController ui(source);
@@ -2775,6 +2808,7 @@ int main() {
         ui_compiled_constraints_are_bound_to_clarification_and_gate_execution();
         acceptance_evidence_binds_validator_revision_assets_and_result();
         ui_workbench_captures_selection_and_exposes_accept_reject_flow();
+        ui_agent_entry_preserves_context_selection_across_workspaces();
         ui_prepared_task_supports_condition_preflight_and_rechecks_source_revision();
         ui_recipe_selection_round_trips_and_locks_with_checkpoint();
         ui_clarification_requires_an_operator_answer_before_review();

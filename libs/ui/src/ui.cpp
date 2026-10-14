@@ -203,8 +203,8 @@ std::vector<WorkspaceDefinition> make_workspace_registry() {
          BottomPanel::assets, true, {}},
         future(Workspace::animate, "animate", "Animate", timeline_panels, BottomPanel::timeline,
                "animation tools are not available in this build"),
-        future(Workspace::review, "review", "Review", model_panels, BottomPanel::problems,
-               "review and comparison tools are not available in this build"),
+        {Workspace::review, "review", "Review", model_panels, BottomPanel::problems,
+         true, {}},
         {Workspace::ai, "ai", "AI", graph_panels, BottomPanel::graph, true, {}},
     };
 }

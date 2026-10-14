@@ -1655,6 +1655,32 @@ struct DesktopState {
         return true;
     }
 
+    bool open_agent_workspace(bool focus_goal) {
+        const auto opened = ui.set_workspace(carto::ui::Workspace::ai);
+        if (!opened) {
+            action_feedback = opened.error().message;
+            action_feedback_error = true;
+            return false;
+        }
+        surface = ShellSurface::workspace;
+        workbench.draft = true;
+        if (focus_goal) agent_goal_focus_requested = true;
+        return true;
+    }
+
+    bool open_agent_review_workspace() {
+        const auto opened = ui.set_workspace(carto::ui::Workspace::review);
+        if (!opened) {
+            action_feedback = opened.error().message;
+            action_feedback_error = true;
+            return false;
+        }
+        surface = ShellSurface::workspace;
+        workbench.draft = true;
+        agent_preview_mode = 2;
+        return true;
+    }
+
     bool save_project(const UiSnapshot& snapshot, bool save_as = false) {
         if (!save_as && snapshot.project_path.has_value()) {
             return dispatch(carto::application::SaveProjectAction{std::nullopt});
@@ -3284,14 +3310,7 @@ struct DesktopState {
         }
         ImGui::SameLine();
         if (ImGui::Button(compact_header ? "Agent" : "Ask Cartographer…")) {
-            const auto opened = ui.set_workspace(carto::ui::Workspace::ai);
-            if (opened) {
-                surface = ShellSurface::workspace;
-                agent_goal_focus_requested = true;
-            } else {
-                action_feedback = opened.error().message;
-                action_feedback_error = true;
-            }
+            static_cast<void>(open_agent_workspace(true));
         }
         ImGui::SameLine();
         if (ImGui::Button(compact_header ? "Flow" : "Compose")) {
@@ -3736,7 +3755,15 @@ struct DesktopState {
                 ImGui::PushStyleColor(ImGuiCol_Button, color(snapshot.colors.panel_selected));
             }
             if (available) {
-                if (ImGui::Button(label)) static_cast<void>(ui.set_workspace(workspace));
+                if (ImGui::Button(label)) {
+                    if (workspace == carto::ui::Workspace::ai) {
+                        static_cast<void>(open_agent_workspace(false));
+                    } else if (workspace == carto::ui::Workspace::review) {
+                        static_cast<void>(open_agent_review_workspace());
+                    } else {
+                        static_cast<void>(ui.set_workspace(workspace));
+                    }
+                }
             } else {
                 ImGui::TextDisabled("%s (future)", label);
             }
@@ -4038,11 +4065,24 @@ struct DesktopState {
             const bool selected = std::find(
                 snapshot.selection.objects.begin(), snapshot.selection.objects.end(), object.object.id) !=
                 snapshot.selection.objects.end();
+            const std::string object_id = std::to_string(object.object.id.value);
+            ImGui::PushID(object_id.c_str());
             if (ImGui::Selectable(object.object.name.c_str(), selected)) {
                 dispatch(SelectObjectAction{object.object.id});
             }
+            if (ImGui::BeginPopupContextItem("outliner-object-context")) {
+                ImGui::TextDisabled("Object %llu",
+                    static_cast<unsigned long long>(object.object.id.value));
+                if (ImGui::MenuItem("Ask Cartographer about this object")) {
+                    if (dispatch(SelectObjectAction{object.object.id})) {
+                        static_cast<void>(open_agent_workspace(true));
+                    }
+                }
+                ImGui::EndPopup();
+            }
             ImGui::SameLine();
             ImGui::TextDisabled("#%llu", static_cast<unsigned long long>(object.object.id.value));
+            ImGui::PopID();
         }
         if (snapshot.objects.empty()) ImGui::TextDisabled("No project objects");
     }
@@ -7645,13 +7685,7 @@ struct DesktopState {
                     ? "Read-only inventory is partial; inspect diagnostics and completeness in Agent."
                     : "Read-only scoped inventory loaded in Agent at its source revision.";
                 action_feedback_error = false;
-                const auto opened = ui.set_workspace(carto::ui::Workspace::ai);
-                if (opened) {
-                    surface = ShellSurface::workspace;
-                } else {
-                    action_feedback = opened.error().message;
-                    action_feedback_error = true;
-                }
+                static_cast<void>(open_agent_workspace(false));
             }
         }
         ImGui::EndDisabled();
@@ -10182,14 +10216,15 @@ struct DesktopState {
             task.passed_steps, task.total_steps,
             task.passed_required_gates, task.required_gates);
         ImGui::SameLine();
-        const char* action_label = task.status == carto::agent::TaskStatus::review
+        const bool review_ready = task.status == carto::agent::TaskStatus::review;
+        const char* action_label = review_ready
             ? "Review result" : task.status == carto::agent::TaskStatus::blocked
                 ? "Resolve task" : "Open task";
         if (ImGui::SmallButton(action_label)) {
-            const auto opened = ui.set_workspace(carto::ui::Workspace::ai);
-            if (!opened) {
-                action_feedback = opened.error().message;
-                action_feedback_error = true;
+            if (review_ready) {
+                static_cast<void>(open_agent_review_workspace());
+            } else {
+                static_cast<void>(open_agent_workspace(false));
             }
         }
         if (task.blocker.has_value() && ImGui::IsItemHovered()) {

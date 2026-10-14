@@ -1241,6 +1241,9 @@ void workspace_registry_is_canonical_and_fail_closed() {
     const auto material = carto::ui::workspace_definition(
         carto::ui::Workspace::material);
     REQUIRE(material && material.value().available);
+    const auto review = carto::ui::workspace_definition(
+        carto::ui::Workspace::review);
+    REQUIRE(review && review.value().available);
     const auto future = carto::ui::workspace_definition(carto::ui::Workspace::cad);
     REQUIRE(future && !future.value().available);
     REQUIRE(!future.value().unavailable_reason.empty());
@@ -1291,6 +1294,17 @@ void workspace_registry_is_canonical_and_fail_closed() {
     REQUIRE(std::find(material_snapshot.visible_panels.begin(),
                       material_snapshot.visible_panels.end(),
                       carto::ui::Panel::assets) != material_snapshot.visible_panels.end());
+
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::review));
+    const auto review_snapshot = ui.snapshot();
+    REQUIRE(review_snapshot.workspace_kind == carto::ui::Workspace::review);
+    REQUIRE(review_snapshot.bottom_panel == carto::ui::BottomPanel::problems);
+    REQUIRE(std::find(review_snapshot.visible_panels.begin(),
+                      review_snapshot.visible_panels.end(),
+                      carto::ui::Panel::viewport) != review_snapshot.visible_panels.end());
+    REQUIRE(std::find(review_snapshot.visible_panels.begin(),
+                      review_snapshot.visible_panels.end(),
+                      carto::ui::Panel::problems) != review_snapshot.visible_panels.end());
 }
 
 void sculpt_viewport_sampling_preserves_frontmost_surface_and_path_spacing() {

@@ -9,6 +9,9 @@
 - Confirm per-step receipts, project/viewport gates, and structured mesh diffs.
 - Expand changed meshes and inspect all changed vertex positions and face-connectivity identities, including added/removed faces; large lists must remain scrollable without silently truncating evidence.
 - Accept the result and confirm the source advances once and the saved-project journal contains one application mutation event.
+- From Model, Material, CONDITION, and Review, use the global Ask Cartographer entry and confirm the Agent Workbench instrument opens with the goal field focused while preserving the selected object or component and source revision.
+- From a Scene outliner row, use the context menu to ask Cartographer about that object; confirm the row's object becomes the sole selected target and no plan or task starts automatically.
+- From a review-ready persistent task strip, choose Review result and confirm the Review workspace opens the Agent Workbench with the speculative after branch visible.
 
 ## Adversarial boundaries
 
