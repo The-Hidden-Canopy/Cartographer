@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -34,6 +35,7 @@ void ontology_is_derived_from_native_tools() {
     carto::application::ApplicationSession session;
     const auto context = context_for(session);
     REQUIRE(context.validate());
+    REQUIRE(context.operations.size() >= 10U);
 
     const auto extrude = std::find_if(context.operations.begin(), context.operations.end(),
         [](const auto& operation) { return operation.id == "mesh.extrude-face"; });
@@ -91,6 +93,18 @@ void ontology_is_derived_from_native_tools() {
     REQUIRE(bevel_vertex->precondition.find("triangles") != std::string::npos);
     REQUIRE(bevel_vertex->precondition.find("segments must equal one") != std::string::npos);
     REQUIRE(!bevel_vertex->auto_approvable);
+    REQUIRE(std::all_of(context.operations.begin(), context.operations.end(),
+        [](const auto& operation) {
+            return operation.contract_complete && operation.effects != 0U &&
+                !operation.targets.empty() && !operation.reads.empty() &&
+                !operation.writes.empty() && !operation.validators.empty();
+        }));
+    REQUIRE(std::count_if(context.operations.begin(), context.operations.end(),
+        [](const auto& operation) { return operation.provider_requestable; }) == 3);
+    REQUIRE(inset->parameter_schema.size() == 1U);
+    REQUIRE(inset->parameter_schema.front().type == carto::ai::ParameterType::length);
+    REQUIRE(inset->parameter_schema.front().unit == carto::ai::ParameterUnit::world_length);
+    REQUIRE(!inset->parameter_schema.front().minimum_inclusive);
 }
 
 void ontology_json_preserves_kernel_and_approval_contract() {
@@ -101,6 +115,41 @@ void ontology_json_preserves_kernel_and_approval_contract() {
     REQUIRE(json.find("strictly convex") != std::string::npos);
     REQUIRE(json.find("\"auto_approvable\":true") != std::string::npos);
     REQUIRE(json.find("\"preview_kind\":\"inset_face\"") != std::string::npos);
+    REQUIRE(json.find("\"parameter_schema\":[{\"name\":\"distance\"") !=
+        std::string::npos);
+    REQUIRE(json.find("\"effects\":[\"geometry\",\"topology\"]") !=
+        std::string::npos);
+    REQUIRE(json.find("\"invalidates\":[\"render_mesh\"") != std::string::npos);
+}
+
+void capability_projection_filters_by_preview_and_work_envelope() {
+    carto::application::ApplicationSession session;
+    const auto snapshot = session.snapshot();
+    const auto registry = carto::ai::build_operation_ontology(snapshot.tools);
+    const auto geometry_only = carto::ai::project_capabilities(
+        registry, carto::ai::effect_mask(carto::ai::CapabilityEffect::geometry));
+    REQUIRE(geometry_only.size() == 1U);
+    REQUIRE(geometry_only.front().id == "mesh.set-vertex-position");
+    REQUIRE(geometry_only.front().provider_requestable);
+    REQUIRE(carto::ai::project_capabilities(registry, 0U).empty());
+    REQUIRE(carto::ai::project_capabilities(registry, 0x80000000U).empty());
+
+    auto invalid = geometry_only.front();
+    invalid.parameter_schema.front().minimum = std::numeric_limits<double>::quiet_NaN();
+    REQUIRE(!invalid.validate());
+    invalid = geometry_only.front();
+    invalid.parameter_schema.front().name = "wrong-name";
+    REQUIRE(!invalid.validate());
+    const auto topology_edit = std::find_if(registry.begin(), registry.end(), [](const auto& op) {
+        return op.id == "mesh.inset-face";
+    });
+    REQUIRE(topology_edit != registry.end());
+    invalid = *topology_edit;
+    invalid.parameter_schema.clear();
+    REQUIRE(!invalid.validate());
+    invalid = geometry_only.front();
+    invalid.effects |= 0x80000000U;
+    REQUIRE(!invalid.validate());
 }
 
 void ontology_fails_closed_on_tool_kernel_contract_drift() {
@@ -120,7 +169,12 @@ void ontology_fails_closed_on_tool_kernel_contract_drift() {
     REQUIRE(operation->kernel_operation == "unclassified");
     REQUIRE(!operation->preview_supported);
     REQUIRE(!operation->auto_approvable);
+    REQUIRE(!operation->contract_complete);
+    REQUIRE(!operation->provider_requestable);
     REQUIRE(operation->precondition.find("do not match") != std::string::npos);
+    REQUIRE(carto::ai::project_capabilities(ontology,
+        carto::ai::effect_mask(carto::ai::CapabilityEffect::geometry) |
+        carto::ai::effect_mask(carto::ai::CapabilityEffect::topology)).size() == 2U);
 }
 
 void native_planner_compiles_a_face_intent_without_mutating_state() {
@@ -322,6 +376,7 @@ int main() {
     try {
         ontology_is_derived_from_native_tools();
         ontology_json_preserves_kernel_and_approval_contract();
+        capability_projection_filters_by_preview_and_work_envelope();
         ontology_fails_closed_on_tool_kernel_contract_drift();
         native_planner_compiles_a_face_intent_without_mutating_state();
         native_planner_rejects_ambiguous_or_wrong_scope_intents();

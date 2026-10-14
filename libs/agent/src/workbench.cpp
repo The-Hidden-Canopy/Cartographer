@@ -18,8 +18,8 @@ constexpr std::size_t kMaxStepIdBytes = 64U;
 constexpr std::size_t kMaxTaskIdBytes = 64U;
 constexpr std::size_t kMaxScopeObjects = 512U;
 constexpr std::size_t kMaxPlanSteps = 256U;
-constexpr std::uint32_t kKnownEffects = effect_mask(Effect::geometry) |
-    effect_mask(Effect::topology);
+constexpr std::uint32_t kKnownEffects = ::carto::agent::effect_mask(Effect::geometry) |
+    ::carto::agent::effect_mask(Effect::topology);
 
 core::Diagnostic invalid(std::string message) {
     return core::Diagnostic(core::ErrorCode::invalid_argument, std::move(message));
@@ -90,21 +90,15 @@ assets::Sha256Digest project_result_digest(const project::ProjectDocument& after
         reinterpret_cast<const std::uint8_t*>(identity.data()), identity.size()));
 }
 
-std::optional<std::uint32_t> effect_for_tool(std::string_view tool_id) noexcept {
-    if (tool_id == "mesh.extrude-face" || tool_id == "mesh.inset-face") {
-        return effect_mask(Effect::geometry) | effect_mask(Effect::topology);
-    }
-    if (tool_id == "mesh.set-vertex-position") return effect_mask(Effect::geometry);
-    return std::nullopt;
-}
-
 std::string effect_names(std::uint32_t effects) {
-    if ((effects & (effect_mask(Effect::geometry) | effect_mask(Effect::topology))) ==
-        (effect_mask(Effect::geometry) | effect_mask(Effect::topology))) {
+    if ((effects & (::carto::agent::effect_mask(Effect::geometry) |
+                    ::carto::agent::effect_mask(Effect::topology))) ==
+        (::carto::agent::effect_mask(Effect::geometry) |
+         ::carto::agent::effect_mask(Effect::topology))) {
         return "geometry and topology";
     }
-    if ((effects & effect_mask(Effect::topology)) != 0U) return "topology";
-    if ((effects & effect_mask(Effect::geometry)) != 0U) return "geometry";
+    if ((effects & ::carto::agent::effect_mask(Effect::topology)) != 0U) return "topology";
+    if ((effects & ::carto::agent::effect_mask(Effect::geometry)) != 0U) return "geometry";
     return "no declared effect";
 }
 
@@ -185,6 +179,13 @@ core::Result<void> AgentWorkEnvelope::validate() const {
         max_objects_touched == 0U || max_objects_touched > kMaxScopeObjects) {
         return core::Result<void>::failure(invalid("work envelope budget is invalid"));
     }
+    SceneQueryBudget query_budget;
+    query_budget.max_queries = max_scene_queries;
+    query_budget.max_objects_examined = max_objects_examined;
+    query_budget.max_topology_elements_examined = max_topology_elements_examined;
+    query_budget.max_semantic_records_examined = max_semantic_records_examined;
+    query_budget.max_result_bytes = max_query_result_bytes;
+    if (auto result = query_budget.validate(); !result) return result;
     return core::Result<void>::success();
 }
 
@@ -209,7 +210,14 @@ AgentTask::AgentTask(
       base_document_(source.document_),
       base_scene_(std::move(source_snapshot.viewport.scene)),
       base_viewport_error_(std::move(source_snapshot.viewport.error)),
-      speculative_(std::move(speculative)) {}
+      speculative_(std::move(speculative)) {
+    query_budget_.max_queries = envelope_.max_scene_queries;
+    query_budget_.max_objects_examined = envelope_.max_objects_examined;
+    query_budget_.max_topology_elements_examined =
+        envelope_.max_topology_elements_examined;
+    query_budget_.max_semantic_records_examined = envelope_.max_semantic_records_examined;
+    query_budget_.max_result_bytes = envelope_.max_query_result_bytes;
+}
 
 core::Result<AgentTask> AgentTask::begin(
     application::ApplicationSession& source,
@@ -313,10 +321,11 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
     const auto authoring = speculative_->authoring_context();
     if (!authoring) return fail(authoring.error().with_context("speculative authoring context"));
     const auto snapshot = speculative_->snapshot();
+    const auto registry = ai::build_operation_ontology(snapshot.tools);
     const ai::Context context{
         snapshot.project_revision,
         authoring.value(),
-        ai::build_operation_ontology(snapshot.tools)};
+        ai::project_capabilities(registry, envelope_.permitted_effects)};
     if (auto result = context.validate(); !result) {
         return fail(result.error().with_context("speculative capability context"));
     }
@@ -326,13 +335,17 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
     if (auto result = proposal.value().validate(context); !result) {
         return fail(result.error().with_context("native proposal validation"));
     }
-    const auto effects = effect_for_tool(proposal.value().tool_id);
-    if (!effects.has_value()) {
+    const auto capability = std::find_if(
+        context.operations.begin(), context.operations.end(),
+        [&proposal](const ai::OperationDescriptor& operation) {
+            return operation.id == proposal.value().tool_id;
+        });
+    if (capability == context.operations.end() || !capability->provider_requestable) {
         return fail(policy("plan selected a capability without a governed effect contract"));
     }
-    if ((*effects & ~envelope_.permitted_effects) != 0U) {
+    if ((capability->effects & ~envelope_.permitted_effects) != 0U) {
         return fail(policy(
-            "work envelope forbids the " + effect_names(*effects) + " effect"));
+            "work envelope forbids the " + effect_names(capability->effects) + " effect"));
     }
 
     auto preview = speculative_->begin_preview(proposal.value().preview_kind);
@@ -382,6 +395,10 @@ core::Result<AgentTaskSnapshot> AgentTask::run() {
         diagnostic_ = invalid_state("one or more required agent acceptance gates failed");
     }
     return core::Result<AgentTaskSnapshot>::success(snapshot());
+}
+
+const project::ProjectDocument& AgentTask::scene_query_document() const {
+    return speculative_->document_;
 }
 
 ProjectDiff AgentTask::build_diff() const {
@@ -609,6 +626,7 @@ AgentTaskSnapshot AgentTask::build_snapshot() const {
     view.steps = receipts_;
     view.gates = gates_;
     view.diff = build_diff();
+    view.query_budget = query_budget_;
     view.before_scene = base_scene_;
     view.after_scene = speculative_snapshot.viewport.scene;
     view.before_viewport_error = base_viewport_error_;

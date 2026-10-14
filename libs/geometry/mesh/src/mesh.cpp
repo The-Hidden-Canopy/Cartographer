@@ -2982,11 +2982,27 @@ std::vector<Vertex> EditableMesh::vertices_sorted() const {
 }
 
 std::vector<Face> EditableMesh::faces_sorted() const {
+    return faces_sorted(faces_.size());
+}
+
+std::vector<Face> EditableMesh::faces_sorted(std::size_t limit) const {
     std::vector<Face> result;
-    result.reserve(faces_.size());
+    result.reserve(std::min(limit, faces_.size()));
     for (const auto& [id, face] : faces_) {
+        if (result.size() >= limit) break;
         static_cast<void>(id);
         result.push_back(face);
+    }
+    return result;
+}
+
+std::vector<EdgeRecord> EditableMesh::edges_sorted(std::size_t limit) const {
+    std::vector<EdgeRecord> result;
+    result.reserve(std::min(limit, edges_.size()));
+    for (const auto& [id, edge] : edges_) {
+        if (result.size() >= limit) break;
+        static_cast<void>(id);
+        result.push_back(edge);
     }
     return result;
 }

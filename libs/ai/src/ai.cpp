@@ -37,6 +37,15 @@ bool safe_token(std::string_view value) {
     });
 }
 
+template <typename T>
+bool unique_values(const std::vector<T>& values) {
+    std::set<T> unique;
+    for (const auto value : values) {
+        if (!unique.insert(value).second) return false;
+    }
+    return true;
+}
+
 std::string lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char byte) {
         return static_cast<char>(std::tolower(byte));
@@ -133,6 +142,256 @@ std::string selection_name(editor::SelectionMode mode) {
     return "unknown";
 }
 
+std::string_view parameter_type_name(ParameterType type) noexcept {
+    switch (type) {
+    case ParameterType::length: return "length";
+    case ParameterType::scalar: return "scalar";
+    case ParameterType::count: return "count";
+    case ParameterType::boolean: return "boolean";
+    case ParameterType::vector3: return "vector3";
+    case ParameterType::edge_reference: return "edge_reference";
+    }
+    return "unknown";
+}
+
+std::string_view parameter_unit_name(ParameterUnit unit) noexcept {
+    switch (unit) {
+    case ParameterUnit::none: return "none";
+    case ParameterUnit::world_length: return "world_length";
+    case ParameterUnit::unit_interval: return "unit_interval";
+    case ParameterUnit::world_position: return "world_position";
+    }
+    return "unknown";
+}
+
+std::string_view effect_name(CapabilityEffect effect) noexcept {
+    switch (effect) {
+    case CapabilityEffect::geometry: return "geometry";
+    case CapabilityEffect::topology: return "topology";
+    }
+    return "unknown";
+}
+
+std::string_view target_name(CapabilityTarget target) noexcept {
+    switch (target) {
+    case CapabilityTarget::selected_face: return "selected_face";
+    case CapabilityTarget::selected_faces: return "selected_faces";
+    case CapabilityTarget::selected_vertex: return "selected_vertex";
+    case CapabilityTarget::selected_vertices: return "selected_vertices";
+    case CapabilityTarget::selected_edge: return "selected_edge";
+    }
+    return "unknown";
+}
+
+std::string_view data_name(CapabilityData data) noexcept {
+    switch (data) {
+    case CapabilityData::selected_component: return "selected_component";
+    case CapabilityData::target_mesh: return "target_mesh";
+    case CapabilityData::incident_topology: return "incident_topology";
+    }
+    return "unknown";
+}
+
+std::string_view write_name(CapabilityWrite write) noexcept {
+    switch (write) {
+    case CapabilityWrite::vertex_positions: return "vertex_positions";
+    case CapabilityWrite::mesh_topology: return "mesh_topology";
+    }
+    return "unknown";
+}
+
+std::string_view invalidation_name(CapabilityInvalidation value) noexcept {
+    switch (value) {
+    case CapabilityInvalidation::render_mesh: return "render_mesh";
+    case CapabilityInvalidation::topology_cache: return "topology_cache";
+    case CapabilityInvalidation::surface_normals: return "surface_normals";
+    case CapabilityInvalidation::tangent_basis: return "tangent_basis";
+    case CapabilityInvalidation::collision_candidates: return "collision_candidates";
+    case CapabilityInvalidation::bakes: return "bakes";
+    case CapabilityInvalidation::navigation: return "navigation";
+    }
+    return "unknown";
+}
+
+std::string_view validator_name(CapabilityValidator value) noexcept {
+    switch (value) {
+    case CapabilityValidator::target_exists: return "target_exists";
+    case CapabilityValidator::finite_parameters: return "finite_parameters";
+    case CapabilityValidator::mesh_valid: return "mesh_valid";
+    case CapabilityValidator::face_planar: return "face_planar";
+    case CapabilityValidator::face_convex: return "face_convex";
+    case CapabilityValidator::manifold_topology: return "manifold_topology";
+    case CapabilityValidator::operation_preconditions: return "operation_preconditions";
+    }
+    return "unknown";
+}
+
+std::string_view risk_name(CapabilityRisk risk) noexcept {
+    switch (risk) {
+    case CapabilityRisk::reversible_geometry: return "reversible_geometry";
+    case CapabilityRisk::reversible_topology: return "reversible_topology";
+    case CapabilityRisk::destructive_topology: return "destructive_topology";
+    case CapabilityRisk::unknown: return "unknown";
+    }
+    return "unknown";
+}
+
+ParameterDefinition parameter(
+    std::string name,
+    ParameterType type,
+    ParameterUnit unit,
+    std::optional<double> minimum,
+    std::optional<double> maximum,
+    bool minimum_inclusive,
+    bool required,
+    std::string display_hint,
+    bool maximum_inclusive = true) {
+    return ParameterDefinition{
+        std::move(name), type, unit, minimum, maximum, minimum_inclusive,
+        maximum_inclusive, required, false, std::move(display_hint)};
+}
+
+void add_capability_contract(
+    const editor::ToolDescriptor& tool,
+    OperationDescriptor& descriptor) {
+    if (descriptor.kernel_operation == "unclassified") return;
+
+    const bool position_only =
+        tool.kernel == editor::ToolKernelKind::editable_mesh_set_vertex_position;
+    const bool topology_change = !position_only;
+    const std::uint32_t geometry = effect_mask(CapabilityEffect::geometry);
+    const std::uint32_t topology = effect_mask(CapabilityEffect::topology);
+
+    descriptor.contract_complete = true;
+    descriptor.provider_requestable = descriptor.preview_supported;
+    descriptor.effects = geometry | (topology_change ? topology : 0U);
+    descriptor.reads = {
+        CapabilityData::selected_component,
+        CapabilityData::target_mesh};
+    descriptor.writes = {CapabilityWrite::vertex_positions};
+    descriptor.invalidates = {
+        CapabilityInvalidation::render_mesh,
+        CapabilityInvalidation::surface_normals,
+        CapabilityInvalidation::tangent_basis,
+        CapabilityInvalidation::collision_candidates,
+        CapabilityInvalidation::bakes,
+        CapabilityInvalidation::navigation};
+    descriptor.validators = {
+        CapabilityValidator::target_exists,
+        CapabilityValidator::finite_parameters,
+        CapabilityValidator::mesh_valid,
+        CapabilityValidator::operation_preconditions};
+    descriptor.risk = position_only
+        ? CapabilityRisk::reversible_geometry
+        : CapabilityRisk::reversible_topology;
+    descriptor.cost = {1U, topology_change ? 64U : 1U, topology_change ? 32U : 1U};
+
+    using Kernel = editor::ToolKernelKind;
+    switch (tool.kernel) {
+    case Kernel::editable_mesh_extrude_face:
+    case Kernel::editable_mesh_inset_face:
+    case Kernel::editable_mesh_delete_face:
+    case Kernel::editable_mesh_poke_face:
+        descriptor.targets = {CapabilityTarget::selected_face};
+        break;
+    case Kernel::editable_mesh_set_vertex_position:
+    case Kernel::editable_mesh_slide_vertex:
+    case Kernel::editable_mesh_bevel_vertex:
+        descriptor.targets = {CapabilityTarget::selected_vertex};
+        break;
+    case Kernel::editable_mesh_split_edge:
+    case Kernel::editable_mesh_bevel_edge:
+    case Kernel::editable_mesh_dissolve_edge:
+        descriptor.targets = {CapabilityTarget::selected_edge};
+        break;
+    case Kernel::editable_mesh_tri_to_quad:
+        descriptor.targets = {CapabilityTarget::selected_faces};
+        break;
+    case Kernel::editable_mesh_merge_vertices:
+        descriptor.targets = {CapabilityTarget::selected_vertices};
+        break;
+    case Kernel::unclassified:
+        descriptor.contract_complete = false;
+        descriptor.effects = 0U;
+        descriptor.targets.clear();
+        descriptor.reads.clear();
+        descriptor.writes.clear();
+        descriptor.invalidates.clear();
+        descriptor.validators.clear();
+        descriptor.risk = CapabilityRisk::unknown;
+        descriptor.cost = {};
+        return;
+    }
+
+    if (topology_change) {
+        descriptor.reads.push_back(CapabilityData::incident_topology);
+        descriptor.writes.push_back(CapabilityWrite::mesh_topology);
+        descriptor.invalidates.push_back(CapabilityInvalidation::topology_cache);
+    }
+
+    if (tool.kernel == Kernel::editable_mesh_delete_face ||
+        tool.kernel == Kernel::editable_mesh_merge_vertices) {
+        descriptor.risk = CapabilityRisk::destructive_topology;
+    }
+    if (tool.kernel == Kernel::editable_mesh_inset_face ||
+        tool.kernel == Kernel::editable_mesh_poke_face ||
+        tool.kernel == Kernel::editable_mesh_bevel_edge ||
+        tool.kernel == Kernel::editable_mesh_bevel_vertex ||
+        tool.kernel == Kernel::editable_mesh_dissolve_edge ||
+        tool.kernel == Kernel::editable_mesh_tri_to_quad) {
+        descriptor.validators.push_back(CapabilityValidator::face_planar);
+        descriptor.validators.push_back(CapabilityValidator::face_convex);
+    }
+    if (tool.kernel == Kernel::editable_mesh_bevel_edge ||
+        tool.kernel == Kernel::editable_mesh_bevel_vertex ||
+        tool.kernel == Kernel::editable_mesh_dissolve_edge ||
+        tool.kernel == Kernel::editable_mesh_tri_to_quad) {
+        descriptor.validators.push_back(CapabilityValidator::manifold_topology);
+    }
+
+    if (tool.kernel == Kernel::editable_mesh_extrude_face ||
+        tool.kernel == Kernel::editable_mesh_inset_face ||
+        tool.kernel == Kernel::editable_mesh_bevel_edge ||
+        tool.kernel == Kernel::editable_mesh_bevel_vertex) {
+        const double lower = 0.0;
+        descriptor.parameter_schema.push_back(parameter(
+            "distance", ParameterType::length, ParameterUnit::world_length,
+            lower, std::nullopt, false, true, "Distance in project world units"));
+    }
+    if (tool.kernel == Kernel::editable_mesh_set_vertex_position) {
+        for (const char axis : {'x', 'y', 'z'}) {
+            descriptor.parameter_schema.push_back(parameter(
+                std::string(1U, axis), ParameterType::scalar, ParameterUnit::world_length,
+                std::nullopt, std::nullopt, true, true,
+                std::string("World-space ") + axis + " coordinate"));
+        }
+    }
+    if (tool.kernel == Kernel::editable_mesh_slide_vertex ||
+        tool.kernel == Kernel::editable_mesh_split_edge) {
+        descriptor.parameter_schema.push_back(parameter(
+            "factor", ParameterType::scalar, ParameterUnit::unit_interval,
+            0.0, 1.0, false, true, "Position along the support edge", false));
+    }
+    if (tool.kernel == Kernel::editable_mesh_slide_vertex) {
+        descriptor.parameter_schema.push_back(parameter(
+            "support_edge", ParameterType::edge_reference, ParameterUnit::none,
+            std::nullopt, std::nullopt, true, false,
+            "Optional incident edge used as the slide support"));
+    }
+    if (tool.kernel == Kernel::editable_mesh_delete_face) {
+        descriptor.parameter_schema.push_back(parameter(
+            "remove_orphaned_vertices", ParameterType::boolean, ParameterUnit::none,
+            std::nullopt, std::nullopt, true, true,
+            "Remove vertices left without incident faces"));
+    }
+    if (tool.kernel == Kernel::editable_mesh_bevel_edge ||
+        tool.kernel == Kernel::editable_mesh_bevel_vertex) {
+        descriptor.parameter_schema.push_back(parameter(
+            "segments", ParameterType::count, ParameterUnit::none,
+            1.0, 1.0, true, true, "Supported segment count"));
+    }
+}
+
 std::string make_request_id(std::uint64_t sequence) {
     return "native-ai-" + std::to_string(sequence);
 }
@@ -162,13 +421,55 @@ core::Result<void> OperationDescriptor::validate() const {
         !safe_token(kernel_operation)) {
         return core::Result<void>::failure(invalid("AI operation descriptor identity is invalid"));
     }
-    if (parameters.size() > 32U || precondition.empty() || precondition.size() > 512U) {
+    if (parameters.size() > 32U || parameter_schema.size() > 32U ||
+        precondition.empty() || precondition.size() > 512U) {
         return core::Result<void>::failure(invalid("AI operation descriptor is too large"));
     }
     for (const auto& parameter : parameters) {
         if (!safe_token(parameter)) {
             return core::Result<void>::failure(invalid("AI operation parameter name is invalid"));
         }
+    }
+    for (std::size_t index = 0U; index < parameter_schema.size(); ++index) {
+        if (auto result = parameter_schema[index].validate(); !result) return result;
+        if (index >= parameters.size() || parameters[index] != parameter_schema[index].name) {
+            return core::Result<void>::failure(invalid(
+                "AI operation typed parameter schema does not match its native parameters"));
+        }
+    }
+    if (contract_complete && parameter_schema.size() != parameters.size()) {
+        return core::Result<void>::failure(invalid(
+            "AI operation capability contract omits a typed native parameter"));
+    }
+    const std::uint32_t known_effects =
+        effect_mask(CapabilityEffect::geometry) | effect_mask(CapabilityEffect::topology);
+    if ((effects & ~known_effects) != 0U) {
+        return core::Result<void>::failure(invalid(
+            "AI operation declares an unknown capability effect"));
+    }
+    if (preview_supported && (!contract_complete || !provider_requestable)) {
+        return core::Result<void>::failure(invalid(
+            "AI preview operation is missing its complete native capability contract"));
+    }
+    if (contract_complete && (effects == 0U || targets.empty() || reads.empty() ||
+            writes.empty() || invalidates.empty() || validators.empty() ||
+            risk == CapabilityRisk::unknown || cost.objects_read == 0U)) {
+        return core::Result<void>::failure(invalid(
+            "AI operation capability contract is incomplete"));
+    }
+    if (provider_requestable && (!contract_complete || !preview_supported || effects == 0U)) {
+        return core::Result<void>::failure(invalid(
+            "provider-requestable operation lacks a complete native preview contract"));
+    }
+    if (!unique_values(targets) || !unique_values(reads) || !unique_values(writes) ||
+        !unique_values(invalidates) || !unique_values(validators)) {
+        return core::Result<void>::failure(invalid(
+            "AI operation capability contract contains duplicate metadata"));
+    }
+    if (!contract_complete && (provider_requestable || effects != 0U ||
+            risk != CapabilityRisk::unknown)) {
+        return core::Result<void>::failure(invalid(
+            "unclassified AI operation claims an incomplete capability contract"));
     }
     if (preview_supported != preview_kind.has_value()) {
         return core::Result<void>::failure(invalid(
@@ -177,6 +478,61 @@ core::Result<void> OperationDescriptor::validate() const {
     if (auto_approvable && !preview_supported) {
         return core::Result<void>::failure(invalid(
             "AI operation cannot be auto-approvable without preview support"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> ParameterDefinition::validate() const {
+    if (!safe_token(name) || display_hint.empty() || display_hint.size() > 256U) {
+        return core::Result<void>::failure(invalid("AI parameter definition is invalid"));
+    }
+    if ((minimum.has_value() && !std::isfinite(*minimum)) ||
+        (maximum.has_value() && !std::isfinite(*maximum))) {
+        return core::Result<void>::failure(invalid("AI parameter bounds must be finite"));
+    }
+    if (minimum.has_value() && maximum.has_value() &&
+        (*minimum > *maximum || (*minimum == *maximum &&
+            (!minimum_inclusive || !maximum_inclusive)))) {
+        return core::Result<void>::failure(invalid("AI parameter bounds are contradictory"));
+    }
+    switch (type) {
+    case ParameterType::length:
+        if (unit != ParameterUnit::world_length) {
+            return core::Result<void>::failure(invalid(
+                "length parameter must declare world-length units"));
+        }
+        break;
+    case ParameterType::scalar:
+        if (unit != ParameterUnit::none && unit != ParameterUnit::world_length &&
+            unit != ParameterUnit::unit_interval) {
+            return core::Result<void>::failure(invalid("scalar parameter unit is invalid"));
+        }
+        if (unit == ParameterUnit::unit_interval &&
+            (!minimum.has_value() || !maximum.has_value() || *minimum < 0.0 || *maximum > 1.0)) {
+            return core::Result<void>::failure(invalid(
+                "unit-interval parameter must be bounded within zero and one"));
+        }
+        break;
+    case ParameterType::count:
+        if ((minimum.has_value() && std::floor(*minimum) != *minimum) ||
+            (maximum.has_value() && std::floor(*maximum) != *maximum)) {
+            return core::Result<void>::failure(invalid(
+                "count parameter bounds must be whole numbers"));
+        }
+        break;
+    case ParameterType::boolean:
+    case ParameterType::edge_reference:
+        if (unit != ParameterUnit::none || minimum.has_value() || maximum.has_value()) {
+            return core::Result<void>::failure(invalid(
+                "non-numeric parameter cannot declare numeric units or bounds"));
+        }
+        break;
+    case ParameterType::vector3:
+        if (unit != ParameterUnit::world_position) {
+            return core::Result<void>::failure(invalid(
+                "vector parameter must declare world-position units"));
+        }
+        break;
     }
     return core::Result<void>::success();
 }
@@ -216,7 +572,8 @@ core::Result<void> Proposal::validate(const Context& expected) const {
         return core::Result<void>::failure(invalid_state(
             "AI proposal references an operation outside the native ontology"));
     }
-    if (!operation->preview_supported || operation->preview_kind != preview_kind) {
+    if (!operation->preview_supported || !operation->contract_complete ||
+        !operation->provider_requestable || operation->preview_kind != preview_kind) {
         return core::Result<void>::failure(invalid_state(
             "AI proposal references an operation without a matching native preview"));
     }
@@ -358,7 +715,28 @@ std::vector<OperationDescriptor> build_operation_ontology(
                 ? "registered tool ID and native kernel contract do not match; preview disabled"
                 : "native tool-specific validation required";
         }
+        add_capability_contract(tool, descriptor);
         result.push_back(std::move(descriptor));
+    }
+    return result;
+}
+
+std::vector<OperationDescriptor> project_capabilities(
+    std::span<const OperationDescriptor> capabilities,
+    std::uint32_t permitted_effects) {
+    const std::uint32_t known_effects =
+        effect_mask(CapabilityEffect::geometry) | effect_mask(CapabilityEffect::topology);
+    if (permitted_effects == 0U || (permitted_effects & ~known_effects) != 0U) return {};
+
+    std::vector<OperationDescriptor> result;
+    result.reserve(capabilities.size());
+    for (const auto& capability : capabilities) {
+        if (!capability.provider_requestable || !capability.contract_complete ||
+            capability.effects == 0U ||
+            (capability.effects & ~permitted_effects) != 0U || !capability.validate()) {
+            continue;
+        }
+        result.push_back(capability);
     }
     return result;
 }
@@ -389,12 +767,74 @@ std::string context_json(const Context& context) {
             std::string(operation.preview_supported ? "true" : "false") +
             ",\"auto_approvable\":" +
             std::string(operation.auto_approvable ? "true" : "false") +
+            ",\"provider_requestable\":" +
+            std::string(operation.provider_requestable ? "true" : "false") +
+            ",\"contract_complete\":" +
+            std::string(operation.contract_complete ? "true" : "false") +
             ",\"preview_kind\":";
         if (operation.preview_kind.has_value()) {
             result += "\"" + preview_name(*operation.preview_kind) + "\"";
         } else {
             result += "null";
         }
+        const auto append_values = [&result](const auto& values, auto to_name) {
+            result.push_back('[');
+            for (std::size_t value_index = 0U; value_index < values.size(); ++value_index) {
+                if (value_index != 0U) result.push_back(',');
+                result += "\"" + std::string(to_name(values[value_index])) + "\"";
+            }
+            result.push_back(']');
+        };
+        result += ",\"effects\":[";
+        bool has_effect = false;
+        for (const auto effect : {CapabilityEffect::geometry, CapabilityEffect::topology}) {
+            if ((operation.effects & effect_mask(effect)) == 0U) continue;
+            if (has_effect) result.push_back(',');
+            result += "\"" + std::string(effect_name(effect)) + "\"";
+            has_effect = true;
+        }
+        result += "],\"targets\":";
+        append_values(operation.targets, target_name);
+        result += ",\"reads\":";
+        append_values(operation.reads, data_name);
+        result += ",\"writes\":";
+        append_values(operation.writes, write_name);
+        result += ",\"invalidates\":";
+        append_values(operation.invalidates, invalidation_name);
+        result += ",\"validators\":";
+        append_values(operation.validators, validator_name);
+        result += ",\"risk\":\"" + std::string(risk_name(operation.risk)) +
+            "\",\"cost\":{\"objects_read\":" +
+            std::to_string(operation.cost.objects_read) +
+            ",\"topology_elements_read\":" +
+            std::to_string(operation.cost.topology_elements_read) +
+            ",\"topology_elements_written\":" +
+            std::to_string(operation.cost.topology_elements_written) + "}";
+        result += ",\"parameter_schema\":[";
+        for (std::size_t parameter_index = 0U;
+             parameter_index < operation.parameter_schema.size(); ++parameter_index) {
+            if (parameter_index != 0U) result.push_back(',');
+            const auto& definition = operation.parameter_schema[parameter_index];
+            result += "{\"name\":\"" + json_escape(definition.name) +
+                "\",\"type\":\"" + std::string(parameter_type_name(definition.type)) +
+                "\",\"unit\":\"" + std::string(parameter_unit_name(definition.unit)) +
+                "\",\"required\":" + std::string(definition.required ? "true" : "false") +
+                ",\"inference_allowed\":" +
+                std::string(definition.inference_allowed ? "true" : "false") +
+                ",\"display_hint\":\"" + json_escape(definition.display_hint) + "\"";
+            if (definition.minimum.has_value()) {
+                result += ",\"minimum\":" + std::to_string(*definition.minimum) +
+                    ",\"minimum_inclusive\":" +
+                    std::string(definition.minimum_inclusive ? "true" : "false");
+            }
+            if (definition.maximum.has_value()) {
+                result += ",\"maximum\":" + std::to_string(*definition.maximum) +
+                    ",\"maximum_inclusive\":" +
+                    std::string(definition.maximum_inclusive ? "true" : "false");
+            }
+            result.push_back('}');
+        }
+        result.push_back(']');
         result.push_back('}');
     }
     result += "]}";

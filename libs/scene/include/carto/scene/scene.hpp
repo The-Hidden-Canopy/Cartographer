@@ -4,6 +4,7 @@
 #include <carto/core/result.hpp>
 #include <carto/core/revision.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -47,6 +48,7 @@ public:
 
     [[nodiscard]] const SceneObject* find(ObjectId id) const noexcept;
     [[nodiscard]] std::vector<SceneObject> objects_sorted() const;
+    [[nodiscard]] std::vector<SceneObject> objects_sorted(std::size_t limit) const;
     [[nodiscard]] core::Result<core::Transform> world_transform(ObjectId id) const;
     [[nodiscard]] core::Result<void> validate() const;
 

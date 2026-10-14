@@ -173,7 +173,8 @@ void work_envelope_blocks_topology_effect_before_live_mutation() {
     REQUIRE(run.value().steps.size() == 1U);
     REQUIRE(run.value().steps.front().status == carto::agent::StepStatus::failed);
     REQUIRE(run.value().steps.front().diagnostic.has_value());
-    REQUIRE(run.value().steps.front().diagnostic->message.find("forbids") != std::string::npos);
+    REQUIRE(run.value().steps.front().diagnostic->message.find(
+        "outside the native ontology") != std::string::npos);
     REQUIRE(source.snapshot().project_revision == before.project_revision);
 }
 

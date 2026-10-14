@@ -11,6 +11,17 @@ target_link_libraries(cartographer_agent_workbench_tests
 carto_target(cartographer_agent_workbench_tests)
 add_test(NAME cartographer_agent_workbench_tests COMMAND cartographer_agent_workbench_tests)
 
+add_executable(cartographer_scene_query_tests
+    scene_query_tests.cpp
+)
+target_link_libraries(cartographer_scene_query_tests
+    PRIVATE
+        carto_agent
+        carto_application
+)
+carto_target(cartographer_scene_query_tests)
+add_test(NAME cartographer_scene_query_tests COMMAND cartographer_scene_query_tests)
+
 add_executable(cartographer_tests
     test_main.cpp
 )

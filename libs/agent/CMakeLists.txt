@@ -1,4 +1,5 @@
 add_library(carto_agent STATIC
+    src/scene_query.cpp
     src/workbench.cpp
 )
 
@@ -13,6 +14,7 @@ target_link_libraries(carto_agent
         carto_ai
         carto_application
         carto_assets
+        carto_condition_authoring
         carto_core
         carto_geometry
         carto_scene

@@ -2,6 +2,7 @@
 
 #include <carto/ai/ai.hpp>
 #include <carto/application/application.hpp>
+#include <carto/agent/scene_query_budget.hpp>
 #include <carto/assets/blob_store.hpp>
 #include <carto/core/result.hpp>
 #include <carto/geometry/ids.hpp>
@@ -18,13 +19,10 @@
 
 namespace carto::agent {
 
-enum class Effect : std::uint32_t {
-    geometry = 1U,
-    topology = 2U,
-};
+using Effect = ai::CapabilityEffect;
 
 [[nodiscard]] constexpr std::uint32_t effect_mask(Effect effect) noexcept {
-    return static_cast<std::uint32_t>(effect);
+    return ai::effect_mask(effect);
 }
 
 struct TargetRef {
@@ -62,10 +60,15 @@ struct AgentPlan {
 
 struct AgentWorkEnvelope {
     std::vector<scene::ObjectId> scope_objects;
-    std::uint32_t permitted_effects = effect_mask(Effect::geometry) |
-        effect_mask(Effect::topology);
+    std::uint32_t permitted_effects = ::carto::agent::effect_mask(Effect::geometry) |
+        ::carto::agent::effect_mask(Effect::topology);
     std::size_t max_commands = 16U;
     std::size_t max_objects_touched = 16U;
+    std::size_t max_scene_queries = 64U;
+    std::size_t max_objects_examined = 4096U;
+    std::size_t max_topology_elements_examined = 16384U;
+    std::size_t max_semantic_records_examined = 8192U;
+    std::size_t max_query_result_bytes = 1U * 1024U * 1024U;
 
     [[nodiscard]] core::Result<void> validate() const;
 };
@@ -169,6 +172,7 @@ struct AgentTaskSnapshot {
     std::vector<StepReceipt> steps;
     std::vector<AcceptanceGateResult> gates;
     ProjectDiff diff;
+    SceneQueryBudget query_budget;
     render::RenderScene before_scene;
     render::RenderScene after_scene;
     std::optional<core::Diagnostic> before_viewport_error;
@@ -197,6 +201,7 @@ public:
     [[nodiscard]] core::Result<void> reject();
 
 private:
+    friend class SceneQuery;
     friend class ::carto::application::HumanApplicationAccess;
     [[nodiscard]] core::Result<application::DispatchReceipt> accept(
         application::HumanActionAdmission admission);
@@ -208,6 +213,7 @@ private:
         application::ApplicationSnapshot source_snapshot);
 
     [[nodiscard]] core::Result<void> execute_step(const AgentPlanStep& step);
+    [[nodiscard]] const project::ProjectDocument& scene_query_document() const;
     [[nodiscard]] AgentTaskSnapshot build_snapshot() const;
     [[nodiscard]] ProjectDiff build_diff() const;
     [[nodiscard]] std::vector<AcceptanceGateResult> evaluate_gates() const;
@@ -223,6 +229,7 @@ private:
     ai::NativePlanner planner_;
     std::vector<StepReceipt> receipts_;
     std::vector<AcceptanceGateResult> gates_;
+    SceneQueryBudget query_budget_;
     std::set<scene::ObjectId> touched_objects_;
     TaskStatus status_ = TaskStatus::prepared;
     std::optional<core::Diagnostic> diagnostic_;

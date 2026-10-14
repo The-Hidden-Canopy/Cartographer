@@ -8,6 +8,7 @@
 
 #include <carto/core/result.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -183,6 +184,8 @@ public:
     [[nodiscard]] const EdgeRecord* find_edge(EdgeId id) const noexcept;
     [[nodiscard]] std::vector<Vertex> vertices_sorted() const;
     [[nodiscard]] std::vector<Face> faces_sorted() const;
+    [[nodiscard]] std::vector<Face> faces_sorted(std::size_t limit) const;
+    [[nodiscard]] std::vector<EdgeRecord> edges_sorted(std::size_t limit) const;
 
     [[nodiscard]] core::Result<void> validate() const;
     [[nodiscard]] core::Result<TopologySnapshot> topology() const;
@@ -191,6 +194,7 @@ public:
     [[nodiscard]] core::Revision revision() const noexcept { return revision_; }
     [[nodiscard]] std::size_t vertex_count() const noexcept { return vertices_.size(); }
     [[nodiscard]] std::size_t face_count() const noexcept { return faces_.size(); }
+    [[nodiscard]] std::size_t edge_count() const noexcept { return edges_.size(); }
 
 private:
     [[nodiscard]] core::Result<void> rebuild_topology();

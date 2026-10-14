@@ -2,7 +2,7 @@
 
 ## Capability
 
-Cartographer can capture a goal and a bounded sequence of exact face or vertex operations, execute the native proposals on a private copy of the current project, validate the branch, and present a structured object/mesh diff for review. The source project stays unchanged until a user accepts the result.
+Cartographer can capture a goal and a bounded sequence of exact face or vertex operations, execute the native proposals on a private copy of the current project, validate the branch, and present a structured object/mesh diff for review. The source project stays unchanged until a user accepts the result. The task also exposes bounded read-only queries over the branch for scoped object identity, exact names, mesh instances, object-origin proximity, face orientation, boundary edges, CONDITION tags, and familiarity records.
 
 The initial native planner supports face inset, face extrusion, and vertex positioning. It does not call an external model or infer targets. The user captures each target from the normal viewport selection path.
 
@@ -12,6 +12,7 @@ The initial native planner supports face inset, face extrusion, and vertex posit
 captured targets + goal
     -> AgentPlan + AgentWorkEnvelope
     -> private ApplicationSession copy
+    -> scoped SceneQuery facts + read-budget ledger
     -> NativePlanner proposal
     -> revision-bound AuthoringPreview
     -> native application command on the copy
@@ -24,7 +25,9 @@ The speculative application copy has no project path or journal binding. It cann
 
 ## Work envelope
 
-The first envelope limits commands to captured object IDs, geometry/topology effects, at most 16 commands, and a bounded touched-object count. Protected object IDs are rejected during plan validation. Because Cartographer can share one mesh asset across several scene objects, every instance of a target mesh must also be inside scope and unprotected; the touch budget counts all affected instances. The planner only emits registered typed proposals, and each proposal must pass its current native ontology and preview validation.
+The envelope limits commands to captured object IDs, geometry/topology effects, at most 16 commands, and a bounded touched-object count. Read budgets independently cap query count, objects examined, topology elements examined, semantic records examined, and result bytes. Queries return copied facts at a source revision and filter results to the objective scope. Protected object IDs are rejected during plan validation. Because Cartographer can share one mesh asset across several scene objects, every instance of a target mesh must also be inside scope and unprotected; the touch budget counts all affected instances. The planner only emits registered typed proposals, and each proposal must pass its current native ontology and preview validation.
+
+The native capability registry describes every registered mesh command with typed parameter bounds and units, target/read/write shapes, effects, invalidations, validators, reversibility risk, and advisory cost hints. Only three commands currently have native preview contracts (face inset, face extrusion, and vertex positioning). The workbench projects that registry through the task's effect mask and exposes only previewable capabilities whose effects fit the envelope. Cost hints describe expected work; query and touch limits remain the enforced budgets. A registry entry never contains a command callback or a document reference.
 
 ## Review evidence
 
@@ -32,4 +35,4 @@ The review view includes source/before/after viewport modes, per-step receipts, 
 
 ## Deliberate limits
 
-This slice does not yet implement SceneQuery, objective compilation beyond goal/scope/protected IDs, plan DAG scheduling, model-backed planning, read/write-set rebase, self-repair, persistent tasks, recipe execution, teach-by-demonstration, user edits to a ghost branch, partial acceptance, or viewport ghost overlays. Tasks fail closed if the project revision changes before acceptance.
+SceneQuery is intentionally a small typed vocabulary. It does not expose collection/prefab lookup, viewport visibility, UV seams, material regions, non-manifold areas, navigation/readiness diagnostics, arbitrary predicates, or provider-side document access. Query results are read-only and revision-bound; missing CONDITION data is reported as unavailable, and stale CONDITION revisions fail closed. The remaining docuseries still needs objective clarification, plan DAG scheduling, model-backed composition, repair, persistent tasks, recipes, demonstration, ghost corrections, safe rebase, and full workspace integration. Tasks fail closed if the project revision changes before acceptance.
