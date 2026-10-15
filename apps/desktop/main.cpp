@@ -6788,7 +6788,22 @@ struct DesktopState {
             (snapshot.selection.mode == carto::editor::SelectionMode::vertex &&
                 snapshot.selection.component_object.has_value() &&
                 snapshot.selection.vertices.size() == 1U);
+        const auto starts_named_target_request = [this]() {
+            std::string_view text(agent_goal);
+            while (!text.empty() && text.front() == ' ') text.remove_prefix(1U);
+            constexpr std::string_view prefix = "on object";
+            if (text.size() < prefix.size()) return false;
+            for (std::size_t index = 0U; index < prefix.size(); ++index) {
+                const auto value = static_cast<unsigned char>(text[index]);
+                const char lower = value >= 'A' && value <= 'Z'
+                    ? static_cast<char>(value + ('a' - 'A'))
+                    : static_cast<char>(value);
+                if (lower != prefix[index]) return false;
+            }
+            return text.size() == prefix.size() || text[prefix.size()] == ' ';
+        }();
         const bool compilable_target =
+            starts_named_target_request ||
             (snapshot.selection.mode == carto::editor::SelectionMode::object &&
                 !snapshot.selection.objects.empty() &&
                 snapshot.selection.objects.size() <= 16U) ||
@@ -6798,7 +6813,10 @@ struct DesktopState {
             (snapshot.selection.mode == carto::editor::SelectionMode::vertex &&
                 snapshot.selection.component_object.has_value() &&
                 snapshot.selection.vertices.size() == 1U);
-        if (snapshot.selection.mode == carto::editor::SelectionMode::object &&
+        if (starts_named_target_request) {
+            ImGui::TextDisabled(
+                "Target: exact-name lookup in the current project; duplicate names fail closed.");
+        } else if (snapshot.selection.mode == carto::editor::SelectionMode::object &&
             !snapshot.selection.objects.empty() &&
             snapshot.selection.objects.size() <= 16U) {
             if (snapshot.selection.objects.size() == 1U) {

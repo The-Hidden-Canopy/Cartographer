@@ -26,6 +26,8 @@
 - An invalid native operation blocks the task without changing the source.
 - Acceptance before gates pass, repeated execution, or rejection after acceptance is invalid.
 - The UI captures only a single exact object, face, or vertex per step and exposes explicit accept/reject actions.
+- `on object "Exact Name": command` resolves one exact stable name through the bounded current-project query and overrides a different viewport selection; an absent, duplicate, stale, incomplete, child, or locked match fails without installing a plan or changing the source.
+- Named-target parsing decodes only `\"` and `\\`, rejects malformed quoting/escaping and empty command text, and excludes the target name from hard-constraint parsing.
 - Object translation is absent from the generic AI proposal path, requires an explicit Agent Workbench transform permission and positive cumulative meter bound, and cannot change the source before human acceptance.
 - Translation rejects multiple selected objects, missing transform permission, an invalid or exceeded distance bound, and an objective `preserve_transform` constraint; a successful root translation changes the object transform while preserving rotation, scale, and mesh content.
 - Distinct geometry results produce distinct digests even when their mesh counts and revision shape match.

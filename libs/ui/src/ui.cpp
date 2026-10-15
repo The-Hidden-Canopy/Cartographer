@@ -2060,6 +2060,9 @@ core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
             "clear answered clarifications before compiling a different objective"));
     }
 
+    const auto parsed_goal = agent::parse_agent_goal(goal);
+    if (!parsed_goal) return core::Result<void>::failure(parsed_goal.error());
+
     const auto source_snapshot = session_.snapshot();
     if (agent_plan_base_revision_.has_value() &&
         *agent_plan_base_revision_ != source_snapshot.project_revision) {
@@ -2076,7 +2079,71 @@ core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
     std::vector<agent::TargetRef> targets;
     const bool object_selection =
         authoring.value().selection_mode == editor::SelectionMode::object;
-    if (object_selection && !authoring.value().objects.empty()) {
+    const bool named_target = parsed_goal.value().exact_object_name.has_value();
+    if (named_target) {
+        constexpr std::size_t kMaxNamedTargetQueryScope = 512U;
+        if (source_snapshot.objects.empty() ||
+            source_snapshot.objects.size() > kMaxNamedTargetQueryScope) {
+            return core::Result<void>::failure(invalid_state(
+                "exact-name target resolution requires a project with 1 to 512 objects"));
+        }
+        std::vector<scene::ObjectId> allowed_scope;
+        allowed_scope.reserve(source_snapshot.objects.size());
+        for (const auto& object : source_snapshot.objects) {
+            allowed_scope.push_back(object.object.id);
+        }
+        std::sort(allowed_scope.begin(), allowed_scope.end());
+        if (std::adjacent_find(allowed_scope.begin(), allowed_scope.end()) !=
+            allowed_scope.end()) {
+            return core::Result<void>::failure(validation(
+                "source project contains duplicate object identities"));
+        }
+        agent::SceneQueryBudget query_budget;
+        const auto query = agent::SceneQuery::execute(session_,
+            agent::SceneQueryRequest{
+                agent::ObjectsByStableNameQuery{
+                    *parsed_goal.value().exact_object_name},
+                512U},
+            query_budget, allowed_scope, source_snapshot.project_revision);
+        if (!query) {
+            return core::Result<void>::failure(query.error().with_context(
+                "resolving the explicit exact-name goal target"));
+        }
+        if (query.value().source_revision != source_snapshot.project_revision ||
+            query.value().truncated || !query.value().diagnostics.empty()) {
+            return core::Result<void>::failure(stale(
+                "exact-name target query is stale or incomplete"));
+        }
+        if (query.value().rows.empty()) {
+            return core::Result<void>::failure(invalid_state(
+                "the exact-name goal target was not found in the current project"));
+        }
+        if (query.value().rows.size() != 1U) {
+            return core::Result<void>::failure(invalid_state(
+                "the exact-name goal target is ambiguous; select one object or use a unique name"));
+        }
+        const auto* named_fact = std::get_if<agent::SceneNamedObjectFact>(
+            &query.value().rows.front());
+        if (named_fact == nullptr ||
+            named_fact->stable_name != *parsed_goal.value().exact_object_name) {
+            return core::Result<void>::failure(validation(
+                "exact-name target query returned an unexpected fact"));
+        }
+        const auto object = std::find_if(source_snapshot.objects.begin(),
+            source_snapshot.objects.end(), [named_fact](const auto& value) {
+                return value.object.id == named_fact->object;
+            });
+        if (object == source_snapshot.objects.end() ||
+            object->object.name != named_fact->stable_name) {
+            return core::Result<void>::failure(stale(
+                "the exact-name target changed after the source snapshot was captured"));
+        }
+        if (object->object.parent.has_value() || object->object.locked) {
+            return core::Result<void>::failure(invalid_state(
+                "exact-name goal targets must be unlocked root objects"));
+        }
+        targets.push_back(agent::TargetRef{named_fact->object, std::monostate{}});
+    } else if (object_selection && !authoring.value().objects.empty()) {
         constexpr std::size_t kMaxSelectedObjectTargets = 16U;
         if (authoring.value().objects.size() > kMaxSelectedObjectTargets) {
             return core::Result<void>::failure(invalid_state(
@@ -2117,7 +2184,7 @@ core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
         if (auto valid = target.validate(); !valid) return valid;
     }
 
-    const auto commands = split_agent_goal_sequence(goal);
+    const auto commands = split_agent_goal_sequence(parsed_goal.value().commands);
     if (!commands) return core::Result<void>::failure(commands.error());
     constexpr std::size_t kMaxCompiledSteps = 16U;
     if (targets.empty() || commands.value().size() > kMaxCompiledSteps / targets.size()) {
@@ -2135,7 +2202,17 @@ core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
     steps.reserve(commands.value().size() * targets.size());
     for (std::size_t target_index = 0U; target_index < targets.size(); ++target_index) {
         auto target_authoring = authoring.value();
-        if (object_selection) target_authoring.objects = {targets[target_index].object};
+        if (named_target) {
+            target_authoring.selection_mode = editor::SelectionMode::object;
+            target_authoring.objects = {targets[target_index].object};
+            target_authoring.vertices.clear();
+            target_authoring.edges.clear();
+            target_authoring.faces.clear();
+            target_authoring.component_object.reset();
+            target_authoring.component_mesh_revision.reset();
+        } else if (object_selection) {
+            target_authoring.objects = {targets[target_index].object};
+        }
         if (auto valid = target_authoring.validate(); !valid) {
             return core::Result<void>::failure(valid.error().with_context(
                 "validating selected goal target"));

@@ -53,6 +53,15 @@ struct HardConstraint {
     [[nodiscard]] core::Result<void> validate() const;
 };
 
+struct ParsedAgentGoal {
+    std::optional<std::string> exact_object_name;
+    std::string commands;
+};
+
+// Parses the optional explicit scope prefix `on object "Exact Name":`.
+// The returned commands preserve the goal text and never infer a target.
+[[nodiscard]] core::Result<ParsedAgentGoal> parse_agent_goal(std::string_view goal);
+
 // Extracts only deterministic topology, world-transform, and numeric vertex-
 // displacement constraints from a goal. Unsupported and conflicting restrictions
 // fail closed instead of being ignored.

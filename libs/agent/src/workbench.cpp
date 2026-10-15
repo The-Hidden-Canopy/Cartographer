@@ -820,13 +820,93 @@ const AgentRecipeDefinition* find_agent_recipe(std::string_view id) noexcept {
     return found == recipes.end() ? nullptr : &*found;
 }
 
-core::Result<std::vector<HardConstraint>> compile_explicit_hard_constraints(
-    std::string_view goal) {
+core::Result<ParsedAgentGoal> parse_agent_goal(std::string_view goal) {
     if (!safe_text(goal, kMaxGoalBytes)) {
-        return core::Result<std::vector<HardConstraint>>::failure(invalid(
+        return core::Result<ParsedAgentGoal>::failure(invalid(
             "objective goal is empty, malformed, or exceeds its text bound"));
     }
-    const auto tokens = objective_tokens(goal);
+
+    std::size_t prefix_begin = 0U;
+    while (prefix_begin < goal.size() && goal[prefix_begin] == ' ') ++prefix_begin;
+    constexpr std::string_view kScopePrefix = "on object";
+    const auto ascii_lower = [](char value) {
+        const auto byte = static_cast<unsigned char>(value);
+        return byte >= 'A' && byte <= 'Z'
+            ? static_cast<char>(byte + ('a' - 'A'))
+            : static_cast<char>(byte);
+    };
+    bool scope_prefix = goal.size() - prefix_begin >= kScopePrefix.size();
+    for (std::size_t index = 0U; scope_prefix && index < kScopePrefix.size(); ++index) {
+        scope_prefix = ascii_lower(goal[prefix_begin + index]) == kScopePrefix[index];
+    }
+    if (scope_prefix && prefix_begin + kScopePrefix.size() < goal.size() &&
+        goal[prefix_begin + kScopePrefix.size()] != ' ') {
+        scope_prefix = false;
+    }
+    if (!scope_prefix) {
+        return core::Result<ParsedAgentGoal>::success(
+            ParsedAgentGoal{std::nullopt, std::string(goal)});
+    }
+
+    std::size_t cursor = prefix_begin + kScopePrefix.size();
+    while (cursor < goal.size() && goal[cursor] == ' ') ++cursor;
+    if (cursor >= goal.size() || goal[cursor] != '"') {
+        return core::Result<ParsedAgentGoal>::failure(invalid(
+            "named goal target must use on object \"Exact Name\": command syntax"));
+    }
+    ++cursor;
+
+    std::string exact_name;
+    bool closed = false;
+    while (cursor < goal.size()) {
+        char value = goal[cursor++];
+        if (value == '"') {
+            closed = true;
+            break;
+        }
+        if (value == '\\') {
+            if (cursor >= goal.size()) {
+                return core::Result<ParsedAgentGoal>::failure(invalid(
+                    "named goal target ends with an incomplete escape"));
+            }
+            value = goal[cursor++];
+            if (value != '"' && value != '\\') {
+                return core::Result<ParsedAgentGoal>::failure(invalid(
+                    "named goal target supports only escaped quotes and backslashes"));
+            }
+        }
+        exact_name.push_back(value);
+        if (exact_name.size() > 256U) {
+            return core::Result<ParsedAgentGoal>::failure(invalid(
+                "named goal target exceeds the 256-byte stable-name limit"));
+        }
+    }
+    if (!closed || exact_name.empty()) {
+        return core::Result<ParsedAgentGoal>::failure(invalid(
+            "named goal target must contain a closed, non-empty exact object name"));
+    }
+    while (cursor < goal.size() && goal[cursor] == ' ') ++cursor;
+    if (cursor >= goal.size() || goal[cursor] != ':') {
+        return core::Result<ParsedAgentGoal>::failure(invalid(
+            "named goal target must end with a colon before its command"));
+    }
+    ++cursor;
+    while (cursor < goal.size() && goal[cursor] == ' ') ++cursor;
+    if (cursor == goal.size()) {
+        return core::Result<ParsedAgentGoal>::failure(invalid(
+            "named goal target must include a native command after the colon"));
+    }
+    return core::Result<ParsedAgentGoal>::success(ParsedAgentGoal{
+        std::move(exact_name), std::string(goal.substr(cursor))});
+}
+
+core::Result<std::vector<HardConstraint>> compile_explicit_hard_constraints(
+    std::string_view goal) {
+    const auto parsed_goal = parse_agent_goal(goal);
+    if (!parsed_goal) {
+        return core::Result<std::vector<HardConstraint>>::failure(parsed_goal.error());
+    }
+    const auto tokens = objective_tokens(parsed_goal.value().commands);
     const bool preserves_topology =
         contains_objective_phrase(tokens, {"do", "not", "change", "topology"}) ||
         contains_objective_phrase(tokens, {"don", "t", "change", "topology"}) ||

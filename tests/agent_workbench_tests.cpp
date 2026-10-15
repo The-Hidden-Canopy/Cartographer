@@ -4606,6 +4606,112 @@ void ui_compiles_multi_object_goals_into_independent_reviewed_branches() {
     }
 }
 
+void ui_named_goal_targets_resolve_exact_names_and_ignore_selection_fallbacks() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Selected fallback", {1.0, 1.0, 1.0}}));
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Preserve topology", {1.0, 1.0, 1.0}}));
+    const auto objects = source.snapshot().objects;
+    REQUIRE(objects.size() == 2U);
+    const auto fallback = objects[0].object.id;
+    const auto named_target = objects[1].object.id;
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{fallback}));
+
+    const std::string goal =
+        R"(on object "Preserve topology": translate object by 0.1 0 0)";
+    const auto parsed = carto::agent::parse_agent_goal(goal);
+    REQUIRE(parsed);
+    REQUIRE(parsed.value().exact_object_name == std::optional<std::string>{"Preserve topology"});
+    REQUIRE(parsed.value().commands == "translate object by 0.1 0 0");
+    const auto constraints = carto::agent::compile_explicit_hard_constraints(goal);
+    REQUIRE(constraints && constraints.value().empty());
+
+    const auto source_revision = source.snapshot().project_revision;
+    const auto compilation = ui.compile_agent_goal_sequence(goal);
+    if (!compilation) {
+        throw TestFailure("named goal compilation failed: " +
+            compilation.error().message);
+    }
+    const auto compiled = ui.snapshot();
+    REQUIRE(compiled.agent_plan_draft.size() == 1U);
+    REQUIRE(compiled.agent_plan_draft.front().target.object == named_target);
+    REQUIRE(compiled.agent_plan_draft.front().intent == "translate object by 0.1 0 0");
+    REQUIRE(compiled.selection.objects == std::vector<carto::scene::ObjectId>{fallback});
+    REQUIRE(source.snapshot().project_revision == source_revision);
+
+    auto prepared = ui.prepare_agent_plan(
+        goal, translation_envelope({named_target}, 1.0));
+    REQUIRE(prepared && prepared.value().status == carto::agent::TaskStatus::prepared);
+    const auto review = ui.run_prepared_agent_plan();
+    REQUIRE(review && review.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(review.value().can_accept);
+    REQUIRE(source.snapshot().project_revision == source_revision);
+    REQUIRE(ui.accept_agent_plan());
+    const auto accepted = source.snapshot();
+    const auto accepted_fallback = std::find_if(accepted.objects.begin(), accepted.objects.end(),
+        [fallback](const auto& object) { return object.object.id == fallback; });
+    const auto accepted_target = std::find_if(accepted.objects.begin(), accepted.objects.end(),
+        [named_target](const auto& object) { return object.object.id == named_target; });
+    REQUIRE(accepted_fallback != accepted.objects.end());
+    REQUIRE(accepted_target != accepted.objects.end());
+    REQUIRE(accepted_fallback->object.local_transform.translation.x == 0.0);
+    REQUIRE(accepted_target->object.local_transform.translation.x > 0.09);
+    REQUIRE(accepted_target->object.local_transform.translation.x < 0.11);
+}
+
+void ui_named_goal_target_resolution_rejects_missing_and_ambiguous_names() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Selected fallback", {1.0, 1.0, 1.0}}));
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Duplicate", {1.0, 1.0, 1.0}}));
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Duplicate", {1.0, 1.0, 1.0}}));
+    const auto objects = source.snapshot().objects;
+    REQUIRE(objects.size() == 3U);
+    const auto fallback = objects.front().object.id;
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{fallback}));
+    const auto source_revision = source.snapshot().project_revision;
+
+    const auto ambiguous = ui.compile_agent_goal_sequence(
+        R"(on object "Duplicate": translate object by 0.1 0 0)");
+    REQUIRE(!ambiguous);
+    REQUIRE(ambiguous.error().message.find("ambiguous") != std::string::npos);
+    REQUIRE(ui.snapshot().agent_plan_draft.empty());
+    REQUIRE(!ui.snapshot().agent_task.has_value());
+
+    const auto missing = ui.compile_agent_goal_sequence(
+        R"(on object "Missing": translate object by 0.1 0 0)");
+    REQUIRE(!missing);
+    REQUIRE(missing.error().message.find("not found") != std::string::npos);
+    REQUIRE(ui.snapshot().agent_plan_draft.empty());
+    REQUIRE(!ui.snapshot().agent_task.has_value());
+    REQUIRE(ui.snapshot().selection.objects == std::vector<carto::scene::ObjectId>{fallback});
+    REQUIRE(source.snapshot().project_revision == source_revision);
+}
+
+void agent_goal_scope_parser_rejects_malformed_prefixes_and_decodes_only_safe_escapes() {
+    const auto escaped = carto::agent::parse_agent_goal(
+        R"(on object "Lamp \"A\" \\ B": translate object by 0.1 0 0)");
+    REQUIRE(escaped);
+    REQUIRE(escaped.value().exact_object_name == std::optional<std::string>{"Lamp \"A\" \\ B"});
+    REQUIRE(escaped.value().commands == "translate object by 0.1 0 0");
+
+    REQUIRE(!carto::agent::parse_agent_goal(
+        R"(on object "Lamp\q": translate object by 0.1 0 0)"));
+    REQUIRE(!carto::agent::parse_agent_goal(
+        R"(on object "Lamp" translate object by 0.1 0 0)"));
+    REQUIRE(!carto::agent::parse_agent_goal(R"(on object "Lamp":)"));
+    REQUIRE(!carto::agent::parse_agent_goal(R"(on object Lamp: translate object by 0.1 0 0)"));
+}
+
 void ui_goal_compiler_rejects_expanded_multi_object_budget_atomically() {
     carto::application::ApplicationSession source;
     carto::ui::UiController ui(source);
@@ -4856,6 +4962,9 @@ int main() {
         ui_rebases_disjoint_source_edits_and_reauthorizes_clarifications();
         ui_compiles_explicit_goal_sequences_into_reviewable_agent_dags();
         ui_compiles_multi_object_goals_into_independent_reviewed_branches();
+        ui_named_goal_targets_resolve_exact_names_and_ignore_selection_fallbacks();
+        ui_named_goal_target_resolution_rejects_missing_and_ambiguous_names();
+        agent_goal_scope_parser_rejects_malformed_prefixes_and_decodes_only_safe_escapes();
         ui_goal_compiler_rejects_expanded_multi_object_budget_atomically();
         ui_goal_compiler_fails_closed_and_preserves_manual_drafts();
         condition_inventory_audit_never_promotes_partial_evidence_to_readiness();
