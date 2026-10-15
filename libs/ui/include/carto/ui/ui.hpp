@@ -413,6 +413,8 @@ struct AgentDemonstrationTargetBindingView {
     agent::AgentDemonstrationTargetKind target_kind =
         agent::AgentDemonstrationTargetKind::object;
     bool bound = false;
+    // Current-project display only. Never serialized into traces or recipes.
+    std::string target_label;
 };
 
 // A UI snapshot is a presentation projection. The inherited application

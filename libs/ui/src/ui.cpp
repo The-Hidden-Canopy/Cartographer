@@ -151,7 +151,7 @@ std::vector<AgentDemonstrationTargetBindingView> demonstration_binding_requireme
             if (existing == requirements.end()) {
                 requirements.push_back(AgentDemonstrationTargetBindingView{
                     target_set_index, step.target_alias, step.component_alias,
-                    step.target_kind, false});
+                    step.target_kind, false, {}});
             }
         }
     }
@@ -4718,13 +4718,38 @@ UiSnapshot UiController::snapshot() const {
             bindings_current && !agent_task_.has_value() &&
             !agent_checkpoint_pending_.has_value();
         for (auto& requirement : requirements) {
-            requirement.bound = bindings_current && std::any_of(
+            const auto binding = std::find_if(
                 agent_demonstration_bindings_.begin(),
                 agent_demonstration_bindings_.end(), [&requirement](const auto& binding) {
                     return binding.target_set_index == requirement.target_set_index &&
                         binding.target_alias == requirement.target_alias &&
                         binding.component_alias == requirement.component_alias;
                 });
+            const auto object = binding == agent_demonstration_bindings_.end()
+                ? result.objects.end()
+                : std::find_if(result.objects.begin(), result.objects.end(),
+                    [&binding](const auto& candidate) {
+                        return candidate.object.id == binding->target.object;
+                    });
+            requirement.bound = bindings_current &&
+                binding != agent_demonstration_bindings_.end() &&
+                object != result.objects.end();
+            if (requirement.bound) {
+                requirement.target_label = object->object.name.empty()
+                    ? "(unnamed object)"
+                    : object->object.name;
+                requirement.target_label += " (#" +
+                    std::to_string(object->object.id.value) + ")";
+                if (const auto* face = std::get_if<geometry::FaceId>(
+                        &binding->target.component)) {
+                    requirement.target_label += ", face #" +
+                        std::to_string(face->value);
+                } else if (const auto* vertex = std::get_if<geometry::VertexId>(
+                        &binding->target.component)) {
+                    requirement.target_label += ", vertex #" +
+                        std::to_string(vertex->value);
+                }
+            }
             result.agent_demonstration_ready_to_preview =
                 result.agent_demonstration_ready_to_preview && requirement.bound;
             result.agent_demonstration_bindings.push_back(requirement);

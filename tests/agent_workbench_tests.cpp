@@ -1102,6 +1102,10 @@ void native_demonstrations_apply_to_unique_exact_structural_matches() {
         [](const auto& binding) { return binding.bound; }));
     REQUIRE(bound.agent_demonstration_bindings[0].target_set_index == 0U);
     REQUIRE(bound.agent_demonstration_bindings[1].target_set_index == 1U);
+    REQUIRE(bound.agent_demonstration_bindings[0].target_label.find("CANARY_DEMO_TARGET_TWO") !=
+        std::string::npos);
+    REQUIRE(bound.agent_demonstration_bindings[1].target_label.find("CANARY_DEMO_TARGET_THREE") !=
+        std::string::npos);
 
     const auto revision_before_preview = source.snapshot().project_revision;
     const auto preview = ui.preview_agent_demonstration_trace();

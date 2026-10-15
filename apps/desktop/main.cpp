@@ -7231,10 +7231,11 @@ struct DesktopState {
                     ImGui::PushID(static_cast<int>(binding.target_set_index));
                     ImGui::PushID(static_cast<int>(binding.target_alias));
                     ImGui::PushID(static_cast<int>(binding.component_alias));
-                    ImGui::Text("Set %zu · object %u / component %u · %s · %s",
+                    ImGui::Text("Set %zu · object %u / component %u · %s · %s%s",
                         binding.target_set_index + 1U, binding.target_alias,
                         binding.component_alias, target_kind,
-                        binding.bound ? "bound" : "unbound");
+                        binding.bound ? "bound to " : "unbound",
+                        binding.bound ? binding.target_label.c_str() : "");
                     ImGui::SameLine();
                     if (ImGui::SmallButton("Bind current selection")) {
                         const auto bound = ui.bind_agent_demonstration_target(
