@@ -479,11 +479,18 @@ std::vector<std::string> objective_tokens(std::string_view text) {
     std::string current;
     for (std::size_t index = 0U; index < text.size(); ++index) {
         const auto character = static_cast<unsigned char>(text[index]);
-        const bool decimal_point = text[index] == '.' && index > 0U &&
-            index + 1U < text.size() &&
-            is_digit(static_cast<unsigned char>(text[index - 1U])) &&
-            is_digit(static_cast<unsigned char>(text[index + 1U]));
-        if (is_ascii_alphanumeric(character) || decimal_point) {
+        const bool decimal_point = text[index] == '.' && index + 1U < text.size() &&
+            is_digit(static_cast<unsigned char>(text[index + 1U])) &&
+            (index == 0U || is_digit(static_cast<unsigned char>(text[index - 1U])) ||
+                (!is_ascii_alphanumeric(static_cast<unsigned char>(text[index - 1U])) &&
+                    text[index - 1U] != '-'));
+        const bool negative_number_sign = text[index] == '-' && index + 1U < text.size() &&
+            (is_digit(static_cast<unsigned char>(text[index + 1U])) ||
+                (text[index + 1U] == '.' && index + 2U < text.size() &&
+                    is_digit(static_cast<unsigned char>(text[index + 2U])))) &&
+            (index == 0U || !is_ascii_alphanumeric(
+                static_cast<unsigned char>(text[index - 1U])));
+        if (is_ascii_alphanumeric(character) || decimal_point || negative_number_sign) {
             const auto lowercase = character >= static_cast<unsigned char>('A') &&
                 character <= static_cast<unsigned char>('Z')
                 ? static_cast<unsigned char>(character + ('a' - 'A')) : character;
@@ -514,6 +521,19 @@ bool contains_objective_phrase(
         if (matches) return true;
     }
     return false;
+}
+
+bool matches_objective_phrase_at(
+    const std::vector<std::string>& tokens,
+    std::size_t start,
+    std::span<const std::string_view> phrase) {
+    if (phrase.empty() || start > tokens.size() || phrase.size() > tokens.size() - start) {
+        return false;
+    }
+    for (std::size_t offset = 0U; offset < phrase.size(); ++offset) {
+        if (tokens[start + offset] != phrase[offset]) return false;
+    }
+    return true;
 }
 
 void consume_objective_phrase(
@@ -557,7 +577,8 @@ bool has_uncompiled_restriction(
         if (token == "no" || token == "never" || token == "avoid" ||
             token == "without" || token == "preserve" || token == "protect" ||
             token == "protected" || token == "untouched" || token == "unchanged" ||
-            token == "keep" || token == "unless" || token == "except" ||
+            token == "keep" || token == "maximum" || token == "limit" ||
+            token == "displacement" || token == "unless" || token == "except" ||
             token == "if" || token == "not") {
             return true;
         }
@@ -593,6 +614,50 @@ bool has_uncompiled_topology_change(
         }
     }
     return false;
+}
+
+core::Result<std::optional<double>> compile_vertex_displacement_bound(
+    const std::vector<std::string>& tokens,
+    std::vector<bool>& consumed) {
+    constexpr std::array<std::array<std::string_view, 4U>, 3U> prefixes{{
+        {"maximum", "vertex", "displacement", {}},
+        {"limit", "vertex", "displacement", "to"},
+        {"vertex", "displacement", "at", "most"},
+    }};
+    constexpr std::array<std::size_t, 3U> prefix_sizes{3U, 4U, 4U};
+    std::optional<double> bound;
+    for (std::size_t start = 0U; start < tokens.size(); ++start) {
+        for (std::size_t prefix_index = 0U; prefix_index < prefixes.size(); ++prefix_index) {
+            const auto phrase = std::span<const std::string_view>(
+                prefixes[prefix_index].data(), prefix_sizes[prefix_index]);
+            if (!matches_objective_phrase_at(tokens, start, phrase)) continue;
+            if (bound.has_value()) {
+                return core::Result<std::optional<double>>::failure(invalid(
+                    "objective may declare only one vertex-displacement bound"));
+            }
+            const std::size_t value_index = start + prefix_sizes[prefix_index];
+            if (value_index + 2U >= tokens.size() || tokens[value_index + 1U] != "world" ||
+                tokens[value_index + 2U] != "units") {
+                return core::Result<std::optional<double>>::failure(invalid(
+                    "vertex-displacement bound must include a number followed by 'world units'"));
+            }
+            const auto& value_text = tokens[value_index];
+            double value = 0.0;
+            const auto parsed = std::from_chars(
+                value_text.data(), value_text.data() + value_text.size(), value,
+                std::chars_format::general);
+            if (parsed.ec != std::errc{} || parsed.ptr != value_text.data() + value_text.size() ||
+                !std::isfinite(value) || value <= 0.0 || value > 1'000'000.0) {
+                return core::Result<std::optional<double>>::failure(invalid(
+                    "vertex-displacement bound must be finite, positive, and at most 1000000 world units"));
+            }
+            bound = value;
+            for (std::size_t index = start; index < value_index + 3U; ++index) {
+                consumed[index] = true;
+            }
+        }
+    }
+    return core::Result<std::optional<double>>::success(bound);
 }
 
 core::Result<void> save_immutable_artifact(
@@ -767,9 +832,49 @@ core::Result<std::vector<HardConstraint>> compile_explicit_hard_constraints(
         contains_objective_phrase(tokens, {"topology", "might", "change"}) ||
         contains_objective_phrase(tokens, {"topology", "is", "allowed", "to", "change"}) ||
         contains_objective_phrase(tokens, {"change", "topology", "if", "needed"});
+    const bool preserves_transform =
+        contains_objective_phrase(tokens, {"preserve", "transform"}) ||
+        contains_objective_phrase(tokens, {"preserve", "transforms"}) ||
+        contains_objective_phrase(tokens, {"preserve", "world", "transform"}) ||
+        contains_objective_phrase(tokens, {"preserve", "world", "transforms"}) ||
+        contains_objective_phrase(tokens, {"preserve", "object", "transform"}) ||
+        contains_objective_phrase(tokens, {"preserve", "object", "transforms"}) ||
+        contains_objective_phrase(tokens, {"keep", "transform", "unchanged"}) ||
+        contains_objective_phrase(tokens, {"keep", "transforms", "unchanged"}) ||
+        contains_objective_phrase(tokens, {"keep", "world", "transform", "unchanged"}) ||
+        contains_objective_phrase(tokens, {"keep", "world", "transforms", "unchanged"}) ||
+        contains_objective_phrase(tokens, {"keep", "object", "transform", "unchanged"}) ||
+        contains_objective_phrase(tokens, {"keep", "object", "transforms", "unchanged"}) ||
+        contains_objective_phrase(tokens, {"do", "not", "change", "transform"}) ||
+        contains_objective_phrase(tokens, {"do", "not", "change", "transforms"}) ||
+        contains_objective_phrase(tokens, {"do", "not", "change", "world", "transform"}) ||
+        contains_objective_phrase(tokens, {"do", "not", "change", "world", "transforms"}) ||
+        contains_objective_phrase(tokens, {"do", "not", "change", "object", "transform"}) ||
+        contains_objective_phrase(tokens, {"do", "not", "change", "object", "transforms"}) ||
+        contains_objective_phrase(tokens, {"don", "t", "change", "transform"}) ||
+        contains_objective_phrase(tokens, {"don", "t", "change", "transforms"}) ||
+        contains_objective_phrase(tokens, {"transforms", "must", "remain", "unchanged"}) ||
+        contains_objective_phrase(tokens, {"transform", "must", "remain", "unchanged"}) ||
+        contains_objective_phrase(tokens, {"world", "transforms", "must", "remain", "unchanged"});
+    const bool permits_transform_change =
+        contains_objective_phrase(tokens, {"do", "not", "preserve", "transform"}) ||
+        contains_objective_phrase(tokens, {"do", "not", "preserve", "transforms"}) ||
+        contains_objective_phrase(tokens, {"don", "t", "preserve", "transform"}) ||
+        contains_objective_phrase(tokens, {"don", "t", "preserve", "transforms"}) ||
+        contains_objective_phrase(tokens, {"allow", "transform", "changes"}) ||
+        contains_objective_phrase(tokens, {"allow", "transforms", "to", "change"}) ||
+        contains_objective_phrase(tokens, {"permit", "transform", "changes"}) ||
+        contains_objective_phrase(tokens, {"permit", "transforms", "to", "change"}) ||
+        contains_objective_phrase(tokens, {"transforms", "may", "change"}) ||
+        contains_objective_phrase(tokens, {"transform", "may", "change"}) ||
+        contains_objective_phrase(tokens, {"world", "transforms", "may", "change"});
     if (preserves_topology && permits_topology_change) {
         return core::Result<std::vector<HardConstraint>>::failure(invalid(
             "objective gives conflicting topology requirements"));
+    }
+    if (preserves_transform && permits_transform_change) {
+        return core::Result<std::vector<HardConstraint>>::failure(invalid(
+            "objective gives conflicting transform requirements"));
     }
 
     std::vector<bool> consumed(tokens.size(), false);
@@ -800,6 +905,58 @@ core::Result<std::vector<HardConstraint>> compile_explicit_hard_constraints(
     consume_objective_phrase(tokens, consumed, {"topology", "must", "remain", "unchanged"});
     consume_objective_phrase(tokens, consumed, {"topology", "should", "not", "change"});
 
+    consume_objective_phrase(tokens, consumed, {"preserve", "transform"});
+    consume_objective_phrase(tokens, consumed, {"preserve", "transforms"});
+    consume_objective_phrase(tokens, consumed, {"preserve", "world", "transform"});
+    consume_objective_phrase(tokens, consumed, {"preserve", "world", "transforms"});
+    consume_objective_phrase(tokens, consumed, {"preserve", "object", "transform"});
+    consume_objective_phrase(tokens, consumed, {"preserve", "object", "transforms"});
+    consume_objective_phrase(tokens, consumed, {"keep", "transform", "unchanged"});
+    consume_objective_phrase(tokens, consumed, {"keep", "transforms", "unchanged"});
+    consume_objective_phrase(tokens, consumed, {"keep", "world", "transform", "unchanged"});
+    consume_objective_phrase(tokens, consumed, {"keep", "world", "transforms", "unchanged"});
+    consume_objective_phrase(tokens, consumed, {"keep", "object", "transform", "unchanged"});
+    consume_objective_phrase(tokens, consumed, {"keep", "object", "transforms", "unchanged"});
+    consume_objective_phrase(tokens, consumed, {"do", "not", "change", "transform"});
+    consume_objective_phrase(tokens, consumed, {"do", "not", "change", "transforms"});
+    consume_objective_phrase(tokens, consumed,
+        {"do", "not", "change", "world", "transform"});
+    consume_objective_phrase(tokens, consumed,
+        {"do", "not", "change", "world", "transforms"});
+    consume_objective_phrase(tokens, consumed,
+        {"do", "not", "change", "object", "transform"});
+    consume_objective_phrase(tokens, consumed,
+        {"do", "not", "change", "object", "transforms"});
+    consume_objective_phrase(tokens, consumed, {"don", "t", "change", "transform"});
+    consume_objective_phrase(tokens, consumed, {"don", "t", "change", "transforms"});
+    consume_objective_phrase(tokens, consumed,
+        {"transforms", "must", "remain", "unchanged"});
+    consume_objective_phrase(tokens, consumed,
+        {"transform", "must", "remain", "unchanged"});
+    consume_objective_phrase(tokens, consumed,
+        {"world", "transforms", "must", "remain", "unchanged"});
+    consume_objective_phrase(tokens, consumed,
+        {"do", "not", "preserve", "transform"});
+    consume_objective_phrase(tokens, consumed,
+        {"do", "not", "preserve", "transforms"});
+    consume_objective_phrase(tokens, consumed,
+        {"don", "t", "preserve", "transform"});
+    consume_objective_phrase(tokens, consumed,
+        {"don", "t", "preserve", "transforms"});
+    consume_objective_phrase(tokens, consumed, {"allow", "transform", "changes"});
+    consume_objective_phrase(tokens, consumed, {"allow", "transforms", "to", "change"});
+    consume_objective_phrase(tokens, consumed, {"permit", "transform", "changes"});
+    consume_objective_phrase(tokens, consumed, {"permit", "transforms", "to", "change"});
+    consume_objective_phrase(tokens, consumed, {"transforms", "may", "change"});
+    consume_objective_phrase(tokens, consumed, {"transform", "may", "change"});
+    consume_objective_phrase(tokens, consumed, {"world", "transforms", "may", "change"});
+
+    auto displacement_bound = compile_vertex_displacement_bound(tokens, consumed);
+    if (!displacement_bound) {
+        return core::Result<std::vector<HardConstraint>>::failure(
+            displacement_bound.error());
+    }
+
     if (preserves_topology && has_uncompiled_topology_change(tokens, consumed)) {
         return core::Result<std::vector<HardConstraint>>::failure(invalid(
             "objective gives conflicting topology requirements"));
@@ -817,6 +974,22 @@ core::Result<std::vector<HardConstraint>> compile_explicit_hard_constraints(
             std::nullopt,
             0.0,
             "Compiled from explicit goal language requiring unchanged topology."});
+    }
+    if (preserves_transform) {
+        constraints.push_back(HardConstraint{
+            "compiled.preserve-transform",
+            ObjectiveConstraintKind::preserve_transform,
+            std::nullopt,
+            0.0,
+            "Compiled from explicit goal language requiring unchanged world transforms."});
+    }
+    if (displacement_bound.value().has_value()) {
+        constraints.push_back(HardConstraint{
+            "compiled.maximum-vertex-displacement",
+            ObjectiveConstraintKind::maximum_vertex_displacement,
+            std::nullopt,
+            *displacement_bound.value(),
+            "Compiled from an explicit maximum world-space vertex-displacement bound."});
     }
     for (const auto& constraint : constraints) {
         if (auto result = constraint.validate(); !result) {
@@ -898,16 +1071,16 @@ core::Result<void> HardConstraint::validate() const {
         }
         break;
     case ObjectiveConstraintKind::preserve_transform:
-        if (!object.has_value() || maximum_displacement != 0.0) {
+        if (maximum_displacement != 0.0) {
             return core::Result<void>::failure(invalid(
-                "transform-preservation constraint requires one object and no numeric bound"));
+                "transform-preservation constraint cannot declare a numeric bound"));
         }
         break;
     case ObjectiveConstraintKind::maximum_vertex_displacement:
-        if (!object.has_value() || !std::isfinite(maximum_displacement) ||
+        if (!std::isfinite(maximum_displacement) ||
             maximum_displacement <= 0.0) {
             return core::Result<void>::failure(invalid(
-                "vertex-displacement constraint requires one object and a finite positive bound"));
+                "vertex-displacement constraint requires a finite positive bound"));
         }
         break;
     default:
@@ -2569,14 +2742,21 @@ std::vector<AcceptanceGateResult> AgentTask::evaluate_gates() const {
     for (const auto& constraint : plan_.objective.hard_constraints) {
         bool passed = true;
         std::string evidence;
-        std::vector<scene::ObjectId> constraint_objects = all_affected_objects;
-        std::vector<std::uint64_t> constraint_assets = all_affected_assets;
+        std::vector<scene::ObjectId> constraint_objects = constraint.object.has_value()
+            ? std::vector<scene::ObjectId>{*constraint.object}
+            : plan_.objective.scope_objects;
+        std::vector<std::uint64_t> constraint_assets;
         if (constraint.object.has_value()) {
-            constraint_objects = {*constraint.object};
             const auto* object = base_document_.scene().find(*constraint.object);
-            constraint_assets.clear();
             if (object != nullptr && object->mesh_asset.has_value()) {
                 constraint_assets.push_back(*object->mesh_asset);
+            }
+        } else {
+            for (const auto object_id : constraint_objects) {
+                const auto* object = base_document_.scene().find(object_id);
+                if (object != nullptr && object->mesh_asset.has_value()) {
+                    constraint_assets.push_back(*object->mesh_asset);
+                }
             }
         }
         if (constraint.kind == ObjectiveConstraintKind::preserve_topology) {
@@ -2599,63 +2779,82 @@ std::vector<AcceptanceGateResult> AgentTask::evaluate_gates() const {
             evidence = passed ? "no vertex or face topology changed"
                               : "a vertex or face topology record changed";
         } else if (constraint.kind == ObjectiveConstraintKind::preserve_transform) {
-            const auto before_transform = base_document_.scene().world_transform(*constraint.object);
-            const auto after_transform = speculative_->document_.scene().world_transform(
-                *constraint.object);
-            passed = before_transform && after_transform &&
-                same_transform(before_transform.value(), after_transform.value());
-            evidence = passed ? "target world transform is unchanged"
-                : "target world transform changed or could not be resolved";
+            for (const auto object_id : constraint_objects) {
+                const auto before_transform =
+                    base_document_.scene().world_transform(object_id);
+                const auto after_transform =
+                    speculative_->document_.scene().world_transform(object_id);
+                if (!before_transform || !after_transform ||
+                    !same_transform(before_transform.value(), after_transform.value())) {
+                    passed = false;
+                    break;
+                }
+            }
+            evidence = passed
+                ? (constraint.object.has_value()
+                    ? "target world transform is unchanged"
+                    : "all affected world transforms are unchanged")
+                : "an affected world transform changed or could not be resolved";
         } else {
-            const auto* before_object = base_document_.scene().find(*constraint.object);
-            const auto* after_object = speculative_->document_.scene().find(*constraint.object);
             double maximum_observed = 0.0;
             bool measurement_complete = true;
-            if (before_object == nullptr || after_object == nullptr ||
-                before_object->mesh_asset != after_object->mesh_asset ||
-                !before_object->mesh_asset.has_value()) {
-                passed = false;
-                measurement_complete = false;
-            } else {
-                const auto before_transform = base_document_.scene().world_transform(*constraint.object);
-                const auto after_transform = speculative_->document_.scene().world_transform(
-                    *constraint.object);
-                const auto before_mesh = base_document_.meshes().find(*before_object->mesh_asset);
-                const auto after_mesh = speculative_->document_.meshes().find(
-                    *after_object->mesh_asset);
-                if (!before_transform || !after_transform) {
+            std::size_t topology_elements_examined = 0U;
+            for (const auto object_id : constraint_objects) {
+                const auto* before_object = base_document_.scene().find(object_id);
+                const auto* after_object = speculative_->document_.scene().find(object_id);
+                if (before_object == nullptr || after_object == nullptr ||
+                    before_object->mesh_asset != after_object->mesh_asset) {
                     passed = false;
                     measurement_complete = false;
-                } else if (before_mesh == base_document_.meshes().end() ||
+                    continue;
+                }
+                if (!before_object->mesh_asset.has_value()) continue;
+                const auto before_transform =
+                    base_document_.scene().world_transform(object_id);
+                const auto after_transform =
+                    speculative_->document_.scene().world_transform(object_id);
+                const auto before_mesh =
+                    base_document_.meshes().find(*before_object->mesh_asset);
+                const auto after_mesh = speculative_->document_.meshes().find(
+                    *after_object->mesh_asset);
+                if (!before_transform || !after_transform ||
+                    before_mesh == base_document_.meshes().end() ||
                     after_mesh == speculative_->document_.meshes().end()) {
                     passed = false;
                     measurement_complete = false;
-                } else if (before_mesh->second.vertex_count() != after_mesh->second.vertex_count()) {
+                    continue;
+                }
+                const std::size_t vertex_count = before_mesh->second.vertex_count();
+                if (vertex_count != after_mesh->second.vertex_count()) {
                     passed = false;
                     measurement_complete = false;
-                } else if (before_mesh->second.vertex_count() >
-                    envelope_.max_topology_elements_examined) {
+                    continue;
+                }
+                if (topology_elements_examined > envelope_.max_topology_elements_examined ||
+                    vertex_count > envelope_.max_topology_elements_examined -
+                        topology_elements_examined) {
                     passed = false;
                     measurement_complete = false;
-                } else {
-                    for (const auto& vertex : before_mesh->second.vertices_sorted()) {
-                        const auto* after_vertex = after_mesh->second.find_vertex(vertex.id);
-                        if (after_vertex == nullptr) {
-                            passed = false;
-                            measurement_complete = false;
-                            break;
-                        }
-                        const double displacement = (transform_point(
-                            after_transform.value(), after_vertex->position) - transform_point(
-                            before_transform.value(), vertex.position)).length();
-                        if (!std::isfinite(displacement)) {
-                            passed = false;
-                            measurement_complete = false;
-                            break;
-                        }
-                        maximum_observed = std::max(maximum_observed, displacement);
-                        if (displacement > constraint.maximum_displacement) passed = false;
+                    continue;
+                }
+                topology_elements_examined += vertex_count;
+                for (const auto& vertex : before_mesh->second.vertices_sorted()) {
+                    const auto* after_vertex = after_mesh->second.find_vertex(vertex.id);
+                    if (after_vertex == nullptr) {
+                        passed = false;
+                        measurement_complete = false;
+                        break;
                     }
+                    const double displacement = (transform_point(
+                        after_transform.value(), after_vertex->position) - transform_point(
+                        before_transform.value(), vertex.position)).length();
+                    if (!std::isfinite(displacement)) {
+                        passed = false;
+                        measurement_complete = false;
+                        break;
+                    }
+                    maximum_observed = std::max(maximum_observed, displacement);
+                    if (displacement > constraint.maximum_displacement) passed = false;
                 }
             }
             evidence = "maximum observed vertex displacement " +

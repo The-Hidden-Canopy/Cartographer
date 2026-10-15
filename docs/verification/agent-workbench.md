@@ -64,7 +64,7 @@
 - Changing the goal or source revision after an answer invalidates the workflow; a failed unresolved attempt does not consume the next task identity.
 - Reordering identity lists does not change the canonical objective digest, while changing an answer or hard constraint does.
 - Topology-preservation constraints reject a topology capability before speculative execution, and displacement gates block an over-limit result.
-- A bounded goal compiler recognizes explicit topology-preservation phrases, adds the hard constraint before clarification receipts, and rejects plans that omit the compiled constraint even when constructed directly.
+- The bounded goal compiler recognizes explicit topology-preservation, world-transform-preservation, and positive vertex-displacement bounds with world-unit suffixes; it rejects malformed or conflicting constraints and direct plans that omit a generated constraint.
 - Unsupported restrictions, conditional exceptions, and conflicting topology requirements fail before task creation; the desktop goal editor previews supported limits and disables Run when the goal cannot be enforced.
 - UI constraint drafts reject out-of-scope targets, missing rationale, duplicate identities, and unknown constraint kinds; answered objectives cannot be silently weakened, and checkpoint round-trip preserves the accepted constraints.
 - A policy-rejected step records the unchanged speculative revision as its after-revision, allowing blocked-task checkpoint validation without inventing a project mutation.
@@ -163,4 +163,4 @@ Multi-target demonstration tranche:
 - Recipe files are immutable. Opening a recipe leaves the project revision unchanged, creates no task, carries no target bindings, and cannot preview until current targets are explicitly rebound.
 - Trace v1 payloads remain readable after the v2 structural signature extension. Signatures are stable across object names, IDs, scale, and translation because they encode only bounded topology counts and local incidence.
 
-Add failure injection for durable journal append rollback, additional unrelated and conflicting source edits during safe rebase, bounded repair exhaustion, semantic-sidecar size pressure, and provider timeouts as those tranches are implemented. Clarification questions and answers are reviewable evidence, not natural-language commands; the workbench compiles only a bounded set of explicit topology-preservation phrases and does not infer questions automatically.
+Add failure injection for durable journal append rollback, additional unrelated and conflicting source edits during safe rebase, bounded repair exhaustion, semantic-sidecar size pressure, and provider timeouts as those tranches are implemented. Clarification questions and answers are reviewable evidence, not natural-language commands; the workbench compiles only explicit topology, transform, and numeric displacement constraints and does not infer questions automatically.

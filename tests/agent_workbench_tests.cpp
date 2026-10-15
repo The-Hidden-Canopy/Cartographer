@@ -2734,6 +2734,124 @@ void explicit_objective_compilation_is_bounded_and_fails_closed() {
     REQUIRE(direct_plan.validate());
 }
 
+void objective_compiler_binds_explicit_transform_and_displacement_limits() {
+    const auto preserve_transform = carto::agent::compile_explicit_hard_constraints(
+        "Keep world transforms unchanged.");
+    REQUIRE(preserve_transform);
+    REQUIRE(preserve_transform.value().size() == 1U);
+    REQUIRE(preserve_transform.value().front().kind ==
+        carto::agent::ObjectiveConstraintKind::preserve_transform);
+    REQUIRE(!preserve_transform.value().front().object.has_value());
+    REQUIRE(preserve_transform.value().front().validate());
+
+    const auto displacement = carto::agent::compile_explicit_hard_constraints(
+        "Maximum vertex displacement 0.25 world units.");
+    REQUIRE(displacement);
+    REQUIRE(displacement.value().size() == 1U);
+    REQUIRE(displacement.value().front().kind ==
+        carto::agent::ObjectiveConstraintKind::maximum_vertex_displacement);
+    REQUIRE(displacement.value().front().maximum_displacement == 0.25);
+    REQUIRE(!displacement.value().front().object.has_value());
+    REQUIRE(displacement.value().front().validate());
+
+    const auto alternate = carto::agent::compile_explicit_hard_constraints(
+        "Limit vertex displacement to 0.5 world units.");
+    REQUIRE(alternate);
+    REQUIRE(alternate.value().front().maximum_displacement == 0.5);
+    const auto leading_decimal = carto::agent::compile_explicit_hard_constraints(
+        "Limit vertex displacement to .25 world units.");
+    REQUIRE(leading_decimal);
+    REQUIRE(leading_decimal.value().front().maximum_displacement == 0.25);
+
+    REQUIRE(!carto::agent::compile_explicit_hard_constraints(
+        "Preserve transforms but allow transforms to change."));
+    REQUIRE(!carto::agent::compile_explicit_hard_constraints(
+        "Maximum vertex displacement -0.25 world units."));
+    REQUIRE(!carto::agent::compile_explicit_hard_constraints(
+        "Maximum vertex displacement 0.25 meters."));
+    REQUIRE(!carto::agent::compile_explicit_hard_constraints(
+        "Maximum vertex displacement."));
+    REQUIRE(!carto::agent::compile_explicit_hard_constraints(
+        "Maximum vertex displacement 1000001 world units."));
+    REQUIRE(!carto::agent::compile_explicit_hard_constraints(
+        "Maximum vertex displacement 0.1 world units and limit vertex displacement to 0.2 world units."));
+
+    carto::application::ApplicationSession transform_source;
+    const auto transform_objects = create_boxes(transform_source, 1U);
+    auto transform_plan = plan_for(transform_source.snapshot(), transform_objects, {
+        {"step-1", {transform_objects.front(), std::monostate{}},
+            "translate object by 0.25 0 0"},
+    });
+    transform_plan.objective.goal = "Preserve transforms";
+    REQUIRE(!transform_plan.validate());
+    transform_plan.objective.hard_constraints = preserve_transform.value();
+    REQUIRE(transform_plan.validate());
+    const auto transform_revision = transform_source.snapshot().project_revision;
+    auto transform_task = carto::agent::AgentTask::begin(
+        transform_source, std::move(transform_plan),
+        translation_envelope(transform_objects, 1.0));
+    REQUIRE(transform_task);
+    const auto transform_run = transform_task.value().run();
+    REQUIRE(transform_run);
+    REQUIRE(transform_run.value().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(transform_run.value().diagnostic->message.find(
+        "compiled.preserve-transform") != std::string::npos);
+    REQUIRE(transform_source.snapshot().project_revision == transform_revision);
+
+    carto::application::ApplicationSession ui_transform_source;
+    carto::ui::UiController ui_transform(ui_transform_source);
+    REQUIRE(ui_transform.dispatch(carto::application::CreateBoxAction{
+        "Compiled transform target", {1.0, 1.0, 1.0}}));
+    const auto ui_target = ui_transform_source.snapshot().objects.front().object.id;
+    REQUIRE(ui_transform.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui_transform.dispatch(carto::application::SelectObjectAction{ui_target}));
+    REQUIRE(ui_transform.queue_agent_step("translate object by 0.25 0 0"));
+    const auto ui_revision = ui_transform_source.snapshot().project_revision;
+    const auto ui_run = ui_transform.run_agent_plan(
+        "Keep transforms unchanged", translation_envelope({ui_target}, 1.0));
+    REQUIRE(ui_run);
+    REQUIRE(ui_run.value().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(ui_run.value().hard_constraints.size() == 1U);
+    REQUIRE(ui_run.value().hard_constraints.front().kind ==
+        carto::agent::ObjectiveConstraintKind::preserve_transform);
+    REQUIRE(ui_transform_source.snapshot().project_revision == ui_revision);
+
+    carto::application::ApplicationSession displacement_source;
+    const auto displacement_objects = create_boxes(displacement_source, 2U);
+    const auto displacement_snapshot = displacement_source.snapshot();
+    const auto first_vertex = displacement_snapshot.viewport.scene.find(
+        displacement_objects[0])->mesh->vertex_ids.front();
+    const auto second_vertex = displacement_snapshot.viewport.scene.find(
+        displacement_objects[1])->mesh->vertex_ids.front();
+    auto displacement_plan = plan_for(displacement_snapshot, displacement_objects, {
+        {"step-1", {displacement_objects[0], first_vertex}, "move vertex to 4 0 0"},
+        {"step-2", {displacement_objects[1], second_vertex}, "move vertex to 0 4 0"},
+    });
+    displacement_plan.objective.goal = "Maximum vertex displacement 0.25 world units";
+    REQUIRE(!displacement_plan.validate());
+    displacement_plan.objective.hard_constraints = displacement.value();
+    REQUIRE(displacement_plan.validate());
+    const auto displacement_revision = displacement_source.snapshot().project_revision;
+    auto displacement_task = carto::agent::AgentTask::begin(
+        displacement_source, std::move(displacement_plan),
+        envelope_for(displacement_objects));
+    REQUIRE(displacement_task);
+    const auto displacement_run = displacement_task.value().run();
+    REQUIRE(displacement_run);
+    REQUIRE(displacement_run.value().status == carto::agent::TaskStatus::blocked);
+    const auto displacement_gate = std::find_if(
+        displacement_run.value().gates.begin(), displacement_run.value().gates.end(),
+        [](const auto& gate) {
+            return gate.id == "constraint.compiled.maximum-vertex-displacement";
+        });
+    REQUIRE(displacement_gate != displacement_run.value().gates.end());
+    REQUIRE(!displacement_gate->passed);
+    REQUIRE(displacement_gate->affected_objects.size() == 2U);
+    REQUIRE(displacement_gate->evidence.find("0.250000 world units") != std::string::npos);
+    REQUIRE(displacement_source.snapshot().project_revision == displacement_revision);
+}
+
 void ui_compiled_constraints_are_bound_to_clarification_and_gate_execution() {
     carto::application::ApplicationSession source;
     carto::ui::UiController ui(source);
@@ -3406,6 +3524,7 @@ int main() {
         clarification_receipt_rejects_changed_plan_graph();
         objective_hard_constraints_block_topology_and_excess_displacement();
         explicit_objective_compilation_is_bounded_and_fails_closed();
+        objective_compiler_binds_explicit_transform_and_displacement_limits();
         ui_compiled_constraints_are_bound_to_clarification_and_gate_execution();
         acceptance_evidence_binds_validator_revision_assets_and_result();
         ui_workbench_captures_selection_and_exposes_accept_reject_flow();

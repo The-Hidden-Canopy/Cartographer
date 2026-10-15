@@ -52,8 +52,9 @@ struct HardConstraint {
     [[nodiscard]] core::Result<void> validate() const;
 };
 
-// Extracts only deterministic topology-preservation language from a goal.
-// Unsupported and conflicting restrictions fail closed instead of being ignored.
+// Extracts only deterministic topology, world-transform, and numeric vertex-
+// displacement constraints from a goal. Unsupported and conflicting restrictions
+// fail closed instead of being ignored.
 [[nodiscard]] core::Result<std::vector<HardConstraint>>
 compile_explicit_hard_constraints(std::string_view goal);
 

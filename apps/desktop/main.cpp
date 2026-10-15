@@ -6689,9 +6689,26 @@ struct DesktopState {
             ImGui::TextColored(color(snapshot.colors.semantic_warning),
                 "Goal restriction is not enforceable: %s",
                 compiled_goal_constraints.error().message.c_str());
-        } else if (goal_preserves_topology) {
-            ImGui::TextDisabled(
-                "Goal-derived hard limit: topology must remain unchanged.");
+        } else if (compiled_goal_constraints) {
+            for (const auto& constraint : compiled_goal_constraints.value()) {
+                switch (constraint.kind) {
+                case carto::agent::ObjectiveConstraintKind::preserve_topology:
+                    ImGui::TextDisabled(
+                        "Goal-derived hard limit: topology must remain unchanged.");
+                    break;
+                case carto::agent::ObjectiveConstraintKind::preserve_transform:
+                    ImGui::TextDisabled(
+                        "Goal-derived hard limit: affected world transforms must remain unchanged.");
+                    break;
+                case carto::agent::ObjectiveConstraintKind::maximum_vertex_displacement: {
+                    const std::string bound = std::to_string(constraint.maximum_displacement);
+                    ImGui::TextDisabled(
+                        "Goal-derived hard limit: vertex displacement ≤ %s world units.",
+                        bound.c_str());
+                    break;
+                }
+                }
+            }
         }
         const auto& agent_recipes = carto::agent::agent_recipe_catalog();
         std::vector<std::string> recipe_labels{"No recipe"};
