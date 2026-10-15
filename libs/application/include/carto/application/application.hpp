@@ -1017,6 +1017,21 @@ private:
         std::string_view task_id,
         std::string_view objective_digest,
         std::string_view diff_digest);
+    [[nodiscard]] core::Result<DispatchReceipt> install_agent_rebase_branch(
+        const project::ProjectDocument& candidate,
+        core::Revision expected_revision,
+        std::string_view checkpoint_task_id,
+        std::string_view plan_context_digest,
+        std::string_view checkpoint_source_digest);
+    [[nodiscard]] core::Result<project::ProjectDocument> merge_agent_rebase_document(
+        const project::ProjectDocument& base,
+        const project::ProjectDocument& speculative,
+        const std::vector<scene::ObjectId>& read_objects,
+        const std::vector<std::uint64_t>& read_mesh_assets,
+        const std::vector<scene::ObjectId>& write_objects,
+        const std::vector<std::uint64_t>& write_mesh_assets) const;
+    [[nodiscard]] core::Result<void> install_agent_checkpoint_source(
+        project::ProjectDocument checkpoint_source);
     struct SpeculativeCopyTag final {};
     ApplicationSession(const ApplicationSession& source, SpeculativeCopyTag);
     struct PreparedJournal {

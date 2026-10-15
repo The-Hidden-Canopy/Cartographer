@@ -256,6 +256,15 @@ private:
     ProjectDocument& operator=(const ProjectDocument&) = default;
     ProjectDocument& operator=(ProjectDocument&&) = default;
 
+    [[nodiscard]] static core::Result<ProjectDocument> merge_disjoint_scene_mesh_changes(
+        const ProjectDocument& base,
+        const ProjectDocument& current,
+        const ProjectDocument& speculative,
+        const std::vector<scene::ObjectId>& read_objects,
+        const std::vector<std::uint64_t>& read_mesh_assets,
+        const std::vector<scene::ObjectId>& write_objects,
+        const std::vector<std::uint64_t>& write_mesh_assets);
+
     [[nodiscard]] core::Result<scene::ObjectId> create_object(
         std::string name,
         core::Transform transform = core::Transform::identity());

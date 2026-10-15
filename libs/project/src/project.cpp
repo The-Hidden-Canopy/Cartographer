@@ -466,6 +466,312 @@ core::Result<ProjectDocument> ProjectDocument::create(std::string name) {
     return core::Result<ProjectDocument>::success(std::move(document));
 }
 
+core::Result<ProjectDocument> ProjectDocument::merge_disjoint_scene_mesh_changes(
+    const ProjectDocument& base,
+    const ProjectDocument& current,
+    const ProjectDocument& speculative,
+    const std::vector<scene::ObjectId>& read_objects,
+    const std::vector<std::uint64_t>& read_mesh_assets,
+    const std::vector<scene::ObjectId>& write_objects,
+    const std::vector<std::uint64_t>& write_mesh_assets) {
+    const auto stale = [](std::string message) {
+        return core::Result<ProjectDocument>::failure(Diagnostic(
+            ErrorCode::stale_data, std::move(message)));
+    };
+    const auto invalid_merge = [](std::string message) {
+        return core::Result<ProjectDocument>::failure(Diagnostic(
+            ErrorCode::invalid_state, std::move(message)));
+    };
+    if (auto result = base.validate(); !result) {
+        return core::Result<ProjectDocument>::failure(
+            result.error().with_context("checkpoint rebase base"));
+    }
+    if (auto result = current.validate(); !result) {
+        return core::Result<ProjectDocument>::failure(
+            result.error().with_context("checkpoint rebase current source"));
+    }
+    if (auto result = speculative.validate(); !result) {
+        return core::Result<ProjectDocument>::failure(
+            result.error().with_context("checkpoint rebase speculative artifact"));
+    }
+    if (base.source_namespace_ != current.source_namespace_ ||
+        base.source_namespace_ != speculative.source_namespace_ ||
+        base.name_ != speculative.name_ || current.revision_ < base.revision_ ||
+        speculative.revision_ <= base.revision_) {
+        return stale("checkpoint rebase documents do not share a valid source lineage");
+    }
+    if (current.revision_ == base.revision_ && current.serialize() != base.serialize()) {
+        return stale("checkpoint rebase source changed without advancing its revision");
+    }
+    if (current.revision_.exhausted()) {
+        return core::Result<ProjectDocument>::failure(exhausted_revision());
+    }
+    if (read_objects.size() > kMaxSerializedObjects ||
+        read_mesh_assets.size() > kMaxSerializedMeshes ||
+        write_objects.size() > kMaxSerializedObjects ||
+        write_mesh_assets.size() > kMaxSerializedMeshes ||
+        !std::is_sorted(read_objects.begin(), read_objects.end()) ||
+        std::adjacent_find(read_objects.begin(), read_objects.end()) != read_objects.end() ||
+        !std::is_sorted(read_mesh_assets.begin(), read_mesh_assets.end()) ||
+        std::adjacent_find(read_mesh_assets.begin(), read_mesh_assets.end()) !=
+            read_mesh_assets.end() ||
+        !std::is_sorted(write_objects.begin(), write_objects.end()) ||
+        std::adjacent_find(write_objects.begin(), write_objects.end()) != write_objects.end() ||
+        !std::is_sorted(write_mesh_assets.begin(), write_mesh_assets.end()) ||
+        std::adjacent_find(write_mesh_assets.begin(), write_mesh_assets.end()) !=
+            write_mesh_assets.end()) {
+        return invalid_merge("checkpoint rebase write sets are not canonical and bounded");
+    }
+    const std::set<scene::ObjectId> object_writes(
+        write_objects.begin(), write_objects.end());
+    const std::set<scene::ObjectId> object_reads(
+        read_objects.begin(), read_objects.end());
+    const std::set<std::uint64_t> mesh_reads(
+        read_mesh_assets.begin(), read_mesh_assets.end());
+    const std::set<std::uint64_t> mesh_writes(
+        write_mesh_assets.begin(), write_mesh_assets.end());
+    const auto subset = [](const auto& values, const auto& superset) {
+        return std::all_of(values.begin(), values.end(), [&superset](const auto value) {
+            return superset.contains(value);
+        });
+    };
+    if (!subset(object_writes, object_reads) || !subset(mesh_writes, mesh_reads)) {
+        return invalid_merge("checkpoint rebase write sets expand beyond their read sets");
+    }
+    const auto same_transform = [](const core::Transform& left,
+                                   const core::Transform& right) {
+        return left.translation.x == right.translation.x &&
+            left.translation.y == right.translation.y &&
+            left.translation.z == right.translation.z &&
+            left.rotation.x == right.rotation.x && left.rotation.y == right.rotation.y &&
+            left.rotation.z == right.rotation.z && left.rotation.w == right.rotation.w &&
+            left.scale.x == right.scale.x && left.scale.y == right.scale.y &&
+            left.scale.z == right.scale.z;
+    };
+    const auto same_object_metadata = [](const scene::SceneObject& left,
+                                         const scene::SceneObject& right) {
+        return left.id == right.id && left.name == right.name &&
+            left.parent == right.parent && left.mesh_asset == right.mesh_asset &&
+            left.visible == right.visible && left.locked == right.locked;
+    };
+    const auto same_object = [&same_transform, &same_object_metadata](
+        const scene::SceneObject* left, const scene::SceneObject* right) {
+        if (left == nullptr || right == nullptr) return left == right;
+        return same_object_metadata(*left, *right) &&
+            same_transform(left->local_transform, right->local_transform);
+    };
+    const auto same_mesh_projection = [&base](
+        const ProjectDocument& left,
+        const ProjectDocument& right,
+        std::uint64_t asset) {
+        const auto left_mesh = left.meshes_.find(asset);
+        const auto right_mesh = right.meshes_.find(asset);
+        if (left_mesh == left.meshes_.end() || right_mesh == right.meshes_.end()) {
+            return left_mesh == left.meshes_.end() && right_mesh == right.meshes_.end();
+        }
+        ProjectDocument left_projection;
+        left_projection.source_namespace_ = base.source_namespace_;
+        left_projection.name_ = base.name_;
+        left_projection.meshes_.emplace(asset, left_mesh->second);
+        ProjectDocument right_projection = left_projection;
+        right_projection.meshes_[asset] = right_mesh->second;
+        return left_projection.serialize() == right_projection.serialize();
+    };
+
+    if (base.condition_authoring_ != current.condition_authoring_ ||
+        base.engineering_authoring_ != current.engineering_authoring_) {
+        return stale("checkpoint rebase semantic sidecars changed without field-level provenance");
+    }
+    for (const scene::ObjectId object : object_reads) {
+        if (!same_object(base.scene_.find(object), current.scene_.find(object))) {
+            return stale("checkpoint rebase read object changed or disappeared");
+        }
+    }
+    for (const std::uint64_t asset : mesh_reads) {
+        if (!base.meshes_.contains(asset) || !current.meshes_.contains(asset) ||
+            !same_mesh_projection(base, current, asset)) {
+            return stale("checkpoint rebase read mesh changed or disappeared");
+        }
+    }
+
+    std::set<scene::ObjectId> object_ids;
+    for (const auto& object : base.scene_.objects_sorted()) object_ids.insert(object.id);
+    for (const auto& object : speculative.scene_.objects_sorted()) object_ids.insert(object.id);
+    if (object_ids.size() != base.scene_.size() ||
+        object_ids.size() != speculative.scene_.size()) {
+        return invalid_merge("speculative checkpoint added or removed scene objects");
+    }
+    for (const scene::ObjectId object : object_ids) {
+        const auto* before = base.scene_.find(object);
+        const auto* proposed = speculative.scene_.find(object);
+        if (before == nullptr || proposed == nullptr ||
+            !same_object_metadata(*before, *proposed)) {
+            return invalid_merge("speculative checkpoint changed scene metadata outside the rebase contract");
+        }
+        if (!same_transform(before->local_transform, proposed->local_transform) &&
+            !object_writes.contains(object)) {
+            return invalid_merge("speculative checkpoint changed an object outside its write set");
+        }
+    }
+    for (const scene::ObjectId object : object_writes) {
+        const auto* before = base.scene_.find(object);
+        const auto* latest = current.scene_.find(object);
+        const auto* proposed = speculative.scene_.find(object);
+        if (before == nullptr || latest == nullptr || proposed == nullptr ||
+            !same_object(before, latest) || !same_object_metadata(*before, *proposed)) {
+            return stale("checkpoint rebase object write target changed or disappeared");
+        }
+    }
+
+    std::set<std::uint64_t> mesh_ids;
+    for (const auto& [asset, mesh] : base.meshes_) {
+        static_cast<void>(mesh);
+        mesh_ids.insert(asset);
+    }
+    for (const auto& [asset, mesh] : speculative.meshes_) {
+        static_cast<void>(mesh);
+        mesh_ids.insert(asset);
+    }
+    if (mesh_ids.size() != base.meshes_.size() ||
+        mesh_ids.size() != speculative.meshes_.size()) {
+        return invalid_merge("speculative checkpoint added or removed mesh assets");
+    }
+    for (const std::uint64_t asset : mesh_ids) {
+        const bool changed = !same_mesh_projection(base, speculative, asset);
+        if (changed && !mesh_writes.contains(asset)) {
+            return invalid_merge("speculative checkpoint changed a mesh outside its write set");
+        }
+    }
+    for (const std::uint64_t asset : mesh_writes) {
+        if (!base.meshes_.contains(asset) || !current.meshes_.contains(asset) ||
+            !speculative.meshes_.contains(asset) ||
+            !same_mesh_projection(base, current, asset)) {
+            return stale("checkpoint rebase mesh write target changed or disappeared");
+        }
+    }
+    if (!mesh_writes.empty()) {
+        std::set<scene::ObjectId> source_object_ids;
+        for (const auto& object : base.scene_.objects_sorted()) source_object_ids.insert(object.id);
+        for (const auto& object : current.scene_.objects_sorted()) source_object_ids.insert(object.id);
+        for (const scene::ObjectId object : source_object_ids) {
+            const auto* before = base.scene_.find(object);
+            const auto* latest = current.scene_.find(object);
+            const auto is_written_asset = [&mesh_writes](const scene::SceneObject* value) {
+                return value != nullptr && value->mesh_asset.has_value() &&
+                    mesh_writes.contains(*value->mesh_asset);
+            };
+            if (is_written_asset(before) || is_written_asset(latest)) {
+                if (before == nullptr || latest == nullptr ||
+                    before->mesh_asset != latest->mesh_asset) {
+                    return stale("checkpoint rebase changed membership of a written mesh asset");
+                }
+            }
+        }
+    }
+
+    if (speculative.topology_receipts_.size() < base.topology_receipts_.size()) {
+        return invalid_merge("speculative checkpoint removed topology receipt history");
+    }
+    for (std::size_t index = 0U; index < base.topology_receipts_.size(); ++index) {
+        const auto& before = base.topology_receipts_[index];
+        const auto& proposed = speculative.topology_receipts_[index];
+        if (before.mesh_asset != proposed.mesh_asset ||
+            before.receipt.serialize() != proposed.receipt.serialize()) {
+            return invalid_merge("speculative checkpoint rewrote topology receipt history");
+        }
+    }
+    for (std::size_t index = base.topology_receipts_.size();
+         index < speculative.topology_receipts_.size(); ++index) {
+        const auto& added = speculative.topology_receipts_[index];
+        if (!mesh_writes.contains(added.mesh_asset)) {
+            return invalid_merge("speculative checkpoint added topology evidence outside its write set");
+        }
+        if (auto result = added.validate(); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+    }
+
+    std::set<std::uint64_t> cloth_receipt_ids;
+    for (const auto& [asset, receipt] : base.cloth_rest_pose_receipts_) {
+        static_cast<void>(receipt);
+        cloth_receipt_ids.insert(asset);
+    }
+    for (const auto& [asset, receipt] : speculative.cloth_rest_pose_receipts_) {
+        static_cast<void>(receipt);
+        cloth_receipt_ids.insert(asset);
+    }
+    for (const std::uint64_t asset : cloth_receipt_ids) {
+        const auto before = base.cloth_rest_pose_receipts_.find(asset);
+        const auto proposed = speculative.cloth_rest_pose_receipts_.find(asset);
+        const bool same = before == base.cloth_rest_pose_receipts_.end()
+            ? proposed == speculative.cloth_rest_pose_receipts_.end()
+            : proposed != speculative.cloth_rest_pose_receipts_.end() &&
+                before->second == proposed->second;
+        if (!same && !mesh_writes.contains(asset)) {
+            return invalid_merge("speculative checkpoint changed cloth provenance outside its write set");
+        }
+    }
+
+    ProjectDocument expected_speculative = base;
+    for (const scene::ObjectId object : write_objects) {
+        const auto* proposed = speculative.scene_.find(object);
+        if (auto result = expected_speculative.scene_.set_local_transform(
+                object, proposed->local_transform); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+    }
+    for (const std::uint64_t asset : write_mesh_assets) {
+        expected_speculative.meshes_[asset] = speculative.meshes_.at(asset);
+        const auto receipt = speculative.cloth_rest_pose_receipts_.find(asset);
+        if (receipt == speculative.cloth_rest_pose_receipts_.end()) {
+            expected_speculative.cloth_rest_pose_receipts_.erase(asset);
+        } else {
+            expected_speculative.cloth_rest_pose_receipts_[asset] = receipt->second;
+        }
+    }
+    expected_speculative.topology_receipts_ = speculative.topology_receipts_;
+    expected_speculative.revision_ = speculative.revision_;
+    if (expected_speculative.serialize() != speculative.serialize()) {
+        return invalid_merge("speculative checkpoint contains changes outside scene, mesh, and topology provenance writes");
+    }
+
+    ProjectDocument merged = current;
+    for (const scene::ObjectId object : write_objects) {
+        const auto* proposed = speculative.scene_.find(object);
+        if (auto result = merged.scene_.set_local_transform(
+                object, proposed->local_transform); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+    }
+    for (const std::uint64_t asset : write_mesh_assets) {
+        merged.meshes_[asset] = speculative.meshes_.at(asset);
+        const auto receipt = speculative.cloth_rest_pose_receipts_.find(asset);
+        if (receipt == speculative.cloth_rest_pose_receipts_.end()) {
+            merged.cloth_rest_pose_receipts_.erase(asset);
+        } else {
+            merged.cloth_rest_pose_receipts_[asset] = receipt->second;
+        }
+    }
+    merged.topology_receipts_.insert(
+        merged.topology_receipts_.end(),
+        speculative.topology_receipts_.begin() +
+            static_cast<std::ptrdiff_t>(base.topology_receipts_.size()),
+        speculative.topology_receipts_.end());
+    const std::uint64_t replay_revision_delta =
+        speculative.revision_.value() - base.revision_.value();
+    if (replay_revision_delta >
+        core::Revision::max_value() - current.revision_.value()) {
+        return core::Result<ProjectDocument>::failure(exhausted_revision());
+    }
+    merged.revision_ = core::Revision(
+        current.revision_.value() + replay_revision_delta);
+    if (auto result = merged.validate(); !result) {
+        return core::Result<ProjectDocument>::failure(
+            result.error().with_context("merged checkpoint rebase project"));
+    }
+    return core::Result<ProjectDocument>::success(std::move(merged));
+}
+
 core::Result<void> ProjectDocument::set_name(std::string name) {
     if (revision_.exhausted()) {
         return core::Result<void>::failure(exhausted_revision());

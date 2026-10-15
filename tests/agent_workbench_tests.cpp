@@ -140,8 +140,9 @@ void skip_checkpoint_strings(const std::vector<std::string>& fields, std::size_t
     cursor += static_cast<std::size_t>(count);
 }
 
-std::vector<std::string> legacy_v3_fields_from_v8(std::vector<std::string> fields) {
-    REQUIRE(fields.size() > 10U && fields[0] == "8");
+std::vector<std::string> legacy_v3_fields_from_current(std::vector<std::string> fields) {
+    REQUIRE(fields.size() > 10U && fields[0] == "9");
+    fields[0] = "8";
     fields.pop_back(); // Version 8 stores ghost anchors and recompute receipts in an extension.
     fields[0] = "7";
     fields[0] = "3";
@@ -361,8 +362,19 @@ void object_translation_checkpoint_rebase_tracks_transform_write_set() {
     const auto rebased_snapshot = rebased.value().snapshot();
     REQUIRE(rebased_snapshot.status == carto::agent::TaskStatus::review);
     REQUIRE(rebased_snapshot.rebases.size() == 1U);
+    REQUIRE(rebased_snapshot.rebases.front().reused_step_ids.size() == 1U);
+    REQUIRE(rebased_snapshot.rebases.front().reused_step_ids.front() == "step-1");
     REQUIRE(rebased_snapshot.rebases.front().write_mesh_assets.empty());
     REQUIRE(source.snapshot().objects.back().object.local_transform.translation.y == 3.0);
+    TempDirectory rebased_directory;
+    const auto rebased_path = rebased_directory.path() / "reused.carto-agent-task";
+    REQUIRE(rebased.value().save_checkpoint(rebased_path));
+    const auto persisted_rebase =
+        carto::agent::AgentTask::load_checkpoint(rebased_path);
+    REQUIRE(persisted_rebase);
+    REQUIRE(persisted_rebase.value().rebase_lineage.size() == 1U);
+    REQUIRE(persisted_rebase.value().rebase_lineage.front().reused_step_ids.size() == 1U);
+    REQUIRE(persisted_rebase.value().rebase_lineage.front().reused_step_ids.front() == "step-1");
     REQUIRE(carto::application::HumanApplicationAccess::accept_agent_task(rebased.value()));
     const auto accepted = source.snapshot();
     const auto accepted_target = std::find_if(accepted.objects.begin(), accepted.objects.end(),
@@ -1728,6 +1740,29 @@ void persistent_checkpoint_reauthorization_and_stale_source_are_fail_closed() {
     REQUIRE(rebased_snapshot.rebases.front().previous_source_revision ==
         stale_checkpoint.value().source_revision);
     REQUIRE(rebased_snapshot.rebases.front().rebased_source_revision == current_revision);
+    REQUIRE(rebased_snapshot.rebases.front().reused_step_ids.size() == 1U);
+    REQUIRE(rebased_snapshot.rebases.front().reused_step_ids.front() == "step-1");
+    REQUIRE(stale_source.snapshot().project_revision == current_revision);
+
+    auto tampered_checkpoint = stale_checkpoint.value();
+    const auto name_field = tampered_checkpoint.speculative_project.find("NAME ");
+    REQUIRE(name_field != std::string::npos);
+    const auto name_end = tampered_checkpoint.speculative_project.find('\n', name_field);
+    REQUIRE(name_end != std::string::npos);
+    tampered_checkpoint.speculative_project.replace(
+        name_field, name_end - name_field, "NAME \"Tampered checkpoint\"");
+    tampered_checkpoint.speculative_digest = carto::assets::sha256(
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(
+                tampered_checkpoint.speculative_project.data()),
+            tampered_checkpoint.speculative_project.size()));
+    REQUIRE(tampered_checkpoint.validate());
+    auto tampered_plan = tampered_checkpoint.plan;
+    tampered_plan.objective.base_revision = current_revision;
+    const auto rejected_artifact = carto::agent::AgentTask::rebase_checkpoint(
+        stale_source, tampered_checkpoint, tampered_plan);
+    REQUIRE(!rejected_artifact);
+    REQUIRE(rejected_artifact.error().code == carto::core::ErrorCode::stale_data);
     REQUIRE(stale_source.snapshot().project_revision == current_revision);
 
     auto changed_intent = stale_checkpoint.value().plan;
@@ -2008,7 +2043,8 @@ void persistent_checkpoint_v1_format_remains_readable() {
         return std::to_string(value.size()) + ":" + std::string(value) + "|";
     };
     auto v4_fields = checkpoint_fields(current_body);
-    REQUIRE(v4_fields.size() > 13U && v4_fields[0] == "8");
+    REQUIRE(v4_fields.size() > 13U && v4_fields[0] == "9");
+    v4_fields[0] = "8";
     v4_fields.pop_back();
     v4_fields[0] = "7";
     v4_fields[0] = "4";
@@ -2021,7 +2057,7 @@ void persistent_checkpoint_v1_format_remains_readable() {
     REQUIRE(decoded_v4);
     REQUIRE(decoded_v4.value().plan.objective.recipe_id.empty());
 
-    const auto v3_fields = legacy_v3_fields_from_v8(checkpoint_fields(current_body));
+    const auto v3_fields = legacy_v3_fields_from_current(checkpoint_fields(current_body));
     const std::string v3_body = checkpoint_body(v3_fields);
     REQUIRE(v3_body.starts_with("1:3|"));
     REQUIRE(v3_body.ends_with("1:0|1:0|1:0|0:|"));
@@ -3743,7 +3779,7 @@ void ui_ghost_corrections_are_scoped_revalidated_and_checkpointed() {
     const std::size_t body_begin = body_length_end + 1U;
     auto legacy_v5_fields = checkpoint_fields(
         legacy_encoding.value().substr(body_begin, body_length));
-    REQUIRE(legacy_v5_fields[0] == "8");
+    REQUIRE(legacy_v5_fields[0] == "9");
     legacy_v5_fields.pop_back();
     legacy_v5_fields[0] = "7";
     REQUIRE(legacy_v5_fields[0] == "7");

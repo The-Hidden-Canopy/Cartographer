@@ -1758,6 +1758,13 @@ core::Result<void> AgentRebaseReceipt::validate() const {
             }) && std::is_sorted(values.begin(), values.end()) &&
             std::adjacent_find(values.begin(), values.end()) == values.end();
     };
+    const auto ordered_step_ids = [](const std::vector<std::string>& values) {
+        return values.size() <= kMaxPlanSteps &&
+            std::all_of(values.begin(), values.end(), [](const std::string& value) {
+                return safe_text(value, kMaxTaskIdBytes);
+            }) && std::is_sorted(values.begin(), values.end()) &&
+            std::adjacent_find(values.begin(), values.end()) == values.end();
+    };
     const auto subset = [](const auto& smaller, const auto& larger) {
         return std::all_of(smaller.begin(), smaller.end(), [&larger](const auto value) {
             return std::binary_search(larger.begin(), larger.end(), value);
@@ -1773,6 +1780,7 @@ core::Result<void> AgentRebaseReceipt::validate() const {
         write_mesh_assets.size() > kMaxScopeObjects ||
         !ordered_objects(read_objects) || !ordered_objects(write_objects) ||
         !ordered_assets(read_mesh_assets) || !ordered_assets(write_mesh_assets) ||
+        !ordered_step_ids(reused_step_ids) ||
         !subset(write_objects, read_objects) || !subset(write_mesh_assets, read_mesh_assets) ||
         rebase_set_digest("read", read_objects, read_mesh_assets) != read_set_digest ||
         rebase_set_digest("write", write_objects, write_mesh_assets) != write_set_digest) {
@@ -4501,10 +4509,10 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
     }
     for (const auto& correction : checkpoint.ghost_corrections) {
         write_objects.insert(correction.object);
-        if (correction.kind != GhostCorrectionKind::vertex_position) continue;
+        if (correction.kind == GhostCorrectionKind::object_transform) continue;
         const auto* target = base.scene().find(correction.object);
         if (target == nullptr || !target->mesh_asset.has_value()) {
-            add_blocker("checkpoint ghost vertex correction has no saved mesh binding");
+            add_blocker("checkpoint ghost mesh correction has no saved mesh binding");
             continue;
         }
         read_mesh_assets.insert(*target->mesh_asset);
@@ -4720,6 +4728,96 @@ core::Result<AgentTask> AgentTask::rebase_checkpoint(
     receipt.write_objects = analysis.value().write_objects;
     receipt.read_mesh_assets = analysis.value().read_mesh_assets;
     receipt.write_mesh_assets = analysis.value().write_mesh_assets;
+
+    // A review checkpoint whose dependency graph is untouched can reuse its
+    // verified artifact. First replay it against the exact historical source;
+    // then three-way merge only its declared writes onto the current source.
+    // Any changed resource that invalidates a plan node continues through the
+    // existing fresh-replay path below.
+    if (checkpoint.status == TaskStatus::review &&
+        analysis.value().invalidated_step_ids.empty()) {
+        auto historical_base = project::ProjectDocument::deserialize(
+            checkpoint.source_project);
+        if (!historical_base) {
+            return core::Result<AgentTask>::failure(historical_base.error());
+        }
+        auto merge_base = historical_base.value();
+        auto historical_source = std::unique_ptr<application::ApplicationSession>(
+            new application::ApplicationSession(
+                source, application::ApplicationSession::SpeculativeCopyTag{}));
+        if (auto installed = historical_source->install_agent_checkpoint_source(
+                std::move(historical_base.value())); !installed) {
+            return core::Result<AgentTask>::failure(installed.error());
+        }
+        auto historical_speculative = std::unique_ptr<application::ApplicationSession>(
+            new application::ApplicationSession(
+                *historical_source, application::ApplicationSession::SpeculativeCopyTag{}));
+        AgentTask historical_task(
+            *historical_source, checkpoint.plan, checkpoint.envelope,
+            std::move(historical_speculative), historical_source->snapshot(),
+            checkpoint.repair_lineage, checkpoint.rebase_lineage);
+        historical_task.ghost_corrections_ = checkpoint.ghost_corrections;
+        historical_task.ghost_recompute_lineage_ = checkpoint.ghost_recomputes;
+        historical_task.replay_ghost_corrections_ =
+            !historical_task.ghost_corrections_.empty();
+        const auto historical_run = historical_task.run();
+        if (!historical_run || historical_task.status_ != TaskStatus::review ||
+            digest_text(historical_task.speculative_->document_.serialize()) !=
+                checkpoint.speculative_digest ||
+            historical_task.build_diff().digest != checkpoint.diff_digest) {
+            return core::Result<AgentTask>::failure(stale(
+                "checkpoint did not reproduce its saved review branch on the historical source"));
+        }
+
+        auto merged = source.merge_agent_rebase_document(
+            merge_base, saved_speculative.value(),
+            analysis.value().read_objects, analysis.value().read_mesh_assets,
+            analysis.value().write_objects, analysis.value().write_mesh_assets);
+        if (!merged) return core::Result<AgentTask>::failure(merged.error());
+        for (const auto& progress : historical_task.plan_progress_) {
+            if (progress.status == StepStatus::passed) {
+                receipt.reused_step_ids.push_back(progress.step_id);
+            }
+        }
+        std::sort(receipt.reused_step_ids.begin(), receipt.reused_step_ids.end());
+        if (auto valid = receipt.validate(); !valid) {
+            return core::Result<AgentTask>::failure(valid.error());
+        }
+        const auto installed = rebased.value().speculative_->install_agent_rebase_branch(
+            merged.value(), analysis.value().current_revision, checkpoint.plan.id,
+            checkpoint.plan_context_digest.hex(), checkpoint.source_digest.hex());
+        if (!installed) {
+            return core::Result<AgentTask>::failure(installed.error());
+        }
+
+        rebased.value().receipts_ = std::move(historical_task.receipts_);
+        rebased.value().plan_progress_ = std::move(historical_task.plan_progress_);
+        rebased.value().touched_objects_ = std::move(historical_task.touched_objects_);
+        rebased.value().transform_distance_used_meters_ =
+            historical_task.transform_distance_used_meters_;
+        rebased.value().query_budget_ = historical_task.query_budget_;
+        rebased.value().ghost_correction_replay_failed_ =
+            historical_task.ghost_correction_replay_failed_;
+        rebased.value().replay_ghost_corrections_ =
+            historical_task.replay_ghost_corrections_;
+        rebased.value().diagnostic_ = historical_task.diagnostic_;
+        rebased.value().rebases_.push_back(std::move(receipt));
+        rebased.value().status_ = TaskStatus::review;
+        rebased.value().gates_ = rebased.value().evaluate_gates();
+        const bool required_gates_pass = std::all_of(
+            rebased.value().gates_.begin(), rebased.value().gates_.end(),
+            [](const AcceptanceGateResult& gate) {
+                return !gate.required || gate.passed;
+            });
+        if (!required_gates_pass) {
+            rebased.value().status_ = TaskStatus::blocked;
+            rebased.value().diagnostic_ = invalid_state(
+                "rebased checkpoint reuse failed a required acceptance gate");
+        }
+        rebased.value().cached_snapshot_.reset();
+        return rebased;
+    }
+
     if (auto valid = receipt.validate(); !valid) {
         return core::Result<AgentTask>::failure(valid.error());
     }

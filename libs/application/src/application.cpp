@@ -845,6 +845,98 @@ core::Result<DispatchReceipt> ApplicationSession::accept_speculative_result(
     return result;
 }
 
+core::Result<DispatchReceipt> ApplicationSession::install_agent_rebase_branch(
+    const project::ProjectDocument& candidate,
+    core::Revision expected_revision,
+    std::string_view checkpoint_task_id,
+    std::string_view plan_context_digest,
+    std::string_view checkpoint_source_digest) {
+    const auto parsed_plan_digest = assets::Sha256Digest::from_hex(plan_context_digest);
+    const auto parsed_source_digest = assets::Sha256Digest::from_hex(checkpoint_source_digest);
+    if (active_source_ != OperationSource::human || checkpoint_task_id.empty() ||
+        checkpoint_task_id.size() > 64U ||
+        checkpoint_task_id.find_first_of("\r\n") != std::string_view::npos ||
+        !parsed_plan_digest || !parsed_source_digest) {
+        return core::Result<DispatchReceipt>::failure(invalid_state(
+            "agent branch rebase requires a validated checkpoint lineage"));
+    }
+    if (document_.revision() != expected_revision) {
+        return core::Result<DispatchReceipt>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "speculative source changed before the rebased branch was installed"));
+    }
+    if (expected_revision.exhausted() || candidate.revision() <= expected_revision) {
+        return core::Result<DispatchReceipt>::failure(invalid_state(
+            "rebased speculative branch must advance its exact base revision"));
+    }
+    if (auto result = candidate.validate(); !result) {
+        return core::Result<DispatchReceipt>::failure(
+            result.error().with_context("agent speculative rebase branch"));
+    }
+
+    editor::CommandBus prior_history = std::move(history_);
+    history_ = editor::CommandBus{};
+    editor::ProjectCommandAdmission admission;
+    const OperationSource previous_source = active_source_;
+    std::string previous_provenance = std::move(active_provenance_id_);
+    active_source_ = OperationSource::ai_proposal;
+    active_provenance_id_ = std::string(checkpoint_task_id);
+    const std::string operation = "Rebase Agent Speculative Branch " +
+        std::string(checkpoint_task_id) + " plan=" + parsed_plan_digest.value().hex() +
+        " source=" + parsed_source_digest.value().hex();
+    auto result = execute_command(
+        std::make_unique<editor::ReplaceProjectDocumentCommand>(
+            admission, document_, candidate),
+        operation);
+    active_source_ = previous_source;
+    active_provenance_id_ = std::move(previous_provenance);
+    if (!result) {
+        history_ = std::move(prior_history);
+        return result;
+    }
+
+    selection_.clear();
+    last_tool_action_.reset();
+    last_tool_context_.reset();
+    viewport_mesh_cache_.clear();
+    if (project_generation_ == std::numeric_limits<std::uint64_t>::max()) {
+        project_generation_ = 0U;
+    } else {
+        ++project_generation_;
+    }
+    return result;
+}
+
+core::Result<project::ProjectDocument> ApplicationSession::merge_agent_rebase_document(
+    const project::ProjectDocument& base,
+    const project::ProjectDocument& speculative,
+    const std::vector<scene::ObjectId>& read_objects,
+    const std::vector<std::uint64_t>& read_mesh_assets,
+    const std::vector<scene::ObjectId>& write_objects,
+    const std::vector<std::uint64_t>& write_mesh_assets) const {
+    return project::ProjectDocument::merge_disjoint_scene_mesh_changes(
+        base, document_, speculative, read_objects, read_mesh_assets,
+        write_objects, write_mesh_assets);
+}
+
+core::Result<void> ApplicationSession::install_agent_checkpoint_source(
+    project::ProjectDocument checkpoint_source) {
+    if (auto result = checkpoint_source.validate(); !result) {
+        return core::Result<void>::failure(
+            result.error().with_context("historical agent checkpoint source"));
+    }
+    document_.swap(checkpoint_source);
+    saved_revision_ = document_.revision();
+    reset_editor_state();
+    viewport_mesh_cache_.clear();
+    if (project_generation_ == std::numeric_limits<std::uint64_t>::max()) {
+        project_generation_ = 0U;
+    } else {
+        ++project_generation_;
+    }
+    return core::Result<void>::success();
+}
+
 core::Result<DispatchReceipt> ApplicationSession::dispatch(
     HumanActionAdmission,
     const ApplicationAction& action,

@@ -345,6 +345,9 @@ struct AgentRebaseReceipt {
     std::vector<scene::ObjectId> write_objects;
     std::vector<std::uint64_t> read_mesh_assets;
     std::vector<std::uint64_t> write_mesh_assets;
+    // Plan steps whose verified checkpoint results were reused verbatim on a
+    // source revision that changed only outside their declared read/write set.
+    std::vector<std::string> reused_step_ids;
 
     [[nodiscard]] core::Result<void> validate() const;
 };
@@ -590,7 +593,7 @@ struct AgentDemonstrationRecipe {
 // resumed task can run. Project bytes remain artifacts owned by this record;
 // they are never applied to the live source by loading a checkpoint.
 struct AgentTaskCheckpoint {
-    static constexpr std::uint32_t kFormatVersion = 8U;
+    static constexpr std::uint32_t kFormatVersion = 9U;
 
     TaskStatus status = TaskStatus::prepared;
     AgentPlan plan;

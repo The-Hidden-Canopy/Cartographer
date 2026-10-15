@@ -658,6 +658,8 @@ void write_rebase(Writer& writer, const AgentRebaseReceipt& rebase) {
     for (const auto asset : rebase.read_mesh_assets) writer.number(asset);
     writer.number(rebase.write_mesh_assets.size());
     for (const auto asset : rebase.write_mesh_assets) writer.number(asset);
+    writer.number(rebase.reused_step_ids.size());
+    for (const auto& step_id : rebase.reused_step_ids) writer.field(step_id);
 }
 
 AgentRebaseReceipt read_rebase(Reader& reader, std::uint64_t version) {
@@ -681,6 +683,13 @@ AgentRebaseReceipt read_rebase(Reader& reader, std::uint64_t version) {
     rebase.write_mesh_assets.reserve(write_asset_count);
     for (std::size_t index = 0U; index < write_asset_count; ++index) {
         rebase.write_mesh_assets.push_back(reader.number());
+    }
+    if (version >= 9U) {
+        const auto reused_step_count = reader.count(256U);
+        rebase.reused_step_ids.reserve(reused_step_count);
+        for (std::size_t index = 0U; index < reused_step_count; ++index) {
+            rebase.reused_step_ids.push_back(reader.field(64U));
+        }
     }
     return rebase;
 }
@@ -853,9 +862,19 @@ core::Result<void> AgentTaskCheckpoint::validate() const {
         const auto step = std::find_if(plan.steps.begin(), plan.steps.end(), [&receipt](const auto& item) {
             return item.id == receipt.step_id && item.target.object == receipt.target_object;
         });
+        const bool reused_after_rebase = std::any_of(
+            rebase_lineage.begin(), rebase_lineage.end(), [&receipt](const auto& rebase) {
+                return std::binary_search(
+                    rebase.reused_step_ids.begin(), rebase.reused_step_ids.end(),
+                    receipt.step_id);
+            });
+        const bool historical_receipt_is_bound = reused_after_rebase &&
+            !rebase_lineage.empty() &&
+            receipt.revision_before >= rebase_lineage.front().previous_source_revision &&
+            receipt.revision_before < source_revision;
         if (step == plan.steps.end() ||
             (receipt.status != StepStatus::passed && receipt.status != StepStatus::failed) ||
-            receipt.revision_before < source_revision ||
+            (receipt.revision_before < source_revision && !historical_receipt_is_bound) ||
             receipt.revision_after < receipt.revision_before ||
             receipt.revision_after > speculative.value().revision()) {
             return core::Result<void>::failure(malformed(
