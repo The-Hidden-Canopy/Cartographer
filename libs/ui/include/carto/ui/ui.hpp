@@ -576,6 +576,12 @@ public:
         scene::ObjectId object,
         core::Transform transform,
         std::string justification);
+    [[nodiscard]] core::Result<agent::AgentTaskSnapshot>
+    correct_agent_ghost_vertex_position(
+        scene::ObjectId object,
+        geometry::VertexId vertex,
+        core::Vec3d position,
+        std::string justification);
     [[nodiscard]] core::Result<application::DispatchReceipt> accept_agent_plan();
     [[nodiscard]] core::Result<void> reject_agent_plan();
     [[nodiscard]] core::Result<void> clear_agent_plan();

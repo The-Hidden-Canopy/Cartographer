@@ -237,6 +237,10 @@ bool same_transform(const core::Transform& left, const core::Transform& right) n
         left.scale.z == right.scale.z;
 }
 
+bool same_position(core::Vec3d left, core::Vec3d right) noexcept {
+    return left.x == right.x && left.y == right.y && left.z == right.z;
+}
+
 core::Result<AgentDemonstrationParameters> parameterize_demo_step(
     const ai::Proposal& proposal,
     const project::ProjectDocument& document,
@@ -1013,18 +1017,51 @@ core::Result<void> TargetRef::validate() const {
 }
 
 core::Result<assets::Sha256Digest> GhostCorrectionReceipt::computed_evidence_digest() const {
-    if (!safe_text(task_id, kMaxTaskIdBytes) || !object ||
-        !before_transform.finite() || !after_transform.finite() ||
-        same_transform(before_transform, after_transform) || source_revision.exhausted() ||
+    if (!safe_text(task_id, kMaxTaskIdBytes) || !object || source_revision.exhausted() ||
         branch_revision_before.exhausted() ||
         branch_revision_after != branch_revision_before.next() || plan_context_digest.is_zero() ||
         !safe_text(justification, 1024U)) {
         return core::Result<assets::Sha256Digest>::failure(invalid(
             "ghost correction evidence is incomplete or outside its bounds"));
     }
-    std::string canonical = "cartographer.agent.ghost-correction.v1|";
+    std::string canonical;
+    switch (kind) {
+    case GhostCorrectionKind::object_transform:
+        if (vertex.has_value() || !same_position(before_position, {}) ||
+            !same_position(after_position, {}) || !before_transform.finite() ||
+            !after_transform.finite() || same_transform(before_transform, after_transform)) {
+            return core::Result<assets::Sha256Digest>::failure(invalid(
+                "object-transform correction contains invalid or unrelated vertex evidence"));
+        }
+        // Preserve the v1 digest for legacy transform receipts in v5 checkpoints.
+        canonical = "cartographer.agent.ghost-correction.v1|";
+        break;
+    case GhostCorrectionKind::vertex_position:
+        if (!vertex.has_value() || !*vertex || !before_position.finite() ||
+            !after_position.finite() || same_position(before_position, after_position) ||
+            !same_transform(before_transform, core::Transform::identity()) ||
+            !same_transform(after_transform, core::Transform::identity())) {
+            return core::Result<assets::Sha256Digest>::failure(invalid(
+                "vertex-position correction contains invalid or unrelated transform evidence"));
+        }
+        canonical = "cartographer.agent.ghost-correction.v2|";
+        append_number(canonical, static_cast<std::uint64_t>(kind));
+        break;
+    default:
+        return core::Result<assets::Sha256Digest>::failure(invalid(
+            "ghost correction kind is unknown"));
+    }
     append_field(canonical, task_id);
     append_number(canonical, object.value);
+    if (kind == GhostCorrectionKind::vertex_position) {
+        append_number(canonical, vertex->value);
+        append_double(canonical, before_position.x);
+        append_double(canonical, before_position.y);
+        append_double(canonical, before_position.z);
+        append_double(canonical, after_position.x);
+        append_double(canonical, after_position.y);
+        append_double(canonical, after_position.z);
+    }
     const auto append_transform = [&canonical](const core::Transform& transform) {
         append_double(canonical, transform.translation.x);
         append_double(canonical, transform.translation.y);
@@ -1996,6 +2033,134 @@ core::Result<void> AgentTask::correct_ghost_transform(
     return core::Result<void>::success();
 }
 
+core::Result<void> AgentTask::correct_ghost_vertex_position(
+    scene::ObjectId object,
+    geometry::VertexId vertex,
+    core::Vec3d position,
+    std::string justification) {
+    if ((status_ != TaskStatus::review && status_ != TaskStatus::blocked) ||
+        receipts_.empty() || !source_ || !speculative_) {
+        return core::Result<void>::failure(invalid_state(
+            "ghost corrections require an executed speculative task"));
+    }
+    if (source_->document_.revision() != plan_.objective.base_revision) {
+        return core::Result<void>::failure(stale(
+            "source project changed while the speculative result was under review"));
+    }
+    if (!contains(plan_.objective.scope_objects, object) || !scope_contains(object)) {
+        return core::Result<void>::failure(policy(
+            "ghost correction target is outside the declared task scope"));
+    }
+    if (contains(plan_.objective.protected_objects, object)) {
+        return core::Result<void>::failure(policy(
+            "ghost correction cannot change an object protected by the objective"));
+    }
+    if (!safe_text(justification, 1024U)) {
+        return core::Result<void>::failure(invalid(
+            "ghost correction requires a bounded non-empty operator justification"));
+    }
+    if (!position.finite() || !vertex) {
+        return core::Result<void>::failure(invalid(
+            "ghost vertex correction requires a valid vertex and finite position"));
+    }
+    if (ghost_corrections_.size() >= 256U) {
+        return core::Result<void>::failure(policy(
+            "ghost correction evidence budget is exhausted"));
+    }
+    const auto* target = speculative_->document_.scene().find(object);
+    if (target == nullptr || target->locked || !target->mesh_asset.has_value()) {
+        return core::Result<void>::failure(policy(
+            "ghost vertex correction requires an unlocked mesh object"));
+    }
+    const auto mesh = speculative_->document_.meshes().find(*target->mesh_asset);
+    if (mesh == speculative_->document_.meshes().end()) {
+        return core::Result<void>::failure(stale(
+            "ghost vertex correction target has no current mesh asset"));
+    }
+    const auto* current_vertex = mesh->second.find_vertex(vertex);
+    if (current_vertex == nullptr) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "ghost correction vertex is absent from the speculative mesh"));
+    }
+    for (const auto& instance : speculative_->document_.scene().objects_sorted()) {
+        if (instance.mesh_asset != target->mesh_asset) continue;
+        if (!scope_contains(instance.id) ||
+            !contains(plan_.objective.scope_objects, instance.id) || instance.locked ||
+            contains(plan_.objective.protected_objects, instance.id)) {
+            return core::Result<void>::failure(policy(
+                "all instances of a corrected shared mesh must be in-scope, unlocked, and unprotected"));
+        }
+    }
+    if (same_position(current_vertex->position, position)) {
+        return core::Result<void>::failure(invalid(
+            "ghost correction does not change the selected vertex"));
+    }
+    const auto plan_context_digest = plan_.context_digest();
+    if (!plan_context_digest) {
+        return core::Result<void>::failure(plan_context_digest.error());
+    }
+
+    GhostCorrectionReceipt correction;
+    correction.kind = GhostCorrectionKind::vertex_position;
+    correction.task_id = plan_.id;
+    correction.object = object;
+    correction.vertex = vertex;
+    correction.before_position = current_vertex->position;
+    correction.after_position = position;
+    correction.source_revision = plan_.objective.base_revision;
+    correction.branch_revision_before = speculative_->document_.revision();
+    correction.branch_revision_after = correction.branch_revision_before.next();
+    correction.plan_context_digest = plan_context_digest.value();
+    correction.parent_evidence_digest = ghost_corrections_.empty()
+        ? assets::Sha256Digest{} : ghost_corrections_.back().evidence_digest;
+    correction.justification = std::move(justification);
+    const auto evidence_digest = correction.computed_evidence_digest();
+    if (!evidence_digest) return core::Result<void>::failure(evidence_digest.error());
+    correction.evidence_digest = evidence_digest.value();
+
+    auto selected_mode = application::HumanApplicationAccess::dispatch(
+        *speculative_, application::SetSelectionModeAction{
+            editor::SelectionMode::vertex});
+    if (!selected_mode) return core::Result<void>::failure(selected_mode.error());
+    auto selected_vertex = application::HumanApplicationAccess::dispatch(
+        *speculative_, application::SelectVertexAction{object, vertex});
+    if (!selected_vertex) return core::Result<void>::failure(selected_vertex.error());
+    editor::ToolArguments arguments;
+    arguments.position = position;
+    const auto dispatched = application::HumanApplicationAccess::dispatch(
+        *speculative_, application::InvokeToolAction{
+            "mesh.set-vertex-position", arguments});
+    if (!dispatched) {
+        return core::Result<void>::failure(dispatched.error().with_context(
+            "human ghost vertex correction"));
+    }
+    if (speculative_->document_.revision() != correction.branch_revision_after) {
+        return core::Result<void>::failure(invalid_state(
+            "ghost vertex correction did not advance exactly one speculative revision"));
+    }
+    ghost_corrections_.push_back(std::move(correction));
+    gates_ = evaluate_gates();
+    const bool required_gates_pass = std::all_of(
+        gates_.begin(), gates_.end(), [](const AcceptanceGateResult& gate) {
+            return !gate.required || gate.passed;
+        });
+    const bool all_steps_passed = std::all_of(
+        plan_progress_.begin(), plan_progress_.end(), [](const PlanStepProgress& progress) {
+            return progress.status == StepStatus::passed;
+        });
+    if (all_steps_passed && required_gates_pass) {
+        status_ = TaskStatus::review;
+        diagnostic_.reset();
+    } else {
+        status_ = TaskStatus::blocked;
+        diagnostic_ = invalid_state(
+            "human ghost correction leaves one or more required acceptance gates blocked");
+    }
+    cached_snapshot_.reset();
+    return core::Result<void>::success();
+}
+
 core::Result<void> AgentTask::apply_ghost_corrections() {
     if (ghost_corrections_.empty()) {
         replay_ghost_corrections_ = false;
@@ -2007,8 +2172,10 @@ core::Result<void> AgentTask::apply_ghost_corrections() {
     }
     assets::Sha256Digest expected_parent;
     std::map<scene::ObjectId, core::Transform> first_transforms;
-    std::map<scene::ObjectId, core::Transform> final_transforms;
     std::map<scene::ObjectId, core::Transform> last_recorded_transforms;
+    using GhostVertexKey = std::pair<std::uint64_t, geometry::VertexId>;
+    std::map<GhostVertexKey, core::Vec3d> first_vertex_positions;
+    std::map<GhostVertexKey, core::Vec3d> last_vertex_positions;
     for (const auto& correction : ghost_corrections_) {
         const bool plan_context_matches =
             (correction.task_id == plan_.id &&
@@ -2040,15 +2207,50 @@ core::Result<void> AgentTask::apply_ghost_corrections() {
             return core::Result<void>::failure(policy(
                 "locked ghost correction lineage no longer matches the task scope"));
         }
-        const auto previous = last_recorded_transforms.find(correction.object);
-        if (previous != last_recorded_transforms.end() &&
-            !same_transform(previous->second, correction.before_transform)) {
-            return core::Result<void>::failure(stale(
-                "locked ghost correction transform chain is discontinuous"));
+        if (correction.kind == GhostCorrectionKind::object_transform) {
+            const auto previous = last_recorded_transforms.find(correction.object);
+            if (previous != last_recorded_transforms.end() &&
+                !same_transform(previous->second, correction.before_transform)) {
+                return core::Result<void>::failure(stale(
+                    "locked ghost correction transform chain is discontinuous"));
+            }
+            first_transforms.try_emplace(correction.object, correction.before_transform);
+            last_recorded_transforms[correction.object] = correction.after_transform;
+        } else if (correction.kind == GhostCorrectionKind::vertex_position &&
+            correction.vertex.has_value()) {
+            const auto* target = speculative_->document_.scene().find(correction.object);
+            if (target == nullptr || target->locked || !target->mesh_asset.has_value()) {
+                return core::Result<void>::failure(policy(
+                    "locked ghost vertex target is missing, locked, or has no mesh"));
+            }
+            const auto mesh = speculative_->document_.meshes().find(*target->mesh_asset);
+            if (mesh == speculative_->document_.meshes().end() ||
+                mesh->second.find_vertex(*correction.vertex) == nullptr) {
+                return core::Result<void>::failure(stale(
+                    "locked ghost vertex target is missing from its replayed mesh"));
+            }
+            for (const auto& instance : speculative_->document_.scene().objects_sorted()) {
+                if (instance.mesh_asset == target->mesh_asset &&
+                    (!scope_contains(instance.id) ||
+                     !contains(plan_.objective.scope_objects, instance.id) || instance.locked ||
+                     contains(plan_.objective.protected_objects, instance.id))) {
+                    return core::Result<void>::failure(policy(
+                        "locked ghost vertex correction escapes shared-mesh scope"));
+                }
+            }
+            const GhostVertexKey key{*target->mesh_asset, *correction.vertex};
+            const auto previous = last_vertex_positions.find(key);
+            if (previous != last_vertex_positions.end() &&
+                !same_position(previous->second, correction.before_position)) {
+                return core::Result<void>::failure(stale(
+                    "locked ghost vertex correction chain is discontinuous"));
+            }
+            first_vertex_positions.try_emplace(key, correction.before_position);
+            last_vertex_positions[key] = correction.after_position;
+        } else {
+            return core::Result<void>::failure(invalid(
+                "locked ghost correction kind is unknown"));
         }
-        first_transforms.try_emplace(correction.object, correction.before_transform);
-        last_recorded_transforms[correction.object] = correction.after_transform;
-        final_transforms[correction.object] = correction.after_transform;
         expected_parent = correction.evidence_digest;
     }
 
@@ -2062,15 +2264,66 @@ core::Result<void> AgentTask::apply_ghost_corrections() {
             return core::Result<void>::failure(stale(
                 "replayed plan changed the base transform for a locked ghost correction"));
         }
-        const auto& final_transform = final_transforms.at(object);
-        if (same_transform(current->local_transform, final_transform)) continue;
+    }
+    for (const auto& [key, expected_position] : first_vertex_positions) {
+        const auto mesh = speculative_->document_.meshes().find(key.first);
+        const auto* vertex = mesh != speculative_->document_.meshes().end()
+            ? mesh->second.find_vertex(key.second) : nullptr;
+        if (vertex == nullptr || !same_position(vertex->position, expected_position)) {
+            return core::Result<void>::failure(stale(
+                "replayed plan changed the base position for a locked ghost vertex correction"));
+        }
+    }
+
+    for (const auto& correction : ghost_corrections_) {
         const auto revision_before = speculative_->document_.revision();
-        const auto dispatched = application::HumanApplicationAccess::dispatch(
-            *speculative_, application::SetObjectTransformAction{
-                object, final_transform, revision_before});
-        if (!dispatched) {
-            return core::Result<void>::failure(dispatched.error().with_context(
-                "replaying locked ghost correction"));
+        if (correction.kind == GhostCorrectionKind::object_transform) {
+            const auto* current = speculative_->document_.scene().find(correction.object);
+            if (current == nullptr || !same_transform(
+                    current->local_transform, correction.before_transform)) {
+                return core::Result<void>::failure(stale(
+                    "replaying plan changed the locked ghost transform correction chain"));
+            }
+            const auto dispatched = application::HumanApplicationAccess::dispatch(
+                *speculative_, application::SetObjectTransformAction{
+                    correction.object, correction.after_transform, revision_before});
+            if (!dispatched) {
+                return core::Result<void>::failure(dispatched.error().with_context(
+                    "replaying locked ghost correction"));
+            }
+        } else {
+            const auto* current = speculative_->document_.scene().find(correction.object);
+            const auto mesh = current != nullptr && current->mesh_asset.has_value()
+                ? speculative_->document_.meshes().find(*current->mesh_asset)
+                : speculative_->document_.meshes().end();
+            const auto* vertex = correction.vertex.has_value() &&
+                    mesh != speculative_->document_.meshes().end()
+                ? mesh->second.find_vertex(*correction.vertex) : nullptr;
+            if (vertex == nullptr || !same_position(vertex->position, correction.before_position)) {
+                return core::Result<void>::failure(stale(
+                    "replaying plan changed the locked ghost vertex correction chain"));
+            }
+            auto mode = application::HumanApplicationAccess::dispatch(
+                *speculative_, application::SetSelectionModeAction{
+                    editor::SelectionMode::vertex});
+            if (!mode) return core::Result<void>::failure(mode.error());
+            auto selected = application::HumanApplicationAccess::dispatch(
+                *speculative_, application::SelectVertexAction{
+                    correction.object, *correction.vertex});
+            if (!selected) return core::Result<void>::failure(selected.error());
+            editor::ToolArguments arguments;
+            arguments.position = correction.after_position;
+            const auto dispatched = application::HumanApplicationAccess::dispatch(
+                *speculative_, application::InvokeToolAction{
+                    "mesh.set-vertex-position", arguments});
+            if (!dispatched) {
+                return core::Result<void>::failure(dispatched.error().with_context(
+                    "replaying locked ghost vertex correction"));
+            }
+        }
+        if (speculative_->document_.revision() != revision_before.next()) {
+            return core::Result<void>::failure(invalid_state(
+                "replaying a locked ghost correction did not advance one speculative revision"));
         }
     }
     replay_ghost_corrections_ = false;
@@ -3520,6 +3773,17 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
     }
     for (const auto& correction : checkpoint.ghost_corrections) {
         write_objects.insert(correction.object);
+        if (correction.kind != GhostCorrectionKind::vertex_position) continue;
+        const auto* target = base.scene().find(correction.object);
+        if (target == nullptr || !target->mesh_asset.has_value()) {
+            add_blocker("checkpoint ghost vertex correction has no saved mesh binding");
+            continue;
+        }
+        read_mesh_assets.insert(*target->mesh_asset);
+        write_mesh_assets.insert(*target->mesh_asset);
+        for (const auto& instance : base.scene().objects_sorted()) {
+            if (instance.mesh_asset == target->mesh_asset) write_objects.insert(instance.id);
+        }
     }
     for (const auto object : write_objects) add_read_ancestry(base, object);
 
@@ -3737,6 +4001,16 @@ core::Result<void> HumanApplicationAccess::correct_agent_ghost_transform(
     core::Transform transform,
     std::string justification) {
     return task.correct_ghost_transform(object, transform, std::move(justification));
+}
+
+core::Result<void> HumanApplicationAccess::correct_agent_ghost_vertex_position(
+    ::carto::agent::AgentTask& task,
+    scene::ObjectId object,
+    geometry::VertexId vertex,
+    core::Vec3d position,
+    std::string justification) {
+    return task.correct_ghost_vertex_position(
+        object, vertex, position, std::move(justification));
 }
 
 core::Result<void> HumanApplicationAccess::answer_agent_clarification(

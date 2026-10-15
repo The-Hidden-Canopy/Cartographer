@@ -291,14 +291,23 @@ struct AgentRepairReceipt {
     std::vector<AcceptanceGateResult> previous_gate_results;
 };
 
-// Immutable evidence for an operator-authored transform on the speculative
-// branch. The task may replay this correction during resume, rebase, or repair,
-// but the receipt never grants authority to mutate the live source project.
+enum class GhostCorrectionKind : std::uint8_t {
+    object_transform,
+    vertex_position,
+};
+
+// Immutable evidence for an operator-authored edit on the speculative branch.
+// The task may replay this correction during resume, rebase, or repair, but the
+// receipt never grants authority to mutate the live source project.
 struct GhostCorrectionReceipt {
+    GhostCorrectionKind kind = GhostCorrectionKind::object_transform;
     std::string task_id;
     scene::ObjectId object;
+    std::optional<geometry::VertexId> vertex;
     core::Transform before_transform = core::Transform::identity();
     core::Transform after_transform = core::Transform::identity();
+    core::Vec3d before_position{};
+    core::Vec3d after_position{};
     core::Revision source_revision;
     core::Revision branch_revision_before;
     core::Revision branch_revision_after;
@@ -546,7 +555,7 @@ struct AgentDemonstrationRecipe {
 // resumed task can run. Project bytes remain artifacts owned by this record;
 // they are never applied to the live source by loading a checkpoint.
 struct AgentTaskCheckpoint {
-    static constexpr std::uint32_t kFormatVersion = 5U;
+    static constexpr std::uint32_t kFormatVersion = 6U;
 
     TaskStatus status = TaskStatus::prepared;
     AgentPlan plan;
@@ -649,6 +658,11 @@ private:
     [[nodiscard]] core::Result<void> correct_ghost_transform(
         scene::ObjectId object,
         core::Transform transform,
+        std::string justification);
+    [[nodiscard]] core::Result<void> correct_ghost_vertex_position(
+        scene::ObjectId object,
+        geometry::VertexId vertex,
+        core::Vec3d position,
         std::string justification);
     [[nodiscard]] core::Result<void> apply_ghost_corrections();
     [[nodiscard]] const project::ProjectDocument& scene_query_document() const;

@@ -1218,6 +1218,10 @@ struct DesktopState {
     std::string agent_repair_justification;
     std::string agent_ghost_justification;
     carto::scene::ObjectId agent_ghost_selected_object{};
+    carto::scene::ObjectId agent_ghost_vertex_object{};
+    carto::geometry::VertexId agent_ghost_selected_vertex{};
+    carto::core::Vec3d agent_ghost_vertex_position{};
+    carto::core::Revision agent_ghost_vertex_branch_revision{};
     bool agent_ghost_edit_mode = false;
     int agent_clarification_impact = 0;
     int agent_step_dependency = 0;
@@ -7438,12 +7442,16 @@ struct DesktopState {
                 agent_preview_mode = 0;
                 agent_ghost_edit_mode = false;
                 agent_ghost_selected_object = {};
+                agent_ghost_vertex_object = {};
+                agent_ghost_selected_vertex = {};
             }
             ImGui::SameLine();
             if (ImGui::SmallButton("Show before")) {
                 agent_preview_mode = 1;
                 agent_ghost_edit_mode = false;
                 agent_ghost_selected_object = {};
+                agent_ghost_vertex_object = {};
+                agent_ghost_selected_vertex = {};
             }
             ImGui::SameLine();
             if (ImGui::SmallButton("Show after")) agent_preview_mode = 2;
@@ -7456,6 +7464,8 @@ struct DesktopState {
                 agent_ghost_edit_mode = !agent_ghost_edit_mode;
                 agent_preview_mode = 2;
                 agent_ghost_selected_object = {};
+                agent_ghost_vertex_object = {};
+                agent_ghost_selected_vertex = {};
                 if (!agent_ghost_edit_mode) agent_ghost_justification.clear();
             }
             ImGui::EndDisabled();
@@ -7480,13 +7490,101 @@ struct DesktopState {
                     ImGui::TextDisabled("Selected ghost object %llu",
                         static_cast<unsigned long long>(agent_ghost_selected_object.value));
                 }
+                if (agent_ghost_vertex_object != agent_ghost_selected_object ||
+                    agent_ghost_vertex_branch_revision != task.speculative_revision) {
+                    agent_ghost_vertex_object = agent_ghost_selected_object;
+                    agent_ghost_selected_vertex = {};
+                    agent_ghost_vertex_position = {};
+                    agent_ghost_vertex_branch_revision = task.speculative_revision;
+                }
+                const auto* ghost_vertex_instance = agent_ghost_selected_object
+                    ? task.after_scene.find(agent_ghost_selected_object) : nullptr;
+                const auto ghost_vertex_object_view = std::find_if(
+                    snapshot.objects.begin(), snapshot.objects.end(),
+                    [this](const auto& value) {
+                        return value.object.id == agent_ghost_selected_object;
+                    });
+                const bool ghost_vertex_target_available = ghost_vertex_instance != nullptr &&
+                    ghost_vertex_instance->mesh != nullptr &&
+                    ghost_vertex_object_view != snapshot.objects.end() &&
+                    !ghost_vertex_object_view->object.locked &&
+                    std::find(task.scope_objects.begin(), task.scope_objects.end(),
+                        agent_ghost_selected_object) != task.scope_objects.end() &&
+                    std::find(task.protected_objects.begin(), task.protected_objects.end(),
+                        agent_ghost_selected_object) == task.protected_objects.end();
+                if (!ghost_vertex_target_available) {
+                    ImGui::TextDisabled(
+                        "Select an in-scope mesh object in the after view to edit one of its vertices.");
+                } else {
+                    std::string selected_vertex_label = agent_ghost_selected_vertex
+                        ? "Vertex " + std::to_string(agent_ghost_selected_vertex.value)
+                        : "Select a ghost vertex";
+                    if (ImGui::BeginCombo("Ghost vertex", selected_vertex_label.c_str())) {
+                        for (const auto vertex_id : ghost_vertex_instance->mesh->vertex_ids) {
+                            const std::string label = "Vertex " +
+                                std::to_string(vertex_id.value);
+                            const bool selected_vertex = vertex_id == agent_ghost_selected_vertex;
+                            if (ImGui::Selectable(label.c_str(), selected_vertex)) {
+                                agent_ghost_selected_vertex = vertex_id;
+                                const auto vertex = std::find(
+                                    ghost_vertex_instance->mesh->vertex_ids.begin(),
+                                    ghost_vertex_instance->mesh->vertex_ids.end(), vertex_id);
+                                if (vertex != ghost_vertex_instance->mesh->vertex_ids.end()) {
+                                    const auto vertex_index = static_cast<std::size_t>(
+                                        std::distance(
+                                            ghost_vertex_instance->mesh->vertex_ids.begin(), vertex));
+                                    if (vertex_index < ghost_vertex_instance->mesh->positions.size()) {
+                                        agent_ghost_vertex_position =
+                                            ghost_vertex_instance->mesh->positions[vertex_index];
+                                    }
+                                }
+                            }
+                        }
+                        ImGui::EndCombo();
+                    }
+                    if (agent_ghost_selected_vertex) {
+                        ImGui::InputDouble("Ghost vertex X", &agent_ghost_vertex_position.x);
+                        ImGui::InputDouble("Ghost vertex Y", &agent_ghost_vertex_position.y);
+                        ImGui::InputDouble("Ghost vertex Z", &agent_ghost_vertex_position.z);
+                    }
+                    const bool source_revision_current =
+                        snapshot.project_revision == task.base_revision;
+                    ImGui::BeginDisabled(!agent_ghost_selected_vertex ||
+                        !source_revision_current || agent_ghost_justification.empty());
+                    if (ImGui::SmallButton("Apply vertex correction")) {
+                        const auto corrected = ui.correct_agent_ghost_vertex_position(
+                            agent_ghost_selected_object, agent_ghost_selected_vertex,
+                            agent_ghost_vertex_position, agent_ghost_justification);
+                        if (!corrected) {
+                            agent_feedback = corrected.error().message;
+                        } else {
+                            agent_feedback = corrected.value().status ==
+                                    carto::agent::TaskStatus::review
+                                ? "Vertex correction locked on the speculative branch; gates pass."
+                                : "Vertex correction locked on the speculative branch; a gate remains blocked.";
+                            agent_ghost_selected_vertex = {};
+                            agent_ghost_vertex_object = {};
+                        }
+                    }
+                    ImGui::EndDisabled();
+                }
             }
             if (!task.ghost_corrections.empty()) {
                 ImGui::Text("Locked human corrections · %zu", task.ghost_corrections.size());
                 for (const auto& correction : task.ghost_corrections) {
-                    ImGui::BulletText("%s · object %llu · %s", correction.task_id.c_str(),
-                        static_cast<unsigned long long>(correction.object.value),
-                        correction.justification.c_str());
+                    if (correction.kind == carto::agent::GhostCorrectionKind::vertex_position &&
+                        correction.vertex.has_value()) {
+                        ImGui::BulletText("%s · object %llu · vertex %llu · %s",
+                            correction.task_id.c_str(),
+                            static_cast<unsigned long long>(correction.object.value),
+                            static_cast<unsigned long long>(correction.vertex->value),
+                            correction.justification.c_str());
+                    } else {
+                        ImGui::BulletText("%s · object %llu · transform · %s",
+                            correction.task_id.c_str(),
+                            static_cast<unsigned long long>(correction.object.value),
+                            correction.justification.c_str());
+                    }
                 }
             }
             ImGui::TextDisabled(

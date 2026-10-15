@@ -817,6 +817,12 @@ private:
         scene::ObjectId object,
         core::Transform transform,
         std::string justification);
+    [[nodiscard]] static core::Result<void> correct_agent_ghost_vertex_position(
+        ::carto::agent::AgentTask& task,
+        scene::ObjectId object,
+        geometry::VertexId vertex,
+        core::Vec3d position,
+        std::string justification);
 
     [[nodiscard]] static core::Result<DispatchReceipt> commit_preview(
         ApplicationSession& session,
