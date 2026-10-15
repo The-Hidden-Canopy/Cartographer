@@ -3261,6 +3261,8 @@ core::Result<void> UiController::load_agent_checkpoint(
     agent_objective_id_ = checkpoint.value().plan.objective.id;
     agent_repair_mode_ = false;
     agent_checkpoint_rebased_ = false;
+    agent_checkpoint_directly_conflicting_steps_.clear();
+    agent_checkpoint_invalidated_steps_.clear();
     agent_checkpoint_pending_.emplace(std::move(checkpoint.value()));
     return core::Result<void>::success();
 }
@@ -3270,12 +3272,17 @@ core::Result<void> UiController::rebase_agent_checkpoint() {
         return core::Result<void>::failure(invalid_state(
             "load one saved checkpoint before requesting a rebase"));
     }
+    agent_checkpoint_directly_conflicting_steps_.clear();
+    agent_checkpoint_invalidated_steps_.clear();
     const auto analysis = agent::AgentTask::analyze_checkpoint_rebase(
         session_, *agent_checkpoint_pending_);
     if (!analysis) {
         record_ui_problem(analysis.error().with_context("agent task rebase analysis"));
         return core::Result<void>::failure(analysis.error());
     }
+    agent_checkpoint_directly_conflicting_steps_ =
+        analysis.value().directly_conflicting_step_ids;
+    agent_checkpoint_invalidated_steps_ = analysis.value().invalidated_step_ids;
     if (!analysis.value().can_rebase()) {
         std::string message = "checkpoint rebase is blocked";
         for (std::size_t index = 0U;
@@ -3334,6 +3341,8 @@ core::Result<agent::AgentTaskSnapshot> UiController::resume_agent_checkpoint() {
     agent_task_.emplace(std::move(resumed.value()));
     agent_checkpoint_pending_.reset();
     agent_checkpoint_rebased_ = false;
+    agent_checkpoint_directly_conflicting_steps_.clear();
+    agent_checkpoint_invalidated_steps_.clear();
     agent_repair_mode_ = false;
     const auto result = agent_task_->snapshot();
     return core::Result<agent::AgentTaskSnapshot>::success(result);
@@ -3434,6 +3443,8 @@ core::Result<void> UiController::clear_agent_plan() {
     agent_clarifications_draft_.clear();
     agent_checkpoint_pending_.reset();
     agent_checkpoint_rebased_ = false;
+    agent_checkpoint_directly_conflicting_steps_.clear();
+    agent_checkpoint_invalidated_steps_.clear();
     agent_plan_base_revision_.reset();
     agent_goal_.clear();
     agent_plan_id_.clear();
@@ -4743,6 +4754,9 @@ UiSnapshot UiController::snapshot() const {
         result.agent_checkpoint_rebase_revision = agent_plan_base_revision_.value_or(
             agent_checkpoint_pending_->source_revision);
     }
+    result.agent_checkpoint_directly_conflicting_steps =
+        agent_checkpoint_directly_conflicting_steps_;
+    result.agent_checkpoint_invalidated_steps = agent_checkpoint_invalidated_steps_;
     if (agent_task_.has_value()) {
         const auto task = agent_task_->snapshot();
         result.agent_task = task;

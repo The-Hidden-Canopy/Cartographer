@@ -4388,6 +4388,8 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
 
     std::set<scene::ObjectId> read_objects;
     std::set<scene::ObjectId> write_objects;
+    std::map<scene::ObjectId, std::set<std::string>> steps_by_object_dependency;
+    std::map<std::uint64_t, std::set<std::string>> steps_by_mesh_dependency;
     std::set<std::uint64_t> read_mesh_assets;
     std::set<std::uint64_t> write_mesh_assets;
     const auto add_blocker = [&analysis](std::string message) {
@@ -4404,8 +4406,11 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
             read_mesh_assets.insert(*found->mesh_asset);
         }
     };
-    const auto add_read_ancestry = [&read_objects, &add_blocker](
-        const project::ProjectDocument& document, scene::ObjectId object) {
+    const auto add_read_ancestry = [
+        &read_objects, &add_blocker, &steps_by_object_dependency](
+        const project::ProjectDocument& document,
+        scene::ObjectId object,
+        std::optional<std::string_view> step_id) {
         std::set<scene::ObjectId> visited;
         const scene::SceneObject* current_object = document.scene().find(object);
         std::size_t depth = 0U;
@@ -4416,6 +4421,9 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
                 return;
             }
             read_objects.insert(parent);
+            if (step_id.has_value()) {
+                steps_by_object_dependency[parent].insert(std::string(*step_id));
+            }
             current_object = document.scene().find(parent);
             if (current_object == nullptr) {
                 add_blocker("checkpoint scope ancestry references a missing parent object");
@@ -4445,15 +4453,19 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
             continue;
         }
         add_mesh_ref(base, object);
-        add_read_ancestry(base, object);
+        add_read_ancestry(base, object, std::nullopt);
     }
     for (const auto& step : checkpoint.plan.steps) {
         write_objects.insert(step.target.object);
+        steps_by_object_dependency[step.target.object].insert(step.id);
         const auto* target = base.scene().find(step.target.object);
         if (target == nullptr) {
             add_blocker("checkpoint write target " + std::to_string(step.target.object.value) +
                 " is absent from its saved source");
             continue;
+        }
+        if (target->mesh_asset.has_value()) {
+            steps_by_mesh_dependency[*target->mesh_asset].insert(step.id);
         }
         if (std::holds_alternative<std::monostate>(step.target.component)) {
             for (const auto& object : base.scene().objects_sorted()) {
@@ -4468,6 +4480,7 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
                     }
                     if (parent == step.target.object) {
                         write_objects.insert(object.id);
+                        steps_by_object_dependency[object.id].insert(step.id);
                         break;
                     }
                     ancestor = base.scene().find(parent);
@@ -4500,15 +4513,20 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
             if (instance.mesh_asset == target->mesh_asset) write_objects.insert(instance.id);
         }
     }
-    for (const auto object : write_objects) add_read_ancestry(base, object);
+    for (const auto object : write_objects) add_read_ancestry(base, object, std::nullopt);
+    for (const auto& step : checkpoint.plan.steps) {
+        add_read_ancestry(base, step.target.object, step.id);
+    }
 
     std::set<scene::ObjectId> object_ids;
     for (const auto& object : base.scene().objects_sorted()) object_ids.insert(object.id);
     for (const auto& object : current.scene().objects_sorted()) object_ids.insert(object.id);
+    std::set<scene::ObjectId> changed_objects;
     for (const scene::ObjectId object : object_ids) {
         const auto* before = base.scene().find(object);
         const auto* after = current.scene().find(object);
         if (same_scene_object(before, after)) continue;
+        changed_objects.insert(object);
         const bool read_conflict = read_objects.contains(object);
         const bool asset_membership_changed = before == nullptr || after == nullptr ||
             before->mesh_asset != after->mesh_asset;
@@ -4550,19 +4568,85 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
         static_cast<void>(mesh);
         mesh_ids.insert(id);
     }
+    std::set<std::uint64_t> changed_meshes;
     for (const std::uint64_t asset : mesh_ids) {
         const auto before = base.meshes().find(asset);
         const auto after = current.meshes().find(asset);
         const auto* before_mesh = before == base.meshes().end() ? nullptr : &before->second;
         const auto* after_mesh = after == current.meshes().end() ? nullptr : &after->second;
-        if (same_mesh_state(before_mesh, after_mesh) || !read_mesh_assets.contains(asset)) continue;
+        if (same_mesh_state(before_mesh, after_mesh)) continue;
+        changed_meshes.insert(asset);
+        if (!read_mesh_assets.contains(asset)) continue;
         analysis.conflicting_mesh_assets.push_back(asset);
         add_blocker("read mesh asset " + std::to_string(asset) +
             " changed since the checkpoint source");
     }
-    if (base.condition_authoring() != current.condition_authoring() ||
-        base.engineering_authoring() != current.engineering_authoring()) {
+    const bool semantic_sidecar_changed =
+        base.condition_authoring() != current.condition_authoring() ||
+        base.engineering_authoring() != current.engineering_authoring();
+    if (semantic_sidecar_changed) {
         add_blocker("CONDITION or engineering sidecar changed; checkpoint has no field-level semantic read provenance");
+    }
+
+    // Identify the smallest plan branch that must be reconsidered when source
+    // identities used by a step changed. This is review evidence only: rebase
+    // remains blocked until the existing read/write conflict policy permits it.
+    std::set<std::string> directly_conflicting_steps;
+    const auto mark_steps = [&directly_conflicting_steps](
+        const auto& dependencies, const auto& identity) {
+        const auto found = dependencies.find(identity);
+        if (found != dependencies.end()) {
+            directly_conflicting_steps.insert(found->second.begin(), found->second.end());
+        }
+    };
+    for (const auto object : changed_objects) {
+        mark_steps(steps_by_object_dependency, object);
+        const auto* before = base.scene().find(object);
+        const auto* after = current.scene().find(object);
+        if (before != nullptr && before->mesh_asset.has_value()) {
+            mark_steps(steps_by_mesh_dependency, *before->mesh_asset);
+        }
+        if (after != nullptr && after->mesh_asset.has_value()) {
+            mark_steps(steps_by_mesh_dependency, *after->mesh_asset);
+        }
+    }
+    for (const auto asset : changed_meshes) {
+        mark_steps(steps_by_mesh_dependency, asset);
+    }
+    if (semantic_sidecar_changed) {
+        for (const auto& step : checkpoint.plan.steps) {
+            directly_conflicting_steps.insert(step.id);
+        }
+    }
+    std::set<std::string> invalidated_steps = directly_conflicting_steps;
+    bool added_dependent = true;
+    while (added_dependent) {
+        added_dependent = false;
+        for (const auto& step : checkpoint.plan.steps) {
+            if (invalidated_steps.contains(step.id)) continue;
+            const bool depends_on_invalidated = std::any_of(
+                step.dependencies.begin(), step.dependencies.end(),
+                [&invalidated_steps](const std::string& dependency) {
+                    return invalidated_steps.contains(dependency);
+                });
+            if (depends_on_invalidated) {
+                invalidated_steps.insert(step.id);
+                added_dependent = true;
+            }
+        }
+    }
+    const auto scheduled_steps = checkpoint.plan.schedule_order();
+    if (!scheduled_steps) {
+        add_blocker("checkpoint plan dependency graph cannot be scheduled for rebase analysis");
+    } else {
+        for (const auto& step_id : scheduled_steps.value()) {
+            if (directly_conflicting_steps.contains(step_id)) {
+                analysis.directly_conflicting_step_ids.push_back(step_id);
+            }
+            if (invalidated_steps.contains(step_id)) {
+                analysis.invalidated_step_ids.push_back(step_id);
+            }
+        }
     }
 
     analysis.read_objects.assign(read_objects.begin(), read_objects.end());

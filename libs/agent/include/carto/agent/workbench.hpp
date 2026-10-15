@@ -629,6 +629,8 @@ struct AgentRebaseAnalysis {
     std::vector<std::uint64_t> write_mesh_assets;
     std::vector<scene::ObjectId> conflicting_objects;
     std::vector<std::uint64_t> conflicting_mesh_assets;
+    std::vector<std::string> directly_conflicting_step_ids;
+    std::vector<std::string> invalidated_step_ids;
     std::vector<std::string> blockers;
 
     [[nodiscard]] bool can_rebase() const noexcept { return blockers.empty(); }

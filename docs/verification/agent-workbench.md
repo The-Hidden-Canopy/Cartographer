@@ -115,10 +115,11 @@
 - CONDITION or engineering sidecar changes block rebase while field-level query provenance is unavailable. Rebase requires a plan bound to the exact current revision, unchanged intent/scope/dependencies, and renewed human clarification answers.
 - A conflict-free rebase replays the complete native plan against the current source and compares the saved and replayed task write-set objects/meshes. Replay drift blocks acceptance. The accepted result includes all unrelated source edits because the speculative branch starts from the current source.
 - Rebase lineage records the previous/current source revisions and digests, canonical read/write set digests, and bounded identities. Checkpoint format version 7 reads versions 1 through 6 without fields introduced by later versions.
-- Rebase currently replays the full plan conservatively; per-step invalidation and re-execution from a minimal affected DAG frontier are not implemented.
+- Rebase conflict analysis reports steps whose target, target ancestry, shared target mesh, or semantic sidecar changed, then computes the transitive dependent-step closure in stable scheduler order. The Agent workspace shows both direct conflicts and the invalidated branch while the rebase remains blocked. Independent steps with no changed source dependency remain outside that report. Rebase execution still replays the full plan; selective reuse or re-execution from the minimal frontier is not implemented.
 - Accepted and rejected checkpoints remain inspectable history and cannot be resumed. Checkpoint writes do not replace an existing file, preserving prior task history.
 - Corrupted files, attempts to overwrite a checkpoint, conflicting source changes, missing reapproval, and replayed write-set drift are blocked without changing the live project.
 - A disjoint source edit can be explicitly rebased, retained in the resulting source, and accepted only after the plan is reauthorized for the new revision.
+- An adversarial DAG fixture changes one target source object, verifies that only its direct step and transitive dependent step are reported invalidated, excludes the independent step, and confirms the UI exposes the same evidence without mutating the live source.
 
 ## Cross-workspace task status
 

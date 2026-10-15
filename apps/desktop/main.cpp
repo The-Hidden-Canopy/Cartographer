@@ -7091,6 +7091,23 @@ struct DesktopState {
             ImGui::TextDisabled(
                 "The saved speculative branch is re-created and checked before review. "
                 "Any consequential clarification must be answered again.");
+            if (!snapshot.agent_checkpoint_invalidated_steps.empty()) {
+                std::string invalidated_steps;
+                for (const auto& step_id : snapshot.agent_checkpoint_invalidated_steps) {
+                    if (!invalidated_steps.empty()) invalidated_steps += ", ";
+                    invalidated_steps += step_id;
+                }
+                std::string direct_conflicts;
+                for (const auto& step_id :
+                     snapshot.agent_checkpoint_directly_conflicting_steps) {
+                    if (!direct_conflicts.empty()) direct_conflicts += ", ";
+                    direct_conflicts += step_id;
+                }
+                ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                    "Directly affected plan steps: %s",
+                    direct_conflicts.empty() ? "source-level evidence" : direct_conflicts.c_str());
+                ImGui::TextWrapped("Invalidated DAG branch: %s", invalidated_steps.c_str());
+            }
             if (checkpoint_source_advanced &&
                 (!snapshot.agent_checkpoint_rebased || checkpoint_rebase_stale)) {
                 ImGui::TextColored(color(snapshot.colors.semantic_warning),

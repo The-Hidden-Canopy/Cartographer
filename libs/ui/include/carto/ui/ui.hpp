@@ -452,6 +452,8 @@ struct UiSnapshot : application::ApplicationSnapshot {
     std::string agent_checkpoint_task_id;
     core::Revision agent_checkpoint_base_revision;
     core::Revision agent_checkpoint_rebase_revision;
+    std::vector<std::string> agent_checkpoint_directly_conflicting_steps;
+    std::vector<std::string> agent_checkpoint_invalidated_steps;
     std::optional<agent::AgentTaskSnapshot> agent_task;
     std::optional<agent::SceneQueryResult> agent_condition_inventory;
     std::optional<agent::AgentDemonstration> agent_demonstration;
@@ -761,6 +763,8 @@ private:
     std::size_t agent_demonstration_target_set_count_ = 1U;
     std::optional<agent::AgentTaskCheckpoint> agent_checkpoint_pending_;
     bool agent_checkpoint_rebased_ = false;
+    std::vector<std::string> agent_checkpoint_directly_conflicting_steps_;
+    std::vector<std::string> agent_checkpoint_invalidated_steps_;
     std::string agent_goal_;
     std::string agent_plan_id_;
     std::string agent_objective_id_;

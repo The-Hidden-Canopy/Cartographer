@@ -1873,6 +1873,60 @@ void persistent_checkpoint_reauthorization_and_stale_source_are_fail_closed() {
         }));
 }
 
+void checkpoint_rebase_reports_only_the_conflicted_dag_branch() {
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 3U);
+    auto plan = plan_for(source.snapshot(), objects, {
+        {"step-a", {objects[0], carto::geometry::FaceId{1U}}, "inset face 0.1"},
+        {"step-b", {objects[1], carto::geometry::FaceId{1U}}, "inset face 0.1", {"step-a"}},
+        {"step-c", {objects[2], carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    auto task = carto::agent::AgentTask::begin(source, plan, envelope_for(objects));
+    REQUIRE(task);
+    const auto run = task.value().run();
+    REQUIRE(run && run.value().status == carto::agent::TaskStatus::review);
+
+    TempDirectory directory;
+    const auto path = directory.path() / "dag-rebase.carto-agent-task";
+    REQUIRE(task.value().save_checkpoint(path));
+    const auto checkpoint = carto::agent::AgentTask::load_checkpoint(path);
+    REQUIRE(checkpoint);
+
+    const auto before = source.snapshot().objects.front().object.local_transform;
+    auto changed = before;
+    changed.translation.x += 0.25;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        source, carto::application::SetObjectTransformAction{objects[0], changed, std::nullopt}));
+
+    const auto analysis = carto::agent::AgentTask::analyze_checkpoint_rebase(
+        source, checkpoint.value());
+    REQUIRE(analysis);
+    REQUIRE(!analysis.value().can_rebase());
+    REQUIRE(analysis.value().directly_conflicting_step_ids.size() == 1U);
+    REQUIRE(analysis.value().directly_conflicting_step_ids.front() == "step-a");
+    REQUIRE(analysis.value().invalidated_step_ids.size() == 2U);
+    REQUIRE(std::find(analysis.value().invalidated_step_ids.begin(),
+        analysis.value().invalidated_step_ids.end(), "step-a") !=
+        analysis.value().invalidated_step_ids.end());
+    REQUIRE(std::find(analysis.value().invalidated_step_ids.begin(),
+        analysis.value().invalidated_step_ids.end(), "step-b") !=
+        analysis.value().invalidated_step_ids.end());
+    REQUIRE(std::find(analysis.value().invalidated_step_ids.begin(),
+        analysis.value().invalidated_step_ids.end(), "step-c") ==
+        analysis.value().invalidated_step_ids.end());
+
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.load_agent_checkpoint(path));
+    const auto blocked_rebase = ui.rebase_agent_checkpoint();
+    REQUIRE(!blocked_rebase);
+    const auto ui_snapshot = ui.snapshot();
+    REQUIRE(ui_snapshot.agent_checkpoint_directly_conflicting_steps ==
+        analysis.value().directly_conflicting_step_ids);
+    REQUIRE(ui_snapshot.agent_checkpoint_invalidated_steps ==
+        analysis.value().invalidated_step_ids);
+    REQUIRE(source.snapshot().project_revision == analysis.value().current_revision);
+}
+
 void prepared_checkpoint_requires_explicit_resume_before_native_execution() {
     carto::application::ApplicationSession source;
     const auto objects = create_boxes(source, 1U);
@@ -4283,6 +4337,7 @@ int main() {
         ui_ghost_corrections_remain_locked_through_repair();
         persistent_checkpoint_replays_review_and_blocks_artifact_drift();
         persistent_checkpoint_reauthorization_and_stale_source_are_fail_closed();
+        checkpoint_rebase_reports_only_the_conflicted_dag_branch();
         prepared_checkpoint_requires_explicit_resume_before_native_execution();
         persistent_checkpoint_rejects_corruption_and_overwrite();
         persistent_checkpoint_v1_format_remains_readable();
