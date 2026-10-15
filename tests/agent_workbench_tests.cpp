@@ -4735,6 +4735,8 @@ void ui_named_goal_target_resolution_rejects_missing_and_ambiguous_names() {
     const auto objects = source.snapshot().objects;
     REQUIRE(objects.size() == 3U);
     const auto fallback = objects.front().object.id;
+    const auto duplicate_a = objects[1].object.id;
+    const auto duplicate_b = objects[2].object.id;
     REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
         carto::editor::SelectionMode::object}));
     REQUIRE(ui.dispatch(carto::application::SelectObjectAction{fallback}));
@@ -4743,7 +4745,7 @@ void ui_named_goal_target_resolution_rejects_missing_and_ambiguous_names() {
     const auto ambiguous = ui.compile_agent_goal_sequence(
         R"(on object "Duplicate": translate object by 0.1 0 0)");
     REQUIRE(!ambiguous);
-    REQUIRE(ambiguous.error().message.find("ambiguous") != std::string::npos);
+    REQUIRE(ambiguous.error().message.find("does not match") != std::string::npos);
     REQUIRE(ui.snapshot().agent_plan_draft.empty());
     REQUIRE(!ui.snapshot().agent_task.has_value());
 
@@ -4755,6 +4757,59 @@ void ui_named_goal_target_resolution_rejects_missing_and_ambiguous_names() {
     REQUIRE(!ui.snapshot().agent_task.has_value());
     REQUIRE(ui.snapshot().selection.objects == std::vector<carto::scene::ObjectId>{fallback});
     REQUIRE(source.snapshot().project_revision == source_revision);
+
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{duplicate_a}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{
+        duplicate_b, carto::editor::SelectionOperation::add}));
+    const auto multi_selected = ui.compile_agent_goal_sequence(
+        R"(on object "Duplicate": translate object by 0.1 0 0)");
+    REQUIRE(!multi_selected);
+    REQUIRE(multi_selected.error().message.find("exactly one matching object") !=
+        std::string::npos);
+    REQUIRE(ui.snapshot().agent_plan_draft.empty());
+    REQUIRE(!ui.snapshot().agent_task.has_value());
+    REQUIRE(source.snapshot().project_revision == source_revision);
+
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{duplicate_a}));
+    const auto resolved = ui.compile_agent_goal_sequence(
+        R"(on object "Duplicate": translate object by 0.1 0 0)");
+    if (!resolved) {
+        throw TestFailure("selected duplicate name did not compile: " +
+            resolved.error().message);
+    }
+    const auto compiled = ui.snapshot();
+    REQUIRE(compiled.agent_plan_draft.size() == 1U);
+    REQUIRE(compiled.agent_plan_draft.front().target.object == duplicate_a);
+    REQUIRE(compiled.agent_clarifications_draft.empty());
+    REQUIRE(compiled.selection.objects == std::vector<carto::scene::ObjectId>{duplicate_a});
+    REQUIRE(source.snapshot().project_revision == source_revision);
+
+    auto prepared = ui.prepare_agent_plan(
+        R"(on object "Duplicate": translate object by 0.1 0 0)",
+        translation_envelope({duplicate_a}, 1.0));
+    REQUIRE(prepared && prepared.value().status == carto::agent::TaskStatus::prepared);
+    REQUIRE(prepared.value().scope_objects ==
+        std::vector<carto::scene::ObjectId>{duplicate_a});
+    const auto review = ui.run_prepared_agent_plan();
+    REQUIRE(review && review.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(review.value().can_accept);
+    REQUIRE(source.snapshot().project_revision == source_revision);
+    REQUIRE(ui.accept_agent_plan());
+
+    const auto accepted = source.snapshot();
+    const auto accepted_fallback = std::find_if(accepted.objects.begin(), accepted.objects.end(),
+        [fallback](const auto& object) { return object.object.id == fallback; });
+    const auto accepted_a = std::find_if(accepted.objects.begin(), accepted.objects.end(),
+        [duplicate_a](const auto& object) { return object.object.id == duplicate_a; });
+    const auto accepted_b = std::find_if(accepted.objects.begin(), accepted.objects.end(),
+        [duplicate_b](const auto& object) { return object.object.id == duplicate_b; });
+    REQUIRE(accepted_fallback != accepted.objects.end());
+    REQUIRE(accepted_a != accepted.objects.end());
+    REQUIRE(accepted_b != accepted.objects.end());
+    REQUIRE(accepted_fallback->object.local_transform.translation.x == 0.0);
+    REQUIRE(accepted_b->object.local_transform.translation.x == 0.0);
+    REQUIRE(accepted_a->object.local_transform.translation.x > 0.09);
+    REQUIRE(accepted_a->object.local_transform.translation.x < 0.11);
 }
 
 void agent_goal_scope_parser_rejects_malformed_prefixes_and_decodes_only_safe_escapes() {

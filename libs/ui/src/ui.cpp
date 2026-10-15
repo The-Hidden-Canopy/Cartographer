@@ -2077,6 +2077,8 @@ core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
     }
 
     std::vector<agent::TargetRef> targets;
+    std::vector<agent::SceneNamedObjectFact> named_target_candidates;
+    std::optional<scene::ObjectId> selected_named_target;
     const bool object_selection =
         authoring.value().selection_mode == editor::SelectionMode::object;
     const bool named_target = parsed_goal.value().exact_object_name.has_value();
@@ -2118,23 +2120,39 @@ core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
             return core::Result<void>::failure(invalid_state(
                 "the exact-name goal target was not found in the current project"));
         }
-        if (query.value().rows.size() != 1U) {
-            return core::Result<void>::failure(invalid_state(
-                "the exact-name goal target is ambiguous; select one object or use a unique name"));
+        named_target_candidates.reserve(query.value().rows.size());
+        for (const auto& row : query.value().rows) {
+            const auto* fact = std::get_if<agent::SceneNamedObjectFact>(&row);
+            if (fact == nullptr ||
+                fact->stable_name != *parsed_goal.value().exact_object_name) {
+                return core::Result<void>::failure(validation(
+                    "exact-name target query returned an unexpected fact"));
+            }
+            named_target_candidates.push_back(*fact);
         }
-        const auto* named_fact = std::get_if<agent::SceneNamedObjectFact>(
-            &query.value().rows.front());
-        if (named_fact == nullptr ||
-            named_fact->stable_name != *parsed_goal.value().exact_object_name) {
-            return core::Result<void>::failure(validation(
-                "exact-name target query returned an unexpected fact"));
+        if (named_target_candidates.size() == 1U) {
+            selected_named_target = named_target_candidates.front().object;
+        } else {
+            if (!object_selection || authoring.value().objects.size() != 1U) {
+                return core::Result<void>::failure(invalid_state(
+                    "the exact-name goal target is ambiguous; select exactly one matching object or use a unique name"));
+            }
+            const scene::ObjectId selected = authoring.value().objects.front();
+            const auto selected_candidate = std::find_if(
+                named_target_candidates.begin(), named_target_candidates.end(),
+                [selected](const auto& candidate) { return candidate.object == selected; });
+            if (selected_candidate == named_target_candidates.end()) {
+                return core::Result<void>::failure(invalid_state(
+                    "the selected object does not match the exact-name goal target"));
+            }
+            selected_named_target = selected;
         }
         const auto object = std::find_if(source_snapshot.objects.begin(),
-            source_snapshot.objects.end(), [named_fact](const auto& value) {
-                return value.object.id == named_fact->object;
+            source_snapshot.objects.end(), [selected_named_target](const auto& value) {
+                return value.object.id == *selected_named_target;
             });
         if (object == source_snapshot.objects.end() ||
-            object->object.name != named_fact->stable_name) {
+            object->object.name != *parsed_goal.value().exact_object_name) {
             return core::Result<void>::failure(stale(
                 "the exact-name target changed after the source snapshot was captured"));
         }
@@ -2142,7 +2160,7 @@ core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
             return core::Result<void>::failure(invalid_state(
                 "exact-name goal targets must be unlocked root objects"));
         }
-        targets.push_back(agent::TargetRef{named_fact->object, std::monostate{}});
+        targets.push_back(agent::TargetRef{*selected_named_target, std::monostate{}});
     } else if (object_selection && !authoring.value().objects.empty()) {
         constexpr std::size_t kMaxSelectedObjectTargets = 16U;
         if (authoring.value().objects.size() > kMaxSelectedObjectTargets) {

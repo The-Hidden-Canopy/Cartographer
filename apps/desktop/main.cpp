@@ -6817,7 +6817,7 @@ struct DesktopState {
                 snapshot.selection.vertices.size() == 1U);
         if (starts_named_target_request) {
             ImGui::TextDisabled(
-                "Target: exact-name lookup in the current project; duplicate names fail closed.");
+                "Target: exact-name lookup; duplicate names require exactly one matching object selected.");
         } else if (snapshot.selection.mode == carto::editor::SelectionMode::object &&
             !snapshot.selection.objects.empty() &&
             snapshot.selection.objects.size() <= 16U) {
