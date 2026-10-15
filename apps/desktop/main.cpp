@@ -7181,7 +7181,7 @@ struct DesktopState {
                         snapshot.agent_demonstration_recipe_name.c_str());
                 }
                 ImGui::TextDisabled(
-                    "The file has aliases and typed deltas only. Preview needs explicit target bindings and runs on a speculative branch.");
+                    "The file has aliases, typed deltas, and optional topology-derived signatures; it has no target bindings and runs only through speculative preview.");
                 const auto visible_steps = std::min<std::size_t>(trace.steps.size(), 16U);
                 for (std::size_t index = 0U; index < visible_steps; ++index) {
                     const auto& trace_step = trace.steps[index];
@@ -7191,7 +7191,22 @@ struct DesktopState {
                 }
                 ImGui::SeparatorText("Bind trace aliases to selected targets");
                 ImGui::TextDisabled(
-                    "Each target set is mapped explicitly. Select one matching target per row; sets cannot overlap or infer similarity.");
+                    "Use explicit bindings for exact target choices, or select the completed exemplar object and apply its topology-only matches.");
+                const bool has_structural_evidence = trace.steps.size() == 1U &&
+                    trace.steps.front().structure_signature.has_value() &&
+                    trace.steps.front().result_object_structure_signature.has_value();
+                ImGui::BeginDisabled(!has_structural_evidence);
+                if (ImGui::SmallButton("Apply to similar")) {
+                    const auto applied = ui.apply_agent_demonstration_to_similar();
+                    agent_feedback = applied
+                        ? "Bound " + std::to_string(applied.value()) +
+                            " unique structural-signature matches. Review the speculative diff and gates before acceptance."
+                        : applied.error().message;
+                }
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                ImGui::TextDisabled(
+                    "One command only; ambiguous signature matches are skipped. Select the completed source object as the exemplar.");
                 int target_set_count = static_cast<int>(
                     snapshot.agent_demonstration_target_set_count);
                 ImGui::SetNextItemWidth(120.0F);

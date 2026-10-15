@@ -3,8 +3,10 @@
 #include <carto/ui/ui.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <charconv>
+#include <cstdint>
 #include <filesystem>
 #include <limits>
 #include <fstream>
@@ -12,6 +14,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace {
 
@@ -995,6 +998,153 @@ void human_native_command_range_captures_alias_only_trace() {
     REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
         "Unrelated edit clears recent trace", {1.0, 1.0, 1.0}}));
     REQUIRE(source.snapshot().native_operation_trace.empty());
+}
+
+void native_demonstrations_apply_to_unique_exact_structural_matches() {
+    TempDirectory directory;
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreatePlaneAction{
+        "CANARY_DEMO_SOURCE_NAME", 2.0, 2.0}));
+    const auto source_object = source.snapshot().objects.front().object.id;
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        source_object, carto::geometry::FaceId{1U}}));
+    REQUIRE(ui.dispatch(carto::application::InvokeToolAction{
+        "mesh.inset-face", carto::editor::ToolArguments{0.1, {}, true, 0.5, std::nullopt}}));
+    const auto captured_operations = source.snapshot().native_operation_trace;
+    REQUIRE(captured_operations.size() == 1U);
+    REQUIRE(ui.capture_agent_demonstration_trace(
+        captured_operations.front().operation_id, captured_operations.front().operation_id));
+    const auto captured = ui.snapshot().agent_demonstration_trace;
+    REQUIRE(captured.has_value());
+    REQUIRE(captured->steps.front().structure_signature.has_value());
+    REQUIRE(captured->steps.front().result_object_structure_signature.has_value());
+    const auto encoded = captured->serialize();
+    REQUIRE(encoded);
+    REQUIRE(encoded.value().find("CANARY_DEMO_SOURCE_NAME") == std::string::npos);
+    REQUIRE(encoded.value().find("E:/HiddenCanopy") == std::string::npos);
+
+    const auto field = [](std::string_view value) {
+        return std::to_string(value.size()) + ":" + std::string(value) + "|";
+    };
+    const auto number = [&field](std::uint64_t value) {
+        return field(std::to_string(value));
+    };
+    std::string legacy_body;
+    legacy_body += number(1U);
+    legacy_body += number(1U);
+    legacy_body += number(1U);
+    legacy_body += field("object.translate");
+    legacy_body += number(0U);
+    legacy_body += number(1U);
+    legacy_body += number(0U);
+    legacy_body += number(0U);
+    legacy_body += number(1U);
+    legacy_body += number(1U);
+    legacy_body += number(std::bit_cast<std::uint64_t>(0.5));
+    legacy_body += number(std::bit_cast<std::uint64_t>(0.0));
+    legacy_body += number(std::bit_cast<std::uint64_t>(0.0));
+    const auto* legacy_bytes = reinterpret_cast<const std::uint8_t*>(legacy_body.data());
+    const auto legacy_digest = carto::assets::sha256(
+        std::span<const std::uint8_t>(legacy_bytes, legacy_body.size()));
+    const std::string legacy_trace =
+        "CARTOGRAPHER_AGENT_DEMONSTRATION_TRACE_V1\n" +
+        field(legacy_body) + field(legacy_digest.hex());
+    const auto legacy_decoded = carto::agent::AgentDemonstrationTrace::deserialize(legacy_trace);
+    REQUIRE(legacy_decoded);
+    REQUIRE(legacy_decoded.value().steps.size() == 1U);
+    REQUIRE(!legacy_decoded.value().steps.front().structure_signature.has_value());
+    REQUIRE(!legacy_decoded.value().steps.front().result_object_structure_signature.has_value());
+
+    const auto trace_path = directory.path() / "structural-demo.carto-agent-trace";
+    REQUIRE(ui.save_agent_demonstration_trace(trace_path));
+    REQUIRE(ui.clear_agent_demonstration_trace());
+    REQUIRE(ui.load_agent_demonstration_trace(trace_path));
+
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{source_object}));
+    REQUIRE(!ui.apply_agent_demonstration_to_similar());
+    REQUIRE(ui.snapshot().agent_demonstration_bindings.size() == 1U);
+    REQUIRE(!ui.snapshot().agent_demonstration_bindings.front().bound);
+
+    REQUIRE(ui.dispatch(carto::application::CreatePlaneAction{
+        "CANARY_DEMO_TARGET_ONE", 3.0, 2.0}));
+    REQUIRE(ui.dispatch(carto::application::CreatePlaneAction{
+        "CANARY_DEMO_TARGET_TWO", 4.0, 2.0}));
+    REQUIRE(ui.dispatch(carto::application::CreatePlaneAction{
+        "CANARY_DEMO_TARGET_THREE", 5.0, 2.0}));
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Different topology distractor", {1.0, 1.0, 1.0}}));
+    const auto objects = source.snapshot().objects;
+    REQUIRE(objects.size() == 5U);
+    const auto first_target = objects[1].object.id;
+    REQUIRE(ui.dispatch(carto::application::DuplicateMeshInstanceAction{
+        first_target, "CANARY_SHARED_TARGET_COPY", {2.0, 0.0, 0.0}}));
+    const auto shared_copy = source.snapshot().objects.back().object.id;
+    auto moved_target = objects[1].object.local_transform;
+    moved_target.translation.x += 5.0;
+    REQUIRE(ui.dispatch(carto::application::SetObjectTransformAction{
+        first_target, moved_target, std::nullopt}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{first_target}));
+    REQUIRE(!ui.apply_agent_demonstration_to_similar());
+
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{source_object}));
+    const auto target_set_count = ui.apply_agent_demonstration_to_similar();
+    REQUIRE(target_set_count && target_set_count.value() == 2U);
+    const auto bound = ui.snapshot();
+    REQUIRE(bound.agent_demonstration_target_set_count == 2U);
+    REQUIRE(bound.agent_demonstration_bindings.size() == 2U);
+    REQUIRE(std::all_of(bound.agent_demonstration_bindings.begin(),
+        bound.agent_demonstration_bindings.end(),
+        [](const auto& binding) { return binding.bound; }));
+    REQUIRE(bound.agent_demonstration_bindings[0].target_set_index == 0U);
+    REQUIRE(bound.agent_demonstration_bindings[1].target_set_index == 1U);
+
+    const auto revision_before_preview = source.snapshot().project_revision;
+    const auto preview = ui.preview_agent_demonstration_trace();
+    REQUIRE(preview);
+    REQUIRE(preview.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(preview.value().plan_steps.size() == 2U);
+    REQUIRE(preview.value().scope_objects.size() == 2U);
+    const auto preview_plan = ui.snapshot().agent_plan_draft;
+    REQUIRE(preview_plan.size() == 2U);
+    REQUIRE(preview_plan[0].target.object != preview_plan[1].target.object);
+    REQUIRE(preview_plan[0].target.object != first_target);
+    REQUIRE(preview_plan[1].target.object != first_target);
+    REQUIRE(preview_plan[0].target.object != shared_copy);
+    REQUIRE(preview_plan[1].target.object != shared_copy);
+    REQUIRE(preview.value().can_accept);
+    REQUIRE(source.snapshot().project_revision == revision_before_preview);
+}
+
+void native_demonstrations_skip_ambiguous_structural_matches() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Symmetric source", {1.0, 1.0, 1.0}}));
+    const auto source_object = source.snapshot().objects.front().object.id;
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        source_object, carto::geometry::FaceId{1U}}));
+    REQUIRE(ui.dispatch(carto::application::InvokeToolAction{
+        "mesh.inset-face", carto::editor::ToolArguments{0.1, {}, true, 0.5, std::nullopt}}));
+    const auto operation = source.snapshot().native_operation_trace.back().operation_id;
+    REQUIRE(ui.capture_agent_demonstration_trace(operation, operation));
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Symmetric candidate", {2.0, 2.0, 2.0}}));
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{source_object}));
+    REQUIRE(!ui.apply_agent_demonstration_to_similar());
+    const auto snapshot = ui.snapshot();
+    REQUIRE(snapshot.agent_demonstration_target_set_count == 1U);
+    REQUIRE(snapshot.agent_demonstration_bindings.size() == 1U);
+    REQUIRE(!snapshot.agent_demonstration_bindings.front().bound);
+    REQUIRE(!snapshot.agent_task.has_value());
 }
 
 void plan_dag_orders_dependencies_and_rejects_invalid_graphs() {
@@ -3164,6 +3314,8 @@ int main() {
         accepted_task_demonstration_is_redacted_read_only_and_checksummed();
         vertex_demonstration_stores_relative_displacement_only();
         human_native_command_range_captures_alias_only_trace();
+        native_demonstrations_apply_to_unique_exact_structural_matches();
+        native_demonstrations_skip_ambiguous_structural_matches();
         plan_dag_orders_dependencies_and_rejects_invalid_graphs();
         failed_dag_node_invalidates_only_dependent_steps();
         bounded_repair_restarts_from_source_and_preserves_attempt_lineage();

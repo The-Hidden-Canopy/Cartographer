@@ -146,7 +146,9 @@
 - The UI binds every trace alias to exactly one selected target of the recorded object/face/vertex kind. It rejects unknown aliases, wrong selection kinds, multiple source aliases mapped to one target object, inconsistent component bindings, and bindings made stale by a project revision change.
 - Preview scales normalized face distances by the selected target face's longest boundary edge and applies vertex deltas to the selected target vertex. Object, face, and vertex parameters become a sequential bounded AgentTask; repeated geometry edits against the same mesh asset fail closed until sequential correspondence is available.
 - A successful bound trace preview produces a review task and diff without changing the source revision. The existing explicit acceptance action is required to commit; acceptance then invalidates the old target bindings by revision.
-- Trace files still contain no target bindings, acceptance gates, or source authority. Automatic structural correspondence, “apply to similar,” transfer-quality claims, and reusable demonstration recipes remain unimplemented.
+- Trace v2 preserves the existing alias-only privacy boundary and adds topology-only before-command and post-command object signatures. It contains no source object/component IDs, names, coordinates, transforms, target bindings, acceptance gates, or source authority. Trace v1 remains readable without correspondence evidence.
+- “Apply to similar” requires one captured command and a selected completed exemplar whose post-command structure matches the trace. It excludes that exemplar, finds pre-command object/component signatures, skips per-object component ambiguity, omits repeated mesh assets for geometry edits, and caps target sets at 16. The result remains a speculative preview and does not accept automatically.
+- Structural correspondence tests cover two unique signature matches, a different-topology distractor, the wrong exemplar, zero matches, symmetric ambiguous faces, shared-mesh exclusion, signature round-trip, privacy canaries, and unchanged source revision through preview.
 
 ## Follow-up coverage
 
@@ -158,5 +160,6 @@ Multi-target demonstration tranche:
 - A two-set preview covers six expanded steps, applies accepted transforms to both target sets, and leaves the source revision unchanged until acceptance. Changing set count during a task is rejected.
 - A demonstration recipe round-trips its bounded user-selected name and redacted trace, detects corruption, and rejects control characters in the name. It omits object-name canaries from the trace payload.
 - Recipe files are immutable. Opening a recipe leaves the project revision unchanged, creates no task, carries no target bindings, and cannot preview until current targets are explicitly rebound.
+- Trace v1 payloads remain readable after the v2 structural signature extension. Signatures are stable across object names, IDs, scale, and translation because they encode only bounded topology counts and local incidence.
 
 Add failure injection for durable journal append rollback, additional unrelated and conflicting source edits during safe rebase, bounded repair exhaustion, semantic-sidecar size pressure, and provider timeouts as those tranches are implemented. Clarification questions and answers are reviewable evidence, not natural-language commands; the workbench compiles only a bounded set of explicit topology-preservation phrases and does not infer questions automatically.

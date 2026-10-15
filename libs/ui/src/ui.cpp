@@ -2692,6 +2692,156 @@ core::Result<void> UiController::bind_agent_demonstration_target(
     return core::Result<void>::success();
 }
 
+core::Result<std::size_t> UiController::apply_agent_demonstration_to_similar() {
+    if (!agent_demonstration_trace_.has_value()) {
+        return core::Result<std::size_t>::failure(invalid_state(
+            "load or capture a demonstration trace before finding similar targets"));
+    }
+    if (agent_task_.has_value() || agent_checkpoint_pending_.has_value()) {
+        return core::Result<std::size_t>::failure(invalid_state(
+            "clear the current task or checkpoint before finding similar targets"));
+    }
+    if (auto valid_trace = agent_demonstration_trace_->validate(); !valid_trace) {
+        return core::Result<std::size_t>::failure(valid_trace.error());
+    }
+    if (agent_demonstration_trace_->steps.size() != 1U) {
+        return core::Result<std::size_t>::failure(unsupported(
+            "automatic correspondence currently supports one captured command at a time"));
+    }
+    const auto& trace_step = agent_demonstration_trace_->steps.front();
+    if (!trace_step.structure_signature.has_value()) {
+        return core::Result<std::size_t>::failure(unsupported(
+            "this legacy or unsupported demonstration has no structural correspondence evidence"));
+    }
+    if (!trace_step.result_object_structure_signature.has_value()) {
+        return core::Result<std::size_t>::failure(unsupported(
+            "this demonstration has no post-command exemplar evidence"));
+    }
+
+    const auto snapshot = session_.snapshot();
+    if (snapshot.selection.mode != editor::SelectionMode::object ||
+        snapshot.selection.objects.size() != 1U ||
+        snapshot.selection.component_object.has_value()) {
+        return core::Result<std::size_t>::failure(invalid_state(
+            "select exactly one completed demonstration object as the exemplar"));
+    }
+    const scene::ObjectId exemplar_object = snapshot.selection.objects.front();
+    const auto exemplar_view = std::find_if(
+        snapshot.objects.begin(), snapshot.objects.end(), [exemplar_object](const auto& value) {
+            return value.object.id == exemplar_object;
+        });
+    if (exemplar_view == snapshot.objects.end() || !exemplar_view->object.visible ||
+        exemplar_view->object.locked ||
+        (trace_step.target_kind == agent::AgentDemonstrationTargetKind::object &&
+         exemplar_view->object.parent.has_value())) {
+        return core::Result<std::size_t>::failure(invalid_state(
+            "the exemplar must be a visible, unlocked target of the recorded kind"));
+    }
+
+    const auto exemplar_signature = session_.native_structure_signature(
+        exemplar_object, std::monostate{});
+    if (!exemplar_signature ||
+        exemplar_signature.value() != *trace_step.result_object_structure_signature) {
+        return core::Result<std::size_t>::failure(stale(
+            "selected object no longer matches the captured post-command exemplar evidence"));
+    }
+
+    const auto target_kind = trace_step.target_kind ==
+            agent::AgentDemonstrationTargetKind::object
+        ? application::NativeTraceTargetKind::object
+        : (trace_step.target_kind == agent::AgentDemonstrationTargetKind::face
+            ? application::NativeTraceTargetKind::face
+            : application::NativeTraceTargetKind::vertex);
+    const auto matches = session_.find_native_structure_matches(
+        target_kind, *trace_step.structure_signature, exemplar_object);
+    if (!matches) {
+        return core::Result<std::size_t>::failure(matches.error());
+    }
+
+    std::map<scene::ObjectId, std::optional<
+        std::variant<std::monostate, geometry::FaceId, geometry::VertexId>>> candidates;
+    std::set<scene::ObjectId> ambiguous_objects;
+    for (const auto& match : matches.value()) {
+        if (ambiguous_objects.contains(match.object)) continue;
+        const auto [candidate, inserted] = candidates.emplace(
+            match.object, std::optional{match.component});
+        if (!inserted) {
+            candidates.erase(candidate);
+            ambiguous_objects.insert(match.object);
+        }
+    }
+    if (trace_step.target_kind != agent::AgentDemonstrationTargetKind::object) {
+        if (!exemplar_view->object.mesh_asset.has_value()) {
+            return core::Result<std::size_t>::failure(stale(
+                "selected exemplar has no current mesh asset"));
+        }
+        std::map<std::uint64_t, std::size_t> asset_owners;
+        for (const auto& object : snapshot.objects) {
+            if (object.object.mesh_asset.has_value()) {
+                ++asset_owners[*object.object.mesh_asset];
+            }
+        }
+        for (const auto& [object, component] : candidates) {
+            static_cast<void>(component);
+            const auto candidate_view = std::find_if(
+                snapshot.objects.begin(), snapshot.objects.end(), [&object](const auto& value) {
+                    return value.object.id == object;
+                });
+            if (candidate_view == snapshot.objects.end() ||
+                !candidate_view->object.mesh_asset.has_value()) {
+                return core::Result<std::size_t>::failure(stale(
+                    "structural match is no longer an authored mesh object"));
+            }
+        }
+        for (auto candidate = candidates.begin(); candidate != candidates.end();) {
+            const auto candidate_view = std::find_if(
+                snapshot.objects.begin(), snapshot.objects.end(), [&candidate](const auto& value) {
+                    return value.object.id == candidate->first;
+                });
+            const auto candidate_asset = *candidate_view->object.mesh_asset;
+            if (candidate_asset == *exemplar_view->object.mesh_asset ||
+                asset_owners[candidate_asset] > 1U) {
+                candidate = candidates.erase(candidate);
+            } else {
+                ++candidate;
+            }
+        }
+    }
+    if (candidates.empty()) {
+        return core::Result<std::size_t>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "no unique matching structural signatures were found for the selected exemplar"));
+    }
+    if (candidates.size() > kMaxAgentDemonstrationTargetSets) {
+        return core::Result<std::size_t>::failure(unsupported(
+            "more than 16 matching structural signatures were found; narrow the target scope"));
+    }
+
+    agent_demonstration_target_set_count_ = candidates.size();
+    agent_demonstration_bindings_.clear();
+    agent_demonstration_binding_revision_ = snapshot.project_revision;
+    std::size_t target_set_index = 0U;
+    for (const auto& [object, component] : candidates) {
+        if (!component.has_value()) {
+            return core::Result<std::size_t>::failure(invalid_state(
+                "structural match did not resolve a unique target component"));
+        }
+        agent::TargetRef target;
+        target.object = object;
+        if (std::holds_alternative<geometry::FaceId>(*component)) {
+            target.component = std::get<geometry::FaceId>(*component);
+        } else if (std::holds_alternative<geometry::VertexId>(*component)) {
+            target.component = std::get<geometry::VertexId>(*component);
+        } else {
+            target.component = std::monostate{};
+        }
+        agent_demonstration_bindings_.push_back({
+            target_set_index++, trace_step.target_alias,
+            trace_step.component_alias, target});
+    }
+    return core::Result<std::size_t>::success(candidates.size());
+}
+
 core::Result<void> UiController::clear_agent_demonstration_target_bindings() {
     agent_demonstration_bindings_.clear();
     agent_demonstration_binding_revision_.reset();

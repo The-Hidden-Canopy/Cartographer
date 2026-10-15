@@ -494,13 +494,15 @@ struct AgentDemonstrationTraceStep {
     std::uint64_t revision_before_offset = 0U;
     std::uint64_t revision_after_offset = 0U;
     AgentDemonstrationParameters parameters;
+    std::optional<assets::Sha256Digest> structure_signature;
+    std::optional<assets::Sha256Digest> result_object_structure_signature;
 };
 
 // An explicitly selected range of successful, human-authored native
 // operations. The serialized trace contains aliases and transferable typed
 // values only; it has no project, source identity, mutation, or replay path.
 struct AgentDemonstrationTrace {
-    static constexpr std::uint32_t kFormatVersion = 1U;
+    static constexpr std::uint32_t kFormatVersion = 2U;
 
     std::uint64_t result_revision_span = 0U;
     std::vector<AgentDemonstrationTraceStep> steps;

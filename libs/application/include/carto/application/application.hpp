@@ -1,5 +1,6 @@
 #pragma once
 
+#include <carto/assets/blob_store.hpp>
 #include <carto/core/diagnostic.hpp>
 #include <carto/core/math.hpp>
 #include <carto/core/result.hpp>
@@ -114,6 +115,17 @@ enum class NativeTraceParameterization : std::uint8_t {
     relative_displacement,
 };
 
+enum class NativeTraceTargetKind : std::uint8_t {
+    object,
+    face,
+    vertex,
+};
+
+struct NativeStructureMatch {
+    scene::ObjectId object;
+    std::variant<std::monostate, geometry::FaceId, geometry::VertexId> component;
+};
+
 // Bounded, in-memory evidence for successful human native edits. The trace
 // retains source identities only for the current session so export can
 // replace them with aliases; it is never written into the project journal.
@@ -129,6 +141,12 @@ struct NativeOperationTraceEntry {
         NativeTraceParameterization::normalized_face_distance;
     double normalized_distance = 0.0;
     core::Vec3d relative_displacement;
+    // A topology-only, alias-safe match key. It contains no source IDs,
+    // names, coordinates, transforms, or project path.
+    std::optional<assets::Sha256Digest> structure_signature;
+    // Post-command object topology lets a human select and verify the source
+    // exemplar after a topology edit has replaced its original component.
+    std::optional<assets::Sha256Digest> result_object_structure_signature;
 };
 
 struct SculptLayerView {
@@ -868,6 +886,13 @@ public:
         OperationSource source = OperationSource::human,
         std::string_view provenance_id = {});
     [[nodiscard]] ApplicationSnapshot snapshot() const;
+    [[nodiscard]] core::Result<assets::Sha256Digest> native_structure_signature(
+        scene::ObjectId object,
+        std::variant<std::monostate, geometry::FaceId, geometry::VertexId> component) const;
+    [[nodiscard]] core::Result<std::vector<NativeStructureMatch>> find_native_structure_matches(
+        NativeTraceTargetKind kind,
+        const assets::Sha256Digest& signature,
+        std::optional<scene::ObjectId> excluded_object = std::nullopt) const;
 
     [[nodiscard]] const WorkspaceState& workspace() const noexcept { return workspace_; }
     [[nodiscard]] core::Result<void> can_close(bool discard_dirty = false) const;

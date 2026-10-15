@@ -1421,7 +1421,9 @@ core::Result<AgentDemonstrationTrace> AgentDemonstrationTrace::capture(
             component_alias,
             operation.revision_before.value() - base_revision,
             operation.revision_after.value() - base_revision,
-            parameters});
+            parameters,
+            operation.structure_signature,
+            operation.result_object_structure_signature});
         previous_revision = operation.revision_after.value();
     }
     trace.result_revision_span = previous_revision - base_revision;
@@ -1448,7 +1450,11 @@ core::Result<void> AgentDemonstrationTrace::validate() const {
             step.revision_before_offset != previous_after ||
             step.revision_after_offset <= step.revision_before_offset ||
             step.revision_after_offset > result_revision_span ||
-            !step.parameters.validate(step.tool_id)) {
+            !step.parameters.validate(step.tool_id) ||
+            (step.structure_signature.has_value() &&
+             step.structure_signature->is_zero()) ||
+            (step.result_object_structure_signature.has_value() &&
+             step.result_object_structure_signature->is_zero())) {
             return core::Result<void>::failure(malformed(
                 "demonstration trace step is invalid or discontinuous"));
         }
@@ -1536,6 +1542,14 @@ core::Result<std::string> AgentDemonstrationTrace::serialize() const {
             payload.real(step.parameters.relative_displacement.y);
             payload.real(step.parameters.relative_displacement.z);
         }
+        payload.number(step.structure_signature.has_value() ? 1U : 0U);
+        if (step.structure_signature.has_value()) {
+            payload.digest(*step.structure_signature);
+        }
+        payload.number(step.result_object_structure_signature.has_value() ? 1U : 0U);
+        if (step.result_object_structure_signature.has_value()) {
+            payload.digest(*step.result_object_structure_signature);
+        }
     }
     const std::string body = std::move(payload).take();
     Writer outer;
@@ -1568,7 +1582,8 @@ core::Result<AgentDemonstrationTrace> AgentDemonstrationTrace::deserialize(
             "demonstration trace checksum does not match its contents"));
     }
     Reader reader(body);
-    if (reader.number() != kFormatVersion) {
+    const std::uint64_t format_version = reader.number();
+    if (format_version != 1U && format_version != kFormatVersion) {
         return core::Result<AgentDemonstrationTrace>::failure(core::Diagnostic(
             core::ErrorCode::version_mismatch,
             "agent demonstration trace version is unsupported"));
@@ -1610,6 +1625,20 @@ core::Result<AgentDemonstrationTrace> AgentDemonstrationTrace::deserialize(
         } else {
             step.parameters.relative_displacement = {
                 reader.real(), reader.real(), reader.real()};
+        }
+        if (format_version >= 2U) {
+            const auto has_signature = reader.number();
+            if (has_signature > 1U) {
+                reader.fail("demonstration structural signature marker is invalid");
+            } else if (has_signature == 1U) {
+                step.structure_signature = reader.digest();
+            }
+            const auto has_result_signature = reader.number();
+            if (has_result_signature > 1U) {
+                reader.fail("demonstration result structure signature marker is invalid");
+            } else if (has_result_signature == 1U) {
+                step.result_object_structure_signature = reader.digest();
+            }
         }
         trace.steps.push_back(std::move(step));
     }

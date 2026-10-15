@@ -552,6 +552,7 @@ public:
         std::uint32_t target_alias,
         std::uint32_t component_alias,
         std::size_t target_set_index = 0U);
+    [[nodiscard]] core::Result<std::size_t> apply_agent_demonstration_to_similar();
     [[nodiscard]] core::Result<void> set_agent_demonstration_target_set_count(
         std::size_t target_set_count);
     [[nodiscard]] core::Result<void> clear_agent_demonstration_target_bindings();

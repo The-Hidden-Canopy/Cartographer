@@ -45,8 +45,255 @@ assets::Sha256Digest canonical_mesh_geometry_digest(
 
 namespace {
 
+constexpr std::size_t kMaxNativeStructureMeshElements = 100'000U;
+constexpr std::size_t kMaxNativeStructureMatches = 4096U;
+
+struct NativeStructureSignatureIndex {
+    assets::Sha256Digest object;
+    std::map<geometry::FaceId, assets::Sha256Digest> faces;
+    std::map<geometry::VertexId, assets::Sha256Digest> vertices;
+};
+
 core::Diagnostic invalid_state(std::string message) {
     return core::Diagnostic(core::ErrorCode::invalid_state, std::move(message));
+}
+
+assets::Sha256Digest structure_digest(std::string_view bytes) {
+    return assets::sha256(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()));
+}
+
+core::Result<NativeStructureSignatureIndex> build_native_structure_signature_index(
+    const geometry::EditableMesh& mesh,
+    bool include_face_signatures,
+    bool include_vertex_signatures,
+    std::optional<geometry::FaceId> only_face = std::nullopt,
+    std::optional<geometry::VertexId> only_vertex = std::nullopt) {
+    if (mesh.vertex_count() > kMaxNativeStructureMeshElements ||
+        mesh.face_count() > kMaxNativeStructureMeshElements ||
+        mesh.edge_count() > kMaxNativeStructureMeshElements) {
+        return core::Result<NativeStructureSignatureIndex>::failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "structural correspondence exceeds the bounded mesh element limit"));
+    }
+    if (auto valid = mesh.validate(); !valid) {
+        return core::Result<NativeStructureSignatureIndex>::failure(valid.error().with_context(
+            "structural correspondence source mesh"));
+    }
+
+    const auto vertices = mesh.vertices_sorted();
+    const auto faces = mesh.faces_sorted();
+    std::map<geometry::VertexId, std::vector<std::size_t>> incident_face_arities;
+    std::map<geometry::FaceId, std::vector<std::size_t>> neighboring_face_arities;
+    std::map<std::pair<geometry::VertexId, geometry::VertexId>, std::vector<geometry::FaceId>>
+        edge_faces;
+    std::map<geometry::VertexId, std::vector<geometry::VertexId>> neighbors;
+    std::vector<std::size_t> face_arities;
+    face_arities.reserve(faces.size());
+    for (const auto& face : faces) {
+        face_arities.push_back(face.vertices.size());
+        for (const auto vertex : face.vertices) {
+            incident_face_arities[vertex].push_back(face.vertices.size());
+        }
+        for (std::size_t index = 0U; index < face.vertices.size(); ++index) {
+            auto first = face.vertices[index];
+            auto second = face.vertices[(index + 1U) % face.vertices.size()];
+            if (second < first) std::swap(first, second);
+            edge_faces[{first, second}].push_back(face.id);
+            neighbors[first].push_back(second);
+            neighbors[second].push_back(first);
+        }
+    }
+
+    std::size_t boundary_edge_count = 0U;
+    std::vector<std::size_t> edge_face_counts;
+    edge_face_counts.reserve(edge_faces.size());
+    for (auto& [edge, attached_faces] : edge_faces) {
+        static_cast<void>(edge);
+        std::sort(attached_faces.begin(), attached_faces.end());
+        attached_faces.erase(std::unique(attached_faces.begin(), attached_faces.end()),
+            attached_faces.end());
+        if (attached_faces.empty() || attached_faces.size() > 2U) {
+            return core::Result<NativeStructureSignatureIndex>::failure(core::Diagnostic(
+                core::ErrorCode::unsupported,
+                "structural correspondence requires manifold edge incidence"));
+        }
+        edge_face_counts.push_back(attached_faces.size());
+        if (attached_faces.size() == 1U) {
+            ++boundary_edge_count;
+        } else {
+            const auto first = mesh.find_face(attached_faces[0]);
+            const auto second = mesh.find_face(attached_faces[1]);
+            if (first == nullptr || second == nullptr) {
+                return core::Result<NativeStructureSignatureIndex>::failure(core::Diagnostic(
+                    core::ErrorCode::stale_data,
+                    "structural correspondence found a missing adjacent face"));
+            }
+            neighboring_face_arities[first->id].push_back(second->vertices.size());
+            neighboring_face_arities[second->id].push_back(first->vertices.size());
+        }
+    }
+
+    for (auto& [vertex, arities] : incident_face_arities) {
+        static_cast<void>(vertex);
+        std::sort(arities.begin(), arities.end());
+    }
+    for (auto& [face, arities] : neighboring_face_arities) {
+        static_cast<void>(face);
+        std::sort(arities.begin(), arities.end());
+    }
+    for (auto& [vertex, adjacent] : neighbors) {
+        static_cast<void>(vertex);
+        std::sort(adjacent.begin(), adjacent.end());
+        adjacent.erase(std::unique(adjacent.begin(), adjacent.end()), adjacent.end());
+    }
+    std::sort(face_arities.begin(), face_arities.end());
+    std::sort(edge_face_counts.begin(), edge_face_counts.end());
+
+    std::ostringstream canonical;
+    canonical.imbue(std::locale::classic());
+    canonical << "CARTOGRAPHER_NATIVE_STRUCTURE 1\n"
+        << "M " << vertices.size() << ' ' << faces.size() << ' '
+        << edge_faces.size() << ' ' << boundary_edge_count << '\n';
+    const auto append_values = [&canonical](const auto& values) {
+        canonical << values.size();
+        for (const auto value : values) canonical << ' ' << value;
+        canonical << '\n';
+    };
+    append_values(face_arities);
+    append_values(edge_face_counts);
+    std::vector<std::size_t> vertex_valences;
+    vertex_valences.reserve(vertices.size());
+    for (const auto& vertex : vertices) {
+        const auto found = incident_face_arities.find(vertex.id);
+        vertex_valences.push_back(found == incident_face_arities.end() ? 0U : found->second.size());
+    }
+    std::sort(vertex_valences.begin(), vertex_valences.end());
+    append_values(vertex_valences);
+
+    NativeStructureSignatureIndex index;
+    index.object = structure_digest(canonical.str());
+    if (include_face_signatures) {
+        for (const auto& face : faces) {
+            if (only_face.has_value() && face.id != *only_face) continue;
+            std::vector<std::size_t> local_vertex_valences;
+            local_vertex_valences.reserve(face.vertices.size());
+            std::size_t local_boundary_edges = 0U;
+            for (std::size_t boundary_index = 0U;
+                 boundary_index < face.vertices.size(); ++boundary_index) {
+                const auto vertex = face.vertices[boundary_index];
+                const auto incident = incident_face_arities.find(vertex);
+                local_vertex_valences.push_back(
+                    incident == incident_face_arities.end() ? 0U : incident->second.size());
+                auto first = vertex;
+                auto second = face.vertices[(boundary_index + 1U) % face.vertices.size()];
+                if (second < first) std::swap(first, second);
+                const auto edge = edge_faces.find({first, second});
+                if (edge == edge_faces.end()) {
+                    return core::Result<NativeStructureSignatureIndex>::failure(core::Diagnostic(
+                        core::ErrorCode::stale_data,
+                        "structural correspondence face edge is missing"));
+                }
+                if (edge->second.size() == 1U) ++local_boundary_edges;
+            }
+            std::sort(local_vertex_valences.begin(), local_vertex_valences.end());
+            std::ostringstream local;
+            local.imbue(std::locale::classic());
+            local << "CARTOGRAPHER_NATIVE_COMPONENT 1 FACE " << index.object.hex() << '\n'
+                << face.vertices.size() << ' ' << local_boundary_edges << '\n';
+            const auto append_local_values = [&local](const auto& values) {
+                local << values.size();
+                for (const auto value : values) local << ' ' << value;
+                local << '\n';
+            };
+            append_local_values(local_vertex_valences);
+            const auto adjacent = neighboring_face_arities.find(face.id);
+            if (adjacent == neighboring_face_arities.end()) {
+                append_local_values(std::vector<std::size_t>{});
+            } else {
+                append_local_values(adjacent->second);
+            }
+            index.faces.emplace(face.id, structure_digest(local.str()));
+        }
+    }
+
+    if (include_vertex_signatures) {
+        for (const auto& vertex : vertices) {
+            if (only_vertex.has_value() && vertex.id != *only_vertex) continue;
+            const auto incident = incident_face_arities.find(vertex.id);
+            const auto adjacent = neighbors.find(vertex.id);
+            std::vector<std::size_t> neighbor_valences;
+            std::size_t local_boundary_edges = 0U;
+            if (adjacent != neighbors.end()) {
+                neighbor_valences.reserve(adjacent->second.size());
+                for (const auto neighbor : adjacent->second) {
+                    const auto neighbor_incident = incident_face_arities.find(neighbor);
+                    neighbor_valences.push_back(neighbor_incident == incident_face_arities.end()
+                        ? 0U : neighbor_incident->second.size());
+                    auto first = vertex.id;
+                    auto second = neighbor;
+                    if (second < first) std::swap(first, second);
+                    const auto edge = edge_faces.find({first, second});
+                    if (edge == edge_faces.end()) {
+                        return core::Result<NativeStructureSignatureIndex>::failure(core::Diagnostic(
+                            core::ErrorCode::stale_data,
+                            "structural correspondence vertex edge is missing"));
+                    }
+                    if (edge->second.size() == 1U) ++local_boundary_edges;
+                }
+            }
+            std::sort(neighbor_valences.begin(), neighbor_valences.end());
+            std::ostringstream local;
+            local.imbue(std::locale::classic());
+            local << "CARTOGRAPHER_NATIVE_COMPONENT 1 VERTEX " << index.object.hex() << '\n'
+                << (incident == incident_face_arities.end() ? 0U : incident->second.size())
+                << ' ' << local_boundary_edges << '\n';
+            const auto append_local_values = [&local](const auto& values) {
+                local << values.size();
+                for (const auto value : values) local << ' ' << value;
+                local << '\n';
+            };
+            if (incident == incident_face_arities.end()) {
+                append_local_values(std::vector<std::size_t>{});
+            } else {
+                append_local_values(incident->second);
+            }
+            append_local_values(neighbor_valences);
+            index.vertices.emplace(vertex.id, structure_digest(local.str()));
+        }
+    }
+    return core::Result<NativeStructureSignatureIndex>::success(std::move(index));
+}
+
+core::Result<assets::Sha256Digest> structure_signature_for_mesh(
+    const geometry::EditableMesh& mesh,
+    const std::variant<std::monostate, geometry::FaceId, geometry::VertexId>& component) {
+    const bool include_faces = std::holds_alternative<geometry::FaceId>(component);
+    const bool include_vertices = std::holds_alternative<geometry::VertexId>(component);
+    auto index = build_native_structure_signature_index(
+        mesh, include_faces, include_vertices,
+        include_faces ? std::optional<geometry::FaceId>{
+            std::get<geometry::FaceId>(component)} : std::nullopt,
+        include_vertices ? std::optional<geometry::VertexId>{
+            std::get<geometry::VertexId>(component)} : std::nullopt);
+    if (!index) return core::Result<assets::Sha256Digest>::failure(index.error());
+    if (std::holds_alternative<std::monostate>(component)) {
+        return core::Result<assets::Sha256Digest>::success(index.value().object);
+    }
+    if (std::holds_alternative<geometry::FaceId>(component)) {
+        const auto found = index.value().faces.find(std::get<geometry::FaceId>(component));
+        if (found != index.value().faces.end()) {
+            return core::Result<assets::Sha256Digest>::success(found->second);
+        }
+    } else if (std::holds_alternative<geometry::VertexId>(component)) {
+        const auto found = index.value().vertices.find(std::get<geometry::VertexId>(component));
+        if (found != index.value().vertices.end()) {
+            return core::Result<assets::Sha256Digest>::success(found->second);
+        }
+    }
+    return core::Result<assets::Sha256Digest>::failure(core::Diagnostic(
+        core::ErrorCode::stale_data,
+        "structural correspondence target is missing from its source mesh"));
 }
 
 core::Result<void> verify_source_blob(
@@ -671,6 +918,15 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 }
                 const auto before_transform = object->local_transform;
                 const bool is_root_object = !object->parent.has_value();
+                std::optional<assets::Sha256Digest> structure_signature;
+                if (object->mesh_asset.has_value()) {
+                    const auto mesh = document_.meshes().find(*object->mesh_asset);
+                    if (mesh != document_.meshes().end()) {
+                        const auto signature = structure_signature_for_mesh(
+                            mesh->second, std::monostate{});
+                        if (signature) structure_signature = signature.value();
+                    }
+                }
                 editor::ProjectCommandAdmission admission;
                 auto result = execute_command(
                     std::make_unique<editor::SetProjectObjectTransformCommand>(
@@ -696,6 +952,17 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                     const double magnitude = displacement.length();
                     if (active_source_ == OperationSource::human && translation_only &&
                         displacement.finite() && std::isfinite(magnitude) && magnitude > 0.0) {
+                        std::optional<assets::Sha256Digest> result_object_signature;
+                        const auto* result_object = document_.scene().find(value.object);
+                        if (result_object != nullptr && result_object->mesh_asset.has_value()) {
+                            const auto result_mesh = document_.meshes().find(
+                                *result_object->mesh_asset);
+                            if (result_mesh != document_.meshes().end()) {
+                                const auto signature = structure_signature_for_mesh(
+                                    result_mesh->second, std::monostate{});
+                                if (signature) result_object_signature = signature.value();
+                            }
+                        }
                         append_native_operation_trace(NativeOperationTraceEntry{
                             result.value().operation_id,
                             "object.translate",
@@ -706,7 +973,9 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                             std::monostate{},
                             NativeTraceParameterization::relative_displacement,
                             0.0,
-                            displacement});
+                            displacement,
+                            structure_signature,
+                            result_object_signature});
                     } else {
                         native_operation_trace_.clear();
                     }
@@ -1694,11 +1963,14 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
                 }
                 const double normalized_distance = longest_edge > 0.0
                     ? action.arguments.distance / longest_edge : 0.0;
+                std::optional<assets::Sha256Digest> structure_signature;
+                const auto descriptor = structure_signature_for_mesh(mesh->second, face_id);
+                if (descriptor) structure_signature = descriptor.value();
                 if (std::isfinite(normalized_distance) && normalized_distance > 0.0) {
                     trace_candidate = NativeOperationTraceEntry{
                         0U, action.tool_id, OperationSource::human, before, {}, target_object, face_id,
                         NativeTraceParameterization::normalized_face_distance,
-                        normalized_distance, {}};
+                        normalized_distance, {}, structure_signature, std::nullopt};
                 }
             } else if (mesh != before_document.meshes().end() &&
                 action.tool_id == "mesh.extrude-face" &&
@@ -1721,11 +1993,14 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
                 }
                 const double normalized_distance = longest_edge > 0.0
                     ? action.arguments.distance / longest_edge : 0.0;
+                std::optional<assets::Sha256Digest> structure_signature;
+                const auto descriptor = structure_signature_for_mesh(mesh->second, face_id);
+                if (descriptor) structure_signature = descriptor.value();
                 if (std::isfinite(normalized_distance) && normalized_distance > 0.0) {
                     trace_candidate = NativeOperationTraceEntry{
                         0U, action.tool_id, OperationSource::human, before, {}, target_object, face_id,
                         NativeTraceParameterization::normalized_face_distance,
-                        normalized_distance, {}};
+                        normalized_distance, {}, structure_signature, std::nullopt};
                 }
             } else if (action.tool_id == "mesh.set-vertex-position" &&
                 invocation_context->vertices.size() == 1U) {
@@ -1734,11 +2009,15 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
                 if (vertex != nullptr) {
                     const auto displacement = action.arguments.position - vertex->position;
                     const double magnitude = displacement.length();
+                    std::optional<assets::Sha256Digest> structure_signature;
+                    const auto descriptor = structure_signature_for_mesh(
+                        mesh->second, vertex_id);
+                    if (descriptor) structure_signature = descriptor.value();
                     if (displacement.finite() && std::isfinite(magnitude) && magnitude > 0.0) {
                         trace_candidate = NativeOperationTraceEntry{
                             0U, action.tool_id, OperationSource::human, before, {}, target_object, vertex_id,
                             NativeTraceParameterization::relative_displacement,
-                            0.0, displacement};
+                            0.0, displacement, structure_signature, std::nullopt};
                     }
                 }
             }
@@ -1755,6 +2034,17 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
         std::move(parameters));
     if (result && result.value().document_changed) {
         if (trace_candidate.has_value() && result.value().source == OperationSource::human) {
+            const auto* result_object = document_.scene().find(trace_candidate->target_object);
+            if (result_object != nullptr && result_object->mesh_asset.has_value()) {
+                const auto result_mesh = document_.meshes().find(*result_object->mesh_asset);
+                if (result_mesh != document_.meshes().end()) {
+                    const auto signature = structure_signature_for_mesh(
+                        result_mesh->second, std::monostate{});
+                    if (signature) {
+                        trace_candidate->result_object_structure_signature = signature.value();
+                    }
+                }
+            }
             trace_candidate->operation_id = result.value().operation_id;
             trace_candidate->revision_before = result.value().revision_before;
             trace_candidate->revision_after = result.value().revision_after;
@@ -3661,6 +3951,103 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
         result.viewport.scene = std::move(viewport_scene);
     }
     return result;
+}
+
+core::Result<assets::Sha256Digest> ApplicationSession::native_structure_signature(
+    scene::ObjectId object_id,
+    std::variant<std::monostate, geometry::FaceId, geometry::VertexId> component) const {
+    const auto* object = document_.scene().find(object_id);
+    if (object == nullptr || !object->mesh_asset.has_value()) {
+        return core::Result<assets::Sha256Digest>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "structural correspondence target has no current mesh object"));
+    }
+    const auto mesh = document_.meshes().find(*object->mesh_asset);
+    if (mesh == document_.meshes().end()) {
+        return core::Result<assets::Sha256Digest>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "structural correspondence target references a missing mesh asset"));
+    }
+    return structure_signature_for_mesh(mesh->second, component);
+}
+
+core::Result<std::vector<NativeStructureMatch>>
+ApplicationSession::find_native_structure_matches(
+    NativeTraceTargetKind kind,
+    const assets::Sha256Digest& signature,
+    std::optional<scene::ObjectId> excluded_object) const {
+    if (signature.is_zero()) {
+        return core::Result<std::vector<NativeStructureMatch>>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "structural correspondence signature is empty"));
+    }
+    if (kind != NativeTraceTargetKind::object && kind != NativeTraceTargetKind::face &&
+        kind != NativeTraceTargetKind::vertex) {
+        return core::Result<std::vector<NativeStructureMatch>>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "structural correspondence target kind is unknown"));
+    }
+    if (document_.scene().size() > kMaxNativeStructureMeshElements) {
+        return core::Result<std::vector<NativeStructureMatch>>::failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "structural correspondence exceeds the bounded scene object limit"));
+    }
+
+    std::vector<NativeStructureMatch> matches;
+    std::size_t inspected_components = 0U;
+    for (const auto& object : document_.scene().objects_sorted()) {
+        if ((excluded_object.has_value() && object.id == *excluded_object) ||
+            !object.visible || object.locked || !object.mesh_asset.has_value() ||
+            (kind == NativeTraceTargetKind::object && object.parent.has_value())) {
+            continue;
+        }
+        const auto mesh = document_.meshes().find(*object.mesh_asset);
+        if (mesh == document_.meshes().end()) {
+            return core::Result<std::vector<NativeStructureMatch>>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "structural correspondence candidate references a missing mesh asset"));
+        }
+        const std::size_t component_count = kind == NativeTraceTargetKind::face
+            ? mesh->second.face_count()
+            : (kind == NativeTraceTargetKind::vertex ? mesh->second.vertex_count() : 1U);
+        if (component_count > kMaxNativeStructureMeshElements - inspected_components) {
+            return core::Result<std::vector<NativeStructureMatch>>::failure(core::Diagnostic(
+                core::ErrorCode::unsupported,
+                "structural correspondence exceeds the bounded candidate scan limit"));
+        }
+        inspected_components += component_count;
+        auto index = build_native_structure_signature_index(
+            mesh->second,
+            kind == NativeTraceTargetKind::face,
+            kind == NativeTraceTargetKind::vertex);
+        if (!index) {
+            return core::Result<std::vector<NativeStructureMatch>>::failure(index.error());
+        }
+
+        if (kind == NativeTraceTargetKind::object) {
+            if (index.value().object == signature) {
+                matches.push_back({object.id, std::monostate{}});
+            }
+        } else if (kind == NativeTraceTargetKind::face) {
+            for (const auto& [face, candidate_signature] : index.value().faces) {
+                if (candidate_signature == signature) {
+                    matches.push_back({object.id, face});
+                }
+            }
+        } else {
+            for (const auto& [vertex, candidate_signature] : index.value().vertices) {
+                if (candidate_signature == signature) {
+                    matches.push_back({object.id, vertex});
+                }
+            }
+        }
+        if (matches.size() > kMaxNativeStructureMatches) {
+            return core::Result<std::vector<NativeStructureMatch>>::failure(core::Diagnostic(
+                core::ErrorCode::unsupported,
+                "structural correspondence exceeds the bounded match result limit"));
+        }
+    }
+    return core::Result<std::vector<NativeStructureMatch>>::success(std::move(matches));
 }
 
 } // namespace carto::application
