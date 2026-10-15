@@ -1,5 +1,9 @@
 # Agent Workbench: speculative authoring slice
 
+## CONDITION evidence audit
+
+The desktop can summarize the bounded inventory's current/reviewed source lineage and metadata scan completeness. It must label these as evidence checks, not readiness gates. The report never establishes CONDITION production readiness because this query does not validate geometry, UV/material state, collision, or domain-specific acceptance requirements.
+
 ## Capability
 
 Cartographer can capture a goal and a bounded sequence of exact object, face, or vertex operations, execute the native proposals on a private copy of the current project, validate the branch, and present a structured object/mesh diff for review. The source project stays unchanged until a user accepts the result. The task also exposes bounded read-only queries over the branch for scoped object identity, exact names, mesh instances, object-origin proximity, face orientation, boundary edges, CONDITION tags, familiarity records, and per-asset CONDITION metadata counts. CONDITION facts carry source identity, source revision, current/reviewed state, and protected features where applicable; stale or unreviewed evidence is returned as such, not presented as current.

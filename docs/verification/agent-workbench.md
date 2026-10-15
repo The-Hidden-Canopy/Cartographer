@@ -37,6 +37,8 @@
 - CONDITION tag and familiarity facts include their source ID, revision, current/reviewed flags, and protected features where applicable; stale or unreviewed source evidence is never projected as current.
 - CONDITION inventory returns scoped asset class/fidelity/source/protected-feature facts and exact counts for profiles, familiarity, views, variants, temporal packages, surface states, anchors, and collection/prefab/kit membership, including kit membership through referenced prefabs.
 - Inventory counts expose no collection, prefab, or kit names and do not imply geometry, UV, material, or production readiness.
+- The desktop evidence audit counts only current/reviewed source lineage and complete metadata scans; stale, unreviewed, malformed-lineage, empty, diagnostic, or truncated input never establishes readiness.
+- The audit explicitly keeps production readiness false because inventory facts do not evaluate geometry, UV/material state, collision, or domain-specific validation gates.
 - A targeted inventory request outside the task scope is rejected; a zero object identity is rejected before consuming query budget.
 - A current project sidecar with stale per-asset source revision or digest reports `source_current=false`; stale project revisions fail closed, while unreviewed evidence remains explicitly unreviewed.
 - CONDITION tag, familiarity, and inventory asset/source/relationship scans respect the semantic-record budget without overrun; truncation is explicit and inventory rows mark related counts incomplete when the metadata scan did not finish.

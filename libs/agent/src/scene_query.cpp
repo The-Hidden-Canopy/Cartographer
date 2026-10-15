@@ -781,4 +781,56 @@ core::Result<SceneQueryResult> SceneQuery::execute(
     return core::Result<SceneQueryResult>::success(std::move(result));
 }
 
+ConditionEvidenceAudit audit_condition_inventory(const SceneQueryResult& inventory) {
+    ConditionEvidenceAudit audit;
+    audit.source_revision = inventory.source_revision;
+    audit.query_complete = inventory.source_revision.value() != 0U &&
+        !inventory.truncated && inventory.diagnostics.empty();
+    std::set<std::uint64_t> observed_asset_ids;
+    for (const auto& row : inventory.rows) {
+        const auto* fact = std::get_if<ConditionAssetInventoryFact>(&row);
+        if (fact == nullptr) {
+            ++audit.unrecognized_rows;
+            audit.query_complete = false;
+            continue;
+        }
+        const auto asset_class = static_cast<std::uint8_t>(fact->asset_class);
+        const auto fidelity = static_cast<std::uint8_t>(fact->fidelity);
+        if (fact->asset == 0U || !fact->authored_object ||
+            asset_class > static_cast<std::uint8_t>(condition::AssetClass::material) ||
+            fidelity > static_cast<std::uint8_t>(condition::FidelityClass::background) ||
+            !observed_asset_ids.insert(fact->asset).second) {
+            ++audit.unrecognized_rows;
+            audit.query_complete = false;
+            continue;
+        }
+        const bool lineage_present = fact->source_id != 0U &&
+            !fact->source_revision.empty();
+        if (!lineage_present) audit.query_complete = false;
+        const bool source_verified = lineage_present && fact->source_current &&
+            fact->source_reviewed;
+        const bool metadata_scan_verified = lineage_present &&
+            fact->related_records_complete && !inventory.truncated &&
+            inventory.diagnostics.empty();
+        audit.assets.push_back(ConditionAssetEvidenceAudit{
+            fact->asset,
+            fact->authored_object,
+            fact->asset_class,
+            fact->fidelity,
+            !lineage_present ? ConditionEvidenceStatus::unavailable
+                : source_verified ? ConditionEvidenceStatus::verified
+                                  : ConditionEvidenceStatus::needs_review,
+            !lineage_present ? ConditionEvidenceStatus::unavailable
+                : metadata_scan_verified ? ConditionEvidenceStatus::verified
+                                         : ConditionEvidenceStatus::incomplete});
+        if (source_verified) ++audit.current_reviewed_sources;
+        if (metadata_scan_verified) ++audit.complete_metadata_scans;
+    }
+    audit.source_evidence_complete = audit.query_complete && !audit.assets.empty() &&
+        audit.current_reviewed_sources == audit.assets.size();
+    audit.metadata_scan_complete = audit.query_complete && !audit.assets.empty() &&
+        audit.complete_metadata_scans == audit.assets.size();
+    return audit;
+}
+
 } // namespace carto::agent

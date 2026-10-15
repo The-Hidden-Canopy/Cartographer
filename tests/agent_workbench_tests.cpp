@@ -4687,6 +4687,114 @@ void ui_goal_compiler_fails_closed_and_preserves_manual_drafts() {
     REQUIRE(source.snapshot().project_revision == source_revision);
 }
 
+void condition_inventory_audit_never_promotes_partial_evidence_to_readiness() {
+    carto::agent::SceneQueryResult current_inventory;
+    current_inventory.source_revision = carto::core::Revision{7U};
+    carto::agent::ConditionAssetInventoryFact current_fact;
+    current_fact.asset = 3U;
+    current_fact.authored_object = carto::scene::ObjectId{11U};
+    current_fact.asset_class = carto::condition::AssetClass::prop;
+    current_fact.fidelity = carto::condition::FidelityClass::standard;
+    current_fact.source_id = 5U;
+    current_fact.source_revision = "source-r4";
+    current_fact.source_current = true;
+    current_fact.source_reviewed = true;
+    current_fact.related_records_complete = true;
+    current_inventory.rows.emplace_back(current_fact);
+
+    const auto current_audit =
+        carto::agent::audit_condition_inventory(current_inventory);
+    REQUIRE(current_audit.query_complete);
+    REQUIRE(current_audit.source_evidence_complete);
+    REQUIRE(current_audit.metadata_scan_complete);
+    REQUIRE(current_audit.assets.size() == 1U);
+    REQUIRE(current_audit.assets.front().source_status ==
+        carto::agent::ConditionEvidenceStatus::verified);
+    REQUIRE(current_audit.assets.front().metadata_scan_status ==
+        carto::agent::ConditionEvidenceStatus::verified);
+    REQUIRE(!current_audit.production_readiness_established);
+
+    auto stale_inventory = current_inventory;
+    auto& stale_fact = std::get<carto::agent::ConditionAssetInventoryFact>(
+        stale_inventory.rows.front());
+    stale_fact.source_current = false;
+    stale_fact.source_reviewed = false;
+    const auto stale_audit = carto::agent::audit_condition_inventory(stale_inventory);
+    REQUIRE(stale_audit.query_complete);
+    REQUIRE(!stale_audit.source_evidence_complete);
+    REQUIRE(stale_audit.assets.front().source_status ==
+        carto::agent::ConditionEvidenceStatus::needs_review);
+    REQUIRE(!stale_audit.production_readiness_established);
+
+    auto malformed_lineage = current_inventory;
+    auto& malformed_fact = std::get<carto::agent::ConditionAssetInventoryFact>(
+        malformed_lineage.rows.front());
+    malformed_fact.source_id = 0U;
+    malformed_fact.source_revision.clear();
+    const auto malformed_audit =
+        carto::agent::audit_condition_inventory(malformed_lineage);
+    REQUIRE(!malformed_audit.source_evidence_complete);
+    REQUIRE(malformed_audit.assets.front().source_status ==
+        carto::agent::ConditionEvidenceStatus::unavailable);
+
+    auto partial_inventory = current_inventory;
+    partial_inventory.truncated = true;
+    partial_inventory.diagnostics.push_back(carto::core::Diagnostic(
+        carto::core::ErrorCode::stale_data, "partial inventory fixture"));
+    const auto partial_audit =
+        carto::agent::audit_condition_inventory(partial_inventory);
+    REQUIRE(!partial_audit.query_complete);
+    REQUIRE(!partial_audit.source_evidence_complete);
+    REQUIRE(!partial_audit.metadata_scan_complete);
+    REQUIRE(partial_audit.assets.front().metadata_scan_status ==
+        carto::agent::ConditionEvidenceStatus::incomplete);
+    REQUIRE(!partial_audit.production_readiness_established);
+
+    auto mixed_inventory = current_inventory;
+    mixed_inventory.rows.emplace_back(carto::agent::SceneObjectIdentityFact{
+        carto::scene::ObjectId{99U}});
+    const auto mixed_audit =
+        carto::agent::audit_condition_inventory(mixed_inventory);
+    REQUIRE(!mixed_audit.query_complete);
+    REQUIRE(mixed_audit.unrecognized_rows == 1U);
+    REQUIRE(!mixed_audit.source_evidence_complete);
+    REQUIRE(!mixed_audit.production_readiness_established);
+
+    auto duplicate_inventory = current_inventory;
+    duplicate_inventory.rows.emplace_back(current_fact);
+    const auto duplicate_audit =
+        carto::agent::audit_condition_inventory(duplicate_inventory);
+    REQUIRE(!duplicate_audit.query_complete);
+    REQUIRE(duplicate_audit.unrecognized_rows == 1U);
+    REQUIRE(!duplicate_audit.source_evidence_complete);
+
+    auto invalid_class_inventory = current_inventory;
+    auto& invalid_class_fact = std::get<carto::agent::ConditionAssetInventoryFact>(
+        invalid_class_inventory.rows.front());
+    invalid_class_fact.asset_class =
+        static_cast<carto::condition::AssetClass>(255U);
+    const auto invalid_class_audit =
+        carto::agent::audit_condition_inventory(invalid_class_inventory);
+    REQUIRE(!invalid_class_audit.query_complete);
+    REQUIRE(invalid_class_audit.unrecognized_rows == 1U);
+    REQUIRE(!invalid_class_audit.production_readiness_established);
+
+    auto missing_revision_inventory = current_inventory;
+    missing_revision_inventory.source_revision = carto::core::Revision{};
+    const auto missing_revision_audit =
+        carto::agent::audit_condition_inventory(missing_revision_inventory);
+    REQUIRE(!missing_revision_audit.query_complete);
+    REQUIRE(!missing_revision_audit.source_evidence_complete);
+
+    const auto empty_audit = carto::agent::audit_condition_inventory(
+        carto::agent::SceneQueryResult{});
+    REQUIRE(!empty_audit.query_complete);
+    REQUIRE(empty_audit.assets.empty());
+    REQUIRE(!empty_audit.source_evidence_complete);
+    REQUIRE(!empty_audit.metadata_scan_complete);
+    REQUIRE(!empty_audit.production_readiness_established);
+}
+
 int main() {
     try {
         root_object_translation_is_explicit_bounded_and_checkpointed();
@@ -4750,6 +4858,7 @@ int main() {
         ui_compiles_multi_object_goals_into_independent_reviewed_branches();
         ui_goal_compiler_rejects_expanded_multi_object_budget_atomically();
         ui_goal_compiler_fails_closed_and_preserves_manual_drafts();
+        condition_inventory_audit_never_promotes_partial_evidence_to_readiness();
         std::cout << "Cartographer agent workbench invariants passed\n";
         return 0;
     } catch (const std::exception& error) {

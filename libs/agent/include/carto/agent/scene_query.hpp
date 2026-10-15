@@ -189,6 +189,41 @@ struct SceneQueryResult {
     bool truncated = false;
 };
 
+enum class ConditionEvidenceStatus : std::uint8_t {
+    verified,
+    needs_review,
+    incomplete,
+    unavailable,
+};
+
+struct ConditionAssetEvidenceAudit {
+    std::uint64_t asset = 0U;
+    scene::ObjectId authored_object;
+    condition::AssetClass asset_class{};
+    condition::FidelityClass fidelity{};
+    ConditionEvidenceStatus source_status = ConditionEvidenceStatus::unavailable;
+    ConditionEvidenceStatus metadata_scan_status = ConditionEvidenceStatus::unavailable;
+};
+
+// A conservative summary of the bounded inventory query. "verified" applies
+// only to source lineage or scan completeness; it never means CONDITION-ready.
+struct ConditionEvidenceAudit {
+    core::Revision source_revision;
+    std::vector<ConditionAssetEvidenceAudit> assets;
+    std::size_t current_reviewed_sources = 0U;
+    std::size_t complete_metadata_scans = 0U;
+    std::size_t unrecognized_rows = 0U;
+    bool query_complete = false;
+    bool source_evidence_complete = false;
+    bool metadata_scan_complete = false;
+    // The inventory vocabulary has no geometry, UV/material, or production
+    // validation facts, so it cannot establish overall readiness.
+    static constexpr bool production_readiness_established = false;
+};
+
+[[nodiscard]] ConditionEvidenceAudit audit_condition_inventory(
+    const SceneQueryResult& inventory);
+
 // SceneQuery is a bounded read-only vocabulary. It returns copied facts and
 // stable identities; it never exposes a project, scene, or mesh reference.
 class SceneQuery final {

@@ -10623,10 +10623,38 @@ struct DesktopState {
             snapshot.agent_task->status != carto::agent::TaskStatus::accepted &&
             snapshot.agent_task->status != carto::agent::TaskStatus::rejected;
         const char* scope_label = active_task ? "task scope" : "selected scope";
+        const auto evidence_audit =
+            carto::agent::audit_condition_inventory(inventory);
         ImGui::Text("CONDITION inventory · %s · R%llu · %zu asset fact(s)%s",
             scope_label,
             static_cast<unsigned long long>(inventory.source_revision.value()),
             inventory.rows.size(), inventory.truncated ? " · partial" : "");
+        ImGui::TextDisabled(
+            "Evidence audit · current and reviewed sources %zu/%zu observed · "
+            "complete metadata scans %zu/%zu",
+            evidence_audit.current_reviewed_sources, evidence_audit.assets.size(),
+            evidence_audit.complete_metadata_scans, evidence_audit.assets.size());
+        if (!evidence_audit.query_complete) {
+            ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                "The inventory query is incomplete; these counts do not cover the whole scope.");
+        } else if (evidence_audit.assets.empty()) {
+            ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                "No CONDITION asset evidence was returned for this scope.");
+        } else if (!evidence_audit.source_evidence_complete) {
+            ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                "One or more scoped sources are stale, unreviewed, or missing lineage.");
+        }
+        if (evidence_audit.unrecognized_rows > 0U) {
+            ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                "The audit excluded %zu malformed or unrelated fact row(s).",
+                evidence_audit.unrecognized_rows);
+        }
+        if (!evidence_audit.metadata_scan_complete && !evidence_audit.assets.empty()) {
+            ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                "Some scoped metadata counts are incomplete.");
+        }
+        ImGui::TextColored(color(snapshot.colors.semantic_warning),
+            "Readiness is not established: geometry, UV/material, collision, and production gates were not evaluated.");
         for (const auto& diagnostic : inventory.diagnostics) {
             ImGui::TextColored(color(snapshot.colors.semantic_warning),
                 "%s", diagnostic.message.c_str());
