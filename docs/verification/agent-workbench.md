@@ -81,6 +81,7 @@
 ## Plan DAG coverage
 
 - Dependencies may point forward or backward in the declared list; scheduling is stable and topological.
+- The UI can compose a face edit on one object and a root transform on another under an explicit combined envelope; review shows the mesh and transform result while the source remains unchanged until one human acceptance.
 - Goal compilation over multiple selected root objects creates one independent branch per object and chains `then` commands only within each branch; review and explicit acceptance apply the whole candidate once.
 - Locked or nested object selections and multi-target command expansion beyond the 16-step work envelope fail atomically without installing a plan or changing the source.
 - Missing, duplicate, self, and cyclic dependencies are rejected before the speculative session is created.

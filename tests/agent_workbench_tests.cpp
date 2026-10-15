@@ -531,6 +531,50 @@ void multi_step_branch_isolated_until_reviewed_acceptance() {
             before.viewport.scene.instances()[0].mesh->source_revision);
 }
 
+void ui_composes_mesh_and_transform_steps_before_explicit_acceptance() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    const auto objects = create_boxes(source, 2U);
+    const auto before = source.snapshot();
+
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        objects[0], carto::geometry::FaceId{1U}}));
+    REQUIRE(ui.queue_agent_step("inset face 0.1"));
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{objects[1]}));
+    REQUIRE(ui.queue_agent_step("translate object by 0.2 0 0", {"step-1"}));
+
+    const auto draft = ui.snapshot();
+    REQUIRE(draft.agent_plan_draft.size() == 2U);
+    REQUIRE(draft.agent_plan_draft[0].target.object == objects[0]);
+    REQUIRE(draft.agent_plan_draft[1].target.object == objects[1]);
+    REQUIRE(draft.agent_plan_draft[1].dependencies == std::vector<std::string>{"step-1"});
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+
+    const auto review = ui.run_agent_plan(
+        "Inset the selected face, then move the second object",
+        translation_envelope(objects, 0.5));
+    REQUIRE(review && review.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(review.value().can_accept);
+    REQUIRE(review.value().scope_objects == objects);
+    REQUIRE(review.value().steps.size() == 2U);
+    REQUIRE(review.value().diff.changed_mesh_count() == 1U);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+
+    REQUIRE(ui.accept_agent_plan());
+    const auto after = source.snapshot();
+    REQUIRE(after.project_revision == before.project_revision.next());
+    const auto first = after.viewport.scene.find(objects[0]);
+    const auto second = after.viewport.scene.find(objects[1]);
+    REQUIRE(first != nullptr);
+    REQUIRE(second != nullptr);
+    REQUIRE(first->world_transform.translation.x == 0.0);
+    REQUIRE(second->world_transform.translation.x == 0.2);
+}
+
 
 void accepted_task_demonstration_is_redacted_read_only_and_checksummed() {
     TempDirectory directory;
@@ -5073,6 +5117,7 @@ int main() {
         ui_objective_constraints_are_scoped_persisted_and_bound_to_answers();
         ui_workbench_captures_object_target_and_requires_explicit_transform_envelope();
         multi_step_branch_isolated_until_reviewed_acceptance();
+        ui_composes_mesh_and_transform_steps_before_explicit_acceptance();
         accepted_task_demonstration_is_redacted_read_only_and_checksummed();
         vertex_demonstration_stores_relative_displacement_only();
         human_native_command_range_captures_alias_only_trace();
