@@ -3219,6 +3219,7 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
 
     touched_objects_.insert(affected_objects.begin(), affected_objects.end());
     transform_distance_used_meters_ += transform_step_distance;
+    step_transform_distance_meters_[step.id] = transform_step_distance;
     receipt.status = StepStatus::passed;
     receipt.revision_after = speculative_->document_.revision();
     receipts_.push_back(std::move(receipt));
@@ -3265,6 +3266,120 @@ core::Result<AgentTaskSnapshot> AgentTask::run() {
             progress_it->diagnostic = policy(
                 "plan branch invalidated because dependency " + *failed_dependency +
                 " did not pass");
+            continue;
+        }
+        if (rebase_reused_step_ids_.contains(step_id)) {
+            progress_it->status = StepStatus::ready;
+            progress_it->status = StepStatus::running;
+            const auto reused_receipt = rebase_reused_step_receipts_.find(step_id);
+            if (!rebase_source_document_.has_value() ||
+                !rebase_speculative_document_.has_value() ||
+                reused_receipt == rebase_reused_step_receipts_.end() ||
+                reused_receipt->second.status != StepStatus::passed || rebases_.empty()) {
+                status_ = TaskStatus::blocked;
+                diagnostic_ = invalid_state(
+                    "rebase reuse is missing its verified historical step evidence");
+                break;
+            }
+            std::vector<scene::ObjectId> step_write_objects;
+            std::vector<std::uint64_t> step_write_mesh_assets;
+            if (std::holds_alternative<std::monostate>(step_it->target.component)) {
+                std::set<scene::ObjectId> writes;
+                for (const auto& object :
+                     rebase_source_document_->scene().objects_sorted()) {
+                    const scene::SceneObject* ancestor = &object;
+                    std::set<scene::ObjectId> visited;
+                    for (std::size_t depth = 0U; ancestor != nullptr &&
+                         ancestor->parent.has_value(); ++depth) {
+                        const scene::ObjectId parent = *ancestor->parent;
+                        if (depth >= 4096U || !visited.insert(parent).second) {
+                            status_ = TaskStatus::blocked;
+                            diagnostic_ = invalid_state(
+                                "rebase reuse found an invalid transform hierarchy");
+                            break;
+                        }
+                        if (parent == step_it->target.object) {
+                            writes.insert(object.id);
+                            break;
+                        }
+                        ancestor = rebase_source_document_->scene().find(parent);
+                    }
+                    if (status_ == TaskStatus::blocked) break;
+                    if (object.id == step_it->target.object) writes.insert(object.id);
+                }
+                if (status_ == TaskStatus::blocked) break;
+                step_write_objects.assign(writes.begin(), writes.end());
+            } else {
+                const auto* target = rebase_source_document_->scene().find(
+                    step_it->target.object);
+                if (target == nullptr || !target->mesh_asset.has_value()) {
+                    status_ = TaskStatus::blocked;
+                    diagnostic_ = stale(
+                        "reused mesh step target disappeared from its historical source");
+                    break;
+                }
+                step_write_mesh_assets.push_back(*target->mesh_asset);
+            }
+            const auto& historical_receipt = reused_receipt->second;
+            if (historical_receipt.revision_after <= historical_receipt.revision_before) {
+                status_ = TaskStatus::blocked;
+                diagnostic_ = invalid_state(
+                    "reused step has no positive historical revision delta");
+                break;
+            }
+            const std::uint64_t revision_delta =
+                historical_receipt.revision_after.value() -
+                historical_receipt.revision_before.value();
+            const auto branch_revision = speculative_->document_.revision();
+            auto candidate = speculative_->merge_agent_rebase_step_document(
+                *rebase_source_document_, *rebase_speculative_document_,
+                step_write_objects, step_write_mesh_assets, revision_delta);
+            if (!candidate) {
+                progress_it->status = StepStatus::failed;
+                progress_it->diagnostic = candidate.error();
+                status_ = TaskStatus::blocked;
+                diagnostic_ = candidate.error().with_context(
+                    "merging a verified unaffected plan step");
+                break;
+            }
+            const auto installed = speculative_->install_agent_rebase_branch(
+                candidate.value(), branch_revision, plan_.id,
+                rebases_.back().checkpoint_plan_context_digest.hex(),
+                rebases_.back().checkpoint_source_digest.hex());
+            if (!installed) {
+                progress_it->status = StepStatus::failed;
+                progress_it->diagnostic = installed.error();
+                status_ = TaskStatus::blocked;
+                diagnostic_ = installed.error().with_context(
+                    "installing a verified unaffected plan step");
+                break;
+            }
+            touched_objects_.insert(
+                step_write_objects.begin(), step_write_objects.end());
+            for (const std::uint64_t asset : step_write_mesh_assets) {
+                for (const auto& instance :
+                     rebase_source_document_->scene().objects_sorted()) {
+                    if (instance.mesh_asset == asset) touched_objects_.insert(instance.id);
+                }
+            }
+            const auto reused_distance = step_transform_distance_meters_.find(step_id);
+            const double distance = reused_distance == step_transform_distance_meters_.end()
+                ? 0.0 : reused_distance->second;
+            if (!std::isfinite(distance) || distance < 0.0 ||
+                transform_distance_used_meters_ >
+                    envelope_.max_transform_distance_meters ||
+                distance > envelope_.max_transform_distance_meters -
+                    transform_distance_used_meters_) {
+                progress_it->status = StepStatus::failed;
+                progress_it->diagnostic = policy(
+                    "reused steps exceed the work envelope transform-distance budget");
+                status_ = TaskStatus::blocked;
+                diagnostic_ = progress_it->diagnostic;
+                break;
+            }
+            transform_distance_used_meters_ += distance;
+            progress_it->status = StepStatus::passed;
+            receipts_.push_back(historical_receipt);
             continue;
         }
         progress_it->status = StepStatus::ready;
@@ -4396,6 +4511,9 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
 
     std::set<scene::ObjectId> read_objects;
     std::set<scene::ObjectId> write_objects;
+    std::set<scene::ObjectId> transform_write_roots;
+    std::map<std::string, std::set<scene::ObjectId>> write_objects_by_step;
+    std::map<std::string, std::set<std::uint64_t>> write_meshes_by_step;
     std::map<scene::ObjectId, std::set<std::string>> steps_by_object_dependency;
     std::map<std::uint64_t, std::set<std::string>> steps_by_mesh_dependency;
     std::set<std::uint64_t> read_mesh_assets;
@@ -4405,13 +4523,6 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
             std::find(analysis.blockers.begin(), analysis.blockers.end(), message) ==
                 analysis.blockers.end()) {
             analysis.blockers.push_back(std::move(message));
-        }
-    };
-    const auto add_mesh_ref = [&read_mesh_assets](
-        const project::ProjectDocument& document, scene::ObjectId object) {
-        const auto* found = document.scene().find(object);
-        if (found != nullptr && found->mesh_asset.has_value()) {
-            read_mesh_assets.insert(*found->mesh_asset);
         }
     };
     const auto add_read_ancestry = [
@@ -4453,29 +4564,20 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
         add_blocker("current source project no longer passes document validation");
     }
 
-    for (const scene::ObjectId object : checkpoint.plan.objective.scope_objects) {
-        read_objects.insert(object);
-        if (base.scene().find(object) == nullptr) {
-            add_blocker("checkpoint scope object " + std::to_string(object.value) +
-                " is absent from its saved source");
-            continue;
-        }
-        add_mesh_ref(base, object);
-        add_read_ancestry(base, object, std::nullopt);
-    }
     for (const auto& step : checkpoint.plan.steps) {
-        write_objects.insert(step.target.object);
+        read_objects.insert(step.target.object);
         steps_by_object_dependency[step.target.object].insert(step.id);
         const auto* target = base.scene().find(step.target.object);
         if (target == nullptr) {
-            add_blocker("checkpoint write target " + std::to_string(step.target.object.value) +
+            add_blocker("checkpoint step target " + std::to_string(step.target.object.value) +
                 " is absent from its saved source");
             continue;
         }
-        if (target->mesh_asset.has_value()) {
-            steps_by_mesh_dependency[*target->mesh_asset].insert(step.id);
-        }
+        add_read_ancestry(base, step.target.object, step.id);
         if (std::holds_alternative<std::monostate>(step.target.component)) {
+            transform_write_roots.insert(step.target.object);
+            write_objects.insert(step.target.object);
+            write_objects_by_step[step.id].insert(step.target.object);
             for (const auto& object : base.scene().objects_sorted()) {
                 const scene::SceneObject* ancestor = &object;
                 std::set<scene::ObjectId> visited;
@@ -4487,7 +4589,9 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
                         break;
                     }
                     if (parent == step.target.object) {
+                        read_objects.insert(object.id);
                         write_objects.insert(object.id);
+                        write_objects_by_step[step.id].insert(object.id);
                         steps_by_object_dependency[object.id].insert(step.id);
                         break;
                     }
@@ -4500,16 +4604,52 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
             continue;
         }
         if (!target->mesh_asset.has_value()) {
-            add_blocker("checkpoint write target " + std::to_string(step.target.object.value) +
+            add_blocker("checkpoint mesh step target " + std::to_string(step.target.object.value) +
                 " has no saved mesh binding");
             continue;
         }
-        read_mesh_assets.insert(*target->mesh_asset);
-        write_mesh_assets.insert(*target->mesh_asset);
+        const std::uint64_t asset = *target->mesh_asset;
+        read_mesh_assets.insert(asset);
+        write_mesh_assets.insert(asset);
+        write_meshes_by_step[step.id].insert(asset);
+        steps_by_mesh_dependency[asset].insert(step.id);
+        for (const auto& instance : base.scene().objects_sorted()) {
+            if (instance.mesh_asset == target->mesh_asset) {
+                read_objects.insert(instance.id);
+                steps_by_object_dependency[instance.id].insert(step.id);
+                add_read_ancestry(base, instance.id, step.id);
+            }
+        }
     }
     for (const auto& correction : checkpoint.ghost_corrections) {
-        write_objects.insert(correction.object);
-        if (correction.kind == GhostCorrectionKind::object_transform) continue;
+        read_objects.insert(correction.object);
+        add_read_ancestry(base, correction.object, std::nullopt);
+        if (correction.kind == GhostCorrectionKind::object_transform) {
+            transform_write_roots.insert(correction.object);
+            write_objects.insert(correction.object);
+            for (const auto& object : base.scene().objects_sorted()) {
+                const scene::SceneObject* ancestor = &object;
+                std::set<scene::ObjectId> visited;
+                for (std::size_t depth = 0U; ancestor != nullptr &&
+                     ancestor->parent.has_value(); ++depth) {
+                    const scene::ObjectId parent = *ancestor->parent;
+                    if (depth >= 4096U || !visited.insert(parent).second) {
+                        add_blocker("checkpoint ghost-transform hierarchy is invalid");
+                        break;
+                    }
+                    if (parent == correction.object) {
+                        read_objects.insert(object.id);
+                        write_objects.insert(object.id);
+                        break;
+                    }
+                    ancestor = base.scene().find(parent);
+                    if (ancestor == nullptr) {
+                        add_blocker("checkpoint ghost-transform hierarchy has a missing parent");
+                    }
+                }
+            }
+            continue;
+        }
         const auto* target = base.scene().find(correction.object);
         if (target == nullptr || !target->mesh_asset.has_value()) {
             add_blocker("checkpoint ghost mesh correction has no saved mesh binding");
@@ -4518,18 +4658,29 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
         read_mesh_assets.insert(*target->mesh_asset);
         write_mesh_assets.insert(*target->mesh_asset);
         for (const auto& instance : base.scene().objects_sorted()) {
-            if (instance.mesh_asset == target->mesh_asset) write_objects.insert(instance.id);
+            if (instance.mesh_asset == target->mesh_asset) read_objects.insert(instance.id);
         }
     }
     for (const auto object : write_objects) add_read_ancestry(base, object, std::nullopt);
-    for (const auto& step : checkpoint.plan.steps) {
-        add_read_ancestry(base, step.target.object, step.id);
-    }
 
     std::set<scene::ObjectId> object_ids;
     for (const auto& object : base.scene().objects_sorted()) object_ids.insert(object.id);
     for (const auto& object : current.scene().objects_sorted()) object_ids.insert(object.id);
     std::set<scene::ObjectId> changed_objects;
+    const auto is_in_transform_write_subtree = [&transform_write_roots](
+        const project::ProjectDocument& document, scene::ObjectId object) {
+        std::set<scene::ObjectId> visited;
+        const scene::SceneObject* current_object = document.scene().find(object);
+        for (std::size_t depth = 0U; current_object != nullptr; ++depth) {
+            if (transform_write_roots.contains(current_object->id)) return true;
+            if (!current_object->parent.has_value()) return false;
+            if (depth >= 4096U || !visited.insert(*current_object->parent).second) {
+                return true;
+            }
+            current_object = document.scene().find(*current_object->parent);
+        }
+        return false;
+    };
     for (const scene::ObjectId object : object_ids) {
         const auto* before = base.scene().find(object);
         const auto* after = current.scene().find(object);
@@ -4543,7 +4694,13 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
                 write_mesh_assets.contains(*before->mesh_asset)) ||
              (after != nullptr && after->mesh_asset.has_value() &&
                 write_mesh_assets.contains(*after->mesh_asset)));
-        if (read_conflict || shared_write_asset) {
+        const bool write_conflict = write_objects.contains(object);
+        const bool changed_transform_subtree =
+            is_in_transform_write_subtree(base, object) ||
+            is_in_transform_write_subtree(current, object);
+        if (write_conflict || shared_write_asset ||
+            changed_transform_subtree ||
+            (read_conflict && (before == nullptr || after == nullptr))) {
             analysis.conflicting_objects.push_back(object);
             if (shared_write_asset) {
                 const auto add_conflicting_asset = [&analysis](std::uint64_t asset) {
@@ -4560,9 +4717,15 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
                 add_blocker("object " + std::to_string(object.value) +
                     " changed its membership in a mesh asset written by the task");
             }
-            if (read_conflict) {
-                add_blocker("read object " + std::to_string(object.value) +
+            if (write_conflict) {
+                add_blocker("write object " + std::to_string(object.value) +
                     " changed since the checkpoint source");
+            } else if (changed_transform_subtree) {
+                add_blocker("object " + std::to_string(object.value) +
+                    " changed membership in a root-transform write subtree");
+            } else if (read_conflict && (before == nullptr || after == nullptr)) {
+                add_blocker("read object " + std::to_string(object.value) +
+                    " was added or removed since the checkpoint source");
             }
         }
     }
@@ -4586,8 +4749,10 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
         changed_meshes.insert(asset);
         if (!read_mesh_assets.contains(asset)) continue;
         analysis.conflicting_mesh_assets.push_back(asset);
-        add_blocker("read mesh asset " + std::to_string(asset) +
-            " changed since the checkpoint source");
+        if (write_mesh_assets.contains(asset) || before_mesh == nullptr || after_mesh == nullptr) {
+            add_blocker("write mesh asset " + std::to_string(asset) +
+                " changed since the checkpoint source");
+        }
     }
     const bool semantic_sidecar_changed =
         base.condition_authoring() != current.condition_authoring() ||
@@ -4596,9 +4761,9 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
         add_blocker("CONDITION or engineering sidecar changed; checkpoint has no field-level semantic read provenance");
     }
 
-    // Identify the smallest plan branch that must be reconsidered when source
-    // identities used by a step changed. This is review evidence only: rebase
-    // remains blocked until the existing read/write conflict policy permits it.
+    // Identify the smallest plan branch whose source inputs changed. Read-only
+    // changes invalidate those nodes and their dependents for replay; overlapping
+    // write conflicts remain blockers.
     std::set<std::string> directly_conflicting_steps;
     const auto mark_steps = [&directly_conflicting_steps](
         const auto& dependencies, const auto& identity) {
@@ -4621,6 +4786,20 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
     for (const auto asset : changed_meshes) {
         mark_steps(steps_by_mesh_dependency, asset);
     }
+    const bool ghost_read_dependency_changed = !checkpoint.ghost_corrections.empty() &&
+        (std::any_of(changed_objects.begin(), changed_objects.end(),
+             [&read_objects](scene::ObjectId object) {
+                 return read_objects.contains(object);
+             }) ||
+         std::any_of(changed_meshes.begin(), changed_meshes.end(),
+             [&read_mesh_assets](std::uint64_t asset) {
+                 return read_mesh_assets.contains(asset);
+             }));
+    if (ghost_read_dependency_changed) {
+        for (const auto& step : checkpoint.plan.steps) {
+            directly_conflicting_steps.insert(step.id);
+        }
+    }
     if (semantic_sidecar_changed) {
         for (const auto& step : checkpoint.plan.steps) {
             directly_conflicting_steps.insert(step.id);
@@ -4632,11 +4811,38 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
         added_dependent = false;
         for (const auto& step : checkpoint.plan.steps) {
             if (invalidated_steps.contains(step.id)) continue;
-            const bool depends_on_invalidated = std::any_of(
+            bool depends_on_invalidated = std::any_of(
                 step.dependencies.begin(), step.dependencies.end(),
                 [&invalidated_steps](const std::string& dependency) {
                     return invalidated_steps.contains(dependency);
                 });
+            if (!depends_on_invalidated) {
+                for (const auto& invalidated_id : invalidated_steps) {
+                    const auto object_writes = write_objects_by_step.find(invalidated_id);
+                    if (object_writes != write_objects_by_step.end() &&
+                        std::any_of(object_writes->second.begin(),
+                            object_writes->second.end(),
+                            [&steps_by_object_dependency, &step](scene::ObjectId object) {
+                                const auto readers = steps_by_object_dependency.find(object);
+                                return readers != steps_by_object_dependency.end() &&
+                                    readers->second.contains(step.id);
+                            })) {
+                        depends_on_invalidated = true;
+                        break;
+                    }
+                    const auto mesh_writes = write_meshes_by_step.find(invalidated_id);
+                    if (mesh_writes != write_meshes_by_step.end() &&
+                        std::any_of(mesh_writes->second.begin(), mesh_writes->second.end(),
+                            [&steps_by_mesh_dependency, &step](std::uint64_t asset) {
+                                const auto readers = steps_by_mesh_dependency.find(asset);
+                                return readers != steps_by_mesh_dependency.end() &&
+                                    readers->second.contains(step.id);
+                            })) {
+                        depends_on_invalidated = true;
+                        break;
+                    }
+                }
+            }
             if (depends_on_invalidated) {
                 invalidated_steps.insert(step.id);
                 added_dependent = true;
@@ -4732,8 +4938,7 @@ core::Result<AgentTask> AgentTask::rebase_checkpoint(
     // A review checkpoint whose dependency graph is untouched can reuse its
     // verified artifact. First replay it against the exact historical source;
     // then three-way merge only its declared writes onto the current source.
-    // Any changed resource that invalidates a plan node continues through the
-    // existing fresh-replay path below.
+    // Changed plan inputs continue through the affected-branch replay below.
     if (checkpoint.status == TaskStatus::review &&
         analysis.value().invalidated_step_ids.empty()) {
         auto historical_base = project::ProjectDocument::deserialize(
@@ -4818,6 +5023,137 @@ core::Result<AgentTask> AgentTask::rebase_checkpoint(
         return rebased;
     }
 
+    if (checkpoint.status == TaskStatus::review &&
+        !analysis.value().invalidated_step_ids.empty() &&
+        checkpoint.ghost_corrections.empty()) {
+        auto historical_base = project::ProjectDocument::deserialize(
+            checkpoint.source_project);
+        if (!historical_base) {
+            return core::Result<AgentTask>::failure(historical_base.error());
+        }
+        auto merge_base = historical_base.value();
+        auto historical_source = std::unique_ptr<application::ApplicationSession>(
+            new application::ApplicationSession(
+                source, application::ApplicationSession::SpeculativeCopyTag{}));
+        if (auto installed = historical_source->install_agent_checkpoint_source(
+                std::move(historical_base.value())); !installed) {
+            return core::Result<AgentTask>::failure(installed.error());
+        }
+        auto historical_speculative = std::unique_ptr<application::ApplicationSession>(
+            new application::ApplicationSession(
+                *historical_source, application::ApplicationSession::SpeculativeCopyTag{}));
+        AgentTask historical_task(
+            *historical_source, checkpoint.plan, checkpoint.envelope,
+            std::move(historical_speculative), historical_source->snapshot(),
+            checkpoint.repair_lineage, checkpoint.rebase_lineage);
+        const auto historical_run = historical_task.run();
+        if (!historical_run || historical_task.status_ != TaskStatus::review ||
+            digest_text(historical_task.speculative_->document_.serialize()) !=
+                checkpoint.speculative_digest ||
+            historical_task.build_diff().digest != checkpoint.diff_digest) {
+            return core::Result<AgentTask>::failure(stale(
+                "checkpoint did not reproduce its saved review branch on the historical source"));
+        }
+
+        std::set<std::string> invalidated_ids(
+            analysis.value().invalidated_step_ids.begin(),
+            analysis.value().invalidated_step_ids.end());
+        std::map<scene::ObjectId, std::string> object_writers;
+        std::map<std::uint64_t, std::string> mesh_writers;
+        bool can_selectively_replay = true;
+        for (const auto& step : checkpoint.plan.steps) {
+            if (std::holds_alternative<std::monostate>(step.target.component)) {
+                for (const auto& object : merge_base.scene().objects_sorted()) {
+                    const scene::SceneObject* ancestor = &object;
+                    std::set<scene::ObjectId> visited;
+                    bool affected = object.id == step.target.object;
+                    for (std::size_t depth = 0U; !affected && ancestor != nullptr &&
+                         ancestor->parent.has_value(); ++depth) {
+                        const scene::ObjectId parent = *ancestor->parent;
+                        if (depth >= 4096U || !visited.insert(parent).second) {
+                            can_selectively_replay = false;
+                            break;
+                        }
+                        if (parent == step.target.object) {
+                            affected = true;
+                            break;
+                        }
+                        ancestor = merge_base.scene().find(parent);
+                    }
+                    if (!can_selectively_replay) break;
+                    if (affected &&
+                        !object_writers.emplace(object.id, step.id).second) {
+                        can_selectively_replay = false;
+                        break;
+                    }
+                }
+            } else {
+                const auto* target = merge_base.scene().find(step.target.object);
+                if (target == nullptr || !target->mesh_asset.has_value() ||
+                    !mesh_writers.emplace(*target->mesh_asset, step.id).second) {
+                    can_selectively_replay = false;
+                }
+            }
+            if (!can_selectively_replay) break;
+        }
+
+        std::set<std::string> reused_ids;
+        if (can_selectively_replay) {
+            const auto schedule = checkpoint.plan.schedule_order();
+            if (!schedule) {
+                can_selectively_replay = false;
+            }
+            if (schedule) {
+                for (const auto& step_id : schedule.value()) {
+                    if (!invalidated_ids.contains(step_id)) reused_ids.insert(step_id);
+                }
+            }
+            if (can_selectively_replay) {
+                can_selectively_replay = !reused_ids.empty() && std::all_of(
+                    reused_ids.begin(), reused_ids.end(),
+                    [&historical_task](const auto& step_id) {
+                        return std::any_of(historical_task.receipts_.begin(),
+                            historical_task.receipts_.end(),
+                            [&step_id](const StepReceipt& receipt) {
+                                return receipt.step_id == step_id &&
+                                    receipt.status == StepStatus::passed;
+                            });
+                    });
+            }
+        }
+        if (can_selectively_replay) {
+            receipt.reused_step_ids.assign(reused_ids.begin(), reused_ids.end());
+            if (auto valid = receipt.validate(); !valid) {
+                return core::Result<AgentTask>::failure(valid.error());
+            }
+            rebased.value().rebases_.push_back(std::move(receipt));
+            rebased.value().rebase_source_document_.emplace(std::move(merge_base));
+            rebased.value().rebase_speculative_document_.emplace(
+                historical_task.speculative_->document_);
+            rebased.value().rebase_reused_step_ids_ = std::move(reused_ids);
+            for (const auto& historical_receipt : historical_task.receipts_) {
+                if (rebased.value().rebase_reused_step_ids_.contains(
+                        historical_receipt.step_id)) {
+                    rebased.value().rebase_reused_step_receipts_.emplace(
+                        historical_receipt.step_id, historical_receipt);
+                }
+            }
+            for (const auto& [step_id, distance] :
+                 historical_task.step_transform_distance_meters_) {
+                if (rebased.value().rebase_reused_step_ids_.contains(step_id)) {
+                    rebased.value().step_transform_distance_meters_.emplace(
+                        step_id, distance);
+                }
+            }
+            rebased.value().touched_objects_ = historical_task.touched_objects_;
+            rebased.value().query_budget_ = historical_task.query_budget_;
+            const auto replayed = rebased.value().run();
+            if (!replayed) return core::Result<AgentTask>::failure(replayed.error());
+            rebased.value().cached_snapshot_.reset();
+            return rebased;
+        }
+    }
+
     if (auto valid = receipt.validate(); !valid) {
         return core::Result<AgentTask>::failure(valid.error());
     }
@@ -4826,7 +5162,8 @@ core::Result<AgentTask> AgentTask::rebase_checkpoint(
     if (!replayed) return core::Result<AgentTask>::failure(replayed.error());
     rebased.value().cached_snapshot_.reset();
 
-    if (checkpoint.status != TaskStatus::prepared) {
+    if (checkpoint.status != TaskStatus::prepared &&
+        analysis.value().invalidated_step_ids.empty()) {
         bool write_result_matches = true;
         for (const scene::ObjectId object : analysis.value().write_objects) {
             if (!same_scene_object(

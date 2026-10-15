@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -740,6 +741,11 @@ private:
     std::unique_ptr<application::ApplicationSession> speculative_;
     ai::NativePlanner planner_;
     std::vector<StepReceipt> receipts_;
+    std::optional<project::ProjectDocument> rebase_source_document_;
+    std::optional<project::ProjectDocument> rebase_speculative_document_;
+    std::set<std::string> rebase_reused_step_ids_;
+    std::map<std::string, StepReceipt> rebase_reused_step_receipts_;
+    std::map<std::string, double> step_transform_distance_meters_;
     std::vector<AgentRepairReceipt> repairs_;
     std::vector<AgentRebaseReceipt> rebases_;
     std::vector<GhostCorrectionReceipt> ghost_corrections_;

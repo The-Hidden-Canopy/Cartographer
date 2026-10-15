@@ -919,6 +919,20 @@ core::Result<project::ProjectDocument> ApplicationSession::merge_agent_rebase_do
         write_objects, write_mesh_assets);
 }
 
+core::Result<project::ProjectDocument> ApplicationSession::merge_agent_rebase_step_document(
+    const project::ProjectDocument& base,
+    const project::ProjectDocument& speculative,
+    const std::vector<scene::ObjectId>& write_objects,
+    const std::vector<std::uint64_t>& write_mesh_assets,
+    std::uint64_t revision_delta) const {
+    auto selected = project::ProjectDocument::select_agent_rebase_step_changes(
+        base, speculative, write_objects, write_mesh_assets, revision_delta);
+    if (!selected) return selected;
+    return project::ProjectDocument::merge_disjoint_scene_mesh_changes(
+        base, document_, selected.value(), write_objects, write_mesh_assets,
+        write_objects, write_mesh_assets);
+}
+
 core::Result<void> ApplicationSession::install_agent_checkpoint_source(
     project::ProjectDocument checkpoint_source) {
     if (auto result = checkpoint_source.validate(); !result) {

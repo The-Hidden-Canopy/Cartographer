@@ -264,6 +264,12 @@ private:
         const std::vector<std::uint64_t>& read_mesh_assets,
         const std::vector<scene::ObjectId>& write_objects,
         const std::vector<std::uint64_t>& write_mesh_assets);
+    [[nodiscard]] static core::Result<ProjectDocument> select_agent_rebase_step_changes(
+        const ProjectDocument& base,
+        const ProjectDocument& speculative,
+        const std::vector<scene::ObjectId>& write_objects,
+        const std::vector<std::uint64_t>& write_mesh_assets,
+        std::uint64_t revision_delta);
 
     [[nodiscard]] core::Result<scene::ObjectId> create_object(
         std::string name,

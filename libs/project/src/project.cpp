@@ -772,6 +772,107 @@ core::Result<ProjectDocument> ProjectDocument::merge_disjoint_scene_mesh_changes
     return core::Result<ProjectDocument>::success(std::move(merged));
 }
 
+core::Result<ProjectDocument> ProjectDocument::select_agent_rebase_step_changes(
+    const ProjectDocument& base,
+    const ProjectDocument& speculative,
+    const std::vector<scene::ObjectId>& write_objects,
+    const std::vector<std::uint64_t>& write_mesh_assets,
+    std::uint64_t revision_delta) {
+    const auto invalid_selection = [](std::string message) {
+        return core::Result<ProjectDocument>::failure(Diagnostic(
+            ErrorCode::invalid_state, std::move(message)));
+    };
+    if (auto result = base.validate(); !result) {
+        return core::Result<ProjectDocument>::failure(
+            result.error().with_context("checkpoint rebase step base"));
+    }
+    if (auto result = speculative.validate(); !result) {
+        return core::Result<ProjectDocument>::failure(
+            result.error().with_context("checkpoint rebase step artifact"));
+    }
+    if (base.source_namespace_ != speculative.source_namespace_ ||
+        base.name_ != speculative.name_ || speculative.revision_ <= base.revision_ ||
+        revision_delta == 0U ||
+        revision_delta > core::Revision::max_value() - base.revision_.value()) {
+        return invalid_selection(
+            "checkpoint rebase step artifacts do not share a bounded source lineage");
+    }
+    if (write_objects.size() > kMaxSerializedObjects ||
+        write_mesh_assets.size() > kMaxSerializedMeshes ||
+        !std::is_sorted(write_objects.begin(), write_objects.end()) ||
+        std::adjacent_find(write_objects.begin(), write_objects.end()) != write_objects.end() ||
+        !std::is_sorted(write_mesh_assets.begin(), write_mesh_assets.end()) ||
+        std::adjacent_find(write_mesh_assets.begin(), write_mesh_assets.end()) !=
+            write_mesh_assets.end()) {
+        return invalid_selection(
+            "checkpoint rebase step write sets are not canonical and bounded");
+    }
+
+    ProjectDocument selected = base;
+    for (const scene::ObjectId object : write_objects) {
+        const auto* before = base.scene_.find(object);
+        const auto* after = speculative.scene_.find(object);
+        if (before == nullptr || after == nullptr || before->id != after->id ||
+            before->name != after->name || before->parent != after->parent ||
+            before->mesh_asset != after->mesh_asset || before->visible != after->visible ||
+            before->locked != after->locked) {
+            return invalid_selection(
+                "checkpoint rebase step changed or removed an object write target");
+        }
+        if (auto result = selected.scene_.set_local_transform(
+                object, after->local_transform); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+    }
+    for (const std::uint64_t asset : write_mesh_assets) {
+        const auto before = base.meshes_.find(asset);
+        const auto after = speculative.meshes_.find(asset);
+        if (before == base.meshes_.end() || after == speculative.meshes_.end()) {
+            return invalid_selection(
+                "checkpoint rebase step changed or removed a mesh write target");
+        }
+        selected.meshes_[asset] = after->second;
+        const auto receipt = speculative.cloth_rest_pose_receipts_.find(asset);
+        if (receipt == speculative.cloth_rest_pose_receipts_.end()) {
+            selected.cloth_rest_pose_receipts_.erase(asset);
+        } else {
+            selected.cloth_rest_pose_receipts_[asset] = receipt->second;
+        }
+    }
+    if (speculative.topology_receipts_.size() < base.topology_receipts_.size()) {
+        return invalid_selection(
+            "checkpoint rebase step removed topology receipt history");
+    }
+    for (std::size_t index = 0U; index < base.topology_receipts_.size(); ++index) {
+        const auto& before = base.topology_receipts_[index];
+        const auto& after = speculative.topology_receipts_[index];
+        if (before.mesh_asset != after.mesh_asset ||
+            before.receipt.serialize() != after.receipt.serialize()) {
+            return invalid_selection(
+                "checkpoint rebase step rewrote topology receipt history");
+        }
+    }
+    const std::set<std::uint64_t> selected_assets(
+        write_mesh_assets.begin(), write_mesh_assets.end());
+    for (std::size_t index = base.topology_receipts_.size();
+         index < speculative.topology_receipts_.size(); ++index) {
+        const auto& receipt = speculative.topology_receipts_[index];
+        if (selected_assets.contains(receipt.mesh_asset)) {
+            if (auto result = receipt.validate(); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            selected.topology_receipts_.push_back(receipt);
+        }
+    }
+    selected.revision_ = core::Revision(
+        base.revision_.value() + revision_delta);
+    if (auto result = selected.validate(); !result) {
+        return core::Result<ProjectDocument>::failure(
+            result.error().with_context("selected checkpoint rebase step"));
+    }
+    return core::Result<ProjectDocument>::success(std::move(selected));
+}
+
 core::Result<void> ProjectDocument::set_name(std::string name) {
     if (revision_.exhausted()) {
         return core::Result<void>::failure(exhausted_revision());

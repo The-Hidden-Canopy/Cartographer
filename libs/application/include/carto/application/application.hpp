@@ -1030,6 +1030,12 @@ private:
         const std::vector<std::uint64_t>& read_mesh_assets,
         const std::vector<scene::ObjectId>& write_objects,
         const std::vector<std::uint64_t>& write_mesh_assets) const;
+    [[nodiscard]] core::Result<project::ProjectDocument> merge_agent_rebase_step_document(
+        const project::ProjectDocument& base,
+        const project::ProjectDocument& speculative,
+        const std::vector<scene::ObjectId>& write_objects,
+        const std::vector<std::uint64_t>& write_mesh_assets,
+        std::uint64_t revision_delta) const;
     [[nodiscard]] core::Result<void> install_agent_checkpoint_source(
         project::ProjectDocument checkpoint_source);
     struct SpeculativeCopyTag final {};
