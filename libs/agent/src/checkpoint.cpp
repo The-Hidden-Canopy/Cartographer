@@ -598,6 +598,10 @@ void write_ghost_correction(Writer& writer, const GhostCorrectionReceipt& correc
     writer.real(correction.after_position.x);
     writer.real(correction.after_position.y);
     writer.real(correction.after_position.z);
+    writer.number(correction.face.has_value() ? correction.face->value : 0U);
+    writer.real(correction.distance);
+    writer.digest(correction.before_mesh_digest);
+    writer.digest(correction.after_mesh_digest);
 }
 
 GhostCorrectionReceipt read_ghost_correction(Reader& reader, std::uint64_t version) {
@@ -615,7 +619,10 @@ GhostCorrectionReceipt read_ghost_correction(Reader& reader, std::uint64_t versi
     correction.evidence_digest = reader.digest();
     if (version >= 6U) {
         const auto kind = reader.number();
-        if (kind > static_cast<std::uint64_t>(GhostCorrectionKind::vertex_position)) {
+        const auto maximum_kind = version >= 7U
+            ? GhostCorrectionKind::face_extrusion
+            : GhostCorrectionKind::vertex_position;
+        if (kind > static_cast<std::uint64_t>(maximum_kind)) {
             reader.fail("checkpoint ghost correction kind is unknown");
         }
         correction.kind = static_cast<GhostCorrectionKind>(kind);
@@ -623,6 +630,13 @@ GhostCorrectionReceipt read_ghost_correction(Reader& reader, std::uint64_t versi
         if (vertex != 0U) correction.vertex = geometry::VertexId{vertex};
         correction.before_position = {reader.real(), reader.real(), reader.real()};
         correction.after_position = {reader.real(), reader.real(), reader.real()};
+    }
+    if (version >= 7U) {
+        const auto face = reader.number();
+        if (face != 0U) correction.face = geometry::FaceId{face};
+        correction.distance = reader.real();
+        correction.before_mesh_digest = reader.digest();
+        correction.after_mesh_digest = reader.digest();
     }
     return correction;
 }
@@ -847,6 +861,7 @@ core::Result<void> AgentTaskCheckpoint::validate() const {
     std::map<scene::ObjectId, core::Transform> correction_final_transforms;
     std::map<std::pair<std::uint64_t, geometry::VertexId>, core::Vec3d>
         correction_final_vertices;
+    std::map<std::uint64_t, assets::Sha256Digest> correction_final_mesh_digests;
     for (const auto& correction : ghost_corrections) {
         if (auto result = correction.validate(); !result) {
             return core::Result<void>::failure(result.error().with_context(
@@ -929,6 +944,53 @@ core::Result<void> AgentTaskCheckpoint::validate() const {
                     "checkpoint ghost vertex correction chain is discontinuous"));
             }
             correction_final_vertices[key] = correction.after_position;
+            if (!correction.before_mesh_digest.is_zero()) {
+                const auto previous_mesh = correction_final_mesh_digests.find(
+                    *target->mesh_asset);
+                if (previous_mesh != correction_final_mesh_digests.end() &&
+                    previous_mesh->second != correction.before_mesh_digest) {
+                    return core::Result<void>::failure(malformed(
+                        "checkpoint ghost mesh correction chain is discontinuous"));
+                }
+                correction_final_mesh_digests[*target->mesh_asset] =
+                    correction.after_mesh_digest;
+            }
+        } else if (correction.kind == GhostCorrectionKind::face_inset ||
+            correction.kind == GhostCorrectionKind::face_extrusion) {
+            const auto* target = speculative.value().scene().find(correction.object);
+            if (target == nullptr || target->locked ||
+                !target->mesh_asset.has_value() || !correction.face.has_value() ||
+                correction.before_mesh_digest.is_zero() ||
+                correction.after_mesh_digest.is_zero()) {
+                return core::Result<void>::failure(malformed(
+                    "checkpoint face correction lacks current scoped mesh evidence"));
+            }
+            const auto mesh = speculative.value().meshes().find(*target->mesh_asset);
+            if (mesh == speculative.value().meshes().end()) {
+                return core::Result<void>::failure(malformed(
+                    "checkpoint face correction target has no current mesh"));
+            }
+            for (const auto& instance : speculative.value().scene().objects_sorted()) {
+                if (instance.mesh_asset == target->mesh_asset &&
+                    (std::find(plan.objective.scope_objects.begin(),
+                         plan.objective.scope_objects.end(), instance.id) ==
+                         plan.objective.scope_objects.end() || instance.locked ||
+                     std::find(plan.objective.protected_objects.begin(),
+                         plan.objective.protected_objects.end(), instance.id) !=
+                         plan.objective.protected_objects.end())) {
+                    return core::Result<void>::failure(malformed(
+                        "checkpoint face correction escapes shared-mesh scope"));
+                }
+            }
+            const auto previous_mesh = correction_final_mesh_digests.find(
+                *target->mesh_asset);
+            if (previous_mesh != correction_final_mesh_digests.end() &&
+                previous_mesh->second != correction.before_mesh_digest) {
+                return core::Result<void>::failure(malformed(
+                    "checkpoint ghost mesh correction chain is discontinuous"));
+            }
+            correction_final_mesh_digests[*target->mesh_asset] =
+                correction.after_mesh_digest;
         }
         expected_correction_parent = correction.evidence_digest;
     }
@@ -947,6 +1009,14 @@ core::Result<void> AgentTaskCheckpoint::validate() const {
             if (vertex == nullptr || !same_position(vertex->position, expected_position)) {
                 return core::Result<void>::failure(malformed(
                     "review checkpoint does not contain its locked ghost vertex correction"));
+            }
+        }
+        for (const auto& [asset_id, expected_digest] : correction_final_mesh_digests) {
+            const auto mesh = speculative.value().meshes().find(asset_id);
+            if (mesh == speculative.value().meshes().end() ||
+                application::canonical_mesh_geometry_digest(mesh->second) != expected_digest) {
+                return core::Result<void>::failure(malformed(
+                    "review checkpoint does not contain its locked ghost mesh correction"));
             }
         }
     }
@@ -1173,7 +1243,7 @@ core::Result<AgentDemonstration> AgentDemonstration::capture(
 }
 
 core::Result<void> AgentDemonstration::validate() const {
-    if ((format_version != 1U && format_version != kFormatVersion) ||
+    if (format_version < 1U || format_version > kFormatVersion ||
         (!recipe_id.empty() && !safe_demonstration_text(recipe_id, 256U)) ||
         steps.empty() || steps.size() > kMaxDemonstrationSteps ||
         gates.empty() || gates.size() > kMaxDemonstrationGates ||

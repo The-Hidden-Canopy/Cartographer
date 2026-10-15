@@ -140,8 +140,8 @@ void skip_checkpoint_strings(const std::vector<std::string>& fields, std::size_t
     cursor += static_cast<std::size_t>(count);
 }
 
-std::vector<std::string> legacy_v3_fields_from_v6(std::vector<std::string> fields) {
-    REQUIRE(fields.size() > 10U && fields[0] == "6");
+std::vector<std::string> legacy_v3_fields_from_v7(std::vector<std::string> fields) {
+    REQUIRE(fields.size() > 10U && fields[0] == "7");
     fields[0] = "3";
     fields.erase(fields.begin() + 13); // Version 4 has no recipe field.
     std::size_t cursor = 10U;
@@ -1890,7 +1890,7 @@ void persistent_checkpoint_v1_format_remains_readable() {
         return std::to_string(value.size()) + ":" + std::string(value) + "|";
     };
     auto v4_fields = checkpoint_fields(current_body);
-    REQUIRE(v4_fields.size() > 13U && v4_fields[0] == "6");
+    REQUIRE(v4_fields.size() > 13U && v4_fields[0] == "7");
     v4_fields[0] = "4";
     v4_fields.erase(v4_fields.begin() + 13); // Version 4 has no recipe field.
     const std::string v4_body = checkpoint_body(v4_fields);
@@ -1901,7 +1901,7 @@ void persistent_checkpoint_v1_format_remains_readable() {
     REQUIRE(decoded_v4);
     REQUIRE(decoded_v4.value().plan.objective.recipe_id.empty());
 
-    const auto v3_fields = legacy_v3_fields_from_v6(checkpoint_fields(current_body));
+    const auto v3_fields = legacy_v3_fields_from_v7(checkpoint_fields(current_body));
     const std::string v3_body = checkpoint_body(v3_fields);
     REQUIRE(v3_body.starts_with("1:3|"));
     REQUIRE(v3_body.ends_with("1:0|1:0|1:0|0:|"));
@@ -3531,8 +3531,8 @@ void ui_ghost_corrections_are_scoped_revalidated_and_checkpointed() {
     const std::size_t body_begin = body_length_end + 1U;
     auto legacy_v5_fields = checkpoint_fields(
         current_encoding.value().substr(body_begin, body_length));
-    REQUIRE(legacy_v5_fields[0] == "6");
-    legacy_v5_fields.erase(legacy_v5_fields.end() - 9, legacy_v5_fields.end() - 1);
+    REQUIRE(legacy_v5_fields[0] == "7");
+    legacy_v5_fields.erase(legacy_v5_fields.end() - 13, legacy_v5_fields.end() - 1);
     legacy_v5_fields[0] = "5";
     const std::string legacy_v5_body = checkpoint_body(legacy_v5_fields);
     const auto legacy_v5_digest = carto::assets::sha256(std::span<const std::uint8_t>(
@@ -3716,43 +3716,229 @@ void ui_ghost_vertex_correction_is_scoped_replayed_and_checkpointed() {
     REQUIRE(accepted_instance->mesh->positions[accepted_vertex_index].x == corrected_position.x);
 }
 
+void ui_ghost_topology_correction_is_scoped_replayed_and_checkpointed() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Ghost topology target", {1.0, 1.0, 1.0}}));
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Out-of-scope ghost topology", {1.0, 1.0, 1.0}}));
+    const auto base = source.snapshot();
+    const auto target = base.objects[0].object.id;
+    const auto out_of_scope = base.objects[1].object.id;
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        target, carto::geometry::FaceId{1U}}));
+    REQUIRE(ui.queue_agent_step("inset face 0.1"));
+    const auto run = ui.run_agent_plan("Prepare the selected face for topology review");
+    REQUIRE(run && run.value().status == carto::agent::TaskStatus::review);
+    const auto* before_instance = run.value().after_scene.find(target);
+    REQUIRE(before_instance != nullptr && before_instance->mesh != nullptr);
+    REQUIRE(!before_instance->mesh->triangle_faces.empty());
+    const auto face = before_instance->mesh->triangle_faces.front();
+    const auto branch_revision = run.value().speculative_revision;
+    const auto source_revision = source.snapshot().project_revision;
+
+    REQUIRE(!ui.correct_agent_ghost_face(
+        target, face, carto::agent::GhostCorrectionKind::face_inset, 0.1, ""));
+    REQUIRE(!ui.correct_agent_ghost_face(
+        target, face, carto::agent::GhostCorrectionKind::face_inset,
+        std::numeric_limits<double>::quiet_NaN(), "Reject a non-finite correction."));
+    REQUIRE(!ui.correct_agent_ghost_face(
+        target, face, carto::agent::GhostCorrectionKind::face_extrusion,
+        -0.1, "Reject a negative correction distance."));
+    REQUIRE(!ui.correct_agent_ghost_face(
+        out_of_scope, face, carto::agent::GhostCorrectionKind::face_inset,
+        0.05, "Reject a face outside the declared scope."));
+    REQUIRE(!ui.correct_agent_ghost_face(
+        target, carto::geometry::FaceId{999999U},
+        carto::agent::GhostCorrectionKind::face_inset,
+        0.05, "Reject a missing face identity."));
+    REQUIRE(ui.snapshot().agent_task->speculative_revision == branch_revision);
+    REQUIRE(source.snapshot().project_revision == source_revision);
+
+    const auto first_corrected = ui.correct_agent_ghost_face(
+        target, face, carto::agent::GhostCorrectionKind::face_inset, 0.05,
+        "Inset the ghost face to preserve the intended frame clearance.");
+    REQUIRE(first_corrected &&
+        first_corrected.value().status == carto::agent::TaskStatus::review);
+    const auto* first_corrected_instance = first_corrected.value().after_scene.find(target);
+    REQUIRE(first_corrected_instance != nullptr && first_corrected_instance->mesh != nullptr);
+    const auto extrusion_face = first_corrected_instance->mesh->triangle_faces.back();
+    const auto corrected = ui.correct_agent_ghost_face(
+        target, extrusion_face, carto::agent::GhostCorrectionKind::face_extrusion, 0.025,
+        "Extrude the corrected ghost face to restore the shallow frame reveal.");
+    REQUIRE(corrected && corrected.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(corrected.value().can_accept);
+    REQUIRE(corrected.value().speculative_revision == branch_revision.next().next());
+    REQUIRE(corrected.value().ghost_corrections.size() == 2U);
+    const auto& receipt = corrected.value().ghost_corrections.front();
+    REQUIRE(receipt.kind == carto::agent::GhostCorrectionKind::face_inset);
+    REQUIRE(receipt.object == target);
+    REQUIRE(receipt.face == std::optional<carto::geometry::FaceId>(face));
+    REQUIRE(receipt.distance == 0.05);
+    REQUIRE(!receipt.before_mesh_digest.is_zero());
+    REQUIRE(!receipt.after_mesh_digest.is_zero());
+    REQUIRE(receipt.before_mesh_digest != receipt.after_mesh_digest);
+    REQUIRE(receipt.validate());
+    const auto& extrusion_receipt = corrected.value().ghost_corrections.back();
+    REQUIRE(extrusion_receipt.kind ==
+        carto::agent::GhostCorrectionKind::face_extrusion);
+    REQUIRE(extrusion_receipt.parent_evidence_digest == receipt.evidence_digest);
+    REQUIRE(extrusion_receipt.before_mesh_digest == receipt.after_mesh_digest);
+    REQUIRE(extrusion_receipt.validate());
+    REQUIRE(source.snapshot().project_revision == source_revision);
+    const auto* after_instance = corrected.value().after_scene.find(target);
+    REQUIRE(after_instance != nullptr && after_instance->mesh != nullptr);
+    REQUIRE(after_instance->mesh->triangle_faces.size() >
+        before_instance->mesh->triangle_faces.size());
+
+    TempDirectory directory;
+    const auto checkpoint_path = directory.path() / "ghost-topology.carto-agent-task";
+    REQUIRE(ui.save_agent_checkpoint(checkpoint_path));
+    const auto checkpoint = carto::agent::AgentTask::load_checkpoint(checkpoint_path);
+    REQUIRE(checkpoint);
+    auto forged = checkpoint.value();
+    forged.ghost_corrections.front().distance += 0.01;
+    REQUIRE(!forged.serialize());
+
+    carto::ui::UiController resumed_ui(source);
+    REQUIRE(resumed_ui.load_agent_checkpoint(checkpoint_path));
+    const auto resumed = resumed_ui.resume_agent_checkpoint();
+    REQUIRE(resumed && resumed.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(resumed.value().can_accept);
+    REQUIRE(resumed.value().ghost_corrections.size() == 2U);
+    REQUIRE(resumed.value().ghost_corrections.front().evidence_digest == receipt.evidence_digest);
+    REQUIRE(resumed.value().ghost_corrections.back().evidence_digest ==
+        extrusion_receipt.evidence_digest);
+    const auto* resumed_instance = resumed.value().after_scene.find(target);
+    REQUIRE(resumed_instance != nullptr && resumed_instance->mesh != nullptr);
+    REQUIRE(resumed_instance->mesh->triangle_faces.size() ==
+        after_instance->mesh->triangle_faces.size());
+
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Unrelated source edit before topology rebase", {0.5, 0.5, 0.5}}));
+    const auto rebased_revision = source.snapshot().project_revision;
+    carto::ui::UiController rebased_ui(source);
+    REQUIRE(rebased_ui.load_agent_checkpoint(checkpoint_path));
+    REQUIRE(rebased_ui.rebase_agent_checkpoint());
+    const auto rebased = rebased_ui.resume_agent_checkpoint();
+    REQUIRE(rebased && rebased.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(rebased.value().can_accept);
+    REQUIRE(rebased.value().ghost_corrections.size() == 2U);
+    REQUIRE(source.snapshot().project_revision == rebased_revision);
+    REQUIRE(rebased_ui.accept_agent_plan());
+    REQUIRE(source.snapshot().project_revision == rebased_revision.next());
+    const auto accepted_instance = source.snapshot().viewport.scene.find(target);
+    REQUIRE(accepted_instance != nullptr && accepted_instance->mesh != nullptr);
+    REQUIRE(accepted_instance->mesh->triangle_faces.size() ==
+        after_instance->mesh->triangle_faces.size());
+
+    carto::application::ApplicationSession bounded_source;
+    carto::ui::UiController bounded_ui(bounded_source);
+    REQUIRE(bounded_ui.dispatch(carto::application::CreateBoxAction{
+        "Topology-restricted target", {1.0, 1.0, 1.0}}));
+    const auto bounded_target = bounded_source.snapshot().objects.front().object.id;
+    REQUIRE(bounded_ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::vertex}));
+    const carto::geometry::VertexId bounded_vertex{1U};
+    REQUIRE(bounded_ui.dispatch(carto::application::SelectVertexAction{
+        bounded_target, bounded_vertex}));
+    REQUIRE(bounded_ui.set_agent_recipe("bounded-vertex-edit"));
+    REQUIRE(bounded_ui.queue_agent_step("move vertex to 0.5 0 0"));
+    const auto bounded_run = bounded_ui.run_agent_plan(
+        "Move the selected vertex while preserving topology");
+    REQUIRE(bounded_run && bounded_run.value().status == carto::agent::TaskStatus::review);
+    const auto bounded_revision = bounded_run.value().speculative_revision;
+    REQUIRE(!bounded_ui.correct_agent_ghost_face(
+        bounded_target, carto::geometry::FaceId{1U},
+        carto::agent::GhostCorrectionKind::face_extrusion,
+        0.05, "A topology correction must exceed this recipe's authority."));
+    REQUIRE(bounded_ui.snapshot().agent_task->speculative_revision == bounded_revision);
+
+    carto::application::ApplicationSession shared_source;
+    carto::ui::UiController shared_ui(shared_source);
+    REQUIRE(shared_ui.dispatch(carto::application::CreateBoxAction{
+        "Shared ghost mesh", {1.0, 1.0, 1.0}}));
+    const auto shared_target = shared_source.snapshot().objects.front().object.id;
+    REQUIRE(shared_ui.dispatch(carto::application::DuplicateMeshInstanceAction{
+        shared_target, "Out-of-scope shared instance", {2.0, 0.0, 0.0}}));
+    REQUIRE(shared_ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(shared_ui.dispatch(carto::application::SelectFaceAction{
+        shared_target, carto::geometry::FaceId{1U}}));
+    REQUIRE(shared_ui.queue_agent_step("inset face 0.1"));
+    const auto shared_run = shared_ui.run_agent_plan("Prepare the shared face for review");
+    const auto shared_task = shared_ui.snapshot().agent_task;
+    REQUIRE(shared_task.has_value());
+    REQUIRE(!shared_run || shared_run.value().status == shared_task->status);
+    REQUIRE(shared_task->status == carto::agent::TaskStatus::review ||
+        shared_task->status == carto::agent::TaskStatus::blocked);
+    const auto shared_revision = shared_task->speculative_revision;
+    REQUIRE(!shared_ui.correct_agent_ghost_face(
+        shared_target, carto::geometry::FaceId{1U},
+        carto::agent::GhostCorrectionKind::face_inset,
+        0.05, "A shared out-of-scope instance must block this correction."));
+    REQUIRE(shared_ui.snapshot().agent_task->speculative_revision == shared_revision);
+}
+
 void ui_ghost_corrections_remain_locked_through_repair() {
     carto::application::ApplicationSession source;
     carto::ui::UiController ui(source);
     REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
         "Repair ghost target", {1.0, 1.0, 1.0}}));
-    const auto target = source.snapshot().objects.front().object.id;
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Separate repair target", {1.0, 1.0, 1.0}}));
+    const auto initial = source.snapshot();
+    const auto target = initial.objects[0].object.id;
+    const auto repair_target = initial.objects[1].object.id;
+    const auto source_before = source.snapshot();
+    const auto* original_instance = source_before.viewport.scene.find(target);
+    REQUIRE(original_instance != nullptr && original_instance->mesh != nullptr);
+    const std::size_t original_triangle_count =
+        original_instance->mesh->triangle_faces.size();
     REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
         carto::editor::SelectionMode::face}));
     REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
         target, carto::geometry::FaceId{1U}}));
+    REQUIRE(ui.queue_agent_step("inset face 0.1"));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        repair_target, carto::geometry::FaceId{1U}}));
     REQUIRE(ui.queue_agent_step("inset face 1000"));
     const auto base_revision = source.snapshot().project_revision;
-    const auto failed = ui.run_agent_plan("Correct the failed branch by hand and repair it");
+    const auto failed = ui.run_agent_plan(
+        "Prepare two separate faces while preserving the first completed branch");
     REQUIRE(failed);
     REQUIRE(failed.value().status == carto::agent::TaskStatus::blocked);
 
-    auto corrected_transform = source.snapshot().objects.front().object.local_transform;
-    corrected_transform.translation.z = 1.25;
-    const auto corrected = ui.correct_agent_ghost_transform(
-        target, corrected_transform,
-        "Keep the edited ghost clear of the lower support during repair.");
+    const auto blocked_branch = ui.snapshot().agent_task.value();
+    const auto* blocked_target = blocked_branch.after_scene.find(target);
+    REQUIRE(blocked_target != nullptr && blocked_target->mesh != nullptr);
+    const auto correction_face = blocked_target->mesh->triangle_faces.front();
+    const auto corrected = ui.correct_agent_ghost_face(
+        target, correction_face,
+        carto::agent::GhostCorrectionKind::face_inset, 0.05,
+        "Inset the corrected ghost face while the failed branch is reviewed.");
     REQUIRE(corrected);
     REQUIRE(corrected.value().status == carto::agent::TaskStatus::blocked);
     REQUIRE(corrected.value().ghost_corrections.size() == 1U);
+    const auto& correction = corrected.value().ghost_corrections.front();
+    REQUIRE(correction.kind == carto::agent::GhostCorrectionKind::face_inset);
+    REQUIRE(correction.validate());
     REQUIRE(source.snapshot().project_revision == base_revision);
 
-    auto revised_step = ui.snapshot().agent_plan_draft.front();
+    auto revised_step = ui.snapshot().agent_plan_draft.back();
     revised_step.intent = "inset face 0.1";
     REQUIRE(ui.revise_agent_plan_step(revised_step));
     const auto repaired = ui.repair_agent_plan(
-        "Retry the face with a bounded inset while preserving the operator ghost correction.");
+        "Retry the other face with a bounded inset and keep the first ghost correction.");
     REQUIRE(repaired);
     REQUIRE(repaired.value().status == carto::agent::TaskStatus::review);
     REQUIRE(repaired.value().can_accept);
     REQUIRE(repaired.value().ghost_corrections.size() == 1U);
     REQUIRE(repaired.value().ghost_corrections.front().evidence_digest ==
-        corrected.value().ghost_corrections.front().evidence_digest);
+        correction.evidence_digest);
     REQUIRE(repaired.value().repairs.size() == 1U);
     REQUIRE(repaired.value().repairs.front().previous_ghost_correction_count == 1U);
     REQUIRE(!repaired.value().repairs.front().previous_ghost_correction_digest.is_zero());
@@ -3773,8 +3959,10 @@ void ui_ghost_corrections_remain_locked_through_repair() {
             return value.object.id == target;
         });
     REQUIRE(accepted != accepted_snapshot.objects.end());
-    REQUIRE(accepted->object.local_transform.translation.z ==
-        corrected_transform.translation.z);
+    REQUIRE(accepted->object.local_transform.translation.x == 0.0);
+    const auto* accepted_instance = accepted_snapshot.viewport.scene.find(target);
+    REQUIRE(accepted_instance != nullptr && accepted_instance->mesh != nullptr);
+    REQUIRE(accepted_instance->mesh->triangle_faces.size() > original_triangle_count);
 }
 
 } // namespace
@@ -3824,6 +4012,7 @@ int main() {
         ui_repair_invalidates_plan_bound_human_receipts_until_reanswered();
         ui_ghost_corrections_are_scoped_revalidated_and_checkpointed();
         ui_ghost_vertex_correction_is_scoped_replayed_and_checkpointed();
+        ui_ghost_topology_correction_is_scoped_replayed_and_checkpointed();
         ui_ghost_corrections_remain_locked_through_repair();
         persistent_checkpoint_replays_review_and_blocks_artifact_drift();
         persistent_checkpoint_reauthorization_and_stale_source_are_fail_closed();

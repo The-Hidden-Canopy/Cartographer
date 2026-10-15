@@ -1222,6 +1222,12 @@ struct DesktopState {
     carto::geometry::VertexId agent_ghost_selected_vertex{};
     carto::core::Vec3d agent_ghost_vertex_position{};
     carto::core::Revision agent_ghost_vertex_branch_revision{};
+    carto::scene::ObjectId agent_ghost_face_object{};
+    carto::geometry::FaceId agent_ghost_selected_face{};
+    carto::agent::GhostCorrectionKind agent_ghost_face_kind =
+        carto::agent::GhostCorrectionKind::face_inset;
+    double agent_ghost_face_distance = 0.1;
+    carto::core::Revision agent_ghost_face_branch_revision{};
     bool agent_ghost_edit_mode = false;
     int agent_clarification_impact = 0;
     int agent_step_dependency = 0;
@@ -7444,6 +7450,8 @@ struct DesktopState {
                 agent_ghost_selected_object = {};
                 agent_ghost_vertex_object = {};
                 agent_ghost_selected_vertex = {};
+                agent_ghost_face_object = {};
+                agent_ghost_selected_face = {};
             }
             ImGui::SameLine();
             if (ImGui::SmallButton("Show before")) {
@@ -7452,6 +7460,8 @@ struct DesktopState {
                 agent_ghost_selected_object = {};
                 agent_ghost_vertex_object = {};
                 agent_ghost_selected_vertex = {};
+                agent_ghost_face_object = {};
+                agent_ghost_selected_face = {};
             }
             ImGui::SameLine();
             if (ImGui::SmallButton("Show after")) agent_preview_mode = 2;
@@ -7466,6 +7476,8 @@ struct DesktopState {
                 agent_ghost_selected_object = {};
                 agent_ghost_vertex_object = {};
                 agent_ghost_selected_vertex = {};
+                agent_ghost_face_object = {};
+                agent_ghost_selected_face = {};
                 if (!agent_ghost_edit_mode) agent_ghost_justification.clear();
             }
             ImGui::EndDisabled();
@@ -7567,6 +7579,67 @@ struct DesktopState {
                         }
                     }
                     ImGui::EndDisabled();
+                    if (agent_ghost_face_object != agent_ghost_selected_object ||
+                        agent_ghost_face_branch_revision != task.speculative_revision) {
+                        agent_ghost_face_object = agent_ghost_selected_object;
+                        agent_ghost_selected_face = {};
+                        agent_ghost_face_distance = 0.1;
+                        agent_ghost_face_branch_revision = task.speculative_revision;
+                    }
+                    ImGui::Separator();
+                    ImGui::TextDisabled("Topology correction");
+                    std::set<carto::geometry::FaceId> ghost_face_ids(
+                        ghost_vertex_instance->mesh->triangle_faces.begin(),
+                        ghost_vertex_instance->mesh->triangle_faces.end());
+                    std::string selected_face_label = agent_ghost_selected_face
+                        ? "Face " + std::to_string(agent_ghost_selected_face.value)
+                        : "Select a ghost face";
+                    if (ImGui::BeginCombo("Ghost face", selected_face_label.c_str())) {
+                        for (const auto face_id : ghost_face_ids) {
+                            const std::string label = "Face " +
+                                std::to_string(face_id.value);
+                            const bool selected_face = face_id == agent_ghost_selected_face;
+                            if (ImGui::Selectable(label.c_str(), selected_face)) {
+                                agent_ghost_selected_face = face_id;
+                            }
+                        }
+                        ImGui::EndCombo();
+                    }
+                    const char* correction_kind_label =
+                        agent_ghost_face_kind == carto::agent::GhostCorrectionKind::face_extrusion
+                            ? "Extrude face" : "Inset face";
+                    if (ImGui::BeginCombo("Face operation", correction_kind_label)) {
+                        if (ImGui::Selectable("Inset face",
+                                agent_ghost_face_kind == carto::agent::GhostCorrectionKind::face_inset)) {
+                            agent_ghost_face_kind =
+                                carto::agent::GhostCorrectionKind::face_inset;
+                        }
+                        if (ImGui::Selectable("Extrude face",
+                                agent_ghost_face_kind == carto::agent::GhostCorrectionKind::face_extrusion)) {
+                            agent_ghost_face_kind =
+                                carto::agent::GhostCorrectionKind::face_extrusion;
+                        }
+                        ImGui::EndCombo();
+                    }
+                    ImGui::InputDouble("Ghost face distance", &agent_ghost_face_distance);
+                    ImGui::BeginDisabled(!agent_ghost_selected_face ||
+                        !source_revision_current || agent_ghost_justification.empty());
+                    if (ImGui::SmallButton("Apply topology correction")) {
+                        const auto corrected = ui.correct_agent_ghost_face(
+                            agent_ghost_selected_object, agent_ghost_selected_face,
+                            agent_ghost_face_kind, agent_ghost_face_distance,
+                            agent_ghost_justification);
+                        if (!corrected) {
+                            agent_feedback = corrected.error().message;
+                        } else {
+                            agent_feedback = corrected.value().status ==
+                                    carto::agent::TaskStatus::review
+                                ? "Topology correction locked on the speculative branch; gates pass."
+                                : "Topology correction locked on the speculative branch; a gate remains blocked.";
+                            agent_ghost_selected_face = {};
+                        }
+                    }
+                    ImGui::EndDisabled();
                 }
             }
             if (!task.ghost_corrections.empty()) {
@@ -7579,6 +7652,16 @@ struct DesktopState {
                             static_cast<unsigned long long>(correction.object.value),
                             static_cast<unsigned long long>(correction.vertex->value),
                             correction.justification.c_str());
+                    } else if (correction.face.has_value() && (correction.kind ==
+                            carto::agent::GhostCorrectionKind::face_inset ||
+                        correction.kind == carto::agent::GhostCorrectionKind::face_extrusion)) {
+                        ImGui::BulletText("%s · object %llu · face %llu · %s %.6g · %s",
+                            correction.task_id.c_str(),
+                            static_cast<unsigned long long>(correction.object.value),
+                            static_cast<unsigned long long>(correction.face->value),
+                            correction.kind == carto::agent::GhostCorrectionKind::face_inset
+                                ? "inset" : "extrude",
+                            correction.distance, correction.justification.c_str());
                     } else {
                         ImGui::BulletText("%s · object %llu · transform · %s",
                             correction.task_id.c_str(),

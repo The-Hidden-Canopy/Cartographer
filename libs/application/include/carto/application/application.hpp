@@ -42,6 +42,7 @@ class UiController;
 namespace carto::agent {
 class AgentTask;
 class SceneQuery;
+enum class GhostCorrectionKind : std::uint8_t;
 struct AgentPlan;
 }
 
@@ -822,6 +823,13 @@ private:
         scene::ObjectId object,
         geometry::VertexId vertex,
         core::Vec3d position,
+        std::string justification);
+    [[nodiscard]] static core::Result<void> correct_agent_ghost_face(
+        ::carto::agent::AgentTask& task,
+        scene::ObjectId object,
+        geometry::FaceId face,
+        ::carto::agent::GhostCorrectionKind kind,
+        double distance,
         std::string justification);
 
     [[nodiscard]] static core::Result<DispatchReceipt> commit_preview(

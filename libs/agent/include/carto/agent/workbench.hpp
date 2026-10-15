@@ -294,6 +294,8 @@ struct AgentRepairReceipt {
 enum class GhostCorrectionKind : std::uint8_t {
     object_transform,
     vertex_position,
+    face_inset,
+    face_extrusion,
 };
 
 // Immutable evidence for an operator-authored edit on the speculative branch.
@@ -304,10 +306,14 @@ struct GhostCorrectionReceipt {
     std::string task_id;
     scene::ObjectId object;
     std::optional<geometry::VertexId> vertex;
+    std::optional<geometry::FaceId> face;
     core::Transform before_transform = core::Transform::identity();
     core::Transform after_transform = core::Transform::identity();
     core::Vec3d before_position{};
     core::Vec3d after_position{};
+    double distance = 0.0;
+    assets::Sha256Digest before_mesh_digest;
+    assets::Sha256Digest after_mesh_digest;
     core::Revision source_revision;
     core::Revision branch_revision_before;
     core::Revision branch_revision_after;
@@ -555,7 +561,7 @@ struct AgentDemonstrationRecipe {
 // resumed task can run. Project bytes remain artifacts owned by this record;
 // they are never applied to the live source by loading a checkpoint.
 struct AgentTaskCheckpoint {
-    static constexpr std::uint32_t kFormatVersion = 6U;
+    static constexpr std::uint32_t kFormatVersion = 7U;
 
     TaskStatus status = TaskStatus::prepared;
     AgentPlan plan;
@@ -663,6 +669,12 @@ private:
         scene::ObjectId object,
         geometry::VertexId vertex,
         core::Vec3d position,
+        std::string justification);
+    [[nodiscard]] core::Result<void> correct_ghost_face(
+        scene::ObjectId object,
+        geometry::FaceId face,
+        GhostCorrectionKind kind,
+        double distance,
         std::string justification);
     [[nodiscard]] core::Result<void> apply_ghost_corrections();
     [[nodiscard]] const project::ProjectDocument& scene_query_document() const;

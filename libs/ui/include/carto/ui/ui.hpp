@@ -582,6 +582,12 @@ public:
         geometry::VertexId vertex,
         core::Vec3d position,
         std::string justification);
+    [[nodiscard]] core::Result<agent::AgentTaskSnapshot> correct_agent_ghost_face(
+        scene::ObjectId object,
+        geometry::FaceId face,
+        agent::GhostCorrectionKind kind,
+        double distance,
+        std::string justification);
     [[nodiscard]] core::Result<application::DispatchReceipt> accept_agent_plan();
     [[nodiscard]] core::Result<void> reject_agent_plan();
     [[nodiscard]] core::Result<void> clear_agent_plan();
