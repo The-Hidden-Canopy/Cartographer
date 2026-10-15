@@ -6810,6 +6810,18 @@ struct DesktopState {
         const bool unresolved_task = snapshot.agent_task.has_value() &&
             snapshot.agent_task->status != carto::agent::TaskStatus::accepted &&
             snapshot.agent_task->status != carto::agent::TaskStatus::rejected;
+        ImGui::TextDisabled(
+            "Build a reviewable plan from supported native commands separated by “then” or semicolons.");
+        ImGui::BeginDisabled(!selected_target || agent_goal.empty() ||
+            !snapshot.agent_plan_draft.empty() || snapshot.agent_task.has_value() ||
+            snapshot.agent_checkpoint_loaded || !objective_constraints_valid);
+        if (ImGui::Button("Compile goal sequence", ImVec2(-1, 28))) {
+            const auto compiled = ui.compile_agent_goal_sequence(agent_goal);
+            agent_feedback = compiled
+                ? "Goal compiled into a bounded plan. Review its steps before preparing the task."
+                : compiled.error().message;
+        }
+        ImGui::EndDisabled();
         ImGui::BeginDisabled(!selected_target || agent_step.empty() || unresolved_task);
         if (ImGui::Button("Queue selected target", ImVec2(-1, 28))) {
             std::vector<std::string> dependencies;

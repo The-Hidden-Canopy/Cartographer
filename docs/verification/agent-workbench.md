@@ -131,6 +131,13 @@
 - The strip is hidden in the Agent workspace, after acceptance/rejection, and when no task exists.
 - Native-shell smoke coverage should click the global “Ask Cartographer” entry from Project, Market, and Model surfaces, then confirm Agent workspace navigation and goal-field focus without changing task or project state.
 
+## Goal-to-plan compilation
+
+- The goal editor compiles supported native command clauses separated by case-insensitive `then` or semicolons into a linear plan DAG bound to the one selected object, face, or vertex and the captured source revision.
+- Compilation validates each clause against the native preview ontology and installs no partial plan when a clause is unsupported. The source revision remains unchanged; task preparation and execution still require their existing explicit UI actions.
+- The sequence limit is 16 commands. Extra instruction text is rejected by the native planner rather than silently ignored, and an existing manual draft cannot be replaced by compilation.
+- An end-to-end controller fixture compiles two object translations, checks their dependency edge, prepares and runs the task speculatively, verifies the live source remains unchanged before acceptance, then accepts the result through the human application boundary.
+
 ## Recipe contract coverage
 
 - `Bounded mesh edit` keeps the operator-authored plan and binds its recipe ID into objective and clarification digests; changing a recipe after a human answer is rejected until the objective is reauthorized.

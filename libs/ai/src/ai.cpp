@@ -991,27 +991,52 @@ core::Result<Proposal> NativePlanner::propose(
     }
 
     if (words.front() == "extrude" || words.front() == "extrude-face") {
-        if (parsed_numbers.value().size() != 1U) {
+        const bool exact_syntax = parsed_numbers.value().size() == 1U &&
+            static_cast<bool>(parse_number(words.back())) &&
+            ((words.size() == 2U &&
+                 (words[0] == "extrude" || words[0] == "extrude-face")) ||
+             (words.size() == 3U && words[0] == "extrude" && words[1] == "face") ||
+             (words.size() == 4U && words[0] == "extrude" && words[1] == "face" &&
+                 words[2] == "by"));
+        if (!exact_syntax) {
             return core::Result<Proposal>::failure(invalid(
-                "extrude intent requires exactly one distance"));
+                "extrude intent must be `extrude <distance>`, `extrude face <distance>`, "
+                "`extrude face by <distance>`, or `extrude-face <distance>`"));
         }
         return make_face_proposal(
             request_id, std::string(intent), context, "mesh.extrude-face",
             editor::PreviewKind::extrude_face, parsed_numbers.value().front());
     }
     if (words.front() == "inset" || words.front() == "inset-face") {
-        if (parsed_numbers.value().size() != 1U) {
+        const bool exact_syntax = parsed_numbers.value().size() == 1U &&
+            static_cast<bool>(parse_number(words.back())) &&
+            ((words.size() == 2U &&
+                 (words[0] == "inset" || words[0] == "inset-face")) ||
+             (words.size() == 3U && words[0] == "inset" && words[1] == "face") ||
+             (words.size() == 4U && words[0] == "inset" && words[1] == "face" &&
+                 words[2] == "by"));
+        if (!exact_syntax) {
             return core::Result<Proposal>::failure(invalid(
-                "inset intent requires exactly one distance"));
+                "inset intent must be `inset <distance>`, `inset face <distance>`, "
+                "`inset face by <distance>`, or `inset-face <distance>`"));
         }
         return make_face_proposal(
             request_id, std::string(intent), context, "mesh.inset-face",
             editor::PreviewKind::inset_face, parsed_numbers.value().front());
     }
     if (words.front() == "move" || words.front() == "set") {
-        if (words.size() < 2U || words[1] != "vertex" || parsed_numbers.value().size() != 3U) {
+        const bool exact_syntax =
+            (words.size() == 5U || (words.size() == 6U && words[2] == "to")) &&
+            words[1] == "vertex" && parsed_numbers.value().size() == 3U;
+        const std::size_t coordinate_offset = words.size() == 6U ? 3U : 2U;
+        const bool coordinates_valid = exact_syntax &&
+            static_cast<bool>(parse_number(words[coordinate_offset])) &&
+            static_cast<bool>(parse_number(words[coordinate_offset + 1U])) &&
+            static_cast<bool>(parse_number(words[coordinate_offset + 2U]));
+        if (!coordinates_valid) {
             return core::Result<Proposal>::failure(invalid(
-                "move vertex intent requires exactly three coordinates"));
+                "vertex intent must be `move vertex <x> <y> <z>` or "
+                "`move vertex to <x> <y> <z>`"));
         }
         Proposal proposal{
             request_id, context.project_revision, context.authoring,

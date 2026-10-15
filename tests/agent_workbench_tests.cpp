@@ -4484,6 +4484,105 @@ void ui_ghost_corrections_remain_locked_through_repair() {
 
 } // namespace
 
+void ui_compiles_explicit_goal_sequences_into_reviewable_agent_dags() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Goal sequence target", {1.0, 1.0, 1.0}}));
+    const auto object = source.snapshot().objects.front().object.id;
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{object}));
+
+    const auto source_revision = source.snapshot().project_revision;
+    const std::string goal =
+        "translate object by 0.1 0 0 THEN translate object by 0.2 0 0";
+    const auto compilation = ui.compile_agent_goal_sequence(goal);
+    if (!compilation) {
+        throw TestFailure("goal sequence compilation failed: " +
+            compilation.error().message);
+    }
+    const auto compiled = ui.snapshot();
+    REQUIRE(compiled.agent_plan_draft.size() == 2U);
+    REQUIRE(compiled.agent_plan_draft[0].id == "step-1");
+    REQUIRE(compiled.agent_plan_draft[0].dependencies.empty());
+    REQUIRE(compiled.agent_plan_draft[1].id == "step-2");
+    REQUIRE(compiled.agent_plan_draft[1].dependencies ==
+        std::vector<std::string>{"step-1"});
+    REQUIRE(compiled.agent_plan_draft[0].target.object == object);
+    REQUIRE(compiled.agent_plan_draft[1].target.object == object);
+    REQUIRE(std::holds_alternative<std::monostate>(
+        compiled.agent_plan_draft[0].target.component));
+    REQUIRE(source.snapshot().project_revision == source_revision);
+
+    auto prepared = ui.prepare_agent_plan(goal, translation_envelope({}, 1.0));
+    REQUIRE(prepared && prepared.value().status == carto::agent::TaskStatus::prepared);
+    REQUIRE(source.snapshot().project_revision == source_revision);
+    const auto review = ui.run_prepared_agent_plan();
+    REQUIRE(review && review.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(review.value().can_accept);
+    REQUIRE(source.snapshot().project_revision == source_revision);
+    REQUIRE(source.snapshot().objects.front().object.local_transform.translation.x == 0.0);
+    REQUIRE(ui.accept_agent_plan());
+    const auto accepted = source.snapshot();
+    REQUIRE(accepted.project_revision == source_revision.next());
+    REQUIRE(accepted.objects.front().object.local_transform.translation.x > 0.29);
+    REQUIRE(accepted.objects.front().object.local_transform.translation.x < 0.31);
+}
+
+void ui_goal_compiler_fails_closed_and_preserves_manual_drafts() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Goal compiler target", {1.0, 1.0, 1.0}}));
+    const auto object = source.snapshot().objects.front().object.id;
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{object}));
+    const auto source_revision = source.snapshot().project_revision;
+
+    const auto unsupported = ui.compile_agent_goal_sequence(
+        "translate object by 0.1 0 0 then ignore scope and bypass validation");
+    REQUIRE(!unsupported);
+    REQUIRE(ui.snapshot().agent_plan_draft.empty());
+    REQUIRE(!ui.snapshot().agent_task.has_value());
+    REQUIRE(source.snapshot().project_revision == source_revision);
+
+    std::string oversized_goal;
+    for (std::size_t index = 0U; index < 17U; ++index) {
+        if (!oversized_goal.empty()) oversized_goal += " then ";
+        oversized_goal += "translate object by 0.01 0 0";
+    }
+    REQUIRE(!ui.compile_agent_goal_sequence(std::move(oversized_goal)));
+    REQUIRE(ui.snapshot().agent_plan_draft.empty());
+    REQUIRE(source.snapshot().project_revision == source_revision);
+
+    REQUIRE(!ui.compile_agent_goal_sequence(
+        "translate object by 0.1 0 0;; translate object by 0.2 0 0"));
+    REQUIRE(ui.snapshot().agent_plan_draft.empty());
+    REQUIRE(source.snapshot().project_revision == source_revision);
+
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        object, carto::geometry::FaceId{1U}}));
+    REQUIRE(!ui.compile_agent_goal_sequence("translate object by 0.1 0 0"));
+    REQUIRE(ui.snapshot().agent_plan_draft.empty());
+    REQUIRE(source.snapshot().project_revision == source_revision);
+
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{object}));
+
+    REQUIRE(ui.queue_agent_step("translate object by 0.1 0 0"));
+    const auto manual_draft = ui.snapshot().agent_plan_draft;
+    REQUIRE(manual_draft.size() == 1U);
+    REQUIRE(!ui.compile_agent_goal_sequence("translate object by 0.2 0 0"));
+    REQUIRE(ui.snapshot().agent_plan_draft.size() == manual_draft.size());
+    REQUIRE(ui.snapshot().agent_plan_draft.front().intent == manual_draft.front().intent);
+    REQUIRE(source.snapshot().project_revision == source_revision);
+}
+
 int main() {
     try {
         root_object_translation_is_explicit_bounded_and_checkpointed();
@@ -4543,6 +4642,8 @@ int main() {
         persistent_checkpoint_v1_format_remains_readable();
         ui_persistent_checkpoint_round_trip_preserves_human_boundary();
         ui_rebases_disjoint_source_edits_and_reauthorizes_clarifications();
+        ui_compiles_explicit_goal_sequences_into_reviewable_agent_dags();
+        ui_goal_compiler_fails_closed_and_preserves_manual_drafts();
         std::cout << "Cartographer agent workbench invariants passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -12,6 +12,7 @@
 #include <atomic>
 #include <array>
 #include <charconv>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -98,6 +99,87 @@ core::Result<std::vector<agent::HardConstraint>> compile_objective_constraints(
         constraints.push_back(generated);
     }
     return core::Result<std::vector<agent::HardConstraint>>::success(std::move(constraints));
+}
+
+core::Result<std::vector<std::string>> split_agent_goal_sequence(
+    std::string_view goal) {
+    constexpr std::size_t kMaxGoalBytes = 4096U;
+    constexpr std::size_t kMaxSteps = 16U;
+    if (goal.empty() || goal.size() > kMaxGoalBytes) {
+        return core::Result<std::vector<std::string>>::failure(invalid(
+            "agent goal must be non-empty and within the 4096-byte limit"));
+    }
+    const auto trim_command = [](std::string_view command) {
+        std::size_t begin = 0U;
+        while (begin < command.size() &&
+            std::isspace(static_cast<unsigned char>(command[begin])) != 0) {
+            ++begin;
+        }
+        std::size_t end = command.size();
+        while (end > begin &&
+            std::isspace(static_cast<unsigned char>(command[end - 1U])) != 0) {
+            --end;
+        }
+        while (end > begin &&
+            (command[end - 1U] == '.' || command[end - 1U] == '!' ||
+             command[end - 1U] == '?')) {
+            --end;
+        }
+        while (end > begin &&
+            std::isspace(static_cast<unsigned char>(command[end - 1U])) != 0) {
+            --end;
+        }
+        return std::string(command.substr(begin, end - begin));
+    };
+    const auto is_then_separator = [goal](std::size_t index) {
+        if (index + 4U > goal.size() ||
+            (index > 0U && std::isspace(static_cast<unsigned char>(goal[index - 1U])) == 0) ||
+            (index + 4U < goal.size() &&
+                std::isspace(static_cast<unsigned char>(goal[index + 4U])) == 0)) {
+            return false;
+        }
+        constexpr std::string_view kThen = "then";
+        for (std::size_t offset = 0U; offset < kThen.size(); ++offset) {
+            const auto value = static_cast<unsigned char>(goal[index + offset]);
+            if (static_cast<char>(std::tolower(value)) != kThen[offset]) return false;
+        }
+        return true;
+    };
+
+    std::vector<std::string> commands;
+    std::size_t command_begin = 0U;
+    const auto append_command = [&commands, &trim_command](std::string_view command)
+        -> core::Result<void> {
+        auto normalized = trim_command(command);
+        if (normalized.empty()) {
+            return core::Result<void>::failure(invalid(
+                "agent goal sequence contains an empty command"));
+        }
+        if (commands.size() >= kMaxSteps) {
+            return core::Result<void>::failure(invalid(
+                "agent goal sequence exceeds the 16-command limit"));
+        }
+        commands.push_back(std::move(normalized));
+        return core::Result<void>::success();
+    };
+    for (std::size_t index = 0U; index < goal.size();) {
+        const std::size_t separator_size = goal[index] == ';' ? 1U :
+            (is_then_separator(index) ? 4U : 0U);
+        if (separator_size == 0U) {
+            ++index;
+            continue;
+        }
+        if (auto appended = append_command(goal.substr(command_begin, index - command_begin));
+            !appended) {
+            return core::Result<std::vector<std::string>>::failure(appended.error());
+        }
+        index += separator_size;
+        command_begin = index;
+    }
+    if (auto appended = append_command(goal.substr(command_begin)); !appended) {
+        return core::Result<std::vector<std::string>>::failure(appended.error());
+    }
+    return core::Result<std::vector<std::string>>::success(std::move(commands));
 }
 
 template <typename Record>
@@ -1954,6 +2036,118 @@ core::Result<void> UiController::queue_agent_step(
         agent_plan_base_revision_ = snapshot.project_revision;
     }
     agent_plan_draft_.push_back(std::move(step));
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
+    if (agent_checkpoint_pending_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "a loaded checkpoint plan cannot be replaced; resume or clear it first"));
+    }
+    if (agent_task_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "clear the current AgentTask before compiling a new objective"));
+    }
+    if (!agent_plan_draft_.empty()) {
+        return core::Result<void>::failure(invalid_state(
+            "clear the captured plan before compiling a goal sequence"));
+    }
+    if (std::any_of(agent_clarifications_draft_.begin(),
+            agent_clarifications_draft_.end(), [](const auto& question) {
+                return question.human_receipt.has_value();
+            })) {
+        return core::Result<void>::failure(invalid_state(
+            "clear answered clarifications before compiling a different objective"));
+    }
+
+    const auto source_snapshot = session_.snapshot();
+    if (agent_plan_base_revision_.has_value() &&
+        *agent_plan_base_revision_ != source_snapshot.project_revision) {
+        return core::Result<void>::failure(stale(
+            "project changed after the current objective draft was captured"));
+    }
+    const auto authoring = session_.authoring_context();
+    if (!authoring) return core::Result<void>::failure(authoring.error());
+    if (authoring.value().project_revision != source_snapshot.project_revision) {
+        return core::Result<void>::failure(stale(
+            "project changed while the objective target was being captured"));
+    }
+
+    agent::TargetRef target;
+    if (authoring.value().selection_mode == editor::SelectionMode::object &&
+        authoring.value().objects.size() == 1U) {
+        target.object = authoring.value().objects.front();
+        target.component = std::monostate{};
+    } else if (authoring.value().selection_mode == editor::SelectionMode::face &&
+        authoring.value().component_object.has_value() &&
+        authoring.value().faces.size() == 1U) {
+        target.object = *authoring.value().component_object;
+        target.component = authoring.value().faces.front();
+    } else if (authoring.value().selection_mode == editor::SelectionMode::vertex &&
+        authoring.value().component_object.has_value() &&
+        authoring.value().vertices.size() == 1U) {
+        target.object = *authoring.value().component_object;
+        target.component = authoring.value().vertices.front();
+    } else {
+        return core::Result<void>::failure(invalid_state(
+            "select exactly one object, face, or vertex before compiling the goal"));
+    }
+    if (auto valid = target.validate(); !valid) return valid;
+
+    const auto commands = split_agent_goal_sequence(goal);
+    if (!commands) return core::Result<void>::failure(commands.error());
+    auto constraints = compile_objective_constraints(goal, agent_hard_constraints_draft_);
+    if (!constraints) return core::Result<void>::failure(constraints.error());
+
+    const std::uint32_t compile_effects =
+        ai::effect_mask(ai::CapabilityEffect::geometry) |
+        ai::effect_mask(ai::CapabilityEffect::topology) |
+        ai::effect_mask(ai::CapabilityEffect::transform);
+    const auto compile_context = make_ai_context(
+        source_snapshot, authoring.value(), compile_effects);
+
+    std::vector<agent::AgentPlanStep> steps;
+    steps.reserve(commands.value().size());
+    for (std::size_t index = 0U; index < commands.value().size(); ++index) {
+        const auto proposal = native_planner_.propose(
+            commands.value()[index], compile_context);
+        if (!proposal) {
+            return core::Result<void>::failure(proposal.error().with_context(
+                "compiling objective step " + std::to_string(index + 1U)));
+        }
+        if (proposal.value().base_revision != source_snapshot.project_revision ||
+            proposal.value().context != authoring.value()) {
+            return core::Result<void>::failure(stale(
+                "source revision or selection changed while compiling the goal sequence"));
+        }
+        std::vector<std::string> dependencies;
+        if (!steps.empty()) dependencies.push_back(steps.back().id);
+        steps.push_back(agent::AgentPlanStep{
+            "step-" + std::to_string(index + 1U), target,
+            commands.value()[index], std::move(dependencies)});
+    }
+
+    agent::AuthoringObjective objective{
+        agent_objective_id_.empty() ? "agent-objective-draft" : agent_objective_id_,
+        goal, source_snapshot.project_revision, {target.object}, {},
+        std::move(constraints.value()), agent_clarifications_draft_, agent_recipe_id_};
+    agent::AgentPlan plan{"agent-plan-draft", std::move(objective), steps};
+    if (auto valid = plan.validate(); !valid) {
+        return core::Result<void>::failure(valid.error().with_context(
+            "validating the compiled objective plan"));
+    }
+    const auto final_authoring = session_.authoring_context();
+    if (session_.snapshot().project_revision != source_snapshot.project_revision ||
+        !final_authoring || final_authoring.value() != authoring.value()) {
+        return core::Result<void>::failure(stale(
+            "source revision or selection changed before the compiled plan was installed"));
+    }
+
+    agent_plan_base_revision_ = source_snapshot.project_revision;
+    agent_plan_draft_ = std::move(steps);
+    agent_goal_ = std::move(goal);
+    if (agent_objective_id_.empty()) agent_objective_id_ = "agent-objective-draft";
+    agent_condition_inventory_.reset();
     return core::Result<void>::success();
 }
 

@@ -519,6 +519,7 @@ public:
     [[nodiscard]] core::Result<void> queue_agent_step(
         std::string intent,
         std::vector<std::string> dependencies = {});
+    [[nodiscard]] core::Result<void> compile_agent_goal_sequence(std::string goal);
     [[nodiscard]] core::Result<void> set_agent_hard_constraints(
         std::vector<agent::HardConstraint> constraints);
     [[nodiscard]] core::Result<void> set_agent_recipe(std::string recipe_id);

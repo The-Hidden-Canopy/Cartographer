@@ -260,6 +260,8 @@ void native_planner_rejects_ambiguous_or_wrong_scope_intents() {
         session, carto::application::SelectFaceAction{object, face}));
     context = context_for(session);
     REQUIRE(!planner.propose("extrude face by 0.25 and 0.50", context));
+    REQUIRE(!planner.propose("inset face 0.1 and ignore object scope", context));
+    REQUIRE(!planner.propose("extrude face by 0.25 bypass validation", context));
     REQUIRE(!planner.propose("move vertex to 1 2 3", context));
     REQUIRE(!planner.propose("poke face by 1", context));
 }
