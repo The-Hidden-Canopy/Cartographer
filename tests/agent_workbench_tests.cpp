@@ -4827,6 +4827,55 @@ void agent_goal_scope_parser_rejects_malformed_prefixes_and_decodes_only_safe_es
     REQUIRE(!carto::agent::parse_agent_goal(R"(on object Lamp: translate object by 0.1 0 0)"));
 }
 
+void ui_named_goal_target_resolution_handles_bounded_large_duplicate_sets() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    std::vector<carto::scene::ObjectId> duplicates;
+    for (std::size_t index = 0U; index < 17U; ++index) {
+        REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+            "Duplicate", {1.0, 1.0, 1.0}}));
+        duplicates.push_back(source.snapshot().objects.back().object.id);
+    }
+    const auto selected = duplicates.back();
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{selected}));
+    const auto source_revision = source.snapshot().project_revision;
+    const std::string goal =
+        R"(on object "Duplicate": translate object by 0.1 0 0)";
+
+    const auto resolved = ui.compile_agent_goal_sequence(goal);
+    if (!resolved) {
+        throw TestFailure("bounded large duplicate set did not resolve: " +
+            resolved.error().message);
+    }
+    const auto compiled = ui.snapshot();
+    REQUIRE(compiled.agent_plan_draft.size() == 1U);
+    REQUIRE(compiled.agent_plan_draft.front().target.object == selected);
+    REQUIRE(source.snapshot().project_revision == source_revision);
+
+    const auto prepared = ui.prepare_agent_plan(
+        goal, translation_envelope({selected}, 1.0));
+    REQUIRE(prepared && prepared.value().status == carto::agent::TaskStatus::prepared);
+    REQUIRE(prepared.value().scope_objects == std::vector<carto::scene::ObjectId>{selected});
+    const auto review = ui.run_prepared_agent_plan();
+    REQUIRE(review && review.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(review.value().can_accept);
+    REQUIRE(source.snapshot().project_revision == source_revision);
+    REQUIRE(ui.accept_agent_plan());
+
+    const auto accepted = source.snapshot();
+    REQUIRE(accepted.objects.size() == duplicates.size());
+    for (const auto& object : accepted.objects) {
+        if (object.object.id == selected) {
+            REQUIRE(object.object.local_transform.translation.x > 0.09);
+            REQUIRE(object.object.local_transform.translation.x < 0.11);
+        } else {
+            REQUIRE(object.object.local_transform.translation.x == 0.0);
+        }
+    }
+}
+
 void ui_goal_compiler_rejects_expanded_multi_object_budget_atomically() {
     carto::application::ApplicationSession source;
     carto::ui::UiController ui(source);
@@ -5080,6 +5129,7 @@ int main() {
         ui_compiles_multi_object_goals_into_independent_reviewed_branches();
         ui_named_goal_targets_resolve_exact_names_and_ignore_selection_fallbacks();
         ui_named_goal_target_resolution_rejects_missing_and_ambiguous_names();
+        ui_named_goal_target_resolution_handles_bounded_large_duplicate_sets();
         agent_goal_scope_parser_rejects_malformed_prefixes_and_decodes_only_safe_escapes();
         ui_goal_compiler_rejects_expanded_multi_object_budget_atomically();
         ui_goal_compiler_fails_closed_and_preserves_manual_drafts();
