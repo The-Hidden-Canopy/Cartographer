@@ -459,6 +459,7 @@ struct UiSnapshot : application::ApplicationSnapshot {
     std::string agent_demonstration_recipe_name;
     std::vector<AgentDemonstrationTargetBindingView> agent_demonstration_bindings;
     std::size_t agent_demonstration_target_set_count = 1U;
+    bool agent_demonstration_similar_targets_supported = false;
     bool agent_demonstration_ready_to_preview = false;
 };
 

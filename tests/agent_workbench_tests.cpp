@@ -1124,6 +1124,73 @@ void native_demonstrations_apply_to_unique_exact_structural_matches() {
     REQUIRE(source.snapshot().project_revision == revision_before_preview);
 }
 
+void native_demonstration_multi_command_translations_match_similar_objects() {
+    TempDirectory directory;
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreatePlaneAction{
+        "CANARY_TRANSLATION_EXEMPLAR", 2.0, 2.0}));
+    const auto exemplar = source.snapshot().objects.front().object.id;
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{exemplar}));
+
+    auto transform = source.snapshot().objects.front().object.local_transform;
+    transform.translation.x += 0.5;
+    REQUIRE(ui.dispatch(carto::application::SetObjectTransformAction{
+        exemplar, transform, std::nullopt}));
+    transform = source.snapshot().objects.front().object.local_transform;
+    transform.translation.z += 0.25;
+    REQUIRE(ui.dispatch(carto::application::SetObjectTransformAction{
+        exemplar, transform, std::nullopt}));
+
+    const auto captured_operations = source.snapshot().native_operation_trace;
+    REQUIRE(captured_operations.size() == 2U);
+    REQUIRE(ui.capture_agent_demonstration_trace(
+        captured_operations.front().operation_id,
+        captured_operations.back().operation_id));
+    const auto captured = ui.snapshot().agent_demonstration_trace;
+    REQUIRE(captured.has_value());
+    REQUIRE(captured->steps.size() == 2U);
+    REQUIRE(ui.snapshot().agent_demonstration_similar_targets_supported);
+
+    auto mismatched = *captured;
+    REQUIRE(mismatched.steps[1].structure_signature.has_value());
+    mismatched.steps[1].structure_signature->bytes[0] ^= 0x01U;
+    const auto mismatched_path = directory.path() / "mismatched-translation-trace.carto-agent-trace";
+    REQUIRE(mismatched.save(mismatched_path));
+    REQUIRE(ui.load_agent_demonstration_trace(mismatched_path));
+    REQUIRE(!ui.snapshot().agent_demonstration_similar_targets_supported);
+    REQUIRE(!ui.apply_agent_demonstration_to_similar());
+
+    const auto valid_path = directory.path() / "valid-translation-trace.carto-agent-trace";
+    REQUIRE(captured->save(valid_path));
+    REQUIRE(ui.load_agent_demonstration_trace(valid_path));
+    REQUIRE(ui.dispatch(carto::application::CreatePlaneAction{
+        "CANARY_TRANSLATION_TARGET", 2.0, 2.0}));
+    const auto target = source.snapshot().objects.back().object.id;
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{exemplar}));
+
+    const auto bound_count = ui.apply_agent_demonstration_to_similar();
+    REQUIRE(bound_count && bound_count.value() == 1U);
+    const auto bound = ui.snapshot();
+    REQUIRE(bound.agent_demonstration_bindings.size() == 1U);
+    REQUIRE(bound.agent_demonstration_bindings.front().bound);
+    REQUIRE(bound.agent_demonstration_bindings.front().target_label.find(
+        "CANARY_TRANSLATION_TARGET") != std::string::npos);
+
+    const auto source_revision = source.snapshot().project_revision;
+    const auto preview = ui.preview_agent_demonstration_trace();
+    REQUIRE(preview);
+    REQUIRE(preview.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(preview.value().plan_steps.size() == 2U);
+    const auto preview_plan = ui.snapshot().agent_plan_draft;
+    REQUIRE(preview_plan.size() == 2U);
+    REQUIRE(preview_plan[0].target.object == target);
+    REQUIRE(preview_plan[1].target.object == target);
+    REQUIRE(source.snapshot().project_revision == source_revision);
+}
+
 void native_demonstrations_skip_ambiguous_structural_matches() {
     carto::application::ApplicationSession source;
     carto::ui::UiController ui(source);
@@ -3319,6 +3386,7 @@ int main() {
         vertex_demonstration_stores_relative_displacement_only();
         human_native_command_range_captures_alias_only_trace();
         native_demonstrations_apply_to_unique_exact_structural_matches();
+        native_demonstration_multi_command_translations_match_similar_objects();
         native_demonstrations_skip_ambiguous_structural_matches();
         plan_dag_orders_dependencies_and_rejects_invalid_graphs();
         failed_dag_node_invalidates_only_dependent_steps();

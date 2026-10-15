@@ -158,6 +158,31 @@ std::vector<AgentDemonstrationTargetBindingView> demonstration_binding_requireme
     return requirements;
 }
 
+bool supports_demonstration_structural_matching(
+    const agent::AgentDemonstrationTrace& trace) {
+    if (trace.steps.empty()) return false;
+    const auto& first = trace.steps.front();
+    if (!first.structure_signature.has_value() ||
+        !first.result_object_structure_signature.has_value()) {
+        return false;
+    }
+    if (trace.steps.size() == 1U) return true;
+    if (first.target_kind != agent::AgentDemonstrationTargetKind::object ||
+        first.tool_id != "object.translate" || first.target_alias == 0U ||
+        first.component_alias != 0U ||
+        first.structure_signature != first.result_object_structure_signature) {
+        return false;
+    }
+    return std::all_of(trace.steps.begin(), trace.steps.end(), [&first](const auto& step) {
+        return step.target_kind == agent::AgentDemonstrationTargetKind::object &&
+            step.tool_id == "object.translate" &&
+            step.target_alias == first.target_alias &&
+            step.component_alias == first.component_alias &&
+            step.structure_signature == first.structure_signature &&
+            step.result_object_structure_signature == first.result_object_structure_signature;
+    });
+}
+
 core::Result<std::string> demonstration_number_text(double value) {
     if (!std::isfinite(value)) {
         return core::Result<std::string>::failure(invalid(
@@ -2704,10 +2729,6 @@ core::Result<std::size_t> UiController::apply_agent_demonstration_to_similar() {
     if (auto valid_trace = agent_demonstration_trace_->validate(); !valid_trace) {
         return core::Result<std::size_t>::failure(valid_trace.error());
     }
-    if (agent_demonstration_trace_->steps.size() != 1U) {
-        return core::Result<std::size_t>::failure(unsupported(
-            "automatic correspondence currently supports one captured command at a time"));
-    }
     const auto& trace_step = agent_demonstration_trace_->steps.front();
     if (!trace_step.structure_signature.has_value()) {
         return core::Result<std::size_t>::failure(unsupported(
@@ -2716,6 +2737,10 @@ core::Result<std::size_t> UiController::apply_agent_demonstration_to_similar() {
     if (!trace_step.result_object_structure_signature.has_value()) {
         return core::Result<std::size_t>::failure(unsupported(
             "this demonstration has no post-command exemplar evidence"));
+    }
+    if (!supports_demonstration_structural_matching(*agent_demonstration_trace_)) {
+        return core::Result<std::size_t>::failure(unsupported(
+            "multi-command correspondence requires one object alias of translations with unchanged structural signatures"));
     }
 
     const auto snapshot = session_.snapshot();
@@ -4710,6 +4735,8 @@ UiSnapshot UiController::snapshot() const {
     result.agent_demonstration_target_set_count =
         agent_demonstration_target_set_count_;
     if (agent_demonstration_trace_.has_value()) {
+        result.agent_demonstration_similar_targets_supported =
+            supports_demonstration_structural_matching(*agent_demonstration_trace_);
         const bool bindings_current = agent_demonstration_binding_revision_.has_value() &&
             *agent_demonstration_binding_revision_ == result.project_revision;
         auto requirements = demonstration_binding_requirements(

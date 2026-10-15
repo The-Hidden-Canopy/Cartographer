@@ -7192,10 +7192,8 @@ struct DesktopState {
                 ImGui::SeparatorText("Bind trace aliases to selected targets");
                 ImGui::TextDisabled(
                     "Use explicit bindings for exact target choices, or select the completed exemplar object and apply its topology-only matches.");
-                const bool has_structural_evidence = trace.steps.size() == 1U &&
-                    trace.steps.front().structure_signature.has_value() &&
-                    trace.steps.front().result_object_structure_signature.has_value();
-                ImGui::BeginDisabled(!has_structural_evidence);
+                ImGui::BeginDisabled(
+                    !snapshot.agent_demonstration_similar_targets_supported);
                 if (ImGui::SmallButton("Apply to similar")) {
                     const auto applied = ui.apply_agent_demonstration_to_similar();
                     agent_feedback = applied
@@ -7206,7 +7204,7 @@ struct DesktopState {
                 ImGui::EndDisabled();
                 ImGui::SameLine();
                 ImGui::TextDisabled(
-                    "One command only; ambiguous signature matches are skipped. Select the completed source object as the exemplar.");
+                    "Stable-structure translation chains and single commands only; ambiguous matches are skipped. Select the completed source object as the exemplar.");
                 int target_set_count = static_cast<int>(
                     snapshot.agent_demonstration_target_set_count);
                 ImGui::SetNextItemWidth(120.0F);
