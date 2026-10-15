@@ -204,6 +204,7 @@ struct AgentWorkEnvelope {
     std::size_t max_query_result_bytes = 1U * 1024U * 1024U;
     std::size_t max_repair_attempts = 2U;
     std::size_t max_additional_operations = 4U;
+    std::size_t max_ghost_recomputations = 4U;
     double max_transform_distance_meters = 0.0;
 
     [[nodiscard]] core::Result<void> validate() const;
@@ -319,6 +320,9 @@ struct GhostCorrectionReceipt {
     core::Revision branch_revision_after;
     assets::Sha256Digest plan_context_digest;
     assets::Sha256Digest parent_evidence_digest;
+    // A bound empty value means the correction has no plan-step anchor and is
+    // replayed after the plan. A missing value denotes a legacy receipt.
+    std::optional<std::string> recompute_after_step_id;
     std::string justification;
     assets::Sha256Digest evidence_digest;
 
@@ -340,6 +344,28 @@ struct AgentRebaseReceipt {
     std::vector<std::uint64_t> read_mesh_assets;
     std::vector<std::uint64_t> write_mesh_assets;
 
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+// Preserves the executed branch and DAG evidence surrounding an operator
+// correction. The current task receipts describe the recomputed branch; this
+// record keeps the superseded branch reviewable and binds the replay result.
+struct AgentGhostRecomputeReceipt {
+    std::string task_id;
+    std::string anchor_step_id;
+    assets::Sha256Digest correction_evidence_digest;
+    std::vector<std::string> dependent_step_ids;
+    std::vector<StepReceipt> previous_step_receipts;
+    std::vector<AcceptanceGateResult> previous_gate_results;
+    assets::Sha256Digest previous_diff_digest;
+    assets::Sha256Digest result_diff_digest;
+    core::Revision previous_speculative_revision;
+    core::Revision result_speculative_revision;
+    bool replay_completed = false;
+    std::optional<core::Diagnostic> diagnostic;
+    assets::Sha256Digest evidence_digest;
+
+    [[nodiscard]] core::Result<assets::Sha256Digest> computed_evidence_digest() const;
     [[nodiscard]] core::Result<void> validate() const;
 };
 
@@ -427,6 +453,7 @@ struct AgentTaskSnapshot {
     std::vector<AgentRepairReceipt> repairs;
     std::vector<AgentRebaseReceipt> rebases;
     std::vector<GhostCorrectionReceipt> ghost_corrections;
+    std::vector<AgentGhostRecomputeReceipt> ghost_recomputes;
     std::size_t repair_attempts_remaining = 0U;
     std::vector<AcceptanceGateResult> gates;
     ProjectDiff diff;
@@ -561,7 +588,7 @@ struct AgentDemonstrationRecipe {
 // resumed task can run. Project bytes remain artifacts owned by this record;
 // they are never applied to the live source by loading a checkpoint.
 struct AgentTaskCheckpoint {
-    static constexpr std::uint32_t kFormatVersion = 7U;
+    static constexpr std::uint32_t kFormatVersion = 8U;
 
     TaskStatus status = TaskStatus::prepared;
     AgentPlan plan;
@@ -579,6 +606,7 @@ struct AgentTaskCheckpoint {
     std::vector<AgentRepairReceipt> repair_lineage;
     std::vector<AgentRebaseReceipt> rebase_lineage;
     std::vector<GhostCorrectionReceipt> ghost_corrections;
+    std::vector<AgentGhostRecomputeReceipt> ghost_recomputes;
     std::string last_validation_report;
 
     [[nodiscard]] core::Result<void> validate() const;
@@ -676,7 +704,20 @@ private:
         GhostCorrectionKind kind,
         double distance,
         std::string justification);
-    [[nodiscard]] core::Result<void> apply_ghost_corrections();
+    [[nodiscard]] core::Result<std::string> ghost_correction_anchor(
+        scene::ObjectId object,
+        GhostCorrectionKind kind) const;
+    [[nodiscard]] core::Result<std::optional<std::string>> effective_ghost_anchor(
+        const GhostCorrectionReceipt& correction) const;
+    [[nodiscard]] std::vector<std::string> dependent_plan_steps(
+        std::string_view anchor_step_id) const;
+    [[nodiscard]] core::Result<void> validate_ghost_correction_lineage() const;
+    [[nodiscard]] core::Result<void> apply_ghost_corrections(
+        std::optional<std::string_view> after_step_id = std::nullopt);
+    [[nodiscard]] core::Result<void> recompute_after_ghost_correction(
+        const assets::Sha256Digest& correction_evidence_digest,
+        std::string anchor_step_id,
+        std::vector<std::string> dependent_step_ids);
     [[nodiscard]] const project::ProjectDocument& scene_query_document() const;
     [[nodiscard]] AgentTaskSnapshot build_snapshot() const;
     [[nodiscard]] ProjectDiff build_diff() const;
@@ -695,7 +736,9 @@ private:
     std::vector<AgentRepairReceipt> repairs_;
     std::vector<AgentRebaseReceipt> rebases_;
     std::vector<GhostCorrectionReceipt> ghost_corrections_;
+    std::vector<AgentGhostRecomputeReceipt> ghost_recompute_lineage_;
     bool replay_ghost_corrections_ = false;
+    bool ghost_correction_replay_failed_ = false;
     std::vector<PlanStepProgress> plan_progress_;
     std::vector<AcceptanceGateResult> gates_;
     SceneQueryBudget query_budget_;

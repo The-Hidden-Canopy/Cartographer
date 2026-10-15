@@ -1020,7 +1020,9 @@ core::Result<assets::Sha256Digest> GhostCorrectionReceipt::computed_evidence_dig
     if (!safe_text(task_id, kMaxTaskIdBytes) || !object || source_revision.exhausted() ||
         branch_revision_before.exhausted() ||
         branch_revision_after != branch_revision_before.next() || plan_context_digest.is_zero() ||
-        !safe_text(justification, 1024U)) {
+        !safe_text(justification, 1024U) ||
+        (recompute_after_step_id.has_value() && !recompute_after_step_id->empty() &&
+            !safe_text(*recompute_after_step_id, kMaxStepIdBytes))) {
         return core::Result<assets::Sha256Digest>::failure(invalid(
             "ghost correction evidence is incomplete or outside its bounds"));
     }
@@ -1069,6 +1071,12 @@ core::Result<assets::Sha256Digest> GhostCorrectionReceipt::computed_evidence_dig
     default:
         return core::Result<assets::Sha256Digest>::failure(invalid(
             "ghost correction kind is unknown"));
+    }
+    if (recompute_after_step_id.has_value()) {
+        canonical = "cartographer.agent.ghost-correction.v4|";
+        append_number(canonical, static_cast<std::uint64_t>(kind));
+        append_number(canonical, 1U);
+        append_field(canonical, *recompute_after_step_id);
     }
     append_field(canonical, task_id);
     append_number(canonical, object.value);
@@ -1120,6 +1128,93 @@ core::Result<void> GhostCorrectionReceipt::validate() const {
     if (evidence_digest.is_zero() || evidence_digest != computed.value()) {
         return core::Result<void>::failure(invalid(
             "ghost correction evidence digest does not bind its operator action"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<assets::Sha256Digest>
+AgentGhostRecomputeReceipt::computed_evidence_digest() const {
+    if (!safe_text(task_id, kMaxTaskIdBytes) ||
+        (!anchor_step_id.empty() && !safe_text(anchor_step_id, kMaxStepIdBytes)) ||
+        correction_evidence_digest.is_zero() || previous_diff_digest.is_zero() ||
+        result_diff_digest.is_zero() || dependent_step_ids.size() > kMaxPlanSteps ||
+        previous_step_receipts.size() > 4096U || previous_gate_results.size() > 256U ||
+        (!replay_completed && !diagnostic.has_value()) ||
+        (diagnostic.has_value() && diagnostic->message.size() > 2048U)) {
+        return core::Result<assets::Sha256Digest>::failure(invalid(
+            "ghost recompute evidence is incomplete or outside its bounds"));
+    }
+    std::set<std::string> unique_steps;
+    for (const auto& step_id : dependent_step_ids) {
+        if (!safe_text(step_id, kMaxStepIdBytes) || step_id == anchor_step_id ||
+            !unique_steps.insert(step_id).second) {
+            return core::Result<assets::Sha256Digest>::failure(invalid(
+                "ghost recompute dependent-step lineage is invalid"));
+        }
+    }
+
+    std::string canonical = "cartographer.agent.ghost-recompute.v1|";
+    append_field(canonical, task_id);
+    append_field(canonical, anchor_step_id);
+    append_field(canonical, correction_evidence_digest.hex());
+    append_number(canonical, dependent_step_ids.size());
+    for (const auto& step_id : dependent_step_ids) append_field(canonical, step_id);
+    append_number(canonical, previous_step_receipts.size());
+    for (const auto& receipt : previous_step_receipts) {
+        append_field(canonical, receipt.step_id);
+        append_field(canonical, receipt.intent);
+        append_field(canonical, receipt.tool_id);
+        append_number(canonical, receipt.target_object.value);
+        append_number(canonical, receipt.revision_before.value());
+        append_number(canonical, receipt.revision_after.value());
+        append_number(canonical, static_cast<std::uint64_t>(receipt.status));
+        append_number(canonical, receipt.diagnostic.has_value() ? 1U : 0U);
+        if (receipt.diagnostic.has_value()) {
+            append_number(canonical,
+                static_cast<std::uint64_t>(receipt.diagnostic->code));
+            append_field(canonical, receipt.diagnostic->message);
+        }
+    }
+    append_number(canonical, previous_gate_results.size());
+    for (const auto& gate : previous_gate_results) {
+        append_field(canonical, gate.id);
+        append_number(canonical, gate.required ? 1U : 0U);
+        append_number(canonical, gate.passed ? 1U : 0U);
+        append_field(canonical, gate.evidence);
+        append_field(canonical, gate.validator_version);
+        append_number(canonical, gate.source_revision.value());
+        append_number(canonical, gate.evaluated_revision.value());
+        append_number(canonical, gate.affected_objects.size());
+        for (const auto object : gate.affected_objects) append_number(canonical, object.value);
+        append_number(canonical, gate.affected_asset_ids.size());
+        for (const auto asset : gate.affected_asset_ids) append_number(canonical, asset);
+        append_field(canonical, gate.result_digest.hex());
+        append_field(canonical, gate.evidence_digest.hex());
+        append_number(canonical, gate.diagnostic.has_value() ? 1U : 0U);
+        if (gate.diagnostic.has_value()) {
+            append_number(canonical, static_cast<std::uint64_t>(gate.diagnostic->code));
+            append_field(canonical, gate.diagnostic->message);
+        }
+    }
+    append_field(canonical, previous_diff_digest.hex());
+    append_field(canonical, result_diff_digest.hex());
+    append_number(canonical, previous_speculative_revision.value());
+    append_number(canonical, result_speculative_revision.value());
+    append_number(canonical, replay_completed ? 1U : 0U);
+    append_number(canonical, diagnostic.has_value() ? 1U : 0U);
+    if (diagnostic.has_value()) {
+        append_number(canonical, static_cast<std::uint64_t>(diagnostic->code));
+        append_field(canonical, diagnostic->message);
+    }
+    return core::Result<assets::Sha256Digest>::success(digest_text(canonical));
+}
+
+core::Result<void> AgentGhostRecomputeReceipt::validate() const {
+    const auto computed = computed_evidence_digest();
+    if (!computed) return core::Result<void>::failure(computed.error());
+    if (evidence_digest.is_zero() || evidence_digest != computed.value()) {
+        return core::Result<void>::failure(invalid(
+            "ghost recompute digest does not bind the prior and replayed branches"));
     }
     return core::Result<void>::success();
 }
@@ -1599,9 +1694,10 @@ core::Result<void> AgentWorkEnvelope::validate() const {
     }
     if (max_topology_operations > 1'000'000U ||
         max_repair_attempts > kMaxRepairAttempts ||
-        max_additional_operations > kMaxPlanSteps) {
+        max_additional_operations > kMaxPlanSteps ||
+        max_ghost_recomputations > 16U) {
         return core::Result<void>::failure(invalid(
-            "work envelope repair budget exceeds its supported bound"));
+            "work envelope repair or ghost-recompute budget exceeds its supported bound"));
     }
     const bool permits_transform =
         (permitted_effects & ::carto::agent::effect_mask(Effect::transform)) != 0U;
@@ -1824,6 +1920,8 @@ core::Result<AgentTask> AgentTask::repair(
         envelope.max_repair_attempts > failed_attempt.envelope_.max_repair_attempts ||
         envelope.max_additional_operations >
             failed_attempt.envelope_.max_additional_operations ||
+        envelope.max_ghost_recomputations >
+            failed_attempt.envelope_.max_ghost_recomputations ||
         envelope.max_transform_distance_meters >
             failed_attempt.envelope_.max_transform_distance_meters) {
         return core::Result<AgentTask>::failure(policy(
@@ -1951,6 +2049,8 @@ core::Result<AgentTask> AgentTask::repair(
     next_attempt.value().repairs_ = failed_attempt.repairs_;
     next_attempt.value().rebases_ = failed_attempt.rebases_;
     next_attempt.value().ghost_corrections_ = failed_attempt.ghost_corrections_;
+    next_attempt.value().ghost_recompute_lineage_ =
+        failed_attempt.ghost_recompute_lineage_;
     next_attempt.value().replay_ghost_corrections_ =
         !next_attempt.value().ghost_corrections_.empty();
     next_attempt.value().repairs_.push_back(std::move(repair_receipt));
@@ -2012,6 +2112,16 @@ core::Result<void> AgentTask::correct_ghost_transform(
     if (!plan_context_digest) {
         return core::Result<void>::failure(plan_context_digest.error());
     }
+    const auto anchor_step = ghost_correction_anchor(
+        object, GhostCorrectionKind::object_transform);
+    if (!anchor_step) return core::Result<void>::failure(anchor_step.error());
+    const auto dependent_steps = anchor_step.value().empty()
+        ? std::vector<std::string>{} : dependent_plan_steps(anchor_step.value());
+    if (!dependent_steps.empty() &&
+        ghost_recompute_lineage_.size() >= envelope_.max_ghost_recomputations) {
+        return core::Result<void>::failure(policy(
+            "work envelope ghost-recompute budget is exhausted"));
+    }
 
     GhostCorrectionReceipt correction;
     correction.task_id = plan_.id;
@@ -2024,6 +2134,7 @@ core::Result<void> AgentTask::correct_ghost_transform(
     correction.plan_context_digest = plan_context_digest.value();
     correction.parent_evidence_digest = ghost_corrections_.empty()
         ? assets::Sha256Digest{} : ghost_corrections_.back().evidence_digest;
+    correction.recompute_after_step_id = anchor_step.value();
     correction.justification = std::move(justification);
     const auto evidence_digest = correction.computed_evidence_digest();
     if (!evidence_digest) return core::Result<void>::failure(evidence_digest.error());
@@ -2040,26 +2151,12 @@ core::Result<void> AgentTask::correct_ghost_transform(
         return core::Result<void>::failure(invalid_state(
             "ghost correction did not advance exactly one speculative revision"));
     }
+    const auto correction_evidence_digest = correction.evidence_digest;
     ghost_corrections_.push_back(std::move(correction));
     gates_ = evaluate_gates();
-    const bool required_gates_pass = std::all_of(
-        gates_.begin(), gates_.end(), [](const AcceptanceGateResult& gate) {
-            return !gate.required || gate.passed;
-        });
-    const bool all_steps_passed = std::all_of(
-        plan_progress_.begin(), plan_progress_.end(), [](const PlanStepProgress& progress) {
-            return progress.status == StepStatus::passed;
-        });
-    if (all_steps_passed && required_gates_pass) {
-        status_ = TaskStatus::review;
-        diagnostic_.reset();
-    } else {
-        status_ = TaskStatus::blocked;
-        diagnostic_ = invalid_state(
-            "human ghost correction leaves one or more required acceptance gates blocked");
-    }
     cached_snapshot_.reset();
-    return core::Result<void>::success();
+    return recompute_after_ghost_correction(
+        correction_evidence_digest, anchor_step.value(), dependent_steps);
 }
 
 core::Result<void> AgentTask::correct_ghost_vertex_position(
@@ -2144,6 +2241,17 @@ core::Result<void> AgentTask::correct_ghost_vertex_position(
     correction.plan_context_digest = plan_context_digest.value();
     correction.parent_evidence_digest = ghost_corrections_.empty()
         ? assets::Sha256Digest{} : ghost_corrections_.back().evidence_digest;
+    const auto anchor_step = ghost_correction_anchor(
+        object, GhostCorrectionKind::vertex_position);
+    if (!anchor_step) return core::Result<void>::failure(anchor_step.error());
+    const auto dependent_steps = anchor_step.value().empty()
+        ? std::vector<std::string>{} : dependent_plan_steps(anchor_step.value());
+    if (!dependent_steps.empty() &&
+        ghost_recompute_lineage_.size() >= envelope_.max_ghost_recomputations) {
+        return core::Result<void>::failure(policy(
+            "work envelope ghost-recompute budget is exhausted"));
+    }
+    correction.recompute_after_step_id = anchor_step.value();
     correction.justification = std::move(justification);
 
     auto selected_mode = application::HumanApplicationAccess::dispatch(
@@ -2180,26 +2288,12 @@ core::Result<void> AgentTask::correct_ghost_vertex_position(
         return core::Result<void>::failure(invalid_state(
             "ghost vertex correction did not advance exactly one speculative revision"));
     }
+    const auto correction_evidence_digest = correction.evidence_digest;
     ghost_corrections_.push_back(std::move(correction));
     gates_ = evaluate_gates();
-    const bool required_gates_pass = std::all_of(
-        gates_.begin(), gates_.end(), [](const AcceptanceGateResult& gate) {
-            return !gate.required || gate.passed;
-        });
-    const bool all_steps_passed = std::all_of(
-        plan_progress_.begin(), plan_progress_.end(), [](const PlanStepProgress& progress) {
-            return progress.status == StepStatus::passed;
-        });
-    if (all_steps_passed && required_gates_pass) {
-        status_ = TaskStatus::review;
-        diagnostic_.reset();
-    } else {
-        status_ = TaskStatus::blocked;
-        diagnostic_ = invalid_state(
-            "human ghost correction leaves one or more required acceptance gates blocked");
-    }
     cached_snapshot_.reset();
-    return core::Result<void>::success();
+    return recompute_after_ghost_correction(
+        correction_evidence_digest, anchor_step.value(), dependent_steps);
 }
 
 core::Result<void> AgentTask::correct_ghost_face(
@@ -2305,6 +2399,16 @@ core::Result<void> AgentTask::correct_ghost_face(
     correction.plan_context_digest = plan_context_digest.value();
     correction.parent_evidence_digest = ghost_corrections_.empty()
         ? assets::Sha256Digest{} : ghost_corrections_.back().evidence_digest;
+    const auto anchor_step = ghost_correction_anchor(object, kind);
+    if (!anchor_step) return core::Result<void>::failure(anchor_step.error());
+    const auto dependent_steps = anchor_step.value().empty()
+        ? std::vector<std::string>{} : dependent_plan_steps(anchor_step.value());
+    if (!dependent_steps.empty() &&
+        ghost_recompute_lineage_.size() >= envelope_.max_ghost_recomputations) {
+        return core::Result<void>::failure(policy(
+            "work envelope ghost-recompute budget is exhausted"));
+    }
+    correction.recompute_after_step_id = anchor_step.value();
     correction.justification = std::move(justification);
 
     auto selected_mode = application::HumanApplicationAccess::dispatch(
@@ -2342,47 +2446,167 @@ core::Result<void> AgentTask::correct_ghost_face(
         return core::Result<void>::failure(invalid_state(
             "ghost face correction did not advance exactly one speculative revision"));
     }
+    const auto correction_evidence_digest = correction.evidence_digest;
     ghost_corrections_.push_back(std::move(correction));
     gates_ = evaluate_gates();
-    const bool required_gates_pass = std::all_of(
-        gates_.begin(), gates_.end(), [](const AcceptanceGateResult& gate) {
-            return !gate.required || gate.passed;
-        });
-    const bool all_steps_passed = std::all_of(
-        plan_progress_.begin(), plan_progress_.end(), [](const PlanStepProgress& progress) {
-            return progress.status == StepStatus::passed;
-        });
-    if (all_steps_passed && required_gates_pass) {
-        status_ = TaskStatus::review;
-        diagnostic_.reset();
-    } else {
-        status_ = TaskStatus::blocked;
-        diagnostic_ = invalid_state(
-            "human ghost correction leaves one or more required acceptance gates blocked");
-    }
     cached_snapshot_.reset();
-    return core::Result<void>::success();
+    return recompute_after_ghost_correction(
+        correction_evidence_digest, anchor_step.value(), dependent_steps);
 }
 
-core::Result<void> AgentTask::apply_ghost_corrections() {
-    if (ghost_corrections_.empty()) {
-        replay_ghost_corrections_ = false;
-        return core::Result<void>::success();
+core::Result<std::string> AgentTask::ghost_correction_anchor(
+    scene::ObjectId object,
+    GhostCorrectionKind kind) const {
+    if (!speculative_) {
+        return core::Result<std::string>::failure(invalid_state(
+            "ghost correction anchor requires a speculative branch"));
     }
+    const auto* target = speculative_->document_.scene().find(object);
+    if (target == nullptr) {
+        return core::Result<std::string>::failure(stale(
+            "ghost correction anchor target is missing"));
+    }
+    std::set<scene::ObjectId> affected_objects;
+    if (kind == GhostCorrectionKind::object_transform) {
+        for (const auto& candidate : speculative_->document_.scene().objects_sorted()) {
+            const scene::SceneObject* current = &candidate;
+            bool affected = candidate.id == object;
+            std::set<scene::ObjectId> visited;
+            while (!affected && current->parent.has_value()) {
+                if (!visited.insert(current->id).second) {
+                    return core::Result<std::string>::failure(invalid_state(
+                        "ghost correction target hierarchy contains a cycle"));
+                }
+                if (*current->parent == object) {
+                    affected = true;
+                    break;
+                }
+                current = speculative_->document_.scene().find(*current->parent);
+                if (current == nullptr) {
+                    return core::Result<std::string>::failure(stale(
+                        "ghost correction target hierarchy has a missing parent"));
+                }
+            }
+            if (affected) {
+                if (!scope_contains(candidate.id) ||
+                    !contains(plan_.objective.scope_objects, candidate.id) ||
+                    candidate.locked ||
+                    contains(plan_.objective.protected_objects, candidate.id)) {
+                    return core::Result<std::string>::failure(policy(
+                        "root ghost transform would affect an out-of-scope, locked, or protected descendant"));
+                }
+                affected_objects.insert(candidate.id);
+            }
+        }
+    } else if (kind == GhostCorrectionKind::vertex_position ||
+        kind == GhostCorrectionKind::face_inset ||
+        kind == GhostCorrectionKind::face_extrusion) {
+        if (!target->mesh_asset.has_value()) {
+            return core::Result<std::string>::failure(policy(
+                "mesh ghost correction target has no mesh asset"));
+        }
+        for (const auto& candidate : speculative_->document_.scene().objects_sorted()) {
+            if (candidate.mesh_asset != target->mesh_asset) continue;
+            if (!scope_contains(candidate.id) ||
+                !contains(plan_.objective.scope_objects, candidate.id) ||
+                candidate.locked ||
+                contains(plan_.objective.protected_objects, candidate.id)) {
+                return core::Result<std::string>::failure(policy(
+                    "ghost mesh correction would affect an out-of-scope, locked, or protected instance"));
+            }
+            affected_objects.insert(candidate.id);
+        }
+    } else {
+        return core::Result<std::string>::failure(invalid(
+            "ghost correction kind cannot be anchored to the plan"));
+    }
+
+    const auto schedule = plan_.schedule_order();
+    if (!schedule) return core::Result<std::string>::failure(schedule.error());
+    std::string anchor;
+    for (const auto& step_id : schedule.value()) {
+        const auto step = std::find_if(plan_.steps.begin(), plan_.steps.end(),
+            [&step_id](const AgentPlanStep& candidate) { return candidate.id == step_id; });
+        const auto progress = std::find_if(plan_progress_.begin(), plan_progress_.end(),
+            [&step_id](const PlanStepProgress& candidate) {
+                return candidate.step_id == step_id;
+            });
+        if (step != plan_.steps.end() && affected_objects.contains(step->target.object) &&
+            progress != plan_progress_.end() && progress->status == StepStatus::passed) {
+            anchor = step_id;
+        }
+    }
+    return core::Result<std::string>::success(std::move(anchor));
+}
+
+core::Result<std::optional<std::string>> AgentTask::effective_ghost_anchor(
+    const GhostCorrectionReceipt& correction) const {
+    if (!correction.recompute_after_step_id.has_value() ||
+        correction.recompute_after_step_id->empty()) {
+        return core::Result<std::optional<std::string>>::success(std::nullopt);
+    }
+    const auto step = std::find_if(plan_.steps.begin(), plan_.steps.end(),
+        [&correction](const AgentPlanStep& candidate) {
+            return candidate.id == *correction.recompute_after_step_id;
+        });
+    if (step != plan_.steps.end()) {
+        return core::Result<std::optional<std::string>>::success(step->id);
+    }
+    const auto current_context = plan_.context_digest();
+    if (!current_context) {
+        return core::Result<std::optional<std::string>>::failure(current_context.error());
+    }
+    if (correction.plan_context_digest == current_context.value()) {
+        return core::Result<std::optional<std::string>>::failure(stale(
+            "locked ghost correction anchor is absent from its bound plan"));
+    }
+    // A reviewed repair may replace the plan step. In that case the new plan
+    // runs from source and the inherited human constraint is applied afterward.
+    return core::Result<std::optional<std::string>>::success(std::nullopt);
+}
+
+std::vector<std::string> AgentTask::dependent_plan_steps(
+    std::string_view anchor_step_id) const {
+    const auto schedule = plan_.schedule_order();
+    if (!schedule) return {};
+    std::set<std::string> descendants{std::string(anchor_step_id)};
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto& step : plan_.steps) {
+            if (descendants.contains(step.id)) continue;
+            const bool depends_on_descendant = std::any_of(
+                step.dependencies.begin(), step.dependencies.end(),
+                [&descendants](const std::string& dependency) {
+                    return descendants.contains(dependency);
+                });
+            if (depends_on_descendant) {
+                descendants.insert(step.id);
+                changed = true;
+            }
+        }
+    }
+    std::vector<std::string> result;
+    for (const auto& step_id : schedule.value()) {
+        if (step_id != anchor_step_id && descendants.contains(step_id)) {
+            result.push_back(step_id);
+        }
+    }
+    return result;
+}
+
+core::Result<void> AgentTask::validate_ghost_correction_lineage() const {
+    if (ghost_corrections_.empty()) return core::Result<void>::success();
     const auto current_plan_context = plan_.context_digest();
     if (!current_plan_context) {
         return core::Result<void>::failure(current_plan_context.error());
     }
     assets::Sha256Digest expected_parent;
-    std::map<scene::ObjectId, core::Transform> first_transforms;
     std::map<scene::ObjectId, core::Transform> last_recorded_transforms;
     using GhostVertexKey = std::pair<std::uint64_t, geometry::VertexId>;
-    std::map<GhostVertexKey, core::Vec3d> first_vertex_positions;
     std::map<GhostVertexKey, core::Vec3d> last_vertex_positions;
-    std::map<scene::ObjectId, assets::Sha256Digest> first_mesh_digests;
     std::map<scene::ObjectId, assets::Sha256Digest> last_mesh_digests;
-    const auto shared_mesh_scope_valid = [this](
-        const scene::SceneObject& target) {
+    const auto shared_mesh_scope_valid = [this](const scene::SceneObject& target) {
         for (const auto& instance : speculative_->document_.scene().objects_sorted()) {
             if (instance.mesh_asset == target.mesh_asset &&
                 (!scope_contains(instance.id) ||
@@ -2415,9 +2639,10 @@ core::Result<void> AgentTask::apply_ghost_corrections() {
                     correction.source_revision == rebase.rebased_source_revision;
             });
         if (auto valid = correction.validate(); !valid) return valid;
+        const auto anchor = effective_ghost_anchor(correction);
+        if (!anchor) return core::Result<void>::failure(anchor.error());
         if (correction.parent_evidence_digest != expected_parent ||
-            !source_revision_matches ||
-            !plan_context_matches ||
+            !source_revision_matches || !plan_context_matches ||
             !contains(plan_.objective.scope_objects, correction.object) ||
             !scope_contains(correction.object) ||
             contains(plan_.objective.protected_objects, correction.object)) {
@@ -2425,13 +2650,17 @@ core::Result<void> AgentTask::apply_ghost_corrections() {
                 "locked ghost correction lineage no longer matches the task scope"));
         }
         if (correction.kind == GhostCorrectionKind::object_transform) {
+            const auto* target = speculative_->document_.scene().find(correction.object);
+            if (target == nullptr || target->locked || target->parent.has_value()) {
+                return core::Result<void>::failure(policy(
+                    "locked ghost transform target is missing, locked, or no longer a root"));
+            }
             const auto previous = last_recorded_transforms.find(correction.object);
             if (previous != last_recorded_transforms.end() &&
                 !same_transform(previous->second, correction.before_transform)) {
                 return core::Result<void>::failure(stale(
                     "locked ghost correction transform chain is discontinuous"));
             }
-            first_transforms.try_emplace(correction.object, correction.before_transform);
             last_recorded_transforms[correction.object] = correction.after_transform;
         } else if (correction.kind == GhostCorrectionKind::vertex_position &&
             correction.vertex.has_value()) {
@@ -2441,11 +2670,8 @@ core::Result<void> AgentTask::apply_ghost_corrections() {
                     "locked ghost vertex target is missing, locked, or has no mesh"));
             }
             const auto mesh = speculative_->document_.meshes().find(*target->mesh_asset);
-            if (mesh == speculative_->document_.meshes().end()) {
-                return core::Result<void>::failure(stale(
-                    "locked ghost vertex target is missing from its replayed mesh"));
-            }
-            if (!shared_mesh_scope_valid(*target)) {
+            if (mesh == speculative_->document_.meshes().end() ||
+                !shared_mesh_scope_valid(*target)) {
                 return core::Result<void>::failure(policy(
                     "locked ghost vertex correction escapes shared-mesh scope"));
             }
@@ -2456,15 +2682,6 @@ core::Result<void> AgentTask::apply_ghost_corrections() {
                 return core::Result<void>::failure(stale(
                     "locked ghost vertex correction chain is discontinuous"));
             }
-            const bool follows_mesh_correction = last_mesh_digests.contains(correction.object);
-            if (!follows_mesh_correction &&
-                mesh->second.find_vertex(*correction.vertex) == nullptr) {
-                return core::Result<void>::failure(stale(
-                    "locked ghost vertex target is missing from its replayed mesh"));
-            }
-            if (!follows_mesh_correction) {
-                first_vertex_positions.try_emplace(key, correction.before_position);
-            }
             last_vertex_positions[key] = correction.after_position;
             if (!correction.before_mesh_digest.is_zero()) {
                 const auto previous_mesh = last_mesh_digests.find(correction.object);
@@ -2473,19 +2690,12 @@ core::Result<void> AgentTask::apply_ghost_corrections() {
                     return core::Result<void>::failure(stale(
                         "locked ghost mesh correction chain is discontinuous"));
                 }
-                first_mesh_digests.try_emplace(
-                    correction.object, correction.before_mesh_digest);
                 last_mesh_digests[correction.object] = correction.after_mesh_digest;
             }
         } else if (correction.kind == GhostCorrectionKind::face_inset ||
             correction.kind == GhostCorrectionKind::face_extrusion) {
             const auto* target = speculative_->document_.scene().find(correction.object);
-            if (target == nullptr || target->locked || !target->mesh_asset.has_value()) {
-                return core::Result<void>::failure(policy(
-                    "locked ghost face target is missing, locked, or has no mesh"));
-            }
-            const auto mesh = speculative_->document_.meshes().find(*target->mesh_asset);
-            if (mesh == speculative_->document_.meshes().end() ||
+            if (target == nullptr || target->locked || !target->mesh_asset.has_value() ||
                 !correction.face.has_value() || !shared_mesh_scope_valid(*target)) {
                 return core::Result<void>::failure(policy(
                     "locked ghost face correction escapes its mesh or shared-mesh scope"));
@@ -2496,8 +2706,6 @@ core::Result<void> AgentTask::apply_ghost_corrections() {
                 return core::Result<void>::failure(stale(
                     "locked ghost mesh correction chain is discontinuous"));
             }
-            first_mesh_digests.try_emplace(
-                correction.object, correction.before_mesh_digest);
             last_mesh_digests[correction.object] = correction.after_mesh_digest;
         } else {
             return core::Result<void>::failure(invalid(
@@ -2505,47 +2713,67 @@ core::Result<void> AgentTask::apply_ghost_corrections() {
         }
         expected_parent = correction.evidence_digest;
     }
+    return core::Result<void>::success();
+}
 
-    for (const auto& [object, expected_transform] : first_transforms) {
-        const auto* current = speculative_->document_.scene().find(object);
-        if (current == nullptr || current->locked || current->parent.has_value()) {
-            return core::Result<void>::failure(policy(
-                "locked ghost correction target is missing, locked, or no longer a root object"));
-        }
-        if (!same_transform(current->local_transform, expected_transform)) {
-            return core::Result<void>::failure(stale(
-                "replayed plan changed the base transform for a locked ghost correction"));
-        }
+core::Result<void> AgentTask::apply_ghost_corrections(
+    std::optional<std::string_view> after_step_id) {
+    if (ghost_corrections_.empty()) {
+        if (!after_step_id.has_value()) replay_ghost_corrections_ = false;
+        return core::Result<void>::success();
     }
-    for (const auto& [key, expected_position] : first_vertex_positions) {
-        const auto mesh = speculative_->document_.meshes().find(key.first);
-        const auto* vertex = mesh != speculative_->document_.meshes().end()
-            ? mesh->second.find_vertex(key.second) : nullptr;
-        if (vertex == nullptr || !same_position(vertex->position, expected_position)) {
-            return core::Result<void>::failure(stale(
-                "replayed plan changed the base position for a locked ghost vertex correction"));
+    if (auto valid = validate_ghost_correction_lineage(); !valid) return valid;
+    const auto shared_mesh_scope_valid = [this](const scene::SceneObject& target) {
+        for (const auto& instance : speculative_->document_.scene().objects_sorted()) {
+            if (instance.mesh_asset == target.mesh_asset &&
+                (!scope_contains(instance.id) ||
+                 !contains(plan_.objective.scope_objects, instance.id) || instance.locked ||
+                 contains(plan_.objective.protected_objects, instance.id))) {
+                return false;
+            }
         }
-    }
-    for (const auto& [object, expected_digest] : first_mesh_digests) {
-        const auto* target = speculative_->document_.scene().find(object);
-        const auto mesh = target != nullptr && target->mesh_asset.has_value()
-            ? speculative_->document_.meshes().find(*target->mesh_asset)
-            : speculative_->document_.meshes().end();
-        if (mesh == speculative_->document_.meshes().end() ||
-            application::canonical_mesh_geometry_digest(mesh->second) != expected_digest) {
-            return core::Result<void>::failure(stale(
-                "replayed plan changed the base mesh for a locked ghost correction"));
-        }
-    }
-
+        return true;
+    };
     for (const auto& correction : ghost_corrections_) {
+        const auto anchor = effective_ghost_anchor(correction);
+        if (!anchor) return core::Result<void>::failure(anchor.error());
+        const bool selected_for_replay = after_step_id.has_value()
+            ? anchor.value().has_value() && *anchor.value() == *after_step_id
+            : !anchor.value().has_value();
+        if (!selected_for_replay) continue;
+
         const auto revision_before = speculative_->document_.revision();
         if (correction.kind == GhostCorrectionKind::object_transform) {
             const auto* current = speculative_->document_.scene().find(correction.object);
-            if (current == nullptr || !same_transform(
-                    current->local_transform, correction.before_transform)) {
+            if (current == nullptr || current->locked || current->parent.has_value() ||
+                !same_transform(current->local_transform, correction.before_transform)) {
                 return core::Result<void>::failure(stale(
-                    "replaying plan changed the locked ghost transform correction chain"));
+                    "replayed plan changed the locked ghost transform correction chain"));
+            }
+            for (const auto& candidate : speculative_->document_.scene().objects_sorted()) {
+                const scene::SceneObject* ancestor = &candidate;
+                bool affected = candidate.id == correction.object;
+                std::set<scene::ObjectId> visited;
+                while (!affected && ancestor->parent.has_value()) {
+                    if (!visited.insert(ancestor->id).second) {
+                        return core::Result<void>::failure(invalid_state(
+                            "ghost correction target hierarchy contains a cycle"));
+                    }
+                    if (*ancestor->parent == correction.object) {
+                        affected = true;
+                        break;
+                    }
+                    ancestor = speculative_->document_.scene().find(*ancestor->parent);
+                    if (ancestor == nullptr) {
+                        return core::Result<void>::failure(stale(
+                            "ghost correction target hierarchy has a missing parent"));
+                    }
+                }
+                if (affected && (!scope_contains(candidate.id) || candidate.locked ||
+                    contains(plan_.objective.protected_objects, candidate.id))) {
+                    return core::Result<void>::failure(policy(
+                        "locked ghost transform replay would affect an unsafe descendant"));
+                }
             }
             const auto dispatched = application::HumanApplicationAccess::dispatch(
                 *speculative_, application::SetObjectTransformAction{
@@ -2562,10 +2790,11 @@ core::Result<void> AgentTask::apply_ghost_corrections() {
             const auto* vertex = correction.vertex.has_value() &&
                     mesh != speculative_->document_.meshes().end()
                 ? mesh->second.find_vertex(*correction.vertex) : nullptr;
-            if (vertex == nullptr || !same_position(vertex->position, correction.before_position) ||
+            if (current == nullptr || current->locked || vertex == nullptr ||
+                !same_position(vertex->position, correction.before_position) ||
                 (!correction.before_mesh_digest.is_zero() &&
                  application::canonical_mesh_geometry_digest(mesh->second) !=
-                     correction.before_mesh_digest)) {
+                     correction.before_mesh_digest) || !shared_mesh_scope_valid(*current)) {
                 return core::Result<void>::failure(stale(
                     "replaying plan changed the locked ghost vertex correction chain"));
             }
@@ -2602,12 +2831,12 @@ core::Result<void> AgentTask::apply_ghost_corrections() {
             const auto mesh = current != nullptr && current->mesh_asset.has_value()
                 ? speculative_->document_.meshes().find(*current->mesh_asset)
                 : speculative_->document_.meshes().end();
-            if (mesh == speculative_->document_.meshes().end() ||
+            if (current == nullptr || current->locked ||
+                mesh == speculative_->document_.meshes().end() ||
                 !correction.face.has_value() ||
                 mesh->second.find_face(*correction.face) == nullptr ||
                 application::canonical_mesh_geometry_digest(mesh->second) !=
-                    correction.before_mesh_digest ||
-                !shared_mesh_scope_valid(*current)) {
+                    correction.before_mesh_digest || !shared_mesh_scope_valid(*current)) {
                 return core::Result<void>::failure(stale(
                     "replaying plan changed the locked ghost face correction target"));
             }
@@ -2647,7 +2876,117 @@ core::Result<void> AgentTask::apply_ghost_corrections() {
                 "replaying a locked ghost correction did not advance one speculative revision"));
         }
     }
-    replay_ghost_corrections_ = false;
+    if (!after_step_id.has_value()) replay_ghost_corrections_ = false;
+    return core::Result<void>::success();
+}
+
+core::Result<void> AgentTask::recompute_after_ghost_correction(
+    const assets::Sha256Digest& correction_evidence_digest,
+    std::string anchor_step_id,
+    std::vector<std::string> dependent_step_ids) {
+    if (dependent_step_ids.empty()) {
+        const bool required_gates_pass = std::all_of(
+            gates_.begin(), gates_.end(), [](const AcceptanceGateResult& gate) {
+                return !gate.required || gate.passed;
+            });
+        const bool all_steps_passed = std::all_of(
+            plan_progress_.begin(), plan_progress_.end(), [](const PlanStepProgress& progress) {
+                return progress.status == StepStatus::passed;
+            });
+        if (all_steps_passed && required_gates_pass) {
+            status_ = TaskStatus::review;
+            diagnostic_.reset();
+        } else {
+            status_ = TaskStatus::blocked;
+            diagnostic_ = invalid_state(
+                "human ghost correction leaves one or more required gates or plan steps blocked");
+        }
+        cached_snapshot_.reset();
+        return core::Result<void>::success();
+    }
+    if (!source_ || !speculative_ ||
+        ghost_recompute_lineage_.size() >= envelope_.max_ghost_recomputations) {
+        status_ = TaskStatus::blocked;
+        diagnostic_ = policy("work envelope ghost-recompute budget is exhausted");
+        cached_snapshot_.reset();
+        return core::Result<void>::success();
+    }
+
+    AgentGhostRecomputeReceipt recompute;
+    recompute.task_id = plan_.id;
+    recompute.anchor_step_id = std::move(anchor_step_id);
+    recompute.correction_evidence_digest = correction_evidence_digest;
+    recompute.dependent_step_ids = std::move(dependent_step_ids);
+    recompute.previous_step_receipts = receipts_;
+    recompute.previous_gate_results = gates_;
+    recompute.previous_diff_digest = build_diff().digest;
+    recompute.previous_speculative_revision = speculative_->document_.revision();
+
+    const auto record_failed_replay = [this, &recompute](core::Diagnostic diagnostic) {
+        recompute.replay_completed = false;
+        recompute.diagnostic = diagnostic;
+        recompute.result_diff_digest = build_diff().digest;
+        recompute.result_speculative_revision = speculative_->document_.revision();
+        const auto evidence = recompute.computed_evidence_digest();
+        if (evidence) {
+            recompute.evidence_digest = evidence.value();
+            ghost_recompute_lineage_.push_back(recompute);
+        }
+        status_ = TaskStatus::blocked;
+        diagnostic_ = std::move(diagnostic);
+        cached_snapshot_.reset();
+        return core::Result<void>::success();
+    };
+
+    auto candidate_result = AgentTask::begin(*source_, plan_, envelope_);
+    if (!candidate_result) {
+        return record_failed_replay(candidate_result.error().with_context(
+            "rebuilding the speculative branch after a human ghost correction"));
+    }
+    auto candidate = std::move(candidate_result.value());
+    candidate.repairs_ = repairs_;
+    candidate.rebases_ = rebases_;
+    candidate.ghost_corrections_ = ghost_corrections_;
+    candidate.ghost_recompute_lineage_ = ghost_recompute_lineage_;
+    candidate.replay_ghost_corrections_ = true;
+    const auto replayed = candidate.run();
+    if (!replayed) {
+        return record_failed_replay(replayed.error().with_context(
+            "replaying the dependent plan after a human ghost correction"));
+    }
+    if (candidate.ghost_correction_replay_failed_) {
+        return record_failed_replay(candidate.diagnostic_.value_or(stale(
+            "human ghost correction could not be replayed at its bound plan step")));
+    }
+
+    recompute.replay_completed = true;
+    recompute.diagnostic = candidate.diagnostic_;
+    recompute.result_diff_digest = candidate.build_diff().digest;
+    recompute.result_speculative_revision = candidate.speculative_->document_.revision();
+    const auto recompute_digest = recompute.computed_evidence_digest();
+    if (!recompute_digest) {
+        return record_failed_replay(recompute_digest.error().with_context(
+            "binding ghost recompute lineage"));
+    }
+    recompute.evidence_digest = recompute_digest.value();
+    candidate.ghost_recompute_lineage_.push_back(std::move(recompute));
+
+    speculative_ = std::move(candidate.speculative_);
+    receipts_ = std::move(candidate.receipts_);
+    repairs_ = std::move(candidate.repairs_);
+    rebases_ = std::move(candidate.rebases_);
+    ghost_corrections_ = std::move(candidate.ghost_corrections_);
+    ghost_recompute_lineage_ = std::move(candidate.ghost_recompute_lineage_);
+    replay_ghost_corrections_ = candidate.replay_ghost_corrections_;
+    ghost_correction_replay_failed_ = candidate.ghost_correction_replay_failed_;
+    plan_progress_ = std::move(candidate.plan_progress_);
+    gates_ = std::move(candidate.gates_);
+    query_budget_ = candidate.query_budget_;
+    touched_objects_ = std::move(candidate.touched_objects_);
+    transform_distance_used_meters_ = candidate.transform_distance_used_meters_;
+    status_ = candidate.status_;
+    diagnostic_ = std::move(candidate.diagnostic_);
+    cached_snapshot_.reset();
     return core::Result<void>::success();
 }
 
@@ -2866,6 +3205,7 @@ core::Result<AgentTaskSnapshot> AgentTask::run() {
             "agent plan can only run once"));
     }
     cached_snapshot_.reset();
+    ghost_correction_replay_failed_ = false;
     status_ = TaskStatus::running;
     const auto scheduled = plan_.schedule_order();
     if (!scheduled) {
@@ -2917,11 +3257,44 @@ core::Result<AgentTaskSnapshot> AgentTask::run() {
             }
             if (!diagnostic_.has_value()) diagnostic_ = result.error();
         }
+        if (result && replay_ghost_corrections_) {
+            const auto replayed = apply_ghost_corrections(step_id);
+            if (!replayed) {
+                ghost_correction_replay_failed_ = true;
+                status_ = TaskStatus::blocked;
+                diagnostic_ = replayed.error();
+                break;
+            }
+        }
     }
     if (status_ == TaskStatus::running && replay_ghost_corrections_) {
-        if (auto corrected = apply_ghost_corrections(); !corrected) {
-            status_ = TaskStatus::blocked;
-            diagnostic_ = corrected.error();
+        for (const auto& correction : ghost_corrections_) {
+            const auto anchor = effective_ghost_anchor(correction);
+            if (!anchor) {
+                ghost_correction_replay_failed_ = true;
+                status_ = TaskStatus::blocked;
+                diagnostic_ = anchor.error();
+                break;
+            }
+            if (!anchor.value().has_value()) continue;
+            const auto progress = std::find_if(
+                plan_progress_.begin(), plan_progress_.end(), [&anchor](const auto& item) {
+                    return item.step_id == *anchor.value();
+                });
+            if (progress == plan_progress_.end() || progress->status != StepStatus::passed) {
+                ghost_correction_replay_failed_ = true;
+                status_ = TaskStatus::blocked;
+                diagnostic_ = stale(
+                    "locked ghost correction anchor did not pass during plan replay");
+                break;
+            }
+        }
+        if (status_ == TaskStatus::running) {
+            if (auto corrected = apply_ghost_corrections(); !corrected) {
+                ghost_correction_replay_failed_ = true;
+                status_ = TaskStatus::blocked;
+                diagnostic_ = corrected.error();
+            }
         }
     }
     gates_ = evaluate_gates();
@@ -3482,6 +3855,7 @@ AgentTaskSnapshot AgentTask::build_snapshot() const {
     view.repairs = repairs_;
     view.rebases = rebases_;
     view.ghost_corrections = ghost_corrections_;
+    view.ghost_recomputes = ghost_recompute_lineage_;
     view.repair_attempts_remaining = envelope_.max_repair_attempts > repairs_.size()
         ? envelope_.max_repair_attempts - repairs_.size() : 0U;
     view.gates = gates_;
@@ -3813,6 +4187,7 @@ core::Result<void> AgentTask::save_checkpoint(
     checkpoint.repair_lineage = repairs_;
     checkpoint.rebase_lineage = rebases_;
     checkpoint.ghost_corrections = ghost_corrections_;
+    checkpoint.ghost_recomputes = ghost_recompute_lineage_;
     for (const auto& gate : gates_) {
         if (!checkpoint.last_validation_report.empty()) {
             checkpoint.last_validation_report.push_back('\n');
@@ -3956,6 +4331,7 @@ core::Result<AgentTask> AgentTask::resume_checkpoint(
     resumed.value().repairs_ = checkpoint.repair_lineage;
     resumed.value().rebases_ = checkpoint.rebase_lineage;
     resumed.value().ghost_corrections_ = checkpoint.ghost_corrections;
+    resumed.value().ghost_recompute_lineage_ = checkpoint.ghost_recomputes;
     resumed.value().replay_ghost_corrections_ =
         !resumed.value().ghost_corrections_.empty();
     const auto replayed = resumed.value().run();
@@ -4226,6 +4602,7 @@ core::Result<AgentTask> AgentTask::rebase_checkpoint(
     rebased.value().repairs_ = checkpoint.repair_lineage;
     rebased.value().rebases_ = checkpoint.rebase_lineage;
     rebased.value().ghost_corrections_ = checkpoint.ghost_corrections;
+    rebased.value().ghost_recompute_lineage_ = checkpoint.ghost_recomputes;
     rebased.value().replay_ghost_corrections_ =
         !rebased.value().ghost_corrections_.empty();
     AgentRebaseReceipt receipt;

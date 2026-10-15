@@ -683,6 +683,59 @@ AgentRebaseReceipt read_rebase(Reader& reader, std::uint64_t version) {
     return rebase;
 }
 
+void write_ghost_recompute(
+    Writer& writer,
+    const AgentGhostRecomputeReceipt& recompute) {
+    writer.field(recompute.task_id);
+    writer.field(recompute.anchor_step_id);
+    writer.digest(recompute.correction_evidence_digest);
+    writer.number(recompute.dependent_step_ids.size());
+    for (const auto& step_id : recompute.dependent_step_ids) writer.field(step_id);
+    writer.number(recompute.previous_step_receipts.size());
+    for (const auto& receipt : recompute.previous_step_receipts) {
+        write_step_receipt(writer, receipt);
+    }
+    writer.number(recompute.previous_gate_results.size());
+    for (const auto& gate : recompute.previous_gate_results) write_gate(writer, gate);
+    writer.digest(recompute.previous_diff_digest);
+    writer.digest(recompute.result_diff_digest);
+    writer.number(recompute.previous_speculative_revision.value());
+    writer.number(recompute.result_speculative_revision.value());
+    writer.boolean(recompute.replay_completed);
+    write_diagnostic(writer, recompute.diagnostic);
+    writer.digest(recompute.evidence_digest);
+}
+
+AgentGhostRecomputeReceipt read_ghost_recompute(Reader& reader) {
+    AgentGhostRecomputeReceipt recompute;
+    recompute.task_id = reader.field(64U);
+    recompute.anchor_step_id = reader.field(64U);
+    recompute.correction_evidence_digest = reader.digest();
+    const auto dependent_count = reader.count(256U);
+    recompute.dependent_step_ids.reserve(dependent_count);
+    for (std::size_t index = 0U; index < dependent_count; ++index) {
+        recompute.dependent_step_ids.push_back(reader.field(64U));
+    }
+    const auto receipt_count = reader.count(4096U);
+    recompute.previous_step_receipts.reserve(receipt_count);
+    for (std::size_t index = 0U; index < receipt_count; ++index) {
+        recompute.previous_step_receipts.push_back(read_step_receipt(reader));
+    }
+    const auto gate_count = reader.count(256U);
+    recompute.previous_gate_results.reserve(gate_count);
+    for (std::size_t index = 0U; index < gate_count; ++index) {
+        recompute.previous_gate_results.push_back(read_gate(reader));
+    }
+    recompute.previous_diff_digest = reader.digest();
+    recompute.result_diff_digest = reader.digest();
+    recompute.previous_speculative_revision = core::Revision(reader.number());
+    recompute.result_speculative_revision = core::Revision(reader.number());
+    recompute.replay_completed = reader.boolean();
+    recompute.diagnostic = read_diagnostic(reader);
+    recompute.evidence_digest = reader.digest();
+    return recompute;
+}
+
 void write_progress(Writer& writer, const PlanStepProgress& progress) {
     writer.field(progress.step_id);
     write_strings(writer, progress.dependencies);
@@ -772,6 +825,7 @@ core::Result<void> AgentTaskCheckpoint::validate() const {
     if (plan_progress.size() != plan.steps.size() || plan_progress.size() > 256U ||
         step_receipts.size() > 4096U || repair_lineage.size() > 4U ||
         rebase_lineage.size() > 16U || ghost_corrections.size() > 256U ||
+        ghost_recomputes.size() > envelope.max_ghost_recomputations ||
         repair_lineage.size() > envelope.max_repair_attempts) {
         return core::Result<void>::failure(malformed(
             "checkpoint progress or lineage count is invalid"));
@@ -856,6 +910,20 @@ core::Result<void> AgentTaskCheckpoint::validate() const {
     for (const auto& rebase : rebase_lineage) {
         known_task_ids.insert(rebase.checkpoint_task_id);
     }
+    for (const auto& recompute : ghost_recomputes) {
+        if (auto result = recompute.validate(); !result) {
+            return core::Result<void>::failure(result.error().with_context(
+                "checkpoint ghost recompute lineage"));
+        }
+        const bool correction_is_bound = std::any_of(
+            ghost_corrections.begin(), ghost_corrections.end(), [&recompute](const auto& correction) {
+                return correction.evidence_digest == recompute.correction_evidence_digest;
+            });
+        if (!known_task_ids.contains(recompute.task_id) || !correction_is_bound) {
+            return core::Result<void>::failure(malformed(
+                "checkpoint ghost recompute is outside correction or task lineage"));
+        }
+    }
     const auto plan_context_digest_value = plan.context_digest();
     assets::Sha256Digest expected_correction_parent;
     std::map<scene::ObjectId, core::Transform> correction_final_transforms;
@@ -902,6 +970,16 @@ core::Result<void> AgentTaskCheckpoint::validate() const {
                 plan.objective.protected_objects.end()) {
             return core::Result<void>::failure(malformed(
                 "checkpoint ghost correction is outside its plan, scope, or lineage"));
+        }
+        if (correction.task_id == plan.id &&
+            correction.plan_context_digest == plan_context_digest_value.value() &&
+            correction.recompute_after_step_id.has_value() &&
+            !correction.recompute_after_step_id->empty() &&
+            std::none_of(plan.steps.begin(), plan.steps.end(), [&correction](const auto& step) {
+                return step.id == *correction.recompute_after_step_id;
+            })) {
+            return core::Result<void>::failure(malformed(
+                "checkpoint ghost correction anchor is absent from its bound plan"));
         }
         if (correction.kind == GhostCorrectionKind::object_transform) {
             const auto previous = correction_final_transforms.find(correction.object);
@@ -994,6 +1072,42 @@ core::Result<void> AgentTaskCheckpoint::validate() const {
         }
         expected_correction_parent = correction.evidence_digest;
     }
+    for (const auto& recompute : ghost_recomputes) {
+        if (recompute.task_id != plan.id) continue;
+        const auto anchor = std::find_if(plan.steps.begin(), plan.steps.end(),
+            [&recompute](const auto& step) { return step.id == recompute.anchor_step_id; });
+        if (anchor == plan.steps.end()) {
+            return core::Result<void>::failure(malformed(
+                "checkpoint ghost recompute anchor is absent from its bound plan"));
+        }
+        std::set<std::string> descendants{recompute.anchor_step_id};
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const auto& step : plan.steps) {
+                if (descendants.contains(step.id)) continue;
+                if (std::any_of(step.dependencies.begin(), step.dependencies.end(),
+                        [&descendants](const std::string& dependency) {
+                            return descendants.contains(dependency);
+                        })) {
+                    descendants.insert(step.id);
+                    changed = true;
+                }
+            }
+        }
+        const auto scheduled = plan.schedule_order();
+        if (!scheduled) return core::Result<void>::failure(scheduled.error());
+        std::vector<std::string> expected_dependents;
+        for (const auto& step_id : scheduled.value()) {
+            if (step_id != recompute.anchor_step_id && descendants.contains(step_id)) {
+                expected_dependents.push_back(step_id);
+            }
+        }
+        if (expected_dependents != recompute.dependent_step_ids) {
+            return core::Result<void>::failure(malformed(
+                "checkpoint ghost recompute does not match the plan dependency graph"));
+        }
+    }
     if (status == TaskStatus::review) {
         for (const auto& [object, expected_transform] : correction_final_transforms) {
             const auto* actual = speculative.value().scene().find(object);
@@ -1053,6 +1167,21 @@ core::Result<std::string> AgentTaskCheckpoint::serialize() const {
         write_ghost_correction(payload, correction);
     }
     payload.field(last_validation_report);
+    Writer extension;
+    extension.number(1U);
+    extension.number(envelope.max_ghost_recomputations);
+    extension.number(ghost_corrections.size());
+    for (const auto& correction : ghost_corrections) {
+        extension.boolean(correction.recompute_after_step_id.has_value());
+        if (correction.recompute_after_step_id.has_value()) {
+            extension.field(*correction.recompute_after_step_id);
+        }
+    }
+    extension.number(ghost_recomputes.size());
+    for (const auto& recompute : ghost_recomputes) {
+        write_ghost_recompute(extension, recompute);
+    }
+    payload.field(std::move(extension).take());
     auto body = std::move(payload).take();
     Writer outer;
     outer.field(body);
@@ -1100,6 +1229,10 @@ core::Result<AgentTaskCheckpoint> AgentTaskCheckpoint::deserialize(std::string_v
     checkpoint.speculative_project = reader.field(kMaxProjectBytes);
     checkpoint.plan = read_plan(reader, version);
     checkpoint.envelope = read_envelope(reader, version);
+    if (!reader.good()) {
+        return core::Result<AgentTaskCheckpoint>::failure(malformed(
+            "checkpoint plan or work envelope: " + reader.error().message));
+    }
     const auto progress_count = reader.count(256U);
     checkpoint.plan_progress.reserve(progress_count);
     for (std::size_t index = 0U; index < progress_count; ++index) {
@@ -1129,7 +1262,42 @@ core::Result<AgentTaskCheckpoint> AgentTaskCheckpoint::deserialize(std::string_v
             checkpoint.ghost_corrections.push_back(read_ghost_correction(reader, version));
         }
     }
+    if (!reader.good()) {
+        return core::Result<AgentTaskCheckpoint>::failure(malformed(
+            "checkpoint task evidence: " + reader.error().message));
+    }
     checkpoint.last_validation_report = reader.field(kMaxTextBytes);
+    if (version >= 8U) {
+        const std::string extension_bytes = reader.field(kMaxCheckpointBytes);
+        Reader extension(extension_bytes);
+        if (extension.number() != 1U) {
+            extension.fail("checkpoint workbench extension version is unsupported");
+        }
+        checkpoint.envelope.max_ghost_recomputations = extension.count(16U);
+        const auto anchor_count = extension.count(256U);
+        if (anchor_count != checkpoint.ghost_corrections.size()) {
+            extension.fail("checkpoint ghost-anchor count does not match its receipts");
+        }
+        for (std::size_t index = 0U;
+             index < anchor_count && index < checkpoint.ghost_corrections.size(); ++index) {
+            if (extension.boolean()) {
+                checkpoint.ghost_corrections[index].recompute_after_step_id =
+                    extension.field(64U);
+            }
+        }
+        const auto recompute_count = extension.count(16U);
+        checkpoint.ghost_recomputes.reserve(recompute_count);
+        for (std::size_t index = 0U; index < recompute_count; ++index) {
+            checkpoint.ghost_recomputes.push_back(read_ghost_recompute(extension));
+        }
+        if (!extension.good()) {
+            return core::Result<AgentTaskCheckpoint>::failure(malformed(
+                "checkpoint workbench extension: " + extension.error().message));
+        }
+        if (!extension.finished()) {
+            return core::Result<AgentTaskCheckpoint>::failure(extension.error());
+        }
+    }
     if (!reader.finished()) {
         return core::Result<AgentTaskCheckpoint>::failure(reader.error());
     }

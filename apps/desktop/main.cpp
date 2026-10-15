@@ -7488,7 +7488,8 @@ struct DesktopState {
                 }
                 ImGui::TextDisabled(
                     "Click an in-scope root object, then drag its X or Z handle. "
-                    "Each change stays on the speculative branch and reruns gates.");
+                    "Each change stays on the speculative branch, recomputes dependent steps, "
+                    "and reruns gates.");
                 std::array<char, 1025> correction_reason{};
                 const std::size_t correction_reason_bytes = std::min(
                     agent_ghost_justification.size(), correction_reason.size() - 1U);
@@ -7667,6 +7668,36 @@ struct DesktopState {
                             correction.task_id.c_str(),
                             static_cast<unsigned long long>(correction.object.value),
                             correction.justification.c_str());
+                    }
+                }
+            }
+            if (!task.ghost_recomputes.empty()) {
+                ImGui::Separator();
+                ImGui::Text("Dependent plan recomputations · %zu",
+                    task.ghost_recomputes.size());
+                for (const auto& recompute : task.ghost_recomputes) {
+                    std::string dependent_steps;
+                    for (const auto& step_id : recompute.dependent_step_ids) {
+                        if (!dependent_steps.empty()) dependent_steps += ", ";
+                        dependent_steps += step_id;
+                    }
+                    ImGui::BulletText("%s · after %s · %s",
+                        recompute.task_id.c_str(), recompute.anchor_step_id.c_str(),
+                        recompute.replay_completed ? "replayed" : "blocked");
+                    ImGui::TextDisabled("  %zu dependent step(s): %s",
+                        recompute.dependent_step_ids.size(),
+                        dependent_steps.empty() ? "none" : dependent_steps.c_str());
+                    const std::string diff_digest = recompute.result_diff_digest.hex();
+                    const std::string evidence_digest = recompute.evidence_digest.hex();
+                    ImGui::TextDisabled(
+                        "  branch revision %llu → %llu · diff %.12s · evidence %.12s",
+                        static_cast<unsigned long long>(
+                            recompute.previous_speculative_revision.value()),
+                        static_cast<unsigned long long>(
+                            recompute.result_speculative_revision.value()),
+                        diff_digest.c_str(), evidence_digest.c_str());
+                    if (recompute.diagnostic.has_value()) {
+                        ImGui::TextWrapped("  %s", recompute.diagnostic->message.c_str());
                     }
                 }
             }

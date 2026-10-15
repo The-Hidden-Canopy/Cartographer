@@ -140,8 +140,10 @@ void skip_checkpoint_strings(const std::vector<std::string>& fields, std::size_t
     cursor += static_cast<std::size_t>(count);
 }
 
-std::vector<std::string> legacy_v3_fields_from_v7(std::vector<std::string> fields) {
-    REQUIRE(fields.size() > 10U && fields[0] == "7");
+std::vector<std::string> legacy_v3_fields_from_v8(std::vector<std::string> fields) {
+    REQUIRE(fields.size() > 10U && fields[0] == "8");
+    fields.pop_back(); // Version 8 stores ghost anchors and recompute receipts in an extension.
+    fields[0] = "7";
     fields[0] = "3";
     fields.erase(fields.begin() + 13); // Version 4 has no recipe field.
     std::size_t cursor = 10U;
@@ -1890,7 +1892,9 @@ void persistent_checkpoint_v1_format_remains_readable() {
         return std::to_string(value.size()) + ":" + std::string(value) + "|";
     };
     auto v4_fields = checkpoint_fields(current_body);
-    REQUIRE(v4_fields.size() > 13U && v4_fields[0] == "7");
+    REQUIRE(v4_fields.size() > 13U && v4_fields[0] == "8");
+    v4_fields.pop_back();
+    v4_fields[0] = "7";
     v4_fields[0] = "4";
     v4_fields.erase(v4_fields.begin() + 13); // Version 4 has no recipe field.
     const std::string v4_body = checkpoint_body(v4_fields);
@@ -1901,7 +1905,7 @@ void persistent_checkpoint_v1_format_remains_readable() {
     REQUIRE(decoded_v4);
     REQUIRE(decoded_v4.value().plan.objective.recipe_id.empty());
 
-    const auto v3_fields = legacy_v3_fields_from_v7(checkpoint_fields(current_body));
+    const auto v3_fields = legacy_v3_fields_from_v8(checkpoint_fields(current_body));
     const std::string v3_body = checkpoint_body(v3_fields);
     REQUIRE(v3_body.starts_with("1:3|"));
     REQUIRE(v3_body.ends_with("1:0|1:0|1:0|0:|"));
@@ -3518,19 +3522,28 @@ void ui_ghost_corrections_are_scoped_revalidated_and_checkpointed() {
     REQUIRE(ui.save_agent_checkpoint(checkpoint_path));
     const auto current_checkpoint = carto::agent::AgentTask::load_checkpoint(checkpoint_path);
     REQUIRE(current_checkpoint);
-    const auto current_encoding = current_checkpoint.value().serialize();
-    REQUIRE(current_encoding);
+    auto legacy_source = current_checkpoint.value();
+    legacy_source.ghost_corrections.front().recompute_after_step_id.reset();
+    const auto legacy_evidence =
+        legacy_source.ghost_corrections.front().computed_evidence_digest();
+    REQUIRE(legacy_evidence);
+    legacy_source.ghost_corrections.front().evidence_digest = legacy_evidence.value();
+    const auto legacy_encoding = legacy_source.serialize();
+    REQUIRE(legacy_encoding);
     constexpr std::string_view checkpoint_magic =
         "CARTOGRAPHER_AGENT_TASK_CHECKPOINT_V1\n";
-    const std::size_t body_length_end = current_encoding.value().find(
+    const std::size_t body_length_end = legacy_encoding.value().find(
         ':', checkpoint_magic.size());
     REQUIRE(body_length_end != std::string::npos);
     const auto body_length = static_cast<std::size_t>(std::stoull(
-        current_encoding.value().substr(
+        legacy_encoding.value().substr(
             checkpoint_magic.size(), body_length_end - checkpoint_magic.size())));
     const std::size_t body_begin = body_length_end + 1U;
     auto legacy_v5_fields = checkpoint_fields(
-        current_encoding.value().substr(body_begin, body_length));
+        legacy_encoding.value().substr(body_begin, body_length));
+    REQUIRE(legacy_v5_fields[0] == "8");
+    legacy_v5_fields.pop_back();
+    legacy_v5_fields[0] = "7";
     REQUIRE(legacy_v5_fields[0] == "7");
     legacy_v5_fields.erase(legacy_v5_fields.end() - 13, legacy_v5_fields.end() - 1);
     legacy_v5_fields[0] = "5";
@@ -3714,6 +3727,110 @@ void ui_ghost_vertex_correction_is_scoped_replayed_and_checkpointed() {
     const auto accepted_vertex_index = static_cast<std::size_t>(std::distance(
         accepted_instance->mesh->vertex_ids.begin(), accepted_vertex));
     REQUIRE(accepted_instance->mesh->positions[accepted_vertex_index].x == corrected_position.x);
+}
+
+void ui_ghost_correction_recomputes_dependent_steps_and_persists_lineage() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    const auto objects = create_boxes(source, 2U);
+    const auto vertex_source = source.snapshot();
+    const auto target = objects[0];
+    const auto dependent_target = objects[1];
+    const auto* target_instance = vertex_source.viewport.scene.find(target);
+    REQUIRE(target_instance != nullptr && target_instance->mesh != nullptr);
+    REQUIRE(!target_instance->mesh->vertex_ids.empty());
+    const auto vertex = target_instance->mesh->vertex_ids.front();
+
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::vertex}));
+    REQUIRE(ui.dispatch(carto::application::SelectVertexAction{target, vertex}));
+    REQUIRE(ui.queue_agent_step("move vertex to 0.25 0 0"));
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        dependent_target, carto::geometry::FaceId{1U}}));
+    REQUIRE(ui.queue_agent_step("inset face 0.1", {"step-1"}));
+
+    const auto source_revision = source.snapshot().project_revision;
+    const auto initial_run = ui.run_agent_plan(
+        "Move one vertex, then edit the dependent face after review.");
+    REQUIRE(initial_run && initial_run.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(initial_run.value().steps.size() == 2U);
+    REQUIRE(initial_run.value().steps[0].status == carto::agent::StepStatus::passed);
+    REQUIRE(initial_run.value().steps[1].status == carto::agent::StepStatus::passed);
+    REQUIRE(initial_run.value().ghost_recomputes.empty());
+    const auto old_dependent_step = initial_run.value().steps[1];
+    const auto* edited_vertex_instance = initial_run.value().after_scene.find(target);
+    REQUIRE(edited_vertex_instance != nullptr && edited_vertex_instance->mesh != nullptr);
+    const auto edited_vertex = std::find(
+        edited_vertex_instance->mesh->vertex_ids.begin(),
+        edited_vertex_instance->mesh->vertex_ids.end(), vertex);
+    REQUIRE(edited_vertex != edited_vertex_instance->mesh->vertex_ids.end());
+    const auto edited_vertex_index = static_cast<std::size_t>(std::distance(
+        edited_vertex_instance->mesh->vertex_ids.begin(), edited_vertex));
+    const auto corrected_position =
+        edited_vertex_instance->mesh->positions[edited_vertex_index] +
+        carto::core::Vec3d{0.125, 0.0, 0.0};
+
+    const auto corrected = ui.correct_agent_ghost_vertex_position(
+        target, vertex, corrected_position,
+        "Lock the corrected corner before recomputing dependent work.");
+    REQUIRE(corrected && corrected.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(corrected.value().can_accept);
+    REQUIRE(corrected.value().ghost_corrections.size() == 1U);
+    REQUIRE(corrected.value().ghost_corrections.front().recompute_after_step_id ==
+        std::optional<std::string>("step-1"));
+    REQUIRE(corrected.value().ghost_recomputes.size() == 1U);
+    const auto& recompute = corrected.value().ghost_recomputes.front();
+    REQUIRE(recompute.task_id == corrected.value().task_id);
+    REQUIRE(recompute.anchor_step_id == "step-1");
+    REQUIRE(recompute.dependent_step_ids == std::vector<std::string>{"step-2"});
+    REQUIRE(recompute.previous_step_receipts.size() == 2U);
+    REQUIRE(recompute.previous_step_receipts[1].revision_before ==
+        old_dependent_step.revision_before);
+    REQUIRE(recompute.replay_completed);
+    REQUIRE(!recompute.previous_diff_digest.is_zero());
+    REQUIRE(recompute.result_diff_digest == corrected.value().diff.digest);
+    REQUIRE(recompute.validate());
+    REQUIRE(corrected.value().steps.size() == 2U);
+    REQUIRE(corrected.value().steps[1].step_id == "step-2");
+    REQUIRE(corrected.value().steps[1].revision_before ==
+        old_dependent_step.revision_before.next());
+    REQUIRE(source.snapshot().project_revision == source_revision);
+
+    TempDirectory directory;
+    const auto checkpoint_path = directory.path() / "ghost-dependent-recompute.carto-agent-task";
+    REQUIRE(ui.save_agent_checkpoint(checkpoint_path));
+    const auto checkpoint = carto::agent::AgentTask::load_checkpoint(checkpoint_path);
+    REQUIRE(checkpoint);
+    REQUIRE(checkpoint.value().ghost_recomputes.size() == 1U);
+    REQUIRE(checkpoint.value().ghost_corrections.front().recompute_after_step_id ==
+        std::optional<std::string>("step-1"));
+    REQUIRE(checkpoint.value().ghost_recomputes.front().evidence_digest ==
+        recompute.evidence_digest);
+
+    auto forged_anchor = checkpoint.value();
+    forged_anchor.ghost_corrections.front().recompute_after_step_id = "missing-step";
+    const auto forged_correction_digest =
+        forged_anchor.ghost_corrections.front().computed_evidence_digest();
+    REQUIRE(forged_correction_digest);
+    forged_anchor.ghost_corrections.front().evidence_digest =
+        forged_correction_digest.value();
+    REQUIRE(!forged_anchor.serialize());
+    auto forged_budget = checkpoint.value();
+    forged_budget.envelope.max_ghost_recomputations = 0U;
+    REQUIRE(!forged_budget.serialize());
+
+    carto::ui::UiController resumed_ui(source);
+    REQUIRE(resumed_ui.load_agent_checkpoint(checkpoint_path));
+    const auto resumed = resumed_ui.resume_agent_checkpoint();
+    REQUIRE(resumed && resumed.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(resumed.value().ghost_recomputes.size() == 1U);
+    REQUIRE(resumed.value().ghost_recomputes.front().evidence_digest ==
+        recompute.evidence_digest);
+    REQUIRE(resumed.value().steps[1].revision_before ==
+        old_dependent_step.revision_before.next());
+    REQUIRE(source.snapshot().project_revision == source_revision);
 }
 
 void ui_ghost_topology_correction_is_scoped_replayed_and_checkpointed() {
@@ -4012,6 +4129,7 @@ int main() {
         ui_repair_invalidates_plan_bound_human_receipts_until_reanswered();
         ui_ghost_corrections_are_scoped_revalidated_and_checkpointed();
         ui_ghost_vertex_correction_is_scoped_replayed_and_checkpointed();
+        ui_ghost_correction_recomputes_dependent_steps_and_persists_lineage();
         ui_ghost_topology_correction_is_scoped_replayed_and_checkpointed();
         ui_ghost_corrections_remain_locked_through_repair();
         persistent_checkpoint_replays_review_and_blocks_artifact_drift();
