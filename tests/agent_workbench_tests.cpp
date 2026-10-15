@@ -2766,6 +2766,8 @@ void objective_compiler_binds_explicit_transform_and_displacement_limits() {
     REQUIRE(!carto::agent::compile_explicit_hard_constraints(
         "Preserve transforms but allow transforms to change."));
     REQUIRE(!carto::agent::compile_explicit_hard_constraints(
+        "Don't change the transform."));
+    REQUIRE(!carto::agent::compile_explicit_hard_constraints(
         "Maximum vertex displacement -0.25 world units."));
     REQUIRE(!carto::agent::compile_explicit_hard_constraints(
         "Maximum vertex displacement 0.25 meters."));
