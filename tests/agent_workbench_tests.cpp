@@ -3770,6 +3770,66 @@ void ui_clarification_requires_an_operator_answer_before_review() {
     REQUIRE(stale_source.snapshot().project_revision == edited_revision);
 }
 
+void ui_candidate_clarification_choice_is_scoped_and_receipted() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Candidate clarification target", {1.0, 1.0, 1.0}}));
+    const auto object = source.snapshot().objects.front().object.id;
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        object, carto::geometry::FaceId{1U}}));
+    REQUIRE(ui.queue_agent_step("inset face 0.1"));
+
+    REQUIRE(!ui.queue_agent_clarification(
+        "Choose the intended edit.",
+        carto::agent::ClarificationImpact::topology_deletion,
+        {{"only", "Only one choice", {object}}}));
+    REQUIRE(!ui.queue_agent_clarification(
+        "Choose the intended edit.",
+        carto::agent::ClarificationImpact::topology_deletion,
+        {{"inside", "In scope", {object}},
+         {"outside", "Out of scope", {carto::scene::ObjectId{999U}}}}));
+    REQUIRE(ui.snapshot().agent_clarifications_draft.empty());
+
+    REQUIRE(ui.queue_agent_clarification(
+        "How should this face change?",
+        carto::agent::ClarificationImpact::topology_deletion,
+        {{"preserve", "Preserve the current surface", {object}},
+         {"inset", "Allow the captured inset", {object}}}));
+    const auto source_revision = source.snapshot().project_revision;
+    const auto queued = ui.snapshot();
+    REQUIRE(queued.agent_clarifications_draft.size() == 1U);
+    REQUIRE(queued.agent_clarifications_draft.front().candidates.size() == 2U);
+    REQUIRE(!queued.agent_clarifications_draft.front().human_receipt.has_value());
+    REQUIRE(!ui.run_agent_plan("Apply the bounded inset after the operator choice."));
+    REQUIRE(!ui.choose_agent_clarification_candidate(
+        "Apply the bounded inset after the operator choice.", "question-1", "missing"));
+    REQUIRE(!ui.snapshot().agent_clarifications_draft.front().human_receipt.has_value());
+    REQUIRE(source.snapshot().project_revision == source_revision);
+
+    REQUIRE(ui.choose_agent_clarification_candidate(
+        "Apply the bounded inset after the operator choice.", "question-1", "inset"));
+    const auto answered = ui.snapshot().agent_clarifications_draft.front();
+    REQUIRE(answered.selected_candidate_id == std::optional<std::string>("inset"));
+    REQUIRE(answered.human_receipt.has_value());
+    REQUIRE(!answered.freeform_answer.has_value());
+    REQUIRE(!ui.queue_agent_step("inset face 0.2"));
+    REQUIRE(source.snapshot().project_revision == source_revision);
+
+    const auto run = ui.run_agent_plan("Apply the bounded inset after the operator choice.");
+    REQUIRE(run && run.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(run.value().can_accept);
+    REQUIRE(run.value().clarifications.size() == 1U);
+    REQUIRE(run.value().clarifications.front().selected_candidate_id ==
+        std::optional<std::string>("inset"));
+    REQUIRE(run.value().clarifications.front().human_receipt.has_value());
+    REQUIRE(source.snapshot().project_revision == source_revision);
+    REQUIRE(ui.accept_agent_plan());
+    REQUIRE(source.snapshot().project_revision == source_revision.next());
+}
+
 void ui_repairs_failed_step_with_operator_justification_and_scope_checks() {
     carto::application::ApplicationSession source;
     carto::ui::UiController ui(source);
@@ -4943,6 +5003,7 @@ int main() {
         ui_prepared_task_supports_condition_preflight_and_rechecks_source_revision();
         ui_recipe_selection_round_trips_and_locks_with_checkpoint();
         ui_clarification_requires_an_operator_answer_before_review();
+        ui_candidate_clarification_choice_is_scoped_and_receipted();
         ui_repairs_failed_step_with_operator_justification_and_scope_checks();
         ui_repair_invalidates_plan_bound_human_receipts_until_reanswered();
         ui_ghost_corrections_are_scoped_revalidated_and_checkpointed();

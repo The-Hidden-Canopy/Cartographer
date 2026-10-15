@@ -2387,7 +2387,8 @@ core::Result<void> UiController::set_agent_hard_constraints(
 
 core::Result<void> UiController::queue_agent_clarification(
     std::string prompt,
-    agent::ClarificationImpact impact) {
+    agent::ClarificationImpact impact,
+    std::vector<agent::ClarificationCandidate> candidates) {
     if (agent_checkpoint_pending_.has_value()) {
         return core::Result<void>::failure(invalid_state(
             "a loaded checkpoint objective cannot be edited; resume or clear it first"));
@@ -2429,6 +2430,11 @@ core::Result<void> UiController::queue_agent_clarification(
         return core::Result<void>::failure(invalid_state(
             "objective reached the 128-question safety limit"));
     }
+    if (!candidates.empty() &&
+        (candidates.size() < 2U || candidates.size() > 16U)) {
+        return core::Result<void>::failure(invalid(
+            "candidate clarification requires 2 to 16 choices"));
+    }
 
     std::vector<scene::ObjectId> scope;
     for (const auto& step : agent_plan_draft_) {
@@ -2443,6 +2449,7 @@ core::Result<void> UiController::queue_agent_clarification(
     question.impacts = {impact};
     question.affected_objects = std::move(scope);
     question.downstream_plan_branches = agent_plan_draft_.size();
+    question.candidates = std::move(candidates);
     question.requires_explicit_answer = true;
     if (auto result = question.validate(question.affected_objects, {}); !result) {
         return result;
@@ -2455,6 +2462,23 @@ core::Result<void> UiController::answer_agent_clarification(
     std::string goal,
     std::string_view question_id,
     std::string answer) {
+    return record_agent_clarification_answer(
+        std::move(goal), question_id, std::nullopt, std::move(answer));
+}
+
+core::Result<void> UiController::choose_agent_clarification_candidate(
+    std::string goal,
+    std::string_view question_id,
+    std::string candidate_id) {
+    return record_agent_clarification_answer(
+        std::move(goal), question_id, std::move(candidate_id), std::nullopt);
+}
+
+core::Result<void> UiController::record_agent_clarification_answer(
+    std::string goal,
+    std::string_view question_id,
+    std::optional<std::string> candidate_id,
+    std::optional<std::string> freeform_answer) {
     if (agent_task_.has_value() &&
         (!agent_repair_mode_ ||
          agent_task_->snapshot().status != agent::TaskStatus::blocked)) {
@@ -2497,7 +2521,7 @@ core::Result<void> UiController::answer_agent_clarification(
         std::move(constraints.value()), agent_clarifications_draft_, agent_recipe_id_};
     agent::AgentPlan plan{task_id, std::move(objective), agent_plan_draft_};
     const auto answered = application::HumanApplicationAccess::answer_agent_clarification(
-        plan, question_id, std::nullopt, std::move(answer));
+        plan, question_id, std::move(candidate_id), std::move(freeform_answer));
     if (!answered) return answered;
     agent_goal_ = plan.objective.goal;
     agent_clarifications_draft_ = std::move(plan.objective.clarifications);

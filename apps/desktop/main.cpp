@@ -1230,6 +1230,8 @@ struct DesktopState {
     carto::core::Revision agent_ghost_face_branch_revision{};
     bool agent_ghost_edit_mode = false;
     int agent_clarification_impact = 0;
+    std::string agent_clarification_candidate_a;
+    std::string agent_clarification_candidate_b;
     int agent_step_dependency = 0;
     int agent_repair_step_index = 0;
     std::string agent_feedback;
@@ -6899,6 +6901,36 @@ struct DesktopState {
         if (ImGui::InputText("Decision question", question_input.data(), question_input.size())) {
             agent_question.assign(question_input.data());
         }
+        ImGui::TextDisabled(
+            "Optional choices record an answer against the captured plan; they add no steps or scope. Leave both blank for freeform text.");
+        std::array<char, 257> candidate_a_input{};
+        const std::size_t candidate_a_bytes = std::min(
+            agent_clarification_candidate_a.size(), candidate_a_input.size() - 1U);
+        std::copy_n(agent_clarification_candidate_a.data(), candidate_a_bytes,
+            candidate_a_input.data());
+        if (ImGui::InputText("Choice A (optional)", candidate_a_input.data(),
+                candidate_a_input.size())) {
+            agent_clarification_candidate_a.assign(candidate_a_input.data());
+        }
+        std::array<char, 257> candidate_b_input{};
+        const std::size_t candidate_b_bytes = std::min(
+            agent_clarification_candidate_b.size(), candidate_b_input.size() - 1U);
+        std::copy_n(agent_clarification_candidate_b.data(), candidate_b_bytes,
+            candidate_b_input.data());
+        if (ImGui::InputText("Choice B (optional)", candidate_b_input.data(),
+                candidate_b_input.size())) {
+            agent_clarification_candidate_b.assign(candidate_b_input.data());
+        }
+        const bool no_candidate_choices = agent_clarification_candidate_a.empty() &&
+            agent_clarification_candidate_b.empty();
+        const bool complete_candidate_choices =
+            !agent_clarification_candidate_a.empty() &&
+            !agent_clarification_candidate_b.empty() &&
+            agent_clarification_candidate_a != agent_clarification_candidate_b;
+        if (!no_candidate_choices && !complete_candidate_choices) {
+            ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                "Provide two distinct choices, or leave both fields blank.");
+        }
         constexpr std::array<const char*, 9> clarification_impact_names{
             "Object scope", "Topology deletion", "Familiarity-critical feature",
             "Collision or navigation", "Interaction anchor", "Source hierarchy",
@@ -6921,15 +6953,36 @@ struct DesktopState {
             clarification_impact_names.data(),
             static_cast<int>(clarification_impact_names.size()));
         ImGui::BeginDisabled(agent_question.empty() || snapshot.agent_plan_draft.empty() ||
-            snapshot.agent_task.has_value() || snapshot.agent_checkpoint_loaded);
+            snapshot.agent_task.has_value() || snapshot.agent_checkpoint_loaded ||
+            (!no_candidate_choices && !complete_candidate_choices));
         if (ImGui::Button("Require an answer", ImVec2(-1, 26))) {
+            std::vector<carto::agent::ClarificationCandidate> candidates;
+            if (complete_candidate_choices) {
+                std::vector<carto::scene::ObjectId> affected_objects;
+                for (const auto& planned : snapshot.agent_plan_draft) {
+                    if (std::find(affected_objects.begin(), affected_objects.end(),
+                            planned.target.object) == affected_objects.end()) {
+                        affected_objects.push_back(planned.target.object);
+                    }
+                }
+                candidates.push_back({"choice-a", agent_clarification_candidate_a,
+                    affected_objects});
+                candidates.push_back({"choice-b", agent_clarification_candidate_b,
+                    std::move(affected_objects)});
+            }
             const auto queued = ui.queue_agent_clarification(
                 agent_question, clarification_impacts[static_cast<std::size_t>(
-                    agent_clarification_impact)]);
+                    agent_clarification_impact)], std::move(candidates));
             agent_feedback = queued
-                ? "Question bound to the current target scope; answer it before running."
+                ? (complete_candidate_choices
+                    ? "Question and choices bound to the current plan; answer before running."
+                    : "Question bound to the current target scope; answer before running.")
                 : queued.error().message;
-            if (queued) agent_question.clear();
+            if (queued) {
+                agent_question.clear();
+                agent_clarification_candidate_a.clear();
+                agent_clarification_candidate_b.clear();
+            }
         }
         ImGui::EndDisabled();
         bool clarifications_answered = true;
@@ -6939,26 +6992,52 @@ struct DesktopState {
             if (question.freeform_answer.has_value()) {
                 ImGui::TextWrapped("Operator answer · %s", question.freeform_answer->c_str());
             } else if (question.selected_candidate_id.has_value()) {
-                ImGui::Text("Operator choice · %s", question.selected_candidate_id->c_str());
+                const auto selected = std::find_if(question.candidates.begin(),
+                    question.candidates.end(), [&question](const auto& candidate) {
+                        return candidate.id == *question.selected_candidate_id;
+                    });
+                ImGui::TextWrapped("Operator choice · %s",
+                    selected == question.candidates.end()
+                        ? question.selected_candidate_id->c_str()
+                        : selected->label.c_str());
             } else {
                 clarifications_answered = false;
-                std::array<char, 1025> answer_input{};
-                const std::size_t answer_bytes = std::min(
-                    agent_answer.size(), answer_input.size() - 1U);
-                std::copy_n(agent_answer.data(), answer_bytes, answer_input.data());
-                if (ImGui::InputText("Answer", answer_input.data(), answer_input.size())) {
-                    agent_answer.assign(answer_input.data());
+                if (!question.candidates.empty()) {
+                    ImGui::TextDisabled("Choose one candidate answer:");
+                    ImGui::BeginDisabled(agent_goal.empty() ||
+                        snapshot.agent_checkpoint_loaded ||
+                        (snapshot.agent_task.has_value() && !snapshot.agent_repair_ready));
+                    for (const auto& candidate : question.candidates) {
+                        ImGui::PushID(candidate.id.c_str());
+                        if (ImGui::Button(candidate.label.c_str(), ImVec2(-1, 26))) {
+                            const auto answered = ui.choose_agent_clarification_candidate(
+                                agent_goal, question.id, candidate.id);
+                            agent_feedback = answered
+                                ? "Choice recorded against this exact objective, plan, and target revision."
+                                : answered.error().message;
+                        }
+                        ImGui::PopID();
+                    }
+                    ImGui::EndDisabled();
+                } else {
+                    std::array<char, 1025> answer_input{};
+                    const std::size_t answer_bytes = std::min(
+                        agent_answer.size(), answer_input.size() - 1U);
+                    std::copy_n(agent_answer.data(), answer_bytes, answer_input.data());
+                    if (ImGui::InputText("Answer", answer_input.data(), answer_input.size())) {
+                        agent_answer.assign(answer_input.data());
+                    }
+                    ImGui::BeginDisabled(agent_answer.empty() || agent_goal.empty());
+                    if (ImGui::Button("Confirm operator answer", ImVec2(-1, 26))) {
+                        const auto answered = ui.answer_agent_clarification(
+                            agent_goal, question.id, agent_answer);
+                        agent_feedback = answered
+                            ? "Answer recorded against this exact objective and target revision."
+                            : answered.error().message;
+                        if (answered) agent_answer.clear();
+                    }
+                    ImGui::EndDisabled();
                 }
-                ImGui::BeginDisabled(agent_answer.empty() || agent_goal.empty());
-                if (ImGui::Button("Confirm operator answer", ImVec2(-1, 26))) {
-                    const auto answered = ui.answer_agent_clarification(
-                        agent_goal, question.id, agent_answer);
-                    agent_feedback = answered
-                        ? "Answer recorded against this exact objective and target revision."
-                        : answered.error().message;
-                    if (answered) agent_answer.clear();
-                }
-                ImGui::EndDisabled();
             }
             ImGui::PopID();
         }

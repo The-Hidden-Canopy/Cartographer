@@ -66,6 +66,8 @@
 - Constraint and question identities are unique, all referenced objects and constraints are in scope, and malformed bounds or candidate answers are rejected.
 - A consequential unresolved question blocks task creation without creating or mutating a speculative branch; only the explicit human application boundary can issue an answer receipt, and a selected candidate cannot contradict queued targets.
 - The native UI can queue an operator-required question, refuses to run while it is unanswered, and records the explicit answer in the same objective/revision context shown in review.
+- The UI can show two or more authored candidate choices, records only a listed choice through the human application boundary, rejects unknown choices and out-of-scope candidate targets, and preserves the source revision until explicit acceptance.
+- Candidate answers add no plan steps or scope; a changed plan invalidates the receipt and requires a new operator answer.
 - The answer receipt is invalidated by a changed plan intent, target, order, or dependency graph, even when the objective text is unchanged.
 - Changing the goal or source revision after an answer invalidates the workflow; a failed unresolved attempt does not consume the next task identity.
 - Reordering identity lists does not change the canonical objective digest, while changing an answer or hard constraint does.

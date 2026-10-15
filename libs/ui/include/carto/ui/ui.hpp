@@ -525,11 +525,16 @@ public:
     [[nodiscard]] core::Result<void> set_agent_recipe(std::string recipe_id);
     [[nodiscard]] core::Result<void> queue_agent_clarification(
         std::string prompt,
-        agent::ClarificationImpact impact);
+        agent::ClarificationImpact impact,
+        std::vector<agent::ClarificationCandidate> candidates = {});
     [[nodiscard]] core::Result<void> answer_agent_clarification(
         std::string goal,
         std::string_view question_id,
         std::string answer);
+    [[nodiscard]] core::Result<void> choose_agent_clarification_candidate(
+        std::string goal,
+        std::string_view question_id,
+        std::string candidate_id);
     [[nodiscard]] core::Result<agent::AgentTaskSnapshot> prepare_agent_plan(
         std::string goal,
         std::optional<agent::AgentWorkEnvelope> requested_envelope = std::nullopt);
@@ -726,6 +731,11 @@ private:
         const application::ApplicationAction& action,
         OperationCategory category);
     [[nodiscard]] core::Result<void> apply_preferences(const UiPreferences& preferences);
+    [[nodiscard]] core::Result<void> record_agent_clarification_answer(
+        std::string goal,
+        std::string_view question_id,
+        std::optional<std::string> candidate_id,
+        std::optional<std::string> freeform_answer);
     [[nodiscard]] core::Result<void> sync_application_workspace(
         const std::vector<Panel>& panels);
     [[nodiscard]] std::vector<CommandView> command_views() const;
