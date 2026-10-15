@@ -6779,7 +6779,7 @@ struct DesktopState {
         }
         ImGui::Combo("Depends on", &agent_step_dependency,
             dependency_labels.data(), static_cast<int>(dependency_labels.size()));
-        const bool selected_target =
+        const bool single_selected_target =
             (snapshot.selection.mode == carto::editor::SelectionMode::object &&
                 snapshot.selection.objects.size() == 1U) ||
             (snapshot.selection.mode == carto::editor::SelectionMode::face &&
@@ -6788,10 +6788,27 @@ struct DesktopState {
             (snapshot.selection.mode == carto::editor::SelectionMode::vertex &&
                 snapshot.selection.component_object.has_value() &&
                 snapshot.selection.vertices.size() == 1U);
+        const bool compilable_target =
+            (snapshot.selection.mode == carto::editor::SelectionMode::object &&
+                !snapshot.selection.objects.empty() &&
+                snapshot.selection.objects.size() <= 16U) ||
+            (snapshot.selection.mode == carto::editor::SelectionMode::face &&
+                snapshot.selection.component_object.has_value() &&
+                snapshot.selection.faces.size() == 1U) ||
+            (snapshot.selection.mode == carto::editor::SelectionMode::vertex &&
+                snapshot.selection.component_object.has_value() &&
+                snapshot.selection.vertices.size() == 1U);
         if (snapshot.selection.mode == carto::editor::SelectionMode::object &&
-            snapshot.selection.objects.size() == 1U) {
-            ImGui::TextDisabled("Target: object %llu",
-                static_cast<unsigned long long>(snapshot.selection.objects.front().value));
+            !snapshot.selection.objects.empty() &&
+            snapshot.selection.objects.size() <= 16U) {
+            if (snapshot.selection.objects.size() == 1U) {
+                ImGui::TextDisabled("Target: object %llu",
+                    static_cast<unsigned long long>(snapshot.selection.objects.front().value));
+            } else {
+                ImGui::TextDisabled(
+                    "Targets: %llu selected root objects · goal compilation creates independent branches",
+                    static_cast<unsigned long long>(snapshot.selection.objects.size()));
+            }
         } else if (snapshot.selection.mode == carto::editor::SelectionMode::face &&
             snapshot.selection.component_object.has_value() &&
             snapshot.selection.faces.size() == 1U) {
@@ -6805,14 +6822,16 @@ struct DesktopState {
                 static_cast<unsigned long long>(snapshot.selection.component_object->value),
                 static_cast<unsigned long long>(snapshot.selection.vertices.front().value));
         } else {
-            ImGui::TextDisabled("Select exactly one object, face, or vertex to capture a plan step.");
+            ImGui::TextDisabled(
+                "Compile up to 16 selected root objects, or select one face or vertex. "
+                "Manual step capture still uses one target.");
         }
         const bool unresolved_task = snapshot.agent_task.has_value() &&
             snapshot.agent_task->status != carto::agent::TaskStatus::accepted &&
             snapshot.agent_task->status != carto::agent::TaskStatus::rejected;
         ImGui::TextDisabled(
             "Build a reviewable plan from supported native commands separated by “then” or semicolons.");
-        ImGui::BeginDisabled(!selected_target || agent_goal.empty() ||
+        ImGui::BeginDisabled(!compilable_target || agent_goal.empty() ||
             !snapshot.agent_plan_draft.empty() || snapshot.agent_task.has_value() ||
             snapshot.agent_checkpoint_loaded || !objective_constraints_valid);
         if (ImGui::Button("Compile goal sequence", ImVec2(-1, 28))) {
@@ -6822,7 +6841,7 @@ struct DesktopState {
                 : compiled.error().message;
         }
         ImGui::EndDisabled();
-        ImGui::BeginDisabled(!selected_target || agent_step.empty() || unresolved_task);
+        ImGui::BeginDisabled(!single_selected_target || agent_step.empty() || unresolved_task);
         if (ImGui::Button("Queue selected target", ImVec2(-1, 28))) {
             std::vector<std::string> dependencies;
             if (agent_step_dependency > 0) {

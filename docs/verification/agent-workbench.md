@@ -75,6 +75,8 @@
 ## Plan DAG coverage
 
 - Dependencies may point forward or backward in the declared list; scheduling is stable and topological.
+- Goal compilation over multiple selected root objects creates one independent branch per object and chains `then` commands only within each branch; review and explicit acceptance apply the whole candidate once.
+- Locked or nested object selections and multi-target command expansion beyond the 16-step work envelope fail atomically without installing a plan or changing the source.
 - Missing, duplicate, self, and cyclic dependencies are rejected before the speculative session is created.
 - A failed step invalidates its dependent branch, while independent ready steps can complete on the isolated branch.
 - Any failed or invalidated step keeps acceptance blocked, even when an independent branch produced a valid diff.

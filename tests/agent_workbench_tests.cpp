@@ -4530,6 +4530,110 @@ void ui_compiles_explicit_goal_sequences_into_reviewable_agent_dags() {
     REQUIRE(accepted.objects.front().object.local_transform.translation.x < 0.31);
 }
 
+void ui_compiles_multi_object_goals_into_independent_reviewed_branches() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Multi target A", {1.0, 1.0, 1.0}}));
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Multi target B", {1.0, 1.0, 1.0}}));
+    const auto objects = source.snapshot().objects;
+    REQUIRE(objects.size() == 2U);
+    const auto first = objects[0].object.id;
+    const auto second = objects[1].object.id;
+
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{first}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{
+        second, carto::editor::SelectionOperation::add}));
+    const auto source_revision = source.snapshot().project_revision;
+    const std::string goal =
+        "translate object by 0.1 0 0 then translate object by 0 0.2 0";
+
+    const auto compilation = ui.compile_agent_goal_sequence(goal);
+    if (!compilation) {
+        throw TestFailure("multi-object goal compilation failed: " +
+            compilation.error().message);
+    }
+    const auto compiled = ui.snapshot();
+    REQUIRE(compiled.agent_plan_draft.size() == 4U);
+    REQUIRE(compiled.agent_plan_draft[0].target.object == first);
+    REQUIRE(compiled.agent_plan_draft[0].dependencies.empty());
+    REQUIRE(compiled.agent_plan_draft[1].target.object == first);
+    REQUIRE(compiled.agent_plan_draft[1].dependencies ==
+        std::vector<std::string>{compiled.agent_plan_draft[0].id});
+    REQUIRE(compiled.agent_plan_draft[2].target.object == second);
+    REQUIRE(compiled.agent_plan_draft[2].dependencies.empty());
+    REQUIRE(compiled.agent_plan_draft[3].target.object == second);
+    REQUIRE(compiled.agent_plan_draft[3].dependencies ==
+        std::vector<std::string>{compiled.agent_plan_draft[2].id});
+    REQUIRE(source.snapshot().project_revision == source_revision);
+
+    auto envelope = translation_envelope({}, 1.0);
+    envelope.max_objects_touched = 2U;
+    const auto prepared = ui.prepare_agent_plan(goal, std::move(envelope));
+    REQUIRE(prepared && prepared.value().status == carto::agent::TaskStatus::prepared);
+    const auto review = ui.run_prepared_agent_plan();
+    if (!review) {
+        throw TestFailure("multi-object plan execution failed: " + review.error().message);
+    }
+    if (review.value().status != carto::agent::TaskStatus::review) {
+        throw TestFailure("multi-object plan was blocked: " +
+            (review.value().diagnostic.has_value()
+                ? review.value().diagnostic->message : "no task diagnostic"));
+    }
+    REQUIRE(review.value().can_accept);
+    REQUIRE(review.value().steps.size() == 4U);
+    REQUIRE(std::all_of(review.value().steps.begin(),
+        review.value().steps.end(), [](const auto& receipt) {
+            return receipt.status == carto::agent::StepStatus::passed;
+        }));
+    REQUIRE(source.snapshot().project_revision == source_revision);
+    for (const auto& object : source.snapshot().objects) {
+        REQUIRE(object.object.local_transform.translation.x == 0.0);
+        REQUIRE(object.object.local_transform.translation.y == 0.0);
+    }
+
+    REQUIRE(ui.accept_agent_plan());
+    const auto accepted = source.snapshot();
+    REQUIRE(accepted.project_revision == source_revision.next());
+    for (const auto& object : accepted.objects) {
+        REQUIRE(object.object.local_transform.translation.x > 0.09);
+        REQUIRE(object.object.local_transform.translation.x < 0.11);
+        REQUIRE(object.object.local_transform.translation.y > 0.19);
+        REQUIRE(object.object.local_transform.translation.y < 0.21);
+    }
+}
+
+void ui_goal_compiler_rejects_expanded_multi_object_budget_atomically() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    for (std::size_t index = 0U; index < 9U; ++index) {
+        REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+            "Budget target " + std::to_string(index), {1.0, 1.0, 1.0}}));
+    }
+    const auto objects = source.snapshot().objects;
+    REQUIRE(objects.size() == 9U);
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{
+        objects.front().object.id}));
+    for (std::size_t index = 1U; index < objects.size(); ++index) {
+        REQUIRE(ui.dispatch(carto::application::SelectObjectAction{
+            objects[index].object.id, carto::editor::SelectionOperation::add}));
+    }
+    const auto source_revision = source.snapshot().project_revision;
+
+    const auto rejected = ui.compile_agent_goal_sequence(
+        "translate object by 0.1 0 0 then translate object by 0 0.1 0");
+    REQUIRE(!rejected);
+    REQUIRE(rejected.error().message.find("16-step work budget") != std::string::npos);
+    REQUIRE(ui.snapshot().agent_plan_draft.empty());
+    REQUIRE(!ui.snapshot().agent_task.has_value());
+    REQUIRE(source.snapshot().project_revision == source_revision);
+}
+
 void ui_goal_compiler_fails_closed_and_preserves_manual_drafts() {
     carto::application::ApplicationSession source;
     carto::ui::UiController ui(source);
@@ -4643,6 +4747,8 @@ int main() {
         ui_persistent_checkpoint_round_trip_preserves_human_boundary();
         ui_rebases_disjoint_source_edits_and_reauthorizes_clarifications();
         ui_compiles_explicit_goal_sequences_into_reviewable_agent_dags();
+        ui_compiles_multi_object_goals_into_independent_reviewed_branches();
+        ui_goal_compiler_rejects_expanded_multi_object_budget_atomically();
         ui_goal_compiler_fails_closed_and_preserves_manual_drafts();
         std::cout << "Cartographer agent workbench invariants passed\n";
         return 0;

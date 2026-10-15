@@ -2073,29 +2073,57 @@ core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
             "project changed while the objective target was being captured"));
     }
 
-    agent::TargetRef target;
-    if (authoring.value().selection_mode == editor::SelectionMode::object &&
-        authoring.value().objects.size() == 1U) {
-        target.object = authoring.value().objects.front();
-        target.component = std::monostate{};
+    std::vector<agent::TargetRef> targets;
+    const bool object_selection =
+        authoring.value().selection_mode == editor::SelectionMode::object;
+    if (object_selection && !authoring.value().objects.empty()) {
+        constexpr std::size_t kMaxSelectedObjectTargets = 16U;
+        if (authoring.value().objects.size() > kMaxSelectedObjectTargets) {
+            return core::Result<void>::failure(invalid_state(
+                "goal compilation supports at most 16 explicitly selected root objects"));
+        }
+        auto selected_objects = authoring.value().objects;
+        std::sort(selected_objects.begin(), selected_objects.end());
+        for (const auto object_id : selected_objects) {
+            const auto object = std::find_if(source_snapshot.objects.begin(),
+                source_snapshot.objects.end(), [object_id](const auto& value) {
+                    return value.object.id == object_id;
+                });
+            if (object == source_snapshot.objects.end()) {
+                return core::Result<void>::failure(stale(
+                    "a selected goal target no longer exists in the source project"));
+            }
+            if (object->object.parent.has_value() || object->object.locked) {
+                return core::Result<void>::failure(invalid_state(
+                    "goal compilation requires unlocked root-object targets"));
+            }
+            targets.push_back(agent::TargetRef{object_id, std::monostate{}});
+        }
     } else if (authoring.value().selection_mode == editor::SelectionMode::face &&
         authoring.value().component_object.has_value() &&
         authoring.value().faces.size() == 1U) {
-        target.object = *authoring.value().component_object;
-        target.component = authoring.value().faces.front();
+        targets.push_back(agent::TargetRef{
+            *authoring.value().component_object, authoring.value().faces.front()});
     } else if (authoring.value().selection_mode == editor::SelectionMode::vertex &&
         authoring.value().component_object.has_value() &&
         authoring.value().vertices.size() == 1U) {
-        target.object = *authoring.value().component_object;
-        target.component = authoring.value().vertices.front();
+        targets.push_back(agent::TargetRef{
+            *authoring.value().component_object, authoring.value().vertices.front()});
     } else {
         return core::Result<void>::failure(invalid_state(
-            "select exactly one object, face, or vertex before compiling the goal"));
+            "select one or more root objects, or exactly one face or vertex, before compiling the goal"));
     }
-    if (auto valid = target.validate(); !valid) return valid;
+    for (const auto& target : targets) {
+        if (auto valid = target.validate(); !valid) return valid;
+    }
 
     const auto commands = split_agent_goal_sequence(goal);
     if (!commands) return core::Result<void>::failure(commands.error());
+    constexpr std::size_t kMaxCompiledSteps = 16U;
+    if (targets.empty() || commands.value().size() > kMaxCompiledSteps / targets.size()) {
+        return core::Result<void>::failure(invalid_state(
+            "expanded goal DAG exceeds the 16-step work budget"));
+    }
     auto constraints = compile_objective_constraints(goal, agent_hard_constraints_draft_);
     if (!constraints) return core::Result<void>::failure(constraints.error());
 
@@ -2103,33 +2131,52 @@ core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
         ai::effect_mask(ai::CapabilityEffect::geometry) |
         ai::effect_mask(ai::CapabilityEffect::topology) |
         ai::effect_mask(ai::CapabilityEffect::transform);
-    const auto compile_context = make_ai_context(
-        source_snapshot, authoring.value(), compile_effects);
-
     std::vector<agent::AgentPlanStep> steps;
-    steps.reserve(commands.value().size());
-    for (std::size_t index = 0U; index < commands.value().size(); ++index) {
-        const auto proposal = native_planner_.propose(
-            commands.value()[index], compile_context);
-        if (!proposal) {
-            return core::Result<void>::failure(proposal.error().with_context(
-                "compiling objective step " + std::to_string(index + 1U)));
+    steps.reserve(commands.value().size() * targets.size());
+    for (std::size_t target_index = 0U; target_index < targets.size(); ++target_index) {
+        auto target_authoring = authoring.value();
+        if (object_selection) target_authoring.objects = {targets[target_index].object};
+        if (auto valid = target_authoring.validate(); !valid) {
+            return core::Result<void>::failure(valid.error().with_context(
+                "validating selected goal target"));
         }
-        if (proposal.value().base_revision != source_snapshot.project_revision ||
-            proposal.value().context != authoring.value()) {
-            return core::Result<void>::failure(stale(
-                "source revision or selection changed while compiling the goal sequence"));
+        const auto compile_context = make_ai_context(
+            source_snapshot, target_authoring, compile_effects);
+        std::optional<std::string> previous_step_id;
+        for (std::size_t command_index = 0U;
+             command_index < commands.value().size(); ++command_index) {
+            const auto proposal = native_planner_.propose(
+                commands.value()[command_index], compile_context);
+            if (!proposal) {
+                return core::Result<void>::failure(proposal.error().with_context(
+                    "compiling target " + std::to_string(target_index + 1U) +
+                    ", objective step " + std::to_string(command_index + 1U)));
+            }
+            if (proposal.value().base_revision != source_snapshot.project_revision ||
+                proposal.value().context != target_authoring) {
+                return core::Result<void>::failure(stale(
+                    "source revision or selection changed while compiling the goal DAG"));
+            }
+            const std::string step_id = targets.size() == 1U
+                ? "step-" + std::to_string(command_index + 1U)
+                : "target-" + std::to_string(target_index + 1U) + "-step-" +
+                    std::to_string(command_index + 1U);
+            std::vector<std::string> dependencies;
+            if (previous_step_id.has_value()) dependencies.push_back(*previous_step_id);
+            steps.push_back(agent::AgentPlanStep{
+                step_id, targets[target_index], commands.value()[command_index],
+                std::move(dependencies)});
+            previous_step_id = step_id;
         }
-        std::vector<std::string> dependencies;
-        if (!steps.empty()) dependencies.push_back(steps.back().id);
-        steps.push_back(agent::AgentPlanStep{
-            "step-" + std::to_string(index + 1U), target,
-            commands.value()[index], std::move(dependencies)});
     }
+
+    std::vector<scene::ObjectId> objective_scope;
+    objective_scope.reserve(targets.size());
+    for (const auto& target : targets) objective_scope.push_back(target.object);
 
     agent::AuthoringObjective objective{
         agent_objective_id_.empty() ? "agent-objective-draft" : agent_objective_id_,
-        goal, source_snapshot.project_revision, {target.object}, {},
+        goal, source_snapshot.project_revision, std::move(objective_scope), {},
         std::move(constraints.value()), agent_clarifications_draft_, agent_recipe_id_};
     agent::AgentPlan plan{"agent-plan-draft", std::move(objective), steps};
     if (auto valid = plan.validate(); !valid) {
