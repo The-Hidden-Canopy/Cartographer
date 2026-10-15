@@ -564,7 +564,8 @@ void accepted_task_demonstration_is_redacted_read_only_and_checksummed() {
 
     const auto decoded = carto::agent::AgentDemonstration::deserialize(encoded.value());
     REQUIRE(decoded);
-    REQUIRE(decoded.value().format_version == 2U);
+    REQUIRE(encoded.value().starts_with("CARTOGRAPHER_AGENT_DEMONSTRATION_V3\n"));
+    REQUIRE(decoded.value().format_version == 3U);
     REQUIRE(decoded.value().steps.size() == 2U);
     REQUIRE(decoded.value().steps[0].target_alias == 1U);
     REQUIRE(decoded.value().steps[1].target_alias == 2U);
@@ -577,7 +578,7 @@ void accepted_task_demonstration_is_redacted_read_only_and_checksummed() {
         demonstration.value().diff_digest.hex());
 
     std::string corrupted = encoded.value();
-    const std::string magic = "CARTOGRAPHER_AGENT_DEMONSTRATION_V2\n";
+    const std::string magic = "CARTOGRAPHER_AGENT_DEMONSTRATION_V3\n";
     const auto body_length_end = corrupted.find(':', magic.size());
     REQUIRE(body_length_end != std::string::npos);
     const auto body_start = body_length_end + 1U;
@@ -624,6 +625,17 @@ void accepted_task_demonstration_is_redacted_read_only_and_checksummed() {
         malicious_parameter_digest + "|";
     REQUIRE(!carto::agent::AgentDemonstration::deserialize(
         checksummed_non_finite_parameter));
+
+    auto compatible_v2 = demonstration.value();
+    compatible_v2.format_version = 2U;
+    const auto compatible_v2_bytes = compatible_v2.serialize();
+    REQUIRE(compatible_v2_bytes);
+    REQUIRE(compatible_v2_bytes.value().starts_with(
+        "CARTOGRAPHER_AGENT_DEMONSTRATION_V2\n"));
+    const auto decoded_v2 = carto::agent::AgentDemonstration::deserialize(
+        compatible_v2_bytes.value());
+    REQUIRE(decoded_v2);
+    REQUIRE(decoded_v2.value().format_version == 2U);
 
     auto mismatched_parameter = demonstration.value();
     mismatched_parameter.steps.front().parameters->parameterization =
@@ -675,7 +687,7 @@ void accepted_task_demonstration_is_redacted_read_only_and_checksummed() {
     REQUIRE(viewer.load_agent_demonstration(path));
     const auto view = viewer.snapshot();
     REQUIRE(view.agent_demonstration.has_value());
-    REQUIRE(view.agent_demonstration->format_version == 2U);
+    REQUIRE(view.agent_demonstration->format_version == 3U);
     REQUIRE(view.agent_demonstration->steps.front().parameters.has_value());
     REQUIRE(!view.agent_task.has_value());
     REQUIRE(viewer_source.snapshot().project_revision == viewer_revision);
@@ -728,13 +740,17 @@ void human_native_command_range_captures_alias_only_trace() {
         "CANARY_MANUAL_TRACE_ALPHA", {1.0, 1.0, 1.0}});
     const auto second_box = ui.dispatch(carto::application::CreateBoxAction{
         "CANARY_MANUAL_TRACE_BETA", {1.0, 1.0, 1.0}});
+    const auto third_box = ui.dispatch(carto::application::CreateBoxAction{
+        "CANARY_MANUAL_TRACE_GAMMA", {1.0, 1.0, 1.0}});
     REQUIRE(first_box);
     REQUIRE(second_box);
+    REQUIRE(third_box);
     const auto created_snapshot = source.snapshot();
-    REQUIRE(created_snapshot.objects.size() == 2U);
+    REQUIRE(created_snapshot.objects.size() == 3U);
     const std::vector<carto::scene::ObjectId> objects{
         created_snapshot.objects[0].object.id,
-        created_snapshot.objects[1].object.id};
+        created_snapshot.objects[1].object.id,
+        created_snapshot.objects[2].object.id};
 
     REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
         carto::editor::SelectionMode::face}));
@@ -746,37 +762,49 @@ void human_native_command_range_captures_alias_only_trace() {
         objects[1], carto::geometry::FaceId{1U}}));
     REQUIRE(ui.dispatch(carto::application::InvokeToolAction{
         "mesh.extrude-face", carto::editor::ToolArguments{0.2, {}, true, 0.5, std::nullopt}}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        objects[2], carto::geometry::FaceId{1U}}));
+    REQUIRE(ui.dispatch(carto::application::InvokeToolAction{
+        "mesh.poke-face", carto::editor::ToolArguments{}}));
     auto moved_transform = source.snapshot().objects[0].object.local_transform;
     moved_transform.translation.x += 0.25;
     REQUIRE(ui.dispatch(carto::application::SetObjectTransformAction{
         objects[0], moved_transform, std::nullopt}));
 
     const auto before_capture = source.snapshot();
-    REQUIRE(before_capture.native_operation_trace.size() == 3U);
+    REQUIRE(before_capture.native_operation_trace.size() == 4U);
     REQUIRE(before_capture.native_operation_trace[0].source ==
         carto::application::OperationSource::human);
     REQUIRE(before_capture.native_operation_trace[0].tool_id == "mesh.inset-face");
     REQUIRE(before_capture.native_operation_trace[1].tool_id == "mesh.extrude-face");
-    REQUIRE(before_capture.native_operation_trace[2].tool_id == "object.translate");
+    REQUIRE(before_capture.native_operation_trace[2].tool_id == "mesh.poke-face");
+    REQUIRE(before_capture.native_operation_trace[2].parameterization ==
+        carto::application::NativeTraceParameterization::parameterless);
+    REQUIRE(before_capture.native_operation_trace[3].tool_id == "object.translate");
     REQUIRE(ui.capture_agent_demonstration_trace(
         before_capture.native_operation_trace.front().operation_id,
         before_capture.native_operation_trace.back().operation_id));
     const auto captured = ui.snapshot();
     REQUIRE(captured.agent_demonstration_trace.has_value());
-    REQUIRE(captured.agent_demonstration_trace->steps.size() == 3U);
+    REQUIRE(captured.agent_demonstration_trace->steps.size() == 4U);
     REQUIRE(captured.agent_demonstration_trace->steps[0].target_alias == 1U);
     REQUIRE(captured.agent_demonstration_trace->steps[1].target_alias == 2U);
+    REQUIRE(captured.agent_demonstration_trace->steps[2].target_alias == 3U);
     REQUIRE(captured.agent_demonstration_trace->steps[0].component_alias == 1U);
     REQUIRE(captured.agent_demonstration_trace->steps[1].component_alias == 2U);
     REQUIRE(captured.agent_demonstration_trace->steps[0].parameters.parameterization ==
         carto::agent::AgentDemonstrationParameterization::normalized_face_distance);
-    REQUIRE(captured.agent_demonstration_trace->steps[2].target_kind ==
+    REQUIRE(captured.agent_demonstration_trace->steps[2].component_alias == 3U);
+    REQUIRE(captured.agent_demonstration_trace->steps[2].tool_id == "mesh.poke-face");
+    REQUIRE(captured.agent_demonstration_trace->steps[2].parameters.parameterization ==
+        carto::agent::AgentDemonstrationParameterization::parameterless);
+    REQUIRE(captured.agent_demonstration_trace->steps[3].target_kind ==
         carto::agent::AgentDemonstrationTargetKind::object);
-    REQUIRE(captured.agent_demonstration_trace->steps[2].target_alias == 1U);
-    REQUIRE(captured.agent_demonstration_trace->steps[2].component_alias == 0U);
-    REQUIRE(captured.agent_demonstration_trace->steps[2].parameters.relative_displacement.x ==
+    REQUIRE(captured.agent_demonstration_trace->steps[3].target_alias == 1U);
+    REQUIRE(captured.agent_demonstration_trace->steps[3].component_alias == 0U);
+    REQUIRE(captured.agent_demonstration_trace->steps[3].parameters.relative_displacement.x ==
         0.25);
-    REQUIRE(captured.agent_demonstration_trace->result_revision_span == 3U);
+    REQUIRE(captured.agent_demonstration_trace->result_revision_span == 4U);
     REQUIRE(source.snapshot().project_revision == before_capture.project_revision);
     REQUIRE(!ui.capture_agent_demonstration_trace(
         before_capture.native_operation_trace.back().operation_id,
@@ -788,9 +816,10 @@ void human_native_command_range_captures_alias_only_trace() {
     REQUIRE(encoded);
     REQUIRE(encoded.value().find("CANARY_MANUAL_TRACE_ALPHA") == std::string::npos);
     REQUIRE(encoded.value().find("CANARY_MANUAL_TRACE_BETA") == std::string::npos);
+    REQUIRE(encoded.value().find("CANARY_MANUAL_TRACE_GAMMA") == std::string::npos);
     const auto decoded = carto::agent::AgentDemonstrationTrace::deserialize(encoded.value());
     REQUIRE(decoded);
-    REQUIRE(decoded.value().steps.size() == 3U);
+    REQUIRE(decoded.value().steps.size() == 4U);
     REQUIRE(decoded.value().steps.front().target_alias == 1U);
     REQUIRE(decoded.value().steps[1].target_alias == 2U);
     REQUIRE(decoded.value().steps.back().target_alias == 1U);
@@ -801,11 +830,12 @@ void human_native_command_range_captures_alias_only_trace() {
     REQUIRE(encoded_recipe);
     REQUIRE(encoded_recipe.value().find("CANARY_MANUAL_TRACE_ALPHA") == std::string::npos);
     REQUIRE(encoded_recipe.value().find("CANARY_MANUAL_TRACE_BETA") == std::string::npos);
+    REQUIRE(encoded_recipe.value().find("CANARY_MANUAL_TRACE_GAMMA") == std::string::npos);
     const auto decoded_recipe =
         carto::agent::AgentDemonstrationRecipe::deserialize(encoded_recipe.value());
     REQUIRE(decoded_recipe);
     REQUIRE(decoded_recipe.value().name == "Manual room finish");
-    REQUIRE(decoded_recipe.value().trace.steps.size() == 3U);
+    REQUIRE(decoded_recipe.value().trace.steps.size() == 4U);
     auto invalid_recipe_name = recipe;
     invalid_recipe_name.name = "invalid\nrecipe";
     REQUIRE(!invalid_recipe_name.serialize());
@@ -831,14 +861,14 @@ void human_native_command_range_captures_alias_only_trace() {
     const auto saved_recipe = carto::agent::AgentDemonstrationRecipe::load(recipe_path);
     REQUIRE(saved_recipe);
     REQUIRE(saved_recipe.value().name == "manual-range");
-    REQUIRE(saved_recipe.value().trace.steps.size() == 3U);
+    REQUIRE(saved_recipe.value().trace.steps.size() == 4U);
     carto::application::ApplicationSession recipe_viewer_source;
     carto::ui::UiController recipe_viewer(recipe_viewer_source);
     const auto recipe_viewer_revision = recipe_viewer_source.snapshot().project_revision;
     REQUIRE(recipe_viewer.load_agent_demonstration_recipe(recipe_path));
     const auto loaded_recipe = recipe_viewer.snapshot();
     REQUIRE(loaded_recipe.agent_demonstration_recipe_name == "manual-range");
-    REQUIRE(loaded_recipe.agent_demonstration_trace->steps.size() == 3U);
+    REQUIRE(loaded_recipe.agent_demonstration_trace->steps.size() == 4U);
     REQUIRE(!loaded_recipe.agent_demonstration_ready_to_preview);
     REQUIRE(!recipe_viewer.preview_agent_demonstration_trace());
     REQUIRE(!recipe_viewer.snapshot().agent_task.has_value());
@@ -847,7 +877,7 @@ void human_native_command_range_captures_alias_only_trace() {
     carto::ui::UiController viewer(viewer_source);
     const auto viewer_revision = viewer_source.snapshot().project_revision;
     REQUIRE(viewer.load_agent_demonstration_trace(path));
-    REQUIRE(viewer.snapshot().agent_demonstration_trace->steps.size() == 3U);
+    REQUIRE(viewer.snapshot().agent_demonstration_trace->steps.size() == 4U);
     REQUIRE(viewer_source.snapshot().project_revision == viewer_revision);
     REQUIRE(viewer.clear_agent_demonstration_trace());
     REQUIRE(!viewer.snapshot().agent_demonstration_trace.has_value());
@@ -860,8 +890,12 @@ void human_native_command_range_captures_alias_only_trace() {
         "Transfer target gamma", {1.0, 1.0, 1.0}}));
     REQUIRE(viewer.dispatch(carto::application::CreateBoxAction{
         "Transfer target delta", {1.0, 1.0, 1.0}}));
+    REQUIRE(viewer.dispatch(carto::application::CreateBoxAction{
+        "Transfer target epsilon", {1.0, 1.0, 1.0}}));
+    REQUIRE(viewer.dispatch(carto::application::CreateBoxAction{
+        "Transfer target zeta", {1.0, 1.0, 1.0}}));
     const auto target_objects = viewer_source.snapshot().objects;
-    REQUIRE(target_objects.size() == 4U);
+    REQUIRE(target_objects.size() == 6U);
     REQUIRE(viewer.load_agent_demonstration_trace(path));
     REQUIRE(viewer.dispatch(carto::application::SetSelectionModeAction{
         carto::editor::SelectionMode::face}));
@@ -872,7 +906,7 @@ void human_native_command_range_captures_alias_only_trace() {
     REQUIRE(!viewer.set_agent_demonstration_target_set_count(17U));
     REQUIRE(viewer.snapshot().agent_demonstration_target_set_count == 1U);
     REQUIRE(viewer.set_agent_demonstration_target_set_count(2U));
-    REQUIRE(viewer.snapshot().agent_demonstration_bindings.size() == 6U);
+    REQUIRE(viewer.snapshot().agent_demonstration_bindings.size() == 8U);
     REQUIRE(!viewer.preview_agent_demonstration_trace());
     REQUIRE(!viewer.snapshot().agent_task.has_value());
     REQUIRE(viewer.dispatch(carto::application::SelectFaceAction{
@@ -880,7 +914,7 @@ void human_native_command_range_captures_alias_only_trace() {
     REQUIRE(viewer.bind_agent_demonstration_target(1U, 1U, 0U));
     REQUIRE(viewer.set_agent_demonstration_target_set_count(3U));
     const auto three_sets_unbound = viewer.snapshot();
-    REQUIRE(three_sets_unbound.agent_demonstration_bindings.size() == 9U);
+    REQUIRE(three_sets_unbound.agent_demonstration_bindings.size() == 12U);
     REQUIRE(std::none_of(three_sets_unbound.agent_demonstration_bindings.begin(),
         three_sets_unbound.agent_demonstration_bindings.end(),
         [](const auto& binding) { return binding.bound; }));
@@ -896,18 +930,28 @@ void human_native_command_range_captures_alias_only_trace() {
         target_objects[1].object.id, carto::geometry::FaceId{1U}}));
     REQUIRE(viewer.bind_agent_demonstration_target(2U, 2U, 0U));
     REQUIRE(viewer.dispatch(carto::application::SelectFaceAction{
-        target_objects[2].object.id, carto::geometry::FaceId{1U}}));
+        target_objects[3].object.id, carto::geometry::FaceId{1U}}));
     REQUIRE(viewer.bind_agent_demonstration_target(1U, 1U, 1U));
     REQUIRE(viewer.dispatch(carto::application::SelectFaceAction{
-        target_objects[3].object.id, carto::geometry::FaceId{1U}}));
+        target_objects[4].object.id, carto::geometry::FaceId{1U}}));
     REQUIRE(viewer.bind_agent_demonstration_target(2U, 2U, 1U));
+    REQUIRE(viewer.dispatch(carto::application::SelectFaceAction{
+        target_objects[2].object.id, carto::geometry::FaceId{1U}}));
+    const auto first_poke_binding = viewer.bind_agent_demonstration_target(3U, 3U, 0U);
+    if (!first_poke_binding) {
+        throw TestFailure("face-poke target binding failed: " +
+            first_poke_binding.error().message);
+    }
+    REQUIRE(viewer.dispatch(carto::application::SelectFaceAction{
+        target_objects[5].object.id, carto::geometry::FaceId{1U}}));
+    REQUIRE(viewer.bind_agent_demonstration_target(3U, 3U, 1U));
     REQUIRE(viewer.dispatch(carto::application::SetSelectionModeAction{
         carto::editor::SelectionMode::object}));
     REQUIRE(viewer.dispatch(carto::application::SelectObjectAction{
         target_objects[0].object.id}));
     REQUIRE(viewer.bind_agent_demonstration_target(1U, 0U, 0U));
     REQUIRE(viewer.dispatch(carto::application::SelectObjectAction{
-        target_objects[2].object.id}));
+        target_objects[3].object.id}));
     REQUIRE(viewer.bind_agent_demonstration_target(1U, 0U, 1U));
     const auto fully_bound = viewer.snapshot();
     REQUIRE(fully_bound.agent_demonstration_ready_to_preview);
@@ -923,37 +967,55 @@ void human_native_command_range_captures_alias_only_trace() {
     }
     const auto target_revision = viewer_source.snapshot().project_revision;
     const auto trace_preview = viewer.preview_agent_demonstration_trace();
-    REQUIRE(trace_preview);
+    if (!trace_preview) {
+        throw TestFailure("demonstration trace preview failed: " +
+            trace_preview.error().message);
+    }
     REQUIRE(trace_preview.value().status == carto::agent::TaskStatus::review);
-    REQUIRE(trace_preview.value().plan_steps.size() == 6U);
-    REQUIRE(trace_preview.value().scope_objects.size() == 4U);
+    REQUIRE(trace_preview.value().plan_steps.size() == 8U);
+    REQUIRE(trace_preview.value().scope_objects.size() == 6U);
     const auto& expanded_steps = trace_preview.value().plan_steps;
     const auto set_one_second = std::find_if(expanded_steps.begin(), expanded_steps.end(),
         [](const auto& step) { return step.step_id == "demonstration-set-1-step-2"; });
     const auto set_one_third = std::find_if(expanded_steps.begin(), expanded_steps.end(),
         [](const auto& step) { return step.step_id == "demonstration-set-1-step-3"; });
+    const auto set_one_fourth = std::find_if(expanded_steps.begin(), expanded_steps.end(),
+        [](const auto& step) { return step.step_id == "demonstration-set-1-step-4"; });
     const auto set_two_first = std::find_if(expanded_steps.begin(), expanded_steps.end(),
         [](const auto& step) { return step.step_id == "demonstration-set-2-step-1"; });
     const auto set_two_second = std::find_if(expanded_steps.begin(), expanded_steps.end(),
         [](const auto& step) { return step.step_id == "demonstration-set-2-step-2"; });
+    const auto set_two_third = std::find_if(expanded_steps.begin(), expanded_steps.end(),
+        [](const auto& step) { return step.step_id == "demonstration-set-2-step-3"; });
+    const auto set_two_fourth = std::find_if(expanded_steps.begin(), expanded_steps.end(),
+        [](const auto& step) { return step.step_id == "demonstration-set-2-step-4"; });
     REQUIRE(set_one_second != expanded_steps.end());
     REQUIRE(set_one_third != expanded_steps.end());
+    REQUIRE(set_one_fourth != expanded_steps.end());
     REQUIRE(set_two_first != expanded_steps.end());
     REQUIRE(set_two_second != expanded_steps.end());
+    REQUIRE(set_two_third != expanded_steps.end());
+    REQUIRE(set_two_fourth != expanded_steps.end());
     REQUIRE(set_one_second->dependencies ==
         std::vector<std::string>{"demonstration-set-1-step-1"});
     REQUIRE(set_one_third->dependencies ==
         std::vector<std::string>{"demonstration-set-1-step-2"});
+    REQUIRE(set_one_fourth->dependencies ==
+        std::vector<std::string>{"demonstration-set-1-step-3"});
     REQUIRE(set_two_first->dependencies.empty());
     REQUIRE(set_two_second->dependencies ==
         std::vector<std::string>{"demonstration-set-2-step-1"});
+    REQUIRE(set_two_third->dependencies ==
+        std::vector<std::string>{"demonstration-set-2-step-2"});
+    REQUIRE(set_two_fourth->dependencies ==
+        std::vector<std::string>{"demonstration-set-2-step-3"});
     REQUIRE(!viewer.set_agent_demonstration_target_set_count(1U));
     REQUIRE(viewer_source.snapshot().project_revision == target_revision);
     const auto accepted_trace = viewer.accept_agent_plan();
     REQUIRE(accepted_trace);
     REQUIRE(viewer_source.snapshot().project_revision > target_revision);
     const auto accepted_snapshot = viewer_source.snapshot();
-    for (const std::size_t target_index : {0U, 2U}) {
+    for (const std::size_t target_index : {0U, 3U}) {
         const auto& before_object = target_objects[target_index];
         const auto after_object = std::find_if(accepted_snapshot.objects.begin(),
             accepted_snapshot.objects.end(), [&before_object](const auto& value) {
@@ -3158,6 +3220,92 @@ void ui_workbench_captures_selection_and_exposes_accept_reject_flow() {
     REQUIRE(ui.snapshot().project_revision == source_revision.next());
 }
 
+void ui_agent_workbench_pokes_faces_only_on_a_reviewed_branch() {
+    TempDirectory directory;
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Poke target", {1.0, 1.0, 1.0}}));
+    const auto object = source.snapshot().objects.front().object.id;
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{
+        object, carto::geometry::FaceId{1U}}));
+    const auto before = source.snapshot();
+    const auto* before_instance = before.viewport.scene.find(object);
+    REQUIRE(before_instance != nullptr && before_instance->mesh != nullptr);
+
+    REQUIRE(!ui.apply_ai_intent("poke face"));
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+    REQUIRE(ui.queue_agent_step("poke face"));
+    const auto run = ui.run_agent_plan("Poke the selected face");
+    REQUIRE(run);
+    REQUIRE(run.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(run.value().can_accept);
+    REQUIRE(run.value().diff.changed_mesh_count() == 1U);
+    REQUIRE(run.value().steps.size() == 1U);
+    REQUIRE(run.value().steps.front().tool_id == "mesh.poke-face");
+    REQUIRE(run.value().steps.front().demonstration_parameters.has_value());
+    REQUIRE(run.value().steps.front().demonstration_parameters->parameterization ==
+        carto::agent::AgentDemonstrationParameterization::parameterless);
+    const auto* ghost_instance = run.value().after_scene.find(object);
+    REQUIRE(ghost_instance != nullptr && ghost_instance->mesh != nullptr);
+    REQUIRE(ghost_instance->mesh->vertex_ids.size() ==
+        before_instance->mesh->vertex_ids.size() + 1U);
+    REQUIRE(ghost_instance->mesh->triangle_faces.size() >
+        before_instance->mesh->triangle_faces.size());
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+    REQUIRE(source.snapshot().viewport.scene.find(object)->mesh->vertex_ids.size() ==
+        before_instance->mesh->vertex_ids.size());
+
+    REQUIRE(ui.accept_agent_plan());
+    REQUIRE(source.snapshot().project_revision == before.project_revision.next());
+    REQUIRE(source.snapshot().viewport.scene.find(object)->mesh->vertex_ids.size() ==
+        before_instance->mesh->vertex_ids.size() + 1U);
+    const auto demonstration_path = directory.path() / "accepted-poke.carto-agent-demo";
+    REQUIRE(ui.save_agent_demonstration(demonstration_path));
+    const auto demonstration = carto::agent::AgentDemonstration::load(demonstration_path);
+    REQUIRE(demonstration);
+    REQUIRE(demonstration.value().format_version == 3U);
+    REQUIRE(demonstration.value().steps.size() == 1U);
+    REQUIRE(demonstration.value().steps.front().parameters.has_value());
+    REQUIRE(demonstration.value().steps.front().parameters->parameterization ==
+        carto::agent::AgentDemonstrationParameterization::parameterless);
+
+    carto::application::ApplicationSession geometry_only_source;
+    const auto geometry_only_objects = create_boxes(geometry_only_source, 1U);
+    const auto geometry_only_before = geometry_only_source.snapshot();
+    auto geometry_only_plan = plan_for(geometry_only_before, geometry_only_objects, {
+        {"step-1", {geometry_only_objects.front(), carto::geometry::FaceId{1U}}, "poke face"},
+    });
+    auto geometry_only_envelope = envelope_for(geometry_only_objects);
+    geometry_only_envelope.permitted_effects =
+        carto::agent::effect_mask(carto::agent::Effect::geometry);
+    auto geometry_only_task = carto::agent::AgentTask::begin(
+        geometry_only_source, std::move(geometry_only_plan), geometry_only_envelope);
+    REQUIRE(geometry_only_task);
+    const auto blocked = geometry_only_task.value().run();
+    REQUIRE(blocked);
+    REQUIRE(blocked.value().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(!blocked.value().can_accept);
+    REQUIRE(geometry_only_source.snapshot().project_revision ==
+        geometry_only_before.project_revision);
+
+    carto::application::ApplicationSession invalid_source;
+    const auto invalid_objects = create_boxes(invalid_source, 1U);
+    const auto invalid_before = invalid_source.snapshot();
+    auto invalid_plan = plan_for(invalid_before, invalid_objects, {
+        {"step-1", {invalid_objects.front(), carto::geometry::FaceId{1U}}, "poke face by 1"},
+    });
+    auto invalid_task = carto::agent::AgentTask::begin(
+        invalid_source, std::move(invalid_plan), envelope_for(invalid_objects));
+    REQUIRE(invalid_task);
+    const auto invalid_run = invalid_task.value().run();
+    REQUIRE(invalid_run);
+    REQUIRE(invalid_run.value().status == carto::agent::TaskStatus::blocked);
+    REQUIRE(invalid_source.snapshot().project_revision == invalid_before.project_revision);
+}
+
 void ui_agent_entry_preserves_context_selection_across_workspaces() {
     carto::application::ApplicationSession source;
     carto::ui::UiController ui(source);
@@ -4121,6 +4269,7 @@ int main() {
         ui_compiled_constraints_are_bound_to_clarification_and_gate_execution();
         acceptance_evidence_binds_validator_revision_assets_and_result();
         ui_workbench_captures_selection_and_exposes_accept_reject_flow();
+        ui_agent_workbench_pokes_faces_only_on_a_reviewed_branch();
         ui_agent_entry_preserves_context_selection_across_workspaces();
         ui_prepared_task_supports_condition_preflight_and_rechecks_source_revision();
         ui_recipe_selection_round_trips_and_locks_with_checkpoint();

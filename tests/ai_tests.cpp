@@ -70,7 +70,11 @@ void ontology_is_derived_from_native_tools() {
     REQUIRE(translate->validators.size() == 5U);
     REQUIRE(translate->validators[1] == carto::ai::CapabilityValidator::root_object);
     REQUIRE(translate->validators[2] == carto::ai::CapabilityValidator::unlocked_subtree);
-    REQUIRE(poke != context.operations.end() && !poke->preview_supported);
+    REQUIRE(poke != context.operations.end() && poke->preview_supported);
+    REQUIRE(poke->provider_requestable);
+    REQUIRE(!poke->auto_approvable);
+    REQUIRE(poke->preview_kind == carto::editor::PreviewKind::poke_face);
+    REQUIRE(poke->parameter_schema.empty());
     REQUIRE(delete_face != context.operations.end() && !delete_face->preview_supported);
     REQUIRE(merge_vertices != context.operations.end() && !merge_vertices->preview_supported);
     REQUIRE(dissolve_edge != context.operations.end() && !dissolve_edge->preview_supported);
@@ -95,7 +99,7 @@ void ontology_is_derived_from_native_tools() {
     REQUIRE(slide_vertex->precondition.find("strictly between") != std::string::npos);
     REQUIRE(poke->kernel_operation == "geometry.EditableMesh.poke_face");
     REQUIRE(poke->precondition.find("strictly convex") != std::string::npos);
-    REQUIRE(poke->precondition.find("future preview") != std::string::npos);
+    REQUIRE(poke->precondition.find("centroid strictly inside") != std::string::npos);
     REQUIRE(bevel_edge->kernel_operation == "geometry.EditableMesh.bevel_edge");
     REQUIRE(bevel_edge->precondition.find("segments must equal one") != std::string::npos);
     REQUIRE(!bevel_edge->auto_approvable);
@@ -111,7 +115,7 @@ void ontology_is_derived_from_native_tools() {
                 !operation.writes.empty() && !operation.validators.empty();
         }));
     REQUIRE(std::count_if(context.operations.begin(), context.operations.end(),
-        [](const auto& operation) { return operation.provider_requestable; }) == 4);
+        [](const auto& operation) { return operation.provider_requestable; }) == 5);
     REQUIRE(inset->parameter_schema.size() == 1U);
     REQUIRE(inset->parameter_schema.front().type == carto::ai::ParameterType::length);
     REQUIRE(inset->parameter_schema.front().unit == carto::ai::ParameterUnit::world_length);
@@ -126,6 +130,7 @@ void ontology_json_preserves_kernel_and_approval_contract() {
     REQUIRE(json.find("strictly convex") != std::string::npos);
     REQUIRE(json.find("\"auto_approvable\":true") != std::string::npos);
     REQUIRE(json.find("\"preview_kind\":\"inset_face\"") != std::string::npos);
+    REQUIRE(json.find("\"preview_kind\":\"poke_face\"") != std::string::npos);
     REQUIRE(json.find("\"parameter_schema\":[{\"name\":\"distance\"") !=
         std::string::npos);
     REQUIRE(json.find("\"effects\":[\"geometry\",\"topology\"]") !=
@@ -187,9 +192,16 @@ void ontology_fails_closed_on_tool_kernel_contract_drift() {
     REQUIRE(!operation->contract_complete);
     REQUIRE(!operation->provider_requestable);
     REQUIRE(operation->precondition.find("do not match") != std::string::npos);
-    REQUIRE(carto::ai::project_capabilities(ontology,
+    const auto projected = carto::ai::project_capabilities(ontology,
         carto::ai::effect_mask(carto::ai::CapabilityEffect::geometry) |
-        carto::ai::effect_mask(carto::ai::CapabilityEffect::topology)).size() == 2U);
+        carto::ai::effect_mask(carto::ai::CapabilityEffect::topology));
+    REQUIRE(projected.size() == 3U);
+    REQUIRE(std::none_of(projected.begin(), projected.end(), [](const auto& capability) {
+        return capability.id == "mesh.extrude-face";
+    }));
+    REQUIRE(std::any_of(projected.begin(), projected.end(), [](const auto& capability) {
+        return capability.id == "mesh.poke-face";
+    }));
 }
 
 void native_planner_compiles_a_face_intent_without_mutating_state() {
@@ -213,6 +225,14 @@ void native_planner_compiles_a_face_intent_without_mutating_state() {
     REQUIRE(proposal.value().parameters.distance.has_value());
     REQUIRE(*proposal.value().parameters.distance == 0.25);
     REQUIRE(proposal.value().validate(context));
+    const auto poke_proposal = planner.propose("poke face", context);
+    REQUIRE(poke_proposal);
+    REQUIRE(poke_proposal.value().tool_id == "mesh.poke-face");
+    REQUIRE(poke_proposal.value().preview_kind == carto::editor::PreviewKind::poke_face);
+    REQUIRE(poke_proposal.value().validate(context));
+    REQUIRE(!poke_proposal.value().validate_auto_approval(context));
+    REQUIRE(carto::ai::proposal_json(poke_proposal.value()).find(
+        "\"preview_kind\":\"poke_face\"") != std::string::npos);
     auto review_only_context = context;
     const auto review_only_operation = std::find_if(
         review_only_context.operations.begin(), review_only_context.operations.end(),
@@ -241,6 +261,7 @@ void native_planner_rejects_ambiguous_or_wrong_scope_intents() {
     context = context_for(session);
     REQUIRE(!planner.propose("extrude face by 0.25 and 0.50", context));
     REQUIRE(!planner.propose("move vertex to 1 2 3", context));
+    REQUIRE(!planner.propose("poke face by 1", context));
 }
 
 void native_planner_compiles_translation_only_for_one_selected_object() {
@@ -326,6 +347,31 @@ void ui_ai_flow_is_preview_only_until_explicit_commit() {
     REQUIRE(committed.value().provenance_id == proposal.value().request_id);
     REQUIRE(ui.snapshot().operations.back().category == carto::ui::OperationCategory::provider);
     REQUIRE(session.snapshot().project_revision > before.project_revision);
+}
+
+void ui_face_poke_requires_an_explicit_preview_commit() {
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{"Box", {1.0, 1.0, 1.0}}));
+    const auto object = session.snapshot().objects.front().object.id;
+    const auto face = session.snapshot().viewport.scene.instances().front().mesh->triangle_faces.front();
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(carto::application::SelectFaceAction{object, face}));
+    const auto before = session.snapshot();
+
+    REQUIRE(!ui.apply_ai_intent("poke face"));
+    REQUIRE(session.snapshot().project_revision == before.project_revision);
+    const auto proposal = ui.propose_ai("poke face");
+    REQUIRE(proposal);
+    auto preview = ui.begin_ai_preview(proposal.value());
+    REQUIRE(preview);
+    REQUIRE(session.snapshot().project_revision == before.project_revision);
+
+    const auto committed = ui.commit_ai_preview(preview.value(), proposal.value());
+    REQUIRE(committed);
+    REQUIRE(committed.value().action == "Invoke Tool: mesh.poke-face");
+    REQUIRE(session.snapshot().project_revision == before.project_revision.next());
 }
 
 void native_ai_can_press_auto_apply_through_typed_boundary() {
@@ -457,6 +503,7 @@ int main() {
         native_planner_compiles_translation_only_for_one_selected_object();
         generic_ai_proposals_cannot_bypass_agent_transform_envelope();
         ui_ai_flow_is_preview_only_until_explicit_commit();
+        ui_face_poke_requires_an_explicit_preview_commit();
         native_ai_can_press_auto_apply_through_typed_boundary();
         disabled_native_ai_auto_apply_requires_explicit_review();
         stale_ai_preview_is_rejected_without_mutation();

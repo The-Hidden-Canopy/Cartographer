@@ -229,11 +229,13 @@ struct PlanStepProgress {
 enum class AgentDemonstrationParameterization : std::uint8_t {
     normalized_face_distance,
     relative_displacement,
+    parameterless,
 };
 
 // Transferable typed values deliberately omit absolute object, vertex, and
 // world-position data. Face distances are normalized by the source face's
-// longest edge; vertex/object moves are stored as relative displacement.
+// longest edge; vertex/object moves are stored as relative displacement;
+// deterministic operations such as face poke carry no parameter values.
 struct AgentDemonstrationParameters {
     AgentDemonstrationParameterization parameterization =
         AgentDemonstrationParameterization::normalized_face_distance;
@@ -495,7 +497,7 @@ struct AgentDemonstrationGate {
 };
 
 struct AgentDemonstration {
-    static constexpr std::uint32_t kFormatVersion = 2U;
+    static constexpr std::uint32_t kFormatVersion = 3U;
 
     std::uint32_t format_version = kFormatVersion;
     std::string recipe_id;
@@ -545,7 +547,7 @@ struct AgentDemonstrationTraceStep {
 // operations. The serialized trace contains aliases and transferable typed
 // values only; it has no project, source identity, mutation, or replay path.
 struct AgentDemonstrationTrace {
-    static constexpr std::uint32_t kFormatVersion = 2U;
+    static constexpr std::uint32_t kFormatVersion = 3U;
 
     std::uint64_t result_revision_span = 0U;
     std::vector<AgentDemonstrationTraceStep> steps;

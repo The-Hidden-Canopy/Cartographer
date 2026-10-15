@@ -1428,6 +1428,19 @@ core::Result<ApplicationAction> ApplicationSession::preview_action(
             "mesh.inset-face", editor::ToolArguments{
                 *parameters.distance, {}, true, 0.5, std::nullopt}});
     }
+    if (preview.kind() == editor::PreviewKind::poke_face) {
+        if (parameters.transform.has_value() || parameters.distance.has_value() ||
+            parameters.position.has_value()) {
+            return core::Result<ApplicationAction>::failure(invalid_state(
+                "face poke preview contains unexpected parameters"));
+        }
+        return core::Result<ApplicationAction>::success(InvokeToolAction{
+            "mesh.poke-face", editor::ToolArguments{}});
+    }
+    if (preview.kind() != editor::PreviewKind::set_vertex_position) {
+        return core::Result<ApplicationAction>::failure(invalid_state(
+            "preview kind has no native application action"));
+    }
     if (!parameters.position.has_value()) {
         return core::Result<ApplicationAction>::failure(invalid_state(
             "vertex position preview has no position"));
@@ -2002,6 +2015,17 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
                         NativeTraceParameterization::normalized_face_distance,
                         normalized_distance, {}, structure_signature, std::nullopt};
                 }
+            } else if (mesh != before_document.meshes().end() &&
+                action.tool_id == "mesh.poke-face" &&
+                invocation_context->faces.size() == 1U) {
+                const auto face_id = invocation_context->faces.front();
+                std::optional<assets::Sha256Digest> structure_signature;
+                const auto descriptor = structure_signature_for_mesh(mesh->second, face_id);
+                if (descriptor) structure_signature = descriptor.value();
+                trace_candidate = NativeOperationTraceEntry{
+                    0U, action.tool_id, OperationSource::human, before, {}, target_object, face_id,
+                    NativeTraceParameterization::parameterless,
+                    0.0, {}, structure_signature, std::nullopt};
             } else if (action.tool_id == "mesh.set-vertex-position" &&
                 invocation_context->vertices.size() == 1U) {
                 const auto vertex_id = invocation_context->vertices.front();
@@ -3442,6 +3466,7 @@ core::Result<DispatchReceipt> ApplicationSession::accepted(
     const bool supported_native_trace_action = active_source_ == OperationSource::human &&
         (action == "Invoke Tool: mesh.inset-face" ||
          action == "Invoke Tool: mesh.extrude-face" ||
+         action == "Invoke Tool: mesh.poke-face" ||
          action == "Invoke Tool: mesh.set-vertex-position" ||
          action == "Set Object Transform");
     if (revision_before != document_.revision() && !supported_native_trace_action) {

@@ -30,6 +30,8 @@ constexpr std::string_view kDemonstrationMagicV1 =
     "CARTOGRAPHER_AGENT_DEMONSTRATION_V1\n";
 constexpr std::string_view kDemonstrationMagicV2 =
     "CARTOGRAPHER_AGENT_DEMONSTRATION_V2\n";
+constexpr std::string_view kDemonstrationMagicV3 =
+    "CARTOGRAPHER_AGENT_DEMONSTRATION_V3\n";
 constexpr std::string_view kDemonstrationTraceMagic =
     "CARTOGRAPHER_AGENT_DEMONSTRATION_TRACE_V1\n";
 constexpr std::string_view kDemonstrationRecipeMagic =
@@ -1437,6 +1439,12 @@ core::Result<void> AgentDemonstration::validate() const {
             return core::Result<void>::failure(malformed(
                 "demonstration step typed parameters do not match its native tool"));
         }
+        if (format_version < 3U && step.parameters.has_value() &&
+            step.parameters->parameterization ==
+                AgentDemonstrationParameterization::parameterless) {
+            return core::Result<void>::failure(malformed(
+                "legacy demonstration format cannot encode parameterless operations"));
+        }
         if (format_version == 1U && step.parameters.has_value()) {
             return core::Result<void>::failure(malformed(
                 "legacy demonstration format cannot contain typed parameters"));
@@ -1495,7 +1503,8 @@ core::Result<std::string> AgentDemonstration::serialize() const {
                 if (step.parameters->parameterization ==
                     AgentDemonstrationParameterization::normalized_face_distance) {
                     payload.real(step.parameters->normalized_distance);
-                } else {
+                } else if (step.parameters->parameterization ==
+                    AgentDemonstrationParameterization::relative_displacement) {
                     payload.real(step.parameters->relative_displacement.x);
                     payload.real(step.parameters->relative_displacement.y);
                     payload.real(step.parameters->relative_displacement.z);
@@ -1521,7 +1530,8 @@ core::Result<std::string> AgentDemonstration::serialize() const {
     outer.field(body);
     outer.digest(digest_text(body));
     std::string result(format_version == 1U
-        ? kDemonstrationMagicV1 : kDemonstrationMagicV2);
+        ? kDemonstrationMagicV1
+        : format_version == 2U ? kDemonstrationMagicV2 : kDemonstrationMagicV3);
     result += std::move(outer).take();
     if (result.size() > kMaxDemonstrationBytes) {
         return core::Result<std::string>::failure(malformed(
@@ -1534,13 +1544,16 @@ core::Result<AgentDemonstration> AgentDemonstration::deserialize(
     std::string_view bytes) {
     const bool version_one = bytes.starts_with(kDemonstrationMagicV1);
     const bool version_two = bytes.starts_with(kDemonstrationMagicV2);
-    if (bytes.size() > kMaxDemonstrationBytes || (!version_one && !version_two)) {
+    const bool version_three = bytes.starts_with(kDemonstrationMagicV3);
+    if (bytes.size() > kMaxDemonstrationBytes ||
+        (!version_one && !version_two && !version_three)) {
         return core::Result<AgentDemonstration>::failure(malformed(
             "demonstration header is unknown or file exceeds its size bound"));
     }
     const std::string_view magic = version_one
-        ? kDemonstrationMagicV1 : kDemonstrationMagicV2;
-    const std::uint32_t expected_version = version_one ? 1U : 2U;
+        ? kDemonstrationMagicV1
+        : version_two ? kDemonstrationMagicV2 : kDemonstrationMagicV3;
+    const std::uint32_t expected_version = version_one ? 1U : version_two ? 2U : 3U;
     Reader outer(bytes.substr(magic.size()));
     const std::string body = outer.field(kMaxDemonstrationBytes);
     const auto supplied_digest = outer.digest();
@@ -1589,8 +1602,10 @@ core::Result<AgentDemonstration> AgentDemonstration::deserialize(
         if (expected_version >= 2U && reader.boolean()) {
             AgentDemonstrationParameters parameters;
             const auto parameterization = reader.number();
-            if (parameterization > static_cast<std::uint64_t>(
-                    AgentDemonstrationParameterization::relative_displacement)) {
+            const auto maximum_parameterization = expected_version >= 3U
+                ? AgentDemonstrationParameterization::parameterless
+                : AgentDemonstrationParameterization::relative_displacement;
+            if (parameterization > static_cast<std::uint64_t>(maximum_parameterization)) {
                 reader.fail("demonstration parameterization kind is unknown");
             }
             parameters.parameterization = static_cast<
@@ -1598,7 +1613,8 @@ core::Result<AgentDemonstration> AgentDemonstration::deserialize(
             if (parameters.parameterization ==
                 AgentDemonstrationParameterization::normalized_face_distance) {
                 parameters.normalized_distance = reader.real();
-            } else {
+            } else if (parameters.parameterization ==
+                AgentDemonstrationParameterization::relative_displacement) {
                 parameters.relative_displacement = {
                     reader.real(), reader.real(), reader.real()};
             }
@@ -1700,6 +1716,10 @@ core::Result<AgentDemonstrationTrace> AgentDemonstrationTrace::capture(
                 AgentDemonstrationParameterization::relative_displacement;
             parameters.relative_displacement = operation.relative_displacement;
             break;
+        case application::NativeTraceParameterization::parameterless:
+            parameters.parameterization =
+                AgentDemonstrationParameterization::parameterless;
+            break;
         default:
             return core::Result<AgentDemonstrationTrace>::failure(malformed(
                 "selected native command range has an unknown parameterization"));
@@ -1707,9 +1727,16 @@ core::Result<AgentDemonstrationTrace> AgentDemonstrationTrace::capture(
         if (auto result = parameters.validate(operation.tool_id); !result) {
             return core::Result<AgentDemonstrationTrace>::failure(result.error());
         }
+        const bool valid_face_parameterization =
+            (operation.tool_id == "mesh.poke-face" &&
+                parameters.parameterization ==
+                    AgentDemonstrationParameterization::parameterless) ||
+            ((operation.tool_id == "mesh.inset-face" ||
+              operation.tool_id == "mesh.extrude-face") &&
+                parameters.parameterization ==
+                    AgentDemonstrationParameterization::normalized_face_distance);
         if ((target_kind == AgentDemonstrationTargetKind::face &&
-                parameters.parameterization !=
-                    AgentDemonstrationParameterization::normalized_face_distance) ||
+                !valid_face_parameterization) ||
             (target_kind == AgentDemonstrationTargetKind::vertex &&
                 parameters.parameterization !=
                     AgentDemonstrationParameterization::relative_displacement) ||
@@ -1781,10 +1808,16 @@ core::Result<void> AgentDemonstrationTrace::validate() const {
                     "demonstration trace object target is invalid"));
             }
         } else if (step.target_kind == AgentDemonstrationTargetKind::face) {
+            const bool supported_face_demo =
+                ((step.tool_id == "mesh.inset-face" ||
+                  step.tool_id == "mesh.extrude-face") &&
+                    step.parameters.parameterization ==
+                        AgentDemonstrationParameterization::normalized_face_distance) ||
+                (step.tool_id == "mesh.poke-face" &&
+                    step.parameters.parameterization ==
+                        AgentDemonstrationParameterization::parameterless);
             if (step.component_alias == 0U || step.component_alias > 4096U ||
-                (step.tool_id != "mesh.inset-face" && step.tool_id != "mesh.extrude-face") ||
-                step.parameters.parameterization !=
-                    AgentDemonstrationParameterization::normalized_face_distance) {
+                !supported_face_demo) {
                 return core::Result<void>::failure(malformed(
                     "demonstration trace face target is invalid"));
             }
@@ -1844,7 +1877,8 @@ core::Result<std::string> AgentDemonstrationTrace::serialize() const {
         if (step.parameters.parameterization ==
             AgentDemonstrationParameterization::normalized_face_distance) {
             payload.real(step.parameters.normalized_distance);
-        } else {
+        } else if (step.parameters.parameterization ==
+            AgentDemonstrationParameterization::relative_displacement) {
             payload.real(step.parameters.relative_displacement.x);
             payload.real(step.parameters.relative_displacement.y);
             payload.real(step.parameters.relative_displacement.z);
@@ -1890,7 +1924,7 @@ core::Result<AgentDemonstrationTrace> AgentDemonstrationTrace::deserialize(
     }
     Reader reader(body);
     const std::uint64_t format_version = reader.number();
-    if (format_version != 1U && format_version != kFormatVersion) {
+    if (format_version < 1U || format_version > kFormatVersion) {
         return core::Result<AgentDemonstrationTrace>::failure(core::Diagnostic(
             core::ErrorCode::version_mismatch,
             "agent demonstration trace version is unsupported"));
@@ -1920,8 +1954,10 @@ core::Result<AgentDemonstrationTrace> AgentDemonstrationTrace::deserialize(
         step.revision_before_offset = reader.number();
         step.revision_after_offset = reader.number();
         const auto parameterization = reader.number();
-        if (parameterization > static_cast<std::uint64_t>(
-                AgentDemonstrationParameterization::relative_displacement)) {
+        const auto maximum_parameterization = format_version >= 3U
+            ? AgentDemonstrationParameterization::parameterless
+            : AgentDemonstrationParameterization::relative_displacement;
+        if (parameterization > static_cast<std::uint64_t>(maximum_parameterization)) {
             reader.fail("demonstration trace parameterization is unknown");
         }
         step.parameters.parameterization = static_cast<
@@ -1929,7 +1965,8 @@ core::Result<AgentDemonstrationTrace> AgentDemonstrationTrace::deserialize(
         if (step.parameters.parameterization ==
             AgentDemonstrationParameterization::normalized_face_distance) {
             step.parameters.normalized_distance = reader.real();
-        } else {
+        } else if (step.parameters.parameterization ==
+            AgentDemonstrationParameterization::relative_displacement) {
             step.parameters.relative_displacement = {
                 reader.real(), reader.real(), reader.real()};
         }

@@ -3,7 +3,7 @@
 ## End-to-end fixture
 
 - Create a project with separate mesh objects.
-- Capture exact face targets and queue native inset/extrude steps.
+- Capture exact face targets and queue native inset/extrude steps plus a parameterless face poke.
 - Run the plan on the speculative session.
 - Confirm the source revision and geometry remain unchanged before review.
 - Confirm per-step receipts, project/viewport gates, and structured mesh diffs.
@@ -19,6 +19,8 @@
 - A protected target is rejected before execution.
 - A target mesh shared by an out-of-scope or protected instance is rejected, and all in-scope instances count toward the touched-object budget.
 - A topology edit is blocked when the envelope permits geometry only.
+- Face poke is blocked by geometry-only scope, rejects numeric parameters, stays off the live source before review, and remains unavailable to AI auto-apply.
+- A human-accepted face-poke step serializes as a parameterless typed demonstration; older demonstration versions remain readable.
 - A plan based on a stale source revision cannot start.
 - A missing goal cannot start a task, and a source edit after speculative execution prevents acceptance without overwriting the newer source.
 - An invalid native operation blocks the task without changing the source.

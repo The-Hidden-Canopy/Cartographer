@@ -114,6 +114,7 @@ enum class OperationSource {
 enum class NativeTraceParameterization : std::uint8_t {
     normalized_face_distance,
     relative_displacement,
+    parameterless,
 };
 
 enum class NativeTraceTargetKind : std::uint8_t {

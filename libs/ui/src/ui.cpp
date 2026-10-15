@@ -242,8 +242,18 @@ core::Result<std::string> demonstration_step_intent(
     }
     if (step.target_kind == agent::AgentDemonstrationTargetKind::face) {
         const auto* face_id = std::get_if<geometry::FaceId>(&target.component);
-        if (face_id == nullptr ||
-            (step.tool_id != "mesh.inset-face" && step.tool_id != "mesh.extrude-face")) {
+        if (face_id == nullptr) {
+            return core::Result<std::string>::failure(invalid(
+                "face demonstration binding does not match its native operation"));
+        }
+        if (step.tool_id == "mesh.poke-face" &&
+            step.parameters.parameterization ==
+                agent::AgentDemonstrationParameterization::parameterless) {
+            return core::Result<std::string>::success("poke face");
+        }
+        if ((step.tool_id != "mesh.inset-face" && step.tool_id != "mesh.extrude-face") ||
+            step.parameters.parameterization !=
+                agent::AgentDemonstrationParameterization::normalized_face_distance) {
             return core::Result<std::string>::failure(invalid(
                 "face demonstration binding does not match its native operation"));
         }

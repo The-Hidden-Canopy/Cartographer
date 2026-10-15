@@ -119,6 +119,43 @@ void component_preview_emits_affected_ids_and_parameters() {
     REQUIRE(*committed.value().parameters->distance == 0.25);
 }
 
+void face_poke_preview_is_parameterless_and_revision_bound() {
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::CreateBoxAction{"Box", {1.0, 1.0, 1.0}}));
+    const auto initial = session.snapshot();
+    const auto object = initial.objects.front().object.id;
+    const auto face = initial.viewport.scene.instances().front().mesh->triangle_faces.front();
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::SetSelectionModeAction{
+            carto::editor::SelectionMode::face}));
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::SelectFaceAction{object, face}));
+    const auto before = session.snapshot();
+    const auto* before_instance = before.viewport.scene.find(object);
+    REQUIRE(before_instance != nullptr && before_instance->mesh != nullptr);
+
+    auto preview = session.begin_preview(carto::editor::PreviewKind::poke_face);
+    REQUIRE(preview);
+    REQUIRE(!preview.value().update(carto::editor::PreviewParameters{
+        std::nullopt, 0.1, std::nullopt}));
+    REQUIRE(preview.value().active());
+    REQUIRE(preview.value().update(carto::editor::PreviewParameters{}));
+    REQUIRE(session.snapshot().project_revision == before.project_revision);
+
+    const auto committed = carto::application::HumanApplicationAccess::commit_preview(
+        session, preview.value());
+    REQUIRE(committed);
+    const auto after = session.snapshot();
+    const auto* after_instance = after.viewport.scene.find(object);
+    REQUIRE(after_instance != nullptr && after_instance->mesh != nullptr);
+    REQUIRE(after_instance->mesh->vertex_ids.size() ==
+        before_instance->mesh->vertex_ids.size() + 1U);
+    REQUIRE(after_instance->mesh->triangle_faces.size() >
+        before_instance->mesh->triangle_faces.size());
+    REQUIRE(after.project_revision == before.project_revision.next());
+}
+
 void ui_preview_facade_records_only_the_committed_operation() {
     carto::application::ApplicationSession session;
     carto::ui::UiController ui(session);
@@ -161,6 +198,7 @@ int main() {
         preview_updates_are_ephemeral_and_commit_through_admission();
         stale_preview_is_refused_without_a_second_mutation();
         component_preview_emits_affected_ids_and_parameters();
+        face_poke_preview_is_parameterless_and_revision_bound();
         ui_preview_facade_records_only_the_committed_operation();
         preview_validation_is_fail_closed();
     } catch (const std::exception& error) {

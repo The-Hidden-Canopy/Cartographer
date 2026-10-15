@@ -246,7 +246,18 @@ core::Result<AgentDemonstrationParameters> parameterize_demo_step(
     const project::ProjectDocument& document,
     const TargetRef& target) {
     AgentDemonstrationParameters parameters;
-    if (proposal.preview_kind == editor::PreviewKind::inset_face ||
+    if (proposal.preview_kind == editor::PreviewKind::poke_face) {
+        if (proposal.tool_id != "mesh.poke-face" ||
+            !std::holds_alternative<geometry::FaceId>(target.component) ||
+            proposal.parameters.transform.has_value() ||
+            proposal.parameters.distance.has_value() ||
+            proposal.parameters.position.has_value()) {
+            return core::Result<AgentDemonstrationParameters>::failure(invalid_state(
+                "face-poke demonstration must bind one face and carry no parameters"));
+        }
+        parameters.parameterization =
+            AgentDemonstrationParameterization::parameterless;
+    } else if (proposal.preview_kind == editor::PreviewKind::inset_face ||
         proposal.preview_kind == editor::PreviewKind::extrude_face) {
         const auto* face_id = std::get_if<geometry::FaceId>(&target.component);
         const auto* object = document.scene().find(target.object);
@@ -765,6 +776,13 @@ core::Result<void> AgentDemonstrationParameters::validate(std::string_view tool_
         }
         return core::Result<void>::success();
     }
+    case AgentDemonstrationParameterization::parameterless:
+        if (tool_id != "mesh.poke-face" || normalized_distance != 0.0 ||
+            !displacement_is_zero) {
+            return core::Result<void>::failure(invalid(
+                "parameterless demonstration is invalid for its native tool"));
+        }
+        return core::Result<void>::success();
     }
     return core::Result<void>::failure(invalid(
         "demonstration parameterization kind is unknown"));

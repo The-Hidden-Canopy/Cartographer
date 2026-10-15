@@ -24,7 +24,8 @@ bool valid_kind(PreviewKind kind) noexcept {
     return kind == PreviewKind::object_transform ||
         kind == PreviewKind::object_translation_delta ||
         kind == PreviewKind::extrude_face ||
-        kind == PreviewKind::inset_face || kind == PreviewKind::set_vertex_position;
+        kind == PreviewKind::inset_face || kind == PreviewKind::set_vertex_position ||
+        kind == PreviewKind::poke_face;
 }
 
 } // namespace
@@ -66,6 +67,13 @@ core::Result<void> PreviewParameters::validate(PreviewKind kind) const {
         }
         return core::Result<void>::success();
     }
+    if (kind == PreviewKind::poke_face) {
+        if (transform.has_value() || distance.has_value() || position.has_value()) {
+            return core::Result<void>::failure(
+                invalid("face poke preview does not accept parameters"));
+        }
+        return core::Result<void>::success();
+    }
     if (!position.has_value() || transform.has_value() || distance.has_value()) {
         return core::Result<void>::failure(
             invalid("vertex position preview requires only a position"));
@@ -94,7 +102,8 @@ core::Result<AuthoringPreview> AuthoringPreview::begin(
         return core::Result<AuthoringPreview>::failure(invalid(
             "object transform preview requires exactly one selected object"));
     }
-    if ((kind == PreviewKind::extrude_face || kind == PreviewKind::inset_face) &&
+    if ((kind == PreviewKind::extrude_face || kind == PreviewKind::inset_face ||
+         kind == PreviewKind::poke_face) &&
         (context.selection_mode != SelectionMode::face || context.faces.size() != 1U ||
          !context.component_object.has_value())) {
             return core::Result<AuthoringPreview>::failure(invalid(

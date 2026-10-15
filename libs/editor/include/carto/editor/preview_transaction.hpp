@@ -19,6 +19,7 @@ enum class PreviewKind {
     extrude_face,
     inset_face,
     set_vertex_position,
+    poke_face,
 };
 
 struct PreviewParameters {

@@ -129,6 +129,7 @@ std::string preview_name(editor::PreviewKind kind) {
     case editor::PreviewKind::extrude_face: return "extrude_face";
     case editor::PreviewKind::inset_face: return "inset_face";
     case editor::PreviewKind::set_vertex_position: return "set_vertex_position";
+    case editor::PreviewKind::poke_face: return "poke_face";
     }
     return "unknown";
 }
@@ -615,7 +616,8 @@ core::Result<void> Proposal::validate(const Context& expected) const {
                 "object translation requires exactly one selected object"));
         }
     } else if (preview_kind == editor::PreviewKind::extrude_face ||
-        preview_kind == editor::PreviewKind::inset_face) {
+        preview_kind == editor::PreviewKind::inset_face ||
+        preview_kind == editor::PreviewKind::poke_face) {
         if (expected.authoring.selection_mode != editor::SelectionMode::face ||
             expected.authoring.faces.size() != 1U ||
             !expected.authoring.component_object.has_value()) {
@@ -676,7 +678,9 @@ std::vector<OperationDescriptor> build_operation_ontology(
         } else if (matches("mesh.poke-face", editor::ToolKernelKind::editable_mesh_poke_face)) {
             descriptor.kernel_operation = "geometry.EditableMesh.poke_face";
             descriptor.precondition =
-                "exactly one object-bound face selected; face is finite, planar, strictly convex, and has a centroid strictly inside; operation requires a future preview contract";
+                "exactly one object-bound face selected; face is finite, planar, strictly convex, and has a centroid strictly inside";
+            descriptor.preview_supported = true;
+            descriptor.preview_kind = editor::PreviewKind::poke_face;
         } else if (matches(
                        "mesh.set-vertex-position",
                        editor::ToolKernelKind::editable_mesh_set_vertex_position)) {
@@ -956,6 +960,23 @@ core::Result<Proposal> NativePlanner::propose(
     if (!parsed_numbers) return core::Result<Proposal>::failure(parsed_numbers.error());
     const std::string request_id = make_request_id(next_request_id_++);
 
+    if ((words.size() == 2U && words[0] == "poke" && words[1] == "face") ||
+        (words.size() == 1U && words[0] == "poke-face")) {
+        if (!parsed_numbers.value().empty()) {
+            return core::Result<Proposal>::failure(invalid(
+                "poke face intent does not accept numeric parameters"));
+        }
+        Proposal proposal{
+            request_id, context.project_revision, context.authoring,
+            editor::PreviewKind::poke_face, editor::PreviewParameters{},
+            "mesh.poke-face", std::string(intent),
+            "Native planner produced a parameterless, revision-bound face-poke preview."};
+        if (auto result = proposal.validate(context); !result) {
+            return core::Result<Proposal>::failure(result.error());
+        }
+        return core::Result<Proposal>::success(std::move(proposal));
+    }
+
     if (words.size() == 6U && words[0] == "translate" && words[1] == "object" &&
         words[2] == "by") {
         if (parsed_numbers.value().size() != 3U) {
@@ -1008,7 +1029,7 @@ core::Result<Proposal> NativePlanner::propose(
         return core::Result<Proposal>::success(std::move(proposal));
     }
     return core::Result<Proposal>::failure(invalid(
-        "native planner supports translate object, extrude, inset, and move vertex intents"));
+        "native planner supports translate object, extrude, inset, poke face, and move vertex intents"));
 }
 
 } // namespace carto::ai
