@@ -1191,6 +1191,147 @@ void native_demonstration_multi_command_translations_match_similar_objects() {
     REQUIRE(source.snapshot().project_revision == source_revision);
 }
 
+void native_demonstration_multi_command_vertex_edits_match_and_accumulate() {
+    TempDirectory directory;
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Vertex exemplar", {1.0, 1.0, 1.0}}));
+    const auto exemplar = source.snapshot().objects.back().object.id;
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Vertex candidate", {1.0, 1.0, 1.0}}));
+    const auto candidate = source.snapshot().objects.back().object.id;
+
+    const auto split_edge = [&ui, &source](carto::scene::ObjectId object) {
+        const auto before = source.snapshot();
+        const auto* instance = before.viewport.scene.find(object);
+        REQUIRE(instance != nullptr && instance->mesh != nullptr);
+        const auto previous_vertices = instance->mesh->vertex_ids;
+        const auto edge = instance->mesh->triangle_edges.front()[0];
+        REQUIRE(edge.has_value());
+        REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+            carto::editor::SelectionMode::edge}));
+        REQUIRE(ui.dispatch(carto::application::SelectEdgeAction{object, *edge}));
+        carto::editor::ToolArguments split_arguments;
+        split_arguments.factor = 0.5;
+        REQUIRE(ui.dispatch(carto::application::InvokeToolAction{
+            "mesh.split-edge", split_arguments}));
+        const auto after = source.snapshot();
+        const auto* split_instance = after.viewport.scene.find(object);
+        REQUIRE(split_instance != nullptr && split_instance->mesh != nullptr);
+        const auto inserted = std::find_if(
+            split_instance->mesh->vertex_ids.begin(), split_instance->mesh->vertex_ids.end(),
+            [&previous_vertices](carto::geometry::VertexId vertex) {
+                return std::find(previous_vertices.begin(), previous_vertices.end(), vertex) ==
+                    previous_vertices.end();
+            });
+        REQUIRE(inserted != split_instance->mesh->vertex_ids.end());
+        return *inserted;
+    };
+    const auto exemplar_vertex = split_edge(exemplar);
+    const auto candidate_vertex = split_edge(candidate);
+    const auto pre_edit = source.snapshot();
+    const auto exemplar_mesh = pre_edit.viewport.scene.find(exemplar)->mesh;
+    const auto exemplar_position = std::find(
+        exemplar_mesh->vertex_ids.begin(), exemplar_mesh->vertex_ids.end(), exemplar_vertex);
+    REQUIRE(exemplar_position != exemplar_mesh->vertex_ids.end());
+    const auto exemplar_vertex_index = static_cast<std::size_t>(std::distance(
+        exemplar_mesh->vertex_ids.begin(), exemplar_position));
+    const auto first_operation_index = pre_edit.native_operation_trace.size();
+
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::vertex}));
+    REQUIRE(ui.dispatch(carto::application::SelectVertexAction{exemplar, exemplar_vertex}));
+    carto::editor::ToolArguments first_move;
+    first_move.position = exemplar_mesh->positions[exemplar_vertex_index] +
+        carto::core::Vec3d{0.1, 0.0, 0.0};
+    REQUIRE(ui.dispatch(carto::application::InvokeToolAction{
+        "mesh.set-vertex-position", first_move}));
+
+    const auto after_first = source.snapshot();
+    const auto first_mesh = after_first.viewport.scene.find(exemplar)->mesh;
+    const auto first_vertex_position = std::find(
+        first_mesh->vertex_ids.begin(), first_mesh->vertex_ids.end(), exemplar_vertex);
+    REQUIRE(first_vertex_position != first_mesh->vertex_ids.end());
+    const auto first_vertex_index = static_cast<std::size_t>(std::distance(
+        first_mesh->vertex_ids.begin(), first_vertex_position));
+    carto::editor::ToolArguments second_move;
+    second_move.position = first_mesh->positions[first_vertex_index] +
+        carto::core::Vec3d{0.0, 0.2, 0.0};
+    REQUIRE(ui.dispatch(carto::application::SelectVertexAction{exemplar, exemplar_vertex}));
+    REQUIRE(ui.dispatch(carto::application::InvokeToolAction{
+        "mesh.set-vertex-position", second_move}));
+
+    const auto captured_operations = source.snapshot().native_operation_trace;
+    REQUIRE(captured_operations.size() == first_operation_index + 2U);
+    REQUIRE(ui.capture_agent_demonstration_trace(
+        captured_operations[first_operation_index].operation_id,
+        captured_operations.back().operation_id));
+    const auto captured = ui.snapshot();
+    REQUIRE(captured.agent_demonstration_trace.has_value());
+    REQUIRE(captured.agent_demonstration_trace->steps.size() == 2U);
+    REQUIRE(captured.agent_demonstration_trace->steps[0].target_kind ==
+        carto::agent::AgentDemonstrationTargetKind::vertex);
+    REQUIRE(captured.agent_demonstration_trace->steps[0].target_alias ==
+        captured.agent_demonstration_trace->steps[1].target_alias);
+    REQUIRE(captured.agent_demonstration_trace->steps[0].component_alias ==
+        captured.agent_demonstration_trace->steps[1].component_alias);
+    REQUIRE(captured.agent_demonstration_similar_targets_supported);
+
+    auto mismatched_trace = *captured.agent_demonstration_trace;
+    REQUIRE(mismatched_trace.steps[1].structure_signature.has_value());
+    mismatched_trace.steps[1].structure_signature->bytes[0] ^= 0x01U;
+    const auto mismatched_path = directory.path() / "mismatched-vertex-trace.carto-agent-trace";
+    REQUIRE(mismatched_trace.save(mismatched_path));
+    REQUIRE(ui.load_agent_demonstration_trace(mismatched_path));
+    REQUIRE(!ui.snapshot().agent_demonstration_similar_targets_supported);
+    REQUIRE(!ui.apply_agent_demonstration_to_similar());
+    const auto valid_path = directory.path() / "valid-vertex-trace.carto-agent-trace";
+    REQUIRE(captured.agent_demonstration_trace->save(valid_path));
+    REQUIRE(ui.load_agent_demonstration_trace(valid_path));
+
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{exemplar}));
+    const auto target_set_count = ui.apply_agent_demonstration_to_similar();
+    REQUIRE(target_set_count && target_set_count.value() == 1U);
+
+    const auto candidate_before = source.snapshot().viewport.scene.find(candidate)->mesh;
+    const auto candidate_vertex_position = std::find(
+        candidate_before->vertex_ids.begin(), candidate_before->vertex_ids.end(),
+        candidate_vertex);
+    REQUIRE(candidate_vertex_position != candidate_before->vertex_ids.end());
+    const auto candidate_vertex_index = static_cast<std::size_t>(std::distance(
+        candidate_before->vertex_ids.begin(), candidate_vertex_position));
+    const auto expected_position = candidate_before->positions[candidate_vertex_index] +
+        carto::core::Vec3d{0.1, 0.2, 0.0};
+    const auto source_revision = source.snapshot().project_revision;
+    const auto preview = ui.preview_agent_demonstration_trace();
+    REQUIRE(preview);
+    REQUIRE(preview.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(preview.value().can_accept);
+    REQUIRE(preview.value().plan_steps.size() == 2U);
+    const auto preview_plan = ui.snapshot().agent_plan_draft;
+    REQUIRE(preview_plan.size() == 2U);
+    REQUIRE(preview_plan[0].target.object == candidate);
+    REQUIRE(preview_plan[1].target.object == candidate);
+    const auto* preview_vertex = std::get_if<carto::geometry::VertexId>(
+        &preview_plan.front().target.component);
+    REQUIRE(preview_vertex != nullptr && *preview_vertex == candidate_vertex);
+    const auto* after_instance = preview.value().after_scene.find(candidate);
+    REQUIRE(after_instance != nullptr && after_instance->mesh != nullptr);
+    const auto after_vertex_position = std::find(
+        after_instance->mesh->vertex_ids.begin(), after_instance->mesh->vertex_ids.end(),
+        candidate_vertex);
+    REQUIRE(after_vertex_position != after_instance->mesh->vertex_ids.end());
+    const auto after_vertex_index = static_cast<std::size_t>(std::distance(
+        after_instance->mesh->vertex_ids.begin(), after_vertex_position));
+    REQUIRE(after_instance->mesh->positions[after_vertex_index].x == expected_position.x);
+    REQUIRE(after_instance->mesh->positions[after_vertex_index].y == expected_position.y);
+    REQUIRE(after_instance->mesh->positions[after_vertex_index].z == expected_position.z);
+    REQUIRE(source.snapshot().project_revision == source_revision);
+}
+
 void native_demonstrations_skip_ambiguous_structural_matches() {
     carto::application::ApplicationSession source;
     carto::ui::UiController ui(source);
@@ -3507,6 +3648,7 @@ int main() {
         human_native_command_range_captures_alias_only_trace();
         native_demonstrations_apply_to_unique_exact_structural_matches();
         native_demonstration_multi_command_translations_match_similar_objects();
+        native_demonstration_multi_command_vertex_edits_match_and_accumulate();
         native_demonstrations_skip_ambiguous_structural_matches();
         plan_dag_orders_dependencies_and_rejects_invalid_graphs();
         failed_dag_node_invalidates_only_dependent_steps();

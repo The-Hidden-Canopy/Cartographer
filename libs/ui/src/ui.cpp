@@ -167,6 +167,18 @@ bool supports_demonstration_structural_matching(
         return false;
     }
     if (trace.steps.size() == 1U) return true;
+    if (first.target_kind == agent::AgentDemonstrationTargetKind::vertex &&
+        first.tool_id == "mesh.set-vertex-position" && first.target_alias != 0U &&
+        first.component_alias != 0U) {
+        return std::all_of(trace.steps.begin(), trace.steps.end(), [&first](const auto& step) {
+            return step.target_kind == agent::AgentDemonstrationTargetKind::vertex &&
+                step.tool_id == "mesh.set-vertex-position" &&
+                step.target_alias == first.target_alias &&
+                step.component_alias == first.component_alias &&
+                step.structure_signature == first.structure_signature &&
+                step.result_object_structure_signature == first.result_object_structure_signature;
+        });
+    }
     if (first.target_kind != agent::AgentDemonstrationTargetKind::object ||
         first.tool_id != "object.translate" || first.target_alias == 0U ||
         first.component_alias != 0U ||
@@ -202,7 +214,8 @@ core::Result<std::string> demonstration_number_text(double value) {
 core::Result<std::string> demonstration_step_intent(
     const agent::AgentDemonstrationTraceStep& step,
     const agent::TargetRef& target,
-    const application::ApplicationSnapshot& snapshot) {
+    const application::ApplicationSnapshot& snapshot,
+    std::optional<core::Vec3d> vertex_base_position = std::nullopt) {
     if (auto result = step.parameters.validate(step.tool_id); !result) {
         return core::Result<std::string>::failure(result.error());
     }
@@ -285,7 +298,8 @@ core::Result<std::string> demonstration_step_intent(
         }
         const auto vertex_index = static_cast<std::size_t>(std::distance(
             instance->mesh->vertex_ids.begin(), vertex));
-        const auto position = instance->mesh->positions[vertex_index] +
+        const auto position = vertex_base_position.value_or(
+            instance->mesh->positions[vertex_index]) +
             step.parameters.relative_displacement;
         const auto x = demonstration_number_text(position.x);
         const auto y = demonstration_number_text(position.y);
@@ -2740,7 +2754,7 @@ core::Result<std::size_t> UiController::apply_agent_demonstration_to_similar() {
     }
     if (!supports_demonstration_structural_matching(*agent_demonstration_trace_)) {
         return core::Result<std::size_t>::failure(unsupported(
-            "multi-command correspondence requires one object alias of translations with unchanged structural signatures"));
+            "multi-command correspondence requires a single alias chain of unchanged transforms or topology-stable edits to one vertex"));
     }
 
     const auto snapshot = session_.snapshot();
@@ -2916,7 +2930,13 @@ core::Result<agent::AgentTaskSnapshot> UiController::preview_agent_demonstration
         agent_demonstration_target_set_count_);
     std::vector<agent::AgentPlanStep> steps;
     steps.reserve(expanded_step_count);
-    std::set<std::uint64_t> changed_mesh_assets;
+    std::map<std::uint64_t, std::pair<std::size_t, scene::ObjectId>> changed_mesh_assets;
+    std::map<std::pair<scene::ObjectId, geometry::VertexId>, core::Vec3d>
+        planned_vertex_positions;
+    const bool sequential_vertex_trace = agent_demonstration_trace_->steps.size() > 1U &&
+        agent_demonstration_trace_->steps.front().target_kind ==
+            agent::AgentDemonstrationTargetKind::vertex &&
+        supports_demonstration_structural_matching(*agent_demonstration_trace_);
     std::uint32_t permitted_effects = 0U;
     double transform_distance_budget = 0.0;
     bool has_topology_operation = false;
@@ -3014,9 +3034,13 @@ core::Result<agent::AgentTaskSnapshot> UiController::preview_agent_demonstration
                 return core::Result<agent::AgentTaskSnapshot>::failure(stale(
                     "bound mesh target has no current authored mesh asset"));
             }
-            if (!changed_mesh_assets.insert(*object->object.mesh_asset).second) {
+            const auto [asset_entry, inserted] = changed_mesh_assets.emplace(
+                *object->object.mesh_asset,
+                std::pair{target_set_index, binding->target.object});
+            if (!inserted && (!sequential_vertex_trace ||
+                    asset_entry->second != std::pair{target_set_index, binding->target.object})) {
                 return core::Result<agent::AgentTaskSnapshot>::failure(unsupported(
-                    "trace preview requires one mesh edit per source mesh until sequential correspondence is available"));
+                    "trace preview requires separate mesh assets across targets; repeated edits are supported only for one topology-stable vertex target"));
             }
             if (trace_step.target_kind == agent::AgentDemonstrationTargetKind::face) {
                 permitted_effects |= agent::effect_mask(agent::Effect::geometry) |
@@ -3027,9 +3051,38 @@ core::Result<agent::AgentTaskSnapshot> UiController::preview_agent_demonstration
             }
         }
 
-        auto intent = demonstration_step_intent(trace_step, binding->target, snapshot);
+        std::optional<core::Vec3d> vertex_base_position;
+        const auto* vertex_id = std::get_if<geometry::VertexId>(&binding->target.component);
+        if (vertex_id != nullptr) {
+            const auto key = std::pair{binding->target.object, *vertex_id};
+            const auto planned_position = planned_vertex_positions.find(key);
+            if (planned_position != planned_vertex_positions.end()) {
+                vertex_base_position = planned_position->second;
+            } else {
+                const auto* instance = snapshot.viewport.scene.find(binding->target.object);
+                if (instance == nullptr || instance->mesh == nullptr) {
+                    return core::Result<agent::AgentTaskSnapshot>::failure(stale(
+                        "bound demonstration vertex has no current source mesh"));
+                }
+                const auto vertex = std::find(instance->mesh->vertex_ids.begin(),
+                    instance->mesh->vertex_ids.end(), *vertex_id);
+                if (vertex == instance->mesh->vertex_ids.end()) {
+                    return core::Result<agent::AgentTaskSnapshot>::failure(stale(
+                        "bound demonstration vertex is absent from the source mesh"));
+                }
+                const auto vertex_index = static_cast<std::size_t>(std::distance(
+                    instance->mesh->vertex_ids.begin(), vertex));
+                vertex_base_position = instance->mesh->positions[vertex_index];
+            }
+        }
+        auto intent = demonstration_step_intent(
+            trace_step, binding->target, snapshot, vertex_base_position);
         if (!intent) {
             return core::Result<agent::AgentTaskSnapshot>::failure(intent.error());
+        }
+        if (vertex_id != nullptr && vertex_base_position.has_value()) {
+            planned_vertex_positions[{binding->target.object, *vertex_id}] =
+                *vertex_base_position + trace_step.parameters.relative_displacement;
         }
         std::vector<std::string> dependencies;
         const std::string step_id = "demonstration-set-" +
