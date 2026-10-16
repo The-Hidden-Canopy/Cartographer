@@ -10993,10 +10993,11 @@ struct DesktopState {
             static_cast<unsigned long long>(inventory.source_revision.value()),
             inventory.rows.size(), inventory.truncated ? " · partial" : "");
         ImGui::TextDisabled(
-            "Evidence audit · current and reviewed sources %zu/%zu observed · "
-            "complete metadata scans %zu/%zu",
+            "Evidence audit · current and reviewed source lineage %zu/%zu · "
+            "complete metadata scans %zu/%zu · technical checks %zu/%zu",
             evidence_audit.current_reviewed_sources, evidence_audit.assets.size(),
-            evidence_audit.complete_metadata_scans, evidence_audit.assets.size());
+            evidence_audit.complete_metadata_scans, evidence_audit.assets.size(),
+            evidence_audit.complete_technical_inspections, evidence_audit.assets.size());
         if (!evidence_audit.query_complete) {
             ImGui::TextColored(color(snapshot.colors.semantic_warning),
                 "The inventory query is incomplete; these counts do not cover the whole scope.");
@@ -11016,8 +11017,14 @@ struct DesktopState {
             ImGui::TextColored(color(snapshot.colors.semantic_warning),
                 "Some scoped metadata counts are incomplete.");
         }
+        if (!evidence_audit.technical_inspection_complete && !evidence_audit.assets.empty()) {
+            ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                "Some technical checks are incomplete in this bounded query.");
+        }
         ImGui::TextColored(color(snapshot.colors.semantic_warning),
-            "Readiness is not established: geometry, UV/material, collision, and production gates were not evaluated.");
+            "Overall readiness is not established: tangents, bake validation and freshness, collision, "
+            "traversal, source-to-geometry/material digest correspondence, and CONDITION policy "
+            "are not evaluated.");
         for (const auto& diagnostic : inventory.diagnostics) {
             ImGui::TextColored(color(snapshot.colors.semantic_warning),
                 "%s", diagnostic.message.c_str());
@@ -11037,11 +11044,31 @@ struct DesktopState {
                 static_cast<unsigned long long>(fact->authored_object.value),
                 static_cast<int>(asset_class.size()), asset_class.data(),
                 static_cast<int>(fidelity.size()), fidelity.data());
-            ImGui::TextDisabled("Source %llu · %s · %s · revision %s",
+            ImGui::TextDisabled("Source evidence %llu · lineage %s · %s · revision %s",
                 static_cast<unsigned long long>(fact->source_id),
                 fact->source_current ? "current" : "stale",
                 fact->source_reviewed ? "reviewed" : "unreviewed",
                 fact->source_revision.c_str());
+            const auto mesh_check =
+                carto::agent::condition_technical_check_status_name(fact->mesh_validation);
+            const auto uv_check =
+                carto::agent::condition_technical_check_status_name(fact->uv_set_presence);
+            const auto material_check =
+                carto::agent::condition_technical_check_status_name(
+                    fact->material_region_assignments);
+            ImGui::BulletText(
+                "Mesh %llu validation %.*s · %zu vertices / %zu edges / %zu faces",
+                static_cast<unsigned long long>(fact->mesh_asset),
+                static_cast<int>(mesh_check.size()), mesh_check.data(),
+                fact->mesh_vertices, fact->mesh_edges, fact->mesh_faces);
+            ImGui::BulletText(
+                "UV-set presence %.*s · %zu set(s), render ID %llu, lightmap candidates %zu",
+                static_cast<int>(uv_check.size()), uv_check.data(), fact->uv_set_count,
+                static_cast<unsigned long long>(fact->active_render_uv_set),
+                fact->lightmap_candidate_uv_sets);
+            ImGui::BulletText("Material assignments %.*s · %zu region(s), %zu resolved",
+                static_cast<int>(material_check.size()), material_check.data(),
+                fact->material_region_count, fact->resolved_material_region_count);
             ImGui::BulletText(
                 "Safe Place %llu · familiarity %llu · views %llu · variants %llu · temporal %llu",
                 static_cast<unsigned long long>(fact->safe_place_profiles),

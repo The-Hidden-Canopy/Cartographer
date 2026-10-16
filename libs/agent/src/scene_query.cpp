@@ -723,6 +723,124 @@ core::Result<SceneQueryResult> SceneQuery::execute(
                 if (!related_records_complete) result.truncated = true;
                 for (auto& fact : facts) {
                     fact.related_records_complete = related_records_complete;
+                    fact.mesh_validation = ConditionTechnicalCheckStatus::unavailable;
+                    fact.uv_set_presence = ConditionTechnicalCheckStatus::unavailable;
+                    fact.material_region_assignments = ConditionTechnicalCheckStatus::unavailable;
+                    if (budget.objects_examined >= budget.max_objects_examined) {
+                        result.truncated = true;
+                        fact.mesh_validation = ConditionTechnicalCheckStatus::incomplete;
+                        fact.uv_set_presence = ConditionTechnicalCheckStatus::incomplete;
+                        fact.material_region_assignments = ConditionTechnicalCheckStatus::incomplete;
+                        if (!append_row(result, budget, request.limit, std::move(fact))) break;
+                        continue;
+                    }
+                    ++budget.objects_examined;
+                    ++result.objects_examined;
+                    const auto* object = document.scene().find(fact.authored_object);
+                    if (object == nullptr || !object->mesh_asset.has_value()) {
+                        fact.mesh_validation = ConditionTechnicalCheckStatus::failed;
+                        fact.uv_set_presence = ConditionTechnicalCheckStatus::failed;
+                        fact.material_region_assignments = ConditionTechnicalCheckStatus::failed;
+                        fact.technical_checks_complete = true;
+                        if (!append_row(result, budget, request.limit, std::move(fact))) break;
+                        continue;
+                    }
+                    fact.mesh_asset = *object->mesh_asset;
+                    const auto mesh = document.meshes().find(*object->mesh_asset);
+                    if (mesh == document.meshes().end()) {
+                        fact.mesh_validation = ConditionTechnicalCheckStatus::failed;
+                        fact.uv_set_presence = ConditionTechnicalCheckStatus::failed;
+                        fact.material_region_assignments = ConditionTechnicalCheckStatus::failed;
+                        fact.technical_checks_complete = true;
+                        if (!append_row(result, budget, request.limit, std::move(fact))) break;
+                        continue;
+                    }
+                    fact.mesh_vertices = mesh->second.vertex_count();
+                    fact.mesh_edges = mesh->second.edge_count();
+                    fact.mesh_faces = mesh->second.face_count();
+                    const std::size_t maximum = std::numeric_limits<std::size_t>::max();
+                    if (fact.mesh_vertices > maximum - fact.mesh_edges ||
+                        fact.mesh_vertices + fact.mesh_edges > maximum - fact.mesh_faces) {
+                        result.truncated = true;
+                        fact.mesh_validation = ConditionTechnicalCheckStatus::incomplete;
+                        fact.uv_set_presence = ConditionTechnicalCheckStatus::incomplete;
+                        fact.material_region_assignments = ConditionTechnicalCheckStatus::incomplete;
+                        if (!append_row(result, budget, request.limit, std::move(fact))) break;
+                        continue;
+                    }
+                    const std::size_t mesh_elements =
+                        fact.mesh_vertices + fact.mesh_edges + fact.mesh_faces;
+                    const std::size_t remaining_topology =
+                        budget.max_topology_elements_examined -
+                        budget.topology_elements_examined;
+                    if (mesh_elements > remaining_topology) {
+                        result.truncated = true;
+                        fact.mesh_validation = ConditionTechnicalCheckStatus::incomplete;
+                        fact.uv_set_presence = ConditionTechnicalCheckStatus::incomplete;
+                        fact.material_region_assignments = ConditionTechnicalCheckStatus::incomplete;
+                        if (!append_row(result, budget, request.limit, std::move(fact))) break;
+                        continue;
+                    }
+                    budget.topology_elements_examined += mesh_elements;
+                    result.topology_elements_examined += mesh_elements;
+                    if (!mesh->second.validate()) {
+                        fact.mesh_validation = ConditionTechnicalCheckStatus::failed;
+                        fact.technical_checks_complete = true;
+                        if (!append_row(result, budget, request.limit, std::move(fact))) break;
+                        continue;
+                    }
+                    fact.mesh_validation = ConditionTechnicalCheckStatus::passed;
+                    fact.uv_set_count = mesh->second.uv_sets().descriptors().size();
+                    if (const auto* active_uv = mesh->second.uv_sets().active_for_render();
+                        active_uv != nullptr) {
+                        fact.active_render_uv_set = active_uv->id;
+                    }
+                    for (const auto& [ignored, uv_set] :
+                            mesh->second.uv_sets().descriptors()) {
+                        static_cast<void>(ignored);
+                        if (uv_set.lightmap_candidate) ++fact.lightmap_candidate_uv_sets;
+                    }
+                    fact.uv_set_presence = fact.active_render_uv_set != 0U &&
+                        fact.lightmap_candidate_uv_sets > 0U
+                        ? ConditionTechnicalCheckStatus::passed
+                        : ConditionTechnicalCheckStatus::failed;
+
+                    std::set<std::uint32_t> material_regions;
+                    bool material_region_schema_valid = true;
+                    for (const std::string_view layer_id : {
+                             std::string_view{"condition.material_region"},
+                             std::string_view{"cartographer.material_slot"}}) {
+                        const auto* layer = mesh->second.attributes().find(layer_id);
+                        if (layer == nullptr) continue;
+                        if (layer->descriptor.domain != attributes::AttributeDomain::face ||
+                            layer->descriptor.type != attributes::AttributeType::uint32) {
+                            material_region_schema_valid = false;
+                            continue;
+                        }
+                        for (const auto& value : layer->values) {
+                            const auto* region = std::get_if<std::uint32_t>(&value);
+                            if (region == nullptr) {
+                                material_region_schema_valid = false;
+                            } else if (*region != 0U) {
+                                material_regions.insert(*region);
+                            }
+                        }
+                    }
+                    fact.material_region_count = material_regions.size();
+                    for (const std::uint32_t region : material_regions) {
+                        const auto assignment = document.material_catalog().assignments().find(
+                            project::MaterialRegionKey{*object->mesh_asset, region});
+                        if (assignment == document.material_catalog().assignments().end()) continue;
+                        const auto resolved = document.material_catalog().resolve_material(
+                            assignment->second.material, assignment->second.variant);
+                        if (resolved) ++fact.resolved_material_region_count;
+                    }
+                    fact.material_region_assignments = material_region_schema_valid &&
+                        !material_regions.empty() && fact.resolved_material_region_count ==
+                            fact.material_region_count
+                        ? ConditionTechnicalCheckStatus::passed
+                        : ConditionTechnicalCheckStatus::failed;
+                    fact.technical_checks_complete = true;
                     if (!append_row(result, budget, request.limit, std::move(fact))) break;
                 }
             } else {
@@ -781,6 +899,18 @@ core::Result<SceneQueryResult> SceneQuery::execute(
     return core::Result<SceneQueryResult>::success(std::move(result));
 }
 
+std::string_view condition_technical_check_status_name(
+    ConditionTechnicalCheckStatus status) noexcept {
+    switch (status) {
+    case ConditionTechnicalCheckStatus::passed: return "passed";
+    case ConditionTechnicalCheckStatus::failed: return "failed";
+    case ConditionTechnicalCheckStatus::incomplete: return "incomplete";
+    case ConditionTechnicalCheckStatus::unavailable: return "unavailable";
+    case ConditionTechnicalCheckStatus::not_evaluated: return "not_evaluated";
+    }
+    return "unknown";
+}
+
 ConditionEvidenceAudit audit_condition_inventory(const SceneQueryResult& inventory) {
     ConditionEvidenceAudit audit;
     audit.source_revision = inventory.source_revision;
@@ -799,6 +929,9 @@ ConditionEvidenceAudit audit_condition_inventory(const SceneQueryResult& invento
         if (fact->asset == 0U || !fact->authored_object ||
             asset_class > static_cast<std::uint8_t>(condition::AssetClass::material) ||
             fidelity > static_cast<std::uint8_t>(condition::FidelityClass::background) ||
+            fact->mesh_validation > ConditionTechnicalCheckStatus::not_evaluated ||
+            fact->uv_set_presence > ConditionTechnicalCheckStatus::not_evaluated ||
+            fact->material_region_assignments > ConditionTechnicalCheckStatus::not_evaluated ||
             !observed_asset_ids.insert(fact->asset).second) {
             ++audit.unrecognized_rows;
             audit.query_complete = false;
@@ -825,11 +958,32 @@ ConditionEvidenceAudit audit_condition_inventory(const SceneQueryResult& invento
                                          : ConditionEvidenceStatus::incomplete});
         if (source_verified) ++audit.current_reviewed_sources;
         if (metadata_scan_verified) ++audit.complete_metadata_scans;
+        const auto terminal_check = [](ConditionTechnicalCheckStatus status) {
+            return status == ConditionTechnicalCheckStatus::passed ||
+                status == ConditionTechnicalCheckStatus::failed ||
+                status == ConditionTechnicalCheckStatus::unavailable;
+        };
+        if (fact->technical_checks_complete &&
+            terminal_check(fact->mesh_validation) && terminal_check(fact->uv_set_presence) &&
+            terminal_check(fact->material_region_assignments)) {
+            ++audit.complete_technical_inspections;
+        }
+        if (fact->mesh_validation == ConditionTechnicalCheckStatus::passed) {
+            ++audit.mesh_valid_assets;
+        }
+        if (fact->uv_set_presence == ConditionTechnicalCheckStatus::passed) {
+            ++audit.uv_set_presence_passed_assets;
+        }
+        if (fact->material_region_assignments == ConditionTechnicalCheckStatus::passed) {
+            ++audit.material_region_assignments_passed_assets;
+        }
     }
     audit.source_evidence_complete = audit.query_complete && !audit.assets.empty() &&
         audit.current_reviewed_sources == audit.assets.size();
     audit.metadata_scan_complete = audit.query_complete && !audit.assets.empty() &&
         audit.complete_metadata_scans == audit.assets.size();
+    audit.technical_inspection_complete = audit.query_complete && !audit.assets.empty() &&
+        audit.complete_technical_inspections == audit.assets.size();
     return audit;
 }
 

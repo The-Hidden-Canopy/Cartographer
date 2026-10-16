@@ -1,11 +1,15 @@
 #include <carto/agent/workbench.hpp>
 #include <carto/agent/scene_query.hpp>
+#include <carto/attributes/set.hpp>
+#include <carto/attributes/uv.hpp>
 #include <carto/application/application.hpp>
 #include <carto/condition/authoring.hpp>
+#include <carto/geometry/mesh.hpp>
 #include <carto/project/project.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -35,6 +39,87 @@ std::vector<carto::scene::ObjectId> create_boxes(
     std::vector<carto::scene::ObjectId> objects;
     for (const auto& view : session.snapshot().objects) objects.push_back(view.object.id);
     return objects;
+}
+
+carto::geometry::EditableMesh make_condition_technical_mesh(bool include_lightmap_candidate = true) {
+    using namespace carto;
+    geometry::EditableMesh mesh;
+    REQUIRE(mesh.insert_bulk(
+        {{geometry::VertexId{1U}, {0.0, 0.0, 0.0}},
+         {geometry::VertexId{2U}, {1.0, 0.0, 0.0}},
+         {geometry::VertexId{3U}, {0.0, 1.0, 0.0}}},
+        {{geometry::FaceId{1U}, {geometry::VertexId{1U}, geometry::VertexId{2U},
+             geometry::VertexId{3U}}}}));
+
+    attributes::AttributeSet payload({
+        {attributes::AttributeDomain::corner, 3U},
+        {attributes::AttributeDomain::face, 1U},
+    });
+    REQUIRE(payload.add_layer(attributes::AttributeLayer{
+        {"uv.render.corners", attributes::AttributeDomain::corner,
+            attributes::AttributeType::vec2},
+        {core::Vec2d{0.0, 0.0}, core::Vec2d{1.0, 0.0}, core::Vec2d{0.0, 1.0}}}));
+    if (include_lightmap_candidate) {
+        REQUIRE(payload.add_layer(attributes::AttributeLayer{
+            {"uv.lightmap.corners", attributes::AttributeDomain::corner,
+                attributes::AttributeType::vec2},
+            {core::Vec2d{0.0, 0.0}, core::Vec2d{0.5, 0.0}, core::Vec2d{0.0, 0.5}}}));
+    }
+    REQUIRE(payload.add_layer(attributes::AttributeLayer{
+        {"cartographer.material_slot", attributes::AttributeDomain::face,
+            attributes::AttributeType::uint32},
+        {std::uint32_t{1U}}}));
+
+    attributes::UvSetTable uv_sets;
+    REQUIRE(uv_sets.add(attributes::UvSetDescriptor{
+        1U, "Render UV", "uv.render.corners", true, true, false, 1U}));
+    if (include_lightmap_candidate) {
+        REQUIRE(uv_sets.add(attributes::UvSetDescriptor{
+            2U, "Lightmap UV", "uv.lightmap.corners", false, false, true, 1U}));
+    }
+    REQUIRE(mesh.set_attribute_payload(std::move(payload), std::move(uv_sets)));
+    REQUIRE(mesh.validate());
+    return mesh;
+}
+
+carto::scene::ObjectId create_condition_mesh_target(
+    carto::application::ApplicationSession& session,
+    bool assign_material,
+    bool include_lightmap_candidate = true) {
+    using namespace carto;
+    REQUIRE(application::HumanApplicationAccess::dispatch(
+        session, application::CreateMeshObjectAction{
+            "CONDITION technical target", make_condition_technical_mesh(
+                include_lightmap_candidate)}));
+    auto snapshot = session.snapshot();
+    REQUIRE(snapshot.objects.size() == 1U);
+    REQUIRE(snapshot.objects.front().object.mesh_asset.has_value());
+    const auto object = snapshot.objects.front().object.id;
+    const auto mesh_asset = *snapshot.objects.front().object.mesh_asset;
+    REQUIRE(application::HumanApplicationAccess::dispatch(
+        session, application::CreateMaterialAction{
+            snapshot.project_revision, "Unassigned preview material", {}}));
+    snapshot = session.snapshot();
+    REQUIRE(snapshot.materials.size() == 1U);
+    if (assign_material) {
+        REQUIRE(application::HumanApplicationAccess::dispatch(
+            session, application::SetMaterialRegionAssignmentAction{
+                snapshot.project_revision, {mesh_asset, 1U},
+                snapshot.materials.front().id, std::nullopt}));
+    }
+    return object;
+}
+
+void import_condition_fixture_for(
+    carto::application::ApplicationSession& session,
+    carto::scene::ObjectId object) {
+    auto fixture = carto::condition::make_condition_fixture();
+    REQUIRE(fixture);
+    fixture.value().project_revision = session.snapshot().project_revision.next();
+    fixture.value().assets.front().authored_object_id = object.value;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::ImportConditionAuthoringAction{
+            fixture.value().serialize()}));
 }
 
 carto::agent::AgentTask begin_task(
@@ -420,6 +505,13 @@ void condition_inventory_is_scoped_factual_and_budgeted() {
     REQUIRE(exterior != nullptr);
     REQUIRE(sign != nullptr);
     REQUIRE(room != nullptr);
+    REQUIRE(exterior->mesh_validation ==
+        carto::agent::ConditionTechnicalCheckStatus::passed);
+    REQUIRE(exterior->uv_set_presence ==
+        carto::agent::ConditionTechnicalCheckStatus::failed);
+    REQUIRE(exterior->material_region_assignments ==
+        carto::agent::ConditionTechnicalCheckStatus::failed);
+    REQUIRE(exterior->technical_checks_complete);
     REQUIRE(exterior->authored_object == objects[0U]);
     REQUIRE(exterior->source_id == 1U);
     REQUIRE(exterior->source_revision == "fixture-1");
@@ -440,6 +532,12 @@ void condition_inventory_is_scoped_factual_and_budgeted() {
     REQUIRE(exterior->prefab_memberships == 0U);
     REQUIRE(exterior->region_kit_memberships == 1U);
     REQUIRE(exterior->related_records_complete);
+    const auto inventory_audit = carto::agent::audit_condition_inventory(inventory.value());
+    REQUIRE(inventory_audit.technical_inspection_complete);
+    REQUIRE(inventory_audit.mesh_valid_assets == 3U);
+    REQUIRE(inventory_audit.uv_set_presence_passed_assets == 0U);
+    REQUIRE(inventory_audit.material_region_assignments_passed_assets == 0U);
+    REQUIRE(!carto::agent::ConditionEvidenceAudit::production_readiness_established);
     REQUIRE(sign->authored_object == objects[1U]);
     REQUIRE(sign->asset_class == carto::condition::AssetClass::prop);
     REQUIRE(sign->familiarity_records == 1U);
@@ -512,6 +610,10 @@ void condition_inventory_is_scoped_factual_and_budgeted() {
     REQUIRE(stale_fact_for(2U)->source_reviewed);
     REQUIRE(stale_fact_for(3U) != nullptr);
     REQUIRE(stale_fact_for(3U)->source_current);
+    const auto stale_audit = carto::agent::audit_condition_inventory(stale_lineage.value());
+    REQUIRE(!stale_audit.source_evidence_complete);
+    REQUIRE(stale_audit.technical_inspection_complete);
+    REQUIRE(!carto::agent::ConditionEvidenceAudit::production_readiness_established);
 
     carto::application::ApplicationSession stale_revision_session;
     const auto stale_revision_objects = create_boxes(
@@ -566,6 +668,104 @@ void condition_inventory_is_scoped_factual_and_budgeted() {
     REQUIRE(bounded_session.snapshot().project_revision == bounded_task.snapshot().base_revision);
 }
 
+void condition_inventory_reports_bounded_technical_checks_without_readiness() {
+    using namespace carto;
+    application::ApplicationSession assigned_session;
+    const auto assigned_object = create_condition_mesh_target(assigned_session, true);
+    import_condition_fixture_for(assigned_session, assigned_object);
+    const auto captured_revision = assigned_session.snapshot().project_revision;
+    auto assigned_task = begin_task(assigned_session, {assigned_object});
+    auto assigned = agent::SceneQuery::execute(assigned_task, {
+        agent::ConditionAssetInventoryQuery{assigned_object}, 8U});
+    REQUIRE(assigned);
+    REQUIRE(!assigned.value().truncated);
+    REQUIRE(assigned.value().rows.size() == 1U);
+    const auto* assigned_fact = std::get_if<agent::ConditionAssetInventoryFact>(
+        &assigned.value().rows.front());
+    REQUIRE(assigned_fact != nullptr);
+    REQUIRE(assigned_fact->mesh_validation == agent::ConditionTechnicalCheckStatus::passed);
+    REQUIRE(assigned_fact->mesh_vertices == 3U);
+    REQUIRE(assigned_fact->mesh_edges == 3U);
+    REQUIRE(assigned_fact->mesh_faces == 1U);
+    REQUIRE(assigned_fact->uv_set_presence == agent::ConditionTechnicalCheckStatus::passed);
+    REQUIRE(assigned_fact->uv_set_count == 2U);
+    REQUIRE(assigned_fact->active_render_uv_set == 1U);
+    REQUIRE(assigned_fact->lightmap_candidate_uv_sets == 1U);
+    REQUIRE(assigned_fact->material_region_assignments ==
+        agent::ConditionTechnicalCheckStatus::passed);
+    REQUIRE(assigned_fact->material_region_count == 1U);
+    REQUIRE(assigned_fact->resolved_material_region_count == 1U);
+    REQUIRE(assigned_fact->technical_checks_complete);
+    const auto assigned_audit = agent::audit_condition_inventory(assigned.value());
+    REQUIRE(assigned_audit.technical_inspection_complete);
+    REQUIRE(assigned_audit.mesh_valid_assets == 1U);
+    REQUIRE(assigned_audit.uv_set_presence_passed_assets == 1U);
+    REQUIRE(assigned_audit.material_region_assignments_passed_assets == 1U);
+    REQUIRE(!agent::ConditionEvidenceAudit::production_readiness_established);
+    REQUIRE(assigned_session.snapshot().project_revision == captured_revision);
+
+    application::ApplicationSession unassigned_session;
+    const auto unassigned_object = create_condition_mesh_target(unassigned_session, false);
+    import_condition_fixture_for(unassigned_session, unassigned_object);
+    auto unassigned_task = begin_task(unassigned_session, {unassigned_object});
+    auto unassigned = agent::SceneQuery::execute(unassigned_task, {
+        agent::ConditionAssetInventoryQuery{unassigned_object}, 8U});
+    REQUIRE(unassigned);
+    REQUIRE(!unassigned.value().truncated);
+    const auto* unassigned_fact = std::get_if<agent::ConditionAssetInventoryFact>(
+        &unassigned.value().rows.front());
+    REQUIRE(unassigned_fact != nullptr);
+    REQUIRE(unassigned_fact->mesh_validation == agent::ConditionTechnicalCheckStatus::passed);
+    REQUIRE(unassigned_fact->uv_set_presence == agent::ConditionTechnicalCheckStatus::passed);
+    REQUIRE(unassigned_fact->material_region_assignments ==
+        agent::ConditionTechnicalCheckStatus::failed);
+    REQUIRE(unassigned_fact->material_region_count == 1U);
+    REQUIRE(unassigned_fact->resolved_material_region_count == 0U);
+    REQUIRE(unassigned_fact->technical_checks_complete);
+
+    application::ApplicationSession missing_candidate_session;
+    const auto missing_candidate_object = create_condition_mesh_target(
+        missing_candidate_session, true, false);
+    import_condition_fixture_for(missing_candidate_session, missing_candidate_object);
+    auto missing_candidate_task = begin_task(
+        missing_candidate_session, {missing_candidate_object});
+    auto missing_candidate = agent::SceneQuery::execute(missing_candidate_task, {
+        agent::ConditionAssetInventoryQuery{missing_candidate_object}, 8U});
+    REQUIRE(missing_candidate);
+    const auto* missing_candidate_fact = std::get_if<agent::ConditionAssetInventoryFact>(
+        &missing_candidate.value().rows.front());
+    REQUIRE(missing_candidate_fact != nullptr);
+    REQUIRE(missing_candidate_fact->uv_set_count == 1U);
+    REQUIRE(missing_candidate_fact->active_render_uv_set == 1U);
+    REQUIRE(missing_candidate_fact->lightmap_candidate_uv_sets == 0U);
+    REQUIRE(missing_candidate_fact->uv_set_presence ==
+        agent::ConditionTechnicalCheckStatus::failed);
+
+    application::ApplicationSession bounded_session;
+    const auto bounded_object = create_condition_mesh_target(bounded_session, true);
+    import_condition_fixture_for(bounded_session, bounded_object);
+    agent::AgentWorkEnvelope bounded_envelope;
+    bounded_envelope.max_topology_elements_examined = 1U;
+    auto bounded_task = begin_task(bounded_session, {bounded_object}, bounded_envelope);
+    auto bounded = agent::SceneQuery::execute(bounded_task, {
+        agent::ConditionAssetInventoryQuery{bounded_object}, 8U});
+    REQUIRE(bounded);
+    REQUIRE(bounded.value().truncated);
+    REQUIRE(bounded.value().rows.size() == 1U);
+    const auto* bounded_fact = std::get_if<agent::ConditionAssetInventoryFact>(
+        &bounded.value().rows.front());
+    REQUIRE(bounded_fact != nullptr);
+    REQUIRE(!bounded_fact->technical_checks_complete);
+    REQUIRE(bounded_fact->mesh_validation == agent::ConditionTechnicalCheckStatus::incomplete);
+    REQUIRE(bounded_fact->uv_set_presence == agent::ConditionTechnicalCheckStatus::incomplete);
+    REQUIRE(bounded_fact->material_region_assignments ==
+        agent::ConditionTechnicalCheckStatus::incomplete);
+    const auto bounded_audit = agent::audit_condition_inventory(bounded.value());
+    REQUIRE(!bounded_audit.technical_inspection_complete);
+    REQUIRE(!agent::ConditionEvidenceAudit::production_readiness_established);
+    REQUIRE(bounded_session.snapshot().project_revision == bounded_task.snapshot().base_revision);
+}
+
 void live_condition_inventory_is_revision_bound_and_read_only() {
     carto::application::ApplicationSession session;
     const auto objects = create_boxes(session, {"Selected", "Unselected"});
@@ -609,6 +809,7 @@ int main() {
         query_and_scan_budgets_truncate_or_fail_closed();
         condition_semantics_require_current_explicit_source_data();
         condition_inventory_is_scoped_factual_and_budgeted();
+        condition_inventory_reports_bounded_technical_checks_without_readiness();
         live_condition_inventory_is_revision_bound_and_read_only();
         return 0;
     } catch (const std::exception& error) {

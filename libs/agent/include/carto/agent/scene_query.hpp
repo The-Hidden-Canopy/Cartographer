@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -132,6 +133,17 @@ struct ConditionAssetTagFact {
     std::vector<std::string> protected_features;
 };
 
+enum class ConditionTechnicalCheckStatus : std::uint8_t {
+    passed,
+    failed,
+    incomplete,
+    unavailable,
+    not_evaluated,
+};
+
+[[nodiscard]] std::string_view condition_technical_check_status_name(
+    ConditionTechnicalCheckStatus status) noexcept;
+
 struct ConditionAssetInventoryFact {
     std::uint64_t asset = 0U;
     scene::ObjectId authored_object;
@@ -153,6 +165,24 @@ struct ConditionAssetInventoryFact {
     std::size_t prefab_memberships = 0U;
     std::size_t region_kit_memberships = 0U;
     bool related_records_complete = false;
+    // These checks report only what the project currently stores. They do not
+    // establish full production or CONDITION readiness.
+    std::uint64_t mesh_asset = 0U;
+    ConditionTechnicalCheckStatus mesh_validation =
+        ConditionTechnicalCheckStatus::not_evaluated;
+    ConditionTechnicalCheckStatus uv_set_presence =
+        ConditionTechnicalCheckStatus::not_evaluated;
+    ConditionTechnicalCheckStatus material_region_assignments =
+        ConditionTechnicalCheckStatus::not_evaluated;
+    std::size_t mesh_vertices = 0U;
+    std::size_t mesh_edges = 0U;
+    std::size_t mesh_faces = 0U;
+    std::size_t uv_set_count = 0U;
+    std::uint64_t active_render_uv_set = 0U;
+    std::size_t lightmap_candidate_uv_sets = 0U;
+    std::size_t material_region_count = 0U;
+    std::size_t resolved_material_region_count = 0U;
+    bool technical_checks_complete = false;
 };
 
 struct FamiliarityRecordFact {
@@ -212,12 +242,17 @@ struct ConditionEvidenceAudit {
     std::vector<ConditionAssetEvidenceAudit> assets;
     std::size_t current_reviewed_sources = 0U;
     std::size_t complete_metadata_scans = 0U;
+    std::size_t complete_technical_inspections = 0U;
+    std::size_t mesh_valid_assets = 0U;
+    std::size_t uv_set_presence_passed_assets = 0U;
+    std::size_t material_region_assignments_passed_assets = 0U;
     std::size_t unrecognized_rows = 0U;
     bool query_complete = false;
     bool source_evidence_complete = false;
     bool metadata_scan_complete = false;
-    // The inventory vocabulary has no geometry, UV/material, or production
-    // validation facts, so it cannot establish overall readiness.
+    bool technical_inspection_complete = false;
+    // Collision, traversal, tangents, bakes, source-digest correspondence,
+    // and domain-specific CONDITION policy are not evaluated by this query.
     static constexpr bool production_readiness_established = false;
 };
 

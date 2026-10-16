@@ -61,6 +61,7 @@
 - Invalid query parameters fail before consuming query budget.
 - The UI rejects inventory inspection without a selection; with a selection and no task it runs at the captured live project revision and reports copied facts in `UiSnapshot` without changing project revision or sidecar revision.
 - The CONDITION workspace routes selected-asset inspection into Agent, and cached facts disappear from the snapshot when their source revision or selection scope changes.
+- Scoped CONDITION inventory displays bounded mesh validation, active render/lightmap UV-set presence, and explicit material-region assignment resolution. Unassigned regions and missing lightmap candidates fail closed; topology-budget exhaustion remains incomplete, and no technical result claims overall readiness.
 - After task preparation the UI exposes only the captured task scope; execution rechecks that source revision, and a concurrent human edit rejects execution while leaving the task prepared.
 
 ## Capability registry coverage
