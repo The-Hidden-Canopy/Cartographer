@@ -42,6 +42,7 @@ class PokeProjectSelectedFaceCommand;
 class SetProjectObjectTransformCommand;
 class SetProjectSculptStackCommand;
 class SetProjectSelectedVertexPositionCommand;
+class SetProjectMeshCommand;
 class SlideProjectSelectedVertexCommand;
 class BevelProjectSelectedEdgeCommand;
 class BevelProjectSelectedVertexCommand;
@@ -237,6 +238,7 @@ private:
     friend class ::carto::editor::SetProjectObjectTransformCommand;
     friend class ::carto::editor::SetProjectSculptStackCommand;
     friend class ::carto::editor::SetProjectSelectedVertexPositionCommand;
+    friend class ::carto::editor::SetProjectMeshCommand;
     friend class ::carto::editor::SlideProjectSelectedVertexCommand;
     friend class ::carto::editor::BevelProjectSelectedEdgeCommand;
     friend class ::carto::editor::BevelProjectSelectedVertexCommand;

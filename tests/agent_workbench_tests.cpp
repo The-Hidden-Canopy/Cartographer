@@ -2854,6 +2854,170 @@ void agent_material_assignment_fails_closed_on_authority_and_source_boundaries()
     }
 }
 
+void ui_reviews_persists_and_undoes_opt_in_lightmap_uv_generation() {
+    using namespace carto;
+    TempDirectory temp;
+    application::ApplicationSession source;
+    ui::UiController ui(source);
+    REQUIRE(ui.dispatch(application::CreateBoxAction{"UV target", {1.0, 1.0, 1.0}}));
+    const auto created = source.snapshot();
+    const auto object = created.objects.front().object.id;
+    const auto mesh_asset = *created.objects.front().object.mesh_asset;
+    REQUIRE(ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(application::SelectObjectAction{object}));
+
+    const auto project_path = temp.path() / "lightmap-agent.carto";
+    REQUIRE(ui.dispatch(application::SaveProjectAction{project_path}));
+    const auto recovery_before = application::ApplicationSession::inspect_recovery(project_path);
+    REQUIRE(recovery_before);
+    const auto initial = source.snapshot();
+    const auto intent = std::string(
+        "generate lightmap uv set 9 resolution 128 padding 2 tiles 1");
+    REQUIRE(ui.compile_agent_goal_sequence(intent));
+    auto envelope = envelope_for({object});
+    envelope.permitted_effects |= agent::effect_mask(agent::Effect::uv);
+    const auto run = ui.run_agent_plan(intent, envelope);
+    REQUIRE(run);
+    REQUIRE(run.value().status == agent::TaskStatus::review);
+    REQUIRE(run.value().can_accept);
+    REQUIRE(run.value().diff.changed_mesh_count() == 1U);
+    REQUIRE(run.value().diff.meshes.size() == 1U);
+    const auto& mesh_change = run.value().diff.meshes.front();
+    REQUIRE(mesh_change.asset_id == mesh_asset);
+    REQUIRE(mesh_change.before_vertices == mesh_change.after_vertices);
+    REQUIRE(mesh_change.before_faces == mesh_change.after_faces);
+    const auto uv_change = std::find_if(mesh_change.uv_sets.begin(), mesh_change.uv_sets.end(),
+        [](const auto& change) { return change.id == 9U; });
+    REQUIRE(uv_change != mesh_change.uv_sets.end());
+    REQUIRE(!uv_change->before.has_value());
+    REQUIRE(uv_change->after.has_value());
+    REQUIRE(uv_change->after->lightmap_candidate);
+    REQUIRE(uv_change->changed_corner_count > 0U);
+    REQUIRE(!uv_change->samples.empty());
+    REQUIRE(std::any_of(mesh_change.attribute_layers.begin(), mesh_change.attribute_layers.end(),
+        [](const auto& layer) {
+            return layer.layer_id == "uv.agent.lightmap.9" && layer.added &&
+                layer.domain == attributes::AttributeDomain::corner &&
+                layer.type == attributes::AttributeType::vec2 && layer.after_value_count > 0U;
+        }));
+    REQUIRE(source.snapshot().project_revision == initial.project_revision);
+    REQUIRE(source.snapshot().native_operation_trace.size() ==
+        initial.native_operation_trace.size());
+    const auto recovery_during_preview =
+        application::ApplicationSession::inspect_recovery(project_path);
+    REQUIRE(recovery_during_preview);
+    REQUIRE(recovery_during_preview.value().journal_entry_count ==
+        recovery_before.value().journal_entry_count);
+
+    const auto checkpoint_path = temp.path() / "lightmap-agent.carto-agent-task";
+    REQUIRE(ui.save_agent_checkpoint(checkpoint_path));
+    ui::UiController resumed(source);
+    REQUIRE(resumed.load_agent_checkpoint(checkpoint_path));
+    const auto resumed_preview = resumed.resume_agent_checkpoint();
+    REQUIRE(resumed_preview);
+    REQUIRE(resumed_preview.value().status == agent::TaskStatus::review);
+    REQUIRE(resumed_preview.value().can_accept);
+    REQUIRE((resumed_preview.value().diff.meshes.front().uv_sets.front().after.has_value()));
+    REQUIRE(source.snapshot().project_revision == initial.project_revision);
+
+    const auto accepted = resumed.accept_agent_plan();
+    REQUIRE(accepted && accepted.value().document_changed);
+    REQUIRE(source.snapshot().project_revision > initial.project_revision);
+    const auto recovery_after_accept =
+        application::ApplicationSession::inspect_recovery(project_path);
+    REQUIRE(recovery_after_accept);
+    REQUIRE(recovery_after_accept.value().state ==
+        application::RecoveryInspectionState::pending);
+    REQUIRE(recovery_after_accept.value().journal_entry_count ==
+        recovery_before.value().journal_entry_count + 1U);
+
+    REQUIRE(resumed.dispatch(application::SaveProjectAction{project_path}));
+    const auto accepted_document = project::ProjectDocument::load(project_path);
+    REQUIRE(accepted_document);
+    const auto accepted_mesh = accepted_document.value().meshes().find(mesh_asset);
+    REQUIRE(accepted_mesh != accepted_document.value().meshes().end());
+    const auto* accepted_set = accepted_mesh->second.uv_sets().find(9U);
+    REQUIRE(accepted_set != nullptr && accepted_set->lightmap_candidate);
+    REQUIRE(accepted_mesh->second.attributes().find("uv.agent.lightmap.9") != nullptr);
+
+    REQUIRE(resumed.dispatch(application::UndoAction{}));
+    REQUIRE(resumed.dispatch(application::SaveProjectAction{project_path}));
+    const auto undone_document = project::ProjectDocument::load(project_path);
+    REQUIRE(undone_document);
+    REQUIRE(undone_document.value().meshes().at(mesh_asset).uv_sets().find(9U) == nullptr);
+
+    REQUIRE(resumed.dispatch(application::RedoAction{}));
+    REQUIRE(resumed.dispatch(application::SaveProjectAction{project_path}));
+    const auto redone_document = project::ProjectDocument::load(project_path);
+    REQUIRE(redone_document);
+    const auto* redone_set = redone_document.value().meshes().at(mesh_asset).uv_sets().find(9U);
+    REQUIRE(redone_set != nullptr && redone_set->lightmap_candidate);
+}
+
+void agent_lightmap_uv_fails_closed_without_permission_or_complete_mesh_scope() {
+    using namespace carto;
+    const std::string intent =
+        "generate lightmap uv set 9 resolution 128 padding 2 tiles 1";
+    {
+        application::ApplicationSession source;
+        const auto objects = create_boxes(source, 1U);
+        const auto before = source.snapshot();
+        auto plan = plan_for(before, objects, {
+            {"step-1", {objects.front(), std::monostate{}}, intent},
+        });
+        auto task = agent::AgentTask::begin(source, std::move(plan), envelope_for(objects));
+        REQUIRE(task);
+        const auto blocked = task.value().run();
+        REQUIRE(blocked && blocked.value().status == agent::TaskStatus::blocked);
+        REQUIRE(blocked.value().steps.front().diagnostic.has_value());
+        REQUIRE(blocked.value().steps.front().diagnostic->message.find(
+            "forbids the UV effect") != std::string::npos);
+        REQUIRE(source.snapshot().project_revision == before.project_revision);
+    }
+
+    {
+        application::ApplicationSession source;
+        const auto objects = create_boxes(source, 1U);
+        REQUIRE(application::HumanApplicationAccess::dispatch(
+            source, application::DuplicateMeshInstanceAction{
+                objects.front(), "Out-of-scope UV instance", {2.0, 0.0, 0.0}}));
+        const auto before = source.snapshot();
+        auto plan = plan_for(before, {objects.front()}, {
+            {"step-1", {objects.front(), std::monostate{}}, intent},
+        });
+        auto envelope = envelope_for({objects.front()});
+        envelope.permitted_effects |= agent::effect_mask(agent::Effect::uv);
+        auto task = agent::AgentTask::begin(source, std::move(plan), envelope);
+        REQUIRE(task);
+        const auto blocked = task.value().run();
+        REQUIRE(blocked && blocked.value().status == agent::TaskStatus::blocked);
+        REQUIRE(blocked.value().steps.front().diagnostic.has_value());
+        REQUIRE(blocked.value().steps.front().diagnostic->message.find(
+            "shared by an object outside the work envelope") != std::string::npos);
+        REQUIRE(source.snapshot().project_revision == before.project_revision);
+    }
+}
+
+void direct_lightmap_uv_action_rejects_invalid_and_stale_parameters() {
+    using namespace carto;
+    application::ApplicationSession source;
+    REQUIRE(application::HumanApplicationAccess::dispatch(
+        source, application::CreateBoxAction{"UV boundary", {1.0, 1.0, 1.0}}));
+    const auto object = source.snapshot().objects.front().object.id;
+    const auto before = source.snapshot();
+    const auto invalid = application::HumanApplicationAccess::dispatch(
+        source, application::GenerateUniqueLightmapUvAction{
+            before.project_revision, object, 0U, 128U, 2U, 1U});
+    REQUIRE(!invalid);
+    REQUIRE(invalid.error().code == core::ErrorCode::invalid_argument);
+    const auto stale = application::HumanApplicationAccess::dispatch(
+        source, application::GenerateUniqueLightmapUvAction{
+            before.project_revision.next(), object, 9U, 128U, 2U, 1U});
+    REQUIRE(!stale);
+    REQUIRE(stale.error().code == core::ErrorCode::stale_data);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+}
+
 void material_catalog_checkpoint_rebase_is_blocked_until_its_write_set_is_modeled() {
     TempDirectory temp;
     carto::application::ApplicationSession source;
@@ -5970,6 +6134,9 @@ int main() {
         agent_material_assignment_is_speculative_reviewed_and_checkpointed();
         ui_compiles_and_reviews_an_opt_in_material_assignment();
         agent_material_assignment_fails_closed_on_authority_and_source_boundaries();
+        ui_reviews_persists_and_undoes_opt_in_lightmap_uv_generation();
+        agent_lightmap_uv_fails_closed_without_permission_or_complete_mesh_scope();
+        direct_lightmap_uv_action_rejects_invalid_and_stale_parameters();
         material_catalog_checkpoint_rebase_is_blocked_until_its_write_set_is_modeled();
         work_envelope_blocks_topology_effect_before_live_mutation();
         work_envelope_blocks_topology_churn_over_budget();

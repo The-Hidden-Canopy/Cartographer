@@ -1,6 +1,7 @@
 #pragma once
 
 #include <carto/assets/blob_store.hpp>
+#include <carto/attributes/uv.hpp>
 #include <carto/core/diagnostic.hpp>
 #include <carto/core/math.hpp>
 #include <carto/core/result.hpp>
@@ -716,6 +717,15 @@ struct SetMaterialRegionAssignmentAction {
     std::optional<project::MaterialVariantId> variant;
 };
 
+struct GenerateUniqueLightmapUvAction {
+    core::Revision expected_project_revision;
+    scene::ObjectId object;
+    attributes::UvSetId output_uv_set = 0U;
+    std::uint32_t resolution = 0U;
+    std::uint32_t padding_texels = 0U;
+    std::uint32_t maximum_udim_tiles = 0U;
+};
+
 struct SetMaterialGraphAction {
     core::Revision expected_project_revision;
     std::optional<core::Revision> expected_graph_revision;
@@ -784,6 +794,7 @@ using ApplicationAction = std::variant<
     CreateMaterialAction,
     UpdateMaterialAction,
     SetMaterialRegionAssignmentAction,
+    GenerateUniqueLightmapUvAction,
     SetMaterialGraphAction,
     SetMaterialGraphBindingAction,
     SetRoadAuthoringAction,
@@ -992,6 +1003,8 @@ private:
         const UpdateMaterialAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> set_material_region_assignment(
         const SetMaterialRegionAssignmentAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> generate_unique_lightmap_uv(
+        const GenerateUniqueLightmapUvAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> set_material_graph(
         const SetMaterialGraphAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> set_material_graph_binding(

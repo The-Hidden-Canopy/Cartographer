@@ -90,6 +90,12 @@ struct UniqueLightmapUvArtifact {
     const UniqueLightmapUvRecipe& recipe,
     const geometry::EditableMesh& source);
 
+// Builds a validated mesh containing the artifact's new corner-domain UV set.
+// The source mesh remains unchanged; callers own transactional publication.
+[[nodiscard]] core::Result<geometry::EditableMesh> with_unique_lightmap_uv(
+    const geometry::EditableMesh& source,
+    const UniqueLightmapUvArtifact& artifact);
+
 // Applies a verified artifact only to the transaction's staged mesh. The caller
 // owns commit/rollback and should use lightmap_uv_transaction_operation() when
 // committing so the journal event records the exact settings and output digests.

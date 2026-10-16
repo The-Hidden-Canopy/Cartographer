@@ -737,14 +737,24 @@ core::Result<void> apply_unique_lightmap_uv(
         return core::Result<void>::failure(core::Diagnostic(
             core::ErrorCode::not_found, "lightmap UV transaction target mesh does not exist"));
     }
-    if (auto result = artifact.validate(mesh->second); !result) return result;
-    if (mesh->second.uv_sets().find(artifact.recipe.output_uv_set) != nullptr ||
-        mesh->second.attributes().find(artifact.recipe.output_layer_id) != nullptr) {
-        return core::Result<void>::failure(validation(
+    const auto updated = with_unique_lightmap_uv(mesh->second, artifact);
+    if (!updated) return core::Result<void>::failure(updated.error());
+    return transaction.replace_mesh(mesh_asset, updated.value());
+}
+
+core::Result<geometry::EditableMesh> with_unique_lightmap_uv(
+    const geometry::EditableMesh& source,
+    const UniqueLightmapUvArtifact& artifact) {
+    if (auto result = artifact.validate(source); !result) {
+        return core::Result<geometry::EditableMesh>::failure(result.error());
+    }
+    if (source.uv_sets().find(artifact.recipe.output_uv_set) != nullptr ||
+        source.attributes().find(artifact.recipe.output_layer_id) != nullptr) {
+        return core::Result<geometry::EditableMesh>::failure(validation(
             "lightmap UV target set or corner layer already exists"));
     }
-    const auto topology = mesh->second.topology();
-    if (!topology) return core::Result<void>::failure(topology.error());
+    const auto topology = source.topology();
+    if (!topology) return core::Result<geometry::EditableMesh>::failure(topology.error());
     std::map<geometry::CornerId, core::Vec2d> coordinates;
     for (const LightmapUvCorner& corner : artifact.corners) {
         coordinates.emplace(corner.corner, corner.uv);
@@ -754,29 +764,31 @@ core::Result<void> apply_unique_lightmap_uv(
     for (const geometry::CornerRecord& corner : topology.value().corners) {
         const auto coordinate = coordinates.find(corner.id);
         if (coordinate == coordinates.end()) {
-            return core::Result<void>::failure(validation(
+            return core::Result<geometry::EditableMesh>::failure(validation(
                 "lightmap UV artifact omits a staged mesh corner"));
         }
         values.emplace_back(coordinate->second);
     }
 
     attributes::AttributeSet attribute_set({
-        {attributes::AttributeDomain::vertex, mesh->second.vertex_count()},
+        {attributes::AttributeDomain::vertex, source.vertex_count()},
         {attributes::AttributeDomain::edge, topology.value().edges.size()},
-        {attributes::AttributeDomain::face, mesh->second.face_count()},
+        {attributes::AttributeDomain::face, source.face_count()},
         {attributes::AttributeDomain::corner, topology.value().corners.size()},
     });
-    for (const auto& [ignored, layer] : mesh->second.attributes().layers()) {
+    for (const auto& [ignored, layer] : source.attributes().layers()) {
         static_cast<void>(ignored);
-        if (auto result = attribute_set.add_layer(layer); !result) return result;
+        if (auto result = attribute_set.add_layer(layer); !result) {
+            return core::Result<geometry::EditableMesh>::failure(result.error());
+        }
     }
     if (auto result = attribute_set.add_layer(attributes::AttributeLayer{
             {artifact.recipe.output_layer_id, attributes::AttributeDomain::corner,
                 attributes::AttributeType::vec2},
             std::move(values)}); !result) {
-        return result;
+        return core::Result<geometry::EditableMesh>::failure(result.error());
     }
-    attributes::UvSetTable uv_sets = mesh->second.uv_sets();
+    attributes::UvSetTable uv_sets = source.uv_sets();
     if (auto result = uv_sets.add(attributes::UvSetDescriptor{
             artifact.recipe.output_uv_set,
             artifact.recipe.output_name,
@@ -785,15 +797,17 @@ core::Result<void> apply_unique_lightmap_uv(
             false,
             true,
              2U}); !result) {
-        return result;
+        return core::Result<geometry::EditableMesh>::failure(result.error());
     }
-    geometry::EditableMesh updated = mesh->second;
+    geometry::EditableMesh updated = source;
     if (auto result = updated.set_attribute_payload(std::move(attribute_set), std::move(uv_sets));
         !result) {
-        return result;
+        return core::Result<geometry::EditableMesh>::failure(result.error());
     }
-    if (auto result = updated.validate(); !result) return result;
-    return transaction.replace_mesh(mesh_asset, std::move(updated));
+    if (auto result = updated.validate(); !result) {
+        return core::Result<geometry::EditableMesh>::failure(result.error());
+    }
+    return core::Result<geometry::EditableMesh>::success(std::move(updated));
 }
 
 std::string lightmap_uv_transaction_operation(const UniqueLightmapUvArtifact& artifact) {

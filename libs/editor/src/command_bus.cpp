@@ -1075,6 +1075,67 @@ core::Result<void> SetProjectSelectedVertexPositionCommand::undo() {
     return core::Result<void>::success();
 }
 
+SetProjectMeshCommand::SetProjectMeshCommand(
+    ProjectCommandAdmission,
+    project::ProjectDocument& document,
+    std::uint64_t mesh_asset,
+    core::Revision expected_project_revision,
+    core::Revision expected_mesh_revision,
+    geometry::EditableMesh after)
+    : document_(&document),
+      mesh_asset_(mesh_asset),
+      expected_project_revision_(expected_project_revision),
+      expected_mesh_revision_(expected_mesh_revision),
+      after_(std::move(after)) {}
+
+core::Result<void> SetProjectMeshCommand::execute() {
+    if (!document_ || mesh_asset_ == 0U || applied_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "project mesh command has incomplete or already-applied state"));
+    }
+    const core::Revision expected_project =
+        current_project_revision_.value_or(expected_project_revision_);
+    const core::Revision expected_mesh =
+        current_mesh_revision_.value_or(expected_mesh_revision_);
+    if (document_->revision() != expected_project) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "project mesh command revision no longer matches the project"));
+    }
+    const auto current = document_->meshes().find(mesh_asset_);
+    if (current == document_->meshes().end() || current->second.revision() != expected_mesh) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "project mesh command no longer matches its source mesh revision"));
+    }
+    if (!before_.has_value()) before_ = current->second;
+    const auto replaced = document_->replace_mesh_if_revision(
+        mesh_asset_, expected_mesh, after_);
+    if (!replaced) return core::Result<void>::failure(replaced.error());
+    current_mesh_revision_ = replaced.value();
+    current_project_revision_ = document_->revision();
+    applied_ = true;
+    return core::Result<void>::success();
+}
+
+core::Result<void> SetProjectMeshCommand::undo() {
+    if (!document_ || !applied_ || !before_.has_value() ||
+        !current_project_revision_.has_value() || !current_mesh_revision_.has_value() ||
+        document_->revision() != *current_project_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "project mesh no longer matches the command being undone"));
+    }
+    const auto replaced = document_->replace_mesh_if_revision(
+        mesh_asset_, *current_mesh_revision_, *before_);
+    if (!replaced) return core::Result<void>::failure(replaced.error());
+    current_mesh_revision_ = replaced.value();
+    current_project_revision_ = document_->revision();
+    applied_ = false;
+    return core::Result<void>::success();
+}
+
 SlideVertexCommand::SlideVertexCommand(
     geometry::EditableMesh& mesh,
     geometry::VertexId vertex,

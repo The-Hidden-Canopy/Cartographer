@@ -181,6 +181,47 @@ void material_assignment_preview_requires_exact_typed_ids() {
     REQUIRE(!parameters.validate(carto::editor::PreviewKind::object_translation_delta));
 }
 
+void unique_lightmap_uv_preview_is_typed_bounded_and_object_scoped() {
+    using namespace carto;
+    editor::PreviewParameters parameters;
+    parameters.lightmap_uv_set_id = 17U;
+    parameters.lightmap_resolution = 128U;
+    parameters.lightmap_padding_texels = 16U;
+    parameters.lightmap_maximum_udim_tiles = 100U;
+    REQUIRE(parameters.validate(editor::PreviewKind::generate_unique_lightmap_uv));
+
+    parameters.lightmap_uv_set_id = 0U;
+    REQUIRE(!parameters.validate(editor::PreviewKind::generate_unique_lightmap_uv));
+    parameters.lightmap_uv_set_id = 17U;
+    parameters.lightmap_resolution = 15U;
+    REQUIRE(!parameters.validate(editor::PreviewKind::generate_unique_lightmap_uv));
+    parameters.lightmap_resolution = 8193U;
+    REQUIRE(!parameters.validate(editor::PreviewKind::generate_unique_lightmap_uv));
+    parameters.lightmap_resolution = 128U;
+    parameters.lightmap_padding_texels = 17U;
+    REQUIRE(!parameters.validate(editor::PreviewKind::generate_unique_lightmap_uv));
+    parameters.lightmap_padding_texels = 0U;
+    REQUIRE(!parameters.validate(editor::PreviewKind::generate_unique_lightmap_uv));
+    parameters.lightmap_padding_texels = 16U;
+    parameters.lightmap_maximum_udim_tiles = 0U;
+    REQUIRE(!parameters.validate(editor::PreviewKind::generate_unique_lightmap_uv));
+    parameters.lightmap_maximum_udim_tiles = 101U;
+    REQUIRE(!parameters.validate(editor::PreviewKind::generate_unique_lightmap_uv));
+    parameters.lightmap_maximum_udim_tiles = 100U;
+    parameters.distance = 0.5;
+    REQUIRE(!parameters.validate(editor::PreviewKind::generate_unique_lightmap_uv));
+    REQUIRE(!parameters.validate(editor::PreviewKind::object_transform));
+
+    editor::AuthoringContext context;
+    context.selection_mode = editor::SelectionMode::object;
+    context.objects = {scene::ObjectId{7U}};
+    REQUIRE(editor::AuthoringPreview::begin(
+        core::Revision{4U}, context, editor::PreviewKind::generate_unique_lightmap_uv));
+    context.objects.push_back(scene::ObjectId{8U});
+    REQUIRE(!editor::AuthoringPreview::begin(
+        core::Revision{4U}, context, editor::PreviewKind::generate_unique_lightmap_uv));
+}
+
 void ui_preview_facade_records_only_the_committed_operation() {
     carto::application::ApplicationSession session;
     carto::ui::UiController ui(session);
@@ -225,6 +266,7 @@ int main() {
         component_preview_emits_affected_ids_and_parameters();
         face_poke_preview_is_parameterless_and_revision_bound();
         material_assignment_preview_requires_exact_typed_ids();
+        unique_lightmap_uv_preview_is_typed_bounded_and_object_scoped();
         ui_preview_facade_records_only_the_committed_operation();
         preview_validation_is_fail_closed();
     } catch (const std::exception& error) {

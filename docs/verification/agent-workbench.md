@@ -11,6 +11,10 @@
 - The Agent Workbench material permission is off by default. With it enabled, `assign material <id> to region <id> [variant <id>]` runs only on the speculative branch and requires exact non-zero unsigned IDs.
 - Confirm material-only and mixed geometry/material plans remain review-only, report a material-binding diff, preserve the source before acceptance, and commit through the normal human acceptance event.
 - Confirm omitted material permission, malformed or overflowing IDs, missing materials, missing variants, undeclared regions, and shared mesh instances outside scope block without changing the source.
+- The Agent Workbench UV permission is off by default. With it enabled, `generate lightmap uv set <id> resolution <pixels> padding <texels> tiles <count>` adds only a new, non-active lightmap-candidate set and corner layer; the existing UV sets and topology remain unchanged.
+- Confirm UV review reports the new descriptor, exact changed-corner count and bounded samples, leaves the source revision and journal unchanged, and remains review-only after checkpoint save/resume. Acceptance writes one journal event; save/reopen, undo, and redo preserve or remove the candidate set as expected.
+- Confirm omitted UV permission, zero/overflowing IDs, invalid resolution/padding/tile bounds, stale source revision, occupied UV-set/layer identities, unsupported planar geometry, unfit atlas budgets, and shared-mesh instances outside scope fail without changing the source.
+- Confirm generic AI cannot enter the UV preview or auto-apply path, and UV generation is projected only when the Agent Workbench envelope explicitly grants the UV effect.
 - Confirm generic AI proposals cannot request the material capability, and material checkpoints replay only against their exact source revision; rebase blocks while catalog writes are absent from its read/write-set model.
 - Expand changed meshes and inspect all changed vertex positions and face-connectivity identities, including added/removed faces; large lists must remain scrollable without silently truncating evidence.
 - Accept the result and confirm the source advances once and the saved-project journal contains one application mutation event.
@@ -65,6 +69,7 @@
 - Parameter names match the native tool, numeric bounds are finite and coherent, and length/factor/count units are explicit.
 - Geometry-only envelopes expose vertex positioning while excluding topology-changing previews; unsupported registered tools never appear in the planner projection.
 - Transform-only projection exposes the typed root-object operation, while the generic AI context remains geometry/topology-only; the translation contract is never auto-approvable.
+- UV-only projection exposes exactly the typed lightmap-generation operation; its unsigned set identity, resolution, padding, and tile bounds agree with preview validation, and the operation is never auto-approvable.
 - The projected context contains no command callback, project document, or direct mutation handle.
 
 ## Objective and clarification coverage

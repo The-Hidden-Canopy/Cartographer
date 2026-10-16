@@ -32,7 +32,8 @@ constexpr double kMaxNearestObjectRadiusWorldUnits = 1'000'000.0;
 constexpr std::uint32_t kKnownEffects = ::carto::agent::effect_mask(Effect::geometry) |
     ::carto::agent::effect_mask(Effect::topology) |
     ::carto::agent::effect_mask(Effect::transform) |
-    ::carto::agent::effect_mask(Effect::material);
+    ::carto::agent::effect_mask(Effect::material) |
+    ::carto::agent::effect_mask(Effect::uv);
 
 core::Diagnostic invalid(std::string message) {
     return core::Diagnostic(core::ErrorCode::invalid_argument, std::move(message));
@@ -618,6 +619,7 @@ std::string effect_names(std::uint32_t effects) {
     if ((effects & ::carto::agent::effect_mask(Effect::topology)) != 0U) append("topology");
     if ((effects & ::carto::agent::effect_mask(Effect::transform)) != 0U) append("transform");
     if ((effects & ::carto::agent::effect_mask(Effect::material)) != 0U) append("material");
+    if ((effects & ::carto::agent::effect_mask(Effect::uv)) != 0U) append("uv");
     return result.empty() ? "no declared effect" : result;
 }
 
@@ -960,6 +962,14 @@ const std::vector<AgentRecipeDefinition>& agent_recipe_catalog() noexcept {
             "Uses the operator-authored plan, permits vertex geometry only, and requires mesh topology and scene-object identity to remain unchanged.",
             0U,
             ::carto::agent::effect_mask(Effect::geometry),
+            true,
+        },
+        {
+            "lightmap-uv-generation",
+            "Generate unique lightmap UVs",
+            "Adds a deterministic, revision-bound lightmap-candidate UV set without changing mesh topology or existing UV sets.",
+            0U,
+            ::carto::agent::effect_mask(Effect::uv),
             true,
         },
     };
@@ -3337,13 +3347,23 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
     }
     const bool material_assignment = intent_starts_with(
         step.intent, "assign", "material");
+    const bool lightmap_uv_generation = intent_starts_with(
+        step.intent, "generate", "lightmap", "uv");
     if (material_assignment &&
         (envelope_.permitted_effects & ::carto::agent::effect_mask(Effect::material)) == 0U) {
         return fail(policy("work envelope forbids the material effect"));
     }
+    if (lightmap_uv_generation &&
+        (envelope_.permitted_effects & ::carto::agent::effect_mask(Effect::uv)) == 0U) {
+        return fail(policy("work envelope forbids the UV effect"));
+    }
     if (material_assignment &&
         !std::holds_alternative<std::monostate>(step.target.component)) {
         return fail(policy("material assignment requires an object target"));
+    }
+    if (lightmap_uv_generation &&
+        !std::holds_alternative<std::monostate>(step.target.component)) {
+        return fail(policy("lightmap UV generation requires an object target"));
     }
     const auto* target_object = speculative_->document_.scene().find(step.target.object);
     if (target_object == nullptr) {
@@ -3351,7 +3371,7 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
     }
     const bool object_translation =
         std::holds_alternative<std::monostate>(step.target.component) &&
-        !material_assignment;
+        !material_assignment && !lightmap_uv_generation;
     if (object_translation &&
         (envelope_.permitted_effects & ::carto::agent::effect_mask(Effect::transform)) == 0U) {
         return fail(policy("work envelope forbids the transform effect"));
@@ -3408,9 +3428,9 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
                 return fail(policy(
                     "plan target mesh is shared by an object protected by the objective"));
             }
-            if (material_assignment && object.locked) {
+            if ((material_assignment || lightmap_uv_generation) && object.locked) {
                 return fail(policy(
-                    "material assignment would affect a locked shared-mesh instance"));
+                    "mesh authoring would affect a locked shared-mesh instance"));
             }
             affected_objects.insert(object.id);
         }
@@ -3428,7 +3448,7 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
 
     application::ApplicationAction select_mode;
     application::ApplicationAction select_component;
-    if (object_translation || material_assignment) {
+    if (object_translation || material_assignment || lightmap_uv_generation) {
         select_mode = application::SetSelectionModeAction{editor::SelectionMode::object};
         select_component = application::SelectObjectAction{step.target.object};
     } else if (const auto* face = std::get_if<geometry::FaceId>(&step.target.component)) {
@@ -3527,7 +3547,7 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
         return fail(result.error().with_context("speculative preview parameters"));
     }
     const auto committed = application::HumanApplicationAccess::commit_preview(
-        *speculative_, preview.value(), material_assignment
+        *speculative_, preview.value(), (material_assignment || lightmap_uv_generation)
             ? application::OperationSource::agent_workbench
             : application::OperationSource::ai_proposal,
         plan_.id + ":" + step.id);

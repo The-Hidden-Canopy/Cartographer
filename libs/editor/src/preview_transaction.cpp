@@ -26,7 +26,8 @@ bool valid_kind(PreviewKind kind) noexcept {
         kind == PreviewKind::extrude_face ||
         kind == PreviewKind::inset_face || kind == PreviewKind::set_vertex_position ||
         kind == PreviewKind::poke_face ||
-        kind == PreviewKind::set_material_region_assignment;
+        kind == PreviewKind::set_material_region_assignment ||
+        kind == PreviewKind::generate_unique_lightmap_uv;
 }
 
 } // namespace
@@ -37,9 +38,16 @@ core::Result<void> PreviewParameters::validate(PreviewKind kind) const {
     }
     const bool has_material_parameters = material_region_id.has_value() ||
         material_id.has_value() || material_variant_id.has_value();
+    const bool has_lightmap_uv_parameters = lightmap_uv_set_id.has_value() ||
+        lightmap_resolution.has_value() || lightmap_padding_texels.has_value() ||
+        lightmap_maximum_udim_tiles.has_value();
     if (kind != PreviewKind::set_material_region_assignment && has_material_parameters) {
         return core::Result<void>::failure(invalid(
             "non-material preview contains material assignment parameters"));
+    }
+    if (kind != PreviewKind::generate_unique_lightmap_uv && has_lightmap_uv_parameters) {
+        return core::Result<void>::failure(invalid(
+            "non-lightmap preview contains lightmap UV parameters"));
     }
     if (kind == PreviewKind::object_transform) {
         if (!transform.has_value() || distance.has_value() || position.has_value()) {
@@ -92,6 +100,23 @@ core::Result<void> PreviewParameters::validate(PreviewKind kind) const {
         }
         return core::Result<void>::success();
     }
+    if (kind == PreviewKind::generate_unique_lightmap_uv) {
+        if (transform.has_value() || distance.has_value() || position.has_value() ||
+            !lightmap_uv_set_id.has_value() || lightmap_uv_set_id.value() == 0U ||
+            !lightmap_resolution.has_value() || lightmap_resolution.value() < 16U ||
+            lightmap_resolution.value() > 8192U ||
+            !lightmap_padding_texels.has_value() ||
+            lightmap_padding_texels.value() == 0U ||
+            lightmap_padding_texels.value() > lightmap_resolution.value() / 8U ||
+            !lightmap_maximum_udim_tiles.has_value() ||
+            lightmap_maximum_udim_tiles.value() == 0U ||
+            lightmap_maximum_udim_tiles.value() > 100U) {
+            return core::Result<void>::failure(invalid(
+                "unique lightmap UV preview requires a non-zero set ID, bounded resolution, "
+                "positive padding, and a bounded UDIM tile count"));
+        }
+        return core::Result<void>::success();
+    }
     if (!position.has_value() || transform.has_value() || distance.has_value()) {
         return core::Result<void>::failure(
             invalid("vertex position preview requires only a position"));
@@ -116,7 +141,8 @@ core::Result<AuthoringPreview> AuthoringPreview::begin(
     }
     if ((kind == PreviewKind::object_transform ||
          kind == PreviewKind::object_translation_delta ||
-         kind == PreviewKind::set_material_region_assignment) &&
+         kind == PreviewKind::set_material_region_assignment ||
+         kind == PreviewKind::generate_unique_lightmap_uv) &&
         (context.selection_mode != SelectionMode::object || context.objects.size() != 1U)) {
         return core::Result<AuthoringPreview>::failure(invalid(
             "object operation preview requires exactly one selected object"));

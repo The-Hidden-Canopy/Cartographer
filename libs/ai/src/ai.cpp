@@ -76,13 +76,13 @@ core::Result<double> parse_number(std::string token) {
 core::Result<std::uint64_t> parse_unsigned_identity(const std::string& token) {
     if (token.empty() || token.front() < '0' || token.front() > '9') {
         return core::Result<std::uint64_t>::failure(invalid(
-            "material assignment IDs must be unsigned decimal integers"));
+            "identity values must be unsigned decimal integers"));
     }
     std::uint64_t value = 0U;
     const auto parsed = std::from_chars(token.data(), token.data() + token.size(), value);
     if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size() || value == 0U) {
         return core::Result<std::uint64_t>::failure(invalid(
-            "material assignment IDs must be non-zero unsigned integers in range"));
+            "identity values must be non-zero unsigned integers in range"));
     }
     return core::Result<std::uint64_t>::success(value);
 }
@@ -147,6 +147,8 @@ std::string preview_name(editor::PreviewKind kind) {
     case editor::PreviewKind::poke_face: return "poke_face";
     case editor::PreviewKind::set_material_region_assignment:
         return "set_material_region_assignment";
+    case editor::PreviewKind::generate_unique_lightmap_uv:
+        return "generate_unique_lightmap_uv";
     }
     return "unknown";
 }
@@ -191,6 +193,7 @@ std::string_view effect_name(CapabilityEffect effect) noexcept {
     case CapabilityEffect::topology: return "topology";
     case CapabilityEffect::transform: return "transform";
     case CapabilityEffect::material: return "material";
+    case CapabilityEffect::uv: return "uv";
     }
     return "unknown";
 }
@@ -216,6 +219,7 @@ std::string_view data_name(CapabilityData data) noexcept {
     case CapabilityData::incident_topology: return "incident_topology";
     case CapabilityData::material_catalog: return "material_catalog";
     case CapabilityData::material_regions: return "material_regions";
+    case CapabilityData::lightmap_uv_inputs: return "lightmap_uv_inputs";
     }
     return "unknown";
 }
@@ -226,6 +230,7 @@ std::string_view write_name(CapabilityWrite write) noexcept {
     case CapabilityWrite::vertex_positions: return "vertex_positions";
     case CapabilityWrite::mesh_topology: return "mesh_topology";
     case CapabilityWrite::material_region_assignment: return "material_region_assignment";
+    case CapabilityWrite::uv_set: return "uv_set";
     }
     return "unknown";
 }
@@ -259,6 +264,8 @@ std::string_view validator_name(CapabilityValidator value) noexcept {
     case CapabilityValidator::material_source_exists: return "material_source_exists";
     case CapabilityValidator::material_variant_exists: return "material_variant_exists";
     case CapabilityValidator::material_region_exists: return "material_region_exists";
+    case CapabilityValidator::lightmap_uv_generation_valid:
+        return "lightmap_uv_generation_valid";
     }
     return "unknown";
 }
@@ -270,6 +277,7 @@ std::string_view risk_name(CapabilityRisk risk) noexcept {
     case CapabilityRisk::reversible_topology: return "reversible_topology";
     case CapabilityRisk::destructive_topology: return "destructive_topology";
     case CapabilityRisk::reversible_material: return "reversible_material";
+    case CapabilityRisk::reversible_uv: return "reversible_uv";
     case CapabilityRisk::unknown: return "unknown";
     }
     return "unknown";
@@ -499,7 +507,8 @@ core::Result<void> OperationDescriptor::validate() const {
     }
     const std::uint32_t known_effects =
         effect_mask(CapabilityEffect::geometry) | effect_mask(CapabilityEffect::topology) |
-        effect_mask(CapabilityEffect::transform) | effect_mask(CapabilityEffect::material);
+        effect_mask(CapabilityEffect::transform) | effect_mask(CapabilityEffect::material) |
+        effect_mask(CapabilityEffect::uv);
     if ((effects & ~known_effects) != 0U) {
         return core::Result<void>::failure(invalid(
             "AI operation declares an unknown capability effect"));
@@ -668,6 +677,12 @@ core::Result<void> Proposal::validate(const Context& expected) const {
             expected.authoring.objects.size() != 1U) {
             return core::Result<void>::failure(invalid_state(
                 "material assignment requires exactly one selected mesh object"));
+        }
+    } else if (preview_kind == editor::PreviewKind::generate_unique_lightmap_uv) {
+        if (expected.authoring.selection_mode != editor::SelectionMode::object ||
+            expected.authoring.objects.size() != 1U) {
+            return core::Result<void>::failure(invalid_state(
+                "lightmap UV generation requires exactly one selected mesh object"));
         }
     } else {
         return core::Result<void>::failure(invalid_state(
@@ -880,6 +895,53 @@ std::vector<OperationDescriptor> build_operation_ontology(
     material_assignment.risk = CapabilityRisk::reversible_material;
     material_assignment.cost.objects_read = 1U;
     result.push_back(std::move(material_assignment));
+
+    OperationDescriptor lightmap_uv_generation;
+    lightmap_uv_generation.id = "uv.generate-lightmap";
+    lightmap_uv_generation.display_name = "Generate Unique Lightmap UVs";
+    lightmap_uv_generation.kernel_operation = "production.UniqueLightmapUv.generate";
+    lightmap_uv_generation.parameters = {
+        "uv_set_id", "resolution", "padding_texels", "maximum_udim_tiles"};
+    lightmap_uv_generation.parameter_schema = {
+        parameter("uv_set_id", ParameterType::unsigned_identity, ParameterUnit::none,
+            std::nullopt, std::nullopt, true, true, "New UV set identity"),
+        parameter("resolution", ParameterType::count, ParameterUnit::none,
+            16.0, 8192.0, true, true, "Lightmap tile resolution in pixels"),
+        parameter("padding_texels", ParameterType::count, ParameterUnit::none,
+            1.0, 1024.0, true, true, "Required island padding in texels"),
+        parameter("maximum_udim_tiles", ParameterType::count, ParameterUnit::none,
+            1.0, 100.0, true, true, "Maximum generated UDIM tile count"),
+    };
+    lightmap_uv_generation.precondition =
+        "exactly one unlocked mesh object is selected; the new UV set and derived corner layer "
+        "do not already exist; the mesh has bounded planar faces; requested padding and UDIM "
+        "budget fit; every instance of the shared mesh is in-scope, unprotected, and unlocked; "
+        "source revision is current";
+    lightmap_uv_generation.preview_supported = true;
+    lightmap_uv_generation.auto_approvable = false;
+    lightmap_uv_generation.preview_kind = editor::PreviewKind::generate_unique_lightmap_uv;
+    lightmap_uv_generation.contract_complete = true;
+    lightmap_uv_generation.provider_requestable = true;
+    lightmap_uv_generation.effects = effect_mask(CapabilityEffect::uv);
+    lightmap_uv_generation.targets = {CapabilityTarget::selected_object};
+    lightmap_uv_generation.reads = {
+        CapabilityData::target_mesh,
+        CapabilityData::incident_topology,
+        CapabilityData::lightmap_uv_inputs};
+    lightmap_uv_generation.writes = {CapabilityWrite::uv_set};
+    lightmap_uv_generation.invalidates = {
+        CapabilityInvalidation::render_mesh,
+        CapabilityInvalidation::tangent_basis,
+        CapabilityInvalidation::bakes};
+    lightmap_uv_generation.validators = {
+        CapabilityValidator::target_exists,
+        CapabilityValidator::unlocked_subtree,
+        CapabilityValidator::mesh_valid,
+        CapabilityValidator::lightmap_uv_generation_valid,
+        CapabilityValidator::operation_preconditions};
+    lightmap_uv_generation.risk = CapabilityRisk::reversible_uv;
+    lightmap_uv_generation.cost.objects_read = 1U;
+    result.push_back(std::move(lightmap_uv_generation));
     return result;
 }
 
@@ -888,7 +950,8 @@ std::vector<OperationDescriptor> project_capabilities(
     std::uint32_t permitted_effects) {
     const std::uint32_t known_effects =
         effect_mask(CapabilityEffect::geometry) | effect_mask(CapabilityEffect::topology) |
-        effect_mask(CapabilityEffect::transform) | effect_mask(CapabilityEffect::material);
+        effect_mask(CapabilityEffect::transform) | effect_mask(CapabilityEffect::material) |
+        effect_mask(CapabilityEffect::uv);
     if (permitted_effects == 0U || (permitted_effects & ~known_effects) != 0U) return {};
 
     std::vector<OperationDescriptor> result;
@@ -951,7 +1014,7 @@ std::string context_json(const Context& context) {
         result += ",\"effects\":[";
         bool has_effect = false;
         for (const auto effect : {CapabilityEffect::geometry, CapabilityEffect::topology,
-                CapabilityEffect::transform, CapabilityEffect::material}) {
+                CapabilityEffect::transform, CapabilityEffect::material, CapabilityEffect::uv}) {
             if ((operation.effects & effect_mask(effect)) == 0U) continue;
             if (has_effect) result.push_back(',');
             result += "\"" + std::string(effect_name(effect)) + "\"";
@@ -1032,6 +1095,22 @@ std::string proposal_json(const Proposal& proposal) {
         result += ",\"variant_id\":" +
             std::to_string(*proposal.parameters.material_variant_id);
     }
+    if (proposal.parameters.lightmap_uv_set_id.has_value()) {
+        result += ",\"uv_set_id\":" +
+            std::to_string(*proposal.parameters.lightmap_uv_set_id);
+    }
+    if (proposal.parameters.lightmap_resolution.has_value()) {
+        result += ",\"resolution\":" +
+            std::to_string(*proposal.parameters.lightmap_resolution);
+    }
+    if (proposal.parameters.lightmap_padding_texels.has_value()) {
+        result += ",\"padding_texels\":" +
+            std::to_string(*proposal.parameters.lightmap_padding_texels);
+    }
+    if (proposal.parameters.lightmap_maximum_udim_tiles.has_value()) {
+        result += ",\"maximum_udim_tiles\":" +
+            std::to_string(*proposal.parameters.lightmap_maximum_udim_tiles);
+    }
     result += "}";
     return result;
 }
@@ -1053,6 +1132,43 @@ core::Result<Proposal> NativePlanner::propose(
     const auto parsed_numbers = numbers(words);
     if (!parsed_numbers) return core::Result<Proposal>::failure(parsed_numbers.error());
     const std::string request_id = make_request_id(next_request_id_++);
+
+    if (words.front() == "generate") {
+        const bool exact_syntax = words.size() == 11U && words[1] == "lightmap" &&
+            words[2] == "uv" && words[3] == "set" && words[5] == "resolution" &&
+            words[7] == "padding" && words[9] == "tiles";
+        if (!exact_syntax) {
+            return core::Result<Proposal>::failure(invalid(
+                "lightmap UV intent must be `generate lightmap uv set <id> resolution "
+                "<pixels> padding <texels> tiles <count>`"));
+        }
+        const auto uv_set = parse_unsigned_identity(words[4]);
+        const auto resolution = parse_unsigned_identity(words[6]);
+        const auto padding = parse_unsigned_identity(words[8]);
+        const auto tiles = parse_unsigned_identity(words[10]);
+        if (!uv_set || !resolution || !padding || !tiles ||
+            resolution.value() > 8192U || padding.value() > 8192U ||
+            tiles.value() > 100U) {
+            const core::Diagnostic error = !uv_set ? uv_set.error() :
+                !resolution ? resolution.error() : !padding ? padding.error() :
+                !tiles ? tiles.error() : invalid("lightmap UV bounds exceed supported ranges");
+            return core::Result<Proposal>::failure(error);
+        }
+        editor::PreviewParameters parameters;
+        parameters.lightmap_uv_set_id = uv_set.value();
+        parameters.lightmap_resolution = static_cast<std::uint32_t>(resolution.value());
+        parameters.lightmap_padding_texels = static_cast<std::uint32_t>(padding.value());
+        parameters.lightmap_maximum_udim_tiles = static_cast<std::uint32_t>(tiles.value());
+        Proposal proposal{
+            request_id, context.project_revision, context.authoring,
+            editor::PreviewKind::generate_unique_lightmap_uv, std::move(parameters),
+            "uv.generate-lightmap", std::string(intent),
+            "Native planner produced a revision-bound lightmap UV generation preview."};
+        if (auto result = proposal.validate(context); !result) {
+            return core::Result<Proposal>::failure(result.error());
+        }
+        return core::Result<Proposal>::success(std::move(proposal));
+    }
 
     if (words.front() == "assign") {
         const bool with_variant = words.size() == 8U && words[6] == "variant";
@@ -1187,7 +1303,8 @@ core::Result<Proposal> NativePlanner::propose(
         return core::Result<Proposal>::success(std::move(proposal));
     }
     return core::Result<Proposal>::failure(invalid(
-        "native planner supports translate object, extrude, inset, poke face, and move vertex intents"));
+        "native planner supports translate object, extrude, inset, poke face, move vertex, "
+        "material assignment, and lightmap UV generation intents"));
 }
 
 } // namespace carto::ai

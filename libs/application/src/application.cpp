@@ -1,5 +1,6 @@
 #include <carto/application/application.hpp>
 #include <carto/project/recovery.hpp>
+#include <carto/production/lightmap_uv.hpp>
 
 #include <algorithm>
 #include <bit>
@@ -1133,6 +1134,8 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return update_material(value);
             } else if constexpr (std::is_same_v<Action, SetMaterialRegionAssignmentAction>) {
                 return set_material_region_assignment(value);
+            } else if constexpr (std::is_same_v<Action, GenerateUniqueLightmapUvAction>) {
+                return generate_unique_lightmap_uv(value);
             } else if constexpr (std::is_same_v<Action, SetMaterialGraphAction>) {
                 return set_material_graph(value);
             } else if constexpr (std::is_same_v<Action, SetMaterialGraphBindingAction>) {
@@ -1565,6 +1568,22 @@ core::Result<ApplicationAction> ApplicationSession::preview_action(
             context.project_revision,
             {*object->mesh_asset, *parameters.material_region_id},
             static_cast<render::MaterialId>(*parameters.material_id), variant});
+    }
+    if (preview.kind() == editor::PreviewKind::generate_unique_lightmap_uv) {
+        if (context.objects.size() != 1U || !parameters.lightmap_uv_set_id.has_value() ||
+            !parameters.lightmap_resolution.has_value() ||
+            !parameters.lightmap_padding_texels.has_value() ||
+            !parameters.lightmap_maximum_udim_tiles.has_value()) {
+            return core::Result<ApplicationAction>::failure(invalid_state(
+                "lightmap UV preview has no complete target and parameter payload"));
+        }
+        return core::Result<ApplicationAction>::success(GenerateUniqueLightmapUvAction{
+            context.project_revision,
+            context.objects.front(),
+            *parameters.lightmap_uv_set_id,
+            *parameters.lightmap_resolution,
+            *parameters.lightmap_padding_texels,
+            *parameters.lightmap_maximum_udim_tiles});
     }
     if (preview.kind() != editor::PreviewKind::set_vertex_position) {
         return core::Result<ApplicationAction>::failure(invalid_state(
@@ -3290,6 +3309,74 @@ core::Result<DispatchReceipt> ApplicationSession::set_material_region_assignment
     return commit_material_catalog(
         std::move(catalog), action.expected_project_revision,
         "Set Material Region Assignment");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::generate_unique_lightmap_uv(
+    const GenerateUniqueLightmapUvAction& action) {
+    if (active_source_ != OperationSource::human &&
+        active_source_ != OperationSource::agent_workbench) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "lightmap UV generation requires the human or scoped Agent Workbench boundary"));
+    }
+    if (!action.object || action.output_uv_set == 0U || action.resolution < 16U ||
+        action.padding_texels == 0U || action.maximum_udim_tiles == 0U) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "lightmap UV generation requires non-zero object, set, padding, and tile values"));
+    }
+    if (document_.revision() != action.expected_project_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "lightmap UV generation snapshot no longer matches the project revision"));
+    }
+    const auto* object = document_.scene().find(action.object);
+    if (object == nullptr || !object->mesh_asset.has_value()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "lightmap UV generation target no longer has an authored mesh"));
+    }
+    if (object->locked || !object->visible) {
+        return failure(invalid_state(
+            "hidden or locked scene objects cannot receive generated lightmap UVs"));
+    }
+    const std::uint64_t mesh_asset = *object->mesh_asset;
+    const auto mesh = document_.meshes().find(mesh_asset);
+    if (mesh == document_.meshes().end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "lightmap UV generation target references a missing mesh asset"));
+    }
+    for (const auto& instance : document_.scene().objects_sorted()) {
+        if (instance.mesh_asset == object->mesh_asset && instance.locked) {
+            return failure(invalid_state(
+                "lightmap UV generation would affect a locked shared-mesh instance"));
+        }
+    }
+    const std::string suffix = std::to_string(action.output_uv_set);
+    const auto recipe = production::make_unique_lightmap_uv_recipe(
+        document_, mesh_asset, action.output_uv_set,
+        "Agent Lightmap " + suffix, "uv.agent.lightmap." + suffix,
+        action.resolution, action.padding_texels, action.maximum_udim_tiles);
+    if (!recipe) return failure(recipe.error().with_context("lightmap UV recipe"));
+    const auto artifact = production::compile_unique_lightmap_uv(recipe.value(), mesh->second);
+    if (!artifact) return failure(artifact.error().with_context("lightmap UV generation"));
+    auto updated_mesh = production::with_unique_lightmap_uv(mesh->second, artifact.value());
+    if (!updated_mesh) {
+        return failure(updated_mesh.error().with_context("lightmap UV artifact application"));
+    }
+    const std::string digest_operation =
+        production::lightmap_uv_transaction_operation(artifact.value());
+    if (digest_operation.empty()) {
+        return failure(invalid_state("lightmap UV artifact has no transaction digest"));
+    }
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectMeshCommand>(
+            admission, document_, mesh_asset, action.expected_project_revision,
+            mesh->second.revision(), std::move(updated_mesh.value())),
+        "Generate Unique Lightmap UVs " + digest_operation,
+        AffectedSet{{action.object}, {}, {}, {}});
 }
 
 core::Result<DispatchReceipt> ApplicationSession::set_material_graph(

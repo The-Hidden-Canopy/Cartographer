@@ -45,6 +45,8 @@ void ontology_is_derived_from_native_tools() {
         [](const auto& operation) { return operation.id == "object.translate"; });
     const auto material = std::find_if(context.operations.begin(), context.operations.end(),
         [](const auto& operation) { return operation.id == "material.assign-region"; });
+    const auto lightmap_uv = std::find_if(context.operations.begin(), context.operations.end(),
+        [](const auto& operation) { return operation.id == "uv.generate-lightmap"; });
     const auto poke = std::find_if(context.operations.begin(), context.operations.end(),
         [](const auto& operation) { return operation.id == "mesh.poke-face"; });
     const auto delete_face = std::find_if(context.operations.begin(), context.operations.end(),
@@ -82,6 +84,20 @@ void ontology_is_derived_from_native_tools() {
     REQUIRE(material->parameter_schema.front().type ==
         carto::ai::ParameterType::unsigned_identity);
     REQUIRE(!material->parameter_schema.back().required);
+    REQUIRE(lightmap_uv != context.operations.end() && lightmap_uv->preview_supported);
+    REQUIRE(lightmap_uv->provider_requestable && !lightmap_uv->auto_approvable);
+    REQUIRE(lightmap_uv->preview_kind ==
+        carto::editor::PreviewKind::generate_unique_lightmap_uv);
+    REQUIRE(lightmap_uv->effects == carto::ai::effect_mask(
+        carto::ai::CapabilityEffect::uv));
+    REQUIRE(lightmap_uv->writes == std::vector<carto::ai::CapabilityWrite>{
+        carto::ai::CapabilityWrite::uv_set});
+    REQUIRE(lightmap_uv->validators.back() ==
+        carto::ai::CapabilityValidator::operation_preconditions);
+    REQUIRE(std::find(lightmap_uv->validators.begin(), lightmap_uv->validators.end(),
+        carto::ai::CapabilityValidator::lightmap_uv_generation_valid) !=
+        lightmap_uv->validators.end());
+    REQUIRE(lightmap_uv->precondition.find("shared mesh") != std::string::npos);
     REQUIRE(poke != context.operations.end() && poke->preview_supported);
     REQUIRE(poke->provider_requestable);
     REQUIRE(!poke->auto_approvable);
@@ -127,7 +143,7 @@ void ontology_is_derived_from_native_tools() {
                 !operation.writes.empty() && !operation.validators.empty();
         }));
     REQUIRE(std::count_if(context.operations.begin(), context.operations.end(),
-        [](const auto& operation) { return operation.provider_requestable; }) == 6);
+        [](const auto& operation) { return operation.provider_requestable; }) == 7);
     REQUIRE(inset->parameter_schema.size() == 1U);
     REQUIRE(inset->parameter_schema.front().type == carto::ai::ParameterType::length);
     REQUIRE(inset->parameter_schema.front().unit == carto::ai::ParameterUnit::world_length);
@@ -144,6 +160,9 @@ void ontology_json_preserves_kernel_and_approval_contract() {
     REQUIRE(json.find("\"preview_kind\":\"inset_face\"") != std::string::npos);
     REQUIRE(json.find("\"preview_kind\":\"poke_face\"") != std::string::npos);
     REQUIRE(json.find("project.MaterialCatalog.assign_region") != std::string::npos);
+    REQUIRE(json.find("production.UniqueLightmapUv.generate") != std::string::npos);
+    REQUIRE(json.find("\"preview_kind\":\"generate_unique_lightmap_uv\"") !=
+        std::string::npos);
     REQUIRE(json.find("\"effects\":[\"material\"]") != std::string::npos);
     REQUIRE(json.find("unsigned_identity") != std::string::npos);
     REQUIRE(json.find("\"parameter_schema\":[{\"name\":\"distance\"") !=
@@ -172,6 +191,15 @@ void capability_projection_filters_by_preview_and_work_envelope() {
         registry, carto::ai::effect_mask(carto::ai::CapabilityEffect::material));
     REQUIRE(material_only.size() == 1U);
     REQUIRE(material_only.front().id == "material.assign-region");
+    const auto uv_only = carto::ai::project_capabilities(
+        registry, carto::ai::effect_mask(carto::ai::CapabilityEffect::uv));
+    REQUIRE(uv_only.size() == 1U);
+    REQUIRE(uv_only.front().id == "uv.generate-lightmap");
+    const auto without_uv = carto::ai::project_capabilities(
+        registry, carto::ai::effect_mask(carto::ai::CapabilityEffect::material));
+    REQUIRE(std::none_of(without_uv.begin(), without_uv.end(),
+        [](const auto& capability) { return capability.effects ==
+            carto::ai::effect_mask(carto::ai::CapabilityEffect::uv); }));
     const auto geometry_and_material = carto::ai::project_capabilities(
         registry, carto::ai::effect_mask(carto::ai::CapabilityEffect::geometry) |
             carto::ai::effect_mask(carto::ai::CapabilityEffect::material));
@@ -372,6 +400,62 @@ void native_planner_compiles_exact_typed_material_assignment_intents() {
     }
 }
 
+void native_planner_compiles_bounded_lightmap_uv_intents() {
+    using namespace carto;
+    application::ApplicationSession session;
+    REQUIRE(application::HumanApplicationAccess::dispatch(
+        session, application::CreateBoxAction{"Root", {1.0, 1.0, 1.0}}));
+    const auto object = session.snapshot().objects.front().object.id;
+    REQUIRE(application::HumanApplicationAccess::dispatch(
+        session, application::SetSelectionModeAction{editor::SelectionMode::object}));
+    REQUIRE(application::HumanApplicationAccess::dispatch(
+        session, application::SelectObjectAction{object}));
+
+    auto context = context_for(session);
+    context.operations = ai::project_capabilities(
+        context.operations, ai::effect_mask(ai::CapabilityEffect::uv));
+    ai::NativePlanner planner;
+    const auto proposal = planner.propose(
+        "generate lightmap uv set 18446744073709551615 resolution 8192 padding 1024 tiles 100",
+        context);
+    REQUIRE(proposal);
+    REQUIRE(proposal.value().tool_id == "uv.generate-lightmap");
+    REQUIRE(proposal.value().preview_kind ==
+        editor::PreviewKind::generate_unique_lightmap_uv);
+    REQUIRE(proposal.value().parameters.lightmap_uv_set_id ==
+        std::optional<std::uint64_t>{std::numeric_limits<std::uint64_t>::max()});
+    REQUIRE(proposal.value().parameters.lightmap_resolution ==
+        std::optional<std::uint32_t>{8192U});
+    REQUIRE(proposal.value().parameters.lightmap_padding_texels ==
+        std::optional<std::uint32_t>{1024U});
+    REQUIRE(proposal.value().parameters.lightmap_maximum_udim_tiles ==
+        std::optional<std::uint32_t>{100U});
+    REQUIRE(proposal.value().validate(context));
+    REQUIRE(!proposal.value().validate_auto_approval(context));
+    const auto json = ai::proposal_json(proposal.value());
+    REQUIRE(json.find("\"uv_set_id\":18446744073709551615") != std::string::npos);
+    REQUIRE(json.find("\"resolution\":8192") != std::string::npos);
+    REQUIRE(json.find("\"padding_texels\":1024") != std::string::npos);
+    REQUIRE(json.find("\"maximum_udim_tiles\":100") != std::string::npos);
+
+    for (const std::string intent : {
+             "generate lightmap uv set 0 resolution 128 padding 2 tiles 1",
+             "generate lightmap uv set 1 resolution 15 padding 1 tiles 1",
+             "generate lightmap uv set 1 resolution 8193 padding 1 tiles 1",
+             "generate lightmap uv set 1 resolution 128 padding 17 tiles 1",
+             "generate lightmap uv set 1 resolution 128 padding 0 tiles 1",
+             "generate lightmap uv set 1 resolution 128 padding 2 tiles 101",
+             "generate lightmap uv set 1 resolution 128 padding 2 tiles 0",
+             "generate lightmap uv set 18446744073709551616 resolution 128 padding 2 tiles 1",
+             "generate lightmap uv set 1 resolution 128.5 padding 2 tiles 1",
+             "generate lightmap uv set 1 resolution 128 padding 2 tiles 1 extra"}) {
+        REQUIRE(!planner.propose(intent, context));
+    }
+    context.operations.clear();
+    REQUIRE(!planner.propose(
+        "generate lightmap uv set 1 resolution 128 padding 2 tiles 1", context));
+}
+
 void generic_ai_proposals_cannot_bypass_agent_transform_envelope() {
     carto::application::ApplicationSession session;
     carto::ui::UiController ui(session);
@@ -384,6 +468,7 @@ void generic_ai_proposals_cannot_bypass_agent_transform_envelope() {
 
     REQUIRE(!ui.propose_ai("translate object by 0.25 0 0"));
     REQUIRE(!ui.propose_ai("assign material 1 to region 7"));
+    REQUIRE(!ui.propose_ai("generate lightmap uv set 1 resolution 128 padding 2 tiles 1"));
     auto full_context = context_for(session);
     carto::ai::NativePlanner planner;
     const auto external_proposal = planner.propose(
@@ -393,6 +478,14 @@ void generic_ai_proposals_cannot_bypass_agent_transform_envelope() {
     const auto external_material_proposal = planner.propose(
         "assign material 1 to region 7", full_context);
     REQUIRE(external_material_proposal);
+    auto uv_context = full_context;
+    uv_context.operations = carto::ai::project_capabilities(
+        uv_context.operations,
+        carto::ai::effect_mask(carto::ai::CapabilityEffect::uv));
+    const auto external_uv_proposal = planner.propose(
+        "generate lightmap uv set 1 resolution 128 padding 2 tiles 1", uv_context);
+    REQUIRE(external_uv_proposal);
+    REQUIRE(!ui.begin_ai_preview(external_uv_proposal.value()));
     REQUIRE(!ui.begin_ai_preview(external_material_proposal.value()));
     REQUIRE(session.snapshot().project_revision == before.project_revision);
     REQUIRE(session.snapshot().objects.front().object.local_transform.translation.x == 0.0);
@@ -577,6 +670,7 @@ int main() {
         native_planner_rejects_ambiguous_or_wrong_scope_intents();
         native_planner_compiles_translation_only_for_one_selected_object();
         native_planner_compiles_exact_typed_material_assignment_intents();
+        native_planner_compiles_bounded_lightmap_uv_intents();
         generic_ai_proposals_cannot_bypass_agent_transform_envelope();
         ui_ai_flow_is_preview_only_until_explicit_commit();
         ui_face_poke_requires_an_explicit_preview_commit();

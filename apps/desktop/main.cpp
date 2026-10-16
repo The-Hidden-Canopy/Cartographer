@@ -1211,6 +1211,7 @@ struct DesktopState {
     std::string agent_step;
     bool agent_allow_root_translation = false;
     bool agent_allow_material_assignment = false;
+    bool agent_allow_lightmap_uv = false;
     double agent_translation_distance_meters = 1.0;
     std::string agent_question;
     std::string agent_clarification_rationale;
@@ -7243,13 +7244,22 @@ struct DesktopState {
                 "Uses explicit IDs from the current project: assign material <id> to region <id> "
                 "with optional variant <id>. Shared mesh instances must all be in scope and unlocked.");
         }
+        ImGui::Checkbox(
+            "Permit unique lightmap UV generation", &agent_allow_lightmap_uv);
+        if (agent_allow_lightmap_uv) {
+            ImGui::TextDisabled(
+                "Creates a new lightmap-candidate UV set on the speculative branch. Intent: "
+                "generate lightmap uv set <id> resolution <pixels> padding <texels> tiles <count>. "
+                "Existing UV sets remain unchanged.");
+        }
         ImGui::BeginDisabled(task_present || snapshot.agent_checkpoint_loaded ||
             snapshot.agent_plan_draft.empty() ||
             agent_goal.empty() || !clarifications_answered ||
             !objective_constraints_valid);
         if (ImGui::Button("Prepare task for preflight", ImVec2(-1, 30))) {
             std::optional<carto::agent::AgentWorkEnvelope> requested_envelope;
-            if (agent_allow_root_translation || agent_allow_material_assignment) {
+            if (agent_allow_root_translation || agent_allow_material_assignment ||
+                agent_allow_lightmap_uv) {
                 requested_envelope.emplace();
                 if (agent_allow_root_translation) {
                     requested_envelope->permitted_effects |=
@@ -7260,6 +7270,10 @@ struct DesktopState {
                 if (agent_allow_material_assignment) {
                     requested_envelope->permitted_effects |=
                         carto::agent::effect_mask(carto::agent::Effect::material);
+                }
+                if (agent_allow_lightmap_uv) {
+                    requested_envelope->permitted_effects |=
+                        carto::agent::effect_mask(carto::agent::Effect::uv);
                 }
             }
             const auto prepared = ui.prepare_agent_plan(
@@ -7273,7 +7287,8 @@ struct DesktopState {
             "before native commands run.");
         if (ImGui::Button("Run speculative plan", ImVec2(-1, 30))) {
             std::optional<carto::agent::AgentWorkEnvelope> requested_envelope;
-            if (agent_allow_root_translation || agent_allow_material_assignment) {
+            if (agent_allow_root_translation || agent_allow_material_assignment ||
+                agent_allow_lightmap_uv) {
                 requested_envelope.emplace();
                 if (agent_allow_root_translation) {
                     requested_envelope->permitted_effects |=
@@ -7284,6 +7299,10 @@ struct DesktopState {
                 if (agent_allow_material_assignment) {
                     requested_envelope->permitted_effects |=
                         carto::agent::effect_mask(carto::agent::Effect::material);
+                }
+                if (agent_allow_lightmap_uv) {
+                    requested_envelope->permitted_effects |=
+                        carto::agent::effect_mask(carto::agent::Effect::uv);
                 }
             }
             const auto run = ui.run_agent_plan(agent_goal, std::move(requested_envelope));

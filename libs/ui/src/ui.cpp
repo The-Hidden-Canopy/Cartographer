@@ -2365,7 +2365,8 @@ core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
         ai::effect_mask(ai::CapabilityEffect::geometry) |
         ai::effect_mask(ai::CapabilityEffect::topology) |
         ai::effect_mask(ai::CapabilityEffect::transform) |
-        ai::effect_mask(ai::CapabilityEffect::material);
+        ai::effect_mask(ai::CapabilityEffect::material) |
+        ai::effect_mask(ai::CapabilityEffect::uv);
     std::vector<agent::AgentPlanStep> steps;
     steps.reserve(commands.value().size() * targets.size());
     for (std::size_t target_index = 0U; target_index < targets.size(); ++target_index) {

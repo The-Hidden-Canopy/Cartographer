@@ -366,6 +366,34 @@ private:
     std::optional<core::Revision> current_mesh_revision_;
 };
 
+// Replaces one validated project mesh revision as an undoable authoring command.
+// The project and mesh revisions are both checked before each execute/undo.
+class SetProjectMeshCommand final : public EditorCommand {
+public:
+    SetProjectMeshCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        std::uint64_t mesh_asset,
+        core::Revision expected_project_revision,
+        core::Revision expected_mesh_revision,
+        geometry::EditableMesh after);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Set Project Mesh"; }
+
+private:
+    project::ProjectDocument* document_;
+    std::uint64_t mesh_asset_;
+    core::Revision expected_project_revision_;
+    core::Revision expected_mesh_revision_;
+    std::optional<core::Revision> current_project_revision_;
+    std::optional<core::Revision> current_mesh_revision_;
+    std::optional<geometry::EditableMesh> before_;
+    geometry::EditableMesh after_;
+    bool applied_ = false;
+};
+
 class SlideVertexCommand final : public EditorCommand {
 public:
     SlideVertexCommand(
