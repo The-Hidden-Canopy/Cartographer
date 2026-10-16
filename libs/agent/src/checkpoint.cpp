@@ -658,6 +658,16 @@ void write_rebase(Writer& writer, const AgentRebaseReceipt& rebase) {
     for (const auto asset : rebase.read_mesh_assets) writer.number(asset);
     writer.number(rebase.write_mesh_assets.size());
     for (const auto asset : rebase.write_mesh_assets) writer.number(asset);
+    writer.number(rebase.read_material_regions.size());
+    for (const auto key : rebase.read_material_regions) {
+        writer.number(key.mesh_asset);
+        writer.number(key.region_id);
+    }
+    writer.number(rebase.write_material_regions.size());
+    for (const auto key : rebase.write_material_regions) {
+        writer.number(key.mesh_asset);
+        writer.number(key.region_id);
+    }
     writer.number(rebase.reused_step_ids.size());
     for (const auto& step_id : rebase.reused_step_ids) writer.field(step_id);
 }
@@ -683,6 +693,32 @@ AgentRebaseReceipt read_rebase(Reader& reader, std::uint64_t version) {
     rebase.write_mesh_assets.reserve(write_asset_count);
     for (std::size_t index = 0U; index < write_asset_count; ++index) {
         rebase.write_mesh_assets.push_back(reader.number());
+    }
+    if (version >= 10U) {
+        const auto read_material_region_count = reader.count(512U);
+        rebase.read_material_regions.reserve(read_material_region_count);
+        for (std::size_t index = 0U; index < read_material_region_count; ++index) {
+            const auto mesh_asset = reader.number();
+            const auto region_id = reader.number();
+            if (region_id > std::numeric_limits<std::uint32_t>::max()) {
+                reader.fail("checkpoint material region id exceeds its bound");
+            }
+            rebase.read_material_regions.push_back(project::MaterialRegionKey{
+                mesh_asset, region_id <= std::numeric_limits<std::uint32_t>::max()
+                    ? static_cast<std::uint32_t>(region_id) : 0U});
+        }
+        const auto write_material_region_count = reader.count(512U);
+        rebase.write_material_regions.reserve(write_material_region_count);
+        for (std::size_t index = 0U; index < write_material_region_count; ++index) {
+            const auto mesh_asset = reader.number();
+            const auto region_id = reader.number();
+            if (region_id > std::numeric_limits<std::uint32_t>::max()) {
+                reader.fail("checkpoint material region id exceeds its bound");
+            }
+            rebase.write_material_regions.push_back(project::MaterialRegionKey{
+                mesh_asset, region_id <= std::numeric_limits<std::uint32_t>::max()
+                    ? static_cast<std::uint32_t>(region_id) : 0U});
+        }
     }
     if (version >= 9U) {
         const auto reused_step_count = reader.count(256U);

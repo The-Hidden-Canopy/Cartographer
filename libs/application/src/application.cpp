@@ -914,10 +914,12 @@ core::Result<project::ProjectDocument> ApplicationSession::merge_agent_rebase_do
     const std::vector<scene::ObjectId>& read_objects,
     const std::vector<std::uint64_t>& read_mesh_assets,
     const std::vector<scene::ObjectId>& write_objects,
-    const std::vector<std::uint64_t>& write_mesh_assets) const {
+    const std::vector<std::uint64_t>& write_mesh_assets,
+    const std::vector<project::MaterialRegionKey>& read_material_regions,
+    const std::vector<project::MaterialRegionKey>& write_material_regions) const {
     return project::ProjectDocument::merge_disjoint_scene_mesh_changes(
         base, document_, speculative, read_objects, read_mesh_assets,
-        write_objects, write_mesh_assets);
+        write_objects, write_mesh_assets, read_material_regions, write_material_regions);
 }
 
 core::Result<project::ProjectDocument> ApplicationSession::merge_agent_rebase_step_document(

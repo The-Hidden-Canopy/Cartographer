@@ -1043,7 +1043,9 @@ private:
         const std::vector<scene::ObjectId>& read_objects,
         const std::vector<std::uint64_t>& read_mesh_assets,
         const std::vector<scene::ObjectId>& write_objects,
-        const std::vector<std::uint64_t>& write_mesh_assets) const;
+        const std::vector<std::uint64_t>& write_mesh_assets,
+        const std::vector<project::MaterialRegionKey>& read_material_regions = {},
+        const std::vector<project::MaterialRegionKey>& write_material_regions = {}) const;
     [[nodiscard]] core::Result<project::ProjectDocument> merge_agent_rebase_step_document(
         const project::ProjectDocument& base,
         const project::ProjectDocument& speculative,

@@ -363,6 +363,8 @@ struct AgentRebaseReceipt {
     std::vector<scene::ObjectId> write_objects;
     std::vector<std::uint64_t> read_mesh_assets;
     std::vector<std::uint64_t> write_mesh_assets;
+    std::vector<project::MaterialRegionKey> read_material_regions;
+    std::vector<project::MaterialRegionKey> write_material_regions;
     // Plan steps whose verified checkpoint results were reused verbatim on a
     // source revision that changed only outside their declared read/write set.
     std::vector<std::string> reused_step_ids;
@@ -693,7 +695,7 @@ struct AgentDemonstrationRecipe {
 // resumed task can run. Project bytes remain artifacts owned by this record;
 // they are never applied to the live source by loading a checkpoint.
 struct AgentTaskCheckpoint {
-    static constexpr std::uint32_t kFormatVersion = 9U;
+    static constexpr std::uint32_t kFormatVersion = 10U;
 
     TaskStatus status = TaskStatus::prepared;
     AgentPlan plan;
@@ -730,6 +732,8 @@ struct AgentRebaseAnalysis {
     std::vector<scene::ObjectId> write_objects;
     std::vector<std::uint64_t> read_mesh_assets;
     std::vector<std::uint64_t> write_mesh_assets;
+    std::vector<project::MaterialRegionKey> read_material_regions;
+    std::vector<project::MaterialRegionKey> write_material_regions;
     std::vector<scene::ObjectId> conflicting_objects;
     std::vector<std::uint64_t> conflicting_mesh_assets;
     std::vector<std::string> directly_conflicting_step_ids;

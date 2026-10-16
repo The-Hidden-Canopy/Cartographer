@@ -589,13 +589,22 @@ bool same_mesh_state(
 assets::Sha256Digest rebase_set_digest(
     std::string_view label,
     const std::vector<scene::ObjectId>& objects,
-    const std::vector<std::uint64_t>& mesh_assets) {
+    const std::vector<std::uint64_t>& mesh_assets,
+    const std::vector<project::MaterialRegionKey>& material_regions) {
     std::string canonical = "cartographer.agent.rebase-set.v1|";
     append_field(canonical, label);
     append_number(canonical, objects.size());
     for (const auto object : objects) append_number(canonical, object.value);
     append_number(canonical, mesh_assets.size());
     for (const auto mesh_asset : mesh_assets) append_number(canonical, mesh_asset);
+    if (!material_regions.empty()) {
+        append_field(canonical, "material-regions");
+        append_number(canonical, material_regions.size());
+        for (const auto key : material_regions) {
+            append_number(canonical, key.mesh_asset);
+            append_number(canonical, key.region_id);
+        }
+    }
     return digest_text(canonical);
 }
 
@@ -673,6 +682,79 @@ bool intent_starts_with(
     return tokens.size() >= (third.has_value() ? 3U : 2U) &&
         tokens[0] == first && tokens[1] == second &&
         (!third.has_value() || tokens[2] == *third);
+}
+
+struct MaterialAssignmentIntent {
+    std::uint64_t material = 0U;
+    std::uint32_t region = 0U;
+    std::optional<std::uint64_t> variant;
+};
+
+std::optional<MaterialAssignmentIntent> parse_material_assignment_intent(
+    std::string_view intent) {
+    const auto tokens = objective_tokens(intent);
+    const bool with_variant = tokens.size() == 8U && tokens[6] == "variant";
+    if (!(tokens.size() == 6U || with_variant) || tokens[0] != "assign" ||
+        tokens[1] != "material" || tokens[3] != "to" || tokens[4] != "region") {
+        return std::nullopt;
+    }
+    const auto parse_identity = [](const std::string& value)
+            -> std::optional<std::uint64_t> {
+        std::uint64_t parsed_value = 0U;
+        const auto parsed = std::from_chars(
+            value.data(), value.data() + value.size(), parsed_value);
+        if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+            parsed_value == 0U) {
+            return std::nullopt;
+        }
+        return parsed_value;
+    };
+    const auto material = parse_identity(tokens[2]);
+    const auto region = parse_identity(tokens[5]);
+    if (!material.has_value() || !region.has_value() ||
+        *region > std::numeric_limits<std::uint32_t>::max()) {
+        return std::nullopt;
+    }
+    MaterialAssignmentIntent parsed{*material, static_cast<std::uint32_t>(*region),
+        std::nullopt};
+    if (with_variant) {
+        parsed.variant = parse_identity(tokens[7]);
+        if (!parsed.variant.has_value()) return std::nullopt;
+    }
+    return parsed;
+}
+
+core::Result<std::string> material_catalog_source_projection(
+    const project::MaterialCatalog& catalog) {
+    auto without_assignments = catalog;
+    std::vector<project::MaterialRegionKey> keys;
+    keys.reserve(without_assignments.assignments().size());
+    for (const auto& [key, assignment] : without_assignments.assignments()) {
+        static_cast<void>(assignment);
+        keys.push_back(key);
+    }
+    for (const auto key : keys) {
+        if (auto erased = without_assignments.erase_assignment(key); !erased) {
+            return core::Result<std::string>::failure(erased.error());
+        }
+    }
+    return core::Result<std::string>::success(without_assignments.serialize());
+}
+
+bool same_material_assignment_at(
+    const project::MaterialCatalog& left,
+    const project::MaterialCatalog& right,
+    project::MaterialRegionKey key) {
+    const auto left_assignment = left.assignments().find(key);
+    const auto right_assignment = right.assignments().find(key);
+    if (left_assignment == left.assignments().end() ||
+        right_assignment == right.assignments().end()) {
+        return left_assignment == left.assignments().end() &&
+            right_assignment == right.assignments().end();
+    }
+    return left_assignment->second.key == right_assignment->second.key &&
+        left_assignment->second.material == right_assignment->second.material &&
+        left_assignment->second.variant == right_assignment->second.variant;
 }
 
 bool contains_objective_phrase(
@@ -2070,6 +2152,13 @@ core::Result<void> AgentRebaseReceipt::validate() const {
             }) && std::is_sorted(values.begin(), values.end()) &&
             std::adjacent_find(values.begin(), values.end()) == values.end();
     };
+    const auto ordered_material_regions = [](
+            const std::vector<project::MaterialRegionKey>& values) {
+        return std::all_of(values.begin(), values.end(), [](project::MaterialRegionKey key) {
+                return key.mesh_asset != 0U && key.region_id != 0U;
+            }) && std::is_sorted(values.begin(), values.end()) &&
+            std::adjacent_find(values.begin(), values.end()) == values.end();
+    };
     const auto ordered_step_ids = [](const std::vector<std::string>& values) {
         return values.size() <= kMaxPlanSteps &&
             std::all_of(values.begin(), values.end(), [](const std::string& value) {
@@ -2090,12 +2179,29 @@ core::Result<void> AgentRebaseReceipt::validate() const {
         read_objects.size() > kMaxScopeObjects || write_objects.size() > kMaxScopeObjects ||
         read_mesh_assets.size() > kMaxScopeObjects ||
         write_mesh_assets.size() > kMaxScopeObjects ||
+        read_material_regions.size() > kMaxScopeObjects ||
+        write_material_regions.size() > kMaxScopeObjects ||
         !ordered_objects(read_objects) || !ordered_objects(write_objects) ||
         !ordered_assets(read_mesh_assets) || !ordered_assets(write_mesh_assets) ||
+        !ordered_material_regions(read_material_regions) ||
+        !ordered_material_regions(write_material_regions) ||
         !ordered_step_ids(reused_step_ids) ||
         !subset(write_objects, read_objects) || !subset(write_mesh_assets, read_mesh_assets) ||
-        rebase_set_digest("read", read_objects, read_mesh_assets) != read_set_digest ||
-        rebase_set_digest("write", write_objects, write_mesh_assets) != write_set_digest) {
+        !subset(write_material_regions, read_material_regions) ||
+        std::any_of(read_material_regions.begin(), read_material_regions.end(),
+            [this](project::MaterialRegionKey key) {
+                return !std::binary_search(
+                    read_mesh_assets.begin(), read_mesh_assets.end(), key.mesh_asset);
+            }) ||
+        std::any_of(write_material_regions.begin(), write_material_regions.end(),
+            [this](project::MaterialRegionKey key) {
+                return !std::binary_search(
+                    write_mesh_assets.begin(), write_mesh_assets.end(), key.mesh_asset);
+            }) ||
+        rebase_set_digest("read", read_objects, read_mesh_assets,
+            read_material_regions) != read_set_digest ||
+        rebase_set_digest("write", write_objects, write_mesh_assets,
+            write_material_regions) != write_set_digest) {
         return core::Result<void>::failure(invalid(
             "agent rebase receipt is malformed or its read/write sets are not bound"));
     }
@@ -5198,8 +5304,14 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
     std::map<std::string, std::set<std::uint64_t>> write_meshes_by_step;
     std::map<scene::ObjectId, std::set<std::string>> steps_by_object_dependency;
     std::map<std::uint64_t, std::set<std::string>> steps_by_mesh_dependency;
+    std::map<project::MaterialRegionKey, std::set<std::string>>
+        steps_by_material_region_dependency;
     std::set<std::uint64_t> read_mesh_assets;
     std::set<std::uint64_t> write_mesh_assets;
+    std::set<project::MaterialRegionKey> read_material_regions;
+    std::set<project::MaterialRegionKey> write_material_regions;
+    std::set<std::string> material_source_dependent_steps;
+    std::set<std::string> material_conflicting_steps;
     const auto add_blocker = [&analysis](std::string message) {
         if (analysis.blockers.size() < 512U &&
             std::find(analysis.blockers.begin(), analysis.blockers.end(), message) ==
@@ -5249,9 +5361,20 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
     for (const auto& step : checkpoint.plan.steps) {
         read_objects.insert(step.target.object);
         steps_by_object_dependency[step.target.object].insert(step.id);
-        if (intent_starts_with(step.intent, "assign", "material")) {
-            add_blocker(
-                "material catalog writes are not yet represented by checkpoint rebase read/write sets");
+        const bool material_assignment = intent_starts_with(
+            step.intent, "assign", "material");
+        const auto material_intent = material_assignment
+            ? parse_material_assignment_intent(step.intent) : std::nullopt;
+        if (material_assignment) {
+            material_source_dependent_steps.insert(step.id);
+            if (!material_intent.has_value()) {
+                add_blocker(
+                    "checkpoint material assignment intent cannot be represented by a bounded region write set");
+            }
+            if (!std::holds_alternative<std::monostate>(step.target.component)) {
+                add_blocker(
+                    "checkpoint material assignment does not use an object target");
+            }
         }
         const auto* target = base.scene().find(step.target.object);
         if (target == nullptr) {
@@ -5260,7 +5383,8 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
             continue;
         }
         add_read_ancestry(base, step.target.object, step.id);
-        if (std::holds_alternative<std::monostate>(step.target.component)) {
+        if (!material_assignment &&
+            std::holds_alternative<std::monostate>(step.target.component)) {
             transform_write_roots.insert(step.target.object);
             write_objects.insert(step.target.object);
             write_objects_by_step[step.id].insert(step.target.object);
@@ -5299,6 +5423,31 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
         write_mesh_assets.insert(asset);
         write_meshes_by_step[step.id].insert(asset);
         steps_by_mesh_dependency[asset].insert(step.id);
+        if (material_assignment && material_intent.has_value()) {
+            const project::MaterialRegionKey key{asset, material_intent->region};
+            read_material_regions.insert(key);
+            write_material_regions.insert(key);
+            steps_by_material_region_dependency[key].insert(step.id);
+            const auto material = base.material_catalog().materials().find(
+                material_intent->material);
+            const auto resolved = base.material_catalog().resolve_material(
+                material_intent->material, material_intent->variant);
+            if (material == base.material_catalog().materials().end() || !resolved) {
+                add_blocker(
+                    "checkpoint material assignment source does not resolve in its saved catalog");
+            }
+            if (material_intent->variant.has_value()) {
+                const auto variant = base.material_catalog().variants().find(
+                    *material_intent->variant);
+                if (variant == base.material_catalog().variants().end() ||
+                    (!variant->second.permitted_mesh_assets.empty() &&
+                        !std::binary_search(variant->second.permitted_mesh_assets.begin(),
+                            variant->second.permitted_mesh_assets.end(), asset))) {
+                    add_blocker(
+                        "checkpoint material variant does not permit its saved mesh asset");
+                }
+            }
+        }
         for (const auto& instance : base.scene().objects_sorted()) {
             if (instance.mesh_asset == target->mesh_asset) {
                 read_objects.insert(instance.id);
@@ -5348,6 +5497,38 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
         }
     }
     for (const auto object : write_objects) add_read_ancestry(base, object, std::nullopt);
+
+    if (!read_material_regions.empty()) {
+        const auto base_material_sources = material_catalog_source_projection(
+            base.material_catalog());
+        const auto current_material_sources = material_catalog_source_projection(
+            current.material_catalog());
+        if (!base_material_sources || !current_material_sources) {
+            add_blocker(
+                "checkpoint material catalog dependencies could not be inspected safely");
+            material_conflicting_steps.insert(
+                material_source_dependent_steps.begin(),
+                material_source_dependent_steps.end());
+        } else if (base_material_sources.value() != current_material_sources.value()) {
+            add_blocker(
+                "material source definitions changed since the checkpoint source");
+            material_conflicting_steps.insert(
+                material_source_dependent_steps.begin(),
+                material_source_dependent_steps.end());
+        }
+        for (const auto key : read_material_regions) {
+            if (!same_material_assignment_at(
+                    base.material_catalog(), current.material_catalog(), key)) {
+                add_blocker(
+                    "material region assignment changed since the checkpoint source");
+                const auto steps = steps_by_material_region_dependency.find(key);
+                if (steps != steps_by_material_region_dependency.end()) {
+                    material_conflicting_steps.insert(
+                        steps->second.begin(), steps->second.end());
+                }
+            }
+        }
+    }
 
     std::set<scene::ObjectId> object_ids;
     for (const auto& object : base.scene().objects_sorted()) object_ids.insert(object.id);
@@ -5450,7 +5631,7 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
     // Identify the smallest plan branch whose source inputs changed. Read-only
     // changes invalidate those nodes and their dependents for replay; overlapping
     // write conflicts remain blockers.
-    std::set<std::string> directly_conflicting_steps;
+    std::set<std::string> directly_conflicting_steps = material_conflicting_steps;
     const auto mark_steps = [&directly_conflicting_steps](
         const auto& dependencies, const auto& identity) {
         const auto found = dependencies.find(identity);
@@ -5553,6 +5734,10 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
     analysis.write_objects.assign(write_objects.begin(), write_objects.end());
     analysis.read_mesh_assets.assign(read_mesh_assets.begin(), read_mesh_assets.end());
     analysis.write_mesh_assets.assign(write_mesh_assets.begin(), write_mesh_assets.end());
+    analysis.read_material_regions.assign(
+        read_material_regions.begin(), read_material_regions.end());
+    analysis.write_material_regions.assign(
+        write_material_regions.begin(), write_material_regions.end());
     std::sort(analysis.conflicting_objects.begin(), analysis.conflicting_objects.end());
     analysis.conflicting_objects.erase(std::unique(
         analysis.conflicting_objects.begin(), analysis.conflicting_objects.end()),
@@ -5562,9 +5747,11 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
         analysis.conflicting_mesh_assets.begin(), analysis.conflicting_mesh_assets.end()),
         analysis.conflicting_mesh_assets.end());
     analysis.read_set_digest = rebase_set_digest(
-        "read", analysis.read_objects, analysis.read_mesh_assets);
+        "read", analysis.read_objects, analysis.read_mesh_assets,
+        analysis.read_material_regions);
     analysis.write_set_digest = rebase_set_digest(
-        "write", analysis.write_objects, analysis.write_mesh_assets);
+        "write", analysis.write_objects, analysis.write_mesh_assets,
+        analysis.write_material_regions);
     return core::Result<AgentRebaseAnalysis>::success(std::move(analysis));
 }
 
@@ -5620,6 +5807,8 @@ core::Result<AgentTask> AgentTask::rebase_checkpoint(
     receipt.write_objects = analysis.value().write_objects;
     receipt.read_mesh_assets = analysis.value().read_mesh_assets;
     receipt.write_mesh_assets = analysis.value().write_mesh_assets;
+    receipt.read_material_regions = analysis.value().read_material_regions;
+    receipt.write_material_regions = analysis.value().write_material_regions;
 
     // A review checkpoint whose dependency graph is untouched can reuse its
     // verified artifact. First replay it against the exact historical source;
@@ -5663,7 +5852,9 @@ core::Result<AgentTask> AgentTask::rebase_checkpoint(
         auto merged = source.merge_agent_rebase_document(
             merge_base, saved_speculative.value(),
             analysis.value().read_objects, analysis.value().read_mesh_assets,
-            analysis.value().write_objects, analysis.value().write_mesh_assets);
+            analysis.value().write_objects, analysis.value().write_mesh_assets,
+            analysis.value().read_material_regions,
+            analysis.value().write_material_regions);
         if (!merged) return core::Result<AgentTask>::failure(merged.error());
         for (const auto& progress : historical_task.plan_progress_) {
             if (progress.status == StepStatus::passed) {
@@ -5746,8 +5937,14 @@ core::Result<AgentTask> AgentTask::rebase_checkpoint(
             analysis.value().invalidated_step_ids.end());
         std::map<scene::ObjectId, std::string> object_writers;
         std::map<std::uint64_t, std::string> mesh_writers;
-        bool can_selectively_replay = true;
+        const bool has_material_assignment = std::any_of(
+            checkpoint.plan.steps.begin(), checkpoint.plan.steps.end(),
+            [](const AgentPlanStep& step) {
+                return intent_starts_with(step.intent, "assign", "material");
+            });
+        bool can_selectively_replay = !has_material_assignment;
         for (const auto& step : checkpoint.plan.steps) {
+            if (!can_selectively_replay) break;
             if (std::holds_alternative<std::monostate>(step.target.component)) {
                 for (const auto& object : merge_base.scene().objects_sorted()) {
                     const scene::SceneObject* ancestor = &object;
@@ -5868,6 +6065,14 @@ core::Result<AgentTask> AgentTask::rebase_checkpoint(
                     rebased.value().speculative_->document_.meshes().end()
                 ? nullptr : &new_mesh->second;
             if (!same_mesh_state(old_value, new_value)) {
+                write_result_matches = false;
+                break;
+            }
+        }
+        for (const auto key : analysis.value().write_material_regions) {
+            if (!same_material_assignment_at(
+                    saved_speculative.value().material_catalog(),
+                    rebased.value().speculative_->document_.material_catalog(), key)) {
                 write_result_matches = false;
                 break;
             }

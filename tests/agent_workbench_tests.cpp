@@ -64,7 +64,8 @@ std::vector<carto::scene::ObjectId> create_boxes(
 
 carto::geometry::EditableMesh add_test_uv_set(
     carto::geometry::EditableMesh mesh,
-    const std::vector<carto::core::Vec2d>& uv_values) {
+    const std::vector<carto::core::Vec2d>& uv_values,
+    bool include_second_material_region = false) {
     using namespace carto;
     const auto topology = mesh.topology();
     REQUIRE(topology);
@@ -80,8 +81,13 @@ carto::geometry::EditableMesh add_test_uv_set(
         {"uv.source.corners", attributes::AttributeDomain::corner,
             attributes::AttributeType::vec2},
         std::move(values)}));
-    std::vector<attributes::AttributeValue> material_regions(
-        faces.size(), std::uint32_t{1U});
+    std::vector<attributes::AttributeValue> material_regions;
+    material_regions.reserve(faces.size());
+    for (std::size_t index = 0U; index < faces.size(); ++index) {
+        const std::uint32_t region = include_second_material_region && index % 2U == 1U
+            ? 2U : 1U;
+        material_regions.emplace_back(region);
+    }
     REQUIRE(attribute_set.add_layer(attributes::AttributeLayer{
         {"cartographer.material_slot", attributes::AttributeDomain::face,
             attributes::AttributeType::uint32},
@@ -147,14 +153,16 @@ struct MaterialTargetFixture {
 };
 
 MaterialTargetFixture create_material_target(
-    carto::application::ApplicationSession& session) {
+    carto::application::ApplicationSession& session,
+    bool include_second_material_region = false) {
     auto mesh = carto::geometry::make_box({1.0, 1.0, 1.0});
     REQUIRE(mesh);
     const auto topology = mesh.value().topology();
     REQUIRE(topology);
     std::vector<carto::core::Vec2d> uv_values(
         topology.value().corners.size(), carto::core::Vec2d{});
-    auto authored_mesh = add_test_uv_set(std::move(mesh.value()), uv_values);
+    auto authored_mesh = add_test_uv_set(
+        std::move(mesh.value()), uv_values, include_second_material_region);
     REQUIRE(carto::application::HumanApplicationAccess::dispatch(
         session, carto::application::CreateMeshObjectAction{
             "Material target", std::move(authored_mesh)}));
@@ -233,7 +241,7 @@ void skip_checkpoint_strings(const std::vector<std::string>& fields, std::size_t
 }
 
 std::vector<std::string> legacy_v3_fields_from_current(std::vector<std::string> fields) {
-    REQUIRE(fields.size() > 10U && fields[0] == "9");
+    REQUIRE(fields.size() > 10U && fields[0] == "10");
     fields[0] = "8";
     fields.pop_back(); // Version 8 stores ghost anchors and recompute receipts in an extension.
     fields[0] = "7";
@@ -2341,7 +2349,7 @@ void persistent_checkpoint_v1_format_remains_readable() {
         return std::to_string(value.size()) + ":" + std::string(value) + "|";
     };
     auto v4_fields = checkpoint_fields(current_body);
-    REQUIRE(v4_fields.size() > 13U && v4_fields[0] == "9");
+    REQUIRE(v4_fields.size() > 13U && v4_fields[0] == "10");
     v4_fields[0] = "8";
     v4_fields.pop_back();
     v4_fields[0] = "7";
@@ -3018,42 +3026,168 @@ void direct_lightmap_uv_action_rejects_invalid_and_stale_parameters() {
     REQUIRE(source.snapshot().project_revision == before.project_revision);
 }
 
-void material_catalog_checkpoint_rebase_is_blocked_until_its_write_set_is_modeled() {
+void material_catalog_checkpoint_rebase_models_region_writes_and_detects_conflicts() {
     TempDirectory temp;
-    carto::application::ApplicationSession source;
-    const auto fixture = create_material_target(source);
-    const auto before = source.snapshot();
-    auto plan = plan_for(before, {fixture.object}, {
-        {"step-1", {fixture.object, std::monostate{}},
-            "assign material " + std::to_string(fixture.material) + " to region 1"},
-    });
-    auto envelope = envelope_for({fixture.object});
-    envelope.permitted_effects |= carto::agent::effect_mask(carto::agent::Effect::material);
-    const auto reauthorized_plan = plan;
-    auto task = carto::agent::AgentTask::begin(source, std::move(plan), envelope);
-    REQUIRE(task);
-    REQUIRE(task.value().run().value().can_accept);
-    const auto checkpoint_path = temp.path() / "material-rebase.carto-agent-task";
-    REQUIRE(task.value().save_checkpoint(checkpoint_path));
-    const auto checkpoint = carto::agent::AgentTask::load_checkpoint(checkpoint_path);
-    REQUIRE(checkpoint);
+    const auto save_material_checkpoint = [&temp](
+            carto::application::ApplicationSession& source,
+            const MaterialTargetFixture& fixture,
+            std::string_view name) {
+        const auto before = source.snapshot();
+        auto plan = plan_for(before, {fixture.object}, {
+            {"step-1", {fixture.object, std::monostate{}},
+                "assign material " + std::to_string(fixture.material) + " to region 1"},
+        });
+        auto envelope = envelope_for({fixture.object});
+        envelope.permitted_effects |=
+            carto::agent::effect_mask(carto::agent::Effect::material);
+        auto task = carto::agent::AgentTask::begin(source, std::move(plan), envelope);
+        REQUIRE(task);
+        const auto run = task.value().run();
+        REQUIRE(run && run.value().can_accept);
+        const auto checkpoint_path = temp.path() / name;
+        REQUIRE(task.value().save_checkpoint(checkpoint_path));
+        auto checkpoint = carto::agent::AgentTask::load_checkpoint(checkpoint_path);
+        REQUIRE(checkpoint);
+        return std::move(checkpoint.value());
+    };
 
-    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
-        source, carto::application::CreateBoxAction{"Disjoint source edit", {1.0, 1.0, 1.0}}));
-    const auto analysis = carto::agent::AgentTask::analyze_checkpoint_rebase(
-        source, checkpoint.value());
-    REQUIRE(analysis);
-    REQUIRE(!analysis.value().can_rebase());
-    REQUIRE(std::any_of(analysis.value().blockers.begin(), analysis.value().blockers.end(),
-        [](const auto& blocker) {
-            return blocker.find("material catalog writes are not yet represented") !=
-                std::string::npos;
-        }));
-    const auto rejected_rebase = carto::agent::AgentTask::rebase_checkpoint(
-        source, checkpoint.value(), reauthorized_plan);
-    REQUIRE(!rejected_rebase);
-    REQUIRE(rejected_rebase.error().code == carto::core::ErrorCode::stale_data);
-    REQUIRE(source.snapshot().material_assignments.empty());
+    {
+        carto::application::ApplicationSession source;
+        const auto fixture = create_material_target(source);
+        const auto checkpoint = save_material_checkpoint(
+            source, fixture, "material-rebase-disjoint-scene.carto-agent-task");
+        REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+            source, carto::application::CreateBoxAction{
+                "Disjoint source edit", {1.0, 1.0, 1.0}}));
+        const auto analysis = carto::agent::AgentTask::analyze_checkpoint_rebase(
+            source, checkpoint);
+        REQUIRE(analysis && analysis.value().can_rebase());
+        const carto::project::MaterialRegionKey key{fixture.mesh_asset, 1U};
+        REQUIRE(analysis.value().read_material_regions ==
+            std::vector<carto::project::MaterialRegionKey>{key});
+        REQUIRE(analysis.value().write_material_regions ==
+            std::vector<carto::project::MaterialRegionKey>{key});
+        REQUIRE(std::find(analysis.value().write_mesh_assets.begin(),
+            analysis.value().write_mesh_assets.end(), fixture.mesh_asset) !=
+            analysis.value().write_mesh_assets.end());
+
+        auto reauthorized_plan = checkpoint.plan;
+        reauthorized_plan.objective.base_revision = source.snapshot().project_revision;
+        auto rebased = carto::agent::AgentTask::rebase_checkpoint(
+            source, checkpoint, reauthorized_plan);
+        REQUIRE(rebased);
+        REQUIRE(rebased.value().snapshot().status == carto::agent::TaskStatus::review);
+        REQUIRE(rebased.value().snapshot().can_accept);
+        REQUIRE(rebased.value().snapshot().rebases.size() == 1U);
+        REQUIRE(rebased.value().snapshot().rebases.front().read_material_regions ==
+            std::vector<carto::project::MaterialRegionKey>{key});
+        REQUIRE(source.snapshot().material_assignments.empty());
+
+        const auto rebased_checkpoint_path =
+            temp.path() / "material-rebase-receipt.carto-agent-task";
+        REQUIRE(rebased.value().save_checkpoint(rebased_checkpoint_path));
+        const auto saved_rebase = carto::agent::AgentTask::load_checkpoint(
+            rebased_checkpoint_path);
+        REQUIRE(saved_rebase);
+        REQUIRE(saved_rebase.value().rebase_lineage.size() == 1U);
+        REQUIRE(saved_rebase.value().rebase_lineage.front().write_material_regions ==
+            std::vector<carto::project::MaterialRegionKey>{key});
+
+        REQUIRE(carto::application::HumanApplicationAccess::accept_agent_task(
+            rebased.value()));
+        REQUIRE(source.snapshot().material_assignments.size() == 1U);
+        REQUIRE(source.snapshot().material_assignments.front().material == fixture.material);
+    }
+
+    {
+        carto::application::ApplicationSession source;
+        const auto fixture = create_material_target(source, true);
+        const auto checkpoint = save_material_checkpoint(
+            source, fixture, "material-rebase-disjoint-region.carto-agent-task");
+        auto current = source.snapshot();
+        REQUIRE(carto::application::HumanApplicationAccess::dispatch(source,
+            carto::application::SetMaterialRegionAssignmentAction{
+                current.project_revision,
+                {fixture.mesh_asset, 2U}, fixture.material, std::nullopt}));
+        const auto analysis = carto::agent::AgentTask::analyze_checkpoint_rebase(
+            source, checkpoint);
+        REQUIRE(analysis && analysis.value().can_rebase());
+        auto reauthorized_plan = checkpoint.plan;
+        reauthorized_plan.objective.base_revision = source.snapshot().project_revision;
+        auto rebased = carto::agent::AgentTask::rebase_checkpoint(
+            source, checkpoint, reauthorized_plan);
+        REQUIRE(rebased && rebased.value().snapshot().can_accept);
+        REQUIRE(source.snapshot().material_assignments.size() == 1U);
+        REQUIRE(source.snapshot().material_assignments.front().key.region_id == 2U);
+        REQUIRE(carto::application::HumanApplicationAccess::accept_agent_task(
+            rebased.value()));
+        const auto accepted = source.snapshot();
+        REQUIRE(accepted.material_assignments.size() == 2U);
+        REQUIRE(std::any_of(accepted.material_assignments.begin(),
+            accepted.material_assignments.end(), [](const auto& assignment) {
+                return assignment.key.region_id == 1U;
+            }));
+        REQUIRE(std::any_of(accepted.material_assignments.begin(),
+            accepted.material_assignments.end(), [](const auto& assignment) {
+                return assignment.key.region_id == 2U;
+            }));
+    }
+
+    {
+        carto::application::ApplicationSession source;
+        const auto fixture = create_material_target(source);
+        auto current = source.snapshot();
+        REQUIRE(carto::application::HumanApplicationAccess::dispatch(source,
+            carto::application::CreateMaterialAction{
+                current.project_revision, "Alternate workbench stone", {}}));
+        const auto alternate_material = source.snapshot().materials.back().id;
+        const auto checkpoint = save_material_checkpoint(
+            source, fixture, "material-rebase-same-region.carto-agent-task");
+        current = source.snapshot();
+        REQUIRE(carto::application::HumanApplicationAccess::dispatch(source,
+            carto::application::SetMaterialRegionAssignmentAction{
+                current.project_revision,
+                {fixture.mesh_asset, 1U}, alternate_material, std::nullopt}));
+        const auto analysis = carto::agent::AgentTask::analyze_checkpoint_rebase(
+            source, checkpoint);
+        REQUIRE(analysis && !analysis.value().can_rebase());
+        REQUIRE(std::any_of(analysis.value().blockers.begin(), analysis.value().blockers.end(),
+            [](const auto& blocker) {
+                return blocker.find("material region assignment changed") !=
+                    std::string::npos;
+            }));
+        auto reauthorized_plan = checkpoint.plan;
+        reauthorized_plan.objective.base_revision = source.snapshot().project_revision;
+        const auto rejected = carto::agent::AgentTask::rebase_checkpoint(
+            source, checkpoint, reauthorized_plan);
+        REQUIRE(!rejected);
+        REQUIRE(rejected.error().code == carto::core::ErrorCode::stale_data);
+        REQUIRE(source.snapshot().material_assignments.size() == 1U);
+        REQUIRE(source.snapshot().material_assignments.front().material == alternate_material);
+    }
+
+    {
+        carto::application::ApplicationSession source;
+        const auto fixture = create_material_target(source);
+        const auto checkpoint = save_material_checkpoint(
+            source, fixture, "material-rebase-source-change.carto-agent-task");
+        auto current = source.snapshot();
+        auto changed_definition = current.materials.front().definition;
+        changed_definition.roughness = 0.37;
+        REQUIRE(carto::application::HumanApplicationAccess::dispatch(source,
+            carto::application::UpdateMaterialAction{
+                current.project_revision, fixture.material,
+                current.materials.front().revision, changed_definition}));
+        const auto analysis = carto::agent::AgentTask::analyze_checkpoint_rebase(
+            source, checkpoint);
+        REQUIRE(analysis && !analysis.value().can_rebase());
+        REQUIRE(std::any_of(analysis.value().blockers.begin(), analysis.value().blockers.end(),
+            [](const auto& blocker) {
+                return blocker.find("material source definitions changed") !=
+                    std::string::npos;
+            }));
+        REQUIRE(source.snapshot().material_assignments.empty());
+    }
 }
 
 void work_envelope_blocks_topology_effect_before_live_mutation() {
@@ -4911,7 +5045,7 @@ void ui_ghost_corrections_are_scoped_revalidated_and_checkpointed() {
     const std::size_t body_begin = body_length_end + 1U;
     auto legacy_v5_fields = checkpoint_fields(
         legacy_encoding.value().substr(body_begin, body_length));
-    REQUIRE(legacy_v5_fields[0] == "9");
+    REQUIRE(legacy_v5_fields[0] == "10");
     legacy_v5_fields.pop_back();
     legacy_v5_fields[0] = "7";
     REQUIRE(legacy_v5_fields[0] == "7");
@@ -6137,7 +6271,7 @@ int main() {
         ui_reviews_persists_and_undoes_opt_in_lightmap_uv_generation();
         agent_lightmap_uv_fails_closed_without_permission_or_complete_mesh_scope();
         direct_lightmap_uv_action_rejects_invalid_and_stale_parameters();
-        material_catalog_checkpoint_rebase_is_blocked_until_its_write_set_is_modeled();
+        material_catalog_checkpoint_rebase_models_region_writes_and_detects_conflicts();
         work_envelope_blocks_topology_effect_before_live_mutation();
         work_envelope_blocks_topology_churn_over_budget();
         diff_digest_tracks_geometry_values_not_only_change_shape();

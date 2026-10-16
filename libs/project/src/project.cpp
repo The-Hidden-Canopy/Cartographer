@@ -88,6 +88,57 @@ constexpr std::uint64_t kMaxSerializedSpatialFieldLineage = 4096U;
 constexpr std::uint64_t kMaxSerializedSpatialFieldBytes =
     spatial_field::ScalarField2D::kMaxSerializedBytes;
 constexpr std::uint64_t kMaxSerializedSpatialFieldAggregateBytes = 32ULL * 1024ULL * 1024ULL;
+
+const MaterialRegionAssignment* material_assignment_at(
+    const MaterialCatalog& catalog,
+    MaterialRegionKey key) {
+    const auto found = catalog.assignments().find(key);
+    return found == catalog.assignments().end() ? nullptr : &found->second;
+}
+
+bool same_material_assignment(
+    const MaterialRegionAssignment* left,
+    const MaterialRegionAssignment* right) noexcept {
+    if (left == nullptr || right == nullptr) return left == right;
+    return left->key == right->key && left->material == right->material &&
+        left->variant == right->variant;
+}
+
+core::Result<void> copy_material_assignment(
+    MaterialCatalog& destination,
+    const MaterialCatalog& source,
+    MaterialRegionKey key) {
+    const auto* source_assignment = material_assignment_at(source, key);
+    const auto destination_found = destination.assignments().find(key);
+    if (source_assignment == nullptr) {
+        if (destination_found == destination.assignments().end()) {
+            return core::Result<void>::success();
+        }
+        return destination.erase_assignment(key);
+    }
+    if (destination_found == destination.assignments().end()) {
+        return destination.insert_assignment(*source_assignment);
+    }
+    return destination.replace_assignment(*source_assignment);
+}
+
+core::Result<MaterialCatalog> material_catalog_without_assignments(
+    const MaterialCatalog& catalog) {
+    MaterialCatalog result = catalog;
+    std::vector<MaterialRegionKey> keys;
+    keys.reserve(result.assignments().size());
+    for (const auto& [key, assignment] : result.assignments()) {
+        static_cast<void>(assignment);
+        keys.push_back(key);
+    }
+    for (const auto key : keys) {
+        if (auto erased = result.erase_assignment(key); !erased) {
+            return core::Result<MaterialCatalog>::failure(erased.error());
+        }
+    }
+    return core::Result<MaterialCatalog>::success(std::move(result));
+}
+
 std::mutex g_project_save_mutex;
 std::atomic<std::uint64_t> g_project_temp_counter{0U};
 std::atomic<std::uint64_t> g_project_namespace_counter{0U};
@@ -473,7 +524,9 @@ core::Result<ProjectDocument> ProjectDocument::merge_disjoint_scene_mesh_changes
     const std::vector<scene::ObjectId>& read_objects,
     const std::vector<std::uint64_t>& read_mesh_assets,
     const std::vector<scene::ObjectId>& write_objects,
-    const std::vector<std::uint64_t>& write_mesh_assets) {
+    const std::vector<std::uint64_t>& write_mesh_assets,
+    const std::vector<MaterialRegionKey>& read_material_regions,
+    const std::vector<MaterialRegionKey>& write_material_regions) {
     const auto stale = [](std::string message) {
         return core::Result<ProjectDocument>::failure(Diagnostic(
             ErrorCode::stale_data, std::move(message)));
@@ -510,6 +563,8 @@ core::Result<ProjectDocument> ProjectDocument::merge_disjoint_scene_mesh_changes
         read_mesh_assets.size() > kMaxSerializedMeshes ||
         write_objects.size() > kMaxSerializedObjects ||
         write_mesh_assets.size() > kMaxSerializedMeshes ||
+        read_material_regions.size() > MaterialCatalog::kMaxRecordsPerKind ||
+        write_material_regions.size() > MaterialCatalog::kMaxRecordsPerKind ||
         !std::is_sorted(read_objects.begin(), read_objects.end()) ||
         std::adjacent_find(read_objects.begin(), read_objects.end()) != read_objects.end() ||
         !std::is_sorted(read_mesh_assets.begin(), read_mesh_assets.end()) ||
@@ -519,7 +574,17 @@ core::Result<ProjectDocument> ProjectDocument::merge_disjoint_scene_mesh_changes
         std::adjacent_find(write_objects.begin(), write_objects.end()) != write_objects.end() ||
         !std::is_sorted(write_mesh_assets.begin(), write_mesh_assets.end()) ||
         std::adjacent_find(write_mesh_assets.begin(), write_mesh_assets.end()) !=
-            write_mesh_assets.end()) {
+            write_mesh_assets.end() ||
+        !std::is_sorted(read_material_regions.begin(), read_material_regions.end()) ||
+        std::adjacent_find(read_material_regions.begin(), read_material_regions.end()) !=
+            read_material_regions.end() ||
+        !std::is_sorted(write_material_regions.begin(), write_material_regions.end()) ||
+        std::adjacent_find(write_material_regions.begin(), write_material_regions.end()) !=
+            write_material_regions.end() ||
+        std::any_of(read_material_regions.begin(), read_material_regions.end(),
+            [](MaterialRegionKey key) { return key.mesh_asset == 0U || key.region_id == 0U; }) ||
+        std::any_of(write_material_regions.begin(), write_material_regions.end(),
+            [](MaterialRegionKey key) { return key.mesh_asset == 0U || key.region_id == 0U; })) {
         return invalid_merge("checkpoint rebase write sets are not canonical and bounded");
     }
     const std::set<scene::ObjectId> object_writes(
@@ -530,13 +595,43 @@ core::Result<ProjectDocument> ProjectDocument::merge_disjoint_scene_mesh_changes
         read_mesh_assets.begin(), read_mesh_assets.end());
     const std::set<std::uint64_t> mesh_writes(
         write_mesh_assets.begin(), write_mesh_assets.end());
+    const std::set<MaterialRegionKey> material_reads(
+        read_material_regions.begin(), read_material_regions.end());
+    const std::set<MaterialRegionKey> material_writes(
+        write_material_regions.begin(), write_material_regions.end());
     const auto subset = [](const auto& values, const auto& superset) {
         return std::all_of(values.begin(), values.end(), [&superset](const auto value) {
             return superset.contains(value);
         });
     };
-    if (!subset(object_writes, object_reads) || !subset(mesh_writes, mesh_reads)) {
+    if (!subset(object_writes, object_reads) || !subset(mesh_writes, mesh_reads) ||
+        !subset(material_writes, material_reads) ||
+        std::any_of(read_material_regions.begin(), read_material_regions.end(),
+            [&mesh_reads](MaterialRegionKey key) {
+                return !mesh_reads.contains(key.mesh_asset);
+            }) ||
+        std::any_of(write_material_regions.begin(), write_material_regions.end(),
+            [&mesh_writes](MaterialRegionKey key) {
+                return !mesh_writes.contains(key.mesh_asset);
+            })) {
         return invalid_merge("checkpoint rebase write sets expand beyond their read sets");
+    }
+    if (!read_material_regions.empty()) {
+        auto base_sources = material_catalog_without_assignments(base.material_catalog_);
+        auto current_sources = material_catalog_without_assignments(current.material_catalog_);
+        if (!base_sources || !current_sources) {
+            return invalid_merge("checkpoint rebase could not inspect material catalog dependencies");
+        }
+        if (base_sources.value().serialize() != current_sources.value().serialize()) {
+            return stale("material source definitions changed since the checkpoint source");
+        }
+        for (const MaterialRegionKey key : read_material_regions) {
+            if (!same_material_assignment(
+                    material_assignment_at(base.material_catalog_, key),
+                    material_assignment_at(current.material_catalog_, key))) {
+                return stale("material region assignment changed since the checkpoint source");
+            }
+        }
     }
     const auto same_transform = [](const core::Transform& left,
                                    const core::Transform& right) {
@@ -729,6 +824,18 @@ core::Result<ProjectDocument> ProjectDocument::merge_disjoint_scene_mesh_changes
             expected_speculative.cloth_rest_pose_receipts_[asset] = receipt->second;
         }
     }
+    MaterialCatalog expected_material_catalog = base.material_catalog_;
+    for (const MaterialRegionKey key : write_material_regions) {
+        if (auto copied = copy_material_assignment(
+                expected_material_catalog, speculative.material_catalog_, key); !copied) {
+            return core::Result<ProjectDocument>::failure(copied.error());
+        }
+    }
+    if (expected_material_catalog.serialize() != speculative.material_catalog_.serialize()) {
+        return invalid_merge(
+            "speculative checkpoint changed material catalog data outside declared region assignments");
+    }
+    expected_speculative.material_catalog_ = std::move(expected_material_catalog);
     expected_speculative.topology_receipts_ = speculative.topology_receipts_;
     expected_speculative.revision_ = speculative.revision_;
     if (expected_speculative.serialize() != speculative.serialize()) {
@@ -752,6 +859,14 @@ core::Result<ProjectDocument> ProjectDocument::merge_disjoint_scene_mesh_changes
             merged.cloth_rest_pose_receipts_[asset] = receipt->second;
         }
     }
+    MaterialCatalog merged_material_catalog = current.material_catalog_;
+    for (const MaterialRegionKey key : write_material_regions) {
+        if (auto copied = copy_material_assignment(
+                merged_material_catalog, speculative.material_catalog_, key); !copied) {
+            return core::Result<ProjectDocument>::failure(copied.error());
+        }
+    }
+    merged.material_catalog_ = std::move(merged_material_catalog);
     merged.topology_receipts_.insert(
         merged.topology_receipts_.end(),
         speculative.topology_receipts_.begin() +
