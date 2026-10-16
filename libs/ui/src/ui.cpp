@@ -2082,6 +2082,7 @@ core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
     const bool object_selection =
         authoring.value().selection_mode == editor::SelectionMode::object;
     const bool named_target = parsed_goal.value().exact_object_name.has_value();
+    const bool nearest_spatial_target = parsed_goal.value().nearest_object_scope.has_value();
     if (named_target) {
         constexpr std::size_t kMaxNamedTargetQueryScope = 512U;
         if (source_snapshot.objects.empty() ||
@@ -2161,6 +2162,128 @@ core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
                 "exact-name goal targets must be unlocked root objects"));
         }
         targets.push_back(agent::TargetRef{*selected_named_target, std::monostate{}});
+    } else if (nearest_spatial_target) {
+        constexpr std::size_t kMaxSpatialTargetQueryScope = 512U;
+        if (source_snapshot.objects.empty() ||
+            source_snapshot.objects.size() > kMaxSpatialTargetQueryScope) {
+            return core::Result<void>::failure(invalid_state(
+                "nearest-object target resolution requires a project with 1 to 512 objects"));
+        }
+        std::vector<scene::ObjectId> allowed_scope;
+        allowed_scope.reserve(source_snapshot.objects.size());
+        for (const auto& object : source_snapshot.objects) {
+            allowed_scope.push_back(object.object.id);
+        }
+        std::sort(allowed_scope.begin(), allowed_scope.end());
+        if (std::adjacent_find(allowed_scope.begin(), allowed_scope.end()) !=
+            allowed_scope.end()) {
+            return core::Result<void>::failure(validation(
+                "source project contains duplicate object identities"));
+        }
+
+        agent::SceneQueryBudget query_budget;
+        const auto& spatial_scope = *parsed_goal.value().nearest_object_scope;
+        const auto anchor_query = agent::SceneQuery::execute(session_,
+            agent::SceneQueryRequest{
+                agent::ObjectsByStableNameQuery{spatial_scope.anchor_name},
+                kMaxSpatialTargetQueryScope},
+            query_budget, allowed_scope, source_snapshot.project_revision);
+        if (!anchor_query) {
+            return core::Result<void>::failure(anchor_query.error().with_context(
+                "resolving the named anchor for nearest-object target resolution"));
+        }
+        if (anchor_query.value().source_revision != source_snapshot.project_revision ||
+            anchor_query.value().truncated || !anchor_query.value().diagnostics.empty()) {
+            return core::Result<void>::failure(stale(
+                "nearest-object anchor query is stale or incomplete"));
+        }
+        if (anchor_query.value().rows.empty()) {
+            return core::Result<void>::failure(invalid_state(
+                "the nearest-object scope anchor was not found in the current project"));
+        }
+        if (anchor_query.value().rows.size() != 1U) {
+            return core::Result<void>::failure(invalid_state(
+                "nearest-object scope requires a uniquely named anchor"));
+        }
+        const auto* anchor_fact = std::get_if<agent::SceneNamedObjectFact>(
+            &anchor_query.value().rows.front());
+        if (anchor_fact == nullptr || anchor_fact->stable_name != spatial_scope.anchor_name) {
+            return core::Result<void>::failure(validation(
+                "nearest-object anchor query returned an unexpected fact"));
+        }
+        const auto anchor_object = std::find_if(source_snapshot.objects.begin(),
+            source_snapshot.objects.end(), [anchor_fact](const auto& object) {
+                return object.object.id == anchor_fact->object;
+            });
+        if (anchor_object == source_snapshot.objects.end() ||
+            anchor_object->object.name != spatial_scope.anchor_name) {
+            return core::Result<void>::failure(stale(
+                "nearest-object anchor changed after the source snapshot was captured"));
+        }
+        const auto* anchor_instance = source_snapshot.viewport.scene.find(anchor_fact->object);
+        if (anchor_instance == nullptr ||
+            !anchor_instance->world_transform.translation.finite()) {
+            return core::Result<void>::failure(stale(
+                "nearest-object anchor has no current finite world origin"));
+        }
+        const auto spatial_query = agent::SceneQuery::execute(session_,
+            agent::SceneQueryRequest{
+                agent::ObjectsWithinDistanceQuery{
+                    anchor_instance->world_transform.translation,
+                    spatial_scope.radius_world_units},
+                kMaxSpatialTargetQueryScope},
+            query_budget, allowed_scope, source_snapshot.project_revision);
+        if (!spatial_query) {
+            return core::Result<void>::failure(spatial_query.error().with_context(
+                "resolving the nearest object around the named anchor"));
+        }
+        if (spatial_query.value().source_revision != source_snapshot.project_revision ||
+            spatial_query.value().truncated || !spatial_query.value().diagnostics.empty()) {
+            return core::Result<void>::failure(stale(
+                "nearest-object spatial query is stale or incomplete"));
+        }
+        constexpr double kDistanceTieTolerance = 1e-9;
+        std::optional<agent::SceneSpatialObjectFact> nearest_candidate;
+        bool nearest_is_ambiguous = false;
+        for (const auto& row : spatial_query.value().rows) {
+            const auto* fact = std::get_if<agent::SceneSpatialObjectFact>(&row);
+            if (fact == nullptr || !fact->object || !fact->world_origin.finite() ||
+                !std::isfinite(fact->distance) || fact->distance < 0.0 ||
+                fact->distance > spatial_scope.radius_world_units) {
+                return core::Result<void>::failure(validation(
+                    "nearest-object spatial query returned an invalid fact"));
+            }
+            if (fact->object == anchor_fact->object) continue;
+            if (!nearest_candidate.has_value() ||
+                fact->distance < nearest_candidate->distance - kDistanceTieTolerance) {
+                nearest_candidate = *fact;
+                nearest_is_ambiguous = false;
+            } else if (std::abs(fact->distance - nearest_candidate->distance) <=
+                kDistanceTieTolerance) {
+                nearest_is_ambiguous = true;
+            }
+        }
+        if (!nearest_candidate.has_value()) {
+            return core::Result<void>::failure(invalid_state(
+                "no other object origin lies within the nearest-object target radius"));
+        }
+        if (nearest_is_ambiguous) {
+            return core::Result<void>::failure(invalid_state(
+                "nearest-object target is tied; use an exact name or select one object"));
+        }
+        const auto target_object = std::find_if(source_snapshot.objects.begin(),
+            source_snapshot.objects.end(), [&nearest_candidate](const auto& object) {
+                return object.object.id == nearest_candidate->object;
+            });
+        if (target_object == source_snapshot.objects.end()) {
+            return core::Result<void>::failure(stale(
+                "nearest-object target changed after the source snapshot was captured"));
+        }
+        if (target_object->object.parent.has_value() || target_object->object.locked) {
+            return core::Result<void>::failure(invalid_state(
+                "nearest-object target must be an unlocked root object; no farther object was substituted"));
+        }
+        targets.push_back(agent::TargetRef{nearest_candidate->object, std::monostate{}});
     } else if (object_selection && !authoring.value().objects.empty()) {
         constexpr std::size_t kMaxSelectedObjectTargets = 16U;
         if (authoring.value().objects.size() > kMaxSelectedObjectTargets) {

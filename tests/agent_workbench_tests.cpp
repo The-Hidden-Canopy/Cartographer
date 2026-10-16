@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace {
 
@@ -4869,6 +4870,141 @@ void agent_goal_scope_parser_rejects_malformed_prefixes_and_decodes_only_safe_es
         R"(on object "Lamp" translate object by 0.1 0 0)"));
     REQUIRE(!carto::agent::parse_agent_goal(R"(on object "Lamp":)"));
     REQUIRE(!carto::agent::parse_agent_goal(R"(on object Lamp: translate object by 0.1 0 0)"));
+
+    const auto nearest = carto::agent::parse_agent_goal(
+        R"(on nearest object within 2.5 world units of "Anchor \"A\"": translate object by 0.1 0 0)");
+    REQUIRE(nearest);
+    REQUIRE(!nearest.value().exact_object_name.has_value());
+    REQUIRE(nearest.value().nearest_object_scope.has_value());
+    REQUIRE(nearest.value().nearest_object_scope->anchor_name == "Anchor \"A\"");
+    REQUIRE(nearest.value().nearest_object_scope->radius_world_units == 2.5);
+    REQUIRE(nearest.value().commands == "translate object by 0.1 0 0");
+    REQUIRE(!carto::agent::parse_agent_goal(
+        R"(on nearest object within 0 world units of "Anchor": translate object by 0.1 0 0)"));
+    REQUIRE(!carto::agent::parse_agent_goal(
+        R"(on nearest object within 1000001 world units of "Anchor": translate object by 0.1 0 0)"));
+    REQUIRE(!carto::agent::parse_agent_goal(
+        R"(on nearest object within 2 units of "Anchor": translate object by 0.1 0 0)"));
+}
+
+void ui_spatial_goal_resolves_unique_nearest_root_without_selection_fallback() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    const auto objects = create_boxes(source, 3U);
+    const auto anchor = objects[0];
+    const auto nearest = objects[1];
+    const auto selected_fallback = objects[2];
+    auto nearest_transform = source.snapshot().objects[1].object.local_transform;
+    nearest_transform.translation = {1.0, 0.0, 0.0};
+    REQUIRE(ui.dispatch(carto::application::SetObjectTransformAction{
+        nearest, nearest_transform, std::nullopt}));
+    auto fallback_transform = source.snapshot().objects[2].object.local_transform;
+    fallback_transform.translation = {3.0, 0.0, 0.0};
+    REQUIRE(ui.dispatch(carto::application::SetObjectTransformAction{
+        selected_fallback, fallback_transform, std::nullopt}));
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{selected_fallback}));
+    const auto source_revision = source.snapshot().project_revision;
+    const std::string goal =
+        R"(on nearest object within 2 world units of "Box 1": translate object by 0.25 0 0)";
+
+    const auto resolved = ui.compile_agent_goal_sequence(goal);
+    if (!resolved) {
+        throw TestFailure("unique nearest spatial target did not compile: " +
+            resolved.error().message);
+    }
+    const auto compiled = ui.snapshot();
+    REQUIRE(compiled.agent_plan_draft.size() == 1U);
+    REQUIRE(compiled.agent_plan_draft.front().target.object == nearest);
+    REQUIRE(compiled.selection.objects == std::vector<carto::scene::ObjectId>{selected_fallback});
+    REQUIRE(source.snapshot().project_revision == source_revision);
+
+    const auto prepared = ui.prepare_agent_plan(goal, translation_envelope({nearest}, 0.5));
+    REQUIRE(prepared && prepared.value().status == carto::agent::TaskStatus::prepared);
+    REQUIRE(prepared.value().scope_objects == std::vector<carto::scene::ObjectId>{nearest});
+    const auto review = ui.run_prepared_agent_plan();
+    REQUIRE(review && review.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(review.value().can_accept);
+    REQUIRE(source.snapshot().project_revision == source_revision);
+    REQUIRE(ui.accept_agent_plan());
+
+    const auto accepted = source.snapshot();
+    const auto anchor_scene = accepted.viewport.scene.find(anchor);
+    const auto nearest_scene = accepted.viewport.scene.find(nearest);
+    const auto fallback_scene = accepted.viewport.scene.find(selected_fallback);
+    REQUIRE(anchor_scene != nullptr);
+    REQUIRE(nearest_scene != nullptr);
+    REQUIRE(fallback_scene != nullptr);
+    REQUIRE(anchor_scene->world_transform.translation.x == 0.0);
+    REQUIRE(nearest_scene->world_transform.translation.x == 1.25);
+    REQUIRE(fallback_scene->world_transform.translation.x == 3.0);
+}
+
+void ui_spatial_goal_rejects_tied_nearest_candidates_atomically() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    const auto objects = create_boxes(source, 3U);
+    for (const auto& [index, position] : std::vector<std::pair<std::size_t, double>>{
+             {1U, -1.0}, {2U, 1.0}}) {
+        auto transform = source.snapshot().objects[index].object.local_transform;
+        transform.translation = {position, 0.0, 0.0};
+        REQUIRE(ui.dispatch(carto::application::SetObjectTransformAction{
+            objects[index], transform, std::nullopt}));
+    }
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{objects[1]}));
+    const auto source_revision = source.snapshot().project_revision;
+
+    const auto outside_radius = ui.compile_agent_goal_sequence(
+        R"(on nearest object within 0.5 world units of "Box 1": translate object by 0.25 0 0)");
+    REQUIRE(!outside_radius);
+    REQUIRE(outside_radius.error().message.find("no other object") != std::string::npos);
+    REQUIRE(ui.snapshot().agent_plan_draft.empty());
+    REQUIRE(source.snapshot().project_revision == source_revision);
+
+    const auto tied = ui.compile_agent_goal_sequence(
+        R"(on nearest object within 2 world units of "Box 1": translate object by 0.25 0 0)");
+    REQUIRE(!tied);
+    REQUIRE(tied.error().message.find("tied") != std::string::npos);
+    REQUIRE(ui.snapshot().agent_plan_draft.empty());
+    REQUIRE(!ui.snapshot().agent_task.has_value());
+    REQUIRE(source.snapshot().project_revision == source_revision);
+
+    const auto missing_anchor = ui.compile_agent_goal_sequence(
+        R"(on nearest object within 2 world units of "Missing Anchor": translate object by 0.25 0 0)");
+    REQUIRE(!missing_anchor);
+    REQUIRE(missing_anchor.error().message.find("anchor was not found") != std::string::npos);
+    REQUIRE(ui.snapshot().agent_plan_draft.empty());
+    REQUIRE(source.snapshot().project_revision == source_revision);
+}
+
+void ui_spatial_goal_rejects_duplicate_named_anchors() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Anchor", {1.0, 1.0, 1.0}}));
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Target", {1.0, 1.0, 1.0}}));
+    REQUIRE(ui.dispatch(carto::application::CreateBoxAction{
+        "Anchor", {1.0, 1.0, 1.0}}));
+    const auto objects = source.snapshot().objects;
+    REQUIRE(objects.size() == 3U);
+    auto target_transform = objects[1].object.local_transform;
+    target_transform.translation = {1.0, 0.0, 0.0};
+    REQUIRE(ui.dispatch(carto::application::SetObjectTransformAction{
+        objects[1].object.id, target_transform, std::nullopt}));
+    const auto source_revision = source.snapshot().project_revision;
+
+    const auto ambiguous_anchor = ui.compile_agent_goal_sequence(
+        R"(on nearest object within 2 world units of "Anchor": translate object by 0.25 0 0)");
+    REQUIRE(!ambiguous_anchor);
+    REQUIRE(ambiguous_anchor.error().message.find("uniquely named anchor") !=
+        std::string::npos);
+    REQUIRE(ui.snapshot().agent_plan_draft.empty());
+    REQUIRE(!ui.snapshot().agent_task.has_value());
+    REQUIRE(source.snapshot().project_revision == source_revision);
 }
 
 void ui_named_goal_target_resolution_handles_bounded_large_duplicate_sets() {
@@ -5176,6 +5312,9 @@ int main() {
         ui_named_goal_target_resolution_rejects_missing_and_ambiguous_names();
         ui_named_goal_target_resolution_handles_bounded_large_duplicate_sets();
         agent_goal_scope_parser_rejects_malformed_prefixes_and_decodes_only_safe_escapes();
+        ui_spatial_goal_resolves_unique_nearest_root_without_selection_fallback();
+        ui_spatial_goal_rejects_tied_nearest_candidates_atomically();
+        ui_spatial_goal_rejects_duplicate_named_anchors();
         ui_goal_compiler_rejects_expanded_multi_object_budget_atomically();
         ui_goal_compiler_fails_closed_and_preserves_manual_drafts();
         condition_inventory_audit_never_promotes_partial_evidence_to_readiness();

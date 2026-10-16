@@ -28,6 +28,7 @@ constexpr std::size_t kMaxTaskIdBytes = 64U;
 constexpr std::size_t kMaxScopeObjects = 512U;
 constexpr std::size_t kMaxPlanSteps = 256U;
 constexpr std::size_t kMaxRepairAttempts = 4U;
+constexpr double kMaxNearestObjectRadiusWorldUnits = 1'000'000.0;
 constexpr std::uint32_t kKnownEffects = ::carto::agent::effect_mask(Effect::geometry) |
     ::carto::agent::effect_mask(Effect::topology) |
     ::carto::agent::effect_mask(Effect::transform);
@@ -828,35 +829,77 @@ core::Result<ParsedAgentGoal> parse_agent_goal(std::string_view goal) {
 
     std::size_t prefix_begin = 0U;
     while (prefix_begin < goal.size() && goal[prefix_begin] == ' ') ++prefix_begin;
-    constexpr std::string_view kScopePrefix = "on object";
+    constexpr std::string_view kNamedScopePrefix = "on object";
+    constexpr std::string_view kNearestScopePrefix = "on nearest object within";
     const auto ascii_lower = [](char value) {
         const auto byte = static_cast<unsigned char>(value);
         return byte >= 'A' && byte <= 'Z'
             ? static_cast<char>(byte + ('a' - 'A'))
             : static_cast<char>(byte);
     };
-    bool scope_prefix = goal.size() - prefix_begin >= kScopePrefix.size();
-    for (std::size_t index = 0U; scope_prefix && index < kScopePrefix.size(); ++index) {
-        scope_prefix = ascii_lower(goal[prefix_begin + index]) == kScopePrefix[index];
-    }
-    if (scope_prefix && prefix_begin + kScopePrefix.size() < goal.size() &&
-        goal[prefix_begin + kScopePrefix.size()] != ' ') {
-        scope_prefix = false;
-    }
-    if (!scope_prefix) {
-        return core::Result<ParsedAgentGoal>::success(
-            ParsedAgentGoal{std::nullopt, std::string(goal)});
+    const auto prefix_matches = [&](std::string_view prefix) {
+        if (goal.size() - prefix_begin < prefix.size()) return false;
+        for (std::size_t index = 0U; index < prefix.size(); ++index) {
+            if (ascii_lower(goal[prefix_begin + index]) != prefix[index]) return false;
+        }
+        return true;
+    };
+    const auto phrase_matches = [&](std::size_t offset, std::string_view phrase) {
+        if (goal.size() - offset < phrase.size()) return false;
+        for (std::size_t index = 0U; index < phrase.size(); ++index) {
+            if (ascii_lower(goal[offset + index]) != phrase[index]) return false;
+        }
+        return true;
+    };
+    const bool nearest_scope = prefix_matches(kNearestScopePrefix) &&
+        (goal.size() == prefix_begin + kNearestScopePrefix.size() ||
+         goal[prefix_begin + kNearestScopePrefix.size()] == ' ');
+    const bool named_scope = prefix_matches(kNamedScopePrefix) &&
+        (goal.size() == prefix_begin + kNamedScopePrefix.size() ||
+         goal[prefix_begin + kNamedScopePrefix.size()] == ' ');
+    if (!nearest_scope && !named_scope) {
+        ParsedAgentGoal parsed;
+        parsed.commands = std::string(goal);
+        return core::Result<ParsedAgentGoal>::success(std::move(parsed));
     }
 
-    std::size_t cursor = prefix_begin + kScopePrefix.size();
-    while (cursor < goal.size() && goal[cursor] == ' ') ++cursor;
+    std::size_t cursor = prefix_begin +
+        (nearest_scope ? kNearestScopePrefix.size() : kNamedScopePrefix.size());
+    std::optional<double> radius_world_units;
+    if (nearest_scope) {
+        while (cursor < goal.size() && goal[cursor] == ' ') ++cursor;
+        double radius = 0.0;
+        const auto parsed_radius = std::from_chars(
+            goal.data() + cursor, goal.data() + goal.size(), radius,
+            std::chars_format::general);
+        if (parsed_radius.ec != std::errc{} || parsed_radius.ptr == goal.data() + cursor ||
+            !std::isfinite(radius) || radius <= 0.0 ||
+            radius > kMaxNearestObjectRadiusWorldUnits) {
+            return core::Result<ParsedAgentGoal>::failure(invalid(
+                "nearest-object scope radius must be positive and at most 1000000 world units"));
+        }
+        radius_world_units = radius;
+        cursor = static_cast<std::size_t>(parsed_radius.ptr - goal.data());
+        while (cursor < goal.size() && goal[cursor] == ' ') ++cursor;
+        constexpr std::string_view kRadiusSuffix = "world units of";
+        if (!phrase_matches(cursor, kRadiusSuffix)) {
+            return core::Result<ParsedAgentGoal>::failure(invalid(
+                "nearest-object scope must use '<radius> world units of \"Anchor Name\"'"));
+        }
+        cursor += kRadiusSuffix.size();
+        while (cursor < goal.size() && goal[cursor] == ' ') ++cursor;
+    } else {
+        while (cursor < goal.size() && goal[cursor] == ' ') ++cursor;
+    }
     if (cursor >= goal.size() || goal[cursor] != '"') {
         return core::Result<ParsedAgentGoal>::failure(invalid(
-            "named goal target must use on object \"Exact Name\": command syntax"));
+            nearest_scope
+                ? "nearest-object scope must name its exact anchor in double quotes"
+                : "named goal target must use on object \"Exact Name\": command syntax"));
     }
     ++cursor;
 
-    std::string exact_name;
+    std::string target_name;
     bool closed = false;
     while (cursor < goal.size()) {
         char value = goal[cursor++];
@@ -875,15 +918,15 @@ core::Result<ParsedAgentGoal> parse_agent_goal(std::string_view goal) {
                     "named goal target supports only escaped quotes and backslashes"));
             }
         }
-        exact_name.push_back(value);
-        if (exact_name.size() > 256U) {
+        target_name.push_back(value);
+        if (target_name.size() > 256U) {
             return core::Result<ParsedAgentGoal>::failure(invalid(
-                "named goal target exceeds the 256-byte stable-name limit"));
+                "named goal target name exceeds the 256-byte stable-name limit"));
         }
     }
-    if (!closed || exact_name.empty()) {
+    if (!closed || target_name.empty()) {
         return core::Result<ParsedAgentGoal>::failure(invalid(
-            "named goal target must contain a closed, non-empty exact object name"));
+            "named goal target must contain a closed, non-empty exact name"));
     }
     while (cursor < goal.size() && goal[cursor] == ' ') ++cursor;
     if (cursor >= goal.size() || goal[cursor] != ':') {
@@ -894,10 +937,17 @@ core::Result<ParsedAgentGoal> parse_agent_goal(std::string_view goal) {
     while (cursor < goal.size() && goal[cursor] == ' ') ++cursor;
     if (cursor == goal.size()) {
         return core::Result<ParsedAgentGoal>::failure(invalid(
-            "named goal target must include a native command after the colon"));
+            "scoped goal target must include a native command after the colon"));
     }
-    return core::Result<ParsedAgentGoal>::success(ParsedAgentGoal{
-        std::move(exact_name), std::string(goal.substr(cursor))});
+    ParsedAgentGoal parsed;
+    parsed.commands = std::string(goal.substr(cursor));
+    if (nearest_scope) {
+        parsed.nearest_object_scope.emplace(ParsedAgentGoal::NearestObjectScope{
+            std::move(target_name), *radius_world_units});
+    } else {
+        parsed.exact_object_name = std::move(target_name);
+    }
+    return core::Result<ParsedAgentGoal>::success(std::move(parsed));
 }
 
 core::Result<std::vector<HardConstraint>> compile_explicit_hard_constraints(

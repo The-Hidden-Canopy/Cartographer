@@ -6790,22 +6790,28 @@ struct DesktopState {
             (snapshot.selection.mode == carto::editor::SelectionMode::vertex &&
                 snapshot.selection.component_object.has_value() &&
                 snapshot.selection.vertices.size() == 1U);
-        const auto starts_named_target_request = [this]() {
-            std::string_view text(agent_goal);
-            while (!text.empty() && text.front() == ' ') text.remove_prefix(1U);
-            constexpr std::string_view prefix = "on object";
-            if (text.size() < prefix.size()) return false;
+        std::string_view goal_prefix_text(agent_goal);
+        while (!goal_prefix_text.empty() && goal_prefix_text.front() == ' ')
+            goal_prefix_text.remove_prefix(1U);
+        const auto starts_scope_prefix = [goal_prefix_text](std::string_view prefix) {
+            if (goal_prefix_text.size() < prefix.size()) return false;
             for (std::size_t index = 0U; index < prefix.size(); ++index) {
-                const auto value = static_cast<unsigned char>(text[index]);
+                const auto value = static_cast<unsigned char>(goal_prefix_text[index]);
                 const char lower = value >= 'A' && value <= 'Z'
                     ? static_cast<char>(value + ('a' - 'A'))
                     : static_cast<char>(value);
                 if (lower != prefix[index]) return false;
             }
-            return text.size() == prefix.size() || text[prefix.size()] == ' ';
-        }();
+            return goal_prefix_text.size() == prefix.size() ||
+                goal_prefix_text[prefix.size()] == ' ';
+        };
+        const bool starts_named_target_request = starts_scope_prefix("on object");
+        const bool starts_nearest_target_request =
+            starts_scope_prefix("on nearest object within");
+        const bool starts_scoped_target_request = starts_named_target_request ||
+            starts_nearest_target_request;
         const bool compilable_target =
-            starts_named_target_request ||
+            starts_scoped_target_request ||
             (snapshot.selection.mode == carto::editor::SelectionMode::object &&
                 !snapshot.selection.objects.empty() &&
                 snapshot.selection.objects.size() <= 16U) ||
@@ -6818,6 +6824,9 @@ struct DesktopState {
         if (starts_named_target_request) {
             ImGui::TextDisabled(
                 "Target: exact-name lookup; duplicate names require exactly one matching object selected.");
+        } else if (starts_nearest_target_request) {
+            ImGui::TextDisabled(
+                "Target: nearest object origin within the stated world-unit radius of a unique exact-name anchor; selection is ignored and ties fail.");
         } else if (snapshot.selection.mode == carto::editor::SelectionMode::object &&
             !snapshot.selection.objects.empty() &&
             snapshot.selection.objects.size() <= 16U) {

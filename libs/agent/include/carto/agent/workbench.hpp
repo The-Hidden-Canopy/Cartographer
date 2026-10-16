@@ -56,9 +56,15 @@ struct HardConstraint {
 struct ParsedAgentGoal {
     std::optional<std::string> exact_object_name;
     std::string commands;
+    struct NearestObjectScope {
+        std::string anchor_name;
+        double radius_world_units = 0.0;
+    };
+    std::optional<NearestObjectScope> nearest_object_scope;
 };
 
-// Parses the optional explicit scope prefix `on object "Exact Name":`.
+// Parses an exact-name scope prefix or the explicit nearest-object scope
+// `on nearest object within <radius> world units of "Anchor Name":`.
 // The returned commands preserve the goal text and never infer a target.
 [[nodiscard]] core::Result<ParsedAgentGoal> parse_agent_goal(std::string_view goal);
 
