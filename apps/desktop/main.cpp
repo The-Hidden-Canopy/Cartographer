@@ -1159,6 +1159,10 @@ struct DesktopState {
     Vec3d inspector_vertex_position{};
     carto::render::MaterialId selected_material_id = 0U;
     std::uint32_t material_region_id = 1U;
+    std::uint64_t agent_lightmap_uv_set_id = 0U;
+    std::uint32_t agent_lightmap_uv_resolution = 128U;
+    std::uint32_t agent_lightmap_uv_padding = 2U;
+    std::uint32_t agent_lightmap_uv_tiles = 1U;
     carto::core::Revision material_draft_revision{};
     carto::render::StandardMaterial material_draft;
     bool material_draft_loaded = false;
@@ -1733,6 +1737,30 @@ struct DesktopState {
         return true;
     }
 
+    bool agent_lightmap_uv_scope_is_complete(const UiSnapshot& snapshot) const {
+        if (!agent_material_scope_is_complete(snapshot)) return false;
+        std::set<std::uint64_t> selected_meshes;
+        for (const auto object_id : snapshot.selection.objects) {
+            const auto target = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
+                [object_id](const auto& object) {
+                    return object.object.id == object_id;
+                });
+            if (target == snapshot.objects.end() || !target->object.mesh_asset.has_value() ||
+                !selected_meshes.insert(*target->object.mesh_asset).second) {
+                return false;
+            }
+        }
+        for (const auto mesh_asset : selected_meshes) {
+            const auto instances = std::count_if(
+                snapshot.objects.begin(), snapshot.objects.end(),
+                [mesh_asset](const auto& object) {
+                    return object.object.mesh_asset == mesh_asset;
+                });
+            if (instances != 1) return false;
+        }
+        return true;
+    }
+
     bool draft_material_assignment_in_agent(
         const UiSnapshot& snapshot,
         carto::render::MaterialId material,
@@ -1780,6 +1808,55 @@ struct DesktopState {
             static_cast<void>(ui.clear_agent_plan());
             agent_goal.clear();
             agent_allow_material_assignment = false;
+            agent_entry_notice.clear();
+            return false;
+        }
+        return true;
+    }
+
+    bool draft_lightmap_uv_in_agent(
+        const UiSnapshot& snapshot,
+        std::uint64_t set_id,
+        std::uint32_t resolution,
+        std::uint32_t padding,
+        std::uint32_t tiles) {
+        const bool active_task = snapshot.agent_task.has_value() &&
+            snapshot.agent_task->status != carto::agent::TaskStatus::accepted &&
+            snapshot.agent_task->status != carto::agent::TaskStatus::rejected;
+        if (set_id == 0U || resolution == 0U || resolution > 8192U ||
+            padding > 8192U || tiles == 0U || tiles > 100U ||
+            !agent_lightmap_uv_scope_is_complete(snapshot) || active_task ||
+            snapshot.agent_checkpoint_loaded || !snapshot.agent_plan_draft.empty() ||
+            !agent_goal.empty()) {
+            action_feedback =
+                "Cannot draft this UV candidate: choose valid bounds and a unique, unlocked "
+                "mesh scope, then finish any existing Agent draft/task/checkpoint.";
+            action_feedback_error = true;
+            return false;
+        }
+
+        const std::string intent = "generate lightmap uv set " + std::to_string(set_id) +
+            " resolution " + std::to_string(resolution) + " padding " +
+            std::to_string(padding) + " tiles " + std::to_string(tiles);
+        const auto compiled = ui.compile_agent_goal_sequence(intent);
+        if (!compiled) {
+            action_feedback = compiled.error().message;
+            action_feedback_error = true;
+            return false;
+        }
+        agent_goal = intent;
+        agent_allow_lightmap_uv = true;
+        agent_entry_notice =
+            "Drafted a lightmap-candidate UV set from Material for " +
+            std::to_string(snapshot.selection.objects.size()) +
+            " unique mesh object(s). It remains speculative and does not establish seam "
+            "quality, bake freshness, or production readiness.";
+        action_feedback_error = false;
+        action_feedback = "UV plan drafted. Review its set identity and effect permission in Agent.";
+        if (!open_agent_workspace(true)) {
+            static_cast<void>(ui.clear_agent_plan());
+            agent_goal.clear();
+            agent_allow_lightmap_uv = false;
             agent_entry_notice.clear();
             return false;
         }
@@ -6298,6 +6375,49 @@ struct DesktopState {
         } else if (material_draft_dirty || material_graph_draft_dirty) {
             ImGui::TextDisabled(
                 "Save or discard pending Material edits before drafting an assignment.");
+        }
+
+        const bool agent_lightmap_uv_scope_complete =
+            agent_lightmap_uv_scope_is_complete(snapshot);
+        const bool agent_uv_bounds_valid = agent_lightmap_uv_set_id != 0U &&
+            agent_lightmap_uv_resolution != 0U &&
+            agent_lightmap_uv_resolution <= 8192U &&
+            agent_lightmap_uv_padding <= 8192U &&
+            agent_lightmap_uv_tiles > 0U && agent_lightmap_uv_tiles <= 100U;
+        const bool agent_uv_draft_available = agent_lightmap_uv_scope_complete &&
+            agent_uv_bounds_valid && !agent_task_active &&
+            !snapshot.agent_checkpoint_loaded && snapshot.agent_plan_draft.empty() &&
+            agent_goal.empty();
+        ImGui::Separator();
+        ImGui::TextDisabled("Speculative lightmap-candidate UV generation");
+        ImGui::TextWrapped(
+            "Choose a new set identity and bounded atlas inputs. This creates a non-active "
+            "candidate UV set; it does not unwrap seams or establish bake readiness.");
+        ImGui::InputScalar("Candidate UV Set ID", ImGuiDataType_U64,
+                           &agent_lightmap_uv_set_id);
+        ImGui::InputScalar("Resolution", ImGuiDataType_U32,
+                           &agent_lightmap_uv_resolution);
+        ImGui::InputScalar("Padding (texels)", ImGuiDataType_U32,
+                           &agent_lightmap_uv_padding);
+        ImGui::InputScalar("Maximum UDIM tiles", ImGuiDataType_U32,
+                           &agent_lightmap_uv_tiles);
+        ImGui::BeginDisabled(!agent_uv_draft_available);
+        if (ImGui::Button("Draft UV candidate in Cartographer", ImVec2(-1, 28))) {
+            static_cast<void>(draft_lightmap_uv_in_agent(
+                snapshot, agent_lightmap_uv_set_id, agent_lightmap_uv_resolution,
+                agent_lightmap_uv_padding, agent_lightmap_uv_tiles));
+        }
+        ImGui::EndDisabled();
+        if (!agent_lightmap_uv_scope_complete) {
+            ImGui::TextDisabled(
+                "Select 1–16 unlocked root mesh objects with one unique mesh asset per object.");
+        } else if (!agent_uv_bounds_valid) {
+            ImGui::TextDisabled(
+                "Set ID and resolution must be non-zero; resolution/padding are capped at 8192 and tiles at 100.");
+        } else if (agent_task_active || snapshot.agent_checkpoint_loaded ||
+                   !snapshot.agent_plan_draft.empty() || !agent_goal.empty()) {
+            ImGui::TextDisabled(
+                "Finish or clear the current Agent goal, plan, task, or checkpoint first.");
         }
 
         ImGui::Separator();

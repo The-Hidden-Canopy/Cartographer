@@ -3018,6 +3018,43 @@ void ui_reviews_persists_and_undoes_opt_in_lightmap_uv_generation() {
     REQUIRE(redone_set != nullptr && redone_set->lightmap_candidate);
 }
 
+void ui_compiles_lightmap_uv_generation_for_multiple_unique_mesh_targets() {
+    using namespace carto;
+    application::ApplicationSession source;
+    const auto objects = create_boxes(source, 2U);
+    ui::UiController ui(source);
+    REQUIRE(ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(application::SelectObjectAction{objects.front()}));
+    REQUIRE(ui.dispatch(application::SelectObjectAction{
+        objects.back(), editor::SelectionOperation::add}));
+
+    const std::string intent =
+        "generate lightmap uv set 27 resolution 256 padding 4 tiles 2";
+    REQUIRE(ui.compile_agent_goal_sequence(intent));
+    REQUIRE(ui.snapshot().agent_plan_draft.size() == 2U);
+    auto envelope = envelope_for(objects);
+    envelope.permitted_effects |= agent::effect_mask(agent::Effect::uv);
+    const auto before = source.snapshot();
+    const auto run = ui.run_agent_plan(intent, envelope);
+    REQUIRE(run);
+    REQUIRE(run.value().status == agent::TaskStatus::review);
+    REQUIRE(run.value().can_accept);
+    REQUIRE(run.value().steps.size() == 2U);
+    REQUIRE(run.value().diff.meshes.size() == 2U);
+    REQUIRE(std::all_of(run.value().diff.meshes.begin(), run.value().diff.meshes.end(),
+        [](const auto& mesh) {
+            const auto set = std::find_if(mesh.uv_sets.begin(), mesh.uv_sets.end(),
+                [](const auto& change) {
+                    return change.id == 27U && change.after.has_value() &&
+                        change.after->lightmap_candidate;
+                });
+            return set != mesh.uv_sets.end();
+        }));
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+    REQUIRE(ui.accept_agent_plan());
+    REQUIRE(source.snapshot().project_revision > before.project_revision);
+}
+
 void agent_lightmap_uv_fails_closed_without_permission_or_complete_mesh_scope() {
     using namespace carto;
     const std::string intent =
@@ -6369,6 +6406,7 @@ int main() {
         ui_compiles_material_assignment_for_all_selected_shared_mesh_instances();
         agent_material_assignment_fails_closed_on_authority_and_source_boundaries();
         ui_reviews_persists_and_undoes_opt_in_lightmap_uv_generation();
+        ui_compiles_lightmap_uv_generation_for_multiple_unique_mesh_targets();
         agent_lightmap_uv_fails_closed_without_permission_or_complete_mesh_scope();
         direct_lightmap_uv_action_rejects_invalid_and_stale_parameters();
         material_catalog_checkpoint_rebase_models_region_writes_and_detects_conflicts();
