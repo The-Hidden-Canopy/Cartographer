@@ -7956,9 +7956,84 @@ struct DesktopState {
                     }
                 }
             }
-            ImGui::Text("Diff · %llu objects · %llu meshes",
+            ImGui::Text(
+                "Diff · %llu objects · %llu meshes · %llu bindings · %llu materials · %llu textures",
                 static_cast<unsigned long long>(task.diff.changed_object_count()),
-                static_cast<unsigned long long>(task.diff.changed_mesh_count()));
+                static_cast<unsigned long long>(task.diff.changed_mesh_count()),
+                static_cast<unsigned long long>(
+                    task.diff.changed_material_binding_count()),
+                static_cast<unsigned long long>(
+                    task.diff.changed_material_source_count()),
+                static_cast<unsigned long long>(
+                    task.diff.changed_texture_source_count()));
+            if (task.diff.material_catalog_changed) {
+                ImGui::TextDisabled(
+                    "Material catalog changed; variant, sampler, graph, and blob records are not expanded here.");
+            }
+            if (!task.diff.material_bindings.empty() &&
+                ImGui::TreeNode("Material binding changes")) {
+                const auto material_label = [](
+                        const std::optional<carto::project::MaterialRegionAssignment>& binding,
+                        const std::optional<std::string>& name) {
+                    if (!binding.has_value()) return std::string("(unassigned)");
+                    std::string label = name.value_or("Material");
+                    label += " #" + std::to_string(binding->material);
+                    if (binding->variant.has_value()) {
+                        label += " · variant #" + std::to_string(*binding->variant);
+                    }
+                    return label;
+                };
+                for (const auto& binding : task.diff.material_bindings) {
+                    const std::string before = material_label(
+                        binding.before, binding.before_material_name);
+                    const std::string after = material_label(
+                        binding.after, binding.after_material_name);
+                    const char* change = binding.added ? "added" :
+                        binding.removed ? "removed" : "reassigned";
+                    ImGui::BulletText(
+                        "Mesh %llu · region %u · %s · %s → %s",
+                        static_cast<unsigned long long>(binding.key.mesh_asset),
+                        static_cast<unsigned int>(binding.key.region_id), change,
+                        before.c_str(), after.c_str());
+                }
+                ImGui::TreePop();
+            }
+            if (!task.diff.material_sources.empty() &&
+                ImGui::TreeNode("Material source changes")) {
+                for (const auto& material : task.diff.material_sources) {
+                    const char* change = material.added ? "added" :
+                        material.removed ? "removed" : "updated";
+                    const std::string before = material.before_name.value_or("(absent)");
+                    const std::string after = material.after_name.value_or("(absent)");
+                    ImGui::BulletText(
+                        "Material #%llu · %s · %s → %s%s",
+                        static_cast<unsigned long long>(material.id), change,
+                        before.c_str(), after.c_str(),
+                        material.definition_changed
+                            ? " · definition changed" : "");
+                    if (material.texture_dependencies_changed) {
+                        ImGui::TextDisabled("  Texture dependencies changed");
+                    }
+                }
+                ImGui::TreePop();
+            }
+            if (!task.diff.texture_sources.empty() &&
+                ImGui::TreeNode("Texture source changes")) {
+                for (const auto& texture : task.diff.texture_sources) {
+                    const char* change = texture.added ? "added" :
+                        texture.removed ? "removed" : "updated";
+                    const std::string before = texture.before_name.value_or("(absent)");
+                    const std::string after = texture.after_name.value_or("(absent)");
+                    const char* affected = texture.content_changed && texture.metadata_changed
+                        ? "content and source metadata"
+                        : texture.content_changed ? "content" : "source metadata";
+                    ImGui::BulletText(
+                        "Texture #%llu · %s · %s changed · %s → %s",
+                        static_cast<unsigned long long>(texture.id), change, affected,
+                        before.c_str(), after.c_str());
+                }
+                ImGui::TreePop();
+            }
             for (const auto& object_change : task.diff.objects) {
                 if (object_change.mesh_content_changed || object_change.transform_changed ||
                     object_change.mesh_binding_changed || object_change.name_changed) {

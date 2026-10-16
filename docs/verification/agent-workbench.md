@@ -6,7 +6,8 @@
 - Capture exact face targets and queue native inset/extrude steps plus a parameterless face poke.
 - Run the plan on the speculative session.
 - Confirm the source revision and geometry remain unchanged before review.
-- Confirm per-step receipts, project/viewport gates, and structured mesh diffs.
+- Confirm per-step receipts, project/viewport gates, and structured mesh and material-region binding diffs.
+- Material assignment, reassignment, and removal appear in review with before/after material and variant identities; material source edits, texture-source content/metadata changes, and texture dependency changes have separate evidence rows. A material-only change satisfies the non-empty diff predicate.
 - Expand changed meshes and inspect all changed vertex positions and face-connectivity identities, including added/removed faces; large lists must remain scrollable without silently truncating evidence.
 - Accept the result and confirm the source advances once and the saved-project journal contains one application mutation event.
 - From Model, Material, CONDITION, and Review, use the global Ask Cartographer entry and confirm the Agent Workbench instrument opens with the goal field focused while preserving the selected object or component and source revision.

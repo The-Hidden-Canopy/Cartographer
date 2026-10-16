@@ -72,12 +72,20 @@ carto::geometry::EditableMesh add_test_uv_set(
     std::vector<attributes::AttributeValue> values;
     values.reserve(uv_values.size());
     for (const auto value : uv_values) values.emplace_back(value);
+    const auto faces = mesh.faces_sorted();
     attributes::AttributeSet attribute_set({
-        {attributes::AttributeDomain::corner, topology.value().corners.size()}});
+        {attributes::AttributeDomain::corner, topology.value().corners.size()},
+        {attributes::AttributeDomain::face, faces.size()}});
     REQUIRE(attribute_set.add_layer(attributes::AttributeLayer{
         {"uv.source.corners", attributes::AttributeDomain::corner,
             attributes::AttributeType::vec2},
         std::move(values)}));
+    std::vector<attributes::AttributeValue> material_regions(
+        faces.size(), std::uint32_t{1U});
+    REQUIRE(attribute_set.add_layer(attributes::AttributeLayer{
+        {"cartographer.material_slot", attributes::AttributeDomain::face,
+            attributes::AttributeType::uint32},
+        std::move(material_regions)}));
     attributes::UvSetTable uv_sets;
     REQUIRE(uv_sets.add(attributes::UvSetDescriptor{
         7U, "Source UV", "uv.source.corners", true, true, false, 1U}));
@@ -2823,6 +2831,103 @@ void project_diff_reports_uv_layer_and_bounded_corner_changes() {
         plane_uv_diff->samples.front().before->x + 0.25);
     REQUIRE(!plane_uv_diff->samples_truncated);
 
+    const project::ProjectDocument material_before = plane_document;
+    project::MaterialCatalog material_catalog;
+    render::MaterialAsset first_material;
+    first_material.id = 71U;
+    first_material.name = "First surface";
+    REQUIRE(material_catalog.insert_material(first_material));
+    render::MaterialAsset second_material;
+    second_material.id = 72U;
+    second_material.name = "Second surface";
+    REQUIRE(material_catalog.insert_material(second_material));
+    project::MaterialVariant first_variant;
+    first_variant.id = 91U;
+    first_variant.name = "First surface variant";
+    first_variant.base_material = first_material.id;
+    first_variant.overrides.roughness = 0.3;
+    REQUIRE(material_catalog.insert_variant(first_variant));
+    const project::MaterialRegionKey material_region{plane_asset, 1U};
+    REQUIRE(material_catalog.insert_assignment(
+        project::MaterialRegionAssignment{material_region, first_material.id, std::nullopt}));
+    auto material_update = project::ProjectTransaction::begin(
+        plane_document, journal, "agent-project-diff-tests");
+    REQUIRE(material_update);
+    REQUIRE(material_update.value().set_material_catalog(material_catalog));
+    REQUIRE(material_update.value().commit("agent-project-diff.material-added"));
+    const project::ProjectDocument material_assigned = plane_document;
+    const agent::ProjectDiff material_added_diff = agent::ProjectDiff::between(
+        material_before, material_assigned);
+    REQUIRE(material_added_diff.changed_mesh_count() == 0U);
+    REQUIRE(material_added_diff.changed_material_binding_count() == 1U);
+    REQUIRE(material_added_diff.changed_material_source_count() == 2U);
+    REQUIRE(material_added_diff.material_sources.front().added);
+    REQUIRE(material_added_diff.has_changes());
+    REQUIRE(!agent::ProjectDiff::between(material_before, material_before).has_changes());
+    REQUIRE(material_added_diff.material_bindings.front().added);
+    REQUIRE(!material_added_diff.material_bindings.front().before.has_value());
+    REQUIRE(material_added_diff.material_bindings.front().after.has_value());
+    REQUIRE(material_added_diff.material_bindings.front().after->material == 71U);
+    REQUIRE(material_added_diff.material_bindings.front().after_material_name ==
+        std::optional<std::string>("First surface"));
+
+    project::MaterialCatalog variant_catalog = material_assigned.material_catalog();
+    REQUIRE(variant_catalog.replace_assignment(project::MaterialRegionAssignment{
+        material_region, first_material.id, first_variant.id}));
+    auto variant_update = project::ProjectTransaction::begin(
+        plane_document, journal, "agent-project-diff-tests");
+    REQUIRE(variant_update);
+    REQUIRE(variant_update.value().set_material_catalog(std::move(variant_catalog)));
+    REQUIRE(variant_update.value().commit("agent-project-diff.variant-changed"));
+    const project::ProjectDocument material_variant = plane_document;
+    const agent::ProjectDiff material_variant_diff = agent::ProjectDiff::between(
+        material_assigned, material_variant);
+    REQUIRE(material_variant_diff.changed_material_binding_count() == 1U);
+    REQUIRE(!material_variant_diff.material_bindings.front().material_changed);
+    REQUIRE(material_variant_diff.material_bindings.front().variant_changed);
+    REQUIRE(!material_variant_diff.material_bindings.front().before->variant.has_value());
+    REQUIRE(material_variant_diff.material_bindings.front().after->variant ==
+        std::optional<project::MaterialVariantId>(first_variant.id));
+
+    project::MaterialCatalog reassigned_catalog = material_variant.material_catalog();
+    REQUIRE(reassigned_catalog.replace_assignment(project::MaterialRegionAssignment{
+        material_region, second_material.id, std::nullopt}));
+    auto reassign_update = project::ProjectTransaction::begin(
+        plane_document, journal, "agent-project-diff-tests");
+    REQUIRE(reassign_update);
+    REQUIRE(reassign_update.value().set_material_catalog(std::move(reassigned_catalog)));
+    REQUIRE(reassign_update.value().commit("agent-project-diff.material-reassigned"));
+    const project::ProjectDocument material_reassigned = plane_document;
+    const agent::ProjectDiff material_reassigned_diff = agent::ProjectDiff::between(
+        material_variant, material_reassigned);
+    REQUIRE(material_reassigned_diff.changed_material_binding_count() == 1U);
+    REQUIRE(!material_reassigned_diff.material_bindings.front().added);
+    REQUIRE(!material_reassigned_diff.material_bindings.front().removed);
+    REQUIRE(material_reassigned_diff.material_bindings.front().material_changed);
+    REQUIRE(material_reassigned_diff.material_bindings.front().variant_changed);
+    REQUIRE(material_reassigned_diff.material_bindings.front().before->material == 71U);
+    REQUIRE(material_reassigned_diff.material_bindings.front().before->variant ==
+        std::optional<project::MaterialVariantId>(first_variant.id));
+    REQUIRE(material_reassigned_diff.material_bindings.front().after->material == 72U);
+    REQUIRE(material_reassigned_diff.material_bindings.front().before_material_name ==
+        std::optional<std::string>("First surface"));
+    REQUIRE(material_reassigned_diff.material_bindings.front().after_material_name ==
+        std::optional<std::string>("Second surface"));
+
+    project::MaterialCatalog removed_catalog = material_reassigned.material_catalog();
+    REQUIRE(removed_catalog.erase_assignment(material_region));
+    auto remove_assignment_update = project::ProjectTransaction::begin(
+        plane_document, journal, "agent-project-diff-tests");
+    REQUIRE(remove_assignment_update);
+    REQUIRE(remove_assignment_update.value().set_material_catalog(std::move(removed_catalog)));
+    REQUIRE(remove_assignment_update.value().commit("agent-project-diff.material-removed"));
+    const agent::ProjectDiff material_removed_diff = agent::ProjectDiff::between(
+        material_reassigned, plane_document);
+    REQUIRE(material_removed_diff.changed_material_binding_count() == 1U);
+    REQUIRE(material_removed_diff.material_bindings.front().removed);
+    REQUIRE(material_removed_diff.material_bindings.front().before->material == 72U);
+    REQUIRE(!material_removed_diff.material_bindings.front().after.has_value());
+
     auto empty_document = project::ProjectDocument::create("Empty project diff test");
     REQUIRE(empty_document);
     const agent::ProjectDiff added_mesh_diff = agent::ProjectDiff::between(
@@ -2929,6 +3034,155 @@ void project_diff_reports_uv_layer_and_bounded_corner_changes() {
     REQUIRE(many_uv_diff->changed_corner_count == many_topology.value().corners.size());
     REQUIRE(many_uv_diff->samples.size() == agent::kMaxProjectDiffUvSamples);
     REQUIRE(many_uv_diff->samples_truncated);
+}
+
+void project_diff_reports_material_and_texture_source_changes() {
+    using namespace carto;
+    TempDirectory directory;
+    journal::Journal journal(directory.path() / "material-project-diff.journal");
+    auto plane = geometry::make_plane(2.0, 2.0);
+    REQUIRE(plane);
+    const auto topology = plane.value().topology();
+    REQUIRE(topology);
+    std::vector<core::Vec2d> uv_values(
+        topology.value().corners.size(), core::Vec2d{0.0, 0.0});
+    std::uint64_t mesh_asset = 0U;
+    auto document = make_project_with_mesh(
+        journal, add_test_uv_set(std::move(plane).value(), uv_values), mesh_asset);
+
+    const auto digest_text = [](std::string_view value) {
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(value.data());
+        return assets::sha256(std::span<const std::uint8_t>(bytes, value.size()));
+    };
+    project::MaterialCatalog original_catalog;
+    REQUIRE(original_catalog.insert_texture(project::TextureSourceRecord{
+        .id = 501U,
+        .name = "Albedo source",
+        .relative_locator = "textures/albedo.png",
+        .content_digest = digest_text("albedo source before"),
+        .format = assets::TextureSourceFormat::png,
+        .width = 1U,
+        .height = 1U,
+        .provenance = "agent-project-diff-fixture",
+        .revision = core::Revision{1U},
+    }));
+    render::MaterialAsset original_material;
+    original_material.id = 71U;
+    original_material.name = "Paint source";
+    original_material.revision = core::Revision{1U};
+    original_material.definition.base_color.asset = 501U;
+    REQUIRE(original_catalog.insert_material(original_material));
+    auto original_update = project::ProjectTransaction::begin(
+        document, journal, "agent-project-diff-tests");
+    REQUIRE(original_update);
+    REQUIRE(original_update.value().set_material_catalog(std::move(original_catalog)));
+    REQUIRE(original_update.value().commit("agent-project-diff.material-source-before"));
+    const project::ProjectDocument before = document;
+
+    project::MaterialCatalog changed_catalog;
+    REQUIRE(changed_catalog.insert_texture(project::TextureSourceRecord{
+        .id = 501U,
+        .name = "Albedo source",
+        .relative_locator = "textures/albedo.png",
+        .content_digest = digest_text("albedo source after"),
+        .format = assets::TextureSourceFormat::png,
+        .width = 1U,
+        .height = 1U,
+        .provenance = "agent-project-diff-fixture",
+        .revision = core::Revision{2U},
+    }));
+    REQUIRE(changed_catalog.insert_texture(project::TextureSourceRecord{
+        .id = 502U,
+        .name = "Replacement albedo",
+        .relative_locator = "textures/replacement.png",
+        .content_digest = digest_text("replacement albedo"),
+        .format = assets::TextureSourceFormat::png,
+        .width = 1U,
+        .height = 1U,
+        .provenance = "agent-project-diff-fixture",
+        .revision = core::Revision{1U},
+    }));
+    render::MaterialAsset changed_material;
+    changed_material.id = 71U;
+    changed_material.name = "Paint source updated";
+    changed_material.revision = core::Revision{2U};
+    changed_material.definition.roughness = 0.35;
+    changed_material.definition.base_color.asset = 502U;
+    changed_material.definition.base_color.uv_set = 7U;
+    REQUIRE(changed_catalog.insert_material(changed_material));
+    auto changed_update = project::ProjectTransaction::begin(
+        document, journal, "agent-project-diff-tests");
+    REQUIRE(changed_update);
+    REQUIRE(changed_update.value().set_material_catalog(std::move(changed_catalog)));
+    REQUIRE(changed_update.value().commit("agent-project-diff.material-source-after"));
+    const project::ProjectDocument after = document;
+
+    const agent::ProjectDiff diff = agent::ProjectDiff::between(before, after);
+    REQUIRE(diff.material_catalog_changed);
+    REQUIRE(diff.changed_material_source_count() == 1U);
+    const auto material = std::find_if(
+        diff.material_sources.begin(), diff.material_sources.end(),
+        [](const auto& value) { return value.id == 71U; });
+    REQUIRE(material != diff.material_sources.end());
+    REQUIRE(material->source_changed);
+    REQUIRE(material->definition_changed);
+    REQUIRE(material->texture_dependencies_changed);
+    REQUIRE(material->before_name == std::optional<std::string>("Paint source"));
+    REQUIRE(material->after_name == std::optional<std::string>("Paint source updated"));
+    REQUIRE(diff.changed_texture_source_count() == 2U);
+    const auto changed_texture = std::find_if(
+        diff.texture_sources.begin(), diff.texture_sources.end(),
+        [](const auto& value) { return value.id == 501U; });
+    REQUIRE(changed_texture != diff.texture_sources.end());
+    REQUIRE(changed_texture->source_changed);
+    REQUIRE(changed_texture->content_changed);
+    REQUIRE(changed_texture->metadata_changed);
+    const auto added_texture = std::find_if(
+        diff.texture_sources.begin(), diff.texture_sources.end(),
+        [](const auto& value) { return value.id == 502U; });
+    REQUIRE(added_texture != diff.texture_sources.end());
+    REQUIRE(added_texture->added);
+    REQUIRE(added_texture->content_changed);
+    REQUIRE(diff.has_changes());
+
+    project::MaterialCatalog variant_catalog = after.material_catalog();
+    project::MaterialVariant variant;
+    variant.id = 91U;
+    variant.name = "Surface variant";
+    variant.base_material = changed_material.id;
+    variant.overrides.roughness = 0.6;
+    REQUIRE(variant_catalog.insert_variant(variant));
+    auto variant_update = project::ProjectTransaction::begin(
+        document, journal, "agent-project-diff-tests");
+    REQUIRE(variant_update);
+    REQUIRE(variant_update.value().set_material_catalog(std::move(variant_catalog)));
+    REQUIRE(variant_update.value().commit("agent-project-diff.variant-only"));
+    const project::ProjectDocument after_variant = document;
+    const agent::ProjectDiff unexpanded_catalog_diff = agent::ProjectDiff::between(
+        after, after_variant);
+    REQUIRE(unexpanded_catalog_diff.material_catalog_changed);
+    REQUIRE(unexpanded_catalog_diff.material_bindings.empty());
+    REQUIRE(unexpanded_catalog_diff.material_sources.empty());
+    REQUIRE(unexpanded_catalog_diff.texture_sources.empty());
+    REQUIRE(unexpanded_catalog_diff.has_changes());
+
+    project::MaterialCatalog pruned_catalog;
+    REQUIRE(pruned_catalog.insert_texture(
+        after_variant.material_catalog().textures().at(502U)));
+    REQUIRE(pruned_catalog.insert_material(changed_material));
+    REQUIRE(pruned_catalog.insert_variant(variant));
+    auto prune_update = project::ProjectTransaction::begin(
+        document, journal, "agent-project-diff-tests");
+    REQUIRE(prune_update);
+    REQUIRE(prune_update.value().set_material_catalog(std::move(pruned_catalog)));
+    REQUIRE(prune_update.value().commit("agent-project-diff.texture-removed"));
+    const agent::ProjectDiff removed_texture_diff = agent::ProjectDiff::between(
+        after_variant, document);
+    REQUIRE(removed_texture_diff.changed_texture_source_count() == 1U);
+    REQUIRE(removed_texture_diff.texture_sources.front().id == 501U);
+    REQUIRE(removed_texture_diff.texture_sources.front().removed);
+    REQUIRE(removed_texture_diff.texture_sources.front().content_changed);
+    REQUIRE(removed_texture_diff.texture_sources.front().metadata_changed);
 }
 
 void shared_mesh_instances_must_be_in_scope_and_within_touch_budget() {
@@ -5503,6 +5757,7 @@ int main() {
         work_envelope_blocks_topology_churn_over_budget();
         diff_digest_tracks_geometry_values_not_only_change_shape();
         project_diff_reports_uv_layer_and_bounded_corner_changes();
+        project_diff_reports_material_and_texture_source_changes();
         bounded_mesh_recipe_caps_execution_and_binds_its_acceptance_gate();
         bounded_vertex_recipe_preserves_topology_and_repair_authority();
         shared_mesh_instances_must_be_in_scope_and_within_touch_budget();

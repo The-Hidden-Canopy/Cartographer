@@ -341,7 +341,7 @@ core::Result<AgentDemonstrationParameters> parameterize_demo_step(
     return core::Result<AgentDemonstrationParameters>::success(std::move(parameters));
 }
 
-bool has_changes(const ObjectChange& change) noexcept {
+bool object_has_changes(const ObjectChange& change) noexcept {
     return change.added || change.removed || change.name_changed ||
         change.transform_changed || change.parent_changed ||
         change.mesh_binding_changed || change.mesh_content_changed ||
@@ -407,6 +407,91 @@ std::optional<std::map<geometry::CornerId, core::Vec2d>> uv_values_by_corner(
         }
     }
     return values;
+}
+
+bool same_vec3d(const core::Vec3d& left, const core::Vec3d& right) noexcept {
+    return left.x == right.x && left.y == right.y && left.z == right.z;
+}
+
+bool same_vec4d(const core::Vec4d& left, const core::Vec4d& right) noexcept {
+    return left.x == right.x && left.y == right.y &&
+        left.z == right.z && left.w == right.w;
+}
+
+bool same_material_texture_dependencies(
+    const render::StandardMaterial& left,
+    const render::StandardMaterial& right) noexcept {
+    return left.base_color == right.base_color &&
+        left.metallic_roughness == right.metallic_roughness &&
+        left.normal == right.normal && left.occlusion == right.occlusion &&
+        left.emissive == right.emissive;
+}
+
+bool material_has_texture_dependencies(const render::StandardMaterial& material) noexcept {
+    return static_cast<bool>(material.base_color) ||
+        static_cast<bool>(material.metallic_roughness) ||
+        static_cast<bool>(material.normal) || static_cast<bool>(material.occlusion) ||
+        static_cast<bool>(material.emissive);
+}
+
+bool material_uses_texture(
+    const render::StandardMaterial& material,
+    assets::TextureAssetId texture) noexcept {
+    return material.base_color.asset == texture ||
+        material.metallic_roughness.asset == texture ||
+        material.normal.asset == texture || material.occlusion.asset == texture ||
+        material.emissive.asset == texture;
+}
+
+bool same_material_surface_definition(
+    const render::StandardMaterial& left,
+    const render::StandardMaterial& right) noexcept {
+    return same_vec4d(left.base_color_factor, right.base_color_factor) &&
+        left.metallic == right.metallic && left.roughness == right.roughness &&
+        left.normal_scale == right.normal_scale &&
+        left.occlusion_strength == right.occlusion_strength &&
+        same_vec3d(left.emissive_factor, right.emissive_factor) &&
+        left.emissive_strength == right.emissive_strength &&
+        left.dielectric_f0 == right.dielectric_f0 &&
+        left.clearcoat == right.clearcoat &&
+        left.clearcoat_roughness == right.clearcoat_roughness &&
+        left.alpha_mode == right.alpha_mode && left.alpha_cutoff == right.alpha_cutoff;
+}
+
+bool same_standard_material(
+    const render::StandardMaterial& left,
+    const render::StandardMaterial& right) noexcept {
+    return same_material_surface_definition(left, right) &&
+        same_material_texture_dependencies(left, right);
+}
+
+bool same_material_source(
+    const render::MaterialAsset& left,
+    const render::MaterialAsset& right) noexcept {
+    return left.id == right.id && left.name == right.name &&
+        left.revision == right.revision &&
+        same_standard_material(left.definition, right.definition);
+}
+
+bool same_texture_source_content(
+    const project::TextureSourceRecord& left,
+    const project::TextureSourceRecord& right) noexcept {
+    return left.content_digest == right.content_digest && left.format == right.format &&
+        left.width == right.width && left.height == right.height;
+}
+
+bool same_texture_source_metadata(
+    const project::TextureSourceRecord& left,
+    const project::TextureSourceRecord& right) noexcept {
+    return left.name == right.name && left.relative_locator == right.relative_locator &&
+        left.provenance == right.provenance && left.revision == right.revision;
+}
+
+bool same_texture_source(
+    const project::TextureSourceRecord& left,
+    const project::TextureSourceRecord& right) noexcept {
+    return left.id == right.id && same_texture_source_content(left, right) &&
+        same_texture_source_metadata(left, right);
 }
 
 bool same_scene_object(
@@ -1923,11 +2008,30 @@ core::Result<void> AgentWorkEnvelope::validate() const {
 
 std::size_t ProjectDiff::changed_object_count() const noexcept {
     return static_cast<std::size_t>(std::count_if(
-        objects.begin(), objects.end(), has_changes));
+        objects.begin(), objects.end(), object_has_changes));
 }
 
 std::size_t ProjectDiff::changed_mesh_count() const noexcept {
     return meshes.size();
+}
+
+std::size_t ProjectDiff::changed_material_binding_count() const noexcept {
+    return material_bindings.size();
+}
+
+std::size_t ProjectDiff::changed_material_source_count() const noexcept {
+    return material_sources.size();
+}
+
+std::size_t ProjectDiff::changed_texture_source_count() const noexcept {
+    return texture_sources.size();
+}
+
+bool ProjectDiff::has_changes() const noexcept {
+    return changed_object_count() != 0U || changed_mesh_count() != 0U ||
+        changed_material_binding_count() != 0U || changed_material_source_count() != 0U ||
+        changed_texture_source_count() != 0U || material_catalog_changed ||
+        engineering_changed || condition_changed;
 }
 
 core::Result<void> AgentRebaseReceipt::validate() const {
@@ -3675,7 +3779,7 @@ ProjectDiff ProjectDiff::between(
             change.visibility_changed = before->second.visible != after->second.visible;
             change.lock_changed = before->second.locked != after->second.locked;
         }
-        if (has_changes(change)) diff.objects.push_back(change);
+        if (object_has_changes(change)) diff.objects.push_back(change);
     }
 
     const auto& before_meshes = base_document_.meshes();
@@ -3971,6 +4075,146 @@ ProjectDiff ProjectDiff::between(
             diff.objects.push_back(std::move(change));
         }
     }
+    const auto& before_assignments =
+        base_document_.material_catalog().assignments();
+    const auto& after_assignments =
+        speculative_document.material_catalog().assignments();
+    std::set<project::MaterialRegionKey> material_region_keys;
+    for (const auto& [key, assignment] : before_assignments) {
+        static_cast<void>(assignment);
+        material_region_keys.insert(key);
+    }
+    for (const auto& [key, assignment] : after_assignments) {
+        static_cast<void>(assignment);
+        material_region_keys.insert(key);
+    }
+    const auto material_name = [](
+            const project::MaterialCatalog& catalog,
+            const project::MaterialRegionAssignment& assignment)
+            -> std::optional<std::string> {
+        const auto found = catalog.materials().find(assignment.material);
+        return found == catalog.materials().end()
+            ? std::nullopt : std::optional<std::string>(found->second.name);
+    };
+    for (const auto key : material_region_keys) {
+        const auto before_assignment = before_assignments.find(key);
+        const auto after_assignment = after_assignments.find(key);
+        MaterialBindingChange change;
+        change.key = key;
+        change.added = before_assignment == before_assignments.end();
+        change.removed = after_assignment == after_assignments.end();
+        if (!change.added) {
+            change.before = before_assignment->second;
+            change.before_material_name = material_name(
+                base_document_.material_catalog(), before_assignment->second);
+        }
+        if (!change.removed) {
+            change.after = after_assignment->second;
+            change.after_material_name = material_name(
+                speculative_document.material_catalog(), after_assignment->second);
+        }
+        if (!change.added && !change.removed) {
+            change.material_changed = before_assignment->second.material !=
+                after_assignment->second.material;
+            change.variant_changed = before_assignment->second.variant !=
+                after_assignment->second.variant;
+        }
+        if (change.added || change.removed || change.material_changed ||
+            change.variant_changed) {
+            diff.material_bindings.push_back(std::move(change));
+        }
+    }
+    const auto& before_materials = base_document_.material_catalog().materials();
+    const auto& after_materials = speculative_document.material_catalog().materials();
+    std::set<render::MaterialId> material_ids;
+    for (const auto& [id, material] : before_materials) {
+        static_cast<void>(material);
+        material_ids.insert(id);
+    }
+    for (const auto& [id, material] : after_materials) {
+        static_cast<void>(material);
+        material_ids.insert(id);
+    }
+    for (const render::MaterialId id : material_ids) {
+        const auto before_material = before_materials.find(id);
+        const auto after_material = after_materials.find(id);
+        MaterialSourceChange change;
+        change.id = id;
+        change.added = before_material == before_materials.end();
+        change.removed = after_material == after_materials.end();
+        if (!change.added) {
+            change.before_name = before_material->second.name;
+            change.before_revision = before_material->second.revision;
+        }
+        if (!change.removed) {
+            change.after_name = after_material->second.name;
+            change.after_revision = after_material->second.revision;
+        }
+        if (change.added) {
+            change.source_changed = true;
+            change.definition_changed = true;
+            change.texture_dependencies_changed = material_has_texture_dependencies(
+                after_material->second.definition);
+        } else if (change.removed) {
+            change.source_changed = true;
+            change.definition_changed = true;
+            change.texture_dependencies_changed = material_has_texture_dependencies(
+                before_material->second.definition);
+        } else {
+            change.definition_changed = !same_material_surface_definition(
+                before_material->second.definition, after_material->second.definition);
+            change.source_changed = !same_material_source(
+                before_material->second, after_material->second);
+            change.texture_dependencies_changed = !same_material_texture_dependencies(
+                before_material->second.definition, after_material->second.definition);
+        }
+        if (change.added || change.removed || change.source_changed) {
+            diff.material_sources.push_back(std::move(change));
+        }
+    }
+
+    const auto& before_textures = base_document_.material_catalog().textures();
+    const auto& after_textures = speculative_document.material_catalog().textures();
+    std::set<assets::TextureAssetId> texture_ids;
+    for (const auto& [id, texture] : before_textures) {
+        static_cast<void>(texture);
+        texture_ids.insert(id);
+    }
+    for (const auto& [id, texture] : after_textures) {
+        static_cast<void>(texture);
+        texture_ids.insert(id);
+    }
+    for (const assets::TextureAssetId id : texture_ids) {
+        const auto before_texture = before_textures.find(id);
+        const auto after_texture = after_textures.find(id);
+        TextureSourceChange change;
+        change.id = id;
+        change.added = before_texture == before_textures.end();
+        change.removed = after_texture == after_textures.end();
+        if (!change.added) {
+            change.before_name = before_texture->second.name;
+            change.before_content_digest = before_texture->second.content_digest;
+        }
+        if (!change.removed) {
+            change.after_name = after_texture->second.name;
+            change.after_content_digest = after_texture->second.content_digest;
+        }
+        if (change.added || change.removed) {
+            change.source_changed = true;
+            change.content_changed = true;
+            change.metadata_changed = true;
+        } else {
+            change.source_changed = !same_texture_source(
+                before_texture->second, after_texture->second);
+            change.content_changed = !same_texture_source_content(
+                before_texture->second, after_texture->second);
+            change.metadata_changed = !same_texture_source_metadata(
+                before_texture->second, after_texture->second);
+        }
+        if (change.source_changed) diff.texture_sources.push_back(std::move(change));
+    }
+    diff.material_catalog_changed = base_document_.material_catalog().serialize() !=
+        speculative_document.material_catalog().serialize();
     diff.engineering_changed = base_document_.engineering_authoring() !=
         speculative_document.engineering_authoring();
     diff.condition_changed = base_document_.condition_authoring() !=
@@ -3995,6 +4239,44 @@ std::vector<AcceptanceGateResult> AgentTask::evaluate_gates() const {
     for (const auto& change : diff.objects) all_affected_objects.push_back(change.id);
     for (const auto& step : plan_.steps) all_affected_objects.push_back(step.target.object);
     for (const auto& mesh : diff.meshes) all_affected_assets.push_back(mesh.asset_id);
+    for (const auto& binding : diff.material_bindings) {
+        all_affected_assets.push_back(binding.key.mesh_asset);
+    }
+    const auto append_material_assets = [&all_affected_assets](
+            const project::MaterialCatalog& catalog,
+            render::MaterialId material) {
+        for (const auto& [key, assignment] : catalog.assignments()) {
+            if (assignment.material == material) all_affected_assets.push_back(key.mesh_asset);
+        }
+    };
+    for (const auto& material : diff.material_sources) {
+        append_material_assets(base_document_.material_catalog(), material.id);
+        append_material_assets(speculative_->document_.material_catalog(), material.id);
+    }
+    for (const auto& texture : diff.texture_sources) {
+        for (const project::MaterialCatalog* catalog : {
+                 &base_document_.material_catalog(),
+                 &speculative_->document_.material_catalog()}) {
+            for (const auto& [material_id, material] : catalog->materials()) {
+                if (material_uses_texture(material.definition, texture.id)) {
+                    append_material_assets(*catalog, material_id);
+                }
+            }
+        }
+    }
+    const auto append_assets_to_objects = [
+            &all_affected_assets, &all_affected_objects](
+            const project::ProjectDocument& document) {
+        for (const auto& object : document.scene().objects_sorted()) {
+            if (object.mesh_asset.has_value() && std::find(
+                    all_affected_assets.begin(), all_affected_assets.end(),
+                    *object.mesh_asset) != all_affected_assets.end()) {
+                all_affected_objects.push_back(object.id);
+            }
+        }
+    };
+    append_assets_to_objects(base_document_);
+    append_assets_to_objects(speculative_->document_);
     for (const auto& step : plan_.steps) {
         const auto* object = base_document_.scene().find(step.target.object);
         if (object != nullptr && object->mesh_asset.has_value()) {
@@ -4097,8 +4379,7 @@ std::vector<AcceptanceGateResult> AgentTask::evaluate_gates() const {
         std::to_string(receipts_.size()) + " of " + std::to_string(plan_.steps.size()) +
             " native steps passed",
         all_affected_objects, all_affected_assets, std::move(step_diagnostic)));
-    const bool changed = diff.changed_object_count() != 0U ||
-        diff.changed_mesh_count() != 0U || diff.engineering_changed || diff.condition_changed;
+    const bool changed = diff.has_changes();
     gates.push_back(make_gate(
         "diff.non_empty", changed,
         changed ? "structured source diff contains changes" : "no source changes were produced",

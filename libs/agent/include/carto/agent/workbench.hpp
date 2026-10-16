@@ -454,6 +454,44 @@ struct UvSetChange {
     bool samples_truncated = false;
 };
 
+struct MaterialBindingChange {
+    project::MaterialRegionKey key;
+    std::optional<project::MaterialRegionAssignment> before;
+    std::optional<project::MaterialRegionAssignment> after;
+    std::optional<std::string> before_material_name;
+    std::optional<std::string> after_material_name;
+    bool added = false;
+    bool removed = false;
+    bool material_changed = false;
+    bool variant_changed = false;
+};
+
+struct MaterialSourceChange {
+    render::MaterialId id = 0U;
+    std::optional<std::string> before_name;
+    std::optional<std::string> after_name;
+    std::optional<core::Revision> before_revision;
+    std::optional<core::Revision> after_revision;
+    bool added = false;
+    bool removed = false;
+    bool source_changed = false;
+    bool definition_changed = false;
+    bool texture_dependencies_changed = false;
+};
+
+struct TextureSourceChange {
+    assets::TextureAssetId id = 0U;
+    std::optional<std::string> before_name;
+    std::optional<std::string> after_name;
+    std::optional<assets::Sha256Digest> before_content_digest;
+    std::optional<assets::Sha256Digest> after_content_digest;
+    bool added = false;
+    bool removed = false;
+    bool source_changed = false;
+    bool content_changed = false;
+    bool metadata_changed = false;
+};
+
 struct MeshChange {
     std::uint64_t asset_id = 0U;
     bool added = false;
@@ -475,6 +513,10 @@ struct ProjectDiff {
     core::Revision speculative_revision;
     std::vector<ObjectChange> objects;
     std::vector<MeshChange> meshes;
+    std::vector<MaterialBindingChange> material_bindings;
+    std::vector<MaterialSourceChange> material_sources;
+    std::vector<TextureSourceChange> texture_sources;
+    bool material_catalog_changed = false;
     bool engineering_changed = false;
     bool condition_changed = false;
     assets::Sha256Digest digest;
@@ -484,6 +526,10 @@ struct ProjectDiff {
         const project::ProjectDocument& after);
     [[nodiscard]] std::size_t changed_object_count() const noexcept;
     [[nodiscard]] std::size_t changed_mesh_count() const noexcept;
+    [[nodiscard]] std::size_t changed_material_binding_count() const noexcept;
+    [[nodiscard]] std::size_t changed_material_source_count() const noexcept;
+    [[nodiscard]] std::size_t changed_texture_source_count() const noexcept;
+    [[nodiscard]] bool has_changes() const noexcept;
 };
 
 enum class TaskStatus {
