@@ -3190,6 +3190,48 @@ void material_catalog_checkpoint_rebase_models_region_writes_and_detects_conflic
     }
 }
 
+void ui_material_assignment_rebase_preserves_region_receipt_for_review() {
+    TempDirectory temp;
+    carto::application::ApplicationSession source;
+    const auto fixture = create_material_target(source);
+    carto::ui::UiController authoring_ui(source);
+    REQUIRE(authoring_ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(authoring_ui.dispatch(carto::application::SelectObjectAction{fixture.object}));
+    const std::string intent = "assign material " +
+        std::to_string(fixture.material) + " to region 1";
+    REQUIRE(authoring_ui.compile_agent_goal_sequence(intent));
+    auto envelope = envelope_for({fixture.object});
+    envelope.permitted_effects |=
+        carto::agent::effect_mask(carto::agent::Effect::material);
+    const auto run = authoring_ui.run_agent_plan(intent, envelope);
+    REQUIRE(run && run.value().status == carto::agent::TaskStatus::review);
+    const auto checkpoint_path = temp.path() / "ui-material-rebase.carto-agent-task";
+    REQUIRE(authoring_ui.save_agent_checkpoint(checkpoint_path));
+
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        source, carto::application::CreateBoxAction{
+            "Unrelated source edit", {0.5, 0.5, 0.5}}));
+    carto::ui::UiController reopened_ui(source);
+    REQUIRE(reopened_ui.load_agent_checkpoint(checkpoint_path));
+    REQUIRE(reopened_ui.rebase_agent_checkpoint());
+    const auto rebased = reopened_ui.resume_agent_checkpoint();
+    REQUIRE(rebased && rebased.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(rebased.value().can_accept);
+    const carto::project::MaterialRegionKey key{fixture.mesh_asset, 1U};
+    REQUIRE(rebased.value().rebases.size() == 1U);
+    REQUIRE(rebased.value().rebases.front().read_material_regions ==
+        std::vector<carto::project::MaterialRegionKey>{key});
+    REQUIRE(rebased.value().rebases.front().write_material_regions ==
+        std::vector<carto::project::MaterialRegionKey>{key});
+    const auto ui_snapshot = reopened_ui.snapshot();
+    REQUIRE(ui_snapshot.agent_task.has_value());
+    REQUIRE(ui_snapshot.agent_task->rebases.size() == 1U);
+    REQUIRE(ui_snapshot.agent_task->rebases.front().write_material_regions ==
+        std::vector<carto::project::MaterialRegionKey>{key});
+    REQUIRE(source.snapshot().material_assignments.empty());
+}
+
 void work_envelope_blocks_topology_effect_before_live_mutation() {
     carto::application::ApplicationSession source;
     const auto objects = create_boxes(source, 1U);
@@ -6272,6 +6314,7 @@ int main() {
         agent_lightmap_uv_fails_closed_without_permission_or_complete_mesh_scope();
         direct_lightmap_uv_action_rejects_invalid_and_stale_parameters();
         material_catalog_checkpoint_rebase_models_region_writes_and_detects_conflicts();
+        ui_material_assignment_rebase_preserves_region_receipt_for_review();
         work_envelope_blocks_topology_effect_before_live_mutation();
         work_envelope_blocks_topology_churn_over_budget();
         diff_digest_tracks_geometry_values_not_only_change_shape();

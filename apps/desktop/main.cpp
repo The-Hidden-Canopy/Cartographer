@@ -7653,6 +7653,44 @@ struct DesktopState {
             ImGui::TextDisabled("Objective %.12s · based on R%llu",
                 objective_digest.c_str(),
                 static_cast<unsigned long long>(task.base_revision.value()));
+            if (!task.rebases.empty()) {
+                ImGui::SeparatorText("Rebase lineage");
+                const auto format_material_regions = [](
+                        const std::vector<carto::project::MaterialRegionKey>& keys) {
+                    std::string value;
+                    const std::size_t visible = std::min<std::size_t>(keys.size(), 8U);
+                    for (std::size_t index = 0U; index < visible; ++index) {
+                        if (!value.empty()) value += ", ";
+                        value += std::to_string(keys[index].mesh_asset) + "/" +
+                            std::to_string(keys[index].region_id);
+                    }
+                    if (keys.size() > visible) {
+                        value += ", +" + std::to_string(keys.size() - visible) + " more";
+                    }
+                    return value.empty() ? std::string("none") : value;
+                };
+                const std::size_t visible_rebases = std::min<std::size_t>(
+                    task.rebases.size(), 4U);
+                for (std::size_t index = 0U; index < visible_rebases; ++index) {
+                    const auto& receipt = task.rebases[index];
+                    ImGui::Text("Source R%llu → R%llu · %zu reused step(s)",
+                        static_cast<unsigned long long>(
+                            receipt.previous_source_revision.value()),
+                        static_cast<unsigned long long>(
+                            receipt.rebased_source_revision.value()),
+                        receipt.reused_step_ids.size());
+                    ImGui::TextWrapped("Material reads (%zu): %s",
+                        receipt.read_material_regions.size(),
+                        format_material_regions(receipt.read_material_regions).c_str());
+                    ImGui::TextWrapped("Material writes (%zu): %s",
+                        receipt.write_material_regions.size(),
+                        format_material_regions(receipt.write_material_regions).c_str());
+                }
+                if (task.rebases.size() > visible_rebases) {
+                    ImGui::TextDisabled("Showing %zu of %zu rebase records.",
+                        visible_rebases, task.rebases.size());
+                }
+            }
             for (const auto& question : task.clarifications) {
                 ImGui::TextWrapped("Operator question · %s", question.prompt.c_str());
                 if (question.freeform_answer.has_value()) {
