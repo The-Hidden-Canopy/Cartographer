@@ -3836,17 +3836,28 @@ void ui_candidate_clarification_choice_is_scoped_and_receipted() {
         carto::agent::ClarificationImpact::topology_deletion,
         {{"inside", "In scope", {object}},
          {"outside", "Out of scope", {carto::scene::ObjectId{999U}}}}));
+    REQUIRE(!ui.queue_agent_clarification(
+        "Choose the intended edit.",
+        carto::agent::ClarificationImpact::topology_deletion, {},
+        std::string(513U, 'r')));
+    REQUIRE(!ui.queue_agent_clarification(
+        "Choose the intended edit.",
+        carto::agent::ClarificationImpact::topology_deletion, {},
+        "Unsafe\nrationale"));
     REQUIRE(ui.snapshot().agent_clarifications_draft.empty());
 
     REQUIRE(ui.queue_agent_clarification(
         "How should this face change?",
         carto::agent::ClarificationImpact::topology_deletion,
         {{"preserve", "Preserve the current surface", {object}},
-         {"inset", "Allow the captured inset", {object}}}));
+         {"inset", "Allow the captured inset", {object}}},
+        "The plan must know whether the operator permits the captured face inset."));
     const auto source_revision = source.snapshot().project_revision;
     const auto queued = ui.snapshot();
     REQUIRE(queued.agent_clarifications_draft.size() == 1U);
     REQUIRE(queued.agent_clarifications_draft.front().candidates.size() == 2U);
+    REQUIRE(queued.agent_clarifications_draft.front().rationale ==
+        "The plan must know whether the operator permits the captured face inset.");
     REQUIRE(!queued.agent_clarifications_draft.front().human_receipt.has_value());
     REQUIRE(!ui.run_agent_plan("Apply the bounded inset after the operator choice."));
     REQUIRE(!ui.choose_agent_clarification_candidate(

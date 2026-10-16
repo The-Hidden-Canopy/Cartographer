@@ -526,7 +526,8 @@ public:
     [[nodiscard]] core::Result<void> queue_agent_clarification(
         std::string prompt,
         agent::ClarificationImpact impact,
-        std::vector<agent::ClarificationCandidate> candidates = {});
+        std::vector<agent::ClarificationCandidate> candidates = {},
+        std::string rationale = {});
     [[nodiscard]] core::Result<void> answer_agent_clarification(
         std::string goal,
         std::string_view question_id,

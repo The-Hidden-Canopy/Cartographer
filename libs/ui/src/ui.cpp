@@ -2529,7 +2529,8 @@ core::Result<void> UiController::set_agent_hard_constraints(
 core::Result<void> UiController::queue_agent_clarification(
     std::string prompt,
     agent::ClarificationImpact impact,
-    std::vector<agent::ClarificationCandidate> candidates) {
+    std::vector<agent::ClarificationCandidate> candidates,
+    std::string rationale) {
     if (agent_checkpoint_pending_.has_value()) {
         return core::Result<void>::failure(invalid_state(
             "a loaded checkpoint objective cannot be edited; resume or clear it first"));
@@ -2586,7 +2587,9 @@ core::Result<void> UiController::queue_agent_clarification(
     agent::ClarificationQuestion question;
     question.id = "question-" + std::to_string(agent_clarifications_draft_.size() + 1U);
     question.prompt = std::move(prompt);
-    question.rationale = "The operator requires an explicit answer before this plan may run.";
+    question.rationale = rationale.empty()
+        ? "The operator requires an explicit answer before this plan may run."
+        : std::move(rationale);
     question.impacts = {impact};
     question.affected_objects = std::move(scope);
     question.downstream_plan_branches = agent_plan_draft_.size();
