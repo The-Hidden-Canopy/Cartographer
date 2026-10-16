@@ -1207,6 +1207,7 @@ struct DesktopState {
     std::optional<carto::editor::AuthoringPreview> ai_preview;
     std::string ai_feedback;
     std::string agent_goal;
+    std::string agent_entry_notice;
     bool agent_goal_focus_requested = false;
     std::string agent_step;
     bool agent_allow_root_translation = false;
@@ -1696,6 +1697,92 @@ struct DesktopState {
         surface = ShellSurface::workspace;
         workbench.draft = true;
         if (focus_goal) agent_goal_focus_requested = true;
+        return true;
+    }
+
+    bool agent_material_scope_is_complete(const UiSnapshot& snapshot) const {
+        if (snapshot.selection.mode != carto::editor::SelectionMode::object ||
+            snapshot.selection.objects.empty() ||
+            snapshot.selection.objects.size() > 16U) {
+            return false;
+        }
+        const std::set<carto::scene::ObjectId> selected_objects(
+            snapshot.selection.objects.begin(), snapshot.selection.objects.end());
+        std::set<std::uint64_t> selected_meshes;
+        for (const auto object_id : selected_objects) {
+            const auto target = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
+                [object_id](const auto& object) {
+                    return object.object.id == object_id;
+                });
+            if (target == snapshot.objects.end() || !target->object.mesh_asset.has_value() ||
+                target->object.parent.has_value() || target->object.locked) {
+                return false;
+            }
+            selected_meshes.insert(*target->object.mesh_asset);
+        }
+        for (const auto& object : snapshot.objects) {
+            if (!object.object.mesh_asset.has_value() ||
+                !selected_meshes.contains(*object.object.mesh_asset)) {
+                continue;
+            }
+            if (!selected_objects.contains(object.object.id) ||
+                object.object.parent.has_value() || object.object.locked) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool draft_material_assignment_in_agent(
+        const UiSnapshot& snapshot,
+        carto::render::MaterialId material,
+        std::uint32_t region) {
+        const bool active_task = snapshot.agent_task.has_value() &&
+            snapshot.agent_task->status != carto::agent::TaskStatus::accepted &&
+            snapshot.agent_task->status != carto::agent::TaskStatus::rejected;
+        if (material == 0U || region == 0U ||
+            !agent_material_scope_is_complete(snapshot) || active_task ||
+            snapshot.agent_checkpoint_loaded || !snapshot.agent_plan_draft.empty() ||
+            !agent_goal.empty() || material_draft_dirty || material_graph_draft_dirty) {
+            action_feedback =
+                "Cannot draft this assignment: select a complete unlocked mesh scope and "
+                "finish any existing Agent or Material draft first.";
+            action_feedback_error = true;
+            return false;
+        }
+        const bool material_exists = std::any_of(
+            snapshot.materials.begin(), snapshot.materials.end(),
+            [material](const auto& candidate) { return candidate.id == material; });
+        if (!material_exists) {
+            action_feedback = "The selected material source is no longer current.";
+            action_feedback_error = true;
+            return false;
+        }
+
+        const std::string intent = "assign material " + std::to_string(material) +
+            " to region " + std::to_string(region);
+        const auto compiled = ui.compile_agent_goal_sequence(intent);
+        if (!compiled) {
+            action_feedback = compiled.error().message;
+            action_feedback_error = true;
+            return false;
+        }
+        agent_goal = intent;
+        agent_allow_material_assignment = true;
+        agent_entry_notice =
+            "Drafted from the Material workspace for " +
+            std::to_string(snapshot.selection.objects.size()) +
+            " selected mesh object(s). This is a speculative plan; the project stays "
+            "unchanged until you run, review, and accept it.";
+        action_feedback_error = false;
+        action_feedback = "Assignment plan drafted. Review its step and effect permission in Agent.";
+        if (!open_agent_workspace(true)) {
+            static_cast<void>(ui.clear_agent_plan());
+            agent_goal.clear();
+            agent_allow_material_assignment = false;
+            agent_entry_notice.clear();
+            return false;
+        }
         return true;
     }
 
@@ -6108,7 +6195,16 @@ struct DesktopState {
             if (object != snapshot.objects.end()) selected_mesh_asset = object->object.mesh_asset;
         }
         if (!selected_mesh_asset.has_value()) {
-            ImGui::TextWrapped("Select one mesh object to author a region binding.");
+            if (snapshot.selection.mode == carto::editor::SelectionMode::object &&
+                !snapshot.selection.objects.empty()) {
+                ImGui::TextWrapped(
+                    "Direct assignment requires one object. Agent can draft across the "
+                    "selected roots when the full shared-mesh scope is selected.");
+                ImGui::InputScalar("Agent Region ID", ImGuiDataType_U32,
+                                   &material_region_id, nullptr, nullptr, "%u");
+            } else {
+                ImGui::TextWrapped("Select one mesh object to author a region binding.");
+            }
         } else {
             ImGui::Text("Mesh asset %llu · affects every instance",
                 static_cast<unsigned long long>(*selected_mesh_asset));
@@ -6164,6 +6260,44 @@ struct DesktopState {
                         snapshot.project_revision, key, std::nullopt, std::nullopt}));
             }
             ImGui::EndDisabled();
+        }
+
+        const bool agent_material_selected = std::any_of(
+            snapshot.materials.begin(), snapshot.materials.end(),
+            [this](const auto& value) { return value.id == selected_material_id; });
+        const bool agent_task_active = snapshot.agent_task.has_value() &&
+            snapshot.agent_task->status != carto::agent::TaskStatus::accepted &&
+            snapshot.agent_task->status != carto::agent::TaskStatus::rejected;
+        const bool agent_material_scope_complete =
+            agent_material_scope_is_complete(snapshot);
+        const bool agent_draft_available = agent_material_selected &&
+            material_region_id != 0U && agent_material_scope_complete &&
+            !agent_task_active && !snapshot.agent_checkpoint_loaded &&
+            snapshot.agent_plan_draft.empty() && agent_goal.empty() &&
+            !material_draft_dirty && !material_graph_draft_dirty;
+        ImGui::Separator();
+        ImGui::TextDisabled("Speculative assignment with Cartographer");
+        ImGui::TextWrapped(
+            "Draft the selected material and region as a native Agent step. Shared mesh "
+            "instances must all be selected; no source change occurs here.");
+        ImGui::BeginDisabled(!agent_draft_available);
+        if (ImGui::Button("Draft assignment in Cartographer", ImVec2(-1, 28))) {
+            static_cast<void>(draft_material_assignment_in_agent(
+                snapshot, selected_material_id, material_region_id));
+        }
+        ImGui::EndDisabled();
+        if (!agent_material_scope_complete) {
+            ImGui::TextDisabled(
+                "Select 1–16 unlocked root mesh objects, including every instance of each shared mesh.");
+        } else if (!agent_material_selected || material_region_id == 0U) {
+            ImGui::TextDisabled("Choose an existing material and a non-zero region ID.");
+        } else if (agent_task_active || snapshot.agent_checkpoint_loaded ||
+                   !snapshot.agent_plan_draft.empty() || !agent_goal.empty()) {
+            ImGui::TextDisabled(
+                "Finish or clear the current Agent goal, plan, task, or checkpoint first.");
+        } else if (material_draft_dirty || material_graph_draft_dirty) {
+            ImGui::TextDisabled(
+                "Save or discard pending Material edits before drafting an assignment.");
         }
 
         ImGui::Separator();
@@ -6689,6 +6823,11 @@ struct DesktopState {
         }
         if (ImGui::InputText("Goal", goal.data(), goal.size())) {
             agent_goal.assign(goal.data());
+            agent_entry_notice.clear();
+        }
+        if (!agent_entry_notice.empty()) {
+            ImGui::TextColored(color(snapshot.colors.semantic_info), "%s",
+                agent_entry_notice.c_str());
         }
         const auto compiled_goal_constraints =
             carto::agent::compile_explicit_hard_constraints(agent_goal);

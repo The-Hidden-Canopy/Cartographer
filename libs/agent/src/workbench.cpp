@@ -3453,6 +3453,8 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
     }
     const bool material_assignment = intent_starts_with(
         step.intent, "assign", "material");
+    const auto material_intent = material_assignment
+        ? parse_material_assignment_intent(step.intent) : std::nullopt;
     const bool lightmap_uv_generation = intent_starts_with(
         step.intent, "generate", "lightmap", "uv");
     if (material_assignment &&
@@ -3646,6 +3648,42 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
     const auto parameterized = parameterize_demo_step(
         proposal.value(), speculative_->document_, step.target);
     if (parameterized) receipt.demonstration_parameters = parameterized.value();
+
+    if (material_assignment && material_intent.has_value() &&
+        target_object->mesh_asset.has_value()) {
+        const project::MaterialRegionKey key{
+            *target_object->mesh_asset, material_intent->region};
+        const auto assigned = speculative_->document_.material_catalog().assignments().find(key);
+        const bool assigned_by_prior_step = std::any_of(
+            receipts_.begin(), receipts_.end(), [this, &material_intent, key](const auto& prior) {
+                if (prior.status != StepStatus::passed) return false;
+                const auto prior_intent = parse_material_assignment_intent(prior.intent);
+                if (!prior_intent.has_value() || prior_intent->material != material_intent->material ||
+                    prior_intent->region != material_intent->region ||
+                    prior_intent->variant != material_intent->variant) {
+                    return false;
+                }
+                const auto* prior_target = speculative_->document_.scene().find(
+                    prior.target_object);
+                return prior_target != nullptr && prior_target->mesh_asset.has_value() &&
+                    *prior_target->mesh_asset == key.mesh_asset;
+            });
+        if (assigned_by_prior_step && assigned !=
+                speculative_->document_.material_catalog().assignments().end() &&
+            assigned->second.material == material_intent->material &&
+            assigned->second.variant == material_intent->variant) {
+            // Region assignments are mesh/region writes. A later selected
+            // instance can share the same write; preserve its step receipt
+            // after validating scope and authority, but don't apply the same
+            // catalog mutation twice.
+            receipt.status = StepStatus::passed;
+            receipt.revision_after = speculative_->document_.revision();
+            touched_objects_.insert(affected_objects.begin(), affected_objects.end());
+            step_transform_distance_meters_[step.id] = 0.0;
+            receipts_.push_back(std::move(receipt));
+            return core::Result<void>::success();
+        }
+    }
 
     auto preview = speculative_->begin_preview(proposal.value().preview_kind);
     if (!preview) return fail(preview.error().with_context("speculative native preview"));

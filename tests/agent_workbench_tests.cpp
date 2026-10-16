@@ -2793,6 +2793,62 @@ void ui_compiles_and_reviews_an_opt_in_material_assignment() {
     REQUIRE(source.snapshot().material_assignments.front().material == fixture.material);
 }
 
+void ui_compiles_material_assignment_for_all_selected_shared_mesh_instances() {
+    TempDirectory temp;
+    carto::application::ApplicationSession source;
+    const auto fixture = create_material_target(source);
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(source,
+        carto::application::DuplicateMeshInstanceAction{
+            fixture.object, "Shared material target", {2.0, 0.0, 0.0}}));
+    const auto duplicate = source.snapshot().objects.back().object.id;
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{fixture.object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{
+        duplicate, carto::editor::SelectionOperation::add}));
+    const std::string intent = "assign material " +
+        std::to_string(fixture.material) + " to region 1";
+    REQUIRE(ui.compile_agent_goal_sequence(intent));
+    REQUIRE(ui.snapshot().agent_plan_draft.size() == 2U);
+    auto envelope = envelope_for({fixture.object, duplicate});
+    envelope.permitted_effects |=
+        carto::agent::effect_mask(carto::agent::Effect::material);
+
+    const auto source_before = source.snapshot();
+    const auto run = ui.run_agent_plan(intent, envelope);
+    REQUIRE(run);
+    REQUIRE(run.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(run.value().can_accept);
+    REQUIRE(run.value().diff.changed_material_binding_count() == 1U);
+    REQUIRE(source.snapshot().project_revision == source_before.project_revision);
+    REQUIRE(source.snapshot().material_assignments.empty());
+    REQUIRE(run.value().steps.size() == 2U);
+    REQUIRE(run.value().steps[0].status == carto::agent::StepStatus::passed);
+    REQUIRE(run.value().steps[1].status == carto::agent::StepStatus::passed);
+    REQUIRE(run.value().steps[1].revision_before == run.value().steps[1].revision_after);
+
+    const auto checkpoint_path =
+        temp.path() / "shared-material-assignment.carto-agent-task";
+    REQUIRE(ui.save_agent_checkpoint(checkpoint_path));
+    carto::ui::UiController resumed_ui(source);
+    REQUIRE(resumed_ui.load_agent_checkpoint(checkpoint_path));
+    const auto resumed = resumed_ui.resume_agent_checkpoint();
+    REQUIRE(resumed);
+    REQUIRE(resumed.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(resumed.value().can_accept);
+    REQUIRE(resumed.value().steps.size() == 2U);
+    REQUIRE(resumed.value().steps[1].revision_before ==
+        resumed.value().steps[1].revision_after);
+    REQUIRE(source.snapshot().project_revision == source_before.project_revision);
+    REQUIRE(resumed_ui.accept_agent_plan());
+    const auto accepted = source.snapshot();
+    REQUIRE(accepted.material_assignments.size() == 1U);
+    REQUIRE((accepted.material_assignments.front().key ==
+        carto::project::MaterialRegionKey{fixture.mesh_asset, 1U}));
+    REQUIRE(accepted.material_assignments.front().material == fixture.material);
+}
+
 void agent_material_assignment_fails_closed_on_authority_and_source_boundaries() {
     {
         carto::application::ApplicationSession source;
@@ -6309,6 +6365,7 @@ int main() {
         saved_acceptance_is_one_durable_application_event();
         agent_material_assignment_is_speculative_reviewed_and_checkpointed();
         ui_compiles_and_reviews_an_opt_in_material_assignment();
+        ui_compiles_material_assignment_for_all_selected_shared_mesh_instances();
         agent_material_assignment_fails_closed_on_authority_and_source_boundaries();
         ui_reviews_persists_and_undoes_opt_in_lightmap_uv_generation();
         agent_lightmap_uv_fails_closed_without_permission_or_complete_mesh_scope();
