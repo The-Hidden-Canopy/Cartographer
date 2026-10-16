@@ -4702,6 +4702,7 @@ void ui_agent_entry_preserves_context_selection_across_workspaces() {
     const auto source_revision = source.snapshot().project_revision;
 
     REQUIRE(ui.set_workspace(carto::ui::Workspace::material));
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::sculpt));
     REQUIRE(ui.set_workspace(carto::ui::Workspace::ai));
     const auto routed = ui.snapshot();
     REQUIRE(routed.workspace_kind == carto::ui::Workspace::ai);

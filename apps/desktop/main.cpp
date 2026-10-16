@@ -6336,6 +6336,30 @@ struct DesktopState {
             ImGui::Text("Project revision %llu",
                 static_cast<unsigned long long>(snapshot.project_revision.value()));
             ImGui::Separator();
+            const bool agent_object_scope =
+                snapshot.selection.mode == carto::editor::SelectionMode::object &&
+                !snapshot.selection.objects.empty() &&
+                snapshot.selection.objects.size() <= 16U;
+            const bool agent_component_scope =
+                snapshot.selection.component_object.has_value() &&
+                ((snapshot.selection.mode == carto::editor::SelectionMode::face &&
+                    snapshot.selection.faces.size() == 1U) ||
+                 (snapshot.selection.mode == carto::editor::SelectionMode::vertex &&
+                    snapshot.selection.vertices.size() == 1U));
+            ImGui::TextDisabled("Speculative Cartographer handoff");
+            ImGui::TextWrapped(
+                "Use the current selection for a supported native mesh edit. Agent tasks "
+                "do not edit SculptStack layers, masks, remesh, or multires settings.");
+            ImGui::BeginDisabled(!agent_object_scope && !agent_component_scope);
+            if (ImGui::Button("Ask Cartographer about this selection", ImVec2(-1, 28))) {
+                agent_entry_notice =
+                    "Opened from Sculpt. The selected target is preserved for supported "
+                    "native mesh plans; SculptStack layer, mask, remesh, and multires edits "
+                    "remain in the Sculpt workspace.";
+                static_cast<void>(open_agent_workspace(true));
+            }
+            ImGui::EndDisabled();
+            ImGui::Separator();
             if (snapshot.selection.mode != carto::editor::SelectionMode::vertex) {
                 if (ImGui::Button("Switch to vertex selection", ImVec2(-1, 30))) {
                     static_cast<void>(dispatch(carto::application::SetSelectionModeAction{
