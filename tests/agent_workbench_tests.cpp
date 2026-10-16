@@ -1,5 +1,8 @@
 #include <carto/agent/workbench.hpp>
 #include <carto/condition/authoring.hpp>
+#include <carto/geometry/primitives.hpp>
+#include <carto/journal/journal.hpp>
+#include <carto/project/transaction.hpp>
 #include <carto/ui/ui.hpp>
 
 #include <algorithm>
@@ -57,6 +60,54 @@ std::vector<carto::scene::ObjectId> create_boxes(
     std::vector<carto::scene::ObjectId> result;
     for (const auto& object : session.snapshot().objects) result.push_back(object.object.id);
     return result;
+}
+
+carto::geometry::EditableMesh add_test_uv_set(
+    carto::geometry::EditableMesh mesh,
+    const std::vector<carto::core::Vec2d>& uv_values) {
+    using namespace carto;
+    const auto topology = mesh.topology();
+    REQUIRE(topology);
+    REQUIRE(uv_values.size() == topology.value().corners.size());
+    std::vector<attributes::AttributeValue> values;
+    values.reserve(uv_values.size());
+    for (const auto value : uv_values) values.emplace_back(value);
+    attributes::AttributeSet attribute_set({
+        {attributes::AttributeDomain::corner, topology.value().corners.size()}});
+    REQUIRE(attribute_set.add_layer(attributes::AttributeLayer{
+        {"uv.source.corners", attributes::AttributeDomain::corner,
+            attributes::AttributeType::vec2},
+        std::move(values)}));
+    attributes::UvSetTable uv_sets;
+    REQUIRE(uv_sets.add(attributes::UvSetDescriptor{
+        7U, "Source UV", "uv.source.corners", true, true, false, 1U}));
+    REQUIRE(mesh.set_attribute_payload(std::move(attribute_set), std::move(uv_sets)));
+    REQUIRE(mesh.validate());
+    return mesh;
+}
+
+carto::project::ProjectDocument make_project_with_mesh(
+    carto::journal::Journal& journal,
+    carto::geometry::EditableMesh mesh,
+    std::uint64_t& mesh_asset) {
+    using namespace carto;
+    auto document = project::ProjectDocument::create("Agent project diff test");
+    REQUIRE(document);
+    const std::string initial_snapshot = document.value().serialize();
+    const auto* snapshot_bytes = reinterpret_cast<const std::uint8_t*>(
+        initial_snapshot.data());
+    REQUIRE(journal.append(journal::JournalAppend{
+        core::Revision{}, document.value().revision(), "project.create",
+        std::span<const std::uint8_t>(snapshot_bytes, initial_snapshot.size()),
+        std::nullopt}));
+    auto transaction = project::ProjectTransaction::begin(
+        document.value(), journal, "agent-project-diff-tests");
+    REQUIRE(transaction);
+    const auto added = transaction.value().add_mesh(std::move(mesh));
+    REQUIRE(added);
+    mesh_asset = added.value();
+    REQUIRE(transaction.value().commit("agent-project-diff.fixture"));
+    return std::move(document).value();
 }
 
 carto::agent::AgentPlan plan_for(
@@ -2709,6 +2760,177 @@ void diff_digest_tracks_geometry_values_not_only_change_shape() {
                 !changed_face->after_vertices.empty()));
 }
 
+void project_diff_reports_uv_layer_and_bounded_corner_changes() {
+    using namespace carto;
+    TempDirectory directory;
+    journal::Journal journal(directory.path() / "uv-project-diff.journal");
+    auto plane = geometry::make_plane(2.0, 2.0);
+    REQUIRE(plane);
+    const auto plane_topology = plane.value().topology();
+    REQUIRE(plane_topology);
+    std::vector<core::Vec2d> plane_uvs;
+    for (std::size_t index = 0U; index < plane_topology.value().corners.size(); ++index) {
+        plane_uvs.push_back({static_cast<double>(index), static_cast<double>(index % 2U)});
+    }
+    std::uint64_t plane_asset = 0U;
+    auto plane_document = make_project_with_mesh(
+        journal, add_test_uv_set(std::move(plane).value(), plane_uvs), plane_asset);
+    const project::ProjectDocument plane_before = plane_document;
+
+    geometry::EditableMesh changed_plane = plane_document.meshes().at(plane_asset);
+    attributes::AttributeSet changed_plane_attributes(
+        changed_plane.attributes().domain_counts());
+    for (const auto& [layer_id, source_layer] : changed_plane.attributes().layers()) {
+        auto layer = source_layer;
+        if (layer_id == "uv.source.corners") {
+            auto* uv = std::get_if<core::Vec2d>(&layer.values.front());
+            REQUIRE(uv != nullptr);
+            uv->x += 0.25;
+        }
+        REQUIRE(changed_plane_attributes.add_layer(std::move(layer)));
+    }
+    REQUIRE(changed_plane.set_attribute_payload(
+        std::move(changed_plane_attributes), changed_plane.uv_sets()));
+    auto update = project::ProjectTransaction::begin(
+        plane_document, journal, "agent-project-diff-tests");
+    REQUIRE(update);
+    REQUIRE(update.value().replace_mesh(plane_asset, std::move(changed_plane)));
+    REQUIRE(update.value().commit("agent-project-diff.uv-change"));
+
+    const agent::ProjectDiff plane_diff =
+        agent::ProjectDiff::between(plane_before, plane_document);
+    REQUIRE(plane_diff.changed_mesh_count() == 1U);
+    const auto plane_mesh_diff = std::find_if(
+        plane_diff.meshes.begin(), plane_diff.meshes.end(), [plane_asset](const auto& mesh) {
+            return mesh.asset_id == plane_asset;
+        });
+    REQUIRE(plane_mesh_diff != plane_diff.meshes.end());
+    const auto plane_layer_diff = std::find_if(
+        plane_mesh_diff->attribute_layers.begin(), plane_mesh_diff->attribute_layers.end(),
+        [](const auto& layer) { return layer.layer_id == "uv.source.corners"; });
+    REQUIRE(plane_layer_diff != plane_mesh_diff->attribute_layers.end());
+    REQUIRE(plane_layer_diff->changed_value_count == 1U);
+    const auto plane_uv_diff = std::find_if(
+        plane_mesh_diff->uv_sets.begin(), plane_mesh_diff->uv_sets.end(),
+        [](const auto& uv_set) { return uv_set.id == 7U; });
+    REQUIRE(plane_uv_diff != plane_mesh_diff->uv_sets.end());
+    REQUIRE(plane_uv_diff->details_available);
+    REQUIRE(plane_uv_diff->changed_corner_count == 1U);
+    REQUIRE(plane_uv_diff->samples.size() == 1U);
+    REQUIRE(plane_uv_diff->samples.front().before.has_value());
+    REQUIRE(plane_uv_diff->samples.front().after.has_value());
+    REQUIRE(plane_uv_diff->samples.front().after->x ==
+        plane_uv_diff->samples.front().before->x + 0.25);
+    REQUIRE(!plane_uv_diff->samples_truncated);
+
+    auto empty_document = project::ProjectDocument::create("Empty project diff test");
+    REQUIRE(empty_document);
+    const agent::ProjectDiff added_mesh_diff = agent::ProjectDiff::between(
+        empty_document.value(), plane_document);
+    const auto added_mesh = std::find_if(
+        added_mesh_diff.meshes.begin(), added_mesh_diff.meshes.end(),
+        [plane_asset](const auto& mesh) { return mesh.asset_id == plane_asset; });
+    REQUIRE(added_mesh != added_mesh_diff.meshes.end());
+    REQUIRE(added_mesh->added);
+    const auto added_uv_set = std::find_if(
+        added_mesh->uv_sets.begin(), added_mesh->uv_sets.end(),
+        [](const auto& uv_set) { return uv_set.id == 7U; });
+    REQUIRE(added_uv_set != added_mesh->uv_sets.end());
+    REQUIRE(added_uv_set->descriptor_changed);
+    REQUIRE(!added_uv_set->before.has_value());
+    REQUIRE(added_uv_set->after.has_value());
+    REQUIRE(added_uv_set->changed_corner_count == plane_topology.value().corners.size());
+    REQUIRE(!added_uv_set->samples.empty());
+    REQUIRE(!added_uv_set->samples.front().before.has_value());
+    REQUIRE(added_uv_set->samples.front().after.has_value());
+
+    const agent::ProjectDiff removed_mesh_diff = agent::ProjectDiff::between(
+        plane_document, empty_document.value());
+    const auto removed_mesh = std::find_if(
+        removed_mesh_diff.meshes.begin(), removed_mesh_diff.meshes.end(),
+        [plane_asset](const auto& mesh) { return mesh.asset_id == plane_asset; });
+    REQUIRE(removed_mesh != removed_mesh_diff.meshes.end());
+    REQUIRE(removed_mesh->removed);
+    const auto removed_uv_set = std::find_if(
+        removed_mesh->uv_sets.begin(), removed_mesh->uv_sets.end(),
+        [](const auto& uv_set) { return uv_set.id == 7U; });
+    REQUIRE(removed_uv_set != removed_mesh->uv_sets.end());
+    REQUIRE(removed_uv_set->descriptor_changed);
+    REQUIRE(removed_uv_set->before.has_value());
+    REQUIRE(!removed_uv_set->after.has_value());
+    REQUIRE(removed_uv_set->changed_corner_count == plane_topology.value().corners.size());
+    REQUIRE(!removed_uv_set->samples.empty());
+    REQUIRE(removed_uv_set->samples.front().before.has_value());
+    REQUIRE(!removed_uv_set->samples.front().after.has_value());
+
+    TempDirectory large_directory;
+    journal::Journal large_journal(large_directory.path() / "uv-project-diff.journal");
+    geometry::EditableMesh many_triangles;
+    std::vector<geometry::Vertex> vertices;
+    std::vector<geometry::Face> faces;
+    constexpr std::size_t triangle_count =
+        (agent::kMaxProjectDiffUvSamples + 2U) / 3U;
+    vertices.reserve(triangle_count * 3U);
+    faces.reserve(triangle_count);
+    for (std::size_t index = 0U; index < triangle_count; ++index) {
+        const std::uint64_t first_id = static_cast<std::uint64_t>(index * 3U + 1U);
+        const double x = static_cast<double>(index * 2U);
+        const geometry::VertexId first{first_id};
+        const geometry::VertexId second{first_id + 1U};
+        const geometry::VertexId third{first_id + 2U};
+        vertices.push_back({first, {x, 0.0, 0.0}});
+        vertices.push_back({second, {x + 1.0, 0.0, 0.0}});
+        vertices.push_back({third, {x, 1.0, 0.0}});
+        faces.push_back({geometry::FaceId{static_cast<std::uint64_t>(index + 1U)},
+            {first, second, third}});
+    }
+    REQUIRE(many_triangles.insert_bulk(std::move(vertices), std::move(faces)));
+    const auto many_topology = many_triangles.topology();
+    REQUIRE(many_topology);
+    std::vector<core::Vec2d> many_uvs(
+        many_topology.value().corners.size(), core::Vec2d{0.0, 0.0});
+    std::uint64_t many_asset = 0U;
+    auto many_document = make_project_with_mesh(
+        large_journal, add_test_uv_set(std::move(many_triangles), many_uvs), many_asset);
+    const project::ProjectDocument many_before = many_document;
+    geometry::EditableMesh changed_many = many_document.meshes().at(many_asset);
+    attributes::AttributeSet changed_many_attributes(
+        changed_many.attributes().domain_counts());
+    for (const auto& [layer_id, source_layer] : changed_many.attributes().layers()) {
+        auto layer = source_layer;
+        if (layer_id == "uv.source.corners") {
+            for (auto& value : layer.values) {
+                auto* uv = std::get_if<core::Vec2d>(&value);
+                REQUIRE(uv != nullptr);
+                uv->x += 1.0;
+            }
+        }
+        REQUIRE(changed_many_attributes.add_layer(std::move(layer)));
+    }
+    REQUIRE(changed_many.set_attribute_payload(
+        std::move(changed_many_attributes), changed_many.uv_sets()));
+    auto large_update = project::ProjectTransaction::begin(
+        many_document, large_journal, "agent-project-diff-tests");
+    REQUIRE(large_update);
+    REQUIRE(large_update.value().replace_mesh(many_asset, std::move(changed_many)));
+    REQUIRE(large_update.value().commit("agent-project-diff.uv-large-change"));
+
+    const agent::ProjectDiff many_diff =
+        agent::ProjectDiff::between(many_before, many_document);
+    const auto many_mesh_diff = std::find_if(
+        many_diff.meshes.begin(), many_diff.meshes.end(), [many_asset](const auto& mesh) {
+            return mesh.asset_id == many_asset;
+        });
+    REQUIRE(many_mesh_diff != many_diff.meshes.end());
+    const auto many_uv_diff = std::find_if(
+        many_mesh_diff->uv_sets.begin(), many_mesh_diff->uv_sets.end(),
+        [](const auto& uv_set) { return uv_set.id == 7U; });
+    REQUIRE(many_uv_diff != many_mesh_diff->uv_sets.end());
+    REQUIRE(many_uv_diff->changed_corner_count == many_topology.value().corners.size());
+    REQUIRE(many_uv_diff->samples.size() == agent::kMaxProjectDiffUvSamples);
+    REQUIRE(many_uv_diff->samples_truncated);
+}
+
 void shared_mesh_instances_must_be_in_scope_and_within_touch_budget() {
     carto::application::ApplicationSession source;
     const auto objects = create_boxes(source, 1U);
@@ -5280,6 +5502,7 @@ int main() {
         work_envelope_blocks_topology_effect_before_live_mutation();
         work_envelope_blocks_topology_churn_over_budget();
         diff_digest_tracks_geometry_values_not_only_change_shape();
+        project_diff_reports_uv_layer_and_bounded_corner_changes();
         bounded_mesh_recipe_caps_execution_and_binds_its_acceptance_gate();
         bounded_vertex_recipe_preserves_topology_and_repair_authority();
         shared_mesh_instances_must_be_in_scope_and_within_touch_budget();

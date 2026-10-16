@@ -354,6 +354,61 @@ assets::Sha256Digest project_result_digest(const project::ProjectDocument& after
         reinterpret_cast<const std::uint8_t*>(identity.data()), identity.size()));
 }
 
+bool same_attribute_value(
+    const attributes::AttributeValue& left,
+    const attributes::AttributeValue& right) {
+    return std::visit([&right](const auto& value) {
+        using Value = std::decay_t<decltype(value)>;
+        const auto* other = std::get_if<Value>(&right);
+        if (other == nullptr) return false;
+        if constexpr (std::is_same_v<Value, core::Vec2d>) {
+            return value.x == other->x && value.y == other->y;
+        } else if constexpr (std::is_same_v<Value, core::Vec3d>) {
+            return value.x == other->x && value.y == other->y && value.z == other->z;
+        } else if constexpr (std::is_same_v<Value, core::Vec4d>) {
+            return value.x == other->x && value.y == other->y &&
+                value.z == other->z && value.w == other->w;
+        } else {
+            return value == *other;
+        }
+    }, left);
+}
+
+bool same_uv_set_descriptor(
+    const attributes::UvSetDescriptor& left,
+    const attributes::UvSetDescriptor& right) noexcept {
+    return left.id == right.id && left.name == right.name &&
+        left.layer_id == right.layer_id &&
+        left.active_for_editing == right.active_for_editing &&
+        left.active_for_render == right.active_for_render &&
+        left.lightmap_candidate == right.lightmap_candidate &&
+        left.tile_policy_version == right.tile_policy_version;
+}
+
+std::optional<std::map<geometry::CornerId, core::Vec2d>> uv_values_by_corner(
+    const geometry::EditableMesh& mesh,
+    std::string_view layer_id) {
+    const auto* layer = mesh.attributes().find(layer_id);
+    if (layer == nullptr ||
+        layer->descriptor.domain != attributes::AttributeDomain::corner ||
+        layer->descriptor.type != attributes::AttributeType::vec2) {
+        return std::nullopt;
+    }
+    const auto topology = mesh.topology();
+    if (!topology || topology.value().corners.size() != layer->values.size()) {
+        return std::nullopt;
+    }
+    std::map<geometry::CornerId, core::Vec2d> values;
+    for (std::size_t index = 0U; index < topology.value().corners.size(); ++index) {
+        const auto* uv = std::get_if<core::Vec2d>(&layer->values[index]);
+        if (uv == nullptr || !uv->finite() ||
+            !values.emplace(topology.value().corners[index].id, *uv).second) {
+            return std::nullopt;
+        }
+    }
+    return values;
+}
+
 bool same_scene_object(
     const scene::SceneObject* left,
     const scene::SceneObject* right) noexcept {
@@ -3588,13 +3643,15 @@ const project::ProjectDocument& AgentTask::scene_query_document() const {
     return speculative_->document_;
 }
 
-ProjectDiff AgentTask::build_diff() const {
+ProjectDiff ProjectDiff::between(
+    const project::ProjectDocument& base_document_,
+    const project::ProjectDocument& speculative_document) {
     ProjectDiff diff;
-    diff.base_revision = plan_.objective.base_revision;
-    diff.speculative_revision = speculative_->document_.revision();
+    diff.base_revision = base_document_.revision();
+    diff.speculative_revision = speculative_document.revision();
 
     const auto before_objects = base_document_.scene().objects_sorted();
-    const auto after_objects = speculative_->document_.scene().objects_sorted();
+    const auto after_objects = speculative_document.scene().objects_sorted();
     std::map<scene::ObjectId, scene::SceneObject> before_by_id;
     std::map<scene::ObjectId, scene::SceneObject> after_by_id;
     for (const auto& object : before_objects) before_by_id.emplace(object.id, object);
@@ -3622,7 +3679,7 @@ ProjectDiff AgentTask::build_diff() const {
     }
 
     const auto& before_meshes = base_document_.meshes();
-    const auto& after_meshes = speculative_->document_.meshes();
+    const auto& after_meshes = speculative_document.meshes();
     std::set<std::uint64_t> mesh_ids;
     for (const auto& [id, mesh] : before_meshes) { static_cast<void>(mesh); mesh_ids.insert(id); }
     for (const auto& [id, mesh] : after_meshes) { static_cast<void>(mesh); mesh_ids.insert(id); }
@@ -3722,15 +3779,175 @@ ProjectDiff AgentTask::build_diff() const {
                     change.faces.push_back(std::move(face_change));
                 }
             }
+
+            std::set<std::string> attribute_layer_ids;
+            for (const auto& [layer_id, layer] : before->second.attributes().layers()) {
+                static_cast<void>(layer);
+                attribute_layer_ids.insert(layer_id);
+            }
+            for (const auto& [layer_id, layer] : after->second.attributes().layers()) {
+                static_cast<void>(layer);
+                attribute_layer_ids.insert(layer_id);
+            }
+            for (const auto& layer_id : attribute_layer_ids) {
+                const auto* before_layer = before->second.attributes().find(layer_id);
+                const auto* after_layer = after->second.attributes().find(layer_id);
+                AttributeLayerChange layer_change;
+                layer_change.layer_id = layer_id;
+                layer_change.added = before_layer == nullptr;
+                layer_change.removed = after_layer == nullptr;
+                const auto* descriptor_layer = after_layer != nullptr
+                    ? after_layer : before_layer;
+                if (descriptor_layer == nullptr) continue;
+                layer_change.domain = descriptor_layer->descriptor.domain;
+                layer_change.type = descriptor_layer->descriptor.type;
+                layer_change.before_value_count = before_layer == nullptr
+                    ? 0U : before_layer->values.size();
+                layer_change.after_value_count = after_layer == nullptr
+                    ? 0U : after_layer->values.size();
+                if (before_layer == nullptr) {
+                    layer_change.changed_value_count = layer_change.after_value_count;
+                } else if (after_layer == nullptr) {
+                    layer_change.changed_value_count = layer_change.before_value_count;
+                } else {
+                    layer_change.descriptor_changed =
+                        before_layer->descriptor.domain != after_layer->descriptor.domain ||
+                        before_layer->descriptor.type != after_layer->descriptor.type;
+                    const std::size_t value_count = std::max(
+                        before_layer->values.size(), after_layer->values.size());
+                    for (std::size_t index = 0U; index < value_count; ++index) {
+                        if (index >= before_layer->values.size() ||
+                            index >= after_layer->values.size() ||
+                            layer_change.descriptor_changed ||
+                            !same_attribute_value(
+                                before_layer->values[index], after_layer->values[index])) {
+                            ++layer_change.changed_value_count;
+                        }
+                    }
+                }
+                if (layer_change.added || layer_change.removed ||
+                    layer_change.descriptor_changed || layer_change.changed_value_count > 0U) {
+                    change.attribute_layers.push_back(std::move(layer_change));
+                }
+            }
+
+            std::set<attributes::UvSetId> uv_set_ids;
+            for (const auto& [uv_set_id, descriptor] : before->second.uv_sets().descriptors()) {
+                static_cast<void>(descriptor);
+                uv_set_ids.insert(uv_set_id);
+            }
+            for (const auto& [uv_set_id, descriptor] : after->second.uv_sets().descriptors()) {
+                static_cast<void>(descriptor);
+                uv_set_ids.insert(uv_set_id);
+            }
+            for (const auto uv_set_id : uv_set_ids) {
+                const auto* before_descriptor = before->second.uv_sets().find(uv_set_id);
+                const auto* after_descriptor = after->second.uv_sets().find(uv_set_id);
+                UvSetChange uv_change;
+                uv_change.id = uv_set_id;
+                if (before_descriptor != nullptr) uv_change.before = *before_descriptor;
+                if (after_descriptor != nullptr) uv_change.after = *after_descriptor;
+                const auto before_values = before_descriptor == nullptr
+                    ? std::optional<std::map<geometry::CornerId, core::Vec2d>>(
+                        std::map<geometry::CornerId, core::Vec2d>{})
+                    : uv_values_by_corner(before->second, before_descriptor->layer_id);
+                const auto after_values = after_descriptor == nullptr
+                    ? std::optional<std::map<geometry::CornerId, core::Vec2d>>(
+                        std::map<geometry::CornerId, core::Vec2d>{})
+                    : uv_values_by_corner(after->second, after_descriptor->layer_id);
+                uv_change.details_available = before_values.has_value() &&
+                    after_values.has_value();
+                if (uv_change.details_available) {
+                    std::set<geometry::CornerId> corner_ids;
+                    for (const auto& [corner_id, value] : *before_values) {
+                        static_cast<void>(value);
+                        corner_ids.insert(corner_id);
+                    }
+                    for (const auto& [corner_id, value] : *after_values) {
+                        static_cast<void>(value);
+                        corner_ids.insert(corner_id);
+                    }
+                    for (const auto corner_id : corner_ids) {
+                        const auto old_value = before_values->find(corner_id);
+                        const auto new_value = after_values->find(corner_id);
+                        const bool old_present = old_value != before_values->end();
+                        const bool new_present = new_value != after_values->end();
+                        if (old_present && new_present &&
+                            old_value->second.x == new_value->second.x &&
+                            old_value->second.y == new_value->second.y) {
+                            continue;
+                        }
+                        ++uv_change.changed_corner_count;
+                        if (uv_change.samples.size() < kMaxProjectDiffUvSamples) {
+                            UvCornerValueChange sample;
+                            sample.corner = corner_id;
+                            if (old_present) sample.before = old_value->second;
+                            if (new_present) sample.after = new_value->second;
+                            uv_change.samples.push_back(std::move(sample));
+                        }
+                    }
+                    uv_change.samples_truncated = uv_change.changed_corner_count >
+                        uv_change.samples.size();
+                }
+                uv_change.descriptor_changed =
+                    (before_descriptor == nullptr) != (after_descriptor == nullptr) ||
+                    (before_descriptor != nullptr && after_descriptor != nullptr &&
+                        !same_uv_set_descriptor(*before_descriptor, *after_descriptor));
+                if (uv_change.descriptor_changed || uv_change.changed_corner_count > 0U ||
+                    !uv_change.details_available) {
+                    change.uv_sets.push_back(std::move(uv_change));
+                }
+            }
+        }
+        if (change.added || change.removed) {
+            const geometry::EditableMesh& one_sided_mesh = change.added
+                ? after->second : before->second;
+            for (const auto& [layer_id, layer] : one_sided_mesh.attributes().layers()) {
+                AttributeLayerChange layer_change;
+                layer_change.layer_id = layer_id;
+                layer_change.domain = layer.descriptor.domain;
+                layer_change.type = layer.descriptor.type;
+                layer_change.added = change.added;
+                layer_change.removed = change.removed;
+                layer_change.before_value_count = change.added ? 0U : layer.values.size();
+                layer_change.after_value_count = change.added ? layer.values.size() : 0U;
+                layer_change.changed_value_count = layer.values.size();
+                change.attribute_layers.push_back(std::move(layer_change));
+            }
+            for (const auto& [uv_set_id, descriptor] :
+                    one_sided_mesh.uv_sets().descriptors()) {
+                UvSetChange uv_change;
+                uv_change.id = uv_set_id;
+                uv_change.descriptor_changed = true;
+                if (change.added) uv_change.after = descriptor;
+                else uv_change.before = descriptor;
+                const auto values = uv_values_by_corner(one_sided_mesh, descriptor.layer_id);
+                uv_change.details_available = values.has_value();
+                if (values.has_value()) {
+                    uv_change.changed_corner_count = values->size();
+                    for (const auto& [corner_id, value] : *values) {
+                        if (uv_change.samples.size() >= kMaxProjectDiffUvSamples) break;
+                        UvCornerValueChange sample;
+                        sample.corner = corner_id;
+                        if (change.added) sample.after = value;
+                        else sample.before = value;
+                        uv_change.samples.push_back(std::move(sample));
+                    }
+                    uv_change.samples_truncated = uv_change.changed_corner_count >
+                        uv_change.samples.size();
+                }
+                change.uv_sets.push_back(std::move(uv_change));
+            }
         }
         if (change.added || change.removed ||
-            change.before_revision != change.after_revision) {
+            change.before_revision != change.after_revision ||
+            !change.attribute_layers.empty() || !change.uv_sets.empty()) {
             diff.meshes.push_back(std::move(change));
         }
     }
     for (const scene::ObjectId id : object_ids) {
         const auto* before_object = base_document_.scene().find(id);
-        const auto* after_object = speculative_->document_.scene().find(id);
+        const auto* after_object = speculative_document.scene().find(id);
         if (before_object == nullptr || after_object == nullptr ||
             before_object->mesh_asset != after_object->mesh_asset ||
             !after_object->mesh_asset.has_value()) {
@@ -3755,11 +3972,15 @@ ProjectDiff AgentTask::build_diff() const {
         }
     }
     diff.engineering_changed = base_document_.engineering_authoring() !=
-        speculative_->document_.engineering_authoring();
+        speculative_document.engineering_authoring();
     diff.condition_changed = base_document_.condition_authoring() !=
-        speculative_->document_.condition_authoring();
-    diff.digest = project_result_digest(speculative_->document_);
+        speculative_document.condition_authoring();
+    diff.digest = project_result_digest(speculative_document);
     return diff;
+}
+
+ProjectDiff AgentTask::build_diff() const {
+    return ProjectDiff::between(base_document_, speculative_->document_);
 }
 
 std::vector<AcceptanceGateResult> AgentTask::evaluate_gates() const {

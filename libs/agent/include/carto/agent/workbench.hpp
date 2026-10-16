@@ -4,8 +4,10 @@
 #include <carto/application/application.hpp>
 #include <carto/agent/scene_query_budget.hpp>
 #include <carto/assets/blob_store.hpp>
+#include <carto/attributes/uv.hpp>
 #include <carto/core/result.hpp>
 #include <carto/geometry/ids.hpp>
+#include <carto/project/project.hpp>
 #include <carto/scene/scene.hpp>
 
 #include <cstddef>
@@ -421,6 +423,37 @@ struct FaceTopologyChange {
     std::vector<geometry::VertexId> after_vertices;
 };
 
+struct AttributeLayerChange {
+    std::string layer_id;
+    attributes::AttributeDomain domain = attributes::AttributeDomain::vertex;
+    attributes::AttributeType type = attributes::AttributeType::float32;
+    bool added = false;
+    bool removed = false;
+    bool descriptor_changed = false;
+    std::size_t before_value_count = 0U;
+    std::size_t after_value_count = 0U;
+    std::size_t changed_value_count = 0U;
+};
+
+struct UvCornerValueChange {
+    geometry::CornerId corner;
+    std::optional<core::Vec2d> before;
+    std::optional<core::Vec2d> after;
+};
+
+inline constexpr std::size_t kMaxProjectDiffUvSamples = 256U;
+
+struct UvSetChange {
+    attributes::UvSetId id = 0U;
+    std::optional<attributes::UvSetDescriptor> before;
+    std::optional<attributes::UvSetDescriptor> after;
+    bool descriptor_changed = false;
+    bool details_available = true;
+    std::size_t changed_corner_count = 0U;
+    std::vector<UvCornerValueChange> samples;
+    bool samples_truncated = false;
+};
+
 struct MeshChange {
     std::uint64_t asset_id = 0U;
     bool added = false;
@@ -433,6 +466,8 @@ struct MeshChange {
     std::size_t after_faces = 0U;
     std::vector<VertexValueChange> vertices;
     std::vector<FaceTopologyChange> faces;
+    std::vector<AttributeLayerChange> attribute_layers;
+    std::vector<UvSetChange> uv_sets;
 };
 
 struct ProjectDiff {
@@ -444,6 +479,9 @@ struct ProjectDiff {
     bool condition_changed = false;
     assets::Sha256Digest digest;
 
+    [[nodiscard]] static ProjectDiff between(
+        const project::ProjectDocument& before,
+        const project::ProjectDocument& after);
     [[nodiscard]] std::size_t changed_object_count() const noexcept;
     [[nodiscard]] std::size_t changed_mesh_count() const noexcept;
 };

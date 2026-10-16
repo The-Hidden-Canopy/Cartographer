@@ -8046,6 +8046,88 @@ struct DesktopState {
                         ImGui::TreePop();
                     }
                 }
+                if (!mesh_change.attribute_layers.empty()) {
+                    const std::string label = "Changed attribute layers (" +
+                        std::to_string(mesh_change.attribute_layers.size()) + ")";
+                    if (ImGui::TreeNode(label.c_str())) {
+                        for (const auto& layer : mesh_change.attribute_layers) {
+                            const char* change = layer.added ? "added" :
+                                layer.removed ? "removed" :
+                                layer.descriptor_changed ? "descriptor changed" :
+                                "values changed";
+                            ImGui::BulletText("%s · %s · %zu → %zu values · %zu changed",
+                                layer.layer_id.c_str(), change,
+                                layer.before_value_count, layer.after_value_count,
+                                layer.changed_value_count);
+                        }
+                        ImGui::TreePop();
+                    }
+                }
+                if (!mesh_change.uv_sets.empty()) {
+                    const std::string label = "UV set changes (" +
+                        std::to_string(mesh_change.uv_sets.size()) + ")";
+                    if (ImGui::TreeNode(label.c_str())) {
+                        for (const auto& uv_set : mesh_change.uv_sets) {
+                            const std::string uv_set_id = std::to_string(uv_set.id);
+                            ImGui::PushID(uv_set_id.c_str());
+                            const char* before_name = uv_set.before.has_value()
+                                ? uv_set.before->name.c_str() : "(absent)";
+                            const char* after_name = uv_set.after.has_value()
+                                ? uv_set.after->name.c_str() : "(absent)";
+                            ImGui::Text("Set %llu · %s → %s%s · %zu changed corner(s)",
+                                static_cast<unsigned long long>(uv_set.id),
+                                before_name, after_name,
+                                uv_set.descriptor_changed ? " · descriptor changed" : "",
+                                uv_set.changed_corner_count);
+                            if (uv_set.descriptor_changed) {
+                                const char* before_layer = uv_set.before.has_value()
+                                    ? uv_set.before->layer_id.c_str() : "(absent)";
+                                const char* after_layer = uv_set.after.has_value()
+                                    ? uv_set.after->layer_id.c_str() : "(absent)";
+                                ImGui::TextDisabled("Corner layer %s → %s", before_layer, after_layer);
+                            }
+                            if (!uv_set.details_available) {
+                                ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                                    "Corner values could not be aligned to stable identities.");
+                            } else if (!uv_set.samples.empty()) {
+                                ImGui::Indent();
+                                ImGuiListClipper clipper;
+                                clipper.Begin(static_cast<int>(uv_set.samples.size()));
+                                while (clipper.Step()) {
+                                    for (int row = clipper.DisplayStart;
+                                         row < clipper.DisplayEnd; ++row) {
+                                        const auto& sample = uv_set.samples[
+                                            static_cast<std::size_t>(row)];
+                                        if (sample.before.has_value() && sample.after.has_value()) {
+                                            ImGui::TextDisabled(
+                                                "Corner %llu · (%.9g, %.9g) → (%.9g, %.9g)",
+                                                static_cast<unsigned long long>(sample.corner.value),
+                                                sample.before->x, sample.before->y,
+                                                sample.after->x, sample.after->y);
+                                        } else if (sample.after.has_value()) {
+                                            ImGui::TextDisabled(
+                                                "Corner %llu · added (%.9g, %.9g)",
+                                                static_cast<unsigned long long>(sample.corner.value),
+                                                sample.after->x, sample.after->y);
+                                        } else {
+                                            ImGui::TextDisabled(
+                                                "Corner %llu · removed",
+                                                static_cast<unsigned long long>(sample.corner.value));
+                                        }
+                                    }
+                                }
+                                ImGui::Unindent();
+                                if (uv_set.samples_truncated) {
+                                    ImGui::TextDisabled(
+                                        "Showing %zu of %zu changed corners; the diff count includes all corners.",
+                                        uv_set.samples.size(), uv_set.changed_corner_count);
+                                }
+                            }
+                            ImGui::PopID();
+                        }
+                        ImGui::TreePop();
+                    }
+                }
                 ImGui::PopID();
             }
             const std::string diff_digest = task.diff.digest.hex();
