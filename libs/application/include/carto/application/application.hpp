@@ -107,6 +107,7 @@ using OperationId = std::uint64_t;
 enum class OperationSource {
     human,
     ai_proposal,
+    agent_workbench,
     plugin,
     recovery,
 };

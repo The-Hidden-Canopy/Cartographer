@@ -1210,6 +1210,7 @@ struct DesktopState {
     bool agent_goal_focus_requested = false;
     std::string agent_step;
     bool agent_allow_root_translation = false;
+    bool agent_allow_material_assignment = false;
     double agent_translation_distance_meters = 1.0;
     std::string agent_question;
     std::string agent_clarification_rationale;
@@ -7235,18 +7236,31 @@ struct DesktopState {
                 "Native step: "
                 "translate object by <dx> <dy> <dz>.");
         }
+        ImGui::Checkbox(
+            "Permit material-region assignment", &agent_allow_material_assignment);
+        if (agent_allow_material_assignment) {
+            ImGui::TextDisabled(
+                "Uses explicit IDs from the current project: assign material <id> to region <id> "
+                "with optional variant <id>. Shared mesh instances must all be in scope and unlocked.");
+        }
         ImGui::BeginDisabled(task_present || snapshot.agent_checkpoint_loaded ||
             snapshot.agent_plan_draft.empty() ||
             agent_goal.empty() || !clarifications_answered ||
             !objective_constraints_valid);
         if (ImGui::Button("Prepare task for preflight", ImVec2(-1, 30))) {
             std::optional<carto::agent::AgentWorkEnvelope> requested_envelope;
-            if (agent_allow_root_translation) {
+            if (agent_allow_root_translation || agent_allow_material_assignment) {
                 requested_envelope.emplace();
-                requested_envelope->permitted_effects |=
-                    carto::agent::effect_mask(carto::agent::Effect::transform);
-                requested_envelope->max_transform_distance_meters =
-                    agent_translation_distance_meters;
+                if (agent_allow_root_translation) {
+                    requested_envelope->permitted_effects |=
+                        carto::agent::effect_mask(carto::agent::Effect::transform);
+                    requested_envelope->max_transform_distance_meters =
+                        agent_translation_distance_meters;
+                }
+                if (agent_allow_material_assignment) {
+                    requested_envelope->permitted_effects |=
+                        carto::agent::effect_mask(carto::agent::Effect::material);
+                }
             }
             const auto prepared = ui.prepare_agent_plan(
                 agent_goal, std::move(requested_envelope));
@@ -7259,12 +7273,18 @@ struct DesktopState {
             "before native commands run.");
         if (ImGui::Button("Run speculative plan", ImVec2(-1, 30))) {
             std::optional<carto::agent::AgentWorkEnvelope> requested_envelope;
-            if (agent_allow_root_translation) {
+            if (agent_allow_root_translation || agent_allow_material_assignment) {
                 requested_envelope.emplace();
-                requested_envelope->permitted_effects |=
-                    carto::agent::effect_mask(carto::agent::Effect::transform);
-                requested_envelope->max_transform_distance_meters =
-                    agent_translation_distance_meters;
+                if (agent_allow_root_translation) {
+                    requested_envelope->permitted_effects |=
+                        carto::agent::effect_mask(carto::agent::Effect::transform);
+                    requested_envelope->max_transform_distance_meters =
+                        agent_translation_distance_meters;
+                }
+                if (agent_allow_material_assignment) {
+                    requested_envelope->permitted_effects |=
+                        carto::agent::effect_mask(carto::agent::Effect::material);
+                }
             }
             const auto run = ui.run_agent_plan(agent_goal, std::move(requested_envelope));
             if (run) {

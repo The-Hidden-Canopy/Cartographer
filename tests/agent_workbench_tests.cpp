@@ -140,6 +140,38 @@ carto::agent::AgentWorkEnvelope envelope_for(
     return envelope;
 }
 
+struct MaterialTargetFixture {
+    carto::scene::ObjectId object;
+    std::uint64_t mesh_asset = 0U;
+    carto::render::MaterialId material = 0U;
+};
+
+MaterialTargetFixture create_material_target(
+    carto::application::ApplicationSession& session) {
+    auto mesh = carto::geometry::make_box({1.0, 1.0, 1.0});
+    REQUIRE(mesh);
+    const auto topology = mesh.value().topology();
+    REQUIRE(topology);
+    std::vector<carto::core::Vec2d> uv_values(
+        topology.value().corners.size(), carto::core::Vec2d{});
+    auto authored_mesh = add_test_uv_set(std::move(mesh.value()), uv_values);
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::CreateMeshObjectAction{
+            "Material target", std::move(authored_mesh)}));
+    auto snapshot = session.snapshot();
+    REQUIRE(snapshot.objects.size() == 1U);
+    REQUIRE(snapshot.objects.front().object.mesh_asset.has_value());
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::CreateMaterialAction{
+            snapshot.project_revision, "Workbench stone", {}}));
+    snapshot = session.snapshot();
+    REQUIRE(snapshot.materials.size() == 1U);
+    return MaterialTargetFixture{
+        snapshot.objects.front().object.id,
+        *snapshot.objects.front().object.mesh_asset,
+        snapshot.materials.front().id};
+}
+
 carto::agent::AgentWorkEnvelope translation_envelope(
     const std::vector<carto::scene::ObjectId>& scope,
     double max_distance) {
@@ -2676,6 +2708,188 @@ void saved_acceptance_is_one_durable_application_event() {
     const auto saved = carto::application::ApplicationSession::inspect_recovery(path);
     REQUIRE(saved);
     REQUIRE(saved.value().state == carto::application::RecoveryInspectionState::clean);
+}
+
+void agent_material_assignment_is_speculative_reviewed_and_checkpointed() {
+    TempDirectory temp;
+    carto::application::ApplicationSession source;
+    const auto fixture = create_material_target(source);
+    const auto before = source.snapshot();
+    auto plan = plan_for(before, {fixture.object}, {
+        {"step-1", {fixture.object, std::monostate{}},
+            "assign material " + std::to_string(fixture.material) + " to region 1"},
+    });
+    auto envelope = envelope_for({fixture.object});
+    envelope.permitted_effects |= carto::agent::effect_mask(carto::agent::Effect::material);
+    const auto reauthorized_plan = plan;
+    auto task = carto::agent::AgentTask::begin(source, std::move(plan), envelope);
+    REQUIRE(task);
+
+    const auto run = task.value().run();
+    REQUIRE(run);
+    REQUIRE(run.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(run.value().can_accept);
+    REQUIRE(run.value().diff.has_changes());
+    REQUIRE(run.value().diff.changed_material_binding_count() == 1U);
+    REQUIRE(run.value().diff.material_catalog_changed);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+    REQUIRE(source.snapshot().material_assignments.empty());
+
+    const auto checkpoint_path = temp.path() / "material-task.carto-agent-task";
+    REQUIRE(task.value().save_checkpoint(checkpoint_path));
+    const auto checkpoint = carto::agent::AgentTask::load_checkpoint(checkpoint_path);
+    REQUIRE(checkpoint);
+    REQUIRE((checkpoint.value().envelope.permitted_effects &
+        carto::agent::effect_mask(carto::agent::Effect::material)) != 0U);
+    auto resumed = carto::agent::AgentTask::resume_checkpoint(
+        source, checkpoint.value(), reauthorized_plan);
+    REQUIRE(resumed);
+    REQUIRE(resumed.value().snapshot().status == carto::agent::TaskStatus::review);
+    REQUIRE(resumed.value().snapshot().can_accept);
+    REQUIRE(source.snapshot().material_assignments.empty());
+
+    const auto accepted = carto::application::HumanApplicationAccess::accept_agent_task(
+        resumed.value());
+    REQUIRE(accepted && accepted.value().document_changed);
+    const auto after = source.snapshot();
+    REQUIRE(after.project_revision > before.project_revision);
+    REQUIRE(after.material_assignments.size() == 1U);
+    REQUIRE((after.material_assignments.front().key ==
+        carto::project::MaterialRegionKey{fixture.mesh_asset, 1U}));
+    REQUIRE(after.material_assignments.front().material == fixture.material);
+    REQUIRE(!resumed.value().create_demonstration());
+}
+
+void ui_compiles_and_reviews_an_opt_in_material_assignment() {
+    carto::application::ApplicationSession source;
+    const auto fixture = create_material_target(source);
+    carto::ui::UiController ui(source);
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{fixture.object}));
+    const std::string intent = "assign material " +
+        std::to_string(fixture.material) + " to region 1";
+    REQUIRE(ui.compile_agent_goal_sequence(intent));
+    const auto before = source.snapshot();
+    auto envelope = envelope_for({fixture.object});
+    envelope.permitted_effects |= carto::agent::effect_mask(carto::agent::Effect::material);
+    const auto run = ui.run_agent_plan(intent, envelope);
+    REQUIRE(run);
+    REQUIRE(run.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(run.value().can_accept);
+    REQUIRE(run.value().diff.changed_material_binding_count() == 1U);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+    REQUIRE(source.snapshot().material_assignments.empty());
+    REQUIRE(ui.accept_agent_plan());
+    REQUIRE(source.snapshot().material_assignments.size() == 1U);
+    REQUIRE(source.snapshot().material_assignments.front().material == fixture.material);
+}
+
+void agent_material_assignment_fails_closed_on_authority_and_source_boundaries() {
+    {
+        carto::application::ApplicationSession source;
+        const auto fixture = create_material_target(source);
+        const auto before = source.snapshot();
+        auto plan = plan_for(before, {fixture.object}, {
+            {"step-1", {fixture.object, std::monostate{}},
+                "assign material " + std::to_string(fixture.material) + " to region 1"},
+        });
+        auto task = carto::agent::AgentTask::begin(
+            source, std::move(plan), envelope_for({fixture.object}));
+        REQUIRE(task);
+        const auto run = task.value().run();
+        REQUIRE(run && run.value().status == carto::agent::TaskStatus::blocked);
+        REQUIRE(run.value().steps.front().diagnostic.has_value());
+        REQUIRE(run.value().steps.front().diagnostic->message.find(
+            "forbids the material effect") != std::string::npos);
+        REQUIRE(source.snapshot().project_revision == before.project_revision);
+        REQUIRE(source.snapshot().material_assignments.empty());
+    }
+
+    for (const std::string intent : {
+             "assign material 999 to region 1",
+             "assign material 1 to region 999",
+             "assign material 1 to region 1 variant 999"}) {
+        carto::application::ApplicationSession source;
+        const auto fixture = create_material_target(source);
+        const auto before = source.snapshot();
+        auto plan = plan_for(before, {fixture.object}, {
+            {"step-1", {fixture.object, std::monostate{}}, intent},
+        });
+        auto envelope = envelope_for({fixture.object});
+        envelope.permitted_effects |=
+            carto::agent::effect_mask(carto::agent::Effect::material);
+        auto task = carto::agent::AgentTask::begin(source, std::move(plan), envelope);
+        REQUIRE(task);
+        const auto run = task.value().run();
+        REQUIRE(run && run.value().status == carto::agent::TaskStatus::blocked);
+        REQUIRE(run.value().steps.front().status == carto::agent::StepStatus::failed);
+        REQUIRE(source.snapshot().project_revision == before.project_revision);
+        REQUIRE(source.snapshot().material_assignments.empty());
+    }
+
+    {
+        carto::application::ApplicationSession source;
+        const auto fixture = create_material_target(source);
+        REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+            source, carto::application::DuplicateMeshInstanceAction{
+                fixture.object, "Out-of-scope material instance", {2.0, 0.0, 0.0}}));
+        const auto before = source.snapshot();
+        auto plan = plan_for(before, {fixture.object}, {
+            {"step-1", {fixture.object, std::monostate{}},
+                "assign material " + std::to_string(fixture.material) + " to region 1"},
+        });
+        auto envelope = envelope_for({fixture.object});
+        envelope.permitted_effects |=
+            carto::agent::effect_mask(carto::agent::Effect::material);
+        auto task = carto::agent::AgentTask::begin(source, std::move(plan), envelope);
+        REQUIRE(task);
+        const auto run = task.value().run();
+        REQUIRE(run && run.value().status == carto::agent::TaskStatus::blocked);
+        REQUIRE(run.value().steps.front().diagnostic.has_value());
+        REQUIRE(run.value().steps.front().diagnostic->message.find(
+            "shared by an object outside the work envelope") != std::string::npos);
+        REQUIRE(source.snapshot().project_revision == before.project_revision);
+        REQUIRE(source.snapshot().material_assignments.empty());
+    }
+}
+
+void material_catalog_checkpoint_rebase_is_blocked_until_its_write_set_is_modeled() {
+    TempDirectory temp;
+    carto::application::ApplicationSession source;
+    const auto fixture = create_material_target(source);
+    const auto before = source.snapshot();
+    auto plan = plan_for(before, {fixture.object}, {
+        {"step-1", {fixture.object, std::monostate{}},
+            "assign material " + std::to_string(fixture.material) + " to region 1"},
+    });
+    auto envelope = envelope_for({fixture.object});
+    envelope.permitted_effects |= carto::agent::effect_mask(carto::agent::Effect::material);
+    const auto reauthorized_plan = plan;
+    auto task = carto::agent::AgentTask::begin(source, std::move(plan), envelope);
+    REQUIRE(task);
+    REQUIRE(task.value().run().value().can_accept);
+    const auto checkpoint_path = temp.path() / "material-rebase.carto-agent-task";
+    REQUIRE(task.value().save_checkpoint(checkpoint_path));
+    const auto checkpoint = carto::agent::AgentTask::load_checkpoint(checkpoint_path);
+    REQUIRE(checkpoint);
+
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        source, carto::application::CreateBoxAction{"Disjoint source edit", {1.0, 1.0, 1.0}}));
+    const auto analysis = carto::agent::AgentTask::analyze_checkpoint_rebase(
+        source, checkpoint.value());
+    REQUIRE(analysis);
+    REQUIRE(!analysis.value().can_rebase());
+    REQUIRE(std::any_of(analysis.value().blockers.begin(), analysis.value().blockers.end(),
+        [](const auto& blocker) {
+            return blocker.find("material catalog writes are not yet represented") !=
+                std::string::npos;
+        }));
+    const auto rejected_rebase = carto::agent::AgentTask::rebase_checkpoint(
+        source, checkpoint.value(), reauthorized_plan);
+    REQUIRE(!rejected_rebase);
+    REQUIRE(rejected_rebase.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(source.snapshot().material_assignments.empty());
 }
 
 void work_envelope_blocks_topology_effect_before_live_mutation() {
@@ -5753,6 +5967,10 @@ int main() {
         bounded_repair_restarts_from_source_and_preserves_attempt_lineage();
         repair_rejects_expansion_stale_source_empty_justification_and_exhaustion();
         saved_acceptance_is_one_durable_application_event();
+        agent_material_assignment_is_speculative_reviewed_and_checkpointed();
+        ui_compiles_and_reviews_an_opt_in_material_assignment();
+        agent_material_assignment_fails_closed_on_authority_and_source_boundaries();
+        material_catalog_checkpoint_rebase_is_blocked_until_its_write_set_is_modeled();
         work_envelope_blocks_topology_effect_before_live_mutation();
         work_envelope_blocks_topology_churn_over_budget();
         diff_digest_tracks_geometry_values_not_only_change_shape();

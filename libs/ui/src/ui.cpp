@@ -182,6 +182,32 @@ core::Result<std::vector<std::string>> split_agent_goal_sequence(
     return core::Result<std::vector<std::string>>::success(std::move(commands));
 }
 
+bool starts_with_agent_command_words(
+    std::string_view command,
+    std::string_view first,
+    std::string_view second,
+    std::string_view third) {
+    std::size_t cursor = 0U;
+    const auto matches = [&command, &cursor](std::string_view expected) {
+        while (cursor < command.size() &&
+            std::isspace(static_cast<unsigned char>(command[cursor])) != 0) {
+            ++cursor;
+        }
+        const std::size_t begin = cursor;
+        while (cursor < command.size() &&
+            std::isspace(static_cast<unsigned char>(command[cursor])) == 0) {
+            ++cursor;
+        }
+        if (cursor - begin != expected.size()) return false;
+        for (std::size_t index = 0U; index < expected.size(); ++index) {
+            const auto value = static_cast<unsigned char>(command[begin + index]);
+            if (static_cast<char>(std::tolower(value)) != expected[index]) return false;
+        }
+        return true;
+    };
+    return matches(first) && matches(second) && matches(third);
+}
+
 template <typename Record>
 core::Result<void> append_condition_record(
     std::vector<Record>& records, Record record, std::string_view label) {
@@ -2338,7 +2364,8 @@ core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
     const std::uint32_t compile_effects =
         ai::effect_mask(ai::CapabilityEffect::geometry) |
         ai::effect_mask(ai::CapabilityEffect::topology) |
-        ai::effect_mask(ai::CapabilityEffect::transform);
+        ai::effect_mask(ai::CapabilityEffect::transform) |
+        ai::effect_mask(ai::CapabilityEffect::material);
     std::vector<agent::AgentPlanStep> steps;
     steps.reserve(commands.value().size() * targets.size());
     for (std::size_t target_index = 0U; target_index < targets.size(); ++target_index) {
@@ -2713,11 +2740,18 @@ core::Result<agent::AgentTaskSnapshot> UiController::prepare_agent_plan(
     }
     const bool permits_transform = requested_envelope.has_value() &&
         (requested_envelope->permitted_effects &
-            agent::effect_mask(agent::Effect::transform)) != 0U;
+            agent::effect_mask(agent::Effect::transform)) != 0U &&
+        std::any_of(agent_plan_draft_.begin(), agent_plan_draft_.end(),
+            [](const auto& step) {
+                return starts_with_agent_command_words(
+                    step.intent, "translate", "object", "by");
+            });
     if (permits_transform) {
         std::vector<scene::ObjectId> transform_roots;
         for (const auto& step : agent_plan_draft_) {
-            if (std::holds_alternative<std::monostate>(step.target.component) &&
+            if (starts_with_agent_command_words(
+                    step.intent, "translate", "object", "by") &&
+                std::holds_alternative<std::monostate>(step.target.component) &&
                 std::find(transform_roots.begin(), transform_roots.end(),
                     step.target.object) == transform_roots.end()) {
                 transform_roots.push_back(step.target.object);

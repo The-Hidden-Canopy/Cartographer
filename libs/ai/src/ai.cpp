@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -72,6 +73,20 @@ core::Result<double> parse_number(std::string token) {
     return core::Result<double>::success(value);
 }
 
+core::Result<std::uint64_t> parse_unsigned_identity(const std::string& token) {
+    if (token.empty() || token.front() < '0' || token.front() > '9') {
+        return core::Result<std::uint64_t>::failure(invalid(
+            "material assignment IDs must be unsigned decimal integers"));
+    }
+    std::uint64_t value = 0U;
+    const auto parsed = std::from_chars(token.data(), token.data() + token.size(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size() || value == 0U) {
+        return core::Result<std::uint64_t>::failure(invalid(
+            "material assignment IDs must be non-zero unsigned integers in range"));
+    }
+    return core::Result<std::uint64_t>::success(value);
+}
+
 core::Result<std::vector<double>> numbers(const std::vector<std::string>& words) {
     std::vector<double> result;
     for (const auto& word : words) {
@@ -130,6 +145,8 @@ std::string preview_name(editor::PreviewKind kind) {
     case editor::PreviewKind::inset_face: return "inset_face";
     case editor::PreviewKind::set_vertex_position: return "set_vertex_position";
     case editor::PreviewKind::poke_face: return "poke_face";
+    case editor::PreviewKind::set_material_region_assignment:
+        return "set_material_region_assignment";
     }
     return "unknown";
 }
@@ -149,6 +166,7 @@ std::string_view parameter_type_name(ParameterType type) noexcept {
     case ParameterType::length: return "length";
     case ParameterType::scalar: return "scalar";
     case ParameterType::count: return "count";
+    case ParameterType::unsigned_identity: return "unsigned_identity";
     case ParameterType::boolean: return "boolean";
     case ParameterType::vector3: return "vector3";
     case ParameterType::edge_reference: return "edge_reference";
@@ -172,6 +190,7 @@ std::string_view effect_name(CapabilityEffect effect) noexcept {
     case CapabilityEffect::geometry: return "geometry";
     case CapabilityEffect::topology: return "topology";
     case CapabilityEffect::transform: return "transform";
+    case CapabilityEffect::material: return "material";
     }
     return "unknown";
 }
@@ -195,6 +214,8 @@ std::string_view data_name(CapabilityData data) noexcept {
     case CapabilityData::selected_component: return "selected_component";
     case CapabilityData::target_mesh: return "target_mesh";
     case CapabilityData::incident_topology: return "incident_topology";
+    case CapabilityData::material_catalog: return "material_catalog";
+    case CapabilityData::material_regions: return "material_regions";
     }
     return "unknown";
 }
@@ -204,6 +225,7 @@ std::string_view write_name(CapabilityWrite write) noexcept {
     case CapabilityWrite::object_transform: return "object_transform";
     case CapabilityWrite::vertex_positions: return "vertex_positions";
     case CapabilityWrite::mesh_topology: return "mesh_topology";
+    case CapabilityWrite::material_region_assignment: return "material_region_assignment";
     }
     return "unknown";
 }
@@ -234,6 +256,9 @@ std::string_view validator_name(CapabilityValidator value) noexcept {
     case CapabilityValidator::face_convex: return "face_convex";
     case CapabilityValidator::manifold_topology: return "manifold_topology";
     case CapabilityValidator::operation_preconditions: return "operation_preconditions";
+    case CapabilityValidator::material_source_exists: return "material_source_exists";
+    case CapabilityValidator::material_variant_exists: return "material_variant_exists";
+    case CapabilityValidator::material_region_exists: return "material_region_exists";
     }
     return "unknown";
 }
@@ -244,6 +269,7 @@ std::string_view risk_name(CapabilityRisk risk) noexcept {
     case CapabilityRisk::reversible_geometry: return "reversible_geometry";
     case CapabilityRisk::reversible_topology: return "reversible_topology";
     case CapabilityRisk::destructive_topology: return "destructive_topology";
+    case CapabilityRisk::reversible_material: return "reversible_material";
     case CapabilityRisk::unknown: return "unknown";
     }
     return "unknown";
@@ -473,7 +499,7 @@ core::Result<void> OperationDescriptor::validate() const {
     }
     const std::uint32_t known_effects =
         effect_mask(CapabilityEffect::geometry) | effect_mask(CapabilityEffect::topology) |
-        effect_mask(CapabilityEffect::transform);
+        effect_mask(CapabilityEffect::transform) | effect_mask(CapabilityEffect::material);
     if ((effects & ~known_effects) != 0U) {
         return core::Result<void>::failure(invalid(
             "AI operation declares an unknown capability effect"));
@@ -549,6 +575,12 @@ core::Result<void> ParameterDefinition::validate() const {
             (maximum.has_value() && std::floor(*maximum) != *maximum)) {
             return core::Result<void>::failure(invalid(
                 "count parameter bounds must be whole numbers"));
+        }
+        break;
+    case ParameterType::unsigned_identity:
+        if (unit != ParameterUnit::none || minimum.has_value() || maximum.has_value()) {
+            return core::Result<void>::failure(invalid(
+                "unsigned identity parameter cannot declare numeric units or bounds"));
         }
         break;
     case ParameterType::boolean:
@@ -630,6 +662,12 @@ core::Result<void> Proposal::validate(const Context& expected) const {
             !expected.authoring.component_object.has_value()) {
             return core::Result<void>::failure(invalid_state(
                 "vertex proposal requires exactly one object-bound selected vertex"));
+        }
+    } else if (preview_kind == editor::PreviewKind::set_material_region_assignment) {
+        if (expected.authoring.selection_mode != editor::SelectionMode::object ||
+            expected.authoring.objects.size() != 1U) {
+            return core::Result<void>::failure(invalid_state(
+                "material assignment requires exactly one selected mesh object"));
         }
     } else {
         return core::Result<void>::failure(invalid_state(
@@ -797,6 +835,51 @@ std::vector<OperationDescriptor> build_operation_ontology(
     translation.risk = CapabilityRisk::reversible_transform;
     translation.cost.objects_read = 1U;
     result.push_back(std::move(translation));
+
+    OperationDescriptor material_assignment;
+    material_assignment.id = "material.assign-region";
+    material_assignment.display_name = "Assign Material to Region";
+    material_assignment.kernel_operation = "project.MaterialCatalog.assign_region";
+    material_assignment.parameters = {"material_id", "region_id", "variant_id"};
+    material_assignment.parameter_schema = {
+        parameter("material_id", ParameterType::unsigned_identity, ParameterUnit::none,
+            std::nullopt, std::nullopt, true, true, "Existing material ID"),
+        parameter("region_id", ParameterType::unsigned_identity, ParameterUnit::none,
+            std::nullopt, std::nullopt, true, true, "Authored face-region ID"),
+        parameter("variant_id", ParameterType::unsigned_identity, ParameterUnit::none,
+            std::nullopt, std::nullopt, true, false,
+            "Optional existing material variant ID"),
+    };
+    material_assignment.precondition =
+        "exactly one unlocked mesh object is selected; the region is declared by a face-domain "
+        "uint32 material-region layer; the material and optional variant exist; every instance "
+        "of the shared mesh is in-scope, unprotected, and unlocked; source revision is current";
+    material_assignment.preview_supported = true;
+    material_assignment.auto_approvable = false;
+    material_assignment.preview_kind = editor::PreviewKind::set_material_region_assignment;
+    material_assignment.contract_complete = true;
+    material_assignment.provider_requestable = true;
+    material_assignment.effects = effect_mask(CapabilityEffect::material);
+    material_assignment.targets = {CapabilityTarget::selected_object};
+    material_assignment.reads = {
+        CapabilityData::target_mesh,
+        CapabilityData::material_catalog,
+        CapabilityData::material_regions};
+    material_assignment.writes = {CapabilityWrite::material_region_assignment};
+    material_assignment.invalidates = {
+        CapabilityInvalidation::render_mesh,
+        CapabilityInvalidation::tangent_basis,
+        CapabilityInvalidation::bakes};
+    material_assignment.validators = {
+        CapabilityValidator::target_exists,
+        CapabilityValidator::unlocked_subtree,
+        CapabilityValidator::material_source_exists,
+        CapabilityValidator::material_variant_exists,
+        CapabilityValidator::material_region_exists,
+        CapabilityValidator::operation_preconditions};
+    material_assignment.risk = CapabilityRisk::reversible_material;
+    material_assignment.cost.objects_read = 1U;
+    result.push_back(std::move(material_assignment));
     return result;
 }
 
@@ -805,7 +888,7 @@ std::vector<OperationDescriptor> project_capabilities(
     std::uint32_t permitted_effects) {
     const std::uint32_t known_effects =
         effect_mask(CapabilityEffect::geometry) | effect_mask(CapabilityEffect::topology) |
-        effect_mask(CapabilityEffect::transform);
+        effect_mask(CapabilityEffect::transform) | effect_mask(CapabilityEffect::material);
     if (permitted_effects == 0U || (permitted_effects & ~known_effects) != 0U) return {};
 
     std::vector<OperationDescriptor> result;
@@ -868,7 +951,7 @@ std::string context_json(const Context& context) {
         result += ",\"effects\":[";
         bool has_effect = false;
         for (const auto effect : {CapabilityEffect::geometry, CapabilityEffect::topology,
-                CapabilityEffect::transform}) {
+                CapabilityEffect::transform, CapabilityEffect::material}) {
             if ((operation.effects & effect_mask(effect)) == 0U) continue;
             if (has_effect) result.push_back(',');
             result += "\"" + std::string(effect_name(effect)) + "\"";
@@ -938,6 +1021,17 @@ std::string proposal_json(const Proposal& proposal) {
             ",\"y\":" + std::to_string(position.y) +
             ",\"z\":" + std::to_string(position.z) + "}";
     }
+    if (proposal.parameters.material_id.has_value()) {
+        result += ",\"material_id\":" + std::to_string(*proposal.parameters.material_id);
+    }
+    if (proposal.parameters.material_region_id.has_value()) {
+        result += ",\"region_id\":" +
+            std::to_string(*proposal.parameters.material_region_id);
+    }
+    if (proposal.parameters.material_variant_id.has_value()) {
+        result += ",\"variant_id\":" +
+            std::to_string(*proposal.parameters.material_variant_id);
+    }
     result += "}";
     return result;
 }
@@ -959,6 +1053,45 @@ core::Result<Proposal> NativePlanner::propose(
     const auto parsed_numbers = numbers(words);
     if (!parsed_numbers) return core::Result<Proposal>::failure(parsed_numbers.error());
     const std::string request_id = make_request_id(next_request_id_++);
+
+    if (words.front() == "assign") {
+        const bool with_variant = words.size() == 8U && words[6] == "variant";
+        const bool exact_syntax = (words.size() == 6U || with_variant) &&
+            words[1] == "material" && words[3] == "to" && words[4] == "region";
+        if (!exact_syntax) {
+            return core::Result<Proposal>::failure(invalid(
+                "material intent must be `assign material <id> to region <id>` with an "
+                "optional `variant <id>` suffix"));
+        }
+        const auto material = parse_unsigned_identity(words[2]);
+        const auto region = parse_unsigned_identity(words[5]);
+        if (!material || !region || region.value() >
+                std::numeric_limits<std::uint32_t>::max()) {
+            return core::Result<Proposal>::failure(!material ? material.error() :
+                !region ? region.error() : invalid("material region ID exceeds uint32 range"));
+        }
+        std::optional<std::uint64_t> variant;
+        if (with_variant) {
+            const auto parsed_variant = parse_unsigned_identity(words[7]);
+            if (!parsed_variant) {
+                return core::Result<Proposal>::failure(parsed_variant.error());
+            }
+            variant = parsed_variant.value();
+        }
+        editor::PreviewParameters parameters;
+        parameters.material_id = material.value();
+        parameters.material_region_id = static_cast<std::uint32_t>(region.value());
+        parameters.material_variant_id = variant;
+        Proposal proposal{
+            request_id, context.project_revision, context.authoring,
+            editor::PreviewKind::set_material_region_assignment, std::move(parameters),
+            "material.assign-region", std::string(intent),
+            "Native planner produced a revision-bound material-region assignment preview."};
+        if (auto result = proposal.validate(context); !result) {
+            return core::Result<Proposal>::failure(result.error());
+        }
+        return core::Result<Proposal>::success(std::move(proposal));
+    }
 
     if ((words.size() == 2U && words[0] == "poke" && words[1] == "face") ||
         (words.size() == 1U && words[0] == "poke-face")) {

@@ -43,6 +43,8 @@ void ontology_is_derived_from_native_tools() {
         [](const auto& operation) { return operation.id == "mesh.inset-face"; });
     const auto translate = std::find_if(context.operations.begin(), context.operations.end(),
         [](const auto& operation) { return operation.id == "object.translate"; });
+    const auto material = std::find_if(context.operations.begin(), context.operations.end(),
+        [](const auto& operation) { return operation.id == "material.assign-region"; });
     const auto poke = std::find_if(context.operations.begin(), context.operations.end(),
         [](const auto& operation) { return operation.id == "mesh.poke-face"; });
     const auto delete_face = std::find_if(context.operations.begin(), context.operations.end(),
@@ -70,6 +72,16 @@ void ontology_is_derived_from_native_tools() {
     REQUIRE(translate->validators.size() == 5U);
     REQUIRE(translate->validators[1] == carto::ai::CapabilityValidator::root_object);
     REQUIRE(translate->validators[2] == carto::ai::CapabilityValidator::unlocked_subtree);
+    REQUIRE(material != context.operations.end() && material->preview_supported);
+    REQUIRE(material->provider_requestable && !material->auto_approvable);
+    REQUIRE(material->effects == carto::ai::effect_mask(
+        carto::ai::CapabilityEffect::material));
+    REQUIRE(material->writes == std::vector<carto::ai::CapabilityWrite>{
+        carto::ai::CapabilityWrite::material_region_assignment});
+    REQUIRE(material->parameter_schema.size() == 3U);
+    REQUIRE(material->parameter_schema.front().type ==
+        carto::ai::ParameterType::unsigned_identity);
+    REQUIRE(!material->parameter_schema.back().required);
     REQUIRE(poke != context.operations.end() && poke->preview_supported);
     REQUIRE(poke->provider_requestable);
     REQUIRE(!poke->auto_approvable);
@@ -115,7 +127,7 @@ void ontology_is_derived_from_native_tools() {
                 !operation.writes.empty() && !operation.validators.empty();
         }));
     REQUIRE(std::count_if(context.operations.begin(), context.operations.end(),
-        [](const auto& operation) { return operation.provider_requestable; }) == 5);
+        [](const auto& operation) { return operation.provider_requestable; }) == 6);
     REQUIRE(inset->parameter_schema.size() == 1U);
     REQUIRE(inset->parameter_schema.front().type == carto::ai::ParameterType::length);
     REQUIRE(inset->parameter_schema.front().unit == carto::ai::ParameterUnit::world_length);
@@ -131,6 +143,9 @@ void ontology_json_preserves_kernel_and_approval_contract() {
     REQUIRE(json.find("\"auto_approvable\":true") != std::string::npos);
     REQUIRE(json.find("\"preview_kind\":\"inset_face\"") != std::string::npos);
     REQUIRE(json.find("\"preview_kind\":\"poke_face\"") != std::string::npos);
+    REQUIRE(json.find("project.MaterialCatalog.assign_region") != std::string::npos);
+    REQUIRE(json.find("\"effects\":[\"material\"]") != std::string::npos);
+    REQUIRE(json.find("unsigned_identity") != std::string::npos);
     REQUIRE(json.find("\"parameter_schema\":[{\"name\":\"distance\"") !=
         std::string::npos);
     REQUIRE(json.find("\"effects\":[\"geometry\",\"topology\"]") !=
@@ -153,6 +168,16 @@ void capability_projection_filters_by_preview_and_work_envelope() {
         registry, carto::ai::effect_mask(carto::ai::CapabilityEffect::transform));
     REQUIRE(transforms.size() == 1U);
     REQUIRE(transforms.front().id == "object.translate");
+    const auto material_only = carto::ai::project_capabilities(
+        registry, carto::ai::effect_mask(carto::ai::CapabilityEffect::material));
+    REQUIRE(material_only.size() == 1U);
+    REQUIRE(material_only.front().id == "material.assign-region");
+    const auto geometry_and_material = carto::ai::project_capabilities(
+        registry, carto::ai::effect_mask(carto::ai::CapabilityEffect::geometry) |
+            carto::ai::effect_mask(carto::ai::CapabilityEffect::material));
+    REQUIRE(geometry_and_material.size() == 2U);
+    REQUIRE(std::none_of(geometry_and_material.begin(), geometry_and_material.end(),
+        [](const auto& capability) { return capability.id == "object.translate"; }));
 
     auto invalid = geometry_only.front();
     invalid.parameter_schema.front().minimum = std::numeric_limits<double>::quiet_NaN();
@@ -304,6 +329,49 @@ void native_planner_compiles_translation_only_for_one_selected_object() {
     REQUIRE(!planner.propose("translate object by 1 2", context));
 }
 
+void native_planner_compiles_exact_typed_material_assignment_intents() {
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::CreateBoxAction{"Root", {1.0, 1.0, 1.0}}));
+    const auto object = session.snapshot().objects.front().object.id;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::SetSelectionModeAction{
+            carto::editor::SelectionMode::object}));
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::SelectObjectAction{object}));
+
+    auto context = context_for(session);
+    context.operations = carto::ai::project_capabilities(
+        context.operations, carto::ai::effect_mask(carto::ai::CapabilityEffect::material));
+    carto::ai::NativePlanner planner;
+    const auto proposal = planner.propose(
+        "assign material 18446744073709551615 to region 7 variant 9", context);
+    REQUIRE(proposal);
+    REQUIRE(proposal.value().tool_id == "material.assign-region");
+    REQUIRE(proposal.value().preview_kind ==
+        carto::editor::PreviewKind::set_material_region_assignment);
+    REQUIRE(proposal.value().parameters.material_id ==
+        std::optional<std::uint64_t>{std::numeric_limits<std::uint64_t>::max()});
+    REQUIRE(proposal.value().parameters.material_region_id == std::optional<std::uint32_t>{7U});
+    REQUIRE(proposal.value().parameters.material_variant_id == std::optional<std::uint64_t>{9U});
+    REQUIRE(proposal.value().validate(context));
+    REQUIRE(!proposal.value().validate_auto_approval(context));
+    const auto json = carto::ai::proposal_json(proposal.value());
+    REQUIRE(json.find("\"material_id\":18446744073709551615") != std::string::npos);
+    REQUIRE(json.find("\"region_id\":7") != std::string::npos);
+    REQUIRE(json.find("\"variant_id\":9") != std::string::npos);
+
+    for (const std::string intent : {
+             "assign material 1 to region 7 extra",
+             "assign material 1.0 to region 7",
+             "assign material 0 to region 7",
+             "assign material 1 to region 4294967296",
+             "assign material 18446744073709551616 to region 7",
+             "assign material 1 to region 7 variant 0"}) {
+        REQUIRE(!planner.propose(intent, context));
+    }
+}
+
 void generic_ai_proposals_cannot_bypass_agent_transform_envelope() {
     carto::application::ApplicationSession session;
     carto::ui::UiController ui(session);
@@ -315,12 +383,17 @@ void generic_ai_proposals_cannot_bypass_agent_transform_envelope() {
     const auto before = session.snapshot();
 
     REQUIRE(!ui.propose_ai("translate object by 0.25 0 0"));
+    REQUIRE(!ui.propose_ai("assign material 1 to region 7"));
     auto full_context = context_for(session);
     carto::ai::NativePlanner planner;
     const auto external_proposal = planner.propose(
         "translate object by 0.25 0 0", full_context);
     REQUIRE(external_proposal);
     REQUIRE(!ui.begin_ai_preview(external_proposal.value()));
+    const auto external_material_proposal = planner.propose(
+        "assign material 1 to region 7", full_context);
+    REQUIRE(external_material_proposal);
+    REQUIRE(!ui.begin_ai_preview(external_material_proposal.value()));
     REQUIRE(session.snapshot().project_revision == before.project_revision);
     REQUIRE(session.snapshot().objects.front().object.local_transform.translation.x == 0.0);
 }
@@ -503,6 +576,7 @@ int main() {
         native_planner_compiles_a_face_intent_without_mutating_state();
         native_planner_rejects_ambiguous_or_wrong_scope_intents();
         native_planner_compiles_translation_only_for_one_selected_object();
+        native_planner_compiles_exact_typed_material_assignment_intents();
         generic_ai_proposals_cannot_bypass_agent_transform_envelope();
         ui_ai_flow_is_preview_only_until_explicit_commit();
         ui_face_poke_requires_an_explicit_preview_commit();

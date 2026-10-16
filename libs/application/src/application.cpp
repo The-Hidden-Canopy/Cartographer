@@ -1543,6 +1543,29 @@ core::Result<ApplicationAction> ApplicationSession::preview_action(
         return core::Result<ApplicationAction>::success(InvokeToolAction{
             "mesh.poke-face", editor::ToolArguments{}});
     }
+    if (preview.kind() == editor::PreviewKind::set_material_region_assignment) {
+        if (context.objects.size() != 1U ||
+            !parameters.material_region_id.has_value() ||
+            !parameters.material_id.has_value()) {
+            return core::Result<ApplicationAction>::failure(invalid_state(
+                "material assignment preview has no complete object and ID payload"));
+        }
+        const auto* object = document_.scene().find(context.objects.front());
+        if (object == nullptr || !object->mesh_asset.has_value()) {
+            return core::Result<ApplicationAction>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "material assignment preview target no longer has an authored mesh"));
+        }
+        std::optional<project::MaterialVariantId> variant;
+        if (parameters.material_variant_id.has_value()) {
+            variant = static_cast<project::MaterialVariantId>(
+                *parameters.material_variant_id);
+        }
+        return core::Result<ApplicationAction>::success(SetMaterialRegionAssignmentAction{
+            context.project_revision,
+            {*object->mesh_asset, *parameters.material_region_id},
+            static_cast<render::MaterialId>(*parameters.material_id), variant});
+    }
     if (preview.kind() != editor::PreviewKind::set_vertex_position) {
         return core::Result<ApplicationAction>::failure(invalid_state(
             "preview kind has no native application action"));
@@ -3207,10 +3230,11 @@ core::Result<DispatchReceipt> ApplicationSession::update_material(
 
 core::Result<DispatchReceipt> ApplicationSession::set_material_region_assignment(
     const SetMaterialRegionAssignmentAction& action) {
-    if (active_source_ != OperationSource::human) {
+    if (active_source_ != OperationSource::human &&
+        active_source_ != OperationSource::agent_workbench) {
         return failure(core::Diagnostic(
             core::ErrorCode::unsupported,
-            "material-region assignment requires the human authoring boundary"));
+            "material-region assignment requires the human or scoped Agent Workbench boundary"));
     }
     if (document_.revision() != action.expected_project_revision) {
         return failure(core::Diagnostic(
@@ -3438,10 +3462,11 @@ core::Result<DispatchReceipt> ApplicationSession::commit_material_catalog(
     project::MaterialCatalog catalog,
     core::Revision expected_project_revision,
     std::string action) {
-    if (active_source_ != OperationSource::human) {
+    if (active_source_ != OperationSource::human &&
+        active_source_ != OperationSource::agent_workbench) {
         return failure(core::Diagnostic(
             core::ErrorCode::unsupported,
-            "material catalog changes require the human authoring boundary"));
+            "material catalog changes require the human or scoped Agent Workbench boundary"));
     }
     if (document_.revision() != expected_project_revision) {
         return failure(core::Diagnostic(

@@ -25,7 +25,8 @@ bool valid_kind(PreviewKind kind) noexcept {
         kind == PreviewKind::object_translation_delta ||
         kind == PreviewKind::extrude_face ||
         kind == PreviewKind::inset_face || kind == PreviewKind::set_vertex_position ||
-        kind == PreviewKind::poke_face;
+        kind == PreviewKind::poke_face ||
+        kind == PreviewKind::set_material_region_assignment;
 }
 
 } // namespace
@@ -33,6 +34,12 @@ bool valid_kind(PreviewKind kind) noexcept {
 core::Result<void> PreviewParameters::validate(PreviewKind kind) const {
     if (!valid_kind(kind)) {
         return core::Result<void>::failure(invalid("preview kind is invalid"));
+    }
+    const bool has_material_parameters = material_region_id.has_value() ||
+        material_id.has_value() || material_variant_id.has_value();
+    if (kind != PreviewKind::set_material_region_assignment && has_material_parameters) {
+        return core::Result<void>::failure(invalid(
+            "non-material preview contains material assignment parameters"));
     }
     if (kind == PreviewKind::object_transform) {
         if (!transform.has_value() || distance.has_value() || position.has_value()) {
@@ -74,6 +81,17 @@ core::Result<void> PreviewParameters::validate(PreviewKind kind) const {
         }
         return core::Result<void>::success();
     }
+    if (kind == PreviewKind::set_material_region_assignment) {
+        if (transform.has_value() || distance.has_value() || position.has_value() ||
+            !material_region_id.has_value() || material_region_id.value() == 0U ||
+            !material_id.has_value() || material_id.value() == 0U ||
+            (material_variant_id.has_value() && material_variant_id.value() == 0U)) {
+            return core::Result<void>::failure(invalid(
+                "material assignment preview requires non-zero region and material IDs, "
+                "an optional non-zero variant ID, and no unrelated parameters"));
+        }
+        return core::Result<void>::success();
+    }
     if (!position.has_value() || transform.has_value() || distance.has_value()) {
         return core::Result<void>::failure(
             invalid("vertex position preview requires only a position"));
@@ -97,10 +115,11 @@ core::Result<AuthoringPreview> AuthoringPreview::begin(
         return core::Result<AuthoringPreview>::failure(invalid("preview kind is invalid"));
     }
     if ((kind == PreviewKind::object_transform ||
-         kind == PreviewKind::object_translation_delta) &&
+         kind == PreviewKind::object_translation_delta ||
+         kind == PreviewKind::set_material_region_assignment) &&
         (context.selection_mode != SelectionMode::object || context.objects.size() != 1U)) {
         return core::Result<AuthoringPreview>::failure(invalid(
-            "object transform preview requires exactly one selected object"));
+            "object operation preview requires exactly one selected object"));
     }
     if ((kind == PreviewKind::extrude_face || kind == PreviewKind::inset_face ||
          kind == PreviewKind::poke_face) &&

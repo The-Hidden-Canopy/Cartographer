@@ -156,6 +156,31 @@ void face_poke_preview_is_parameterless_and_revision_bound() {
     REQUIRE(after.project_revision == before.project_revision.next());
 }
 
+void material_assignment_preview_requires_exact_typed_ids() {
+    carto::editor::PreviewParameters parameters;
+    parameters.material_region_id = 7U;
+    parameters.material_id = 11U;
+    REQUIRE(parameters.validate(
+        carto::editor::PreviewKind::set_material_region_assignment));
+    parameters.material_variant_id = 3U;
+    REQUIRE(parameters.validate(
+        carto::editor::PreviewKind::set_material_region_assignment));
+
+    parameters.material_region_id = 0U;
+    REQUIRE(!parameters.validate(
+        carto::editor::PreviewKind::set_material_region_assignment));
+    parameters.material_region_id = 7U;
+    parameters.material_id = 0U;
+    REQUIRE(!parameters.validate(
+        carto::editor::PreviewKind::set_material_region_assignment));
+    parameters.material_id = 11U;
+    parameters.distance = 0.1;
+    REQUIRE(!parameters.validate(
+        carto::editor::PreviewKind::set_material_region_assignment));
+    parameters.distance.reset();
+    REQUIRE(!parameters.validate(carto::editor::PreviewKind::object_translation_delta));
+}
+
 void ui_preview_facade_records_only_the_committed_operation() {
     carto::application::ApplicationSession session;
     carto::ui::UiController ui(session);
@@ -199,6 +224,7 @@ int main() {
         stale_preview_is_refused_without_a_second_mutation();
         component_preview_emits_affected_ids_and_parameters();
         face_poke_preview_is_parameterless_and_revision_bound();
+        material_assignment_preview_requires_exact_typed_ids();
         ui_preview_facade_records_only_the_committed_operation();
         preview_validation_is_fail_closed();
     } catch (const std::exception& error) {

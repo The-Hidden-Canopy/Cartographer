@@ -18,6 +18,7 @@ enum class CapabilityEffect : std::uint32_t {
     geometry = 1U,
     topology = 2U,
     transform = 4U,
+    material = 8U,
 };
 
 [[nodiscard]] constexpr std::uint32_t effect_mask(CapabilityEffect effect) noexcept {
@@ -28,6 +29,7 @@ enum class ParameterType : std::uint8_t {
     length,
     scalar,
     count,
+    unsigned_identity,
     boolean,
     vector3,
     edge_reference,
@@ -71,12 +73,15 @@ enum class CapabilityData : std::uint8_t {
     selected_component,
     target_mesh,
     incident_topology,
+    material_catalog,
+    material_regions,
 };
 
 enum class CapabilityWrite : std::uint8_t {
     object_transform,
     vertex_positions,
     mesh_topology,
+    material_region_assignment,
 };
 
 enum class CapabilityInvalidation : std::uint8_t {
@@ -101,6 +106,9 @@ enum class CapabilityValidator : std::uint8_t {
     face_convex,
     manifold_topology,
     operation_preconditions,
+    material_source_exists,
+    material_variant_exists,
+    material_region_exists,
 };
 
 enum class CapabilityRisk : std::uint8_t {
@@ -108,6 +116,7 @@ enum class CapabilityRisk : std::uint8_t {
     reversible_geometry,
     reversible_topology,
     destructive_topology,
+    reversible_material,
     unknown,
 };
 

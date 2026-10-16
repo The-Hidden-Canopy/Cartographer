@@ -31,7 +31,8 @@ constexpr std::size_t kMaxRepairAttempts = 4U;
 constexpr double kMaxNearestObjectRadiusWorldUnits = 1'000'000.0;
 constexpr std::uint32_t kKnownEffects = ::carto::agent::effect_mask(Effect::geometry) |
     ::carto::agent::effect_mask(Effect::topology) |
-    ::carto::agent::effect_mask(Effect::transform);
+    ::carto::agent::effect_mask(Effect::transform) |
+    ::carto::agent::effect_mask(Effect::material);
 
 core::Diagnostic invalid(std::string message) {
     return core::Diagnostic(core::ErrorCode::invalid_argument, std::move(message));
@@ -616,6 +617,7 @@ std::string effect_names(std::uint32_t effects) {
     if ((effects & ::carto::agent::effect_mask(Effect::geometry)) != 0U) append("geometry");
     if ((effects & ::carto::agent::effect_mask(Effect::topology)) != 0U) append("topology");
     if ((effects & ::carto::agent::effect_mask(Effect::transform)) != 0U) append("transform");
+    if ((effects & ::carto::agent::effect_mask(Effect::material)) != 0U) append("material");
     return result.empty() ? "no declared effect" : result;
 }
 
@@ -658,6 +660,17 @@ std::vector<std::string> objective_tokens(std::string_view text) {
     }
     if (!current.empty()) tokens.push_back(std::move(current));
     return tokens;
+}
+
+bool intent_starts_with(
+    std::string_view intent,
+    std::string_view first,
+    std::string_view second,
+    std::optional<std::string_view> third = std::nullopt) {
+    const auto tokens = objective_tokens(intent);
+    return tokens.size() >= (third.has_value() ? 3U : 2U) &&
+        tokens[0] == first && tokens[1] == second &&
+        (!third.has_value() || tokens[2] == *third);
 }
 
 bool contains_objective_phrase(
@@ -3322,12 +3335,23 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
     if (!scope_contains(step.target.object)) {
         return fail(policy("plan step target is outside the work envelope"));
     }
+    const bool material_assignment = intent_starts_with(
+        step.intent, "assign", "material");
+    if (material_assignment &&
+        (envelope_.permitted_effects & ::carto::agent::effect_mask(Effect::material)) == 0U) {
+        return fail(policy("work envelope forbids the material effect"));
+    }
+    if (material_assignment &&
+        !std::holds_alternative<std::monostate>(step.target.component)) {
+        return fail(policy("material assignment requires an object target"));
+    }
     const auto* target_object = speculative_->document_.scene().find(step.target.object);
     if (target_object == nullptr) {
         return fail(policy("plan target object no longer exists in the speculative branch"));
     }
     const bool object_translation =
-        std::holds_alternative<std::monostate>(step.target.component);
+        std::holds_alternative<std::monostate>(step.target.component) &&
+        !material_assignment;
     if (object_translation &&
         (envelope_.permitted_effects & ::carto::agent::effect_mask(Effect::transform)) == 0U) {
         return fail(policy("work envelope forbids the transform effect"));
@@ -3384,6 +3408,10 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
                 return fail(policy(
                     "plan target mesh is shared by an object protected by the objective"));
             }
+            if (material_assignment && object.locked) {
+                return fail(policy(
+                    "material assignment would affect a locked shared-mesh instance"));
+            }
             affected_objects.insert(object.id);
         }
     }
@@ -3400,7 +3428,7 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
 
     application::ApplicationAction select_mode;
     application::ApplicationAction select_component;
-    if (object_translation) {
+    if (object_translation || material_assignment) {
         select_mode = application::SetSelectionModeAction{editor::SelectionMode::object};
         select_component = application::SelectObjectAction{step.target.object};
     } else if (const auto* face = std::get_if<geometry::FaceId>(&step.target.component)) {
@@ -3499,7 +3527,9 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
         return fail(result.error().with_context("speculative preview parameters"));
     }
     const auto committed = application::HumanApplicationAccess::commit_preview(
-        *speculative_, preview.value(), application::OperationSource::ai_proposal,
+        *speculative_, preview.value(), material_assignment
+            ? application::OperationSource::agent_workbench
+            : application::OperationSource::ai_proposal,
         plan_.id + ":" + step.id);
     if (!committed) return fail(committed.error().with_context("speculative native command"));
     if (auto result = speculative_->document_.validate(); !result) {
@@ -5199,6 +5229,10 @@ core::Result<AgentRebaseAnalysis> AgentTask::analyze_checkpoint_rebase(
     for (const auto& step : checkpoint.plan.steps) {
         read_objects.insert(step.target.object);
         steps_by_object_dependency[step.target.object].insert(step.id);
+        if (intent_starts_with(step.intent, "assign", "material")) {
+            add_blocker(
+                "material catalog writes are not yet represented by checkpoint rebase read/write sets");
+        }
         const auto* target = base.scene().find(step.target.object);
         if (target == nullptr) {
             add_blocker("checkpoint step target " + std::to_string(step.target.object.value) +

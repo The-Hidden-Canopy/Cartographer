@@ -8,6 +8,10 @@
 - Confirm the source revision and geometry remain unchanged before review.
 - Confirm per-step receipts, project/viewport gates, and structured mesh and material-region binding diffs.
 - Material assignment, reassignment, and removal appear in review with before/after material and variant identities; material source edits, texture-source content/metadata changes, and texture dependency changes have separate evidence rows. A material-only change satisfies the non-empty diff predicate.
+- The Agent Workbench material permission is off by default. With it enabled, `assign material <id> to region <id> [variant <id>]` runs only on the speculative branch and requires exact non-zero unsigned IDs.
+- Confirm material-only and mixed geometry/material plans remain review-only, report a material-binding diff, preserve the source before acceptance, and commit through the normal human acceptance event.
+- Confirm omitted material permission, malformed or overflowing IDs, missing materials, missing variants, undeclared regions, and shared mesh instances outside scope block without changing the source.
+- Confirm generic AI proposals cannot request the material capability, and material checkpoints replay only against their exact source revision; rebase blocks while catalog writes are absent from its read/write-set model.
 - Expand changed meshes and inspect all changed vertex positions and face-connectivity identities, including added/removed faces; large lists must remain scrollable without silently truncating evidence.
 - Accept the result and confirm the source advances once and the saved-project journal contains one application mutation event.
 - From Model, Material, CONDITION, and Review, use the global Ask Cartographer entry and confirm the Agent Workbench instrument opens with the goal field focused while preserving the selected object or component and source revision.

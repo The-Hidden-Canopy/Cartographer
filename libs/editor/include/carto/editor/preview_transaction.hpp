@@ -5,7 +5,9 @@
 #include <carto/core/revision.hpp>
 #include <carto/editor/authoring_context.hpp>
 
+#include <cstdint>
 #include <optional>
+#include <utility>
 
 namespace carto::application {
 class ApplicationSession;
@@ -20,12 +22,31 @@ enum class PreviewKind {
     inset_face,
     set_vertex_position,
     poke_face,
+    set_material_region_assignment,
 };
 
 struct PreviewParameters {
+    PreviewParameters() = default;
+    PreviewParameters(
+        std::optional<core::Transform> transform_value,
+        std::optional<double> distance_value,
+        std::optional<core::Vec3d> position_value,
+        std::optional<std::uint32_t> region_id_value = std::nullopt,
+        std::optional<std::uint64_t> material_id_value = std::nullopt,
+        std::optional<std::uint64_t> material_variant_id_value = std::nullopt)
+        : transform(std::move(transform_value)),
+          distance(distance_value),
+          position(std::move(position_value)),
+          material_region_id(region_id_value),
+          material_id(material_id_value),
+          material_variant_id(material_variant_id_value) {}
+
     std::optional<core::Transform> transform;
     std::optional<double> distance;
     std::optional<core::Vec3d> position;
+    std::optional<std::uint32_t> material_region_id;
+    std::optional<std::uint64_t> material_id;
+    std::optional<std::uint64_t> material_variant_id;
 
     [[nodiscard]] core::Result<void> validate(PreviewKind kind) const;
 };
