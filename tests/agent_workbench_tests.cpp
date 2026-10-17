@@ -6852,9 +6852,15 @@ void condition_inventory_audit_never_promotes_partial_evidence_to_readiness() {
     REQUIRE(find_readiness_gate(observed_report, "condition.mesh_validation")->status ==
         carto::agent::ConditionReadinessGateStatus::passed);
     REQUIRE(find_readiness_gate(observed_report, "condition.material_region_assignments")->
-        affected_assets == std::vector<std::uint64_t>{3U});
+        scoped_assets == std::vector<std::uint64_t>{3U});
+    REQUIRE(find_readiness_gate(observed_report, "condition.material_region_assignments")->
+        affected_assets.empty());
     REQUIRE(find_readiness_gate(observed_report, "condition.tangent_validation")->status ==
         carto::agent::ConditionReadinessGateStatus::not_evaluated);
+    REQUIRE(find_readiness_gate(observed_report, "condition.tangent_validation")->
+        scoped_assets == std::vector<std::uint64_t>{3U});
+    REQUIRE(find_readiness_gate(observed_report, "condition.tangent_validation")->
+        affected_assets.empty());
     REQUIRE(!carto::agent::ConditionReadinessReport::production_readiness_established);
 
     auto stale_readiness_inventory = observed_inventory;
@@ -6865,6 +6871,8 @@ void condition_inventory_audit_never_promotes_partial_evidence_to_readiness() {
         carto::agent::audit_condition_readiness(stale_readiness_inventory);
     REQUIRE(find_readiness_gate(stale_readiness, "condition.source_evidence")->status ==
         carto::agent::ConditionReadinessGateStatus::failed);
+    REQUIRE(find_readiness_gate(stale_readiness, "condition.source_evidence")->
+        affected_assets == std::vector<std::uint64_t>{3U});
     REQUIRE(!stale_readiness.all_observed_checks_passed);
 
     auto failed_readiness_inventory = observed_inventory;
@@ -6877,7 +6885,32 @@ void condition_inventory_audit_never_promotes_partial_evidence_to_readiness() {
     REQUIRE(find_readiness_gate(failed_readiness,
         "condition.material_region_assignments")->status ==
         carto::agent::ConditionReadinessGateStatus::failed);
+    REQUIRE(find_readiness_gate(failed_readiness,
+        "condition.material_region_assignments")->affected_assets ==
+        std::vector<std::uint64_t>{3U});
     REQUIRE(!failed_readiness.all_observed_checks_passed);
+
+    auto mixed_outcome_inventory = observed_inventory;
+    auto passing_asset = observed_fact;
+    passing_asset.asset = 4U;
+    passing_asset.authored_object = carto::scene::ObjectId{99U};
+    mixed_outcome_inventory.rows.emplace_back(passing_asset);
+    auto& failing_asset = std::get<carto::agent::ConditionAssetInventoryFact>(
+        mixed_outcome_inventory.rows.front());
+    failing_asset.material_region_assignments =
+        carto::agent::ConditionTechnicalCheckStatus::failed;
+    const auto mixed_outcome_report =
+        carto::agent::audit_condition_readiness(mixed_outcome_inventory);
+    const auto* mixed_assignment_gate = find_readiness_gate(
+        mixed_outcome_report, "condition.material_region_assignments");
+    REQUIRE(mixed_assignment_gate != nullptr);
+    REQUIRE(mixed_assignment_gate->status ==
+        carto::agent::ConditionReadinessGateStatus::failed);
+    REQUIRE((mixed_assignment_gate->scoped_assets ==
+        std::vector<std::uint64_t>{3U, 4U}));
+    REQUIRE(mixed_assignment_gate->affected_assets ==
+        std::vector<std::uint64_t>{3U});
+    REQUIRE(!mixed_outcome_report.all_observed_checks_passed);
 
     auto partial_readiness_inventory = observed_inventory;
     partial_readiness_inventory.truncated = true;
@@ -6914,6 +6947,9 @@ void condition_inventory_audit_never_promotes_partial_evidence_to_readiness() {
     REQUIRE(find_readiness_gate(unavailable_readiness,
         "condition.source_evidence")->status ==
         carto::agent::ConditionReadinessGateStatus::unavailable);
+    REQUIRE(find_readiness_gate(unavailable_readiness,
+        "condition.source_evidence")->affected_assets ==
+        std::vector<std::uint64_t>{3U});
     REQUIRE(!unavailable_readiness.all_observed_checks_passed);
 
     const auto empty_readiness = carto::agent::audit_condition_readiness(

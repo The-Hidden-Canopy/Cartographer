@@ -1029,12 +1029,14 @@ ConditionReadinessReport audit_condition_readiness(const SceneQueryResult& inven
         std::size_t incomplete = 0U;
         std::size_t unavailable = 0U;
         for (const auto* fact : facts) {
-            switch (get_status(*fact)) {
+            const auto status = get_status(*fact);
+            switch (status) {
             case ConditionTechnicalCheckStatus::passed: ++passed; break;
             case ConditionTechnicalCheckStatus::failed: ++failed; break;
             case ConditionTechnicalCheckStatus::incomplete: ++incomplete; break;
             case ConditionTechnicalCheckStatus::unavailable: ++unavailable; break;
             case ConditionTechnicalCheckStatus::not_evaluated: ++incomplete; break;
+            default: ++incomplete; break;
             }
         }
         ConditionReadinessGate gate;
@@ -1058,8 +1060,12 @@ ConditionReadinessReport audit_condition_readiness(const SceneQueryResult& inven
             std::to_string(facts.size()) + " observed asset(s)" +
             (complete ? "; inventory complete" : "; inventory incomplete");
         for (const auto* fact : facts) {
-            gate.affected_assets.push_back(fact->asset);
-            gate.affected_objects.push_back(fact->authored_object);
+            gate.scoped_assets.push_back(fact->asset);
+            gate.scoped_objects.push_back(fact->authored_object);
+            if (get_status(*fact) != ConditionTechnicalCheckStatus::passed) {
+                gate.affected_assets.push_back(fact->asset);
+                gate.affected_objects.push_back(fact->authored_object);
+            }
         }
         report.gates.push_back(std::move(gate));
     };
@@ -1101,8 +1107,8 @@ ConditionReadinessReport audit_condition_readiness(const SceneQueryResult& inven
         gate.status = ConditionReadinessGateStatus::not_evaluated;
         gate.evidence = std::move(evidence);
         for (const auto* fact : facts) {
-            gate.affected_assets.push_back(fact->asset);
-            gate.affected_objects.push_back(fact->authored_object);
+            gate.scoped_assets.push_back(fact->asset);
+            gate.scoped_objects.push_back(fact->authored_object);
         }
         report.gates.push_back(std::move(gate));
     };

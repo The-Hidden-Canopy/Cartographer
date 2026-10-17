@@ -272,13 +272,17 @@ struct ConditionReadinessGate {
     std::string label;
     ConditionReadinessGateStatus status = ConditionReadinessGateStatus::not_evaluated;
     std::string evidence;
+    std::vector<std::uint64_t> scoped_assets;
+    std::vector<scene::ObjectId> scoped_objects;
     std::vector<std::uint64_t> affected_assets;
     std::vector<scene::ObjectId> affected_objects;
 };
 
 // Gate results summarize only facts present in a complete, revision-bound
 // inventory. Missing domain validators remain explicit and this report never
-// establishes overall CONDITION or production readiness.
+// establishes overall CONDITION or production readiness. Scoped identities
+// describe the observed query; affected identities name only rows that failed,
+// were unavailable, or were incomplete at the asset level.
 struct ConditionReadinessReport {
     ConditionEvidenceAudit inventory;
     std::vector<ConditionReadinessGate> gates;
