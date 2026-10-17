@@ -973,6 +973,7 @@ enum class FileDialogKind {
     engineering,
     engineering_authoring,
     engineering_bom_csv,
+    engineering_evidence,
     condition,
     condition_authoring,
     audio_clip,
@@ -1072,6 +1073,10 @@ enum class StandardMeshExport {
     case FileDialogKind::engineering_bom_csv:
         dialog.lpstrFilter = L"Engineering BOM CSV (*.csv)\0*.csv\0All Files\0*.*\0";
         dialog.lpstrDefExt = L"csv";
+        break;
+    case FileDialogKind::engineering_evidence:
+        dialog.lpstrFilter =
+            L"Engineering drawing or specification evidence\0*.*\0All Files\0*.*\0";
         break;
     case FileDialogKind::condition:
         dialog.lpstrFilter =
@@ -2169,6 +2174,22 @@ struct DesktopState {
         action_feedback = "Imported and reconciled BOM source " +
             path->filename().string() + " into " +
             std::to_string(snapshot.engineering.bom_count) + " source and reconciliation rows.";
+        action_feedback_error = false;
+    }
+
+    void attach_engineering_evidence(carto::engineering::SourceKind kind) {
+        const auto path = choose_file(false, FileDialogKind::engineering_evidence);
+        if (!path.has_value()) return;
+        const auto attached = ui.attach_engineering_evidence(*path, kind);
+        if (!attached) {
+            action_feedback = attached.error().message;
+            action_feedback_error = true;
+            return;
+        }
+        const char* source_kind = kind == carto::engineering::SourceKind::drawing
+            ? "drawing" : "specification";
+        action_feedback = std::string("Attached ") + source_kind + " evidence " +
+            path->filename().string() + "; no source interpretation was performed.";
         action_feedback_error = false;
     }
 
@@ -9996,6 +10017,12 @@ struct DesktopState {
             }
             if (ImGui::Button("Import BOM CSV...", ImVec2(-1, 28))) {
                 import_engineering_bom_csv();
+            }
+            if (ImGui::Button("Attach drawing evidence...", ImVec2(-1, 28))) {
+                attach_engineering_evidence(carto::engineering::SourceKind::drawing);
+            }
+            if (ImGui::Button("Attach specification evidence...", ImVec2(-1, 28))) {
+                attach_engineering_evidence(carto::engineering::SourceKind::specification);
             }
             ImGui::SeparatorText("Inspection target review");
             if (engineering.targets.empty()) {

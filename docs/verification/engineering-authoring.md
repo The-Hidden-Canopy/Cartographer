@@ -15,6 +15,14 @@ rows, and lets an operator add a sensor and access contract to an eligible
 requirement. It exports an admitted `.carto-inspection` package when publication
 gates pass.
 
+An operator can attach a drawing or specification file up to 64 MiB as opaque
+source evidence. Cartographer records its content digest, filename locator, and
+attachment provenance, but does not embed, parse, extract, or interpret the
+file. Manual requirements can cite the attached source while retaining the
+operator-provided original assertion. Replacing evidence with the same kind and
+filename preserves the old digest and marks linked requirements and dependent
+products stale. Local directory paths are not stored in these source locators.
+
 Characteristic creation is revision-bound and human-only. The application
 copies the requirement's current topology bindings, checks the requirement to
 characteristic kind mapping, requires explicit sensor, coverage, and allowed

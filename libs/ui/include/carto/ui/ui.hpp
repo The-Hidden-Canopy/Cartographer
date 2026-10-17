@@ -616,6 +616,9 @@ public:
         const std::filesystem::path& path);
     [[nodiscard]] core::Result<application::DispatchReceipt> import_engineering_bom_csv(
         const std::filesystem::path& path);
+    [[nodiscard]] core::Result<application::DispatchReceipt> attach_engineering_evidence(
+        const std::filesystem::path& path,
+        engineering::SourceKind kind);
     [[nodiscard]] core::Result<application::DispatchReceipt> create_engineering_characteristic(
         const application::CreateEngineeringCharacteristicAction& action);
     [[nodiscard]] core::Result<application::DispatchReceipt> create_engineering_target(

@@ -1117,6 +1117,8 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return import_engineering_authoring(value);
             } else if constexpr (std::is_same_v<Action, ImportEngineeringBomCsvAction>) {
                 return import_engineering_bom_csv(value);
+            } else if constexpr (std::is_same_v<Action, AttachEngineeringEvidenceAction>) {
+                return attach_engineering_evidence(value);
             } else if constexpr (std::is_same_v<Action, CreateEngineeringRequirementAction>) {
                 return create_engineering_requirement(value);
             } else if constexpr (std::is_same_v<Action, CreateEngineeringCharacteristicAction>) {
@@ -2944,11 +2946,13 @@ core::Result<DispatchReceipt> ApplicationSession::import_engineering_bom_csv(
             core::ErrorCode::stale_data,
             "engineering BOM import was based on a stale project revision"));
     }
-    if (action.locator.empty() || action.locator.size() > 4096U ||
+    if (action.locator.empty() || action.locator.size() > 255U ||
+        action.locator == "." || action.locator == ".." ||
+        action.locator.find_first_of("/\\:") != std::string::npos ||
         action.csv_bytes.empty() || action.csv_bytes.size() > engineering::kMaxBomCsvBytes) {
         return failure(core::Diagnostic(
             core::ErrorCode::invalid_argument,
-            "engineering BOM import requires a source locator and bounded CSV bytes"));
+            "engineering BOM import requires a safe filename locator and bounded CSV bytes"));
     }
     const auto current = engineering_authoring();
     if (!current) return failure(current.error().with_context("engineering BOM import"));
@@ -3069,6 +3073,164 @@ core::Result<DispatchReceipt> ApplicationSession::import_engineering_bom_csv(
             before,
             project::SerializedEngineeringAuthoring{serialized, digest.value()}),
         "Import and Reconcile Engineering BOM CSV");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::attach_engineering_evidence(
+    const AttachEngineeringEvidenceAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "engineering evidence attachment requires the explicit human command boundary"));
+    }
+    if (action.expected_project_revision != document_.revision()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "engineering evidence attachment was based on a stale project revision"));
+    }
+    if ((action.kind != engineering::SourceKind::drawing &&
+            action.kind != engineering::SourceKind::specification) ||
+        action.locator.empty() || action.locator.size() > 255U ||
+        action.locator == "." || action.locator == ".." ||
+        action.locator.find_first_of("/\\:") != std::string::npos ||
+        action.source_bytes.empty() ||
+        action.source_bytes.size() > engineering::kMaxEngineeringEvidenceBytes) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "engineering evidence must be a bounded drawing or specification file name and byte stream"));
+    }
+
+    const auto current = engineering_authoring();
+    if (!current) return failure(current.error().with_context(
+        "engineering evidence attachment"));
+    if (current.value().project_revision != action.expected_authoring_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "engineering evidence attachment was based on a stale authoring revision"));
+    }
+    if (current.value().project_revision.exhausted()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "engineering authoring revision space is exhausted"));
+    }
+
+    const auto source_digest = structure_digest(action.source_bytes);
+    std::vector<engineering::Id> superseded_source_ids;
+    for (const auto& source : current.value().sources) {
+        if (source.kind == action.kind && source.locator == action.locator) {
+            superseded_source_ids.push_back(source.id);
+        }
+    }
+    std::sort(superseded_source_ids.begin(), superseded_source_ids.end());
+    if (!superseded_source_ids.empty()) {
+        const auto latest = std::find_if(current.value().sources.begin(),
+            current.value().sources.end(), [&superseded_source_ids](const auto& source) {
+                return source.id == superseded_source_ids.back();
+            });
+        if (latest != current.value().sources.end() && latest->digest == source_digest &&
+            std::none_of(latest->diagnostics.begin(), latest->diagnostics.end(),
+                [](const std::string& diagnostic) {
+                    return diagnostic.starts_with("superseded by engineering evidence ") ||
+                        diagnostic.find("source revision changed") != std::string::npos;
+                })) {
+            return accepted("Attach Engineering Evidence", document_.revision());
+        }
+    }
+
+    engineering::Id source_id = 1U;
+    for (const auto& source : current.value().sources) {
+        if (source.id == std::numeric_limits<engineering::Id>::max()) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "engineering source identity space is exhausted"));
+        }
+        source_id = std::max(source_id, source.id + 1U);
+    }
+
+    auto updated = current.value();
+    std::set<engineering::Id> affected_requirement_ids;
+    for (auto& previous : updated.sources) {
+        if (std::find(superseded_source_ids.begin(), superseded_source_ids.end(),
+                previous.id) == superseded_source_ids.end()) {
+            continue;
+        }
+        const std::string supersession = "superseded by engineering evidence " +
+            std::to_string(source_id);
+        if (std::find(previous.diagnostics.begin(), previous.diagnostics.end(),
+                supersession) == previous.diagnostics.end()) {
+            previous.diagnostics.push_back(supersession);
+        }
+        for (auto& requirement : updated.requirements) {
+            if (requirement.provenance.source_id == previous.id) {
+                requirement.extraction = engineering::ExtractionState::stale;
+                affected_requirement_ids.insert(requirement.id);
+            }
+        }
+    }
+
+    std::set<engineering::Id> affected_characteristic_ids;
+    for (auto& characteristic : updated.characteristics) {
+        if (!affected_requirement_ids.contains(characteristic.requirement_id)) continue;
+        characteristic.status = engineering::InspectionStatus::stale;
+        affected_characteristic_ids.insert(characteristic.id);
+    }
+    std::set<engineering::Id> affected_target_ids;
+    for (auto& target : updated.targets) {
+        if (!affected_characteristic_ids.contains(target.characteristic_id)) continue;
+        target.status = engineering::TargetStatus::stale;
+        affected_target_ids.insert(target.id);
+    }
+    if (updated.path.has_value() && std::any_of(
+            updated.path->samples.begin(), updated.path->samples.end(),
+            [&affected_target_ids](const auto& sample) {
+                return sample.target_id.has_value() &&
+                    affected_target_ids.contains(*sample.target_id);
+            })) {
+        updated.path->status = engineering::DerivedProductStatus::stale;
+        for (auto& sample : updated.path->samples) {
+            sample.status = engineering::PathSampleStatus::stale;
+        }
+    }
+    if (!superseded_source_ids.empty()) {
+        for (auto& product : updated.derived_products) {
+            product.status = engineering::DerivedProductStatus::stale;
+            product.stale_reason = "engineering evidence source was superseded";
+        }
+    }
+
+    engineering::EngineeringSource source;
+    source.id = source_id;
+    source.kind = action.kind;
+    source.locator = action.locator;
+    source.revision = "content-sha256:" + source_digest.hex();
+    source.digest = source_digest;
+    source.provider_identity = "cartographer.opaque-source-attachment";
+    source.provider_version = "1.0.0";
+    source.import_settings_digest = structure_digest(
+        "cartographer.opaque-source-attachment.v1;mode=digest-only");
+    source.import_run_id = "opaque-source-" + source_digest.hex();
+    source.units = "unspecified";
+    source.diagnostics.push_back(
+        "opaque evidence only; no parsing, interpretation, or extraction performed");
+    source.diagnostics.push_back(
+        "source bytes are not embedded; the content digest binds the external file");
+    updated.sources.push_back(std::move(source));
+    updated.project_revision = updated.project_revision.next();
+    if (auto valid = updated.validate(); !valid) {
+        return failure(valid.error().with_context("engineering evidence attachment"));
+    }
+    const std::string serialized = updated.serialize();
+    const auto digest = updated.canonical_digest();
+    if (!digest) return failure(digest.error().with_context(
+        "engineering evidence attachment digest"));
+    const auto before = document_.engineering_authoring();
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectEngineeringAuthoringCommand>(
+            admission,
+            document_,
+            before,
+            project::SerializedEngineeringAuthoring{serialized, digest.value()}),
+        "Attach Engineering Evidence");
 }
 
 core::Result<DispatchReceipt> ApplicationSession::create_engineering_requirement(

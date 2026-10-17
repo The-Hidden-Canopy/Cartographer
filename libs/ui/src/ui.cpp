@@ -559,6 +559,7 @@ bool is_operation_action(const application::ApplicationAction& action) {
             std::is_same_v<Action, application::ImportEngineeringFixtureAction> ||
             std::is_same_v<Action, application::ImportEngineeringAuthoringAction> ||
             std::is_same_v<Action, application::ImportEngineeringBomCsvAction> ||
+            std::is_same_v<Action, application::AttachEngineeringEvidenceAction> ||
             std::is_same_v<Action, application::CreateEngineeringRequirementAction> ||
             std::is_same_v<Action, application::CreateEngineeringCharacteristicAction> ||
             std::is_same_v<Action, application::CreateEngineeringTargetAction> ||
@@ -4276,7 +4277,33 @@ core::Result<application::DispatchReceipt> UiController::import_engineering_bom_
         application::ImportEngineeringBomCsvAction{
             snapshot.project_revision,
             snapshot.engineering.authored_revision,
-            path.generic_string(),
+            path.filename().generic_string(),
+            std::move(bytes).value()},
+        OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::attach_engineering_evidence(
+    const std::filesystem::path& path,
+    engineering::SourceKind kind) {
+    if (kind != engineering::SourceKind::drawing &&
+        kind != engineering::SourceKind::specification) {
+        return core::Result<application::DispatchReceipt>::failure(invalid(
+            "opaque engineering evidence supports drawing or specification sources only"));
+    }
+    auto bytes = read_bounded_file(path,
+        engineering::kMaxEngineeringEvidenceBytes, "engineering evidence");
+    if (!bytes) return core::Result<application::DispatchReceipt>::failure(bytes.error());
+    const auto snapshot = session_.snapshot();
+    if (!snapshot.engineering.present) {
+        return core::Result<application::DispatchReceipt>::failure(invalid(
+            "import engineering authoring before attaching source evidence"));
+    }
+    return dispatch_with_category(
+        application::AttachEngineeringEvidenceAction{
+            snapshot.project_revision,
+            snapshot.engineering.authored_revision,
+            kind,
+            path.filename().generic_string(),
             std::move(bytes).value()},
         OperationCategory::provider);
 }

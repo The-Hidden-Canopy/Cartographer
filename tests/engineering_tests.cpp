@@ -1160,6 +1160,18 @@ void ui_imports_bom_csv_through_revision_bound_journal_and_preserves_source_hist
     REQUIRE(after.engineering.bom.at(2U).assembly_quantity == 2.0);
     REQUIRE(after.operations.back().category == carto::ui::OperationCategory::provider);
     REQUIRE(after.operations.back().action == "Import and Reconcile Engineering BOM CSV");
+    const auto imported_authoring = session.engineering_authoring();
+    REQUIRE(imported_authoring);
+    REQUIRE(imported_authoring.value().sources.back().locator == csv_path.filename().generic_string());
+    REQUIRE(imported_authoring.value().sources.back().locator.find(root.generic_string()) ==
+        std::string::npos);
+    auto unsafe_locator = carto::application::ImportEngineeringBomCsvAction{
+        after.project_revision,
+        after.engineering.authored_revision,
+        csv_path.generic_string(),
+        initial_csv};
+    REQUIRE(!carto::application::HumanApplicationAccess::dispatch(session, unsafe_locator));
+    REQUIRE(session.snapshot().project_revision == after.project_revision);
 
     const auto idempotent = ui.import_engineering_bom_csv(csv_path);
     REQUIRE(idempotent);
@@ -1227,6 +1239,145 @@ void ui_imports_bom_csv_through_revision_bound_journal_and_preserves_source_hist
         reopened, carto::application::OpenProjectAction{project_path}));
     REQUIRE(reopened.snapshot().engineering.bom_count == 7U);
     REQUIRE(reopened.snapshot().engineering.digest == ui.snapshot().engineering.digest);
+
+    std::error_code ignored;
+    std::filesystem::remove_all(root, ignored);
+}
+
+void ui_attaches_opaque_engineering_evidence_with_safe_provenance() {
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto root = std::filesystem::temp_directory_path() /
+        ("cartographer-engineering-evidence-" + std::to_string(stamp));
+    std::filesystem::create_directories(root);
+    const auto source_path = root / "drawing.pdf";
+    const std::string original_bytes("opaque evidence\0tail", 20U);
+    {
+        std::ofstream stream(source_path, std::ios::binary);
+        REQUIRE(stream.good());
+        stream.write(original_bytes.data(), static_cast<std::streamsize>(original_bytes.size()));
+        REQUIRE(stream.good());
+    }
+
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.dispatch(carto::application::NewProjectAction{"Engineering evidence"}));
+    REQUIRE(ui.import_engineering_fixture());
+    const auto before = ui.snapshot();
+    const carto::application::AttachEngineeringEvidenceAction ai_action{
+        before.project_revision,
+        before.engineering.authored_revision,
+        carto::engineering::SourceKind::drawing,
+        source_path.filename().generic_string(),
+        original_bytes};
+    REQUIRE(!ui.submit_ai_proposal(ai_action));
+    REQUIRE(ui.snapshot().project_revision == before.project_revision);
+
+    const auto attached = ui.attach_engineering_evidence(
+        source_path, carto::engineering::SourceKind::drawing);
+    REQUIRE(attached && attached.value().document_changed);
+    auto snapshot = ui.snapshot();
+    REQUIRE(snapshot.project_revision == before.project_revision.next());
+    REQUIRE(snapshot.engineering.source_count == before.engineering.source_count + 1U);
+    auto authoring = session.engineering_authoring();
+    REQUIRE(authoring);
+    const auto& source = authoring.value().sources.back();
+    REQUIRE(source.kind == carto::engineering::SourceKind::drawing);
+    REQUIRE(source.locator == "drawing.pdf");
+    REQUIRE(source.locator.find(root.generic_string()) == std::string::npos);
+    REQUIRE(source.digest == digest(original_bytes));
+    REQUIRE(source.revision == "content-sha256:" + source.digest.hex());
+    REQUIRE(source.diagnostics.size() == 2U);
+    REQUIRE(source.diagnostics.front().find("no parsing") != std::string::npos);
+    const auto serialized = authoring.value().serialize();
+    REQUIRE(serialized.find(original_bytes) == std::string::npos);
+    REQUIRE(serialized.find(root.generic_string()) == std::string::npos);
+    REQUIRE(snapshot.operations.back().category == carto::ui::OperationCategory::provider);
+    REQUIRE(snapshot.operations.back().action == "Attach Engineering Evidence");
+    const auto source_id = source.id;
+
+    REQUIRE(ui.dispatch(carto::application::UndoAction{}));
+    REQUIRE(ui.snapshot().engineering.source_count == before.engineering.source_count);
+    REQUIRE(ui.dispatch(carto::application::RedoAction{}));
+    snapshot = ui.snapshot();
+    REQUIRE(snapshot.engineering.source_count == before.engineering.source_count + 1U);
+
+    const auto same_source = ui.attach_engineering_evidence(
+        source_path, carto::engineering::SourceKind::drawing);
+    REQUIRE(same_source && !same_source.value().document_changed);
+    REQUIRE(ui.snapshot().project_revision == snapshot.project_revision);
+
+    carto::application::CreateEngineeringRequirementAction requirement;
+    requirement.expected_project_revision = snapshot.project_revision;
+    requirement.expected_authoring_revision = snapshot.engineering.authored_revision;
+    requirement.source_id = source_id;
+    requirement.topology_ids = {100U};
+    requirement.nominal = 9.0;
+    requirement.plus = 0.1;
+    requirement.minus = 0.1;
+    requirement.source_page = 34U;
+    requirement.source_callout = "DIM-NEW";
+    requirement.original_text = "9.00 +/- 0.10 mm";
+    requirement.acceptance_rule = "within bilateral tolerance";
+    REQUIRE(ui.dispatch(requirement));
+    snapshot = ui.snapshot();
+    authoring = session.engineering_authoring();
+    REQUIRE(authoring);
+    REQUIRE(authoring.value().requirements.back().provenance.source_id == source_id);
+
+    const std::string replacement_bytes("revised drawing evidence");
+    {
+        std::ofstream stream(source_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(stream.good());
+        stream.write(replacement_bytes.data(),
+            static_cast<std::streamsize>(replacement_bytes.size()));
+        REQUIRE(stream.good());
+    }
+    const auto replaced = ui.attach_engineering_evidence(
+        source_path, carto::engineering::SourceKind::drawing);
+    REQUIRE(replaced && replaced.value().document_changed);
+    const auto after_replace = ui.snapshot();
+    REQUIRE(after_replace.engineering.source_count == snapshot.engineering.source_count + 1U);
+    REQUIRE(after_replace.engineering.stale);
+    authoring = session.engineering_authoring();
+    REQUIRE(authoring);
+    REQUIRE(authoring.value().sources[2U].digest == digest(original_bytes));
+    REQUIRE(authoring.value().sources.back().digest == digest(replacement_bytes));
+    REQUIRE(authoring.value().requirements.back().extraction ==
+        carto::engineering::ExtractionState::stale);
+    REQUIRE(ui.dispatch(carto::application::UndoAction{}));
+    authoring = session.engineering_authoring();
+    REQUIRE(authoring);
+    REQUIRE(authoring.value().sources.back().digest == digest(original_bytes));
+    REQUIRE(authoring.value().requirements.back().extraction ==
+        carto::engineering::ExtractionState::manual);
+    REQUIRE(ui.dispatch(carto::application::RedoAction{}));
+    authoring = session.engineering_authoring();
+    REQUIRE(authoring);
+    REQUIRE(authoring.value().sources.back().digest == digest(replacement_bytes));
+    REQUIRE(authoring.value().requirements.back().extraction ==
+        carto::engineering::ExtractionState::stale);
+
+    auto stale_action = carto::application::AttachEngineeringEvidenceAction{
+        snapshot.project_revision,
+        snapshot.engineering.authored_revision,
+        carto::engineering::SourceKind::specification,
+        "spec.txt",
+        "specification"};
+    REQUIRE(!ui.dispatch(stale_action));
+    const auto current = ui.snapshot();
+    stale_action.expected_project_revision = current.project_revision;
+    REQUIRE(!ui.dispatch(stale_action));
+    stale_action.expected_authoring_revision = current.engineering.authored_revision;
+    stale_action.locator = root.generic_string() + "\\private\\spec.txt";
+    REQUIRE(!ui.dispatch(stale_action));
+    stale_action.locator = "drawing.pdf";
+    stale_action.kind = carto::engineering::SourceKind::step_ap242;
+    REQUIRE(!ui.dispatch(stale_action));
+    stale_action.kind = carto::engineering::SourceKind::specification;
+    stale_action.source_bytes.resize(
+        carto::engineering::kMaxEngineeringEvidenceBytes + 1U, 'x');
+    REQUIRE(!ui.dispatch(stale_action));
+    REQUIRE(ui.snapshot().project_revision == current.project_revision);
 
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);
@@ -1377,6 +1528,7 @@ int main() {
         application_wires_engineering_authoring_through_persistence_and_history();
         ui_exposes_engineering_workspace_and_immutable_publication();
         ui_imports_bom_csv_through_revision_bound_journal_and_preserves_source_history();
+        ui_attaches_opaque_engineering_evidence_with_safe_provenance();
         ui_imports_exports_and_reconciles_engineering_authoring_files();
         std::cout << "engineering tests passed\n";
         return 0;

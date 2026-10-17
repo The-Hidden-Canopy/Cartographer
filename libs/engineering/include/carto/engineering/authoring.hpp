@@ -327,6 +327,7 @@ public:
 };
 
 inline constexpr std::size_t kMaxBomCsvBytes = 4U * 1024U * 1024U;
+inline constexpr std::size_t kMaxEngineeringEvidenceBytes = 64U * 1024U * 1024U;
 
 // Parses the bounded Cartographer BOM CSV profile. The header order is fixed:
 // part_number,revision,description,material,quantity,unit.

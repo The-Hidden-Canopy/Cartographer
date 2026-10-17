@@ -778,6 +778,13 @@ struct ImportEngineeringBomCsvAction {
     std::string locator;
     std::string csv_bytes;
 };
+struct AttachEngineeringEvidenceAction {
+    core::Revision expected_project_revision;
+    core::Revision expected_authoring_revision;
+    engineering::SourceKind kind = engineering::SourceKind::drawing;
+    std::string locator;
+    std::string source_bytes;
+};
 struct CreateEngineeringRequirementAction {
     core::Revision expected_project_revision;
     core::Revision expected_authoring_revision;
@@ -980,6 +987,7 @@ using ApplicationAction = std::variant<
     ImportEngineeringFixtureAction,
     ImportEngineeringAuthoringAction,
     ImportEngineeringBomCsvAction,
+    AttachEngineeringEvidenceAction,
     CreateEngineeringRequirementAction,
     CreateEngineeringCharacteristicAction,
     CreateEngineeringTargetAction,
@@ -1188,6 +1196,8 @@ private:
         const ImportEngineeringAuthoringAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> import_engineering_bom_csv(
         const ImportEngineeringBomCsvAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> attach_engineering_evidence(
+        const AttachEngineeringEvidenceAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_engineering_requirement(
         const CreateEngineeringRequirementAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_engineering_characteristic(
