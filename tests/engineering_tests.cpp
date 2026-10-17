@@ -948,6 +948,11 @@ void ui_exposes_engineering_workspace_and_immutable_publication() {
     REQUIRE(snapshot.engineering.requirements.size() == 3U);
     REQUIRE(snapshot.engineering.requirements.front().original_text ==
         "12.50 +/- 0.05 mm");
+    REQUIRE(snapshot.engineering.path.has_value());
+    REQUIRE(snapshot.engineering.path->status == "unverified");
+    REQUIRE(snapshot.engineering.path->samples.size() == 2U);
+    REQUIRE(snapshot.engineering.path->samples.front().status == "unverified");
+    REQUIRE(snapshot.engineering.path->samples.front().target_id == 500U);
 
     const auto package = ui.build_engineering_package();
     REQUIRE(package);

@@ -9329,6 +9329,54 @@ struct DesktopState {
         }
     }
 
+    void draw_engineering_path_review(const UiSnapshot& snapshot) {
+        const auto& path = snapshot.engineering.path;
+        if (!path.has_value()) return;
+        ImGui::SeparatorText("Stored inspection path samples");
+        ImGui::Text("Path %llu · %s · %zu samples · basis revision %llu",
+            static_cast<unsigned long long>(path->id), path->status.c_str(),
+            path->samples.size(),
+            static_cast<unsigned long long>(path->basis_revision.value()));
+        ImGui::TextWrapped(
+            "Stored path data is shown as received. This panel does not calculate reachability, "
+            "collision, clearance, or execution feasibility.");
+        const bool samples_visible = ImGui::BeginChild(
+            "Engineering stored path samples", ImVec2(0, 112), true,
+            ImGuiWindowFlags_HorizontalScrollbar);
+        if (samples_visible) {
+            ImGuiListClipper clipper;
+            clipper.Begin(static_cast<int>(path->samples.size()), 24.0F);
+            while (clipper.Step()) {
+                for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
+                    const auto& sample = path->samples[static_cast<std::size_t>(index)];
+                    std::string target_status = "unbound";
+                    if (sample.target_id.has_value()) {
+                        const auto target = std::find_if(snapshot.engineering.targets.begin(),
+                            snapshot.engineering.targets.end(), [&sample](const auto& candidate) {
+                                return candidate.id == *sample.target_id;
+                            });
+                        target_status = target == snapshot.engineering.targets.end()
+                            ? "missing" : target->status;
+                    }
+                    ImGui::Text("Sample %u · u %.4f · %s · target %s · clearance value %.5g",
+                        sample.sequence, sample.normalized, sample.status.c_str(),
+                        target_status.c_str(), sample.clearance);
+                    const std::string target_id_text = sample.target_id.has_value()
+                        ? std::to_string(*sample.target_id) : "none";
+                    ImGui::SetItemTooltip(
+                        "Target: %s\nRecorded tool pose: (%+.7g, %+.7g, %+.7g)\n"
+                        "Rotation: (%+.7g, %+.7g, %+.7g, %+.7g)",
+                        target_id_text.c_str(),
+                        sample.tool_pose.translation.x, sample.tool_pose.translation.y,
+                        sample.tool_pose.translation.z, sample.tool_pose.rotation.x,
+                        sample.tool_pose.rotation.y, sample.tool_pose.rotation.z,
+                        sample.tool_pose.rotation.w);
+                }
+            }
+        }
+        ImGui::EndChild();
+    }
+
     void draw_engineering_workcell_authoring(const UiSnapshot& snapshot) {
         const auto& engineering = snapshot.engineering;
         ImGui::SeparatorText("Static workcell authoring");
@@ -9734,7 +9782,7 @@ struct DesktopState {
             ImGui::Text("Derived products %zu  ·  %s",
                         engineering.derived_product_count,
                         engineering.workcell_present ? "Workcell bound" : "Workcell missing");
-            if (engineering.path_present) ImGui::TextDisabled("Inspection path record present");
+            draw_engineering_path_review(snapshot);
             ImGui::SeparatorText("BOM source reconciliation");
             if (engineering.bom.empty()) {
                 ImGui::TextDisabled("No BOM rows are present.");

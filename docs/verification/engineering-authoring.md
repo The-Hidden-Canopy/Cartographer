@@ -45,6 +45,11 @@ the editor does not import or verify robot models, fixture assets, or
 calibration data. These edits describe static workcell context and do not
 establish robot reachability or collision results.
 
+When a stored path record exists, the workspace lists its sample coordinate,
+reported status, target status, and clearance value, with the recorded tool
+pose available for inspection. The panel displays stored data only; it does not
+generate paths or interpret unverified samples as runtime receipts.
+
 ## BOM CSV profile
 
 The Engineering workspace accepts a UTF-8 CSV with this exact header order:
@@ -94,7 +99,8 @@ invalid source/topology/unit and stale-revision rejection, strict BOM CSV
 parsing, source-preserving BOM re-import, ambiguous/missing reconciliation,
 invalidated BOM evidence, requirement-kind compatibility, missing/contradictory
 access constraints, stale source/topology refusal, proposed-target authoring,
-workcell-frame revision checks, revisioned entity and keep-out edits,
+workcell-frame revision checks, read-only path sample projection, revisioned
+entity and keep-out edits,
 workcell-history migration and round-trip, journal undo/redo, and explicit
 refusal to fake a CAD import. A newly authored requirement is not
 publication-ready by itself:

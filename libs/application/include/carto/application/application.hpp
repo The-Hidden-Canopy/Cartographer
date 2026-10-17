@@ -382,6 +382,22 @@ struct EngineeringAuthoringView {
         std::vector<engineering::WorkcellRevisionRecord> revision_history;
     };
     std::optional<Workcell> workcell;
+    struct PathSample {
+        std::uint32_t sequence = 0U;
+        double normalized = 0.0;
+        core::Transform tool_pose = core::Transform::identity();
+        std::optional<std::uint64_t> target_id;
+        std::string status;
+        double clearance = 0.0;
+    };
+    struct Path {
+        std::uint64_t id = 0U;
+        assets::Sha256Digest basis_digest;
+        core::Revision basis_revision;
+        std::string status;
+        std::vector<PathSample> samples;
+    };
+    std::optional<Path> path;
     struct BomLine {
         std::uint64_t id = 0U;
         std::uint64_t source_id = 0U;

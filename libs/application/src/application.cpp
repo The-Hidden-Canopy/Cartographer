@@ -5051,6 +5051,21 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
                 result.engineering.workcell = std::move(workcell_view);
             }
             result.engineering.path_present = authoring.path.has_value();
+            if (authoring.path.has_value()) {
+                EngineeringAuthoringView::Path path_view;
+                const auto& path = *authoring.path;
+                path_view.id = path.id;
+                path_view.basis_digest = path.basis_digest;
+                path_view.basis_revision = path.basis_revision;
+                path_view.status = engineering::derived_product_status_name(path.status);
+                path_view.samples.reserve(path.samples.size());
+                for (const auto& sample : path.samples) {
+                    path_view.samples.push_back(EngineeringAuthoringView::PathSample{
+                        sample.sequence, sample.normalized, sample.tool_pose, sample.target_id,
+                        engineering::path_sample_status_name(sample.status), sample.clearance});
+                }
+                result.engineering.path = std::move(path_view);
+            }
             const auto package = engineering::InspectionPackage::publish(
                 authoring, document_.revision(), authoring.project_namespace);
             if (!package) {
