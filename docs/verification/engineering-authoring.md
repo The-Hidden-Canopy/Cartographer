@@ -34,6 +34,17 @@ authored. New targets remain proposed until human review; target authoring
 marks existing paths and dependent products stale. Pose entry does not test
 reachability, collision, sensor visibility, or execution feasibility.
 
+The workcell panel edits transforms for existing entities and reference frames,
+and transforms and dimensions for existing keep-out regions. Every edit is a
+human command with a new operator-supplied workcell revision and a one-line
+reason retained with the affected item identity and workcell-state digest in
+revision history. Existing workcell content cannot be replaced through a
+general authoring import. It marks non-rejected targets and path products
+stale. Existing source locators remain visible as recorded metadata;
+the editor does not import or verify robot models, fixture assets, or
+calibration data. These edits describe static workcell context and do not
+establish robot reachability or collision results.
+
 ## BOM CSV profile
 
 The Engineering workspace accepts a UTF-8 CSV with this exact header order:
@@ -68,7 +79,9 @@ hardware behavior. Those checks remain with the consuming runtime.
 ## Persistence and failure behavior
 
 Project schema 16 stores a digest-bound `ENGINEERING_AUTHORING` record when
-present. Mutations pass through editor commands and can be undone or redone.
+present. Engineering authoring schema 2 retains workcell revision history and
+continues to read schema 1 records. Mutations pass through editor commands and
+can be undone or redone.
 Source invalidation preserves authored identity while marking dependent
 products stale; stale authoring cannot be published as admitted. Project
 formats 1 through 14 remain readable.
@@ -81,7 +94,9 @@ invalid source/topology/unit and stale-revision rejection, strict BOM CSV
 parsing, source-preserving BOM re-import, ambiguous/missing reconciliation,
 invalidated BOM evidence, requirement-kind compatibility, missing/contradictory
 access constraints, stale source/topology refusal, proposed-target authoring,
-workcell-frame revision checks, journal undo/redo, and explicit refusal to fake
-a CAD import. A newly authored requirement is not publication-ready by itself:
+workcell-frame revision checks, revisioned entity and keep-out edits,
+workcell-history migration and round-trip, journal undo/redo, and explicit
+refusal to fake a CAD import. A newly authored requirement is not
+publication-ready by itself:
 package publication still requires its linked inspection characteristics and
 all other package gates.

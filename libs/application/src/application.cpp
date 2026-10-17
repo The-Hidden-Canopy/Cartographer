@@ -1123,6 +1123,8 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return create_engineering_characteristic(value);
             } else if constexpr (std::is_same_v<Action, CreateEngineeringTargetAction>) {
                 return create_engineering_target(value);
+            } else if constexpr (std::is_same_v<Action, UpdateEngineeringWorkcellAction>) {
+                return update_engineering_workcell(value);
             } else if constexpr (std::is_same_v<Action, ReviewEngineeringTargetAction>) {
                 return review_engineering_target(value);
             } else if constexpr (std::is_same_v<Action, InvalidateEngineeringSourceAction>) {
@@ -2885,6 +2887,34 @@ core::Result<DispatchReceipt> ApplicationSession::import_engineering_authoring(
     const auto digest = decoded.value().canonical_digest();
     if (!digest) return failure(digest.error().with_context("engineering authoring import digest"));
     const auto current = document_.engineering_authoring();
+    if (current.has_value()) {
+        const auto current_authoring = engineering_authoring();
+        if (!current_authoring) {
+            return failure(current_authoring.error().with_context("engineering authoring import"));
+        }
+        if (current_authoring.value().workcell.has_value()) {
+            if (!decoded.value().workcell.has_value()) {
+                return failure(core::Diagnostic(
+                    core::ErrorCode::invalid_state,
+                    "an existing workcell cannot be removed through an authoring document import"));
+            }
+            const auto current_workcell_digest =
+                current_authoring.value().workcell->canonical_digest();
+            const auto imported_workcell_digest = decoded.value().workcell->canonical_digest();
+            if (!current_workcell_digest || !imported_workcell_digest) {
+                return failure((!current_workcell_digest
+                    ? current_workcell_digest.error() : imported_workcell_digest.error())
+                    .with_context("engineering workcell import"));
+            }
+            if (current_workcell_digest.value() != imported_workcell_digest.value() ||
+                current_authoring.value().workcell_revision_history !=
+                    decoded.value().workcell_revision_history) {
+                return failure(core::Diagnostic(
+                    core::ErrorCode::invalid_state,
+                    "workcell changes require the revision-bound workcell authoring command"));
+            }
+        }
+    }
     if (current.has_value() && current->bytes == serialized && current->digest == digest.value()) {
         return accepted("Import Engineering Authoring Document", document_.revision());
     }
@@ -3589,6 +3619,173 @@ core::Result<DispatchReceipt> ApplicationSession::create_engineering_target(
             before,
             project::SerializedEngineeringAuthoring{serialized, digest.value()}),
         "Create Proposed Inspection Target");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::update_engineering_workcell(
+    const UpdateEngineeringWorkcellAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "workcell edits require the explicit human command boundary"));
+    }
+    if (action.expected_project_revision != document_.revision()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "workcell edit was based on a stale project revision"));
+    }
+    const bool edits_entity = action.entity_id.has_value();
+    const bool edits_keep_out = action.keep_out_id.has_value();
+    const auto has_nonblank_text = [](std::string_view value) {
+        return std::any_of(value.begin(), value.end(), [](unsigned char byte) {
+            return !std::isspace(byte);
+        });
+    };
+    const auto is_single_line = [](std::string_view value) {
+        return std::all_of(value.begin(), value.end(), [](unsigned char byte) {
+            return byte >= 0x20U && byte != 0x7fU;
+        });
+    };
+    if (edits_entity == edits_keep_out || action.expected_workcell_revision.empty() ||
+        action.expected_workcell_revision.size() > 128U ||
+        action.new_workcell_revision.empty() || action.new_workcell_revision.size() > 128U ||
+        action.new_workcell_revision == action.expected_workcell_revision ||
+        action.justification.size() > 1024U || !has_nonblank_text(action.justification) ||
+        !has_nonblank_text(action.expected_workcell_revision) ||
+        !has_nonblank_text(action.new_workcell_revision) ||
+        !is_single_line(action.expected_workcell_revision) ||
+        !is_single_line(action.new_workcell_revision) || !is_single_line(action.justification)) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "workcell edit requires one target, a new revision label, and a one-line justification"));
+    }
+    if (action.transform.scale.x != 1.0 || action.transform.scale.y != 1.0 ||
+        action.transform.scale.z != 1.0 || !action.transform.finite()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "workcell transforms must be finite rigid transforms without scale"));
+    }
+
+    const auto current = engineering_authoring();
+    if (!current) return failure(current.error().with_context("workcell edit"));
+    if (current.value().project_revision != action.expected_authoring_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "workcell edit was based on a stale engineering authoring revision"));
+    }
+    if (current.value().project_revision.exhausted()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "engineering authoring revision space is exhausted"));
+    }
+    if (!current.value().workcell.has_value()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "workcell edit requires an existing authored workcell"));
+    }
+    const auto& existing_workcell = *current.value().workcell;
+    if (existing_workcell.revision != action.expected_workcell_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "workcell edit was based on a stale workcell revision"));
+    }
+    if (current.value().workcell_revision_history.size() >=
+            engineering::AuthoringDocument::kMaxCollectionEntries ||
+        std::any_of(current.value().workcell_revision_history.begin(),
+            current.value().workcell_revision_history.end(), [&action](const auto& record) {
+                return record.revision == action.new_workcell_revision;
+            })) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "workcell revision history is full or the new revision already exists"));
+    }
+
+    auto updated = current.value();
+    core::Transform authored_transform = action.transform;
+    authored_transform.rotation = authored_transform.rotation.normalized();
+    std::string operation_name;
+    std::string subject_kind;
+    std::uint64_t subject_id = 0U;
+    if (edits_entity) {
+        auto entity = std::find_if(updated.workcell->entities.begin(),
+            updated.workcell->entities.end(), [&action](const auto& value) {
+                return value.id == *action.entity_id;
+            });
+        bool reference_frame = false;
+        if (entity == updated.workcell->entities.end()) {
+            entity = std::find_if(updated.workcell->frames.begin(),
+                updated.workcell->frames.end(), [&action](const auto& value) {
+                    return value.id == *action.entity_id;
+                });
+            reference_frame = true;
+        }
+        if (entity == (reference_frame ? updated.workcell->frames.end()
+                                      : updated.workcell->entities.end())) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::not_found,
+                "workcell edit references a missing entity or frame"));
+        }
+        entity->transform = authored_transform;
+        subject_kind = reference_frame ? "frame" : "entity";
+        subject_id = entity->id;
+        operation_name = reference_frame ? "Update Workcell Frame" : "Update Workcell Entity";
+    } else {
+        const auto keep_out = std::find_if(updated.workcell->keep_outs.begin(),
+            updated.workcell->keep_outs.end(), [&action](const auto& value) {
+                return value.id == *action.keep_out_id;
+            });
+        if (keep_out == updated.workcell->keep_outs.end()) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::not_found,
+                "workcell edit references a missing keep-out region"));
+        }
+        keep_out->transform = authored_transform;
+        keep_out->dimensions = action.dimensions;
+        subject_kind = "keep-out";
+        subject_id = keep_out->id;
+        if (auto valid = keep_out->validate(); !valid) {
+            return failure(valid.error().with_context("workcell keep-out edit"));
+        }
+        operation_name = "Update Workcell Keep-Out";
+    }
+    updated.workcell->revision = action.new_workcell_revision;
+    const auto workcell_digest = updated.workcell->canonical_digest();
+    if (!workcell_digest) {
+        return failure(workcell_digest.error().with_context("workcell revision digest"));
+    }
+    updated.workcell_revision_history.push_back(engineering::WorkcellRevisionRecord{
+        action.new_workcell_revision, action.expected_workcell_revision, subject_kind,
+        subject_id, workcell_digest.value(), action.justification});
+    for (auto& target : updated.targets) {
+        if (target.status != engineering::TargetStatus::rejected) {
+            target.status = engineering::TargetStatus::stale;
+        }
+    }
+    if (updated.path.has_value()) {
+        updated.path->status = engineering::DerivedProductStatus::stale;
+        for (auto& sample : updated.path->samples) {
+            sample.status = engineering::PathSampleStatus::stale;
+        }
+    }
+    for (auto& product : updated.derived_products) {
+        product.status = engineering::DerivedProductStatus::stale;
+        product.stale_reason = "workcell revision changed; inspection targets and paths require review";
+    }
+    updated.project_revision = updated.project_revision.next();
+    if (auto valid = updated.validate(); !valid) {
+        return failure(valid.error().with_context("workcell edit"));
+    }
+    const std::string serialized = updated.serialize();
+    const auto digest = updated.canonical_digest();
+    if (!digest) return failure(digest.error().with_context("workcell edit digest"));
+    const auto before = document_.engineering_authoring();
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectEngineeringAuthoringCommand>(
+            admission,
+            document_,
+            before,
+            project::SerializedEngineeringAuthoring{serialized, digest.value()}),
+        std::move(operation_name));
 }
 
 core::Result<DispatchReceipt> ApplicationSession::review_engineering_target(
@@ -4824,6 +5021,35 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
                         return value.status == engineering::DerivedProductStatus::stale;
                     });
             result.engineering.workcell_present = authoring.workcell.has_value();
+            if (authoring.workcell.has_value()) {
+                EngineeringAuthoringView::Workcell workcell_view;
+                const auto& workcell = *authoring.workcell;
+                workcell_view.id = workcell.id;
+                workcell_view.revision = workcell.revision;
+                workcell_view.robot_model_identity = workcell.robot_model_identity;
+                workcell_view.robot_source_identity = workcell.robot_source_identity;
+                workcell_view.active_tool_frame = workcell.active_tool_frame;
+                workcell_view.capability_profile = workcell.capability_profile;
+                workcell_view.sensor_identity = workcell.sensor_identity;
+                workcell_view.revision_history = authoring.workcell_revision_history;
+                for (const auto& entity : workcell.entities) {
+                    workcell_view.entities.push_back(EngineeringAuthoringView::WorkcellEntity{
+                        entity.id, engineering::workcell_entity_kind_name(entity.kind),
+                        entity.name, entity.source, entity.transform, entity.enabled, false});
+                }
+                for (const auto& frame : workcell.frames) {
+                    workcell_view.entities.push_back(EngineeringAuthoringView::WorkcellEntity{
+                        frame.id, engineering::workcell_entity_kind_name(frame.kind),
+                        frame.name, frame.source, frame.transform, frame.enabled, true});
+                }
+                for (const auto& keep_out : workcell.keep_outs) {
+                    workcell_view.keep_outs.push_back(EngineeringAuthoringView::WorkcellKeepOut{
+                        keep_out.id, engineering::keep_out_kind_name(keep_out.kind),
+                        keep_out.purpose, keep_out.source, keep_out.transform,
+                        keep_out.dimensions, keep_out.enabled});
+                }
+                result.engineering.workcell = std::move(workcell_view);
+            }
             result.engineering.path_present = authoring.path.has_value();
             const auto package = engineering::InspectionPackage::publish(
                 authoring, document_.revision(), authoring.project_namespace);

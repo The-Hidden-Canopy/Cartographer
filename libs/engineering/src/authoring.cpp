@@ -621,6 +621,41 @@ core::Result<void> EngineeringWorkcell::validate() const {
     return core::Result<void>::success();
 }
 
+core::Result<assets::Sha256Digest> EngineeringWorkcell::canonical_digest() const {
+    if (auto result = validate(); !result) {
+        return core::Result<assets::Sha256Digest>::failure(result.error());
+    }
+    std::ostringstream output;
+    output << "WORKCELL_RECORD " << id << ' ' << std::quoted(revision) << ' '
+           << std::quoted(robot_model_identity) << ' ' << std::quoted(robot_source_identity) << ' '
+           << std::quoted(active_tool_frame) << ' ' << std::quoted(capability_profile) << ' '
+           << std::quoted(sensor_identity) << '\n';
+    output << "ENTITIES " << entities.size() << '\n';
+    for (const auto& entity : entities) {
+        output << "ENTITY " << entity.id << ' ' << workcell_entity_kind_name(entity.kind) << ' '
+               << std::quoted(entity.name) << ' ';
+        write_transform(output, entity.transform);
+        output << ' ' << std::quoted(entity.source) << ' ' << (entity.enabled ? 1 : 0) << '\n';
+    }
+    output << "KEEP_OUTS " << keep_outs.size() << '\n';
+    for (const auto& keep_out : keep_outs) {
+        output << "KEEP_OUT " << keep_out.id << ' ' << keep_out_kind_name(keep_out.kind) << ' '
+               << std::quoted(keep_out.purpose) << ' ';
+        write_transform(output, keep_out.transform);
+        output << ' ' << keep_out.dimensions.x << ' ' << keep_out.dimensions.y << ' '
+               << keep_out.dimensions.z << ' ' << std::quoted(keep_out.source) << ' '
+               << (keep_out.enabled ? 1 : 0) << '\n';
+    }
+    output << "FRAMES " << frames.size() << '\n';
+    for (const auto& frame : frames) {
+        output << "FRAME " << frame.id << ' ' << workcell_entity_kind_name(frame.kind) << ' '
+               << std::quoted(frame.name) << ' ';
+        write_transform(output, frame.transform);
+        output << ' ' << std::quoted(frame.source) << ' ' << (frame.enabled ? 1 : 0) << '\n';
+    }
+    return core::Result<assets::Sha256Digest>::success(digest_text(output.str()));
+}
+
 core::Result<void> DerivedProductState::validate() const {
     if (id == 0U || basis_digest.is_zero() || !enum_known(status, {
         DerivedProductStatus::current, DerivedProductStatus::stale,
@@ -741,6 +776,49 @@ core::Result<void> AuthoringDocument::validate() const {
         }
     }
     if (workcell.has_value()) if (auto result = workcell->validate(); !result) return result;
+    if (workcell_revision_history.size() > kMaxCollectionEntries ||
+        (!workcell.has_value() && !workcell_revision_history.empty())) {
+        return core::Result<void>::failure(validation("workcell revision history is unresolved or exceeds its limit"));
+    }
+    std::set<std::string> workcell_revisions;
+    for (std::size_t index = 0U; index < workcell_revision_history.size(); ++index) {
+        const auto& record = workcell_revision_history[index];
+        const bool has_justification = std::any_of(
+            record.justification.begin(), record.justification.end(),
+            [](unsigned char byte) { return byte != ' '; });
+        const bool subject_kind_valid = record.subject_kind == "entity" ||
+            record.subject_kind == "frame" || record.subject_kind == "keep-out";
+        const bool subject_exists = workcell.has_value() &&
+            (record.subject_kind == "entity"
+                ? contains_id(workcell->entities, &WorkcellEntity::id, record.subject_id)
+                : record.subject_kind == "frame"
+                    ? contains_id(workcell->frames, &WorkcellEntity::id, record.subject_id)
+                    : record.subject_kind == "keep-out" &&
+                        contains_id(workcell->keep_outs, &KeepOutRegion::id, record.subject_id));
+        if (!safe_text(record.revision, false, 128U) ||
+            !safe_text(record.previous_revision, false, 128U) ||
+            !subject_kind_valid || record.subject_id == 0U || !subject_exists ||
+            record.state_digest.is_zero() ||
+            !safe_text(record.justification, false, 1024U) || !has_justification ||
+            record.revision == record.previous_revision ||
+            !workcell_revisions.insert(record.revision).second ||
+            (index > 0U && record.previous_revision !=
+                workcell_revision_history[index - 1U].revision)) {
+            return core::Result<void>::failure(validation("workcell revision history is malformed"));
+        }
+    }
+    if (!workcell_revision_history.empty() &&
+        workcell_revision_history.back().revision != workcell->revision) {
+        return core::Result<void>::failure(validation("workcell revision does not match its history"));
+    }
+    if (!workcell_revision_history.empty()) {
+        const auto workcell_digest = workcell->canonical_digest();
+        if (!workcell_digest) return core::Result<void>::failure(workcell_digest.error());
+        if (workcell_revision_history.back().state_digest != workcell_digest.value()) {
+            return core::Result<void>::failure(validation(
+                "current workcell content does not match its latest revision record"));
+        }
+    }
     if (path.has_value()) {
         if (auto result = path->validate(); !result) return result;
         for (const auto& sample : path->samples) if (sample.target_id.has_value() && !contains_id(targets, &InspectionTarget::id, *sample.target_id)) return core::Result<void>::failure(validation("path target reference is unresolved"));
@@ -793,6 +871,14 @@ std::string AuthoringDocument::serialize() const {
         output << "FRAMES " << value.frames.size() << '\n';
         for (const auto& entity : value.frames) { output << "FRAME " << entity.id << ' ' << workcell_entity_kind_name(entity.kind) << ' ' << std::quoted(entity.name) << ' '; write_transform(output, entity.transform); output << ' ' << std::quoted(entity.source) << ' ' << (entity.enabled ? 1 : 0) << '\n'; }
     }
+    output << "WORKCELL_REVISION_HISTORY " << workcell_revision_history.size() << '\n';
+    for (const auto& record : workcell_revision_history) {
+        output << "WORKCELL_REVISION " << std::quoted(record.revision) << ' '
+               << std::quoted(record.previous_revision) << ' '
+               << std::quoted(record.subject_kind) << ' ' << record.subject_id << ' '
+               << record.state_digest.hex() << ' '
+               << std::quoted(record.justification) << '\n';
+    }
     output << "PATH " << (path.has_value() ? 1 : 0) << '\n';
     if (path.has_value()) {
         output << "PATH_RECORD " << path->id << ' ' << path->basis_digest.hex() << ' ' << path->basis_revision.value() << ' ' << derived_product_status_name(path->status) << ' ' << path->samples.size() << '\n';
@@ -814,7 +900,12 @@ core::Result<AuthoringDocument> AuthoringDocument::deserialize(std::string_view 
     std::istringstream input{std::string(text)};
     std::string magic;
     std::uint64_t version = 0U;
-    if (!(input >> magic >> version) || magic != kAuthoringMagic || version != kSchemaVersion) return core::Result<AuthoringDocument>::failure(parse_error("engineering authoring header is invalid"));
+    if (!(input >> magic >> version) || magic != kAuthoringMagic ||
+        (version != 1U && version != kSchemaVersion)) {
+        return core::Result<AuthoringDocument>::failure(parse_error(
+            "engineering authoring header is invalid"));
+    }
+    const std::uint64_t authoring_schema_version = version;
     AuthoringDocument document;
     if (!require_record(input, "PROJECT") || !read_text(input, document.project_namespace, false) || !read_uint(input, version)) return core::Result<AuthoringDocument>::failure(parse_error("engineering project record is invalid"));
     document.project_revision = core::Revision(version);
@@ -845,6 +936,26 @@ core::Result<AuthoringDocument> AuthoringDocument::deserialize(std::string_view 
     for (std::size_t index = 0U; index < count; ++index) { InspectionTarget value; std::string status; bool human = false; if (!require_record(input, "TARGET") || !read_id(input, value.id) || !read_id(input, value.characteristic_id) || !read_id(input, value.source_topology_id) || !read_transform(input, value.sensor_pose) || !read_double(input, value.standoff) || !(input >> status) || !read_text(input, value.generation_basis, false) || !read_bool(input, human)) return core::Result<AuthoringDocument>::failure(parse_error("inspection target record is invalid")); const auto parsed = parse_named<TargetStatus>(status, {{TargetStatus::proposed, "proposed"}, {TargetStatus::accepted, "accepted"}, {TargetStatus::rejected, "rejected"}, {TargetStatus::stale, "stale"}, {TargetStatus::unreachable, "unreachable"}, {TargetStatus::collision, "collision"}, {TargetStatus::occluded, "occluded"}, {TargetStatus::runtime_verified, "runtime-verified"}, {TargetStatus::runtime_failed, "runtime-failed"}}, "target status is invalid"); if (!parsed) return core::Result<AuthoringDocument>::failure(parsed.error()); value.status = parsed.value(); value.human_authored = human; document.targets.push_back(std::move(value)); }
     std::uint64_t present = 0U; if (!require_record(input, "WORKCELL") || !read_uint(input, present) || present > 1U) return core::Result<AuthoringDocument>::failure(parse_error("workcell section is invalid"));
     if (present != 0U) { EngineeringWorkcell value; if (!require_record(input, "WORKCELL_RECORD") || !read_id(input, value.id) || !read_text(input, value.revision, false) || !read_text(input, value.robot_model_identity, false) || !read_text(input, value.robot_source_identity, false) || !read_text(input, value.active_tool_frame, false) || !read_text(input, value.capability_profile, false) || !read_text(input, value.sensor_identity, false)) return core::Result<AuthoringDocument>::failure(parse_error("workcell record is invalid")); if (!read_section_count("ENTITIES", count)) return core::Result<AuthoringDocument>::failure(parse_error("workcell entities section is invalid")); for (std::size_t index = 0U; index < count; ++index) { WorkcellEntity entity; std::string kind; bool enabled = false; if (!require_record(input, "ENTITY") || !read_id(input, entity.id) || !(input >> kind) || !read_text(input, entity.name, false) || !read_transform(input, entity.transform) || !read_text(input, entity.source) || !read_bool(input, enabled)) return core::Result<AuthoringDocument>::failure(parse_error("workcell entity is invalid")); const auto parsed = parse_named<WorkcellEntityKind>(kind, {{WorkcellEntityKind::inspection_assembly, "inspection-assembly"}, {WorkcellEntityKind::fixture, "fixture"}, {WorkcellEntityKind::robot_base, "robot-base"}, {WorkcellEntityKind::sensor_tool, "sensor-tool"}, {WorkcellEntityKind::reference_frame, "reference-frame"}, {WorkcellEntityKind::operator_exclusion, "operator-exclusion"}}, "workcell entity kind is invalid"); if (!parsed) return core::Result<AuthoringDocument>::failure(parsed.error()); entity.kind = parsed.value(); entity.enabled = enabled; value.entities.push_back(std::move(entity)); } if (!read_section_count("KEEP_OUTS", count)) return core::Result<AuthoringDocument>::failure(parse_error("keep-outs section is invalid")); for (std::size_t index = 0U; index < count; ++index) { KeepOutRegion keep_out; std::string kind; bool enabled = false; if (!require_record(input, "KEEP_OUT") || !read_id(input, keep_out.id) || !(input >> kind) || !read_text(input, keep_out.purpose, false) || !read_transform(input, keep_out.transform) || !read_double(input, keep_out.dimensions.x) || !read_double(input, keep_out.dimensions.y) || !read_double(input, keep_out.dimensions.z) || !read_text(input, keep_out.source) || !read_bool(input, enabled)) return core::Result<AuthoringDocument>::failure(parse_error("keep-out record is invalid")); const auto parsed = parse_named<KeepOutKind>(kind, {{KeepOutKind::box, "box"}, {KeepOutKind::sphere, "sphere"}, {KeepOutKind::cylinder, "cylinder"}, {KeepOutKind::mesh, "mesh"}}, "keep-out kind is invalid"); if (!parsed) return core::Result<AuthoringDocument>::failure(parsed.error()); keep_out.kind = parsed.value(); keep_out.enabled = enabled; value.keep_outs.push_back(std::move(keep_out)); } if (!read_section_count("FRAMES", count)) return core::Result<AuthoringDocument>::failure(parse_error("workcell frames section is invalid")); for (std::size_t index = 0U; index < count; ++index) { WorkcellEntity entity; std::string kind; bool enabled = false; if (!require_record(input, "FRAME") || !read_id(input, entity.id) || !(input >> kind) || !read_text(input, entity.name, false) || !read_transform(input, entity.transform) || !read_text(input, entity.source) || !read_bool(input, enabled)) return core::Result<AuthoringDocument>::failure(parse_error("workcell frame is invalid")); const auto parsed = parse_named<WorkcellEntityKind>(kind, {{WorkcellEntityKind::reference_frame, "reference-frame"}}, "workcell frame kind is invalid"); if (!parsed) return core::Result<AuthoringDocument>::failure(parsed.error()); entity.kind = parsed.value(); entity.enabled = enabled; value.frames.push_back(std::move(entity)); } document.workcell = std::move(value); }
+    if (authoring_schema_version >= 2U) {
+        if (!read_section_count("WORKCELL_REVISION_HISTORY", count)) {
+            return core::Result<AuthoringDocument>::failure(parse_error(
+                "workcell revision history section is invalid"));
+        }
+        for (std::size_t index = 0U; index < count; ++index) {
+            WorkcellRevisionRecord record;
+            if (!require_record(input, "WORKCELL_REVISION") ||
+                !read_text(input, record.revision, false) ||
+                !read_text(input, record.previous_revision, false) ||
+                !read_text(input, record.subject_kind, false) ||
+                !read_id(input, record.subject_id) ||
+                !read_digest(input, record.state_digest) ||
+                !read_text(input, record.justification, false)) {
+                return core::Result<AuthoringDocument>::failure(parse_error(
+                    "workcell revision history entry is invalid"));
+            }
+            document.workcell_revision_history.push_back(std::move(record));
+        }
+    }
     if (!require_record(input, "PATH") || !read_uint(input, present) || present > 1U) return core::Result<AuthoringDocument>::failure(parse_error("path section is invalid"));
     if (present != 0U) { GeneratedPath value; std::string status; if (!require_record(input, "PATH_RECORD") || !read_id(input, value.id) || !read_digest(input, value.basis_digest) || !read_uint(input, version) || !(input >> status) || !read_count(input, count, AuthoringDocument::kMaxCollectionEntries)) return core::Result<AuthoringDocument>::failure(parse_error("path record is invalid")); value.basis_revision = core::Revision(version); const auto parsed = parse_named<DerivedProductStatus>(status, {{DerivedProductStatus::current, "current"}, {DerivedProductStatus::stale, "stale"}, {DerivedProductStatus::rejected, "rejected"}, {DerivedProductStatus::unverified, "unverified"}}, "path status is invalid"); if (!parsed) return core::Result<AuthoringDocument>::failure(parsed.error()); value.status = parsed.value(); for (std::size_t index = 0U; index < count; ++index) { PathSample sample; std::string sample_status; if (!require_record(input, "SAMPLE") || !read_uint(input, version) || !read_double(input, sample.normalized) || !read_transform(input, sample.tool_pose) || !read_optional_id(input, sample.target_id) || !(input >> sample_status) || !read_double(input, sample.clearance)) return core::Result<AuthoringDocument>::failure(parse_error("path sample is invalid")); sample.sequence = static_cast<std::uint32_t>(version); const auto parsed_sample = parse_named<PathSampleStatus>(sample_status, {{PathSampleStatus::valid, "valid"}, {PathSampleStatus::rejected, "rejected"}, {PathSampleStatus::stale, "stale"}, {PathSampleStatus::unreachable, "unreachable"}, {PathSampleStatus::collision, "collision"}, {PathSampleStatus::clearance_warning, "clearance-warning"}, {PathSampleStatus::unverified, "unverified"}}, "path sample status is invalid"); if (!parsed_sample) return core::Result<AuthoringDocument>::failure(parsed_sample.error()); sample.status = parsed_sample.value(); value.samples.push_back(std::move(sample)); } document.path = std::move(value); }
     if (!read_section_count("DERIVED", count)) return core::Result<AuthoringDocument>::failure(parse_error("derived section is invalid"));

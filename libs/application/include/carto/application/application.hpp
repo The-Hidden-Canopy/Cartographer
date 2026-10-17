@@ -351,6 +351,37 @@ struct EngineeringAuthoringView {
         core::Vec3d pose_translation{};
     };
     std::vector<Target> targets;
+    struct WorkcellEntity {
+        std::uint64_t id = 0U;
+        std::string kind;
+        std::string name;
+        std::string source;
+        core::Transform transform = core::Transform::identity();
+        bool enabled = false;
+        bool reference_frame = false;
+    };
+    struct WorkcellKeepOut {
+        std::uint64_t id = 0U;
+        std::string kind;
+        std::string purpose;
+        std::string source;
+        core::Transform transform = core::Transform::identity();
+        core::Vec3d dimensions{1.0, 1.0, 1.0};
+        bool enabled = false;
+    };
+    struct Workcell {
+        std::uint64_t id = 0U;
+        std::string revision;
+        std::string robot_model_identity;
+        std::string robot_source_identity;
+        std::string active_tool_frame;
+        std::string capability_profile;
+        std::string sensor_identity;
+        std::vector<WorkcellEntity> entities;
+        std::vector<WorkcellKeepOut> keep_outs;
+        std::vector<engineering::WorkcellRevisionRecord> revision_history;
+    };
+    std::optional<Workcell> workcell;
     struct BomLine {
         std::uint64_t id = 0U;
         std::uint64_t source_id = 0U;
@@ -767,6 +798,17 @@ struct CreateEngineeringTargetAction {
     std::string pose_frame = "workcell";
     std::string justification;
 };
+struct UpdateEngineeringWorkcellAction {
+    core::Revision expected_project_revision;
+    core::Revision expected_authoring_revision;
+    std::string expected_workcell_revision;
+    std::string new_workcell_revision;
+    std::optional<std::uint64_t> entity_id;
+    std::optional<std::uint64_t> keep_out_id;
+    core::Transform transform = core::Transform::identity();
+    core::Vec3d dimensions{1.0, 1.0, 1.0};
+    std::string justification;
+};
 struct ReviewEngineeringTargetAction {
     core::Revision expected_project_revision;
     core::Revision expected_authoring_revision;
@@ -906,6 +948,7 @@ using ApplicationAction = std::variant<
     CreateEngineeringRequirementAction,
     CreateEngineeringCharacteristicAction,
     CreateEngineeringTargetAction,
+    UpdateEngineeringWorkcellAction,
     ReviewEngineeringTargetAction,
     InvalidateEngineeringSourceAction,
     ImportConditionFixtureAction,
@@ -1114,6 +1157,8 @@ private:
         const CreateEngineeringCharacteristicAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_engineering_target(
         const CreateEngineeringTargetAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> update_engineering_workcell(
+        const UpdateEngineeringWorkcellAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> review_engineering_target(
         const ReviewEngineeringTargetAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> invalidate_engineering_source(

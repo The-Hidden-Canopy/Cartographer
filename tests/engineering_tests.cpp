@@ -662,11 +662,18 @@ void inspection_target_authoring_is_human_revision_and_workcell_bound() {
     REQUIRE(!ui.dispatch(duplicate));
     REQUIRE(session.snapshot().project_revision == after_create.project_revision);
 
-    auto changed_workcell = authored.value();
-    changed_workcell.project_revision = changed_workcell.project_revision.next();
-    changed_workcell.workcell->revision = "D";
+    auto changed_basis = authored.value();
+    auto imported_target = std::find_if(changed_basis.targets.begin(),
+        changed_basis.targets.end(), [](const auto& value) {
+            return value.id == 504U;
+        });
+    REQUIRE(imported_target != changed_basis.targets.end());
+    const auto revision_marker = imported_target->generation_basis.find("workcell-revision=C");
+    REQUIRE(revision_marker != std::string::npos);
+    imported_target->generation_basis.replace(revision_marker,
+        std::string("workcell-revision=C").size(), "workcell-revision=B");
     REQUIRE(ui.dispatch(carto::application::ImportEngineeringAuthoringAction{
-        changed_workcell.serialize()}));
+        changed_basis.serialize()}));
     const auto changed_snapshot = session.snapshot();
     const auto blocked_review = ui.dispatch(carto::application::ReviewEngineeringTargetAction{
         changed_snapshot.project_revision, changed_snapshot.engineering.authored_revision,
@@ -713,6 +720,144 @@ void inspection_target_authoring_is_human_revision_and_workcell_bound() {
         });
     REQUIRE(stale_target != stale_snapshot.engineering.targets.end());
     REQUIRE(stale_target->status == "stale");
+}
+
+void workcell_edits_are_revisioned_audited_and_invalidate_targets() {
+    auto fixture = carto::engineering::make_dv012_fixture();
+    REQUIRE(fixture);
+    std::string legacy_bytes = fixture.value().serialize();
+    const std::string current_header = "CARTOGRAPHER_ENGINEERING_AUTHORING 2\n";
+    const std::string legacy_header = "CARTOGRAPHER_ENGINEERING_AUTHORING 1\n";
+    REQUIRE(legacy_bytes.starts_with(current_header));
+    legacy_bytes.replace(0U, current_header.size(), legacy_header);
+    const std::string empty_history = "WORKCELL_REVISION_HISTORY 0\n";
+    const auto history_offset = legacy_bytes.find(empty_history);
+    REQUIRE(history_offset != std::string::npos);
+    legacy_bytes.erase(history_offset, empty_history.size());
+    const auto migrated = carto::engineering::AuthoringDocument::deserialize(legacy_bytes);
+    REQUIRE(migrated);
+    REQUIRE(migrated.value().workcell_revision_history.empty());
+    REQUIRE(migrated.value().serialize().starts_with(current_header));
+
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::NewProjectAction{"Workcell edits"}));
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::ImportEngineeringFixtureAction{}));
+    carto::ui::UiController ui(session);
+
+    const auto make_entity_action = [](const carto::application::ApplicationSnapshot& snapshot,
+                                       std::string revision) {
+        carto::application::UpdateEngineeringWorkcellAction action;
+        action.expected_project_revision = snapshot.project_revision;
+        action.expected_authoring_revision = snapshot.engineering.authored_revision;
+        action.expected_workcell_revision = snapshot.engineering.workcell->revision;
+        action.new_workcell_revision = std::move(revision);
+        action.entity_id = 603U;
+        action.transform = {{0.2, 0.0, 0.0}, carto::core::Quaternion::identity(),
+            {1.0, 1.0, 1.0}};
+        action.justification = "Operator-entered robot base placement from station setup sheet";
+        return action;
+    };
+    const auto before = session.snapshot();
+    REQUIRE(before.engineering.workcell.has_value());
+    const auto valid_action = make_entity_action(before, "D");
+    REQUIRE(!ui.submit_ai_proposal(valid_action));
+
+    const auto before_authoring = session.engineering_authoring();
+    REQUIRE(before_authoring);
+    auto unrevisioned_import = before_authoring.value();
+    unrevisioned_import.workcell->entities.at(2U).transform.translation.x = 9.0;
+    REQUIRE(!ui.dispatch(carto::application::ImportEngineeringAuthoringAction{
+        unrevisioned_import.serialize()}));
+
+    auto stale_workcell = valid_action;
+    stale_workcell.expected_workcell_revision = "B";
+    REQUIRE(!ui.dispatch(stale_workcell));
+    auto same_revision = valid_action;
+    same_revision.new_workcell_revision = "C";
+    REQUIRE(!ui.dispatch(same_revision));
+    auto missing_justification = valid_action;
+    missing_justification.justification.clear();
+    REQUIRE(!ui.dispatch(missing_justification));
+    auto ambiguous_target = valid_action;
+    ambiguous_target.keep_out_id = 610U;
+    REQUIRE(!ui.dispatch(ambiguous_target));
+    auto scaled_transform = valid_action;
+    scaled_transform.transform.scale = {1.0, 1.5, 1.0};
+    REQUIRE(!ui.dispatch(scaled_transform));
+    auto invalid_keep_out = valid_action;
+    invalid_keep_out.entity_id.reset();
+    invalid_keep_out.keep_out_id = 610U;
+    invalid_keep_out.dimensions = {-1.0, 0.5, 0.25};
+    REQUIRE(!ui.dispatch(invalid_keep_out));
+    REQUIRE(session.snapshot().project_revision == before.project_revision);
+
+    const auto updated = ui.update_engineering_workcell(valid_action);
+    REQUIRE(updated && updated.value().document_changed);
+    const auto after_update = session.snapshot();
+    REQUIRE(after_update.project_revision == before.project_revision.next());
+    REQUIRE(after_update.engineering.workcell->revision == "D");
+    REQUIRE(after_update.engineering.workcell->revision_history.size() == 1U);
+    REQUIRE(after_update.engineering.workcell->revision_history.front().previous_revision == "C");
+    REQUIRE(after_update.engineering.workcell->revision_history.front().subject_kind == "entity");
+    REQUIRE(after_update.engineering.workcell->revision_history.front().subject_id == 603U);
+    REQUIRE(after_update.engineering.workcell->revision_history.front().justification ==
+        valid_action.justification);
+    const auto authored = session.engineering_authoring();
+    REQUIRE(authored);
+    const auto robot_base = std::find_if(authored.value().workcell->entities.begin(),
+        authored.value().workcell->entities.end(), [](const auto& value) {
+            return value.id == 603U;
+        });
+    REQUIRE(robot_base != authored.value().workcell->entities.end());
+    REQUIRE(robot_base->transform.translation.x == 0.2);
+    REQUIRE(robot_base->source == "fixture://dv012/robot");
+    REQUIRE(authored.value().targets.at(0U).status == carto::engineering::TargetStatus::stale);
+    REQUIRE(authored.value().targets.at(1U).status == carto::engineering::TargetStatus::rejected);
+    REQUIRE(authored.value().path->status == carto::engineering::DerivedProductStatus::stale);
+    REQUIRE(authored.value().derived_products.front().stale_reason.find("workcell revision") !=
+        std::string::npos);
+    REQUIRE(!after_update.engineering.publication_ready);
+    REQUIRE(ui.snapshot().operations.back().action == "Update Workcell Entity");
+    REQUIRE(ui.snapshot().operations.back().category ==
+        carto::ui::OperationCategory::committed_command);
+    const auto reopened = carto::engineering::AuthoringDocument::deserialize(
+        authored.value().serialize());
+    REQUIRE(reopened);
+    REQUIRE(reopened.value().workcell_revision_history ==
+        authored.value().workcell_revision_history);
+    auto malformed_history = authored.value();
+    malformed_history.workcell_revision_history.front().subject_id = 99999U;
+    REQUIRE(!malformed_history.validate());
+    auto changed_under_revision = authored.value();
+    changed_under_revision.workcell->entities.at(2U).transform.translation.x = 0.3;
+    REQUIRE(!changed_under_revision.validate());
+
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::UndoAction{}));
+    REQUIRE(session.snapshot().engineering.workcell->revision == "C");
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::RedoAction{}));
+    REQUIRE(session.snapshot().engineering.workcell->revision == "D");
+
+    auto keep_out_action = valid_action;
+    const auto before_keep_out = session.snapshot();
+    keep_out_action.expected_project_revision = before_keep_out.project_revision;
+    keep_out_action.expected_authoring_revision = before_keep_out.engineering.authored_revision;
+    keep_out_action.expected_workcell_revision = "D";
+    keep_out_action.new_workcell_revision = "E";
+    keep_out_action.entity_id.reset();
+    keep_out_action.keep_out_id = 610U;
+    keep_out_action.transform = carto::core::Transform::identity();
+    keep_out_action.dimensions = {0.6, 0.6, 0.3};
+    keep_out_action.justification = "Operator-entered fixture exclusion extent from setup review";
+    REQUIRE(ui.update_engineering_workcell(keep_out_action));
+    const auto after_keep_out = session.engineering_authoring();
+    REQUIRE(after_keep_out);
+    REQUIRE(after_keep_out.value().workcell_revision_history.size() == 2U);
+    REQUIRE(after_keep_out.value().workcell_revision_history.back().previous_revision == "D");
+    REQUIRE(after_keep_out.value().workcell->keep_outs.front().dimensions.x == 0.6);
 }
 
 void application_wires_engineering_authoring_through_persistence_and_history() {
@@ -1074,6 +1219,7 @@ int main() {
         manual_requirement_authoring_is_revision_bound_and_auditable();
         inspection_characteristics_require_current_human_verified_contracts();
         inspection_target_authoring_is_human_revision_and_workcell_bound();
+        workcell_edits_are_revisioned_audited_and_invalidate_targets();
         inspection_target_review_is_human_revision_bound_and_preserves_decisions();
         source_invalidation_preserves_authored_records_and_stales_products();
         step_boundary_never_fakes_a_cad_import();

@@ -246,6 +246,7 @@ struct EngineeringWorkcell {
     std::string active_tool_frame;
     std::string capability_profile;
     std::string sensor_identity;
+    [[nodiscard]] core::Result<assets::Sha256Digest> canonical_digest() const;
     [[nodiscard]] core::Result<void> validate() const;
 };
 
@@ -285,9 +286,19 @@ struct CapabilityEvidence {
     [[nodiscard]] core::Result<void> validate() const;
 };
 
+struct WorkcellRevisionRecord {
+    std::string revision;
+    std::string previous_revision;
+    std::string subject_kind;
+    Id subject_id = 0U;
+    assets::Sha256Digest state_digest;
+    std::string justification;
+    friend bool operator==(const WorkcellRevisionRecord&, const WorkcellRevisionRecord&) = default;
+};
+
 class AuthoringDocument final {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 1U;
+    static constexpr std::uint32_t kSchemaVersion = 2U;
     static constexpr std::size_t kMaxSerializedBytes = 32U * 1024U * 1024U;
     static constexpr std::size_t kMaxCollectionEntries = 100'000U;
 
@@ -302,6 +313,7 @@ public:
     std::vector<InspectionCharacteristic> characteristics;
     std::vector<InspectionTarget> targets;
     std::optional<EngineeringWorkcell> workcell;
+    std::vector<WorkcellRevisionRecord> workcell_revision_history;
     std::optional<GeneratedPath> path;
     std::vector<DerivedProductState> derived_products;
     CapabilityEvidence evidence;

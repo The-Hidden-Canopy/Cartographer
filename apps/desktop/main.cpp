@@ -1302,6 +1302,20 @@ struct DesktopState {
     double engineering_target_rotation_w = 1.0;
     double engineering_target_standoff = 0.0;
     std::array<char, 1025> engineering_target_justification{};
+    std::uint64_t engineering_workcell_selection_id = 0U;
+    bool engineering_workcell_selection_is_keep_out = false;
+    double engineering_workcell_position_x = 0.0;
+    double engineering_workcell_position_y = 0.0;
+    double engineering_workcell_position_z = 0.0;
+    double engineering_workcell_rotation_x = 0.0;
+    double engineering_workcell_rotation_y = 0.0;
+    double engineering_workcell_rotation_z = 0.0;
+    double engineering_workcell_rotation_w = 1.0;
+    double engineering_workcell_dimension_x = 1.0;
+    double engineering_workcell_dimension_y = 1.0;
+    double engineering_workcell_dimension_z = 1.0;
+    std::array<char, 129> engineering_workcell_new_revision{};
+    std::array<char, 1025> engineering_workcell_justification{};
     std::optional<std::uint64_t> condition_source_update_id;
     std::array<char, 129> condition_source_revision{};
     std::array<char, 65> condition_source_digest{};
@@ -8819,6 +8833,10 @@ struct DesktopState {
             engineering_target_characteristic_id = 0U;
             engineering_target_topology_id = 0U;
             engineering_target_justification.fill('\0');
+            engineering_workcell_selection_id = 0U;
+            engineering_workcell_selection_is_keep_out = false;
+            engineering_workcell_new_revision.fill('\0');
+            engineering_workcell_justification.fill('\0');
         }
 
         struct RequirementOption {
@@ -9311,6 +9329,207 @@ struct DesktopState {
         }
     }
 
+    void draw_engineering_workcell_authoring(const UiSnapshot& snapshot) {
+        const auto& engineering = snapshot.engineering;
+        ImGui::SeparatorText("Static workcell authoring");
+        if (!engineering.workcell.has_value()) {
+            ImGui::TextDisabled("Import an engineering authoring record with a workcell before editing static context.");
+            return;
+        }
+        const auto& workcell = *engineering.workcell;
+        ImGui::Text("Workcell %llu · revision %s",
+            static_cast<unsigned long long>(workcell.id), workcell.revision.c_str());
+        ImGui::TextDisabled("Robot %s · source %s · tool %s · sensor %s",
+            workcell.robot_model_identity.c_str(), workcell.robot_source_identity.c_str(),
+            workcell.active_tool_frame.c_str(), workcell.sensor_identity.c_str());
+        ImGui::TextWrapped(
+            "Edit an existing static entity, reference frame, or keep-out with an operator revision and reason. "
+            "Cartographer does not validate robot reachability, collision, or calibration.");
+
+        const auto selected_entity = [&]() {
+            return std::find_if(workcell.entities.begin(), workcell.entities.end(), [this](const auto& value) {
+                return !engineering_workcell_selection_is_keep_out &&
+                    value.id == engineering_workcell_selection_id;
+            });
+        };
+        const auto selected_frame = [&]() {
+            return std::find_if(workcell.entities.begin(), workcell.entities.end(), [this](const auto& value) {
+                return engineering_workcell_selection_id == value.id && value.reference_frame;
+            });
+        };
+        const auto selected_keep_out = [&]() {
+            return std::find_if(workcell.keep_outs.begin(), workcell.keep_outs.end(), [this](const auto& value) {
+                return engineering_workcell_selection_is_keep_out &&
+                    value.id == engineering_workcell_selection_id;
+            });
+        };
+        const auto entity_exists = std::any_of(workcell.entities.begin(), workcell.entities.end(), [this](const auto& value) {
+            return !engineering_workcell_selection_is_keep_out &&
+                value.id == engineering_workcell_selection_id;
+        });
+        const auto keep_out_exists = std::any_of(workcell.keep_outs.begin(), workcell.keep_outs.end(), [this](const auto& value) {
+            return engineering_workcell_selection_is_keep_out &&
+                value.id == engineering_workcell_selection_id;
+        });
+        if (engineering_workcell_selection_id != 0U && !entity_exists && !keep_out_exists) {
+            engineering_workcell_selection_id = 0U;
+        }
+        const auto load_selection = [this, &workcell](
+            std::uint64_t id, bool keep_out, const carto::core::Transform& transform,
+            const carto::core::Vec3d& dimensions) {
+            engineering_workcell_selection_id = id;
+            engineering_workcell_selection_is_keep_out = keep_out;
+            engineering_workcell_position_x = transform.translation.x;
+            engineering_workcell_position_y = transform.translation.y;
+            engineering_workcell_position_z = transform.translation.z;
+            engineering_workcell_rotation_x = transform.rotation.x;
+            engineering_workcell_rotation_y = transform.rotation.y;
+            engineering_workcell_rotation_z = transform.rotation.z;
+            engineering_workcell_rotation_w = transform.rotation.w;
+            engineering_workcell_dimension_x = dimensions.x;
+            engineering_workcell_dimension_y = dimensions.y;
+            engineering_workcell_dimension_z = dimensions.z;
+            engineering_workcell_new_revision.fill('\0');
+            const std::string suggested_revision = workcell.revision + ".1";
+            std::copy_n(suggested_revision.begin(),
+                std::min(suggested_revision.size(), engineering_workcell_new_revision.size() - 1U),
+                engineering_workcell_new_revision.begin());
+            engineering_workcell_justification.fill('\0');
+        };
+
+        std::string entity_preview = "Choose an entity or frame";
+        const auto entity = selected_entity();
+        if (entity != workcell.entities.end()) {
+            entity_preview = entity->name + " · " + entity->kind + " · " +
+                std::to_string(entity->id);
+        }
+        if (ImGui::BeginCombo("Workcell entity or frame", entity_preview.c_str())) {
+            for (const auto& candidate : workcell.entities) {
+                const std::string label = candidate.name + " · " + candidate.kind + " · " +
+                    std::to_string(candidate.id);
+                const std::string id = "workcell-entity-" + std::to_string(candidate.id);
+                ImGui::PushID(id.c_str());
+                if (ImGui::Selectable(label.c_str(),
+                        !engineering_workcell_selection_is_keep_out &&
+                            engineering_workcell_selection_id == candidate.id)) {
+                    load_selection(candidate.id, false, candidate.transform, {1.0, 1.0, 1.0});
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+
+        std::string keep_out_preview = "Choose a keep-out region";
+        const auto keep_out = selected_keep_out();
+        if (keep_out != workcell.keep_outs.end()) {
+            keep_out_preview = keep_out->purpose + " · " + keep_out->kind + " · " +
+                std::to_string(keep_out->id);
+        }
+        if (ImGui::BeginCombo("Keep-out region", keep_out_preview.c_str())) {
+            for (const auto& candidate : workcell.keep_outs) {
+                const std::string label = candidate.purpose + " · " + candidate.kind + " · " +
+                    std::to_string(candidate.id);
+                const std::string id = "workcell-keepout-" + std::to_string(candidate.id);
+                ImGui::PushID(id.c_str());
+                if (ImGui::Selectable(label.c_str(),
+                        engineering_workcell_selection_is_keep_out &&
+                            engineering_workcell_selection_id == candidate.id)) {
+                    load_selection(candidate.id, true, candidate.transform, candidate.dimensions);
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+
+        const auto current_entity = selected_entity();
+        const auto current_frame = selected_frame();
+        const auto current_keep_out = selected_keep_out();
+        const bool selection_valid = current_entity != workcell.entities.end() ||
+            current_frame != workcell.entities.end() ||
+            current_keep_out != workcell.keep_outs.end();
+        if (!selection_valid) {
+            ImGui::TextDisabled("Choose an existing workcell item to edit.");
+            return;
+        }
+        const std::string_view source = current_keep_out != workcell.keep_outs.end()
+            ? std::string_view(current_keep_out->source)
+            : std::string_view(current_frame != workcell.entities.end()
+                ? current_frame->source : current_entity->source);
+        ImGui::TextDisabled("Recorded source locator: %.*s",
+            static_cast<int>(source.size()), source.data());
+        ImGui::InputDouble("Workcell position X", &engineering_workcell_position_x, 0.001, 0.01, "%.6g");
+        ImGui::InputDouble("Workcell position Y", &engineering_workcell_position_y, 0.001, 0.01, "%.6g");
+        ImGui::InputDouble("Workcell position Z", &engineering_workcell_position_z, 0.001, 0.01, "%.6g");
+        ImGui::InputDouble("Workcell quaternion X", &engineering_workcell_rotation_x, 0.01, 0.1, "%.6g");
+        ImGui::InputDouble("Workcell quaternion Y", &engineering_workcell_rotation_y, 0.01, 0.1, "%.6g");
+        ImGui::InputDouble("Workcell quaternion Z", &engineering_workcell_rotation_z, 0.01, 0.1, "%.6g");
+        ImGui::InputDouble("Workcell quaternion W", &engineering_workcell_rotation_w, 0.01, 0.1, "%.6g");
+        if (current_keep_out != workcell.keep_outs.end()) {
+            ImGui::InputDouble("Keep-out dimension X", &engineering_workcell_dimension_x, 0.001, 0.01, "%.6g");
+            ImGui::InputDouble("Keep-out dimension Y", &engineering_workcell_dimension_y, 0.001, 0.01, "%.6g");
+            ImGui::InputDouble("Keep-out dimension Z", &engineering_workcell_dimension_z, 0.001, 0.01, "%.6g");
+        }
+        ImGui::InputText("New workcell revision", engineering_workcell_new_revision.data(),
+            engineering_workcell_new_revision.size());
+        ImGui::InputTextMultiline("Workcell edit reason",
+            engineering_workcell_justification.data(), engineering_workcell_justification.size(),
+            ImVec2(-1, 52));
+
+        const carto::core::Transform transform{
+            {engineering_workcell_position_x, engineering_workcell_position_y,
+             engineering_workcell_position_z},
+            {engineering_workcell_rotation_x, engineering_workcell_rotation_y,
+             engineering_workcell_rotation_z, engineering_workcell_rotation_w},
+            {1.0, 1.0, 1.0}};
+        const std::string_view justification(engineering_workcell_justification.data());
+        const bool reason_present = std::any_of(
+            justification.begin(), justification.end(), [](unsigned char byte) {
+                return !std::isspace(byte);
+            });
+        const std::string_view new_revision(engineering_workcell_new_revision.data());
+        const bool revision_changed = !new_revision.empty() &&
+            new_revision != workcell.revision;
+        const bool dimensions_valid = current_keep_out == workcell.keep_outs.end() ||
+            (std::isfinite(engineering_workcell_dimension_x) && engineering_workcell_dimension_x > 0.0 &&
+             std::isfinite(engineering_workcell_dimension_y) && engineering_workcell_dimension_y > 0.0 &&
+             std::isfinite(engineering_workcell_dimension_z) && engineering_workcell_dimension_z > 0.0);
+        const bool fields_valid = transform.finite() && revision_changed && reason_present &&
+            dimensions_valid;
+        ImGui::BeginDisabled(!fields_valid);
+        if (ImGui::Button("Save workcell revision", ImVec2(-1, 30))) {
+            carto::application::UpdateEngineeringWorkcellAction action;
+            action.expected_project_revision = snapshot.project_revision;
+            action.expected_authoring_revision = engineering.authored_revision;
+            action.expected_workcell_revision = workcell.revision;
+            action.new_workcell_revision = std::string(new_revision);
+            if (current_keep_out != workcell.keep_outs.end()) {
+                action.keep_out_id = current_keep_out->id;
+                action.dimensions = {engineering_workcell_dimension_x,
+                    engineering_workcell_dimension_y, engineering_workcell_dimension_z};
+            } else {
+                action.entity_id = current_frame != workcell.entities.end()
+                    ? current_frame->id : current_entity->id;
+            }
+            action.transform = transform;
+            action.justification = std::string(justification);
+            if (dispatch(action)) {
+                engineering_workcell_selection_id = 0U;
+            }
+        }
+        ImGui::EndDisabled();
+        if (!fields_valid) {
+            ImGui::TextDisabled("Requires a normalizable finite pose, a new revision label, and a reason.");
+        }
+        if (!workcell.revision_history.empty()) {
+            const auto& last_change = workcell.revision_history.back();
+            ImGui::TextDisabled("Last change: %s → %s · %s %llu",
+                last_change.previous_revision.c_str(), last_change.revision.c_str(),
+                last_change.subject_kind.c_str(),
+                static_cast<unsigned long long>(last_change.subject_id));
+            ImGui::SetItemTooltip("%s", last_change.justification.c_str());
+        }
+    }
+
     void draw_engineering_target_authoring(const UiSnapshot& snapshot) {
         const auto& engineering = snapshot.engineering;
         if (engineering_target_characteristic_id != 0U &&
@@ -9653,6 +9872,7 @@ struct DesktopState {
             }
             draw_engineering_requirement_authoring(snapshot);
             draw_engineering_characteristic_authoring(snapshot);
+            draw_engineering_workcell_authoring(snapshot);
             draw_engineering_target_authoring(snapshot);
             if (engineering.stale) {
                 ImGui::TextColored(color(snapshot.colors.semantic_error),
