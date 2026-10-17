@@ -4486,6 +4486,86 @@ void bounded_vertex_recipe_preserves_topology_and_repair_authority() {
         source, vertex_plan, std::move(transform_envelope)));
 }
 
+void material_recipe_isolates_assignment_and_preserves_topology() {
+    using namespace carto;
+    TempDirectory temp;
+    application::ApplicationSession source;
+    const auto fixture = create_material_target(source);
+    const auto before = source.snapshot();
+    const auto* recipe = agent::find_agent_recipe("material-region-assignment");
+    REQUIRE(recipe != nullptr);
+    REQUIRE(recipe->max_topology_operations == 0U);
+    REQUIRE(recipe->preserve_topology);
+    REQUIRE(recipe->permitted_effects == agent::effect_mask(agent::Effect::material));
+
+    auto material_plan = plan_for(before, {fixture.object}, {
+        {"step-material", {fixture.object, std::monostate{}},
+            "assign material " + std::to_string(fixture.material) + " to region 1"},
+    });
+    material_plan.objective.recipe_id = std::string(recipe->id);
+    auto broad_envelope = envelope_for({fixture.object});
+    broad_envelope.permitted_effects |= agent::effect_mask(agent::Effect::material) |
+        agent::effect_mask(agent::Effect::topology);
+    broad_envelope.max_topology_operations = 128U;
+    auto material_task = agent::AgentTask::begin(
+        source, material_plan, broad_envelope);
+    REQUIRE(material_task);
+    const auto material_review = material_task.value().run();
+    REQUIRE(material_review);
+    REQUIRE(material_review.value().status == agent::TaskStatus::review);
+    REQUIRE(material_review.value().can_accept);
+    REQUIRE(material_review.value().recipe_id == "material-region-assignment");
+    const auto scene_identity_gate = std::find_if(
+        material_review.value().gates.begin(), material_review.value().gates.end(),
+        [](const auto& gate) {
+            return gate.id == "recipe.material-region-assignment.scene-identity";
+        });
+    REQUIRE(scene_identity_gate != material_review.value().gates.end());
+    REQUIRE(scene_identity_gate->required && scene_identity_gate->passed);
+    const auto topology_gate = std::find_if(
+        material_review.value().gates.begin(), material_review.value().gates.end(),
+        [](const auto& gate) {
+            return gate.id == "recipe.material-region-assignment.topology-preservation";
+        });
+    REQUIRE(topology_gate != material_review.value().gates.end());
+    REQUIRE(topology_gate->required && topology_gate->passed);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+    REQUIRE(source.snapshot().material_assignments.empty());
+
+    const auto checkpoint_path = temp.path() / "material-recipe.carto-agent-task";
+    REQUIRE(material_task.value().save_checkpoint(checkpoint_path));
+    const auto checkpoint = agent::AgentTask::load_checkpoint(checkpoint_path);
+    REQUIRE(checkpoint);
+    REQUIRE(checkpoint.value().plan.objective.recipe_id == "material-region-assignment");
+    REQUIRE(checkpoint.value().envelope.max_topology_operations == 0U);
+    REQUIRE(checkpoint.value().envelope.permitted_effects ==
+        agent::effect_mask(agent::Effect::material));
+
+    auto topology_plan = plan_for(before, {fixture.object}, {
+        {"step-topology", {fixture.object, geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    topology_plan.objective.recipe_id = "material-region-assignment";
+    auto topology_envelope = envelope_for({fixture.object});
+    topology_envelope.permitted_effects |= agent::effect_mask(agent::Effect::material) |
+        agent::effect_mask(agent::Effect::topology);
+    auto topology_task = agent::AgentTask::begin(
+        source, std::move(topology_plan), std::move(topology_envelope));
+    REQUIRE(topology_task);
+    const auto blocked = topology_task.value().run();
+    REQUIRE(blocked);
+    REQUIRE(blocked.value().status == agent::TaskStatus::blocked);
+    REQUIRE(blocked.value().steps.front().status == agent::StepStatus::failed);
+    REQUIRE(blocked.value().steps.front().diagnostic.has_value());
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+    REQUIRE(source.snapshot().material_assignments.empty());
+
+    const auto accepted = application::HumanApplicationAccess::accept_agent_task(
+        material_task.value());
+    REQUIRE(accepted && accepted.value().document_changed);
+    REQUIRE(source.snapshot().material_assignments.size() == 1U);
+    REQUIRE(source.snapshot().material_assignments.front().material == fixture.material);
+}
+
 void scope_protection_and_stale_revision_fail_closed() {
     carto::application::ApplicationSession source;
     const auto objects = create_boxes(source, 2U);
@@ -7170,6 +7250,7 @@ int main() {
         project_diff_reports_material_and_texture_source_changes();
         bounded_mesh_recipe_caps_execution_and_binds_its_acceptance_gate();
         bounded_vertex_recipe_preserves_topology_and_repair_authority();
+        material_recipe_isolates_assignment_and_preserves_topology();
         shared_mesh_instances_must_be_in_scope_and_within_touch_budget();
         scope_protection_and_stale_revision_fail_closed();
         failed_native_step_and_invalid_task_transitions_do_not_commit();

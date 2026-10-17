@@ -1064,6 +1064,14 @@ const std::vector<AgentRecipeDefinition>& agent_recipe_catalog() noexcept {
             ::carto::agent::effect_mask(Effect::uv),
             true,
         },
+        {
+            "material-region-assignment",
+            "Material-region assignment",
+            "Uses the operator-authored plan for material-region assignments only and requires mesh topology and scene-object identity to remain unchanged.",
+            0U,
+            ::carto::agent::effect_mask(Effect::material),
+            true,
+        },
     };
     return recipes;
 }

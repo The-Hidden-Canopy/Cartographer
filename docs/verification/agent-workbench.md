@@ -181,6 +181,7 @@
 - Checkpoint format v7 round-trips recipes and typed vertex/face correction evidence; older versions remain readable with no recipe selected. A forged checkpoint that expands the recipe envelope is rejected.
 - `Topology-preserving vertex edit` limits the work envelope to geometry effects and zero topology operations. It adds a required gate over mesh, vertex, and face topology changes while allowing vertex-position edits; topology-changing operations and transform authority fail closed, and repair reapplies the recipe limits.
 - A forged checkpoint that adds topology permission to the vertex recipe is rejected, while a geometry-only edit and a repaired geometry-only plan remain reviewable without mutating the source project.
+- `Material-region assignment` clamps the envelope to material effects and zero topology operations, adds required scene-identity and topology-preservation gates, survives checkpoint round-trip, and rejects a topology operation even when the operator initially grants broader geometry/topology effects.
 - Recipes constrain validation and envelope policy; they do not generate steps or infer an objective.
 
 
