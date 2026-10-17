@@ -50,7 +50,7 @@ public package fixtures:
   policy;
 - private plugin binaries, proprietary kernels, optimization recipes, and
   unreleased execution telemetry; and
-- private sandbox policy, VANTA runtime payloads, or replay evidence that has
+- private sandbox policy, private runtime payloads, or replay evidence that has
   not cleared its release boundary.
 
 Public packages may contain only public verification keys or test-only key
@@ -66,15 +66,15 @@ reference that has no authority by itself.
 
 The v5 scientific record is intentionally generic: typed IDs and provenance
 can be shared publicly, but it does not carry private telemetry, credentials,
-provider runtime handles, model weights, or execution authority. Anatomy-provider
+provider runtime handles, model weights, or execution authority. Provider
 publication manifests carry only reviewed semantic IDs, source geometry/license
-lineage, and opaque candidate references; they do not admit VANTA assets or
+lineage, and opaque candidate references; they do not admit private assets or
 runtime components. A result field is not source truth, and a
 provider-import preservation report carries only bounded source keys,
 disposition labels, targets, and notes—not imported payloads, credentials, or
 provider execution state. Functional-genome exchange envelopes carry the
 public semantic payload, source receipt, and canonical digest only; they do not
-carry MENAGERIE interpretation logic, private provider handles, or runtime
+carry private interpretation logic, provider handles, or runtime
 admission state. The derived development timeline is read-only
 inspection data and is not a second public source of truth. The bilateral
 landmark, measurement, and evolutionary-morphospace previews are likewise
@@ -89,11 +89,11 @@ semantic identity, explicit Cartographer geometry bindings, bounded path and
 structure topology, deterministic instance recipe/seed/extent metadata, and
 sparse canonical property edits. It does not store a private generator,
 adaptive representation or certification policy, runtime entity handles,
-VANTA residency state, private game content, or execution telemetry.
+private residency state, private game content, or execution telemetry.
 
 The anatomy provider candidate envelope is likewise provider-neutral. It carries
 source revision and geometry/manifest digests, but no provider credentials,
-runtime entity handles, private catalog payloads, or VANTA admission state.
+runtime entity handles, private catalog payloads, or private admission state.
 
 The following do not belong in public project files:
 
@@ -106,18 +106,12 @@ The following do not belong in public project files:
 
 ## Repository rule
 
-The default build is the public foundation. The moat categories above are kept
-out of the public tree and are never required by the public build. OWH, GMIB,
-simulation, anatomy, and other ordinary integration work may be developed in
-the adjacent companion tree while provenance and licensing are being cleared;
-they are open-by-default candidates, not an automatic permanent exclusion.
-
-Private development can use the same public contracts by configuring an
-explicit out-of-tree source root. CMake rejects a moat or not-yet-cleared
-source root or GMIB root located inside the public checkout, so an ignored
-`private/` or `moat/` directory cannot silently become part of a supposedly
-public configuration. Those paths are deliberately not part of the public
-presets, release instructions, or runtime dependency graph.
+The default build is the public foundation. Private runtime and uncleared
+integration source trees are not CMake inputs and cannot be added to the
+Cartographer target graph through an out-of-tree source-root option. Private
+services may be developed separately; any future connection must use an
+explicit provider-neutral API and must not embed their runtime into Cartographer.
+The standalone project remains usable without such a service.
 
 Project recovery sidecars are local state rather than source: `.carto.journal`,
 `.carto.lock`, `.journal.lock`, and temporary `.carto.tmp-*` publication files
@@ -146,12 +140,9 @@ quarantine rules, and all reachable Git history. The tracked-but-ignored check
 is explicit because
 `.gitignore` is not retroactive. It never rewrites history, expires reflogs,
 deletes files, or contacts a remote. Use `--include-reflog` for a local hygiene
-audit that also inspects reflog/unreachable objects. Legacy GMIB, anatomy, OWH,
-and simulation paths are reported for provenance/licensing review unless an
-exact root is covered by the owner-reviewed
-`docs/verification/public-history-provenance.json` manifest. The manifest is
-machine-checked and cannot classify a forbidden path or an entry without
-explicit owner review, disposition, license basis, and commit identities.
+audit that also inspects reflog/unreachable objects. Legacy integration paths
+are reported for provenance/licensing review and are never cleared by an
+in-repository donor-name/commit allowlist.
 The audit also scans current text and reachable history for known protected
 field-growth implementation markers, so placing a private preview under a
 generic geometry directory does not bypass the path quarantine.
