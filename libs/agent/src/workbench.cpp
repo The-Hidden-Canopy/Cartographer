@@ -58,6 +58,16 @@ bool safe_text(std::string_view value, std::size_t limit) noexcept {
         });
 }
 
+void copy_query_budget_usage(
+    SceneQueryBudget& destination,
+    const SceneQueryBudget& source) noexcept {
+    destination.queries_used = source.queries_used;
+    destination.objects_examined = source.objects_examined;
+    destination.topology_elements_examined = source.topology_elements_examined;
+    destination.semantic_records_examined = source.semantic_records_examined;
+    destination.result_bytes = source.result_bytes;
+}
+
 template <typename Id>
 core::Result<void> validate_object_ids(
     const std::vector<Id>& ids,
@@ -5305,14 +5315,7 @@ core::Result<AgentTask> AgentTask::resume_checkpoint(
 
     auto resumed = begin(source, std::move(reauthorized_plan), checkpoint.envelope);
     if (!resumed) return resumed;
-    resumed.value().query_budget_.queries_used = checkpoint.query_budget.queries_used;
-    resumed.value().query_budget_.objects_examined =
-        checkpoint.query_budget.objects_examined;
-    resumed.value().query_budget_.topology_elements_examined =
-        checkpoint.query_budget.topology_elements_examined;
-    resumed.value().query_budget_.semantic_records_examined =
-        checkpoint.query_budget.semantic_records_examined;
-    resumed.value().query_budget_.result_bytes = checkpoint.query_budget.result_bytes;
+    copy_query_budget_usage(resumed.value().query_budget_, checkpoint.query_budget);
     resumed.value().repairs_ = checkpoint.repair_lineage;
     resumed.value().rebases_ = checkpoint.rebase_lineage;
     resumed.value().ghost_corrections_ = checkpoint.ghost_corrections;
@@ -5844,6 +5847,7 @@ core::Result<AgentTask> AgentTask::rebase_checkpoint(
     if (!saved_speculative) return core::Result<AgentTask>::failure(saved_speculative.error());
     auto rebased = begin(source, std::move(reauthorized_plan), checkpoint.envelope);
     if (!rebased) return rebased;
+    copy_query_budget_usage(rebased.value().query_budget_, checkpoint.query_budget);
     rebased.value().repairs_ = checkpoint.repair_lineage;
     rebased.value().rebases_ = checkpoint.rebase_lineage;
     rebased.value().ghost_corrections_ = checkpoint.ghost_corrections;
@@ -5892,6 +5896,7 @@ core::Result<AgentTask> AgentTask::rebase_checkpoint(
             *historical_source, checkpoint.plan, checkpoint.envelope,
             std::move(historical_speculative), historical_source->snapshot(),
             checkpoint.repair_lineage, checkpoint.rebase_lineage);
+        copy_query_budget_usage(historical_task.query_budget_, checkpoint.query_budget);
         historical_task.ghost_corrections_ = checkpoint.ghost_corrections;
         historical_task.ghost_recompute_lineage_ = checkpoint.ghost_recomputes;
         historical_task.replay_ghost_corrections_ =
@@ -5979,6 +5984,7 @@ core::Result<AgentTask> AgentTask::rebase_checkpoint(
             *historical_source, checkpoint.plan, checkpoint.envelope,
             std::move(historical_speculative), historical_source->snapshot(),
             checkpoint.repair_lineage, checkpoint.rebase_lineage);
+        copy_query_budget_usage(historical_task.query_budget_, checkpoint.query_budget);
         const auto historical_run = historical_task.run();
         if (!historical_run || historical_task.status_ != TaskStatus::review ||
             digest_text(historical_task.speculative_->document_.serialize()) !=

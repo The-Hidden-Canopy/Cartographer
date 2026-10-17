@@ -137,7 +137,7 @@
 ## Persistent task checkpoint coverage
 
 - Checkpoints are immutable, versioned files with a checksum, source and speculative project digests, objective/plan context digest, work envelope, step progress, failure receipts, repair lineage, rebase reuse lineage, ghost recomputation lineage, last diff digest, validation report, and provider identity. Version 11 adds consumed SceneQuery counters bound to the envelope limits; version 10 adds read/write material-region keys to rebase receipts; version 9 adds reused step IDs; version 8 stores typed vertex and face ghost corrections plus recompute anchors/receipts. Versions 1 through 10 remain readable.
-- SceneQuery budget usage survives checkpoint save, load, and same-source resume; a checksummed checkpoint whose usage exceeds its limits is rejected. Legacy versions default usage to zero because they did not persist counters.
+- SceneQuery budget usage survives checkpoint save, load, same-source resume, and safe rebase; a checksummed checkpoint whose usage exceeds its limits is rejected. Legacy versions default usage to zero because they did not persist counters.
 - Checkpoint loading validates size bounds, schema version, project documents, source revision, scope equality, enum values, progress, and digest bindings before exposing workflow state.
 - A checkpoint is workflow state. Loading it does not replace or mutate the live project document.
 - Human clarification answers and their private receipts are removed from checkpoint plans; consequential questions must be answered again through the human application boundary.

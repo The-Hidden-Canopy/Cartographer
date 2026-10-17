@@ -2487,6 +2487,54 @@ void checkpoint_resume_preserves_consumed_scene_query_budget() {
     REQUIRE(source.snapshot().project_revision == task.value().snapshot().base_revision);
 }
 
+void checkpoint_rebase_preserves_consumed_scene_query_budget() {
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 2U);
+    const auto target = objects.front();
+    const auto unrelated = objects.back();
+    auto plan = plan_for(source.snapshot(), {target}, {
+        {"step-1", {target, carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    auto envelope = envelope_for({target});
+    envelope.max_scene_queries = 1U;
+    auto task = carto::agent::AgentTask::begin(source, plan, envelope);
+    REQUIRE(task);
+    REQUIRE(carto::agent::SceneQuery::execute(task.value(), {
+        carto::agent::ObjectsByStableNameQuery{"Box 1"}, 4U}));
+    REQUIRE(task.value().snapshot().query_budget.queries_used == 1U);
+    REQUIRE(task.value().run());
+
+    TempDirectory directory;
+    const auto path = directory.path() / "rebase-query-budget.carto-agent-task";
+    REQUIRE(task.value().save_checkpoint(path));
+    const auto checkpoint = carto::agent::AgentTask::load_checkpoint(path);
+    REQUIRE(checkpoint);
+
+    auto unrelated_transform = source.snapshot().objects.back().object.local_transform;
+    unrelated_transform.translation.y += 0.5;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        source, carto::application::SetObjectTransformAction{
+            unrelated, unrelated_transform, std::nullopt}));
+    const auto current_revision = source.snapshot().project_revision;
+    const auto analysis = carto::agent::AgentTask::analyze_checkpoint_rebase(
+        source, checkpoint.value());
+    REQUIRE(analysis && analysis.value().can_rebase());
+    REQUIRE(analysis.value().invalidated_step_ids.empty());
+
+    auto reauthorized = checkpoint.value().plan;
+    reauthorized.objective.base_revision = current_revision;
+    auto rebased = carto::agent::AgentTask::rebase_checkpoint(
+        source, checkpoint.value(), std::move(reauthorized));
+    REQUIRE(rebased);
+    REQUIRE(rebased.value().snapshot().status == carto::agent::TaskStatus::review);
+    REQUIRE(rebased.value().snapshot().query_budget.queries_used == 1U);
+    REQUIRE(source.snapshot().project_revision == current_revision);
+    const auto second_query = carto::agent::SceneQuery::execute(rebased.value(), {
+        carto::agent::ObjectsByStableNameQuery{"Box 1"}, 4U});
+    REQUIRE(!second_query);
+    REQUIRE(rebased.value().snapshot().query_budget.queries_used == 1U);
+}
+
 void persistent_checkpoint_rejects_corruption_and_overwrite() {
     carto::application::ApplicationSession source;
     const auto objects = create_boxes(source, 1U);
@@ -6885,6 +6933,7 @@ int main() {
         checkpoint_rebase_reports_and_executes_only_the_affected_dag_branch();
         prepared_checkpoint_requires_explicit_resume_before_native_execution();
         checkpoint_resume_preserves_consumed_scene_query_budget();
+        checkpoint_rebase_preserves_consumed_scene_query_budget();
         persistent_checkpoint_rejects_corruption_and_overwrite();
         persistent_checkpoint_v1_format_remains_readable();
         ui_persistent_checkpoint_round_trip_preserves_human_boundary();
