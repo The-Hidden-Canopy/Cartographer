@@ -15,6 +15,15 @@ rows, and lets an operator add a sensor and access contract to an eligible
 requirement. It exports an admitted `.carto-inspection` package when publication
 gates pass.
 
+The Engineering workspace also imports a bounded structured requirement CSV.
+Each row binds to one exact, current STEP topology external ID and enters as a
+proposal. Missing or ambiguous topology aborts the complete import without a
+partial project mutation. A person must verify, correct, or reject each proposal
+with a one-line reason before it can affect inspection authoring. Corrections
+retain the imported source text and provenance while storing the corrected
+normalized values and review reason; rejected records remain disabled and
+visible in history.
+
 An operator can attach a drawing or specification file up to 64 MiB as opaque
 source evidence. Cartographer records its content digest, filename locator, and
 attachment provenance, but does not embed, parse, extract, or interpret the
@@ -85,6 +94,20 @@ unambiguous occurrence hierarchy; unknown units, missing material, or
 cyclic/deep occurrence hierarchies remain unresolved. The importer does not
 perform fuzzy matching or unit conversion.
 
+## Requirement CSV profile
+
+The Engineering workspace accepts UTF-8 CSV with this exact header order:
+`page,section,callout,kind,topology_external_id,nominal,plus,minus,unit,acceptance_rule,original_text`.
+The bounded dimensional subset supports distance, diameter, radius, angle,
+thickness, and clearance. Units are explicit (`degrees`, `millimeters`,
+`meters`, or `inches`); values and tolerances must be finite and within the
+supported profile. The source digest covers the exact input bytes. Imports are
+atomic, revision-bound, and idempotent for the same filename and digest;
+changed bytes create a new source snapshot and stale linked proposals and
+dependent products. IDs are resolved by exact match against current STEP
+topology only. No fuzzy mapping, unit conversion, semantic extraction, or
+automatic approval occurs.
+
 ## Import and runtime boundary
 
 The public STEP AP242 provider inspects only the first 64 KiB and recognizes a
@@ -105,9 +128,9 @@ hardware behavior. Those checks remain with the consuming runtime.
 ## Persistence and failure behavior
 
 Project schema 16 stores a digest-bound `ENGINEERING_AUTHORING` record when
-present. Engineering authoring schema 2 retains workcell revision history and
-continues to read schema 1 records. Mutations pass through editor commands and
-can be undone or redone.
+present. Engineering authoring schema 3 stores human requirement-review reasons,
+retains workcell revision history, and migrates schema 1 and 2 records. Mutations
+pass through editor commands and can be undone or redone.
 Source invalidation preserves authored identity while marking dependent
 products stale; stale authoring cannot be published as admitted. Project
 formats 1 through 14 remain readable.
@@ -116,6 +139,9 @@ The acceptance tests cover deterministic fixture round-trip, provenance,
 tamper rejection, stale-source invalidation, schema-version fencing, project
 save/reopen, undo/redo, UI publication, revision-bound manual requirement
 authoring, revision-bound accept/reject decisions, AI-proposal rejection,
+strict requirement CSV parsing, ambiguous-topology atomic refusal,
+revision-bound verify/correct/reject actions, preserved proposal text and
+justification across source replacement and reopen,
 invalid source/topology/unit and stale-revision rejection, strict BOM CSV
 parsing, source-preserving BOM re-import, ambiguous/missing reconciliation,
 invalidated BOM evidence, requirement-kind compatibility, missing/contradictory

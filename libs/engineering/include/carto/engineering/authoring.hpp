@@ -156,6 +156,7 @@ struct EngineeringRequirement {
     std::vector<std::string> modifier_refs;
     std::string acceptance_rule;
     bool enabled = true;
+    std::string human_review_justification;
     [[nodiscard]] core::Result<void> validate() const;
 };
 
@@ -298,7 +299,7 @@ struct WorkcellRevisionRecord {
 
 class AuthoringDocument final {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 2U;
+    static constexpr std::uint32_t kSchemaVersion = 3U;
     static constexpr std::size_t kMaxSerializedBytes = 32U * 1024U * 1024U;
     static constexpr std::size_t kMaxCollectionEntries = 100'000U;
 
@@ -327,12 +328,32 @@ public:
 };
 
 inline constexpr std::size_t kMaxBomCsvBytes = 4U * 1024U * 1024U;
+inline constexpr std::size_t kMaxRequirementCsvBytes = 4U * 1024U * 1024U;
 inline constexpr std::size_t kMaxEngineeringEvidenceBytes = 64U * 1024U * 1024U;
+
+struct RequirementCsvRecord {
+    std::uint32_t page = 0U;
+    std::string section;
+    std::string callout;
+    RequirementKind kind = RequirementKind::dimensional_distance;
+    std::string topology_external_id;
+    double nominal = 0.0;
+    double plus = 0.0;
+    double minus = 0.0;
+    std::string unit;
+    std::string acceptance_rule;
+    std::string original_text;
+};
 
 // Parses the bounded Cartographer BOM CSV profile. The header order is fixed:
 // part_number,revision,description,material,quantity,unit.
 [[nodiscard]] core::Result<std::vector<EngineeringBomLine>> parse_bom_csv(
     std::string_view bytes, Id source_id, Id first_line_id);
+
+// Parses the bounded, explicit requirement subset. Records require an exact
+// topology external ID and remain proposals until a human reviews them.
+[[nodiscard]] core::Result<std::vector<RequirementCsvRecord>> parse_requirement_csv(
+    std::string_view bytes);
 
 // Reconciles only exact engineering external IDs. Unknown units, ambiguous IDs,
 // and unsupported occurrence hierarchies remain unresolved instead of being

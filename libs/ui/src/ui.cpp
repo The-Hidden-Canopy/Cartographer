@@ -560,8 +560,10 @@ bool is_operation_action(const application::ApplicationAction& action) {
             std::is_same_v<Action, application::ImportEngineeringFixtureAction> ||
             std::is_same_v<Action, application::ImportEngineeringAuthoringAction> ||
             std::is_same_v<Action, application::ImportEngineeringBomCsvAction> ||
+            std::is_same_v<Action, application::ImportEngineeringRequirementCsvAction> ||
             std::is_same_v<Action, application::AttachEngineeringEvidenceAction> ||
             std::is_same_v<Action, application::CreateEngineeringRequirementAction> ||
+            std::is_same_v<Action, application::ReviewEngineeringRequirementAction> ||
             std::is_same_v<Action, application::CreateEngineeringCharacteristicAction> ||
             std::is_same_v<Action, application::CreateEngineeringTargetAction> ||
             std::is_same_v<Action, application::UpdateEngineeringWorkcellAction> ||
@@ -4316,6 +4318,25 @@ core::Result<application::DispatchReceipt> UiController::import_engineering_bom_
     }
     return dispatch_with_category(
         application::ImportEngineeringBomCsvAction{
+            snapshot.project_revision,
+            snapshot.engineering.authored_revision,
+            path.filename().generic_string(),
+            std::move(bytes).value()},
+        OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::import_engineering_requirement_csv(
+    const std::filesystem::path& path) {
+    auto bytes = read_bounded_file(path, engineering::kMaxRequirementCsvBytes,
+        "engineering requirement CSV");
+    if (!bytes) return core::Result<application::DispatchReceipt>::failure(bytes.error());
+    const auto snapshot = session_.snapshot();
+    if (!snapshot.engineering.present) {
+        return core::Result<application::DispatchReceipt>::failure(invalid(
+            "import the engineering authoring document before importing requirements"));
+    }
+    return dispatch_with_category(
+        application::ImportEngineeringRequirementCsvAction{
             snapshot.project_revision,
             snapshot.engineering.authored_revision,
             path.filename().generic_string(),

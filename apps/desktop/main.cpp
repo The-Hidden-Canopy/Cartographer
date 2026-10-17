@@ -974,6 +974,7 @@ enum class FileDialogKind {
     engineering_authoring,
     engineering_step,
     engineering_bom_csv,
+    engineering_requirement_csv,
     engineering_evidence,
     condition,
     condition_authoring,
@@ -1077,6 +1078,11 @@ enum class StandardMeshExport {
         break;
     case FileDialogKind::engineering_bom_csv:
         dialog.lpstrFilter = L"Engineering BOM CSV (*.csv)\0*.csv\0All Files\0*.*\0";
+        dialog.lpstrDefExt = L"csv";
+        break;
+    case FileDialogKind::engineering_requirement_csv:
+        dialog.lpstrFilter =
+            L"Engineering requirement CSV (*.csv)\0*.csv\0All Files\0*.*\0";
         dialog.lpstrDefExt = L"csv";
         break;
     case FileDialogKind::engineering_evidence:
@@ -1270,6 +1276,9 @@ struct DesktopState {
     std::optional<carto::assets::Sha256Digest> engineering_form_digest;
     std::uint64_t engineering_requirement_source_id = 0U;
     std::optional<std::uint64_t> engineering_requirement_topology_id;
+    std::optional<std::uint64_t> engineering_review_requirement_id;
+    std::uint64_t engineering_review_loaded_requirement_id = 0U;
+    std::array<char, 513> engineering_review_justification{};
     int engineering_requirement_kind = 0;
     int engineering_requirement_unit = 0;
     double engineering_requirement_nominal = 12.5;
@@ -2200,6 +2209,29 @@ struct DesktopState {
         action_feedback = "Imported and reconciled BOM source " +
             path->filename().string() + " into " +
             std::to_string(snapshot.engineering.bom_count) + " source and reconciliation rows.";
+        action_feedback_error = false;
+    }
+
+    void import_engineering_requirement_csv() {
+        const auto path = choose_file(false, FileDialogKind::engineering_requirement_csv);
+        if (!path.has_value()) return;
+        const auto imported = ui.import_engineering_requirement_csv(*path);
+        if (!imported) {
+            action_feedback = imported.error().message;
+            action_feedback_error = true;
+            return;
+        }
+        const auto snapshot = ui.snapshot();
+        engineering_review_requirement_id.reset();
+        engineering_review_loaded_requirement_id = 0U;
+        const auto proposal_count = std::count_if(
+            snapshot.engineering.requirements.begin(),
+            snapshot.engineering.requirements.end(), [](const auto& requirement) {
+                return requirement.extraction == "machine-extracted-proposed";
+            });
+        action_feedback = "Imported " + path->filename().string() + "; " +
+            std::to_string(proposal_count) +
+            " imported proposals remain blocked until human review.";
         action_feedback_error = false;
     }
 
@@ -8890,6 +8922,9 @@ struct DesktopState {
             engineering_requirement_source_id = engineering.sources.empty()
                 ? 0U : engineering.sources.front().id;
             engineering_requirement_topology_id.reset();
+            engineering_review_requirement_id.reset();
+            engineering_review_loaded_requirement_id = 0U;
+            engineering_review_justification.fill('\0');
             engineering_requirement_page = 0U;
             engineering_requirement_section.fill('\0');
             engineering_requirement_callout.fill('\0');
@@ -8942,6 +8977,49 @@ struct DesktopState {
             engineering_requirement_kind, 0,
             static_cast<int>(supported_kinds.size() - 1U));
 
+        if (engineering_review_requirement_id.has_value()) {
+            const auto reviewed = std::find_if(
+                engineering.requirements.begin(), engineering.requirements.end(),
+                [this](const auto& requirement) {
+                    return requirement.id == *engineering_review_requirement_id;
+                });
+            if (reviewed == engineering.requirements.end() || !reviewed->enabled ||
+                reviewed->extraction != "machine-extracted-proposed") {
+                engineering_review_requirement_id.reset();
+                engineering_review_loaded_requirement_id = 0U;
+            } else if (engineering_review_loaded_requirement_id != reviewed->id) {
+                const auto copy_to_buffer = [](auto& buffer, std::string_view value) {
+                    buffer.fill('\0');
+                    const std::size_t count = std::min(value.size(), buffer.size() - 1U);
+                    std::copy_n(value.begin(), count, buffer.begin());
+                };
+                engineering_review_loaded_requirement_id = reviewed->id;
+                engineering_requirement_source_id = reviewed->source_id;
+                engineering_requirement_topology_id = reviewed->topology_ids.empty()
+                    ? std::nullopt
+                    : std::optional<std::uint64_t>{reviewed->topology_ids.front()};
+                engineering_requirement_nominal = reviewed->nominal;
+                engineering_requirement_plus = reviewed->plus;
+                engineering_requirement_minus = reviewed->minus;
+                engineering_requirement_page = reviewed->source_page;
+                engineering_requirement_unit = 0;
+                copy_to_buffer(engineering_requirement_section, reviewed->source_section);
+                copy_to_buffer(engineering_requirement_callout, reviewed->callout);
+                copy_to_buffer(engineering_requirement_original_text, reviewed->original_text);
+                copy_to_buffer(engineering_requirement_acceptance, reviewed->acceptance_rule);
+                const auto kind_option = std::find_if(
+                    supported_kinds.begin(), supported_kinds.end(),
+                    [&reviewed](const auto& option) {
+                        return option.kind == reviewed->model_kind;
+                    });
+                if (kind_option != supported_kinds.end()) {
+                    engineering_requirement_kind = static_cast<int>(
+                        std::distance(supported_kinds.begin(), kind_option));
+                }
+                engineering_review_justification.fill('\0');
+            }
+        }
+
         ImGui::Separator();
         ImGui::TextDisabled("Manual requirement · source evidence retained");
         ImGui::TextWrapped(
@@ -8955,6 +9033,8 @@ struct DesktopState {
                 for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
                     const auto& requirement =
                         engineering.requirements[static_cast<std::size_t>(index)];
+                    const std::string requirement_id = std::to_string(requirement.id);
+                    ImGui::PushID(requirement_id.c_str());
                     ImGui::Text("Requirement %llu · %s · %s",
                         static_cast<unsigned long long>(requirement.id),
                         requirement.kind.c_str(), requirement.extraction.c_str());
@@ -8963,6 +9043,18 @@ struct DesktopState {
                     ImGui::TextDisabled("%zu topology binding(s) · %s %g +%g/-%g",
                         requirement.topology_ids.size(), requirement.unit.c_str(),
                         requirement.nominal, requirement.plus, requirement.minus);
+                    if (requirement.extraction == "machine-extracted-proposed" &&
+                        requirement.enabled && ImGui::SmallButton(
+                            engineering_review_requirement_id == requirement.id
+                                ? "Selected for human review" : "Review proposal")) {
+                        engineering_review_requirement_id = requirement.id;
+                        engineering_review_loaded_requirement_id = 0U;
+                    }
+                    if (!requirement.human_review_justification.empty()) {
+                        ImGui::TextDisabled("Human review: %s",
+                            requirement.human_review_justification.c_str());
+                    }
+                    ImGui::PopID();
                 }
             }
         }
@@ -9152,6 +9244,71 @@ struct DesktopState {
         if (!fields_valid) {
             ImGui::TextDisabled(
                 "Requires a source, current topology, source text, acceptance rule, and valid bounds.");
+        }
+        if (engineering_review_requirement_id.has_value()) {
+            const auto reviewed = std::find_if(
+                engineering.requirements.begin(), engineering.requirements.end(),
+                [this](const auto& requirement) {
+                    return requirement.id == *engineering_review_requirement_id;
+                });
+            if (reviewed != engineering.requirements.end() &&
+                reviewed->extraction == "machine-extracted-proposed" && reviewed->enabled) {
+                ImGui::SeparatorText("Human review of imported proposal");
+                ImGui::TextWrapped(
+                    "The original source text and source binding stay intact. Corrections update only the normalized requirement fields.");
+                ImGui::InputText("Review justification",
+                    engineering_review_justification.data(),
+                    engineering_review_justification.size());
+                const bool reason_present = has_text(engineering_review_justification);
+                ImGui::BeginDisabled(!reason_present);
+                if (ImGui::Button("Verify imported values", ImVec2(-1, 28))) {
+                    carto::application::ReviewEngineeringRequirementAction action;
+                    action.expected_project_revision = snapshot.project_revision;
+                    action.expected_authoring_revision = engineering.authored_revision;
+                    action.requirement_id = reviewed->id;
+                    action.decision = carto::application::RequirementReviewDecision::verify;
+                    action.justification = engineering_review_justification.data();
+                    if (dispatch(action)) {
+                        engineering_review_requirement_id.reset();
+                        engineering_review_loaded_requirement_id = 0U;
+                    }
+                }
+                if (ImGui::Button("Reject proposal", ImVec2(-1, 28))) {
+                    carto::application::ReviewEngineeringRequirementAction action;
+                    action.expected_project_revision = snapshot.project_revision;
+                    action.expected_authoring_revision = engineering.authored_revision;
+                    action.requirement_id = reviewed->id;
+                    action.decision = carto::application::RequirementReviewDecision::reject;
+                    action.justification = engineering_review_justification.data();
+                    if (dispatch(action)) {
+                        engineering_review_requirement_id.reset();
+                        engineering_review_loaded_requirement_id = 0U;
+                    }
+                }
+                ImGui::EndDisabled();
+                ImGui::BeginDisabled(!reason_present || !fields_valid);
+                if (ImGui::Button("Correct values and accept", ImVec2(-1, 28))) {
+                    carto::application::ReviewEngineeringRequirementAction action;
+                    action.expected_project_revision = snapshot.project_revision;
+                    action.expected_authoring_revision = engineering.authored_revision;
+                    action.requirement_id = reviewed->id;
+                    action.decision = carto::application::RequirementReviewDecision::correct;
+                    action.corrected_kind = supported_kinds[requirement_kind_index()].kind;
+                    action.corrected_nominal = engineering_requirement_nominal;
+                    action.corrected_plus = engineering_requirement_plus;
+                    action.corrected_minus = engineering_requirement_minus;
+                    action.corrected_unit = angular ? "degrees" : length_units[
+                        static_cast<std::size_t>(engineering_requirement_unit)];
+                    action.corrected_acceptance_rule =
+                        engineering_requirement_acceptance.data();
+                    action.justification = engineering_review_justification.data();
+                    if (dispatch(action)) {
+                        engineering_review_requirement_id.reset();
+                        engineering_review_loaded_requirement_id = 0U;
+                    }
+                }
+                ImGui::EndDisabled();
+            }
         }
     }
 
@@ -10050,6 +10207,11 @@ struct DesktopState {
             if (ImGui::Button("Import BOM CSV...", ImVec2(-1, 28))) {
                 import_engineering_bom_csv();
             }
+            if (ImGui::Button("Import structured requirement CSV...", ImVec2(-1, 28))) {
+                import_engineering_requirement_csv();
+            }
+            ImGui::TextDisabled(
+                "Imported requirement rows stay proposals until reviewed and justified by a person.");
             if (ImGui::Button("Attach drawing evidence...", ImVec2(-1, 28))) {
                 attach_engineering_evidence(carto::engineering::SourceKind::drawing);
             }

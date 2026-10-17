@@ -621,6 +621,8 @@ public:
         const std::filesystem::path& path) const;
     [[nodiscard]] core::Result<application::DispatchReceipt> import_engineering_bom_csv(
         const std::filesystem::path& path);
+    [[nodiscard]] core::Result<application::DispatchReceipt> import_engineering_requirement_csv(
+        const std::filesystem::path& path);
     [[nodiscard]] core::Result<application::DispatchReceipt> attach_engineering_evidence(
         const std::filesystem::path& path,
         engineering::SourceKind kind);

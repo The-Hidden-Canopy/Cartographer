@@ -86,6 +86,111 @@ bool valid_utf8(std::string_view value) {
     return true;
 }
 
+core::Result<std::vector<std::vector<std::string>>> parse_csv_rows(
+    std::string_view bytes, std::size_t max_bytes, std::string_view label) {
+    if (bytes.empty() || bytes.size() > max_bytes || !valid_utf8(bytes)) {
+        return core::Result<std::vector<std::vector<std::string>>>::failure(parse_error(
+            std::string(label) + " must be non-empty, bounded UTF-8 text"));
+    }
+    if (bytes.starts_with("\xef\xbb\xbf")) bytes.remove_prefix(3U);
+
+    std::vector<std::vector<std::string>> rows;
+    std::vector<std::string> fields;
+    std::string field;
+    bool quoted = false;
+    bool quote_closed = false;
+    bool row_has_content = false;
+    const auto finish_field = [&]() {
+        fields.push_back(std::move(field));
+        field.clear();
+        quote_closed = false;
+    };
+    const auto finish_row = [&]() {
+        finish_field();
+        if (fields.size() == 1U && fields.front().empty()) return false;
+        rows.push_back(std::move(fields));
+        fields.clear();
+        row_has_content = false;
+        return rows.size() <= AuthoringDocument::kMaxCollectionEntries + 1U;
+    };
+
+    for (std::size_t index = 0U; index < bytes.size(); ++index) {
+        const char byte = bytes[index];
+        if (quoted) {
+            if (byte == '"') {
+                if (index + 1U < bytes.size() && bytes[index + 1U] == '"') {
+                    field.push_back('"');
+                    ++index;
+                } else {
+                    quoted = false;
+                    quote_closed = true;
+                }
+            } else if (byte == '\r' || byte == '\n') {
+                return core::Result<std::vector<std::vector<std::string>>>::failure(parse_error(
+                    std::string(label) + " fields cannot contain line breaks"));
+            } else {
+                field.push_back(byte);
+            }
+            row_has_content = true;
+            continue;
+        }
+        if (quote_closed) {
+            if (byte == ',') {
+                finish_field();
+                row_has_content = true;
+                continue;
+            }
+            if (byte == '\r' || byte == '\n') {
+                if (!finish_row()) {
+                    return core::Result<std::vector<std::vector<std::string>>>::failure(parse_error(
+                        std::string(label) + " contains a blank or oversized row"));
+                }
+                if (byte == '\r' && index + 1U < bytes.size() && bytes[index + 1U] == '\n') {
+                    ++index;
+                }
+                continue;
+            }
+            return core::Result<std::vector<std::vector<std::string>>>::failure(parse_error(
+                std::string(label) + " contains data after a closing quote"));
+        }
+        if (byte == '"') {
+            if (!field.empty()) {
+                return core::Result<std::vector<std::vector<std::string>>>::failure(parse_error(
+                    std::string(label) + " quote must begin a field"));
+            }
+            quoted = true;
+            row_has_content = true;
+        } else if (byte == ',') {
+            finish_field();
+            row_has_content = true;
+        } else if (byte == '\r' || byte == '\n') {
+            if (!finish_row()) {
+                return core::Result<std::vector<std::vector<std::string>>>::failure(parse_error(
+                    std::string(label) + " contains a blank or oversized row"));
+            }
+            if (byte == '\r' && index + 1U < bytes.size() && bytes[index + 1U] == '\n') {
+                ++index;
+            }
+        } else {
+            field.push_back(byte);
+            row_has_content = true;
+        }
+    }
+    if (quoted) {
+        return core::Result<std::vector<std::vector<std::string>>>::failure(parse_error(
+            std::string(label) + " ends inside a quoted field"));
+    }
+    if (row_has_content && !finish_row()) {
+        return core::Result<std::vector<std::vector<std::string>>>::failure(parse_error(
+            std::string(label) + " contains a blank or oversized row"));
+    }
+    if (rows.size() < 2U || rows.size() - 1U > AuthoringDocument::kMaxCollectionEntries) {
+        return core::Result<std::vector<std::vector<std::string>>>::failure(parse_error(
+            std::string(label) + " requires a header and bounded data rows"));
+    }
+    return core::Result<std::vector<std::vector<std::string>>>::success(std::move(rows));
+}
+
 assets::Sha256Digest digest_text(std::string_view value) {
     return assets::sha256(std::span<const std::uint8_t>{
         reinterpret_cast<const std::uint8_t*>(value.data()), value.size()});
@@ -498,6 +603,7 @@ core::Result<void> EngineeringRequirement::validate() const {
         !valid_ids(topology_ids) || topology_ids.empty() || !std::isfinite(nominal) ||
         !std::isfinite(plus) || !std::isfinite(minus) || plus < 0.0 || minus < 0.0 ||
         !safe_text(unit) || !safe_text(acceptance_rule, true) ||
+        !safe_text(human_review_justification, true) ||
         !valid_ids(std::vector<Id>{provenance.source_id})) {
         return core::Result<void>::failure(validation("engineering requirement is malformed"));
     }
@@ -852,7 +958,7 @@ std::string AuthoringDocument::serialize() const {
     for (const auto& value : bom) output << "BOM_LINE " << value.id << ' ' << std::quoted(value.part_number) << ' ' << std::quoted(value.revision) << ' ' << std::quoted(value.description) << ' ' << std::quoted(value.material) << ' ' << std::setprecision(17) << value.quantity << ' ' << std::quoted(value.unit) << ' ' << value.source_id << ' ' << value.mapped_part_id.value_or(0U) << ' ' << reconciliation_status_name(value.reconciliation) << '\n';
     output << "REQUIREMENTS " << requirements.size() << '\n';
     for (const auto& value : requirements) {
-        output << "REQUIREMENT " << value.id << ' ' << requirement_kind_name(value.kind) << ' ' << extraction_state_name(value.extraction) << ' ' << value.provenance.source_id << ' ' << value.provenance.page << ' ' << std::quoted(value.provenance.section) << ' ' << std::quoted(value.provenance.callout) << ' ' << std::quoted(value.provenance.drawing_zone) << ' ' << std::quoted(value.provenance.extractor_identity) << ' ' << std::setprecision(17) << value.provenance.extraction_confidence << ' ' << std::quoted(value.provenance.original_text) << ' '; write_ids(output, value.topology_ids); output << ' ' << value.nominal << ' ' << value.plus << ' ' << value.minus << ' ' << std::quoted(value.unit) << ' '; write_strings(output, value.datum_refs); output << ' '; write_strings(output, value.modifier_refs); output << ' ' << std::quoted(value.acceptance_rule) << ' ' << (value.enabled ? 1 : 0) << '\n';
+        output << "REQUIREMENT " << value.id << ' ' << requirement_kind_name(value.kind) << ' ' << extraction_state_name(value.extraction) << ' ' << value.provenance.source_id << ' ' << value.provenance.page << ' ' << std::quoted(value.provenance.section) << ' ' << std::quoted(value.provenance.callout) << ' ' << std::quoted(value.provenance.drawing_zone) << ' ' << std::quoted(value.provenance.extractor_identity) << ' ' << std::setprecision(17) << value.provenance.extraction_confidence << ' ' << std::quoted(value.provenance.original_text) << ' '; write_ids(output, value.topology_ids); output << ' ' << value.nominal << ' ' << value.plus << ' ' << value.minus << ' ' << std::quoted(value.unit) << ' '; write_strings(output, value.datum_refs); output << ' '; write_strings(output, value.modifier_refs); output << ' ' << std::quoted(value.acceptance_rule) << ' ' << (value.enabled ? 1 : 0) << ' ' << std::quoted(value.human_review_justification) << '\n';
     }
     output << "CHARACTERISTICS " << characteristics.size() << '\n';
     for (const auto& value : characteristics) {
@@ -901,7 +1007,7 @@ core::Result<AuthoringDocument> AuthoringDocument::deserialize(std::string_view 
     std::string magic;
     std::uint64_t version = 0U;
     if (!(input >> magic >> version) || magic != kAuthoringMagic ||
-        (version != 1U && version != kSchemaVersion)) {
+        (version < 1U || version > kSchemaVersion)) {
         return core::Result<AuthoringDocument>::failure(parse_error(
             "engineering authoring header is invalid"));
     }
@@ -928,8 +1034,69 @@ core::Result<AuthoringDocument> AuthoringDocument::deserialize(std::string_view 
     for (std::size_t index = 0U; index < count; ++index) { TopologyBinding value; std::optional<Id> occurrence; std::string kind; std::uint64_t triangle = 0U; if (!require_record(input, "TOPOLOGY_BINDING") || !read_id(input, value.id) || !read_id(input, value.source_id) || !read_id(input, value.part_id) || !read_optional_id(input, occurrence) || !(input >> kind) || !read_text(input, value.external_id, false) || !read_text(input, value.source_revision, false) || !read_uint(input, value.display_mesh_asset) || !read_uint(input, triangle)) return core::Result<AuthoringDocument>::failure(parse_error("topology binding record is invalid")); const auto parsed = parse_named<TopologyKind>(kind, {{TopologyKind::assembly, "assembly"}, {TopologyKind::part, "part"}, {TopologyKind::occurrence, "occurrence"}, {TopologyKind::body, "body"}, {TopologyKind::face, "face"}, {TopologyKind::edge, "edge"}, {TopologyKind::vertex, "vertex"}, {TopologyKind::feature, "feature"}, {TopologyKind::datum, "datum"}, {TopologyKind::topology_set, "topology-set"}}, "topology kind is invalid"); if (!parsed) return core::Result<AuthoringDocument>::failure(parsed.error()); value.occurrence_id = occurrence; value.kind = parsed.value(); value.display_triangle = static_cast<std::uint32_t>(triangle); document.topology.push_back(std::move(value)); }
     if (!read_section_count("BOM", count)) return core::Result<AuthoringDocument>::failure(parse_error("engineering BOM section is invalid"));
     for (std::size_t index = 0U; index < count; ++index) { EngineeringBomLine value; std::string status; std::optional<Id> mapped; if (!require_record(input, "BOM_LINE") || !read_id(input, value.id) || !read_text(input, value.part_number, false) || !read_text(input, value.revision, false) || !read_text(input, value.description) || !read_text(input, value.material) || !read_double(input, value.quantity) || !read_text(input, value.unit, false) || !read_id(input, value.source_id) || !read_optional_id(input, mapped) || !(input >> status)) return core::Result<AuthoringDocument>::failure(parse_error("BOM line record is invalid")); const auto parsed = parse_named<ReconciliationStatus>(status, {{ReconciliationStatus::exact, "exact"}, {ReconciliationStatus::matched_by_external_id, "matched-by-external-id"}, {ReconciliationStatus::matched_by_part_number, "matched-by-part-number"}, {ReconciliationStatus::quantity_mismatch, "quantity-mismatch"}, {ReconciliationStatus::revision_mismatch, "revision-mismatch"}, {ReconciliationStatus::material_mismatch, "material-mismatch"}, {ReconciliationStatus::source_only, "source-only"}, {ReconciliationStatus::assembly_only, "assembly-only"}, {ReconciliationStatus::ambiguous, "ambiguous"}, {ReconciliationStatus::unresolved, "unresolved"}}, "BOM reconciliation status is invalid"); if (!parsed) return core::Result<AuthoringDocument>::failure(parsed.error()); value.mapped_part_id = mapped; value.reconciliation = parsed.value(); document.bom.push_back(std::move(value)); }
-    if (!read_section_count("REQUIREMENTS", count)) return core::Result<AuthoringDocument>::failure(parse_error("requirements section is invalid"));
-    for (std::size_t index = 0U; index < count; ++index) { EngineeringRequirement value; std::string kind; std::string extraction; std::uint64_t page = 0U; bool enabled = false; if (!require_record(input, "REQUIREMENT") || !read_id(input, value.id) || !(input >> kind) || !(input >> extraction) || !read_id(input, value.provenance.source_id) || !read_uint(input, page) || page > std::numeric_limits<std::uint32_t>::max() || !read_text(input, value.provenance.section) || !read_text(input, value.provenance.callout) || !read_text(input, value.provenance.drawing_zone) || !read_text(input, value.provenance.extractor_identity) || !read_double(input, value.provenance.extraction_confidence) || !read_text(input, value.provenance.original_text) || !read_ids(input, value.topology_ids) || !read_double(input, value.nominal) || !read_double(input, value.plus) || !read_double(input, value.minus) || !read_text(input, value.unit, false) || !read_strings(input, value.datum_refs) || !read_strings(input, value.modifier_refs) || !read_text(input, value.acceptance_rule) || !read_bool(input, enabled)) return core::Result<AuthoringDocument>::failure(parse_error("requirement record is invalid")); value.provenance.page = static_cast<std::uint32_t>(page); const auto parsed_kind = parse_named<RequirementKind>(kind, {{RequirementKind::dimensional_distance, "dimensional-distance"}, {RequirementKind::diameter, "diameter"}, {RequirementKind::radius, "radius"}, {RequirementKind::angle, "angle"}, {RequirementKind::thickness, "thickness"}, {RequirementKind::clearance, "clearance"}, {RequirementKind::position, "position"}, {RequirementKind::flatness, "flatness"}, {RequirementKind::parallelism, "parallelism"}, {RequirementKind::perpendicularity, "perpendicularity"}, {RequirementKind::concentricity, "concentricity"}, {RequirementKind::surface_condition, "surface-condition"}, {RequirementKind::presence_absence, "presence-absence"}, {RequirementKind::visual_surface, "visual-surface"}, {RequirementKind::assembly_relationship, "assembly-relationship"}, {RequirementKind::material_verification, "material-verification"}}, "requirement kind is invalid"); const auto parsed_extraction = parse_named<ExtractionState>(extraction, {{ExtractionState::manual, "manual"}, {ExtractionState::imported_structured, "imported-structured"}, {ExtractionState::machine_extracted_proposed, "machine-extracted-proposed"}, {ExtractionState::human_verified, "human-verified"}, {ExtractionState::human_corrected, "human-corrected"}, {ExtractionState::rejected, "rejected"}, {ExtractionState::stale, "stale"}}, "requirement extraction state is invalid"); if (!parsed_kind || !parsed_extraction) return core::Result<AuthoringDocument>::failure(!parsed_kind ? parsed_kind.error() : parsed_extraction.error()); value.kind = parsed_kind.value(); value.extraction = parsed_extraction.value(); value.enabled = enabled; document.requirements.push_back(std::move(value)); }
+    if (!read_section_count("REQUIREMENTS", count)) {
+        return core::Result<AuthoringDocument>::failure(parse_error(
+            "requirements section is invalid"));
+    }
+    for (std::size_t index = 0U; index < count; ++index) {
+        EngineeringRequirement value;
+        std::string kind;
+        std::string extraction;
+        std::uint64_t page = 0U;
+        bool enabled = false;
+        if (!require_record(input, "REQUIREMENT") || !read_id(input, value.id) ||
+            !(input >> kind) || !(input >> extraction) ||
+            !read_id(input, value.provenance.source_id) || !read_uint(input, page) ||
+            page > std::numeric_limits<std::uint32_t>::max() ||
+            !read_text(input, value.provenance.section) ||
+            !read_text(input, value.provenance.callout) ||
+            !read_text(input, value.provenance.drawing_zone) ||
+            !read_text(input, value.provenance.extractor_identity) ||
+            !read_double(input, value.provenance.extraction_confidence) ||
+            !read_text(input, value.provenance.original_text) ||
+            !read_ids(input, value.topology_ids) || !read_double(input, value.nominal) ||
+            !read_double(input, value.plus) || !read_double(input, value.minus) ||
+            !read_text(input, value.unit, false) || !read_strings(input, value.datum_refs) ||
+            !read_strings(input, value.modifier_refs) ||
+            !read_text(input, value.acceptance_rule) || !read_bool(input, enabled) ||
+            (authoring_schema_version >= 3U &&
+                !read_text(input, value.human_review_justification))) {
+            return core::Result<AuthoringDocument>::failure(parse_error(
+                "requirement record is invalid"));
+        }
+        value.provenance.page = static_cast<std::uint32_t>(page);
+        const auto parsed_kind = parse_named<RequirementKind>(kind, {
+            {RequirementKind::dimensional_distance, "dimensional-distance"},
+            {RequirementKind::diameter, "diameter"}, {RequirementKind::radius, "radius"},
+            {RequirementKind::angle, "angle"}, {RequirementKind::thickness, "thickness"},
+            {RequirementKind::clearance, "clearance"}, {RequirementKind::position, "position"},
+            {RequirementKind::flatness, "flatness"},
+            {RequirementKind::parallelism, "parallelism"},
+            {RequirementKind::perpendicularity, "perpendicularity"},
+            {RequirementKind::concentricity, "concentricity"},
+            {RequirementKind::surface_condition, "surface-condition"},
+            {RequirementKind::presence_absence, "presence-absence"},
+            {RequirementKind::visual_surface, "visual-surface"},
+            {RequirementKind::assembly_relationship, "assembly-relationship"},
+            {RequirementKind::material_verification, "material-verification"}},
+            "requirement kind is invalid");
+        const auto parsed_extraction = parse_named<ExtractionState>(extraction, {
+            {ExtractionState::manual, "manual"},
+            {ExtractionState::imported_structured, "imported-structured"},
+            {ExtractionState::machine_extracted_proposed, "machine-extracted-proposed"},
+            {ExtractionState::human_verified, "human-verified"},
+            {ExtractionState::human_corrected, "human-corrected"},
+            {ExtractionState::rejected, "rejected"}, {ExtractionState::stale, "stale"}},
+            "requirement extraction state is invalid");
+        if (!parsed_kind || !parsed_extraction) {
+            return core::Result<AuthoringDocument>::failure(
+                !parsed_kind ? parsed_kind.error() : parsed_extraction.error());
+        }
+        value.kind = parsed_kind.value();
+        value.extraction = parsed_extraction.value();
+        value.enabled = enabled;
+        document.requirements.push_back(std::move(value));
+    }
     if (!read_section_count("CHARACTERISTICS", count)) return core::Result<AuthoringDocument>::failure(parse_error("characteristics section is invalid"));
     for (std::size_t index = 0U; index < count; ++index) { InspectionCharacteristic value; std::string kind; std::string status; std::uint64_t priority = 0U; bool line_of_sight = false, contact = false, fixture = false, reposition = false; if (!require_record(input, "CHARACTERISTIC") || !read_id(input, value.id) || !read_id(input, value.requirement_id) || !(input >> kind) || !read_ids(input, value.topology_ids) || !read_text(input, value.sensor.sensor_type, false) || !read_text(input, value.sensor.tool_center_frame, false) || !read_double(input, value.sensor.min_standoff) || !read_double(input, value.sensor.max_standoff) || !read_double(input, value.sensor.preferred_standoff) || !read_double(input, value.sensor.orientation_cone_degrees) || !read_double(input, value.sensor.field_of_view_degrees) || !read_double(input, value.sensor.min_clearance) || !read_bool(input, line_of_sight) || !read_bool(input, contact) || !read_double(input, value.sensor.measurement_duration_seconds) || !read_text(input, value.coverage.kind, false) || !read_double(input, value.coverage.percentage) || !read_strings(input, value.access.allowed_approach_directions) || !read_strings(input, value.access.forbidden_approach_directions) || !read_double(input, value.access.minimum_approach_clearance) || !read_bool(input, fixture) || !read_bool(input, reposition) || !read_uint(input, priority) || priority > std::numeric_limits<std::uint32_t>::max() || !(input >> status)) return core::Result<AuthoringDocument>::failure(parse_error("characteristic record is invalid")); const auto parsed_kind = parse_named<InspectionKind>(kind, {{InspectionKind::point_measurement, "point-measurement"}, {InspectionKind::distance, "distance"}, {InspectionKind::angle, "angle"}, {InspectionKind::diameter, "diameter"}, {InspectionKind::thickness, "thickness"}, {InspectionKind::clearance, "clearance"}, {InspectionKind::surface_scan, "surface-scan"}, {InspectionKind::visual_surface_check, "visual-surface-check"}, {InspectionKind::feature_presence, "feature-presence"}, {InspectionKind::datum_capture, "datum-capture"}, {InspectionKind::dimensional_feature_check, "dimensional-feature-check"}}, "inspection kind is invalid"); const auto parsed_status = parse_named<InspectionStatus>(status, {{InspectionStatus::authored, "authored"}, {InspectionStatus::disabled, "disabled"}, {InspectionStatus::stale, "stale"}}, "inspection status is invalid"); if (!parsed_kind || !parsed_status) return core::Result<AuthoringDocument>::failure(!parsed_kind ? parsed_kind.error() : parsed_status.error()); value.priority = static_cast<std::uint32_t>(priority); value.kind = parsed_kind.value(); value.status = parsed_status.value(); value.sensor.line_of_sight_required = line_of_sight; value.sensor.contact_required = contact; value.access.fixture_occlusion_allowed = fixture; value.access.robot_base_reposition_permitted = reposition; document.characteristics.push_back(std::move(value)); }
     if (!read_section_count("TARGETS", count)) return core::Result<AuthoringDocument>::failure(parse_error("targets section is invalid"));
@@ -1145,6 +1312,87 @@ core::Result<std::vector<EngineeringBomLine>> parse_bom_csv(
         result.push_back(std::move(line));
     }
     return core::Result<std::vector<EngineeringBomLine>>::success(std::move(result));
+}
+
+core::Result<std::vector<RequirementCsvRecord>> parse_requirement_csv(
+    std::string_view bytes) {
+    auto parsed_rows = parse_csv_rows(bytes, kMaxRequirementCsvBytes,
+        "engineering requirement CSV");
+    if (!parsed_rows) {
+        return core::Result<std::vector<RequirementCsvRecord>>::failure(
+            parsed_rows.error());
+    }
+    static const std::vector<std::string> expected_header{
+        "page", "section", "callout", "kind", "topology_external_id", "nominal",
+        "plus", "minus", "unit", "acceptance_rule", "original_text"};
+    const auto& rows = parsed_rows.value();
+    if (rows.front() != expected_header) {
+        return core::Result<std::vector<RequirementCsvRecord>>::failure(parse_error(
+            "requirement CSV header must be page,section,callout,kind,topology_external_id,nominal,plus,minus,unit,acceptance_rule,original_text"));
+    }
+
+    std::vector<RequirementCsvRecord> result;
+    result.reserve(rows.size() - 1U);
+    for (std::size_t index = 1U; index < rows.size(); ++index) {
+        const auto& row = rows[index];
+        const std::string row_context = "requirement CSV row " + std::to_string(index + 1U);
+        if (row.size() != expected_header.size()) {
+            return core::Result<std::vector<RequirementCsvRecord>>::failure(parse_error(
+                row_context + " has the wrong number of columns"));
+        }
+        RequirementCsvRecord record;
+        const auto [page_end, page_error] = std::from_chars(
+            row[0].data(), row[0].data() + row[0].size(), record.page);
+        const auto kind = parse_named<RequirementKind>(row[3], {
+            {RequirementKind::dimensional_distance, "dimensional-distance"},
+            {RequirementKind::diameter, "diameter"},
+            {RequirementKind::radius, "radius"},
+            {RequirementKind::angle, "angle"},
+            {RequirementKind::thickness, "thickness"},
+            {RequirementKind::clearance, "clearance"}}, "unsupported requirement kind");
+        const auto parse_number = [](const std::string& value, double& destination) {
+            const auto [end, error] = std::from_chars(
+                value.data(), value.data() + value.size(), destination,
+                std::chars_format::general);
+            return error == std::errc{} && end == value.data() + value.size() &&
+                std::isfinite(destination);
+        };
+        if (page_error != std::errc{} || page_end != row[0].data() + row[0].size() ||
+            !kind || !parse_number(row[5], record.nominal) ||
+            !parse_number(row[6], record.plus) || !parse_number(row[7], record.minus)) {
+            return core::Result<std::vector<RequirementCsvRecord>>::failure(parse_error(
+                row_context + " has an invalid page, kind, or numeric value"));
+        }
+        record.section = row[1];
+        record.callout = row[2];
+        record.kind = kind.value();
+        record.topology_external_id = row[4];
+        record.unit = row[8];
+        record.acceptance_rule = row[9];
+        record.original_text = row[10];
+
+        const bool angular = record.kind == RequirementKind::angle;
+        const bool requires_positive_nominal = record.kind == RequirementKind::diameter ||
+            record.kind == RequirementKind::radius || record.kind == RequirementKind::thickness;
+        const bool supported_unit = angular
+            ? record.unit == "degrees"
+            : record.unit == "millimeters" || record.unit == "meters" ||
+                record.unit == "inches";
+        if (!safe_text(record.section) || !safe_text(record.callout) ||
+            !safe_text(record.topology_external_id) || !safe_text(record.unit) ||
+            !safe_text(record.acceptance_rule) ||
+            !safe_text(record.original_text) || !supported_unit ||
+            record.plus < 0.0 || record.minus < 0.0 ||
+            (requires_positive_nominal ? record.nominal <= 0.0 : record.nominal < 0.0) ||
+            (angular && (record.nominal > 360.0 ||
+                record.nominal - record.minus < 0.0 ||
+                record.nominal + record.plus > 360.0))) {
+            return core::Result<std::vector<RequirementCsvRecord>>::failure(parse_error(
+                row_context + " is outside the supported requirement profile"));
+        }
+        result.push_back(std::move(record));
+    }
+    return core::Result<std::vector<RequirementCsvRecord>>::success(std::move(result));
 }
 
 std::optional<double> assembly_quantity_for_part(
@@ -1396,7 +1644,7 @@ core::Result<AuthoringDocument> make_dv012_fixture() {
     document.occurrences = {{20U, "BRACKET-A17:1", 10U, std::nullopt, core::Transform::identity(), 1U, 1U}, {21U, "BRACKET-A17:2", 10U, std::nullopt, core::Transform{{0.12, 0.0, 0.0}, core::Quaternion::identity(), {1.0, 1.0, 1.0}}, 1U, 1U}, {22U, "PIN-P04:1", 11U, std::nullopt, core::Transform{{0.06, 0.04, 0.0}, core::Quaternion::identity(), {1.0, 1.0, 1.0}}, 1U, 1U}};
     document.topology = {{100U, 1U, 10U, 20U, TopologyKind::face, "FACE-A17-OUTER", "C", 1000U, 12U}, {101U, 1U, 10U, 20U, TopologyKind::edge, "EDGE-A17-DATUM", "C", 1000U, 13U}, {102U, 1U, 11U, 22U, TopologyKind::face, "FACE-P04-END", "C", 1001U, 4U}};
     document.bom = {{200U, "BRACKET-A17", "C", "Machined bracket", "7075-T6", 2.0, "each", 2U, 10U, ReconciliationStatus::exact}, {201U, "PIN-P04", "B", "Inspection pin", "17-4PH", 1.0, "each", 2U, 11U, ReconciliationStatus::exact}};
-    document.requirements = {{300U, RequirementKind::dimensional_distance, ExtractionState::human_verified, {1U, 34U, "Section 4", "DIM-17", "B4", "fixture-pmi", 0.98, "12.50 +/- 0.05 mm"}, {100U, 101U}, 12.5, 0.05, 0.05, "millimeters", {"A", "B"}, {}, "within bilateral tolerance", true}, {301U, RequirementKind::visual_surface, ExtractionState::human_corrected, {1U, 34U, "Section 4", "SURF-02", "C2", "fixture-pmi", 0.91, "No visible tool marks"}, {100U}, 0.0, 0.0, 0.0, "visual", {}, {}, "uniform surface", true}, {302U, RequirementKind::diameter, ExtractionState::imported_structured, {1U, 34U, "Section 5", "DIA-03", "D1", "fixture-pmi", 0.88, "4.00 +/- 0.02 mm"}, {102U}, 4.0, 0.02, 0.02, "millimeters", {"A"}, {}, "within bilateral tolerance", true}};
+    document.requirements = {{300U, RequirementKind::dimensional_distance, ExtractionState::human_verified, {1U, 34U, "Section 4", "DIM-17", "B4", "fixture-pmi", 0.98, "12.50 +/- 0.05 mm"}, {100U, 101U}, 12.5, 0.05, 0.05, "millimeters", {"A", "B"}, {}, "within bilateral tolerance", true, {}}, {301U, RequirementKind::visual_surface, ExtractionState::human_corrected, {1U, 34U, "Section 4", "SURF-02", "C2", "fixture-pmi", 0.91, "No visible tool marks"}, {100U}, 0.0, 0.0, 0.0, "visual", {}, {}, "uniform surface", true, {}}, {302U, RequirementKind::diameter, ExtractionState::imported_structured, {1U, 34U, "Section 5", "DIA-03", "D1", "fixture-pmi", 0.88, "4.00 +/- 0.02 mm"}, {102U}, 4.0, 0.02, 0.02, "millimeters", {"A"}, {}, "within bilateral tolerance", true, {}}};
     SensorConstraint sensor{"structured-light", "tool0", 0.10, 0.35, 0.20, 25.0, 60.0, 0.05, true, false, 0.5};
     AccessConstraint access{{"+z"}, {"-x"}, 0.05, false, false};
     document.characteristics = {{400U, 300U, InspectionKind::distance, {100U, 101U}, sensor, {"single_point", 0.0}, access, 10U, InspectionStatus::authored}, {401U, 301U, InspectionKind::visual_surface_check, {100U}, sensor, {"full_visible_surface", 100.0}, access, 20U, InspectionStatus::authored}, {402U, 302U, InspectionKind::diameter, {102U}, sensor, {"feature_loop", 100.0}, access, 30U, InspectionStatus::authored}};

@@ -13,6 +13,7 @@
 #include <iostream>
 #include <limits>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -176,6 +177,39 @@ void bom_csv_parser_and_reconciliation_fail_closed_on_ambiguous_evidence() {
     REQUIRE(!carto::engineering::assembly_quantity_for_part(cyclic_occurrences, 10U));
 }
 
+void requirement_csv_parser_accepts_only_the_declared_dimensional_profile() {
+    const std::string csv =
+        "page,section,callout,kind,topology_external_id,nominal,plus,minus,unit,acceptance_rule,original_text\r\n"
+        "34,\"Section 5\",DIA-04,diameter,FACE-P04-END,5.0,0.02,0.02,millimeters,\"within bilateral tolerance\",\"Diameter 5.0, +/- 0.02 mm\"\r\n";
+    const auto parsed = carto::engineering::parse_requirement_csv(csv);
+    REQUIRE(parsed);
+    REQUIRE(parsed.value().size() == 1U);
+    REQUIRE(parsed.value().front().page == 34U);
+    REQUIRE(parsed.value().front().section == "Section 5");
+    REQUIRE(parsed.value().front().kind == carto::engineering::RequirementKind::diameter);
+    REQUIRE(parsed.value().front().topology_external_id == "FACE-P04-END");
+    REQUIRE(parsed.value().front().nominal == 5.0);
+    REQUIRE(parsed.value().front().original_text == "Diameter 5.0, +/- 0.02 mm");
+
+    REQUIRE(!carto::engineering::parse_requirement_csv(
+        "callout,kind,topology_external_id,nominal,plus,minus,unit,acceptance_rule,original_text\n"
+        "DIA-04,diameter,FACE-P04-END,5,0.02,0.02,millimeters,pass,Diameter 5\n"));
+    REQUIRE(!carto::engineering::parse_requirement_csv(
+        "page,section,callout,kind,topology_external_id,nominal,plus,minus,unit,acceptance_rule,original_text\n"
+        "34,S,DIA-04,position,FACE-P04-END,5,0,0,millimeters,pass,Position\n"));
+    REQUIRE(!carto::engineering::parse_requirement_csv(
+        "page,section,callout,kind,topology_external_id,nominal,plus,minus,unit,acceptance_rule,original_text\n"
+        "34,S,DIA-04,diameter,FACE-P04-END,NaN,0,0,millimeters,pass,Diameter\n"));
+    REQUIRE(!carto::engineering::parse_requirement_csv(
+        "page,section,callout,kind,topology_external_id,nominal,plus,minus,unit,acceptance_rule,original_text\n"
+        "34,S,DIA-04,diameter,FACE-P04-END,5,0,0,centimeters,pass,Diameter\n"));
+    REQUIRE(!carto::engineering::parse_requirement_csv(
+        "page,section,callout,kind,topology_external_id,nominal,plus,minus,unit,acceptance_rule,original_text\n"
+        "34,S,DIA-04,angle,FACE-P04-END,359,2,0,degrees,pass,Angle\n"));
+    REQUIRE(!carto::engineering::parse_requirement_csv(
+        std::string(carto::engineering::kMaxRequirementCsvBytes + 1U, 'x')));
+}
+
 void publication_and_vanta_admission_bind_exact_bytes() {
     const auto fixture = carto::engineering::make_dv012_fixture();
     REQUIRE(fixture);
@@ -207,7 +241,7 @@ void publication_and_vanta_admission_bind_exact_bytes() {
         carto::engineering::ExtractionState::manual,
         {1U, 34U, "Manual", "DIM-NEW", "B5", "", 0.0, "9.00 +/- 0.10 mm"},
         {100U}, 9.0, 0.1, 0.1, "millimeters", {}, {},
-        "within bilateral tolerance", true});
+        "within bilateral tolerance", true, {}});
     REQUIRE(missing_characteristic.validate());
     REQUIRE(!carto::engineering::InspectionPackage::publish(
         missing_characteristic, missing_characteristic.project_revision,
@@ -725,11 +759,25 @@ void inspection_target_authoring_is_human_revision_and_workcell_bound() {
 void workcell_edits_are_revisioned_audited_and_invalidate_targets() {
     auto fixture = carto::engineering::make_dv012_fixture();
     REQUIRE(fixture);
-    std::string legacy_bytes = fixture.value().serialize();
-    const std::string current_header = "CARTOGRAPHER_ENGINEERING_AUTHORING 2\n";
+    const std::string current_header = "CARTOGRAPHER_ENGINEERING_AUTHORING 3\n";
     const std::string legacy_header = "CARTOGRAPHER_ENGINEERING_AUTHORING 1\n";
-    REQUIRE(legacy_bytes.starts_with(current_header));
-    legacy_bytes.replace(0U, current_header.size(), legacy_header);
+    const auto downgrade = [](std::string bytes, std::string_view header) {
+        const std::string current = "CARTOGRAPHER_ENGINEERING_AUTHORING 3\n";
+        REQUIRE(bytes.starts_with(current));
+        bytes.replace(0U, current.size(), header);
+        std::istringstream input(bytes);
+        std::ostringstream output;
+        std::string line;
+        while (std::getline(input, line)) {
+            if (line.starts_with("REQUIREMENT ") && line.ends_with(" \"\"")) {
+                line.resize(line.size() - 3U);
+            }
+            output << line << '\n';
+        }
+        return output.str();
+    };
+    std::string legacy_bytes = downgrade(
+        fixture.value().serialize(), legacy_header);
     const std::string empty_history = "WORKCELL_REVISION_HISTORY 0\n";
     const auto history_offset = legacy_bytes.find(empty_history);
     REQUIRE(history_offset != std::string::npos);
@@ -738,6 +786,11 @@ void workcell_edits_are_revisioned_audited_and_invalidate_targets() {
     REQUIRE(migrated);
     REQUIRE(migrated.value().workcell_revision_history.empty());
     REQUIRE(migrated.value().serialize().starts_with(current_header));
+    const auto schema_two = carto::engineering::AuthoringDocument::deserialize(
+        downgrade(fixture.value().serialize(),
+            "CARTOGRAPHER_ENGINEERING_AUTHORING 2\n"));
+    REQUIRE(schema_two);
+    REQUIRE(schema_two.value().serialize().starts_with(current_header));
 
     carto::application::ApplicationSession session;
     REQUIRE(carto::application::HumanApplicationAccess::dispatch(
@@ -1244,6 +1297,277 @@ void ui_imports_bom_csv_through_revision_bound_journal_and_preserves_source_hist
     std::filesystem::remove_all(root, ignored);
 }
 
+void ui_imports_and_reviews_structured_requirements_without_promoting_proposals() {
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto root = std::filesystem::temp_directory_path() /
+        ("cartographer-engineering-requirement-csv-" + std::to_string(stamp));
+    std::filesystem::create_directories(root);
+    const auto csv_path = root / "requirements.csv";
+    const std::string initial_csv =
+        "page,section,callout,kind,topology_external_id,nominal,plus,minus,unit,acceptance_rule,original_text\n"
+        "34,\"Section 5\",DIA-04,diameter,FACE-P04-END,5.0,0.02,0.02,millimeters,\"within bilateral tolerance\",\"Diameter 5.0 +/- 0.02 mm\"\n"
+        "35,\"Section 6\",DIST-07,dimensional-distance,EDGE-A17-DATUM,12.0,0.05,0.05,millimeters,\"within bilateral tolerance\",\"12.00 +/- 0.05 mm between datums\"\n"
+        "36,\"Section 7\",DIA-08,diameter,FACE-P04-END,3.0,0.01,0.01,millimeters,\"within bilateral tolerance\",\"Diameter 3.00 +/- 0.01 mm\"\n";
+
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.dispatch(carto::application::NewProjectAction{"Requirement CSV import"}));
+    REQUIRE(ui.import_engineering_fixture());
+
+    auto ambiguous_authoring = session.engineering_authoring();
+    REQUIRE(ambiguous_authoring);
+    ambiguous_authoring.value().topology.push_back({
+        103U, 1U, 10U, 20U, carto::engineering::TopologyKind::face,
+        "FACE-A17-OUTER", "C", 1000U, 14U});
+    REQUIRE(ambiguous_authoring.value().validate());
+    REQUIRE(ui.dispatch(carto::application::ImportEngineeringAuthoringAction{
+        ambiguous_authoring.value().serialize()}));
+
+    const std::string ambiguous_csv =
+        "page,section,callout,kind,topology_external_id,nominal,plus,minus,unit,acceptance_rule,original_text\n"
+        "34,S,DIA-AMBIGUOUS,diameter,FACE-A17-OUTER,5,0.02,0.02,millimeters,pass,Diameter 5\n";
+    {
+        std::ofstream stream(csv_path, std::ios::binary);
+        REQUIRE(stream.good());
+        stream << ambiguous_csv;
+        REQUIRE(stream.good());
+    }
+    const auto before_ambiguous = ui.snapshot();
+    REQUIRE(!ui.import_engineering_requirement_csv(csv_path));
+    REQUIRE(ui.snapshot().project_revision == before_ambiguous.project_revision);
+    REQUIRE(ui.snapshot().engineering.digest == before_ambiguous.engineering.digest);
+
+    {
+        std::ofstream stream(csv_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(stream.good());
+        stream << initial_csv;
+        REQUIRE(stream.good());
+    }
+    const auto before = ui.snapshot();
+    const carto::application::ImportEngineeringRequirementCsvAction ai_action{
+        before.project_revision, before.engineering.authored_revision,
+        csv_path.filename().generic_string(), initial_csv};
+    REQUIRE(!ui.submit_ai_proposal(ai_action));
+    REQUIRE(ui.snapshot().project_revision == before.project_revision);
+
+    const auto imported = ui.import_engineering_requirement_csv(csv_path);
+    REQUIRE(imported);
+    REQUIRE(imported.value().document_changed);
+    auto after = ui.snapshot();
+    REQUIRE(after.project_revision == before.project_revision.next());
+    REQUIRE(after.engineering.source_count == 3U);
+    REQUIRE(after.engineering.requirement_count == 6U);
+    REQUIRE(after.operations.back().category == carto::ui::OperationCategory::provider);
+    REQUIRE(after.operations.back().action == "Import Engineering Requirement CSV");
+    const auto first_proposal = std::find_if(after.engineering.requirements.begin(),
+        after.engineering.requirements.end(), [](const auto& requirement) {
+            return requirement.callout == "DIA-04";
+        });
+    const auto second_proposal = std::find_if(after.engineering.requirements.begin(),
+        after.engineering.requirements.end(), [](const auto& requirement) {
+            return requirement.callout == "DIST-07";
+        });
+    const auto third_proposal = std::find_if(after.engineering.requirements.begin(),
+        after.engineering.requirements.end(), [](const auto& requirement) {
+            return requirement.callout == "DIA-08";
+        });
+    REQUIRE(first_proposal != after.engineering.requirements.end());
+    REQUIRE(second_proposal != after.engineering.requirements.end());
+    REQUIRE(third_proposal != after.engineering.requirements.end());
+    const auto first_proposal_id = first_proposal->id;
+    const auto second_proposal_id = second_proposal->id;
+    const auto third_proposal_id = third_proposal->id;
+    REQUIRE(first_proposal->extraction == "machine-extracted-proposed");
+    REQUIRE(first_proposal->topology_ids == std::vector<std::uint64_t>{102U});
+    REQUIRE(first_proposal->original_text == "Diameter 5.0 +/- 0.02 mm");
+    REQUIRE(after.engineering.sources.back().locator == "requirements.csv");
+    REQUIRE(after.engineering.sources.back().locator.find(root.generic_string()) ==
+        std::string::npos);
+    REQUIRE(!ui.build_engineering_package());
+
+    carto::application::CreateEngineeringCharacteristicAction premature_characteristic;
+    premature_characteristic.expected_project_revision = after.project_revision;
+    premature_characteristic.expected_authoring_revision = after.engineering.authored_revision;
+    premature_characteristic.requirement_id = first_proposal_id;
+    premature_characteristic.kind = carto::engineering::InspectionKind::diameter;
+    REQUIRE(!ui.dispatch(premature_characteristic));
+    REQUIRE(ui.snapshot().project_revision == after.project_revision);
+
+    carto::application::ReviewEngineeringRequirementAction missing_reason;
+    missing_reason.expected_project_revision = after.project_revision;
+    missing_reason.expected_authoring_revision = after.engineering.authored_revision;
+    missing_reason.requirement_id = first_proposal_id;
+    REQUIRE(!ui.dispatch(missing_reason));
+    missing_reason.justification = "Operator verified against the source callout";
+    REQUIRE(!ui.submit_ai_proposal(missing_reason));
+    REQUIRE(ui.snapshot().project_revision == after.project_revision);
+
+    auto correction = missing_reason;
+    correction.decision = carto::application::RequirementReviewDecision::correct;
+    correction.corrected_kind = carto::engineering::RequirementKind::diameter;
+    correction.corrected_nominal = 5.1;
+    correction.corrected_plus = 0.02;
+    correction.corrected_minus = 0.02;
+    correction.corrected_unit = "millimeters";
+    correction.corrected_acceptance_rule = "within corrected bilateral tolerance";
+    correction.justification = "Corrected the normalized nominal to match the cited drawing view";
+    REQUIRE(ui.dispatch(correction));
+    REQUIRE(ui.snapshot().operations.back().action == "Correct Engineering Requirement");
+
+    after = ui.snapshot();
+    carto::application::ReviewEngineeringRequirementAction verification;
+    verification.expected_project_revision = after.project_revision;
+    verification.expected_authoring_revision = after.engineering.authored_revision;
+    verification.requirement_id = second_proposal_id;
+    verification.decision = carto::application::RequirementReviewDecision::verify;
+    verification.justification = "Compared the parsed distance and tolerance to the source text";
+    REQUIRE(ui.dispatch(verification));
+    REQUIRE(ui.snapshot().operations.back().action == "Verify Engineering Requirement");
+
+    after = ui.snapshot();
+    carto::application::ReviewEngineeringRequirementAction rejection;
+    rejection.expected_project_revision = after.project_revision;
+    rejection.expected_authoring_revision = after.engineering.authored_revision;
+    rejection.requirement_id = third_proposal_id;
+    rejection.decision = carto::application::RequirementReviewDecision::reject;
+    rejection.justification = "This callout belongs to a different part and must not be applied";
+    REQUIRE(ui.dispatch(rejection));
+    REQUIRE(ui.snapshot().operations.back().action == "Reject Engineering Requirement");
+
+    auto reviewed = session.engineering_authoring();
+    REQUIRE(reviewed);
+    const auto corrected = std::find_if(reviewed.value().requirements.begin(),
+        reviewed.value().requirements.end(), [&first_proposal_id](const auto& requirement) {
+        return requirement.id == first_proposal_id;
+        });
+    const auto verified = std::find_if(reviewed.value().requirements.begin(),
+        reviewed.value().requirements.end(), [&second_proposal_id](const auto& requirement) {
+        return requirement.id == second_proposal_id;
+        });
+    const auto rejected = std::find_if(reviewed.value().requirements.begin(),
+        reviewed.value().requirements.end(), [&third_proposal_id](const auto& requirement) {
+        return requirement.id == third_proposal_id;
+        });
+    REQUIRE(corrected != reviewed.value().requirements.end());
+    REQUIRE(corrected->extraction == carto::engineering::ExtractionState::human_corrected);
+    REQUIRE(corrected->nominal == 5.1);
+    REQUIRE(corrected->provenance.original_text == "Diameter 5.0 +/- 0.02 mm");
+    REQUIRE(corrected->human_review_justification == correction.justification);
+    REQUIRE(verified != reviewed.value().requirements.end());
+    REQUIRE(verified->extraction == carto::engineering::ExtractionState::human_verified);
+    REQUIRE(rejected != reviewed.value().requirements.end());
+    REQUIRE(rejected->extraction == carto::engineering::ExtractionState::rejected);
+    REQUIRE(!rejected->enabled);
+
+    auto current = ui.snapshot();
+    carto::application::CreateEngineeringCharacteristicAction characteristic;
+    characteristic.expected_project_revision = current.project_revision;
+    characteristic.expected_authoring_revision = current.engineering.authored_revision;
+    characteristic.requirement_id = corrected->id;
+    characteristic.kind = carto::engineering::InspectionKind::diameter;
+    characteristic.sensor.sensor_type = "laser-triangulation";
+    characteristic.sensor.tool_center_frame = "TCP";
+    characteristic.sensor.min_standoff = 0.1;
+    characteristic.sensor.max_standoff = 0.5;
+    characteristic.sensor.preferred_standoff = 0.25;
+    characteristic.sensor.field_of_view_degrees = 30.0;
+    characteristic.access.allowed_approach_directions = {"+z"};
+    const auto created_characteristic = ui.dispatch(characteristic);
+    if (!created_characteristic) {
+        throw TestFailure(created_characteristic.error().message);
+    }
+
+    const auto idempotent_revision = ui.snapshot().project_revision;
+    REQUIRE(ui.import_engineering_requirement_csv(csv_path));
+    REQUIRE(ui.snapshot().project_revision == idempotent_revision);
+
+    std::string replacement_csv = initial_csv;
+    const auto old_value = replacement_csv.find("5.0,0.02,0.02");
+    REQUIRE(old_value != std::string::npos);
+    replacement_csv.replace(old_value, std::string("5.0,0.02,0.02").size(),
+        "5.2,0.02,0.02");
+    {
+        std::ofstream stream(csv_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(stream.good());
+        stream << replacement_csv;
+        REQUIRE(stream.good());
+    }
+    REQUIRE(ui.import_engineering_requirement_csv(csv_path));
+    after = ui.snapshot();
+    REQUIRE(after.engineering.source_count == 4U);
+    const auto old_corrected = std::find_if(after.engineering.requirements.begin(),
+        after.engineering.requirements.end(), [&first_proposal_id](const auto& requirement) {
+        return requirement.id == first_proposal_id;
+        });
+    const auto old_rejected = std::find_if(after.engineering.requirements.begin(),
+        after.engineering.requirements.end(), [&third_proposal_id](const auto& requirement) {
+            return requirement.id == third_proposal_id;
+        });
+    REQUIRE(old_corrected != after.engineering.requirements.end());
+    REQUIRE(old_corrected->extraction == "stale");
+    REQUIRE(old_rejected != after.engineering.requirements.end());
+    REQUIRE(old_rejected->extraction == "rejected");
+    REQUIRE(!old_rejected->enabled);
+    REQUIRE(std::any_of(after.engineering.requirements.begin(),
+        after.engineering.requirements.end(), [](const auto& requirement) {
+            return requirement.source_id == 4U &&
+                requirement.extraction == "machine-extracted-proposed";
+        }));
+
+    const auto new_proposal = std::find_if(after.engineering.requirements.begin(),
+        after.engineering.requirements.end(), [](const auto& requirement) {
+            return requirement.source_id == 4U && requirement.callout == "DIA-04";
+        });
+    REQUIRE(new_proposal != after.engineering.requirements.end());
+    const auto new_proposal_id = new_proposal->id;
+
+    REQUIRE(ui.invalidate_engineering_source(1U, "D", digest("new STEP source revision")));
+    after = ui.snapshot();
+    carto::application::ReviewEngineeringRequirementAction stale_topology_review;
+    stale_topology_review.expected_project_revision = after.project_revision;
+    stale_topology_review.expected_authoring_revision = after.engineering.authored_revision;
+    stale_topology_review.requirement_id = new_proposal_id;
+    stale_topology_review.decision = carto::application::RequirementReviewDecision::verify;
+    stale_topology_review.justification = "Attempt to review after CAD source changed";
+    REQUIRE(!ui.dispatch(stale_topology_review));
+
+    REQUIRE(ui.dispatch(carto::application::UndoAction{}));
+    after = ui.snapshot();
+    const auto restored_proposal = std::find_if(after.engineering.requirements.begin(),
+        after.engineering.requirements.end(), [&new_proposal_id](const auto& requirement) {
+        return requirement.id == new_proposal_id;
+        });
+    REQUIRE(restored_proposal != after.engineering.requirements.end());
+    carto::application::ReviewEngineeringRequirementAction restored_review;
+    restored_review.expected_project_revision = after.project_revision;
+    restored_review.expected_authoring_revision = after.engineering.authored_revision;
+    restored_review.requirement_id = new_proposal_id;
+    restored_review.decision = carto::application::RequirementReviewDecision::verify;
+    restored_review.justification = "Verified after restoring the current CAD source revision";
+    REQUIRE(ui.dispatch(restored_review));
+    REQUIRE(ui.dispatch(carto::application::UndoAction{}));
+    REQUIRE(ui.dispatch(carto::application::RedoAction{}));
+
+    const auto project_path = root / "requirements.carto";
+    REQUIRE(ui.dispatch(carto::application::SaveProjectAction{project_path}));
+    carto::application::ApplicationSession reopened;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        reopened, carto::application::OpenProjectAction{project_path}));
+    const auto reopened_authoring = reopened.engineering_authoring();
+    REQUIRE(reopened_authoring);
+    const auto persisted_correction = std::find_if(
+        reopened_authoring.value().requirements.begin(),
+        reopened_authoring.value().requirements.end(), [&first_proposal_id](const auto& requirement) {
+        return requirement.id == first_proposal_id;
+        });
+    REQUIRE(persisted_correction != reopened_authoring.value().requirements.end());
+    REQUIRE(persisted_correction->human_review_justification == correction.justification);
+    REQUIRE(reopened.snapshot().engineering.digest == ui.snapshot().engineering.digest);
+
+    std::error_code ignored;
+    std::filesystem::remove_all(root, ignored);
+}
+
 void ui_attaches_opaque_engineering_evidence_with_safe_provenance() {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto root = std::filesystem::temp_directory_path() /
@@ -1633,6 +1957,7 @@ int main() {
     try {
         fixture_round_trips_with_identity_and_provenance();
         bom_csv_parser_and_reconciliation_fail_closed_on_ambiguous_evidence();
+        requirement_csv_parser_accepts_only_the_declared_dimensional_profile();
         publication_and_vanta_admission_bind_exact_bytes();
         manual_requirement_authoring_is_revision_bound_and_auditable();
         inspection_characteristics_require_current_human_verified_contracts();
@@ -1645,6 +1970,7 @@ int main() {
         application_wires_engineering_authoring_through_persistence_and_history();
         ui_exposes_engineering_workspace_and_immutable_publication();
         ui_imports_bom_csv_through_revision_bound_journal_and_preserves_source_history();
+        ui_imports_and_reviews_structured_requirements_without_promoting_proposals();
         ui_attaches_opaque_engineering_evidence_with_safe_provenance();
         ui_imports_exports_and_reconciles_engineering_authoring_files();
         std::cout << "engineering tests passed\n";

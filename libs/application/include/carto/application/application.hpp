@@ -321,6 +321,9 @@ struct EngineeringAuthoringView {
         std::string original_text;
         std::string acceptance_rule;
         bool enabled = true;
+        std::uint32_t source_page = 0U;
+        std::string source_section;
+        std::string human_review_justification;
     };
     std::vector<Requirement> requirements;
     struct Characteristic {
@@ -778,6 +781,12 @@ struct ImportEngineeringBomCsvAction {
     std::string locator;
     std::string csv_bytes;
 };
+struct ImportEngineeringRequirementCsvAction {
+    core::Revision expected_project_revision;
+    core::Revision expected_authoring_revision;
+    std::string locator;
+    std::string csv_bytes;
+};
 struct AttachEngineeringEvidenceAction {
     core::Revision expected_project_revision;
     core::Revision expected_authoring_revision;
@@ -800,6 +809,20 @@ struct CreateEngineeringRequirementAction {
     std::string source_callout;
     std::string original_text;
     std::string acceptance_rule;
+};
+enum class RequirementReviewDecision : std::uint8_t { verify, correct, reject };
+struct ReviewEngineeringRequirementAction {
+    core::Revision expected_project_revision;
+    core::Revision expected_authoring_revision;
+    engineering::Id requirement_id = 0U;
+    RequirementReviewDecision decision = RequirementReviewDecision::verify;
+    engineering::RequirementKind corrected_kind = engineering::RequirementKind::dimensional_distance;
+    double corrected_nominal = 0.0;
+    double corrected_plus = 0.0;
+    double corrected_minus = 0.0;
+    std::string corrected_unit;
+    std::string corrected_acceptance_rule;
+    std::string justification;
 };
 struct CreateEngineeringCharacteristicAction {
     core::Revision expected_project_revision;
@@ -987,8 +1010,10 @@ using ApplicationAction = std::variant<
     ImportEngineeringFixtureAction,
     ImportEngineeringAuthoringAction,
     ImportEngineeringBomCsvAction,
+    ImportEngineeringRequirementCsvAction,
     AttachEngineeringEvidenceAction,
     CreateEngineeringRequirementAction,
+    ReviewEngineeringRequirementAction,
     CreateEngineeringCharacteristicAction,
     CreateEngineeringTargetAction,
     UpdateEngineeringWorkcellAction,
@@ -1196,10 +1221,14 @@ private:
         const ImportEngineeringAuthoringAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> import_engineering_bom_csv(
         const ImportEngineeringBomCsvAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> import_engineering_requirement_csv(
+        const ImportEngineeringRequirementCsvAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> attach_engineering_evidence(
         const AttachEngineeringEvidenceAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_engineering_requirement(
         const CreateEngineeringRequirementAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> review_engineering_requirement(
+        const ReviewEngineeringRequirementAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_engineering_characteristic(
         const CreateEngineeringCharacteristicAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_engineering_target(
