@@ -137,8 +137,9 @@ present. Engineering authoring schema 3 stores human requirement-review reasons,
 retains workcell revision history, and migrates schema 1 and 2 records. Mutations
 pass through editor commands and can be undone or redone.
 Source invalidation preserves authored identity while marking dependent
-products stale; stale authoring cannot be published as admitted. Project
-formats 1 through 14 remain readable.
+products stale; both package publication and local VANTA contract admission
+refuse a stale path or stale derived product. Project formats 1 through 14
+remain readable.
 
 The acceptance tests cover deterministic fixture round-trip, provenance,
 tamper rejection, stale-source invalidation, schema-version fencing, project

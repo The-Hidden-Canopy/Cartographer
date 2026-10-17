@@ -227,6 +227,53 @@ void publication_and_vanta_admission_bind_exact_bytes() {
     REQUIRE(admission.value().admitted_authoring_digest == package.value().authoring_digest);
     REQUIRE(admission.value().admitted_publication_digest == package.value().publication_digest);
 
+    auto stale_path = fixture.value();
+    stale_path.path->status = carto::engineering::DerivedProductStatus::stale;
+    for (auto& sample : stale_path.path->samples) {
+        sample.status = carto::engineering::PathSampleStatus::stale;
+    }
+    REQUIRE(stale_path.validate());
+    REQUIRE(!carto::engineering::InspectionPackage::publish(
+        stale_path, stale_path.project_revision, stale_path.project_namespace));
+
+    auto stale_derived_product = fixture.value();
+    stale_derived_product.derived_products.front().status =
+        carto::engineering::DerivedProductStatus::stale;
+    stale_derived_product.derived_products.front().stale_reason =
+        "workcell revision changed";
+    REQUIRE(stale_derived_product.validate());
+    REQUIRE(!carto::engineering::InspectionPackage::publish(
+        stale_derived_product, stale_derived_product.project_revision,
+        stale_derived_product.project_namespace));
+
+    const auto admission_for_stale_package = [&](auto mutate, std::string_view expected_reason) {
+        auto tampered_authoring = carto::engineering::AuthoringDocument::deserialize(
+            package.value().authoring_bytes);
+        REQUIRE(tampered_authoring);
+        mutate(tampered_authoring.value());
+        auto stale_package = package.value();
+        stale_package.authoring_bytes = tampered_authoring.value().serialize();
+        REQUIRE(stale_package.refresh_digest());
+        const auto stale_admission = carto::engineering::admit_for_vanta(stale_package);
+        REQUIRE(stale_admission);
+        REQUIRE(stale_admission.value().status ==
+            carto::engineering::VantaAdmissionStatus::refuse);
+        REQUIRE(std::find(stale_admission.value().reasons.begin(),
+            stale_admission.value().reasons.end(), expected_reason) !=
+            stale_admission.value().reasons.end());
+    };
+    admission_for_stale_package([](auto& authoring) {
+        authoring.path->status = carto::engineering::DerivedProductStatus::stale;
+        for (auto& sample : authoring.path->samples) {
+            sample.status = carto::engineering::PathSampleStatus::stale;
+        }
+    }, "inspection path is stale");
+    admission_for_stale_package([](auto& authoring) {
+        authoring.derived_products.front().status =
+            carto::engineering::DerivedProductStatus::stale;
+        authoring.derived_products.front().stale_reason = "source revision changed";
+    }, "derived engineering product 701 is stale");
+
     auto local_source_path = fixture.value();
     const char windows_separator = '\\';
     local_source_path.sources.front().locator = std::string("C:") + windows_separator +

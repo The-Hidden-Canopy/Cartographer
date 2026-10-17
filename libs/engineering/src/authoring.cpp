@@ -1620,6 +1620,22 @@ core::Result<InspectionPackage> InspectionPackage::publish(
     std::string project_namespace) {
     if (auto result = authoring.validate(); !result) return core::Result<InspectionPackage>::failure(result.error());
     if (project_revision.exhausted() || project_namespace != authoring.project_namespace) return core::Result<InspectionPackage>::failure(invalid("inspection publication project identity is invalid"));
+    if (authoring.path.has_value() &&
+        (authoring.path->status == DerivedProductStatus::stale ||
+         std::any_of(authoring.path->samples.begin(), authoring.path->samples.end(),
+             [](const PathSample& sample) {
+                 return sample.status == PathSampleStatus::stale;
+             }))) {
+        return core::Result<InspectionPackage>::failure(stale(
+            "publication is blocked by a stale inspection path"));
+    }
+    if (std::any_of(authoring.derived_products.begin(), authoring.derived_products.end(),
+            [](const DerivedProductState& product) {
+                return product.status == DerivedProductStatus::stale;
+            })) {
+        return core::Result<InspectionPackage>::failure(stale(
+            "publication is blocked by a stale derived engineering product"));
+    }
     for (const auto& requirement : authoring.requirements) {
         if (!requirement.enabled) continue;
         if (requirement.extraction == ExtractionState::stale) {
@@ -1668,6 +1684,20 @@ core::Result<VantaAdmissionResult> admit_for_vanta(const InspectionPackage& pack
     for (const auto& source : authoring.value().sources) if (source.lossy) result.reasons.push_back("source " + std::to_string(source.id) + " declares lossy import");
     for (const auto& line : authoring.value().bom) if (line.reconciliation == ReconciliationStatus::ambiguous || line.reconciliation == ReconciliationStatus::unresolved) result.reasons.push_back("BOM line " + std::to_string(line.id) + " is unresolved");
     for (const auto& target : authoring.value().targets) if (target.status == TargetStatus::stale) result.reasons.push_back("target " + std::to_string(target.id) + " is stale");
+    if (authoring.value().path.has_value() &&
+        (authoring.value().path->status == DerivedProductStatus::stale ||
+         std::any_of(authoring.value().path->samples.begin(),
+             authoring.value().path->samples.end(), [](const PathSample& sample) {
+                 return sample.status == PathSampleStatus::stale;
+             }))) {
+        result.reasons.push_back("inspection path is stale");
+    }
+    for (const auto& product : authoring.value().derived_products) {
+        if (product.status == DerivedProductStatus::stale) {
+            result.reasons.push_back(
+                "derived engineering product " + std::to_string(product.id) + " is stale");
+        }
+    }
     if (authoring.value().workcell->active_tool_frame.empty()) result.reasons.push_back("active tool frame is missing");
     if (!result.reasons.empty()) { result.status = VantaAdmissionStatus::refuse; } else { result.status = VantaAdmissionStatus::admit; }
     if (auto valid_result = result.validate(); !valid_result) return core::Result<VantaAdmissionResult>::failure(valid_result.error());
