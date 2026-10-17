@@ -330,6 +330,22 @@ struct EngineeringAuthoringView {
         bool human_authored = false;
     };
     std::vector<Target> targets;
+    struct BomLine {
+        std::uint64_t id = 0U;
+        std::uint64_t source_id = 0U;
+        std::string part_number;
+        std::string revision;
+        std::string description;
+        std::string material;
+        double quantity = 0.0;
+        std::string unit;
+        std::optional<std::uint64_t> mapped_part_id;
+        std::string mapped_revision;
+        std::string mapped_material;
+        std::optional<double> assembly_quantity;
+        std::string reconciliation;
+    };
+    std::vector<BomLine> bom;
     bool stale = false;
     bool workcell_present = false;
     bool path_present = false;
@@ -688,6 +704,12 @@ struct DuplicateMeshInstanceAction {
 
 struct ImportEngineeringFixtureAction {};
 struct ImportEngineeringAuthoringAction { std::string serialized_document; };
+struct ImportEngineeringBomCsvAction {
+    core::Revision expected_project_revision;
+    core::Revision expected_authoring_revision;
+    std::string locator;
+    std::string csv_bytes;
+};
 struct CreateEngineeringRequirementAction {
     core::Revision expected_project_revision;
     core::Revision expected_authoring_revision;
@@ -839,6 +861,7 @@ using ApplicationAction = std::variant<
     DuplicateMeshInstanceAction,
     ImportEngineeringFixtureAction,
     ImportEngineeringAuthoringAction,
+    ImportEngineeringBomCsvAction,
     CreateEngineeringRequirementAction,
     ReviewEngineeringTargetAction,
     InvalidateEngineeringSourceAction,
@@ -1040,6 +1063,8 @@ private:
     [[nodiscard]] core::Result<DispatchReceipt> import_engineering_fixture();
     [[nodiscard]] core::Result<DispatchReceipt> import_engineering_authoring(
         const ImportEngineeringAuthoringAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> import_engineering_bom_csv(
+        const ImportEngineeringBomCsvAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_engineering_requirement(
         const CreateEngineeringRequirementAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> review_engineering_target(

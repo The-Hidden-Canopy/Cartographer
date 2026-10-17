@@ -10,7 +10,31 @@ characteristic, requirement, and source topology are current can be accepted
 or rejected. Rejected candidates remain in the authoring record. Requirement
 records keep their source text, acceptance rule, source identity, and topology
 identity; they do not replace imported or extracted claims. The workspace also
-exports an admitted `.carto-inspection` package when its publication gates pass.
+imports a bounded BOM CSV profile and displays source-to-assembly reconciliation
+rows before it exports an admitted `.carto-inspection` package when publication
+gates pass.
+
+## BOM CSV profile
+
+The Engineering workspace accepts a UTF-8 CSV with this exact header order:
+`part_number,revision,description,material,quantity,unit`. It supports quoted
+commas and escaped quotes, caps input at 4 MiB and rows at the authoring
+collection limit, and rejects malformed quoting, extra or missing columns,
+blank rows, non-finite quantities, and non-positive quantities. The source
+revision is the SHA-256 of the exact file bytes; no supplier revision is
+inferred. Re-importing changed bytes creates a new source snapshot and marks
+the prior snapshot's reconciliation unresolved while preserving its source
+digest and BOM rows.
+
+Reconciliation matches only an exact engineering part external ID. Duplicate
+IDs remain ambiguous; missing part IDs remain source-only; omitted placed
+parts remain assembly-only. Revision, material, or quantity conflicts are
+preserved in the imported source values and the workspace shows those values
+alongside the mapped assembly values; the status reports the primary
+discrepancy. Quantity comparison is enabled only for `each` and a bounded,
+unambiguous occurrence hierarchy; unknown units, missing material, or
+cyclic/deep occurrence hierarchies remain unresolved. The importer does not
+perform fuzzy matching or unit conversion.
 
 ## Import and runtime boundary
 
@@ -33,7 +57,8 @@ The acceptance tests cover deterministic fixture round-trip, provenance,
 tamper rejection, stale-source invalidation, schema-version fencing, project
 save/reopen, undo/redo, UI publication, revision-bound manual requirement
 authoring, revision-bound accept/reject decisions, AI-proposal rejection,
-invalid source/topology/unit and stale-revision rejection, and explicit
-refusal to fake a CAD import. A newly authored requirement is not
+invalid source/topology/unit and stale-revision rejection, strict BOM CSV
+parsing, source-preserving BOM re-import, ambiguous/missing reconciliation,
+invalidated BOM evidence, and explicit refusal to fake a CAD import. A newly authored requirement is not
 publication-ready by itself: package publication still requires its linked
 inspection characteristics and all other package gates.

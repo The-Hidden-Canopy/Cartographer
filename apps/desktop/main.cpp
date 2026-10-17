@@ -972,6 +972,7 @@ enum class FileDialogKind {
     agent_demonstration_recipe,
     engineering,
     engineering_authoring,
+    engineering_bom_csv,
     condition,
     condition_authoring,
     audio_clip,
@@ -1067,6 +1068,10 @@ enum class StandardMeshExport {
             L"Cartographer Engineering Authoring (*.carto-engineering-authoring)\0"
             L"*.carto-engineering-authoring\0All Files\0*.*\0";
         dialog.lpstrDefExt = L"carto-engineering-authoring";
+        break;
+    case FileDialogKind::engineering_bom_csv:
+        dialog.lpstrFilter = L"Engineering BOM CSV (*.csv)\0*.csv\0All Files\0*.*\0";
+        dialog.lpstrDefExt = L"csv";
         break;
     case FileDialogKind::condition:
         dialog.lpstrFilter =
@@ -2083,6 +2088,22 @@ struct DesktopState {
         action_feedback = "Imported validated engineering authoring from " +
             path->filename().string() + " (" +
             std::to_string(snapshot.engineering.source_count) + " sources).";
+        action_feedback_error = false;
+    }
+
+    void import_engineering_bom_csv() {
+        const auto path = choose_file(false, FileDialogKind::engineering_bom_csv);
+        if (!path.has_value()) return;
+        const auto imported = ui.import_engineering_bom_csv(*path);
+        if (!imported) {
+            action_feedback = imported.error().message;
+            action_feedback_error = true;
+            return;
+        }
+        const auto snapshot = ui.snapshot();
+        action_feedback = "Imported and reconciled BOM source " +
+            path->filename().string() + " into " +
+            std::to_string(snapshot.engineering.bom_count) + " source and reconciliation rows.";
         action_feedback_error = false;
     }
 
@@ -9027,6 +9048,51 @@ struct DesktopState {
                         engineering.derived_product_count,
                         engineering.workcell_present ? "Workcell bound" : "Workcell missing");
             if (engineering.path_present) ImGui::TextDisabled("Inspection path record present");
+            ImGui::SeparatorText("BOM source reconciliation");
+            if (engineering.bom.empty()) {
+                ImGui::TextDisabled("No BOM rows are present.");
+            } else {
+                const bool bom_visible = ImGui::BeginChild(
+                    "Engineering BOM reconciliation", ImVec2(0, 136), true);
+                if (bom_visible) {
+                    ImGuiListClipper clipper;
+                    clipper.Begin(static_cast<int>(engineering.bom.size()), 52.0F);
+                    while (clipper.Step()) {
+                        for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
+                            const auto& line = engineering.bom[static_cast<std::size_t>(index)];
+                            const std::string line_id = std::to_string(line.id);
+                            ImGui::PushID(line_id.c_str());
+                            ImGui::Text("%s · %s rev %s · material %s · %.4g %s · source %llu",
+                                line.reconciliation.c_str(), line.part_number.c_str(),
+                                line.revision.c_str(),
+                                line.material.empty() ? "(unspecified)" : line.material.c_str(),
+                                line.quantity, line.unit.c_str(),
+                                static_cast<unsigned long long>(line.source_id));
+                            if (line.mapped_part_id.has_value()) {
+                                if (line.assembly_quantity.has_value()) {
+                                    ImGui::TextDisabled(
+                                        "Assembly part %llu · rev %s · material %s · quantity %.4g",
+                                        static_cast<unsigned long long>(*line.mapped_part_id),
+                                        line.mapped_revision.c_str(), line.mapped_material.c_str(),
+                                        *line.assembly_quantity);
+                                } else {
+                                    ImGui::TextDisabled(
+                                        "Assembly part %llu · rev %s · material %s · quantity unresolved",
+                                        static_cast<unsigned long long>(*line.mapped_part_id),
+                                        line.mapped_revision.c_str(), line.mapped_material.c_str());
+                                }
+                            } else {
+                                ImGui::TextDisabled("No unique assembly part mapping.");
+                            }
+                            ImGui::PopID();
+                        }
+                    }
+                }
+                ImGui::EndChild();
+            }
+            if (ImGui::Button("Import BOM CSV...", ImVec2(-1, 28))) {
+                import_engineering_bom_csv();
+            }
             ImGui::SeparatorText("Inspection target review");
             if (engineering.targets.empty()) {
                 ImGui::TextDisabled("No inspection targets are authored.");

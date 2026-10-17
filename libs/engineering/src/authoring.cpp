@@ -1,7 +1,9 @@
 #include <carto/engineering/authoring.hpp>
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
+#include <functional>
 #include <iomanip>
 #include <initializer_list>
 #include <limits>
@@ -38,6 +40,50 @@ bool safe_text(std::string_view value, bool allow_empty = false, std::size_t max
     return std::all_of(value.begin(), value.end(), [](unsigned char byte) {
         return byte >= 0x20U && byte != 0x7fU && byte != '\r' && byte != '\n';
     });
+}
+
+bool valid_utf8(std::string_view value) {
+    const auto byte_at = [&value](std::size_t index) {
+        return static_cast<unsigned char>(value[index]);
+    };
+    const auto continuation = [&byte_at, &value](std::size_t index) {
+        return index < value.size() && byte_at(index) >= 0x80U && byte_at(index) <= 0xbfU;
+    };
+    for (std::size_t index = 0U; index < value.size();) {
+        const unsigned char first = byte_at(index);
+        if (first <= 0x7fU) {
+            ++index;
+        } else if (first >= 0xc2U && first <= 0xdfU && continuation(index + 1U)) {
+            index += 2U;
+        } else if (first == 0xe0U && index + 2U < value.size() &&
+                   byte_at(index + 1U) >= 0xa0U && byte_at(index + 1U) <= 0xbfU &&
+                   continuation(index + 2U)) {
+            index += 3U;
+        } else if (((first >= 0xe1U && first <= 0xecU) ||
+                    (first >= 0xeeU && first <= 0xefU)) &&
+                   continuation(index + 1U) && continuation(index + 2U)) {
+            index += 3U;
+        } else if (first == 0xedU && index + 2U < value.size() &&
+                   byte_at(index + 1U) >= 0x80U && byte_at(index + 1U) <= 0x9fU &&
+                   continuation(index + 2U)) {
+            index += 3U;
+        } else if (first == 0xf0U && index + 3U < value.size() &&
+                   byte_at(index + 1U) >= 0x90U && byte_at(index + 1U) <= 0xbfU &&
+                   continuation(index + 2U) && continuation(index + 3U)) {
+            index += 4U;
+        } else if (first >= 0xf1U && first <= 0xf3U &&
+                   continuation(index + 1U) && continuation(index + 2U) &&
+                   continuation(index + 3U)) {
+            index += 4U;
+        } else if (first == 0xf4U && index + 3U < value.size() &&
+                   byte_at(index + 1U) >= 0x80U && byte_at(index + 1U) <= 0x8fU &&
+                   continuation(index + 2U) && continuation(index + 3U)) {
+            index += 4U;
+        } else {
+            return false;
+        }
+    }
+    return true;
 }
 
 assets::Sha256Digest digest_text(std::string_view value) {
@@ -784,6 +830,11 @@ core::Result<void> AuthoringDocument::invalidate_source(
     source->revision = std::move(new_revision);
     source->digest = new_digest;
     source->diagnostics.push_back("source revision changed; dependent authored bindings require reconciliation");
+    if (source->kind == SourceKind::bom) {
+        for (auto& line : bom) {
+            if (line.source_id == source_id) line.reconciliation = ReconciliationStatus::unresolved;
+        }
+    }
     for (auto& requirement : requirements) {
         if (requirement.provenance.source_id == source_id) requirement.extraction = ExtractionState::stale;
     }
@@ -793,6 +844,298 @@ core::Result<void> AuthoringDocument::invalidate_source(
     for (auto& product : derived_products) { product.status = DerivedProductStatus::stale; product.stale_reason = "engineering source revision changed"; }
     project_revision = project_revision.next();
     return validate();
+}
+
+core::Result<std::vector<EngineeringBomLine>> parse_bom_csv(
+    std::string_view bytes, Id source_id, Id first_line_id) {
+    if (bytes.empty() || bytes.size() > kMaxBomCsvBytes || source_id == 0U ||
+        first_line_id == 0U) {
+        return core::Result<std::vector<EngineeringBomLine>>::failure(invalid(
+            "BOM CSV must be non-empty, bounded, and bound to non-zero identities"));
+    }
+    if (!valid_utf8(bytes)) {
+        return core::Result<std::vector<EngineeringBomLine>>::failure(parse_error(
+            "BOM CSV must contain valid UTF-8 text"));
+    }
+    if (bytes.starts_with("\xef\xbb\xbf")) bytes.remove_prefix(3U);
+
+    std::vector<std::vector<std::string>> rows;
+    std::vector<std::string> fields;
+    std::string field;
+    bool quoted = false;
+    bool quote_closed = false;
+    bool row_has_content = false;
+    const auto finish_field = [&]() {
+        fields.push_back(std::move(field));
+        field.clear();
+        quote_closed = false;
+    };
+    const auto finish_row = [&]() -> bool {
+        finish_field();
+        if (fields.empty() || (fields.size() == 1U && fields.front().empty())) return false;
+        rows.push_back(std::move(fields));
+        fields.clear();
+        row_has_content = false;
+        return rows.size() <= AuthoringDocument::kMaxCollectionEntries + 1U;
+    };
+
+    for (std::size_t index = 0U; index < bytes.size(); ++index) {
+        const char byte = bytes[index];
+        if (quoted) {
+            if (byte == '"') {
+                if (index + 1U < bytes.size() && bytes[index + 1U] == '"') {
+                    field.push_back('"');
+                    ++index;
+                } else {
+                    quoted = false;
+                    quote_closed = true;
+                }
+            } else if (byte == '\r' || byte == '\n') {
+                return core::Result<std::vector<EngineeringBomLine>>::failure(parse_error(
+                    "BOM CSV fields cannot contain line breaks"));
+            } else {
+                field.push_back(byte);
+            }
+            row_has_content = true;
+            continue;
+        }
+
+        if (quote_closed) {
+            if (byte == ',') {
+                finish_field();
+                row_has_content = true;
+                continue;
+            }
+            if (byte == '\r' || byte == '\n') {
+                if (!finish_row()) {
+                    return core::Result<std::vector<EngineeringBomLine>>::failure(parse_error(
+                        "BOM CSV contains a blank or oversized row"));
+                }
+                if (byte == '\r' && index + 1U < bytes.size() && bytes[index + 1U] == '\n') {
+                    ++index;
+                }
+                continue;
+            }
+            return core::Result<std::vector<EngineeringBomLine>>::failure(parse_error(
+                "BOM CSV contains data after a closing quote"));
+        }
+
+        if (byte == '"') {
+            if (!field.empty()) {
+                return core::Result<std::vector<EngineeringBomLine>>::failure(parse_error(
+                    "BOM CSV quote must begin a field"));
+            }
+            quoted = true;
+            row_has_content = true;
+        } else if (byte == ',') {
+            finish_field();
+            row_has_content = true;
+        } else if (byte == '\r' || byte == '\n') {
+            if (!finish_row()) {
+                return core::Result<std::vector<EngineeringBomLine>>::failure(parse_error(
+                    "BOM CSV contains a blank or oversized row"));
+            }
+            if (byte == '\r' && index + 1U < bytes.size() && bytes[index + 1U] == '\n') {
+                ++index;
+            }
+        } else {
+            field.push_back(byte);
+            row_has_content = true;
+        }
+    }
+    if (quoted) {
+        return core::Result<std::vector<EngineeringBomLine>>::failure(parse_error(
+            "BOM CSV ends inside a quoted field"));
+    }
+    if (row_has_content) {
+        if (!finish_row()) {
+            return core::Result<std::vector<EngineeringBomLine>>::failure(parse_error(
+                "BOM CSV contains a blank or oversized row"));
+        }
+    }
+    static const std::vector<std::string> expected_header{
+        "part_number", "revision", "description", "material", "quantity", "unit"};
+    if (rows.size() < 2U || rows.front() != expected_header) {
+        return core::Result<std::vector<EngineeringBomLine>>::failure(parse_error(
+            "BOM CSV header must be part_number,revision,description,material,quantity,unit"));
+    }
+    if (rows.size() - 1U > AuthoringDocument::kMaxCollectionEntries) {
+        return core::Result<std::vector<EngineeringBomLine>>::failure(parse_error(
+            "BOM CSV exceeds the engineering row limit"));
+    }
+
+    std::vector<EngineeringBomLine> result;
+    result.reserve(rows.size() - 1U);
+    for (std::size_t index = 1U; index < rows.size(); ++index) {
+        const auto& row = rows[index];
+        if (row.size() != expected_header.size() ||
+            index - 1U > std::numeric_limits<Id>::max() - first_line_id) {
+            return core::Result<std::vector<EngineeringBomLine>>::failure(parse_error(
+                "BOM CSV row has the wrong number of columns or exhausts line identities"));
+        }
+        EngineeringBomLine line;
+        line.id = first_line_id + static_cast<Id>(index - 1U);
+        line.part_number = row[0];
+        line.revision = row[1];
+        line.description = row[2];
+        line.material = row[3];
+        line.unit = row[5];
+        line.source_id = source_id;
+        line.reconciliation = ReconciliationStatus::unresolved;
+        const auto [end, error] = std::from_chars(
+            row[4].data(), row[4].data() + row[4].size(), line.quantity,
+            std::chars_format::general);
+        if (error != std::errc{} || end != row[4].data() + row[4].size() ||
+            !std::isfinite(line.quantity) || line.quantity <= 0.0) {
+            return core::Result<std::vector<EngineeringBomLine>>::failure(parse_error(
+                "BOM CSV quantity must be a finite positive decimal"));
+        }
+        if (auto valid = line.validate(); !valid) {
+            return core::Result<std::vector<EngineeringBomLine>>::failure(
+                valid.error().with_context("BOM CSV row " + std::to_string(index + 1U)));
+        }
+        result.push_back(std::move(line));
+    }
+    return core::Result<std::vector<EngineeringBomLine>>::success(std::move(result));
+}
+
+std::optional<double> assembly_quantity_for_part(
+    const AuthoringDocument& authoring, Id part_id) {
+    if (part_id == 0U || authoring.occurrences.empty()) return std::nullopt;
+    std::map<Id, const EngineeringOccurrence*> occurrences;
+    for (const auto& occurrence : authoring.occurrences) occurrences.emplace(occurrence.id, &occurrence);
+    std::map<Id, std::optional<long double>> memo;
+    std::set<Id> visiting;
+    std::function<std::optional<long double>(Id, std::size_t)> multiplier =
+        [&](Id id, std::size_t depth) -> std::optional<long double> {
+            if (const auto found = memo.find(id); found != memo.end()) return found->second;
+            const auto found = occurrences.find(id);
+            if (found == occurrences.end() || depth >= 256U || !visiting.insert(id).second) {
+                return std::nullopt;
+            }
+            const auto& occurrence = *found->second;
+            long double parent_multiplier = 1.0L;
+            if (occurrence.parent_id.has_value()) {
+                const auto parent = multiplier(*occurrence.parent_id, depth + 1U);
+                if (!parent.has_value()) {
+                    visiting.erase(id);
+                    memo[id] = std::nullopt;
+                    return std::nullopt;
+                }
+                parent_multiplier = *parent;
+            }
+            const long double value = parent_multiplier * occurrence.quantity;
+            visiting.erase(id);
+            if (!std::isfinite(value) || value > std::numeric_limits<double>::max()) {
+                memo[id] = std::nullopt;
+                return std::nullopt;
+            }
+            memo[id] = value;
+            return value;
+        };
+
+    long double total = 0.0L;
+    bool found_part = false;
+    for (const auto& occurrence : authoring.occurrences) {
+        if (occurrence.part_id != part_id) continue;
+        found_part = true;
+        const auto count = multiplier(occurrence.id, 0U);
+        if (!count.has_value()) return std::nullopt;
+        total += *count;
+        if (!std::isfinite(total) || total > std::numeric_limits<double>::max()) {
+            return std::nullopt;
+        }
+    }
+    if (!found_part || total <= 0.0L) return std::nullopt;
+    return static_cast<double>(total);
+}
+
+core::Result<std::vector<EngineeringBomLine>> reconcile_bom_lines(
+    const AuthoringDocument& authoring,
+    std::vector<EngineeringBomLine> imported_lines,
+    Id source_id,
+    Id first_line_id) {
+    if (auto valid = authoring.validate(); !valid) {
+        return core::Result<std::vector<EngineeringBomLine>>::failure(valid.error());
+    }
+    if (source_id == 0U || first_line_id == 0U || imported_lines.empty()) {
+        return core::Result<std::vector<EngineeringBomLine>>::failure(invalid(
+            "BOM reconciliation requires lines and non-zero source identities"));
+    }
+
+    std::set<std::string> imported_part_numbers;
+    for (auto& line : imported_lines) {
+        if (line.source_id != source_id) {
+            return core::Result<std::vector<EngineeringBomLine>>::failure(invalid(
+                "BOM reconciliation source does not match imported line provenance"));
+        }
+        imported_part_numbers.insert(line.part_number);
+        std::vector<const EngineeringPart*> matches;
+        for (const auto& part : authoring.parts) {
+            if (part.external_id == line.part_number) matches.push_back(&part);
+        }
+        line.mapped_part_id.reset();
+        if (matches.empty()) {
+            line.reconciliation = ReconciliationStatus::source_only;
+            continue;
+        }
+        if (matches.size() != 1U) {
+            line.reconciliation = ReconciliationStatus::ambiguous;
+            continue;
+        }
+        const auto& part = *matches.front();
+        line.mapped_part_id = part.id;
+        if (line.revision != part.revision) {
+            line.reconciliation = ReconciliationStatus::revision_mismatch;
+            continue;
+        }
+        if (!line.material.empty() && line.material != part.material) {
+            line.reconciliation = ReconciliationStatus::material_mismatch;
+            continue;
+        }
+        if (line.material.empty()) {
+            line.reconciliation = ReconciliationStatus::unresolved;
+            continue;
+        }
+        if (line.unit != "each") {
+            line.reconciliation = ReconciliationStatus::unresolved;
+            continue;
+        }
+        const auto assembly_quantity = assembly_quantity_for_part(authoring, part.id);
+        if (!assembly_quantity.has_value()) {
+            line.reconciliation = ReconciliationStatus::unresolved;
+            continue;
+        }
+        const double tolerance = std::max({1.0, std::abs(line.quantity),
+            std::abs(*assembly_quantity)}) * 1e-9;
+        line.reconciliation = std::abs(line.quantity - *assembly_quantity) <= tolerance
+            ? ReconciliationStatus::exact : ReconciliationStatus::quantity_mismatch;
+    }
+
+    std::vector<EngineeringBomLine> result = std::move(imported_lines);
+    for (const auto& part : authoring.parts) {
+        if (imported_part_numbers.contains(part.external_id)) continue;
+        const auto quantity = assembly_quantity_for_part(authoring, part.id);
+        if (!quantity.has_value()) continue;
+        if (result.size() >= AuthoringDocument::kMaxCollectionEntries ||
+            first_line_id > std::numeric_limits<Id>::max() - result.size()) {
+            return core::Result<std::vector<EngineeringBomLine>>::failure(invalid(
+                "BOM reconciliation exceeds the line identity or collection limit"));
+        }
+        EngineeringBomLine line;
+        line.id = first_line_id + static_cast<Id>(result.size());
+        line.part_number = part.external_id;
+        line.revision = part.revision;
+        line.description = part.name;
+        line.material = part.material;
+        line.quantity = *quantity;
+        line.unit = "each";
+        line.source_id = source_id;
+        line.mapped_part_id = part.id;
+        line.reconciliation = ReconciliationStatus::assembly_only;
+        result.push_back(std::move(line));
+    }
+    return core::Result<std::vector<EngineeringBomLine>>::success(std::move(result));
 }
 
 core::Result<void> InspectionPackage::validate() const {

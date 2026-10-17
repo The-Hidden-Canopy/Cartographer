@@ -558,6 +558,7 @@ bool is_operation_action(const application::ApplicationAction& action) {
             std::is_same_v<Action, application::SetObjectTransformAction> ||
             std::is_same_v<Action, application::ImportEngineeringFixtureAction> ||
             std::is_same_v<Action, application::ImportEngineeringAuthoringAction> ||
+            std::is_same_v<Action, application::ImportEngineeringBomCsvAction> ||
             std::is_same_v<Action, application::CreateEngineeringRequirementAction> ||
             std::is_same_v<Action, application::ReviewEngineeringTargetAction> ||
             std::is_same_v<Action, application::InvalidateEngineeringSourceAction> ||
@@ -4253,6 +4254,25 @@ core::Result<application::DispatchReceipt> UiController::import_engineering_auth
     if (!bytes) return core::Result<application::DispatchReceipt>::failure(bytes.error());
     return dispatch_with_category(
         application::ImportEngineeringAuthoringAction{std::move(bytes).value()},
+        OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::import_engineering_bom_csv(
+    const std::filesystem::path& path) {
+    auto bytes = read_bounded_file(path, engineering::kMaxBomCsvBytes,
+        "engineering BOM CSV");
+    if (!bytes) return core::Result<application::DispatchReceipt>::failure(bytes.error());
+    const auto snapshot = session_.snapshot();
+    if (!snapshot.engineering.present) {
+        return core::Result<application::DispatchReceipt>::failure(invalid(
+            "import the engineering authoring document before importing its BOM"));
+    }
+    return dispatch_with_category(
+        application::ImportEngineeringBomCsvAction{
+            snapshot.project_revision,
+            snapshot.engineering.authored_revision,
+            path.generic_string(),
+            std::move(bytes).value()},
         OperationCategory::provider);
 }
 

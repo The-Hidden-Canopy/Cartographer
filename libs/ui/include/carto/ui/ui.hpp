@@ -614,6 +614,8 @@ public:
     [[nodiscard]] core::Result<application::DispatchReceipt> import_engineering_fixture();
     [[nodiscard]] core::Result<application::DispatchReceipt> import_engineering_authoring(
         const std::filesystem::path& path);
+    [[nodiscard]] core::Result<application::DispatchReceipt> import_engineering_bom_csv(
+        const std::filesystem::path& path);
     [[nodiscard]] core::Result<void> export_engineering_authoring(
         const std::filesystem::path& path) const;
     [[nodiscard]] core::Result<application::DispatchReceipt> invalidate_engineering_source(

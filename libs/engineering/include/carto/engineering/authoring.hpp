@@ -312,6 +312,27 @@ public:
         Id source_id, std::string new_revision, assets::Sha256Digest new_digest);
 };
 
+inline constexpr std::size_t kMaxBomCsvBytes = 4U * 1024U * 1024U;
+
+// Parses the bounded Cartographer BOM CSV profile. The header order is fixed:
+// part_number,revision,description,material,quantity,unit.
+[[nodiscard]] core::Result<std::vector<EngineeringBomLine>> parse_bom_csv(
+    std::string_view bytes, Id source_id, Id first_line_id);
+
+// Reconciles only exact engineering external IDs. Unknown units, ambiguous IDs,
+// and unsupported occurrence hierarchies remain unresolved instead of being
+// guessed. Assembly-only rows are emitted so omissions remain visible.
+[[nodiscard]] core::Result<std::vector<EngineeringBomLine>> reconcile_bom_lines(
+    const AuthoringDocument& authoring,
+    std::vector<EngineeringBomLine> imported_lines,
+    Id source_id,
+    Id first_line_id);
+
+// Returns null when the part is absent, has no placed occurrence, or its
+// quantity cannot be established from the bounded occurrence hierarchy.
+[[nodiscard]] std::optional<double> assembly_quantity_for_part(
+    const AuthoringDocument& authoring, Id part_id);
+
 struct InspectionPackage final {
     static constexpr std::uint32_t kSchemaVersion = 1U;
     static constexpr std::size_t kMaxSerializedBytes = 48U * 1024U * 1024U;

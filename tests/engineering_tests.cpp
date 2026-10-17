@@ -56,6 +56,116 @@ void fixture_round_trips_with_identity_and_provenance() {
     REQUIRE(reopened.value().topology.at(0U).display_mesh_asset == 1000U);
 }
 
+void bom_csv_parser_and_reconciliation_fail_closed_on_ambiguous_evidence() {
+    const auto fixture = carto::engineering::make_dv012_fixture();
+    REQUIRE(fixture);
+    const std::string valid_csv =
+        "part_number,revision,description,material,quantity,unit\r\n"
+        "BRACKET-A17,C,\"Machined, bracket\",7075-T6,2,each\r\n"
+        "PIN-P04,B,\"Pin \"\"P04\"\"\",17-4PH,1,each\r\n";
+    const auto parsed = carto::engineering::parse_bom_csv(valid_csv, 3U, 900U);
+    REQUIRE(parsed);
+    REQUIRE(parsed.value().size() == 2U);
+    REQUIRE(parsed.value().front().description == "Machined, bracket");
+    REQUIRE(parsed.value().back().description == "Pin \"P04\"");
+    REQUIRE(parsed.value().front().id == 900U);
+    const auto reconciled = carto::engineering::reconcile_bom_lines(
+        fixture.value(), parsed.value(), 3U, 902U);
+    REQUIRE(reconciled);
+    REQUIRE(reconciled.value().size() == 2U);
+    REQUIRE(reconciled.value().at(0U).reconciliation ==
+        carto::engineering::ReconciliationStatus::exact);
+    REQUIRE(reconciled.value().at(1U).reconciliation ==
+        carto::engineering::ReconciliationStatus::exact);
+    REQUIRE(reconciled.value().at(0U).mapped_part_id == 10U);
+
+    const auto incomplete = carto::engineering::parse_bom_csv(
+        "part_number,revision,description,material,quantity,unit\n"
+        "BRACKET-A17,C,Bracket,7075-T6,2,each\n", 4U, 1000U);
+    REQUIRE(incomplete);
+    const auto with_assembly_only = carto::engineering::reconcile_bom_lines(
+        fixture.value(), incomplete.value(), 4U, 1001U);
+    REQUIRE(with_assembly_only);
+    REQUIRE(with_assembly_only.value().size() == 2U);
+    REQUIRE(with_assembly_only.value().at(1U).part_number == "PIN-P04");
+    REQUIRE(with_assembly_only.value().at(1U).reconciliation ==
+        carto::engineering::ReconciliationStatus::assembly_only);
+
+    const auto unknown_part = carto::engineering::parse_bom_csv(
+        "part_number,revision,description,material,quantity,unit\n"
+        "NOT-IN-ASSEMBLY,A,Unknown,,1,each\n", 5U, 1100U);
+    REQUIRE(unknown_part);
+    const auto source_only = carto::engineering::reconcile_bom_lines(
+        fixture.value(), unknown_part.value(), 5U, 1101U);
+    REQUIRE(source_only);
+    REQUIRE(source_only.value().front().reconciliation ==
+        carto::engineering::ReconciliationStatus::source_only);
+
+    auto duplicate_part = fixture.value();
+    duplicate_part.parts.push_back({12U, "BRACKET-A17", "Second bracket record", "C",
+        "7075-T6", std::nullopt, 1U});
+    REQUIRE(duplicate_part.validate());
+    const auto ambiguous = carto::engineering::reconcile_bom_lines(
+        duplicate_part, incomplete.value(), 4U, 1001U);
+    REQUIRE(ambiguous);
+    REQUIRE(ambiguous.value().front().reconciliation ==
+        carto::engineering::ReconciliationStatus::ambiguous);
+
+    const auto revision_mismatch = carto::engineering::parse_bom_csv(
+        "part_number,revision,description,material,quantity,unit\n"
+        "BRACKET-A17,D,Bracket,7075-T6,2,each\n", 6U, 1200U);
+    REQUIRE(revision_mismatch);
+    REQUIRE(carto::engineering::reconcile_bom_lines(
+        fixture.value(), revision_mismatch.value(), 6U, 1201U).value().front().reconciliation ==
+        carto::engineering::ReconciliationStatus::revision_mismatch);
+    const auto material_mismatch = carto::engineering::parse_bom_csv(
+        "part_number,revision,description,material,quantity,unit\n"
+        "BRACKET-A17,C,Bracket,6061-T6,2,each\n", 7U, 1300U);
+    REQUIRE(material_mismatch);
+    REQUIRE(carto::engineering::reconcile_bom_lines(
+        fixture.value(), material_mismatch.value(), 7U, 1301U).value().front().reconciliation ==
+        carto::engineering::ReconciliationStatus::material_mismatch);
+    const auto quantity_mismatch = carto::engineering::parse_bom_csv(
+        "part_number,revision,description,material,quantity,unit\n"
+        "BRACKET-A17,C,Bracket,7075-T6,3,each\n", 8U, 1400U);
+    REQUIRE(quantity_mismatch);
+    REQUIRE(carto::engineering::reconcile_bom_lines(
+        fixture.value(), quantity_mismatch.value(), 8U, 1401U).value().front().reconciliation ==
+        carto::engineering::ReconciliationStatus::quantity_mismatch);
+    const auto unsupported_unit = carto::engineering::parse_bom_csv(
+        "part_number,revision,description,material,quantity,unit\n"
+        "BRACKET-A17,C,Bracket,7075-T6,2,kg\n", 9U, 1500U);
+    REQUIRE(unsupported_unit);
+    REQUIRE(carto::engineering::reconcile_bom_lines(
+        fixture.value(), unsupported_unit.value(), 9U, 1501U).value().front().reconciliation ==
+        carto::engineering::ReconciliationStatus::unresolved);
+
+    REQUIRE(!carto::engineering::parse_bom_csv(
+        "part_number,description,revision,material,quantity,unit\n"
+        "BRACKET-A17,Bracket,C,7075-T6,2,each\n", 3U, 1U));
+    REQUIRE(!carto::engineering::parse_bom_csv(
+        "part_number,revision,description,material,quantity,unit\n"
+        "BRACKET-A17,C,\"unterminated,7075-T6,2,each\n", 3U, 1U));
+    REQUIRE(!carto::engineering::parse_bom_csv(
+        "part_number,revision,description,material,quantity,unit\n"
+        "BRACKET-A17,C,Bracket,7075-T6,NaN,each\n", 3U, 1U));
+    REQUIRE(!carto::engineering::parse_bom_csv(
+        "part_number,revision,description,material,quantity,unit\n"
+        "BRACKET-A17,C,Bracket,7075-T6,2,each,extra\n", 3U, 1U));
+    std::string invalid_utf8 =
+        "part_number,revision,description,material,quantity,unit\n"
+        "BRACKET-A17,C,Bracket,7075-T6,2,each\n";
+    invalid_utf8[invalid_utf8.find("Bracket")] = static_cast<char>(0xff);
+    REQUIRE(!carto::engineering::parse_bom_csv(invalid_utf8, 3U, 1U));
+    REQUIRE(!carto::engineering::parse_bom_csv(
+        std::string(carto::engineering::kMaxBomCsvBytes + 1U, 'x'), 3U, 1U));
+
+    auto cyclic_occurrences = fixture.value();
+    cyclic_occurrences.occurrences.at(0U).parent_id = 21U;
+    cyclic_occurrences.occurrences.at(1U).parent_id = 20U;
+    REQUIRE(!carto::engineering::assembly_quantity_for_part(cyclic_occurrences, 10U));
+}
+
 void publication_and_vanta_admission_bind_exact_bytes() {
     const auto fixture = carto::engineering::make_dv012_fixture();
     REQUIRE(fixture);
@@ -365,7 +475,7 @@ void application_wires_engineering_authoring_through_persistence_and_history() {
     const auto project_path = root / "dv012.carto";
     const auto saved = carto::application::HumanApplicationAccess::dispatch(
         session, carto::application::SaveProjectAction{project_path});
-    if (!saved) throw TestFailure(saved.error().message);
+    if (!saved) throw TestFailure(saved.error().message + " [" + project_path.string() + "]");
 
     std::ifstream project_stream(project_path, std::ios::binary);
     REQUIRE(project_stream.good());
@@ -439,6 +549,120 @@ void ui_exposes_engineering_workspace_and_immutable_publication() {
     const auto reopened = carto::engineering::InspectionPackage::deserialize(bytes);
     REQUIRE(reopened);
     REQUIRE(reopened.value().publication_digest == package.value().publication_digest);
+
+    std::error_code ignored;
+    std::filesystem::remove_all(root, ignored);
+}
+
+void ui_imports_bom_csv_through_revision_bound_journal_and_preserves_source_history() {
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto root = std::filesystem::temp_directory_path() /
+        ("cartographer-engineering-bom-io-" + std::to_string(stamp));
+    std::filesystem::create_directories(root);
+    const auto csv_path = root / "assembly-bom.csv";
+    const std::string initial_csv =
+        "part_number,revision,description,material,quantity,unit\n"
+        "BRACKET-A17,C,Bracket,7075-T6,2,each\n"
+        "PIN-P04,B,Pin,17-4PH,1,each\n";
+    {
+        std::ofstream stream(csv_path, std::ios::binary);
+        REQUIRE(stream.good());
+        stream << initial_csv;
+        REQUIRE(stream.good());
+    }
+
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.dispatch(carto::application::NewProjectAction{"BOM CSV import"}));
+    REQUIRE(ui.import_engineering_fixture());
+    const auto before = ui.snapshot();
+    const auto ai_action = carto::application::ImportEngineeringBomCsvAction{
+        before.project_revision, before.engineering.authored_revision,
+        csv_path.generic_string(), initial_csv};
+    REQUIRE(!ui.submit_ai_proposal(ai_action));
+    REQUIRE(ui.snapshot().project_revision == before.project_revision);
+
+    const auto imported = ui.import_engineering_bom_csv(csv_path);
+    REQUIRE(imported);
+    REQUIRE(imported.value().document_changed);
+    auto after = ui.snapshot();
+    REQUIRE(after.project_revision == before.project_revision.next());
+    REQUIRE(after.engineering.source_count == 3U);
+    REQUIRE(after.engineering.bom_count == 4U);
+    REQUIRE(after.engineering.bom.size() == 4U);
+    REQUIRE(after.engineering.bom.at(2U).source_id == 3U);
+    REQUIRE(after.engineering.bom.at(2U).reconciliation == "exact");
+    REQUIRE(after.engineering.bom.at(2U).mapped_part_id == 10U);
+    REQUIRE(after.engineering.bom.at(2U).assembly_quantity == 2.0);
+    REQUIRE(after.operations.back().category == carto::ui::OperationCategory::provider);
+    REQUIRE(after.operations.back().action == "Import and Reconcile Engineering BOM CSV");
+
+    const auto idempotent = ui.import_engineering_bom_csv(csv_path);
+    REQUIRE(idempotent);
+    REQUIRE(!idempotent.value().document_changed);
+    REQUIRE(ui.snapshot().project_revision == after.project_revision);
+
+    const auto stale = carto::application::HumanApplicationAccess::dispatch(
+        session, ai_action);
+    REQUIRE(!stale);
+    REQUIRE(session.snapshot().project_revision == after.project_revision);
+
+    const auto invalid_path = root / "invalid.csv";
+    {
+        std::ofstream stream(invalid_path, std::ios::binary);
+        REQUIRE(stream.good());
+        stream << "part_number,description,revision,material,quantity,unit\n"
+            "BRACKET-A17,Bracket,C,7075-T6,2,each\n";
+    }
+    const auto before_invalid = ui.snapshot();
+    REQUIRE(!ui.import_engineering_bom_csv(invalid_path));
+    REQUIRE(ui.snapshot().project_revision == before_invalid.project_revision);
+    REQUIRE(ui.snapshot().engineering.digest == before_invalid.engineering.digest);
+
+    const std::string replacement_csv =
+        "part_number,revision,description,material,quantity,unit\n"
+        "BRACKET-A17,C,Bracket,7075-T6,2,each\n"
+        "UNLISTED-PART,A,Unlisted,,1,each\n";
+    {
+        std::ofstream stream(csv_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(stream.good());
+        stream << replacement_csv;
+        REQUIRE(stream.good());
+    }
+    REQUIRE(ui.import_engineering_bom_csv(csv_path));
+    after = ui.snapshot();
+    REQUIRE(after.engineering.source_count == 4U);
+    REQUIRE(after.engineering.bom_count == 7U);
+    const auto old_rows = std::count_if(after.engineering.bom.begin(),
+        after.engineering.bom.end(), [](const auto& line) {
+            return line.source_id == 3U && line.reconciliation == "unresolved";
+        });
+    REQUIRE(old_rows == 2U);
+    REQUIRE(std::any_of(after.engineering.bom.begin(), after.engineering.bom.end(),
+        [](const auto& line) {
+            return line.source_id == 4U && line.reconciliation == "source-only";
+        }));
+    REQUIRE(std::any_of(after.engineering.bom.begin(), after.engineering.bom.end(),
+        [](const auto& line) {
+            return line.source_id == 4U && line.reconciliation == "assembly-only";
+        }));
+    REQUIRE(ui.dispatch(carto::application::UndoAction{}));
+    auto undone = ui.snapshot();
+    REQUIRE(undone.engineering.bom_count == 4U);
+    REQUIRE(std::all_of(undone.engineering.bom.begin(), undone.engineering.bom.end(),
+        [](const auto& line) {
+            return line.source_id != 3U || line.reconciliation == "exact";
+        }));
+    REQUIRE(ui.dispatch(carto::application::RedoAction{}));
+    REQUIRE(ui.snapshot().engineering.bom_count == 7U);
+
+    const auto project_path = root / "bom-import.carto";
+    REQUIRE(ui.dispatch(carto::application::SaveProjectAction{project_path}));
+    carto::application::ApplicationSession reopened;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        reopened, carto::application::OpenProjectAction{project_path}));
+    REQUIRE(reopened.snapshot().engineering.bom_count == 7U);
+    REQUIRE(reopened.snapshot().engineering.digest == ui.snapshot().engineering.digest);
 
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);
@@ -550,6 +774,15 @@ void source_invalidation_preserves_authored_records_and_stales_products() {
             carto::engineering::DerivedProductStatus::stale);
     REQUIRE(!carto::engineering::InspectionPackage::publish(
         fixture.value(), fixture.value().project_revision, fixture.value().project_namespace));
+
+    auto bom_source = carto::engineering::make_dv012_fixture();
+    REQUIRE(bom_source);
+    REQUIRE(bom_source.value().invalidate_source(2U, "D", digest("bom-revision-d")));
+    REQUIRE(std::all_of(bom_source.value().bom.begin(), bom_source.value().bom.end(),
+        [](const auto& line) {
+            return line.source_id != 2U || line.reconciliation ==
+                carto::engineering::ReconciliationStatus::unresolved;
+        }));
 }
 
 void step_boundary_never_fakes_a_cad_import() {
@@ -568,6 +801,7 @@ void step_boundary_never_fakes_a_cad_import() {
 int main() {
     try {
         fixture_round_trips_with_identity_and_provenance();
+        bom_csv_parser_and_reconciliation_fail_closed_on_ambiguous_evidence();
         publication_and_vanta_admission_bind_exact_bytes();
         manual_requirement_authoring_is_revision_bound_and_auditable();
         inspection_target_review_is_human_revision_bound_and_preserves_decisions();
@@ -575,6 +809,7 @@ int main() {
         step_boundary_never_fakes_a_cad_import();
         application_wires_engineering_authoring_through_persistence_and_history();
         ui_exposes_engineering_workspace_and_immutable_publication();
+        ui_imports_bom_csv_through_revision_bound_journal_and_preserves_source_history();
         ui_imports_exports_and_reconciles_engineering_authoring_files();
         std::cout << "engineering tests passed\n";
         return 0;

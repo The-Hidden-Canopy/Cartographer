@@ -1114,6 +1114,8 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return import_engineering_fixture();
             } else if constexpr (std::is_same_v<Action, ImportEngineeringAuthoringAction>) {
                 return import_engineering_authoring(value);
+            } else if constexpr (std::is_same_v<Action, ImportEngineeringBomCsvAction>) {
+                return import_engineering_bom_csv(value);
             } else if constexpr (std::is_same_v<Action, CreateEngineeringRequirementAction>) {
                 return create_engineering_requirement(value);
             } else if constexpr (std::is_same_v<Action, ReviewEngineeringTargetAction>) {
@@ -2891,6 +2893,145 @@ core::Result<DispatchReceipt> ApplicationSession::import_engineering_authoring(
         "Import Engineering Authoring Document");
 }
 
+core::Result<DispatchReceipt> ApplicationSession::import_engineering_bom_csv(
+    const ImportEngineeringBomCsvAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "engineering BOM import requires the explicit human command boundary"));
+    }
+    if (action.expected_project_revision != document_.revision()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "engineering BOM import was based on a stale project revision"));
+    }
+    if (action.locator.empty() || action.locator.size() > 4096U ||
+        action.csv_bytes.empty() || action.csv_bytes.size() > engineering::kMaxBomCsvBytes) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "engineering BOM import requires a source locator and bounded CSV bytes"));
+    }
+    const auto current = engineering_authoring();
+    if (!current) return failure(current.error().with_context("engineering BOM import"));
+    if (current.value().project_revision != action.expected_authoring_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "engineering BOM import was based on a stale authoring revision"));
+    }
+    if (current.value().project_revision.exhausted()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "engineering authoring revision space is exhausted"));
+    }
+
+    const auto source_digest = structure_digest(action.csv_bytes);
+    std::vector<const engineering::EngineeringSource*> same_locator;
+    for (const auto& source : current.value().sources) {
+        if (source.locator != action.locator) continue;
+        if (source.kind != engineering::SourceKind::bom) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "source locator is already bound to a non-BOM engineering source"));
+        }
+        same_locator.push_back(&source);
+    }
+    std::sort(same_locator.begin(), same_locator.end(), [](const auto* left, const auto* right) {
+        return left->id < right->id;
+    });
+    if (!same_locator.empty() && same_locator.back()->digest == source_digest &&
+        std::none_of(same_locator.back()->diagnostics.begin(),
+            same_locator.back()->diagnostics.end(), [](const std::string& diagnostic) {
+                return diagnostic.find("source revision changed") != std::string::npos;
+            })) {
+        return accepted("Import Engineering BOM CSV", document_.revision());
+    }
+
+    engineering::Id source_id = 1U;
+    for (const auto& source : current.value().sources) {
+        if (source.id == std::numeric_limits<engineering::Id>::max()) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "engineering source identity space is exhausted"));
+        }
+        source_id = std::max(source_id, source.id + 1U);
+    }
+    engineering::Id first_line_id = 1U;
+    for (const auto& line : current.value().bom) {
+        if (line.id == std::numeric_limits<engineering::Id>::max()) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "engineering BOM line identity space is exhausted"));
+        }
+        first_line_id = std::max(first_line_id, line.id + 1U);
+    }
+    const auto parsed = engineering::parse_bom_csv(
+        action.csv_bytes, source_id, first_line_id);
+    if (!parsed) return failure(parsed.error().with_context("engineering BOM CSV parse"));
+    if (parsed.value().size() > std::numeric_limits<engineering::Id>::max() - first_line_id) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "engineering BOM line identity space is exhausted"));
+    }
+    const auto reconciled = engineering::reconcile_bom_lines(
+        current.value(), parsed.value(), source_id,
+        first_line_id + static_cast<engineering::Id>(parsed.value().size()));
+    if (!reconciled) {
+        return failure(reconciled.error().with_context("engineering BOM reconciliation"));
+    }
+
+    auto updated = current.value();
+    for (const auto* previous : same_locator) {
+        auto mutable_previous = std::find_if(updated.sources.begin(), updated.sources.end(),
+            [previous](const auto& candidate) { return candidate.id == previous->id; });
+        const std::string supersession = "superseded by BOM source " +
+            std::to_string(source_id);
+        if (mutable_previous != updated.sources.end() &&
+            std::find(mutable_previous->diagnostics.begin(),
+                mutable_previous->diagnostics.end(), supersession) ==
+                    mutable_previous->diagnostics.end()) {
+            mutable_previous->diagnostics.push_back(supersession);
+        }
+        for (auto& line : updated.bom) {
+            if (line.source_id == previous->id) {
+                line.reconciliation = engineering::ReconciliationStatus::unresolved;
+            }
+        }
+    }
+
+    engineering::EngineeringSource source;
+    source.id = source_id;
+    source.kind = engineering::SourceKind::bom;
+    source.locator = action.locator;
+    source.revision = "content-sha256:" + source_digest.hex();
+    source.digest = source_digest;
+    source.provider_identity = "cartographer.bom-csv";
+    source.provider_version = "1.0.0";
+    source.import_settings_digest = structure_digest(
+        "cartographer.bom-csv.v1;header=part_number,revision,description,material,quantity,unit");
+    source.import_run_id = "bom-csv-" + source_digest.hex();
+    source.units = "source-defined";
+    source.diagnostics.push_back(
+        "content-addressed source revision; supplier revision was not inferred");
+    updated.sources.push_back(std::move(source));
+    updated.bom.insert(updated.bom.end(), reconciled.value().begin(), reconciled.value().end());
+    updated.project_revision = updated.project_revision.next();
+    if (auto valid = updated.validate(); !valid) {
+        return failure(valid.error().with_context("engineering BOM import"));
+    }
+    const std::string serialized = updated.serialize();
+    const auto digest = updated.canonical_digest();
+    if (!digest) return failure(digest.error().with_context("engineering BOM import digest"));
+    const auto before = document_.engineering_authoring();
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectEngineeringAuthoringCommand>(
+            admission,
+            document_,
+            before,
+            project::SerializedEngineeringAuthoring{serialized, digest.value()}),
+        "Import and Reconcile Engineering BOM CSV");
+}
+
 core::Result<DispatchReceipt> ApplicationSession::create_engineering_requirement(
     const CreateEngineeringRequirementAction& action) {
     const auto has_non_whitespace = [](std::string_view value) {
@@ -4159,6 +4300,38 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
                     binding.source_revision});
             }
             result.engineering.bom_count = authoring.bom.size();
+            result.engineering.bom.reserve(authoring.bom.size());
+            for (const auto& line : authoring.bom) {
+                EngineeringAuthoringView::BomLine projected{
+                    line.id,
+                    line.source_id,
+                    line.part_number,
+                    line.revision,
+                    line.description,
+                    line.material,
+                    line.quantity,
+                    line.unit,
+                    line.mapped_part_id,
+                    {},
+                    {},
+                    std::nullopt,
+                    engineering::reconciliation_status_name(line.reconciliation)};
+                if (line.mapped_part_id.has_value()) {
+                    const auto part = std::find_if(authoring.parts.begin(), authoring.parts.end(),
+                        [&line](const auto& candidate) {
+                            return candidate.id == *line.mapped_part_id;
+                        });
+                    if (part != authoring.parts.end()) {
+                        projected.mapped_revision = part->revision;
+                        projected.mapped_material = part->material;
+                        projected.assembly_quantity =
+                            engineering::assembly_quantity_for_part(authoring, part->id);
+                    }
+                }
+                result.engineering.bom.push_back(std::move(projected));
+            }
+            std::sort(result.engineering.bom.begin(), result.engineering.bom.end(),
+                [](const auto& left, const auto& right) { return left.id < right.id; });
             result.engineering.requirement_count = authoring.requirements.size();
             result.engineering.requirements.reserve(authoring.requirements.size());
             for (const auto& requirement : authoring.requirements) {
