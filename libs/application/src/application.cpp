@@ -1116,6 +1116,8 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return import_engineering_authoring(value);
             } else if constexpr (std::is_same_v<Action, CreateEngineeringRequirementAction>) {
                 return create_engineering_requirement(value);
+            } else if constexpr (std::is_same_v<Action, ReviewEngineeringTargetAction>) {
+                return review_engineering_target(value);
             } else if constexpr (std::is_same_v<Action, InvalidateEngineeringSourceAction>) {
                 return invalidate_engineering_source(value);
             } else if constexpr (std::is_same_v<Action, ImportConditionFixtureAction>) {
@@ -3049,6 +3051,126 @@ core::Result<DispatchReceipt> ApplicationSession::create_engineering_requirement
         "Create Manual Engineering Requirement");
 }
 
+core::Result<DispatchReceipt> ApplicationSession::review_engineering_target(
+    const ReviewEngineeringTargetAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "inspection target decisions require the explicit human command boundary"));
+    }
+    if (action.decision != engineering::TargetStatus::accepted &&
+        action.decision != engineering::TargetStatus::rejected) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "inspection target review can only accept or reject a proposed target"));
+    }
+    if (action.expected_project_revision != document_.revision()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "inspection target review was based on a stale project revision"));
+    }
+    if (action.target_id == 0U) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "inspection target review requires a non-zero target identity"));
+    }
+    const auto current = engineering_authoring();
+    if (!current) return failure(current.error().with_context(
+        "inspection target review"));
+    if (current.value().project_revision != action.expected_authoring_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "inspection target review was based on a stale authoring revision"));
+    }
+    if (current.value().project_revision.exhausted()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "engineering authoring revision space is exhausted"));
+    }
+    const auto target = std::find_if(current.value().targets.begin(),
+        current.value().targets.end(), [&action](const auto& candidate) {
+            return candidate.id == action.target_id;
+        });
+    if (target == current.value().targets.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "inspection target does not exist"));
+    }
+    if (target->status != engineering::TargetStatus::proposed) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "only proposed inspection targets can receive a human decision"));
+    }
+    const auto characteristic = std::find_if(current.value().characteristics.begin(),
+        current.value().characteristics.end(), [&target](const auto& candidate) {
+            return candidate.id == target->characteristic_id;
+        });
+    if (characteristic == current.value().characteristics.end() ||
+        characteristic->status != engineering::InspectionStatus::authored ||
+        std::find(characteristic->topology_ids.begin(), characteristic->topology_ids.end(),
+            target->source_topology_id) == characteristic->topology_ids.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "inspection target no longer matches an active characteristic topology binding"));
+    }
+    const auto requirement = std::find_if(current.value().requirements.begin(),
+        current.value().requirements.end(), [&characteristic](const auto& candidate) {
+            return candidate.id == characteristic->requirement_id;
+        });
+    if (requirement == current.value().requirements.end() || !requirement->enabled ||
+        requirement->extraction == engineering::ExtractionState::stale ||
+        requirement->extraction == engineering::ExtractionState::rejected ||
+        requirement->extraction == engineering::ExtractionState::machine_extracted_proposed ||
+        std::find(requirement->topology_ids.begin(), requirement->topology_ids.end(),
+            target->source_topology_id) == requirement->topology_ids.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "inspection target cannot be reviewed while its requirement is disabled, stale, or unverified"));
+    }
+    const auto topology = std::find_if(current.value().topology.begin(),
+        current.value().topology.end(), [&target](const auto& candidate) {
+            return candidate.id == target->source_topology_id;
+        });
+    if (topology == current.value().topology.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "inspection target source topology is unresolved"));
+    }
+    const auto source = std::find_if(current.value().sources.begin(),
+        current.value().sources.end(), [&topology](const auto& candidate) {
+            return candidate.id == topology->source_id;
+        });
+    if (source == current.value().sources.end() ||
+        topology->source_revision != source->revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "inspection target source topology is stale"));
+    }
+
+    auto updated = current.value();
+    const auto updated_target = std::find_if(updated.targets.begin(), updated.targets.end(),
+        [&action](const auto& candidate) { return candidate.id == action.target_id; });
+    updated_target->status = action.decision;
+    updated.project_revision = updated.project_revision.next();
+    if (auto valid = updated.validate(); !valid) {
+        return failure(valid.error().with_context("inspection target review"));
+    }
+    const std::string serialized = updated.serialize();
+    const auto digest = updated.canonical_digest();
+    if (!digest) return failure(digest.error().with_context(
+        "inspection target review digest"));
+    const auto before = document_.engineering_authoring();
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectEngineeringAuthoringCommand>(
+            admission,
+            document_,
+            before,
+            project::SerializedEngineeringAuthoring{serialized, digest.value()}),
+        action.decision == engineering::TargetStatus::accepted
+            ? "Accept Inspection Target" : "Reject Inspection Target");
+}
+
 core::Result<DispatchReceipt> ApplicationSession::invalidate_engineering_source(
     const InvalidateEngineeringSourceAction& action) {
     if (active_source_ != OperationSource::human) {
@@ -4056,6 +4178,19 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
             }
             result.engineering.characteristic_count = authoring.characteristics.size();
             result.engineering.target_count = authoring.targets.size();
+            result.engineering.targets.reserve(authoring.targets.size());
+            for (const auto& target : authoring.targets) {
+                result.engineering.targets.push_back(EngineeringAuthoringView::Target{
+                    target.id,
+                    target.characteristic_id,
+                    target.source_topology_id,
+                    engineering::target_status_name(target.status),
+                    target.generation_basis,
+                    target.standoff,
+                    target.human_authored});
+            }
+            std::sort(result.engineering.targets.begin(), result.engineering.targets.end(),
+                [](const auto& left, const auto& right) { return left.id < right.id; });
             result.engineering.derived_product_count = authoring.derived_products.size();
             result.engineering.stale =
                 std::any_of(authoring.requirements.begin(), authoring.requirements.end(),

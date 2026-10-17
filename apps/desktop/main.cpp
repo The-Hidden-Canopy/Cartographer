@@ -9027,6 +9027,53 @@ struct DesktopState {
                         engineering.derived_product_count,
                         engineering.workcell_present ? "Workcell bound" : "Workcell missing");
             if (engineering.path_present) ImGui::TextDisabled("Inspection path record present");
+            ImGui::SeparatorText("Inspection target review");
+            if (engineering.targets.empty()) {
+                ImGui::TextDisabled("No inspection targets are authored.");
+            } else {
+                const bool targets_visible = ImGui::BeginChild(
+                    "Engineering inspection targets", ImVec2(0, 170), true);
+                if (targets_visible) {
+                    ImGuiListClipper clipper;
+                    clipper.Begin(static_cast<int>(engineering.targets.size()), 72.0F);
+                    while (clipper.Step()) {
+                        for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
+                            const auto& target = engineering.targets[static_cast<std::size_t>(index)];
+                            const std::string target_id = std::to_string(target.id);
+                            ImGui::PushID(target_id.c_str());
+                            ImGui::Text("Target %llu · %s",
+                                static_cast<unsigned long long>(target.id), target.status.c_str());
+                            ImGui::TextDisabled("Characteristic %llu · topology %llu · %.4g standoff · %s",
+                                static_cast<unsigned long long>(target.characteristic_id),
+                                static_cast<unsigned long long>(target.source_topology_id),
+                                target.standoff,
+                                target.human_authored ? "human-authored" :
+                                    target.generation_basis.c_str());
+                            if (target.status == "proposed") {
+                                if (ImGui::SmallButton("Accept target")) {
+                                    static_cast<void>(dispatch(
+                                        carto::application::ReviewEngineeringTargetAction{
+                                            snapshot.project_revision,
+                                            engineering.authored_revision,
+                                            target.id,
+                                            carto::engineering::TargetStatus::accepted}));
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::SmallButton("Reject target")) {
+                                    static_cast<void>(dispatch(
+                                        carto::application::ReviewEngineeringTargetAction{
+                                            snapshot.project_revision,
+                                            engineering.authored_revision,
+                                            target.id,
+                                            carto::engineering::TargetStatus::rejected}));
+                                }
+                            }
+                            ImGui::PopID();
+                        }
+                    }
+                }
+                ImGui::EndChild();
+            }
             if (!engineering.digest.is_zero()) {
                 mono_text_disabled(("Authoring " + engineering.digest.hex()).c_str());
             }

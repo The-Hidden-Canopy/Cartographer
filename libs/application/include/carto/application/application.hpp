@@ -320,6 +320,16 @@ struct EngineeringAuthoringView {
         std::string acceptance_rule;
     };
     std::vector<Requirement> requirements;
+    struct Target {
+        std::uint64_t id = 0U;
+        std::uint64_t characteristic_id = 0U;
+        std::uint64_t source_topology_id = 0U;
+        std::string status;
+        std::string generation_basis;
+        double standoff = 0.0;
+        bool human_authored = false;
+    };
+    std::vector<Target> targets;
     bool stale = false;
     bool workcell_present = false;
     bool path_present = false;
@@ -694,6 +704,12 @@ struct CreateEngineeringRequirementAction {
     std::string original_text;
     std::string acceptance_rule;
 };
+struct ReviewEngineeringTargetAction {
+    core::Revision expected_project_revision;
+    core::Revision expected_authoring_revision;
+    std::uint64_t target_id = 0U;
+    engineering::TargetStatus decision = engineering::TargetStatus::proposed;
+};
 
 struct InvalidateEngineeringSourceAction {
     engineering::Id source_id = 0U;
@@ -824,6 +840,7 @@ using ApplicationAction = std::variant<
     ImportEngineeringFixtureAction,
     ImportEngineeringAuthoringAction,
     CreateEngineeringRequirementAction,
+    ReviewEngineeringTargetAction,
     InvalidateEngineeringSourceAction,
     ImportConditionFixtureAction,
     ImportConditionAuthoringAction,
@@ -1025,6 +1042,8 @@ private:
         const ImportEngineeringAuthoringAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_engineering_requirement(
         const CreateEngineeringRequirementAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> review_engineering_target(
+        const ReviewEngineeringTargetAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> invalidate_engineering_source(
         const InvalidateEngineeringSourceAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> import_condition_fixture();

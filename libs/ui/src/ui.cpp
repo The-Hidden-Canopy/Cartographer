@@ -559,6 +559,7 @@ bool is_operation_action(const application::ApplicationAction& action) {
             std::is_same_v<Action, application::ImportEngineeringFixtureAction> ||
             std::is_same_v<Action, application::ImportEngineeringAuthoringAction> ||
             std::is_same_v<Action, application::CreateEngineeringRequirementAction> ||
+            std::is_same_v<Action, application::ReviewEngineeringTargetAction> ||
             std::is_same_v<Action, application::InvalidateEngineeringSourceAction> ||
             std::is_same_v<Action, application::ImportConditionFixtureAction> ||
             std::is_same_v<Action, application::ImportConditionAuthoringAction> ||

@@ -4,6 +4,7 @@
 #include <carto/ui/ui.hpp>
 #include <carto/project/project.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -229,6 +230,111 @@ void manual_requirement_authoring_is_revision_bound_and_auditable() {
     stale_binding.expected_authoring_revision = session.snapshot().engineering.authored_revision;
     REQUIRE(!carto::application::HumanApplicationAccess::dispatch(session, stale_binding));
     REQUIRE(session.snapshot().engineering.stale);
+}
+
+void inspection_target_review_is_human_revision_bound_and_preserves_decisions() {
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::NewProjectAction{"Target Review"}));
+    auto fixture = carto::engineering::make_dv012_fixture();
+    REQUIRE(fixture);
+    fixture.value().project_revision = session.snapshot().project_revision.next();
+    fixture.value().targets.at(0U).status = carto::engineering::TargetStatus::proposed;
+    fixture.value().targets.at(1U).status = carto::engineering::TargetStatus::proposed;
+    fixture.value().targets.at(3U).status = carto::engineering::TargetStatus::proposed;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::ImportEngineeringAuthoringAction{
+            fixture.value().serialize()}));
+    carto::ui::UiController ui(session);
+
+    const auto before = session.snapshot();
+    carto::application::ReviewEngineeringTargetAction accept{
+        before.project_revision, before.engineering.authored_revision, 500U,
+        carto::engineering::TargetStatus::accepted};
+    REQUIRE(!ui.dispatch(carto::application::ReviewEngineeringTargetAction{
+        before.project_revision, before.engineering.authored_revision, 500U,
+        carto::engineering::TargetStatus::runtime_verified}));
+    REQUIRE(!ui.submit_ai_proposal(accept));
+    REQUIRE(session.snapshot().project_revision == before.project_revision);
+
+    const auto accepted = ui.dispatch(accept);
+    REQUIRE(accepted && accepted.value().document_changed);
+    REQUIRE(session.snapshot().project_revision == before.project_revision.next());
+    REQUIRE(session.snapshot().engineering.authored_revision ==
+        before.engineering.authored_revision.next());
+    const auto accepted_snapshot = session.snapshot();
+    const auto accepted_target = std::find_if(
+        accepted_snapshot.engineering.targets.begin(),
+        accepted_snapshot.engineering.targets.end(), [](const auto& target) {
+            return target.id == 500U;
+        });
+    REQUIRE(accepted_target != accepted_snapshot.engineering.targets.end());
+    REQUIRE(accepted_target->status == "accepted");
+    REQUIRE(!ui.snapshot().operations.empty());
+    REQUIRE(ui.snapshot().operations.back().action == "Accept Inspection Target");
+
+    auto stale = accept;
+    stale.decision = carto::engineering::TargetStatus::rejected;
+    REQUIRE(!ui.dispatch(stale));
+    REQUIRE(!ui.dispatch(carto::application::ReviewEngineeringTargetAction{
+        session.snapshot().project_revision,
+        session.snapshot().engineering.authored_revision,
+        500U, carto::engineering::TargetStatus::rejected}));
+    REQUIRE(session.snapshot().project_revision == before.project_revision.next());
+
+    const auto current = session.snapshot();
+    const auto rejected = ui.dispatch(carto::application::ReviewEngineeringTargetAction{
+        current.project_revision, current.engineering.authored_revision, 501U,
+        carto::engineering::TargetStatus::rejected});
+    REQUIRE(rejected && rejected.value().document_changed);
+    const auto rejected_snapshot = session.snapshot();
+    const auto rejected_target = std::find_if(
+        rejected_snapshot.engineering.targets.begin(),
+        rejected_snapshot.engineering.targets.end(), [](const auto& target) {
+            return target.id == 501U;
+        });
+    REQUIRE(rejected_target != rejected_snapshot.engineering.targets.end());
+    REQUIRE(rejected_target->status == "rejected");
+    REQUIRE(session.snapshot().engineering.target_count == 4U);
+    REQUIRE(ui.snapshot().operations.back().action == "Reject Inspection Target");
+
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::UndoAction{}));
+    const auto undone_snapshot = session.snapshot();
+    const auto undone_target = std::find_if(
+        undone_snapshot.engineering.targets.begin(),
+        undone_snapshot.engineering.targets.end(), [](const auto& target) {
+            return target.id == 501U;
+        });
+    REQUIRE(undone_target != undone_snapshot.engineering.targets.end());
+    REQUIRE(undone_target->status == "proposed");
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::RedoAction{}));
+    const auto redone_snapshot = session.snapshot();
+    const auto redone_target = std::find_if(
+        redone_snapshot.engineering.targets.begin(),
+        redone_snapshot.engineering.targets.end(), [](const auto& target) {
+            return target.id == 501U;
+        });
+    REQUIRE(redone_target != redone_snapshot.engineering.targets.end());
+    REQUIRE(redone_target->status == "rejected");
+
+    const auto before_invalidation = session.snapshot();
+    REQUIRE(ui.dispatch(carto::application::InvalidateEngineeringSourceAction{
+        1U, "DV012-rev-d", digest("dv012-rev-d")}));
+    const auto stale_snapshot = session.snapshot();
+    REQUIRE(stale_snapshot.project_revision == before_invalidation.project_revision.next());
+    const auto stale_target = std::find_if(
+        stale_snapshot.engineering.targets.begin(),
+        stale_snapshot.engineering.targets.end(), [](const auto& target) {
+            return target.id == 503U;
+        });
+    REQUIRE(stale_target != stale_snapshot.engineering.targets.end());
+    REQUIRE(stale_target->status == "stale");
+    REQUIRE(!ui.dispatch(carto::application::ReviewEngineeringTargetAction{
+        stale_snapshot.project_revision, stale_snapshot.engineering.authored_revision,
+        503U, carto::engineering::TargetStatus::accepted}));
+    REQUIRE(session.snapshot().project_revision == stale_snapshot.project_revision);
 }
 
 void application_wires_engineering_authoring_through_persistence_and_history() {
@@ -464,6 +570,7 @@ int main() {
         fixture_round_trips_with_identity_and_provenance();
         publication_and_vanta_admission_bind_exact_bytes();
         manual_requirement_authoring_is_revision_bound_and_auditable();
+        inspection_target_review_is_human_revision_bound_and_preserves_decisions();
         source_invalidation_preserves_authored_records_and_stales_products();
         step_boundary_never_fakes_a_cad_import();
         application_wires_engineering_authoring_through_persistence_and_history();
