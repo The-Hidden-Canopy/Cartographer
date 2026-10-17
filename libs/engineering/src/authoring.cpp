@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cctype>
 #include <cmath>
 #include <functional>
 #include <iomanip>
@@ -40,6 +41,39 @@ bool safe_text(std::string_view value, bool allow_empty = false, std::size_t max
     return std::all_of(value.begin(), value.end(), [](unsigned char byte) {
         return byte >= 0x20U && byte != 0x7fU && byte != '\r' && byte != '\n';
     });
+}
+
+bool contains_local_path_reference(std::string_view value) {
+    if (value.size() >= 5U && value[4U] == ':' &&
+        std::tolower(static_cast<unsigned char>(value[0U])) == 'f' &&
+        std::tolower(static_cast<unsigned char>(value[1U])) == 'i' &&
+        std::tolower(static_cast<unsigned char>(value[2U])) == 'l' &&
+        std::tolower(static_cast<unsigned char>(value[3U])) == 'e') return true;
+    const auto scheme_end = value.find("://");
+    if (scheme_end != std::string_view::npos) return false;
+    if (value.find_first_of("/\\") != std::string_view::npos) return true;
+    return value.size() >= 2U &&
+        std::isalpha(static_cast<unsigned char>(value[0U])) != 0 && value[1U] == ':';
+}
+
+bool contains_local_path_reference(const AuthoringDocument& authoring) {
+    for (const auto& source : authoring.sources) {
+        if (contains_local_path_reference(source.locator)) return true;
+    }
+    if (!authoring.workcell.has_value()) return false;
+    const auto& workcell = *authoring.workcell;
+    if (contains_local_path_reference(workcell.robot_source_identity) ||
+        contains_local_path_reference(workcell.robot_model_identity)) return true;
+    for (const auto& entity : workcell.entities) {
+        if (contains_local_path_reference(entity.source)) return true;
+    }
+    for (const auto& keep_out : workcell.keep_outs) {
+        if (contains_local_path_reference(keep_out.source)) return true;
+    }
+    for (const auto& frame : workcell.frames) {
+        if (contains_local_path_reference(frame.source)) return true;
+    }
+    return false;
 }
 
 bool valid_utf8(std::string_view value) {
@@ -1538,6 +1572,10 @@ core::Result<void> InspectionPackage::validate() const {
     if (!safe_text(project_namespace) || authoring_digest.is_zero() || authoring_bytes.empty() || authoring_bytes.size() > AuthoringDocument::kMaxSerializedBytes || !safe_text(publication_profile) || publication_digest.is_zero()) return core::Result<void>::failure(validation("inspection package header is malformed"));
     const auto authoring = AuthoringDocument::deserialize(authoring_bytes);
     if (!authoring) return core::Result<void>::failure(authoring.error().with_context("inspection package authoring"));
+    if (contains_local_path_reference(authoring.value())) {
+        return core::Result<void>::failure(validation(
+            "inspection package contains local filesystem path references"));
+    }
     const auto digest = authoring.value().canonical_digest();
     if (!digest || digest.value() != authoring_digest || authoring.value().project_namespace != project_namespace) return core::Result<void>::failure(validation("inspection package authoring digest or namespace does not match"));
     if (auto result = evidence.validate(); !result) return result;

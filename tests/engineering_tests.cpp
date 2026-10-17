@@ -227,6 +227,47 @@ void publication_and_vanta_admission_bind_exact_bytes() {
     REQUIRE(admission.value().admitted_authoring_digest == package.value().authoring_digest);
     REQUIRE(admission.value().admitted_publication_digest == package.value().publication_digest);
 
+    auto local_source_path = fixture.value();
+    const char windows_separator = '\\';
+    local_source_path.sources.front().locator = std::string("C:") + windows_separator +
+        "Users" + windows_separator + "operator" + windows_separator +
+        "source" + windows_separator + "assembly.step";
+    REQUIRE(local_source_path.validate());
+    REQUIRE(!carto::engineering::InspectionPackage::publish(
+        local_source_path, local_source_path.project_revision,
+        local_source_path.project_namespace));
+
+    auto local_posix_path = fixture.value();
+    local_posix_path.sources.front().locator =
+        std::string(1U, '/') + "home" + "/operator/source/assembly.step";
+    REQUIRE(local_posix_path.validate());
+    REQUIRE(!carto::engineering::InspectionPackage::publish(
+        local_posix_path, local_posix_path.project_revision,
+        local_posix_path.project_namespace));
+
+    auto local_workcell_path = fixture.value();
+    local_workcell_path.workcell->robot_source_identity =
+        std::string("file:///C:") + "/Users/operator/source/robot.urdf";
+    REQUIRE(local_workcell_path.validate());
+    REQUIRE(!carto::engineering::InspectionPackage::publish(
+        local_workcell_path, local_workcell_path.project_revision,
+        local_workcell_path.project_namespace));
+
+    auto external_uri = fixture.value();
+    external_uri.sources.front().locator = "https://engineering.example/assembly.step";
+    REQUIRE(carto::engineering::InspectionPackage::publish(
+        external_uri, external_uri.project_revision, external_uri.project_namespace));
+
+    auto rehashed_local_path_package = package.value();
+    auto disclosed_authoring = carto::engineering::AuthoringDocument::deserialize(
+        rehashed_local_path_package.authoring_bytes);
+    REQUIRE(disclosed_authoring);
+    disclosed_authoring.value().workcell->frames.front().source =
+        "\\\\private-server\\engineering\\datum-a.frame";
+    rehashed_local_path_package.authoring_bytes = disclosed_authoring.value().serialize();
+    REQUIRE(rehashed_local_path_package.refresh_digest());
+    REQUIRE(!rehashed_local_path_package.validate());
+
     auto tampered = reopened.value();
     tampered.authoring_bytes.push_back('x');
     REQUIRE(!tampered.validate());

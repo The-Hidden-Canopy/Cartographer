@@ -124,6 +124,11 @@ the public build has no connected CAD kernel.
 Inspection-package admission validates the public handoff contract; it does
 not prove robot reachability, collision safety, execution feasibility, or
 hardware behavior. Those checks remain with the consuming runtime.
+Package admission also refuses local filesystem paths in engineering source
+locators and workcell model/source references. Use a stable filename or
+non-local URI so workstation directory structure is not embedded in a
+published handoff. The local authoring project remains intact when publication
+is refused.
 
 ## Persistence and failure behavior
 
