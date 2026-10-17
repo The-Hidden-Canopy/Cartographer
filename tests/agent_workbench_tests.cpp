@@ -1,4 +1,5 @@
 #include <carto/agent/workbench.hpp>
+#include <carto/agent/scene_query.hpp>
 #include <carto/condition/authoring.hpp>
 #include <carto/geometry/primitives.hpp>
 #include <carto/journal/journal.hpp>
@@ -242,7 +243,7 @@ void skip_checkpoint_strings(const std::vector<std::string>& fields, std::size_t
 }
 
 std::vector<std::string> legacy_v3_fields_from_current(std::vector<std::string> fields) {
-    REQUIRE(fields.size() > 10U && fields[0] == "10");
+    REQUIRE(fields.size() > 10U && fields[0] == "11");
     fields[0] = "8";
     fields.pop_back(); // Version 8 stores ghost anchors and recompute receipts in an extension.
     fields[0] = "7";
@@ -2381,6 +2382,111 @@ void prepared_checkpoint_requires_explicit_resume_before_native_execution() {
     REQUIRE(source.snapshot().project_revision == base_revision);
 }
 
+void checkpoint_resume_preserves_consumed_scene_query_budget() {
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 1U);
+    auto condition = carto::condition::make_condition_fixture();
+    REQUIRE(condition);
+    condition.value().project_revision = source.snapshot().project_revision.next();
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        source, carto::application::ImportConditionAuthoringAction{
+            condition.value().serialize()}));
+    auto plan = plan_for(source.snapshot(), objects, {
+        {"step-1", {objects.front(), carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    auto envelope = envelope_for(objects);
+    envelope.max_scene_queries = 1U;
+    auto task = carto::agent::AgentTask::begin(source, plan, envelope);
+    REQUIRE(task);
+    const auto first_query = carto::agent::SceneQuery::execute(task.value(), {
+        carto::agent::ConditionAssetInventoryQuery{objects.front()}, 8U});
+    REQUIRE(first_query);
+    const auto first_budget = task.value().snapshot().query_budget;
+    REQUIRE(first_budget.queries_used == 1U);
+    REQUIRE(first_budget.objects_examined > 0U);
+    REQUIRE(first_budget.topology_elements_examined > 0U);
+    REQUIRE(first_budget.semantic_records_examined > 0U);
+    REQUIRE(first_budget.result_bytes > 0U);
+
+    TempDirectory directory;
+    const auto path = directory.path() / "query-budget.carto-agent-task";
+    REQUIRE(task.value().save_checkpoint(path));
+    const auto checkpoint = carto::agent::AgentTask::load_checkpoint(path);
+    REQUIRE(checkpoint);
+    REQUIRE(checkpoint.value().query_budget.queries_used == first_budget.queries_used);
+    REQUIRE(checkpoint.value().query_budget.objects_examined == first_budget.objects_examined);
+    REQUIRE(checkpoint.value().query_budget.topology_elements_examined ==
+        first_budget.topology_elements_examined);
+    REQUIRE(checkpoint.value().query_budget.semantic_records_examined ==
+        first_budget.semantic_records_examined);
+    REQUIRE(checkpoint.value().query_budget.result_bytes == first_budget.result_bytes);
+    const auto encoded = checkpoint.value().serialize();
+    REQUIRE(encoded);
+
+    constexpr std::string_view checkpoint_magic =
+        "CARTOGRAPHER_AGENT_TASK_CHECKPOINT_V1\n";
+    const std::size_t body_length_end = encoded.value().find(':', checkpoint_magic.size());
+    REQUIRE(body_length_end != std::string::npos);
+    const auto body_length = static_cast<std::size_t>(std::stoull(
+        encoded.value().substr(checkpoint_magic.size(), body_length_end - checkpoint_magic.size())));
+    const auto body_begin = body_length_end + 1U;
+    auto legacy_fields = checkpoint_fields(
+        std::string_view(encoded.value()).substr(body_begin, body_length));
+    REQUIRE(legacy_fields.size() > 1U && legacy_fields[0] == "11");
+    auto extension_fields = checkpoint_fields(legacy_fields.back());
+    REQUIRE(extension_fields.size() >= 6U && extension_fields[0] == "2");
+    extension_fields[0] = "1";
+    extension_fields.erase(extension_fields.end() - 5, extension_fields.end());
+    legacy_fields.back() = checkpoint_body(extension_fields);
+    legacy_fields[0] = "10";
+    const auto legacy_body = checkpoint_body(legacy_fields);
+    const auto legacy_digest = carto::assets::sha256(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(legacy_body.data()), legacy_body.size()));
+    const auto field = [](std::string_view value) {
+        return std::to_string(value.size()) + ":" + std::string(value) + "|";
+    };
+    const std::string legacy_v10 = std::string(checkpoint_magic) +
+        field(legacy_body) + field(legacy_digest.hex());
+    const auto decoded_v10 = carto::agent::AgentTaskCheckpoint::deserialize(legacy_v10);
+    REQUIRE(decoded_v10);
+    REQUIRE(decoded_v10.value().query_budget.queries_used == 0U);
+
+    auto overused_checkpoint = checkpoint.value();
+    overused_checkpoint.query_budget.queries_used = 2U;
+    REQUIRE(!overused_checkpoint.validate());
+    REQUIRE(!overused_checkpoint.serialize());
+    overused_checkpoint = checkpoint.value();
+    overused_checkpoint.query_budget.objects_examined =
+        overused_checkpoint.query_budget.max_objects_examined + 1U;
+    REQUIRE(!overused_checkpoint.validate());
+    overused_checkpoint = checkpoint.value();
+    overused_checkpoint.query_budget.topology_elements_examined =
+        overused_checkpoint.query_budget.max_topology_elements_examined + 1U;
+    REQUIRE(!overused_checkpoint.validate());
+    overused_checkpoint = checkpoint.value();
+    overused_checkpoint.query_budget.semantic_records_examined =
+        overused_checkpoint.query_budget.max_semantic_records_examined + 1U;
+    REQUIRE(!overused_checkpoint.validate());
+    overused_checkpoint = checkpoint.value();
+    overused_checkpoint.query_budget.result_bytes =
+        overused_checkpoint.query_budget.max_result_bytes + 1U;
+    REQUIRE(!overused_checkpoint.validate());
+    auto resumed = carto::agent::AgentTask::resume_checkpoint(
+        source, checkpoint.value(), checkpoint.value().plan);
+    REQUIRE(resumed);
+    const auto resumed_budget = resumed.value().snapshot().query_budget;
+    REQUIRE(resumed_budget.queries_used == first_budget.queries_used);
+    REQUIRE(resumed_budget.objects_examined == first_budget.objects_examined);
+    REQUIRE(resumed_budget.topology_elements_examined == first_budget.topology_elements_examined);
+    REQUIRE(resumed_budget.semantic_records_examined == first_budget.semantic_records_examined);
+    REQUIRE(resumed_budget.result_bytes == first_budget.result_bytes);
+    const auto second_query = carto::agent::SceneQuery::execute(resumed.value(), {
+        carto::agent::ConditionAssetInventoryQuery{objects.front()}, 8U});
+    REQUIRE(!second_query);
+    REQUIRE(resumed.value().snapshot().query_budget.queries_used == first_budget.queries_used);
+    REQUIRE(source.snapshot().project_revision == task.value().snapshot().base_revision);
+}
+
 void persistent_checkpoint_rejects_corruption_and_overwrite() {
     carto::application::ApplicationSession source;
     const auto objects = create_boxes(source, 1U);
@@ -2437,7 +2543,7 @@ void persistent_checkpoint_v1_format_remains_readable() {
         return std::to_string(value.size()) + ":" + std::string(value) + "|";
     };
     auto v4_fields = checkpoint_fields(current_body);
-    REQUIRE(v4_fields.size() > 13U && v4_fields[0] == "10");
+    REQUIRE(v4_fields.size() > 13U && v4_fields[0] == "11");
     v4_fields[0] = "8";
     v4_fields.pop_back();
     v4_fields[0] = "7";
@@ -5339,7 +5445,7 @@ void ui_ghost_corrections_are_scoped_revalidated_and_checkpointed() {
     const std::size_t body_begin = body_length_end + 1U;
     auto legacy_v5_fields = checkpoint_fields(
         legacy_encoding.value().substr(body_begin, body_length));
-    REQUIRE(legacy_v5_fields[0] == "10");
+    REQUIRE(legacy_v5_fields[0] == "11");
     legacy_v5_fields.pop_back();
     legacy_v5_fields[0] = "7";
     REQUIRE(legacy_v5_fields[0] == "7");
@@ -6778,6 +6884,7 @@ int main() {
         checkpoint_rebase_blocks_changed_task_write_targets();
         checkpoint_rebase_reports_and_executes_only_the_affected_dag_branch();
         prepared_checkpoint_requires_explicit_resume_before_native_execution();
+        checkpoint_resume_preserves_consumed_scene_query_budget();
         persistent_checkpoint_rejects_corruption_and_overwrite();
         persistent_checkpoint_v1_format_remains_readable();
         ui_persistent_checkpoint_round_trip_preserves_human_boundary();

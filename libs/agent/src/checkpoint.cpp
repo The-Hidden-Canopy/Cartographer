@@ -821,6 +821,16 @@ core::Result<void> AgentTaskCheckpoint::validate() const {
     }
     if (auto result = plan.validate(); !result) return result;
     if (auto result = envelope.validate(); !result) return result;
+    if (query_budget.queries_used > envelope.max_scene_queries ||
+        query_budget.objects_examined > envelope.max_objects_examined ||
+        query_budget.topology_elements_examined >
+            envelope.max_topology_elements_examined ||
+        query_budget.semantic_records_examined >
+            envelope.max_semantic_records_examined ||
+        query_budget.result_bytes > envelope.max_query_result_bytes) {
+        return core::Result<void>::failure(malformed(
+            "checkpoint scene-query budget usage is invalid or exceeds its envelope"));
+    }
     if (const auto* recipe = find_agent_recipe(plan.objective.recipe_id);
         recipe != nullptr &&
         (envelope.max_topology_operations > recipe->max_topology_operations ||
@@ -1225,7 +1235,7 @@ core::Result<std::string> AgentTaskCheckpoint::serialize() const {
     }
     payload.field(last_validation_report);
     Writer extension;
-    extension.number(1U);
+    extension.number(2U);
     extension.number(envelope.max_ghost_recomputations);
     extension.number(ghost_corrections.size());
     for (const auto& correction : ghost_corrections) {
@@ -1238,6 +1248,11 @@ core::Result<std::string> AgentTaskCheckpoint::serialize() const {
     for (const auto& recompute : ghost_recomputes) {
         write_ghost_recompute(extension, recompute);
     }
+    extension.number(query_budget.queries_used);
+    extension.number(query_budget.objects_examined);
+    extension.number(query_budget.topology_elements_examined);
+    extension.number(query_budget.semantic_records_examined);
+    extension.number(query_budget.result_bytes);
     payload.field(std::move(extension).take());
     auto body = std::move(payload).take();
     Writer outer;
@@ -1286,6 +1301,13 @@ core::Result<AgentTaskCheckpoint> AgentTaskCheckpoint::deserialize(std::string_v
     checkpoint.speculative_project = reader.field(kMaxProjectBytes);
     checkpoint.plan = read_plan(reader, version);
     checkpoint.envelope = read_envelope(reader, version);
+    checkpoint.query_budget.max_queries = checkpoint.envelope.max_scene_queries;
+    checkpoint.query_budget.max_objects_examined = checkpoint.envelope.max_objects_examined;
+    checkpoint.query_budget.max_topology_elements_examined =
+        checkpoint.envelope.max_topology_elements_examined;
+    checkpoint.query_budget.max_semantic_records_examined =
+        checkpoint.envelope.max_semantic_records_examined;
+    checkpoint.query_budget.max_result_bytes = checkpoint.envelope.max_query_result_bytes;
     if (!reader.good()) {
         return core::Result<AgentTaskCheckpoint>::failure(malformed(
             "checkpoint plan or work envelope: " + reader.error().message));
@@ -1327,7 +1349,9 @@ core::Result<AgentTaskCheckpoint> AgentTaskCheckpoint::deserialize(std::string_v
     if (version >= 8U) {
         const std::string extension_bytes = reader.field(kMaxCheckpointBytes);
         Reader extension(extension_bytes);
-        if (extension.number() != 1U) {
+        const auto extension_version = extension.number();
+        const auto expected_extension_version = version >= 11U ? 2U : 1U;
+        if (extension_version != expected_extension_version) {
             extension.fail("checkpoint workbench extension version is unsupported");
         }
         checkpoint.envelope.max_ghost_recomputations = extension.count(16U);
@@ -1346,6 +1370,18 @@ core::Result<AgentTaskCheckpoint> AgentTaskCheckpoint::deserialize(std::string_v
         checkpoint.ghost_recomputes.reserve(recompute_count);
         for (std::size_t index = 0U; index < recompute_count; ++index) {
             checkpoint.ghost_recomputes.push_back(read_ghost_recompute(extension));
+        }
+        if (version >= 11U) {
+            checkpoint.query_budget.queries_used = extension.count(
+                checkpoint.query_budget.max_queries);
+            checkpoint.query_budget.objects_examined = extension.count(
+                checkpoint.query_budget.max_objects_examined);
+            checkpoint.query_budget.topology_elements_examined = extension.count(
+                checkpoint.query_budget.max_topology_elements_examined);
+            checkpoint.query_budget.semantic_records_examined = extension.count(
+                checkpoint.query_budget.max_semantic_records_examined);
+            checkpoint.query_budget.result_bytes = extension.count(
+                checkpoint.query_budget.max_result_bytes);
         }
         if (!extension.good()) {
             return core::Result<AgentTaskCheckpoint>::failure(malformed(

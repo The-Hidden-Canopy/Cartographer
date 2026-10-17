@@ -5150,6 +5150,7 @@ core::Result<void> AgentTask::save_checkpoint(
         question.human_receipt.reset();
     }
     checkpoint.envelope = envelope_;
+    checkpoint.query_budget = query_budget_;
     checkpoint.provider_identity = std::move(provider_identity);
     checkpoint.source_revision = base_document_.revision();
     checkpoint.plan_context_digest = plan_context.value();
@@ -5304,6 +5305,14 @@ core::Result<AgentTask> AgentTask::resume_checkpoint(
 
     auto resumed = begin(source, std::move(reauthorized_plan), checkpoint.envelope);
     if (!resumed) return resumed;
+    resumed.value().query_budget_.queries_used = checkpoint.query_budget.queries_used;
+    resumed.value().query_budget_.objects_examined =
+        checkpoint.query_budget.objects_examined;
+    resumed.value().query_budget_.topology_elements_examined =
+        checkpoint.query_budget.topology_elements_examined;
+    resumed.value().query_budget_.semantic_records_examined =
+        checkpoint.query_budget.semantic_records_examined;
+    resumed.value().query_budget_.result_bytes = checkpoint.query_budget.result_bytes;
     resumed.value().repairs_ = checkpoint.repair_lineage;
     resumed.value().rebases_ = checkpoint.rebase_lineage;
     resumed.value().ghost_corrections_ = checkpoint.ghost_corrections;

@@ -697,7 +697,7 @@ struct AgentDemonstrationRecipe {
 // resumed task can run. Project bytes remain artifacts owned by this record;
 // they are never applied to the live source by loading a checkpoint.
 struct AgentTaskCheckpoint {
-    static constexpr std::uint32_t kFormatVersion = 10U;
+    static constexpr std::uint32_t kFormatVersion = 11U;
 
     TaskStatus status = TaskStatus::prepared;
     AgentPlan plan;
@@ -717,6 +717,7 @@ struct AgentTaskCheckpoint {
     std::vector<GhostCorrectionReceipt> ghost_corrections;
     std::vector<AgentGhostRecomputeReceipt> ghost_recomputes;
     std::string last_validation_report;
+    SceneQueryBudget query_budget;
 
     [[nodiscard]] core::Result<void> validate() const;
     [[nodiscard]] core::Result<std::string> serialize() const;
