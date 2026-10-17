@@ -2277,6 +2277,41 @@ void engineering_path_projection_preserves_xz_order_and_is_bounded() {
     REQUIRE(projected.value().minimum_z == 5.0);
     REQUIRE(projected.value().maximum_z == 9.0);
 
+    carto::application::EngineeringAuthoringView::Workcell workcell;
+    workcell.entities.push_back({
+        7U, "robot-base", "Robot Base", {},
+        {{5.0, 0.0, 7.0}, carto::core::Quaternion::identity(),
+            {1.0, 1.0, 1.0}}, true, true});
+    const double half_turn = std::sqrt(0.5);
+    workcell.keep_outs.push_back({
+        8U, "box", "fixture envelope", {},
+        {{2.0, 0.0, 3.0}, {0.0, half_turn, 0.0, half_turn},
+            {1.0, 1.0, 1.0}},
+        {4.0, 2.0, 6.0}, true});
+    workcell.keep_outs.push_back({
+        9U, "box", "disabled fixture", {},
+        {{500.0, 0.0, 500.0}, carto::core::Quaternion::identity(),
+            {1.0, 1.0, 1.0}},
+        {2.0, 2.0, 2.0}, false});
+    const auto contextual = carto::ui::project_engineering_path_xz(path, &workcell);
+    REQUIRE(contextual);
+    REQUIRE(contextual.value().workcell_markers.size() == 1U);
+    REQUIRE(contextual.value().workcell_markers.front().reference_frame);
+    REQUIRE(contextual.value().keep_outs.size() == 1U);
+    REQUIRE(contextual.value().keep_outs.front().id == 8U);
+    REQUIRE(std::abs(contextual.value().keep_outs.front().minimum_x + 1.0) < 1.0e-9);
+    REQUIRE(std::abs(contextual.value().keep_outs.front().maximum_x - 5.0) < 1.0e-9);
+    REQUIRE(std::abs(contextual.value().keep_outs.front().minimum_z - 1.0) < 1.0e-9);
+    REQUIRE(std::abs(contextual.value().keep_outs.front().maximum_z - 5.0) < 1.0e-9);
+    REQUIRE(std::abs(contextual.value().minimum_x + 1.0) < 1.0e-9);
+    REQUIRE(std::abs(contextual.value().maximum_x - 5.0) < 1.0e-9);
+    REQUIRE(std::abs(contextual.value().minimum_z - 1.0) < 1.0e-9);
+    REQUIRE(std::abs(contextual.value().maximum_z - 9.0) < 1.0e-9);
+
+    workcell.keep_outs.front().dimensions.x =
+        std::numeric_limits<double>::quiet_NaN();
+    REQUIRE(!carto::ui::project_engineering_path_xz(path, &workcell));
+
     Path dense;
     dense.samples.reserve(carto::ui::kMaxEngineeringPathProjectionPoints + 1U);
     for (std::size_t index = 0U;

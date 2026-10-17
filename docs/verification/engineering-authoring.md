@@ -70,12 +70,13 @@ establish robot reachability or collision results.
 When a stored path record exists, the workspace lists its sample coordinate,
 reported status, target status, and clearance value, with the recorded tool
 pose available for inspection. It also draws a bounded top-down X/Z projection
-that preserves sample order and target references; dense results are decimated
-to 2,048 displayed points while preserving the first and last sample. This is a
-pose-only view in the authored workcell frame: it omits workcell geometry and
-does not compute reachability, collision, clearance, or execution feasibility.
-The panel does not generate paths or interpret unverified samples as runtime
-receipts.
+that preserves sample order and target references, marks enabled workcell
+frames/entities, and outlines projected keep-out bounds. Rotated keep-outs are
+shown as conservative bounding envelopes; robot, fixture, and sensor meshes
+are omitted. Dense results are decimated to 2,048 displayed points while
+preserving the first and last sample. This view does not compute reachability,
+collision, clearance, or execution feasibility. The panel does not generate
+paths or interpret unverified samples as runtime receipts.
 
 ## BOM CSV profile
 
@@ -179,7 +180,8 @@ parsing, source-preserving BOM re-import, ambiguous/missing reconciliation,
 invalidated BOM evidence, requirement-kind compatibility, missing/contradictory
 access constraints, stale source/topology refusal, proposed-target authoring,
 workcell-frame revision checks, read-only X/Z path projection, sample-order
-and target-link preservation, dense-path decimation and invalid-coordinate
+and target-link preservation, bounded rotated keep-out envelopes, disabled
+workcell-record filtering, dense-path decimation and invalid-coordinate
 refusal, revisioned
 entity and keep-out edits,
 workcell-history migration and round-trip, journal undo/redo, explicit keep-out

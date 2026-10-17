@@ -788,6 +788,7 @@ struct WorkbenchState {
     bool ledger_collapsed = true;
     carto::ui::WorkbenchPreferences persisted;
     std::array<bool, carto::ui::kWorkbenchInstrumentCount> seeded{};
+    std::array<bool, carto::ui::kWorkbenchPaneCount> panes_seeded{};
 };
 
 [[nodiscard]] std::size_t workbench_index(carto::ui::WorkbenchInstrument instrument) noexcept {
@@ -1507,8 +1508,7 @@ struct DesktopState {
     std::optional<std::uint64_t> selected_operation_id;
     std::unique_ptr<carto::production::PreparationJob> preparation_job;
 
-    static constexpr float kWorkbenchRackWidth = 148.0F;
-    static constexpr float kWorkbenchSnapDistance = 18.0F;
+    static constexpr float kWorkbenchRackWidth = 220.0F;
     static constexpr float kWorkbenchPlacementMargin = 12.0F;
 
     DesktopState() : ui(session) {}
@@ -1715,6 +1715,13 @@ struct DesktopState {
             MessageBoxW(window, wide(result.error().message).c_str(),
                         L"Cartographer workbench layout unavailable", MB_OK | MB_ICONWARNING);
         }
+    }
+
+    void reset_workbench_layout() {
+        workbench = WorkbenchState{};
+        workbench.ledger_collapsed = workbench.persisted.ledger_collapsed;
+        workbench_flow = WorkbenchFlow::focus;
+        workbench_bounds_valid = false;
     }
 
     void compose_workbench_flow(WorkbenchFlow flow) {
@@ -3823,9 +3830,8 @@ struct DesktopState {
 
     void draw_navigation_rail(const UiSnapshot& snapshot) {
         const float available_width = ImGui::GetContentRegionAvail().x;
-        const bool narrow = available_width < 760.0F;
-        const float rail_width = narrow ? 72.0F : available_width < 980.0F ? 184.0F : 232.0F;
-        ImGui::BeginChild("ProductRail", ImVec2(rail_width, 0), true);
+        const bool narrow = available_width < 150.0F;
+        ImGui::BeginChild("ProductRail", ImVec2(0, 0), true);
         if (narrow) {
             draw_brand_mark(snapshot, 34.0F);
             ImGui::TextDisabled("Carto");
@@ -3925,7 +3931,7 @@ struct DesktopState {
     }
 
     void draw_tool_rack(const UiSnapshot& snapshot) {
-        ImGui::BeginChild("ToolRack", ImVec2(kWorkbenchRackWidth, 0), true);
+        ImGui::BeginChild("ToolRack", ImVec2(0, 0), true);
         heading_text_colored(snapshot.colors.accent_primary, "Tool rack");
         ImGui::Dummy(ImVec2(0, 4));
         rack_button(snapshot, "Scene", workbench.scene);
@@ -3940,7 +3946,7 @@ struct DesktopState {
     }
 
     void draw_bay_rack(const UiSnapshot& snapshot) {
-        ImGui::BeginChild("InstrumentBay", ImVec2(kWorkbenchRackWidth, 0), true);
+        ImGui::BeginChild("InstrumentBay", ImVec2(0, 0), true);
         heading_text_colored(snapshot.colors.accent_secondary, "Instrument bay");
         ImGui::Dummy(ImVec2(0, 4));
         rack_button(snapshot, "Inspect", workbench.inspector);
@@ -4015,7 +4021,7 @@ struct DesktopState {
             grip_origin + ImVec2(0.0F, 1.0F), grip_origin + ImVec2(grip_extent.x, 5.0F),
             ImGui::ColorConvertFloat4ToU32(grip_color), 2.0F);
         ImGui::EndChild();
-        ImGui::TextDisabled("Drag to reposition · resize · snap to a rack");
+        ImGui::TextDisabled("Drag to reposition · resize · close to hide");
         return true;
     }
 
@@ -4056,98 +4062,64 @@ struct DesktopState {
             std::clamp(position.y, minimum.y, maximum.y));
     }
 
-    void magnetize_instrument(carto::ui::WorkbenchInstrument instrument,
-                              ImVec2 position, ImVec2 size) {
-        const float gap = ImGui::GetStyle().ItemSpacing.x;
-        const ImGuiViewport* viewport = ImGui::GetMainViewport();
-        std::optional<ImVec2> best_position;
-        float best_distance = std::numeric_limits<float>::max();
-        const auto consider = [&](ImVec2 candidate) {
-            const float dx = std::abs(position.x - candidate.x);
-            const float dy = std::abs(position.y - candidate.y);
-            if (dx > kWorkbenchSnapDistance || dy > kWorkbenchSnapDistance) return;
-            const float distance = dx * dx + dy * dy;
-            if (distance < best_distance) {
-                best_distance = distance;
-                best_position = candidate;
-            }
-        };
-
-        // Keep a panel recoverable after a display resize or a stale preference
-        // file, then make the workbench edges behave like a physical frame.
-        const float margin = kWorkbenchPlacementMargin;
-        consider(ImVec2(viewport->WorkPos.x + margin, position.y));
-        consider(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - size.x - margin, position.y));
-        consider(ImVec2(position.x, viewport->WorkPos.y + margin));
-        consider(ImVec2(position.x, viewport->WorkPos.y + viewport->WorkSize.y - size.y - margin));
-        if (workbench_bounds_valid) {
-            consider(ImVec2(workbench_origin.x + gap, position.y));
-            consider(ImVec2(workbench_origin.x + workbench_extent.x - size.x - gap, position.y));
-            consider(ImVec2(position.x, workbench_origin.y + gap));
-            consider(ImVec2(position.x, workbench_origin.y + workbench_extent.y - size.y - gap));
-        }
-
-        for (std::size_t index = 0U; index < carto::ui::kWorkbenchInstrumentCount; ++index) {
-            const auto other = static_cast<carto::ui::WorkbenchInstrument>(index);
-            if (other == instrument || !workbench_visible(workbench, other)) continue;
-            const auto& layout = workbench.persisted.instruments[index];
-            if (!layout.positioned) continue;
-            const ImVec2 other_position = viewport->WorkPos + ImVec2(
-                static_cast<float>(layout.x), static_cast<float>(layout.y));
-            const ImVec2 other_size(static_cast<float>(layout.width),
-                                    static_cast<float>(layout.height));
-            consider(ImVec2(other_position.x + other_size.x + gap, other_position.y));
-            consider(ImVec2(other_position.x - size.x - gap, other_position.y));
-            consider(ImVec2(other_position.x, other_position.y + other_size.y + gap));
-            consider(ImVec2(other_position.x, other_position.y - size.y - gap));
-            // Also align shared edges without forcing the panels to touch.
-            consider(ImVec2(other_position.x, position.y));
-            consider(ImVec2(other_position.x + other_size.x - size.x, position.y));
-            consider(ImVec2(position.x, other_position.y));
-            consider(ImVec2(position.x, other_position.y + other_size.y - size.y));
-        }
-        const ImVec2 settled = clamp_instrument_position(
-            best_position.value_or(position), size);
-        if (std::abs(settled.x - position.x) > 0.5F ||
-            std::abs(settled.y - position.y) > 0.5F) {
-            ImGui::SetWindowPos(settled);
-        }
-    }
-
-    void settle_instrument(carto::ui::WorkbenchInstrument instrument, bool& open) {
-        if (!ImGui::IsMouseReleased(ImGuiMouseButton_Left) ||
-            !ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)) return;
-        const ImVec2 position = ImGui::GetWindowPos();
-        const ImVec2 size = ImGui::GetWindowSize();
-        const ImVec2 rack_gap(ImGui::GetStyle().ItemSpacing.x, ImGui::GetStyle().ItemSpacing.y);
-        const ImRect left_rack(
-            ImVec2(workbench_origin.x - kWorkbenchRackWidth - rack_gap.x, workbench_origin.y),
-            ImVec2(workbench_origin.x - rack_gap.x,
-                   workbench_origin.y + workbench_extent.y));
-        const ImRect right_rack(
-            ImVec2(workbench_origin.x + workbench_extent.x + rack_gap.x, workbench_origin.y),
-            ImVec2(workbench_origin.x + workbench_extent.x + rack_gap.x + kWorkbenchRackWidth,
-                   workbench_origin.y + workbench_extent.y));
-        const ImVec2 pointer = ImGui::GetIO().MousePos;
-        const bool dropped_on_rack = workbench_bounds_valid &&
-            (left_rack.Contains(pointer) || right_rack.Contains(pointer));
-        if (dropped_on_rack) {
-            open = false;
-            auto& layout = workbench.persisted.instruments.at(workbench_index(instrument));
-            layout.positioned = false;
-            layout.x = 0;
-            layout.y = 0;
-            layout.width = 0;
-            layout.height = 0;
-            workbench.seeded.at(workbench_index(instrument)) = false;
-            return;
-        }
-        magnetize_instrument(instrument, position, size);
-    }
-
     void end_instrument(carto::ui::WorkbenchInstrument instrument, bool& open) {
-        settle_instrument(instrument, open);
         if (open) capture_instrument_layout(instrument);
+        ImGui::End();
+    }
+
+    bool begin_workbench_pane(const UiSnapshot& snapshot,
+                              carto::ui::WorkbenchPane pane, const char* title,
+                              ImVec2 default_position, ImVec2 default_size) {
+        auto& layout = workbench.persisted.panes.at(static_cast<std::size_t>(pane));
+        if (!layout.visible) return false;
+        if (!workbench.panes_seeded.at(static_cast<std::size_t>(pane))) {
+            const ImGuiViewport* viewport = ImGui::GetMainViewport();
+            const ImVec2 requested_size = layout.positioned
+                ? ImVec2(static_cast<float>(layout.width), static_cast<float>(layout.height))
+                : default_size;
+            const ImVec2 requested_position = layout.positioned
+                ? viewport->WorkPos + ImVec2(static_cast<float>(layout.x),
+                                             static_cast<float>(layout.y))
+                : viewport->WorkPos + default_position;
+            ImGui::SetNextWindowPos(
+                clamp_instrument_position(requested_position, requested_size), ImGuiCond_Always);
+            ImGui::SetNextWindowSize(requested_size, ImGuiCond_Always);
+            workbench.panes_seeded.at(static_cast<std::size_t>(pane)) = true;
+        }
+        ImVec4 title_color = color(snapshot.colors.panel_1);
+        title_color.w = 0.96F;
+        ImGui::PushStyleColor(ImGuiCol_TitleBg, title_color);
+        ImGui::PushStyleColor(ImGuiCol_TitleBgActive, title_color);
+        const bool visible = ImGui::Begin(title, &layout.visible,
+                                          ImGuiWindowFlags_NoSavedSettings);
+        ImGui::PopStyleColor(2);
+        if (!visible) {
+            ImGui::End();
+            return false;
+        }
+        return true;
+    }
+
+    void capture_workbench_pane_layout(carto::ui::WorkbenchPane pane) {
+        auto& layout = workbench.persisted.panes.at(static_cast<std::size_t>(pane));
+        const ImGuiViewport* viewport = ImGui::GetMainViewport();
+        const ImVec2 position = ImGui::GetWindowPos() - viewport->WorkPos;
+        const ImVec2 size = ImGui::GetWindowSize();
+        if (!std::isfinite(position.x) || !std::isfinite(position.y) ||
+            !std::isfinite(size.x) || !std::isfinite(size.y)) return;
+        layout.positioned = true;
+        layout.x = static_cast<std::int32_t>(std::clamp<std::int64_t>(
+            static_cast<std::int64_t>(std::lround(position.x)), -65536, 65536));
+        layout.y = static_cast<std::int32_t>(std::clamp<std::int64_t>(
+            static_cast<std::int64_t>(std::lround(position.y)), -65536, 65536));
+        layout.width = static_cast<std::int32_t>(std::clamp<std::int64_t>(
+            static_cast<std::int64_t>(std::lround(size.x)), 120, 4096));
+        layout.height = static_cast<std::int32_t>(std::clamp<std::int64_t>(
+            static_cast<std::int64_t>(std::lround(size.y)), 80, 4096));
+    }
+
+    void end_workbench_pane(carto::ui::WorkbenchPane pane) {
+        capture_workbench_pane_layout(pane);
         ImGui::End();
     }
 
@@ -4213,7 +4185,6 @@ struct DesktopState {
     }
 
     void draw_workspace_bar(const UiSnapshot& snapshot) {
-        ImGui::BeginChild("WorkspaceBar", ImVec2(0, 52), true);
         for (const auto& definition : carto::ui::workspace_registry()) {
             const auto workspace = definition.workspace;
             const char* label = definition.label.c_str();
@@ -4247,7 +4218,6 @@ struct DesktopState {
                     ? carto::ui::OperatorMode::ai_first
                     : carto::ui::OperatorMode::person_first));
         }
-        ImGui::EndChild();
     }
 
     void draw_menu(const UiSnapshot& snapshot) {
@@ -4349,44 +4319,44 @@ struct DesktopState {
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("View")) {
-            if (ImGui::MenuItem("Scene instrument", nullptr, workbench.scene)) {
-                workbench.scene = !workbench.scene;
-                mark_custom_workbench();
-            }
-            if (ImGui::MenuItem("Assets instrument", nullptr, workbench.assets)) {
-                workbench.assets = !workbench.assets;
-                mark_custom_workbench();
-            }
-            if (ImGui::MenuItem("Tools instrument", nullptr, workbench.tools)) {
-                workbench.tools = !workbench.tools;
-                mark_custom_workbench();
-            }
-            if (ImGui::MenuItem("Inspector instrument", nullptr, workbench.inspector)) {
-                workbench.inspector = !workbench.inspector;
-                mark_custom_workbench();
-            }
-            if (ImGui::MenuItem("Transform instrument", nullptr, workbench.transform)) {
-                workbench.transform = !workbench.transform;
-                mark_custom_workbench();
-            }
-            if (ImGui::MenuItem("Modify instrument", nullptr, workbench.modify)) {
-                workbench.modify = !workbench.modify;
-                mark_custom_workbench();
-            }
-            if (ImGui::MenuItem("Draft instrument", nullptr, workbench.draft)) {
-                workbench.draft = !workbench.draft;
-                mark_custom_workbench();
-            }
-            if (ImGui::MenuItem("Fidelity instrument", nullptr, workbench.measure)) {
-                workbench.measure = !workbench.measure;
-                mark_custom_workbench();
-            }
-            if (ImGui::MenuItem("Operation ledger", nullptr, !workbench.ledger_collapsed)) {
-                workbench.ledger_collapsed = !workbench.ledger_collapsed;
-                mark_custom_workbench();
-            }
+            const auto pane_item = [this](const char* label, carto::ui::WorkbenchPane pane) {
+                auto& visible = workbench.persisted.panes.at(static_cast<std::size_t>(pane)).visible;
+                if (ImGui::MenuItem(label, nullptr, visible)) visible = !visible;
+            };
+            pane_item("Navigation", carto::ui::WorkbenchPane::navigation);
+            pane_item("Workspace selector", carto::ui::WorkbenchPane::workspace_selector);
+            pane_item("Agent task", carto::ui::WorkbenchPane::agent_task_strip);
+            pane_item("Authoring toolbar", carto::ui::WorkbenchPane::toolbar);
+            pane_item("Tool rack", carto::ui::WorkbenchPane::tool_rack);
+            pane_item("Work surface", carto::ui::WorkbenchPane::work_surface);
+            pane_item("Operation ledger", carto::ui::WorkbenchPane::operation_ledger);
+            pane_item("Instrument bay", carto::ui::WorkbenchPane::instrument_bay);
+            pane_item("AI context", carto::ui::WorkbenchPane::ai_context);
             ImGui::Separator();
-            ImGui::TextDisabled("The work surface is fixed; instruments are movable.");
+            const auto instrument_item = [this](
+                const char* label, carto::ui::WorkbenchInstrument instrument) {
+                bool& visible = workbench_visible(workbench, instrument);
+                if (ImGui::MenuItem(label, nullptr, visible)) {
+                    visible = !visible;
+                    mark_custom_workbench();
+                }
+            };
+            instrument_item("Scene instrument", carto::ui::WorkbenchInstrument::scene);
+            instrument_item("Assets instrument", carto::ui::WorkbenchInstrument::assets);
+            instrument_item("Layers instrument", carto::ui::WorkbenchInstrument::layers);
+            instrument_item("Tools instrument", carto::ui::WorkbenchInstrument::tools);
+            instrument_item("References instrument", carto::ui::WorkbenchInstrument::references);
+            instrument_item("Draft instrument", carto::ui::WorkbenchInstrument::draft);
+            instrument_item("Inspector instrument", carto::ui::WorkbenchInstrument::inspector);
+            instrument_item("Material instrument", carto::ui::WorkbenchInstrument::material);
+            instrument_item("Constraint instrument", carto::ui::WorkbenchInstrument::constraint);
+            instrument_item("Modify instrument", carto::ui::WorkbenchInstrument::modify);
+            instrument_item("Fidelity instrument", carto::ui::WorkbenchInstrument::measure);
+            instrument_item("Transform instrument", carto::ui::WorkbenchInstrument::transform);
+            instrument_item("Extrude instrument", carto::ui::WorkbenchInstrument::extrude);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Reset workspace layout")) reset_workbench_layout();
+            ImGui::TextDisabled("Panels move and resize independently. Close to hide; reopen here.");
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Window")) {
@@ -4419,7 +4389,6 @@ struct DesktopState {
     }
 
     void draw_toolbar(const UiSnapshot& snapshot) {
-        ImGui::BeginChild("Toolbar", ImVec2(0, 52), true);
         heading_text("Work surface");
         ImGui::SameLine();
         if (ImGui::Button("Undo")) dispatch(carto::application::UndoAction{});
@@ -4459,7 +4428,6 @@ struct DesktopState {
             ImGui::SameLine();
             ImGui::TextColored(color(snapshot.colors.semantic_error), "Render unavailable");
         }
-        ImGui::EndChild();
     }
 
     void draw_command_palette(const UiSnapshot& snapshot) {
@@ -9631,8 +9599,10 @@ struct DesktopState {
             "collision, clearance, or execution feasibility.");
         ImGui::SeparatorText("Tool pose projection · workcell X/Z");
         ImGui::TextDisabled(
-            "Order and X/Z positions only. Workcell geometry and feasibility checks are not shown.");
-        const auto projection = carto::ui::project_engineering_path_xz(*path);
+            "Shows frame markers and keep-out envelopes only; workcell meshes and feasibility checks are omitted.");
+        const auto projection = carto::ui::project_engineering_path_xz(
+            *path, snapshot.engineering.workcell.has_value()
+                ? &*snapshot.engineering.workcell : nullptr);
         if (!projection) {
             ImGui::TextColored(color(snapshot.colors.semantic_error),
                 "Path projection unavailable: %s", projection.error().message.c_str());
@@ -9669,12 +9639,29 @@ struct DesktopState {
                 const double center_z = projection.value().minimum_z + range_z * 0.5;
                 const ImVec2 center{origin.x + extent.x * 0.5F,
                     origin.y + extent.y * 0.5F};
+                const auto project_point = [&](double x, double z) {
+                    return ImVec2(
+                        center.x + static_cast<float>((x - center_x) * scale),
+                        center.y - static_cast<float>((z - center_z) * scale));
+                };
+                for (const auto& keep_out : projection.value().keep_outs) {
+                    const auto minimum = project_point(
+                        keep_out.minimum_x, keep_out.maximum_z);
+                    const auto maximum = project_point(
+                        keep_out.maximum_x, keep_out.minimum_z);
+                    draw->AddRect(minimum, maximum,
+                        color_with_alpha(snapshot.colors.semantic_warning, 0.85F),
+                        0.0F, ImDrawFlags_None, 1.5F);
+                    const std::string label = keep_out.kind + " envelope · " +
+                        std::to_string(keep_out.id);
+                    draw->AddText(minimum + ImVec2(3.0F, 2.0F),
+                        color_with_alpha(snapshot.colors.semantic_warning, 0.95F),
+                        label.c_str());
+                }
                 std::vector<ImVec2> screen_points;
                 screen_points.reserve(projection.value().points.size());
                 for (const auto& point : projection.value().points) {
-                    screen_points.emplace_back(
-                        center.x + static_cast<float>((point.position.x - center_x) * scale),
-                        center.y - static_cast<float>((point.position.z - center_z) * scale));
+                    screen_points.push_back(project_point(point.position.x, point.position.z));
                 }
                 const auto line_token = path->status == "stale"
                     ? snapshot.colors.semantic_warning
@@ -9691,6 +9678,33 @@ struct DesktopState {
                         ? 4.0F : 2.5F;
                     draw->AddCircleFilled(screen_points[index], radius,
                         color_with_alpha(snapshot.colors.accent_secondary, 1.0F));
+                    const auto target_id = projection.value().points[index].target_id;
+                    const auto previous_target_id = index == 0U
+                        ? std::optional<std::uint64_t>{}
+                        : projection.value().points[index - 1U].target_id;
+                    if (target_id.has_value() && target_id != previous_target_id) {
+                        const std::string label = "T" + std::to_string(*target_id);
+                        draw->AddText(screen_points[index] + ImVec2(5.0F, 2.0F),
+                            color_with_alpha(snapshot.colors.text_primary, 1.0F),
+                            label.c_str());
+                    }
+                }
+                for (const auto& marker : projection.value().workcell_markers) {
+                    const auto screen = project_point(marker.position.x, marker.position.z);
+                    const auto marker_color = marker.reference_frame
+                        ? snapshot.colors.accent_secondary
+                        : snapshot.colors.text_secondary;
+                    draw->AddLine(screen + ImVec2(-5.0F, 0.0F),
+                        screen + ImVec2(5.0F, 0.0F),
+                        color_with_alpha(marker_color, 0.95F), 1.5F);
+                    draw->AddLine(screen + ImVec2(0.0F, -5.0F),
+                        screen + ImVec2(0.0F, 5.0F),
+                        color_with_alpha(marker_color, 0.95F), 1.5F);
+                    const std::string label = marker.name.empty()
+                        ? marker.kind : marker.name;
+                    draw->AddText(screen + ImVec2(6.0F, 5.0F),
+                        color_with_alpha(snapshot.colors.text_secondary, 0.95F),
+                        label.c_str());
                 }
                 draw->AddText(origin + ImVec2(inset, inset),
                     color_with_alpha(snapshot.colors.text_secondary, 0.95F), "Z ↑");
@@ -12958,7 +12972,7 @@ struct DesktopState {
         instrument_toggle("Modify", workbench.modify);
         instrument_toggle("Fidelity", workbench.measure);
         instrument_toggle("Extrude", workbench.extrude);
-        ImGui::TextDisabled("The viewport and machine frame remain fixed.\nRack instruments can be reopened at any time.");
+        ImGui::TextDisabled("Workspace panes and instruments move independently.\nReopen hidden windows from View.");
         ImGui::EndChild();
         ImGui::EndChild();
     }
@@ -13090,8 +13104,6 @@ struct DesktopState {
                 : task.status == carto::agent::TaskStatus::blocked
                     ? snapshot.colors.semantic_warning
                     : snapshot.colors.accent_primary;
-        ImGui::BeginChild("AgentTaskStrip", ImVec2(0, 48), true,
-            ImGuiWindowFlags_NoScrollbar);
         ImGui::TextColored(color(status_token), "Agent task %s · %s",
             task.task_id.c_str(), carto::agent::task_status_name(task.status));
         ImGui::SameLine();
@@ -13115,36 +13127,93 @@ struct DesktopState {
             ImGui::TextWrapped("%s", task.blocker->message.c_str());
             ImGui::EndTooltip();
         }
-        ImGui::EndChild();
     }
 
     void draw_workspace_surface(const UiSnapshot& snapshot) {
-        draw_workspace_bar(snapshot);
-        draw_agent_task_strip(snapshot);
-        draw_toolbar(snapshot);
+        const ImGuiViewport* viewport = ImGui::GetMainViewport();
+        const float width = viewport->WorkSize.x;
+        const float height = viewport->WorkSize.y;
+        const auto pane_visible = [this](carto::ui::WorkbenchPane pane) {
+            return workbench.persisted.panes.at(static_cast<std::size_t>(pane)).visible;
+        };
+        const bool navigation_visible = pane_visible(carto::ui::WorkbenchPane::navigation);
+        const bool tool_rack_visible = pane_visible(carto::ui::WorkbenchPane::tool_rack);
+        const bool bay_visible = pane_visible(carto::ui::WorkbenchPane::instrument_bay);
+        const bool ai_context_visible = pane_visible(carto::ui::WorkbenchPane::ai_context);
+        const bool task_strip_visible = pane_visible(carto::ui::WorkbenchPane::agent_task_strip) &&
+            snapshot.agent_task_strip.has_value();
+        const float left = (navigation_visible ? kWorkbenchRackWidth + 8.0F : 8.0F) +
+            (tool_rack_visible ? kWorkbenchRackWidth + 8.0F : 0.0F);
+        const float right = (bay_visible ? kWorkbenchRackWidth + 8.0F : 8.0F) +
+            (ai_context_visible ? 328.0F : 0.0F);
+        const float pane_width = std::max(220.0F, width - left - right);
+        const float ledger_y = std::max(460.0F, height - 184.0F);
+        const float surface_y = task_strip_visible ? 252.0F : 190.0F;
+        const float surface_height = std::max(200.0F, ledger_y - surface_y - 18.0F);
+
+        if (begin_workbench_pane(snapshot, carto::ui::WorkbenchPane::navigation,
+                                 "Navigation", ImVec2(8.0F, 64.0F),
+                                 ImVec2(kWorkbenchRackWidth, std::max(220.0F, height - 76.0F)))) {
+            draw_navigation_rail(snapshot);
+            end_workbench_pane(carto::ui::WorkbenchPane::navigation);
+        }
+        if (begin_workbench_pane(snapshot, carto::ui::WorkbenchPane::workspace_selector,
+                                 "Workspace selector", ImVec2(left, 64.0F),
+                                 ImVec2(pane_width, 58.0F))) {
+            draw_workspace_bar(snapshot);
+            end_workbench_pane(carto::ui::WorkbenchPane::workspace_selector);
+        }
+        if (begin_workbench_pane(snapshot, carto::ui::WorkbenchPane::agent_task_strip,
+                                 "Agent task", ImVec2(left, 188.0F),
+                                 ImVec2(pane_width, 58.0F))) {
+            draw_agent_task_strip(snapshot);
+            end_workbench_pane(carto::ui::WorkbenchPane::agent_task_strip);
+        }
+        if (begin_workbench_pane(snapshot, carto::ui::WorkbenchPane::toolbar,
+                                 "Authoring toolbar", ImVec2(left, 126.0F),
+                                 ImVec2(pane_width, 58.0F))) {
+            draw_toolbar(snapshot);
+            end_workbench_pane(carto::ui::WorkbenchPane::toolbar);
+        }
+        if (begin_workbench_pane(snapshot, carto::ui::WorkbenchPane::tool_rack,
+                                 "Tool rack", ImVec2(navigation_visible ? 236.0F : 8.0F, 64.0F),
+                                 ImVec2(kWorkbenchRackWidth, std::max(220.0F, height - 76.0F)))) {
+            draw_tool_rack(snapshot);
+            end_workbench_pane(carto::ui::WorkbenchPane::tool_rack);
+        }
+        if (begin_workbench_pane(snapshot, carto::ui::WorkbenchPane::instrument_bay,
+                                 "Instrument bay", ImVec2(std::max(8.0F, width - 228.0F), 64.0F),
+                                 ImVec2(kWorkbenchRackWidth, std::max(220.0F, height - 76.0F)))) {
+            draw_bay_rack(snapshot);
+            end_workbench_pane(carto::ui::WorkbenchPane::instrument_bay);
+        }
+        if (begin_workbench_pane(snapshot, carto::ui::WorkbenchPane::ai_context,
+                                 "AI context", ImVec2(std::max(8.0F, width - 328.0F), 64.0F),
+                                 ImVec2(320.0F, 280.0F))) {
+            draw_ai_context(snapshot);
+            end_workbench_pane(carto::ui::WorkbenchPane::ai_context);
+        }
+
         workbench_bounds_valid = false;
-        ImGui::BeginChild("WorkbenchLayout", ImVec2(0, 0), false);
-        const float rack_width = kWorkbenchRackWidth;
-        const float bay_gap = ImGui::GetStyle().ItemSpacing.x;
-        const float center_width = std::max(
-            320.0F, ImGui::GetContentRegionAvail().x - rack_width * 2.0F - bay_gap * 2.0F);
-        draw_tool_rack(snapshot);
-        ImGui::SameLine();
-        ImGui::BeginChild("WorkSurfaceFrame", ImVec2(center_width, 0), false);
-        workbench_origin = ImGui::GetWindowPos();
-        workbench_extent = ImGui::GetWindowSize();
-        workbench_bounds_valid = true;
-        const float ledger_height = workbench.ledger_collapsed ? 48.0F : 176.0F;
-        draw_viewport(snapshot, ImVec2(0, -ledger_height - ImGui::GetStyle().ItemSpacing.y));
-        draw_bottom(snapshot, ledger_height);
-        ImGui::EndChild();
-        ImGui::SameLine();
-        draw_bay_rack(snapshot);
-        ImGui::EndChild();
+        if (begin_workbench_pane(snapshot, carto::ui::WorkbenchPane::work_surface,
+                                  "Work surface", ImVec2(left, surface_y),
+                                  ImVec2(pane_width, surface_height))) {
+            workbench_origin = ImGui::GetWindowPos();
+            workbench_extent = ImGui::GetWindowSize();
+            workbench_bounds_valid = true;
+            draw_viewport(snapshot, ImVec2(0.0F, 0.0F));
+            end_workbench_pane(carto::ui::WorkbenchPane::work_surface);
+        }
+        if (begin_workbench_pane(snapshot, carto::ui::WorkbenchPane::operation_ledger,
+                                 "Operation ledger", ImVec2(left, ledger_y),
+                                 ImVec2(pane_width, std::max(120.0F, height - ledger_y - 12.0F)))) {
+            draw_bottom(snapshot, 0.0F);
+            end_workbench_pane(carto::ui::WorkbenchPane::operation_ledger);
+        }
     }
 
     void draw_ai_context(const UiSnapshot& snapshot) {
-        ImGui::BeginChild("AI Context", ImVec2(260, 0), true);
+        ImGui::BeginChild("AI Context", ImVec2(0, 0), true);
         heading_text("AI first");
         ImGui::Separator();
         ImGui::TextDisabled("Intent");
@@ -13343,31 +13412,35 @@ struct DesktopState {
             ImGuiWindowFlags_NoBringToFrontOnFocus;
         ImGui::Begin("Cartographer Shell", nullptr, shell_flags);
         draw_shell_header(snapshot);
-        ImGui::BeginChild("ShellBody", ImVec2(0, 0), false);
-        draw_navigation_rail(snapshot);
-        ImGui::SameLine();
-        ImGui::BeginChild("SurfaceHost", ImVec2(0, 0), false);
-        switch (surface) {
-        case ShellSurface::workspace:
-            draw_workspace_surface(snapshot);
-            break;
-        case ShellSurface::project:
-            draw_project_surface(snapshot);
-            break;
-        case ShellSurface::market:
-            draw_market_surface(snapshot);
-            break;
-        case ShellSurface::diagnostics:
-            draw_diagnostics_surface(snapshot);
-            break;
-        case ShellSurface::settings:
-            draw_settings_surface(snapshot);
-            break;
+        if (surface != ShellSurface::workspace) {
+            ImGui::BeginChild("ShellBody", ImVec2(0, 0), false);
+            draw_navigation_rail(snapshot);
+            ImGui::SameLine();
+            ImGui::BeginChild("SurfaceHost", ImVec2(0, 0), false);
+            switch (surface) {
+            case ShellSurface::workspace:
+                break;
+            case ShellSurface::project:
+                draw_project_surface(snapshot);
+                break;
+            case ShellSurface::market:
+                draw_market_surface(snapshot);
+                break;
+            case ShellSurface::diagnostics:
+                draw_diagnostics_surface(snapshot);
+                break;
+            case ShellSurface::settings:
+                draw_settings_surface(snapshot);
+                break;
+            }
+            ImGui::EndChild();
+            ImGui::EndChild();
         }
-        ImGui::EndChild();
-        ImGui::EndChild();
         ImGui::End();
-        if (surface == ShellSurface::workspace) draw_workbench_instruments(snapshot);
+        if (surface == ShellSurface::workspace) {
+            draw_workspace_surface(snapshot);
+            draw_workbench_instruments(snapshot);
+        }
         draw_command_palette(snapshot);
     }
 };

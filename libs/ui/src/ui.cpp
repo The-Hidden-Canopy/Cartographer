@@ -44,6 +44,8 @@ constexpr std::size_t kMaxPreferenceLineBytes = 1024U;
 constexpr std::size_t kWorkbenchPreferenceV1FieldCount = 2U + kWorkbenchInstrumentCount;
 constexpr std::size_t kWorkbenchPreferenceV2FieldCount =
     kWorkbenchPreferenceV1FieldCount + 2U;
+constexpr std::size_t kWorkbenchPreferenceV3FieldCount =
+    kWorkbenchPreferenceV2FieldCount + kWorkbenchPaneCount;
 std::mutex g_preferences_mutex;
 std::atomic<std::uint64_t> g_preference_temp_counter{0U};
 
@@ -1213,14 +1215,18 @@ core::Result<WorkbenchPreferences> parse_workbench_preferences(std::string_view 
     const auto header = fields.find("header");
     const bool legacy_format = header != fields.end() &&
         header->second == "CARTOGRAPHER_WORKBENCH_PREFS_V1";
-    const bool current_format = header != fields.end() &&
+    const bool v2_format = header != fields.end() &&
         header->second == "CARTOGRAPHER_WORKBENCH_PREFS_V2";
-    if (!legacy_format && !current_format) {
+    const bool current_format = header != fields.end() &&
+        header->second == "CARTOGRAPHER_WORKBENCH_PREFS_V3";
+    if (!legacy_format && !v2_format && !current_format) {
         return core::Result<WorkbenchPreferences>::failure(
             validation("workbench preference header is invalid"));
     }
     const std::size_t expected_field_count = current_format
-        ? kWorkbenchPreferenceV2FieldCount : kWorkbenchPreferenceV1FieldCount;
+        ? kWorkbenchPreferenceV3FieldCount
+        : v2_format ? kWorkbenchPreferenceV2FieldCount
+                    : kWorkbenchPreferenceV1FieldCount;
     if (fields.size() != expected_field_count) {
         return core::Result<WorkbenchPreferences>::failure(
             validation("workbench preference field set is invalid"));
@@ -1236,7 +1242,7 @@ core::Result<WorkbenchPreferences> parse_workbench_preferences(std::string_view 
         return core::Result<WorkbenchPreferences>::failure(
             validation("workbench preference ledger flag is invalid"));
     }
-    if (current_format) {
+    if (v2_format || current_format) {
         const auto last_flow = fields.find("workflow_last_flow");
         const auto flow_counts = fields.find("workflow_flow_counts");
         if (last_flow == fields.end() || flow_counts == fields.end() ||
@@ -1258,6 +1264,23 @@ core::Result<WorkbenchPreferences> parse_workbench_preferences(std::string_view 
         if (!parsed) return core::Result<WorkbenchPreferences>::failure(parsed.error());
         result.instruments[index] = parsed.value();
     }
+    if (current_format) {
+        for (std::size_t index = 0U; index < kWorkbenchPaneCount; ++index) {
+            const auto pane = static_cast<WorkbenchPane>(index);
+            const auto field = fields.find(workbench_pane_name(pane));
+            if (field == fields.end()) {
+                return core::Result<WorkbenchPreferences>::failure(validation(
+                    "workbench preference field is missing: " +
+                    std::string(workbench_pane_name(pane))));
+            }
+            const auto parsed = parse_workbench_layout(field->second);
+            if (!parsed) return core::Result<WorkbenchPreferences>::failure(parsed.error());
+            result.panes[index] = WorkbenchPaneLayout{
+                parsed.value().visible, parsed.value().positioned,
+                parsed.value().x, parsed.value().y,
+                parsed.value().width, parsed.value().height};
+        }
+    }
     if (auto valid_result = result.validate(); !valid_result) {
         return core::Result<WorkbenchPreferences>::failure(valid_result.error());
     }
@@ -1265,7 +1288,7 @@ core::Result<WorkbenchPreferences> parse_workbench_preferences(std::string_view 
 }
 
 std::string serialize_workbench_preferences(const WorkbenchPreferences& preferences) {
-    std::string result = "header=CARTOGRAPHER_WORKBENCH_PREFS_V2\n";
+    std::string result = "header=CARTOGRAPHER_WORKBENCH_PREFS_V3\n";
     result += std::string("ledger_collapsed=") + (preferences.ledger_collapsed ? "1\n" : "0\n");
     result += "workflow_last_flow=" + std::to_string(preferences.last_flow_index) + "\n";
     result += "workflow_flow_counts=";
@@ -1277,6 +1300,15 @@ std::string serialize_workbench_preferences(const WorkbenchPreferences& preferen
     for (std::size_t index = 0U; index < kWorkbenchInstrumentCount; ++index) {
         const auto& layout = preferences.instruments[index];
         result += workbench_instrument_name(all_workbench_instruments()[index]);
+        result += "=";
+        result += layout.visible ? "1," : "0,";
+        result += layout.positioned ? "1," : "0,";
+        result += std::to_string(layout.x) + "," + std::to_string(layout.y) + "," +
+            std::to_string(layout.width) + "," + std::to_string(layout.height) + "\n";
+    }
+    for (std::size_t index = 0U; index < kWorkbenchPaneCount; ++index) {
+        const auto& layout = preferences.panes[index];
+        result += workbench_pane_name(static_cast<WorkbenchPane>(index));
         result += "=";
         result += layout.visible ? "1," : "0,";
         result += layout.positioned ? "1," : "0,";
@@ -1344,20 +1376,28 @@ core::Result<void> WorkbenchPreferences::validate() const {
                 invalid("workbench workflow memory exceeds its safe bound"));
         }
     }
-    for (const auto& layout : instruments) {
+    const auto validate_layout = [](const auto& layout, const char* name) {
         if (!layout.positioned) {
             if (layout.x != 0 || layout.y != 0 || layout.width != 0 || layout.height != 0) {
-                return core::Result<void>::failure(
-                    invalid("unpositioned workbench instruments cannot have geometry"));
+                return core::Result<void>::failure(invalid(
+                    std::string("unpositioned workbench ") + name +
+                    " cannot have geometry"));
             }
-            continue;
+            return core::Result<void>::success();
         }
         if (layout.width < 120 || layout.width > 4096 || layout.height < 80 ||
             layout.height > 4096 || layout.x < -65536 || layout.x > 65536 ||
             layout.y < -65536 || layout.y > 65536) {
-            return core::Result<void>::failure(
-                invalid("workbench instrument layout is outside safe bounds"));
+            return core::Result<void>::failure(invalid(
+                std::string("workbench ") + name + " layout is outside safe bounds"));
         }
+        return core::Result<void>::success();
+    };
+    for (const auto& layout : instruments) {
+        if (auto result = validate_layout(layout, "instrument"); !result) return result;
+    }
+    for (const auto& layout : panes) {
+        if (auto result = validate_layout(layout, "pane"); !result) return result;
     }
     return core::Result<void>::success();
 }
@@ -1559,6 +1599,21 @@ const char* workbench_instrument_name(WorkbenchInstrument instrument) noexcept {
     return "unknown";
 }
 
+const char* workbench_pane_name(WorkbenchPane pane) noexcept {
+    switch (pane) {
+    case WorkbenchPane::navigation: return "pane_navigation";
+    case WorkbenchPane::workspace_selector: return "pane_workspace_selector";
+    case WorkbenchPane::agent_task_strip: return "pane_agent_task_strip";
+    case WorkbenchPane::toolbar: return "pane_toolbar";
+    case WorkbenchPane::tool_rack: return "pane_tool_rack";
+    case WorkbenchPane::work_surface: return "pane_work_surface";
+    case WorkbenchPane::operation_ledger: return "pane_operation_ledger";
+    case WorkbenchPane::instrument_bay: return "pane_instrument_bay";
+    case WorkbenchPane::ai_context: return "pane_ai_context";
+    }
+    return "pane_unknown";
+}
+
 const char* surface_fidelity_status_name(SurfaceFidelityStatus status) noexcept {
     switch (status) {
     case SurfaceFidelityStatus::idle: return "idle";
@@ -1579,7 +1634,8 @@ const char* surface_fidelity_mode_name(surface::RepresentationMode mode) noexcep
 }
 
 core::Result<EngineeringPathProjection> project_engineering_path_xz(
-    const application::EngineeringAuthoringView::Path& path) {
+    const application::EngineeringAuthoringView::Path& path,
+    const application::EngineeringAuthoringView::Workcell* workcell) {
     EngineeringPathProjection projection;
     projection.source_sample_count = path.samples.size();
     if (path.samples.empty()) {
@@ -1590,6 +1646,14 @@ core::Result<EngineeringPathProjection> project_engineering_path_xz(
     projection.maximum_x = -std::numeric_limits<double>::infinity();
     projection.minimum_z = std::numeric_limits<double>::infinity();
     projection.maximum_z = -std::numeric_limits<double>::infinity();
+    const auto include_position = [&projection](core::Vec3d position) {
+        if (!position.finite()) return false;
+        projection.minimum_x = std::min(projection.minimum_x, position.x);
+        projection.maximum_x = std::max(projection.maximum_x, position.x);
+        projection.minimum_z = std::min(projection.minimum_z, position.z);
+        projection.maximum_z = std::max(projection.maximum_z, position.z);
+        return true;
+    };
     for (const auto& sample : path.samples) {
         const auto& position = sample.tool_pose.translation;
         if (!std::isfinite(position.x) || !std::isfinite(position.y) ||
@@ -1597,10 +1661,65 @@ core::Result<EngineeringPathProjection> project_engineering_path_xz(
             return core::Result<EngineeringPathProjection>::failure(validation(
                 "engineering path projection contains an invalid sample"));
         }
-        projection.minimum_x = std::min(projection.minimum_x, position.x);
-        projection.maximum_x = std::max(projection.maximum_x, position.x);
-        projection.minimum_z = std::min(projection.minimum_z, position.z);
-        projection.maximum_z = std::max(projection.maximum_z, position.z);
+        static_cast<void>(include_position(position));
+    }
+    if (workcell != nullptr) {
+        for (const auto& entity : workcell->entities) {
+            if (!entity.enabled) continue;
+            if (entity.id == 0U || !entity.transform.finite() ||
+                !include_position(entity.transform.translation)) {
+                return core::Result<EngineeringPathProjection>::failure(validation(
+                    "engineering workcell marker is invalid"));
+            }
+            projection.workcell_markers.push_back(EngineeringPathProjectionMarker{
+                entity.id, entity.kind, entity.name, entity.transform.translation,
+                entity.reference_frame});
+        }
+        for (const auto& region : workcell->keep_outs) {
+            if (!region.enabled) continue;
+            if (region.id == 0U || !region.transform.finite() ||
+                !region.dimensions.finite() || region.dimensions.x <= 0.0 ||
+                region.dimensions.y <= 0.0 || region.dimensions.z <= 0.0) {
+                return core::Result<EngineeringPathProjection>::failure(validation(
+                    "engineering workcell keep-out projection is invalid"));
+            }
+            EngineeringPathProjectionKeepOut projected_region;
+            projected_region.id = region.id;
+            projected_region.kind = region.kind;
+            projected_region.purpose = region.purpose;
+            projected_region.minimum_x = std::numeric_limits<double>::infinity();
+            projected_region.maximum_x = -std::numeric_limits<double>::infinity();
+            projected_region.minimum_z = std::numeric_limits<double>::infinity();
+            projected_region.maximum_z = -std::numeric_limits<double>::infinity();
+            for (std::uint32_t corner = 0U; corner < 8U; ++corner) {
+                const core::Vec3d local{
+                    (corner & 1U) == 0U ? -region.dimensions.x * 0.5
+                                        : region.dimensions.x * 0.5,
+                    (corner & 2U) == 0U ? -region.dimensions.y * 0.5
+                                        : region.dimensions.y * 0.5,
+                    (corner & 4U) == 0U ? -region.dimensions.z * 0.5
+                                        : region.dimensions.z * 0.5};
+                const auto world = region.transform.translation +
+                    region.transform.rotation.rotate(
+                        core::componentwise_multiply(region.transform.scale, local));
+                if (!world.finite()) {
+                    return core::Result<EngineeringPathProjection>::failure(validation(
+                        "engineering workcell keep-out exceeds the projection range"));
+                }
+                projected_region.minimum_x = std::min(projected_region.minimum_x, world.x);
+                projected_region.maximum_x = std::max(projected_region.maximum_x, world.x);
+                projected_region.minimum_z = std::min(projected_region.minimum_z, world.z);
+                projected_region.maximum_z = std::max(projected_region.maximum_z, world.z);
+            }
+            if (!include_position({projected_region.minimum_x, 0.0,
+                    projected_region.minimum_z}) ||
+                !include_position({projected_region.maximum_x, 0.0,
+                    projected_region.maximum_z})) {
+                return core::Result<EngineeringPathProjection>::failure(validation(
+                    "engineering workcell keep-out exceeds the projection range"));
+            }
+            projection.keep_outs.push_back(std::move(projected_region));
+        }
     }
     if (!std::isfinite(projection.maximum_x - projection.minimum_x) ||
         !std::isfinite(projection.maximum_z - projection.minimum_z)) {

@@ -339,7 +339,30 @@ inline constexpr std::size_t kWorkbenchInstrumentCount = 13U;
 inline constexpr std::size_t kWorkbenchFlowMemoryCount = 4U;
 inline constexpr std::uint32_t kMaxWorkbenchFlowUses = 10000U;
 
+enum class WorkbenchPane {
+    navigation,
+    workspace_selector,
+    agent_task_strip,
+    toolbar,
+    tool_rack,
+    work_surface,
+    operation_ledger,
+    instrument_bay,
+    ai_context,
+};
+
+inline constexpr std::size_t kWorkbenchPaneCount = 9U;
+
 struct WorkbenchInstrumentLayout {
+    bool visible = false;
+    bool positioned = false;
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    std::int32_t width = 0;
+    std::int32_t height = 0;
+};
+
+struct WorkbenchPaneLayout {
     bool visible = false;
     bool positioned = false;
     std::int32_t x = 0;
@@ -356,6 +379,15 @@ struct WorkbenchPreferences {
     std::array<std::uint32_t, kWorkbenchFlowMemoryCount> flow_use_counts{};
     std::int32_t last_flow_index = -1;
     std::array<WorkbenchInstrumentLayout, kWorkbenchInstrumentCount> instruments{};
+    std::array<WorkbenchPaneLayout, kWorkbenchPaneCount> panes = [] {
+        std::array<WorkbenchPaneLayout, kWorkbenchPaneCount> layouts{};
+        layouts[static_cast<std::size_t>(WorkbenchPane::navigation)].visible = true;
+        layouts[static_cast<std::size_t>(WorkbenchPane::workspace_selector)].visible = true;
+        layouts[static_cast<std::size_t>(WorkbenchPane::toolbar)].visible = true;
+        layouts[static_cast<std::size_t>(WorkbenchPane::work_surface)].visible = true;
+        layouts[static_cast<std::size_t>(WorkbenchPane::operation_ledger)].visible = true;
+        return layouts;
+    }();
 
     [[nodiscard]] core::Result<void> validate() const;
 };
@@ -476,10 +508,30 @@ struct EngineeringPathProjectionPoint {
     std::string status;
 };
 
+struct EngineeringPathProjectionMarker {
+    std::uint64_t id = 0U;
+    std::string kind;
+    std::string name;
+    core::Vec3d position;
+    bool reference_frame = false;
+};
+
+struct EngineeringPathProjectionKeepOut {
+    std::uint64_t id = 0U;
+    std::string kind;
+    std::string purpose;
+    double minimum_x = 0.0;
+    double maximum_x = 0.0;
+    double minimum_z = 0.0;
+    double maximum_z = 0.0;
+};
+
 // Bounded presentation-only projection of imported path samples. Coordinates
 // remain in the authored workcell frame; no feasibility is inferred here.
 struct EngineeringPathProjection {
     std::vector<EngineeringPathProjectionPoint> points;
+    std::vector<EngineeringPathProjectionMarker> workcell_markers;
+    std::vector<EngineeringPathProjectionKeepOut> keep_outs;
     double minimum_x = 0.0;
     double maximum_x = 0.0;
     double minimum_z = 0.0;
@@ -500,12 +552,14 @@ struct EngineeringPathProjection {
 [[nodiscard]] const char* mesh_import_format_name(MeshImportFormat format) noexcept;
 [[nodiscard]] const char* market_status_name(MarketStatus status) noexcept;
 [[nodiscard]] const char* workbench_instrument_name(WorkbenchInstrument instrument) noexcept;
+[[nodiscard]] const char* workbench_pane_name(WorkbenchPane pane) noexcept;
 [[nodiscard]] const char* surface_fidelity_status_name(
     SurfaceFidelityStatus status) noexcept;
 [[nodiscard]] const char* surface_fidelity_mode_name(
     surface::RepresentationMode mode) noexcept;
 [[nodiscard]] core::Result<EngineeringPathProjection> project_engineering_path_xz(
-    const application::EngineeringAuthoringView::Path& path);
+    const application::EngineeringAuthoringView::Path& path,
+    const application::EngineeringAuthoringView::Workcell* workcell = nullptr);
 
 [[nodiscard]] core::Result<void> save_workbench_preferences(
     const std::filesystem::path& path,

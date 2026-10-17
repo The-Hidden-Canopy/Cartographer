@@ -566,6 +566,14 @@ void workbench_preferences_round_trip_and_fail_closed() {
     scene.y = 156;
     scene.width = 286;
     scene.height = 330;
+    auto& surface_pane = preferences.panes.at(static_cast<std::size_t>(
+        carto::ui::WorkbenchPane::work_surface));
+    surface_pane.visible = true;
+    surface_pane.positioned = true;
+    surface_pane.x = 248;
+    surface_pane.y = 192;
+    surface_pane.width = 1140;
+    surface_pane.height = 486;
     REQUIRE(carto::ui::save_workbench_preferences(path, preferences));
 
     const auto loaded = carto::ui::load_workbench_preferences(path);
@@ -579,6 +587,12 @@ void workbench_preferences_round_trip_and_fail_closed() {
         carto::ui::WorkbenchInstrument::scene)).x == 142);
     REQUIRE(loaded.value().instruments.at(static_cast<std::size_t>(
         carto::ui::WorkbenchInstrument::scene)).width == 286);
+    REQUIRE(loaded.value().panes.at(static_cast<std::size_t>(
+        carto::ui::WorkbenchPane::work_surface)).visible);
+    REQUIRE(loaded.value().panes.at(static_cast<std::size_t>(
+        carto::ui::WorkbenchPane::work_surface)).x == 248);
+    REQUIRE(loaded.value().panes.at(static_cast<std::size_t>(
+        carto::ui::WorkbenchPane::work_surface)).height == 486);
 
     const std::string before_failed_save = [&path] {
         std::ifstream stream(path, std::ios::binary);
@@ -601,6 +615,15 @@ void workbench_preferences_round_trip_and_fail_closed() {
         std::istreambuf_iterator<char>(after_invalid_memory_stream), {});
     REQUIRE(after_invalid_memory == before_failed_save);
 
+    auto invalid_pane = preferences;
+    invalid_pane.panes.at(static_cast<std::size_t>(
+        carto::ui::WorkbenchPane::work_surface)).height = 20;
+    REQUIRE(!carto::ui::save_workbench_preferences(path, invalid_pane));
+    std::ifstream after_invalid_pane_stream(path, std::ios::binary);
+    const std::string after_invalid_pane(
+        std::istreambuf_iterator<char>(after_invalid_pane_stream), {});
+    REQUIRE(after_invalid_pane == before_failed_save);
+
     {
         std::ofstream legacy(path, std::ios::binary | std::ios::trunc);
         legacy << "header=CARTOGRAPHER_WORKBENCH_PREFS_V1\n"
@@ -617,6 +640,25 @@ void workbench_preferences_round_trip_and_fail_closed() {
     REQUIRE(std::all_of(legacy_loaded.value().flow_use_counts.begin(),
                         legacy_loaded.value().flow_use_counts.end(),
                         [](std::uint32_t uses) { return uses == 0U; }));
+
+    {
+        std::ofstream previous(path, std::ios::binary | std::ios::trunc);
+        previous << "header=CARTOGRAPHER_WORKBENCH_PREFS_V2\n"
+                    "ledger_collapsed=0\n"
+                    "workflow_last_flow=-1\n"
+                    "workflow_flow_counts=0,0,0,0\n";
+        for (std::size_t index = 0U; index < carto::ui::kWorkbenchInstrumentCount; ++index) {
+            const auto instrument = static_cast<carto::ui::WorkbenchInstrument>(index);
+            previous << carto::ui::workbench_instrument_name(instrument)
+                     << "=0,0,0,0,0,0\n";
+        }
+    }
+    const auto previous_loaded = carto::ui::load_workbench_preferences(path);
+    REQUIRE(previous_loaded);
+    REQUIRE(previous_loaded.value().panes.at(static_cast<std::size_t>(
+        carto::ui::WorkbenchPane::navigation)).visible);
+    REQUIRE(previous_loaded.value().panes.at(static_cast<std::size_t>(
+        carto::ui::WorkbenchPane::work_surface)).visible);
 
     {
         std::ofstream corrupt(path, std::ios::binary | std::ios::trunc);
