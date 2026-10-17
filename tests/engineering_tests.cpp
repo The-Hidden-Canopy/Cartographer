@@ -858,6 +858,84 @@ void workcell_edits_are_revisioned_audited_and_invalidate_targets() {
     REQUIRE(after_keep_out.value().workcell_revision_history.size() == 2U);
     REQUIRE(after_keep_out.value().workcell_revision_history.back().previous_revision == "D");
     REQUIRE(after_keep_out.value().workcell->keep_outs.front().dimensions.x == 0.6);
+
+    const auto before_create = session.snapshot();
+    carto::application::CreateEngineeringKeepOutAction create_keep_out;
+    create_keep_out.expected_project_revision = before_create.project_revision;
+    create_keep_out.expected_authoring_revision = before_create.engineering.authored_revision;
+    create_keep_out.expected_workcell_revision = before_create.engineering.workcell->revision;
+    create_keep_out.new_workcell_revision = "F";
+    create_keep_out.purpose = "Operator exclusion volume";
+    create_keep_out.center = {1.0, 0.25, 0.5};
+    create_keep_out.dimensions = {1.2, 0.8, 1.7};
+    create_keep_out.justification = "Operator-entered exclusion from station setup review";
+    REQUIRE(!ui.submit_ai_proposal(create_keep_out));
+    auto stale_workcell_create = create_keep_out;
+    stale_workcell_create.expected_workcell_revision = "D";
+    REQUIRE(!ui.dispatch(stale_workcell_create));
+    auto stale_authoring_create = create_keep_out;
+    stale_authoring_create.expected_authoring_revision =
+        create_keep_out.expected_authoring_revision.next();
+    REQUIRE(!ui.dispatch(stale_authoring_create));
+    auto missing_reason_create = create_keep_out;
+    missing_reason_create.justification.clear();
+    REQUIRE(!ui.dispatch(missing_reason_create));
+    auto multiline_reason_create = create_keep_out;
+    multiline_reason_create.justification = "Operator-entered reason\nsecond line";
+    REQUIRE(!ui.dispatch(multiline_reason_create));
+    auto invalid_dimensions_create = create_keep_out;
+    invalid_dimensions_create.dimensions.y = 0.0;
+    REQUIRE(!ui.dispatch(invalid_dimensions_create));
+    auto invalid_purpose_create = create_keep_out;
+    invalid_purpose_create.purpose = "  ";
+    REQUIRE(!ui.dispatch(invalid_purpose_create));
+    REQUIRE(session.snapshot().project_revision == before_create.project_revision);
+
+    const auto created = ui.create_engineering_keep_out(create_keep_out);
+    REQUIRE(created && created.value().document_changed);
+    const auto after_create = session.snapshot();
+    REQUIRE(after_create.project_revision == before_create.project_revision.next());
+    REQUIRE(after_create.engineering.workcell->revision == "F");
+    REQUIRE(after_create.engineering.workcell->keep_outs.size() == 2U);
+    const auto& authored_keep_out = after_create.engineering.workcell->keep_outs.back();
+    REQUIRE(authored_keep_out.id == 621U);
+    REQUIRE(authored_keep_out.kind == "box");
+    REQUIRE(authored_keep_out.purpose == create_keep_out.purpose);
+    REQUIRE(authored_keep_out.source == "manual://cartographer/workcell");
+    REQUIRE(authored_keep_out.transform.translation.x == create_keep_out.center.x);
+    REQUIRE(authored_keep_out.dimensions.z == create_keep_out.dimensions.z);
+    REQUIRE(after_create.engineering.workcell->revision_history.size() == 3U);
+    const auto& creation_record = after_create.engineering.workcell->revision_history.back();
+    REQUIRE(creation_record.previous_revision == "E");
+    REQUIRE(creation_record.subject_kind == "keep-out");
+    REQUIRE(creation_record.subject_id == authored_keep_out.id);
+    REQUIRE(creation_record.justification == create_keep_out.justification);
+    const auto created_authoring = session.engineering_authoring();
+    REQUIRE(created_authoring && created_authoring.value().validate());
+    const auto created_roundtrip = carto::engineering::AuthoringDocument::deserialize(
+        created_authoring.value().serialize());
+    REQUIRE(created_roundtrip);
+    REQUIRE(created_roundtrip.value().workcell_revision_history ==
+        created_authoring.value().workcell_revision_history);
+    REQUIRE(created_roundtrip.value().workcell->keep_outs.back().id == authored_keep_out.id);
+    REQUIRE(created_authoring.value().targets.at(0U).status ==
+        carto::engineering::TargetStatus::stale);
+    REQUIRE(created_authoring.value().targets.at(1U).status ==
+        carto::engineering::TargetStatus::rejected);
+    REQUIRE(created_authoring.value().path->status ==
+        carto::engineering::DerivedProductStatus::stale);
+    REQUIRE(!after_create.engineering.publication_ready);
+    REQUIRE(ui.snapshot().operations.back().action == "Create Workcell Keep-Out");
+    REQUIRE(ui.snapshot().operations.back().category ==
+        carto::ui::OperationCategory::committed_command);
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::UndoAction{}));
+    REQUIRE(session.snapshot().engineering.workcell->revision == "E");
+    REQUIRE(session.snapshot().engineering.workcell->keep_outs.size() == 1U);
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::RedoAction{}));
+    REQUIRE(session.snapshot().engineering.workcell->revision == "F");
+    REQUIRE(session.snapshot().engineering.workcell->keep_outs.size() == 2U);
 }
 
 void application_wires_engineering_authoring_through_persistence_and_history() {

@@ -1316,6 +1316,15 @@ struct DesktopState {
     double engineering_workcell_dimension_z = 1.0;
     std::array<char, 129> engineering_workcell_new_revision{};
     std::array<char, 1025> engineering_workcell_justification{};
+    double engineering_workcell_new_keep_out_x = 0.0;
+    double engineering_workcell_new_keep_out_y = 0.0;
+    double engineering_workcell_new_keep_out_z = 0.0;
+    double engineering_workcell_new_keep_out_dimension_x = 1.0;
+    double engineering_workcell_new_keep_out_dimension_y = 1.0;
+    double engineering_workcell_new_keep_out_dimension_z = 1.0;
+    std::array<char, 257> engineering_workcell_new_keep_out_purpose{};
+    std::array<char, 129> engineering_workcell_new_keep_out_revision{};
+    std::array<char, 1025> engineering_workcell_new_keep_out_justification{};
     std::optional<std::uint64_t> condition_source_update_id;
     std::array<char, 129> condition_source_revision{};
     std::array<char, 65> condition_source_digest{};
@@ -8837,6 +8846,15 @@ struct DesktopState {
             engineering_workcell_selection_is_keep_out = false;
             engineering_workcell_new_revision.fill('\0');
             engineering_workcell_justification.fill('\0');
+            engineering_workcell_new_keep_out_purpose.fill('\0');
+            engineering_workcell_new_keep_out_revision.fill('\0');
+            engineering_workcell_new_keep_out_justification.fill('\0');
+            engineering_workcell_new_keep_out_x = 0.0;
+            engineering_workcell_new_keep_out_y = 0.0;
+            engineering_workcell_new_keep_out_z = 0.0;
+            engineering_workcell_new_keep_out_dimension_x = 1.0;
+            engineering_workcell_new_keep_out_dimension_y = 1.0;
+            engineering_workcell_new_keep_out_dimension_z = 1.0;
         }
 
         struct RequirementOption {
@@ -9393,6 +9411,73 @@ struct DesktopState {
         ImGui::TextWrapped(
             "Edit an existing static entity, reference frame, or keep-out with an operator revision and reason. "
             "Cartographer does not validate robot reachability, collision, or calibration.");
+
+        ImGui::SeparatorText("Add box keep-out");
+        ImGui::TextDisabled(
+            "Creates a human-authored axis-aligned box in workcell coordinates. Dimensions are full extents; this record does not certify collision safety.");
+        ImGui::InputText("Keep-out purpose", engineering_workcell_new_keep_out_purpose.data(),
+            engineering_workcell_new_keep_out_purpose.size());
+        ImGui::InputDouble("Keep-out center X", &engineering_workcell_new_keep_out_x, 0.001, 0.01, "%.6g");
+        ImGui::InputDouble("Keep-out center Y", &engineering_workcell_new_keep_out_y, 0.001, 0.01, "%.6g");
+        ImGui::InputDouble("Keep-out center Z", &engineering_workcell_new_keep_out_z, 0.001, 0.01, "%.6g");
+        ImGui::InputDouble("Keep-out extent X", &engineering_workcell_new_keep_out_dimension_x, 0.001, 0.01, "%.6g");
+        ImGui::InputDouble("Keep-out extent Y", &engineering_workcell_new_keep_out_dimension_y, 0.001, 0.01, "%.6g");
+        ImGui::InputDouble("Keep-out extent Z", &engineering_workcell_new_keep_out_dimension_z, 0.001, 0.01, "%.6g");
+        ImGui::InputText("New workcell revision for keep-out",
+            engineering_workcell_new_keep_out_revision.data(),
+            engineering_workcell_new_keep_out_revision.size());
+        ImGui::InputText("Keep-out authoring reason",
+            engineering_workcell_new_keep_out_justification.data(),
+            engineering_workcell_new_keep_out_justification.size());
+        const std::string_view keep_out_purpose(engineering_workcell_new_keep_out_purpose.data());
+        const std::string_view keep_out_revision(engineering_workcell_new_keep_out_revision.data());
+        const std::string_view keep_out_reason(engineering_workcell_new_keep_out_justification.data());
+        const bool keep_out_reason_present = std::any_of(
+            keep_out_reason.begin(), keep_out_reason.end(), [](unsigned char byte) {
+                return !std::isspace(byte);
+            });
+        const bool keep_out_geometry_valid = std::isfinite(engineering_workcell_new_keep_out_x) &&
+            std::isfinite(engineering_workcell_new_keep_out_y) &&
+            std::isfinite(engineering_workcell_new_keep_out_z) &&
+            std::isfinite(engineering_workcell_new_keep_out_dimension_x) &&
+            std::isfinite(engineering_workcell_new_keep_out_dimension_y) &&
+            std::isfinite(engineering_workcell_new_keep_out_dimension_z) &&
+            engineering_workcell_new_keep_out_dimension_x > 0.0 &&
+            engineering_workcell_new_keep_out_dimension_y > 0.0 &&
+            engineering_workcell_new_keep_out_dimension_z > 0.0;
+        const bool keep_out_fields_valid = !keep_out_purpose.empty() && keep_out_reason_present &&
+            !keep_out_revision.empty() && keep_out_revision != workcell.revision &&
+            keep_out_geometry_valid;
+        ImGui::BeginDisabled(!keep_out_fields_valid);
+        if (ImGui::Button("Add box keep-out as new workcell revision", ImVec2(-1, 30))) {
+            carto::application::CreateEngineeringKeepOutAction action;
+            action.expected_project_revision = snapshot.project_revision;
+            action.expected_authoring_revision = engineering.authored_revision;
+            action.expected_workcell_revision = workcell.revision;
+            action.new_workcell_revision = std::string(keep_out_revision);
+            action.purpose = std::string(keep_out_purpose);
+            action.center = {engineering_workcell_new_keep_out_x,
+                engineering_workcell_new_keep_out_y, engineering_workcell_new_keep_out_z};
+            action.dimensions = {engineering_workcell_new_keep_out_dimension_x,
+                engineering_workcell_new_keep_out_dimension_y,
+                engineering_workcell_new_keep_out_dimension_z};
+            action.justification = std::string(keep_out_reason);
+            if (dispatch(action)) {
+                const std::string suggested_revision = action.new_workcell_revision + ".1";
+                engineering_workcell_new_keep_out_revision.fill('\0');
+                std::copy_n(suggested_revision.begin(),
+                    std::min(suggested_revision.size(),
+                        engineering_workcell_new_keep_out_revision.size() - 1U),
+                    engineering_workcell_new_keep_out_revision.begin());
+                engineering_workcell_new_keep_out_purpose.fill('\0');
+                engineering_workcell_new_keep_out_justification.fill('\0');
+            }
+        }
+        ImGui::EndDisabled();
+        if (!keep_out_fields_valid) {
+            ImGui::TextDisabled(
+                "Requires a purpose, positive finite dimensions, a new revision label, and a reason.");
+        }
 
         const auto selected_entity = [&]() {
             return std::find_if(workcell.entities.begin(), workcell.entities.end(), [this](const auto& value) {
