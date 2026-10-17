@@ -6828,6 +6828,100 @@ void condition_inventory_audit_never_promotes_partial_evidence_to_readiness() {
         carto::agent::ConditionEvidenceStatus::verified);
     REQUIRE(!current_audit.production_readiness_established);
 
+    const auto find_readiness_gate = [](
+            const carto::agent::ConditionReadinessReport& report,
+            std::string_view id) -> const carto::agent::ConditionReadinessGate* {
+        const auto found = std::find_if(report.gates.begin(), report.gates.end(),
+            [id](const auto& gate) { return gate.id == id; });
+        return found == report.gates.end() ? nullptr : &*found;
+    };
+    auto observed_inventory = current_inventory;
+    auto& observed_fact = std::get<carto::agent::ConditionAssetInventoryFact>(
+        observed_inventory.rows.front());
+    observed_fact.mesh_validation = carto::agent::ConditionTechnicalCheckStatus::passed;
+    observed_fact.uv_set_presence = carto::agent::ConditionTechnicalCheckStatus::passed;
+    observed_fact.material_region_assignments =
+        carto::agent::ConditionTechnicalCheckStatus::passed;
+    observed_fact.technical_checks_complete = true;
+    const auto observed_report =
+        carto::agent::audit_condition_readiness(observed_inventory);
+    REQUIRE(observed_report.inventory.source_revision == observed_inventory.source_revision);
+    REQUIRE(observed_report.all_observed_checks_passed);
+    REQUIRE(observed_report.gates.size() == 12U);
+    REQUIRE(find_readiness_gate(observed_report, "condition.mesh_validation") != nullptr);
+    REQUIRE(find_readiness_gate(observed_report, "condition.mesh_validation")->status ==
+        carto::agent::ConditionReadinessGateStatus::passed);
+    REQUIRE(find_readiness_gate(observed_report, "condition.material_region_assignments")->
+        affected_assets == std::vector<std::uint64_t>{3U});
+    REQUIRE(find_readiness_gate(observed_report, "condition.tangent_validation")->status ==
+        carto::agent::ConditionReadinessGateStatus::not_evaluated);
+    REQUIRE(!carto::agent::ConditionReadinessReport::production_readiness_established);
+
+    auto stale_readiness_inventory = observed_inventory;
+    auto& stale_readiness_fact = std::get<carto::agent::ConditionAssetInventoryFact>(
+        stale_readiness_inventory.rows.front());
+    stale_readiness_fact.source_current = false;
+    const auto stale_readiness =
+        carto::agent::audit_condition_readiness(stale_readiness_inventory);
+    REQUIRE(find_readiness_gate(stale_readiness, "condition.source_evidence")->status ==
+        carto::agent::ConditionReadinessGateStatus::failed);
+    REQUIRE(!stale_readiness.all_observed_checks_passed);
+
+    auto failed_readiness_inventory = observed_inventory;
+    auto& failed_readiness_fact = std::get<carto::agent::ConditionAssetInventoryFact>(
+        failed_readiness_inventory.rows.front());
+    failed_readiness_fact.material_region_assignments =
+        carto::agent::ConditionTechnicalCheckStatus::failed;
+    const auto failed_readiness =
+        carto::agent::audit_condition_readiness(failed_readiness_inventory);
+    REQUIRE(find_readiness_gate(failed_readiness,
+        "condition.material_region_assignments")->status ==
+        carto::agent::ConditionReadinessGateStatus::failed);
+    REQUIRE(!failed_readiness.all_observed_checks_passed);
+
+    auto partial_readiness_inventory = observed_inventory;
+    partial_readiness_inventory.truncated = true;
+    const auto partial_readiness =
+        carto::agent::audit_condition_readiness(partial_readiness_inventory);
+    REQUIRE(find_readiness_gate(partial_readiness, "condition.mesh_validation")->status ==
+        carto::agent::ConditionReadinessGateStatus::incomplete);
+    REQUIRE(!partial_readiness.all_observed_checks_passed);
+
+    auto mixed_readiness_inventory = observed_inventory;
+    mixed_readiness_inventory.rows.emplace_back(carto::agent::SceneObjectIdentityFact{
+        carto::scene::ObjectId{99U}});
+    const auto mixed_readiness =
+        carto::agent::audit_condition_readiness(mixed_readiness_inventory);
+    REQUIRE(find_readiness_gate(mixed_readiness, "condition.source_evidence")->status ==
+        carto::agent::ConditionReadinessGateStatus::incomplete);
+    REQUIRE(!mixed_readiness.all_observed_checks_passed);
+
+    auto duplicate_readiness_inventory = observed_inventory;
+    duplicate_readiness_inventory.rows.push_back(duplicate_readiness_inventory.rows.front());
+    const auto duplicate_readiness =
+        carto::agent::audit_condition_readiness(duplicate_readiness_inventory);
+    REQUIRE(find_readiness_gate(duplicate_readiness, "condition.mesh_validation")->status ==
+        carto::agent::ConditionReadinessGateStatus::incomplete);
+    REQUIRE(!duplicate_readiness.all_observed_checks_passed);
+
+    auto unavailable_readiness_inventory = observed_inventory;
+    auto& unavailable_readiness_fact = std::get<carto::agent::ConditionAssetInventoryFact>(
+        unavailable_readiness_inventory.rows.front());
+    unavailable_readiness_fact.source_id = 0U;
+    unavailable_readiness_fact.source_revision = {};
+    const auto unavailable_readiness =
+        carto::agent::audit_condition_readiness(unavailable_readiness_inventory);
+    REQUIRE(find_readiness_gate(unavailable_readiness,
+        "condition.source_evidence")->status ==
+        carto::agent::ConditionReadinessGateStatus::unavailable);
+    REQUIRE(!unavailable_readiness.all_observed_checks_passed);
+
+    const auto empty_readiness = carto::agent::audit_condition_readiness(
+        carto::agent::SceneQueryResult{});
+    REQUIRE(!empty_readiness.all_observed_checks_passed);
+    REQUIRE(find_readiness_gate(empty_readiness, "condition.source_evidence")->status ==
+        carto::agent::ConditionReadinessGateStatus::incomplete);
+
     auto stale_inventory = current_inventory;
     auto& stale_fact = std::get<carto::agent::ConditionAssetInventoryFact>(
         stale_inventory.rows.front());

@@ -2,7 +2,7 @@
 
 ## CONDITION evidence audit
 
-The desktop can summarize current/reviewed source lineage and metadata scan completeness, then perform bounded factual checks against the project's current mesh data. It reports mesh validation, active render UV and lightmap-candidate presence, and whether every declared non-zero material region resolves through an explicit catalog assignment. These are technical observations, not CONDITION readiness gates. The query does not compare source digests with current geometry or materials, inspect tangents or bake freshness, validate collision or traversal, or apply domain-specific CONDITION policy; overall readiness therefore remains unestablished.
+The desktop can summarize current/reviewed source lineage and metadata scan completeness, then perform bounded factual checks against the project's current mesh data. A gate report labels the observed source-lineage, metadata-scan, mesh-validation, render-UV-presence, and material-region-assignment checks as passed, failed, incomplete, or unavailable. Truncated and mixed queries cannot turn observed passes into complete-scope passes. It separately labels tangent validation, bake freshness, collision, traversal, anchor validity, source-to-geometry/material digest correspondence, and CONDITION policy as not evaluated. These bounded checks do not establish CONDITION readiness: the query does not compare source digests with current geometry or materials, inspect tangents or bake freshness, validate collision or traversal, or apply domain-specific CONDITION policy.
 
 ## Capability
 
