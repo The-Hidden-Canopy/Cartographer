@@ -259,6 +259,38 @@ struct ConditionEvidenceAudit {
 [[nodiscard]] ConditionEvidenceAudit audit_condition_inventory(
     const SceneQueryResult& inventory);
 
+enum class ConditionReadinessGateStatus : std::uint8_t {
+    passed,
+    failed,
+    incomplete,
+    unavailable,
+    not_evaluated,
+};
+
+struct ConditionReadinessGate {
+    std::string id;
+    std::string label;
+    ConditionReadinessGateStatus status = ConditionReadinessGateStatus::not_evaluated;
+    std::string evidence;
+    std::vector<std::uint64_t> affected_assets;
+    std::vector<scene::ObjectId> affected_objects;
+};
+
+// Gate results summarize only facts present in a complete, revision-bound
+// inventory. Missing domain validators remain explicit and this report never
+// establishes overall CONDITION or production readiness.
+struct ConditionReadinessReport {
+    ConditionEvidenceAudit inventory;
+    std::vector<ConditionReadinessGate> gates;
+    bool all_observed_checks_passed = false;
+    static constexpr bool production_readiness_established = false;
+};
+
+[[nodiscard]] ConditionReadinessReport audit_condition_readiness(
+    const SceneQueryResult& inventory);
+[[nodiscard]] std::string_view condition_readiness_gate_status_name(
+    ConditionReadinessGateStatus status) noexcept;
+
 // SceneQuery is a bounded read-only vocabulary. It returns copied facts and
 // stable identities; it never exposes a project, scene, or mesh reference.
 class SceneQuery final {

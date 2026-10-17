@@ -12984,8 +12984,9 @@ struct DesktopState {
             snapshot.agent_task->status != carto::agent::TaskStatus::accepted &&
             snapshot.agent_task->status != carto::agent::TaskStatus::rejected;
         const char* scope_label = active_task ? "task scope" : "selected scope";
-        const auto evidence_audit =
-            carto::agent::audit_condition_inventory(inventory);
+        const auto readiness_report =
+            carto::agent::audit_condition_readiness(inventory);
+        const auto& evidence_audit = readiness_report.inventory;
         ImGui::Text("CONDITION inventory · %s · R%llu · %zu asset fact(s)%s",
             scope_label,
             static_cast<unsigned long long>(inventory.source_revision.value()),
@@ -13011,6 +13012,33 @@ struct DesktopState {
                 "The audit excluded %zu malformed or unrelated fact row(s).",
                 evidence_audit.unrecognized_rows);
         }
+        const auto gate_count = [&readiness_report](
+                carto::agent::ConditionReadinessGateStatus status) {
+            return static_cast<std::size_t>(std::count_if(
+                readiness_report.gates.begin(), readiness_report.gates.end(),
+                [status](const auto& gate) { return gate.status == status; }));
+        };
+        ImGui::TextDisabled(
+            "Gate results · %zu passed · %zu failed · %zu incomplete · %zu unavailable · %zu not evaluated",
+            gate_count(carto::agent::ConditionReadinessGateStatus::passed),
+            gate_count(carto::agent::ConditionReadinessGateStatus::failed),
+            gate_count(carto::agent::ConditionReadinessGateStatus::incomplete),
+            gate_count(carto::agent::ConditionReadinessGateStatus::unavailable),
+            gate_count(carto::agent::ConditionReadinessGateStatus::not_evaluated));
+        for (const auto& gate : readiness_report.gates) {
+            const auto gate_status =
+                carto::agent::condition_readiness_gate_status_name(gate.status);
+            const auto gate_color = gate.status ==
+                    carto::agent::ConditionReadinessGateStatus::passed
+                ? snapshot.colors.semantic_success
+                : gate.status == carto::agent::ConditionReadinessGateStatus::failed
+                    ? snapshot.colors.semantic_error
+                    : snapshot.colors.semantic_warning;
+            ImGui::TextColored(color(gate_color), "%.*s",
+                static_cast<int>(gate_status.size()), gate_status.data());
+            ImGui::SameLine();
+            ImGui::TextWrapped("%s — %s", gate.label.c_str(), gate.evidence.c_str());
+        }
         if (!evidence_audit.metadata_scan_complete && !evidence_audit.assets.empty()) {
             ImGui::TextColored(color(snapshot.colors.semantic_warning),
                 "Some scoped metadata counts are incomplete.");
@@ -13019,10 +13047,13 @@ struct DesktopState {
             ImGui::TextColored(color(snapshot.colors.semantic_warning),
                 "Some technical checks are incomplete in this bounded query.");
         }
-        ImGui::TextColored(color(snapshot.colors.semantic_warning),
-            "Overall readiness is not established: tangents, bake validation and freshness, collision, "
-            "traversal, source-to-geometry/material digest correspondence, and CONDITION policy "
-            "are not evaluated.");
+        if (readiness_report.all_observed_checks_passed) {
+            ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                "Every check exposed by this inventory passed. This is not a CONDITION readiness result.");
+        } else {
+            ImGui::TextColored(color(snapshot.colors.semantic_warning),
+                "Observed checks include failed or incomplete evidence; overall CONDITION readiness is not established.");
+        }
         for (const auto& diagnostic : inventory.diagnostics) {
             ImGui::TextColored(color(snapshot.colors.semantic_warning),
                 "%s", diagnostic.message.c_str());

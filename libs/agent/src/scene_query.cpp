@@ -987,4 +987,147 @@ ConditionEvidenceAudit audit_condition_inventory(const SceneQueryResult& invento
     return audit;
 }
 
+std::string_view condition_readiness_gate_status_name(
+    ConditionReadinessGateStatus status) noexcept {
+    switch (status) {
+    case ConditionReadinessGateStatus::passed: return "passed";
+    case ConditionReadinessGateStatus::failed: return "failed";
+    case ConditionReadinessGateStatus::incomplete: return "incomplete";
+    case ConditionReadinessGateStatus::unavailable: return "unavailable";
+    case ConditionReadinessGateStatus::not_evaluated: return "not evaluated";
+    }
+    return "unknown";
+}
+
+ConditionReadinessReport audit_condition_readiness(const SceneQueryResult& inventory) {
+    ConditionReadinessReport report;
+    report.inventory = audit_condition_inventory(inventory);
+
+    std::set<std::uint64_t> accepted_assets;
+    for (const auto& asset : report.inventory.assets) accepted_assets.insert(asset.asset);
+    std::vector<const ConditionAssetInventoryFact*> facts;
+    std::set<std::uint64_t> observed_assets;
+    for (const auto& row : inventory.rows) {
+        const auto* fact = std::get_if<ConditionAssetInventoryFact>(&row);
+        if (fact == nullptr || !accepted_assets.contains(fact->asset) ||
+            !observed_assets.insert(fact->asset).second) {
+            continue;
+        }
+        facts.push_back(fact);
+    }
+    const bool complete = report.inventory.query_complete &&
+        !facts.empty() && facts.size() == report.inventory.assets.size() &&
+        inventory.rows.size() == report.inventory.assets.size();
+
+    const auto add_observed_gate = [&report, &facts, complete](
+        std::string id,
+        std::string label,
+        const auto& get_status,
+        std::string scope_description) {
+        std::size_t passed = 0U;
+        std::size_t failed = 0U;
+        std::size_t incomplete = 0U;
+        std::size_t unavailable = 0U;
+        for (const auto* fact : facts) {
+            switch (get_status(*fact)) {
+            case ConditionTechnicalCheckStatus::passed: ++passed; break;
+            case ConditionTechnicalCheckStatus::failed: ++failed; break;
+            case ConditionTechnicalCheckStatus::incomplete: ++incomplete; break;
+            case ConditionTechnicalCheckStatus::unavailable: ++unavailable; break;
+            case ConditionTechnicalCheckStatus::not_evaluated: ++incomplete; break;
+            }
+        }
+        ConditionReadinessGate gate;
+        gate.id = std::move(id);
+        gate.label = std::move(label);
+        if (failed > 0U) {
+            gate.status = ConditionReadinessGateStatus::failed;
+        } else if (!facts.empty() && unavailable == facts.size()) {
+            gate.status = ConditionReadinessGateStatus::unavailable;
+        } else if (!complete || incomplete > 0U) {
+            gate.status = ConditionReadinessGateStatus::incomplete;
+        } else if (passed == facts.size()) {
+            gate.status = ConditionReadinessGateStatus::passed;
+        } else {
+            gate.status = ConditionReadinessGateStatus::incomplete;
+        }
+        gate.evidence = std::move(scope_description) + ": " +
+            std::to_string(passed) + " passed, " + std::to_string(failed) +
+            " failed, " + std::to_string(incomplete) + " incomplete, " +
+            std::to_string(unavailable) + " unavailable across " +
+            std::to_string(facts.size()) + " observed asset(s)" +
+            (complete ? "; inventory complete" : "; inventory incomplete");
+        for (const auto* fact : facts) {
+            gate.affected_assets.push_back(fact->asset);
+            gate.affected_objects.push_back(fact->authored_object);
+        }
+        report.gates.push_back(std::move(gate));
+    };
+
+    add_observed_gate("condition.source_evidence", "Current reviewed source evidence",
+        [](const ConditionAssetInventoryFact& fact) {
+            if (fact.source_id == 0U || fact.source_revision.empty()) {
+                return ConditionTechnicalCheckStatus::unavailable;
+            }
+            return fact.source_current && fact.source_reviewed
+                ? ConditionTechnicalCheckStatus::passed
+                : ConditionTechnicalCheckStatus::failed;
+        }, "source lineage");
+    add_observed_gate("condition.metadata_scan", "Related metadata scan complete",
+        [](const ConditionAssetInventoryFact& fact) {
+            if (fact.source_id == 0U || fact.source_revision.empty()) {
+                return ConditionTechnicalCheckStatus::unavailable;
+            }
+            return fact.related_records_complete
+                ? ConditionTechnicalCheckStatus::passed
+                : ConditionTechnicalCheckStatus::incomplete;
+        }, "metadata scan");
+    add_observed_gate("condition.mesh_validation", "Mesh validation",
+        [](const ConditionAssetInventoryFact& fact) { return fact.mesh_validation; },
+        "mesh validation");
+    add_observed_gate("condition.uv_set_presence", "Render UV-set presence",
+        [](const ConditionAssetInventoryFact& fact) { return fact.uv_set_presence; },
+        "UV-set presence only");
+    add_observed_gate("condition.material_region_assignments", "Material-region assignments",
+        [](const ConditionAssetInventoryFact& fact) {
+            return fact.material_region_assignments;
+        }, "explicit region assignment");
+
+    const auto add_unavailable_gate = [&report, &facts](std::string id, std::string label,
+                                                        std::string evidence) {
+        ConditionReadinessGate gate;
+        gate.id = std::move(id);
+        gate.label = std::move(label);
+        gate.status = ConditionReadinessGateStatus::not_evaluated;
+        gate.evidence = std::move(evidence);
+        for (const auto* fact : facts) {
+            gate.affected_assets.push_back(fact->asset);
+            gate.affected_objects.push_back(fact->authored_object);
+        }
+        report.gates.push_back(std::move(gate));
+    };
+    add_unavailable_gate("condition.tangent_validation", "Tangent validation",
+        "No tangent validator is available in this inventory query.");
+    add_unavailable_gate("condition.bake_freshness", "Bake freshness",
+        "Bake outputs, inputs, and freshness are not queried.");
+    add_unavailable_gate("condition.collision_validation", "Collision validation",
+        "Collision geometry and validation are not queried.");
+    add_unavailable_gate("condition.traversal_validation", "Traversal validation",
+        "Traversal and clearance are not queried.");
+    add_unavailable_gate("condition.anchor_validity", "Interaction-anchor validity",
+        "Anchor counts are reported; anchor schema and placement are not validated.");
+    add_unavailable_gate("condition.source_digest_correspondence",
+        "Source-to-geometry digest correspondence",
+        "The inventory query does not compare source digests to current geometry or materials.");
+    add_unavailable_gate("condition.domain_policy", "CONDITION domain policy",
+        "No domain-specific readiness policy is applied by this query.");
+
+    report.all_observed_checks_passed = complete && !facts.empty() &&
+        std::all_of(report.gates.begin(), report.gates.begin() + 5,
+            [](const ConditionReadinessGate& gate) {
+                return gate.status == ConditionReadinessGateStatus::passed;
+            });
+    return report;
+}
+
 } // namespace carto::agent
