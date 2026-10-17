@@ -618,6 +618,8 @@ public:
         const std::filesystem::path& path);
     [[nodiscard]] core::Result<application::DispatchReceipt> create_engineering_characteristic(
         const application::CreateEngineeringCharacteristicAction& action);
+    [[nodiscard]] core::Result<application::DispatchReceipt> create_engineering_target(
+        const application::CreateEngineeringTargetAction& action);
     [[nodiscard]] core::Result<void> export_engineering_authoring(
         const std::filesystem::path& path) const;
     [[nodiscard]] core::Result<application::DispatchReceipt> invalidate_engineering_source(

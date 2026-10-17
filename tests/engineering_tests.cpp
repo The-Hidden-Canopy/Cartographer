@@ -571,6 +571,150 @@ void inspection_target_review_is_human_revision_bound_and_preserves_decisions() 
     REQUIRE(session.snapshot().project_revision == stale_snapshot.project_revision);
 }
 
+void inspection_target_authoring_is_human_revision_and_workcell_bound() {
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::NewProjectAction{"Target authoring"}));
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::ImportEngineeringFixtureAction{}));
+    carto::ui::UiController ui(session);
+
+    const auto make_action = [](const carto::application::ApplicationSnapshot& snapshot) {
+        carto::application::CreateEngineeringTargetAction action;
+        action.expected_project_revision = snapshot.project_revision;
+        action.expected_authoring_revision = snapshot.engineering.authored_revision;
+        action.characteristic_id = 400U;
+        action.source_topology_id = 101U;
+        action.sensor_pose = {{0.12, 0.13, 0.14}, {0.0, 0.0, 0.0, 2.0},
+            {1.0, 1.0, 1.0}};
+        action.standoff = 0.20;
+        action.pose_frame = "workcell";
+        action.justification = "Manual inspection plan callout DIST-17";
+        return action;
+    };
+
+    const auto before = session.snapshot();
+    REQUIRE(before.engineering.workcell_present);
+    const auto valid_action = make_action(before);
+    REQUIRE(!ui.submit_ai_proposal(valid_action));
+
+    auto missing_justification = valid_action;
+    missing_justification.justification.clear();
+    REQUIRE(!ui.dispatch(missing_justification));
+    auto multiline_justification = valid_action;
+    multiline_justification.justification = "line one\nline two";
+    REQUIRE(!ui.dispatch(multiline_justification));
+    auto wrong_frame = valid_action;
+    wrong_frame.pose_frame = "robot-base";
+    REQUIRE(!ui.dispatch(wrong_frame));
+    auto wrong_topology = valid_action;
+    wrong_topology.source_topology_id = 102U;
+    REQUIRE(!ui.dispatch(wrong_topology));
+    auto out_of_range = valid_action;
+    out_of_range.standoff = 0.09;
+    REQUIRE(!ui.dispatch(out_of_range));
+    auto zero_noncontact_standoff = valid_action;
+    zero_noncontact_standoff.standoff = 0.0;
+    REQUIRE(!ui.dispatch(zero_noncontact_standoff));
+    auto unnormalizable_pose = valid_action;
+    unnormalizable_pose.sensor_pose.rotation = {0.0, 0.0, 0.0, 0.0};
+    REQUIRE(!ui.dispatch(unnormalizable_pose));
+    auto scaled_pose = valid_action;
+    scaled_pose.sensor_pose.scale = {1.0, 2.0, 1.0};
+    REQUIRE(!ui.dispatch(scaled_pose));
+    auto stale_project = valid_action;
+    stale_project.expected_project_revision = stale_project.expected_project_revision.next();
+    REQUIRE(!ui.dispatch(stale_project));
+    auto stale_authoring = valid_action;
+    stale_authoring.expected_authoring_revision =
+        stale_authoring.expected_authoring_revision.next();
+    REQUIRE(!ui.dispatch(stale_authoring));
+    REQUIRE(session.snapshot().project_revision == before.project_revision);
+    REQUIRE(session.snapshot().engineering.target_count == before.engineering.target_count);
+
+    const auto created = ui.create_engineering_target(valid_action);
+    REQUIRE(created && created.value().document_changed);
+    auto after_create = session.snapshot();
+    REQUIRE(after_create.project_revision == before.project_revision.next());
+    REQUIRE(after_create.engineering.target_count == before.engineering.target_count + 1U);
+    REQUIRE(!after_create.engineering.publication_ready);
+    const auto authored = session.engineering_authoring();
+    REQUIRE(authored);
+    const auto target = std::find_if(authored.value().targets.begin(),
+        authored.value().targets.end(), [](const auto& value) {
+            return value.id == 504U;
+        });
+    REQUIRE(target != authored.value().targets.end());
+    REQUIRE(target->status == carto::engineering::TargetStatus::proposed);
+    REQUIRE(target->human_authored);
+    REQUIRE(target->sensor_pose.translation.x == 0.12);
+    REQUIRE(target->sensor_pose.rotation.w == 1.0);
+    REQUIRE(target->generation_basis.find("workcell-revision=C") != std::string::npos);
+    REQUIRE(target->generation_basis.find(valid_action.justification) != std::string::npos);
+    REQUIRE(authored.value().path->status ==
+        carto::engineering::DerivedProductStatus::stale);
+    REQUIRE(!ui.snapshot().operations.empty());
+    REQUIRE(ui.snapshot().operations.back().action == "Create Proposed Inspection Target");
+    REQUIRE(ui.snapshot().operations.back().category ==
+        carto::ui::OperationCategory::committed_command);
+
+    auto duplicate = make_action(after_create);
+    REQUIRE(!ui.dispatch(duplicate));
+    REQUIRE(session.snapshot().project_revision == after_create.project_revision);
+
+    auto changed_workcell = authored.value();
+    changed_workcell.project_revision = changed_workcell.project_revision.next();
+    changed_workcell.workcell->revision = "D";
+    REQUIRE(ui.dispatch(carto::application::ImportEngineeringAuthoringAction{
+        changed_workcell.serialize()}));
+    const auto changed_snapshot = session.snapshot();
+    const auto blocked_review = ui.dispatch(carto::application::ReviewEngineeringTargetAction{
+        changed_snapshot.project_revision, changed_snapshot.engineering.authored_revision,
+        504U, carto::engineering::TargetStatus::accepted});
+    REQUIRE(!blocked_review);
+    REQUIRE(session.snapshot().project_revision == changed_snapshot.project_revision);
+    const auto still_proposed = session.engineering_authoring();
+    REQUIRE(still_proposed);
+    REQUIRE(still_proposed.value().targets.back().status ==
+        carto::engineering::TargetStatus::proposed);
+
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::UndoAction{}));
+    after_create = session.snapshot();
+    const auto accepted = ui.dispatch(carto::application::ReviewEngineeringTargetAction{
+        after_create.project_revision, after_create.engineering.authored_revision,
+        504U, carto::engineering::TargetStatus::accepted});
+    REQUIRE(accepted && accepted.value().document_changed);
+    REQUIRE(session.snapshot().engineering.authored_revision ==
+        after_create.engineering.authored_revision.next());
+    REQUIRE(ui.snapshot().operations.back().action == "Accept Inspection Target");
+
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::UndoAction{}));
+    const auto undone = session.engineering_authoring();
+    REQUIRE(undone);
+    REQUIRE(undone.value().targets.back().status ==
+        carto::engineering::TargetStatus::proposed);
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::RedoAction{}));
+    const auto redone = session.engineering_authoring();
+    REQUIRE(redone);
+    REQUIRE(redone.value().targets.back().status ==
+        carto::engineering::TargetStatus::accepted);
+
+    const auto before_invalidation = session.snapshot();
+    REQUIRE(ui.dispatch(carto::application::InvalidateEngineeringSourceAction{
+        1U, "DV012-rev-d", digest("dv012-rev-d-target-authoring")}));
+    const auto stale_snapshot = session.snapshot();
+    REQUIRE(stale_snapshot.project_revision == before_invalidation.project_revision.next());
+    const auto stale_target = std::find_if(stale_snapshot.engineering.targets.begin(),
+        stale_snapshot.engineering.targets.end(), [](const auto& value) {
+            return value.id == 504U;
+        });
+    REQUIRE(stale_target != stale_snapshot.engineering.targets.end());
+    REQUIRE(stale_target->status == "stale");
+}
+
 void application_wires_engineering_authoring_through_persistence_and_history() {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto root = std::filesystem::temp_directory_path() /
@@ -929,6 +1073,7 @@ int main() {
         publication_and_vanta_admission_bind_exact_bytes();
         manual_requirement_authoring_is_revision_bound_and_auditable();
         inspection_characteristics_require_current_human_verified_contracts();
+        inspection_target_authoring_is_human_revision_and_workcell_bound();
         inspection_target_review_is_human_revision_bound_and_preserves_decisions();
         source_invalidation_preserves_authored_records_and_stales_products();
         step_boundary_never_fakes_a_cad_import();

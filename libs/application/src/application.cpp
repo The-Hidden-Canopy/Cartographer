@@ -1121,6 +1121,8 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return create_engineering_requirement(value);
             } else if constexpr (std::is_same_v<Action, CreateEngineeringCharacteristicAction>) {
                 return create_engineering_characteristic(value);
+            } else if constexpr (std::is_same_v<Action, CreateEngineeringTargetAction>) {
+                return create_engineering_target(value);
             } else if constexpr (std::is_same_v<Action, ReviewEngineeringTargetAction>) {
                 return review_engineering_target(value);
             } else if constexpr (std::is_same_v<Action, InvalidateEngineeringSourceAction>) {
@@ -3412,6 +3414,183 @@ core::Result<DispatchReceipt> ApplicationSession::create_engineering_characteris
         "Create Inspection Characteristic");
 }
 
+core::Result<DispatchReceipt> ApplicationSession::create_engineering_target(
+    const CreateEngineeringTargetAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "inspection target authoring requires the explicit human command boundary"));
+    }
+    if (action.expected_project_revision != document_.revision()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "inspection target was based on a stale project revision"));
+    }
+    if (action.characteristic_id == 0U || action.source_topology_id == 0U ||
+        action.pose_frame != "workcell" || action.justification.size() > 1024U ||
+        !std::any_of(action.justification.begin(), action.justification.end(),
+            [](unsigned char byte) { return !std::isspace(byte); }) ||
+        !std::all_of(action.justification.begin(), action.justification.end(),
+            [](unsigned char byte) { return byte >= 0x20U && byte != 0x7fU; })) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "inspection target requires a characteristic, topology, workcell frame, and one-line justification"));
+    }
+    const auto current = engineering_authoring();
+    if (!current) return failure(current.error().with_context("inspection target authoring"));
+    if (current.value().project_revision != action.expected_authoring_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "inspection target was based on a stale authoring revision"));
+    }
+    if (current.value().project_revision.exhausted()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "engineering authoring revision space is exhausted"));
+    }
+    if (!current.value().workcell.has_value()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "inspection target authoring requires an authored workcell frame"));
+    }
+    const auto characteristic = std::find_if(current.value().characteristics.begin(),
+        current.value().characteristics.end(), [&action](const auto& candidate) {
+            return candidate.id == action.characteristic_id;
+        });
+    if (characteristic == current.value().characteristics.end() ||
+        characteristic->status != engineering::InspectionStatus::authored) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "inspection target requires a current authored characteristic"));
+    }
+    const auto requirement = std::find_if(current.value().requirements.begin(),
+        current.value().requirements.end(), [&characteristic](const auto& candidate) {
+            return candidate.id == characteristic->requirement_id;
+        });
+    if (requirement == current.value().requirements.end() || !requirement->enabled ||
+        requirement->extraction == engineering::ExtractionState::stale ||
+        requirement->extraction == engineering::ExtractionState::rejected ||
+        requirement->extraction == engineering::ExtractionState::machine_extracted_proposed ||
+        std::find(requirement->topology_ids.begin(), requirement->topology_ids.end(),
+            action.source_topology_id) == requirement->topology_ids.end() ||
+        std::find(characteristic->topology_ids.begin(), characteristic->topology_ids.end(),
+            action.source_topology_id) == characteristic->topology_ids.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "inspection target topology must remain bound to its verified requirement and characteristic"));
+    }
+    const auto topology = std::find_if(current.value().topology.begin(),
+        current.value().topology.end(), [&action](const auto& binding) {
+            return binding.id == action.source_topology_id;
+        });
+    if (topology == current.value().topology.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "inspection target topology binding is unresolved"));
+    }
+    const auto source = std::find_if(current.value().sources.begin(),
+        current.value().sources.end(), [&topology](const auto& candidate) {
+            return candidate.id == topology->source_id;
+        });
+    if (source == current.value().sources.end() ||
+        topology->source_revision != source->revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "inspection target topology binding is stale against its source"));
+    }
+    if (!std::isfinite(action.standoff) ||
+        (!characteristic->sensor.contact_required && action.standoff <= 0.0) ||
+        action.standoff < characteristic->sensor.min_standoff ||
+        action.standoff > characteristic->sensor.max_standoff ||
+        !action.sensor_pose.finite() ||
+        action.sensor_pose.scale.x != 1.0 || action.sensor_pose.scale.y != 1.0 ||
+        action.sensor_pose.scale.z != 1.0) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "inspection target pose must be finite, unscaled, and inside the sensor standoff bounds"));
+    }
+
+    engineering::InspectionTarget candidate;
+    candidate.characteristic_id = characteristic->id;
+    candidate.source_topology_id = action.source_topology_id;
+    candidate.sensor_pose = action.sensor_pose;
+    candidate.sensor_pose.rotation = candidate.sensor_pose.rotation.normalized();
+    candidate.standoff = action.standoff;
+    candidate.status = engineering::TargetStatus::proposed;
+    candidate.generation_basis = "human-authored;frame=workcell;workcell-revision=" +
+        current.value().workcell->revision + ";justification=" + action.justification;
+    candidate.human_authored = true;
+    const auto same_pose = [](const core::Transform& left, const core::Transform& right) {
+        return left.translation.x == right.translation.x &&
+            left.translation.y == right.translation.y &&
+            left.translation.z == right.translation.z &&
+            left.rotation.x == right.rotation.x && left.rotation.y == right.rotation.y &&
+            left.rotation.z == right.rotation.z && left.rotation.w == right.rotation.w &&
+            left.scale.x == right.scale.x && left.scale.y == right.scale.y &&
+            left.scale.z == right.scale.z;
+    };
+    const auto duplicate = std::find_if(current.value().targets.begin(),
+        current.value().targets.end(), [&candidate, &same_pose](const auto& existing) {
+            return existing.characteristic_id == candidate.characteristic_id &&
+                existing.source_topology_id == candidate.source_topology_id &&
+                existing.standoff == candidate.standoff &&
+                same_pose(existing.sensor_pose, candidate.sensor_pose) &&
+                existing.status != engineering::TargetStatus::stale;
+        });
+    if (duplicate != current.value().targets.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "an equivalent inspection target already exists for this characteristic topology"));
+    }
+    if (current.value().targets.size() >= engineering::AuthoringDocument::kMaxCollectionEntries) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "inspection target collection reached its configured limit"));
+    }
+    std::uint64_t next_id = 1U;
+    for (const auto& existing : current.value().targets) {
+        if (existing.id == std::numeric_limits<std::uint64_t>::max()) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "inspection target identity space is exhausted"));
+        }
+        next_id = std::max(next_id, existing.id + 1U);
+    }
+
+    auto updated = current.value();
+    candidate.id = next_id;
+    if (auto valid = candidate.validate(); !valid) {
+        return failure(valid.error().with_context("inspection target fields"));
+    }
+    updated.targets.push_back(std::move(candidate));
+    if (updated.path.has_value()) {
+        updated.path->status = engineering::DerivedProductStatus::stale;
+        for (auto& sample : updated.path->samples) {
+            sample.status = engineering::PathSampleStatus::stale;
+        }
+    }
+    for (auto& product : updated.derived_products) {
+        product.status = engineering::DerivedProductStatus::stale;
+        product.stale_reason = "inspection target changed; path requires regeneration";
+    }
+    updated.project_revision = updated.project_revision.next();
+    if (auto valid = updated.validate(); !valid) {
+        return failure(valid.error().with_context("inspection target authoring"));
+    }
+    const std::string serialized = updated.serialize();
+    const auto digest = updated.canonical_digest();
+    if (!digest) return failure(digest.error().with_context("inspection target digest"));
+    const auto before = document_.engineering_authoring();
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectEngineeringAuthoringCommand>(
+            admission,
+            document_,
+            before,
+            project::SerializedEngineeringAuthoring{serialized, digest.value()}),
+        "Create Proposed Inspection Target");
+}
+
 core::Result<DispatchReceipt> ApplicationSession::review_engineering_target(
     const ReviewEngineeringTargetAction& action) {
     if (active_source_ != OperationSource::human) {
@@ -3461,6 +3640,21 @@ core::Result<DispatchReceipt> ApplicationSession::review_engineering_target(
         return failure(core::Diagnostic(
             core::ErrorCode::invalid_state,
             "only proposed inspection targets can receive a human decision"));
+    }
+    constexpr std::string_view workcell_basis_prefix =
+        "human-authored;frame=workcell;workcell-revision=";
+    if (target->human_authored && target->generation_basis.starts_with(workcell_basis_prefix)) {
+        const auto revision_start = workcell_basis_prefix.size();
+        const auto revision_end = target->generation_basis.find(';', revision_start);
+        const auto recorded_revision = target->generation_basis.substr(
+            revision_start, revision_end == std::string::npos
+                ? std::string::npos : revision_end - revision_start);
+        if (!current.value().workcell.has_value() || recorded_revision.empty() ||
+            current.value().workcell->revision != recorded_revision) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "inspection target workcell frame changed after the pose was authored"));
+        }
     }
     const auto characteristic = std::find_if(current.value().characteristics.begin(),
         current.value().characteristics.end(), [&target](const auto& candidate) {
@@ -4585,7 +4779,11 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
                         characteristic.sensor.tool_center_frame,
                         characteristic.coverage.kind,
                         characteristic.coverage.percentage,
-                        characteristic.priority});
+                        characteristic.priority,
+                        characteristic.sensor.min_standoff,
+                        characteristic.sensor.preferred_standoff,
+                        characteristic.sensor.max_standoff,
+                        characteristic.sensor.contact_required});
             }
             std::sort(result.engineering.characteristics.begin(),
                 result.engineering.characteristics.end(),
@@ -4600,7 +4798,8 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
                     engineering::target_status_name(target.status),
                     target.generation_basis,
                     target.standoff,
-                    target.human_authored});
+                    target.human_authored,
+                    target.sensor_pose.translation});
             }
             std::sort(result.engineering.targets.begin(), result.engineering.targets.end(),
                 [](const auto& left, const auto& right) { return left.id < right.id; });

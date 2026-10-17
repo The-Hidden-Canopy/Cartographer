@@ -23,6 +23,17 @@ targets or claim that a sensor, robot, or motion plan is runtime-validated.
 Material-verification requirements have no supported inspection-kind mapping
 in this profile and remain blocked from characterization.
 
+An operator can add a proposed inspection target to a current characteristic
+and one of its current topology bindings. The command records the explicit
+workcell frame, workcell revision, pose, sensor standoff, and a one-line human
+justification. It rejects stale project or authoring revisions, stale source
+bindings, unsupported frames, unnormalizable rotations, scaled poses, duplicate
+targets, and standoffs outside the characteristic's sensor bounds. A later
+workcell revision change blocks target acceptance until a new target is
+authored. New targets remain proposed until human review; target authoring
+marks existing paths and dependent products stale. Pose entry does not test
+reachability, collision, sensor visibility, or execution feasibility.
+
 ## BOM CSV profile
 
 The Engineering workspace accepts a UTF-8 CSV with this exact header order:
@@ -69,7 +80,8 @@ authoring, revision-bound accept/reject decisions, AI-proposal rejection,
 invalid source/topology/unit and stale-revision rejection, strict BOM CSV
 parsing, source-preserving BOM re-import, ambiguous/missing reconciliation,
 invalidated BOM evidence, requirement-kind compatibility, missing/contradictory
-access constraints, stale source/topology refusal, journal undo/redo, and
-explicit refusal to fake a CAD import. A newly authored requirement is not
-publication-ready by itself: package publication still requires its linked
-inspection characteristics and all other package gates.
+access constraints, stale source/topology refusal, proposed-target authoring,
+workcell-frame revision checks, journal undo/redo, and explicit refusal to fake
+a CAD import. A newly authored requirement is not publication-ready by itself:
+package publication still requires its linked inspection characteristics and
+all other package gates.

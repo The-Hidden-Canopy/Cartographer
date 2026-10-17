@@ -1291,6 +1291,17 @@ struct DesktopState {
     bool engineering_characteristic_fixture_occlusion = false;
     bool engineering_characteristic_base_reposition = false;
     std::uint32_t engineering_characteristic_priority = 0U;
+    std::uint64_t engineering_target_characteristic_id = 0U;
+    std::uint64_t engineering_target_topology_id = 0U;
+    double engineering_target_position_x = 0.0;
+    double engineering_target_position_y = 0.0;
+    double engineering_target_position_z = 0.0;
+    double engineering_target_rotation_x = 0.0;
+    double engineering_target_rotation_y = 0.0;
+    double engineering_target_rotation_z = 0.0;
+    double engineering_target_rotation_w = 1.0;
+    double engineering_target_standoff = 0.0;
+    std::array<char, 1025> engineering_target_justification{};
     std::optional<std::uint64_t> condition_source_update_id;
     std::array<char, 129> condition_source_revision{};
     std::array<char, 65> condition_source_digest{};
@@ -8805,6 +8816,9 @@ struct DesktopState {
             engineering_requirement_original_text.fill('\0');
             engineering_requirement_acceptance.fill('\0');
             engineering_characteristic_requirement_id = 0U;
+            engineering_target_characteristic_id = 0U;
+            engineering_target_topology_id = 0U;
+            engineering_target_justification.fill('\0');
         }
 
         struct RequirementOption {
@@ -9297,6 +9311,179 @@ struct DesktopState {
         }
     }
 
+    void draw_engineering_target_authoring(const UiSnapshot& snapshot) {
+        const auto& engineering = snapshot.engineering;
+        if (engineering_target_characteristic_id != 0U &&
+            std::none_of(engineering.characteristics.begin(), engineering.characteristics.end(),
+                [this](const auto& characteristic) {
+                    return characteristic.id == engineering_target_characteristic_id &&
+                        characteristic.status == "authored";
+                })) {
+            engineering_target_characteristic_id = 0U;
+            engineering_target_topology_id = 0U;
+        }
+
+        ImGui::SeparatorText("Proposed inspection targets");
+        ImGui::TextWrapped(
+            "Enter a target pose in the workcell frame and explain its basis. New targets remain proposed "
+            "until a human accepts or rejects them; Cartographer does not check reachability or collision.");
+        if (!engineering.workcell_present) {
+            ImGui::TextDisabled("An authored workcell is required before target poses can be authored.");
+            return;
+        }
+        const auto selected_characteristic = std::find_if(
+            engineering.characteristics.begin(), engineering.characteristics.end(),
+            [this](const auto& characteristic) {
+                return characteristic.id == engineering_target_characteristic_id &&
+                    characteristic.status == "authored";
+            });
+        const std::string characteristic_preview =
+            selected_characteristic == engineering.characteristics.end()
+                ? "Choose an authored characteristic"
+                : "Characteristic " + std::to_string(selected_characteristic->id) +
+                    " · " + selected_characteristic->kind + " · sensor " +
+                    selected_characteristic->sensor_type;
+        if (ImGui::BeginCombo("Characteristic for target", characteristic_preview.c_str())) {
+            ImGuiListClipper clipper;
+            clipper.Begin(static_cast<int>(engineering.characteristics.size()), 22.0F);
+            while (clipper.Step()) {
+                for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
+                    const auto& characteristic =
+                        engineering.characteristics[static_cast<std::size_t>(index)];
+                    if (characteristic.status != "authored") continue;
+                    const std::string label = "Characteristic " +
+                        std::to_string(characteristic.id) + " · " + characteristic.kind +
+                        " · requirement " + std::to_string(characteristic.requirement_id);
+                    const std::string id = std::to_string(characteristic.id);
+                    ImGui::PushID(id.c_str());
+                    if (ImGui::Selectable(label.c_str(),
+                            engineering_target_characteristic_id == characteristic.id)) {
+                        engineering_target_characteristic_id = characteristic.id;
+                        engineering_target_topology_id = 0U;
+                        engineering_target_standoff = characteristic.preferred_standoff;
+                    }
+                    ImGui::PopID();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        if (selected_characteristic == engineering.characteristics.end()) {
+            ImGui::TextDisabled("Choose a current characteristic to continue.");
+            return;
+        }
+        ImGui::TextDisabled("Sensor standoff bounds %.6g to %.6g",
+            selected_characteristic->min_standoff, selected_characteristic->max_standoff);
+
+        const auto topology_is_current = [&engineering](std::uint64_t topology_id) {
+            const auto binding = std::find_if(engineering.topology.begin(),
+                engineering.topology.end(), [topology_id](const auto& candidate) {
+                    return candidate.id == topology_id;
+                });
+            if (binding == engineering.topology.end()) return false;
+            const auto source = std::find_if(engineering.sources.begin(),
+                engineering.sources.end(), [&binding](const auto& candidate) {
+                    return candidate.id == binding->source_id;
+                });
+            return source != engineering.sources.end() &&
+                source->revision == binding->source_revision;
+        };
+        if (engineering_target_topology_id != 0U &&
+            (std::find(selected_characteristic->topology_ids.begin(),
+                selected_characteristic->topology_ids.end(), engineering_target_topology_id) ==
+                    selected_characteristic->topology_ids.end() ||
+             !topology_is_current(engineering_target_topology_id))) {
+            engineering_target_topology_id = 0U;
+        }
+        const auto selected_topology = std::find_if(
+            selected_characteristic->topology_ids.begin(),
+            selected_characteristic->topology_ids.end(), [this](std::uint64_t id) {
+                return id == engineering_target_topology_id;
+            });
+        std::string topology_preview = "Choose characteristic topology";
+        if (selected_topology != selected_characteristic->topology_ids.end()) {
+            const auto binding = std::find_if(engineering.topology.begin(),
+                engineering.topology.end(), [&selected_topology](const auto& candidate) {
+                    return candidate.id == *selected_topology;
+                });
+            if (binding != engineering.topology.end()) {
+                topology_preview = "Topology " + std::to_string(binding->id) + " · " +
+                    binding->kind + " · " + binding->external_id;
+            }
+        }
+        if (ImGui::BeginCombo("Target topology", topology_preview.c_str())) {
+            for (const auto topology_id : selected_characteristic->topology_ids) {
+                const auto binding = std::find_if(engineering.topology.begin(),
+                    engineering.topology.end(), [topology_id](const auto& candidate) {
+                        return candidate.id == topology_id;
+                    });
+                if (binding == engineering.topology.end() || !topology_is_current(topology_id)) {
+                    continue;
+                }
+                const std::string label = "Topology " + std::to_string(binding->id) +
+                    " · " + binding->kind + " · " + binding->external_id;
+                const std::string id = std::to_string(binding->id);
+                ImGui::PushID(id.c_str());
+                if (ImGui::Selectable(label.c_str(),
+                        engineering_target_topology_id == binding->id)) {
+                    engineering_target_topology_id = binding->id;
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+
+        ImGui::InputDouble("Target position X", &engineering_target_position_x, 0.001, 0.01, "%.6g");
+        ImGui::InputDouble("Target position Y", &engineering_target_position_y, 0.001, 0.01, "%.6g");
+        ImGui::InputDouble("Target position Z", &engineering_target_position_z, 0.001, 0.01, "%.6g");
+        ImGui::InputDouble("Target quaternion X", &engineering_target_rotation_x, 0.01, 0.1, "%.6g");
+        ImGui::InputDouble("Target quaternion Y", &engineering_target_rotation_y, 0.01, 0.1, "%.6g");
+        ImGui::InputDouble("Target quaternion Z", &engineering_target_rotation_z, 0.01, 0.1, "%.6g");
+        ImGui::InputDouble("Target quaternion W", &engineering_target_rotation_w, 0.01, 0.1, "%.6g");
+        ImGui::InputDouble("Target standoff", &engineering_target_standoff, 0.001, 0.01, "%.6g");
+        ImGui::InputTextMultiline("Target justification",
+            engineering_target_justification.data(), engineering_target_justification.size(),
+            ImVec2(-1, 56));
+        ImGui::TextDisabled("Pose frame: workcell. Rotation is normalized when recorded.");
+
+        const carto::core::Transform pose{
+            {engineering_target_position_x, engineering_target_position_y,
+             engineering_target_position_z},
+            {engineering_target_rotation_x, engineering_target_rotation_y,
+             engineering_target_rotation_z, engineering_target_rotation_w},
+            {1.0, 1.0, 1.0}};
+        const std::string_view justification(engineering_target_justification.data());
+        const bool justification_present = std::any_of(
+            justification.begin(), justification.end(), [](unsigned char byte) {
+                return !std::isspace(byte);
+            });
+        const bool fields_valid = engineering_target_topology_id != 0U &&
+            topology_is_current(engineering_target_topology_id) && pose.finite() &&
+            (selected_characteristic->contact_required ||
+                engineering_target_standoff > 0.0) &&
+            std::isfinite(engineering_target_standoff) &&
+            engineering_target_standoff >= selected_characteristic->min_standoff &&
+            engineering_target_standoff <= selected_characteristic->max_standoff &&
+            justification_present;
+        ImGui::BeginDisabled(!fields_valid);
+        if (ImGui::Button("Add proposed inspection target", ImVec2(-1, 30))) {
+            carto::application::CreateEngineeringTargetAction action;
+            action.expected_project_revision = snapshot.project_revision;
+            action.expected_authoring_revision = engineering.authored_revision;
+            action.characteristic_id = selected_characteristic->id;
+            action.source_topology_id = engineering_target_topology_id;
+            action.sensor_pose = pose;
+            action.standoff = engineering_target_standoff;
+            action.pose_frame = "workcell";
+            action.justification = engineering_target_justification.data();
+            static_cast<void>(dispatch(action));
+        }
+        ImGui::EndDisabled();
+        if (!fields_valid) {
+            ImGui::TextDisabled(
+                "Requires current topology, a finite pose, positive non-contact standoff within bounds, and a justification.");
+        }
+    }
+
     void draw_engineering_instrument(const UiSnapshot& snapshot) {
         if (!begin_instrument(snapshot, carto::ui::WorkbenchInstrument::references,
                               "Engineering", workbench.references, ImVec2(250, 90),
@@ -9396,6 +9583,9 @@ struct DesktopState {
                                 target.standoff,
                                 target.human_authored ? "human-authored" :
                                     target.generation_basis.c_str());
+                            ImGui::SetItemTooltip("Pose: (%+.6g, %+.6g, %+.6g) in workcell frame\nBasis: %s",
+                                target.pose_translation.x, target.pose_translation.y,
+                                target.pose_translation.z, target.generation_basis.c_str());
                             if (target.status == "proposed") {
                                 if (ImGui::SmallButton("Accept target")) {
                                     static_cast<void>(dispatch(
@@ -9463,6 +9653,7 @@ struct DesktopState {
             }
             draw_engineering_requirement_authoring(snapshot);
             draw_engineering_characteristic_authoring(snapshot);
+            draw_engineering_target_authoring(snapshot);
             if (engineering.stale) {
                 ImGui::TextColored(color(snapshot.colors.semantic_error),
                     "Source drift is recorded; import reconciled authoring to restore admission.");

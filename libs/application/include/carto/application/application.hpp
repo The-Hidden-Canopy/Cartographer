@@ -334,6 +334,10 @@ struct EngineeringAuthoringView {
         std::string coverage_kind;
         double coverage_percentage = 0.0;
         std::uint32_t priority = 0U;
+        double min_standoff = 0.0;
+        double preferred_standoff = 0.0;
+        double max_standoff = 0.0;
+        bool contact_required = false;
     };
     std::vector<Characteristic> characteristics;
     struct Target {
@@ -344,6 +348,7 @@ struct EngineeringAuthoringView {
         std::string generation_basis;
         double standoff = 0.0;
         bool human_authored = false;
+        core::Vec3d pose_translation{};
     };
     std::vector<Target> targets;
     struct BomLine {
@@ -752,6 +757,16 @@ struct CreateEngineeringCharacteristicAction {
     engineering::AccessConstraint access;
     std::uint32_t priority = 0U;
 };
+struct CreateEngineeringTargetAction {
+    core::Revision expected_project_revision;
+    core::Revision expected_authoring_revision;
+    std::uint64_t characteristic_id = 0U;
+    std::uint64_t source_topology_id = 0U;
+    core::Transform sensor_pose = core::Transform::identity();
+    double standoff = 0.0;
+    std::string pose_frame = "workcell";
+    std::string justification;
+};
 struct ReviewEngineeringTargetAction {
     core::Revision expected_project_revision;
     core::Revision expected_authoring_revision;
@@ -890,6 +905,7 @@ using ApplicationAction = std::variant<
     ImportEngineeringBomCsvAction,
     CreateEngineeringRequirementAction,
     CreateEngineeringCharacteristicAction,
+    CreateEngineeringTargetAction,
     ReviewEngineeringTargetAction,
     InvalidateEngineeringSourceAction,
     ImportConditionFixtureAction,
@@ -1096,6 +1112,8 @@ private:
         const CreateEngineeringRequirementAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_engineering_characteristic(
         const CreateEngineeringCharacteristicAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> create_engineering_target(
+        const CreateEngineeringTargetAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> review_engineering_target(
         const ReviewEngineeringTargetAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> invalidate_engineering_source(
