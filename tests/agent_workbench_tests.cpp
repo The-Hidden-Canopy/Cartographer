@@ -2171,6 +2171,93 @@ void checkpoint_rebase_reexecutes_only_the_affected_dag_frontier() {
     REQUIRE(accepted_c->mesh->triangle_faces.size() > original_faces);
 }
 
+void checkpoint_rebase_preserves_unrelated_edits_while_replaying_changed_inputs() {
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 2U);
+    const auto target = objects[0];
+    const auto unrelated = objects[1];
+    const auto original = source.snapshot();
+    const auto* original_target = original.viewport.scene.find(target);
+    REQUIRE(original_target != nullptr && original_target->mesh != nullptr);
+    const auto original_face_count = original_target->mesh->triangle_faces.size();
+
+    auto plan = plan_for(original, {target}, {
+        {"step-1", {target, carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    auto task = carto::agent::AgentTask::begin(source, plan, envelope_for({target}));
+    REQUIRE(task);
+    REQUIRE(task.value().run());
+    TempDirectory directory;
+    const auto path = directory.path() / "mixed-source-edits.carto-agent-task";
+    REQUIRE(task.value().save_checkpoint(path));
+    const auto checkpoint = carto::agent::AgentTask::load_checkpoint(path);
+    REQUIRE(checkpoint);
+
+    const auto transform_for = [&source](carto::scene::ObjectId id) {
+        const auto snapshot = source.snapshot();
+        const auto found = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
+            [id](const auto& object) { return object.object.id == id; });
+        REQUIRE(found != snapshot.objects.end());
+        return found->object.local_transform;
+    };
+    auto changed_target_transform = transform_for(target);
+    changed_target_transform.translation.x += 0.25;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        source, carto::application::SetObjectTransformAction{
+            target, changed_target_transform, std::nullopt}));
+    auto unrelated_transform = transform_for(unrelated);
+    unrelated_transform.translation.y += 2.0;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        source, carto::application::SetObjectTransformAction{
+            unrelated, unrelated_transform, std::nullopt}));
+
+    const auto current_revision = source.snapshot().project_revision;
+    const auto analysis = carto::agent::AgentTask::analyze_checkpoint_rebase(
+        source, checkpoint.value());
+    REQUIRE(analysis && analysis.value().can_rebase());
+    REQUIRE(analysis.value().directly_conflicting_step_ids ==
+        std::vector<std::string>{"step-1"});
+    REQUIRE(analysis.value().invalidated_step_ids ==
+        std::vector<std::string>{"step-1"});
+    REQUIRE(std::find(analysis.value().read_objects.begin(),
+        analysis.value().read_objects.end(), target) != analysis.value().read_objects.end());
+    REQUIRE(std::find(analysis.value().read_objects.begin(),
+        analysis.value().read_objects.end(), unrelated) == analysis.value().read_objects.end());
+    REQUIRE(std::find(analysis.value().write_objects.begin(),
+        analysis.value().write_objects.end(), unrelated) == analysis.value().write_objects.end());
+
+    auto reauthorized = checkpoint.value().plan;
+    reauthorized.objective.base_revision = current_revision;
+    auto rebased = carto::agent::AgentTask::rebase_checkpoint(
+        source, checkpoint.value(), std::move(reauthorized));
+    REQUIRE(rebased);
+    const auto rebased_snapshot = rebased.value().snapshot();
+    REQUIRE(rebased_snapshot.status == carto::agent::TaskStatus::review);
+    REQUIRE(rebased_snapshot.can_accept);
+    REQUIRE(rebased_snapshot.rebases.size() == 1U);
+    REQUIRE(rebased_snapshot.rebases.front().reused_step_ids.empty());
+    REQUIRE(source.snapshot().project_revision == current_revision);
+    REQUIRE(transform_for(target).translation.x == changed_target_transform.translation.x);
+    REQUIRE(transform_for(unrelated).translation.y == unrelated_transform.translation.y);
+
+    REQUIRE(carto::application::HumanApplicationAccess::accept_agent_task(rebased.value()));
+    const auto accepted = source.snapshot();
+    REQUIRE(accepted.project_revision == current_revision.next());
+    const auto accepted_target = std::find_if(accepted.objects.begin(), accepted.objects.end(),
+        [target](const auto& object) { return object.object.id == target; });
+    const auto accepted_unrelated = std::find_if(accepted.objects.begin(), accepted.objects.end(),
+        [unrelated](const auto& object) { return object.object.id == unrelated; });
+    REQUIRE(accepted_target != accepted.objects.end());
+    REQUIRE(accepted_unrelated != accepted.objects.end());
+    REQUIRE(accepted_target->object.local_transform.translation.x ==
+        changed_target_transform.translation.x);
+    REQUIRE(accepted_unrelated->object.local_transform.translation.y ==
+        unrelated_transform.translation.y);
+    const auto* accepted_mesh = accepted.viewport.scene.find(target);
+    REQUIRE(accepted_mesh != nullptr && accepted_mesh->mesh != nullptr);
+    REQUIRE(accepted_mesh->mesh->triangle_faces.size() > original_face_count);
+}
+
 void checkpoint_rebase_blocks_changed_task_write_targets() {
     carto::application::ApplicationSession source;
     const auto objects = create_boxes(source, 1U);
@@ -6687,6 +6774,7 @@ int main() {
         persistent_checkpoint_replays_review_and_blocks_artifact_drift();
         persistent_checkpoint_reauthorization_and_stale_source_are_fail_closed();
         checkpoint_rebase_reexecutes_only_the_affected_dag_frontier();
+        checkpoint_rebase_preserves_unrelated_edits_while_replaying_changed_inputs();
         checkpoint_rebase_blocks_changed_task_write_targets();
         checkpoint_rebase_reports_and_executes_only_the_affected_dag_branch();
         prepared_checkpoint_requires_explicit_resume_before_native_execution();
