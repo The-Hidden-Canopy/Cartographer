@@ -561,6 +561,7 @@ bool is_operation_action(const application::ApplicationAction& action) {
             std::is_same_v<Action, application::ImportEngineeringAuthoringAction> ||
             std::is_same_v<Action, application::ImportEngineeringBomCsvAction> ||
             std::is_same_v<Action, application::ImportEngineeringRequirementCsvAction> ||
+            std::is_same_v<Action, application::ImportEngineeringPathResultAction> ||
             std::is_same_v<Action, application::AttachEngineeringEvidenceAction> ||
             std::is_same_v<Action, application::CreateEngineeringRequirementAction> ||
             std::is_same_v<Action, application::ReviewEngineeringRequirementAction> ||
@@ -4340,6 +4341,24 @@ core::Result<application::DispatchReceipt> UiController::import_engineering_requ
             snapshot.project_revision,
             snapshot.engineering.authored_revision,
             path.filename().generic_string(),
+            std::move(bytes).value()},
+        OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::import_engineering_path_result(
+    const std::filesystem::path& path) {
+    auto bytes = read_bounded_file(path, engineering::VantaPathResult::kMaxSerializedBytes,
+        "VANTA path result");
+    if (!bytes) return core::Result<application::DispatchReceipt>::failure(bytes.error());
+    const auto snapshot = session_.snapshot();
+    if (!snapshot.engineering.present) {
+        return core::Result<application::DispatchReceipt>::failure(invalid(
+            "import the engineering authoring document before importing a VANTA path result"));
+    }
+    return dispatch_with_category(
+        application::ImportEngineeringPathResultAction{
+            snapshot.project_revision,
+            snapshot.engineering.authored_revision,
             std::move(bytes).value()},
         OperationCategory::provider);
 }

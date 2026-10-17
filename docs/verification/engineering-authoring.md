@@ -133,13 +133,34 @@ is refused.
 ## Persistence and failure behavior
 
 Project schema 16 stores a digest-bound `ENGINEERING_AUTHORING` record when
-present. Engineering authoring schema 3 stores human requirement-review reasons,
-retains workcell revision history, and migrates schema 1 and 2 records. Mutations
-pass through editor commands and can be undone or redone.
+present. Engineering authoring schema 4 stores human requirement-review reasons,
+retains workcell revision history, and stores VANTA path-result receipts. It
+migrates authoring schemas 1 through 3. Mutations pass through editor commands
+and can be undone or redone.
 Source invalidation preserves authored identity while marking dependent
-products stale; both package publication and local VANTA contract admission
-refuse a stale path or stale derived product. Project formats 1 through 14
-remain readable.
+products stale. A new VANTA request projection omits the previous path result
+and stale derived products while retaining the local project records. Direct
+local VANTA contract admission refuses stale path or derived-product records if
+they are present in the package. Project formats 1 through 14 remain readable.
+
+The Engineering workspace imports `.carto-vanta-path` response files up to
+16 MiB. Exchange schema 1 binds the response to the project namespace, project
+and authoring revisions, request publication digest, and request authoring
+digest. Import requires the current package to pass Cartographer's local VANTA
+admission contract, then rejects a stale request binding, a missing or
+non-accepted inspection target, malformed data, or a mismatched result digest. Accepted
+results become local authoring mutations through the editor command journal;
+they can be undone, redone, saved, and reopened. A provider-reported `current`
+path is stored as `unverified`, while the provider-reported status, identity,
+version, run ID, request digests, and result digest remain in the receipt. The
+digest detects accidental or unsynchronized byte changes; it is not a provider
+signature and does not authenticate VANTA execution. Replacing a prior result
+adds its run and digest to the evidence history. Source invalidation stales the
+stored path and preserves its receipt.
+
+This import is Cartographer-side exchange handling. It neither invokes VANTA
+nor proves that VANTA admitted the package, executed a path planner, or validated
+clearance, reachability, collision, or hardware behavior.
 
 The acceptance tests cover deterministic fixture round-trip, provenance,
 tamper rejection, stale-source invalidation, schema-version fencing, project
@@ -154,11 +175,15 @@ invalidated BOM evidence, requirement-kind compatibility, missing/contradictory
 access constraints, stale source/topology refusal, proposed-target authoring,
 workcell-frame revision checks, read-only path sample projection, revisioned
 entity and keep-out edits,
-workcell-history migration and round-trip, journal undo/redo, and explicit
-keep-out and reference-frame creation with stale revision, AI-proposal,
+workcell-history migration and round-trip, journal undo/redo, explicit keep-out
+and reference-frame creation with stale revision, AI-proposal,
 missing-reason, multiline, invalid-dimension, non-normalizable rotation, and
 scaled-pose rejection, journal undo/redo, and explicit refusal to fake a CAD
-import. A newly authored requirement is not
+import. VANTA response coverage includes digest-bound round-trip and tamper
+rejection, refused admission and stale request and target-reference refusal,
+AI-origin mutation refusal, unverified status preservation, run supersession
+evidence, project save/reopen, and source invalidation of an imported result.
+A newly authored requirement is not
 publication-ready by itself:
 package publication still requires its linked inspection characteristics and
 all other package gates.

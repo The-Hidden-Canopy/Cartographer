@@ -398,6 +398,7 @@ struct EngineeringAuthoringView {
         assets::Sha256Digest basis_digest;
         core::Revision basis_revision;
         std::string status;
+        std::optional<engineering::VantaPathResultReceipt> vanta_receipt;
         std::vector<PathSample> samples;
     };
     std::optional<Path> path;
@@ -787,6 +788,11 @@ struct ImportEngineeringRequirementCsvAction {
     std::string locator;
     std::string csv_bytes;
 };
+struct ImportEngineeringPathResultAction {
+    core::Revision expected_project_revision;
+    core::Revision expected_authoring_revision;
+    std::string result_bytes;
+};
 struct AttachEngineeringEvidenceAction {
     core::Revision expected_project_revision;
     core::Revision expected_authoring_revision;
@@ -1011,6 +1017,7 @@ using ApplicationAction = std::variant<
     ImportEngineeringAuthoringAction,
     ImportEngineeringBomCsvAction,
     ImportEngineeringRequirementCsvAction,
+    ImportEngineeringPathResultAction,
     AttachEngineeringEvidenceAction,
     CreateEngineeringRequirementAction,
     ReviewEngineeringRequirementAction,
@@ -1233,6 +1240,8 @@ private:
         const CreateEngineeringCharacteristicAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_engineering_target(
         const CreateEngineeringTargetAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> import_engineering_path_result(
+        const ImportEngineeringPathResultAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> update_engineering_workcell(
         const UpdateEngineeringWorkcellAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_engineering_keep_out(

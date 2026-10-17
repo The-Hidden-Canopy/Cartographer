@@ -233,8 +233,18 @@ void publication_and_vanta_admission_bind_exact_bytes() {
         sample.status = carto::engineering::PathSampleStatus::stale;
     }
     REQUIRE(stale_path.validate());
-    REQUIRE(!carto::engineering::InspectionPackage::publish(
-        stale_path, stale_path.project_revision, stale_path.project_namespace));
+    const auto stale_path_handoff = carto::engineering::InspectionPackage::publish(
+        stale_path, stale_path.project_revision, stale_path.project_namespace);
+    REQUIRE(stale_path_handoff);
+    const auto stale_path_projection = carto::engineering::AuthoringDocument::deserialize(
+        stale_path_handoff.value().authoring_bytes);
+    REQUIRE(stale_path_projection);
+    REQUIRE(!stale_path_projection.value().path.has_value());
+    const auto stale_path_projection_admission = carto::engineering::admit_for_vanta(
+        stale_path_handoff.value());
+    REQUIRE(stale_path_projection_admission);
+    REQUIRE(stale_path_projection_admission.value().status ==
+        carto::engineering::VantaAdmissionStatus::admit);
 
     auto stale_derived_product = fixture.value();
     stale_derived_product.derived_products.front().status =
@@ -242,17 +252,27 @@ void publication_and_vanta_admission_bind_exact_bytes() {
     stale_derived_product.derived_products.front().stale_reason =
         "workcell revision changed";
     REQUIRE(stale_derived_product.validate());
-    REQUIRE(!carto::engineering::InspectionPackage::publish(
+    const auto stale_derived_handoff = carto::engineering::InspectionPackage::publish(
         stale_derived_product, stale_derived_product.project_revision,
-        stale_derived_product.project_namespace));
+        stale_derived_product.project_namespace);
+    REQUIRE(stale_derived_handoff);
+    const auto stale_derived_projection = carto::engineering::AuthoringDocument::deserialize(
+        stale_derived_handoff.value().authoring_bytes);
+    REQUIRE(stale_derived_projection);
+    REQUIRE(std::none_of(stale_derived_projection.value().derived_products.begin(),
+        stale_derived_projection.value().derived_products.end(), [](const auto& product) {
+            return product.status == carto::engineering::DerivedProductStatus::stale;
+        }));
 
-    const auto admission_for_stale_package = [&](auto mutate, std::string_view expected_reason) {
-        auto tampered_authoring = carto::engineering::AuthoringDocument::deserialize(
-            package.value().authoring_bytes);
-        REQUIRE(tampered_authoring);
-        mutate(tampered_authoring.value());
-        auto stale_package = package.value();
-        stale_package.authoring_bytes = tampered_authoring.value().serialize();
+    const auto admission_for_stale_package = [&](auto mutate,
+                                                  std::string_view expected_reason) {
+        auto stale_authoring = fixture.value();
+        mutate(stale_authoring);
+        carto::engineering::InspectionPackage stale_package;
+        stale_package.project_namespace = stale_authoring.project_namespace;
+        stale_package.project_revision = stale_authoring.project_revision;
+        stale_package.authoring_bytes = stale_authoring.serialize();
+        stale_package.evidence = stale_authoring.evidence;
         REQUIRE(stale_package.refresh_digest());
         const auto stale_admission = carto::engineering::admit_for_vanta(stale_package);
         REQUIRE(stale_admission);
@@ -334,6 +354,72 @@ void publication_and_vanta_admission_bind_exact_bytes() {
     REQUIRE(!carto::engineering::InspectionPackage::publish(
         missing_characteristic, missing_characteristic.project_revision,
         missing_characteristic.project_namespace));
+}
+
+void vanta_path_result_exchange_is_digest_bound_and_backward_compatible() {
+    auto fixture = carto::engineering::make_dv012_fixture();
+    REQUIRE(fixture);
+    const auto package = carto::engineering::InspectionPackage::publish(
+        fixture.value(), fixture.value().project_revision,
+        fixture.value().project_namespace);
+    REQUIRE(package);
+
+    carto::engineering::VantaPathResult result;
+    result.project_namespace = package.value().project_namespace;
+    result.project_revision = package.value().project_revision;
+    result.authoring_revision = fixture.value().project_revision;
+    result.publication_digest = package.value().publication_digest;
+    result.authoring_digest = package.value().authoring_digest;
+    result.provider_identity = "vanta.test-provider";
+    result.provider_version = "test";
+    result.run_id = "dv012-test-run-1";
+    result.path.id = 900U;
+    result.path.basis_digest = package.value().authoring_digest;
+    result.path.basis_revision = result.authoring_revision;
+    result.path.status = carto::engineering::DerivedProductStatus::current;
+    result.path.samples = {
+        {0U, 0.0, carto::core::Transform::identity(), 500U,
+            carto::engineering::PathSampleStatus::valid, 0.25},
+        {1U, 1.0,
+            carto::core::Transform{{0.06, 0.04, 0.20},
+                carto::core::Quaternion::identity(), {1.0, 1.0, 1.0}},
+            503U, carto::engineering::PathSampleStatus::valid, 0.25}};
+    REQUIRE(result.refresh_digest());
+
+    const auto bytes = result.serialize();
+    const auto reopened = carto::engineering::VantaPathResult::deserialize(bytes);
+    if (!reopened) throw TestFailure(reopened.error().message);
+    REQUIRE(reopened.value().serialize() == bytes);
+    REQUIRE(reopened.value().result_digest == result.result_digest);
+    REQUIRE(reopened.value().path.samples.size() == 2U);
+
+    auto tampered = bytes;
+    const auto run_marker = tampered.find("dv012-test-run-1");
+    REQUIRE(run_marker != std::string::npos);
+    tampered[run_marker] = 'x';
+    REQUIRE(!carto::engineering::VantaPathResult::deserialize(tampered));
+    REQUIRE(!carto::engineering::VantaPathResult::deserialize(std::string(
+        carto::engineering::VantaPathResult::kMaxSerializedBytes + 1U, 'x')));
+
+    auto unsafe_identity = result;
+    unsafe_identity.provider_version = "../untrusted";
+    REQUIRE(!unsafe_identity.refresh_digest());
+
+    auto legacy_authoring_bytes = fixture.value().serialize();
+    const auto schema_separator = legacy_authoring_bytes.find(' ');
+    const auto schema_end = legacy_authoring_bytes.find('\n');
+    REQUIRE(schema_separator != std::string::npos && schema_end != std::string::npos);
+    legacy_authoring_bytes.replace(schema_separator + 1U,
+        schema_end - schema_separator - 1U, "3");
+    const auto receipt_marker = legacy_authoring_bytes.find("PATH_RESULT_RECEIPT 0\n");
+    REQUIRE(receipt_marker != std::string::npos);
+    legacy_authoring_bytes.erase(receipt_marker,
+        std::string_view("PATH_RESULT_RECEIPT 0\n").size());
+    const auto legacy_authoring =
+        carto::engineering::AuthoringDocument::deserialize(legacy_authoring_bytes);
+    REQUIRE(legacy_authoring);
+    REQUIRE(legacy_authoring.value().path.has_value());
+    REQUIRE(!legacy_authoring.value().path->vanta_receipt.has_value());
 }
 
 void manual_requirement_authoring_is_revision_bound_and_auditable() {
@@ -847,16 +933,17 @@ void inspection_target_authoring_is_human_revision_and_workcell_bound() {
 void workcell_edits_are_revisioned_audited_and_invalidate_targets() {
     auto fixture = carto::engineering::make_dv012_fixture();
     REQUIRE(fixture);
-    const std::string current_header = "CARTOGRAPHER_ENGINEERING_AUTHORING 3\n";
+    const std::string current_header = "CARTOGRAPHER_ENGINEERING_AUTHORING 4\n";
     const std::string legacy_header = "CARTOGRAPHER_ENGINEERING_AUTHORING 1\n";
     const auto downgrade = [](std::string bytes, std::string_view header) {
-        const std::string current = "CARTOGRAPHER_ENGINEERING_AUTHORING 3\n";
+        const std::string current = "CARTOGRAPHER_ENGINEERING_AUTHORING 4\n";
         REQUIRE(bytes.starts_with(current));
         bytes.replace(0U, current.size(), header);
         std::istringstream input(bytes);
         std::ostringstream output;
         std::string line;
         while (std::getline(input, line)) {
+            if (line == "PATH_RESULT_RECEIPT 0") continue;
             if (line.starts_with("REQUIREMENT ") && line.ends_with(" \"\"")) {
                 line.resize(line.size() - 3U);
             }
@@ -1885,6 +1972,188 @@ void ui_imports_exports_and_reconciles_engineering_authoring_files() {
     std::filesystem::remove_all(root, ignored);
 }
 
+void ui_imports_digest_bound_vanta_paths_without_authenticating_provider_claims() {
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto root = std::filesystem::temp_directory_path() /
+        ("cartographer-vanta-path-result-tests-" + std::to_string(stamp));
+    std::filesystem::create_directories(root);
+
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.dispatch(carto::application::NewProjectAction{"DV012 Path Result"}));
+    REQUIRE(ui.import_engineering_fixture());
+    const auto fixture = carto::engineering::make_dv012_fixture();
+    REQUIRE(fixture);
+
+    const auto make_result = [&](const carto::engineering::InspectionPackage& request,
+                                 const carto::ui::UiSnapshot& snapshot,
+                                 std::string run_id) {
+        carto::engineering::VantaPathResult result;
+        result.project_namespace = request.project_namespace;
+        result.project_revision = request.project_revision;
+        result.authoring_revision = snapshot.engineering.authored_revision;
+        result.publication_digest = request.publication_digest;
+        result.authoring_digest = request.authoring_digest;
+        result.provider_identity = "vanta.test-provider";
+        result.provider_version = "test";
+        result.run_id = std::move(run_id);
+        result.path.id = 900U;
+        result.path.basis_digest = request.authoring_digest;
+        result.path.basis_revision = snapshot.engineering.authored_revision;
+        result.path.status = carto::engineering::DerivedProductStatus::current;
+        result.path.samples = {
+            {0U, 0.0, carto::core::Transform::identity(), 500U,
+                carto::engineering::PathSampleStatus::valid, 0.25},
+            {1U, 1.0,
+                carto::core::Transform{{0.06, 0.04, 0.20},
+                    carto::core::Quaternion::identity(), {1.0, 1.0, 1.0}},
+                503U, carto::engineering::PathSampleStatus::valid, 0.25}};
+        const auto refreshed = result.refresh_digest();
+        if (!refreshed) throw TestFailure(refreshed.error().message);
+        return result;
+    };
+    const auto write_result = [&](std::string_view name,
+                                  const carto::engineering::VantaPathResult& result) {
+        const auto path = root / std::string(name);
+        std::ofstream stream(path, std::ios::binary);
+        REQUIRE(stream.good());
+        stream << result.serialize();
+        REQUIRE(stream.good());
+        return path;
+    };
+    const auto unchanged_after_rejection = [&](const std::filesystem::path& path) {
+        const auto before = ui.snapshot();
+        REQUIRE(!ui.import_engineering_path_result(path));
+        const auto after = ui.snapshot();
+        REQUIRE(after.project_revision == before.project_revision);
+        REQUIRE(after.engineering.authored_revision == before.engineering.authored_revision);
+        REQUIRE(after.engineering.digest == before.engineering.digest);
+    };
+
+    auto request = ui.build_engineering_package();
+    REQUIRE(request);
+    const auto initial = ui.snapshot();
+    auto result = make_result(request.value(), initial, "dv012-test-run-1");
+    const auto valid_path = write_result("valid.carto-vanta-path", result);
+
+    auto wrong_binding = result;
+    wrong_binding.publication_digest = digest("stale publication");
+    REQUIRE(wrong_binding.refresh_digest());
+    unchanged_after_rejection(write_result("stale.carto-vanta-path", wrong_binding));
+
+    auto missing_target = result;
+    missing_target.path.samples.front().target_id = 999999U;
+    REQUIRE(missing_target.refresh_digest());
+    unchanged_after_rejection(write_result("missing-target.carto-vanta-path", missing_target));
+
+    auto rejected_target = result;
+    rejected_target.path.samples.front().target_id = 501U;
+    REQUIRE(rejected_target.refresh_digest());
+    unchanged_after_rejection(write_result("rejected-target.carto-vanta-path", rejected_target));
+
+    const auto before_stale_action = ui.snapshot();
+    REQUIRE(!ui.dispatch(carto::application::ImportEngineeringPathResultAction{
+        before_stale_action.project_revision.next(),
+        before_stale_action.engineering.authored_revision,
+        result.serialize()}));
+    REQUIRE(ui.snapshot().project_revision == before_stale_action.project_revision);
+    REQUIRE(!ui.dispatch(carto::application::ImportEngineeringPathResultAction{
+        before_stale_action.project_revision,
+        before_stale_action.engineering.authored_revision.next(),
+        result.serialize()}));
+    REQUIRE(ui.snapshot().project_revision == before_stale_action.project_revision);
+
+    REQUIRE(!ui.submit_ai_proposal(carto::application::ImportEngineeringPathResultAction{
+        initial.project_revision, initial.engineering.authored_revision, result.serialize()}));
+    REQUIRE(ui.snapshot().project_revision == before_stale_action.project_revision);
+
+    carto::application::ApplicationSession refused_session;
+    carto::ui::UiController refused_ui(refused_session);
+    REQUIRE(refused_ui.dispatch(carto::application::NewProjectAction{"Refused VANTA Request"}));
+    auto lossy_authoring = fixture.value();
+    lossy_authoring.sources.front().lossy = true;
+    const auto lossy_authoring_path = root / "lossy.carto-engineering-authoring";
+    {
+        std::ofstream stream(lossy_authoring_path, std::ios::binary);
+        REQUIRE(stream.good());
+        stream << lossy_authoring.serialize();
+        REQUIRE(stream.good());
+    }
+    REQUIRE(refused_ui.import_engineering_authoring(lossy_authoring_path));
+    const auto refused_request = refused_ui.build_engineering_package();
+    REQUIRE(refused_request);
+    const auto refused_admission = refused_ui.admit_engineering_package();
+    REQUIRE(refused_admission);
+    REQUIRE(refused_admission.value().status ==
+        carto::engineering::VantaAdmissionStatus::refuse);
+    const auto refused_result = make_result(
+        refused_request.value(), refused_ui.snapshot(), "refused-test-run");
+    const auto refused_result_path = write_result(
+        "refused-admission.carto-vanta-path", refused_result);
+    const auto refused_before = refused_ui.snapshot();
+    REQUIRE(!refused_ui.import_engineering_path_result(refused_result_path));
+    REQUIRE(refused_ui.snapshot().project_revision == refused_before.project_revision);
+    REQUIRE(refused_ui.snapshot().engineering.digest == refused_before.engineering.digest);
+
+    REQUIRE(ui.import_engineering_path_result(valid_path));
+    auto imported = ui.snapshot();
+    REQUIRE(imported.engineering.path.has_value());
+    REQUIRE(imported.engineering.path->status == "unverified");
+    REQUIRE(imported.engineering.path->vanta_receipt.has_value());
+    REQUIRE(imported.engineering.path->vanta_receipt->reported_status ==
+        carto::engineering::DerivedProductStatus::current);
+    REQUIRE(imported.engineering.path->vanta_receipt->result_digest == result.result_digest);
+    REQUIRE(imported.engineering.path->vanta_receipt->provider_identity ==
+        "vanta.test-provider");
+    REQUIRE(imported.operations.back().category == carto::ui::OperationCategory::provider);
+
+    const auto persisted_after_first = session.engineering_authoring();
+    REQUIRE(persisted_after_first);
+    const auto first_roundtrip = carto::engineering::AuthoringDocument::deserialize(
+        persisted_after_first.value().serialize());
+    REQUIRE(first_roundtrip);
+    REQUIRE(first_roundtrip.value().path->vanta_receipt->run_id == "dv012-test-run-1");
+
+    request = ui.build_engineering_package();
+    REQUIRE(request);
+    const auto second_snapshot = ui.snapshot();
+    auto second_result = make_result(request.value(), second_snapshot, "dv012-test-run-2");
+    const auto second_path = write_result("second.carto-vanta-path", second_result);
+    REQUIRE(ui.import_engineering_path_result(second_path));
+    const auto after_second = session.engineering_authoring();
+    REQUIRE(after_second);
+    REQUIRE(after_second.value().path->vanta_receipt->run_id == "dv012-test-run-2");
+    REQUIRE(std::any_of(after_second.value().evidence.runtime_validation.begin(),
+        after_second.value().evidence.runtime_validation.end(), [&](const std::string& item) {
+            return item.find(result.result_digest.hex()) != std::string::npos &&
+                item.find("superseded") != std::string::npos;
+        }));
+
+    const auto project_path = root / "path-result.carto";
+    REQUIRE(ui.dispatch(carto::application::SaveProjectAction{project_path}));
+    carto::application::ApplicationSession reopened;
+    carto::ui::UiController reopened_ui(reopened);
+    REQUIRE(reopened_ui.dispatch(carto::application::OpenProjectAction{project_path}));
+    const auto reopened_authoring = reopened.engineering_authoring();
+    REQUIRE(reopened_authoring);
+    REQUIRE(reopened_authoring.value().path->vanta_receipt->run_id == "dv012-test-run-2");
+    REQUIRE(std::any_of(reopened_authoring.value().evidence.runtime_validation.begin(),
+        reopened_authoring.value().evidence.runtime_validation.end(), [&](const std::string& item) {
+            return item.find(result.result_digest.hex()) != std::string::npos;
+        }));
+
+    const auto source = reopened.snapshot().engineering.sources.front();
+    REQUIRE(reopened_ui.invalidate_engineering_source(
+        source.id, source.revision + "-next", digest("updated engineering source")));
+    const auto invalidated = reopened.snapshot();
+    REQUIRE(invalidated.engineering.path.has_value());
+    REQUIRE(invalidated.engineering.path->status == "stale");
+    REQUIRE(invalidated.engineering.path->vanta_receipt->run_id == "dv012-test-run-2");
+
+    std::error_code ignored;
+    std::filesystem::remove_all(root, ignored);
+}
+
 void source_invalidation_preserves_authored_records_and_stales_products() {
     auto fixture = carto::engineering::make_dv012_fixture();
     REQUIRE(fixture);
@@ -2047,6 +2316,7 @@ int main() {
         bom_csv_parser_and_reconciliation_fail_closed_on_ambiguous_evidence();
         requirement_csv_parser_accepts_only_the_declared_dimensional_profile();
         publication_and_vanta_admission_bind_exact_bytes();
+        vanta_path_result_exchange_is_digest_bound_and_backward_compatible();
         manual_requirement_authoring_is_revision_bound_and_auditable();
         inspection_characteristics_require_current_human_verified_contracts();
         inspection_target_authoring_is_human_revision_and_workcell_bound();
@@ -2061,6 +2331,7 @@ int main() {
         ui_imports_and_reviews_structured_requirements_without_promoting_proposals();
         ui_attaches_opaque_engineering_evidence_with_safe_provenance();
         ui_imports_exports_and_reconciles_engineering_authoring_files();
+        ui_imports_digest_bound_vanta_paths_without_authenticating_provider_claims();
         std::cout << "engineering tests passed\n";
         return 0;
     } catch (const std::exception& error) {

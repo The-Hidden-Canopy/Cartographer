@@ -976,6 +976,7 @@ enum class FileDialogKind {
     engineering_bom_csv,
     engineering_requirement_csv,
     engineering_evidence,
+    engineering_path_result,
     condition,
     condition_authoring,
     audio_clip,
@@ -1088,6 +1089,12 @@ enum class StandardMeshExport {
     case FileDialogKind::engineering_evidence:
         dialog.lpstrFilter =
             L"Engineering drawing or specification evidence\0*.*\0All Files\0*.*\0";
+        break;
+    case FileDialogKind::engineering_path_result:
+        dialog.lpstrFilter =
+            L"VANTA Path Result (*.carto-vanta-path)\0*.carto-vanta-path\0"
+            L"All Files\0*.*\0";
+        dialog.lpstrDefExt = L"carto-vanta-path";
         break;
     case FileDialogKind::condition:
         dialog.lpstrFilter =
@@ -2154,6 +2161,27 @@ struct DesktopState {
             (package ? package.value().publication_digest.hex() : std::string{"unknown"}) +
             " to " + path->filename().string() + ".";
         action_feedback_error = false;
+    }
+
+    void import_engineering_path_result() {
+        const auto path = choose_file(false, FileDialogKind::engineering_path_result);
+        if (!path.has_value()) return;
+        const auto imported = ui.import_engineering_path_result(*path);
+        if (!imported) {
+            action_feedback = imported.error().message;
+            action_feedback_error = true;
+            return;
+        }
+        const auto snapshot = ui.snapshot();
+        action_feedback = "Imported a digest-bound path result from " +
+            path->filename().string() + "; its provider identity is recorded but not "
+            "authenticated, and the path remains unverified.";
+        if (snapshot.engineering.path.has_value() &&
+            snapshot.engineering.path->vanta_receipt.has_value()) {
+            action_feedback += " Run " + snapshot.engineering.path->vanta_receipt->run_id + ".";
+        }
+        action_feedback_error = false;
+        mark_custom_workbench();
     }
 
     void import_engineering_authoring() {
@@ -9573,12 +9601,31 @@ struct DesktopState {
 
     void draw_engineering_path_review(const UiSnapshot& snapshot) {
         const auto& path = snapshot.engineering.path;
-        if (!path.has_value()) return;
         ImGui::SeparatorText("Stored inspection path samples");
+        if (ImGui::Button("Import VANTA path result…", ImVec2(-1, 30))) {
+            import_engineering_path_result();
+        }
+        if (!path.has_value()) {
+            ImGui::TextDisabled("No path result is stored in this project.");
+            return;
+        }
         ImGui::Text("Path %llu · %s · %zu samples · basis revision %llu",
             static_cast<unsigned long long>(path->id), path->status.c_str(),
             path->samples.size(),
             static_cast<unsigned long long>(path->basis_revision.value()));
+        if (path->vanta_receipt.has_value()) {
+            const auto& receipt = *path->vanta_receipt;
+            ImGui::TextWrapped("Provider %s · version %s · run %s · reported status %s",
+                receipt.provider_identity.c_str(), receipt.provider_version.c_str(),
+                receipt.run_id.c_str(),
+                carto::engineering::derived_product_status_name(receipt.reported_status));
+            ImGui::TextWrapped("Request publication %s · request authoring %s · result %s",
+                receipt.publication_digest.hex().c_str(),
+                receipt.authoring_digest.hex().c_str(), receipt.result_digest.hex().c_str());
+            ImGui::TextWrapped(
+                "The result digest and current request binding were checked. Provider identity "
+                "and execution are not authenticated; all imported path values remain unverified.");
+        }
         ImGui::TextWrapped(
             "Stored path data is shown as received. This panel does not calculate reachability, "
             "collision, clearance, or execution feasibility.");
@@ -9600,7 +9647,7 @@ struct DesktopState {
                         target_status = target == snapshot.engineering.targets.end()
                             ? "missing" : target->status;
                     }
-                    ImGui::Text("Sample %u · u %.4f · %s · target %s · clearance value %.5g",
+                    ImGui::Text("Sample %u · u %.4f · %s · target %s · reported clearance %.5g",
                         sample.sequence, sample.normalized, sample.status.c_str(),
                         target_status.c_str(), sample.clearance);
                     const std::string target_id_text = sample.target_id.has_value()

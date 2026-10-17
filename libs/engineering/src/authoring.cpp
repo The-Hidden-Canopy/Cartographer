@@ -821,6 +821,24 @@ core::Result<void> PathSample::validate() const {
     return core::Result<void>::success();
 }
 
+core::Result<void> VantaPathResultReceipt::validate() const {
+    const auto safe_identity = [](std::string_view value) {
+        return safe_text(value) && value.find_first_of("/\\:") == std::string_view::npos;
+    };
+    if (!safe_text(project_namespace) || project_revision.exhausted() ||
+        authoring_revision.exhausted() || publication_digest.is_zero() ||
+        authoring_digest.is_zero() || !provider_identity.starts_with("vanta.") ||
+        !safe_identity(provider_identity) || !safe_identity(provider_version) ||
+        !safe_identity(run_id) || result_digest.is_zero() ||
+        !enum_known(reported_status, {DerivedProductStatus::current,
+            DerivedProductStatus::stale, DerivedProductStatus::rejected,
+            DerivedProductStatus::unverified})) {
+        return core::Result<void>::failure(validation(
+            "VANTA path result receipt is malformed"));
+    }
+    return core::Result<void>::success();
+}
+
 core::Result<void> GeneratedPath::validate() const {
     if (id == 0U || basis_digest.is_zero() || samples.empty() ||
         !enum_known(status, {DerivedProductStatus::current, DerivedProductStatus::stale,
@@ -832,7 +850,164 @@ core::Result<void> GeneratedPath::validate() const {
         if (sample.sequence != expected++) return core::Result<void>::failure(validation("path sample sequence is not contiguous"));
         if (auto result = sample.validate(); !result) return result;
     }
+    if (vanta_receipt.has_value()) {
+        if (auto result = vanta_receipt->validate(); !result) return result;
+        if ((status != DerivedProductStatus::unverified &&
+             status != DerivedProductStatus::stale &&
+             status != DerivedProductStatus::rejected) ||
+            basis_digest != vanta_receipt->authoring_digest ||
+            basis_revision != vanta_receipt->authoring_revision) {
+            return core::Result<void>::failure(validation(
+                "VANTA path result must remain unverified and bound to its source authoring"));
+        }
+    }
     return core::Result<void>::success();
+}
+
+core::Result<void> VantaPathResult::validate() const {
+    const auto safe_identity = [](std::string_view value) {
+        return safe_text(value) && value.find_first_of("/\\:") == std::string_view::npos;
+    };
+    if (!safe_text(project_namespace) || project_revision.exhausted() ||
+        authoring_revision.exhausted() || publication_digest.is_zero() ||
+        authoring_digest.is_zero() || !provider_identity.starts_with("vanta.") ||
+        !safe_identity(provider_identity) || !safe_identity(provider_version) ||
+        !safe_identity(run_id) || path.vanta_receipt.has_value() ||
+        path.basis_digest != authoring_digest ||
+        path.basis_revision != authoring_revision || result_digest.is_zero()) {
+        return core::Result<void>::failure(validation(
+            "VANTA path result header or basis is malformed"));
+    }
+    if (auto result = path.validate(); !result) return result;
+    if (result_digest != digest_text(canonical_without_digest())) {
+        return core::Result<void>::failure(validation(
+            "VANTA path result digest does not bind its bytes"));
+    }
+    return core::Result<void>::success();
+}
+
+std::string VantaPathResult::canonical_without_digest() const {
+    std::ostringstream output;
+    output << "CARTO_VANTA_PATH_RESULT 1\n";
+    output << "PROJECT " << std::quoted(project_namespace) << ' '
+           << project_revision.value() << ' ' << authoring_revision.value() << '\n';
+    output << "SOURCE " << publication_digest.hex() << ' '
+           << authoring_digest.hex() << '\n';
+    output << "PROVIDER " << std::quoted(provider_identity) << ' '
+           << std::quoted(provider_version) << ' ' << std::quoted(run_id) << '\n';
+    output << "PATH_RECORD " << path.id << ' ' << path.basis_digest.hex() << ' '
+           << path.basis_revision.value() << ' '
+           << derived_product_status_name(path.status) << ' '
+           << path.samples.size() << '\n';
+    for (const auto& sample : path.samples) {
+        output << "SAMPLE " << sample.sequence << ' ' << std::setprecision(17)
+               << sample.normalized << ' ';
+        write_transform(output, sample.tool_pose);
+        output << ' ' << sample.target_id.value_or(0U) << ' '
+               << path_sample_status_name(sample.status) << ' '
+               << sample.clearance << '\n';
+    }
+    return output.str();
+}
+
+core::Result<void> VantaPathResult::refresh_digest() {
+    result_digest = digest_text(canonical_without_digest());
+    return validate();
+}
+
+std::string VantaPathResult::serialize() const {
+    return canonical_without_digest() + "RESULT " + result_digest.hex() + "\nEND\n";
+}
+
+core::Result<VantaPathResult> VantaPathResult::deserialize(std::string_view text) {
+    if (text.empty() || text.size() > kMaxSerializedBytes) {
+        return core::Result<VantaPathResult>::failure(parse_error(
+            "VANTA path result exceeds its configured size bound"));
+    }
+    std::istringstream input{std::string(text)};
+    std::string magic;
+    std::uint64_t version = 0U;
+    if (!(input >> magic >> version) || magic != "CARTO_VANTA_PATH_RESULT" ||
+        version != 1U) {
+        return core::Result<VantaPathResult>::failure(parse_error(
+            "VANTA path result header is invalid"));
+    }
+    VantaPathResult result;
+    std::uint64_t project_revision = 0U;
+    std::uint64_t authoring_revision = 0U;
+    if (!require_record(input, "PROJECT") ||
+        !read_text(input, result.project_namespace, false) ||
+        !read_uint(input, project_revision) || !read_uint(input, authoring_revision) ||
+        !require_record(input, "SOURCE") || !read_digest(input, result.publication_digest) ||
+        !read_digest(input, result.authoring_digest) || !require_record(input, "PROVIDER") ||
+        !read_text(input, result.provider_identity, false) ||
+        !read_text(input, result.provider_version, false) ||
+        !read_text(input, result.run_id, false)) {
+        return core::Result<VantaPathResult>::failure(parse_error(
+            "VANTA path result source records are invalid"));
+    }
+    result.project_revision = core::Revision(project_revision);
+    result.authoring_revision = core::Revision(authoring_revision);
+
+    std::string status;
+    std::size_t sample_count = 0U;
+    std::uint64_t path_basis_revision = 0U;
+    if (!require_record(input, "PATH_RECORD") || !read_id(input, result.path.id) ||
+        !read_digest(input, result.path.basis_digest) ||
+        !read_uint(input, path_basis_revision) || !(input >> status) ||
+        !read_count(input, sample_count, AuthoringDocument::kMaxCollectionEntries)) {
+        return core::Result<VantaPathResult>::failure(parse_error(
+            "VANTA path result path record is invalid"));
+    }
+    result.path.basis_revision = core::Revision(path_basis_revision);
+    const auto parsed_status = parse_named<DerivedProductStatus>(status,
+        {{DerivedProductStatus::current, "current"},
+         {DerivedProductStatus::stale, "stale"},
+         {DerivedProductStatus::rejected, "rejected"},
+         {DerivedProductStatus::unverified, "unverified"}},
+        "VANTA path result status is invalid");
+    if (!parsed_status) {
+        return core::Result<VantaPathResult>::failure(parsed_status.error());
+    }
+    result.path.status = parsed_status.value();
+    for (std::size_t index = 0U; index < sample_count; ++index) {
+        PathSample sample;
+        std::uint64_t sequence = 0U;
+        std::string sample_status;
+        if (!require_record(input, "SAMPLE") || !read_uint(input, sequence) ||
+            sequence > std::numeric_limits<std::uint32_t>::max() ||
+            !read_double(input, sample.normalized) || !read_transform(input, sample.tool_pose) ||
+            !read_optional_id(input, sample.target_id) || !(input >> sample_status) ||
+            !read_double(input, sample.clearance)) {
+            return core::Result<VantaPathResult>::failure(parse_error(
+                "VANTA path result sample record is invalid"));
+        }
+        const auto parsed_sample = parse_named<PathSampleStatus>(sample_status,
+            {{PathSampleStatus::valid, "valid"},
+             {PathSampleStatus::rejected, "rejected"},
+             {PathSampleStatus::stale, "stale"},
+             {PathSampleStatus::unreachable, "unreachable"},
+             {PathSampleStatus::collision, "collision"},
+             {PathSampleStatus::clearance_warning, "clearance-warning"},
+             {PathSampleStatus::unverified, "unverified"}},
+            "VANTA path result sample status is invalid");
+        if (!parsed_sample) {
+            return core::Result<VantaPathResult>::failure(parsed_sample.error());
+        }
+        sample.sequence = static_cast<std::uint32_t>(sequence);
+        sample.status = parsed_sample.value();
+        result.path.samples.push_back(std::move(sample));
+    }
+    if (!require_record(input, "RESULT") ||
+        !read_digest(input, result.result_digest) || !require_end(input)) {
+        return core::Result<VantaPathResult>::failure(parse_error(
+            "VANTA path result trailer is invalid"));
+    }
+    if (auto valid = result.validate(); !valid) {
+        return core::Result<VantaPathResult>::failure(valid.error().with_context(
+            "VANTA path result"));
+    }
+    return core::Result<VantaPathResult>::success(std::move(result));
 }
 
 core::Result<void> CapabilityEvidence::validate() const {
@@ -961,7 +1136,28 @@ core::Result<void> AuthoringDocument::validate() const {
     }
     if (path.has_value()) {
         if (auto result = path->validate(); !result) return result;
-        for (const auto& sample : path->samples) if (sample.target_id.has_value() && !contains_id(targets, &InspectionTarget::id, *sample.target_id)) return core::Result<void>::failure(validation("path target reference is unresolved"));
+        if (path->vanta_receipt.has_value() &&
+            path->vanta_receipt->project_namespace != project_namespace) {
+            return core::Result<void>::failure(validation(
+                "VANTA path result receipt belongs to a different project"));
+        }
+        for (const auto& sample : path->samples) {
+            if (!sample.target_id.has_value()) continue;
+            const auto target = std::find_if(targets.begin(), targets.end(),
+                [&sample](const InspectionTarget& candidate) {
+                    return candidate.id == *sample.target_id;
+                });
+            if (target == targets.end()) {
+                return core::Result<void>::failure(validation(
+                    "path target reference is unresolved"));
+            }
+            if (path->vanta_receipt.has_value() &&
+                path->status == DerivedProductStatus::unverified &&
+                target->status != TargetStatus::accepted) {
+                return core::Result<void>::failure(validation(
+                    "unverified VANTA path sample references a non-accepted target"));
+            }
+        }
     }
     for (const auto& value : derived_products) if (auto result = value.validate(); !result) return result;
     return evidence.validate();
@@ -1022,6 +1218,21 @@ std::string AuthoringDocument::serialize() const {
     output << "PATH " << (path.has_value() ? 1 : 0) << '\n';
     if (path.has_value()) {
         output << "PATH_RECORD " << path->id << ' ' << path->basis_digest.hex() << ' ' << path->basis_revision.value() << ' ' << derived_product_status_name(path->status) << ' ' << path->samples.size() << '\n';
+        output << "PATH_RESULT_RECEIPT " << (path->vanta_receipt.has_value() ? 1 : 0);
+        if (path->vanta_receipt.has_value()) {
+            const auto& receipt = *path->vanta_receipt;
+            output << ' ' << std::quoted(receipt.project_namespace) << ' '
+                   << receipt.project_revision.value() << ' '
+                   << receipt.authoring_revision.value() << ' '
+                   << receipt.publication_digest.hex() << ' '
+                   << receipt.authoring_digest.hex() << ' '
+                   << std::quoted(receipt.provider_identity) << ' '
+                   << std::quoted(receipt.provider_version) << ' '
+                   << std::quoted(receipt.run_id) << ' '
+                   << receipt.result_digest.hex() << ' '
+                   << derived_product_status_name(receipt.reported_status);
+        }
+        output << '\n';
         for (const auto& sample : path->samples) { output << "SAMPLE " << sample.sequence << ' ' << std::setprecision(17) << sample.normalized << ' '; write_transform(output, sample.tool_pose); output << ' ' << sample.target_id.value_or(0U) << ' ' << path_sample_status_name(sample.status) << ' ' << sample.clearance << '\n'; }
     }
     output << "DERIVED " << derived_products.size() << '\n';
@@ -1158,7 +1369,98 @@ core::Result<AuthoringDocument> AuthoringDocument::deserialize(std::string_view 
         }
     }
     if (!require_record(input, "PATH") || !read_uint(input, present) || present > 1U) return core::Result<AuthoringDocument>::failure(parse_error("path section is invalid"));
-    if (present != 0U) { GeneratedPath value; std::string status; if (!require_record(input, "PATH_RECORD") || !read_id(input, value.id) || !read_digest(input, value.basis_digest) || !read_uint(input, version) || !(input >> status) || !read_count(input, count, AuthoringDocument::kMaxCollectionEntries)) return core::Result<AuthoringDocument>::failure(parse_error("path record is invalid")); value.basis_revision = core::Revision(version); const auto parsed = parse_named<DerivedProductStatus>(status, {{DerivedProductStatus::current, "current"}, {DerivedProductStatus::stale, "stale"}, {DerivedProductStatus::rejected, "rejected"}, {DerivedProductStatus::unverified, "unverified"}}, "path status is invalid"); if (!parsed) return core::Result<AuthoringDocument>::failure(parsed.error()); value.status = parsed.value(); for (std::size_t index = 0U; index < count; ++index) { PathSample sample; std::string sample_status; if (!require_record(input, "SAMPLE") || !read_uint(input, version) || !read_double(input, sample.normalized) || !read_transform(input, sample.tool_pose) || !read_optional_id(input, sample.target_id) || !(input >> sample_status) || !read_double(input, sample.clearance)) return core::Result<AuthoringDocument>::failure(parse_error("path sample is invalid")); sample.sequence = static_cast<std::uint32_t>(version); const auto parsed_sample = parse_named<PathSampleStatus>(sample_status, {{PathSampleStatus::valid, "valid"}, {PathSampleStatus::rejected, "rejected"}, {PathSampleStatus::stale, "stale"}, {PathSampleStatus::unreachable, "unreachable"}, {PathSampleStatus::collision, "collision"}, {PathSampleStatus::clearance_warning, "clearance-warning"}, {PathSampleStatus::unverified, "unverified"}}, "path sample status is invalid"); if (!parsed_sample) return core::Result<AuthoringDocument>::failure(parsed_sample.error()); sample.status = parsed_sample.value(); value.samples.push_back(std::move(sample)); } document.path = std::move(value); }
+    if (present != 0U) {
+        GeneratedPath value;
+        std::string status;
+        if (!require_record(input, "PATH_RECORD") || !read_id(input, value.id) ||
+            !read_digest(input, value.basis_digest) || !read_uint(input, version) ||
+            !(input >> status) ||
+            !read_count(input, count, AuthoringDocument::kMaxCollectionEntries)) {
+            return core::Result<AuthoringDocument>::failure(parse_error(
+                "path record is invalid"));
+        }
+        value.basis_revision = core::Revision(version);
+        const auto parsed = parse_named<DerivedProductStatus>(status,
+            {{DerivedProductStatus::current, "current"},
+             {DerivedProductStatus::stale, "stale"},
+             {DerivedProductStatus::rejected, "rejected"},
+             {DerivedProductStatus::unverified, "unverified"}},
+            "path status is invalid");
+        if (!parsed) return core::Result<AuthoringDocument>::failure(parsed.error());
+        value.status = parsed.value();
+        if (authoring_schema_version >= 4U) {
+            std::uint64_t has_receipt = 0U;
+            if (!require_record(input, "PATH_RESULT_RECEIPT") ||
+                !read_uint(input, has_receipt) || has_receipt > 1U) {
+                return core::Result<AuthoringDocument>::failure(parse_error(
+                    "VANTA path result receipt section is invalid"));
+            }
+            if (has_receipt != 0U) {
+                VantaPathResultReceipt receipt;
+                std::uint64_t receipt_project_revision = 0U;
+                std::uint64_t receipt_authoring_revision = 0U;
+                std::string reported_status;
+                if (!read_text(input, receipt.project_namespace, false) ||
+                    !read_uint(input, receipt_project_revision) ||
+                    !read_uint(input, receipt_authoring_revision) ||
+                    !read_digest(input, receipt.publication_digest) ||
+                    !read_digest(input, receipt.authoring_digest) ||
+                    !read_text(input, receipt.provider_identity, false) ||
+                    !read_text(input, receipt.provider_version, false) ||
+                    !read_text(input, receipt.run_id, false) ||
+                    !read_digest(input, receipt.result_digest) ||
+                    !(input >> reported_status)) {
+                    return core::Result<AuthoringDocument>::failure(parse_error(
+                        "VANTA path result receipt record is invalid"));
+                }
+                receipt.project_revision = core::Revision(receipt_project_revision);
+                receipt.authoring_revision = core::Revision(receipt_authoring_revision);
+                const auto parsed_reported_status = parse_named<DerivedProductStatus>(
+                    reported_status,
+                    {{DerivedProductStatus::current, "current"},
+                     {DerivedProductStatus::stale, "stale"},
+                     {DerivedProductStatus::rejected, "rejected"},
+                     {DerivedProductStatus::unverified, "unverified"}},
+                    "VANTA reported path status is invalid");
+                if (!parsed_reported_status) {
+                    return core::Result<AuthoringDocument>::failure(
+                        parsed_reported_status.error());
+                }
+                receipt.reported_status = parsed_reported_status.value();
+                value.vanta_receipt = std::move(receipt);
+            }
+        }
+        for (std::size_t index = 0U; index < count; ++index) {
+            PathSample sample;
+            std::uint64_t sequence = 0U;
+            std::string sample_status;
+            if (!require_record(input, "SAMPLE") || !read_uint(input, sequence) ||
+                sequence > std::numeric_limits<std::uint32_t>::max() ||
+                !read_double(input, sample.normalized) ||
+                !read_transform(input, sample.tool_pose) ||
+                !read_optional_id(input, sample.target_id) || !(input >> sample_status) ||
+                !read_double(input, sample.clearance)) {
+                return core::Result<AuthoringDocument>::failure(parse_error(
+                    "path sample is invalid"));
+            }
+            sample.sequence = static_cast<std::uint32_t>(sequence);
+            const auto parsed_sample = parse_named<PathSampleStatus>(sample_status,
+                {{PathSampleStatus::valid, "valid"},
+                 {PathSampleStatus::rejected, "rejected"},
+                 {PathSampleStatus::stale, "stale"},
+                 {PathSampleStatus::unreachable, "unreachable"},
+                 {PathSampleStatus::collision, "collision"},
+                 {PathSampleStatus::clearance_warning, "clearance-warning"},
+                 {PathSampleStatus::unverified, "unverified"}},
+                "path sample status is invalid");
+            if (!parsed_sample) {
+                return core::Result<AuthoringDocument>::failure(parsed_sample.error());
+            }
+            sample.status = parsed_sample.value();
+            value.samples.push_back(std::move(sample));
+        }
+        document.path = std::move(value);
+    }
     if (!read_section_count("DERIVED", count)) return core::Result<AuthoringDocument>::failure(parse_error("derived section is invalid"));
     for (std::size_t index = 0U; index < count; ++index) { DerivedProductState value; std::string status; if (!require_record(input, "DERIVED_PRODUCT") || !read_id(input, value.id) || !read_digest(input, value.basis_digest) || !read_uint(input, version) || !(input >> status) || !read_text(input, value.stale_reason)) return core::Result<AuthoringDocument>::failure(parse_error("derived product record is invalid")); value.basis_revision = core::Revision(version); const auto parsed = parse_named<DerivedProductStatus>(status, {{DerivedProductStatus::current, "current"}, {DerivedProductStatus::stale, "stale"}, {DerivedProductStatus::rejected, "rejected"}, {DerivedProductStatus::unverified, "unverified"}}, "derived product status is invalid"); if (!parsed) return core::Result<AuthoringDocument>::failure(parsed.error()); value.status = parsed.value(); document.derived_products.push_back(std::move(value)); }
     if (!require_record(input, "EVIDENCE") || !require_record(input, "PRESERVED") || !read_strings(input, document.evidence.preserved) || !require_record(input, "DERIVED_EVIDENCE") || !read_strings(input, document.evidence.derived) || !require_record(input, "UNSUPPORTED") || !read_strings(input, document.evidence.unsupported) || !require_record(input, "RUNTIME_VALIDATION") || !read_strings(input, document.evidence.runtime_validation) || !require_end(input)) return core::Result<AuthoringDocument>::failure(parse_error("engineering evidence or terminal record is invalid"));
@@ -1620,22 +1922,6 @@ core::Result<InspectionPackage> InspectionPackage::publish(
     std::string project_namespace) {
     if (auto result = authoring.validate(); !result) return core::Result<InspectionPackage>::failure(result.error());
     if (project_revision.exhausted() || project_namespace != authoring.project_namespace) return core::Result<InspectionPackage>::failure(invalid("inspection publication project identity is invalid"));
-    if (authoring.path.has_value() &&
-        (authoring.path->status == DerivedProductStatus::stale ||
-         std::any_of(authoring.path->samples.begin(), authoring.path->samples.end(),
-             [](const PathSample& sample) {
-                 return sample.status == PathSampleStatus::stale;
-             }))) {
-        return core::Result<InspectionPackage>::failure(stale(
-            "publication is blocked by a stale inspection path"));
-    }
-    if (std::any_of(authoring.derived_products.begin(), authoring.derived_products.end(),
-            [](const DerivedProductState& product) {
-                return product.status == DerivedProductStatus::stale;
-            })) {
-        return core::Result<InspectionPackage>::failure(stale(
-            "publication is blocked by a stale derived engineering product"));
-    }
     for (const auto& requirement : authoring.requirements) {
         if (!requirement.enabled) continue;
         if (requirement.extraction == ExtractionState::stale) {
@@ -1666,7 +1952,35 @@ core::Result<InspectionPackage> InspectionPackage::publish(
         if (!accepted) return core::Result<InspectionPackage>::failure(validation("publication requires one accepted target for every enabled characteristic"));
     }
     if (!authoring.workcell.has_value()) return core::Result<InspectionPackage>::failure(validation("publication requires an authored workcell"));
-    InspectionPackage package; package.project_namespace = std::move(project_namespace); package.project_revision = project_revision; package.authoring_bytes = authoring.serialize(); package.evidence = authoring.evidence; if (auto result = package.refresh_digest(); !result) return core::Result<InspectionPackage>::failure(result.error()); if (auto result = package.validate(); !result) return core::Result<InspectionPackage>::failure(result.error()); return core::Result<InspectionPackage>::success(std::move(package));
+    AuthoringDocument publication_authoring = authoring;
+    publication_authoring.path.reset();
+    std::erase_if(publication_authoring.derived_products,
+        [](const DerivedProductState& product) {
+            return product.status == DerivedProductStatus::stale;
+        });
+    if (std::find(publication_authoring.evidence.preserved.begin(),
+            publication_authoring.evidence.preserved.end(),
+            "Cartographer retains prior path results locally; VANTA request packages omit them") ==
+        publication_authoring.evidence.preserved.end()) {
+        publication_authoring.evidence.preserved.push_back(
+            "Cartographer retains prior path results locally; VANTA request packages omit them");
+    }
+    if (auto result = publication_authoring.validate(); !result) {
+        return core::Result<InspectionPackage>::failure(result.error().with_context(
+            "inspection publication projection"));
+    }
+    InspectionPackage package;
+    package.project_namespace = std::move(project_namespace);
+    package.project_revision = project_revision;
+    package.authoring_bytes = publication_authoring.serialize();
+    package.evidence = publication_authoring.evidence;
+    if (auto result = package.refresh_digest(); !result) {
+        return core::Result<InspectionPackage>::failure(result.error());
+    }
+    if (auto result = package.validate(); !result) {
+        return core::Result<InspectionPackage>::failure(result.error());
+    }
+    return core::Result<InspectionPackage>::success(std::move(package));
 }
 
 core::Result<void> VantaAdmissionResult::validate() const {
@@ -1719,7 +2033,7 @@ core::Result<AuthoringDocument> make_dv012_fixture() {
     document.targets = {{500U, 400U, 100U, core::Transform{{0.0, 0.0, 0.20}, core::Quaternion::identity(), {1.0, 1.0, 1.0}}, 0.20, TargetStatus::accepted, "fixture-normal-offset-v1", false}, {501U, 401U, 100U, core::Transform{{0.0, 0.0, 0.22}, core::Quaternion::identity(), {1.0, 1.0, 1.0}}, 0.22, TargetStatus::rejected, "fixture-normal-offset-v1", false}, {502U, 401U, 100U, core::Transform{{0.01, 0.0, 0.20}, core::Quaternion::identity(), {1.0, 1.0, 1.0}}, 0.20, TargetStatus::accepted, "human-corrected-offset-v1", true}, {503U, 402U, 102U, core::Transform{{0.06, 0.04, 0.20}, core::Quaternion::identity(), {1.0, 1.0, 1.0}}, 0.20, TargetStatus::accepted, "fixture-normal-offset-v1", false}};
     document.workcell = EngineeringWorkcell{600U, "C", {{601U, WorkcellEntityKind::inspection_assembly, "Assembly", core::Transform::identity(), "fixture://dv012/assembly.step", true}, {602U, WorkcellEntityKind::fixture, "Fixture", core::Transform::identity(), "fixture://dv012/fixture", true}, {603U, WorkcellEntityKind::robot_base, "Robot Base", core::Transform::identity(), "fixture://dv012/robot", true}, {604U, WorkcellEntityKind::sensor_tool, "Structured Light", core::Transform::identity(), "fixture://dv012/sensor", true}}, {{610U, KeepOutKind::box, "fixture body", core::Transform{{0.0, 0.0, 0.1}, core::Quaternion::identity(), {1.0, 1.0, 1.0}}, {0.5, 0.5, 0.25}, "fixture://dv012/keepout", true}}, {{620U, WorkcellEntityKind::reference_frame, "Inspection Datum A", core::Transform::identity(), "fixture://dv012/datum-a", true}}, "robot.family.example", "fixture://dv012/robot.urdf", "tool0", "dv012-robot-inspection-v1", "structured-light-v1"};
     const auto authoring_digest = digest_text("fixture-target-basis");
-    document.path = GeneratedPath{700U, authoring_digest, core::Revision(1U), DerivedProductStatus::unverified, {{0U, 0.0, core::Transform::identity(), 500U, PathSampleStatus::unverified, 0.25}, {1U, 1.0, core::Transform{{0.06, 0.04, 0.20}, core::Quaternion::identity(), {1.0, 1.0, 1.0}}, 503U, PathSampleStatus::unverified, 0.25}}};
+    document.path = GeneratedPath{700U, authoring_digest, core::Revision(1U), DerivedProductStatus::unverified, {{0U, 0.0, core::Transform::identity(), 500U, PathSampleStatus::unverified, 0.25}, {1U, 1.0, core::Transform{{0.06, 0.04, 0.20}, core::Quaternion::identity(), {1.0, 1.0, 1.0}}, 503U, PathSampleStatus::unverified, 0.25}}, std::nullopt};
     document.derived_products = {{701U, authoring_digest, core::Revision(1U), DerivedProductStatus::unverified, "runtime path feasibility is owned by VANTA"}};
     document.evidence.preserved = {"source identity", "assembly part and occurrence identity", "topology/display correspondence", "requirement source evidence", "human corrections"};
     document.evidence.derived = {"candidate inspection targets", "path preview"};

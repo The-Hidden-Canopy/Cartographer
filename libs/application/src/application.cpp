@@ -1119,6 +1119,8 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return import_engineering_bom_csv(value);
             } else if constexpr (std::is_same_v<Action, ImportEngineeringRequirementCsvAction>) {
                 return import_engineering_requirement_csv(value);
+            } else if constexpr (std::is_same_v<Action, ImportEngineeringPathResultAction>) {
+                return import_engineering_path_result(value);
             } else if constexpr (std::is_same_v<Action, AttachEngineeringEvidenceAction>) {
                 return attach_engineering_evidence(value);
             } else if constexpr (std::is_same_v<Action, CreateEngineeringRequirementAction>) {
@@ -4827,6 +4829,127 @@ core::Result<DispatchReceipt> ApplicationSession::review_engineering_target(
             ? "Accept Inspection Target" : "Reject Inspection Target");
 }
 
+core::Result<DispatchReceipt> ApplicationSession::import_engineering_path_result(
+    const ImportEngineeringPathResultAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "VANTA path result import requires the explicit human command boundary"));
+    }
+    if (action.expected_project_revision != document_.revision()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "VANTA path result was based on a stale project revision"));
+    }
+    if (action.result_bytes.empty() ||
+        action.result_bytes.size() > engineering::VantaPathResult::kMaxSerializedBytes) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "VANTA path result bytes are empty or exceed the configured bound"));
+    }
+    const auto current = engineering_authoring();
+    if (!current) return failure(current.error().with_context("VANTA path result import"));
+    if (current.value().project_revision != action.expected_authoring_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "VANTA path result was based on a stale engineering authoring revision"));
+    }
+    if (current.value().project_revision.exhausted()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "engineering authoring revision space is exhausted"));
+    }
+    const auto decoded = engineering::VantaPathResult::deserialize(action.result_bytes);
+    if (!decoded) {
+        return failure(decoded.error().with_context("VANTA path result import"));
+    }
+    const auto package = engineering::InspectionPackage::publish(
+        current.value(), document_.revision(), current.value().project_namespace);
+    if (!package) {
+        return failure(package.error().with_context(
+            "VANTA path result source package"));
+    }
+    const auto vanta_admission = engineering::admit_for_vanta(package.value());
+    if (!vanta_admission) {
+        return failure(vanta_admission.error().with_context(
+            "VANTA path result request admission"));
+    }
+    if (vanta_admission.value().status != engineering::VantaAdmissionStatus::admit) {
+        std::string reasons;
+        for (const auto& reason : vanta_admission.value().reasons) {
+            if (!reasons.empty()) reasons += "; ";
+            reasons += reason;
+        }
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "VANTA path result request is refused by the local admission contract: " +
+                reasons));
+    }
+    if (decoded.value().project_namespace != package.value().project_namespace ||
+        decoded.value().project_revision != package.value().project_revision ||
+        decoded.value().authoring_revision != current.value().project_revision ||
+        decoded.value().publication_digest != package.value().publication_digest ||
+        decoded.value().authoring_digest != package.value().authoring_digest) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "VANTA path result does not match the current published package digests and revisions"));
+    }
+    for (const auto& sample : decoded.value().path.samples) {
+        if (!sample.target_id.has_value()) continue;
+        const auto target = std::find_if(current.value().targets.begin(),
+            current.value().targets.end(), [&sample](const engineering::InspectionTarget& value) {
+                return value.id == *sample.target_id;
+            });
+        if (target == current.value().targets.end() ||
+            target->status != engineering::TargetStatus::accepted) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "VANTA path result references a missing or non-accepted inspection target"));
+        }
+    }
+
+    auto updated = current.value();
+    if (updated.path.has_value() && updated.path->vanta_receipt.has_value()) {
+        const auto& previous = *updated.path->vanta_receipt;
+        updated.evidence.runtime_validation.push_back(
+            "VANTA path result " + previous.run_id + " with digest " +
+            previous.result_digest.hex() + " was superseded by run " + decoded.value().run_id);
+    }
+    auto imported_path = decoded.value().path;
+    const auto reported_status = imported_path.status;
+    if (reported_status == engineering::DerivedProductStatus::current) {
+        imported_path.status = engineering::DerivedProductStatus::unverified;
+    }
+    imported_path.vanta_receipt = engineering::VantaPathResultReceipt{
+        decoded.value().project_namespace,
+        decoded.value().project_revision,
+        decoded.value().authoring_revision,
+        decoded.value().publication_digest,
+        decoded.value().authoring_digest,
+        decoded.value().provider_identity,
+        decoded.value().provider_version,
+        decoded.value().run_id,
+        decoded.value().result_digest,
+        reported_status};
+    updated.path = std::move(imported_path);
+    updated.project_revision = updated.project_revision.next();
+    if (auto valid = updated.validate(); !valid) {
+        return failure(valid.error().with_context("VANTA path result import"));
+    }
+    const auto serialized = updated.serialize();
+    const auto digest = updated.canonical_digest();
+    if (!digest) return failure(digest.error().with_context("VANTA path result digest"));
+    const auto before = document_.engineering_authoring();
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectEngineeringAuthoringCommand>(
+            admission,
+            document_,
+            before,
+            project::SerializedEngineeringAuthoring{serialized, digest.value()}),
+        "Import VANTA Path Result");
+}
+
 core::Result<DispatchReceipt> ApplicationSession::invalidate_engineering_source(
     const InvalidateEngineeringSourceAction& action) {
     if (active_source_ != OperationSource::human) {
@@ -5965,6 +6088,7 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
                 path_view.basis_digest = path.basis_digest;
                 path_view.basis_revision = path.basis_revision;
                 path_view.status = engineering::derived_product_status_name(path.status);
+                path_view.vanta_receipt = path.vanta_receipt;
                 path_view.samples.reserve(path.samples.size());
                 for (const auto& sample : path.samples) {
                     path_view.samples.push_back(EngineeringAuthoringView::PathSample{

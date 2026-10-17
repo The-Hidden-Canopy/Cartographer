@@ -270,13 +270,52 @@ struct PathSample {
     [[nodiscard]] core::Result<void> validate() const;
 };
 
+struct VantaPathResultReceipt {
+    std::string project_namespace;
+    core::Revision project_revision;
+    core::Revision authoring_revision;
+    assets::Sha256Digest publication_digest;
+    assets::Sha256Digest authoring_digest;
+    std::string provider_identity;
+    std::string provider_version;
+    std::string run_id;
+    assets::Sha256Digest result_digest;
+    DerivedProductStatus reported_status = DerivedProductStatus::unverified;
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
 struct GeneratedPath {
     Id id = 0U;
     assets::Sha256Digest basis_digest;
     core::Revision basis_revision;
     DerivedProductStatus status = DerivedProductStatus::unverified;
     std::vector<PathSample> samples;
+    std::optional<VantaPathResultReceipt> vanta_receipt;
     [[nodiscard]] core::Result<void> validate() const;
+};
+
+// Bounded, digest-bound response file for a VANTA path result. Importing this
+// record preserves the provider's reported statuses but Cartographer stores
+// the path as unverified because this profile does not authenticate signatures.
+struct VantaPathResult final {
+    static constexpr std::size_t kMaxSerializedBytes = 16U * 1024U * 1024U;
+
+    std::string project_namespace;
+    core::Revision project_revision;
+    core::Revision authoring_revision;
+    assets::Sha256Digest publication_digest;
+    assets::Sha256Digest authoring_digest;
+    std::string provider_identity;
+    std::string provider_version;
+    std::string run_id;
+    GeneratedPath path;
+    assets::Sha256Digest result_digest;
+
+    [[nodiscard]] core::Result<void> validate() const;
+    [[nodiscard]] std::string canonical_without_digest() const;
+    [[nodiscard]] core::Result<void> refresh_digest();
+    [[nodiscard]] std::string serialize() const;
+    [[nodiscard]] static core::Result<VantaPathResult> deserialize(std::string_view text);
 };
 
 struct CapabilityEvidence {
@@ -299,7 +338,7 @@ struct WorkcellRevisionRecord {
 
 class AuthoringDocument final {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 3U;
+    static constexpr std::uint32_t kSchemaVersion = 4U;
     static constexpr std::size_t kMaxSerializedBytes = 32U * 1024U * 1024U;
     static constexpr std::size_t kMaxCollectionEntries = 100'000U;
 
