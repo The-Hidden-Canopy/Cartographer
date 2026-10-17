@@ -1578,6 +1578,54 @@ const char* surface_fidelity_mode_name(surface::RepresentationMode mode) noexcep
     return "unknown";
 }
 
+core::Result<EngineeringPathProjection> project_engineering_path_xz(
+    const application::EngineeringAuthoringView::Path& path) {
+    EngineeringPathProjection projection;
+    projection.source_sample_count = path.samples.size();
+    if (path.samples.empty()) {
+        return core::Result<EngineeringPathProjection>::success(std::move(projection));
+    }
+
+    projection.minimum_x = std::numeric_limits<double>::infinity();
+    projection.maximum_x = -std::numeric_limits<double>::infinity();
+    projection.minimum_z = std::numeric_limits<double>::infinity();
+    projection.maximum_z = -std::numeric_limits<double>::infinity();
+    for (const auto& sample : path.samples) {
+        const auto& position = sample.tool_pose.translation;
+        if (!std::isfinite(position.x) || !std::isfinite(position.y) ||
+            !std::isfinite(position.z) || sample.status.empty()) {
+            return core::Result<EngineeringPathProjection>::failure(validation(
+                "engineering path projection contains an invalid sample"));
+        }
+        projection.minimum_x = std::min(projection.minimum_x, position.x);
+        projection.maximum_x = std::max(projection.maximum_x, position.x);
+        projection.minimum_z = std::min(projection.minimum_z, position.z);
+        projection.maximum_z = std::max(projection.maximum_z, position.z);
+    }
+    if (!std::isfinite(projection.maximum_x - projection.minimum_x) ||
+        !std::isfinite(projection.maximum_z - projection.minimum_z)) {
+        return core::Result<EngineeringPathProjection>::failure(validation(
+            "engineering path coordinates exceed the projection range"));
+    }
+
+    const auto projected_count = std::min(
+        path.samples.size(), kMaxEngineeringPathProjectionPoints);
+    projection.points.reserve(projected_count);
+    for (std::size_t index = 0U; index < projected_count; ++index) {
+        const auto source_index = projected_count == path.samples.size()
+            ? index
+            : (index * (path.samples.size() - 1U)) / (projected_count - 1U);
+        const auto& sample = path.samples[source_index];
+        projection.points.push_back(EngineeringPathProjectionPoint{
+            sample.sequence,
+            sample.tool_pose.translation,
+            sample.target_id,
+            sample.status});
+    }
+    projection.omitted_sample_count = path.samples.size() - projected_count;
+    return core::Result<EngineeringPathProjection>::success(std::move(projection));
+}
+
 std::optional<Shortcut> shortcut_for_native_key(const NativeKeyEvent& event) noexcept {
     if (!event.pressed) return std::nullopt;
 

@@ -9629,6 +9629,87 @@ struct DesktopState {
         ImGui::TextWrapped(
             "Stored path data is shown as received. This panel does not calculate reachability, "
             "collision, clearance, or execution feasibility.");
+        ImGui::SeparatorText("Tool pose projection · workcell X/Z");
+        ImGui::TextDisabled(
+            "Order and X/Z positions only. Workcell geometry and feasibility checks are not shown.");
+        const auto projection = carto::ui::project_engineering_path_xz(*path);
+        if (!projection) {
+            ImGui::TextColored(color(snapshot.colors.semantic_error),
+                "Path projection unavailable: %s", projection.error().message.c_str());
+        } else if (projection.value().points.empty()) {
+            ImGui::TextDisabled("The stored path has no pose samples to project.");
+        } else {
+            const bool projection_visible = ImGui::BeginChild(
+                "Engineering path pose projection", ImVec2(0, 190), true,
+                ImGuiWindowFlags_NoScrollbar);
+            if (projection_visible) {
+                const ImVec2 origin = ImGui::GetCursorScreenPos();
+                const ImVec2 extent = ImGui::GetContentRegionAvail();
+                ImDrawList* draw = ImGui::GetWindowDrawList();
+                const auto color_with_alpha = [](carto::ui::UiColor token, float alpha) {
+                    auto value = color(token);
+                    value.w *= alpha;
+                    return ImGui::ColorConvertFloat4ToU32(value);
+                };
+                draw->AddRectFilled(origin, origin + extent,
+                    color_with_alpha(snapshot.colors.canvas_0, 1.0F));
+                draw->AddRect(origin, origin + extent,
+                    color_with_alpha(snapshot.colors.border_soft, 0.9F));
+                const float inset = 18.0F;
+                const float drawable_width = std::max(1.0F, extent.x - inset * 2.0F);
+                const float drawable_height = std::max(1.0F, extent.y - inset * 2.0F);
+                const double range_x = std::max(
+                    projection.value().maximum_x - projection.value().minimum_x, 1.0e-9);
+                const double range_z = std::max(
+                    projection.value().maximum_z - projection.value().minimum_z, 1.0e-9);
+                const double scale = std::min(
+                    static_cast<double>(drawable_width) / range_x,
+                    static_cast<double>(drawable_height) / range_z);
+                const double center_x = projection.value().minimum_x + range_x * 0.5;
+                const double center_z = projection.value().minimum_z + range_z * 0.5;
+                const ImVec2 center{origin.x + extent.x * 0.5F,
+                    origin.y + extent.y * 0.5F};
+                std::vector<ImVec2> screen_points;
+                screen_points.reserve(projection.value().points.size());
+                for (const auto& point : projection.value().points) {
+                    screen_points.emplace_back(
+                        center.x + static_cast<float>((point.position.x - center_x) * scale),
+                        center.y - static_cast<float>((point.position.z - center_z) * scale));
+                }
+                const auto line_token = path->status == "stale"
+                    ? snapshot.colors.semantic_warning
+                    : path->status == "rejected"
+                        ? snapshot.colors.semantic_error
+                        : snapshot.colors.accent_primary;
+                if (screen_points.size() > 1U) {
+                    draw->AddPolyline(screen_points.data(),
+                        static_cast<int>(screen_points.size()),
+                        color_with_alpha(line_token, 0.95F), ImDrawFlags_None, 2.0F);
+                }
+                for (std::size_t index = 0U; index < screen_points.size(); ++index) {
+                    const float radius = (index == 0U || index + 1U == screen_points.size())
+                        ? 4.0F : 2.5F;
+                    draw->AddCircleFilled(screen_points[index], radius,
+                        color_with_alpha(snapshot.colors.accent_secondary, 1.0F));
+                }
+                draw->AddText(origin + ImVec2(inset, inset),
+                    color_with_alpha(snapshot.colors.text_secondary, 0.95F), "Z ↑");
+                draw->AddText(origin + ImVec2(inset, extent.y - inset - 14.0F),
+                    color_with_alpha(snapshot.colors.text_secondary, 0.95F), "X →");
+                draw->AddText(screen_points.front() + ImVec2(6.0F, -7.0F),
+                    color_with_alpha(snapshot.colors.text_primary, 1.0F), "Start");
+                if (screen_points.size() > 1U) {
+                    draw->AddText(screen_points.back() + ImVec2(6.0F, -7.0F),
+                        color_with_alpha(snapshot.colors.text_primary, 1.0F), "End");
+                }
+                if (projection.value().omitted_sample_count > 0U) {
+                    ImGui::Dummy(ImVec2(0.0F, std::max(0.0F, extent.y - 32.0F)));
+                    ImGui::TextDisabled("Plot decimated for display; %zu samples omitted.",
+                        projection.value().omitted_sample_count);
+                }
+            }
+            ImGui::EndChild();
+        }
         const bool samples_visible = ImGui::BeginChild(
             "Engineering stored path samples", ImVec2(0, 112), true,
             ImGuiWindowFlags_HorizontalScrollbar);

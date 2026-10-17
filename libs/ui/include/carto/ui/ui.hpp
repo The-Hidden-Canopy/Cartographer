@@ -467,6 +467,27 @@ struct UiSnapshot : application::ApplicationSnapshot {
     bool agent_demonstration_ready_to_preview = false;
 };
 
+inline constexpr std::size_t kMaxEngineeringPathProjectionPoints = 2048U;
+
+struct EngineeringPathProjectionPoint {
+    std::uint32_t sequence = 0U;
+    core::Vec3d position;
+    std::optional<std::uint64_t> target_id;
+    std::string status;
+};
+
+// Bounded presentation-only projection of imported path samples. Coordinates
+// remain in the authored workcell frame; no feasibility is inferred here.
+struct EngineeringPathProjection {
+    std::vector<EngineeringPathProjectionPoint> points;
+    double minimum_x = 0.0;
+    double maximum_x = 0.0;
+    double minimum_z = 0.0;
+    double maximum_z = 0.0;
+    std::size_t source_sample_count = 0U;
+    std::size_t omitted_sample_count = 0U;
+};
+
 [[nodiscard]] UiColorTokens color_tokens(Theme theme) noexcept;
 [[nodiscard]] const char* theme_name(Theme theme) noexcept;
 [[nodiscard]] const char* density_name(Density density) noexcept;
@@ -483,6 +504,8 @@ struct UiSnapshot : application::ApplicationSnapshot {
     SurfaceFidelityStatus status) noexcept;
 [[nodiscard]] const char* surface_fidelity_mode_name(
     surface::RepresentationMode mode) noexcept;
+[[nodiscard]] core::Result<EngineeringPathProjection> project_engineering_path_xz(
+    const application::EngineeringAuthoringView::Path& path);
 
 [[nodiscard]] core::Result<void> save_workbench_preferences(
     const std::filesystem::path& path,

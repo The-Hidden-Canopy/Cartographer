@@ -2251,6 +2251,59 @@ void step_boundary_never_fakes_a_cad_import() {
         digest("settings")));
 }
 
+void engineering_path_projection_preserves_xz_order_and_is_bounded() {
+    using Path = carto::application::EngineeringAuthoringView::Path;
+    Path path;
+    path.samples = {
+        {4U, 0.0, {{3.0, 100.0, 5.0}, carto::core::Quaternion::identity(),
+            {1.0, 1.0, 1.0}}, 41U, "unverified", 0.25},
+        {9U, 1.0, {{1.0, -100.0, 9.0}, carto::core::Quaternion::identity(),
+            {1.0, 1.0, 1.0}}, 42U, "stale", 0.0},
+    };
+    const auto projected = carto::ui::project_engineering_path_xz(path);
+    REQUIRE(projected);
+    REQUIRE(projected.value().source_sample_count == 2U);
+    REQUIRE(projected.value().omitted_sample_count == 0U);
+    REQUIRE(projected.value().points.size() == 2U);
+    REQUIRE(projected.value().points.front().sequence == 4U);
+    REQUIRE(projected.value().points.front().position.x == 3.0);
+    REQUIRE(projected.value().points.front().position.y == 100.0);
+    REQUIRE(projected.value().points.front().position.z == 5.0);
+    REQUIRE(projected.value().points.front().target_id == 41U);
+    REQUIRE(projected.value().points.back().sequence == 9U);
+    REQUIRE(projected.value().points.back().status == "stale");
+    REQUIRE(projected.value().minimum_x == 1.0);
+    REQUIRE(projected.value().maximum_x == 3.0);
+    REQUIRE(projected.value().minimum_z == 5.0);
+    REQUIRE(projected.value().maximum_z == 9.0);
+
+    Path dense;
+    dense.samples.reserve(carto::ui::kMaxEngineeringPathProjectionPoints + 1U);
+    for (std::size_t index = 0U;
+         index <= carto::ui::kMaxEngineeringPathProjectionPoints; ++index) {
+        dense.samples.push_back({
+            static_cast<std::uint32_t>(index), 0.0,
+            {{static_cast<double>(index), 0.0, static_cast<double>(index * 2U)},
+                carto::core::Quaternion::identity(), {1.0, 1.0, 1.0}},
+            index == carto::ui::kMaxEngineeringPathProjectionPoints
+                ? std::optional<std::uint64_t>{9001U} : std::nullopt,
+            "unverified", 0.0});
+    }
+    const auto bounded = carto::ui::project_engineering_path_xz(dense);
+    REQUIRE(bounded);
+    REQUIRE(bounded.value().points.size() ==
+        carto::ui::kMaxEngineeringPathProjectionPoints);
+    REQUIRE(bounded.value().omitted_sample_count == 1U);
+    REQUIRE(bounded.value().points.front().sequence == 0U);
+    REQUIRE(bounded.value().points.back().sequence ==
+        carto::ui::kMaxEngineeringPathProjectionPoints);
+    REQUIRE(bounded.value().points.back().target_id == 9001U);
+
+    dense.samples.front().tool_pose.translation.x =
+        std::numeric_limits<double>::quiet_NaN();
+    REQUIRE(!carto::ui::project_engineering_path_xz(dense));
+}
+
 void ui_step_probe_is_bounded_read_only_and_does_not_claim_import() {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto root = std::filesystem::temp_directory_path() /
@@ -2324,6 +2377,7 @@ int main() {
         inspection_target_review_is_human_revision_bound_and_preserves_decisions();
         source_invalidation_preserves_authored_records_and_stales_products();
         step_boundary_never_fakes_a_cad_import();
+        engineering_path_projection_preserves_xz_order_and_is_bounded();
         ui_step_probe_is_bounded_read_only_and_does_not_claim_import();
         application_wires_engineering_authoring_through_persistence_and_history();
         ui_exposes_engineering_workspace_and_immutable_publication();
