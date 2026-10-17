@@ -1570,6 +1570,63 @@ void step_boundary_never_fakes_a_cad_import() {
         digest("settings")));
 }
 
+void ui_step_probe_is_bounded_read_only_and_does_not_claim_import() {
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto root = std::filesystem::temp_directory_path() /
+        ("cartographer-engineering-step-probe-" + std::to_string(stamp));
+    std::filesystem::create_directories(root);
+    const auto step_path = root / "assembly.step";
+    {
+        std::ofstream stream(step_path, std::ios::binary);
+        REQUIRE(stream.good());
+        const std::string header =
+            "ISO-10303-21; HEADER; FILE_SCHEMA(('AP242_MANAGED_MODEL_BASED_3D_ENGINEERING')); ENDSEC;\n";
+        stream.write(header.data(), static_cast<std::streamsize>(header.size()));
+        const std::string tail(
+            carto::engineering::kMaxStepHeaderProbeBytes * 16U, 'x');
+        stream.write(tail.data(), static_cast<std::streamsize>(tail.size()));
+        REQUIRE(stream.good());
+    }
+
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::NewProjectAction{"STEP header probe"}));
+    carto::ui::UiController ui(session);
+    const auto before = session.snapshot();
+    const auto before_ui = ui.snapshot();
+    const auto probe = ui.probe_engineering_step(step_path);
+    REQUIRE(probe);
+    REQUIRE(probe.value().recognized);
+    REQUIRE(!probe.value().supported);
+    REQUIRE(probe.value().schema_profile == "AP242_MANAGED_MODEL_BASED_3D_ENGINEERING");
+    REQUIRE(std::any_of(probe.value().diagnostics.begin(), probe.value().diagnostics.end(),
+        [](const std::string& diagnostic) {
+            return diagnostic.find("no public CAD kernel") != std::string::npos;
+        }));
+    REQUIRE(probe.value().units.empty());
+    const auto after = session.snapshot();
+    REQUIRE(after.project_revision == before.project_revision);
+    REQUIRE(after.engineering.present == before.engineering.present);
+    REQUIRE(ui.snapshot().operations.size() == before_ui.operations.size());
+
+    const auto invalid_path = root / "notes.step";
+    {
+        std::ofstream stream(invalid_path, std::ios::binary);
+        REQUIRE(stream.good());
+        stream << "notes: ISO-10303-21; HEADER; FILE_SCHEMA(('AP242')); ENDSEC;";
+        REQUIRE(stream.good());
+    }
+    const auto invalid_probe = ui.probe_engineering_step(invalid_path);
+    REQUIRE(invalid_probe);
+    REQUIRE(!invalid_probe.value().recognized);
+    REQUIRE(session.snapshot().project_revision == before.project_revision);
+    REQUIRE(!ui.probe_engineering_step(root / "missing.step"));
+    REQUIRE(session.snapshot().project_revision == before.project_revision);
+
+    std::error_code ignored;
+    std::filesystem::remove_all(root, ignored);
+}
+
 } // namespace
 
 int main() {
@@ -1584,6 +1641,7 @@ int main() {
         inspection_target_review_is_human_revision_bound_and_preserves_decisions();
         source_invalidation_preserves_authored_records_and_stales_products();
         step_boundary_never_fakes_a_cad_import();
+        ui_step_probe_is_bounded_read_only_and_does_not_claim_import();
         application_wires_engineering_authoring_through_persistence_and_history();
         ui_exposes_engineering_workspace_and_immutable_publication();
         ui_imports_bom_csv_through_revision_bound_journal_and_preserves_source_history();

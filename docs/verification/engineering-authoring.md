@@ -93,6 +93,11 @@ the DATA section is not treated as source identity. It still does not claim
 B-Rep support. `read_assembly`
 remains unsupported until a CAD kernel is connected. The fixture is synthetic
 acceptance data, not a live CAD import.
+The Engineering workspace exposes this as a read-only file probe. It reads at
+most the header limit even for a large STEP file, reports the declared schema
+and provider diagnostics, and does not register a source or mutate the
+project. An AP242 header recognized by this probe is not an imported assembly;
+the public build has no connected CAD kernel.
 Inspection-package admission validates the public handoff contract; it does
 not prove robot reachability, collision safety, execution feasibility, or
 hardware behavior. Those checks remain with the consuming runtime.

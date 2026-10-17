@@ -972,6 +972,7 @@ enum class FileDialogKind {
     agent_demonstration_recipe,
     engineering,
     engineering_authoring,
+    engineering_step,
     engineering_bom_csv,
     engineering_evidence,
     condition,
@@ -1069,6 +1070,10 @@ enum class StandardMeshExport {
             L"Cartographer Engineering Authoring (*.carto-engineering-authoring)\0"
             L"*.carto-engineering-authoring\0All Files\0*.*\0";
         dialog.lpstrDefExt = L"carto-engineering-authoring";
+        break;
+    case FileDialogKind::engineering_step:
+        dialog.lpstrFilter =
+            L"STEP exchange (*.step;*.stp)\0*.step;*.stp\0All Files\0*.*\0";
         break;
     case FileDialogKind::engineering_bom_csv:
         dialog.lpstrFilter = L"Engineering BOM CSV (*.csv)\0*.csv\0All Files\0*.*\0";
@@ -2158,6 +2163,27 @@ struct DesktopState {
         action_feedback = "Imported validated engineering authoring from " +
             path->filename().string() + " (" +
             std::to_string(snapshot.engineering.source_count) + " sources).";
+        action_feedback_error = false;
+    }
+
+    void probe_engineering_step() {
+        const auto path = choose_file(false, FileDialogKind::engineering_step);
+        if (!path.has_value()) return;
+        const auto probed = ui.probe_engineering_step(*path);
+        if (!probed) {
+            action_feedback = probed.error().message;
+            action_feedback_error = true;
+            return;
+        }
+        const auto& result = probed.value();
+        action_feedback = "Read-only STEP header probe for " + path->filename().string() +
+            ": " + (result.recognized
+                ? "recognized schema " + result.schema_profile
+                : "no supported Part 21 header recognized") +
+            ". No assembly or project source was imported.";
+        for (const auto& diagnostic : result.diagnostics) {
+            action_feedback += " " + diagnostic + ".";
+        }
         action_feedback_error = false;
     }
 
@@ -9949,6 +9975,12 @@ struct DesktopState {
         ImGui::TextWrapped(
             "Engineering records stay authoritative in the project. Source evidence and exact "
             "topology bindings remain visible while requirements, inspection constraints, and target decisions are authored as separate records.");
+        ImGui::Separator();
+        if (ImGui::Button("Inspect STEP/AP242 header (read-only)...", ImVec2(-1, 28))) {
+            probe_engineering_step();
+        }
+        ImGui::TextDisabled(
+            "The current public build checks only the bounded header; it does not import CAD geometry.");
         ImGui::Separator();
         if (!snapshot.engineering.present) {
             ImGui::TextDisabled("No engineering authoring is loaded.");

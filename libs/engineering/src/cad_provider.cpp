@@ -6,8 +6,6 @@
 namespace carto::engineering {
 namespace {
 
-constexpr std::size_t kMaximumHeaderScanBytes = 64U * 1024U;
-
 std::string uppercase_ascii(std::string_view value) {
     std::string result(value);
     std::transform(result.begin(), result.end(), result.begin(), [](unsigned char byte) {
@@ -173,7 +171,7 @@ core::Result<ImportProbe> StepAp242Provider::probe(std::string_view source_bytes
     result.provider_identity = std::string(identity());
     result.provider_version = std::string(version());
     const auto header = source_bytes.substr(0U,
-        std::min(source_bytes.size(), kMaximumHeaderScanBytes));
+        std::min(source_bytes.size(), kMaxStepHeaderProbeBytes));
     const auto normalized_header = uppercase_ascii(header);
     constexpr std::string_view kPart21Marker = "ISO-10303-21;";
     const bool has_step_marker = normalized_header.starts_with(kPart21Marker);

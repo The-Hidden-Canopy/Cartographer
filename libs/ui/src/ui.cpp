@@ -7,6 +7,7 @@
 #include <carto/io/stl.hpp>
 #include <carto/providers/registry.hpp>
 #include <carto/condition/wave_import.hpp>
+#include <carto/engineering/cad_provider.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -830,6 +831,37 @@ core::Result<std::string> read_bounded_file(
             std::string(description) + " file changed while it was being read"));
     }
     return core::Result<std::string>::success(std::move(bytes));
+}
+
+core::Result<std::string> read_file_prefix(
+    const std::filesystem::path& path,
+    std::size_t maximum_bytes,
+    std::string_view description) {
+    if (path.empty() || path.filename().empty()) {
+        return core::Result<std::string>::failure(invalid(
+            std::string(description) + " path must name a file"));
+    }
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(path, error)) {
+        return core::Result<std::string>::failure(error
+            ? io_error(std::string(description) + " file is unavailable")
+            : core::Diagnostic(core::ErrorCode::not_found,
+                std::string(description) + " file does not exist"));
+    }
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) {
+        return core::Result<std::string>::failure(io_error(
+            "unable to open " + std::string(description) + " file"));
+    }
+    std::string prefix(maximum_bytes, '\0');
+    stream.read(prefix.data(), static_cast<std::streamsize>(prefix.size()));
+    const auto read = stream.gcount();
+    if (stream.bad() || (stream.fail() && !stream.eof())) {
+        return core::Result<std::string>::failure(io_error(
+            "unable to read " + std::string(description) + " header"));
+    }
+    prefix.resize(static_cast<std::size_t>(read));
+    return core::Result<std::string>::success(std::move(prefix));
 }
 
 struct PendingMeshSource {
@@ -4261,6 +4293,15 @@ core::Result<application::DispatchReceipt> UiController::import_engineering_auth
     return dispatch_with_category(
         application::ImportEngineeringAuthoringAction{std::move(bytes).value()},
         OperationCategory::provider);
+}
+
+core::Result<engineering::ImportProbe> UiController::probe_engineering_step(
+    const std::filesystem::path& path) const {
+    auto prefix = read_file_prefix(path, engineering::kMaxStepHeaderProbeBytes,
+        "STEP source");
+    if (!prefix) return core::Result<engineering::ImportProbe>::failure(prefix.error());
+    engineering::StepAp242Provider provider;
+    return provider.probe(prefix.value());
 }
 
 core::Result<application::DispatchReceipt> UiController::import_engineering_bom_csv(

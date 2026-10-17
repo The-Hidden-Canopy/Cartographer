@@ -2,11 +2,14 @@
 
 #include <carto/engineering/authoring.hpp>
 
+#include <cstddef>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace carto::engineering {
+
+inline constexpr std::size_t kMaxStepHeaderProbeBytes = 64U * 1024U;
 
 struct ImportProbe {
     bool recognized = false;

@@ -8,6 +8,7 @@
 #include <carto/condition/vegetation_preview.hpp>
 #include <carto/core/result.hpp>
 #include <carto/engineering/authoring.hpp>
+#include <carto/engineering/cad_provider.hpp>
 #include <carto/market/market.hpp>
 #include <carto/surface/core.hpp>
 
@@ -614,6 +615,10 @@ public:
     [[nodiscard]] core::Result<application::DispatchReceipt> import_engineering_fixture();
     [[nodiscard]] core::Result<application::DispatchReceipt> import_engineering_authoring(
         const std::filesystem::path& path);
+    // Reads only the bounded STEP exchange header. This does not import
+    // geometry, register a source, or mutate the project.
+    [[nodiscard]] core::Result<engineering::ImportProbe> probe_engineering_step(
+        const std::filesystem::path& path) const;
     [[nodiscard]] core::Result<application::DispatchReceipt> import_engineering_bom_csv(
         const std::filesystem::path& path);
     [[nodiscard]] core::Result<application::DispatchReceipt> attach_engineering_evidence(
