@@ -1506,6 +1506,65 @@ void step_boundary_never_fakes_a_cad_import() {
     REQUIRE(probe);
     REQUIRE(probe.value().recognized);
     REQUIRE(!probe.value().supported);
+    REQUIRE(probe.value().schema_profile == "AP242");
+
+    const auto lowercase_header = provider.probe(
+        "iso-10303-21;\nheader;\nfile_schema(('ap242_managed_model_based_3d_engineering_mim_lf'));\n"
+        "endsec;\ndata;\n");
+    REQUIRE(lowercase_header);
+    REQUIRE(lowercase_header.value().recognized);
+    REQUIRE(!lowercase_header.value().supported);
+    REQUIRE(lowercase_header.value().schema_profile ==
+        "ap242_managed_model_based_3d_engineering_mim_lf");
+
+    const auto unrelated_marker = provider.probe(
+        "notes: ISO-10303-21; HEADER; FILE_SCHEMA(('AP242')); ENDSEC;");
+    REQUIRE(unrelated_marker);
+    REQUIRE(!unrelated_marker.value().recognized);
+    REQUIRE(unrelated_marker.value().schema_profile == "unknown");
+
+    const auto data_section_marker = provider.probe(
+        "ISO-10303-21; HEADER; FILE_SCHEMA(('AP203')); ENDSEC; "
+        "DATA; FILE_SCHEMA(('AP242')); ENDSEC;");
+    REQUIRE(data_section_marker);
+    REQUIRE(data_section_marker.value().recognized);
+    REQUIRE(!data_section_marker.value().supported);
+    REQUIRE(data_section_marker.value().schema_profile == "AP203");
+
+    const auto description_marker = provider.probe(
+        "ISO-10303-21; HEADER; FILE_DESCRIPTION(('AP242 evidence only'),'2;1'); "
+        "FILE_SCHEMA(('AP203')); ENDSEC;");
+    REQUIRE(description_marker);
+    REQUIRE(description_marker.value().recognized);
+    REQUIRE(!description_marker.value().supported);
+    REQUIRE(description_marker.value().schema_profile == "AP203");
+
+    const auto keyword_substring = provider.probe(
+        "ISO-10303-21; NOTHEADER; FILE_SCHEMA(('AP242')); ENDSEC;");
+    REQUIRE(keyword_substring);
+    REQUIRE(!keyword_substring.value().recognized);
+
+    const auto similar_schema_name = provider.probe(
+        "ISO-10303-21; HEADER; FILE_SCHEMA(('NOT_AP242')); ENDSEC;");
+    REQUIRE(similar_schema_name);
+    REQUIRE(similar_schema_name.value().recognized);
+    REQUIRE(!similar_schema_name.value().supported);
+    REQUIRE(similar_schema_name.value().schema_profile == "NOT_AP242");
+    REQUIRE(std::any_of(similar_schema_name.value().diagnostics.begin(),
+        similar_schema_name.value().diagnostics.end(), [](const std::string& diagnostic) {
+            return diagnostic.find("outside the AP242 profile") != std::string::npos;
+        }));
+
+    const auto oversized_header = provider.probe(
+        std::string("ISO-10303-21; HEADER;") + std::string(64U * 1024U, ' ') +
+        "FILE_SCHEMA(('AP242')); ENDSEC;");
+    REQUIRE(oversized_header);
+    REQUIRE(!oversized_header.value().recognized);
+
+    const auto malformed_header = provider.probe(
+        "ISO-10303-21; HEADER; FILE_SCHEMA(AP242); ENDSEC;");
+    REQUIRE(malformed_header);
+    REQUIRE(!malformed_header.value().recognized);
     REQUIRE(!provider.read_assembly(
         "ISO-10303-21;", "fixture.step", "C",
         digest("settings")));

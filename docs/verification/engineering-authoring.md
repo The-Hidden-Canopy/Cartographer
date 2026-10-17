@@ -87,9 +87,12 @@ perform fuzzy matching or unit conversion.
 
 ## Import and runtime boundary
 
-The public STEP AP242 provider may recognize a source header, but it does not
-claim B-Rep support. `read_assembly` remains unsupported until a CAD kernel is
-connected. The fixture is synthetic acceptance data, not a live CAD import.
+The public STEP AP242 provider inspects only the first 64 KiB and recognizes a
+bounded Part 21 header with a declared `FILE_SCHEMA`; marker text in notes or
+the DATA section is not treated as source identity. It still does not claim
+B-Rep support. `read_assembly`
+remains unsupported until a CAD kernel is connected. The fixture is synthetic
+acceptance data, not a live CAD import.
 Inspection-package admission validates the public handoff contract; it does
 not prove robot reachability, collision safety, execution feasibility, or
 hardware behavior. Those checks remain with the consuming runtime.
