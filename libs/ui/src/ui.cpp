@@ -2114,6 +2114,7 @@ core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
         authoring.value().selection_mode == editor::SelectionMode::object;
     const bool named_target = parsed_goal.value().exact_object_name.has_value();
     const bool nearest_spatial_target = parsed_goal.value().nearest_object_scope.has_value();
+    const bool condition_tag_target = parsed_goal.value().condition_tag_scope.has_value();
     if (named_target) {
         constexpr std::size_t kMaxNamedTargetQueryScope = 512U;
         if (source_snapshot.objects.empty() ||
@@ -2315,6 +2316,89 @@ core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
                 "nearest-object target must be an unlocked root object; no farther object was substituted"));
         }
         targets.push_back(agent::TargetRef{nearest_candidate->object, std::monostate{}});
+    } else if (condition_tag_target) {
+        constexpr std::size_t kMaxConditionTagTargetQueryScope = 512U;
+        if (source_snapshot.objects.empty() ||
+            source_snapshot.objects.size() > kMaxConditionTagTargetQueryScope) {
+            return core::Result<void>::failure(invalid_state(
+                "CONDITION tag target resolution requires a project with 1 to 512 objects"));
+        }
+        std::vector<scene::ObjectId> allowed_scope;
+        allowed_scope.reserve(source_snapshot.objects.size());
+        for (const auto& object : source_snapshot.objects) {
+            allowed_scope.push_back(object.object.id);
+        }
+        std::sort(allowed_scope.begin(), allowed_scope.end());
+        if (std::adjacent_find(allowed_scope.begin(), allowed_scope.end()) !=
+            allowed_scope.end()) {
+            return core::Result<void>::failure(validation(
+                "source project contains duplicate object identities"));
+        }
+
+        agent::SceneQueryBudget query_budget;
+        const auto query = agent::SceneQuery::execute(session_,
+            agent::SceneQueryRequest{
+                agent::ConditionAssetsByTagQuery{
+                    *parsed_goal.value().condition_tag_scope},
+                kMaxConditionTagTargetQueryScope},
+            query_budget, allowed_scope, source_snapshot.project_revision);
+        if (!query) {
+            return core::Result<void>::failure(query.error().with_context(
+                "resolving the explicit CONDITION tag goal scope"));
+        }
+        if (query.value().source_revision != source_snapshot.project_revision ||
+            query.value().truncated || !query.value().diagnostics.empty()) {
+            return core::Result<void>::failure(stale(
+                "CONDITION tag target query is stale, incomplete, or unavailable"));
+        }
+        if (query.value().rows.empty()) {
+            return core::Result<void>::failure(invalid_state(
+                "the CONDITION tag goal scope matched no current project objects"));
+        }
+
+        std::set<scene::ObjectId> condition_targets;
+        std::set<std::uint64_t> seen_assets;
+        for (const auto& row : query.value().rows) {
+            const auto* fact = std::get_if<agent::ConditionAssetTagFact>(&row);
+            if (fact == nullptr || fact->asset == 0U || !fact->authored_object ||
+                fact->source_id == 0U || fact->source_revision.empty() ||
+                !seen_assets.insert(fact->asset).second ||
+                !std::binary_search(allowed_scope.begin(), allowed_scope.end(),
+                    fact->authored_object)) {
+                return core::Result<void>::failure(validation(
+                    "CONDITION tag query returned a malformed or out-of-scope fact"));
+            }
+            if (!fact->source_current || !fact->source_reviewed) {
+                return core::Result<void>::failure(stale(
+                    "CONDITION tag scope requires current, reviewed source evidence"));
+            }
+            if (!fact->protected_features.empty()) {
+                return core::Result<void>::failure(invalid_state(
+                    "CONDITION tag target has protected features without a feature-level preservation constraint"));
+            }
+            condition_targets.insert(fact->authored_object);
+        }
+        constexpr std::size_t kMaxConditionTagTargets = 16U;
+        if (condition_targets.empty() ||
+            condition_targets.size() > kMaxConditionTagTargets) {
+            return core::Result<void>::failure(invalid_state(
+                "CONDITION tag scope must resolve to 1 to 16 unique objects"));
+        }
+        for (const auto object_id : condition_targets) {
+            const auto object = std::find_if(source_snapshot.objects.begin(),
+                source_snapshot.objects.end(), [object_id](const auto& value) {
+                    return value.object.id == object_id;
+                });
+            if (object == source_snapshot.objects.end()) {
+                return core::Result<void>::failure(stale(
+                    "a CONDITION tag target no longer exists in the source project"));
+            }
+            if (object->object.parent.has_value() || object->object.locked) {
+                return core::Result<void>::failure(invalid_state(
+                    "CONDITION tag targets must be unlocked root objects; no alternate target was substituted"));
+            }
+            targets.push_back(agent::TargetRef{object_id, std::monostate{}});
+        }
     } else if (object_selection && !authoring.value().objects.empty()) {
         constexpr std::size_t kMaxSelectedObjectTargets = 16U;
         if (authoring.value().objects.size() > kMaxSelectedObjectTargets) {
@@ -2376,7 +2460,7 @@ core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
     steps.reserve(commands.value().size() * targets.size());
     for (std::size_t target_index = 0U; target_index < targets.size(); ++target_index) {
         auto target_authoring = authoring.value();
-        if (named_target) {
+        if (named_target || condition_tag_target) {
             target_authoring.selection_mode = editor::SelectionMode::object;
             target_authoring.objects = {targets[target_index].object};
             target_authoring.vertices.clear();

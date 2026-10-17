@@ -1076,6 +1076,7 @@ core::Result<ParsedAgentGoal> parse_agent_goal(std::string_view goal) {
     while (prefix_begin < goal.size() && goal[prefix_begin] == ' ') ++prefix_begin;
     constexpr std::string_view kNamedScopePrefix = "on object";
     constexpr std::string_view kNearestScopePrefix = "on nearest object within";
+    constexpr std::string_view kConditionTagScopePrefix = "on condition tag";
     const auto ascii_lower = [](char value) {
         const auto byte = static_cast<unsigned char>(value);
         return byte >= 'A' && byte <= 'Z'
@@ -1102,14 +1103,18 @@ core::Result<ParsedAgentGoal> parse_agent_goal(std::string_view goal) {
     const bool named_scope = prefix_matches(kNamedScopePrefix) &&
         (goal.size() == prefix_begin + kNamedScopePrefix.size() ||
          goal[prefix_begin + kNamedScopePrefix.size()] == ' ');
-    if (!nearest_scope && !named_scope) {
+    const bool condition_tag_scope = prefix_matches(kConditionTagScopePrefix) &&
+        (goal.size() == prefix_begin + kConditionTagScopePrefix.size() ||
+         goal[prefix_begin + kConditionTagScopePrefix.size()] == ' ');
+    if (!nearest_scope && !named_scope && !condition_tag_scope) {
         ParsedAgentGoal parsed;
         parsed.commands = std::string(goal);
         return core::Result<ParsedAgentGoal>::success(std::move(parsed));
     }
 
     std::size_t cursor = prefix_begin +
-        (nearest_scope ? kNearestScopePrefix.size() : kNamedScopePrefix.size());
+        (nearest_scope ? kNearestScopePrefix.size() :
+            (condition_tag_scope ? kConditionTagScopePrefix.size() : kNamedScopePrefix.size()));
     std::optional<double> radius_world_units;
     if (nearest_scope) {
         while (cursor < goal.size() && goal[cursor] == ' ') ++cursor;
@@ -1140,7 +1145,9 @@ core::Result<ParsedAgentGoal> parse_agent_goal(std::string_view goal) {
         return core::Result<ParsedAgentGoal>::failure(invalid(
             nearest_scope
                 ? "nearest-object scope must name its exact anchor in double quotes"
-                : "named goal target must use on object \"Exact Name\": command syntax"));
+                : (condition_tag_scope
+                    ? "CONDITION tag scope must use on CONDITION tag \"Exact Tag\": command syntax"
+                    : "named goal target must use on object \"Exact Name\": command syntax")));
     }
     ++cursor;
 
@@ -1155,28 +1162,28 @@ core::Result<ParsedAgentGoal> parse_agent_goal(std::string_view goal) {
         if (value == '\\') {
             if (cursor >= goal.size()) {
                 return core::Result<ParsedAgentGoal>::failure(invalid(
-                    "named goal target ends with an incomplete escape"));
+                    "scoped goal target ends with an incomplete escape"));
             }
             value = goal[cursor++];
             if (value != '"' && value != '\\') {
                 return core::Result<ParsedAgentGoal>::failure(invalid(
-                    "named goal target supports only escaped quotes and backslashes"));
+                    "scoped goal target supports only escaped quotes and backslashes"));
             }
         }
         target_name.push_back(value);
         if (target_name.size() > 256U) {
             return core::Result<ParsedAgentGoal>::failure(invalid(
-                "named goal target name exceeds the 256-byte stable-name limit"));
+                "scoped goal target exceeds the 256-byte limit"));
         }
     }
     if (!closed || target_name.empty()) {
         return core::Result<ParsedAgentGoal>::failure(invalid(
-            "named goal target must contain a closed, non-empty exact name"));
+            "scoped goal target must contain a closed, non-empty exact value"));
     }
     while (cursor < goal.size() && goal[cursor] == ' ') ++cursor;
     if (cursor >= goal.size() || goal[cursor] != ':') {
         return core::Result<ParsedAgentGoal>::failure(invalid(
-            "named goal target must end with a colon before its command"));
+            "scoped goal target must end with a colon before its command"));
     }
     ++cursor;
     while (cursor < goal.size() && goal[cursor] == ' ') ++cursor;
@@ -1189,6 +1196,8 @@ core::Result<ParsedAgentGoal> parse_agent_goal(std::string_view goal) {
     if (nearest_scope) {
         parsed.nearest_object_scope.emplace(ParsedAgentGoal::NearestObjectScope{
             std::move(target_name), *radius_world_units});
+    } else if (condition_tag_scope) {
+        parsed.condition_tag_scope = std::move(target_name);
     } else {
         parsed.exact_object_name = std::move(target_name);
     }

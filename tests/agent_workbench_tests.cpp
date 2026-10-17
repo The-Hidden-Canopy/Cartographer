@@ -6022,6 +6022,175 @@ void agent_goal_scope_parser_rejects_malformed_prefixes_and_decodes_only_safe_es
         R"(on nearest object within 1000001 world units of "Anchor": translate object by 0.1 0 0)"));
     REQUIRE(!carto::agent::parse_agent_goal(
         R"(on nearest object within 2 units of "Anchor": translate object by 0.1 0 0)"));
+
+    const auto condition_tag = carto::agent::parse_agent_goal(
+        R"(ON CONDITION TAG "safe-place": translate object by 0.1 0 0)");
+    REQUIRE(condition_tag);
+    REQUIRE(!condition_tag.value().exact_object_name.has_value());
+    REQUIRE(!condition_tag.value().nearest_object_scope.has_value());
+    REQUIRE(condition_tag.value().condition_tag_scope ==
+        std::optional<std::string>{"safe-place"});
+    REQUIRE(condition_tag.value().commands == "translate object by 0.1 0 0");
+    REQUIRE(!carto::agent::parse_agent_goal(
+        R"(on CONDITION tag "safe\q": translate object by 0.1 0 0)"));
+    REQUIRE(!carto::agent::parse_agent_goal(
+        R"(on CONDITION tag "safe-place" translate object by 0.1 0 0)"));
+    REQUIRE(!carto::agent::parse_agent_goal(R"(on CONDITION tag "": translate object by 0.1 0 0)"));
+    REQUIRE(!carto::agent::parse_agent_goal(R"(on CONDITION tag "safe-place":)"));
+}
+
+void ui_condition_tag_goal_compiles_and_accepts_only_current_reviewed_unprotected_targets() {
+    carto::application::ApplicationSession source;
+    carto::ui::UiController ui(source);
+    const auto objects = create_boxes(source, 3U);
+    REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+        carto::editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(carto::application::SelectObjectAction{objects[2U]}));
+
+    auto fixture = carto::condition::make_condition_fixture();
+    REQUIRE(fixture);
+    fixture.value().project_revision = source.snapshot().project_revision.next();
+    const auto safe_place = std::find_if(fixture.value().assets.begin(),
+        fixture.value().assets.end(), [](const auto& asset) { return asset.id == 1U; });
+    REQUIRE(safe_place != fixture.value().assets.end());
+    safe_place->protected_features.clear();
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        source, carto::application::ImportConditionAuthoringAction{
+            fixture.value().serialize()}));
+
+    const std::string goal =
+        R"(on CONDITION tag "safe-place": translate object by 0.1 0 0)";
+    const auto parsed = carto::agent::parse_agent_goal(goal);
+    REQUIRE(parsed && parsed.value().condition_tag_scope ==
+        std::optional<std::string>{"safe-place"});
+    const auto source_revision = source.snapshot().project_revision;
+    const auto compiled = ui.compile_agent_goal_sequence(goal);
+    if (!compiled) {
+        throw TestFailure("CONDITION-tag goal compilation failed: " +
+            compiled.error().message);
+    }
+    const auto draft = ui.snapshot();
+    REQUIRE(draft.agent_plan_draft.size() == 1U);
+    REQUIRE(draft.agent_plan_draft.front().target.object == objects[0U]);
+    REQUIRE(draft.selection.objects == std::vector<carto::scene::ObjectId>{objects[2U]});
+    REQUIRE(source.snapshot().project_revision == source_revision);
+
+    const auto prepared = ui.prepare_agent_plan(
+        goal, translation_envelope({objects[0U]}, 0.5));
+    REQUIRE(prepared && prepared.value().scope_objects ==
+        std::vector<carto::scene::ObjectId>{objects[0U]});
+    const auto review = ui.run_prepared_agent_plan();
+    REQUIRE(review && review.value().status == carto::agent::TaskStatus::review);
+    REQUIRE(review.value().can_accept);
+    REQUIRE(source.snapshot().project_revision == source_revision);
+    REQUIRE(ui.accept_agent_plan());
+
+    const auto accepted = source.snapshot();
+    REQUIRE(accepted.project_revision == source_revision.next());
+    for (std::size_t index = 0U; index < objects.size(); ++index) {
+        const auto object = std::find_if(accepted.objects.begin(), accepted.objects.end(),
+            [&objects, index](const auto& candidate) {
+                return candidate.object.id == objects[index];
+            });
+        REQUIRE(object != accepted.objects.end());
+        REQUIRE(object->object.local_transform.translation.x ==
+            (index == 0U ? 0.1 : 0.0));
+    }
+}
+
+void ui_condition_tag_goal_rejects_missing_unknown_stale_unreviewed_and_protected_evidence() {
+    const std::string missing_sidecar_goal =
+        R"(on CONDITION tag "safe-place": translate object by 0.1 0 0)";
+    {
+        carto::application::ApplicationSession source;
+        carto::ui::UiController ui(source);
+        const auto objects = create_boxes(source, 2U);
+        REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+            carto::editor::SelectionMode::object}));
+        REQUIRE(ui.dispatch(carto::application::SelectObjectAction{objects[1U]}));
+        const auto revision = source.snapshot().project_revision;
+        const auto rejected = ui.compile_agent_goal_sequence(missing_sidecar_goal);
+        REQUIRE(!rejected);
+        REQUIRE(ui.snapshot().agent_plan_draft.empty());
+        REQUIRE(source.snapshot().project_revision == revision);
+    }
+    {
+        carto::application::ApplicationSession source;
+        carto::ui::UiController ui(source);
+        const auto objects = create_boxes(source, 3U);
+        REQUIRE(ui.dispatch(carto::application::SetSelectionModeAction{
+            carto::editor::SelectionMode::object}));
+        REQUIRE(ui.dispatch(carto::application::SelectObjectAction{objects[2U]}));
+        auto fixture = carto::condition::make_condition_fixture();
+        REQUIRE(fixture);
+        fixture.value().project_revision = source.snapshot().project_revision.next();
+        REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+            source, carto::application::ImportConditionAuthoringAction{
+                fixture.value().serialize()}));
+        const auto revision = source.snapshot().project_revision;
+        const auto unknown = ui.compile_agent_goal_sequence(
+            R"(on CONDITION tag "not-authored": translate object by 0.1 0 0)");
+        REQUIRE(!unknown);
+        REQUIRE(unknown.error().message.find("matched no current project objects") !=
+            std::string::npos);
+        REQUIRE(ui.snapshot().agent_plan_draft.empty());
+        REQUIRE(source.snapshot().project_revision == revision);
+    }
+    {
+        carto::application::ApplicationSession source;
+        carto::ui::UiController ui(source);
+        create_boxes(source, 3U);
+        auto fixture = carto::condition::make_condition_fixture();
+        REQUIRE(fixture);
+        fixture.value().project_revision = source.snapshot().project_revision;
+        REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+            source, carto::application::ImportConditionAuthoringAction{
+                fixture.value().serialize()}));
+        const auto revision = source.snapshot().project_revision;
+        const auto stale = ui.compile_agent_goal_sequence(missing_sidecar_goal);
+        REQUIRE(!stale);
+        REQUIRE(stale.error().code == carto::core::ErrorCode::stale_data);
+        REQUIRE(ui.snapshot().agent_plan_draft.empty());
+        REQUIRE(source.snapshot().project_revision == revision);
+    }
+    {
+        carto::application::ApplicationSession source;
+        carto::ui::UiController ui(source);
+        create_boxes(source, 3U);
+        auto fixture = carto::condition::make_condition_fixture();
+        REQUIRE(fixture);
+        fixture.value().project_revision = source.snapshot().project_revision.next();
+        fixture.value().sources.front().current = false;
+        fixture.value().sources.front().reviewed = false;
+        REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+            source, carto::application::ImportConditionAuthoringAction{
+                fixture.value().serialize()}));
+        const auto revision = source.snapshot().project_revision;
+        const auto unreviewed = ui.compile_agent_goal_sequence(missing_sidecar_goal);
+        REQUIRE(!unreviewed);
+        REQUIRE(unreviewed.error().message.find("current, reviewed source evidence") !=
+            std::string::npos);
+        REQUIRE(ui.snapshot().agent_plan_draft.empty());
+        REQUIRE(source.snapshot().project_revision == revision);
+    }
+    {
+        carto::application::ApplicationSession source;
+        carto::ui::UiController ui(source);
+        create_boxes(source, 3U);
+        auto fixture = carto::condition::make_condition_fixture();
+        REQUIRE(fixture);
+        fixture.value().project_revision = source.snapshot().project_revision.next();
+        REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+            source, carto::application::ImportConditionAuthoringAction{
+                fixture.value().serialize()}));
+        const auto revision = source.snapshot().project_revision;
+        const auto protected_target = ui.compile_agent_goal_sequence(missing_sidecar_goal);
+        REQUIRE(!protected_target);
+        REQUIRE(protected_target.error().message.find("protected features") !=
+            std::string::npos);
+        REQUIRE(ui.snapshot().agent_plan_draft.empty());
+        REQUIRE(source.snapshot().project_revision == revision);
+    }
 }
 
 void ui_spatial_goal_resolves_unique_nearest_root_without_selection_fallback() {
@@ -6461,6 +6630,8 @@ int main() {
         ui_named_goal_target_resolution_rejects_missing_and_ambiguous_names();
         ui_named_goal_target_resolution_handles_bounded_large_duplicate_sets();
         agent_goal_scope_parser_rejects_malformed_prefixes_and_decodes_only_safe_escapes();
+        ui_condition_tag_goal_compiles_and_accepts_only_current_reviewed_unprotected_targets();
+        ui_condition_tag_goal_rejects_missing_unknown_stale_unreviewed_and_protected_evidence();
         ui_spatial_goal_resolves_unique_nearest_root_without_selection_fallback();
         ui_spatial_goal_rejects_tied_nearest_candidates_atomically();
         ui_spatial_goal_rejects_duplicate_named_anchors();

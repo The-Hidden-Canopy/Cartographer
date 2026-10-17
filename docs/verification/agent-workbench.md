@@ -169,6 +169,7 @@
 - Compilation validates each clause against the native preview ontology and installs no partial plan when a clause is unsupported. The source revision remains unchanged; task preparation and execution still require their existing explicit UI actions.
 - The sequence limit is 16 commands. Extra instruction text is rejected by the native planner rather than silently ignored, and an existing manual draft cannot be replaced by compilation.
 - An end-to-end controller fixture compiles two object translations, checks their dependency edge, prepares and runs the task speculatively, verifies the live source remains unchanged before acceptance, then accepts the result through the human application boundary.
+- `on CONDITION tag "Exact Tag":` resolves exact tag membership from the current project sidecar, creates one deterministic chain per unique authored root, and runs through speculative review and explicit acceptance. It never falls back to current selection; missing sidecars, unknown tags, stale or unreviewed source evidence, protected features, malformed facts, incomplete queries, and target/plan budget overflow install no partial draft.
 
 ## Recipe contract coverage
 

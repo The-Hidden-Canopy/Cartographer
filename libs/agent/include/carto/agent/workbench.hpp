@@ -57,6 +57,7 @@ struct HardConstraint {
 
 struct ParsedAgentGoal {
     std::optional<std::string> exact_object_name;
+    std::optional<std::string> condition_tag_scope;
     std::string commands;
     struct NearestObjectScope {
         std::string anchor_name;
@@ -65,8 +66,9 @@ struct ParsedAgentGoal {
     std::optional<NearestObjectScope> nearest_object_scope;
 };
 
-// Parses an exact-name scope prefix or the explicit nearest-object scope
-// `on nearest object within <radius> world units of "Anchor Name":`.
+// Parses an exact-name scope prefix, the explicit nearest-object scope
+// `on nearest object within <radius> world units of "Anchor Name":`, or the
+// exact CONDITION tag scope `on CONDITION tag "tag-name":`.
 // The returned commands preserve the goal text and never infer a target.
 [[nodiscard]] core::Result<ParsedAgentGoal> parse_agent_goal(std::string_view goal);
 
