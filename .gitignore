@@ -107,7 +107,7 @@ _deps/
 /.ctest-tmp/
 /docs/anatomy/
 /docs/spec/
-*.o?w.carto
+*.o?h.carto
 *.private.*
 .codex-remote-attachments/
 
@@ -122,7 +122,3 @@ _deps/
 /docs/verification/consequence-certified-adaptive-geometry.md
 /docs/architecture/persistent-polygons.md
 /docs/verification/persistent-polygons.md
-/docs/architecture/perceptual-optimization.md
-/docs/verification/perceptual-optimization.md
-/docs/architecture/standalone-dcc-viewport-interaction.md
-/docs/verification/standalone-dcc-viewport-interaction.md
