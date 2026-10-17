@@ -104,9 +104,10 @@ _deps/
 # until provenance and licensing are cleared.
 /private/
 /.private/
+/.ctest-tmp/
 /docs/anatomy/
 /docs/spec/
-*.owh.carto
+*.o?w.carto
 *.private.*
 .codex-remote-attachments/
 
