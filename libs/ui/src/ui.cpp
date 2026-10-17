@@ -1,15 +1,19 @@
 #include <carto/ui/ui.hpp>
 
+#include <carto/assets/blob_store.hpp>
 #include <carto/io/builtin_provider.hpp>
 #include <carto/io/obj.hpp>
 #include <carto/io/ply.hpp>
 #include <carto/io/stl.hpp>
 #include <carto/providers/registry.hpp>
+#include <carto/condition/wave_import.hpp>
+#include <carto/engineering/cad_provider.hpp>
 
 #include <algorithm>
 #include <atomic>
 #include <array>
 #include <charconv>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -17,6 +21,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <span>
 #include <string_view>
 #include <system_error>
 #include <type_traits>
@@ -39,6 +44,8 @@ constexpr std::size_t kMaxPreferenceLineBytes = 1024U;
 constexpr std::size_t kWorkbenchPreferenceV1FieldCount = 2U + kWorkbenchInstrumentCount;
 constexpr std::size_t kWorkbenchPreferenceV2FieldCount =
     kWorkbenchPreferenceV1FieldCount + 2U;
+constexpr std::size_t kWorkbenchPreferenceV3FieldCount =
+    kWorkbenchPreferenceV2FieldCount + kWorkbenchPaneCount;
 std::mutex g_preferences_mutex;
 std::atomic<std::uint64_t> g_preference_temp_counter{0U};
 
@@ -66,6 +73,167 @@ core::Diagnostic unsupported(std::string message) {
     return core::Diagnostic(core::ErrorCode::unsupported, std::move(message));
 }
 
+core::Result<std::vector<agent::HardConstraint>> compile_objective_constraints(
+    std::string_view goal,
+    const std::vector<agent::HardConstraint>& authored_constraints) {
+    auto compiled = agent::compile_explicit_hard_constraints(goal);
+    if (!compiled) {
+        return core::Result<std::vector<agent::HardConstraint>>::failure(compiled.error());
+    }
+
+    auto constraints = authored_constraints;
+    for (const auto& generated : compiled.value()) {
+        const auto equivalent = std::find_if(
+            constraints.begin(), constraints.end(), [&generated](const auto& existing) {
+                return existing.kind == generated.kind &&
+                    existing.object == generated.object &&
+                    existing.maximum_displacement == generated.maximum_displacement;
+            });
+        if (equivalent != constraints.end()) continue;
+
+        const bool id_collision = std::any_of(
+            constraints.begin(), constraints.end(), [&generated](const auto& existing) {
+                return existing.id == generated.id;
+            });
+        if (id_collision) {
+            return core::Result<std::vector<agent::HardConstraint>>::failure(invalid(
+                "compiled objective constraint identity collides with an authored constraint"));
+        }
+        constraints.push_back(generated);
+    }
+    return core::Result<std::vector<agent::HardConstraint>>::success(std::move(constraints));
+}
+
+core::Result<std::vector<std::string>> split_agent_goal_sequence(
+    std::string_view goal) {
+    constexpr std::size_t kMaxGoalBytes = 4096U;
+    constexpr std::size_t kMaxSteps = 16U;
+    if (goal.empty() || goal.size() > kMaxGoalBytes) {
+        return core::Result<std::vector<std::string>>::failure(invalid(
+            "agent goal must be non-empty and within the 4096-byte limit"));
+    }
+    const auto trim_command = [](std::string_view command) {
+        std::size_t begin = 0U;
+        while (begin < command.size() &&
+            std::isspace(static_cast<unsigned char>(command[begin])) != 0) {
+            ++begin;
+        }
+        std::size_t end = command.size();
+        while (end > begin &&
+            std::isspace(static_cast<unsigned char>(command[end - 1U])) != 0) {
+            --end;
+        }
+        while (end > begin &&
+            (command[end - 1U] == '.' || command[end - 1U] == '!' ||
+             command[end - 1U] == '?')) {
+            --end;
+        }
+        while (end > begin &&
+            std::isspace(static_cast<unsigned char>(command[end - 1U])) != 0) {
+            --end;
+        }
+        return std::string(command.substr(begin, end - begin));
+    };
+    const auto is_then_separator = [goal](std::size_t index) {
+        if (index + 4U > goal.size() ||
+            (index > 0U && std::isspace(static_cast<unsigned char>(goal[index - 1U])) == 0) ||
+            (index + 4U < goal.size() &&
+                std::isspace(static_cast<unsigned char>(goal[index + 4U])) == 0)) {
+            return false;
+        }
+        constexpr std::string_view kThen = "then";
+        for (std::size_t offset = 0U; offset < kThen.size(); ++offset) {
+            const auto value = static_cast<unsigned char>(goal[index + offset]);
+            if (static_cast<char>(std::tolower(value)) != kThen[offset]) return false;
+        }
+        return true;
+    };
+
+    std::vector<std::string> commands;
+    std::size_t command_begin = 0U;
+    const auto append_command = [&commands, &trim_command](std::string_view command)
+        -> core::Result<void> {
+        auto normalized = trim_command(command);
+        if (normalized.empty()) {
+            return core::Result<void>::failure(invalid(
+                "agent goal sequence contains an empty command"));
+        }
+        if (commands.size() >= kMaxSteps) {
+            return core::Result<void>::failure(invalid(
+                "agent goal sequence exceeds the 16-command limit"));
+        }
+        commands.push_back(std::move(normalized));
+        return core::Result<void>::success();
+    };
+    for (std::size_t index = 0U; index < goal.size();) {
+        const std::size_t separator_size = goal[index] == ';' ? 1U :
+            (is_then_separator(index) ? 4U : 0U);
+        if (separator_size == 0U) {
+            ++index;
+            continue;
+        }
+        if (auto appended = append_command(goal.substr(command_begin, index - command_begin));
+            !appended) {
+            return core::Result<std::vector<std::string>>::failure(appended.error());
+        }
+        index += separator_size;
+        command_begin = index;
+    }
+    if (auto appended = append_command(goal.substr(command_begin)); !appended) {
+        return core::Result<std::vector<std::string>>::failure(appended.error());
+    }
+    return core::Result<std::vector<std::string>>::success(std::move(commands));
+}
+
+bool starts_with_agent_command_words(
+    std::string_view command,
+    std::string_view first,
+    std::string_view second,
+    std::string_view third) {
+    std::size_t cursor = 0U;
+    const auto matches = [&command, &cursor](std::string_view expected) {
+        while (cursor < command.size() &&
+            std::isspace(static_cast<unsigned char>(command[cursor])) != 0) {
+            ++cursor;
+        }
+        const std::size_t begin = cursor;
+        while (cursor < command.size() &&
+            std::isspace(static_cast<unsigned char>(command[cursor])) == 0) {
+            ++cursor;
+        }
+        if (cursor - begin != expected.size()) return false;
+        for (std::size_t index = 0U; index < expected.size(); ++index) {
+            const auto value = static_cast<unsigned char>(command[begin + index]);
+            if (static_cast<char>(std::tolower(value)) != expected[index]) return false;
+        }
+        return true;
+    };
+    return matches(first) && matches(second) && matches(third);
+}
+
+template <typename Record>
+core::Result<void> append_condition_record(
+    std::vector<Record>& records, Record record, std::string_view label) {
+    if (record.id == 0U) {
+        const auto maximum = std::max_element(records.begin(), records.end(),
+            [](const Record& left, const Record& right) { return left.id < right.id; });
+        if (maximum != records.end() && maximum->id == std::numeric_limits<condition::Id>::max()) {
+            return core::Result<void>::failure(invalid_state(
+                std::string(label) + " identity space is exhausted"));
+        }
+        record.id = maximum == records.end() ? 1U : maximum->id + 1U;
+    }
+    const auto insertion = std::lower_bound(records.begin(), records.end(), record.id,
+        [](const Record& existing, condition::Id id) { return existing.id < id; });
+    if (insertion != records.end() && insertion->id == record.id) {
+        return core::Result<void>::failure(invalid(
+            std::string(label) + " identity already exists"));
+    }
+    if (auto valid_record = record.validate(); !valid_record) return valid_record;
+    records.insert(insertion, std::move(record));
+    return core::Result<void>::success();
+}
+
 std::optional<scene::ObjectId> selected_surface_object(
     const application::ApplicationSnapshot& snapshot) {
     if (snapshot.selection.component_object.has_value()) {
@@ -73,6 +241,198 @@ std::optional<scene::ObjectId> selected_surface_object(
     }
     if (!snapshot.selection.objects.empty()) return snapshot.selection.objects.front();
     return std::nullopt;
+}
+
+constexpr std::size_t kMaxAgentDemonstrationTargetSets = 16U;
+constexpr std::size_t kMaxExpandedDemonstrationPlanSteps = 256U;
+
+std::vector<AgentDemonstrationTargetBindingView> demonstration_binding_requirements(
+    const agent::AgentDemonstrationTrace& trace,
+    std::size_t target_set_count) {
+    std::vector<AgentDemonstrationTargetBindingView> requirements;
+    for (std::size_t target_set_index = 0U;
+         target_set_index < target_set_count; ++target_set_index) {
+        for (const auto& step : trace.steps) {
+            const auto existing = std::find_if(requirements.begin(), requirements.end(),
+                [target_set_index, &step](const auto& requirement) {
+                    return requirement.target_set_index == target_set_index &&
+                        requirement.target_alias == step.target_alias &&
+                        requirement.component_alias == step.component_alias;
+                });
+            if (existing == requirements.end()) {
+                requirements.push_back(AgentDemonstrationTargetBindingView{
+                    target_set_index, step.target_alias, step.component_alias,
+                    step.target_kind, false, {}});
+            }
+        }
+    }
+    return requirements;
+}
+
+bool supports_demonstration_structural_matching(
+    const agent::AgentDemonstrationTrace& trace) {
+    if (trace.steps.empty()) return false;
+    const auto& first = trace.steps.front();
+    if (!first.structure_signature.has_value() ||
+        !first.result_object_structure_signature.has_value()) {
+        return false;
+    }
+    if (trace.steps.size() == 1U) return true;
+    if (first.target_kind == agent::AgentDemonstrationTargetKind::vertex &&
+        first.tool_id == "mesh.set-vertex-position" && first.target_alias != 0U &&
+        first.component_alias != 0U) {
+        return std::all_of(trace.steps.begin(), trace.steps.end(), [&first](const auto& step) {
+            return step.target_kind == agent::AgentDemonstrationTargetKind::vertex &&
+                step.tool_id == "mesh.set-vertex-position" &&
+                step.target_alias == first.target_alias &&
+                step.component_alias == first.component_alias &&
+                step.structure_signature == first.structure_signature &&
+                step.result_object_structure_signature == first.result_object_structure_signature;
+        });
+    }
+    if (first.target_kind != agent::AgentDemonstrationTargetKind::object ||
+        first.tool_id != "object.translate" || first.target_alias == 0U ||
+        first.component_alias != 0U ||
+        first.structure_signature != first.result_object_structure_signature) {
+        return false;
+    }
+    return std::all_of(trace.steps.begin(), trace.steps.end(), [&first](const auto& step) {
+        return step.target_kind == agent::AgentDemonstrationTargetKind::object &&
+            step.tool_id == "object.translate" &&
+            step.target_alias == first.target_alias &&
+            step.component_alias == first.component_alias &&
+            step.structure_signature == first.structure_signature &&
+            step.result_object_structure_signature == first.result_object_structure_signature;
+    });
+}
+
+core::Result<std::string> demonstration_number_text(double value) {
+    if (!std::isfinite(value)) {
+        return core::Result<std::string>::failure(invalid(
+            "demonstration parameter is not finite"));
+    }
+    std::array<char, 64U> buffer{};
+    const auto converted = std::to_chars(
+        buffer.data(), buffer.data() + buffer.size(), value, std::chars_format::general);
+    if (converted.ec != std::errc{}) {
+        return core::Result<std::string>::failure(invalid(
+            "demonstration parameter could not be formatted"));
+    }
+    return core::Result<std::string>::success(
+        std::string(buffer.data(), converted.ptr));
+}
+
+core::Result<std::string> demonstration_step_intent(
+    const agent::AgentDemonstrationTraceStep& step,
+    const agent::TargetRef& target,
+    const application::ApplicationSnapshot& snapshot,
+    std::optional<core::Vec3d> vertex_base_position = std::nullopt) {
+    if (auto result = step.parameters.validate(step.tool_id); !result) {
+        return core::Result<std::string>::failure(result.error());
+    }
+    if (step.target_kind == agent::AgentDemonstrationTargetKind::object) {
+        if (!std::holds_alternative<std::monostate>(target.component) ||
+            step.tool_id != "object.translate") {
+            return core::Result<std::string>::failure(invalid(
+                "object demonstration binding does not match its native operation"));
+        }
+        const auto x = demonstration_number_text(step.parameters.relative_displacement.x);
+        const auto y = demonstration_number_text(step.parameters.relative_displacement.y);
+        const auto z = demonstration_number_text(step.parameters.relative_displacement.z);
+        if (!x) return core::Result<std::string>::failure(x.error());
+        if (!y) return core::Result<std::string>::failure(y.error());
+        if (!z) return core::Result<std::string>::failure(z.error());
+        return core::Result<std::string>::success(
+            "translate object by " + x.value() + " " + y.value() + " " + z.value());
+    }
+
+    const auto* instance = snapshot.viewport.scene.find(target.object);
+    if (instance == nullptr || instance->mesh == nullptr) {
+        return core::Result<std::string>::failure(stale(
+            "demonstration target has no current mesh in the viewport snapshot"));
+    }
+    if (step.target_kind == agent::AgentDemonstrationTargetKind::face) {
+        const auto* face_id = std::get_if<geometry::FaceId>(&target.component);
+        if (face_id == nullptr) {
+            return core::Result<std::string>::failure(invalid(
+                "face demonstration binding does not match its native operation"));
+        }
+        if (step.tool_id == "mesh.poke-face" &&
+            step.parameters.parameterization ==
+                agent::AgentDemonstrationParameterization::parameterless) {
+            return core::Result<std::string>::success("poke face");
+        }
+        if ((step.tool_id != "mesh.inset-face" && step.tool_id != "mesh.extrude-face") ||
+            step.parameters.parameterization !=
+                agent::AgentDemonstrationParameterization::normalized_face_distance) {
+            return core::Result<std::string>::failure(invalid(
+                "face demonstration binding does not match its native operation"));
+        }
+        double longest_edge = 0.0;
+        std::size_t boundary_edge_count = 0U;
+        for (std::size_t triangle = 0U;
+             triangle < instance->mesh->triangle_faces.size(); ++triangle) {
+            if (instance->mesh->triangle_faces[triangle] != *face_id) continue;
+            for (std::size_t edge = 0U; edge < 3U; ++edge) {
+                if (!instance->mesh->triangle_edges[triangle][edge].has_value()) continue;
+                const std::size_t first_index = static_cast<std::size_t>(
+                    instance->mesh->indices[triangle * 3U + edge]);
+                const std::size_t second_index = static_cast<std::size_t>(
+                    instance->mesh->indices[triangle * 3U + (edge + 1U) % 3U]);
+                if (first_index >= instance->mesh->positions.size() ||
+                    second_index >= instance->mesh->positions.size()) {
+                    return core::Result<std::string>::failure(stale(
+                        "bound demonstration face has invalid compiled vertex data"));
+                }
+                ++boundary_edge_count;
+                longest_edge = std::max(longest_edge,
+                    (instance->mesh->positions[second_index] -
+                        instance->mesh->positions[first_index]).length());
+            }
+        }
+        if (boundary_edge_count < 3U) {
+            return core::Result<std::string>::failure(stale(
+                "bound demonstration face is missing or degenerate"));
+        }
+        const double distance = step.parameters.normalized_distance * longest_edge;
+        if (!std::isfinite(distance) || distance <= 0.0) {
+            return core::Result<std::string>::failure(invalid(
+                "normalized demonstration face distance is invalid for the selected target"));
+        }
+        const auto formatted = demonstration_number_text(distance);
+        if (!formatted) return core::Result<std::string>::failure(formatted.error());
+        const std::string operation = step.tool_id == "mesh.inset-face"
+            ? "inset face " : "extrude face ";
+        return core::Result<std::string>::success(operation + formatted.value());
+    }
+    if (step.target_kind == agent::AgentDemonstrationTargetKind::vertex) {
+        const auto* vertex_id = std::get_if<geometry::VertexId>(&target.component);
+        if (vertex_id == nullptr || step.tool_id != "mesh.set-vertex-position") {
+            return core::Result<std::string>::failure(invalid(
+                "vertex demonstration binding does not match its native operation"));
+        }
+        const auto vertex = std::find(
+            instance->mesh->vertex_ids.begin(), instance->mesh->vertex_ids.end(), *vertex_id);
+        if (vertex == instance->mesh->vertex_ids.end()) {
+            return core::Result<std::string>::failure(stale(
+                "bound demonstration vertex is missing"));
+        }
+        const auto vertex_index = static_cast<std::size_t>(std::distance(
+            instance->mesh->vertex_ids.begin(), vertex));
+        const auto position = vertex_base_position.value_or(
+            instance->mesh->positions[vertex_index]) +
+            step.parameters.relative_displacement;
+        const auto x = demonstration_number_text(position.x);
+        const auto y = demonstration_number_text(position.y);
+        const auto z = demonstration_number_text(position.z);
+        if (!x) return core::Result<std::string>::failure(x.error());
+        if (!y) return core::Result<std::string>::failure(y.error());
+        if (!z) return core::Result<std::string>::failure(z.error());
+        return core::Result<std::string>::success(
+            "move vertex to " + x.value() + " " + y.value() + " " + z.value());
+    }
+    return core::Result<std::string>::failure(invalid(
+        "demonstration trace target kind is unsupported"));
 }
 
 bool valid(Theme value) noexcept {
@@ -89,6 +449,9 @@ bool valid(OperatorMode value) noexcept {
 
 bool valid(Workspace value) noexcept {
     return value == Workspace::model || value == Workspace::sculpt ||
+        value == Workspace::uv ||
+        value == Workspace::engineering ||
+        value == Workspace::condition ||
         value == Workspace::cad || value == Workspace::build ||
         value == Workspace::material || value == Workspace::animate ||
         value == Workspace::review || value == Workspace::ai;
@@ -113,6 +476,9 @@ std::vector<WorkspaceDefinition> make_workspace_registry() {
         Panel::scene, Panel::viewport, Panel::inspector, Panel::graph, Panel::problems};
     const std::vector<Panel> asset_panels{
         Panel::scene, Panel::viewport, Panel::assets, Panel::inspector, Panel::problems};
+    const std::vector<Panel> engineering_panels{
+        Panel::scene, Panel::viewport, Panel::assets, Panel::inspector,
+        Panel::operations, Panel::problems};
     const std::vector<Panel> timeline_panels{
         Panel::scene, Panel::viewport, Panel::inspector, Panel::timeline, Panel::problems};
     const auto future = [](Workspace workspace,
@@ -129,16 +495,21 @@ std::vector<WorkspaceDefinition> make_workspace_registry() {
         {Workspace::model, "model", "Model", model_panels, BottomPanel::operations, true, {}},
         {Workspace::sculpt, "sculpt", "Sculpt", model_panels, BottomPanel::operations,
          true, {}},
+        {Workspace::uv, "uv", "UV", asset_panels, BottomPanel::assets, true, {}},
+        {Workspace::engineering, "engineering", "Engineering", engineering_panels,
+         BottomPanel::problems, true, {}},
+        {Workspace::condition, "condition", "CONDITION", engineering_panels,
+         BottomPanel::problems, true, {}},
         future(Workspace::cad, "cad", "CAD", graph_panels, BottomPanel::graph,
                "CAD sketch and constraint tools are not available in this build"),
         future(Workspace::build, "build", "Build", asset_panels, BottomPanel::assets,
                "build and assembly tools are not available in this build"),
-        future(Workspace::material, "material", "Material", asset_panels, BottomPanel::assets,
-               "material authoring tools are not available in this build"),
+        {Workspace::material, "material", "Material", asset_panels,
+         BottomPanel::assets, true, {}},
         future(Workspace::animate, "animate", "Animate", timeline_panels, BottomPanel::timeline,
                "animation tools are not available in this build"),
-        future(Workspace::review, "review", "Review", model_panels, BottomPanel::problems,
-               "review and comparison tools are not available in this build"),
+        {Workspace::review, "review", "Review", model_panels, BottomPanel::problems,
+         true, {}},
         {Workspace::ai, "ai", "AI", graph_panels, BottomPanel::graph, true, {}},
     };
 }
@@ -178,21 +549,51 @@ bool is_operation_action(const application::ApplicationAction& action) {
             std::is_same_v<Action, application::AdjustLastToolAction> ||
             std::is_same_v<Action, application::CreateBoxAction> ||
             std::is_same_v<Action, application::CreatePlaneAction> ||
+            std::is_same_v<Action, application::CreateMaterialAction> ||
+            std::is_same_v<Action, application::UpdateMaterialAction> ||
+            std::is_same_v<Action, application::SetMaterialRegionAssignmentAction> ||
+            std::is_same_v<Action, application::SetMaterialGraphAction> ||
+            std::is_same_v<Action, application::SetMaterialGraphBindingAction> ||
             std::is_same_v<Action, application::CreateMeshObjectAction> ||
             std::is_same_v<Action, application::AppendSculptStrokeAction> ||
             std::is_same_v<Action, application::AppendSculptSurfaceStrokeAction> ||
             std::is_same_v<Action, application::SetSculptLayerVisibilityAction> ||
-            std::is_same_v<Action, application::SetObjectTransformAction>;
+            std::is_same_v<Action, application::SetObjectTransformAction> ||
+            std::is_same_v<Action, application::ImportEngineeringFixtureAction> ||
+            std::is_same_v<Action, application::ImportEngineeringAuthoringAction> ||
+            std::is_same_v<Action, application::ImportEngineeringBomCsvAction> ||
+            std::is_same_v<Action, application::ImportEngineeringRequirementCsvAction> ||
+            std::is_same_v<Action, application::ImportEngineeringPathResultAction> ||
+            std::is_same_v<Action, application::AttachEngineeringEvidenceAction> ||
+            std::is_same_v<Action, application::CreateEngineeringRequirementAction> ||
+            std::is_same_v<Action, application::ReviewEngineeringRequirementAction> ||
+            std::is_same_v<Action, application::CreateEngineeringCharacteristicAction> ||
+            std::is_same_v<Action, application::CreateEngineeringTargetAction> ||
+            std::is_same_v<Action, application::UpdateEngineeringWorkcellAction> ||
+            std::is_same_v<Action, application::CreateEngineeringKeepOutAction> ||
+            std::is_same_v<Action, application::CreateEngineeringWorkcellFrameAction> ||
+            std::is_same_v<Action, application::ReviewEngineeringTargetAction> ||
+            std::is_same_v<Action, application::InvalidateEngineeringSourceAction> ||
+            std::is_same_v<Action, application::ImportConditionFixtureAction> ||
+            std::is_same_v<Action, application::ImportConditionAuthoringAction> ||
+            std::is_same_v<Action, application::BindConditionAssetObjectAction> ||
+            std::is_same_v<Action, application::InvalidateConditionSourceAction> ||
+            std::is_same_v<Action, application::CreateSpatialFieldAction> ||
+            std::is_same_v<Action, application::PaintSpatialFieldAction>;
     }, action);
 }
 
 ai::Context make_ai_context(
     const application::ApplicationSnapshot& snapshot,
-    const editor::AuthoringContext& authoring) {
+    const editor::AuthoringContext& authoring,
+    std::uint32_t permitted_effects =
+        ai::effect_mask(ai::CapabilityEffect::geometry) |
+        ai::effect_mask(ai::CapabilityEffect::topology)) {
+    const auto ontology = ai::build_operation_ontology(snapshot.tools);
     return ai::Context{
         snapshot.project_revision,
         authoring,
-        ai::build_operation_ontology(snapshot.tools)};
+        ai::project_capabilities(ontology, permitted_effects)};
 }
 
 bool same_ai_preview(
@@ -310,7 +711,10 @@ core::Result<UiPreferences> parse_preferences(std::string_view text) {
     const auto parsed_mode = parse_enum<OperatorMode>(mode.value(), {
         {"person-first", OperatorMode::person_first}, {"ai-first", OperatorMode::ai_first}});
     const auto parsed_workspace = parse_enum<Workspace>(workspace.value(), {
-        {"model", Workspace::model}, {"sculpt", Workspace::sculpt}, {"cad", Workspace::cad},
+        {"model", Workspace::model}, {"sculpt", Workspace::sculpt},
+        {"uv", Workspace::uv},
+        {"engineering", Workspace::engineering}, {"condition", Workspace::condition},
+        {"cad", Workspace::cad},
         {"build", Workspace::build}, {"material", Workspace::material},
         {"animate", Workspace::animate}, {"review", Workspace::review}, {"ai", Workspace::ai}});
     const auto parsed_density = parse_enum<Density>(density.value(), {
@@ -373,7 +777,7 @@ core::Result<void> atomic_replace(
 #ifdef _WIN32
     if (!MoveFileExW(temporary.wstring().c_str(), destination.wstring().c_str(),
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        return core::Result<void>::failure(io_error("unable to publish workspace preferences atomically"));
+        return core::Result<void>::failure(io_error("unable to publish file atomically"));
     }
     return core::Result<void>::success();
 #else
@@ -381,7 +785,7 @@ core::Result<void> atomic_replace(
     std::filesystem::rename(temporary, destination, error);
     if (error) {
         return core::Result<void>::failure(io_error(
-            "unable to publish workspace preferences atomically: " + error.message()));
+            "unable to publish file atomically: " + error.message()));
     }
     return core::Result<void>::success();
 #endif
@@ -393,6 +797,287 @@ std::filesystem::path preference_temporary_path(const std::filesystem::path& pat
     return std::filesystem::path(
         path.string() + ".tmp-" + std::to_string(static_cast<unsigned long long>(ticks)) +
         "-" + std::to_string(static_cast<unsigned long long>(counter)));
+}
+
+core::Result<std::string> read_bounded_file(
+    const std::filesystem::path& path,
+    std::size_t maximum_bytes,
+    std::string_view description) {
+    if (path.empty() || path.filename().empty()) {
+        return core::Result<std::string>::failure(invalid(
+            std::string(description) + " path must name a file"));
+    }
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(path, error)) {
+        return core::Result<std::string>::failure(error
+            ? io_error(std::string(description) + " file is unavailable")
+            : core::Diagnostic(core::ErrorCode::not_found,
+                std::string(description) + " file does not exist"));
+    }
+    const auto size = std::filesystem::file_size(path, error);
+    if (error) return core::Result<std::string>::failure(io_error(
+        "unable to inspect " + std::string(description) + " size"));
+    if (size > maximum_bytes || size > std::numeric_limits<std::size_t>::max() ||
+        size > static_cast<std::uintmax_t>(std::numeric_limits<std::streamsize>::max())) {
+        return core::Result<std::string>::failure(validation(
+            std::string(description) + " file exceeds the supported size"));
+    }
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) return core::Result<std::string>::failure(io_error(
+        "unable to open " + std::string(description) + " file"));
+    std::string bytes(static_cast<std::size_t>(size), '\0');
+    if (!bytes.empty()) stream.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (stream.gcount() != static_cast<std::streamsize>(bytes.size()) || stream.bad()) {
+        return core::Result<std::string>::failure(io_error(
+            "unable to read complete " + std::string(description) + " file"));
+    }
+    if (stream.peek() != std::char_traits<char>::eof()) {
+        return core::Result<std::string>::failure(stale(
+            std::string(description) + " file changed while it was being read"));
+    }
+    return core::Result<std::string>::success(std::move(bytes));
+}
+
+core::Result<std::string> read_file_prefix(
+    const std::filesystem::path& path,
+    std::size_t maximum_bytes,
+    std::string_view description) {
+    if (path.empty() || path.filename().empty()) {
+        return core::Result<std::string>::failure(invalid(
+            std::string(description) + " path must name a file"));
+    }
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(path, error)) {
+        return core::Result<std::string>::failure(error
+            ? io_error(std::string(description) + " file is unavailable")
+            : core::Diagnostic(core::ErrorCode::not_found,
+                std::string(description) + " file does not exist"));
+    }
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) {
+        return core::Result<std::string>::failure(io_error(
+            "unable to open " + std::string(description) + " file"));
+    }
+    std::string prefix(maximum_bytes, '\0');
+    stream.read(prefix.data(), static_cast<std::streamsize>(prefix.size()));
+    const auto read = stream.gcount();
+    if (stream.bad() || (stream.fail() && !stream.eof())) {
+        return core::Result<std::string>::failure(io_error(
+            "unable to read " + std::string(description) + " header"));
+    }
+    prefix.resize(static_cast<std::size_t>(read));
+    return core::Result<std::string>::success(std::move(prefix));
+}
+
+struct PendingMeshSource {
+    std::filesystem::path project_root;
+    std::filesystem::path staged_path;
+    std::string identity;
+    std::string bytes;
+    assets::Sha256Digest digest;
+};
+
+struct StagedMeshSource {
+    std::string relative_path;
+    assets::Sha256Digest digest;
+};
+
+bool is_within_directory(
+    const std::filesystem::path& directory,
+    const std::filesystem::path& candidate) {
+    const auto relative = candidate.lexically_relative(directory);
+    if (relative.empty() || relative.is_absolute()) return false;
+    for (const auto& component : relative) {
+        if (component == "..") return false;
+    }
+    return true;
+}
+
+core::Result<void> validate_managed_directory_chain(
+    const std::filesystem::path& project_root,
+    const std::filesystem::path& directory) {
+    if (!is_within_directory(project_root, directory)) {
+        return core::Result<void>::failure(validation(
+            "managed mesh directory escaped the saved project directory"));
+    }
+    const auto relative = directory.lexically_relative(project_root);
+    auto cursor = project_root;
+    std::error_code error;
+    for (const auto& component : relative) {
+        cursor /= component;
+        const auto status = std::filesystem::symlink_status(cursor, error);
+        if (error && error != std::errc::no_such_file_or_directory) {
+            return core::Result<void>::failure(io_error(
+                "unable to inspect managed mesh directory"));
+        }
+        error.clear();
+        if (std::filesystem::is_symlink(status) ||
+            (std::filesystem::exists(status) && !std::filesystem::is_directory(status))) {
+            return core::Result<void>::failure(validation(
+                "managed mesh directory contains a link or non-directory component"));
+        }
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<PendingMeshSource> stage_mesh_source(
+    const std::filesystem::path& source_path,
+    const std::filesystem::path& project_path) {
+    constexpr std::size_t kMaxMeshSourceBytes = 128U * 1024U * 1024U;
+    std::error_code error;
+    const auto canonical_source = std::filesystem::canonical(source_path, error);
+    if (error || !std::filesystem::is_regular_file(canonical_source, error) || error) {
+        return core::Result<PendingMeshSource>::failure(io_error(
+            "mesh source is not a readable regular file"));
+    }
+    auto bytes = read_bounded_file(
+        canonical_source, kMaxMeshSourceBytes, "mesh source");
+    if (!bytes) return core::Result<PendingMeshSource>::failure(bytes.error());
+
+    const std::filesystem::path requested_root = project_path.parent_path().empty()
+        ? std::filesystem::current_path(error)
+        : project_path.parent_path();
+    if (error) return core::Result<PendingMeshSource>::failure(io_error(
+        "unable to resolve the saved project directory"));
+    const auto project_root = std::filesystem::weakly_canonical(requested_root, error);
+    if (error || project_root.empty()) return core::Result<PendingMeshSource>::failure(io_error(
+        "unable to resolve the saved project directory"));
+
+    const auto* source_data = reinterpret_cast<const std::uint8_t*>(bytes.value().data());
+    const std::span<const std::uint8_t> source_span(source_data, bytes.value().size());
+    const auto digest = assets::sha256(source_span);
+    const std::string canonical_locator = canonical_source.generic_string();
+    const auto* locator_data = reinterpret_cast<const std::uint8_t*>(canonical_locator.data());
+    const auto identity_digest = assets::sha256(std::span<const std::uint8_t>(
+        locator_data, canonical_locator.size()));
+    const std::string identity = "mesh.source." + identity_digest.hex().substr(0U, 32U);
+
+    const auto staging_root = project_root / ".carto-assets" / "import-staging";
+    if (auto checked = validate_managed_directory_chain(project_root, staging_root); !checked) {
+        return core::Result<PendingMeshSource>::failure(checked.error());
+    }
+    std::filesystem::create_directories(staging_root, error);
+    if (error) return core::Result<PendingMeshSource>::failure(io_error(
+        "unable to create the private mesh import staging directory"));
+    const auto staged_path = preference_temporary_path(staging_root / (digest.hex() + ".snapshot"));
+    std::ofstream staged_file(staged_path, std::ios::binary | std::ios::trunc);
+    if (!staged_file) return core::Result<PendingMeshSource>::failure(io_error(
+        "unable to create a private mesh import snapshot"));
+    staged_file.write(bytes.value().data(), static_cast<std::streamsize>(bytes.value().size()));
+    staged_file.flush();
+    staged_file.close();
+    if (!staged_file) {
+        std::filesystem::remove(staged_path, error);
+        return core::Result<PendingMeshSource>::failure(io_error(
+            "unable to write the private mesh import snapshot"));
+    }
+    return core::Result<PendingMeshSource>::success(PendingMeshSource{
+        project_root, staged_path, identity, std::move(bytes.value()), digest});
+}
+
+void remove_pending_mesh_source(const PendingMeshSource& pending) {
+    std::error_code error;
+    const auto parent = std::filesystem::weakly_canonical(
+        pending.staged_path.parent_path(), error);
+    if (error || !is_within_directory(pending.project_root, parent)) return;
+    std::filesystem::remove(pending.staged_path, error);
+}
+
+core::Result<StagedMeshSource> persist_mesh_source(
+    const PendingMeshSource& pending,
+    MeshImportFormat format) {
+    constexpr std::size_t kMaxMeshSourceBytes = 128U * 1024U * 1024U;
+    const auto staged_bytes = read_bounded_file(
+        pending.staged_path, kMaxMeshSourceBytes, "staged mesh source");
+    if (!staged_bytes) return core::Result<StagedMeshSource>::failure(staged_bytes.error());
+    const auto* staged_data = reinterpret_cast<const std::uint8_t*>(staged_bytes.value().data());
+    if (assets::sha256(std::span<const std::uint8_t>(
+            staged_data, staged_bytes.value().size())) != pending.digest) {
+        return core::Result<StagedMeshSource>::failure(stale(
+            "staged mesh source changed while the importer was reading it"));
+    }
+    const auto* source_data = reinterpret_cast<const std::uint8_t*>(pending.bytes.data());
+    const std::span<const std::uint8_t> source_span(source_data, pending.bytes.size());
+    const auto store_root = pending.project_root / ".carto-assets" / "source-blobs";
+    assets::BlobStore store(store_root);
+    const auto destination = store.path_for(pending.digest);
+    if (auto checked = validate_managed_directory_chain(
+            pending.project_root, destination.parent_path()); !checked) {
+        return core::Result<StagedMeshSource>::failure(checked.error());
+    }
+    std::error_code error;
+    const auto destination_status = std::filesystem::symlink_status(destination, error);
+    if (error && error != std::errc::no_such_file_or_directory) {
+        return core::Result<StagedMeshSource>::failure(io_error(
+            "unable to inspect managed mesh source file"));
+    }
+    error.clear();
+    if (std::filesystem::is_symlink(destination_status)) {
+        return core::Result<StagedMeshSource>::failure(validation(
+            "managed mesh source destination cannot be a symbolic link"));
+    }
+    std::string media_type;
+    switch (format) {
+    case MeshImportFormat::obj: media_type = "model/obj"; break;
+    case MeshImportFormat::ply: media_type = "model/ply"; break;
+    case MeshImportFormat::stl: media_type = "model/stl"; break;
+    }
+    const auto stored = store.put(source_span, std::move(media_type));
+    if (!stored) return core::Result<StagedMeshSource>::failure(stored.error());
+    if (stored.value().digest != pending.digest) {
+        return core::Result<StagedMeshSource>::failure(validation(
+            "managed mesh source digest changed during persistence"));
+    }
+    const auto canonical_destination = std::filesystem::canonical(destination, error);
+    if (error || !is_within_directory(pending.project_root, canonical_destination)) {
+        return core::Result<StagedMeshSource>::failure(validation(
+            "managed mesh source resolved outside the saved project directory"));
+    }
+    const auto relative =
+        canonical_destination.lexically_relative(pending.project_root).generic_string();
+    if (relative.empty() || relative.starts_with("../")) {
+        return core::Result<StagedMeshSource>::failure(validation(
+            "managed mesh source has no safe project-relative path"));
+    }
+    return core::Result<StagedMeshSource>::success(StagedMeshSource{
+        relative, pending.digest});
+}
+
+core::Result<void> write_atomic_file(
+    const std::filesystem::path& path,
+    std::string_view bytes,
+    std::string_view description) {
+    if (path.empty() || path.filename().empty()) {
+        return core::Result<void>::failure(invalid(
+            std::string(description) + " path must name a file"));
+    }
+    const auto parent = path.parent_path();
+    if (!parent.empty()) {
+        std::error_code error;
+        if (!std::filesystem::is_directory(parent, error) || error) {
+            return core::Result<void>::failure(io_error(
+                std::string(description) + " parent directory is unavailable"));
+        }
+    }
+    const auto temporary = preference_temporary_path(path);
+    std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
+    if (!stream) return core::Result<void>::failure(io_error(
+        "unable to create " + std::string(description) + " file"));
+    stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    stream.flush();
+    stream.close();
+    if (!stream) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        return core::Result<void>::failure(io_error(
+            "unable to write " + std::string(description) + " file"));
+    }
+    const auto replaced = atomic_replace(temporary, path);
+    if (!replaced) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+    }
+    return replaced;
 }
 
 constexpr std::array<WorkbenchInstrument, kWorkbenchInstrumentCount>
@@ -530,14 +1215,18 @@ core::Result<WorkbenchPreferences> parse_workbench_preferences(std::string_view 
     const auto header = fields.find("header");
     const bool legacy_format = header != fields.end() &&
         header->second == "CARTOGRAPHER_WORKBENCH_PREFS_V1";
-    const bool current_format = header != fields.end() &&
+    const bool v2_format = header != fields.end() &&
         header->second == "CARTOGRAPHER_WORKBENCH_PREFS_V2";
-    if (!legacy_format && !current_format) {
+    const bool current_format = header != fields.end() &&
+        header->second == "CARTOGRAPHER_WORKBENCH_PREFS_V3";
+    if (!legacy_format && !v2_format && !current_format) {
         return core::Result<WorkbenchPreferences>::failure(
             validation("workbench preference header is invalid"));
     }
     const std::size_t expected_field_count = current_format
-        ? kWorkbenchPreferenceV2FieldCount : kWorkbenchPreferenceV1FieldCount;
+        ? kWorkbenchPreferenceV3FieldCount
+        : v2_format ? kWorkbenchPreferenceV2FieldCount
+                    : kWorkbenchPreferenceV1FieldCount;
     if (fields.size() != expected_field_count) {
         return core::Result<WorkbenchPreferences>::failure(
             validation("workbench preference field set is invalid"));
@@ -553,7 +1242,7 @@ core::Result<WorkbenchPreferences> parse_workbench_preferences(std::string_view 
         return core::Result<WorkbenchPreferences>::failure(
             validation("workbench preference ledger flag is invalid"));
     }
-    if (current_format) {
+    if (v2_format || current_format) {
         const auto last_flow = fields.find("workflow_last_flow");
         const auto flow_counts = fields.find("workflow_flow_counts");
         if (last_flow == fields.end() || flow_counts == fields.end() ||
@@ -575,6 +1264,23 @@ core::Result<WorkbenchPreferences> parse_workbench_preferences(std::string_view 
         if (!parsed) return core::Result<WorkbenchPreferences>::failure(parsed.error());
         result.instruments[index] = parsed.value();
     }
+    if (current_format) {
+        for (std::size_t index = 0U; index < kWorkbenchPaneCount; ++index) {
+            const auto pane = static_cast<WorkbenchPane>(index);
+            const auto field = fields.find(workbench_pane_name(pane));
+            if (field == fields.end()) {
+                return core::Result<WorkbenchPreferences>::failure(validation(
+                    "workbench preference field is missing: " +
+                    std::string(workbench_pane_name(pane))));
+            }
+            const auto parsed = parse_workbench_layout(field->second);
+            if (!parsed) return core::Result<WorkbenchPreferences>::failure(parsed.error());
+            result.panes[index] = WorkbenchPaneLayout{
+                parsed.value().visible, parsed.value().positioned,
+                parsed.value().x, parsed.value().y,
+                parsed.value().width, parsed.value().height};
+        }
+    }
     if (auto valid_result = result.validate(); !valid_result) {
         return core::Result<WorkbenchPreferences>::failure(valid_result.error());
     }
@@ -582,7 +1288,7 @@ core::Result<WorkbenchPreferences> parse_workbench_preferences(std::string_view 
 }
 
 std::string serialize_workbench_preferences(const WorkbenchPreferences& preferences) {
-    std::string result = "header=CARTOGRAPHER_WORKBENCH_PREFS_V2\n";
+    std::string result = "header=CARTOGRAPHER_WORKBENCH_PREFS_V3\n";
     result += std::string("ledger_collapsed=") + (preferences.ledger_collapsed ? "1\n" : "0\n");
     result += "workflow_last_flow=" + std::to_string(preferences.last_flow_index) + "\n";
     result += "workflow_flow_counts=";
@@ -594,6 +1300,15 @@ std::string serialize_workbench_preferences(const WorkbenchPreferences& preferen
     for (std::size_t index = 0U; index < kWorkbenchInstrumentCount; ++index) {
         const auto& layout = preferences.instruments[index];
         result += workbench_instrument_name(all_workbench_instruments()[index]);
+        result += "=";
+        result += layout.visible ? "1," : "0,";
+        result += layout.positioned ? "1," : "0,";
+        result += std::to_string(layout.x) + "," + std::to_string(layout.y) + "," +
+            std::to_string(layout.width) + "," + std::to_string(layout.height) + "\n";
+    }
+    for (std::size_t index = 0U; index < kWorkbenchPaneCount; ++index) {
+        const auto& layout = preferences.panes[index];
+        result += workbench_pane_name(static_cast<WorkbenchPane>(index));
         result += "=";
         result += layout.visible ? "1," : "0,";
         result += layout.positioned ? "1," : "0,";
@@ -661,20 +1376,28 @@ core::Result<void> WorkbenchPreferences::validate() const {
                 invalid("workbench workflow memory exceeds its safe bound"));
         }
     }
-    for (const auto& layout : instruments) {
+    const auto validate_layout = [](const auto& layout, const char* name) {
         if (!layout.positioned) {
             if (layout.x != 0 || layout.y != 0 || layout.width != 0 || layout.height != 0) {
-                return core::Result<void>::failure(
-                    invalid("unpositioned workbench instruments cannot have geometry"));
+                return core::Result<void>::failure(invalid(
+                    std::string("unpositioned workbench ") + name +
+                    " cannot have geometry"));
             }
-            continue;
+            return core::Result<void>::success();
         }
         if (layout.width < 120 || layout.width > 4096 || layout.height < 80 ||
             layout.height > 4096 || layout.x < -65536 || layout.x > 65536 ||
             layout.y < -65536 || layout.y > 65536) {
-            return core::Result<void>::failure(
-                invalid("workbench instrument layout is outside safe bounds"));
+            return core::Result<void>::failure(invalid(
+                std::string("workbench ") + name + " layout is outside safe bounds"));
         }
+        return core::Result<void>::success();
+    };
+    for (const auto& layout : instruments) {
+        if (auto result = validate_layout(layout, "instrument"); !result) return result;
+    }
+    for (const auto& layout : panes) {
+        if (auto result = validate_layout(layout, "pane"); !result) return result;
     }
     return core::Result<void>::success();
 }
@@ -778,6 +1501,9 @@ const char* workspace_name(Workspace workspace) noexcept {
     switch (workspace) {
     case Workspace::model: return "model";
     case Workspace::sculpt: return "sculpt";
+    case Workspace::uv: return "uv";
+    case Workspace::engineering: return "engineering";
+    case Workspace::condition: return "condition";
     case Workspace::cad: return "cad";
     case Workspace::build: return "build";
     case Workspace::material: return "material";
@@ -873,6 +1599,21 @@ const char* workbench_instrument_name(WorkbenchInstrument instrument) noexcept {
     return "unknown";
 }
 
+const char* workbench_pane_name(WorkbenchPane pane) noexcept {
+    switch (pane) {
+    case WorkbenchPane::navigation: return "pane_navigation";
+    case WorkbenchPane::workspace_selector: return "pane_workspace_selector";
+    case WorkbenchPane::agent_task_strip: return "pane_agent_task_strip";
+    case WorkbenchPane::toolbar: return "pane_toolbar";
+    case WorkbenchPane::tool_rack: return "pane_tool_rack";
+    case WorkbenchPane::work_surface: return "pane_work_surface";
+    case WorkbenchPane::operation_ledger: return "pane_operation_ledger";
+    case WorkbenchPane::instrument_bay: return "pane_instrument_bay";
+    case WorkbenchPane::ai_context: return "pane_ai_context";
+    }
+    return "pane_unknown";
+}
+
 const char* surface_fidelity_status_name(SurfaceFidelityStatus status) noexcept {
     switch (status) {
     case SurfaceFidelityStatus::idle: return "idle";
@@ -890,6 +1631,118 @@ const char* surface_fidelity_mode_name(surface::RepresentationMode mode) noexcep
     case surface::RepresentationMode::fidelity_closure: return "fidelity closure";
     }
     return "unknown";
+}
+
+core::Result<EngineeringPathProjection> project_engineering_path_xz(
+    const application::EngineeringAuthoringView::Path& path,
+    const application::EngineeringAuthoringView::Workcell* workcell) {
+    EngineeringPathProjection projection;
+    projection.source_sample_count = path.samples.size();
+    if (path.samples.empty()) {
+        return core::Result<EngineeringPathProjection>::success(std::move(projection));
+    }
+
+    projection.minimum_x = std::numeric_limits<double>::infinity();
+    projection.maximum_x = -std::numeric_limits<double>::infinity();
+    projection.minimum_z = std::numeric_limits<double>::infinity();
+    projection.maximum_z = -std::numeric_limits<double>::infinity();
+    const auto include_position = [&projection](core::Vec3d position) {
+        if (!position.finite()) return false;
+        projection.minimum_x = std::min(projection.minimum_x, position.x);
+        projection.maximum_x = std::max(projection.maximum_x, position.x);
+        projection.minimum_z = std::min(projection.minimum_z, position.z);
+        projection.maximum_z = std::max(projection.maximum_z, position.z);
+        return true;
+    };
+    for (const auto& sample : path.samples) {
+        const auto& position = sample.tool_pose.translation;
+        if (!std::isfinite(position.x) || !std::isfinite(position.y) ||
+            !std::isfinite(position.z) || sample.status.empty()) {
+            return core::Result<EngineeringPathProjection>::failure(validation(
+                "engineering path projection contains an invalid sample"));
+        }
+        static_cast<void>(include_position(position));
+    }
+    if (workcell != nullptr) {
+        for (const auto& entity : workcell->entities) {
+            if (!entity.enabled) continue;
+            if (entity.id == 0U || !entity.transform.finite() ||
+                !include_position(entity.transform.translation)) {
+                return core::Result<EngineeringPathProjection>::failure(validation(
+                    "engineering workcell marker is invalid"));
+            }
+            projection.workcell_markers.push_back(EngineeringPathProjectionMarker{
+                entity.id, entity.kind, entity.name, entity.transform.translation,
+                entity.reference_frame});
+        }
+        for (const auto& region : workcell->keep_outs) {
+            if (!region.enabled) continue;
+            if (region.id == 0U || !region.transform.finite() ||
+                !region.dimensions.finite() || region.dimensions.x <= 0.0 ||
+                region.dimensions.y <= 0.0 || region.dimensions.z <= 0.0) {
+                return core::Result<EngineeringPathProjection>::failure(validation(
+                    "engineering workcell keep-out projection is invalid"));
+            }
+            EngineeringPathProjectionKeepOut projected_region;
+            projected_region.id = region.id;
+            projected_region.kind = region.kind;
+            projected_region.purpose = region.purpose;
+            projected_region.minimum_x = std::numeric_limits<double>::infinity();
+            projected_region.maximum_x = -std::numeric_limits<double>::infinity();
+            projected_region.minimum_z = std::numeric_limits<double>::infinity();
+            projected_region.maximum_z = -std::numeric_limits<double>::infinity();
+            for (std::uint32_t corner = 0U; corner < 8U; ++corner) {
+                const core::Vec3d local{
+                    (corner & 1U) == 0U ? -region.dimensions.x * 0.5
+                                        : region.dimensions.x * 0.5,
+                    (corner & 2U) == 0U ? -region.dimensions.y * 0.5
+                                        : region.dimensions.y * 0.5,
+                    (corner & 4U) == 0U ? -region.dimensions.z * 0.5
+                                        : region.dimensions.z * 0.5};
+                const auto world = region.transform.translation +
+                    region.transform.rotation.rotate(
+                        core::componentwise_multiply(region.transform.scale, local));
+                if (!world.finite()) {
+                    return core::Result<EngineeringPathProjection>::failure(validation(
+                        "engineering workcell keep-out exceeds the projection range"));
+                }
+                projected_region.minimum_x = std::min(projected_region.minimum_x, world.x);
+                projected_region.maximum_x = std::max(projected_region.maximum_x, world.x);
+                projected_region.minimum_z = std::min(projected_region.minimum_z, world.z);
+                projected_region.maximum_z = std::max(projected_region.maximum_z, world.z);
+            }
+            if (!include_position({projected_region.minimum_x, 0.0,
+                    projected_region.minimum_z}) ||
+                !include_position({projected_region.maximum_x, 0.0,
+                    projected_region.maximum_z})) {
+                return core::Result<EngineeringPathProjection>::failure(validation(
+                    "engineering workcell keep-out exceeds the projection range"));
+            }
+            projection.keep_outs.push_back(std::move(projected_region));
+        }
+    }
+    if (!std::isfinite(projection.maximum_x - projection.minimum_x) ||
+        !std::isfinite(projection.maximum_z - projection.minimum_z)) {
+        return core::Result<EngineeringPathProjection>::failure(validation(
+            "engineering path coordinates exceed the projection range"));
+    }
+
+    const auto projected_count = std::min(
+        path.samples.size(), kMaxEngineeringPathProjectionPoints);
+    projection.points.reserve(projected_count);
+    for (std::size_t index = 0U; index < projected_count; ++index) {
+        const auto source_index = projected_count == path.samples.size()
+            ? index
+            : (index * (path.samples.size() - 1U)) / (projected_count - 1U);
+        const auto& sample = path.samples[source_index];
+        projection.points.push_back(EngineeringPathProjectionPoint{
+            sample.sequence,
+            sample.tool_pose.translation,
+            sample.target_id,
+            sample.status});
+    }
+    projection.omitted_sample_count = path.samples.size() - projected_count;
+    return core::Result<EngineeringPathProjection>::success(std::move(projection));
 }
 
 std::optional<Shortcut> shortcut_for_native_key(const NativeKeyEvent& event) noexcept {
@@ -1225,6 +2078,11 @@ core::Result<WorkbenchPreferences> load_workbench_preferences(
 UiController::UiController(application::ApplicationSession& session)
     : session_(session) {}
 
+core::Result<project::MaterialGraph> UiController::material_graph_source(
+    std::string_view identity) const {
+    return session_.material_graph_source(identity);
+}
+
 core::Result<application::DispatchReceipt> UiController::dispatch(
     const application::ApplicationAction& action) {
     return dispatch_with_category(action, OperationCategory::committed_command);
@@ -1335,6 +2193,2087 @@ core::Result<application::DispatchReceipt> UiController::submit_ai_proposal(
     return core::Result<application::DispatchReceipt>::failure(diagnostic);
 }
 
+core::Result<void> UiController::queue_agent_step(
+    std::string intent,
+    std::vector<std::string> dependencies) {
+    if (agent_checkpoint_pending_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "a loaded checkpoint plan cannot be edited; resume or clear it first"));
+    }
+    if (agent_task_.has_value()) {
+        const auto status = agent_task_->snapshot().status;
+        if (status != agent::TaskStatus::accepted && status != agent::TaskStatus::rejected) {
+            return core::Result<void>::failure(invalid_state(
+                "accept or reject the current speculative task before editing its plan"));
+        }
+        agent_task_.reset();
+        agent_condition_inventory_.reset();
+        agent_plan_draft_.clear();
+        agent_hard_constraints_draft_.clear();
+        agent_clarifications_draft_.clear();
+        agent_plan_base_revision_.reset();
+        agent_goal_.clear();
+        agent_plan_id_.clear();
+        agent_objective_id_.clear();
+        agent_repair_mode_ = false;
+    }
+    if (std::any_of(agent_clarifications_draft_.begin(), agent_clarifications_draft_.end(),
+            [](const auto& question) { return question.human_receipt.has_value(); })) {
+        return core::Result<void>::failure(invalid_state(
+            "clear the objective and re-capture clarification after changing its targets"));
+    }
+    if (agent_plan_draft_.size() >= 16U) {
+        return core::Result<void>::failure(invalid_state(
+            "agent plan reached the local 16-command work budget"));
+    }
+    for (const auto& dependency : dependencies) {
+        if (std::none_of(agent_plan_draft_.begin(), agent_plan_draft_.end(),
+                [&dependency](const agent::AgentPlanStep& candidate) {
+                    return candidate.id == dependency;
+                })) {
+            return core::Result<void>::failure(invalid_state(
+                "plan step dependency must name an already captured step"));
+        }
+    }
+    const auto snapshot = session_.snapshot();
+    if (agent_plan_base_revision_.has_value() &&
+        *agent_plan_base_revision_ != snapshot.project_revision) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "project changed after the first agent plan target was captured"));
+    }
+    const auto authoring = session_.authoring_context();
+    if (!authoring) return core::Result<void>::failure(authoring.error());
+
+    agent::TargetRef target;
+    if (authoring.value().selection_mode == editor::SelectionMode::object &&
+        authoring.value().objects.size() == 1U) {
+        target.object = authoring.value().objects.front();
+        target.component = std::monostate{};
+    } else if (authoring.value().selection_mode == editor::SelectionMode::face &&
+        authoring.value().component_object.has_value() &&
+        authoring.value().faces.size() == 1U) {
+        target.object = *authoring.value().component_object;
+        target.component = authoring.value().faces.front();
+    } else if (authoring.value().selection_mode == editor::SelectionMode::vertex &&
+        authoring.value().component_object.has_value() &&
+        authoring.value().vertices.size() == 1U) {
+        target.object = *authoring.value().component_object;
+        target.component = authoring.value().vertices.front();
+    } else {
+        return core::Result<void>::failure(invalid_state(
+            "capture one selected object, face, or vertex for each agent plan step"));
+    }
+
+    agent::AgentPlanStep step{
+        "step-" + std::to_string(agent_plan_draft_.size() + 1U),
+        std::move(target),
+        std::move(intent),
+        std::move(dependencies)};
+    if (auto result = step.validate(); !result) {
+        return core::Result<void>::failure(result.error());
+    }
+    if (!agent_plan_base_revision_.has_value()) {
+        agent_plan_base_revision_ = snapshot.project_revision;
+    }
+    agent_plan_draft_.push_back(std::move(step));
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::compile_agent_goal_sequence(std::string goal) {
+    if (agent_checkpoint_pending_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "a loaded checkpoint plan cannot be replaced; resume or clear it first"));
+    }
+    if (agent_task_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "clear the current AgentTask before compiling a new objective"));
+    }
+    if (!agent_plan_draft_.empty()) {
+        return core::Result<void>::failure(invalid_state(
+            "clear the captured plan before compiling a goal sequence"));
+    }
+    if (std::any_of(agent_clarifications_draft_.begin(),
+            agent_clarifications_draft_.end(), [](const auto& question) {
+                return question.human_receipt.has_value();
+            })) {
+        return core::Result<void>::failure(invalid_state(
+            "clear answered clarifications before compiling a different objective"));
+    }
+
+    const auto parsed_goal = agent::parse_agent_goal(goal);
+    if (!parsed_goal) return core::Result<void>::failure(parsed_goal.error());
+
+    const auto source_snapshot = session_.snapshot();
+    if (agent_plan_base_revision_.has_value() &&
+        *agent_plan_base_revision_ != source_snapshot.project_revision) {
+        return core::Result<void>::failure(stale(
+            "project changed after the current objective draft was captured"));
+    }
+    const auto authoring = session_.authoring_context();
+    if (!authoring) return core::Result<void>::failure(authoring.error());
+    if (authoring.value().project_revision != source_snapshot.project_revision) {
+        return core::Result<void>::failure(stale(
+            "project changed while the objective target was being captured"));
+    }
+
+    std::vector<agent::TargetRef> targets;
+    std::vector<agent::SceneNamedObjectFact> named_target_candidates;
+    std::optional<scene::ObjectId> selected_named_target;
+    const bool object_selection =
+        authoring.value().selection_mode == editor::SelectionMode::object;
+    const bool named_target = parsed_goal.value().exact_object_name.has_value();
+    const bool nearest_spatial_target = parsed_goal.value().nearest_object_scope.has_value();
+    const bool condition_tag_target = parsed_goal.value().condition_tag_scope.has_value();
+    if (named_target) {
+        constexpr std::size_t kMaxNamedTargetQueryScope = 512U;
+        if (source_snapshot.objects.empty() ||
+            source_snapshot.objects.size() > kMaxNamedTargetQueryScope) {
+            return core::Result<void>::failure(invalid_state(
+                "exact-name target resolution requires a project with 1 to 512 objects"));
+        }
+        std::vector<scene::ObjectId> allowed_scope;
+        allowed_scope.reserve(source_snapshot.objects.size());
+        for (const auto& object : source_snapshot.objects) {
+            allowed_scope.push_back(object.object.id);
+        }
+        std::sort(allowed_scope.begin(), allowed_scope.end());
+        if (std::adjacent_find(allowed_scope.begin(), allowed_scope.end()) !=
+            allowed_scope.end()) {
+            return core::Result<void>::failure(validation(
+                "source project contains duplicate object identities"));
+        }
+        agent::SceneQueryBudget query_budget;
+        const auto query = agent::SceneQuery::execute(session_,
+            agent::SceneQueryRequest{
+                agent::ObjectsByStableNameQuery{
+                    *parsed_goal.value().exact_object_name},
+                512U},
+            query_budget, allowed_scope, source_snapshot.project_revision);
+        if (!query) {
+            return core::Result<void>::failure(query.error().with_context(
+                "resolving the explicit exact-name goal target"));
+        }
+        if (query.value().source_revision != source_snapshot.project_revision ||
+            query.value().truncated || !query.value().diagnostics.empty()) {
+            return core::Result<void>::failure(stale(
+                "exact-name target query is stale or incomplete"));
+        }
+        if (query.value().rows.empty()) {
+            return core::Result<void>::failure(invalid_state(
+                "the exact-name goal target was not found in the current project"));
+        }
+        named_target_candidates.reserve(query.value().rows.size());
+        for (const auto& row : query.value().rows) {
+            const auto* fact = std::get_if<agent::SceneNamedObjectFact>(&row);
+            if (fact == nullptr ||
+                fact->stable_name != *parsed_goal.value().exact_object_name) {
+                return core::Result<void>::failure(validation(
+                    "exact-name target query returned an unexpected fact"));
+            }
+            named_target_candidates.push_back(*fact);
+        }
+        if (named_target_candidates.size() == 1U) {
+            selected_named_target = named_target_candidates.front().object;
+        } else {
+            if (!object_selection || authoring.value().objects.size() != 1U) {
+                return core::Result<void>::failure(invalid_state(
+                    "the exact-name goal target is ambiguous; select exactly one matching object or use a unique name"));
+            }
+            const scene::ObjectId selected = authoring.value().objects.front();
+            const auto selected_candidate = std::find_if(
+                named_target_candidates.begin(), named_target_candidates.end(),
+                [selected](const auto& candidate) { return candidate.object == selected; });
+            if (selected_candidate == named_target_candidates.end()) {
+                return core::Result<void>::failure(invalid_state(
+                    "the selected object does not match the exact-name goal target"));
+            }
+            selected_named_target = selected;
+        }
+        const auto object = std::find_if(source_snapshot.objects.begin(),
+            source_snapshot.objects.end(), [selected_named_target](const auto& value) {
+                return value.object.id == *selected_named_target;
+            });
+        if (object == source_snapshot.objects.end() ||
+            object->object.name != *parsed_goal.value().exact_object_name) {
+            return core::Result<void>::failure(stale(
+                "the exact-name target changed after the source snapshot was captured"));
+        }
+        if (object->object.parent.has_value() || object->object.locked) {
+            return core::Result<void>::failure(invalid_state(
+                "exact-name goal targets must be unlocked root objects"));
+        }
+        targets.push_back(agent::TargetRef{*selected_named_target, std::monostate{}});
+    } else if (nearest_spatial_target) {
+        constexpr std::size_t kMaxSpatialTargetQueryScope = 512U;
+        if (source_snapshot.objects.empty() ||
+            source_snapshot.objects.size() > kMaxSpatialTargetQueryScope) {
+            return core::Result<void>::failure(invalid_state(
+                "nearest-object target resolution requires a project with 1 to 512 objects"));
+        }
+        std::vector<scene::ObjectId> allowed_scope;
+        allowed_scope.reserve(source_snapshot.objects.size());
+        for (const auto& object : source_snapshot.objects) {
+            allowed_scope.push_back(object.object.id);
+        }
+        std::sort(allowed_scope.begin(), allowed_scope.end());
+        if (std::adjacent_find(allowed_scope.begin(), allowed_scope.end()) !=
+            allowed_scope.end()) {
+            return core::Result<void>::failure(validation(
+                "source project contains duplicate object identities"));
+        }
+
+        agent::SceneQueryBudget query_budget;
+        const auto& spatial_scope = *parsed_goal.value().nearest_object_scope;
+        const auto anchor_query = agent::SceneQuery::execute(session_,
+            agent::SceneQueryRequest{
+                agent::ObjectsByStableNameQuery{spatial_scope.anchor_name},
+                kMaxSpatialTargetQueryScope},
+            query_budget, allowed_scope, source_snapshot.project_revision);
+        if (!anchor_query) {
+            return core::Result<void>::failure(anchor_query.error().with_context(
+                "resolving the named anchor for nearest-object target resolution"));
+        }
+        if (anchor_query.value().source_revision != source_snapshot.project_revision ||
+            anchor_query.value().truncated || !anchor_query.value().diagnostics.empty()) {
+            return core::Result<void>::failure(stale(
+                "nearest-object anchor query is stale or incomplete"));
+        }
+        if (anchor_query.value().rows.empty()) {
+            return core::Result<void>::failure(invalid_state(
+                "the nearest-object scope anchor was not found in the current project"));
+        }
+        if (anchor_query.value().rows.size() != 1U) {
+            return core::Result<void>::failure(invalid_state(
+                "nearest-object scope requires a uniquely named anchor"));
+        }
+        const auto* anchor_fact = std::get_if<agent::SceneNamedObjectFact>(
+            &anchor_query.value().rows.front());
+        if (anchor_fact == nullptr || anchor_fact->stable_name != spatial_scope.anchor_name) {
+            return core::Result<void>::failure(validation(
+                "nearest-object anchor query returned an unexpected fact"));
+        }
+        const auto anchor_object = std::find_if(source_snapshot.objects.begin(),
+            source_snapshot.objects.end(), [anchor_fact](const auto& object) {
+                return object.object.id == anchor_fact->object;
+            });
+        if (anchor_object == source_snapshot.objects.end() ||
+            anchor_object->object.name != spatial_scope.anchor_name) {
+            return core::Result<void>::failure(stale(
+                "nearest-object anchor changed after the source snapshot was captured"));
+        }
+        const auto* anchor_instance = source_snapshot.viewport.scene.find(anchor_fact->object);
+        if (anchor_instance == nullptr ||
+            !anchor_instance->world_transform.translation.finite()) {
+            return core::Result<void>::failure(stale(
+                "nearest-object anchor has no current finite world origin"));
+        }
+        const auto spatial_query = agent::SceneQuery::execute(session_,
+            agent::SceneQueryRequest{
+                agent::ObjectsWithinDistanceQuery{
+                    anchor_instance->world_transform.translation,
+                    spatial_scope.radius_world_units},
+                kMaxSpatialTargetQueryScope},
+            query_budget, allowed_scope, source_snapshot.project_revision);
+        if (!spatial_query) {
+            return core::Result<void>::failure(spatial_query.error().with_context(
+                "resolving the nearest object around the named anchor"));
+        }
+        if (spatial_query.value().source_revision != source_snapshot.project_revision ||
+            spatial_query.value().truncated || !spatial_query.value().diagnostics.empty()) {
+            return core::Result<void>::failure(stale(
+                "nearest-object spatial query is stale or incomplete"));
+        }
+        constexpr double kDistanceTieTolerance = 1e-9;
+        std::optional<agent::SceneSpatialObjectFact> nearest_candidate;
+        bool nearest_is_ambiguous = false;
+        for (const auto& row : spatial_query.value().rows) {
+            const auto* fact = std::get_if<agent::SceneSpatialObjectFact>(&row);
+            if (fact == nullptr || !fact->object || !fact->world_origin.finite() ||
+                !std::isfinite(fact->distance) || fact->distance < 0.0 ||
+                fact->distance > spatial_scope.radius_world_units) {
+                return core::Result<void>::failure(validation(
+                    "nearest-object spatial query returned an invalid fact"));
+            }
+            if (fact->object == anchor_fact->object) continue;
+            if (!nearest_candidate.has_value() ||
+                fact->distance < nearest_candidate->distance - kDistanceTieTolerance) {
+                nearest_candidate = *fact;
+                nearest_is_ambiguous = false;
+            } else if (std::abs(fact->distance - nearest_candidate->distance) <=
+                kDistanceTieTolerance) {
+                nearest_is_ambiguous = true;
+            }
+        }
+        if (!nearest_candidate.has_value()) {
+            return core::Result<void>::failure(invalid_state(
+                "no other object origin lies within the nearest-object target radius"));
+        }
+        if (nearest_is_ambiguous) {
+            return core::Result<void>::failure(invalid_state(
+                "nearest-object target is tied; use an exact name or select one object"));
+        }
+        const auto target_object = std::find_if(source_snapshot.objects.begin(),
+            source_snapshot.objects.end(), [&nearest_candidate](const auto& object) {
+                return object.object.id == nearest_candidate->object;
+            });
+        if (target_object == source_snapshot.objects.end()) {
+            return core::Result<void>::failure(stale(
+                "nearest-object target changed after the source snapshot was captured"));
+        }
+        if (target_object->object.parent.has_value() || target_object->object.locked) {
+            return core::Result<void>::failure(invalid_state(
+                "nearest-object target must be an unlocked root object; no farther object was substituted"));
+        }
+        targets.push_back(agent::TargetRef{nearest_candidate->object, std::monostate{}});
+    } else if (condition_tag_target) {
+        constexpr std::size_t kMaxConditionTagTargetQueryScope = 512U;
+        if (source_snapshot.objects.empty() ||
+            source_snapshot.objects.size() > kMaxConditionTagTargetQueryScope) {
+            return core::Result<void>::failure(invalid_state(
+                "CONDITION tag target resolution requires a project with 1 to 512 objects"));
+        }
+        std::vector<scene::ObjectId> allowed_scope;
+        allowed_scope.reserve(source_snapshot.objects.size());
+        for (const auto& object : source_snapshot.objects) {
+            allowed_scope.push_back(object.object.id);
+        }
+        std::sort(allowed_scope.begin(), allowed_scope.end());
+        if (std::adjacent_find(allowed_scope.begin(), allowed_scope.end()) !=
+            allowed_scope.end()) {
+            return core::Result<void>::failure(validation(
+                "source project contains duplicate object identities"));
+        }
+
+        agent::SceneQueryBudget query_budget;
+        const auto query = agent::SceneQuery::execute(session_,
+            agent::SceneQueryRequest{
+                agent::ConditionAssetsByTagQuery{
+                    *parsed_goal.value().condition_tag_scope},
+                kMaxConditionTagTargetQueryScope},
+            query_budget, allowed_scope, source_snapshot.project_revision);
+        if (!query) {
+            return core::Result<void>::failure(query.error().with_context(
+                "resolving the explicit CONDITION tag goal scope"));
+        }
+        if (query.value().source_revision != source_snapshot.project_revision ||
+            query.value().truncated || !query.value().diagnostics.empty()) {
+            return core::Result<void>::failure(stale(
+                "CONDITION tag target query is stale, incomplete, or unavailable"));
+        }
+        if (query.value().rows.empty()) {
+            return core::Result<void>::failure(invalid_state(
+                "the CONDITION tag goal scope matched no current project objects"));
+        }
+
+        std::set<scene::ObjectId> condition_targets;
+        std::set<std::uint64_t> seen_assets;
+        for (const auto& row : query.value().rows) {
+            const auto* fact = std::get_if<agent::ConditionAssetTagFact>(&row);
+            if (fact == nullptr || fact->asset == 0U || !fact->authored_object ||
+                fact->source_id == 0U || fact->source_revision.empty() ||
+                !seen_assets.insert(fact->asset).second ||
+                !std::binary_search(allowed_scope.begin(), allowed_scope.end(),
+                    fact->authored_object)) {
+                return core::Result<void>::failure(validation(
+                    "CONDITION tag query returned a malformed or out-of-scope fact"));
+            }
+            if (!fact->source_current || !fact->source_reviewed) {
+                return core::Result<void>::failure(stale(
+                    "CONDITION tag scope requires current, reviewed source evidence"));
+            }
+            if (!fact->protected_features.empty()) {
+                return core::Result<void>::failure(invalid_state(
+                    "CONDITION tag target has protected features without a feature-level preservation constraint"));
+            }
+            condition_targets.insert(fact->authored_object);
+        }
+        constexpr std::size_t kMaxConditionTagTargets = 16U;
+        if (condition_targets.empty() ||
+            condition_targets.size() > kMaxConditionTagTargets) {
+            return core::Result<void>::failure(invalid_state(
+                "CONDITION tag scope must resolve to 1 to 16 unique objects"));
+        }
+        for (const auto object_id : condition_targets) {
+            const auto object = std::find_if(source_snapshot.objects.begin(),
+                source_snapshot.objects.end(), [object_id](const auto& value) {
+                    return value.object.id == object_id;
+                });
+            if (object == source_snapshot.objects.end()) {
+                return core::Result<void>::failure(stale(
+                    "a CONDITION tag target no longer exists in the source project"));
+            }
+            if (object->object.parent.has_value() || object->object.locked) {
+                return core::Result<void>::failure(invalid_state(
+                    "CONDITION tag targets must be unlocked root objects; no alternate target was substituted"));
+            }
+            targets.push_back(agent::TargetRef{object_id, std::monostate{}});
+        }
+    } else if (object_selection && !authoring.value().objects.empty()) {
+        constexpr std::size_t kMaxSelectedObjectTargets = 16U;
+        if (authoring.value().objects.size() > kMaxSelectedObjectTargets) {
+            return core::Result<void>::failure(invalid_state(
+                "goal compilation supports at most 16 explicitly selected root objects"));
+        }
+        auto selected_objects = authoring.value().objects;
+        std::sort(selected_objects.begin(), selected_objects.end());
+        for (const auto object_id : selected_objects) {
+            const auto object = std::find_if(source_snapshot.objects.begin(),
+                source_snapshot.objects.end(), [object_id](const auto& value) {
+                    return value.object.id == object_id;
+                });
+            if (object == source_snapshot.objects.end()) {
+                return core::Result<void>::failure(stale(
+                    "a selected goal target no longer exists in the source project"));
+            }
+            if (object->object.parent.has_value() || object->object.locked) {
+                return core::Result<void>::failure(invalid_state(
+                    "goal compilation requires unlocked root-object targets"));
+            }
+            targets.push_back(agent::TargetRef{object_id, std::monostate{}});
+        }
+    } else if (authoring.value().selection_mode == editor::SelectionMode::face &&
+        authoring.value().component_object.has_value() &&
+        authoring.value().faces.size() == 1U) {
+        targets.push_back(agent::TargetRef{
+            *authoring.value().component_object, authoring.value().faces.front()});
+    } else if (authoring.value().selection_mode == editor::SelectionMode::vertex &&
+        authoring.value().component_object.has_value() &&
+        authoring.value().vertices.size() == 1U) {
+        targets.push_back(agent::TargetRef{
+            *authoring.value().component_object, authoring.value().vertices.front()});
+    } else {
+        return core::Result<void>::failure(invalid_state(
+            "select one or more root objects, or exactly one face or vertex, before compiling the goal"));
+    }
+    for (const auto& target : targets) {
+        if (auto valid = target.validate(); !valid) return valid;
+    }
+
+    const auto commands = split_agent_goal_sequence(parsed_goal.value().commands);
+    if (!commands) return core::Result<void>::failure(commands.error());
+    constexpr std::size_t kMaxCompiledSteps = 16U;
+    if (targets.empty() || commands.value().size() > kMaxCompiledSteps / targets.size()) {
+        return core::Result<void>::failure(invalid_state(
+            "expanded goal DAG exceeds the 16-step work budget"));
+    }
+    auto constraints = compile_objective_constraints(goal, agent_hard_constraints_draft_);
+    if (!constraints) return core::Result<void>::failure(constraints.error());
+
+    const std::uint32_t compile_effects =
+        ai::effect_mask(ai::CapabilityEffect::geometry) |
+        ai::effect_mask(ai::CapabilityEffect::topology) |
+        ai::effect_mask(ai::CapabilityEffect::transform) |
+        ai::effect_mask(ai::CapabilityEffect::material) |
+        ai::effect_mask(ai::CapabilityEffect::uv);
+    std::vector<agent::AgentPlanStep> steps;
+    steps.reserve(commands.value().size() * targets.size());
+    for (std::size_t target_index = 0U; target_index < targets.size(); ++target_index) {
+        auto target_authoring = authoring.value();
+        if (named_target || condition_tag_target) {
+            target_authoring.selection_mode = editor::SelectionMode::object;
+            target_authoring.objects = {targets[target_index].object};
+            target_authoring.vertices.clear();
+            target_authoring.edges.clear();
+            target_authoring.faces.clear();
+            target_authoring.component_object.reset();
+            target_authoring.component_mesh_revision.reset();
+        } else if (object_selection) {
+            target_authoring.objects = {targets[target_index].object};
+        }
+        if (auto valid = target_authoring.validate(); !valid) {
+            return core::Result<void>::failure(valid.error().with_context(
+                "validating selected goal target"));
+        }
+        const auto compile_context = make_ai_context(
+            source_snapshot, target_authoring, compile_effects);
+        std::optional<std::string> previous_step_id;
+        for (std::size_t command_index = 0U;
+             command_index < commands.value().size(); ++command_index) {
+            const auto proposal = native_planner_.propose(
+                commands.value()[command_index], compile_context);
+            if (!proposal) {
+                return core::Result<void>::failure(proposal.error().with_context(
+                    "compiling target " + std::to_string(target_index + 1U) +
+                    ", objective step " + std::to_string(command_index + 1U)));
+            }
+            if (proposal.value().base_revision != source_snapshot.project_revision ||
+                proposal.value().context != target_authoring) {
+                return core::Result<void>::failure(stale(
+                    "source revision or selection changed while compiling the goal DAG"));
+            }
+            const std::string step_id = targets.size() == 1U
+                ? "step-" + std::to_string(command_index + 1U)
+                : "target-" + std::to_string(target_index + 1U) + "-step-" +
+                    std::to_string(command_index + 1U);
+            std::vector<std::string> dependencies;
+            if (previous_step_id.has_value()) dependencies.push_back(*previous_step_id);
+            steps.push_back(agent::AgentPlanStep{
+                step_id, targets[target_index], commands.value()[command_index],
+                std::move(dependencies)});
+            previous_step_id = step_id;
+        }
+    }
+
+    std::vector<scene::ObjectId> objective_scope;
+    objective_scope.reserve(targets.size());
+    for (const auto& target : targets) objective_scope.push_back(target.object);
+
+    agent::AuthoringObjective objective{
+        agent_objective_id_.empty() ? "agent-objective-draft" : agent_objective_id_,
+        goal, source_snapshot.project_revision, std::move(objective_scope), {},
+        std::move(constraints.value()), agent_clarifications_draft_, agent_recipe_id_};
+    agent::AgentPlan plan{"agent-plan-draft", std::move(objective), steps};
+    if (auto valid = plan.validate(); !valid) {
+        return core::Result<void>::failure(valid.error().with_context(
+            "validating the compiled objective plan"));
+    }
+    const auto final_authoring = session_.authoring_context();
+    if (session_.snapshot().project_revision != source_snapshot.project_revision ||
+        !final_authoring || final_authoring.value() != authoring.value()) {
+        return core::Result<void>::failure(stale(
+            "source revision or selection changed before the compiled plan was installed"));
+    }
+
+    agent_plan_base_revision_ = source_snapshot.project_revision;
+    agent_plan_draft_ = std::move(steps);
+    agent_goal_ = std::move(goal);
+    if (agent_objective_id_.empty()) agent_objective_id_ = "agent-objective-draft";
+    agent_condition_inventory_.reset();
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::set_agent_recipe(std::string recipe_id) {
+    if (agent_checkpoint_pending_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "a loaded checkpoint recipe cannot be edited; resume or clear it first"));
+    }
+    if (!recipe_id.empty() && agent::find_agent_recipe(recipe_id) == nullptr) {
+        return core::Result<void>::failure(invalid_state(
+            "selected agent recipe is not registered"));
+    }
+    if (recipe_id == agent_recipe_id_) return core::Result<void>::success();
+    if (std::any_of(agent_clarifications_draft_.begin(),
+            agent_clarifications_draft_.end(), [](const auto& question) {
+                return question.human_receipt.has_value();
+            })) {
+        return core::Result<void>::failure(invalid_state(
+            "clear and re-answer clarifications before changing the objective recipe"));
+    }
+    if (agent_task_.has_value()) {
+        const auto status = agent_task_->snapshot().status;
+        if (status != agent::TaskStatus::accepted && status != agent::TaskStatus::rejected) {
+            return core::Result<void>::failure(invalid_state(
+                "the recipe is locked while a speculative task is active"));
+        }
+        agent_task_.reset();
+        agent_condition_inventory_.reset();
+        agent_plan_draft_.clear();
+        agent_hard_constraints_draft_.clear();
+        agent_clarifications_draft_.clear();
+        agent_plan_base_revision_.reset();
+        agent_goal_.clear();
+        agent_plan_id_.clear();
+        agent_objective_id_.clear();
+        agent_repair_mode_ = false;
+    }
+    agent_recipe_id_ = std::move(recipe_id);
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::set_agent_hard_constraints(
+    std::vector<agent::HardConstraint> constraints) {
+    if (agent_checkpoint_pending_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "a loaded checkpoint objective cannot be edited; resume or clear it first"));
+    }
+    if (agent_task_.has_value()) {
+        const auto status = agent_task_->snapshot().status;
+        if (status != agent::TaskStatus::accepted && status != agent::TaskStatus::rejected) {
+            return core::Result<void>::failure(invalid_state(
+                "objective constraints are locked while a speculative task is active"));
+        }
+        agent_task_.reset();
+        agent_condition_inventory_.reset();
+        agent_plan_draft_.clear();
+        agent_hard_constraints_draft_.clear();
+        agent_clarifications_draft_.clear();
+        agent_plan_base_revision_.reset();
+        agent_goal_.clear();
+        agent_plan_id_.clear();
+        agent_objective_id_.clear();
+        agent_repair_mode_ = false;
+    }
+    if (agent_plan_draft_.empty() || !agent_plan_base_revision_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "capture at least one plan target before setting objective constraints"));
+    }
+    if (session_.snapshot().project_revision != *agent_plan_base_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "project changed after the first agent plan target was captured"));
+    }
+    if (std::any_of(agent_clarifications_draft_.begin(),
+            agent_clarifications_draft_.end(), [](const auto& question) {
+                return question.human_receipt.has_value();
+            })) {
+        return core::Result<void>::failure(invalid_state(
+            "clear and re-answer clarifications before changing objective constraints"));
+    }
+    if (constraints.size() > 256U) {
+        return core::Result<void>::failure(invalid_state(
+            "objective exceeds the 256-constraint safety limit"));
+    }
+
+    std::vector<scene::ObjectId> scope;
+    for (const auto& step : agent_plan_draft_) {
+        if (std::find(scope.begin(), scope.end(), step.target.object) == scope.end()) {
+            scope.push_back(step.target.object);
+        }
+    }
+    std::set<std::string> constraint_ids;
+    for (const auto& constraint : constraints) {
+        if (auto result = constraint.validate(); !result) {
+            return result;
+        }
+        if (!constraint_ids.insert(constraint.id).second) {
+            return core::Result<void>::failure(invalid(
+                "objective constraints contain a duplicate identity"));
+        }
+        if (constraint.object.has_value() &&
+            std::find(scope.begin(), scope.end(), *constraint.object) == scope.end()) {
+            return core::Result<void>::failure(invalid_state(
+                "objective constraint target is outside the captured plan scope"));
+        }
+    }
+    for (const auto& question : agent_clarifications_draft_) {
+        if (auto result = question.validate(scope, constraints); !result) return result;
+    }
+    agent_hard_constraints_draft_ = std::move(constraints);
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::queue_agent_clarification(
+    std::string prompt,
+    agent::ClarificationImpact impact,
+    std::vector<agent::ClarificationCandidate> candidates,
+    std::string rationale) {
+    if (agent_checkpoint_pending_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "a loaded checkpoint objective cannot be edited; resume or clear it first"));
+    }
+    if (agent_task_.has_value()) {
+        const auto status = agent_task_->snapshot().status;
+        if (status != agent::TaskStatus::accepted && status != agent::TaskStatus::rejected) {
+            return core::Result<void>::failure(invalid_state(
+                "accept or reject the current speculative task before editing its objective"));
+        }
+        agent_task_.reset();
+        agent_condition_inventory_.reset();
+        agent_plan_draft_.clear();
+        agent_hard_constraints_draft_.clear();
+        agent_clarifications_draft_.clear();
+        agent_plan_base_revision_.reset();
+        agent_goal_.clear();
+        agent_plan_id_.clear();
+        agent_objective_id_.clear();
+        agent_repair_mode_ = false;
+    }
+    if (agent_plan_draft_.empty() || !agent_plan_base_revision_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "capture at least one plan target before adding an objective clarification"));
+    }
+    const auto snapshot = session_.snapshot();
+    if (snapshot.project_revision != *agent_plan_base_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "project changed after the first agent plan target was captured"));
+    }
+    if (!agent_goal_.empty() || std::any_of(
+            agent_clarifications_draft_.begin(), agent_clarifications_draft_.end(),
+            [](const auto& question) { return question.human_receipt.has_value(); })) {
+        return core::Result<void>::failure(invalid_state(
+            "clarifications are fixed after the first human answer; clear and rebuild the objective"));
+    }
+    if (agent_clarifications_draft_.size() >= 128U) {
+        return core::Result<void>::failure(invalid_state(
+            "objective reached the 128-question safety limit"));
+    }
+    if (!candidates.empty() &&
+        (candidates.size() < 2U || candidates.size() > 16U)) {
+        return core::Result<void>::failure(invalid(
+            "candidate clarification requires 2 to 16 choices"));
+    }
+
+    std::vector<scene::ObjectId> scope;
+    for (const auto& step : agent_plan_draft_) {
+        if (std::find(scope.begin(), scope.end(), step.target.object) == scope.end()) {
+            scope.push_back(step.target.object);
+        }
+    }
+    agent::ClarificationQuestion question;
+    question.id = "question-" + std::to_string(agent_clarifications_draft_.size() + 1U);
+    question.prompt = std::move(prompt);
+    question.rationale = rationale.empty()
+        ? "The operator requires an explicit answer before this plan may run."
+        : std::move(rationale);
+    question.impacts = {impact};
+    question.affected_objects = std::move(scope);
+    question.downstream_plan_branches = agent_plan_draft_.size();
+    question.candidates = std::move(candidates);
+    question.requires_explicit_answer = true;
+    if (auto result = question.validate(question.affected_objects, {}); !result) {
+        return result;
+    }
+    agent_clarifications_draft_.push_back(std::move(question));
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::answer_agent_clarification(
+    std::string goal,
+    std::string_view question_id,
+    std::string answer) {
+    return record_agent_clarification_answer(
+        std::move(goal), question_id, std::nullopt, std::move(answer));
+}
+
+core::Result<void> UiController::choose_agent_clarification_candidate(
+    std::string goal,
+    std::string_view question_id,
+    std::string candidate_id) {
+    return record_agent_clarification_answer(
+        std::move(goal), question_id, std::move(candidate_id), std::nullopt);
+}
+
+core::Result<void> UiController::record_agent_clarification_answer(
+    std::string goal,
+    std::string_view question_id,
+    std::optional<std::string> candidate_id,
+    std::optional<std::string> freeform_answer) {
+    if (agent_task_.has_value() &&
+        (!agent_repair_mode_ ||
+         agent_task_->snapshot().status != agent::TaskStatus::blocked)) {
+        return core::Result<void>::failure(invalid_state(
+            "clarification answers can be changed only while reviewing a blocked-plan repair"));
+    }
+    if (agent_plan_draft_.empty() || !agent_plan_base_revision_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "capture at least one plan target before answering an objective clarification"));
+    }
+    if (session_.snapshot().project_revision != *agent_plan_base_revision_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "project changed after the first agent plan target was captured"));
+    }
+    if (!agent_goal_.empty() && agent_goal_ != goal) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "goal changed after a human clarification was recorded; clear and answer again"));
+    }
+    auto constraints = compile_objective_constraints(goal, agent_hard_constraints_draft_);
+    if (!constraints) {
+        return core::Result<void>::failure(constraints.error());
+    }
+    std::vector<scene::ObjectId> scope;
+    for (const auto& step : agent_plan_draft_) {
+        if (std::find(scope.begin(), scope.end(), step.target.object) == scope.end()) {
+            scope.push_back(step.target.object);
+        }
+    }
+    const std::uint64_t task_sequence = next_agent_task_id_ ==
+        std::numeric_limits<std::uint64_t>::max() ? 1U : next_agent_task_id_;
+    const std::string task_id = agent_plan_id_.empty()
+        ? "agent-task-" + std::to_string(task_sequence) : agent_plan_id_;
+    const std::string objective_id = agent_objective_id_.empty()
+        ? task_id : agent_objective_id_;
+    agent::AuthoringObjective objective{
+        objective_id, std::move(goal),
+        *agent_plan_base_revision_, std::move(scope), {},
+        std::move(constraints.value()), agent_clarifications_draft_, agent_recipe_id_};
+    agent::AgentPlan plan{task_id, std::move(objective), agent_plan_draft_};
+    const auto answered = application::HumanApplicationAccess::answer_agent_clarification(
+        plan, question_id, std::move(candidate_id), std::move(freeform_answer));
+    if (!answered) return answered;
+    agent_goal_ = plan.objective.goal;
+    agent_clarifications_draft_ = std::move(plan.objective.clarifications);
+    return core::Result<void>::success();
+}
+
+core::Result<agent::AgentTaskSnapshot> UiController::prepare_agent_plan(
+    std::string goal,
+    std::optional<agent::AgentWorkEnvelope> requested_envelope) {
+    if (agent_checkpoint_pending_.has_value()) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "resume the loaded checkpoint through its revalidation boundary"));
+    }
+    if (agent_plan_draft_.empty() || !agent_plan_base_revision_.has_value()) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "capture at least one selected object, face, or vertex before running an agent plan"));
+    }
+    if (agent_task_.has_value()) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "a speculative task is already active"));
+    }
+    const auto snapshot = session_.snapshot();
+    if (snapshot.project_revision != *agent_plan_base_revision_) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "agent plan targets were captured against an older project revision"));
+    }
+    if (!agent_goal_.empty() && agent_goal_ != goal) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "goal changed after a human clarification was recorded; clear and answer again"));
+    }
+    auto constraints = compile_objective_constraints(goal, agent_hard_constraints_draft_);
+    if (!constraints) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(constraints.error());
+    }
+    const std::uint64_t task_sequence = next_agent_task_id_ ==
+        std::numeric_limits<std::uint64_t>::max() ? 1U : next_agent_task_id_;
+    const std::string task_id = "agent-task-" + std::to_string(task_sequence);
+    std::vector<scene::ObjectId> scope;
+    for (const auto& step : agent_plan_draft_) {
+        if (std::find(scope.begin(), scope.end(), step.target.object) == scope.end()) {
+            scope.push_back(step.target.object);
+        }
+    }
+    const bool permits_transform = requested_envelope.has_value() &&
+        (requested_envelope->permitted_effects &
+            agent::effect_mask(agent::Effect::transform)) != 0U &&
+        std::any_of(agent_plan_draft_.begin(), agent_plan_draft_.end(),
+            [](const auto& step) {
+                return starts_with_agent_command_words(
+                    step.intent, "translate", "object", "by");
+            });
+    if (permits_transform) {
+        std::vector<scene::ObjectId> transform_roots;
+        for (const auto& step : agent_plan_draft_) {
+            if (starts_with_agent_command_words(
+                    step.intent, "translate", "object", "by") &&
+                std::holds_alternative<std::monostate>(step.target.component) &&
+                std::find(transform_roots.begin(), transform_roots.end(),
+                    step.target.object) == transform_roots.end()) {
+                transform_roots.push_back(step.target.object);
+            }
+        }
+        if (transform_roots.empty()) {
+            return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+                "transform permission requires at least one captured object target"));
+        }
+        for (std::size_t cursor = 0U; cursor < transform_roots.size(); ++cursor) {
+            const scene::ObjectId parent = transform_roots[cursor];
+            for (const auto& object : snapshot.objects) {
+                if (object.object.parent.has_value() && *object.object.parent == parent &&
+                    std::find(scope.begin(), scope.end(), object.object.id) == scope.end()) {
+                    scope.push_back(object.object.id);
+                    transform_roots.push_back(object.object.id);
+                }
+            }
+        }
+    }
+    if (requested_envelope.has_value() &&
+        !requested_envelope->scope_objects.empty()) {
+        auto requested_scope = requested_envelope->scope_objects;
+        auto captured_scope = scope;
+        std::sort(requested_scope.begin(), requested_scope.end());
+        std::sort(captured_scope.begin(), captured_scope.end());
+        if (requested_scope != captured_scope) {
+            return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+                "requested work envelope scope must match the captured target subtree"));
+        }
+    }
+    agent::AgentPlan plan{
+        task_id,
+        agent::AuthoringObjective{
+            agent_objective_id_.empty() ? task_id : agent_objective_id_,
+            std::move(goal), *agent_plan_base_revision_, scope, {},
+            std::move(constraints.value()),
+            agent_clarifications_draft_, agent_recipe_id_},
+        agent_plan_draft_};
+    const std::string task_goal = plan.objective.goal;
+    agent::AgentWorkEnvelope envelope = requested_envelope.value_or(
+        agent::AgentWorkEnvelope{});
+    envelope.scope_objects = scope;
+    envelope.max_commands = std::min<std::size_t>(envelope.max_commands, 16U);
+    if (!requested_envelope.has_value()) envelope.max_objects_touched = scope.size();
+    auto task = agent::AgentTask::begin(session_, std::move(plan), std::move(envelope));
+    if (!task) {
+        record_ui_problem(task.error().with_context("agent workbench plan"));
+        return core::Result<agent::AgentTaskSnapshot>::failure(task.error());
+    }
+    next_agent_task_id_ = task_sequence == std::numeric_limits<std::uint64_t>::max()
+        ? 1U : task_sequence + 1U;
+    agent_goal_ = task_goal;
+    agent_plan_id_ = task_id;
+    if (agent_objective_id_.empty()) agent_objective_id_ = task_id;
+    agent_repair_mode_ = false;
+    agent_condition_inventory_.reset();
+    agent_task_.emplace(std::move(task.value()));
+    return core::Result<agent::AgentTaskSnapshot>::success(agent_task_->snapshot());
+}
+
+core::Result<agent::AgentTaskSnapshot> UiController::run_agent_plan(
+    std::string goal,
+    std::optional<agent::AgentWorkEnvelope> requested_envelope) {
+    if (agent_task_.has_value()) {
+        const auto task = agent_task_->snapshot();
+        if (task.status != agent::TaskStatus::prepared) {
+            return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+                "a speculative task is already active"));
+        }
+        if (goal != agent_goal_) {
+            return core::Result<agent::AgentTaskSnapshot>::failure(stale(
+                "prepared task goal changed; clear and prepare the objective again"));
+        }
+        if (requested_envelope.has_value()) {
+            return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+                "the work envelope is locked after task preparation"));
+        }
+        return run_prepared_agent_plan();
+    }
+    auto prepared = prepare_agent_plan(std::move(goal), std::move(requested_envelope));
+    if (!prepared) return prepared;
+    return run_prepared_agent_plan();
+}
+
+core::Result<agent::AgentTaskSnapshot> UiController::run_prepared_agent_plan() {
+    if (!agent_task_.has_value()) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "there is no prepared speculative agent task to run"));
+    }
+    const auto task = agent_task_->snapshot();
+    if (task.status != agent::TaskStatus::prepared) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "only a prepared agent task can start execution"));
+    }
+    if (session_.snapshot().project_revision != task.base_revision) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(stale(
+            "project changed after task preparation; discard and prepare against the current revision"));
+    }
+    auto result = agent_task_->run();
+    if (!result) {
+        record_ui_problem(result.error().with_context("agent workbench execution"));
+        return result;
+    }
+    return result;
+}
+
+core::Result<agent::SceneQueryResult> UiController::query_agent_condition_inventory() {
+    core::Result<agent::SceneQueryResult> queried =
+        core::Result<agent::SceneQueryResult>::failure(invalid_state(
+            "CONDITION inventory query was not initialized"));
+    const std::optional<agent::AgentTaskSnapshot> current_task =
+        agent_task_.has_value()
+            ? std::optional<agent::AgentTaskSnapshot>(agent_task_->snapshot())
+            : std::nullopt;
+    const bool active_task = current_task.has_value() &&
+        current_task->status != agent::TaskStatus::accepted &&
+        current_task->status != agent::TaskStatus::rejected;
+    if (active_task) {
+        agent_condition_inventory_scope_ = current_task->scope_objects;
+        queried = agent::SceneQuery::execute(*agent_task_, {
+            agent::ConditionAssetInventoryQuery{std::nullopt}, 512U});
+    } else {
+        const auto source_snapshot = session_.snapshot();
+        agent_condition_inventory_scope_ = source_snapshot.selection.objects;
+        if (source_snapshot.selection.component_object.has_value() &&
+            std::find(agent_condition_inventory_scope_.begin(),
+                agent_condition_inventory_scope_.end(),
+                *source_snapshot.selection.component_object) ==
+                agent_condition_inventory_scope_.end()) {
+            agent_condition_inventory_scope_.push_back(
+                *source_snapshot.selection.component_object);
+        }
+        std::sort(agent_condition_inventory_scope_.begin(),
+            agent_condition_inventory_scope_.end());
+        agent_condition_inventory_scope_.erase(std::unique(
+            agent_condition_inventory_scope_.begin(),
+            agent_condition_inventory_scope_.end()),
+            agent_condition_inventory_scope_.end());
+        if (agent_condition_inventory_scope_.empty()) {
+            return core::Result<agent::SceneQueryResult>::failure(invalid_state(
+                "select one or more objects before inspecting CONDITION inventory"));
+        }
+        if (!agent_condition_inventory_query_revision_.has_value() ||
+            *agent_condition_inventory_query_revision_ !=
+                source_snapshot.project_revision) {
+            agent_condition_inventory_query_budget_ = {};
+            agent_condition_inventory_query_revision_ =
+                source_snapshot.project_revision;
+        }
+        queried = agent::SceneQuery::execute(session_, {
+            agent::ConditionAssetInventoryQuery{std::nullopt}, 512U},
+            agent_condition_inventory_query_budget_,
+            agent_condition_inventory_scope_, source_snapshot.project_revision);
+    }
+    if (!queried) {
+        record_ui_problem(queried.error().with_context(
+            "agent CONDITION inventory query"));
+        return core::Result<agent::SceneQueryResult>::failure(queried.error());
+    }
+    agent_condition_inventory_ = queried.value();
+    return queried;
+}
+
+core::Result<void> UiController::revise_agent_plan_step(
+    agent::AgentPlanStep revised_step) {
+    if (!agent_task_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "there is no speculative task to revise for repair"));
+    }
+    const auto task_snapshot = agent_task_->snapshot();
+    const bool failed_required_gate = std::any_of(
+        task_snapshot.gates.begin(), task_snapshot.gates.end(),
+        [](const auto& gate) { return gate.required && !gate.passed; });
+    if (task_snapshot.status != agent::TaskStatus::blocked &&
+        !(task_snapshot.status == agent::TaskStatus::review && failed_required_gate)) {
+        return core::Result<void>::failure(invalid_state(
+            "repair requires a blocked task or a review whose required gate failed"));
+    }
+    if (task_snapshot.repair_attempts_remaining == 0U) {
+        return core::Result<void>::failure(invalid_state(
+            "the task repair-attempt budget is exhausted"));
+    }
+    if (auto valid = revised_step.validate(); !valid) return valid;
+    const auto existing = std::find_if(agent_plan_draft_.begin(), agent_plan_draft_.end(),
+        [&revised_step](const agent::AgentPlanStep& step) {
+            return step.id == revised_step.id;
+        });
+    if (existing == agent_plan_draft_.end()) {
+        return core::Result<void>::failure(invalid(
+            "repair can revise only an existing plan step"));
+    }
+    if (existing->target.object != revised_step.target.object) {
+        return core::Result<void>::failure(invalid_state(
+            "repair cannot expand the target object scope"));
+    }
+    if (existing->intent == revised_step.intent &&
+        existing->target.component == revised_step.target.component &&
+        existing->dependencies == revised_step.dependencies) {
+        return core::Result<void>::failure(invalid(
+            "repair revision must change the step intent, component, or dependencies"));
+    }
+    *existing = std::move(revised_step);
+    agent_repair_mode_ = true;
+    const std::uint64_t task_sequence = next_agent_task_id_ ==
+        std::numeric_limits<std::uint64_t>::max() ? 1U : next_agent_task_id_;
+    agent_plan_id_ = "agent-task-" + std::to_string(task_sequence);
+    for (auto& question : agent_clarifications_draft_) {
+        question.selected_candidate_id.reset();
+        question.freeform_answer.reset();
+        question.human_receipt.reset();
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<agent::AgentTaskSnapshot> UiController::repair_agent_plan(
+    std::string justification) {
+    if (!agent_task_.has_value() || !agent_repair_mode_) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "revise a failed plan step before requesting bounded repair"));
+    }
+    const auto task_snapshot = agent_task_->snapshot();
+    const bool failed_required_gate = std::any_of(
+        task_snapshot.gates.begin(), task_snapshot.gates.end(),
+        [](const auto& gate) { return gate.required && !gate.passed; });
+    if (task_snapshot.status != agent::TaskStatus::blocked &&
+        !(task_snapshot.status == agent::TaskStatus::review && failed_required_gate)) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "repair requires a blocked task or a review whose required gate failed"));
+    }
+    if (!agent_plan_base_revision_.has_value() ||
+        session_.snapshot().project_revision != *agent_plan_base_revision_) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "repair cannot use a source project that changed after the failed task"));
+    }
+    const std::uint64_t task_sequence = next_agent_task_id_ ==
+        std::numeric_limits<std::uint64_t>::max() ? 1U : next_agent_task_id_;
+    const std::string task_id = "agent-task-" + std::to_string(task_sequence);
+    if (agent_plan_id_ != task_id) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "repair plan identity changed while its operator review was open"));
+    }
+    std::vector<scene::ObjectId> scope;
+    for (const auto& step : agent_plan_draft_) {
+        if (std::find(scope.begin(), scope.end(), step.target.object) == scope.end()) {
+            scope.push_back(step.target.object);
+        }
+    }
+    const auto previous = agent_task_->snapshot();
+    agent::AgentPlan revised_plan{
+        task_id,
+        agent::AuthoringObjective{
+            agent_objective_id_, agent_goal_, *agent_plan_base_revision_, scope, {},
+            previous.hard_constraints, agent_clarifications_draft_, agent_recipe_id_},
+        agent_plan_draft_};
+    agent::AgentWorkEnvelope envelope;
+    envelope.scope_objects = scope;
+    envelope.max_commands = 16U;
+    envelope.max_objects_touched = std::max<std::size_t>(scope.size(), 1U);
+    auto repaired = agent::AgentTask::repair(
+        session_, *agent_task_, std::move(revised_plan), std::move(envelope),
+        justification);
+    if (!repaired) {
+        record_ui_problem(repaired.error().with_context("agent plan repair"));
+        return core::Result<agent::AgentTaskSnapshot>::failure(repaired.error());
+    }
+    agent_task_.reset();
+    agent_condition_inventory_.reset();
+    agent_task_.emplace(std::move(repaired.value()));
+    next_agent_task_id_ = task_sequence == std::numeric_limits<std::uint64_t>::max()
+        ? 1U : task_sequence + 1U;
+    agent_plan_id_ = task_id;
+    agent_repair_mode_ = false;
+    auto result = agent_task_->run();
+    if (!result) {
+        record_ui_problem(result.error().with_context("agent repair execution"));
+        return result;
+    }
+    return result;
+}
+
+core::Result<void> UiController::save_agent_checkpoint(
+    const std::filesystem::path& path) const {
+    if (!agent_task_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "there is no agent task to checkpoint"));
+    }
+    return agent_task_->save_checkpoint(path);
+}
+
+
+core::Result<void> UiController::save_agent_demonstration(
+    const std::filesystem::path& path) const {
+    if (!agent_task_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "there is no agent task to record as a demonstration"));
+    }
+    const auto demonstration = agent_task_->create_demonstration();
+    if (!demonstration) {
+        return core::Result<void>::failure(demonstration.error());
+    }
+    return demonstration.value().save(path);
+}
+
+core::Result<void> UiController::load_agent_demonstration(
+    const std::filesystem::path& path) {
+    auto demonstration = agent::AgentDemonstration::load(path);
+    if (!demonstration) {
+        record_ui_problem(demonstration.error().with_context("agent demonstration"));
+        return core::Result<void>::failure(demonstration.error());
+    }
+    agent_demonstration_.emplace(std::move(demonstration.value()));
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::clear_agent_demonstration() {
+    agent_demonstration_.reset();
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::capture_agent_demonstration_trace(
+    application::OperationId first_operation,
+    application::OperationId last_operation) {
+    if (first_operation == 0U || last_operation < first_operation) {
+        return core::Result<void>::failure(invalid_state(
+            "demonstration trace range identities are invalid"));
+    }
+    const auto snapshot = session_.snapshot();
+    const auto& available = snapshot.native_operation_trace;
+    const auto first = std::find_if(available.begin(), available.end(),
+        [first_operation](const auto& operation) {
+            return operation.operation_id == first_operation;
+        });
+    const auto last = std::find_if(available.begin(), available.end(),
+        [last_operation](const auto& operation) {
+            return operation.operation_id == last_operation;
+        });
+    if (first == available.end() || last == available.end() || last < first) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "selected demonstration trace range is no longer in recent native history"));
+    }
+    const auto first_index = static_cast<std::size_t>(std::distance(available.begin(), first));
+    const auto count = static_cast<std::size_t>(std::distance(first, last)) + 1U;
+    const auto selected = std::span<const application::NativeOperationTraceEntry>(
+        available.data() + first_index, count);
+    auto trace = agent::AgentDemonstrationTrace::capture(selected);
+    if (!trace) {
+        record_ui_problem(trace.error().with_context("capture native demonstration range"));
+        return core::Result<void>::failure(trace.error());
+    }
+    agent_demonstration_trace_.emplace(std::move(trace.value()));
+    agent_demonstration_recipe_name_.clear();
+    agent_demonstration_bindings_.clear();
+    agent_demonstration_binding_revision_.reset();
+    agent_demonstration_target_set_count_ = 1U;
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::set_agent_demonstration_target_set_count(
+    std::size_t target_set_count) {
+    if (!agent_demonstration_trace_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "load or capture a demonstration trace before configuring target sets"));
+    }
+    if (target_set_count == 0U ||
+        target_set_count > kMaxAgentDemonstrationTargetSets) {
+        return core::Result<void>::failure(invalid(
+            "demonstration target set count must be between 1 and 16"));
+    }
+    if (agent_demonstration_trace_->steps.size() >
+        kMaxExpandedDemonstrationPlanSteps / target_set_count) {
+        return core::Result<void>::failure(invalid(
+            "expanded demonstration plan exceeds the 256-step limit"));
+    }
+    if (target_set_count == agent_demonstration_target_set_count_) {
+        return core::Result<void>::success();
+    }
+    if (agent_task_.has_value() || agent_checkpoint_pending_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "clear the current task or checkpoint before changing demonstration target sets"));
+    }
+    agent_demonstration_target_set_count_ = target_set_count;
+    agent_demonstration_bindings_.clear();
+    agent_demonstration_binding_revision_.reset();
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::bind_agent_demonstration_target(
+    std::uint32_t target_alias,
+    std::uint32_t component_alias,
+    std::size_t target_set_index) {
+    if (!agent_demonstration_trace_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "load or capture a demonstration trace before binding targets"));
+    }
+    if (auto valid_trace = agent_demonstration_trace_->validate(); !valid_trace) {
+        return valid_trace;
+    }
+    if (target_set_index >= agent_demonstration_target_set_count_) {
+        return core::Result<void>::failure(invalid(
+            "demonstration target set index is outside the configured selection"));
+    }
+    const auto snapshot = session_.snapshot();
+    if (agent_demonstration_binding_revision_.has_value() &&
+        *agent_demonstration_binding_revision_ != snapshot.project_revision) {
+        agent_demonstration_bindings_.clear();
+    }
+    agent_demonstration_binding_revision_ = snapshot.project_revision;
+
+    const auto requirements = demonstration_binding_requirements(
+        *agent_demonstration_trace_, agent_demonstration_target_set_count_);
+    const auto requirement = std::find_if(requirements.begin(), requirements.end(),
+        [target_set_index, target_alias, component_alias](const auto& value) {
+            return value.target_set_index == target_set_index &&
+                value.target_alias == target_alias &&
+                value.component_alias == component_alias;
+        });
+    if (requirement == requirements.end()) {
+        return core::Result<void>::failure(invalid(
+            "selected target alias is not required by this demonstration trace"));
+    }
+
+    agent::TargetRef target;
+    if (requirement->target_kind == agent::AgentDemonstrationTargetKind::object) {
+        if (snapshot.selection.mode != editor::SelectionMode::object ||
+            snapshot.selection.objects.size() != 1U ||
+            snapshot.selection.component_object.has_value()) {
+            return core::Result<void>::failure(invalid_state(
+                "bind an object trace target by selecting exactly one scene object"));
+        }
+        target.object = snapshot.selection.objects.front();
+        target.component = std::monostate{};
+    } else if (requirement->target_kind == agent::AgentDemonstrationTargetKind::face) {
+        if (snapshot.selection.mode != editor::SelectionMode::face ||
+            !snapshot.selection.component_object.has_value() ||
+            snapshot.selection.faces.size() != 1U ||
+            !snapshot.selection.vertices.empty()) {
+            return core::Result<void>::failure(invalid_state(
+                "bind a face trace target by selecting exactly one face"));
+        }
+        target.object = *snapshot.selection.component_object;
+        target.component = snapshot.selection.faces.front();
+        const auto* instance = snapshot.viewport.scene.find(target.object);
+        if (instance == nullptr || instance->mesh == nullptr ||
+            std::find(instance->mesh->triangle_faces.begin(),
+                instance->mesh->triangle_faces.end(), snapshot.selection.faces.front()) ==
+                instance->mesh->triangle_faces.end()) {
+            return core::Result<void>::failure(stale(
+                "selected demonstration face is absent from the current viewport snapshot"));
+        }
+    } else if (requirement->target_kind == agent::AgentDemonstrationTargetKind::vertex) {
+        if (snapshot.selection.mode != editor::SelectionMode::vertex ||
+            !snapshot.selection.component_object.has_value() ||
+            snapshot.selection.vertices.size() != 1U ||
+            !snapshot.selection.faces.empty()) {
+            return core::Result<void>::failure(invalid_state(
+                "bind a vertex trace target by selecting exactly one vertex"));
+        }
+        target.object = *snapshot.selection.component_object;
+        target.component = snapshot.selection.vertices.front();
+        const auto* instance = snapshot.viewport.scene.find(target.object);
+        if (instance == nullptr || instance->mesh == nullptr ||
+            std::find(instance->mesh->vertex_ids.begin(), instance->mesh->vertex_ids.end(),
+                snapshot.selection.vertices.front()) == instance->mesh->vertex_ids.end()) {
+            return core::Result<void>::failure(stale(
+                "selected demonstration vertex is absent from the current viewport snapshot"));
+        }
+    } else {
+        return core::Result<void>::failure(invalid(
+            "demonstration target kind is unknown"));
+    }
+
+    for (const auto& existing : agent_demonstration_bindings_) {
+        if (existing.target_set_index == target_set_index) {
+            if (existing.target_alias == target_alias &&
+                existing.target.object != target.object) {
+                return core::Result<void>::failure(invalid_state(
+                    "all components for one demonstration object alias must map to the same object within a target set"));
+            }
+            if (existing.target_alias != target_alias &&
+                existing.target.object == target.object) {
+                return core::Result<void>::failure(invalid_state(
+                    "different demonstration object aliases must map to different scene objects within a target set"));
+            }
+        } else if (existing.target.object == target.object) {
+            return core::Result<void>::failure(invalid_state(
+                "one scene object cannot be reused across demonstration target sets"));
+        }
+    }
+
+    const auto existing = std::find_if(
+        agent_demonstration_bindings_.begin(), agent_demonstration_bindings_.end(),
+        [target_set_index, target_alias, component_alias](const auto& value) {
+            return value.target_set_index == target_set_index &&
+                value.target_alias == target_alias &&
+                value.component_alias == component_alias;
+        });
+    if (existing == agent_demonstration_bindings_.end()) {
+        agent_demonstration_bindings_.push_back({
+            target_set_index, target_alias, component_alias, target});
+    } else {
+        existing->target = target;
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<std::size_t> UiController::apply_agent_demonstration_to_similar() {
+    if (!agent_demonstration_trace_.has_value()) {
+        return core::Result<std::size_t>::failure(invalid_state(
+            "load or capture a demonstration trace before finding similar targets"));
+    }
+    if (agent_task_.has_value() || agent_checkpoint_pending_.has_value()) {
+        return core::Result<std::size_t>::failure(invalid_state(
+            "clear the current task or checkpoint before finding similar targets"));
+    }
+    if (auto valid_trace = agent_demonstration_trace_->validate(); !valid_trace) {
+        return core::Result<std::size_t>::failure(valid_trace.error());
+    }
+    const auto& trace_step = agent_demonstration_trace_->steps.front();
+    if (!trace_step.structure_signature.has_value()) {
+        return core::Result<std::size_t>::failure(unsupported(
+            "this legacy or unsupported demonstration has no structural correspondence evidence"));
+    }
+    if (!trace_step.result_object_structure_signature.has_value()) {
+        return core::Result<std::size_t>::failure(unsupported(
+            "this demonstration has no post-command exemplar evidence"));
+    }
+    if (!supports_demonstration_structural_matching(*agent_demonstration_trace_)) {
+        return core::Result<std::size_t>::failure(unsupported(
+            "multi-command correspondence requires a single alias chain of unchanged transforms or topology-stable edits to one vertex"));
+    }
+
+    const auto snapshot = session_.snapshot();
+    if (snapshot.selection.mode != editor::SelectionMode::object ||
+        snapshot.selection.objects.size() != 1U ||
+        snapshot.selection.component_object.has_value()) {
+        return core::Result<std::size_t>::failure(invalid_state(
+            "select exactly one completed demonstration object as the exemplar"));
+    }
+    const scene::ObjectId exemplar_object = snapshot.selection.objects.front();
+    const auto exemplar_view = std::find_if(
+        snapshot.objects.begin(), snapshot.objects.end(), [exemplar_object](const auto& value) {
+            return value.object.id == exemplar_object;
+        });
+    if (exemplar_view == snapshot.objects.end() || !exemplar_view->object.visible ||
+        exemplar_view->object.locked ||
+        (trace_step.target_kind == agent::AgentDemonstrationTargetKind::object &&
+         exemplar_view->object.parent.has_value())) {
+        return core::Result<std::size_t>::failure(invalid_state(
+            "the exemplar must be a visible, unlocked target of the recorded kind"));
+    }
+
+    const auto exemplar_signature = session_.native_structure_signature(
+        exemplar_object, std::monostate{});
+    if (!exemplar_signature ||
+        exemplar_signature.value() != *trace_step.result_object_structure_signature) {
+        return core::Result<std::size_t>::failure(stale(
+            "selected object no longer matches the captured post-command exemplar evidence"));
+    }
+
+    const auto target_kind = trace_step.target_kind ==
+            agent::AgentDemonstrationTargetKind::object
+        ? application::NativeTraceTargetKind::object
+        : (trace_step.target_kind == agent::AgentDemonstrationTargetKind::face
+            ? application::NativeTraceTargetKind::face
+            : application::NativeTraceTargetKind::vertex);
+    const auto matches = session_.find_native_structure_matches(
+        target_kind, *trace_step.structure_signature, exemplar_object);
+    if (!matches) {
+        return core::Result<std::size_t>::failure(matches.error());
+    }
+
+    std::map<scene::ObjectId, std::optional<
+        std::variant<std::monostate, geometry::FaceId, geometry::VertexId>>> candidates;
+    std::set<scene::ObjectId> ambiguous_objects;
+    for (const auto& match : matches.value()) {
+        if (ambiguous_objects.contains(match.object)) continue;
+        const auto [candidate, inserted] = candidates.emplace(
+            match.object, std::optional{match.component});
+        if (!inserted) {
+            candidates.erase(candidate);
+            ambiguous_objects.insert(match.object);
+        }
+    }
+    if (trace_step.target_kind != agent::AgentDemonstrationTargetKind::object) {
+        if (!exemplar_view->object.mesh_asset.has_value()) {
+            return core::Result<std::size_t>::failure(stale(
+                "selected exemplar has no current mesh asset"));
+        }
+        std::map<std::uint64_t, std::size_t> asset_owners;
+        for (const auto& object : snapshot.objects) {
+            if (object.object.mesh_asset.has_value()) {
+                ++asset_owners[*object.object.mesh_asset];
+            }
+        }
+        for (const auto& [object, component] : candidates) {
+            static_cast<void>(component);
+            const auto candidate_view = std::find_if(
+                snapshot.objects.begin(), snapshot.objects.end(), [&object](const auto& value) {
+                    return value.object.id == object;
+                });
+            if (candidate_view == snapshot.objects.end() ||
+                !candidate_view->object.mesh_asset.has_value()) {
+                return core::Result<std::size_t>::failure(stale(
+                    "structural match is no longer an authored mesh object"));
+            }
+        }
+        for (auto candidate = candidates.begin(); candidate != candidates.end();) {
+            const auto candidate_view = std::find_if(
+                snapshot.objects.begin(), snapshot.objects.end(), [&candidate](const auto& value) {
+                    return value.object.id == candidate->first;
+                });
+            const auto candidate_asset = *candidate_view->object.mesh_asset;
+            if (candidate_asset == *exemplar_view->object.mesh_asset ||
+                asset_owners[candidate_asset] > 1U) {
+                candidate = candidates.erase(candidate);
+            } else {
+                ++candidate;
+            }
+        }
+    }
+    if (candidates.empty()) {
+        return core::Result<std::size_t>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "no unique matching structural signatures were found for the selected exemplar"));
+    }
+    if (candidates.size() > kMaxAgentDemonstrationTargetSets) {
+        return core::Result<std::size_t>::failure(unsupported(
+            "more than 16 matching structural signatures were found; narrow the target scope"));
+    }
+
+    agent_demonstration_target_set_count_ = candidates.size();
+    agent_demonstration_bindings_.clear();
+    agent_demonstration_binding_revision_ = snapshot.project_revision;
+    std::size_t target_set_index = 0U;
+    for (const auto& [object, component] : candidates) {
+        if (!component.has_value()) {
+            return core::Result<std::size_t>::failure(invalid_state(
+                "structural match did not resolve a unique target component"));
+        }
+        agent::TargetRef target;
+        target.object = object;
+        if (std::holds_alternative<geometry::FaceId>(*component)) {
+            target.component = std::get<geometry::FaceId>(*component);
+        } else if (std::holds_alternative<geometry::VertexId>(*component)) {
+            target.component = std::get<geometry::VertexId>(*component);
+        } else {
+            target.component = std::monostate{};
+        }
+        agent_demonstration_bindings_.push_back({
+            target_set_index++, trace_step.target_alias,
+            trace_step.component_alias, target});
+    }
+    return core::Result<std::size_t>::success(candidates.size());
+}
+
+core::Result<void> UiController::clear_agent_demonstration_target_bindings() {
+    agent_demonstration_bindings_.clear();
+    agent_demonstration_binding_revision_.reset();
+    return core::Result<void>::success();
+}
+
+core::Result<agent::AgentTaskSnapshot> UiController::preview_agent_demonstration_trace() {
+    if (!agent_demonstration_trace_.has_value()) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "load or capture a demonstration trace before previewing it"));
+    }
+    if (agent_task_.has_value()) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "clear the current AgentTask before previewing a demonstration trace"));
+    }
+    if (agent_checkpoint_pending_.has_value()) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "resume or clear the loaded checkpoint before previewing a demonstration trace"));
+    }
+    if (auto valid_trace = agent_demonstration_trace_->validate(); !valid_trace) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(valid_trace.error());
+    }
+    const auto snapshot = session_.snapshot();
+    if (!agent_demonstration_binding_revision_.has_value() ||
+        *agent_demonstration_binding_revision_ != snapshot.project_revision) {
+        agent_demonstration_bindings_.clear();
+        agent_demonstration_binding_revision_.reset();
+        return core::Result<agent::AgentTaskSnapshot>::failure(stale(
+            "project changed after target binding; bind the demonstration targets again"));
+    }
+
+    if (agent_demonstration_target_set_count_ == 0U ||
+        agent_demonstration_target_set_count_ > kMaxAgentDemonstrationTargetSets ||
+        agent_demonstration_trace_->steps.size() >
+            kMaxExpandedDemonstrationPlanSteps / agent_demonstration_target_set_count_) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid(
+            "expanded demonstration target selection exceeds the supported bound"));
+    }
+    const auto requirements = demonstration_binding_requirements(
+        *agent_demonstration_trace_, agent_demonstration_target_set_count_);
+    const std::size_t expanded_step_count =
+        agent_demonstration_trace_->steps.size() * agent_demonstration_target_set_count_;
+    std::vector<scene::ObjectId> scope;
+    std::vector<std::vector<scene::ObjectId>> target_set_scopes(
+        agent_demonstration_target_set_count_);
+    std::vector<std::vector<scene::ObjectId>> transform_roots(
+        agent_demonstration_target_set_count_);
+    std::vector<agent::AgentPlanStep> steps;
+    steps.reserve(expanded_step_count);
+    std::map<std::uint64_t, std::pair<std::size_t, scene::ObjectId>> changed_mesh_assets;
+    std::map<std::pair<scene::ObjectId, geometry::VertexId>, core::Vec3d>
+        planned_vertex_positions;
+    const bool sequential_vertex_trace = agent_demonstration_trace_->steps.size() > 1U &&
+        agent_demonstration_trace_->steps.front().target_kind ==
+            agent::AgentDemonstrationTargetKind::vertex &&
+        supports_demonstration_structural_matching(*agent_demonstration_trace_);
+    std::uint32_t permitted_effects = 0U;
+    double transform_distance_budget = 0.0;
+    bool has_topology_operation = false;
+
+    for (const auto& requirement : requirements) {
+        const auto binding = std::find_if(
+            agent_demonstration_bindings_.begin(), agent_demonstration_bindings_.end(),
+            [&requirement](const auto& value) {
+                return value.target_set_index == requirement.target_set_index &&
+                    value.target_alias == requirement.target_alias &&
+                    value.component_alias == requirement.component_alias;
+            });
+        if (binding == agent_demonstration_bindings_.end()) {
+            return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+                "bind every object and component alias before previewing the trace"));
+        }
+        auto& target_scope = target_set_scopes[requirement.target_set_index];
+        if (std::find(target_scope.begin(), target_scope.end(), binding->target.object) ==
+            target_scope.end()) {
+            target_scope.push_back(binding->target.object);
+        }
+        if (requirement.target_kind == agent::AgentDemonstrationTargetKind::object &&
+            std::find(transform_roots[requirement.target_set_index].begin(),
+                transform_roots[requirement.target_set_index].end(),
+                binding->target.object) ==
+                transform_roots[requirement.target_set_index].end()) {
+            transform_roots[requirement.target_set_index].push_back(binding->target.object);
+        }
+    }
+
+    for (std::size_t target_set_index = 0U;
+         target_set_index < agent_demonstration_target_set_count_; ++target_set_index) {
+        auto& target_scope = target_set_scopes[target_set_index];
+        auto& roots = transform_roots[target_set_index];
+        for (std::size_t cursor = 0U; cursor < roots.size(); ++cursor) {
+            const scene::ObjectId parent = roots[cursor];
+            const auto parent_view = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
+                [parent](const auto& value) { return value.object.id == parent; });
+            if (parent_view == snapshot.objects.end() || parent_view->object.parent.has_value()) {
+                return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+                    "object demonstration targets must bind to existing root objects"));
+            }
+            for (const auto& object : snapshot.objects) {
+                if (!object.object.parent.has_value() || *object.object.parent != parent) continue;
+                if (std::find(target_scope.begin(), target_scope.end(), object.object.id) ==
+                    target_scope.end()) {
+                    target_scope.push_back(object.object.id);
+                    roots.push_back(object.object.id);
+                }
+            }
+        }
+        for (std::size_t prior_set = 0U; prior_set < target_set_index; ++prior_set) {
+            for (const auto object : target_scope) {
+                if (std::find(target_set_scopes[prior_set].begin(),
+                        target_set_scopes[prior_set].end(), object) !=
+                    target_set_scopes[prior_set].end()) {
+                    return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+                        "demonstration target sets cannot overlap through object hierarchy"));
+                }
+            }
+        }
+        for (const auto object : target_scope) {
+            if (std::find(scope.begin(), scope.end(), object) == scope.end()) {
+                scope.push_back(object);
+            }
+        }
+    }
+
+    for (std::size_t target_set_index = 0U;
+         target_set_index < agent_demonstration_target_set_count_; ++target_set_index) {
+      for (std::size_t index = 0U; index < agent_demonstration_trace_->steps.size(); ++index) {
+        const auto& trace_step = agent_demonstration_trace_->steps[index];
+        const auto binding = std::find_if(
+            agent_demonstration_bindings_.begin(), agent_demonstration_bindings_.end(),
+            [target_set_index, &trace_step](const auto& value) {
+                return value.target_set_index == target_set_index &&
+                    value.target_alias == trace_step.target_alias &&
+                    value.component_alias == trace_step.component_alias;
+            });
+        if (binding == agent_demonstration_bindings_.end()) {
+            return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+                "demonstration trace target binding is missing"));
+        }
+
+        if (trace_step.target_kind == agent::AgentDemonstrationTargetKind::object) {
+            permitted_effects |= agent::effect_mask(agent::Effect::transform);
+            transform_distance_budget +=
+                trace_step.parameters.relative_displacement.length();
+        } else {
+            const auto object = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
+                [&binding](const auto& value) {
+                    return value.object.id == binding->target.object;
+                });
+            if (object == snapshot.objects.end() || !object->object.mesh_asset.has_value()) {
+                return core::Result<agent::AgentTaskSnapshot>::failure(stale(
+                    "bound mesh target has no current authored mesh asset"));
+            }
+            const auto [asset_entry, inserted] = changed_mesh_assets.emplace(
+                *object->object.mesh_asset,
+                std::pair{target_set_index, binding->target.object});
+            if (!inserted && (!sequential_vertex_trace ||
+                    asset_entry->second != std::pair{target_set_index, binding->target.object})) {
+                return core::Result<agent::AgentTaskSnapshot>::failure(unsupported(
+                    "trace preview requires separate mesh assets across targets; repeated edits are supported only for one topology-stable vertex target"));
+            }
+            if (trace_step.target_kind == agent::AgentDemonstrationTargetKind::face) {
+                permitted_effects |= agent::effect_mask(agent::Effect::geometry) |
+                    agent::effect_mask(agent::Effect::topology);
+                has_topology_operation = true;
+            } else {
+                permitted_effects |= agent::effect_mask(agent::Effect::geometry);
+            }
+        }
+
+        std::optional<core::Vec3d> vertex_base_position;
+        const auto* vertex_id = std::get_if<geometry::VertexId>(&binding->target.component);
+        if (vertex_id != nullptr) {
+            const auto key = std::pair{binding->target.object, *vertex_id};
+            const auto planned_position = planned_vertex_positions.find(key);
+            if (planned_position != planned_vertex_positions.end()) {
+                vertex_base_position = planned_position->second;
+            } else {
+                const auto* instance = snapshot.viewport.scene.find(binding->target.object);
+                if (instance == nullptr || instance->mesh == nullptr) {
+                    return core::Result<agent::AgentTaskSnapshot>::failure(stale(
+                        "bound demonstration vertex has no current source mesh"));
+                }
+                const auto vertex = std::find(instance->mesh->vertex_ids.begin(),
+                    instance->mesh->vertex_ids.end(), *vertex_id);
+                if (vertex == instance->mesh->vertex_ids.end()) {
+                    return core::Result<agent::AgentTaskSnapshot>::failure(stale(
+                        "bound demonstration vertex is absent from the source mesh"));
+                }
+                const auto vertex_index = static_cast<std::size_t>(std::distance(
+                    instance->mesh->vertex_ids.begin(), vertex));
+                vertex_base_position = instance->mesh->positions[vertex_index];
+            }
+        }
+        auto intent = demonstration_step_intent(
+            trace_step, binding->target, snapshot, vertex_base_position);
+        if (!intent) {
+            return core::Result<agent::AgentTaskSnapshot>::failure(intent.error());
+        }
+        if (vertex_id != nullptr && vertex_base_position.has_value()) {
+            planned_vertex_positions[{binding->target.object, *vertex_id}] =
+                *vertex_base_position + trace_step.parameters.relative_displacement;
+        }
+        std::vector<std::string> dependencies;
+        const std::string step_id = "demonstration-set-" +
+            std::to_string(target_set_index + 1U) + "-step-" +
+            std::to_string(index + 1U);
+        if (index > 0U) {
+            dependencies.push_back("demonstration-set-" +
+                std::to_string(target_set_index + 1U) + "-step-" +
+                std::to_string(index));
+        }
+        steps.push_back(agent::AgentPlanStep{
+            step_id,
+            binding->target,
+            std::move(intent.value()),
+            std::move(dependencies)});
+      }
+    }
+
+    if (!std::isfinite(transform_distance_budget) ||
+        transform_distance_budget > 1'000'000.0) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid(
+            "demonstration transform budget exceeds the supported limit"));
+    }
+    const std::uint64_t task_sequence = next_agent_task_id_ ==
+        std::numeric_limits<std::uint64_t>::max() ? 1U : next_agent_task_id_;
+    const std::string task_id = "agent-demonstration-" + std::to_string(task_sequence);
+    constexpr std::string_view goal =
+        "Preview a captured demonstration on explicitly bound targets";
+    agent::AgentPlan plan{
+        task_id,
+        agent::AuthoringObjective{
+            task_id, std::string(goal), snapshot.project_revision, scope, {}, {}, {}, {}},
+        std::move(steps)};
+    agent::AgentWorkEnvelope envelope;
+    envelope.scope_objects = scope;
+    envelope.permitted_effects = permitted_effects;
+    envelope.max_commands = expanded_step_count;
+    envelope.max_objects_touched = scope.size();
+    envelope.max_topology_operations = has_topology_operation
+        ? 512U * agent_demonstration_target_set_count_ : 0U;
+    envelope.max_repair_attempts = 0U;
+    envelope.max_additional_operations = 0U;
+    envelope.max_transform_distance_meters = transform_distance_budget;
+
+    auto plan_draft = plan.steps;
+    auto task = agent::AgentTask::begin(session_, std::move(plan), std::move(envelope));
+    if (!task) {
+        record_ui_problem(task.error().with_context("demonstration speculative preview"));
+        return core::Result<agent::AgentTaskSnapshot>::failure(task.error());
+    }
+    next_agent_task_id_ = task_sequence == std::numeric_limits<std::uint64_t>::max()
+        ? 1U : task_sequence + 1U;
+    agent_goal_ = std::string(goal);
+    agent_plan_id_ = task_id;
+    agent_objective_id_ = task_id;
+    agent_plan_base_revision_ = snapshot.project_revision;
+    agent_plan_draft_ = std::move(plan_draft);
+    agent_hard_constraints_draft_.clear();
+    agent_clarifications_draft_.clear();
+    agent_recipe_id_.clear();
+    agent_repair_mode_ = false;
+    agent_condition_inventory_.reset();
+    agent_task_.emplace(std::move(task.value()));
+    return run_prepared_agent_plan();
+}
+
+core::Result<void> UiController::save_agent_demonstration_trace(
+    const std::filesystem::path& path) const {
+    if (!agent_demonstration_trace_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "there is no captured native command range to save"));
+    }
+    return agent_demonstration_trace_->save(path);
+}
+
+core::Result<void> UiController::load_agent_demonstration_trace(
+    const std::filesystem::path& path) {
+    auto trace = agent::AgentDemonstrationTrace::load(path);
+    if (!trace) {
+        record_ui_problem(trace.error().with_context("agent demonstration trace"));
+        return core::Result<void>::failure(trace.error());
+    }
+    agent_demonstration_trace_.emplace(std::move(trace.value()));
+    agent_demonstration_recipe_name_.clear();
+    agent_demonstration_bindings_.clear();
+    agent_demonstration_binding_revision_.reset();
+    agent_demonstration_target_set_count_ = 1U;
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::save_agent_demonstration_recipe(
+    const std::filesystem::path& path) {
+    if (!agent_demonstration_trace_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "there is no captured native command range to save as a recipe"));
+    }
+    const auto utf8_name = path.stem().u8string();
+    std::string name;
+    name.reserve(utf8_name.size());
+    for (const char8_t character : utf8_name) {
+        name.push_back(static_cast<char>(character));
+    }
+    agent::AgentDemonstrationRecipe recipe{
+        std::move(name), *agent_demonstration_trace_};
+    auto saved = recipe.save(path);
+    if (saved) agent_demonstration_recipe_name_ = recipe.name;
+    return saved;
+}
+
+core::Result<void> UiController::load_agent_demonstration_recipe(
+    const std::filesystem::path& path) {
+    auto recipe = agent::AgentDemonstrationRecipe::load(path);
+    if (!recipe) {
+        record_ui_problem(recipe.error().with_context("agent demonstration recipe"));
+        return core::Result<void>::failure(recipe.error());
+    }
+    agent_demonstration_recipe_name_ = recipe.value().name;
+    agent_demonstration_trace_.emplace(std::move(recipe.value().trace));
+    agent_demonstration_bindings_.clear();
+    agent_demonstration_binding_revision_.reset();
+    agent_demonstration_target_set_count_ = 1U;
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::clear_agent_demonstration_trace() {
+    agent_demonstration_trace_.reset();
+    agent_demonstration_recipe_name_.clear();
+    agent_demonstration_bindings_.clear();
+    agent_demonstration_binding_revision_.reset();
+    agent_demonstration_target_set_count_ = 1U;
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::load_agent_checkpoint(
+    const std::filesystem::path& path) {
+    if (agent_checkpoint_pending_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "clear the currently loaded checkpoint before opening another"));
+    }
+    if (agent_task_.has_value()) {
+        const auto status = agent_task_->snapshot().status;
+        if (status != agent::TaskStatus::accepted && status != agent::TaskStatus::rejected) {
+            return core::Result<void>::failure(invalid_state(
+                "accept, reject, or clear the active speculative task before opening a checkpoint"));
+        }
+    }
+    auto checkpoint = agent::AgentTask::load_checkpoint(path);
+    if (!checkpoint) {
+        record_ui_problem(checkpoint.error().with_context("agent task checkpoint"));
+        return core::Result<void>::failure(checkpoint.error());
+    }
+    if (checkpoint.value().status == agent::TaskStatus::accepted ||
+        checkpoint.value().status == agent::TaskStatus::rejected) {
+        return core::Result<void>::failure(invalid_state(
+            "accepted and rejected checkpoints are history records and cannot resume"));
+    }
+    agent_task_.reset();
+    agent_condition_inventory_.reset();
+    agent_plan_draft_ = checkpoint.value().plan.steps;
+    agent_hard_constraints_draft_ = checkpoint.value().plan.objective.hard_constraints;
+    agent_clarifications_draft_ = checkpoint.value().plan.objective.clarifications;
+    agent_plan_base_revision_ = checkpoint.value().source_revision;
+    agent_goal_ = checkpoint.value().plan.objective.goal;
+    agent_recipe_id_ = checkpoint.value().plan.objective.recipe_id;
+    agent_plan_id_ = checkpoint.value().plan.id;
+    agent_objective_id_ = checkpoint.value().plan.objective.id;
+    agent_repair_mode_ = false;
+    agent_checkpoint_rebased_ = false;
+    agent_checkpoint_directly_conflicting_steps_.clear();
+    agent_checkpoint_invalidated_steps_.clear();
+    agent_checkpoint_pending_.emplace(std::move(checkpoint.value()));
+    return core::Result<void>::success();
+}
+
+core::Result<void> UiController::rebase_agent_checkpoint() {
+    if (!agent_checkpoint_pending_.has_value() || agent_task_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "load one saved checkpoint before requesting a rebase"));
+    }
+    agent_checkpoint_directly_conflicting_steps_.clear();
+    agent_checkpoint_invalidated_steps_.clear();
+    const auto analysis = agent::AgentTask::analyze_checkpoint_rebase(
+        session_, *agent_checkpoint_pending_);
+    if (!analysis) {
+        record_ui_problem(analysis.error().with_context("agent task rebase analysis"));
+        return core::Result<void>::failure(analysis.error());
+    }
+    agent_checkpoint_directly_conflicting_steps_ =
+        analysis.value().directly_conflicting_step_ids;
+    agent_checkpoint_invalidated_steps_ = analysis.value().invalidated_step_ids;
+    if (!analysis.value().can_rebase()) {
+        std::string message = "checkpoint rebase is blocked";
+        for (std::size_t index = 0U;
+             index < analysis.value().blockers.size() && index < 3U; ++index) {
+            message += index == 0U ? ": " : "; ";
+            message += analysis.value().blockers[index];
+        }
+        const auto diagnostic = core::Diagnostic(
+            core::ErrorCode::stale_data, std::move(message));
+        record_ui_problem(diagnostic.with_context("agent task rebase analysis"));
+        return core::Result<void>::failure(diagnostic);
+    }
+    if (analysis.value().current_revision ==
+            analysis.value().checkpoint_revision &&
+        analysis.value().current_source_digest == agent_checkpoint_pending_->source_digest) {
+        agent_checkpoint_rebased_ = false;
+        agent_plan_base_revision_ = analysis.value().current_revision;
+        return core::Result<void>::success();
+    }
+    if (!agent_plan_base_revision_.has_value() ||
+        *agent_plan_base_revision_ != analysis.value().current_revision) {
+        for (auto& question : agent_clarifications_draft_) {
+            question.selected_candidate_id.reset();
+            question.freeform_answer.reset();
+            question.human_receipt.reset();
+        }
+    }
+    agent_checkpoint_rebased_ = true;
+    agent_plan_base_revision_ = analysis.value().current_revision;
+    return core::Result<void>::success();
+}
+
+core::Result<agent::AgentTaskSnapshot> UiController::resume_agent_checkpoint() {
+    if (!agent_checkpoint_pending_.has_value() || agent_task_.has_value()) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "load one saved checkpoint before requesting resume"));
+    }
+    auto plan = agent_checkpoint_pending_->plan;
+    plan.steps = agent_plan_draft_;
+    plan.objective.goal = agent_goal_;
+    plan.objective.hard_constraints = agent_hard_constraints_draft_;
+    plan.objective.clarifications = agent_clarifications_draft_;
+    if (agent_checkpoint_rebased_ && agent_plan_base_revision_.has_value()) {
+        plan.objective.base_revision = *agent_plan_base_revision_;
+    }
+    auto resumed = agent_checkpoint_rebased_
+        ? agent::AgentTask::rebase_checkpoint(
+            session_, *agent_checkpoint_pending_, std::move(plan))
+        : agent::AgentTask::resume_checkpoint(
+            session_, *agent_checkpoint_pending_, std::move(plan));
+    if (!resumed) {
+        record_ui_problem(resumed.error().with_context("agent task checkpoint resume"));
+        return core::Result<agent::AgentTaskSnapshot>::failure(resumed.error());
+    }
+    agent_condition_inventory_.reset();
+    agent_task_.emplace(std::move(resumed.value()));
+    agent_checkpoint_pending_.reset();
+    agent_checkpoint_rebased_ = false;
+    agent_checkpoint_directly_conflicting_steps_.clear();
+    agent_checkpoint_invalidated_steps_.clear();
+    agent_repair_mode_ = false;
+    const auto result = agent_task_->snapshot();
+    return core::Result<agent::AgentTaskSnapshot>::success(result);
+}
+
+core::Result<agent::AgentTaskSnapshot> UiController::correct_agent_ghost_transform(
+    scene::ObjectId object,
+    core::Transform transform,
+    std::string justification) {
+    if (!agent_task_.has_value()) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "there is no speculative ghost to correct"));
+    }
+    const auto corrected = application::HumanApplicationAccess::correct_agent_ghost_transform(
+        *agent_task_, object, transform, std::move(justification));
+    if (!corrected) {
+        record_ui_problem(corrected.error().with_context("agent ghost correction"));
+        return core::Result<agent::AgentTaskSnapshot>::failure(corrected.error());
+    }
+    return core::Result<agent::AgentTaskSnapshot>::success(agent_task_->snapshot());
+}
+
+core::Result<agent::AgentTaskSnapshot> UiController::correct_agent_ghost_vertex_position(
+    scene::ObjectId object,
+    geometry::VertexId vertex,
+    core::Vec3d position,
+    std::string justification) {
+    if (!agent_task_.has_value()) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "there is no speculative ghost to correct"));
+    }
+    const auto corrected =
+        application::HumanApplicationAccess::correct_agent_ghost_vertex_position(
+            *agent_task_, object, vertex, position, std::move(justification));
+    if (!corrected) {
+        record_ui_problem(corrected.error().with_context("agent ghost vertex correction"));
+        return core::Result<agent::AgentTaskSnapshot>::failure(corrected.error());
+    }
+    return core::Result<agent::AgentTaskSnapshot>::success(agent_task_->snapshot());
+}
+
+core::Result<agent::AgentTaskSnapshot> UiController::correct_agent_ghost_face(
+    scene::ObjectId object,
+    geometry::FaceId face,
+    agent::GhostCorrectionKind kind,
+    double distance,
+    std::string justification) {
+    if (!agent_task_.has_value()) {
+        return core::Result<agent::AgentTaskSnapshot>::failure(invalid_state(
+            "there is no speculative ghost to correct"));
+    }
+    const auto corrected = application::HumanApplicationAccess::correct_agent_ghost_face(
+        *agent_task_, object, face, kind, distance, std::move(justification));
+    if (!corrected) {
+        record_ui_problem(corrected.error().with_context("agent ghost face correction"));
+        return core::Result<agent::AgentTaskSnapshot>::failure(corrected.error());
+    }
+    return core::Result<agent::AgentTaskSnapshot>::success(agent_task_->snapshot());
+}
+
+core::Result<application::DispatchReceipt> UiController::accept_agent_plan() {
+    if (!agent_task_.has_value()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "there is no speculative agent result to accept"));
+    }
+    auto result = application::HumanApplicationAccess::accept_agent_task(*agent_task_);
+    if (result) record_operation(result.value(), OperationCategory::provider);
+    else record_ui_problem(result.error().with_context("agent result acceptance"));
+    return result;
+}
+
+core::Result<void> UiController::reject_agent_plan() {
+    if (!agent_task_.has_value()) {
+        return core::Result<void>::failure(invalid_state(
+            "there is no speculative agent result to reject"));
+    }
+    auto result = agent_task_->reject();
+    if (!result) record_ui_problem(result.error().with_context("agent result rejection"));
+    return result;
+}
+
+core::Result<void> UiController::clear_agent_plan() {
+    if (agent_task_.has_value()) {
+        const auto status = agent_task_->snapshot().status;
+        if (status == agent::TaskStatus::review || status == agent::TaskStatus::blocked ||
+            status == agent::TaskStatus::prepared) {
+            if (auto result = agent_task_->reject(); !result) return result;
+        } else if (status == agent::TaskStatus::running) {
+            return core::Result<void>::failure(invalid_state(
+                "a running agent task cannot be cleared"));
+        }
+        agent_task_.reset();
+        agent_condition_inventory_.reset();
+    }
+    agent_condition_inventory_.reset();
+    agent_plan_draft_.clear();
+    agent_hard_constraints_draft_.clear();
+    agent_clarifications_draft_.clear();
+    agent_checkpoint_pending_.reset();
+    agent_checkpoint_rebased_ = false;
+    agent_checkpoint_directly_conflicting_steps_.clear();
+    agent_checkpoint_invalidated_steps_.clear();
+    agent_plan_base_revision_.reset();
+    agent_goal_.clear();
+    agent_plan_id_.clear();
+    agent_objective_id_.clear();
+    agent_recipe_id_.clear();
+    agent_repair_mode_ = false;
+    return core::Result<void>::success();
+}
+
 core::Result<MeshImportReceipt> UiController::import_mesh(
     const std::filesystem::path& path,
     MeshImportFormat format) {
@@ -1376,37 +4315,112 @@ core::Result<MeshImportReceipt> UiController::import_mesh(
         return fail(resolved.error());
     }
 
+    const auto application_snapshot = session_.snapshot();
+    std::optional<PendingMeshSource> pending_source;
+    std::filesystem::path importer_path = path;
+    if (application_snapshot.project_path.has_value()) {
+        auto staged = stage_mesh_source(
+            path, *application_snapshot.project_path);
+        if (!staged) return fail(staged.error());
+        importer_path = staged.value().staged_path;
+        pending_source = std::move(staged.value());
+    }
+    const auto cleanup_pending_source = [&pending_source]() {
+        if (pending_source.has_value()) remove_pending_mesh_source(*pending_source);
+    };
+
     geometry::EditableMesh mesh;
     io::IoReport report;
     switch (format) {
     case MeshImportFormat::obj: {
-        auto imported = io::import_obj(path);
-        if (!imported) return fail(imported.error());
+        auto imported = io::import_obj(importer_path);
+        if (!imported) {
+            cleanup_pending_source();
+            return fail(imported.error());
+        }
         mesh = std::move(imported.value().mesh);
         report = std::move(imported.value().report);
         break;
     }
     case MeshImportFormat::ply: {
-        auto imported = io::import_ply(path);
-        if (!imported) return fail(imported.error());
+        auto imported = io::import_ply(importer_path);
+        if (!imported) {
+            cleanup_pending_source();
+            return fail(imported.error());
+        }
         mesh = std::move(imported.value().mesh);
         report = std::move(imported.value().report);
         break;
     }
     case MeshImportFormat::stl: {
-        auto imported = io::import_stl(path);
-        if (!imported) return fail(imported.error());
+        auto imported = io::import_stl(importer_path);
+        if (!imported) {
+            cleanup_pending_source();
+            return fail(imported.error());
+        }
         mesh = std::move(imported.value().mesh);
         report = std::move(imported.value().report);
         break;
     }
     default:
+        cleanup_pending_source();
         return fail(unsupported("mesh import format is unsupported"));
+    }
+
+    std::optional<StagedMeshSource> staged_source;
+    if (pending_source.has_value()) {
+        auto persisted = persist_mesh_source(*pending_source, format);
+        cleanup_pending_source();
+        if (!persisted) return fail(persisted.error());
+        staged_source = std::move(persisted.value());
     }
 
     std::string object_name = path.stem().string();
     if (object_name.empty()) object_name = "Imported Mesh";
-    auto admitted = dispatch(application::CreateMeshObjectAction{object_name, std::move(mesh)});
+    std::optional<assets::SourceImportRecord> source_record;
+    if (staged_source.has_value()) {
+        assets::SourceImportRecord record;
+        record.identity = pending_source->identity;
+        record.relative_source_path = staged_source->relative_path;
+        record.source_generation = core::Revision{1U};
+        record.kind = assets::SourceAssetKind::mesh;
+        record.source_digest = staged_source->digest;
+        switch (format) {
+        case MeshImportFormat::obj: record.importer_identity = "carto.import.obj"; break;
+        case MeshImportFormat::ply: record.importer_identity = "carto.import.ply"; break;
+        case MeshImportFormat::stl: record.importer_identity = "carto.import.stl"; break;
+        }
+        record.importer_version = 1U;
+        record.options.import_hierarchy = false;
+        record.options.import_materials = false;
+        record.options.import_normals = false;
+        record.artifact_identity = "pending.mesh";
+        record.artifact_digest = application::canonical_mesh_geometry_digest(mesh);
+        record.domain_digests.push_back(assets::SourceDomainDigest{
+            assets::SourceAssetDomain::geometry, record.artifact_digest});
+        const auto active = std::find_if(
+            application_snapshot.source_assets.begin(),
+            application_snapshot.source_assets.end(),
+            [&record](const application::SourceAssetView& item) {
+                return item.identity == record.identity;
+            });
+        if (active != application_snapshot.source_assets.end()) {
+            record.artifact_identity = active->artifact_identity;
+        }
+        if (auto result = record.validate(); !result) {
+            return fail(result.error());
+        }
+        report.warnings.push_back(
+            "Source bytes were verified and stored as a project-relative content-addressed snapshot.");
+        source_record = std::move(record);
+    } else {
+        report.warnings.push_back(
+            "This import is not source-linked because the workspace has not been saved; "
+            "save the project and import again to bind it.");
+    }
+
+    auto admitted = dispatch(application::CreateMeshObjectAction{
+        object_name, std::move(mesh), std::move(source_record)});
     if (!admitted) {
         return core::Result<MeshImportReceipt>::failure(admitted.error());
     }
@@ -1418,7 +4432,725 @@ core::Result<MeshImportReceipt> UiController::import_mesh(
         report.triangles,
         std::move(report.warnings),
         std::move(admitted).value(),
+        staged_source.has_value(),
+        staged_source.has_value() ? pending_source->identity : std::string{},
+        staged_source.has_value() ? staged_source->relative_path : std::string{},
     });
+}
+
+core::Result<assets::SourceReimportPlan> UiController::preview_source_reimport(
+    std::vector<assets::SourceImportRecord> incoming) const {
+    return session_.preview_source_reimport(std::move(incoming));
+}
+
+core::Result<application::DispatchReceipt> UiController::apply_source_reimport_plan(
+    assets::SourceReimportPlan plan) {
+    return dispatch(application::ApplySourceReimportPlanAction{std::move(plan)});
+}
+
+core::Result<application::DispatchReceipt> UiController::import_engineering_fixture() {
+    return dispatch_with_category(
+        application::ImportEngineeringFixtureAction{},
+        OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::import_engineering_authoring(
+    const std::filesystem::path& path) {
+    auto bytes = read_bounded_file(
+        path, engineering::AuthoringDocument::kMaxSerializedBytes,
+        "engineering authoring document");
+    if (!bytes) return core::Result<application::DispatchReceipt>::failure(bytes.error());
+    return dispatch_with_category(
+        application::ImportEngineeringAuthoringAction{std::move(bytes).value()},
+        OperationCategory::provider);
+}
+
+core::Result<engineering::ImportProbe> UiController::probe_engineering_step(
+    const std::filesystem::path& path) const {
+    auto prefix = read_file_prefix(path, engineering::kMaxStepHeaderProbeBytes,
+        "STEP source");
+    if (!prefix) return core::Result<engineering::ImportProbe>::failure(prefix.error());
+    engineering::StepAp242Provider provider;
+    return provider.probe(prefix.value());
+}
+
+core::Result<application::DispatchReceipt> UiController::import_engineering_bom_csv(
+    const std::filesystem::path& path) {
+    auto bytes = read_bounded_file(path, engineering::kMaxBomCsvBytes,
+        "engineering BOM CSV");
+    if (!bytes) return core::Result<application::DispatchReceipt>::failure(bytes.error());
+    const auto snapshot = session_.snapshot();
+    if (!snapshot.engineering.present) {
+        return core::Result<application::DispatchReceipt>::failure(invalid(
+            "import the engineering authoring document before importing its BOM"));
+    }
+    return dispatch_with_category(
+        application::ImportEngineeringBomCsvAction{
+            snapshot.project_revision,
+            snapshot.engineering.authored_revision,
+            path.filename().generic_string(),
+            std::move(bytes).value()},
+        OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::import_engineering_requirement_csv(
+    const std::filesystem::path& path) {
+    auto bytes = read_bounded_file(path, engineering::kMaxRequirementCsvBytes,
+        "engineering requirement CSV");
+    if (!bytes) return core::Result<application::DispatchReceipt>::failure(bytes.error());
+    const auto snapshot = session_.snapshot();
+    if (!snapshot.engineering.present) {
+        return core::Result<application::DispatchReceipt>::failure(invalid(
+            "import the engineering authoring document before importing requirements"));
+    }
+    return dispatch_with_category(
+        application::ImportEngineeringRequirementCsvAction{
+            snapshot.project_revision,
+            snapshot.engineering.authored_revision,
+            path.filename().generic_string(),
+            std::move(bytes).value()},
+        OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::import_engineering_path_result(
+    const std::filesystem::path& path) {
+    auto bytes = read_bounded_file(path, engineering::VantaPathResult::kMaxSerializedBytes,
+        "VANTA path result");
+    if (!bytes) return core::Result<application::DispatchReceipt>::failure(bytes.error());
+    const auto snapshot = session_.snapshot();
+    if (!snapshot.engineering.present) {
+        return core::Result<application::DispatchReceipt>::failure(invalid(
+            "import the engineering authoring document before importing a VANTA path result"));
+    }
+    return dispatch_with_category(
+        application::ImportEngineeringPathResultAction{
+            snapshot.project_revision,
+            snapshot.engineering.authored_revision,
+            std::move(bytes).value()},
+        OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::attach_engineering_evidence(
+    const std::filesystem::path& path,
+    engineering::SourceKind kind) {
+    if (kind != engineering::SourceKind::drawing &&
+        kind != engineering::SourceKind::specification) {
+        return core::Result<application::DispatchReceipt>::failure(invalid(
+            "opaque engineering evidence supports drawing or specification sources only"));
+    }
+    auto bytes = read_bounded_file(path,
+        engineering::kMaxEngineeringEvidenceBytes, "engineering evidence");
+    if (!bytes) return core::Result<application::DispatchReceipt>::failure(bytes.error());
+    const auto snapshot = session_.snapshot();
+    if (!snapshot.engineering.present) {
+        return core::Result<application::DispatchReceipt>::failure(invalid(
+            "import engineering authoring before attaching source evidence"));
+    }
+    return dispatch_with_category(
+        application::AttachEngineeringEvidenceAction{
+            snapshot.project_revision,
+            snapshot.engineering.authored_revision,
+            kind,
+            path.filename().generic_string(),
+            std::move(bytes).value()},
+        OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::create_engineering_characteristic(
+    const application::CreateEngineeringCharacteristicAction& action) {
+    return dispatch_with_category(action, OperationCategory::committed_command);
+}
+
+core::Result<application::DispatchReceipt> UiController::create_engineering_target(
+    const application::CreateEngineeringTargetAction& action) {
+    return dispatch_with_category(action, OperationCategory::committed_command);
+}
+
+core::Result<application::DispatchReceipt> UiController::update_engineering_workcell(
+    const application::UpdateEngineeringWorkcellAction& action) {
+    return dispatch_with_category(action, OperationCategory::committed_command);
+}
+
+core::Result<application::DispatchReceipt> UiController::create_engineering_keep_out(
+    const application::CreateEngineeringKeepOutAction& action) {
+    return dispatch_with_category(action, OperationCategory::committed_command);
+}
+
+core::Result<application::DispatchReceipt> UiController::create_engineering_workcell_frame(
+    const application::CreateEngineeringWorkcellFrameAction& action) {
+    return dispatch_with_category(action, OperationCategory::committed_command);
+}
+
+core::Result<void> UiController::export_engineering_authoring(
+    const std::filesystem::path& path) const {
+    const auto authoring = session_.engineering_authoring();
+    if (!authoring) return core::Result<void>::failure(authoring.error());
+    return write_atomic_file(
+        path, authoring.value().serialize(), "engineering authoring document");
+}
+
+core::Result<application::DispatchReceipt> UiController::invalidate_engineering_source(
+    engineering::Id source_id,
+    std::string new_revision,
+    assets::Sha256Digest new_digest) {
+    return dispatch_with_category(
+        application::InvalidateEngineeringSourceAction{
+            source_id, std::move(new_revision), new_digest},
+        OperationCategory::provider);
+}
+
+core::Result<engineering::InspectionPackage> UiController::build_engineering_package() const {
+    const auto authoring = session_.engineering_authoring();
+    if (!authoring) {
+        return core::Result<engineering::InspectionPackage>::failure(authoring.error().with_context(
+            "engineering publication"));
+    }
+    const auto snapshot = session_.snapshot();
+    return engineering::InspectionPackage::publish(
+        authoring.value(), snapshot.project_revision, authoring.value().project_namespace);
+}
+
+core::Result<engineering::VantaAdmissionResult> UiController::admit_engineering_package() const {
+    const auto package = build_engineering_package();
+    if (!package) {
+        return core::Result<engineering::VantaAdmissionResult>::failure(package.error());
+    }
+    return engineering::admit_for_vanta(package.value());
+}
+
+core::Result<void> UiController::publish_engineering_package(
+    const std::filesystem::path& path) const {
+    if (path.empty() || path.filename().empty()) {
+        return core::Result<void>::failure(invalid(
+            "engineering publication path must name a file"));
+    }
+    const auto package = build_engineering_package();
+    if (!package) return core::Result<void>::failure(package.error());
+    const auto admission = engineering::admit_for_vanta(package.value());
+    if (!admission) return core::Result<void>::failure(admission.error().with_context(
+        "engineering publication admission"));
+    if (admission.value().status != engineering::VantaAdmissionStatus::admit) {
+        return core::Result<void>::failure(validation(
+            "engineering publication was refused at the runtime boundary"));
+    }
+    const auto parent = path.parent_path();
+    if (!parent.empty()) {
+        std::error_code error;
+        const bool exists = std::filesystem::exists(parent, error);
+        if (error || !exists || !std::filesystem::is_directory(parent, error) || error) {
+            return core::Result<void>::failure(io_error(
+                "engineering publication parent is unavailable"));
+        }
+    }
+    const auto temporary = preference_temporary_path(path);
+    const std::string bytes = package.value().serialize();
+    std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
+    if (!stream) return core::Result<void>::failure(io_error(
+        "unable to create engineering publication package"));
+    stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    stream.flush();
+    stream.close();
+    if (!stream) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        return core::Result<void>::failure(io_error(
+            "unable to write engineering publication package"));
+    }
+    const auto replaced = atomic_replace(temporary, path);
+    if (!replaced) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        return replaced;
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<application::DispatchReceipt> UiController::import_condition_fixture() {
+    return dispatch_with_category(
+        application::ImportConditionFixtureAction{}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::import_condition_authoring(
+    const std::filesystem::path& path) {
+    auto bytes = read_bounded_file(
+        path, condition::AuthoringDocument::kMaxSerializedBytes,
+        "CONDITION authoring document");
+    if (!bytes) return core::Result<application::DispatchReceipt>::failure(bytes.error());
+    return dispatch_with_category(
+        application::ImportConditionAuthoringAction{std::move(bytes).value()},
+        OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::import_condition_audio_clip(
+    const std::filesystem::path& path) {
+    auto bytes = read_bounded_file(path, condition::kMaxWaveClipBytes, "WAVE audio clip");
+    if (!bytes) return core::Result<application::DispatchReceipt>::failure(bytes.error());
+    const std::string& encoded = bytes.value();
+    const auto byte_span = std::span<const std::uint8_t>{
+        reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size()};
+    const auto inspection = condition::inspect_wave_clip(byte_span);
+    if (!inspection) return core::Result<application::DispatchReceipt>::failure(
+        inspection.error().with_context("WAVE audio clip inspection"));
+
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION audio clip import"));
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    if (authoring.value().sources.size() >=
+        condition::AuthoringDocument::kMaxRecordsPerKind) {
+        return core::Result<application::DispatchReceipt>::failure(validation(
+            "CONDITION source evidence count exceeds its limit"));
+    }
+    const auto maximum = std::max_element(authoring.value().sources.begin(),
+        authoring.value().sources.end(), [](const auto& left, const auto& right) {
+            return left.id < right.id;
+        });
+    if (maximum != authoring.value().sources.end() &&
+        maximum->id == std::numeric_limits<condition::Id>::max()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION source identity space is exhausted"));
+    }
+
+    const assets::Sha256Digest digest = assets::sha256(byte_span);
+    constexpr std::string_view import_settings =
+        "Cartographer.WaveImport/v1;RIFF-WAVE;PCM8-16-24-32-or-IEEE-F32-F64;metadata-only";
+    const auto settings_bytes = std::span<const std::uint8_t>{
+        reinterpret_cast<const std::uint8_t*>(import_settings.data()), import_settings.size()};
+    condition::SourceEvidence source;
+    source.id = maximum == authoring.value().sources.end() ? 1U : maximum->id + 1U;
+    source.kind = condition::SourceKind::imported_asset;
+    source.label = "WAVE clip " + digest.hex().substr(0U, 12U);
+    source.logical_locator = "audio/sha256/" + digest.hex() + ".wav";
+    source.revision = "sha256:" + digest.hex();
+    source.digest = digest;
+    source.producer_identity = "Cartographer.WaveImport";
+    source.producer_version = "1";
+    source.import_settings_digest = assets::sha256(settings_bytes);
+    source.reviewed = false;
+    source.current = true;
+    source.diagnostics.push_back("WAVE inspected: " +
+        std::string(inspection.value().encoding_name()) + ", " +
+        std::to_string(inspection.value().channels) + " channels, " +
+        std::to_string(inspection.value().sample_rate) + " Hz, " +
+        std::to_string(inspection.value().bits_per_sample) + " bit, " +
+        std::to_string(inspection.value().frame_count) + " frames");
+    authoring.value().sources.push_back(std::move(source));
+    std::sort(authoring.value().sources.begin(), authoring.value().sources.end(),
+        [](const auto& left, const auto& right) { return left.id < right.id; });
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::bind_condition_asset_to_object(
+    condition::Id asset_id,
+    scene::ObjectId object_id,
+    core::Revision expected_project_revision,
+    core::Revision expected_authoring_revision) {
+    return dispatch_with_category(application::BindConditionAssetObjectAction{
+        expected_project_revision,
+        expected_authoring_revision,
+        asset_id,
+        object_id}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::set_condition_source_reviewed(
+    condition::Id source_id,
+    bool reviewed) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION source review"));
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    const auto source = std::find_if(authoring.value().sources.begin(),
+        authoring.value().sources.end(), [source_id](const auto& value) {
+            return value.id == source_id;
+        });
+    if (source == authoring.value().sources.end()) {
+        return core::Result<application::DispatchReceipt>::failure(
+            core::Diagnostic(core::ErrorCode::not_found,
+                "CONDITION source evidence does not exist"));
+    }
+    if (source->kind != condition::SourceKind::imported_asset) {
+        return core::Result<application::DispatchReceipt>::failure(invalid(
+            "only imported asset evidence can be reviewed through the clip workflow"));
+    }
+    if (reviewed && !source->current) {
+        return core::Result<application::DispatchReceipt>::failure(stale(
+            "stale CONDITION source evidence must be reimported before review"));
+    }
+    if (source->reviewed == reviewed) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION source review state already matches the requested state"));
+    }
+    source->reviewed = reviewed;
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<void> UiController::export_condition_authoring(
+    const std::filesystem::path& path) const {
+    const auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<void>::failure(authoring.error());
+    return write_atomic_file(
+        path, authoring.value().serialize(), "CONDITION authoring document");
+}
+
+core::Result<application::DispatchReceipt> UiController::invalidate_condition_source(
+    condition::Id source_id,
+    std::string new_revision,
+    assets::Sha256Digest new_digest) {
+    return dispatch_with_category(
+        application::InvalidateConditionSourceAction{
+            source_id, std::move(new_revision), new_digest},
+        OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::add_condition_audio_source(
+    condition::AuthoredAudioSource source) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION audio source authoring"));
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    if (auto appended = append_condition_record(
+            authoring.value().audio_sources, std::move(source), "audio source"); !appended) {
+        return core::Result<application::DispatchReceipt>::failure(appended.error());
+    }
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::add_condition_acoustic_zone(
+    condition::AuthoredAcousticZone zone) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION acoustic-zone authoring"));
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    if (auto appended = append_condition_record(
+            authoring.value().acoustic_zones, std::move(zone), "acoustic zone"); !appended) {
+        return core::Result<application::DispatchReceipt>::failure(appended.error());
+    }
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::update_condition_audio_source_distances(
+    condition::Id source_id,
+    core::Revision expected_authoring_revision,
+    double minimum_distance,
+    double maximum_distance) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION audio distance edit"));
+    if (authoring.value().project_revision != expected_authoring_revision) {
+        return core::Result<application::DispatchReceipt>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "CONDITION audio distance edit was based on a stale authoring revision"));
+    }
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    const auto found = std::find_if(authoring.value().audio_sources.begin(),
+        authoring.value().audio_sources.end(), [source_id](const auto& source) {
+            return source.id == source_id;
+        });
+    if (found == authoring.value().audio_sources.end()) {
+        return core::Result<application::DispatchReceipt>::failure(core::Diagnostic(
+            core::ErrorCode::not_found, "CONDITION audio source does not exist"));
+    }
+    found->minimum_distance = minimum_distance;
+    found->maximum_distance = maximum_distance;
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::set_condition_audio_source_enabled(
+    condition::Id source_id,
+    core::Revision expected_authoring_revision,
+    bool enabled) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION audio source state"));
+    if (authoring.value().project_revision != expected_authoring_revision) {
+        return core::Result<application::DispatchReceipt>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "CONDITION audio state edit was based on a stale authoring revision"));
+    }
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    const auto found = std::find_if(authoring.value().audio_sources.begin(),
+        authoring.value().audio_sources.end(), [source_id](const auto& source) {
+            return source.id == source_id;
+        });
+    if (found == authoring.value().audio_sources.end()) {
+        return core::Result<application::DispatchReceipt>::failure(core::Diagnostic(
+            core::ErrorCode::not_found, "CONDITION audio source does not exist"));
+    }
+    found->enabled = enabled;
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::update_condition_acoustic_zone_volume(
+    condition::Id zone_id,
+    core::Revision expected_authoring_revision,
+    core::Vec3d half_extents,
+    double radius) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION acoustic-zone volume edit"));
+    if (authoring.value().project_revision != expected_authoring_revision) {
+        return core::Result<application::DispatchReceipt>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "CONDITION acoustic-zone edit was based on a stale authoring revision"));
+    }
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    const auto found = std::find_if(authoring.value().acoustic_zones.begin(),
+        authoring.value().acoustic_zones.end(), [zone_id](const auto& zone) {
+            return zone.id == zone_id;
+        });
+    if (found == authoring.value().acoustic_zones.end()) {
+        return core::Result<application::DispatchReceipt>::failure(core::Diagnostic(
+            core::ErrorCode::not_found, "CONDITION acoustic zone does not exist"));
+    }
+    found->half_extents = half_extents;
+    found->radius = radius;
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::add_condition_effect_source(
+    condition::EffectSource source) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION effect source authoring"));
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    if (auto appended = append_condition_record(
+            authoring.value().effect_sources, std::move(source), "effect source"); !appended) {
+        return core::Result<application::DispatchReceipt>::failure(appended.error());
+    }
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::add_condition_particle_emitter(
+    condition::ParticleEmitterSource emitter) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION particle emitter authoring"));
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    if (auto appended = append_condition_record(
+            authoring.value().particle_emitters, std::move(emitter), "particle emitter"); !appended) {
+        return core::Result<application::DispatchReceipt>::failure(appended.error());
+    }
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::add_condition_field_influence(
+    condition::FieldInfluenceBinding influence) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION field influence authoring"));
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    if (auto appended = append_condition_record(
+            authoring.value().field_influences, std::move(influence), "field influence"); !appended) {
+        return core::Result<application::DispatchReceipt>::failure(appended.error());
+    }
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::add_condition_vegetation_scatter(
+    condition::VegetationScatterRecipe recipe) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION vegetation scatter authoring"));
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    if (auto appended = append_condition_record(
+            authoring.value().vegetation_scatters, std::move(recipe),
+            "vegetation scatter recipe"); !appended) {
+        return core::Result<application::DispatchReceipt>::failure(appended.error());
+    }
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::add_condition_state_branch(
+    condition::AuthoredStateBranch branch) {
+    auto authoring = session_.condition_authoring();
+    if (!authoring) return core::Result<application::DispatchReceipt>::failure(
+        authoring.error().with_context("CONDITION state branch authoring"));
+    if (authoring.value().project_revision.exhausted()) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "CONDITION authoring revision space is exhausted"));
+    }
+    if (auto appended = append_condition_record(
+            authoring.value().state_branches, std::move(branch), "state branch"); !appended) {
+        return core::Result<application::DispatchReceipt>::failure(appended.error());
+    }
+    authoring.value().project_revision = authoring.value().project_revision.next();
+    if (auto valid_document = authoring.value().validate(); !valid_document) {
+        return core::Result<application::DispatchReceipt>::failure(valid_document.error());
+    }
+    return dispatch_with_category(application::ImportConditionAuthoringAction{
+        authoring.value().serialize()}, OperationCategory::provider);
+}
+
+core::Result<condition::EffectPreviewResult> UiController::preview_condition_effect(
+    condition::Id effect_source_id,
+    std::string_view operating_state,
+    double elapsed_seconds) const {
+    return session_.condition_effect_preview(
+        effect_source_id, operating_state, elapsed_seconds);
+}
+
+core::Result<condition::VegetationPreviewResult> UiController::preview_condition_vegetation(
+    condition::Id recipe_id) const {
+    return session_.condition_vegetation_preview(recipe_id);
+}
+
+core::Result<condition::StateComparisonResult>
+UiController::compare_condition_state_branches(
+    condition::Id left_branch_id,
+    condition::Id right_branch_id) const {
+    return session_.condition_state_comparison(left_branch_id, right_branch_id);
+}
+
+core::Result<condition::Package> UiController::build_condition_package() const {
+    const auto authoring = session_.condition_authoring();
+    if (!authoring) {
+        return core::Result<condition::Package>::failure(authoring.error().with_context(
+            "CONDITION source publication"));
+    }
+    const auto snapshot = session_.snapshot();
+    return condition::Package::publish(
+        authoring.value(), snapshot.project_revision, authoring.value().project_namespace);
+}
+
+core::Result<condition::AdmissionResult> UiController::admit_condition_package() const {
+    const auto package = build_condition_package();
+    if (!package) return core::Result<condition::AdmissionResult>::failure(package.error());
+    return condition::admit_for_consumer(package.value());
+}
+
+core::Result<void> UiController::publish_condition_package(
+    const std::filesystem::path& path) const {
+    if (path.empty() || path.filename().empty()) {
+        return core::Result<void>::failure(invalid(
+            "CONDITION publication path must name a file"));
+    }
+    const auto package = build_condition_package();
+    if (!package) return core::Result<void>::failure(package.error());
+    const auto admission = condition::admit_for_consumer(package.value());
+    if (!admission) return core::Result<void>::failure(admission.error().with_context(
+        "CONDITION publication admission"));
+    if (admission.value().status != condition::PackageAdmissionStatus::admit) {
+        return core::Result<void>::failure(validation(
+            "CONDITION source publication was refused at the public consumer boundary"));
+    }
+    const auto parent = path.parent_path();
+    if (!parent.empty()) {
+        std::error_code error;
+        const bool exists = std::filesystem::exists(parent, error);
+        if (error || !exists || !std::filesystem::is_directory(parent, error) || error) {
+            return core::Result<void>::failure(io_error(
+                "CONDITION publication parent is unavailable"));
+        }
+    }
+    const auto temporary = preference_temporary_path(path);
+    const std::string bytes = package.value().serialize();
+    std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
+    if (!stream) return core::Result<void>::failure(io_error(
+        "unable to create CONDITION source package"));
+    stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    stream.flush();
+    stream.close();
+    if (!stream) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        return core::Result<void>::failure(io_error(
+            "unable to write CONDITION source package"));
+    }
+    const auto replaced = atomic_replace(temporary, path);
+    if (!replaced) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        return replaced;
+    }
+    return core::Result<void>::success();
 }
 
 core::Result<void> UiController::configure_market_library(
@@ -1944,6 +5676,71 @@ UiSnapshot UiController::snapshot() const {
     result.ai_status = preferences_.ai_auto_approve
         ? "Native planner ready. Safe proposals auto-apply through the revision-bound command path."
         : "Native planner ready. Proposals require explicit Apply through the revision-bound command path.";
+    result.agent_goal = agent_goal_;
+    result.agent_recipe_id = agent_recipe_id_;
+    result.agent_plan_draft = agent_plan_draft_;
+    result.agent_hard_constraints_draft = agent_hard_constraints_draft_;
+    result.agent_clarifications_draft = agent_clarifications_draft_;
+    result.agent_repair_ready = agent_repair_mode_;
+    result.agent_checkpoint_loaded = agent_checkpoint_pending_.has_value();
+    result.agent_checkpoint_rebased = agent_checkpoint_rebased_;
+    if (agent_checkpoint_pending_.has_value()) {
+        result.agent_checkpoint_task_id = agent_checkpoint_pending_->plan.id;
+        result.agent_checkpoint_base_revision = agent_checkpoint_pending_->source_revision;
+        result.agent_checkpoint_rebase_revision = agent_plan_base_revision_.value_or(
+            agent_checkpoint_pending_->source_revision);
+    }
+    result.agent_checkpoint_directly_conflicting_steps =
+        agent_checkpoint_directly_conflicting_steps_;
+    result.agent_checkpoint_invalidated_steps = agent_checkpoint_invalidated_steps_;
+    if (agent_task_.has_value()) {
+        const auto task = agent_task_->snapshot();
+        result.agent_task = task;
+        if (preferences_.workspace != Workspace::ai &&
+            task.status != agent::TaskStatus::accepted &&
+            task.status != agent::TaskStatus::rejected) {
+            AgentTaskStripView strip;
+            strip.task_id = task.task_id;
+            strip.status = task.status;
+            strip.total_steps = task.plan_steps.size();
+            strip.blocker = task.diagnostic;
+            for (const auto& step : task.plan_steps) {
+                if (step.status == agent::StepStatus::passed) ++strip.passed_steps;
+            }
+            for (const auto& gate : task.gates) {
+                if (!gate.required) continue;
+                ++strip.required_gates;
+                if (gate.passed) ++strip.passed_required_gates;
+            }
+            result.agent_task_strip = std::move(strip);
+        }
+    }
+    if (agent_condition_inventory_.has_value()) {
+        const bool active_task = result.agent_task.has_value() &&
+            result.agent_task->status != agent::TaskStatus::accepted &&
+            result.agent_task->status != agent::TaskStatus::rejected;
+        if (active_task) {
+            if (agent_condition_inventory_->source_revision ==
+                    result.agent_task->speculative_revision &&
+                agent_condition_inventory_scope_ == result.agent_task->scope_objects) {
+                result.agent_condition_inventory = agent_condition_inventory_;
+            }
+        } else {
+            std::vector<scene::ObjectId> current_scope = result.selection.objects;
+            if (result.selection.component_object.has_value() &&
+                std::find(current_scope.begin(), current_scope.end(),
+                    *result.selection.component_object) == current_scope.end()) {
+                current_scope.push_back(*result.selection.component_object);
+            }
+            std::sort(current_scope.begin(), current_scope.end());
+            current_scope.erase(std::unique(current_scope.begin(), current_scope.end()),
+                current_scope.end());
+            if (agent_condition_inventory_->source_revision == result.project_revision &&
+                agent_condition_inventory_scope_ == current_scope) {
+                result.agent_condition_inventory = agent_condition_inventory_;
+            }
+        }
+    }
     result.market = market_view_;
     if (surface_fidelity_.has_value()) {
         result.surface_fidelity = *surface_fidelity_;
@@ -1982,6 +5779,59 @@ UiSnapshot UiController::snapshot() const {
     } else {
         result.project_status = ProjectStatus::saved;
         result.project_status_text = "Saved";
+    }
+    result.agent_demonstration = agent_demonstration_;
+    result.agent_demonstration_trace = agent_demonstration_trace_;
+    result.agent_demonstration_recipe_name = agent_demonstration_recipe_name_;
+    result.agent_demonstration_target_set_count =
+        agent_demonstration_target_set_count_;
+    if (agent_demonstration_trace_.has_value()) {
+        result.agent_demonstration_similar_targets_supported =
+            supports_demonstration_structural_matching(*agent_demonstration_trace_);
+        const bool bindings_current = agent_demonstration_binding_revision_.has_value() &&
+            *agent_demonstration_binding_revision_ == result.project_revision;
+        auto requirements = demonstration_binding_requirements(
+            *agent_demonstration_trace_, agent_demonstration_target_set_count_);
+        result.agent_demonstration_ready_to_preview = !requirements.empty() &&
+            bindings_current && !agent_task_.has_value() &&
+            !agent_checkpoint_pending_.has_value();
+        for (auto& requirement : requirements) {
+            const auto binding = std::find_if(
+                agent_demonstration_bindings_.begin(),
+                agent_demonstration_bindings_.end(), [&requirement](const auto& binding) {
+                    return binding.target_set_index == requirement.target_set_index &&
+                        binding.target_alias == requirement.target_alias &&
+                        binding.component_alias == requirement.component_alias;
+                });
+            const auto object = binding == agent_demonstration_bindings_.end()
+                ? result.objects.end()
+                : std::find_if(result.objects.begin(), result.objects.end(),
+                    [&binding](const auto& candidate) {
+                        return candidate.object.id == binding->target.object;
+                    });
+            requirement.bound = bindings_current &&
+                binding != agent_demonstration_bindings_.end() &&
+                object != result.objects.end();
+            if (requirement.bound) {
+                requirement.target_label = object->object.name.empty()
+                    ? "(unnamed object)"
+                    : object->object.name;
+                requirement.target_label += " (#" +
+                    std::to_string(object->object.id.value) + ")";
+                if (const auto* face = std::get_if<geometry::FaceId>(
+                        &binding->target.component)) {
+                    requirement.target_label += ", face #" +
+                        std::to_string(face->value);
+                } else if (const auto* vertex = std::get_if<geometry::VertexId>(
+                        &binding->target.component)) {
+                    requirement.target_label += ", vertex #" +
+                        std::to_string(vertex->value);
+                }
+            }
+            result.agent_demonstration_ready_to_preview =
+                result.agent_demonstration_ready_to_preview && requirement.bound;
+            result.agent_demonstration_bindings.push_back(requirement);
+        }
     }
     return result;
 }

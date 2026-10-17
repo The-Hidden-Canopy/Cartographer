@@ -58,6 +58,24 @@ public:
         scientific::ScientificModel model);
     [[nodiscard]] core::Result<void> set_world_model(world::WorldModel model);
     [[nodiscard]] core::Result<void> set_material_catalog(MaterialCatalog catalog);
+    [[nodiscard]] core::Result<void> set_presentation_catalog(PresentationCatalog catalog);
+    [[nodiscard]] core::Result<void> set_curve_path(geometry::CurvePath path);
+    [[nodiscard]] core::Result<void> erase_curve_path(
+        std::string identity,
+        core::Revision expected_source_revision);
+    [[nodiscard]] core::Result<void> set_road_source(RoadSource road);
+    [[nodiscard]] core::Result<void> erase_road_source(
+        std::string identity,
+        core::Revision expected_source_revision);
+    [[nodiscard]] core::Result<void> set_sweep_source(geometry::SweepSource source);
+    [[nodiscard]] core::Result<void> erase_sweep_source(
+        std::string identity,
+        core::Revision expected_source_revision);
+    [[nodiscard]] core::Result<void> set_spatial_field(
+        spatial_field::ScalarField2D field);
+    [[nodiscard]] core::Result<void> erase_spatial_field(
+        std::string identity,
+        core::Revision expected_source_revision);
     [[nodiscard]] core::Result<void> set_semantic_sidecar(
         std::string serialized_sidecar,
         assets::Sha256Digest digest);
@@ -73,6 +91,8 @@ public:
         std::uint64_t mesh_asset,
         std::string serialized_receipt,
         assets::Sha256Digest digest);
+    [[nodiscard]] core::Result<void> apply_source_reimport_plan(
+        const assets::SourceReimportPlan& plan);
     [[nodiscard]] core::Result<void> set_object_transform(
         scene::ObjectId object,
         core::Transform transform);

@@ -5,7 +5,9 @@
 #include <carto/core/revision.hpp>
 #include <carto/editor/authoring_context.hpp>
 
+#include <cstdint>
 #include <optional>
+#include <utility>
 
 namespace carto::application {
 class ApplicationSession;
@@ -15,15 +17,49 @@ namespace carto::editor {
 
 enum class PreviewKind {
     object_transform,
+    object_translation_delta,
     extrude_face,
     inset_face,
     set_vertex_position,
+    poke_face,
+    set_material_region_assignment,
+    generate_unique_lightmap_uv,
 };
 
 struct PreviewParameters {
+    PreviewParameters() = default;
+    PreviewParameters(
+        std::optional<core::Transform> transform_value,
+        std::optional<double> distance_value,
+        std::optional<core::Vec3d> position_value,
+        std::optional<std::uint32_t> region_id_value = std::nullopt,
+        std::optional<std::uint64_t> material_id_value = std::nullopt,
+        std::optional<std::uint64_t> material_variant_id_value = std::nullopt,
+        std::optional<std::uint64_t> lightmap_uv_set_id_value = std::nullopt,
+        std::optional<std::uint32_t> lightmap_resolution_value = std::nullopt,
+        std::optional<std::uint32_t> lightmap_padding_texels_value = std::nullopt,
+        std::optional<std::uint32_t> lightmap_maximum_udim_tiles_value = std::nullopt)
+        : transform(std::move(transform_value)),
+          distance(distance_value),
+          position(std::move(position_value)),
+          material_region_id(region_id_value),
+          material_id(material_id_value),
+          material_variant_id(material_variant_id_value),
+          lightmap_uv_set_id(lightmap_uv_set_id_value),
+          lightmap_resolution(lightmap_resolution_value),
+          lightmap_padding_texels(lightmap_padding_texels_value),
+          lightmap_maximum_udim_tiles(lightmap_maximum_udim_tiles_value) {}
+
     std::optional<core::Transform> transform;
     std::optional<double> distance;
     std::optional<core::Vec3d> position;
+    std::optional<std::uint32_t> material_region_id;
+    std::optional<std::uint64_t> material_id;
+    std::optional<std::uint64_t> material_variant_id;
+    std::optional<std::uint64_t> lightmap_uv_set_id;
+    std::optional<std::uint32_t> lightmap_resolution;
+    std::optional<std::uint32_t> lightmap_padding_texels;
+    std::optional<std::uint32_t> lightmap_maximum_udim_tiles;
 
     [[nodiscard]] core::Result<void> validate(PreviewKind kind) const;
 };

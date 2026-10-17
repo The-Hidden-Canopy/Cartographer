@@ -1,0 +1,198 @@
+# DV012 engineering authoring boundary
+
+The public Cartographer slice stores source-linked engineering authoring and
+inspection evidence in the project. The Engineering workspace presents source
+and topology lineage, loads the deterministic DV012 fixture, and lets an
+operator add a manual dimensional requirement against a current topology
+binding and review proposed inspection targets. A target decision is a
+revision-bound human command: only a proposed target whose active
+characteristic, requirement, and source topology are current can be accepted
+or rejected. Rejected candidates remain in the authoring record. Requirement
+records keep their source text, acceptance rule, source identity, and topology
+identity; they do not replace imported or extracted claims. The workspace also
+imports a bounded BOM CSV profile and displays source-to-assembly reconciliation
+rows, and lets an operator add a sensor and access contract to an eligible
+requirement. It exports an admitted `.carto-inspection` package when publication
+gates pass.
+
+The Engineering workspace also imports a bounded structured requirement CSV.
+Each row binds to one exact, current STEP topology external ID and enters as a
+proposal. Missing or ambiguous topology aborts the complete import without a
+partial project mutation. A person must verify, correct, or reject each proposal
+with a one-line reason before it can affect inspection authoring. Corrections
+retain the imported source text and provenance while storing the corrected
+normalized values and review reason; rejected records remain disabled and
+visible in history.
+
+An operator can attach a drawing or specification file up to 64 MiB as opaque
+source evidence. Cartographer records its content digest, filename locator, and
+attachment provenance, but does not embed, parse, extract, or interpret the
+file. Manual requirements can cite the attached source while retaining the
+operator-provided original assertion. Replacing evidence with the same kind and
+filename preserves the old digest and marks linked requirements and dependent
+products stale. Local directory paths are not stored in these source locators.
+
+Characteristic creation is revision-bound and human-only. The application
+copies the requirement's current topology bindings, checks the requirement to
+characteristic kind mapping, requires explicit sensor, coverage, and allowed
+approach values, and marks dependent path products stale. It does not generate
+targets or claim that a sensor, robot, or motion plan is runtime-validated.
+Material-verification requirements have no supported inspection-kind mapping
+in this profile and remain blocked from characterization.
+
+An operator can add a proposed inspection target to a current characteristic
+and one of its current topology bindings. The command records the explicit
+workcell frame, workcell revision, pose, sensor standoff, and a one-line human
+justification. It rejects stale project or authoring revisions, stale source
+bindings, unsupported frames, unnormalizable rotations, scaled poses, duplicate
+targets, and standoffs outside the characteristic's sensor bounds. A later
+workcell revision change blocks target acceptance until a new target is
+authored. New targets remain proposed until human review; target authoring
+marks existing paths and dependent products stale. Pose entry does not test
+reachability, collision, sensor visibility, or execution feasibility.
+
+The workcell panel edits transforms for existing entities and reference frames,
+and transforms and dimensions for existing keep-out regions. Every edit is a
+human command with a new operator-supplied workcell revision and a one-line
+reason retained with the affected item identity and workcell-state digest in
+revision history. It can also add an axis-aligned box keep-out with an explicit
+purpose, workcell-space center, full extents, new revision, and one-line reason.
+It can add a named reference frame with a rigid workcell-space pose, new
+revision, and one-line reason. New identities are assigned from the current
+workcell contents, and both sources are recorded as human-authored. Existing
+workcell content cannot be replaced through a general authoring import. Each
+revision marks non-rejected targets and path products stale. Existing source
+locators remain visible as recorded metadata;
+the editor does not import or verify robot models, fixture assets, or
+calibration data. These edits describe static workcell context and do not
+establish robot reachability or collision results.
+
+When a stored path record exists, the workspace lists its sample coordinate,
+reported status, target status, and clearance value, with the recorded tool
+pose available for inspection. It also draws a bounded top-down X/Z projection
+that preserves sample order and target references, marks enabled workcell
+frames/entities, and outlines projected keep-out bounds. Rotated keep-outs are
+shown as conservative bounding envelopes; robot, fixture, and sensor meshes
+are omitted. Dense results are decimated to 2,048 displayed points while
+preserving the first and last sample. This view does not compute reachability,
+collision, clearance, or execution feasibility. The panel does not generate
+paths or interpret unverified samples as runtime receipts.
+
+## BOM CSV profile
+
+The Engineering workspace accepts a UTF-8 CSV with this exact header order:
+`part_number,revision,description,material,quantity,unit`. It supports quoted
+commas and escaped quotes, caps input at 4 MiB and rows at the authoring
+collection limit, and rejects malformed quoting, extra or missing columns,
+blank rows, non-finite quantities, and non-positive quantities. The source
+revision is the SHA-256 of the exact file bytes; no supplier revision is
+inferred. Re-importing changed bytes creates a new source snapshot and marks
+the prior snapshot's reconciliation unresolved while preserving its source
+digest and BOM rows.
+
+Reconciliation matches only an exact engineering part external ID. Duplicate
+IDs remain ambiguous; missing part IDs remain source-only; omitted placed
+parts remain assembly-only. Revision, material, or quantity conflicts are
+preserved in the imported source values and the workspace shows those values
+alongside the mapped assembly values; the status reports the primary
+discrepancy. Quantity comparison is enabled only for `each` and a bounded,
+unambiguous occurrence hierarchy; unknown units, missing material, or
+cyclic/deep occurrence hierarchies remain unresolved. The importer does not
+perform fuzzy matching or unit conversion.
+
+## Requirement CSV profile
+
+The Engineering workspace accepts UTF-8 CSV with this exact header order:
+`page,section,callout,kind,topology_external_id,nominal,plus,minus,unit,acceptance_rule,original_text`.
+The bounded dimensional subset supports distance, diameter, radius, angle,
+thickness, and clearance. Units are explicit (`degrees`, `millimeters`,
+`meters`, or `inches`); values and tolerances must be finite and within the
+supported profile. The source digest covers the exact input bytes. Imports are
+atomic, revision-bound, and idempotent for the same filename and digest;
+changed bytes create a new source snapshot and stale linked proposals and
+dependent products. IDs are resolved by exact match against current STEP
+topology only. No fuzzy mapping, unit conversion, semantic extraction, or
+automatic approval occurs.
+
+## Import and runtime boundary
+
+The public STEP AP242 provider inspects only the first 64 KiB and recognizes a
+bounded Part 21 header with a declared `FILE_SCHEMA`; marker text in notes or
+the DATA section is not treated as source identity. It still does not claim
+B-Rep support. `read_assembly`
+remains unsupported until a CAD kernel is connected. The fixture is synthetic
+acceptance data, not a live CAD import.
+The Engineering workspace exposes this as a read-only file probe. It reads at
+most the header limit even for a large STEP file, reports the declared schema
+and provider diagnostics, and does not register a source or mutate the
+project. An AP242 header recognized by this probe is not an imported assembly;
+the public build has no connected CAD kernel.
+Inspection-package admission validates the public handoff contract; it does
+not prove robot reachability, collision safety, execution feasibility, or
+hardware behavior. Those checks remain with the consuming runtime.
+Package admission also refuses local filesystem paths in engineering source
+locators and workcell model/source references. Use a stable filename or
+non-local URI so workstation directory structure is not embedded in a
+published handoff. The local authoring project remains intact when publication
+is refused.
+
+## Persistence and failure behavior
+
+Project schema 16 stores a digest-bound `ENGINEERING_AUTHORING` record when
+present. Engineering authoring schema 4 stores human requirement-review reasons,
+retains workcell revision history, and stores VANTA path-result receipts. It
+migrates authoring schemas 1 through 3. Mutations pass through editor commands
+and can be undone or redone.
+Source invalidation preserves authored identity while marking dependent
+products stale. A new VANTA request projection omits the previous path result
+and stale derived products while retaining the local project records. Direct
+local VANTA contract admission refuses stale path or derived-product records if
+they are present in the package. Project formats 1 through 14 remain readable.
+
+The Engineering workspace imports `.carto-vanta-path` response files up to
+16 MiB. Exchange schema 1 binds the response to the project namespace, project
+and authoring revisions, request publication digest, and request authoring
+digest. Import requires the current package to pass Cartographer's local VANTA
+admission contract, then rejects a stale request binding, a missing or
+non-accepted inspection target, malformed data, or a mismatched result digest. Accepted
+results become local authoring mutations through the editor command journal;
+they can be undone, redone, saved, and reopened. A provider-reported `current`
+path is stored as `unverified`, while the provider-reported status, identity,
+version, run ID, request digests, and result digest remain in the receipt. The
+digest detects accidental or unsynchronized byte changes; it is not a provider
+signature and does not authenticate VANTA execution. Replacing a prior result
+adds its run and digest to the evidence history. Source invalidation stales the
+stored path and preserves its receipt.
+
+This import is Cartographer-side exchange handling. It neither invokes VANTA
+nor proves that VANTA admitted the package, executed a path planner, or validated
+clearance, reachability, collision, or hardware behavior.
+
+The acceptance tests cover deterministic fixture round-trip, provenance,
+tamper rejection, stale-source invalidation, schema-version fencing, project
+save/reopen, undo/redo, UI publication, revision-bound manual requirement
+authoring, revision-bound accept/reject decisions, AI-proposal rejection,
+strict requirement CSV parsing, ambiguous-topology atomic refusal,
+revision-bound verify/correct/reject actions, preserved proposal text and
+justification across source replacement and reopen,
+invalid source/topology/unit and stale-revision rejection, strict BOM CSV
+parsing, source-preserving BOM re-import, ambiguous/missing reconciliation,
+invalidated BOM evidence, requirement-kind compatibility, missing/contradictory
+access constraints, stale source/topology refusal, proposed-target authoring,
+workcell-frame revision checks, read-only X/Z path projection, sample-order
+and target-link preservation, bounded rotated keep-out envelopes, disabled
+workcell-record filtering, dense-path decimation and invalid-coordinate
+refusal, revisioned
+entity and keep-out edits,
+workcell-history migration and round-trip, journal undo/redo, explicit keep-out
+and reference-frame creation with stale revision, AI-proposal,
+missing-reason, multiline, invalid-dimension, non-normalizable rotation, and
+scaled-pose rejection, journal undo/redo, and explicit refusal to fake a CAD
+import. VANTA response coverage includes digest-bound round-trip and tamper
+rejection, refused admission and stale request and target-reference refusal,
+AI-origin mutation refusal, unverified status preservation, run supersession
+evidence, project save/reopen, and source invalidation of an imported result.
+A newly authored requirement is not
+publication-ready by itself:
+package publication still requires its linked inspection characteristics and
+all other package gates.

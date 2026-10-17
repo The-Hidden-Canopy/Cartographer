@@ -1,5 +1,6 @@
 add_library(carto_verification STATIC
     src/capability_ledger.cpp
+    src/donor_promotion.cpp
     src/evidence_report.cpp
     src/failure_injection.cpp
     src/regression_gate.cpp

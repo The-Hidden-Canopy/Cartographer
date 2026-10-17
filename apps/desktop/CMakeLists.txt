@@ -31,6 +31,7 @@ target_link_libraries(cartographer_desktop
         gdi32
         shell32
         dwmapi
+        winmm
 )
 
 target_include_directories(cartographer_desktop PRIVATE

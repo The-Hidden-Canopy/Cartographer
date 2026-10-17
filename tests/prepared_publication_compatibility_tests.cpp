@@ -95,8 +95,8 @@ void fixture_is_producer_reopenable(const std::filesystem::path& root) {
 
     const auto& catalog_reference = product(publication.envelope, "source.material-catalog");
     require(catalog_reference.kind == production::PreparedProductKind::material_catalog &&
-                catalog_reference.format_version == project::MaterialCatalog::kSchemaVersion,
-            "compatibility fixture declares the public material-catalog format");
+                catalog_reference.format_version == 1U,
+            "compatibility fixture retains its original v1 material-catalog declaration");
     const auto catalog_path = publication.revision_path / catalog_reference.relative_path;
     const auto catalog_text = read_text(catalog_path);
     require(assets::sha256(std::span<const std::uint8_t>{

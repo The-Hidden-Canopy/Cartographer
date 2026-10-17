@@ -146,6 +146,19 @@ GIT_WORKSTATION_PATH_PATTERN = (
     r"/home/[A-Za-z0-9._-]+/"
 )
 
+# These names identify the protected procedural field-growth implementation,
+# even when it is staged under an otherwise ordinary public geometry path.
+# The audit reports only the path and category; it never prints matching code.
+GIT_PROTECTED_CONTENT_PATTERN = (
+    r"PlantGrowthRecipe|PlantSpeciesSource|PlantGrowthProduct|PlantBranch|"
+    r"PlantRepresentationKind|build_plant_growth"
+)
+PROTECTED_CONTENT_PATTERN = re.compile(
+    r"\b(?:PlantGrowthRecipe|PlantSpeciesSource|PlantGrowthProduct|PlantBranch|"
+    r"PlantRepresentationKind|build_plant_growth)\b"
+)
+AUDIT_IMPLEMENTATION_PATH = "scripts/public_boundary_audit.py"
+
 MAX_TEXT_SCAN_BYTES = 4 * 1024 * 1024
 
 
@@ -428,6 +441,14 @@ def main() -> int:
             findings.append(f"current file {path}: recognizable credential pattern")
         if text is not None and has_workstation_path(text):
             findings.append(f"current file {path}: workstation path")
+        if (
+            text is not None
+            and normalize_path(path) != AUDIT_IMPLEMENTATION_PATH
+            and PROTECTED_CONTENT_PATTERN.search(text)
+        ):
+            findings.append(
+                f"current file {path}: protected field-growth geometry preview"
+            )
 
     for commit in commits:
         result = run_git(root, "grep", "-I", "-l", "-E", GIT_SECRET_PATTERN, commit, "--")
@@ -438,6 +459,19 @@ def main() -> int:
         if result.returncode == 0:
             for path in result.stdout.splitlines():
                 findings.append(f"history content {commit[:12]}:{path}: workstation path")
+        result = run_git(
+            root, "grep", "-I", "-l", "-E", GIT_PROTECTED_CONTENT_PATTERN,
+            commit, "--",
+        )
+        if result.returncode == 0:
+            for item in result.stdout.splitlines():
+                _, path = item.split(":", 1)
+                if normalize_path(path) == AUDIT_IMPLEMENTATION_PATH:
+                    continue
+                findings.append(
+                    f"history content {commit[:12]}:{path}: "
+                    "protected field-growth geometry preview"
+                )
 
     if arguments.check_ignore_policy:
         check_ignore_policy(root, findings)

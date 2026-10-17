@@ -22,6 +22,12 @@ tests, persistence coverage, diagnostics, and an honest capability entry.
 - [x] v7 project format with v1-v6 readability, five provider-neutral world primitives, deterministic nested persistence, journaled replacement, and dangling authoring-binding rejection
 - [x] v8 project format with v1-v7 readability and durable material, texture, sampler, variant, and material-region assignment authoring truth
 - [x] v9 project format with v1-v8 migration and a durable source namespace that prevents same-name projects from colliding at destination mappings
+- [x] v15 project format with v1-v14 compatibility, digest-bound engineering and CONDITION sidecars, and transactional camera/light source presentation records
+- [x] v16 project format with v1-v15 compatibility and journaled, monotonic-revision curve-path source records
+- [x] v17 project format with v1-v16 compatibility and journaled road-source semantics bound to exact curve revisions
+- [x] v20 project format with v1-v19 compatibility and monotonic curve/road source tombstones across native undo/redo
+- [x] native CONDITION road authoring for one cubic segment, revision-bound centerline/road updates, journaled command history, stale-snapshot refusal, and safe source-pair undo/redo
+- [x] fixture-backed source-authoring vertical slices for CONDITION and DV012 engineering, with project-command history, native workspace projections, and admitted package handoffs
 - [x] neutral preparation v1 with saved profiles, explicit asset/selection/assembly/scene scope, scoped material and texture closure, deterministic envelopes, cancellation, atomic compare-and-swap publication, CLI/desktop routing, and last-valid recovery
 - [x] OBJ import/export with explicit feature-loss warnings
 - [x] bounded ASCII PLY and binary/ASCII STL interchange with explicit feature-loss warnings

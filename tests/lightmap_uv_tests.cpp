@@ -33,7 +33,7 @@ public:
     TempDirectory() {
         static std::atomic<std::uint64_t> sequence{0U};
         const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-        path_ = std::filesystem::temp_directory_path() /
+        path_ = std::filesystem::current_path() /
             ("cartographer-lightmap-uv-tests-" + std::to_string(stamp) + "-" +
                 std::to_string(sequence.fetch_add(1U)));
         std::filesystem::create_directories(path_);
@@ -145,6 +145,27 @@ void generated_uv_is_deterministic_unique_and_transactional() {
     REQUIRE(first.value().validate(source));
     REQUIRE(first.value().texels_per_unit > 0.0);
 
+    const auto source_revision = source.revision();
+    const auto source_uv_set_count = source.uv_sets().descriptors().size();
+    const auto candidate_mesh = production::with_unique_lightmap_uv(source, first.value());
+    REQUIRE(candidate_mesh);
+    REQUIRE(source.revision() == source_revision);
+    REQUIRE(source.uv_sets().descriptors().size() == source_uv_set_count);
+    REQUIRE(source.uv_sets().find(8U) == nullptr);
+    REQUIRE(candidate_mesh.value().uv_sets().find(8U) != nullptr);
+    REQUIRE(candidate_mesh.value().uv_sets().find(7U)->active_for_render);
+    REQUIRE(candidate_mesh.value().attributes().find("uv.lightmap.generated") != nullptr);
+
+    auto colliding_layer_artifact = first.value();
+    colliding_layer_artifact.recipe.output_layer_id = "uv0.corners";
+    REQUIRE(colliding_layer_artifact.refresh_digests());
+    REQUIRE(colliding_layer_artifact.validate(source));
+    const auto rejected_layer_collision = production::with_unique_lightmap_uv(
+        source, colliding_layer_artifact);
+    REQUIRE(!rejected_layer_collision);
+    REQUIRE(rejected_layer_collision.error().code == core::ErrorCode::validation_failed);
+    REQUIRE(source.revision() == source_revision);
+
     const auto tampered = [&] {
         auto value = first.value();
         value.corners.front().uv.x = std::min(1.0, value.corners.front().uv.x + 0.01);
@@ -198,7 +219,7 @@ void generated_uv_is_deterministic_unique_and_transactional() {
     REQUIRE(journal_entries.value().back().event_type == operation);
 
     const auto saved = document.save_atomic(directory.path() / "lightmap.carto");
-    REQUIRE(saved);
+    if (!saved) throw std::runtime_error("lightmap save failed: " + saved.error().message);
     const auto reopened = project::ProjectDocument::load(directory.path() / "lightmap.carto");
     REQUIRE(reopened);
     const auto reopened_mesh = reopened.value().meshes().find(mesh_asset);
@@ -304,7 +325,7 @@ void udim_tiles_are_deterministic_bounded_and_persisted() {
     REQUIRE(transaction.value().commit(operation));
 
     const auto saved = document.save_atomic(directory.path() / "udim.carto");
-    REQUIRE(saved);
+    if (!saved) throw std::runtime_error("UDIM save failed: " + saved.error().message);
     const auto reopened = project::ProjectDocument::load(directory.path() / "udim.carto");
     REQUIRE(reopened);
     const auto reopened_mesh = reopened.value().meshes().find(mesh_asset);

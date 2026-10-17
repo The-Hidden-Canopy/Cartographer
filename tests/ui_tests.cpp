@@ -1,13 +1,17 @@
 #include <carto/ui/ui.hpp>
 #include <carto/journal/journal.hpp>
+#include <carto/attributes/set.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <span>
+#include <string_view>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -41,7 +45,7 @@ class TempDirectory final {
 public:
     TempDirectory() {
         const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-        path_ = std::filesystem::temp_directory_path() /
+        path_ = std::filesystem::current_path() /
             ("cartographer-ui-tests-" + std::to_string(stamp));
         std::filesystem::create_directories(path_);
     }
@@ -117,6 +121,40 @@ void ui_routes_authoritative_actions_and_operation_lineage() {
     REQUIRE(ui.snapshot().operations.back().action == "Invoke Tool: mesh.set-vertex-position");
 }
 
+void ui_routes_spatial_fields_through_the_human_command_boundary() {
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    const carto::application::CreateSpatialFieldAction create{
+        "field.ui.moisture", carto::spatial_field::FieldSemantic::moisture,
+        {0.0, 0.0}, 1.0, 4U, 4U, 0.0, 1.0, 0.0};
+    REQUIRE(!ui.submit_ai_proposal(create));
+    REQUIRE(session.snapshot().spatial_fields.empty());
+    REQUIRE(ui.dispatch(create));
+    auto snapshot = ui.snapshot();
+    REQUIRE(snapshot.spatial_fields.size() == 1U);
+    REQUIRE(snapshot.spatial_fields.front().semantic ==
+        carto::spatial_field::FieldSemantic::moisture);
+    REQUIRE(snapshot.operations.back().category ==
+        carto::ui::OperationCategory::committed_command);
+    REQUIRE(snapshot.operations.back().action == "Create Spatial Field");
+
+    carto::spatial_field::FieldBrush brush;
+    brush.expected_revision = snapshot.spatial_fields.front().source_revision;
+    brush.center_uv = {1.5, 1.5};
+    brush.radius = 2.0;
+    brush.value = 0.6;
+    brush.strength = 1.0;
+    REQUIRE(ui.dispatch(carto::application::PaintSpatialFieldAction{
+        "field.ui.moisture", brush}));
+    snapshot = ui.snapshot();
+    const auto painted_revision = snapshot.spatial_fields.front().source_revision;
+    if (painted_revision != carto::core::Revision{2U}) {
+        throw TestFailure("spatial field paint expected source revision 2, found " +
+            std::to_string(painted_revision.value()));
+    }
+    REQUIRE(snapshot.operations.back().action == "Paint Spatial Field");
+}
+
 void ui_distinguishes_unsaved_from_saved_state() {
     TempDirectory temp;
     carto::application::ApplicationSession session;
@@ -180,6 +218,203 @@ void ui_rejects_unadmitted_ai_proposals() {
         "Human Box", {1.0, 1.0, 1.0}}));
     REQUIRE(session.snapshot().objects.size() == 1U);
     REQUIRE(ui.snapshot().operations.size() == 1U);
+}
+
+void ui_rejects_raw_ai_material_mutations_but_admits_human_material_authoring() {
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    const auto before = ui.snapshot();
+    carto::render::StandardMaterial definition;
+    const auto rejected = ui.submit_ai_proposal(
+        carto::application::CreateMaterialAction{
+            before.project_revision, "AI material", definition});
+    REQUIRE(!rejected);
+    REQUIRE(session.snapshot().project_revision == before.project_revision);
+    REQUIRE(session.snapshot().materials.empty());
+
+    const auto created = ui.dispatch(carto::application::CreateMaterialAction{
+        before.project_revision, "Human material", definition});
+    REQUIRE(created);
+    const auto after = ui.snapshot();
+    REQUIRE(after.materials.size() == 1U);
+    REQUIRE(after.materials.front().name == "Human material");
+    REQUIRE(after.operations.size() == 1U);
+    REQUIRE(after.operations.back().action == "Create Material");
+    REQUIRE(after.operations.back().revision_after > after.operations.back().revision_before);
+
+    auto edited = after.materials.front().definition;
+    edited.roughness = 0.37;
+    const auto updated = ui.dispatch(carto::application::UpdateMaterialAction{
+        after.project_revision, after.materials.front().id,
+        after.materials.front().revision, edited});
+    REQUIRE(updated);
+    const auto after_update = ui.snapshot();
+    REQUIRE(after_update.materials.front().definition.roughness == 0.37);
+    REQUIRE(after_update.operations.size() == 2U);
+    REQUIRE(after_update.operations.back().action == "Update Material");
+
+    auto mesh = carto::geometry::make_box({1.0, 1.0, 1.0});
+    REQUIRE(mesh);
+    const auto faces = mesh.value().faces_sorted();
+    carto::attributes::AttributeSet attributes({
+        {carto::attributes::AttributeDomain::face, faces.size()}});
+    std::vector<carto::attributes::AttributeValue> regions(
+        faces.size(), std::uint32_t{3U});
+    REQUIRE(attributes.add_layer(carto::attributes::AttributeLayer{
+        {"cartographer.material_slot", carto::attributes::AttributeDomain::face,
+         carto::attributes::AttributeType::uint32}, std::move(regions)}));
+    REQUIRE(mesh.value().set_attribute_payload(std::move(attributes), {}));
+    REQUIRE(ui.dispatch(carto::application::CreateMeshObjectAction{
+        "Material target", std::move(mesh.value())}));
+    const auto target = ui.snapshot();
+    const auto mesh_asset = target.objects.front().object.mesh_asset;
+    REQUIRE(mesh_asset.has_value());
+    const carto::project::MaterialRegionKey region{*mesh_asset, 3U};
+
+    const auto ai_assignment = ui.submit_ai_proposal(
+        carto::application::SetMaterialRegionAssignmentAction{
+            target.project_revision, region, after_update.materials.front().id,
+            std::nullopt});
+    REQUIRE(!ai_assignment);
+    REQUIRE(ui.snapshot().material_assignments.empty());
+    const auto human_assignment = ui.dispatch(
+        carto::application::SetMaterialRegionAssignmentAction{
+            target.project_revision, region, after_update.materials.front().id,
+            std::nullopt});
+    REQUIRE(human_assignment);
+    const auto assigned = ui.snapshot();
+    REQUIRE(assigned.material_assignments.size() == 1U);
+    REQUIRE(assigned.material_assignments.front().key == region);
+    REQUIRE(assigned.operations.back().action == "Set Material Region Assignment");
+
+    carto::project::MaterialGraph graph;
+    graph.identity = "materials/ui/galvanized-steel";
+    graph.revision = carto::core::Revision{1U};
+    carto::project::MaterialGraphNode color;
+    color.id = 1U;
+    color.kind = carto::project::MaterialGraphNodeKind::constant_color;
+    color.value_type = carto::project::MaterialGraphValueType::color;
+    color.constants = {0.4, 0.42, 0.44, 1.0};
+    carto::project::MaterialGraphNode alpha;
+    alpha.id = 2U;
+    alpha.kind = carto::project::MaterialGraphNodeKind::constant_scalar;
+    alpha.value_type = carto::project::MaterialGraphValueType::scalar;
+    alpha.constants[0] = 1.0;
+    carto::project::MaterialGraphNode roughness;
+    roughness.id = 3U;
+    roughness.kind = carto::project::MaterialGraphNodeKind::constant_scalar;
+    roughness.value_type = carto::project::MaterialGraphValueType::scalar;
+    roughness.constants[0] = 0.6;
+    carto::project::MaterialGraphNode metallic;
+    metallic.id = 4U;
+    metallic.kind = carto::project::MaterialGraphNodeKind::constant_scalar;
+    metallic.value_type = carto::project::MaterialGraphValueType::scalar;
+    metallic.constants[0] = 0.85;
+    graph.nodes = {color, alpha, roughness, metallic};
+    graph.outputs.base_color = color.id;
+    graph.outputs.alpha = alpha.id;
+    graph.outputs.roughness = roughness.id;
+    graph.outputs.metallic = metallic.id;
+    const auto ai_graph = ui.submit_ai_proposal(
+        carto::application::SetMaterialGraphAction{
+            assigned.project_revision, std::nullopt, std::nullopt, graph});
+    REQUIRE(!ai_graph);
+    REQUIRE(ui.snapshot().material_graphs.empty());
+    const auto created_graph = ui.dispatch(carto::application::SetMaterialGraphAction{
+        assigned.project_revision, std::nullopt, std::nullopt, graph});
+    REQUIRE(created_graph);
+    auto graph_snapshot = ui.snapshot();
+    REQUIRE(graph_snapshot.material_graphs.size() == 1U);
+    REQUIRE(graph_snapshot.material_graphs.front().identity == graph.identity);
+    REQUIRE(graph_snapshot.material_graphs.front().node_count == 4U);
+    REQUIRE(graph_snapshot.operations.back().action == "Set Material Graph");
+    auto editable_graph = ui.material_graph_source(graph.identity);
+    REQUIRE(editable_graph);
+    const auto graph_digest = editable_graph.value().canonical_digest();
+    REQUIRE(graph_digest);
+    auto changed_graph = editable_graph.value();
+    changed_graph.nodes.front().constants[0] = 0.55;
+    changed_graph.revision = changed_graph.revision.next();
+    REQUIRE(ui.dispatch(carto::application::SetMaterialGraphAction{
+        graph_snapshot.project_revision, editable_graph.value().revision,
+        graph_digest.value(), changed_graph}));
+    graph_snapshot = ui.snapshot();
+    REQUIRE(graph_snapshot.material_graphs.front().source_revision ==
+        carto::core::Revision{2U});
+    REQUIRE(graph_snapshot.operations.back().action == "Set Material Graph");
+    editable_graph = ui.material_graph_source(graph.identity);
+    REQUIRE(editable_graph && editable_graph.value().nodes.front().constants[0] == 0.55);
+
+    const auto topology_digest = editable_graph.value().canonical_digest();
+    REQUIRE(topology_digest);
+    auto topology = editable_graph.value();
+    carto::project::MaterialGraphNode color_add;
+    color_add.id = 5U;
+    color_add.kind = carto::project::MaterialGraphNodeKind::add;
+    color_add.value_type = carto::project::MaterialGraphValueType::color;
+    color_add.inputs = {1U, 1U};
+    topology.nodes.push_back(color_add);
+    topology.outputs.base_color = color_add.id;
+    topology.revision = topology.revision.next();
+    REQUIRE(ui.dispatch(carto::application::SetMaterialGraphAction{
+        graph_snapshot.project_revision, editable_graph.value().revision,
+        topology_digest.value(), topology}));
+    graph_snapshot = ui.snapshot();
+    REQUIRE(graph_snapshot.material_graphs.front().source_revision ==
+        carto::core::Revision{3U});
+    REQUIRE(graph_snapshot.material_graphs.front().node_count == 5U);
+    editable_graph = ui.material_graph_source(graph.identity);
+    REQUIRE(editable_graph && editable_graph.value().outputs.base_color == color_add.id);
+    REQUIRE(graph_snapshot.operations.back().action == "Set Material Graph");
+
+    const auto binding_digest = editable_graph.value().canonical_digest();
+    REQUIRE(binding_digest && !graph_snapshot.materials.empty());
+    const carto::application::SetMaterialGraphBindingAction graph_binding{
+        graph_snapshot.project_revision, graph_snapshot.materials.front().id,
+        graph_snapshot.materials.front().revision, graph.identity,
+        editable_graph.value().revision, binding_digest.value()};
+    REQUIRE(!ui.submit_ai_proposal(graph_binding));
+    REQUIRE(ui.snapshot().material_graph_bindings.empty());
+    REQUIRE(ui.dispatch(graph_binding));
+    graph_snapshot = ui.snapshot();
+    REQUIRE(graph_snapshot.material_graph_bindings.size() == 1U);
+    REQUIRE(graph_snapshot.material_graph_bindings.front().source_current);
+    REQUIRE(graph_snapshot.material_graph_bindings.front().graph_identity == graph.identity);
+    REQUIRE(graph_snapshot.operations.back().action == "Bind Material Graph");
+
+    editable_graph = ui.material_graph_source(graph.identity);
+    REQUIRE(editable_graph);
+    const auto before_detached_add_digest = editable_graph.value().canonical_digest();
+    REQUIRE(before_detached_add_digest);
+    auto with_detached_node = editable_graph.value();
+    carto::project::MaterialGraphNode detached_node;
+    detached_node.id = 6U;
+    detached_node.kind = carto::project::MaterialGraphNodeKind::constant_scalar;
+    detached_node.value_type = carto::project::MaterialGraphValueType::scalar;
+    detached_node.constants[0] = 0.3;
+    with_detached_node.nodes.push_back(detached_node);
+    with_detached_node.revision = with_detached_node.revision.next();
+    REQUIRE(ui.dispatch(carto::application::SetMaterialGraphAction{
+        graph_snapshot.project_revision, editable_graph.value().revision,
+        before_detached_add_digest.value(), with_detached_node}));
+    graph_snapshot = ui.snapshot();
+    editable_graph = ui.material_graph_source(graph.identity);
+    REQUIRE(editable_graph && !graph_snapshot.material_graph_bindings.front().source_current);
+    const auto before_delete_digest = editable_graph.value().canonical_digest();
+    REQUIRE(before_delete_digest);
+    auto deleted_node_graph = editable_graph.value();
+    deleted_node_graph.nodes.erase(std::remove_if(
+        deleted_node_graph.nodes.begin(), deleted_node_graph.nodes.end(),
+        [detached_node](const auto& node) { return node.id == detached_node.id; }),
+        deleted_node_graph.nodes.end());
+    deleted_node_graph.retired_node_ids.push_back(detached_node.id);
+    deleted_node_graph.revision = deleted_node_graph.revision.next();
+    REQUIRE(ui.dispatch(carto::application::SetMaterialGraphAction{
+        graph_snapshot.project_revision, editable_graph.value().revision,
+        before_delete_digest.value(), deleted_node_graph}));
+    editable_graph = ui.material_graph_source(graph.identity);
+    REQUIRE(editable_graph && editable_graph.value().retired_node_ids ==
+        std::vector<std::uint64_t>{detached_node.id});
 }
 
 void ui_routes_edge_selection_without_authoring_mutation() {
@@ -331,6 +566,14 @@ void workbench_preferences_round_trip_and_fail_closed() {
     scene.y = 156;
     scene.width = 286;
     scene.height = 330;
+    auto& surface_pane = preferences.panes.at(static_cast<std::size_t>(
+        carto::ui::WorkbenchPane::work_surface));
+    surface_pane.visible = true;
+    surface_pane.positioned = true;
+    surface_pane.x = 248;
+    surface_pane.y = 192;
+    surface_pane.width = 1140;
+    surface_pane.height = 486;
     REQUIRE(carto::ui::save_workbench_preferences(path, preferences));
 
     const auto loaded = carto::ui::load_workbench_preferences(path);
@@ -344,6 +587,12 @@ void workbench_preferences_round_trip_and_fail_closed() {
         carto::ui::WorkbenchInstrument::scene)).x == 142);
     REQUIRE(loaded.value().instruments.at(static_cast<std::size_t>(
         carto::ui::WorkbenchInstrument::scene)).width == 286);
+    REQUIRE(loaded.value().panes.at(static_cast<std::size_t>(
+        carto::ui::WorkbenchPane::work_surface)).visible);
+    REQUIRE(loaded.value().panes.at(static_cast<std::size_t>(
+        carto::ui::WorkbenchPane::work_surface)).x == 248);
+    REQUIRE(loaded.value().panes.at(static_cast<std::size_t>(
+        carto::ui::WorkbenchPane::work_surface)).height == 486);
 
     const std::string before_failed_save = [&path] {
         std::ifstream stream(path, std::ios::binary);
@@ -366,6 +615,15 @@ void workbench_preferences_round_trip_and_fail_closed() {
         std::istreambuf_iterator<char>(after_invalid_memory_stream), {});
     REQUIRE(after_invalid_memory == before_failed_save);
 
+    auto invalid_pane = preferences;
+    invalid_pane.panes.at(static_cast<std::size_t>(
+        carto::ui::WorkbenchPane::work_surface)).height = 20;
+    REQUIRE(!carto::ui::save_workbench_preferences(path, invalid_pane));
+    std::ifstream after_invalid_pane_stream(path, std::ios::binary);
+    const std::string after_invalid_pane(
+        std::istreambuf_iterator<char>(after_invalid_pane_stream), {});
+    REQUIRE(after_invalid_pane == before_failed_save);
+
     {
         std::ofstream legacy(path, std::ios::binary | std::ios::trunc);
         legacy << "header=CARTOGRAPHER_WORKBENCH_PREFS_V1\n"
@@ -382,6 +640,25 @@ void workbench_preferences_round_trip_and_fail_closed() {
     REQUIRE(std::all_of(legacy_loaded.value().flow_use_counts.begin(),
                         legacy_loaded.value().flow_use_counts.end(),
                         [](std::uint32_t uses) { return uses == 0U; }));
+
+    {
+        std::ofstream previous(path, std::ios::binary | std::ios::trunc);
+        previous << "header=CARTOGRAPHER_WORKBENCH_PREFS_V2\n"
+                    "ledger_collapsed=0\n"
+                    "workflow_last_flow=-1\n"
+                    "workflow_flow_counts=0,0,0,0\n";
+        for (std::size_t index = 0U; index < carto::ui::kWorkbenchInstrumentCount; ++index) {
+            const auto instrument = static_cast<carto::ui::WorkbenchInstrument>(index);
+            previous << carto::ui::workbench_instrument_name(instrument)
+                     << "=0,0,0,0,0,0\n";
+        }
+    }
+    const auto previous_loaded = carto::ui::load_workbench_preferences(path);
+    REQUIRE(previous_loaded);
+    REQUIRE(previous_loaded.value().panes.at(static_cast<std::size_t>(
+        carto::ui::WorkbenchPane::navigation)).visible);
+    REQUIRE(previous_loaded.value().panes.at(static_cast<std::size_t>(
+        carto::ui::WorkbenchPane::work_surface)).visible);
 
     {
         std::ofstream corrupt(path, std::ios::binary | std::ios::trunc);
@@ -434,7 +711,7 @@ void ui_connects_surface_fidelity_preview_without_authoring_mutation() {
 
     REQUIRE(ui.dispatch(carto::application::SetObjectTransformAction{
         object, carto::core::Transform{{1.0, 0.0, 0.0}, carto::core::Quaternion::identity(),
-                                       {1.0, 1.0, 1.0}}}));
+                                       {1.0, 1.0, 1.0}}, std::nullopt}));
     preview = ui.snapshot().surface_fidelity;
     REQUIRE(preview.status == carto::ui::SurfaceFidelityStatus::stale);
     REQUIRE(!preview.admitted);
@@ -493,13 +770,44 @@ void ui_imports_mesh_through_provider_and_authoring_boundaries() {
     REQUIRE(ui.dispatch(carto::application::SaveProjectAction{project_path}));
     const auto revision_before = ui.snapshot().project_revision;
 
+    auto unbacked_mesh = carto::geometry::make_box({1.0, 1.0, 1.0});
+    REQUIRE(unbacked_mesh);
+    const std::string missing_source_bytes = "missing source snapshot";
+    carto::assets::SourceImportRecord unbacked_record;
+    unbacked_record.identity = "mesh.source.unbacked";
+    unbacked_record.relative_source_path =
+        ".carto-assets/source-blobs/sha256/missing-source";
+    unbacked_record.source_generation = carto::core::Revision{1U};
+    unbacked_record.kind = carto::assets::SourceAssetKind::mesh;
+    unbacked_record.source_digest = carto::assets::sha256(
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(missing_source_bytes.data()),
+            missing_source_bytes.size()));
+    unbacked_record.importer_identity = "carto.import.obj";
+    unbacked_record.artifact_identity = "pending.mesh";
+    unbacked_record.artifact_digest =
+        carto::application::canonical_mesh_geometry_digest(unbacked_mesh.value());
+    unbacked_record.domain_digests = {{
+        carto::assets::SourceAssetDomain::geometry, unbacked_record.artifact_digest}};
+    const auto fabricated_source = ui.dispatch(
+        carto::application::CreateMeshObjectAction{
+            "Unbacked", std::move(unbacked_mesh.value()), unbacked_record});
+    REQUIRE(!fabricated_source);
+    REQUIRE(ui.snapshot().project_revision == revision_before);
+    REQUIRE(ui.snapshot().objects.empty());
+    REQUIRE(ui.snapshot().source_assets.empty());
+
     const auto imported = ui.import_mesh(obj_path, carto::ui::MeshImportFormat::obj);
     REQUIRE(imported);
     REQUIRE(imported.value().object_name == "triangle");
     REQUIRE(imported.value().vertices == 3U);
     REQUIRE(imported.value().faces == 1U);
     REQUIRE(imported.value().triangles == 1U);
-    REQUIRE(imported.value().dispatch.action == "Create Mesh Object");
+    REQUIRE(imported.value().source_linked);
+    REQUIRE(!imported.value().source_identity.empty());
+    REQUIRE(imported.value().relative_source_path.starts_with(
+        ".carto-assets/source-blobs/sha256/"));
+    REQUIRE(imported.value().dispatch.action == "Import Source Mesh");
     REQUIRE(imported.value().dispatch.document_changed);
     REQUIRE(imported.value().dispatch.source == carto::application::OperationSource::human);
 
@@ -510,8 +818,15 @@ void ui_imports_mesh_through_provider_and_authoring_boundaries() {
     REQUIRE(snapshot.objects.front().object.name == "triangle");
     REQUIRE(snapshot.objects.front().object.mesh_asset.has_value());
     REQUIRE(snapshot.viewport.scene.instances().size() == 1U);
+    REQUIRE(snapshot.source_assets.size() == 1U);
+    REQUIRE(snapshot.source_assets.front().identity == imported.value().source_identity);
+    REQUIRE(snapshot.source_assets.front().source_generation == carto::core::Revision{1U});
+    REQUIRE(snapshot.source_assets.front().artifact_identity ==
+        "mesh.asset." + std::to_string(*snapshot.objects.front().object.mesh_asset));
+    REQUIRE(snapshot.source_assets.front().relative_source_path ==
+        imported.value().relative_source_path);
     REQUIRE(!snapshot.operations.empty());
-    REQUIRE(snapshot.operations.back().action == "Create Mesh Object");
+    REQUIRE(snapshot.operations.back().action == "Import Source Mesh");
 
     const auto recovery = carto::application::ApplicationSession::inspect_recovery(project_path);
     REQUIRE(recovery);
@@ -526,7 +841,21 @@ void ui_imports_mesh_through_provider_and_authoring_boundaries() {
     const std::string journal_payload(
         journal_entries.value().back().payload.begin(),
         journal_entries.value().back().payload.end());
-    REQUIRE(journal_payload.find("operation=Create Mesh Object") != std::string::npos);
+    REQUIRE(journal_payload.find("operation=Import Source Mesh") != std::string::npos);
+
+    REQUIRE(ui.dispatch(carto::application::SaveProjectAction{}));
+    const auto serialized_project = carto::project::ProjectDocument::load(project_path);
+    REQUIRE(serialized_project);
+    REQUIRE(serialized_project.value().source_asset_registry().records().size() == 1U);
+    REQUIRE(serialized_project.value().serialize().find(obj_path.string()) == std::string::npos);
+
+    const auto unchanged_revision = ui.snapshot().project_revision;
+    const auto unchanged_import = ui.import_mesh(obj_path, carto::ui::MeshImportFormat::obj);
+    REQUIRE(unchanged_import);
+    REQUIRE(unchanged_import.value().source_linked);
+    REQUIRE(!unchanged_import.value().dispatch.document_changed);
+    REQUIRE(ui.snapshot().project_revision == unchanged_revision);
+    REQUIRE(ui.snapshot().objects.size() == 1U);
 
     const auto imported_ply = ui.import_mesh(ply_path, carto::ui::MeshImportFormat::ply);
     REQUIRE(imported_ply);
@@ -539,9 +868,30 @@ void ui_imports_mesh_through_provider_and_authoring_boundaries() {
     REQUIRE(imported_stl.value().faces == 1U);
     REQUIRE(imported_stl.value().triangles == 1U);
     REQUIRE(ui.snapshot().objects.size() == 3U);
+    REQUIRE(ui.snapshot().source_assets.size() == 3U);
 
+    const auto broken_obj_path = temp.path() / "broken.obj";
+    {
+        std::ofstream broken(broken_obj_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(broken));
+        broken << "not an OBJ vertex";
+    }
+    const std::string broken_bytes = "not an OBJ vertex";
+    const auto broken_digest = carto::assets::sha256(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(broken_bytes.data()), broken_bytes.size()));
+    carto::assets::BlobStore source_store(
+        project_path.parent_path() / ".carto-assets" / "source-blobs");
     const auto stable_revision = ui.snapshot().project_revision;
     const auto stable_operations = ui.snapshot().operations.size();
+    const auto bad_mesh = ui.import_mesh(
+        broken_obj_path, carto::ui::MeshImportFormat::obj);
+    REQUIRE(!bad_mesh);
+    REQUIRE(!std::filesystem::exists(source_store.path_for(broken_digest)));
+    REQUIRE(std::filesystem::is_empty(
+        project_path.parent_path() / ".carto-assets" / "import-staging"));
+    REQUIRE(ui.snapshot().project_revision == stable_revision);
+    REQUIRE(ui.snapshot().objects.size() == 3U);
+
     const auto missing = ui.import_mesh(
         temp.path() / "missing.obj", carto::ui::MeshImportFormat::obj);
     REQUIRE(!missing);
@@ -558,6 +908,186 @@ void ui_imports_mesh_through_provider_and_authoring_boundaries() {
 
     REQUIRE(ui.handle_shortcut(carto::ui::Shortcut::save));
     REQUIRE(!ui.snapshot().dirty);
+}
+
+void ui_source_mesh_reimport_updates_in_place_and_keeps_monotonic_undo_lineage() {
+    TempDirectory temp;
+    const auto project_path = temp.path() / "source-reimport.carto";
+    const auto source_path = temp.path() / "editable.obj";
+    const auto write_triangle = [&source_path](double z) {
+        std::ofstream source(source_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(source));
+        source << "v 0 0 0\nv 1 0 0\nv 0 1 " << z << "\nf 1 2 3\n";
+    };
+    write_triangle(0.0);
+
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.dispatch(carto::application::SaveProjectAction{project_path}));
+    const auto first = ui.import_mesh(source_path, carto::ui::MeshImportFormat::obj);
+    REQUIRE(first && first.value().source_linked);
+    REQUIRE(ui.snapshot().objects.size() == 1U);
+    const auto original_mesh_asset = ui.snapshot().objects.front().object.mesh_asset;
+    REQUIRE(original_mesh_asset.has_value());
+    const auto first_source = ui.snapshot().source_assets.front();
+    REQUIRE(first_source.source_generation == carto::core::Revision{1U});
+
+    REQUIRE(ui.handle_shortcut(carto::ui::Shortcut::undo));
+    REQUIRE(ui.snapshot().objects.empty());
+    REQUIRE(ui.snapshot().source_assets.empty());
+    REQUIRE(ui.snapshot().source_asset_tombstone_count == 1U);
+    REQUIRE(ui.handle_shortcut(carto::ui::Shortcut::redo));
+    REQUIRE(ui.snapshot().objects.size() == 1U);
+    REQUIRE(ui.snapshot().objects.front().object.mesh_asset == original_mesh_asset);
+    const auto original_source = ui.snapshot().source_assets.front();
+    REQUIRE(original_source.source_generation == carto::core::Revision{2U});
+    REQUIRE(original_source.source_digest == first_source.source_digest);
+
+    write_triangle(1.0);
+    const auto changed = ui.import_mesh(source_path, carto::ui::MeshImportFormat::obj);
+    REQUIRE(changed && changed.value().dispatch.document_changed);
+    REQUIRE(changed.value().source_identity == first.value().source_identity);
+    REQUIRE(ui.snapshot().objects.size() == 1U);
+    REQUIRE(ui.snapshot().objects.front().object.mesh_asset == original_mesh_asset);
+    const auto changed_source = ui.snapshot().source_assets.front();
+    REQUIRE(changed_source.source_generation == carto::core::Revision{3U});
+    REQUIRE(changed_source.source_digest != original_source.source_digest);
+    REQUIRE(changed_source.artifact_digest != original_source.artifact_digest);
+    const auto changed_revision = ui.snapshot().project_revision;
+
+    REQUIRE(ui.handle_shortcut(carto::ui::Shortcut::undo));
+    REQUIRE(ui.snapshot().project_revision > changed_revision);
+    REQUIRE(ui.snapshot().objects.size() == 1U);
+    REQUIRE(ui.snapshot().objects.front().object.mesh_asset == original_mesh_asset);
+    const auto undone_source = ui.snapshot().source_assets.front();
+    REQUIRE(undone_source.source_generation == carto::core::Revision{4U});
+    REQUIRE(undone_source.source_digest == original_source.source_digest);
+    REQUIRE(undone_source.artifact_digest == original_source.artifact_digest);
+
+    REQUIRE(ui.handle_shortcut(carto::ui::Shortcut::redo));
+    const auto redone_source = ui.snapshot().source_assets.front();
+    REQUIRE(redone_source.source_generation == carto::core::Revision{5U});
+    REQUIRE(redone_source.source_digest == changed_source.source_digest);
+    REQUIRE(redone_source.artifact_digest == changed_source.artifact_digest);
+    REQUIRE(ui.snapshot().objects.size() == 1U);
+    REQUIRE(ui.snapshot().objects.front().object.mesh_asset == original_mesh_asset);
+}
+
+void ui_unsaved_mesh_import_remains_available_but_is_explicitly_unlinked() {
+    TempDirectory temp;
+    const auto source_path = temp.path() / "triangle.obj";
+    {
+        std::ofstream source(source_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(source));
+        source << "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+    }
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    const auto imported = ui.import_mesh(source_path, carto::ui::MeshImportFormat::obj);
+    REQUIRE(imported);
+    REQUIRE(!imported.value().source_linked);
+    REQUIRE(imported.value().source_identity.empty());
+    REQUIRE(std::any_of(imported.value().warnings.begin(), imported.value().warnings.end(),
+        [](const std::string& warning) {
+            return warning.find("save the project and import again") != std::string::npos;
+        }));
+    REQUIRE(ui.snapshot().objects.size() == 1U);
+    REQUIRE(ui.snapshot().source_assets.empty());
+}
+
+void ui_rejects_tampered_source_blob_without_fallback_or_project_mutation() {
+    TempDirectory temp;
+    const auto project_path = temp.path() / "tamper-check.carto";
+    const auto source_path = temp.path() / "triangle.obj";
+    {
+        std::ofstream source(source_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(source));
+        source << "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+    }
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.dispatch(carto::application::SaveProjectAction{project_path}));
+    const auto imported = ui.import_mesh(source_path, carto::ui::MeshImportFormat::obj);
+    REQUIRE(imported && imported.value().source_linked);
+    const auto source_view = ui.snapshot().source_assets.front();
+    const auto blob_path = project_path.parent_path() / source_view.relative_source_path;
+    {
+        std::ofstream corrupt(blob_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(corrupt));
+        corrupt << "tampered bytes";
+    }
+    const auto revision_before = ui.snapshot().project_revision;
+    const auto objects_before = ui.snapshot().objects.size();
+    const auto reimport = ui.import_mesh(source_path, carto::ui::MeshImportFormat::obj);
+    REQUIRE(!reimport);
+    REQUIRE(reimport.error().code == carto::core::ErrorCode::validation_failed);
+    REQUIRE(ui.snapshot().project_revision == revision_before);
+    REQUIRE(ui.snapshot().objects.size() == objects_before);
+    REQUIRE(ui.snapshot().source_assets.front().source_digest == source_view.source_digest);
+    REQUIRE(std::filesystem::is_empty(
+        project_path.parent_path() / ".carto-assets" / "import-staging"));
+}
+
+void ui_routes_source_reimport_review_and_keeps_ai_out_of_mutation_path() {
+    const auto digest = [](std::string_view value) {
+        return carto::assets::sha256(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
+    };
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    carto::assets::SourceImportRecord source;
+    source.identity = "asset.fixture";
+    source.relative_source_path = "Assets/fixture.obj";
+    source.source_generation = carto::core::Revision{1U};
+    source.kind = carto::assets::SourceAssetKind::mesh;
+    source.source_digest = digest("source-1");
+    source.importer_identity = "carto.import.obj";
+    source.importer_version = 1U;
+    source.artifact_identity = "mesh.fixture";
+    source.artifact_digest = digest("geometry-1");
+    source.domain_digests = {{
+        carto::assets::SourceAssetDomain::geometry, digest("geometry-1")}};
+
+    const auto plan = ui.preview_source_reimport({source});
+    REQUIRE(plan && plan.value().entries.size() == 1U);
+    const auto imported = ui.apply_source_reimport_plan(plan.value());
+    REQUIRE(imported && imported.value().document_changed);
+    REQUIRE(ui.snapshot().source_assets.size() == 1U);
+
+    auto changed = source;
+    changed.source_generation = carto::core::Revision{2U};
+    changed.source_digest = digest("source-2");
+    changed.artifact_digest = digest("geometry-2");
+    changed.domain_digests.front().digest = digest("geometry-2");
+    const auto update_plan = ui.preview_source_reimport({changed});
+    REQUIRE(update_plan && update_plan.value().entries.front().change ==
+        carto::assets::SourceReimportChange::geometry_changed);
+    const auto raw_ai = ui.submit_ai_proposal(
+        carto::application::ApplySourceReimportPlanAction{update_plan.value()});
+    REQUIRE(!raw_ai && raw_ai.error().code == carto::core::ErrorCode::invalid_state);
+    REQUIRE(ui.snapshot().source_assets.front().source_generation ==
+        carto::core::Revision{1U});
+
+    auto proposed_mesh = carto::geometry::make_box({1.0, 1.0, 1.0});
+    REQUIRE(proposed_mesh);
+    carto::assets::SourceImportRecord proposed_source;
+    proposed_source.identity = "asset.ai_attempt";
+    proposed_source.relative_source_path = ".carto-assets/source-blobs/sha256/ai";
+    proposed_source.source_generation = carto::core::Revision{1U};
+    proposed_source.kind = carto::assets::SourceAssetKind::mesh;
+    proposed_source.source_digest = digest("ai-source");
+    proposed_source.importer_identity = "carto.import.obj";
+    proposed_source.artifact_identity = "pending.mesh";
+    proposed_source.artifact_digest =
+        carto::application::canonical_mesh_geometry_digest(proposed_mesh.value());
+    proposed_source.domain_digests = {{
+        carto::assets::SourceAssetDomain::geometry, proposed_source.artifact_digest}};
+    const auto raw_ai_mesh = ui.submit_ai_proposal(
+        carto::application::CreateMeshObjectAction{
+            "AI Source Mesh", std::move(proposed_mesh.value()), proposed_source});
+    REQUIRE(!raw_ai_mesh && raw_ai_mesh.error().code == carto::core::ErrorCode::invalid_state);
+    REQUIRE(ui.snapshot().source_assets.size() == 1U);
+    REQUIRE(ui.snapshot().objects.empty());
 }
 
 void ui_connects_local_market_boundary_and_fails_closed() {
@@ -725,7 +1255,7 @@ void native_key_contract_maps_core_control_without_imgui() {
 
 void workspace_registry_is_canonical_and_fail_closed() {
     const auto& registry = carto::ui::workspace_registry();
-    REQUIRE(registry.size() == 8U);
+    REQUIRE(registry.size() == 11U);
     std::vector<carto::ui::Workspace> seen;
     for (const auto& definition : registry) {
         REQUIRE(definition.validate());
@@ -744,6 +1274,20 @@ void workspace_registry_is_canonical_and_fail_closed() {
     REQUIRE(ai && ai.value().available);
     const auto sculpt = carto::ui::workspace_definition(carto::ui::Workspace::sculpt);
     REQUIRE(sculpt && sculpt.value().available);
+    const auto uv = carto::ui::workspace_definition(carto::ui::Workspace::uv);
+    REQUIRE(uv && uv.value().available);
+    const auto engineering = carto::ui::workspace_definition(
+        carto::ui::Workspace::engineering);
+    REQUIRE(engineering && engineering.value().available);
+    const auto condition = carto::ui::workspace_definition(
+        carto::ui::Workspace::condition);
+    REQUIRE(condition && condition.value().available);
+    const auto material = carto::ui::workspace_definition(
+        carto::ui::Workspace::material);
+    REQUIRE(material && material.value().available);
+    const auto review = carto::ui::workspace_definition(
+        carto::ui::Workspace::review);
+    REQUIRE(review && review.value().available);
     const auto future = carto::ui::workspace_definition(carto::ui::Workspace::cad);
     REQUIRE(future && !future.value().available);
     REQUIRE(!future.value().unavailable_reason.empty());
@@ -770,6 +1314,48 @@ void workspace_registry_is_canonical_and_fail_closed() {
     const auto sculpt_snapshot = ui.snapshot();
     REQUIRE(sculpt_snapshot.workspace_kind == carto::ui::Workspace::sculpt);
     REQUIRE(sculpt_snapshot.bottom_panel == carto::ui::BottomPanel::operations);
+
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::uv));
+    const auto uv_snapshot = ui.snapshot();
+    REQUIRE(uv_snapshot.workspace_kind == carto::ui::Workspace::uv);
+    REQUIRE(uv_snapshot.bottom_panel == carto::ui::BottomPanel::assets);
+    REQUIRE(std::find(uv_snapshot.visible_panels.begin(), uv_snapshot.visible_panels.end(),
+                      carto::ui::Panel::assets) != uv_snapshot.visible_panels.end());
+
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::engineering));
+    const auto engineering_snapshot = ui.snapshot();
+    REQUIRE(engineering_snapshot.workspace_kind == carto::ui::Workspace::engineering);
+    REQUIRE(engineering_snapshot.bottom_panel == carto::ui::BottomPanel::problems);
+    REQUIRE(std::find(engineering_snapshot.visible_panels.begin(),
+                      engineering_snapshot.visible_panels.end(),
+                      carto::ui::Panel::operations) != engineering_snapshot.visible_panels.end());
+
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::condition));
+    const auto condition_snapshot = ui.snapshot();
+    REQUIRE(condition_snapshot.workspace_kind == carto::ui::Workspace::condition);
+    REQUIRE(condition_snapshot.bottom_panel == carto::ui::BottomPanel::problems);
+    REQUIRE(std::find(condition_snapshot.visible_panels.begin(),
+                      condition_snapshot.visible_panels.end(),
+                      carto::ui::Panel::operations) != condition_snapshot.visible_panels.end());
+
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::material));
+    const auto material_snapshot = ui.snapshot();
+    REQUIRE(material_snapshot.workspace_kind == carto::ui::Workspace::material);
+    REQUIRE(material_snapshot.bottom_panel == carto::ui::BottomPanel::assets);
+    REQUIRE(std::find(material_snapshot.visible_panels.begin(),
+                      material_snapshot.visible_panels.end(),
+                      carto::ui::Panel::assets) != material_snapshot.visible_panels.end());
+
+    REQUIRE(ui.set_workspace(carto::ui::Workspace::review));
+    const auto review_snapshot = ui.snapshot();
+    REQUIRE(review_snapshot.workspace_kind == carto::ui::Workspace::review);
+    REQUIRE(review_snapshot.bottom_panel == carto::ui::BottomPanel::problems);
+    REQUIRE(std::find(review_snapshot.visible_panels.begin(),
+                      review_snapshot.visible_panels.end(),
+                      carto::ui::Panel::viewport) != review_snapshot.visible_panels.end());
+    REQUIRE(std::find(review_snapshot.visible_panels.begin(),
+                      review_snapshot.visible_panels.end(),
+                      carto::ui::Panel::problems) != review_snapshot.visible_panels.end());
 }
 
 void sculpt_viewport_sampling_preserves_frontmost_surface_and_path_spacing() {
@@ -1162,8 +1748,10 @@ int main() {
     try {
         preferences_validate_shell_invariants();
         ui_routes_authoritative_actions_and_operation_lineage();
+        ui_routes_spatial_fields_through_the_human_command_boundary();
         ui_distinguishes_unsaved_from_saved_state();
         ui_rejects_unadmitted_ai_proposals();
+        ui_rejects_raw_ai_material_mutations_but_admits_human_material_authoring();
         ui_routes_edge_selection_without_authoring_mutation();
         ui_preserves_required_viewport_and_supports_mode_theme_density();
         cartographer_brand_palette_is_stable();
@@ -1171,6 +1759,10 @@ int main() {
         workbench_preferences_round_trip_and_fail_closed();
         ui_connects_surface_fidelity_preview_without_authoring_mutation();
         ui_imports_mesh_through_provider_and_authoring_boundaries();
+        ui_source_mesh_reimport_updates_in_place_and_keeps_monotonic_undo_lineage();
+        ui_unsaved_mesh_import_remains_available_but_is_explicitly_unlinked();
+        ui_rejects_tampered_source_blob_without_fallback_or_project_mutation();
+        ui_routes_source_reimport_review_and_keeps_ai_out_of_mutation_path();
         ui_connects_local_market_boundary_and_fails_closed();
         ui_failed_shortcuts_and_actions_remain_bounded();
         ui_command_palette_is_bounded_and_explicit_about_deferred_features();

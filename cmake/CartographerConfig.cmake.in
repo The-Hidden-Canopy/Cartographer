@@ -34,6 +34,8 @@ set(_carto_exported_targets
     Cartographer::carto_representation
     Cartographer::carto_biological
     Cartographer::carto_production_authoring
+    Cartographer::carto_condition_authoring
+    Cartographer::carto_engineering
     Cartographer::carto_web_geometry_compile
     Cartographer::carto_web_geometry_package
     Cartographer::carto_eval

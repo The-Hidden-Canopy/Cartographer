@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace carto::render {
@@ -16,6 +17,7 @@ struct RenderInstance {
     std::shared_ptr<const geometry::CompiledMesh> mesh;
     core::Transform world_transform = core::Transform::identity();
     core::Revision source_revision;
+    std::optional<std::uint64_t> mesh_asset;
 };
 
 class RenderScene {

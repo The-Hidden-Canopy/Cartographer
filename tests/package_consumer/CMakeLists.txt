@@ -10,9 +10,12 @@ target_link_libraries(cartographer_package_consumer
     PRIVATE
         Cartographer::carto_biological
         Cartographer::carto_production_authoring
+        Cartographer::carto_condition_authoring
+        Cartographer::carto_engineering
         Cartographer::carto_project
         Cartographer::carto_production
         Cartographer::carto_hydro
+        Cartographer::carto_terrain
         Cartographer::carto_ui
 )
 

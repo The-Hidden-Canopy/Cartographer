@@ -344,9 +344,12 @@ void publication_rejects_linked_ancestor_paths() {
     const auto linked_parent = temp.path() / "linked-parent";
     std::filesystem::create_directories(actual_parent);
     std::error_code error;
-    require(carto::test_support::create_directory_link(
-                actual_parent, linked_parent, error),
-        "test creates a symbolic-link or junction ancestor");
+    if (!carto::test_support::create_directory_link(
+            actual_parent, linked_parent, error)) {
+        std::cout << "SKIP: linked-ancestor fixture is unavailable: "
+                  << error.message() << " (" << error.value() << ")\n";
+        return;
+    }
 
     const auto fixture = make_fixture(1U, "linked-path-product");
     const auto through_link = linked_parent / "published";

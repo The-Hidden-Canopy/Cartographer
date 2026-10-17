@@ -273,9 +273,14 @@ const SceneObject* Scene::find(ObjectId id) const noexcept {
 }
 
 std::vector<SceneObject> Scene::objects_sorted() const {
+    return objects_sorted(objects_.size());
+}
+
+std::vector<SceneObject> Scene::objects_sorted(std::size_t limit) const {
     std::vector<SceneObject> result;
-    result.reserve(objects_.size());
+    result.reserve(std::min(limit, objects_.size()));
     for (const auto& [id, object] : objects_) {
+        if (result.size() >= limit) break;
         static_cast<void>(id);
         result.push_back(object);
     }

@@ -128,6 +128,196 @@ private:
     bool applied_ = false;
 };
 
+// Binds the validated engineering authoring sidecar through the project
+// command boundary so import, invalidation, undo, and redo share the same
+// revision and journal semantics as ordinary authoring commands.
+class SetProjectEngineeringAuthoringCommand final : public EditorCommand {
+public:
+    SetProjectEngineeringAuthoringCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        std::optional<project::SerializedEngineeringAuthoring> before,
+        project::SerializedEngineeringAuthoring after);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override {
+        return "Set Project Engineering Authoring";
+    }
+
+private:
+    project::ProjectDocument* document_;
+    std::optional<project::SerializedEngineeringAuthoring> before_;
+    project::SerializedEngineeringAuthoring after_;
+    core::Revision expected_project_revision_;
+    bool applied_ = false;
+};
+
+// Binds the validated public CONDITION source-authoring sidecar through the
+// same governed command boundary as all other project mutations.
+// Replaces a complete project snapshot as one admitted application command.
+// Used for an explicitly accepted speculative result; undo restores the prior
+// source content while keeping project revisions monotonic.
+class ReplaceProjectDocumentCommand final : public EditorCommand {
+public:
+    ReplaceProjectDocumentCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        project::ProjectDocument candidate);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override {
+        return "Accept Speculative Project Result";
+    }
+
+private:
+    [[nodiscard]] bool matches_snapshot_ignoring_revision(
+        const project::ProjectDocument& expected) const;
+
+    project::ProjectDocument* document_;
+    project::ProjectDocument before_;
+    project::ProjectDocument after_;
+    core::Revision expected_project_revision_;
+    bool initialized_ = false;
+    bool applied_ = false;
+};
+
+class SetProjectConditionAuthoringCommand final : public EditorCommand {
+public:
+    SetProjectConditionAuthoringCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        std::optional<project::SerializedConditionAuthoring> before,
+        project::SerializedConditionAuthoring after);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override {
+        return "Set Project CONDITION Authoring";
+    }
+
+private:
+    project::ProjectDocument* document_;
+    std::optional<project::SerializedConditionAuthoring> before_;
+    project::SerializedConditionAuthoring after_;
+    core::Revision expected_project_revision_;
+    bool has_executed_ = false;
+    bool applied_ = false;
+};
+
+class SetProjectMaterialCatalogCommand final : public EditorCommand {
+public:
+    SetProjectMaterialCatalogCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        project::MaterialCatalog before,
+        project::MaterialCatalog after);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Set Material Catalog"; }
+
+private:
+    [[nodiscard]] core::Result<void> apply(const project::MaterialCatalog& catalog);
+
+    project::ProjectDocument* document_;
+    project::MaterialCatalog before_;
+    project::MaterialCatalog after_;
+    core::Revision expected_project_revision_;
+    std::optional<core::Revision> current_project_revision_;
+    bool applied_ = false;
+};
+
+class ApplySourceReimportPlanCommand final : public EditorCommand {
+public:
+    ApplySourceReimportPlanCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        assets::SourceReimportPlan reviewed_plan);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Apply Source Reimport Plan"; }
+
+private:
+    [[nodiscard]] core::Result<assets::SourceReimportPlan> plan_for_records(
+        const std::vector<assets::SourceImportRecord>& records) const;
+
+    project::ProjectDocument* document_;
+    assets::SourceReimportPlan reviewed_plan_;
+    std::vector<assets::SourceImportRecord> before_records_;
+    std::vector<assets::SourceImportRecord> after_records_;
+    core::Revision expected_project_revision_;
+    bool initialized_ = false;
+    bool applied_ = false;
+};
+
+class SetProjectSpatialFieldCommand final : public EditorCommand {
+public:
+    SetProjectSpatialFieldCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        std::optional<spatial_field::ScalarField2D> before,
+        spatial_field::ScalarField2D after);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Set Spatial Field"; }
+
+private:
+    project::ProjectDocument* document_;
+    std::optional<spatial_field::ScalarField2D> before_;
+    spatial_field::ScalarField2D after_;
+    bool applied_ = false;
+};
+
+class SetProjectRoadAuthoringCommand final : public EditorCommand {
+public:
+    SetProjectRoadAuthoringCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        geometry::CurvePath centerline,
+        project::RoadSource road);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Set Road Authoring"; }
+
+private:
+    project::ProjectDocument* document_;
+    geometry::CurvePath authored_centerline_;
+    project::RoadSource authored_road_;
+    std::optional<geometry::CurvePath> expected_centerline_;
+    std::optional<project::RoadSource> expected_road_;
+    std::optional<geometry::CurvePath> previous_centerline_;
+    std::optional<project::RoadSource> previous_road_;
+    core::Revision expected_project_revision_;
+    bool initialized_ = false;
+    bool applied_ = false;
+};
+
+class SetProjectSweepSourceCommand final : public EditorCommand {
+public:
+    SetProjectSweepSourceCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        geometry::SweepSource source);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Set Procedural Sweep Source"; }
+
+private:
+    project::ProjectDocument* document_;
+    geometry::SweepSource authored_source_;
+    std::optional<geometry::SweepSource> previous_source_;
+    std::optional<geometry::SweepSource> expected_current_source_;
+    core::Revision expected_project_revision_;
+    bool initialized_ = false;
+    bool applied_ = false;
+};
+
 class SetVertexPositionCommand final : public EditorCommand {
 public:
     SetVertexPositionCommand(
@@ -174,6 +364,34 @@ private:
     std::optional<geometry::EditableMesh> before_;
     std::optional<geometry::EditableMesh> after_;
     std::optional<core::Revision> current_mesh_revision_;
+};
+
+// Replaces one validated project mesh revision as an undoable authoring command.
+// The project and mesh revisions are both checked before each execute/undo.
+class SetProjectMeshCommand final : public EditorCommand {
+public:
+    SetProjectMeshCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        std::uint64_t mesh_asset,
+        core::Revision expected_project_revision,
+        core::Revision expected_mesh_revision,
+        geometry::EditableMesh after);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Set Project Mesh"; }
+
+private:
+    project::ProjectDocument* document_;
+    std::uint64_t mesh_asset_;
+    core::Revision expected_project_revision_;
+    core::Revision expected_mesh_revision_;
+    std::optional<core::Revision> current_project_revision_;
+    std::optional<core::Revision> current_mesh_revision_;
+    std::optional<geometry::EditableMesh> before_;
+    geometry::EditableMesh after_;
+    bool applied_ = false;
 };
 
 class SlideVertexCommand final : public EditorCommand {
@@ -899,6 +1117,44 @@ private:
     geometry::EditableMesh mesh_;
     std::optional<std::uint64_t> mesh_asset_;
     std::optional<scene::SceneObject> object_;
+};
+
+// Imports or reimports one source-backed mesh as a single journaled command.
+// The mesh asset and registry record are restored together on undo/redo.
+class ImportSourceMeshCommand final : public EditorCommand {
+public:
+    ImportSourceMeshCommand(
+        ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        std::string object_name,
+        geometry::EditableMesh mesh,
+        assets::SourceImportRecord source_record);
+
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Import Source Mesh"; }
+
+private:
+    [[nodiscard]] core::Result<void> apply_registry_record(
+        std::optional<assets::SourceImportRecord> record);
+    [[nodiscard]] core::Result<void> apply_imported_mesh();
+    [[nodiscard]] core::Result<void> apply_previous_mesh();
+    [[nodiscard]] core::Result<void> restore_created_instance();
+    [[nodiscard]] core::Result<void> remove_created_instance();
+
+    project::ProjectDocument* document_;
+    std::string object_name_;
+    geometry::EditableMesh imported_mesh_;
+    assets::SourceImportRecord imported_record_;
+    std::optional<assets::SourceImportRecord> previous_record_;
+    std::optional<geometry::EditableMesh> previous_mesh_;
+    std::optional<std::uint64_t> mesh_asset_;
+    std::optional<scene::SceneObject> object_;
+    core::Revision expected_project_revision_;
+    bool created_instance_ = false;
+    bool mesh_changed_ = false;
+    bool initialized_ = false;
+    bool applied_ = false;
 };
 
 // Creates a second root-level scene object that references an existing mesh

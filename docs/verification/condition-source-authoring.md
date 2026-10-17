@@ -1,0 +1,62 @@
+# CONDITION source-authoring boundary
+
+This verification note records the public Cartographer slice derived from the CONDITION source-authoring gap review.
+
+## Public capability
+
+Cartographer can author and persist a neutral `condition::AuthoringDocument` inside a `.carto` project. The document carries:
+
+- reviewed source evidence and source-linked assets;
+- Safe Place, familiarity, and view-condition metadata;
+- projection and physical variant candidates with explicit mutation guards;
+- temporal visual packages and surface-state records;
+- interaction anchors, collections, prefabs, and region-kit manifests;
+- revision-bound audio-source and acoustic-zone intent, referencing reviewed/current imported clip evidence without storing decoded samples or playback state;
+- revision-bound effect-source, bounded particle-emitter, and exact spatial-field influence records, with deterministic local-space preview and explicit normal/disabled operating states;
+- revision-bound vegetation scatter recipes for authored species, bound to distinct moisture, shade, disturbance, vegetation-suitability, and elevation field identities/revisions/digests, with deterministic bounded derived placement previews;
+- branchable Safe Place and surface-history alternatives with exact before-values and conflict-aware comparison;
+- deterministic serialization and SHA-256 package provenance.
+
+The native shell exposes this through the CONDITION workspace. Most existing CONDITION records remain a read-only projection; audio/acoustic, effect-source/emitter/field-influence, and vegetation-scatter descriptors can be appended through the project command/journal path. Bounded RIFF/WAVE intake validates supported uncompressed PCM/IEEE-float metadata and records a content digest plus a content-addressed logical locator. It does not persist the absolute file path or audio samples. Imported clips start unreviewed; an explicit review action is required before package publication. An operator can reselect a current clip source, have the bytes revalidated against the recorded digest, and audition a decoded three-second excerpt through the Windows desktop audio API. The absolute path and decoded PCM are held only in transient process memory and are stopped/released when requested or when the shell exits. Audio descriptors have a revisioned enabled/disabled state for fixture failure variants. The work surface draws source attenuation rings and acoustic-zone outlines only for authored assets mapped to existing scene objects. Min/max attenuation rings, sphere-radius handles, box-zone corner handles, and per-zone priority labels are interactive; drag previews commit through revision-checked project commands on release and cancel when the project snapshot changes. The CONDITION panel lists conservative bounded broad-phase overlap candidates and their authored priorities; this is advisory only and does not claim a runtime winner or acoustic simulation. The effect workbench makes a bounded deterministic 2D point preview in owning-asset local X/Z space; wind/thermal/drainage use authored directional acceleration, avoidance reverses the authored direction, and turbulence adds deterministic bounded perturbation. This is not a renderer-integrated particle system. Vegetation recipes choose only assets classified as vegetation and project fields with exact moisture, shade, disturbance, vegetation-suitability, and terrain-elevation semantics. The moisture field defines the candidate grid; every candidate must be covered by every bound field. Suitability score, seeded density, yaw, and scale yield a deterministic ephemeral point preview with source receipts and a digest. Candidate and output limits fail closed; there is no partial/truncated forest and generated points are not scene instances. These previews do not mutate the project, carry authoring and field receipts, and are hidden when the sidecar or any sampled field changes. A fixture can be loaded through the application session and exported as an admitted `.carto-condition` package.
+
+CONDITION assets can be bound to an existing scene object from the native
+authoring instrument. This is an explicit human-only project command guarded by
+the current project and authoring revisions; the binding is journaled and
+undoable. This makes authored source and zone guides reachable from the native
+work surface without granting a runtime or AI mutation path.
+
+## Governance and failure behavior
+
+- Source authoring is committed through the existing project command boundary and remains revision-bound.
+- Within one project namespace, a changed imported authoring document must advance the embedded authoring revision by exactly one; same-revision, skipped, and stale replacement files fail without changing project state.
+- Source invalidation advances the embedded authoring revision before the command is journaled; undo/redo restore the corresponding revision and source status together. Revision exhaustion fails without a partial source update.
+- Package publication is rejected when source evidence is stale, unreviewed, invalid, or has a dependent source-revision mismatch.
+- Presentation-only variants cannot declare collision, navigation, or interaction impact.
+- The package stores logical source locators only; absolute paths, parent traversal, drive-qualified paths, secrets, and runtime telemetry are not accepted.
+- Package admission verifies the serialized bytes and publication digest before a consumer can use the package.
+- Audio sources require a real imported-asset evidence record and an existing owner asset; invalid ranges, missing/wrong-kind clip references, and non-canonical zone shapes fail before the project command. Stale clip evidence blocks publication.
+- Effect sources require existing owner assets and distinct normal/disabled state labels. Emitters cap rate, lifetime, duration, timestep, and total preview population; field bindings require a safe project-local identity, current non-exhausted source revision, nonzero digest, and unit direction. Preview rejects absent or mismatched project fields, unknown states, out-of-coverage samples, excessive time, and non-finite outputs; it never substitutes a default field or changes project/authoring revisions.
+- Vegetation recipes require an existing vegetation-class asset, five distinct exact-semantic field identities with nonzero revision/digest bindings, bounded spacing/density/scale/threshold controls, and an explicit output cap. Preview rejects missing, stale, wrong-semantic, malformed, or out-of-coverage fields; a candidate grid above 65,536 samples or an output above the recipe cap fails rather than truncating. A disabled recipe produces an empty derived preview. No generated instance is persisted or inserted into scene truth.
+- State branches require exact existing source records, supported typed properties, a current parent branch, and a before-value equal to that source or inherited parent value. Safe Place metrics and surface occupancy/maintenance/damage/wetness can be authored as review alternatives; comparisons mark contested sibling changes and never overwrite the source baseline or activate runtime state.
+- WAVE intake is capped at 64 MiB, 30 minutes, eight channels, and 8–192 kHz; malformed RIFF framing, inconsistent rates/alignment, compressed/extensible formats, and non-finite float samples fail before any project mutation. The content digest binds exactly the bytes inspected; no source path or sample payload is serialized.
+- Audition reopens a user-selected local file only after source identity lookup, the same 64 MiB WAVE validation, and an exact SHA-256 match. Decoding is limited to three seconds and 16 MiB of transient 16-bit PCM; multichannel sources are bounded downmixes. No local path, excerpt, or decoded sample enters the project, sidecar, package, or network path. Windows playback is explicitly a clip-audition utility, not a project mixer or runtime audio authority.
+- Reviewing imported evidence is a separate revision-bound project command. It cannot review stale evidence, and undo restores the prior unreviewed state.
+- Consecutive CONDITION sidecar edits can be undone/redone in history order while project revisions remain monotonic; the sidecar byte precondition prevents undo from overwriting a different authoring document.
+- Acoustic radius and zone-volume edits require the exact authoring revision captured at gesture start, reject stale or invalid edits without partial change, and are undoable/redoable through the same sidecar command path.
+- Scene-object binding requires the exact project and authoring revisions plus an existing asset/object pair. Missing targets and stale snapshots fail closed; unchanged binding is a no-op; accepted changes use the project command journal and undo/redo.
+- CONDITION runtime behavior, player telemetry, private donor services, and game-owned state are intentionally outside this public module.
+
+## Persistence and compatibility
+
+`ProjectDocument` schema 21 stores a `CONDITION_AUTHORING` sidecar record (introduced in schema 14). The embedded CONDITION authoring codec is schema 5 and reads schema 1 with empty audio/effect/vegetation/state sections, schema 2 with empty effect/vegetation/state sections, schema 3 with empty vegetation/state sections, and schema 4 with an empty state section. Earlier supported project schemas remain readable through the existing compatibility path; schema 14+ documents require the record, including an explicit `NONE` record for projects without CONDITION authoring.
+
+The acceptance tests cover fixture round-trip, illegal physical/presentation mutations, stale-source and stale-file rejection, revision exhaustion, audio-source/zone round-trip and hostile references, persisted enabled/disabled source variants, WAVE metadata inspection and malformed-input rejection, bounded PCM excerpt conversion, pathless content provenance, review gating, stale acoustic-edit rejection, zone geometry edit/undo/redo, effect schema-1/schema-2, vegetation schema-1/schema-2/schema-3, and state schema-1 through schema-4 migration, adversarial effect/vegetation/state bounds and references, deterministic normal/disabled and field-driven placement previews, stale/missing/wrong-semantic/out-of-coverage field rejection, no-truncation limits, state before-value drift and contested sibling comparison, nested branch ancestry/cycle rejection, preview non-mutation, `.carto` save/reopen, sidecar command history, undo/redo, UI workspace availability, package publication, and consumer admission. The native shell target compiles interactive source/zone handles, advisory overlap/priority display, effect and vegetation preview canvases, field-bound scatter authoring, Safe Place branch creation/tree comparison, and digest-verified Win32 clip audition; actual pointer-drag and production-fixture visual/audio acceptance have not been demonstrated. There is no project mixer, acoustic simulation, runtime effect pool, spatial runtime playback, committed vegetation instance placement/renderer path, state-driven runtime switching, or game-runtime claim. These are source-authoring and preview fixtures; no production visual-fidelity claim is implied.
+
+The separate `cartographer_condition_authoring_ui_fixture_tests` target generates
+a deterministic one-second synthetic PCM tone and a saved `.carto` scene with
+digest-bound reviewed clip evidence, one audio source, and one acoustic zone.
+It verifies WAVE metadata, scene binding, package admission, save/reopen, and
+that neither the workstation path nor sample bytes enter the project. This is
+repeatable QA data, not production audio or runtime acoustic validation. The
+Windows file-picker capture helper failed during native drag smoke in this
+environment, so actual pointer-drag visual acceptance remains unverified.

@@ -201,12 +201,13 @@ void project_current_schema_sidecar_round_trips() {
         "committed document carries the sidecar digest");
 
     const auto saved = document.save_atomic(temp.path() / "fixture.carto");
-    require(static_cast<bool>(saved) && saved.value().schema_version == 13U,
+    require(static_cast<bool>(saved) &&
+                saved.value().schema_version == project::ProjectDocument::kSchemaVersion,
         "document with a semantic sidecar saves atomically");
 
     const auto loaded = project::ProjectDocument::load(temp.path() / "fixture.carto");
     require(static_cast<bool>(loaded), "project with a semantic sidecar reloads");
-    require(loaded.value().schema_version() == 13U,
+    require(loaded.value().schema_version() == project::ProjectDocument::kSchemaVersion,
         "reloaded document reports the current schema version");
     require(loaded.value().semantic_sidecar_bytes().has_value() &&
                 *loaded.value().semantic_sidecar_bytes() == encoded,
@@ -221,13 +222,14 @@ void project_current_schema_sidecar_round_trips() {
         "stored bytes reparse through the semantic boundary");
 
     std::string legacy_v10 = document.serialize();
-    constexpr std::string_view current_header = "CARTOGRAPHER_PROJECT 13\n";
+    const std::string current_header = "CARTOGRAPHER_PROJECT " +
+        std::to_string(project::ProjectDocument::kSchemaVersion) + "\n";
     constexpr std::string_view legacy_header = "CARTOGRAPHER_PROJECT 10\n";
     constexpr std::string_view sculpt_stack_table = "SCULPT_STACKS 0\n";
     constexpr std::string_view garment_asset_table = "GARMENT_ASSETS 0\n";
     constexpr std::string_view cloth_receipt_table = "CLOTH_REST_POSE_RECEIPTS 0\n";
     require(legacy_v10.starts_with(current_header),
-        "current project serialization starts with schema v13");
+        "current project serialization starts with the current schema");
     legacy_v10.replace(0U, current_header.size(), legacy_header);
     const auto stack_record = legacy_v10.find(sculpt_stack_table);
     require(stack_record != std::string::npos,
@@ -241,6 +243,20 @@ void project_current_schema_sidecar_round_trips() {
     require(cloth_receipt_record != std::string::npos,
         "empty current document emits its cloth rest-pose receipt table");
     legacy_v10.erase(cloth_receipt_record, cloth_receipt_table.size());
+    constexpr std::string_view condition_authoring_record = "CONDITION_AUTHORING NONE\n";
+    const auto condition_record = legacy_v10.find(condition_authoring_record);
+    require(condition_record != std::string::npos,
+        "empty current document emits its CONDITION authoring record");
+    legacy_v10.erase(condition_record, condition_authoring_record.size());
+    constexpr std::string_view presentation_record_prefix = "PRESENTATION_CATALOG ";
+    const auto presentation_record = legacy_v10.find(presentation_record_prefix);
+    require(presentation_record != std::string::npos,
+        "current document emits its presentation catalog record");
+    const auto project_end = legacy_v10.rfind("\nEND\n");
+    require(project_end != std::string::npos && project_end > presentation_record,
+        "project ending follows its presentation catalog record");
+    legacy_v10.erase(presentation_record,
+        project_end + 1U - presentation_record);
     const auto reopened_v10 = project::ProjectDocument::deserialize(legacy_v10);
     require(static_cast<bool>(reopened_v10) &&
                 reopened_v10.value().semantic_sidecar_bytes() ==
@@ -300,7 +316,7 @@ void legacy_v9_documents_read_and_upgrade() {
 
     const auto upgraded = project::ProjectDocument::deserialize(legacy.str());
     require(static_cast<bool>(upgraded), "v9 document reads cleanly");
-    require(upgraded.value().schema_version() == 13U,
+    require(upgraded.value().schema_version() == project::ProjectDocument::kSchemaVersion,
         "v9 document upgrades to the current schema version in memory");
     require(upgraded.value().revision().value() == 7U &&
                 upgraded.value().name() == "legacy-v9",
@@ -309,8 +325,11 @@ void legacy_v9_documents_read_and_upgrade() {
         "legacy document carries no semantic sidecar");
 
     const std::string reencoded = upgraded.value().serialize();
-    require(reencoded.find("CARTOGRAPHER_PROJECT 13") == 0U,
-        "next save persists the upgraded document as v13");
+    const std::string current_schema =
+        "CARTOGRAPHER_PROJECT " +
+        std::to_string(project::ProjectDocument::kSchemaVersion);
+    require(reencoded.find(current_schema) == 0U,
+        "next save persists the upgraded document at the current schema version");
     const auto rereopened = project::ProjectDocument::deserialize(reencoded);
     require(static_cast<bool>(rereopened) &&
                 rereopened.value().serialize() == reencoded,

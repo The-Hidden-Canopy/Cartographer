@@ -66,6 +66,79 @@ constexpr std::uint64_t kMaxSerializedSemanticSidecarBytes = 16ULL * 1024ULL * 1
 constexpr std::uint64_t kMaxSerializedSculptStackBytes = 16ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaxSerializedGarmentAssetBytes = 16ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaxSerializedClothRestPoseReceiptBytes = 16ULL * 1024ULL;
+constexpr std::uint64_t kMaxSerializedEngineeringAuthoringBytes =
+    32ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaxSerializedConditionAuthoringBytes =
+    32ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaxSerializedCurvePaths = 4'096U;
+constexpr std::uint64_t kMaxSerializedCurvePathBytes = 8ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaxSerializedCurvePathAggregateBytes = 32ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaxSerializedRoadSources = 4'096U;
+constexpr std::uint64_t kMaxSerializedRoadSourceBytes = RoadSource::kMaxSerializedBytes;
+constexpr std::uint64_t kMaxSerializedRoadSourceAggregateBytes = 16ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaxSerializedCurvePathLineage = kMaxSerializedCurvePaths;
+constexpr std::uint64_t kMaxSerializedRoadSourceLineage = kMaxSerializedRoadSources;
+constexpr std::uint64_t kMaxSerializedSweepSources = 4'096U;
+constexpr std::uint64_t kMaxSerializedSweepSourceBytes =
+    geometry::SweepSource::kMaxSerializedBytes;
+constexpr std::uint64_t kMaxSerializedSweepSourceAggregateBytes = 16ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaxSerializedSweepSourceLineage = kMaxSerializedSweepSources;
+constexpr std::uint64_t kMaxSerializedSpatialFields = 512U;
+constexpr std::uint64_t kMaxSerializedSpatialFieldLineage = 4096U;
+constexpr std::uint64_t kMaxSerializedSpatialFieldBytes =
+    spatial_field::ScalarField2D::kMaxSerializedBytes;
+constexpr std::uint64_t kMaxSerializedSpatialFieldAggregateBytes = 32ULL * 1024ULL * 1024ULL;
+
+const MaterialRegionAssignment* material_assignment_at(
+    const MaterialCatalog& catalog,
+    MaterialRegionKey key) {
+    const auto found = catalog.assignments().find(key);
+    return found == catalog.assignments().end() ? nullptr : &found->second;
+}
+
+bool same_material_assignment(
+    const MaterialRegionAssignment* left,
+    const MaterialRegionAssignment* right) noexcept {
+    if (left == nullptr || right == nullptr) return left == right;
+    return left->key == right->key && left->material == right->material &&
+        left->variant == right->variant;
+}
+
+core::Result<void> copy_material_assignment(
+    MaterialCatalog& destination,
+    const MaterialCatalog& source,
+    MaterialRegionKey key) {
+    const auto* source_assignment = material_assignment_at(source, key);
+    const auto destination_found = destination.assignments().find(key);
+    if (source_assignment == nullptr) {
+        if (destination_found == destination.assignments().end()) {
+            return core::Result<void>::success();
+        }
+        return destination.erase_assignment(key);
+    }
+    if (destination_found == destination.assignments().end()) {
+        return destination.insert_assignment(*source_assignment);
+    }
+    return destination.replace_assignment(*source_assignment);
+}
+
+core::Result<MaterialCatalog> material_catalog_without_assignments(
+    const MaterialCatalog& catalog) {
+    MaterialCatalog result = catalog;
+    std::vector<MaterialRegionKey> keys;
+    keys.reserve(result.assignments().size());
+    for (const auto& [key, assignment] : result.assignments()) {
+        static_cast<void>(assignment);
+        keys.push_back(key);
+    }
+    for (const auto key : keys) {
+        if (auto erased = result.erase_assignment(key); !erased) {
+            return core::Result<MaterialCatalog>::failure(erased.error());
+        }
+    }
+    return core::Result<MaterialCatalog>::success(std::move(result));
+}
+
 std::mutex g_project_save_mutex;
 std::atomic<std::uint64_t> g_project_temp_counter{0U};
 std::atomic<std::uint64_t> g_project_namespace_counter{0U};
@@ -77,6 +150,23 @@ bool valid_source_namespace(std::string_view value) {
                 (byte >= 'A' && byte <= 'Z') ||
                 (byte >= '0' && byte <= '9') || byte == '.' || byte == '_' ||
                 byte == '-';
+        });
+}
+
+bool valid_spatial_field_identity(std::string_view value) {
+    return !value.empty() && value.size() <= 128U &&
+        std::all_of(value.begin(), value.end(), [](unsigned char byte) {
+            return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+                (byte >= '0' && byte <= '9') || byte == '.' || byte == '_' || byte == '-';
+        });
+}
+
+bool valid_curve_or_road_identity(std::string_view value) {
+    return !value.empty() && value.size() <= 128U && value.front() != '.' &&
+        value.front() != '-' && value.front() != '_' &&
+        std::all_of(value.begin(), value.end(), [](unsigned char byte) {
+            return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+                (byte >= '0' && byte <= '9') || byte == '.' || byte == '_' || byte == '-';
         });
 }
 
@@ -120,6 +210,41 @@ core::Result<void> validate_serialized_count(
             std::to_string(limit)));
     }
     return core::Result<void>::success();
+}
+
+std::string encode_hex_bytes(std::string_view bytes) {
+    constexpr char digits[] = "0123456789abcdef";
+    std::string encoded;
+    encoded.reserve(bytes.size() * 2U);
+    for (const char character : bytes) {
+        const auto byte = static_cast<unsigned char>(character);
+        encoded.push_back(digits[byte >> 4U]);
+        encoded.push_back(digits[byte & 0x0fU]);
+    }
+    return encoded;
+}
+
+std::optional<std::string> decode_hex_bytes(
+    std::string_view encoded,
+    std::size_t maximum_bytes) {
+    if ((encoded.size() % 2U) != 0U || encoded.size() / 2U > maximum_bytes) {
+        return std::nullopt;
+    }
+    const auto nibble = [](char value) -> int {
+        if (value >= '0' && value <= '9') return value - '0';
+        if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+        if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+        return -1;
+    };
+    std::string decoded;
+    decoded.reserve(encoded.size() / 2U);
+    for (std::size_t index = 0U; index < encoded.size(); index += 2U) {
+        const int high = nibble(encoded[index]);
+        const int low = nibble(encoded[index + 1U]);
+        if (high < 0 || low < 0) return std::nullopt;
+        decoded.push_back(static_cast<char>((high << 4) | low));
+    }
+    return decoded;
 }
 
 core::Result<void> require_line(std::istream& input, std::string_view expected) {
@@ -314,8 +439,10 @@ core::Result<void> atomic_replace(
             temporary.wstring().c_str(),
             target.wstring().c_str(),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const auto win32_error = static_cast<unsigned long>(GetLastError());
         return core::Result<void>::failure(
-            Diagnostic(ErrorCode::io_error, "atomic project replacement failed on Windows"));
+            Diagnostic(ErrorCode::io_error, "atomic project replacement failed on Windows (error " +
+                std::to_string(win32_error) + ")"));
     }
     return core::Result<void>::success();
 #else
@@ -390,6 +517,477 @@ core::Result<ProjectDocument> ProjectDocument::create(std::string name) {
     return core::Result<ProjectDocument>::success(std::move(document));
 }
 
+core::Result<ProjectDocument> ProjectDocument::merge_disjoint_scene_mesh_changes(
+    const ProjectDocument& base,
+    const ProjectDocument& current,
+    const ProjectDocument& speculative,
+    const std::vector<scene::ObjectId>& read_objects,
+    const std::vector<std::uint64_t>& read_mesh_assets,
+    const std::vector<scene::ObjectId>& write_objects,
+    const std::vector<std::uint64_t>& write_mesh_assets,
+    const std::vector<MaterialRegionKey>& read_material_regions,
+    const std::vector<MaterialRegionKey>& write_material_regions) {
+    const auto stale = [](std::string message) {
+        return core::Result<ProjectDocument>::failure(Diagnostic(
+            ErrorCode::stale_data, std::move(message)));
+    };
+    const auto invalid_merge = [](std::string message) {
+        return core::Result<ProjectDocument>::failure(Diagnostic(
+            ErrorCode::invalid_state, std::move(message)));
+    };
+    if (auto result = base.validate(); !result) {
+        return core::Result<ProjectDocument>::failure(
+            result.error().with_context("checkpoint rebase base"));
+    }
+    if (auto result = current.validate(); !result) {
+        return core::Result<ProjectDocument>::failure(
+            result.error().with_context("checkpoint rebase current source"));
+    }
+    if (auto result = speculative.validate(); !result) {
+        return core::Result<ProjectDocument>::failure(
+            result.error().with_context("checkpoint rebase speculative artifact"));
+    }
+    if (base.source_namespace_ != current.source_namespace_ ||
+        base.source_namespace_ != speculative.source_namespace_ ||
+        base.name_ != speculative.name_ || current.revision_ < base.revision_ ||
+        speculative.revision_ <= base.revision_) {
+        return stale("checkpoint rebase documents do not share a valid source lineage");
+    }
+    if (current.revision_ == base.revision_ && current.serialize() != base.serialize()) {
+        return stale("checkpoint rebase source changed without advancing its revision");
+    }
+    if (current.revision_.exhausted()) {
+        return core::Result<ProjectDocument>::failure(exhausted_revision());
+    }
+    if (read_objects.size() > kMaxSerializedObjects ||
+        read_mesh_assets.size() > kMaxSerializedMeshes ||
+        write_objects.size() > kMaxSerializedObjects ||
+        write_mesh_assets.size() > kMaxSerializedMeshes ||
+        read_material_regions.size() > MaterialCatalog::kMaxRecordsPerKind ||
+        write_material_regions.size() > MaterialCatalog::kMaxRecordsPerKind ||
+        !std::is_sorted(read_objects.begin(), read_objects.end()) ||
+        std::adjacent_find(read_objects.begin(), read_objects.end()) != read_objects.end() ||
+        !std::is_sorted(read_mesh_assets.begin(), read_mesh_assets.end()) ||
+        std::adjacent_find(read_mesh_assets.begin(), read_mesh_assets.end()) !=
+            read_mesh_assets.end() ||
+        !std::is_sorted(write_objects.begin(), write_objects.end()) ||
+        std::adjacent_find(write_objects.begin(), write_objects.end()) != write_objects.end() ||
+        !std::is_sorted(write_mesh_assets.begin(), write_mesh_assets.end()) ||
+        std::adjacent_find(write_mesh_assets.begin(), write_mesh_assets.end()) !=
+            write_mesh_assets.end() ||
+        !std::is_sorted(read_material_regions.begin(), read_material_regions.end()) ||
+        std::adjacent_find(read_material_regions.begin(), read_material_regions.end()) !=
+            read_material_regions.end() ||
+        !std::is_sorted(write_material_regions.begin(), write_material_regions.end()) ||
+        std::adjacent_find(write_material_regions.begin(), write_material_regions.end()) !=
+            write_material_regions.end() ||
+        std::any_of(read_material_regions.begin(), read_material_regions.end(),
+            [](MaterialRegionKey key) { return key.mesh_asset == 0U || key.region_id == 0U; }) ||
+        std::any_of(write_material_regions.begin(), write_material_regions.end(),
+            [](MaterialRegionKey key) { return key.mesh_asset == 0U || key.region_id == 0U; })) {
+        return invalid_merge("checkpoint rebase write sets are not canonical and bounded");
+    }
+    const std::set<scene::ObjectId> object_writes(
+        write_objects.begin(), write_objects.end());
+    const std::set<scene::ObjectId> object_reads(
+        read_objects.begin(), read_objects.end());
+    const std::set<std::uint64_t> mesh_reads(
+        read_mesh_assets.begin(), read_mesh_assets.end());
+    const std::set<std::uint64_t> mesh_writes(
+        write_mesh_assets.begin(), write_mesh_assets.end());
+    const std::set<MaterialRegionKey> material_reads(
+        read_material_regions.begin(), read_material_regions.end());
+    const std::set<MaterialRegionKey> material_writes(
+        write_material_regions.begin(), write_material_regions.end());
+    const auto subset = [](const auto& values, const auto& superset) {
+        return std::all_of(values.begin(), values.end(), [&superset](const auto value) {
+            return superset.contains(value);
+        });
+    };
+    if (!subset(object_writes, object_reads) || !subset(mesh_writes, mesh_reads) ||
+        !subset(material_writes, material_reads) ||
+        std::any_of(read_material_regions.begin(), read_material_regions.end(),
+            [&mesh_reads](MaterialRegionKey key) {
+                return !mesh_reads.contains(key.mesh_asset);
+            }) ||
+        std::any_of(write_material_regions.begin(), write_material_regions.end(),
+            [&mesh_writes](MaterialRegionKey key) {
+                return !mesh_writes.contains(key.mesh_asset);
+            })) {
+        return invalid_merge("checkpoint rebase write sets expand beyond their read sets");
+    }
+    if (!read_material_regions.empty()) {
+        auto base_sources = material_catalog_without_assignments(base.material_catalog_);
+        auto current_sources = material_catalog_without_assignments(current.material_catalog_);
+        if (!base_sources || !current_sources) {
+            return invalid_merge("checkpoint rebase could not inspect material catalog dependencies");
+        }
+        if (base_sources.value().serialize() != current_sources.value().serialize()) {
+            return stale("material source definitions changed since the checkpoint source");
+        }
+        for (const MaterialRegionKey key : read_material_regions) {
+            if (!same_material_assignment(
+                    material_assignment_at(base.material_catalog_, key),
+                    material_assignment_at(current.material_catalog_, key))) {
+                return stale("material region assignment changed since the checkpoint source");
+            }
+        }
+    }
+    const auto same_transform = [](const core::Transform& left,
+                                   const core::Transform& right) {
+        return left.translation.x == right.translation.x &&
+            left.translation.y == right.translation.y &&
+            left.translation.z == right.translation.z &&
+            left.rotation.x == right.rotation.x && left.rotation.y == right.rotation.y &&
+            left.rotation.z == right.rotation.z && left.rotation.w == right.rotation.w &&
+            left.scale.x == right.scale.x && left.scale.y == right.scale.y &&
+            left.scale.z == right.scale.z;
+    };
+    const auto same_object_metadata = [](const scene::SceneObject& left,
+                                         const scene::SceneObject& right) {
+        return left.id == right.id && left.name == right.name &&
+            left.parent == right.parent && left.mesh_asset == right.mesh_asset &&
+            left.visible == right.visible && left.locked == right.locked;
+    };
+    const auto same_object = [&same_transform, &same_object_metadata](
+        const scene::SceneObject* left, const scene::SceneObject* right) {
+        if (left == nullptr || right == nullptr) return left == right;
+        return same_object_metadata(*left, *right) &&
+            same_transform(left->local_transform, right->local_transform);
+    };
+    const auto same_mesh_projection = [&base](
+        const ProjectDocument& left,
+        const ProjectDocument& right,
+        std::uint64_t asset) {
+        const auto left_mesh = left.meshes_.find(asset);
+        const auto right_mesh = right.meshes_.find(asset);
+        if (left_mesh == left.meshes_.end() || right_mesh == right.meshes_.end()) {
+            return left_mesh == left.meshes_.end() && right_mesh == right.meshes_.end();
+        }
+        ProjectDocument left_projection;
+        left_projection.source_namespace_ = base.source_namespace_;
+        left_projection.name_ = base.name_;
+        left_projection.meshes_.emplace(asset, left_mesh->second);
+        ProjectDocument right_projection = left_projection;
+        right_projection.meshes_[asset] = right_mesh->second;
+        return left_projection.serialize() == right_projection.serialize();
+    };
+
+    if (base.condition_authoring_ != current.condition_authoring_ ||
+        base.engineering_authoring_ != current.engineering_authoring_) {
+        return stale("checkpoint rebase semantic sidecars changed without field-level provenance");
+    }
+    for (const scene::ObjectId object : object_reads) {
+        if (!same_object(base.scene_.find(object), current.scene_.find(object))) {
+            return stale("checkpoint rebase read object changed or disappeared");
+        }
+    }
+    for (const std::uint64_t asset : mesh_reads) {
+        if (!base.meshes_.contains(asset) || !current.meshes_.contains(asset) ||
+            !same_mesh_projection(base, current, asset)) {
+            return stale("checkpoint rebase read mesh changed or disappeared");
+        }
+    }
+
+    std::set<scene::ObjectId> object_ids;
+    for (const auto& object : base.scene_.objects_sorted()) object_ids.insert(object.id);
+    for (const auto& object : speculative.scene_.objects_sorted()) object_ids.insert(object.id);
+    if (object_ids.size() != base.scene_.size() ||
+        object_ids.size() != speculative.scene_.size()) {
+        return invalid_merge("speculative checkpoint added or removed scene objects");
+    }
+    for (const scene::ObjectId object : object_ids) {
+        const auto* before = base.scene_.find(object);
+        const auto* proposed = speculative.scene_.find(object);
+        if (before == nullptr || proposed == nullptr ||
+            !same_object_metadata(*before, *proposed)) {
+            return invalid_merge("speculative checkpoint changed scene metadata outside the rebase contract");
+        }
+        if (!same_transform(before->local_transform, proposed->local_transform) &&
+            !object_writes.contains(object)) {
+            return invalid_merge("speculative checkpoint changed an object outside its write set");
+        }
+    }
+    for (const scene::ObjectId object : object_writes) {
+        const auto* before = base.scene_.find(object);
+        const auto* latest = current.scene_.find(object);
+        const auto* proposed = speculative.scene_.find(object);
+        if (before == nullptr || latest == nullptr || proposed == nullptr ||
+            !same_object(before, latest) || !same_object_metadata(*before, *proposed)) {
+            return stale("checkpoint rebase object write target changed or disappeared");
+        }
+    }
+
+    std::set<std::uint64_t> mesh_ids;
+    for (const auto& [asset, mesh] : base.meshes_) {
+        static_cast<void>(mesh);
+        mesh_ids.insert(asset);
+    }
+    for (const auto& [asset, mesh] : speculative.meshes_) {
+        static_cast<void>(mesh);
+        mesh_ids.insert(asset);
+    }
+    if (mesh_ids.size() != base.meshes_.size() ||
+        mesh_ids.size() != speculative.meshes_.size()) {
+        return invalid_merge("speculative checkpoint added or removed mesh assets");
+    }
+    for (const std::uint64_t asset : mesh_ids) {
+        const bool changed = !same_mesh_projection(base, speculative, asset);
+        if (changed && !mesh_writes.contains(asset)) {
+            return invalid_merge("speculative checkpoint changed a mesh outside its write set");
+        }
+    }
+    for (const std::uint64_t asset : mesh_writes) {
+        if (!base.meshes_.contains(asset) || !current.meshes_.contains(asset) ||
+            !speculative.meshes_.contains(asset) ||
+            !same_mesh_projection(base, current, asset)) {
+            return stale("checkpoint rebase mesh write target changed or disappeared");
+        }
+    }
+    if (!mesh_writes.empty()) {
+        std::set<scene::ObjectId> source_object_ids;
+        for (const auto& object : base.scene_.objects_sorted()) source_object_ids.insert(object.id);
+        for (const auto& object : current.scene_.objects_sorted()) source_object_ids.insert(object.id);
+        for (const scene::ObjectId object : source_object_ids) {
+            const auto* before = base.scene_.find(object);
+            const auto* latest = current.scene_.find(object);
+            const auto is_written_asset = [&mesh_writes](const scene::SceneObject* value) {
+                return value != nullptr && value->mesh_asset.has_value() &&
+                    mesh_writes.contains(*value->mesh_asset);
+            };
+            if (is_written_asset(before) || is_written_asset(latest)) {
+                if (before == nullptr || latest == nullptr ||
+                    before->mesh_asset != latest->mesh_asset) {
+                    return stale("checkpoint rebase changed membership of a written mesh asset");
+                }
+            }
+        }
+    }
+
+    if (speculative.topology_receipts_.size() < base.topology_receipts_.size()) {
+        return invalid_merge("speculative checkpoint removed topology receipt history");
+    }
+    for (std::size_t index = 0U; index < base.topology_receipts_.size(); ++index) {
+        const auto& before = base.topology_receipts_[index];
+        const auto& proposed = speculative.topology_receipts_[index];
+        if (before.mesh_asset != proposed.mesh_asset ||
+            before.receipt.serialize() != proposed.receipt.serialize()) {
+            return invalid_merge("speculative checkpoint rewrote topology receipt history");
+        }
+    }
+    for (std::size_t index = base.topology_receipts_.size();
+         index < speculative.topology_receipts_.size(); ++index) {
+        const auto& added = speculative.topology_receipts_[index];
+        if (!mesh_writes.contains(added.mesh_asset)) {
+            return invalid_merge("speculative checkpoint added topology evidence outside its write set");
+        }
+        if (auto result = added.validate(); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+    }
+
+    std::set<std::uint64_t> cloth_receipt_ids;
+    for (const auto& [asset, receipt] : base.cloth_rest_pose_receipts_) {
+        static_cast<void>(receipt);
+        cloth_receipt_ids.insert(asset);
+    }
+    for (const auto& [asset, receipt] : speculative.cloth_rest_pose_receipts_) {
+        static_cast<void>(receipt);
+        cloth_receipt_ids.insert(asset);
+    }
+    for (const std::uint64_t asset : cloth_receipt_ids) {
+        const auto before = base.cloth_rest_pose_receipts_.find(asset);
+        const auto proposed = speculative.cloth_rest_pose_receipts_.find(asset);
+        const bool same = before == base.cloth_rest_pose_receipts_.end()
+            ? proposed == speculative.cloth_rest_pose_receipts_.end()
+            : proposed != speculative.cloth_rest_pose_receipts_.end() &&
+                before->second == proposed->second;
+        if (!same && !mesh_writes.contains(asset)) {
+            return invalid_merge("speculative checkpoint changed cloth provenance outside its write set");
+        }
+    }
+
+    ProjectDocument expected_speculative = base;
+    for (const scene::ObjectId object : write_objects) {
+        const auto* proposed = speculative.scene_.find(object);
+        if (auto result = expected_speculative.scene_.set_local_transform(
+                object, proposed->local_transform); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+    }
+    for (const std::uint64_t asset : write_mesh_assets) {
+        expected_speculative.meshes_[asset] = speculative.meshes_.at(asset);
+        const auto receipt = speculative.cloth_rest_pose_receipts_.find(asset);
+        if (receipt == speculative.cloth_rest_pose_receipts_.end()) {
+            expected_speculative.cloth_rest_pose_receipts_.erase(asset);
+        } else {
+            expected_speculative.cloth_rest_pose_receipts_[asset] = receipt->second;
+        }
+    }
+    MaterialCatalog expected_material_catalog = base.material_catalog_;
+    for (const MaterialRegionKey key : write_material_regions) {
+        if (auto copied = copy_material_assignment(
+                expected_material_catalog, speculative.material_catalog_, key); !copied) {
+            return core::Result<ProjectDocument>::failure(copied.error());
+        }
+    }
+    if (expected_material_catalog.serialize() != speculative.material_catalog_.serialize()) {
+        return invalid_merge(
+            "speculative checkpoint changed material catalog data outside declared region assignments");
+    }
+    expected_speculative.material_catalog_ = std::move(expected_material_catalog);
+    expected_speculative.topology_receipts_ = speculative.topology_receipts_;
+    expected_speculative.revision_ = speculative.revision_;
+    if (expected_speculative.serialize() != speculative.serialize()) {
+        return invalid_merge("speculative checkpoint contains changes outside scene, mesh, and topology provenance writes");
+    }
+
+    ProjectDocument merged = current;
+    for (const scene::ObjectId object : write_objects) {
+        const auto* proposed = speculative.scene_.find(object);
+        if (auto result = merged.scene_.set_local_transform(
+                object, proposed->local_transform); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+    }
+    for (const std::uint64_t asset : write_mesh_assets) {
+        merged.meshes_[asset] = speculative.meshes_.at(asset);
+        const auto receipt = speculative.cloth_rest_pose_receipts_.find(asset);
+        if (receipt == speculative.cloth_rest_pose_receipts_.end()) {
+            merged.cloth_rest_pose_receipts_.erase(asset);
+        } else {
+            merged.cloth_rest_pose_receipts_[asset] = receipt->second;
+        }
+    }
+    MaterialCatalog merged_material_catalog = current.material_catalog_;
+    for (const MaterialRegionKey key : write_material_regions) {
+        if (auto copied = copy_material_assignment(
+                merged_material_catalog, speculative.material_catalog_, key); !copied) {
+            return core::Result<ProjectDocument>::failure(copied.error());
+        }
+    }
+    merged.material_catalog_ = std::move(merged_material_catalog);
+    merged.topology_receipts_.insert(
+        merged.topology_receipts_.end(),
+        speculative.topology_receipts_.begin() +
+            static_cast<std::ptrdiff_t>(base.topology_receipts_.size()),
+        speculative.topology_receipts_.end());
+    const std::uint64_t replay_revision_delta =
+        speculative.revision_.value() - base.revision_.value();
+    if (replay_revision_delta >
+        core::Revision::max_value() - current.revision_.value()) {
+        return core::Result<ProjectDocument>::failure(exhausted_revision());
+    }
+    merged.revision_ = core::Revision(
+        current.revision_.value() + replay_revision_delta);
+    if (auto result = merged.validate(); !result) {
+        return core::Result<ProjectDocument>::failure(
+            result.error().with_context("merged checkpoint rebase project"));
+    }
+    return core::Result<ProjectDocument>::success(std::move(merged));
+}
+
+core::Result<ProjectDocument> ProjectDocument::select_agent_rebase_step_changes(
+    const ProjectDocument& base,
+    const ProjectDocument& speculative,
+    const std::vector<scene::ObjectId>& write_objects,
+    const std::vector<std::uint64_t>& write_mesh_assets,
+    std::uint64_t revision_delta) {
+    const auto invalid_selection = [](std::string message) {
+        return core::Result<ProjectDocument>::failure(Diagnostic(
+            ErrorCode::invalid_state, std::move(message)));
+    };
+    if (auto result = base.validate(); !result) {
+        return core::Result<ProjectDocument>::failure(
+            result.error().with_context("checkpoint rebase step base"));
+    }
+    if (auto result = speculative.validate(); !result) {
+        return core::Result<ProjectDocument>::failure(
+            result.error().with_context("checkpoint rebase step artifact"));
+    }
+    if (base.source_namespace_ != speculative.source_namespace_ ||
+        base.name_ != speculative.name_ || speculative.revision_ <= base.revision_ ||
+        revision_delta == 0U ||
+        revision_delta > core::Revision::max_value() - base.revision_.value()) {
+        return invalid_selection(
+            "checkpoint rebase step artifacts do not share a bounded source lineage");
+    }
+    if (write_objects.size() > kMaxSerializedObjects ||
+        write_mesh_assets.size() > kMaxSerializedMeshes ||
+        !std::is_sorted(write_objects.begin(), write_objects.end()) ||
+        std::adjacent_find(write_objects.begin(), write_objects.end()) != write_objects.end() ||
+        !std::is_sorted(write_mesh_assets.begin(), write_mesh_assets.end()) ||
+        std::adjacent_find(write_mesh_assets.begin(), write_mesh_assets.end()) !=
+            write_mesh_assets.end()) {
+        return invalid_selection(
+            "checkpoint rebase step write sets are not canonical and bounded");
+    }
+
+    ProjectDocument selected = base;
+    for (const scene::ObjectId object : write_objects) {
+        const auto* before = base.scene_.find(object);
+        const auto* after = speculative.scene_.find(object);
+        if (before == nullptr || after == nullptr || before->id != after->id ||
+            before->name != after->name || before->parent != after->parent ||
+            before->mesh_asset != after->mesh_asset || before->visible != after->visible ||
+            before->locked != after->locked) {
+            return invalid_selection(
+                "checkpoint rebase step changed or removed an object write target");
+        }
+        if (auto result = selected.scene_.set_local_transform(
+                object, after->local_transform); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+    }
+    for (const std::uint64_t asset : write_mesh_assets) {
+        const auto before = base.meshes_.find(asset);
+        const auto after = speculative.meshes_.find(asset);
+        if (before == base.meshes_.end() || after == speculative.meshes_.end()) {
+            return invalid_selection(
+                "checkpoint rebase step changed or removed a mesh write target");
+        }
+        selected.meshes_[asset] = after->second;
+        const auto receipt = speculative.cloth_rest_pose_receipts_.find(asset);
+        if (receipt == speculative.cloth_rest_pose_receipts_.end()) {
+            selected.cloth_rest_pose_receipts_.erase(asset);
+        } else {
+            selected.cloth_rest_pose_receipts_[asset] = receipt->second;
+        }
+    }
+    if (speculative.topology_receipts_.size() < base.topology_receipts_.size()) {
+        return invalid_selection(
+            "checkpoint rebase step removed topology receipt history");
+    }
+    for (std::size_t index = 0U; index < base.topology_receipts_.size(); ++index) {
+        const auto& before = base.topology_receipts_[index];
+        const auto& after = speculative.topology_receipts_[index];
+        if (before.mesh_asset != after.mesh_asset ||
+            before.receipt.serialize() != after.receipt.serialize()) {
+            return invalid_selection(
+                "checkpoint rebase step rewrote topology receipt history");
+        }
+    }
+    const std::set<std::uint64_t> selected_assets(
+        write_mesh_assets.begin(), write_mesh_assets.end());
+    for (std::size_t index = base.topology_receipts_.size();
+         index < speculative.topology_receipts_.size(); ++index) {
+        const auto& receipt = speculative.topology_receipts_[index];
+        if (selected_assets.contains(receipt.mesh_asset)) {
+            if (auto result = receipt.validate(); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            selected.topology_receipts_.push_back(receipt);
+        }
+    }
+    selected.revision_ = core::Revision(
+        base.revision_.value() + revision_delta);
+    if (auto result = selected.validate(); !result) {
+        return core::Result<ProjectDocument>::failure(
+            result.error().with_context("selected checkpoint rebase step"));
+    }
+    return core::Result<ProjectDocument>::success(std::move(selected));
+}
+
 core::Result<void> ProjectDocument::set_name(std::string name) {
     if (revision_.exhausted()) {
         return core::Result<void>::failure(exhausted_revision());
@@ -443,6 +1041,12 @@ core::Result<void> ProjectDocument::remove_object(scene::ObjectId object) {
                 ErrorCode::invalid_state,
                 "cannot remove a scene object referenced by a semantic area"));
         }
+    }
+    if (presentation_catalog_.cameras().contains(object) ||
+        presentation_catalog_.lights().contains(object)) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::invalid_state,
+            "cannot remove a scene object referenced by authored presentation data"));
     }
     if (auto result = scene_.remove_object(object); !result) {
         return result;
@@ -778,6 +1382,429 @@ core::Result<void> ProjectDocument::set_material_catalog(MaterialCatalog catalog
     return core::Result<void>::success();
 }
 
+core::Result<void> ProjectDocument::set_presentation_catalog(
+    PresentationCatalog catalog) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (auto result = catalog.validate(); !result) {
+        return core::Result<void>::failure(result.error().with_context(
+            "presentation catalog admission"));
+    }
+    for (const auto& [object, camera] : catalog.cameras()) {
+        static_cast<void>(camera);
+        if (scene_.find(object) == nullptr) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::not_found, "authored camera references a missing scene object"));
+        }
+    }
+    for (const auto& [object, light] : catalog.lights()) {
+        static_cast<void>(light);
+        if (scene_.find(object) == nullptr) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::not_found, "authored light references a missing scene object"));
+        }
+    }
+    if (presentation_catalog_.serialize() == catalog.serialize()) {
+        return core::Result<void>::success();
+    }
+    presentation_catalog_ = std::move(catalog);
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::set_curve_path(geometry::CurvePath path) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (auto result = path.validate(); !result) {
+        return core::Result<void>::failure(result.error().with_context(
+            "curve path admission"));
+    }
+    const std::string identity = path.source_identity;
+    const auto existing = curve_paths_.find(identity);
+    const auto lineage = curve_path_lineage_.find(identity);
+    if (existing == curve_paths_.end()) {
+        if (lineage != curve_path_lineage_.end() && lineage->second.exhausted()) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::invalid_state,
+                "curve source revision space is exhausted"));
+        }
+        const core::Revision expected = lineage == curve_path_lineage_.end()
+            ? core::Revision{1U} : lineage->second.next();
+        if (path.source_revision != expected) {
+            return core::Result<void>::failure(invalid(
+                "new curve source must advance its retained identity lineage"));
+        }
+        if (curve_paths_.size() >= kMaxSerializedCurvePaths) {
+            return core::Result<void>::failure(parse_error(
+                "project curve source count exceeds its limit"));
+        }
+    } else {
+        if (lineage == curve_path_lineage_.end() ||
+            lineage->second != existing->second.source_revision ||
+            existing->second.source_revision.exhausted() ||
+            path.source_revision != existing->second.source_revision.next()) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::stale_data,
+                "curve source update must advance exactly one source revision"));
+        }
+    }
+
+    const std::string encoded = path.serialize();
+    if (encoded.size() > kMaxSerializedCurvePathBytes) {
+        return core::Result<void>::failure(parse_error(
+            "curve source payload exceeds its project byte limit"));
+    }
+    std::uint64_t aggregate_bytes = encoded.size();
+    for (const auto& [stored_identity, stored_path] : curve_paths_) {
+        if (stored_identity != identity) {
+            const std::size_t stored_size = stored_path.serialize().size();
+            if (stored_size > kMaxSerializedCurvePathAggregateBytes - aggregate_bytes) {
+                return core::Result<void>::failure(parse_error(
+                    "project curve sources exceed their aggregate byte limit"));
+            }
+            aggregate_bytes += static_cast<std::uint64_t>(stored_size);
+        }
+    }
+    if (aggregate_bytes > kMaxSerializedCurvePathAggregateBytes) {
+        return core::Result<void>::failure(parse_error(
+            "project curve sources exceed their aggregate byte limit"));
+    }
+    if (lineage == curve_path_lineage_.end() &&
+        curve_path_lineage_.size() >= kMaxSerializedCurvePathLineage) {
+        return core::Result<void>::failure(parse_error(
+            "project curve source lineage count exceeds its limit"));
+    }
+
+    curve_path_lineage_.insert_or_assign(identity, path.source_revision);
+    curve_paths_.insert_or_assign(identity, std::move(path));
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::erase_curve_path_if_revision(
+    std::string_view identity,
+    core::Revision expected_source_revision) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    const std::string key(identity);
+    const auto existing = curve_paths_.find(key);
+    const auto lineage = curve_path_lineage_.find(key);
+    if (existing == curve_paths_.end() || lineage == curve_path_lineage_.end() ||
+        existing->second.source_revision != expected_source_revision ||
+        lineage->second != expected_source_revision) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::stale_data,
+            "curve source no longer matches the requested source revision"));
+    }
+    if (std::any_of(road_sources_.begin(), road_sources_.end(),
+            [&key](const auto& entry) {
+                return entry.second.centerline_identity == key;
+            })) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::invalid_state,
+            "curve source cannot be removed while a road source references it"));
+    }
+    if (std::any_of(sweep_sources_.begin(), sweep_sources_.end(),
+            [&key](const auto& entry) {
+                return entry.second.centerline_identity == key;
+            })) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::invalid_state,
+            "curve source cannot be removed while a sweep source references it"));
+    }
+    curve_paths_.erase(existing);
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::set_road_source(RoadSource road) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (auto result = road.validate(); !result) {
+        return core::Result<void>::failure(result.error().with_context(
+            "road source admission"));
+    }
+    const auto centerline = curve_paths_.find(road.centerline_identity);
+    if (centerline == curve_paths_.end()) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::not_found, "road source references a missing centerline"));
+    }
+    if (centerline->second.source_revision != road.centerline_revision) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::stale_data, "road source centerline revision is stale"));
+    }
+
+    const std::string identity = road.source_identity;
+    const auto existing = road_sources_.find(identity);
+    const auto lineage = road_source_lineage_.find(identity);
+    if (existing == road_sources_.end()) {
+        if (lineage != road_source_lineage_.end() && lineage->second.exhausted()) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::invalid_state,
+                "road source revision space is exhausted"));
+        }
+        const core::Revision expected = lineage == road_source_lineage_.end()
+            ? core::Revision{1U} : lineage->second.next();
+        if (road.source_revision != expected) {
+            return core::Result<void>::failure(invalid(
+                "new road source must advance its retained identity lineage"));
+        }
+        if (road_sources_.size() >= kMaxSerializedRoadSources) {
+            return core::Result<void>::failure(parse_error(
+                "project road source count exceeds its limit"));
+        }
+    } else if (lineage == road_source_lineage_.end() ||
+        lineage->second != existing->second.source_revision ||
+        existing->second.source_revision.exhausted() ||
+        road.source_revision != existing->second.source_revision.next()) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::stale_data,
+            "road source update must advance exactly one source revision"));
+    }
+
+    const std::string encoded = road.serialize();
+    if (encoded.size() > kMaxSerializedRoadSourceBytes) {
+        return core::Result<void>::failure(parse_error(
+            "road source payload exceeds its project byte limit"));
+    }
+    std::uint64_t aggregate_bytes = encoded.size();
+    for (const auto& [stored_identity, stored_road] : road_sources_) {
+        if (stored_identity != identity) {
+            const std::size_t stored_size = stored_road.serialize().size();
+            if (stored_size > kMaxSerializedRoadSourceAggregateBytes - aggregate_bytes) {
+                return core::Result<void>::failure(parse_error(
+                    "project road sources exceed their aggregate byte limit"));
+            }
+            aggregate_bytes += static_cast<std::uint64_t>(stored_size);
+        }
+    }
+    if (aggregate_bytes > kMaxSerializedRoadSourceAggregateBytes) {
+        return core::Result<void>::failure(parse_error(
+            "project road sources exceed their aggregate byte limit"));
+    }
+
+    if (lineage == road_source_lineage_.end() &&
+        road_source_lineage_.size() >= kMaxSerializedRoadSourceLineage) {
+        return core::Result<void>::failure(parse_error(
+            "project road-source lineage count exceeds its limit"));
+    }
+    road_source_lineage_.insert_or_assign(identity, road.source_revision);
+    road_sources_.insert_or_assign(identity, std::move(road));
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::erase_road_source_if_revision(
+    std::string_view identity,
+    core::Revision expected_source_revision) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    const std::string key(identity);
+    const auto existing = road_sources_.find(key);
+    const auto lineage = road_source_lineage_.find(key);
+    if (existing == road_sources_.end() || lineage == road_source_lineage_.end() ||
+        existing->second.source_revision != expected_source_revision ||
+        lineage->second != expected_source_revision) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::stale_data,
+            "road source no longer matches the requested source revision"));
+    }
+    road_sources_.erase(existing);
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::set_sweep_source(geometry::SweepSource source) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (auto result = source.validate(); !result) {
+        return core::Result<void>::failure(result.error().with_context(
+            "sweep source admission"));
+    }
+    const auto centerline = curve_paths_.find(source.centerline_identity);
+    if (centerline == curve_paths_.end()) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::not_found, "sweep source references a missing centerline"));
+    }
+    if (centerline->second.source_revision != source.centerline_revision) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::stale_data, "sweep source centerline revision is stale"));
+    }
+
+    const std::string identity = source.source_identity;
+    const auto existing = sweep_sources_.find(identity);
+    const auto lineage = sweep_source_lineage_.find(identity);
+    if (existing == sweep_sources_.end()) {
+        if (lineage != sweep_source_lineage_.end() && lineage->second.exhausted()) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::invalid_state, "sweep source revision space is exhausted"));
+        }
+        const core::Revision expected = lineage == sweep_source_lineage_.end()
+            ? core::Revision{1U} : lineage->second.next();
+        if (source.source_revision != expected) {
+            return core::Result<void>::failure(invalid(
+                "new sweep source must advance its retained identity lineage"));
+        }
+        if (sweep_sources_.size() >= kMaxSerializedSweepSources) {
+            return core::Result<void>::failure(parse_error(
+                "project sweep source count exceeds its limit"));
+        }
+    } else if (lineage == sweep_source_lineage_.end() ||
+        lineage->second != existing->second.source_revision ||
+        existing->second.source_revision.exhausted() ||
+        source.source_revision != existing->second.source_revision.next()) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::stale_data,
+            "sweep source update must advance exactly one source revision"));
+    }
+
+    const std::string encoded = source.serialize();
+    if (encoded.size() > kMaxSerializedSweepSourceBytes) {
+        return core::Result<void>::failure(parse_error(
+            "sweep source payload exceeds its project byte limit"));
+    }
+    std::uint64_t aggregate_bytes = encoded.size();
+    for (const auto& [stored_identity, stored_source] : sweep_sources_) {
+        if (stored_identity != identity) {
+            const std::size_t stored_size = stored_source.serialize().size();
+            if (stored_size > kMaxSerializedSweepSourceAggregateBytes - aggregate_bytes) {
+                return core::Result<void>::failure(parse_error(
+                    "project sweep sources exceed their aggregate byte limit"));
+            }
+            aggregate_bytes += static_cast<std::uint64_t>(stored_size);
+        }
+    }
+    if (aggregate_bytes > kMaxSerializedSweepSourceAggregateBytes) {
+        return core::Result<void>::failure(parse_error(
+            "project sweep sources exceed their aggregate byte limit"));
+    }
+    if (lineage == sweep_source_lineage_.end() &&
+        sweep_source_lineage_.size() >= kMaxSerializedSweepSourceLineage) {
+        return core::Result<void>::failure(parse_error(
+            "project sweep-source lineage count exceeds its limit"));
+    }
+    sweep_source_lineage_.insert_or_assign(identity, source.source_revision);
+    sweep_sources_.insert_or_assign(identity, std::move(source));
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::erase_sweep_source_if_revision(
+    std::string_view identity,
+    core::Revision expected_source_revision) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    const std::string key(identity);
+    const auto existing = sweep_sources_.find(key);
+    const auto lineage = sweep_source_lineage_.find(key);
+    if (existing == sweep_sources_.end() || lineage == sweep_source_lineage_.end() ||
+        existing->second.source_revision != expected_source_revision ||
+        lineage->second != expected_source_revision) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::stale_data,
+            "sweep source no longer matches the requested source revision"));
+    }
+    sweep_sources_.erase(existing);
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::set_spatial_field(
+    spatial_field::ScalarField2D field) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (auto result = field.validate(); !result) {
+        return core::Result<void>::failure(result.error().with_context(
+            "spatial field admission"));
+    }
+    const std::string identity = field.identity();
+    const auto existing = spatial_fields_.find(identity);
+    const auto lineage = spatial_field_lineage_.find(identity);
+    const std::string encoded = field.serialize();
+    if (existing != spatial_fields_.end() && existing->second.serialize() == encoded) {
+        return core::Result<void>::success();
+    }
+    if (existing == spatial_fields_.end()) {
+        if (lineage != spatial_field_lineage_.end() && lineage->second.exhausted()) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::invalid_state,
+                "spatial field source revision space is exhausted"));
+        }
+        const core::Revision expected = lineage == spatial_field_lineage_.end()
+            ? core::Revision{1U} : lineage->second.next();
+        if (field.source_revision() != expected) {
+            return core::Result<void>::failure(invalid(
+                "new spatial field must advance its retained identity lineage"));
+        }
+        if (spatial_fields_.size() >= kMaxSerializedSpatialFields) {
+            return core::Result<void>::failure(parse_error(
+                "project spatial-field count exceeds its limit"));
+        }
+    } else if (lineage == spatial_field_lineage_.end() ||
+        lineage->second != existing->second.source_revision() ||
+        existing->second.source_revision().exhausted() ||
+        field.source_revision() != existing->second.source_revision().next()) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::stale_data,
+            "spatial field update must advance exactly one source revision"));
+    }
+    if (encoded.size() > kMaxSerializedSpatialFieldBytes) {
+        return core::Result<void>::failure(parse_error(
+            "spatial field payload exceeds its project byte limit"));
+    }
+    std::uint64_t aggregate_bytes = encoded.size();
+    for (const auto& [stored_identity, stored_field] : spatial_fields_) {
+        if (stored_identity == identity) continue;
+        const std::size_t stored_size = stored_field.serialize().size();
+        if (stored_size > kMaxSerializedSpatialFieldAggregateBytes - aggregate_bytes) {
+            return core::Result<void>::failure(parse_error(
+                "project spatial fields exceed their aggregate byte limit"));
+        }
+        aggregate_bytes += static_cast<std::uint64_t>(stored_size);
+    }
+    if (aggregate_bytes > kMaxSerializedSpatialFieldAggregateBytes) {
+        return core::Result<void>::failure(parse_error(
+            "project spatial fields exceed their aggregate byte limit"));
+    }
+    if (lineage == spatial_field_lineage_.end() &&
+        spatial_field_lineage_.size() >= kMaxSerializedSpatialFieldLineage) {
+        return core::Result<void>::failure(parse_error(
+            "project spatial-field lineage count exceeds its limit"));
+    }
+    spatial_field_lineage_.insert_or_assign(identity, field.source_revision());
+    spatial_fields_.insert_or_assign(identity, std::move(field));
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::erase_spatial_field_if_revision(
+    std::string_view identity,
+    core::Revision expected_source_revision) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    const auto existing = spatial_fields_.find(std::string(identity));
+    const auto lineage = spatial_field_lineage_.find(std::string(identity));
+    if (existing == spatial_fields_.end() || lineage == spatial_field_lineage_.end() ||
+        existing->second.source_revision() != expected_source_revision ||
+        lineage->second != expected_source_revision) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::stale_data,
+            "spatial field no longer matches the requested source revision"));
+    }
+    spatial_fields_.erase(existing);
+    bump_revision();
+    return core::Result<void>::success();
+}
+
 core::Result<void> ProjectDocument::set_semantic_sidecar(
     std::string serialized_sidecar,
     assets::Sha256Digest digest) {
@@ -946,6 +1973,127 @@ core::Result<void> ProjectDocument::set_cloth_rest_pose_receipt(
     return core::Result<void>::success();
 }
 
+core::Result<void> ProjectDocument::set_engineering_authoring(
+    std::string serialized_authoring,
+    assets::Sha256Digest digest) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (serialized_authoring.empty() ||
+        serialized_authoring.size() > kMaxSerializedEngineeringAuthoringBytes ||
+        digest.is_zero()) {
+        return core::Result<void>::failure(invalid(
+            "engineering authoring bytes or digest are outside the supported bounds"));
+    }
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(serialized_authoring.data());
+    if (assets::sha256(std::span<const std::uint8_t>(bytes, serialized_authoring.size())) != digest) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::validation_failed,
+            "engineering authoring digest does not bind the serialized bytes"));
+    }
+    const auto decoded = engineering::AuthoringDocument::deserialize(serialized_authoring);
+    if (!decoded) {
+        return core::Result<void>::failure(decoded.error().with_context(
+            "engineering authoring admission"));
+    }
+    if (engineering_authoring_.has_value() &&
+        engineering_authoring_->bytes == serialized_authoring &&
+        engineering_authoring_->digest == digest) {
+        return core::Result<void>::success();
+    }
+    engineering_authoring_ = SerializedEngineeringAuthoring{
+        std::move(serialized_authoring), digest};
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::erase_engineering_authoring_if_revision(
+    core::Revision expected_revision) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (revision_ != expected_revision) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::stale_data,
+            "engineering authoring removal revision does not match the current project"));
+    }
+    if (!engineering_authoring_.has_value()) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::not_found, "project engineering authoring does not exist"));
+    }
+    engineering_authoring_.reset();
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::set_condition_authoring(
+    std::string serialized_authoring,
+    assets::Sha256Digest digest) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (serialized_authoring.empty() ||
+        serialized_authoring.size() > kMaxSerializedConditionAuthoringBytes ||
+        digest.is_zero()) {
+        return core::Result<void>::failure(invalid(
+            "CONDITION authoring bytes or digest are outside the supported bounds"));
+    }
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(serialized_authoring.data());
+    if (assets::sha256(std::span<const std::uint8_t>(bytes, serialized_authoring.size())) != digest) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::validation_failed,
+            "CONDITION authoring digest does not bind the serialized bytes"));
+    }
+    const auto decoded = condition::AuthoringDocument::deserialize(serialized_authoring);
+    if (!decoded) {
+        return core::Result<void>::failure(decoded.error().with_context(
+            "CONDITION authoring admission"));
+    }
+    if (condition_authoring_.has_value() &&
+        condition_authoring_->bytes == serialized_authoring &&
+        condition_authoring_->digest == digest) {
+        return core::Result<void>::success();
+    }
+    condition_authoring_ = SerializedConditionAuthoring{
+        std::move(serialized_authoring), digest};
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::erase_condition_authoring_if_revision(
+    core::Revision expected_revision) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (revision_ != expected_revision) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::stale_data,
+            "CONDITION authoring removal revision does not match the current project"));
+    }
+    if (!condition_authoring_.has_value()) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::not_found, "project CONDITION authoring does not exist"));
+    }
+    condition_authoring_.reset();
+    bump_revision();
+    return core::Result<void>::success();
+}
+
+core::Result<void> ProjectDocument::apply_source_reimport_plan(
+    const assets::SourceReimportPlan& plan) {
+    const auto updated = assets::apply_source_reimport_plan(source_asset_registry_, plan);
+    if (!updated) return core::Result<void>::failure(updated.error());
+    if (updated.value().serialize() == source_asset_registry_.serialize()) {
+        return core::Result<void>::success();
+    }
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    source_asset_registry_ = std::move(updated.value());
+    bump_revision();
+    return core::Result<void>::success();
+}
+
 core::Result<void> ProjectDocument::set_object_transform(
     scene::ObjectId object,
     core::Transform transform) {
@@ -985,6 +2133,10 @@ core::Result<void> ProjectDocument::validate() const {
     if (!valid_source_namespace(source_namespace_)) {
         return core::Result<void>::failure(parse_error(
             "project source namespace is invalid"));
+    }
+    if (auto result = source_asset_registry_.validate(); !result) {
+        return core::Result<void>::failure(result.error().with_context(
+            "project source asset registry"));
     }
     if (auto result = scene_.validate(); !result) {
         return result;
@@ -1113,6 +2265,46 @@ core::Result<void> ProjectDocument::validate() const {
                 "cloth rest-pose receipt digest does not bind its serialized bytes"));
         }
     }
+    if (engineering_authoring_.has_value()) {
+        const auto& authoring = *engineering_authoring_;
+        if (authoring.bytes.empty() ||
+            authoring.bytes.size() > kMaxSerializedEngineeringAuthoringBytes ||
+            authoring.digest.is_zero()) {
+            return core::Result<void>::failure(parse_error(
+                "project engineering authoring bytes or digest are outside the serialized bounds"));
+        }
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(authoring.bytes.data());
+        if (assets::sha256(std::span<const std::uint8_t>(bytes, authoring.bytes.size())) !=
+            authoring.digest) {
+            return core::Result<void>::failure(parse_error(
+                "project engineering authoring digest does not bind its bytes"));
+        }
+        const auto decoded = engineering::AuthoringDocument::deserialize(authoring.bytes);
+        if (!decoded) {
+            return core::Result<void>::failure(decoded.error().with_context(
+                "project engineering authoring"));
+        }
+    }
+    if (condition_authoring_.has_value()) {
+        const auto& authoring = *condition_authoring_;
+        if (authoring.bytes.empty() ||
+            authoring.bytes.size() > kMaxSerializedConditionAuthoringBytes ||
+            authoring.digest.is_zero()) {
+            return core::Result<void>::failure(parse_error(
+                "project CONDITION authoring bytes or digest are outside the serialized bounds"));
+        }
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(authoring.bytes.data());
+        if (assets::sha256(std::span<const std::uint8_t>(bytes, authoring.bytes.size())) !=
+            authoring.digest) {
+            return core::Result<void>::failure(parse_error(
+                "project CONDITION authoring digest does not bind its bytes"));
+        }
+        const auto decoded = condition::AuthoringDocument::deserialize(authoring.bytes);
+        if (!decoded) {
+            return core::Result<void>::failure(decoded.error().with_context(
+                "project CONDITION authoring"));
+        }
+    }
     if (auto result = world_model_.validate(); !result) {
         return core::Result<void>::failure(result.error().with_context(
             "project world model"));
@@ -1146,6 +2338,208 @@ core::Result<void> ProjectDocument::validate() const {
     if (auto result = material_catalog_.validate(); !result) {
         return core::Result<void>::failure(result.error().with_context(
             "project material catalog"));
+    }
+    if (auto result = presentation_catalog_.validate(); !result) {
+        return core::Result<void>::failure(result.error().with_context(
+            "project presentation catalog"));
+    }
+    if (curve_paths_.size() > kMaxSerializedCurvePaths) {
+        return core::Result<void>::failure(parse_error(
+            "project curve source count exceeds its limit"));
+    }
+    if (curve_path_lineage_.size() > kMaxSerializedCurvePathLineage) {
+        return core::Result<void>::failure(parse_error(
+            "project curve source lineage count exceeds its limit"));
+    }
+    for (const auto& [identity, revision] : curve_path_lineage_) {
+        if (!valid_curve_or_road_identity(identity) || revision.value() == 0U) {
+            return core::Result<void>::failure(parse_error(
+                "project curve source lineage record is invalid"));
+        }
+        const auto active = curve_paths_.find(identity);
+        if (active != curve_paths_.end() && active->second.source_revision != revision) {
+            return core::Result<void>::failure(parse_error(
+                "active curve source disagrees with retained source lineage"));
+        }
+    }
+    std::uint64_t curve_source_bytes = 0U;
+    for (const auto& [identity, path] : curve_paths_) {
+        if (identity != path.source_identity) {
+            return core::Result<void>::failure(parse_error(
+                "project curve source key does not match its embedded identity"));
+        }
+        if (auto result = path.validate(); !result) {
+            return core::Result<void>::failure(result.error().with_context(
+                "project curve source"));
+        }
+        const auto lineage = curve_path_lineage_.find(identity);
+        if (lineage == curve_path_lineage_.end() ||
+            lineage->second != path.source_revision) {
+            return core::Result<void>::failure(parse_error(
+                "active curve source lacks its matching source lineage"));
+        }
+        const std::uint64_t encoded_size = path.serialize().size();
+        if (encoded_size > kMaxSerializedCurvePathBytes ||
+            encoded_size > kMaxSerializedCurvePathAggregateBytes - curve_source_bytes) {
+            return core::Result<void>::failure(parse_error(
+                "project curve source bytes exceed their bounded storage limit"));
+        }
+        curve_source_bytes += encoded_size;
+    }
+    if (road_sources_.size() > kMaxSerializedRoadSources) {
+        return core::Result<void>::failure(parse_error(
+            "project road source count exceeds its limit"));
+    }
+    if (road_source_lineage_.size() > kMaxSerializedRoadSourceLineage) {
+        return core::Result<void>::failure(parse_error(
+            "project road-source lineage count exceeds its limit"));
+    }
+    for (const auto& [identity, revision] : road_source_lineage_) {
+        if (!valid_curve_or_road_identity(identity) || revision.value() == 0U) {
+            return core::Result<void>::failure(parse_error(
+                "project road-source lineage record is invalid"));
+        }
+        const auto active = road_sources_.find(identity);
+        if (active != road_sources_.end() && active->second.source_revision != revision) {
+            return core::Result<void>::failure(parse_error(
+                "active road source disagrees with retained source lineage"));
+        }
+    }
+    std::uint64_t road_source_bytes = 0U;
+    for (const auto& [identity, road] : road_sources_) {
+        if (identity != road.source_identity) {
+            return core::Result<void>::failure(parse_error(
+                "project road source key does not match its embedded identity"));
+        }
+        if (auto result = road.validate(); !result) {
+            return core::Result<void>::failure(result.error().with_context(
+                "project road source"));
+        }
+        const auto lineage = road_source_lineage_.find(identity);
+        if (lineage == road_source_lineage_.end() ||
+            lineage->second != road.source_revision) {
+            return core::Result<void>::failure(parse_error(
+                "active road source lacks its matching source lineage"));
+        }
+        const auto centerline = curve_paths_.find(road.centerline_identity);
+        if (centerline == curve_paths_.end() ||
+            centerline->second.source_revision != road.centerline_revision) {
+            return core::Result<void>::failure(parse_error(
+                "project road source has a missing or stale centerline binding"));
+        }
+        const std::uint64_t encoded_size = road.serialize().size();
+        if (encoded_size > kMaxSerializedRoadSourceBytes ||
+            encoded_size > kMaxSerializedRoadSourceAggregateBytes - road_source_bytes) {
+            return core::Result<void>::failure(parse_error(
+                "project road source bytes exceed their bounded storage limit"));
+        }
+        road_source_bytes += encoded_size;
+    }
+    if (sweep_sources_.size() > kMaxSerializedSweepSources) {
+        return core::Result<void>::failure(parse_error(
+            "project sweep source count exceeds its limit"));
+    }
+    if (sweep_source_lineage_.size() > kMaxSerializedSweepSourceLineage) {
+        return core::Result<void>::failure(parse_error(
+            "project sweep-source lineage count exceeds its limit"));
+    }
+    for (const auto& [identity, revision] : sweep_source_lineage_) {
+        if (!valid_curve_or_road_identity(identity) || revision.value() == 0U) {
+            return core::Result<void>::failure(parse_error(
+                "project sweep-source lineage record is invalid"));
+        }
+        const auto active = sweep_sources_.find(identity);
+        if (active != sweep_sources_.end() && active->second.source_revision != revision) {
+            return core::Result<void>::failure(parse_error(
+                "active sweep source disagrees with retained source lineage"));
+        }
+    }
+    std::uint64_t sweep_source_bytes = 0U;
+    for (const auto& [identity, source] : sweep_sources_) {
+        if (identity != source.source_identity) {
+            return core::Result<void>::failure(parse_error(
+                "project sweep source key does not match its embedded identity"));
+        }
+        if (auto result = source.validate(); !result) {
+            return core::Result<void>::failure(result.error().with_context(
+                "project sweep source"));
+        }
+        const auto lineage = sweep_source_lineage_.find(identity);
+        if (lineage == sweep_source_lineage_.end() ||
+            lineage->second != source.source_revision) {
+            return core::Result<void>::failure(parse_error(
+                "active sweep source lacks its matching source lineage"));
+        }
+        const auto centerline = curve_paths_.find(source.centerline_identity);
+        if (centerline == curve_paths_.end() ||
+            centerline->second.source_revision != source.centerline_revision) {
+            return core::Result<void>::failure(parse_error(
+                "project sweep source has a missing or stale centerline binding"));
+        }
+        const std::uint64_t encoded_size = source.serialize().size();
+        if (encoded_size > kMaxSerializedSweepSourceBytes ||
+            encoded_size > kMaxSerializedSweepSourceAggregateBytes - sweep_source_bytes) {
+            return core::Result<void>::failure(parse_error(
+                "project sweep source bytes exceed their bounded storage limit"));
+        }
+        sweep_source_bytes += encoded_size;
+    }
+    if (spatial_fields_.size() > kMaxSerializedSpatialFields) {
+        return core::Result<void>::failure(parse_error(
+            "project spatial-field count exceeds its limit"));
+    }
+    if (spatial_field_lineage_.size() > kMaxSerializedSpatialFieldLineage) {
+        return core::Result<void>::failure(parse_error(
+            "project spatial-field lineage count exceeds its limit"));
+    }
+    for (const auto& [identity, revision] : spatial_field_lineage_) {
+        if (!valid_spatial_field_identity(identity) || revision.value() == 0U) {
+            return core::Result<void>::failure(parse_error(
+                "project spatial-field lineage record is invalid"));
+        }
+        const auto active = spatial_fields_.find(identity);
+        if (active != spatial_fields_.end() && active->second.source_revision() != revision) {
+            return core::Result<void>::failure(parse_error(
+                "active spatial field disagrees with retained source lineage"));
+        }
+    }
+    std::uint64_t spatial_field_bytes = 0U;
+    for (const auto& [identity, field] : spatial_fields_) {
+        if (identity != field.identity()) {
+            return core::Result<void>::failure(parse_error(
+                "project spatial-field key does not match its embedded identity"));
+        }
+        if (auto result = field.validate(); !result) {
+            return core::Result<void>::failure(result.error().with_context(
+                "project spatial field"));
+        }
+        const auto lineage = spatial_field_lineage_.find(identity);
+        if (lineage == spatial_field_lineage_.end() ||
+            lineage->second != field.source_revision()) {
+            return core::Result<void>::failure(parse_error(
+                "active spatial field lacks its matching source lineage"));
+        }
+        const std::uint64_t encoded_size = field.serialize().size();
+        if (encoded_size > kMaxSerializedSpatialFieldBytes ||
+            encoded_size > kMaxSerializedSpatialFieldAggregateBytes - spatial_field_bytes) {
+            return core::Result<void>::failure(parse_error(
+                "project spatial fields exceed their bounded storage limit"));
+        }
+        spatial_field_bytes += encoded_size;
+    }
+    for (const auto& [object, camera] : presentation_catalog_.cameras()) {
+        static_cast<void>(camera);
+        if (scene_.find(object) == nullptr) {
+            return core::Result<void>::failure(parse_error(
+                "authored camera references a missing scene object"));
+        }
+    }
+    for (const auto& [object, light] : presentation_catalog_.lights()) {
+        static_cast<void>(light);
+        if (scene_.find(object) == nullptr) {
+            return core::Result<void>::failure(parse_error(
+                "authored light references a missing scene object"));
+        }
     }
     for (const auto& [identity, variant] : material_catalog_.variants()) {
         static_cast<void>(identity);
@@ -1186,11 +2580,23 @@ void ProjectDocument::swap(ProjectDocument& other) noexcept {
     std::swap(scientific_model_, other.scientific_model_);
     std::swap(world_model_, other.world_model_);
     std::swap(material_catalog_, other.material_catalog_);
+    std::swap(presentation_catalog_, other.presentation_catalog_);
+    curve_paths_.swap(other.curve_paths_);
+    curve_path_lineage_.swap(other.curve_path_lineage_);
+    road_sources_.swap(other.road_sources_);
+    road_source_lineage_.swap(other.road_source_lineage_);
+    sweep_sources_.swap(other.sweep_sources_);
+    sweep_source_lineage_.swap(other.sweep_source_lineage_);
+    spatial_fields_.swap(other.spatial_fields_);
+    spatial_field_lineage_.swap(other.spatial_field_lineage_);
     std::swap(semantic_sidecar_bytes_, other.semantic_sidecar_bytes_);
     std::swap(semantic_sidecar_digest_, other.semantic_sidecar_digest_);
     sculpt_stacks_.swap(other.sculpt_stacks_);
     garment_assets_.swap(other.garment_assets_);
     cloth_rest_pose_receipts_.swap(other.cloth_rest_pose_receipts_);
+    std::swap(engineering_authoring_, other.engineering_authoring_);
+    std::swap(condition_authoring_, other.condition_authoring_);
+    std::swap(source_asset_registry_, other.source_asset_registry_);
     std::swap(evaluation_graph_digest_, other.evaluation_graph_digest_);
     std::swap(next_mesh_id_, other.next_mesh_id_);
     std::swap(revision_, other.revision_);
@@ -1304,6 +2710,60 @@ std::string ProjectDocument::serialize() const {
         output << "CLOTH_REST_POSE_RECEIPT " << mesh_asset << ' '
                << receipt.digest.hex() << ' ' << std::quoted(receipt.bytes) << '\n';
     }
+    if (engineering_authoring_.has_value()) {
+        output << "ENGINEERING_AUTHORING " << engineering_authoring_->digest.hex() << ' '
+               << std::quoted(engineering_authoring_->bytes) << '\n';
+    }
+    if (condition_authoring_.has_value()) {
+        output << "CONDITION_AUTHORING " << condition_authoring_->digest.hex() << ' '
+               << std::quoted(condition_authoring_->bytes) << '\n';
+    } else {
+        output << "CONDITION_AUTHORING NONE\n";
+    }
+    output << "PRESENTATION_CATALOG "
+           << std::quoted(presentation_catalog_.serialize()) << '\n';
+    output << "CURVE_PATHS " << curve_paths_.size() << '\n';
+    for (const auto& [identity, path] : curve_paths_) {
+        output << "CURVE_PATH " << std::quoted(identity) << ' '
+               << std::quoted(path.serialize()) << '\n';
+    }
+    output << "ROAD_SOURCES " << road_sources_.size() << '\n';
+    for (const auto& [identity, road] : road_sources_) {
+        output << "ROAD_SOURCE " << std::quoted(identity) << ' '
+               << std::quoted(road.serialize()) << '\n';
+    }
+    output << "SWEEP_SOURCES " << sweep_sources_.size() << '\n';
+    for (const auto& [identity, source] : sweep_sources_) {
+        output << "SWEEP_SOURCE " << std::quoted(identity) << ' '
+               << std::quoted(source.serialize()) << '\n';
+    }
+    output << "SPATIAL_FIELDS " << spatial_fields_.size() << '\n';
+    for (const auto& [identity, field] : spatial_fields_) {
+        output << "SPATIAL_FIELD " << std::quoted(identity) << ' '
+               << std::quoted(field.serialize()) << '\n';
+    }
+    output << "SPATIAL_FIELD_LINEAGE " << spatial_field_lineage_.size() << '\n';
+    for (const auto& [identity, revision] : spatial_field_lineage_) {
+        output << "SPATIAL_FIELD_LINEAGE_RECORD " << std::quoted(identity) << ' '
+               << revision.value() << '\n';
+    }
+    output << "CURVE_PATH_LINEAGE " << curve_path_lineage_.size() << '\n';
+    for (const auto& [identity, revision] : curve_path_lineage_) {
+        output << "CURVE_PATH_LINEAGE_RECORD " << std::quoted(identity) << ' '
+               << revision.value() << '\n';
+    }
+    output << "ROAD_SOURCE_LINEAGE " << road_source_lineage_.size() << '\n';
+    for (const auto& [identity, revision] : road_source_lineage_) {
+        output << "ROAD_SOURCE_LINEAGE_RECORD " << std::quoted(identity) << ' '
+               << revision.value() << '\n';
+    }
+    output << "SWEEP_SOURCE_LINEAGE " << sweep_source_lineage_.size() << '\n';
+    for (const auto& [identity, revision] : sweep_source_lineage_) {
+        output << "SWEEP_SOURCE_LINEAGE_RECORD " << std::quoted(identity) << ' '
+               << revision.value() << '\n';
+    }
+    output << "SOURCE_ASSET_REGISTRY_HEX "
+           << encode_hex_bytes(source_asset_registry_.serialize()) << '\n';
     output << "END\n";
     return output.str();
 }
@@ -2114,6 +3574,561 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
     if (version.value() >= 13U && !cloth_rest_pose_receipts_seen) {
         return core::Result<ProjectDocument>::failure(parse_error(
             "project schema v13 is missing its cloth rest-pose receipt record"));
+    }
+    if (terminal_record == "ENGINEERING_AUTHORING") {
+        if (version.value() < 14U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "engineering authoring records require project schema version 14"));
+        }
+        std::string encoded_digest;
+        std::string encoded_authoring;
+        if (!(input >> encoded_digest >> std::quoted(encoded_authoring))) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project engineering authoring record is invalid"));
+        }
+        if (encoded_authoring.empty() ||
+            encoded_authoring.size() > kMaxSerializedEngineeringAuthoringBytes) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project engineering authoring record exceeds its size limit"));
+        }
+        const auto digest = assets::Sha256Digest::from_hex(encoded_digest);
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(encoded_authoring.data());
+        if (!digest || digest.value().is_zero() ||
+            assets::sha256(std::span<const std::uint8_t>(
+                bytes, encoded_authoring.size())) != digest.value()) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project engineering authoring digest does not bind its bytes"));
+        }
+        const auto decoded = engineering::AuthoringDocument::deserialize(encoded_authoring);
+        if (!decoded) {
+            return core::Result<ProjectDocument>::failure(decoded.error().with_context(
+                "serialized engineering authoring"));
+        }
+        document.engineering_authoring_ = SerializedEngineeringAuthoring{
+            std::move(encoded_authoring), digest.value()};
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(
+                parse_error("project is missing its terminal record"));
+        }
+    }
+    bool condition_authoring_seen = false;
+    if (terminal_record == "CONDITION_AUTHORING") {
+        if (version.value() < 14U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "CONDITION authoring records require project schema version 14"));
+        }
+        condition_authoring_seen = true;
+        std::string encoded_digest;
+        if (!(input >> encoded_digest)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project CONDITION authoring record is invalid"));
+        }
+        if (encoded_digest != "NONE") {
+            std::string encoded_authoring;
+            if (!(input >> std::quoted(encoded_authoring)) || encoded_authoring.empty() ||
+                encoded_authoring.size() > kMaxSerializedConditionAuthoringBytes) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project CONDITION authoring record exceeds its size limit"));
+            }
+            const auto digest = assets::Sha256Digest::from_hex(encoded_digest);
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(encoded_authoring.data());
+            if (!digest || digest.value().is_zero() ||
+                assets::sha256(std::span<const std::uint8_t>(
+                    bytes, encoded_authoring.size())) != digest.value()) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project CONDITION authoring digest does not bind its bytes"));
+            }
+            const auto decoded = condition::AuthoringDocument::deserialize(encoded_authoring);
+            if (!decoded) {
+                return core::Result<ProjectDocument>::failure(decoded.error().with_context(
+                    "serialized CONDITION authoring"));
+            }
+            document.condition_authoring_ = SerializedConditionAuthoring{
+                std::move(encoded_authoring), digest.value()};
+        }
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(
+                parse_error("project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 14U && !condition_authoring_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v14 is missing its CONDITION authoring record"));
+    }
+    bool presentation_catalog_seen = false;
+    if (terminal_record == "PRESENTATION_CATALOG") {
+        if (version.value() < 15U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "presentation catalog records require project schema version 15"));
+        }
+        std::string encoded_presentation_catalog;
+        if (!(input >> std::quoted(encoded_presentation_catalog)) ||
+            encoded_presentation_catalog.size() > PresentationCatalog::kMaxSerializedBytes) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project presentation catalog record is invalid or oversized"));
+        }
+        const auto presentation_catalog =
+            PresentationCatalog::deserialize(encoded_presentation_catalog);
+        if (!presentation_catalog) {
+            return core::Result<ProjectDocument>::failure(
+                presentation_catalog.error().with_context("serialized presentation catalog"));
+        }
+        document.presentation_catalog_ = presentation_catalog.value();
+        presentation_catalog_seen = true;
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(
+                parse_error("project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 15U && !presentation_catalog_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v15 is missing its presentation catalog record"));
+    }
+    bool curve_paths_seen = false;
+    if (terminal_record == "CURVE_PATHS") {
+        if (version.value() < 16U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "curve path records require project schema version 16"));
+        }
+        curve_paths_seen = true;
+        auto curve_path_count = read_uint(input, "curve path count");
+        if (!curve_path_count) {
+            return core::Result<ProjectDocument>::failure(curve_path_count.error());
+        }
+        if (auto result = validate_serialized_count(
+                curve_path_count.value(), kMaxSerializedCurvePaths,
+                "project curve path count"); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+        std::uint64_t aggregate_bytes = 0U;
+        for (std::uint64_t index = 0U; index < curve_path_count.value(); ++index) {
+            if (auto result = require_line(input, "CURVE_PATH"); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            std::string identity;
+            std::string encoded_path;
+            if (!(input >> std::quoted(identity) >> std::quoted(encoded_path)) ||
+                encoded_path.empty() || encoded_path.size() > kMaxSerializedCurvePathBytes) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project curve path record is invalid or oversized"));
+            }
+            if (encoded_path.size() >
+                kMaxSerializedCurvePathAggregateBytes - aggregate_bytes) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project curve paths exceed their aggregate byte limit"));
+            }
+            aggregate_bytes += static_cast<std::uint64_t>(encoded_path.size());
+            auto path = geometry::CurvePath::deserialize(encoded_path);
+            if (!path) {
+                return core::Result<ProjectDocument>::failure(path.error().with_context(
+                    "serialized project curve path"));
+            }
+            if (path.value().source_identity != identity ||
+                !document.curve_paths_.emplace(identity, std::move(path.value())).second) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project curve path identity is duplicate or unbound"));
+            }
+        }
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 16U && !curve_paths_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v16 is missing its curve path table"));
+    }
+    bool road_sources_seen = false;
+    if (terminal_record == "ROAD_SOURCES") {
+        if (version.value() < 17U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "road source records require project schema version 17"));
+        }
+        road_sources_seen = true;
+        auto road_source_count = read_uint(input, "road source count");
+        if (!road_source_count) {
+            return core::Result<ProjectDocument>::failure(road_source_count.error());
+        }
+        if (auto result = validate_serialized_count(
+                road_source_count.value(), kMaxSerializedRoadSources,
+                "project road source count"); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+        std::uint64_t aggregate_bytes = 0U;
+        for (std::uint64_t index = 0U; index < road_source_count.value(); ++index) {
+            if (auto result = require_line(input, "ROAD_SOURCE"); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            std::string identity;
+            std::string encoded_road;
+            if (!(input >> std::quoted(identity) >> std::quoted(encoded_road)) ||
+                encoded_road.empty() || encoded_road.size() > kMaxSerializedRoadSourceBytes) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project road source record is invalid or oversized"));
+            }
+            if (encoded_road.size() >
+                kMaxSerializedRoadSourceAggregateBytes - aggregate_bytes) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project road sources exceed their aggregate byte limit"));
+            }
+            aggregate_bytes += static_cast<std::uint64_t>(encoded_road.size());
+            auto road = RoadSource::deserialize(encoded_road);
+            if (!road) {
+                return core::Result<ProjectDocument>::failure(road.error().with_context(
+                    "serialized project road source"));
+            }
+            if (road.value().source_identity != identity ||
+                !document.road_sources_.emplace(identity, std::move(road.value())).second) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project road source identity is duplicate or unbound"));
+            }
+        }
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 17U && !road_sources_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v17 is missing its road source table"));
+    }
+    bool sweep_sources_seen = false;
+    if (terminal_record == "SWEEP_SOURCES") {
+        if (version.value() < 22U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "sweep source records require project schema version 22"));
+        }
+        sweep_sources_seen = true;
+        auto source_count = read_uint(input, "sweep source count");
+        if (!source_count) {
+            return core::Result<ProjectDocument>::failure(source_count.error());
+        }
+        if (auto result = validate_serialized_count(
+                source_count.value(), kMaxSerializedSweepSources,
+                "project sweep-source count"); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+        std::uint64_t aggregate_bytes = 0U;
+        for (std::uint64_t index = 0U; index < source_count.value(); ++index) {
+            if (auto result = require_line(input, "SWEEP_SOURCE"); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            std::string identity;
+            std::string encoded_source;
+            if (!(input >> std::quoted(identity) >> std::quoted(encoded_source)) ||
+                encoded_source.empty() ||
+                encoded_source.size() > kMaxSerializedSweepSourceBytes) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project sweep source record is invalid or oversized"));
+            }
+            if (encoded_source.size() >
+                kMaxSerializedSweepSourceAggregateBytes - aggregate_bytes) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project sweep sources exceed their aggregate byte limit"));
+            }
+            aggregate_bytes += static_cast<std::uint64_t>(encoded_source.size());
+            auto source = geometry::SweepSource::deserialize(encoded_source);
+            if (!source) {
+                return core::Result<ProjectDocument>::failure(source.error().with_context(
+                    "serialized project sweep source"));
+            }
+            if (source.value().source_identity != identity ||
+                !document.sweep_sources_.emplace(identity, std::move(source.value())).second) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project sweep source identity is duplicate or unbound"));
+            }
+        }
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 22U && !sweep_sources_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v22 is missing its sweep-source table"));
+    }
+    bool spatial_fields_seen = false;
+    if (terminal_record == "SPATIAL_FIELDS") {
+        if (version.value() < 18U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "spatial field records require project schema version 18"));
+        }
+        spatial_fields_seen = true;
+        auto field_count = read_uint(input, "spatial field count");
+        if (!field_count) {
+            return core::Result<ProjectDocument>::failure(field_count.error());
+        }
+        if (auto result = validate_serialized_count(
+                field_count.value(), kMaxSerializedSpatialFields,
+                "project spatial-field count"); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+        std::uint64_t aggregate_bytes = 0U;
+        for (std::uint64_t index = 0U; index < field_count.value(); ++index) {
+            if (auto result = require_line(input, "SPATIAL_FIELD"); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            std::string identity;
+            std::string encoded_field;
+            if (!(input >> std::quoted(identity) >> std::quoted(encoded_field)) ||
+                encoded_field.empty() || encoded_field.size() > kMaxSerializedSpatialFieldBytes) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project spatial field record is invalid or oversized"));
+            }
+            if (encoded_field.size() >
+                kMaxSerializedSpatialFieldAggregateBytes - aggregate_bytes) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project spatial fields exceed their aggregate byte limit"));
+            }
+            aggregate_bytes += static_cast<std::uint64_t>(encoded_field.size());
+            auto field = spatial_field::ScalarField2D::deserialize(encoded_field);
+            if (!field) {
+                return core::Result<ProjectDocument>::failure(field.error().with_context(
+                    "serialized project spatial field"));
+            }
+            if (field.value().identity() != identity ||
+                !document.spatial_fields_.emplace(identity, std::move(field.value())).second) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project spatial-field identity is duplicate or unbound"));
+            }
+        }
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 18U && !spatial_fields_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v18 is missing its spatial-field table"));
+    }
+    bool spatial_field_lineage_seen = false;
+    if (terminal_record == "SPATIAL_FIELD_LINEAGE") {
+        if (version.value() < 19U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "spatial field lineage records require project schema version 19"));
+        }
+        spatial_field_lineage_seen = true;
+        auto lineage_count = read_uint(input, "spatial-field lineage count");
+        if (!lineage_count) {
+            return core::Result<ProjectDocument>::failure(lineage_count.error());
+        }
+        if (auto result = validate_serialized_count(
+                lineage_count.value(), kMaxSerializedSpatialFieldLineage,
+                "project spatial-field lineage count"); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+        for (std::uint64_t index = 0U; index < lineage_count.value(); ++index) {
+            if (auto result = require_line(input, "SPATIAL_FIELD_LINEAGE_RECORD"); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            std::string identity;
+            if (!(input >> std::quoted(identity)) || !valid_spatial_field_identity(identity)) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project spatial-field lineage identity is malformed"));
+            }
+            auto revision = read_uint(input, "spatial-field lineage revision");
+            if (!revision || revision.value() == 0U ||
+                !document.spatial_field_lineage_.emplace(
+                    std::move(identity), core::Revision{revision.value()}).second) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project spatial-field lineage record is invalid or duplicated"));
+            }
+        }
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 19U && !spatial_field_lineage_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v19 is missing its spatial-field lineage table"));
+    }
+    if (version.value() < 19U) {
+        for (const auto& [identity, field] : document.spatial_fields_) {
+            document.spatial_field_lineage_.emplace(identity, field.source_revision());
+        }
+    }
+    bool curve_path_lineage_seen = false;
+    if (terminal_record == "CURVE_PATH_LINEAGE") {
+        if (version.value() < 20U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "curve source lineage records require project schema version 20"));
+        }
+        curve_path_lineage_seen = true;
+        auto lineage_count = read_uint(input, "curve source lineage count");
+        if (!lineage_count) {
+            return core::Result<ProjectDocument>::failure(lineage_count.error());
+        }
+        if (auto result = validate_serialized_count(
+                lineage_count.value(), kMaxSerializedCurvePathLineage,
+                "project curve source lineage count"); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+        for (std::uint64_t index = 0U; index < lineage_count.value(); ++index) {
+            if (auto result = require_line(input, "CURVE_PATH_LINEAGE_RECORD"); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            std::string identity;
+            if (!(input >> std::quoted(identity)) ||
+                !valid_curve_or_road_identity(identity)) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project curve source lineage identity is malformed"));
+            }
+            auto revision = read_uint(input, "curve source lineage revision");
+            if (!revision || revision.value() == 0U ||
+                !document.curve_path_lineage_.emplace(
+                    std::move(identity), core::Revision{revision.value()}).second) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project curve source lineage record is invalid or duplicated"));
+            }
+        }
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 20U && !curve_path_lineage_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v20 is missing its curve-source lineage table"));
+    }
+    bool road_source_lineage_seen = false;
+    if (terminal_record == "ROAD_SOURCE_LINEAGE") {
+        if (version.value() < 20U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "road source lineage records require project schema version 20"));
+        }
+        road_source_lineage_seen = true;
+        auto lineage_count = read_uint(input, "road source lineage count");
+        if (!lineage_count) {
+            return core::Result<ProjectDocument>::failure(lineage_count.error());
+        }
+        if (auto result = validate_serialized_count(
+                lineage_count.value(), kMaxSerializedRoadSourceLineage,
+                "project road-source lineage count"); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+        for (std::uint64_t index = 0U; index < lineage_count.value(); ++index) {
+            if (auto result = require_line(input, "ROAD_SOURCE_LINEAGE_RECORD"); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            std::string identity;
+            if (!(input >> std::quoted(identity)) ||
+                !valid_curve_or_road_identity(identity)) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project road-source lineage identity is malformed"));
+            }
+            auto revision = read_uint(input, "road source lineage revision");
+            if (!revision || revision.value() == 0U ||
+                !document.road_source_lineage_.emplace(
+                    std::move(identity), core::Revision{revision.value()}).second) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project road-source lineage record is invalid or duplicated"));
+            }
+        }
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 20U && !road_source_lineage_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v20 is missing its road-source lineage table"));
+    }
+    if (version.value() < 20U) {
+        for (const auto& [identity, path] : document.curve_paths_) {
+            document.curve_path_lineage_.emplace(identity, path.source_revision);
+        }
+        for (const auto& [identity, road] : document.road_sources_) {
+            document.road_source_lineage_.emplace(identity, road.source_revision);
+        }
+    }
+    bool sweep_source_lineage_seen = false;
+    if (terminal_record == "SWEEP_SOURCE_LINEAGE") {
+        if (version.value() < 22U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "sweep-source lineage records require project schema version 22"));
+        }
+        sweep_source_lineage_seen = true;
+        auto lineage_count = read_uint(input, "sweep-source lineage count");
+        if (!lineage_count) {
+            return core::Result<ProjectDocument>::failure(lineage_count.error());
+        }
+        if (auto result = validate_serialized_count(
+                lineage_count.value(), kMaxSerializedSweepSourceLineage,
+                "project sweep-source lineage count"); !result) {
+            return core::Result<ProjectDocument>::failure(result.error());
+        }
+        for (std::uint64_t index = 0U; index < lineage_count.value(); ++index) {
+            if (auto result = require_line(input, "SWEEP_SOURCE_LINEAGE_RECORD"); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            std::string identity;
+            if (!(input >> std::quoted(identity)) ||
+                !valid_curve_or_road_identity(identity)) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project sweep-source lineage identity is malformed"));
+            }
+            auto lineage_revision = read_uint(input, "sweep-source lineage revision");
+            if (!lineage_revision || lineage_revision.value() == 0U ||
+                !document.sweep_source_lineage_.emplace(
+                    std::move(identity), core::Revision{lineage_revision.value()}).second) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project sweep-source lineage record is invalid or duplicated"));
+            }
+        }
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 22U && !sweep_source_lineage_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v22 is missing its sweep-source lineage table"));
+    }
+    bool source_asset_registry_seen = false;
+    if (terminal_record == "SOURCE_ASSET_REGISTRY_HEX") {
+        if (version.value() < 21U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "source asset registry records require project schema version 21"));
+        }
+        source_asset_registry_seen = true;
+        std::string encoded_registry;
+        if (!(input >> encoded_registry)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project source asset registry is malformed or oversized"));
+        }
+        const auto decoded_registry = decode_hex_bytes(
+            encoded_registry, assets::ProjectAssetRegistry::kMaxSerializedBytes);
+        if (!decoded_registry.has_value()) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project source asset registry encoding is invalid or oversized"));
+        }
+        auto registry = assets::ProjectAssetRegistry::deserialize(*decoded_registry);
+        if (!registry) {
+            return core::Result<ProjectDocument>::failure(registry.error().with_context(
+                "serialized project source asset registry"));
+        }
+        document.source_asset_registry_ = std::move(registry.value());
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project is missing its terminal record"));
+        }
+    }
+    if (version.value() >= 21U && !source_asset_registry_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v21 is missing its source asset registry"));
     }
     if (terminal_record != "END") {
         return core::Result<ProjectDocument>::failure(

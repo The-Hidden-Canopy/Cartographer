@@ -1,8 +1,14 @@
 #pragma once
 
 #include <carto/ai/ai.hpp>
+#include <carto/agent/scene_query.hpp>
 #include <carto/application/application.hpp>
+#include <carto/agent/workbench.hpp>
+#include <carto/condition/authoring.hpp>
+#include <carto/condition/vegetation_preview.hpp>
 #include <carto/core/result.hpp>
+#include <carto/engineering/authoring.hpp>
+#include <carto/engineering/cad_provider.hpp>
 #include <carto/market/market.hpp>
 #include <carto/surface/core.hpp>
 
@@ -68,6 +74,9 @@ enum class OperatorMode {
 enum class Workspace {
     model,
     sculpt,
+    uv,
+    engineering,
+    condition,
     cad,
     build,
     material,
@@ -252,6 +261,9 @@ struct MeshImportReceipt {
     std::size_t triangles = 0U;
     std::vector<std::string> warnings;
     application::DispatchReceipt dispatch;
+    bool source_linked = false;
+    std::string source_identity;
+    std::string relative_source_path;
 };
 
 enum class MarketStatus {
@@ -327,7 +339,30 @@ inline constexpr std::size_t kWorkbenchInstrumentCount = 13U;
 inline constexpr std::size_t kWorkbenchFlowMemoryCount = 4U;
 inline constexpr std::uint32_t kMaxWorkbenchFlowUses = 10000U;
 
+enum class WorkbenchPane {
+    navigation,
+    workspace_selector,
+    agent_task_strip,
+    toolbar,
+    tool_rack,
+    work_surface,
+    operation_ledger,
+    instrument_bay,
+    ai_context,
+};
+
+inline constexpr std::size_t kWorkbenchPaneCount = 9U;
+
 struct WorkbenchInstrumentLayout {
+    bool visible = false;
+    bool positioned = false;
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    std::int32_t width = 0;
+    std::int32_t height = 0;
+};
+
+struct WorkbenchPaneLayout {
     bool visible = false;
     bool positioned = false;
     std::int32_t x = 0;
@@ -344,6 +379,15 @@ struct WorkbenchPreferences {
     std::array<std::uint32_t, kWorkbenchFlowMemoryCount> flow_use_counts{};
     std::int32_t last_flow_index = -1;
     std::array<WorkbenchInstrumentLayout, kWorkbenchInstrumentCount> instruments{};
+    std::array<WorkbenchPaneLayout, kWorkbenchPaneCount> panes = [] {
+        std::array<WorkbenchPaneLayout, kWorkbenchPaneCount> layouts{};
+        layouts[static_cast<std::size_t>(WorkbenchPane::navigation)].visible = true;
+        layouts[static_cast<std::size_t>(WorkbenchPane::workspace_selector)].visible = true;
+        layouts[static_cast<std::size_t>(WorkbenchPane::toolbar)].visible = true;
+        layouts[static_cast<std::size_t>(WorkbenchPane::work_surface)].visible = true;
+        layouts[static_cast<std::size_t>(WorkbenchPane::operation_ledger)].visible = true;
+        return layouts;
+    }();
 
     [[nodiscard]] core::Result<void> validate() const;
 };
@@ -386,6 +430,27 @@ struct SurfaceFidelityView {
     [[nodiscard]] core::Result<void> validate() const;
 };
 
+struct AgentTaskStripView {
+    std::string task_id;
+    agent::TaskStatus status = agent::TaskStatus::prepared;
+    std::size_t passed_steps = 0U;
+    std::size_t total_steps = 0U;
+    std::size_t passed_required_gates = 0U;
+    std::size_t required_gates = 0U;
+    std::optional<core::Diagnostic> blocker;
+};
+
+struct AgentDemonstrationTargetBindingView {
+    std::size_t target_set_index = 0U;
+    std::uint32_t target_alias = 0U;
+    std::uint32_t component_alias = 0U;
+    agent::AgentDemonstrationTargetKind target_kind =
+        agent::AgentDemonstrationTargetKind::object;
+    bool bound = false;
+    // Current-project display only. Never serialized into traces or recipes.
+    std::string target_label;
+};
+
 // A UI snapshot is a presentation projection. The inherited application
 // snapshot remains the only authoring data source; UI-only state is kept in
 // the additional fields below and is never serialized into a project.
@@ -405,10 +470,74 @@ struct UiSnapshot : application::ApplicationSnapshot {
     std::vector<core::Diagnostic> ui_problems;
     UiColorTokens colors;
     SurfaceFidelityView surface_fidelity;
+    std::optional<AgentTaskStripView> agent_task_strip;
     MarketView market;
     bool ai_available = false;
     bool ai_auto_approve = true;
     std::string ai_status;
+    std::string agent_goal;
+    std::string agent_recipe_id;
+    std::vector<agent::AgentPlanStep> agent_plan_draft;
+    std::vector<agent::HardConstraint> agent_hard_constraints_draft;
+    std::vector<agent::ClarificationQuestion> agent_clarifications_draft;
+    bool agent_repair_ready = false;
+    bool agent_checkpoint_loaded = false;
+    bool agent_checkpoint_rebased = false;
+    std::string agent_checkpoint_task_id;
+    core::Revision agent_checkpoint_base_revision;
+    core::Revision agent_checkpoint_rebase_revision;
+    std::vector<std::string> agent_checkpoint_directly_conflicting_steps;
+    std::vector<std::string> agent_checkpoint_invalidated_steps;
+    std::optional<agent::AgentTaskSnapshot> agent_task;
+    std::optional<agent::SceneQueryResult> agent_condition_inventory;
+    std::optional<agent::AgentDemonstration> agent_demonstration;
+    std::optional<agent::AgentDemonstrationTrace> agent_demonstration_trace;
+    std::string agent_demonstration_recipe_name;
+    std::vector<AgentDemonstrationTargetBindingView> agent_demonstration_bindings;
+    std::size_t agent_demonstration_target_set_count = 1U;
+    bool agent_demonstration_similar_targets_supported = false;
+    bool agent_demonstration_ready_to_preview = false;
+};
+
+inline constexpr std::size_t kMaxEngineeringPathProjectionPoints = 2048U;
+
+struct EngineeringPathProjectionPoint {
+    std::uint32_t sequence = 0U;
+    core::Vec3d position;
+    std::optional<std::uint64_t> target_id;
+    std::string status;
+};
+
+struct EngineeringPathProjectionMarker {
+    std::uint64_t id = 0U;
+    std::string kind;
+    std::string name;
+    core::Vec3d position;
+    bool reference_frame = false;
+};
+
+struct EngineeringPathProjectionKeepOut {
+    std::uint64_t id = 0U;
+    std::string kind;
+    std::string purpose;
+    double minimum_x = 0.0;
+    double maximum_x = 0.0;
+    double minimum_z = 0.0;
+    double maximum_z = 0.0;
+};
+
+// Bounded presentation-only projection of imported path samples. Coordinates
+// remain in the authored workcell frame; no feasibility is inferred here.
+struct EngineeringPathProjection {
+    std::vector<EngineeringPathProjectionPoint> points;
+    std::vector<EngineeringPathProjectionMarker> workcell_markers;
+    std::vector<EngineeringPathProjectionKeepOut> keep_outs;
+    double minimum_x = 0.0;
+    double maximum_x = 0.0;
+    double minimum_z = 0.0;
+    double maximum_z = 0.0;
+    std::size_t source_sample_count = 0U;
+    std::size_t omitted_sample_count = 0U;
 };
 
 [[nodiscard]] UiColorTokens color_tokens(Theme theme) noexcept;
@@ -423,10 +552,14 @@ struct UiSnapshot : application::ApplicationSnapshot {
 [[nodiscard]] const char* mesh_import_format_name(MeshImportFormat format) noexcept;
 [[nodiscard]] const char* market_status_name(MarketStatus status) noexcept;
 [[nodiscard]] const char* workbench_instrument_name(WorkbenchInstrument instrument) noexcept;
+[[nodiscard]] const char* workbench_pane_name(WorkbenchPane pane) noexcept;
 [[nodiscard]] const char* surface_fidelity_status_name(
     SurfaceFidelityStatus status) noexcept;
 [[nodiscard]] const char* surface_fidelity_mode_name(
     surface::RepresentationMode mode) noexcept;
+[[nodiscard]] core::Result<EngineeringPathProjection> project_engineering_path_xz(
+    const application::EngineeringAuthoringView::Path& path,
+    const application::EngineeringAuthoringView::Workcell* workcell = nullptr);
 
 [[nodiscard]] core::Result<void> save_workbench_preferences(
     const std::filesystem::path& path,
@@ -443,6 +576,8 @@ public:
 
     [[nodiscard]] core::Result<application::DispatchReceipt> dispatch(
         const application::ApplicationAction& action);
+    [[nodiscard]] core::Result<project::MaterialGraph> material_graph_source(
+        std::string_view identity) const;
     [[nodiscard]] core::Result<editor::AuthoringPreview> begin_preview(
         editor::PreviewKind kind) const;
     [[nodiscard]] core::Result<application::DispatchReceipt> commit_preview(
@@ -460,12 +595,197 @@ public:
         const ai::Proposal& proposal);
     [[nodiscard]] core::Result<application::DispatchReceipt> submit_ai_proposal(
         const application::ApplicationAction& action);
+    [[nodiscard]] core::Result<void> queue_agent_step(
+        std::string intent,
+        std::vector<std::string> dependencies = {});
+    [[nodiscard]] core::Result<void> compile_agent_goal_sequence(std::string goal);
+    [[nodiscard]] core::Result<void> set_agent_hard_constraints(
+        std::vector<agent::HardConstraint> constraints);
+    [[nodiscard]] core::Result<void> set_agent_recipe(std::string recipe_id);
+    [[nodiscard]] core::Result<void> queue_agent_clarification(
+        std::string prompt,
+        agent::ClarificationImpact impact,
+        std::vector<agent::ClarificationCandidate> candidates = {},
+        std::string rationale = {});
+    [[nodiscard]] core::Result<void> answer_agent_clarification(
+        std::string goal,
+        std::string_view question_id,
+        std::string answer);
+    [[nodiscard]] core::Result<void> choose_agent_clarification_candidate(
+        std::string goal,
+        std::string_view question_id,
+        std::string candidate_id);
+    [[nodiscard]] core::Result<agent::AgentTaskSnapshot> prepare_agent_plan(
+        std::string goal,
+        std::optional<agent::AgentWorkEnvelope> requested_envelope = std::nullopt);
+    [[nodiscard]] core::Result<agent::AgentTaskSnapshot> run_agent_plan(
+        std::string goal,
+        std::optional<agent::AgentWorkEnvelope> requested_envelope = std::nullopt);
+    [[nodiscard]] core::Result<agent::AgentTaskSnapshot> run_prepared_agent_plan();
+    [[nodiscard]] core::Result<agent::SceneQueryResult> query_agent_condition_inventory();
+    [[nodiscard]] core::Result<void> revise_agent_plan_step(
+        agent::AgentPlanStep revised_step);
+    [[nodiscard]] core::Result<agent::AgentTaskSnapshot> repair_agent_plan(
+        std::string justification);
+    [[nodiscard]] core::Result<void> save_agent_checkpoint(
+        const std::filesystem::path& path) const;
+    [[nodiscard]] core::Result<void> load_agent_checkpoint(
+        const std::filesystem::path& path);
+    [[nodiscard]] core::Result<void> save_agent_demonstration(
+        const std::filesystem::path& path) const;
+    [[nodiscard]] core::Result<void> load_agent_demonstration(
+        const std::filesystem::path& path);
+    [[nodiscard]] core::Result<void> clear_agent_demonstration();
+    [[nodiscard]] core::Result<void> capture_agent_demonstration_trace(
+        application::OperationId first_operation,
+        application::OperationId last_operation);
+    [[nodiscard]] core::Result<void> bind_agent_demonstration_target(
+        std::uint32_t target_alias,
+        std::uint32_t component_alias,
+        std::size_t target_set_index = 0U);
+    [[nodiscard]] core::Result<std::size_t> apply_agent_demonstration_to_similar();
+    [[nodiscard]] core::Result<void> set_agent_demonstration_target_set_count(
+        std::size_t target_set_count);
+    [[nodiscard]] core::Result<void> clear_agent_demonstration_target_bindings();
+    [[nodiscard]] core::Result<agent::AgentTaskSnapshot>
+    preview_agent_demonstration_trace();
+    [[nodiscard]] core::Result<void> save_agent_demonstration_trace(
+        const std::filesystem::path& path) const;
+    [[nodiscard]] core::Result<void> load_agent_demonstration_trace(
+        const std::filesystem::path& path);
+    [[nodiscard]] core::Result<void> save_agent_demonstration_recipe(
+        const std::filesystem::path& path);
+    [[nodiscard]] core::Result<void> load_agent_demonstration_recipe(
+        const std::filesystem::path& path);
+    [[nodiscard]] core::Result<void> clear_agent_demonstration_trace();
+    [[nodiscard]] core::Result<void> rebase_agent_checkpoint();
+    [[nodiscard]] core::Result<agent::AgentTaskSnapshot> resume_agent_checkpoint();
+    [[nodiscard]] core::Result<agent::AgentTaskSnapshot> correct_agent_ghost_transform(
+        scene::ObjectId object,
+        core::Transform transform,
+        std::string justification);
+    [[nodiscard]] core::Result<agent::AgentTaskSnapshot>
+    correct_agent_ghost_vertex_position(
+        scene::ObjectId object,
+        geometry::VertexId vertex,
+        core::Vec3d position,
+        std::string justification);
+    [[nodiscard]] core::Result<agent::AgentTaskSnapshot> correct_agent_ghost_face(
+        scene::ObjectId object,
+        geometry::FaceId face,
+        agent::GhostCorrectionKind kind,
+        double distance,
+        std::string justification);
+    [[nodiscard]] core::Result<application::DispatchReceipt> accept_agent_plan();
+    [[nodiscard]] core::Result<void> reject_agent_plan();
+    [[nodiscard]] core::Result<void> clear_agent_plan();
     // Resolves the built-in provider, parses bounded interchange input, and
     // admits the resulting mesh through the same human application boundary
     // used by native modelling controls. Failures never mutate the project.
     [[nodiscard]] core::Result<MeshImportReceipt> import_mesh(
         const std::filesystem::path& path,
         MeshImportFormat format);
+    [[nodiscard]] core::Result<assets::SourceReimportPlan> preview_source_reimport(
+        std::vector<assets::SourceImportRecord> incoming) const;
+    [[nodiscard]] core::Result<application::DispatchReceipt> apply_source_reimport_plan(
+        assets::SourceReimportPlan plan);
+    [[nodiscard]] core::Result<application::DispatchReceipt> import_engineering_fixture();
+    [[nodiscard]] core::Result<application::DispatchReceipt> import_engineering_authoring(
+        const std::filesystem::path& path);
+    // Reads only the bounded STEP exchange header. This does not import
+    // geometry, register a source, or mutate the project.
+    [[nodiscard]] core::Result<engineering::ImportProbe> probe_engineering_step(
+        const std::filesystem::path& path) const;
+    [[nodiscard]] core::Result<application::DispatchReceipt> import_engineering_bom_csv(
+        const std::filesystem::path& path);
+    [[nodiscard]] core::Result<application::DispatchReceipt> import_engineering_requirement_csv(
+        const std::filesystem::path& path);
+    [[nodiscard]] core::Result<application::DispatchReceipt> import_engineering_path_result(
+        const std::filesystem::path& path);
+    [[nodiscard]] core::Result<application::DispatchReceipt> attach_engineering_evidence(
+        const std::filesystem::path& path,
+        engineering::SourceKind kind);
+    [[nodiscard]] core::Result<application::DispatchReceipt> create_engineering_characteristic(
+        const application::CreateEngineeringCharacteristicAction& action);
+    [[nodiscard]] core::Result<application::DispatchReceipt> create_engineering_target(
+        const application::CreateEngineeringTargetAction& action);
+    [[nodiscard]] core::Result<application::DispatchReceipt> update_engineering_workcell(
+        const application::UpdateEngineeringWorkcellAction& action);
+    [[nodiscard]] core::Result<application::DispatchReceipt> create_engineering_keep_out(
+        const application::CreateEngineeringKeepOutAction& action);
+    [[nodiscard]] core::Result<application::DispatchReceipt> create_engineering_workcell_frame(
+        const application::CreateEngineeringWorkcellFrameAction& action);
+    [[nodiscard]] core::Result<void> export_engineering_authoring(
+        const std::filesystem::path& path) const;
+    [[nodiscard]] core::Result<application::DispatchReceipt> invalidate_engineering_source(
+        engineering::Id source_id,
+        std::string new_revision,
+        assets::Sha256Digest new_digest);
+    [[nodiscard]] core::Result<engineering::InspectionPackage>
+    build_engineering_package() const;
+    [[nodiscard]] core::Result<engineering::VantaAdmissionResult>
+    admit_engineering_package() const;
+    [[nodiscard]] core::Result<void> publish_engineering_package(
+        const std::filesystem::path& path) const;
+    [[nodiscard]] core::Result<application::DispatchReceipt> import_condition_fixture();
+    [[nodiscard]] core::Result<application::DispatchReceipt> import_condition_authoring(
+        const std::filesystem::path& path);
+    [[nodiscard]] core::Result<application::DispatchReceipt> import_condition_audio_clip(
+        const std::filesystem::path& path);
+    [[nodiscard]] core::Result<application::DispatchReceipt> bind_condition_asset_to_object(
+        condition::Id asset_id,
+        scene::ObjectId object_id,
+        core::Revision expected_project_revision,
+        core::Revision expected_authoring_revision);
+    [[nodiscard]] core::Result<application::DispatchReceipt> set_condition_source_reviewed(
+        condition::Id source_id, bool reviewed);
+    [[nodiscard]] core::Result<void> export_condition_authoring(
+        const std::filesystem::path& path) const;
+    [[nodiscard]] core::Result<application::DispatchReceipt> invalidate_condition_source(
+        condition::Id source_id,
+        std::string new_revision,
+        assets::Sha256Digest new_digest);
+    [[nodiscard]] core::Result<application::DispatchReceipt> add_condition_audio_source(
+        condition::AuthoredAudioSource source);
+    [[nodiscard]] core::Result<application::DispatchReceipt> add_condition_acoustic_zone(
+        condition::AuthoredAcousticZone zone);
+    [[nodiscard]] core::Result<application::DispatchReceipt> update_condition_audio_source_distances(
+        condition::Id source_id,
+        core::Revision expected_authoring_revision,
+        double minimum_distance,
+        double maximum_distance);
+    [[nodiscard]] core::Result<application::DispatchReceipt> set_condition_audio_source_enabled(
+        condition::Id source_id,
+        core::Revision expected_authoring_revision,
+        bool enabled);
+    [[nodiscard]] core::Result<application::DispatchReceipt> update_condition_acoustic_zone_volume(
+        condition::Id zone_id,
+        core::Revision expected_authoring_revision,
+        core::Vec3d half_extents,
+        double radius);
+    [[nodiscard]] core::Result<application::DispatchReceipt> add_condition_effect_source(
+        condition::EffectSource source);
+    [[nodiscard]] core::Result<application::DispatchReceipt> add_condition_particle_emitter(
+        condition::ParticleEmitterSource emitter);
+    [[nodiscard]] core::Result<application::DispatchReceipt> add_condition_field_influence(
+        condition::FieldInfluenceBinding influence);
+    [[nodiscard]] core::Result<application::DispatchReceipt> add_condition_vegetation_scatter(
+        condition::VegetationScatterRecipe recipe);
+    [[nodiscard]] core::Result<application::DispatchReceipt> add_condition_state_branch(
+        condition::AuthoredStateBranch branch);
+    [[nodiscard]] core::Result<condition::EffectPreviewResult> preview_condition_effect(
+        condition::Id effect_source_id,
+        std::string_view operating_state,
+        double elapsed_seconds) const;
+    [[nodiscard]] core::Result<condition::VegetationPreviewResult>
+    preview_condition_vegetation(condition::Id recipe_id) const;
+    [[nodiscard]] core::Result<condition::StateComparisonResult>
+    compare_condition_state_branches(condition::Id left_branch_id,
+        condition::Id right_branch_id) const;
+    [[nodiscard]] core::Result<condition::Package> build_condition_package() const;
+    [[nodiscard]] core::Result<condition::AdmissionResult> admit_condition_package() const;
+    [[nodiscard]] core::Result<void> publish_condition_package(
+        const std::filesystem::path& path) const;
     // Connects the native shell to a local, provider-neutral market library.
     // Refresh and install revalidate package contents and receipts; no network
     // or executable package path is reachable through this controller.
@@ -503,10 +823,22 @@ public:
     [[nodiscard]] UiSnapshot snapshot() const;
 
 private:
+    struct AgentDemonstrationTargetBinding {
+        std::size_t target_set_index = 0U;
+        std::uint32_t target_alias = 0U;
+        std::uint32_t component_alias = 0U;
+        agent::TargetRef target;
+    };
+
     [[nodiscard]] core::Result<application::DispatchReceipt> dispatch_with_category(
         const application::ApplicationAction& action,
         OperationCategory category);
     [[nodiscard]] core::Result<void> apply_preferences(const UiPreferences& preferences);
+    [[nodiscard]] core::Result<void> record_agent_clarification_answer(
+        std::string goal,
+        std::string_view question_id,
+        std::optional<std::string> candidate_id,
+        std::optional<std::string> freeform_answer);
     [[nodiscard]] core::Result<void> sync_application_workspace(
         const std::vector<Panel>& panels);
     [[nodiscard]] std::vector<CommandView> command_views() const;
@@ -527,6 +859,31 @@ private:
     std::unique_ptr<market::MarketLibrary> market_library_;
     MarketView market_view_;
     std::uint64_t next_operation_id_ = 1U;
+    std::vector<agent::AgentPlanStep> agent_plan_draft_;
+    std::vector<agent::HardConstraint> agent_hard_constraints_draft_;
+    std::vector<agent::ClarificationQuestion> agent_clarifications_draft_;
+    std::string agent_recipe_id_;
+    std::optional<core::Revision> agent_plan_base_revision_;
+    std::optional<agent::AgentTask> agent_task_;
+    std::optional<agent::SceneQueryResult> agent_condition_inventory_;
+    std::vector<scene::ObjectId> agent_condition_inventory_scope_;
+    agent::SceneQueryBudget agent_condition_inventory_query_budget_;
+    std::optional<core::Revision> agent_condition_inventory_query_revision_;
+    std::optional<agent::AgentDemonstration> agent_demonstration_;
+    std::optional<agent::AgentDemonstrationTrace> agent_demonstration_trace_;
+    std::string agent_demonstration_recipe_name_;
+    std::vector<AgentDemonstrationTargetBinding> agent_demonstration_bindings_;
+    std::optional<core::Revision> agent_demonstration_binding_revision_;
+    std::size_t agent_demonstration_target_set_count_ = 1U;
+    std::optional<agent::AgentTaskCheckpoint> agent_checkpoint_pending_;
+    bool agent_checkpoint_rebased_ = false;
+    std::vector<std::string> agent_checkpoint_directly_conflicting_steps_;
+    std::vector<std::string> agent_checkpoint_invalidated_steps_;
+    std::string agent_goal_;
+    std::string agent_plan_id_;
+    std::string agent_objective_id_;
+    bool agent_repair_mode_ = false;
+    std::uint64_t next_agent_task_id_ = 1U;
 };
 
 } // namespace carto::ui
