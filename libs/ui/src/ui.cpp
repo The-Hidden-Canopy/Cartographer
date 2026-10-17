@@ -564,6 +564,7 @@ bool is_operation_action(const application::ApplicationAction& action) {
             std::is_same_v<Action, application::CreateEngineeringTargetAction> ||
             std::is_same_v<Action, application::UpdateEngineeringWorkcellAction> ||
             std::is_same_v<Action, application::CreateEngineeringKeepOutAction> ||
+            std::is_same_v<Action, application::CreateEngineeringWorkcellFrameAction> ||
             std::is_same_v<Action, application::ReviewEngineeringTargetAction> ||
             std::is_same_v<Action, application::InvalidateEngineeringSourceAction> ||
             std::is_same_v<Action, application::ImportConditionFixtureAction> ||
@@ -4297,6 +4298,11 @@ core::Result<application::DispatchReceipt> UiController::update_engineering_work
 
 core::Result<application::DispatchReceipt> UiController::create_engineering_keep_out(
     const application::CreateEngineeringKeepOutAction& action) {
+    return dispatch_with_category(action, OperationCategory::committed_command);
+}
+
+core::Result<application::DispatchReceipt> UiController::create_engineering_workcell_frame(
+    const application::CreateEngineeringWorkcellFrameAction& action) {
     return dispatch_with_category(action, OperationCategory::committed_command);
 }
 

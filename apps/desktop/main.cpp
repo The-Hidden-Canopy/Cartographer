@@ -1325,6 +1325,16 @@ struct DesktopState {
     std::array<char, 257> engineering_workcell_new_keep_out_purpose{};
     std::array<char, 129> engineering_workcell_new_keep_out_revision{};
     std::array<char, 1025> engineering_workcell_new_keep_out_justification{};
+    double engineering_workcell_new_frame_position_x = 0.0;
+    double engineering_workcell_new_frame_position_y = 0.0;
+    double engineering_workcell_new_frame_position_z = 0.0;
+    double engineering_workcell_new_frame_rotation_x = 0.0;
+    double engineering_workcell_new_frame_rotation_y = 0.0;
+    double engineering_workcell_new_frame_rotation_z = 0.0;
+    double engineering_workcell_new_frame_rotation_w = 1.0;
+    std::array<char, 257> engineering_workcell_new_frame_name{};
+    std::array<char, 129> engineering_workcell_new_frame_revision{};
+    std::array<char, 1025> engineering_workcell_new_frame_justification{};
     std::optional<std::uint64_t> condition_source_update_id;
     std::array<char, 129> condition_source_revision{};
     std::array<char, 65> condition_source_digest{};
@@ -8855,6 +8865,16 @@ struct DesktopState {
             engineering_workcell_new_keep_out_dimension_x = 1.0;
             engineering_workcell_new_keep_out_dimension_y = 1.0;
             engineering_workcell_new_keep_out_dimension_z = 1.0;
+            engineering_workcell_new_frame_name.fill('\0');
+            engineering_workcell_new_frame_revision.fill('\0');
+            engineering_workcell_new_frame_justification.fill('\0');
+            engineering_workcell_new_frame_position_x = 0.0;
+            engineering_workcell_new_frame_position_y = 0.0;
+            engineering_workcell_new_frame_position_z = 0.0;
+            engineering_workcell_new_frame_rotation_x = 0.0;
+            engineering_workcell_new_frame_rotation_y = 0.0;
+            engineering_workcell_new_frame_rotation_z = 0.0;
+            engineering_workcell_new_frame_rotation_w = 1.0;
         }
 
         struct RequirementOption {
@@ -9477,6 +9497,70 @@ struct DesktopState {
         if (!keep_out_fields_valid) {
             ImGui::TextDisabled(
                 "Requires a purpose, positive finite dimensions, a new revision label, and a reason.");
+        }
+
+        ImGui::SeparatorText("Add reference frame");
+        ImGui::TextDisabled(
+            "Creates a human-authored reference frame in workcell coordinates. It records a pose and provenance; it does not verify calibration.");
+        ImGui::InputText("Reference frame name", engineering_workcell_new_frame_name.data(),
+            engineering_workcell_new_frame_name.size());
+        ImGui::InputDouble("Frame position X", &engineering_workcell_new_frame_position_x, 0.001, 0.01, "%.6g");
+        ImGui::InputDouble("Frame position Y", &engineering_workcell_new_frame_position_y, 0.001, 0.01, "%.6g");
+        ImGui::InputDouble("Frame position Z", &engineering_workcell_new_frame_position_z, 0.001, 0.01, "%.6g");
+        ImGui::InputDouble("Frame quaternion X", &engineering_workcell_new_frame_rotation_x, 0.01, 0.1, "%.6g");
+        ImGui::InputDouble("Frame quaternion Y", &engineering_workcell_new_frame_rotation_y, 0.01, 0.1, "%.6g");
+        ImGui::InputDouble("Frame quaternion Z", &engineering_workcell_new_frame_rotation_z, 0.01, 0.1, "%.6g");
+        ImGui::InputDouble("Frame quaternion W", &engineering_workcell_new_frame_rotation_w, 0.01, 0.1, "%.6g");
+        ImGui::InputText("New workcell revision for frame",
+            engineering_workcell_new_frame_revision.data(),
+            engineering_workcell_new_frame_revision.size());
+        ImGui::InputText("Reference frame authoring reason",
+            engineering_workcell_new_frame_justification.data(),
+            engineering_workcell_new_frame_justification.size());
+        const std::string_view frame_name(engineering_workcell_new_frame_name.data());
+        const std::string_view frame_revision(engineering_workcell_new_frame_revision.data());
+        const std::string_view frame_reason(engineering_workcell_new_frame_justification.data());
+        const bool frame_reason_present = std::any_of(
+            frame_reason.begin(), frame_reason.end(), [](unsigned char byte) {
+                return !std::isspace(byte);
+            });
+        const carto::core::Transform frame_transform{
+            {engineering_workcell_new_frame_position_x,
+             engineering_workcell_new_frame_position_y,
+             engineering_workcell_new_frame_position_z},
+            {engineering_workcell_new_frame_rotation_x,
+             engineering_workcell_new_frame_rotation_y,
+             engineering_workcell_new_frame_rotation_z,
+             engineering_workcell_new_frame_rotation_w},
+            {1.0, 1.0, 1.0}};
+        const bool frame_fields_valid = !frame_name.empty() && frame_reason_present &&
+            !frame_revision.empty() && frame_revision != workcell.revision &&
+            frame_transform.finite() && frame_transform.rotation.normalizable();
+        ImGui::BeginDisabled(!frame_fields_valid);
+        if (ImGui::Button("Add reference frame as new workcell revision", ImVec2(-1, 30))) {
+            carto::application::CreateEngineeringWorkcellFrameAction action;
+            action.expected_project_revision = snapshot.project_revision;
+            action.expected_authoring_revision = engineering.authored_revision;
+            action.expected_workcell_revision = workcell.revision;
+            action.new_workcell_revision = std::string(frame_revision);
+            action.name = std::string(frame_name);
+            action.transform = frame_transform;
+            action.justification = std::string(frame_reason);
+            if (dispatch(action)) {
+                const std::string suggested_revision = action.new_workcell_revision + ".1";
+                engineering_workcell_new_frame_revision.fill('\0');
+                std::copy_n(suggested_revision.begin(),
+                    std::min(suggested_revision.size(),
+                        engineering_workcell_new_frame_revision.size() - 1U),
+                    engineering_workcell_new_frame_revision.begin());
+                engineering_workcell_new_frame_name.fill('\0');
+                engineering_workcell_new_frame_justification.fill('\0');
+            }
+        }
+        ImGui::EndDisabled();
+        if (!frame_fields_valid) {
+            ImGui::TextDisabled(
+                "Requires a name, finite normalizable pose, new revision label, and reason.");
         }
 
         const auto selected_entity = [&]() {

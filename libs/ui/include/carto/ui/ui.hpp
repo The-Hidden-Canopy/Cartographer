@@ -624,6 +624,8 @@ public:
         const application::UpdateEngineeringWorkcellAction& action);
     [[nodiscard]] core::Result<application::DispatchReceipt> create_engineering_keep_out(
         const application::CreateEngineeringKeepOutAction& action);
+    [[nodiscard]] core::Result<application::DispatchReceipt> create_engineering_workcell_frame(
+        const application::CreateEngineeringWorkcellFrameAction& action);
     [[nodiscard]] core::Result<void> export_engineering_authoring(
         const std::filesystem::path& path) const;
     [[nodiscard]] core::Result<application::DispatchReceipt> invalidate_engineering_source(

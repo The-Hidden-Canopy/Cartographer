@@ -40,10 +40,12 @@ human command with a new operator-supplied workcell revision and a one-line
 reason retained with the affected item identity and workcell-state digest in
 revision history. It can also add an axis-aligned box keep-out with an explicit
 purpose, workcell-space center, full extents, new revision, and one-line reason.
-The new identity is assigned from the current workcell contents, and its source
-is recorded as human-authored. Existing workcell content cannot be replaced
-through a general authoring import. It marks non-rejected targets and path products
-stale. Existing source locators remain visible as recorded metadata;
+It can add a named reference frame with a rigid workcell-space pose, new
+revision, and one-line reason. New identities are assigned from the current
+workcell contents, and both sources are recorded as human-authored. Existing
+workcell content cannot be replaced through a general authoring import. Each
+revision marks non-rejected targets and path products stale. Existing source
+locators remain visible as recorded metadata;
 the editor does not import or verify robot models, fixture assets, or
 calibration data. These edits describe static workcell context and do not
 establish robot reachability or collision results.
@@ -105,9 +107,10 @@ access constraints, stale source/topology refusal, proposed-target authoring,
 workcell-frame revision checks, read-only path sample projection, revisioned
 entity and keep-out edits,
 workcell-history migration and round-trip, journal undo/redo, and explicit
-keep-out creation with stale revision, AI-proposal, missing-reason, multiline,
-and invalid-dimension rejection, journal undo/redo, and explicit refusal to fake
-a CAD import. A newly authored requirement is not
+keep-out and reference-frame creation with stale revision, AI-proposal,
+missing-reason, multiline, invalid-dimension, non-normalizable rotation, and
+scaled-pose rejection, journal undo/redo, and explicit refusal to fake a CAD
+import. A newly authored requirement is not
 publication-ready by itself:
 package publication still requires its linked inspection characteristics and
 all other package gates.

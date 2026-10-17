@@ -835,6 +835,15 @@ struct CreateEngineeringKeepOutAction {
     core::Vec3d dimensions{1.0, 1.0, 1.0};
     std::string justification;
 };
+struct CreateEngineeringWorkcellFrameAction {
+    core::Revision expected_project_revision;
+    core::Revision expected_authoring_revision;
+    std::string expected_workcell_revision;
+    std::string new_workcell_revision;
+    std::string name;
+    core::Transform transform = core::Transform::identity();
+    std::string justification;
+};
 struct ReviewEngineeringTargetAction {
     core::Revision expected_project_revision;
     core::Revision expected_authoring_revision;
@@ -976,6 +985,7 @@ using ApplicationAction = std::variant<
     CreateEngineeringTargetAction,
     UpdateEngineeringWorkcellAction,
     CreateEngineeringKeepOutAction,
+    CreateEngineeringWorkcellFrameAction,
     ReviewEngineeringTargetAction,
     InvalidateEngineeringSourceAction,
     ImportConditionFixtureAction,
@@ -1188,6 +1198,8 @@ private:
         const UpdateEngineeringWorkcellAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_engineering_keep_out(
         const CreateEngineeringKeepOutAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> create_engineering_workcell_frame(
+        const CreateEngineeringWorkcellFrameAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> review_engineering_target(
         const ReviewEngineeringTargetAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> invalidate_engineering_source(

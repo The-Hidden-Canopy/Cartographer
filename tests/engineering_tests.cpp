@@ -936,6 +936,74 @@ void workcell_edits_are_revisioned_audited_and_invalidate_targets() {
         session, carto::application::RedoAction{}));
     REQUIRE(session.snapshot().engineering.workcell->revision == "F");
     REQUIRE(session.snapshot().engineering.workcell->keep_outs.size() == 2U);
+
+    const auto before_frame = session.snapshot();
+    carto::application::CreateEngineeringWorkcellFrameAction create_frame;
+    create_frame.expected_project_revision = before_frame.project_revision;
+    create_frame.expected_authoring_revision = before_frame.engineering.authored_revision;
+    create_frame.expected_workcell_revision = before_frame.engineering.workcell->revision;
+    create_frame.new_workcell_revision = "G";
+    create_frame.name = "Sensor inspection datum";
+    create_frame.transform = {{0.2, -0.3, 0.4}, {0.0, 0.0, 0.7071067811865475, 0.7071067811865476},
+        {1.0, 1.0, 1.0}};
+    create_frame.justification = "Operator-entered datum pose from station setup sheet";
+    REQUIRE(!ui.submit_ai_proposal(create_frame));
+    auto stale_frame = create_frame;
+    stale_frame.expected_workcell_revision = "E";
+    REQUIRE(!ui.dispatch(stale_frame));
+    auto missing_frame_reason = create_frame;
+    missing_frame_reason.justification.clear();
+    REQUIRE(!ui.dispatch(missing_frame_reason));
+    auto multiline_frame_name = create_frame;
+    multiline_frame_name.name = "Datum\nA";
+    REQUIRE(!ui.dispatch(multiline_frame_name));
+    auto invalid_frame_rotation = create_frame;
+    invalid_frame_rotation.transform.rotation = {0.0, 0.0, 0.0, 0.0};
+    REQUIRE(!ui.dispatch(invalid_frame_rotation));
+    auto scaled_frame = create_frame;
+    scaled_frame.transform.scale = {1.0, 1.1, 1.0};
+    REQUIRE(!ui.dispatch(scaled_frame));
+    REQUIRE(session.snapshot().project_revision == before_frame.project_revision);
+
+    const auto created_frame = ui.create_engineering_workcell_frame(create_frame);
+    REQUIRE(created_frame && created_frame.value().document_changed);
+    const auto after_frame = session.snapshot();
+    REQUIRE(after_frame.engineering.workcell->revision == "G");
+    REQUIRE(after_frame.engineering.workcell->revision_history.size() == 4U);
+    const auto frame_authoring = session.engineering_authoring();
+    REQUIRE(frame_authoring && frame_authoring.value().validate());
+    const auto frame_roundtrip = carto::engineering::AuthoringDocument::deserialize(
+        frame_authoring.value().serialize());
+    REQUIRE(frame_roundtrip);
+    REQUIRE(frame_roundtrip.value().workcell->frames.size() == 2U);
+    REQUIRE(frame_roundtrip.value().workcell_revision_history.back().subject_kind == "frame");
+    const auto& authored_frame = frame_authoring.value().workcell->frames.back();
+    REQUIRE(authored_frame.id == 622U);
+    REQUIRE(authored_frame.kind == carto::engineering::WorkcellEntityKind::reference_frame);
+    REQUIRE(authored_frame.name == create_frame.name);
+    REQUIRE(authored_frame.source == "manual://cartographer/workcell");
+    REQUIRE(std::abs(authored_frame.transform.rotation.z - 0.7071067811865475) < 1e-12);
+    const auto& frame_record = frame_authoring.value().workcell_revision_history.back();
+    REQUIRE(frame_record.previous_revision == "F");
+    REQUIRE(frame_record.subject_kind == "frame");
+    REQUIRE(frame_record.subject_id == authored_frame.id);
+    REQUIRE(frame_record.justification == create_frame.justification);
+    REQUIRE(std::any_of(after_frame.engineering.workcell->entities.begin(),
+        after_frame.engineering.workcell->entities.end(), [](const auto& value) {
+            return value.reference_frame && value.name == "Sensor inspection datum";
+        }));
+    REQUIRE(!after_frame.engineering.publication_ready);
+    REQUIRE(ui.snapshot().operations.back().action == "Create Workcell Reference Frame");
+    REQUIRE(ui.snapshot().operations.back().category ==
+        carto::ui::OperationCategory::committed_command);
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::UndoAction{}));
+    REQUIRE(session.snapshot().engineering.workcell->revision == "F");
+    REQUIRE(session.engineering_authoring().value().workcell->frames.size() == 1U);
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::RedoAction{}));
+    REQUIRE(session.snapshot().engineering.workcell->revision == "G");
+    REQUIRE(session.engineering_authoring().value().workcell->frames.size() == 2U);
 }
 
 void application_wires_engineering_authoring_through_persistence_and_history() {

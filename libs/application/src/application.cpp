@@ -1127,6 +1127,8 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return update_engineering_workcell(value);
             } else if constexpr (std::is_same_v<Action, CreateEngineeringKeepOutAction>) {
                 return create_engineering_keep_out(value);
+            } else if constexpr (std::is_same_v<Action, CreateEngineeringWorkcellFrameAction>) {
+                return create_engineering_workcell_frame(value);
             } else if constexpr (std::is_same_v<Action, ReviewEngineeringTargetAction>) {
                 return review_engineering_target(value);
             } else if constexpr (std::is_same_v<Action, InvalidateEngineeringSourceAction>) {
@@ -3928,6 +3930,146 @@ core::Result<DispatchReceipt> ApplicationSession::create_engineering_keep_out(
             before,
             project::SerializedEngineeringAuthoring{serialized, digest.value()}),
         "Create Workcell Keep-Out");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::create_engineering_workcell_frame(
+    const CreateEngineeringWorkcellFrameAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "workcell frame authoring requires the explicit human command boundary"));
+    }
+    if (action.expected_project_revision != document_.revision()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "workcell frame was based on a stale project revision"));
+    }
+    const auto has_nonblank_text = [](std::string_view value) {
+        return std::any_of(value.begin(), value.end(), [](unsigned char byte) {
+            return !std::isspace(byte);
+        });
+    };
+    const auto is_single_line = [](std::string_view value) {
+        return std::all_of(value.begin(), value.end(), [](unsigned char byte) {
+            return byte >= 0x20U && byte != 0x7fU;
+        });
+    };
+    if (action.expected_workcell_revision.empty() ||
+        action.expected_workcell_revision.size() > 128U ||
+        action.new_workcell_revision.empty() || action.new_workcell_revision.size() > 128U ||
+        action.new_workcell_revision == action.expected_workcell_revision ||
+        action.name.size() > 256U || action.justification.size() > 1024U ||
+        !has_nonblank_text(action.expected_workcell_revision) ||
+        !has_nonblank_text(action.new_workcell_revision) || !has_nonblank_text(action.name) ||
+        !has_nonblank_text(action.justification) ||
+        !is_single_line(action.expected_workcell_revision) ||
+        !is_single_line(action.new_workcell_revision) || !is_single_line(action.name) ||
+        !is_single_line(action.justification) || !action.transform.finite() ||
+        !action.transform.rotation.normalizable() || action.transform.scale.x != 1.0 ||
+        action.transform.scale.y != 1.0 || action.transform.scale.z != 1.0) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "reference frame requires a new workcell revision, name, finite rigid pose, and one-line justification"));
+    }
+
+    const auto current = engineering_authoring();
+    if (!current) return failure(current.error().with_context("workcell frame authoring"));
+    if (current.value().project_revision != action.expected_authoring_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "workcell frame was based on a stale engineering authoring revision"));
+    }
+    if (current.value().project_revision.exhausted()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "engineering authoring revision space is exhausted"));
+    }
+    if (!current.value().workcell.has_value()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "workcell frame authoring requires an existing authored workcell"));
+    }
+    const auto& existing_workcell = *current.value().workcell;
+    if (existing_workcell.revision != action.expected_workcell_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "workcell frame was based on a stale workcell revision"));
+    }
+    if (current.value().workcell_revision_history.size() >=
+            engineering::AuthoringDocument::kMaxCollectionEntries ||
+        existing_workcell.frames.size() >=
+            engineering::AuthoringDocument::kMaxCollectionEntries ||
+        std::any_of(current.value().workcell_revision_history.begin(),
+            current.value().workcell_revision_history.end(), [&action](const auto& record) {
+                return record.revision == action.new_workcell_revision;
+            })) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "workcell revision history or frame collection is full, or the new revision already exists"));
+    }
+
+    auto updated = current.value();
+    auto& workcell = *updated.workcell;
+    std::uint64_t maximum_id = workcell.id;
+    for (const auto& entity : workcell.entities) maximum_id = std::max(maximum_id, entity.id);
+    for (const auto& frame : workcell.frames) maximum_id = std::max(maximum_id, frame.id);
+    for (const auto& keep_out : workcell.keep_outs) maximum_id = std::max(maximum_id, keep_out.id);
+    if (maximum_id == std::numeric_limits<std::uint64_t>::max()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "workcell identity space is exhausted"));
+    }
+    const std::uint64_t frame_id = maximum_id + 1U;
+    engineering::WorkcellEntity frame;
+    frame.id = frame_id;
+    frame.kind = engineering::WorkcellEntityKind::reference_frame;
+    frame.name = action.name;
+    frame.transform = action.transform;
+    frame.transform.rotation = frame.transform.rotation.normalized();
+    frame.source = "manual://cartographer/workcell";
+    if (auto valid = frame.validate(); !valid) {
+        return failure(valid.error().with_context("new workcell reference frame"));
+    }
+    workcell.frames.push_back(std::move(frame));
+    workcell.revision = action.new_workcell_revision;
+    const auto workcell_digest = workcell.canonical_digest();
+    if (!workcell_digest) {
+        return failure(workcell_digest.error().with_context("workcell revision digest"));
+    }
+    updated.workcell_revision_history.push_back(engineering::WorkcellRevisionRecord{
+        action.new_workcell_revision, action.expected_workcell_revision, "frame",
+        frame_id, workcell_digest.value(), action.justification});
+    for (auto& target : updated.targets) {
+        if (target.status != engineering::TargetStatus::rejected) {
+            target.status = engineering::TargetStatus::stale;
+        }
+    }
+    if (updated.path.has_value()) {
+        updated.path->status = engineering::DerivedProductStatus::stale;
+        for (auto& sample : updated.path->samples) {
+            sample.status = engineering::PathSampleStatus::stale;
+        }
+    }
+    for (auto& product : updated.derived_products) {
+        product.status = engineering::DerivedProductStatus::stale;
+        product.stale_reason = "workcell revision changed; inspection targets and paths require review";
+    }
+    updated.project_revision = updated.project_revision.next();
+    if (auto valid = updated.validate(); !valid) {
+        return failure(valid.error().with_context("workcell frame authoring"));
+    }
+    const std::string serialized = updated.serialize();
+    const auto digest = updated.canonical_digest();
+    if (!digest) return failure(digest.error().with_context("workcell frame digest"));
+    const auto before = document_.engineering_authoring();
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectEngineeringAuthoringCommand>(
+            admission,
+            document_,
+            before,
+            project::SerializedEngineeringAuthoring{serialized, digest.value()}),
+        "Create Workcell Reference Frame");
 }
 
 core::Result<DispatchReceipt> ApplicationSession::review_engineering_target(
