@@ -446,6 +446,7 @@ bool valid(OperatorMode value) noexcept {
 
 bool valid(Workspace value) noexcept {
     return value == Workspace::model || value == Workspace::sculpt ||
+        value == Workspace::uv ||
         value == Workspace::engineering ||
         value == Workspace::condition ||
         value == Workspace::cad || value == Workspace::build ||
@@ -491,6 +492,7 @@ std::vector<WorkspaceDefinition> make_workspace_registry() {
         {Workspace::model, "model", "Model", model_panels, BottomPanel::operations, true, {}},
         {Workspace::sculpt, "sculpt", "Sculpt", model_panels, BottomPanel::operations,
          true, {}},
+        {Workspace::uv, "uv", "UV", asset_panels, BottomPanel::assets, true, {}},
         {Workspace::engineering, "engineering", "Engineering", engineering_panels,
          BottomPanel::problems, true, {}},
         {Workspace::condition, "condition", "CONDITION", engineering_panels,
@@ -556,6 +558,7 @@ bool is_operation_action(const application::ApplicationAction& action) {
             std::is_same_v<Action, application::SetObjectTransformAction> ||
             std::is_same_v<Action, application::ImportEngineeringFixtureAction> ||
             std::is_same_v<Action, application::ImportEngineeringAuthoringAction> ||
+            std::is_same_v<Action, application::CreateEngineeringRequirementAction> ||
             std::is_same_v<Action, application::InvalidateEngineeringSourceAction> ||
             std::is_same_v<Action, application::ImportConditionFixtureAction> ||
             std::is_same_v<Action, application::ImportConditionAuthoringAction> ||
@@ -695,6 +698,7 @@ core::Result<UiPreferences> parse_preferences(std::string_view text) {
         {"person-first", OperatorMode::person_first}, {"ai-first", OperatorMode::ai_first}});
     const auto parsed_workspace = parse_enum<Workspace>(workspace.value(), {
         {"model", Workspace::model}, {"sculpt", Workspace::sculpt},
+        {"uv", Workspace::uv},
         {"engineering", Workspace::engineering}, {"condition", Workspace::condition},
         {"cad", Workspace::cad},
         {"build", Workspace::build}, {"material", Workspace::material},
@@ -1414,6 +1418,7 @@ const char* workspace_name(Workspace workspace) noexcept {
     switch (workspace) {
     case Workspace::model: return "model";
     case Workspace::sculpt: return "sculpt";
+    case Workspace::uv: return "uv";
     case Workspace::engineering: return "engineering";
     case Workspace::condition: return "condition";
     case Workspace::cad: return "cad";

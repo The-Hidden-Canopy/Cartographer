@@ -73,6 +73,7 @@ enum class OperatorMode {
 enum class Workspace {
     model,
     sculpt,
+    uv,
     engineering,
     condition,
     cad,

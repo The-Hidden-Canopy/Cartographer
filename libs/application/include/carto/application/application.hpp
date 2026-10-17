@@ -296,11 +296,35 @@ struct EngineeringAuthoringView {
         assets::Sha256Digest digest;
     };
     std::vector<Source> sources;
+    struct Topology {
+        std::uint64_t id = 0U;
+        std::uint64_t source_id = 0U;
+        std::uint64_t part_id = 0U;
+        std::string kind;
+        std::string external_id;
+        std::string source_revision;
+    };
+    std::vector<Topology> topology;
+    struct Requirement {
+        std::uint64_t id = 0U;
+        std::uint64_t source_id = 0U;
+        std::vector<std::uint64_t> topology_ids;
+        std::string kind;
+        std::string extraction;
+        double nominal = 0.0;
+        double plus = 0.0;
+        double minus = 0.0;
+        std::string unit;
+        std::string callout;
+        std::string original_text;
+        std::string acceptance_rule;
+    };
+    std::vector<Requirement> requirements;
     bool stale = false;
     bool workcell_present = false;
     bool path_present = false;
     bool publication_ready = false;
-    bool vanta_admissible = false;
+    bool vanta_contract_admissible = false;
     std::string status;
 };
 
@@ -654,6 +678,22 @@ struct DuplicateMeshInstanceAction {
 
 struct ImportEngineeringFixtureAction {};
 struct ImportEngineeringAuthoringAction { std::string serialized_document; };
+struct CreateEngineeringRequirementAction {
+    core::Revision expected_project_revision;
+    core::Revision expected_authoring_revision;
+    std::uint64_t source_id = 0U;
+    std::vector<std::uint64_t> topology_ids;
+    engineering::RequirementKind kind = engineering::RequirementKind::dimensional_distance;
+    double nominal = 0.0;
+    double plus = 0.0;
+    double minus = 0.0;
+    std::string unit = "millimeters";
+    std::uint32_t source_page = 0U;
+    std::string source_section;
+    std::string source_callout;
+    std::string original_text;
+    std::string acceptance_rule;
+};
 
 struct InvalidateEngineeringSourceAction {
     engineering::Id source_id = 0U;
@@ -783,6 +823,7 @@ using ApplicationAction = std::variant<
     DuplicateMeshInstanceAction,
     ImportEngineeringFixtureAction,
     ImportEngineeringAuthoringAction,
+    CreateEngineeringRequirementAction,
     InvalidateEngineeringSourceAction,
     ImportConditionFixtureAction,
     ImportConditionAuthoringAction,
@@ -982,6 +1023,8 @@ private:
     [[nodiscard]] core::Result<DispatchReceipt> import_engineering_fixture();
     [[nodiscard]] core::Result<DispatchReceipt> import_engineering_authoring(
         const ImportEngineeringAuthoringAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> create_engineering_requirement(
+        const CreateEngineeringRequirementAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> invalidate_engineering_source(
         const InvalidateEngineeringSourceAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> import_condition_fixture();

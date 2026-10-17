@@ -632,11 +632,30 @@ core::Result<void> AuthoringDocument::validate() const {
         if (auto result = value.validate(); !result) return result;
         const auto* requirement = find_id(requirements, &EngineeringRequirement::id, value.requirement_id);
         if (requirement == nullptr) return core::Result<void>::failure(validation("inspection requirement is unresolved"));
-        for (const Id topology_id : value.topology_ids) if (!contains_id(topology, &TopologyBinding::id, topology_id)) return core::Result<void>::failure(validation("inspection topology binding is unresolved"));
+        for (const Id topology_id : value.topology_ids) {
+            if (!contains_id(topology, &TopologyBinding::id, topology_id)) {
+                return core::Result<void>::failure(validation("inspection topology binding is unresolved"));
+            }
+            if (std::find(requirement->topology_ids.begin(), requirement->topology_ids.end(),
+                          topology_id) == requirement->topology_ids.end()) {
+                return core::Result<void>::failure(validation(
+                    "inspection characteristic topology is outside its requirement binding"));
+            }
+        }
     }
     for (const auto& value : targets) {
         if (auto result = value.validate(); !result) return result;
-        if (!contains_id(characteristics, &InspectionCharacteristic::id, value.characteristic_id) || !contains_id(topology, &TopologyBinding::id, value.source_topology_id)) return core::Result<void>::failure(validation("inspection target reference is unresolved"));
+        const auto* characteristic = find_id(
+            characteristics, &InspectionCharacteristic::id, value.characteristic_id);
+        if (characteristic == nullptr ||
+            !contains_id(topology, &TopologyBinding::id, value.source_topology_id)) {
+            return core::Result<void>::failure(validation("inspection target reference is unresolved"));
+        }
+        if (std::find(characteristic->topology_ids.begin(), characteristic->topology_ids.end(),
+                      value.source_topology_id) == characteristic->topology_ids.end()) {
+            return core::Result<void>::failure(validation(
+                "inspection target topology is outside its characteristic binding"));
+        }
     }
     if (workcell.has_value()) if (auto result = workcell->validate(); !result) return result;
     if (path.has_value()) {
@@ -824,7 +843,29 @@ core::Result<InspectionPackage> InspectionPackage::publish(
     std::string project_namespace) {
     if (auto result = authoring.validate(); !result) return core::Result<InspectionPackage>::failure(result.error());
     if (project_revision.exhausted() || project_namespace != authoring.project_namespace) return core::Result<InspectionPackage>::failure(invalid("inspection publication project identity is invalid"));
-    for (const auto& requirement : authoring.requirements) if (requirement.enabled && requirement.extraction == ExtractionState::stale) return core::Result<InspectionPackage>::failure(stale("publication is blocked by a stale engineering requirement"));
+    for (const auto& requirement : authoring.requirements) {
+        if (!requirement.enabled) continue;
+        if (requirement.extraction == ExtractionState::stale) {
+            return core::Result<InspectionPackage>::failure(stale(
+                "publication is blocked by a stale engineering requirement"));
+        }
+        if (requirement.extraction == ExtractionState::rejected ||
+            requirement.extraction == ExtractionState::machine_extracted_proposed) {
+            return core::Result<InspectionPackage>::failure(validation(
+                "publication is blocked until every enabled requirement is human accepted or corrected"));
+        }
+        const bool has_characteristic = std::any_of(
+            authoring.characteristics.begin(), authoring.characteristics.end(),
+            [&requirement](const InspectionCharacteristic& characteristic) {
+                return characteristic.requirement_id == requirement.id &&
+                    characteristic.status != InspectionStatus::disabled &&
+                    characteristic.status != InspectionStatus::stale;
+            });
+        if (!has_characteristic) {
+            return core::Result<InspectionPackage>::failure(validation(
+                "publication requires an active inspection characteristic for every enabled requirement"));
+        }
+    }
     for (const auto& characteristic : authoring.characteristics) {
         if (characteristic.status == InspectionStatus::stale) return core::Result<InspectionPackage>::failure(stale("publication is blocked by a stale inspection characteristic"));
         if (characteristic.status == InspectionStatus::disabled) continue;

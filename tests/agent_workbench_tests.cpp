@@ -3023,6 +3023,8 @@ void ui_compiles_lightmap_uv_generation_for_multiple_unique_mesh_targets() {
     application::ApplicationSession source;
     const auto objects = create_boxes(source, 2U);
     ui::UiController ui(source);
+    REQUIRE(ui.set_workspace(ui::Workspace::uv));
+    REQUIRE(ui.snapshot().workspace_kind == ui::Workspace::uv);
     REQUIRE(ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::object}));
     REQUIRE(ui.dispatch(application::SelectObjectAction{objects.front()}));
     REQUIRE(ui.dispatch(application::SelectObjectAction{

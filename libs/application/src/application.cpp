@@ -1114,6 +1114,8 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return import_engineering_fixture();
             } else if constexpr (std::is_same_v<Action, ImportEngineeringAuthoringAction>) {
                 return import_engineering_authoring(value);
+            } else if constexpr (std::is_same_v<Action, CreateEngineeringRequirementAction>) {
+                return create_engineering_requirement(value);
             } else if constexpr (std::is_same_v<Action, InvalidateEngineeringSourceAction>) {
                 return invalidate_engineering_source(value);
             } else if constexpr (std::is_same_v<Action, ImportConditionFixtureAction>) {
@@ -2887,6 +2889,166 @@ core::Result<DispatchReceipt> ApplicationSession::import_engineering_authoring(
         "Import Engineering Authoring Document");
 }
 
+core::Result<DispatchReceipt> ApplicationSession::create_engineering_requirement(
+    const CreateEngineeringRequirementAction& action) {
+    const auto has_non_whitespace = [](std::string_view value) {
+        return std::any_of(value.begin(), value.end(), [](unsigned char byte) {
+            return byte != ' ' && byte != '\t' && byte != '\r' && byte != '\n' &&
+                byte != '\v' && byte != '\f';
+        });
+    };
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "engineering requirement authoring requires the explicit human boundary"));
+    }
+    if (action.expected_project_revision != document_.revision()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "engineering requirement was based on a stale project revision"));
+    }
+    if (action.source_id == 0U || action.topology_ids.empty() ||
+        action.topology_ids.size() > 64U || !has_non_whitespace(action.original_text) ||
+        !has_non_whitespace(action.acceptance_rule)) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "engineering requirement needs source evidence, topology, original text, and an acceptance rule"));
+    }
+    const auto current = engineering_authoring();
+    if (!current) return failure(current.error().with_context(
+        "engineering requirement authoring"));
+    if (current.value().project_revision != action.expected_authoring_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "engineering requirement was based on a stale authoring revision"));
+    }
+    if (current.value().project_revision.exhausted()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "engineering authoring revision space is exhausted"));
+    }
+    const auto source = std::find_if(current.value().sources.begin(),
+        current.value().sources.end(), [&action](const auto& candidate) {
+            return candidate.id == action.source_id;
+        });
+    if (source == current.value().sources.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "engineering requirement evidence source does not exist"));
+    }
+
+    const auto supported_kind = [](engineering::RequirementKind kind) {
+        using engineering::RequirementKind;
+        return kind == RequirementKind::dimensional_distance ||
+            kind == RequirementKind::diameter || kind == RequirementKind::radius ||
+            kind == RequirementKind::angle || kind == RequirementKind::thickness ||
+            kind == RequirementKind::clearance;
+    };
+    if (!supported_kind(action.kind)) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "this authoring path supports distance, diameter, radius, angle, thickness, and clearance requirements"));
+    }
+    const bool angular = action.kind == engineering::RequirementKind::angle;
+    const bool positive_nominal = action.kind == engineering::RequirementKind::diameter ||
+        action.kind == engineering::RequirementKind::radius ||
+        action.kind == engineering::RequirementKind::thickness;
+    const bool supported_unit = angular
+        ? action.unit == "degrees"
+        : action.unit == "millimeters" || action.unit == "meters" || action.unit == "inches";
+    if (!supported_unit || !std::isfinite(action.nominal) ||
+        (positive_nominal ? action.nominal <= 0.0 : action.nominal < 0.0) ||
+        (angular && (action.nominal > 360.0 || action.nominal - action.minus < 0.0 ||
+                     action.nominal + action.plus > 360.0))) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "engineering requirement value or unit is outside the supported bounded profile"));
+    }
+
+    std::set<std::uint64_t> unique_topology;
+    for (const auto topology_id : action.topology_ids) {
+        if (topology_id == 0U || !unique_topology.insert(topology_id).second) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::invalid_argument,
+                "engineering requirement topology identities must be non-zero and unique"));
+        }
+        const auto binding = std::find_if(current.value().topology.begin(),
+            current.value().topology.end(), [topology_id](const auto& candidate) {
+                return candidate.id == topology_id;
+            });
+        if (binding == current.value().topology.end()) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::not_found,
+                "engineering requirement topology binding does not exist"));
+        }
+        const auto topology_source = std::find_if(current.value().sources.begin(),
+            current.value().sources.end(), [&binding](const auto& candidate) {
+                return candidate.id == binding->source_id;
+            });
+        if (topology_source == current.value().sources.end() ||
+            binding->source_revision != topology_source->revision) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "engineering requirement topology binding is stale against its CAD source"));
+        }
+    }
+
+    if (current.value().requirements.size() >= engineering::AuthoringDocument::kMaxCollectionEntries) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "engineering requirement collection reached its configured limit"));
+    }
+    const auto maximum_id = std::max_element(current.value().requirements.begin(),
+        current.value().requirements.end(), [](const auto& left, const auto& right) {
+            return left.id < right.id;
+        });
+    const std::uint64_t next_id = maximum_id == current.value().requirements.end()
+        ? 1U
+        : maximum_id->id == std::numeric_limits<std::uint64_t>::max()
+            ? 0U : maximum_id->id + 1U;
+    if (next_id == 0U) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "engineering requirement identity space is exhausted"));
+    }
+
+    auto updated = current.value();
+    engineering::EngineeringRequirement requirement;
+    requirement.id = next_id;
+    requirement.kind = action.kind;
+    requirement.extraction = engineering::ExtractionState::manual;
+    requirement.provenance.source_id = action.source_id;
+    requirement.provenance.page = action.source_page;
+    requirement.provenance.section = action.source_section;
+    requirement.provenance.callout = action.source_callout;
+    requirement.provenance.extraction_confidence = 0.0;
+    requirement.provenance.original_text = action.original_text;
+    requirement.topology_ids = action.topology_ids;
+    requirement.nominal = action.nominal;
+    requirement.plus = action.plus;
+    requirement.minus = action.minus;
+    requirement.unit = action.unit;
+    requirement.acceptance_rule = action.acceptance_rule;
+    updated.requirements.push_back(std::move(requirement));
+    updated.project_revision = updated.project_revision.next();
+    if (auto valid = updated.validate(); !valid) {
+        return failure(valid.error().with_context("engineering requirement authoring"));
+    }
+    const std::string serialized = updated.serialize();
+    const auto digest = updated.canonical_digest();
+    if (!digest) return failure(digest.error().with_context(
+        "engineering requirement authoring digest"));
+    const auto before = document_.engineering_authoring();
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectEngineeringAuthoringCommand>(
+            admission,
+            document_,
+            before,
+            project::SerializedEngineeringAuthoring{serialized, digest.value()}),
+        "Create Manual Engineering Requirement");
+}
+
 core::Result<DispatchReceipt> ApplicationSession::invalidate_engineering_source(
     const InvalidateEngineeringSourceAction& action) {
     if (active_source_ != OperationSource::human) {
@@ -3864,8 +4026,34 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
             result.engineering.part_count = authoring.parts.size();
             result.engineering.occurrence_count = authoring.occurrences.size();
             result.engineering.topology_count = authoring.topology.size();
+            result.engineering.topology.reserve(authoring.topology.size());
+            for (const auto& binding : authoring.topology) {
+                result.engineering.topology.push_back(EngineeringAuthoringView::Topology{
+                    binding.id,
+                    binding.source_id,
+                    binding.part_id,
+                    engineering::topology_kind_name(binding.kind),
+                    binding.external_id,
+                    binding.source_revision});
+            }
             result.engineering.bom_count = authoring.bom.size();
             result.engineering.requirement_count = authoring.requirements.size();
+            result.engineering.requirements.reserve(authoring.requirements.size());
+            for (const auto& requirement : authoring.requirements) {
+                result.engineering.requirements.push_back(EngineeringAuthoringView::Requirement{
+                    requirement.id,
+                    requirement.provenance.source_id,
+                    requirement.topology_ids,
+                    engineering::requirement_kind_name(requirement.kind),
+                    engineering::extraction_state_name(requirement.extraction),
+                    requirement.nominal,
+                    requirement.plus,
+                    requirement.minus,
+                    requirement.unit,
+                    requirement.provenance.callout,
+                    requirement.provenance.original_text,
+                    requirement.acceptance_rule});
+            }
             result.engineering.characteristic_count = authoring.characteristics.size();
             result.engineering.target_count = authoring.targets.size();
             result.engineering.derived_product_count = authoring.derived_products.size();
@@ -3903,12 +4091,12 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
                 const auto admission = engineering::admit_for_vanta(package.value());
                 if (admission && admission.value().status ==
                         engineering::VantaAdmissionStatus::admit) {
-                    result.engineering.vanta_admissible = true;
+                    result.engineering.vanta_contract_admissible = true;
                     result.engineering.status =
-                        "Publication package is current and admitted at the neutral runtime boundary.";
+                        "Package passes local VANTA handoff-contract checks; no VANTA runtime admission has been received.";
                 } else {
                     result.engineering.status =
-                        "Publication package is current; runtime admission is refused.";
+                        "Local VANTA handoff-contract checks refused this package.";
                 }
             }
         }

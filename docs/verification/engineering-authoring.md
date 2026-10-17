@@ -1,9 +1,13 @@
 # DV012 engineering authoring boundary
 
 The public Cartographer slice stores source-linked engineering authoring and
-inspection evidence in the project. The Engineering workspace presents a
-read-only summary, loads the deterministic DV012 fixture, and exports an
-admitted `.carto-inspection` package.
+inspection evidence in the project. The Engineering workspace presents source
+and topology lineage, loads the deterministic DV012 fixture, and lets an
+operator add a manual dimensional requirement against a current topology
+binding. That record keeps its source text, acceptance rule, source identity,
+and topology identity; it does not replace imported or extracted claims.
+The workspace also exports an admitted `.carto-inspection` package when its
+publication gates pass.
 
 ## Import and runtime boundary
 
@@ -24,5 +28,8 @@ formats 1 through 14 remain readable.
 
 The acceptance tests cover deterministic fixture round-trip, provenance,
 tamper rejection, stale-source invalidation, schema-version fencing, project
-save/reopen, undo/redo, UI publication, and explicit refusal to fake a CAD
-import.
+save/reopen, undo/redo, UI publication, revision-bound manual requirement
+authoring, invalid source/topology/unit and stale-revision rejection, and
+explicit refusal to fake a CAD import. A newly authored requirement is not
+publication-ready by itself: package publication still requires its linked
+inspection characteristics and all other package gates.

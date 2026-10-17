@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iterator>
 #include <iostream>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -74,6 +75,160 @@ void publication_and_vanta_admission_bind_exact_bytes() {
     auto tampered = reopened.value();
     tampered.authoring_bytes.push_back('x');
     REQUIRE(!tampered.validate());
+
+    auto malformed_binding = fixture.value();
+    malformed_binding.characteristics.front().topology_ids = {102U};
+    REQUIRE(!malformed_binding.validate());
+
+    auto missing_characteristic = fixture.value();
+    missing_characteristic.requirements.push_back({
+        303U, carto::engineering::RequirementKind::dimensional_distance,
+        carto::engineering::ExtractionState::manual,
+        {1U, 34U, "Manual", "DIM-NEW", "B5", "", 0.0, "9.00 +/- 0.10 mm"},
+        {100U}, 9.0, 0.1, 0.1, "millimeters", {}, {},
+        "within bilateral tolerance", true});
+    REQUIRE(missing_characteristic.validate());
+    REQUIRE(!carto::engineering::InspectionPackage::publish(
+        missing_characteristic, missing_characteristic.project_revision,
+        missing_characteristic.project_namespace));
+}
+
+void manual_requirement_authoring_is_revision_bound_and_auditable() {
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::NewProjectAction{"Manual Requirement"}));
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::ImportEngineeringFixtureAction{}));
+    carto::ui::UiController ui(session);
+
+    const auto before = session.snapshot();
+    carto::application::CreateEngineeringRequirementAction action;
+    action.expected_project_revision = before.project_revision;
+    action.expected_authoring_revision = before.engineering.authored_revision;
+    action.source_id = 2U;
+    action.topology_ids = {100U};
+    action.kind = carto::engineering::RequirementKind::dimensional_distance;
+    action.nominal = 9.0;
+    action.plus = 0.1;
+    action.minus = 0.1;
+    action.unit = "millimeters";
+    action.source_page = 34U;
+    action.source_section = "Manual correction";
+    action.source_callout = "DIM-NEW";
+    action.original_text = "9.00 +/- 0.10 mm";
+    action.acceptance_rule = "within bilateral tolerance";
+    const auto created = ui.dispatch(action);
+    REQUIRE(created);
+    REQUIRE(created.value().document_changed);
+    REQUIRE(session.snapshot().project_revision == before.project_revision.next());
+    REQUIRE(session.snapshot().engineering.requirement_count == 4U);
+    REQUIRE(session.snapshot().engineering.requirements.back().extraction == "manual");
+    REQUIRE(session.snapshot().engineering.requirements.back().source_id == 2U);
+    REQUIRE(session.snapshot().engineering.requirements.back().topology_ids ==
+        std::vector<std::uint64_t>{100U});
+    REQUIRE(session.snapshot().engineering.requirements.back().original_text ==
+        "9.00 +/- 0.10 mm");
+    REQUIRE(!ui.snapshot().operations.empty());
+    REQUIRE(ui.snapshot().operations.back().action ==
+        "Create Manual Engineering Requirement");
+    REQUIRE(!session.snapshot().engineering.publication_ready);
+
+    const auto after_create = session.snapshot();
+    auto stale_action = action;
+    stale_action.expected_project_revision = before.project_revision;
+    const auto stale = carto::application::HumanApplicationAccess::dispatch(
+        session, stale_action);
+    REQUIRE(!stale);
+    REQUIRE(session.snapshot().project_revision == after_create.project_revision);
+
+    auto missing_source = action;
+    missing_source.expected_project_revision = after_create.project_revision;
+    missing_source.expected_authoring_revision = after_create.engineering.authored_revision;
+    missing_source.source_id = 999U;
+    REQUIRE(!carto::application::HumanApplicationAccess::dispatch(session, missing_source));
+
+    auto missing_original_text = action;
+    missing_original_text.expected_project_revision = after_create.project_revision;
+    missing_original_text.expected_authoring_revision = after_create.engineering.authored_revision;
+    missing_original_text.original_text.clear();
+    REQUIRE(!carto::application::HumanApplicationAccess::dispatch(
+        session, missing_original_text));
+
+    auto missing_acceptance_rule = action;
+    missing_acceptance_rule.expected_project_revision = after_create.project_revision;
+    missing_acceptance_rule.expected_authoring_revision = after_create.engineering.authored_revision;
+    missing_acceptance_rule.acceptance_rule.clear();
+    REQUIRE(!carto::application::HumanApplicationAccess::dispatch(
+        session, missing_acceptance_rule));
+
+    auto blank_acceptance_rule = missing_acceptance_rule;
+    blank_acceptance_rule.acceptance_rule = "   ";
+    REQUIRE(!carto::application::HumanApplicationAccess::dispatch(
+        session, blank_acceptance_rule));
+
+    auto non_finite_nominal = action;
+    non_finite_nominal.expected_project_revision = after_create.project_revision;
+    non_finite_nominal.expected_authoring_revision = after_create.engineering.authored_revision;
+    non_finite_nominal.nominal = std::numeric_limits<double>::quiet_NaN();
+    REQUIRE(!carto::application::HumanApplicationAccess::dispatch(
+        session, non_finite_nominal));
+
+    auto negative_tolerance = action;
+    negative_tolerance.expected_project_revision = after_create.project_revision;
+    negative_tolerance.expected_authoring_revision = after_create.engineering.authored_revision;
+    negative_tolerance.plus = -0.01;
+    REQUIRE(!carto::application::HumanApplicationAccess::dispatch(
+        session, negative_tolerance));
+
+    auto duplicate_topology = action;
+    duplicate_topology.expected_project_revision = after_create.project_revision;
+    duplicate_topology.expected_authoring_revision = after_create.engineering.authored_revision;
+    duplicate_topology.topology_ids = {100U, 100U};
+    REQUIRE(!carto::application::HumanApplicationAccess::dispatch(
+        session, duplicate_topology));
+
+    auto unsupported_kind = action;
+    unsupported_kind.expected_project_revision = after_create.project_revision;
+    unsupported_kind.expected_authoring_revision = after_create.engineering.authored_revision;
+    unsupported_kind.kind = static_cast<carto::engineering::RequirementKind>(255);
+    REQUIRE(!carto::application::HumanApplicationAccess::dispatch(
+        session, unsupported_kind));
+    REQUIRE(session.snapshot().project_revision == after_create.project_revision);
+
+    auto missing_topology = action;
+    missing_topology.expected_project_revision = after_create.project_revision;
+    missing_topology.expected_authoring_revision = after_create.engineering.authored_revision;
+    missing_topology.topology_ids = {999U};
+    REQUIRE(!carto::application::HumanApplicationAccess::dispatch(session, missing_topology));
+    REQUIRE(session.snapshot().project_revision == after_create.project_revision);
+
+    auto invalid_unit = action;
+    invalid_unit.expected_project_revision = after_create.project_revision;
+    invalid_unit.expected_authoring_revision = after_create.engineering.authored_revision;
+    invalid_unit.unit = "degrees";
+    REQUIRE(!carto::application::HumanApplicationAccess::dispatch(session, invalid_unit));
+    REQUIRE(session.snapshot().project_revision == after_create.project_revision);
+
+    REQUIRE(!ui.submit_ai_proposal(stale_action));
+    REQUIRE(session.snapshot().project_revision == after_create.project_revision);
+
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::UndoAction{}));
+    REQUIRE(session.snapshot().engineering.requirement_count == 3U);
+    REQUIRE(session.snapshot().engineering.publication_ready);
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::RedoAction{}));
+    REQUIRE(session.snapshot().engineering.requirement_count == 4U);
+    REQUIRE(!session.snapshot().engineering.publication_ready);
+
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::InvalidateEngineeringSourceAction{
+            1U, "DV012-rev-d", digest("dv012-rev-d")}));
+    auto stale_binding = action;
+    stale_binding.expected_project_revision = session.snapshot().project_revision;
+    stale_binding.expected_authoring_revision = session.snapshot().engineering.authored_revision;
+    REQUIRE(!carto::application::HumanApplicationAccess::dispatch(session, stale_binding));
+    REQUIRE(session.snapshot().engineering.stale);
 }
 
 void application_wires_engineering_authoring_through_persistence_and_history() {
@@ -95,14 +250,16 @@ void application_wires_engineering_authoring_through_persistence_and_history() {
     REQUIRE(imported.value().document_changed);
     REQUIRE(session.snapshot().engineering.present);
     REQUIRE(session.snapshot().engineering.publication_ready);
-    REQUIRE(session.snapshot().engineering.vanta_admissible);
+    REQUIRE(session.snapshot().engineering.vanta_contract_admissible);
     REQUIRE(session.snapshot().engineering.requirement_count == 3U);
     REQUIRE(session.snapshot().engineering.target_count == 4U);
-    REQUIRE(session.snapshot().engineering.status.find("admitted") != std::string::npos);
+    REQUIRE(session.snapshot().engineering.status.find("local VANTA handoff-contract") !=
+        std::string::npos);
 
     const auto project_path = root / "dv012.carto";
-    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
-        session, carto::application::SaveProjectAction{project_path}));
+    const auto saved = carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::SaveProjectAction{project_path});
+    if (!saved) throw TestFailure(saved.error().message);
 
     std::ifstream project_stream(project_path, std::ios::binary);
     REQUIRE(project_stream.good());
@@ -156,7 +313,12 @@ void ui_exposes_engineering_workspace_and_immutable_publication() {
     const auto snapshot = ui.snapshot();
     REQUIRE(snapshot.engineering.present);
     REQUIRE(snapshot.engineering.publication_ready);
-    REQUIRE(snapshot.engineering.vanta_admissible);
+    REQUIRE(snapshot.engineering.vanta_contract_admissible);
+    REQUIRE(snapshot.engineering.topology.size() == 3U);
+    REQUIRE(snapshot.engineering.topology.front().external_id == "FACE-A17-OUTER");
+    REQUIRE(snapshot.engineering.requirements.size() == 3U);
+    REQUIRE(snapshot.engineering.requirements.front().original_text ==
+        "12.50 +/- 0.05 mm");
 
     const auto package = ui.build_engineering_package();
     REQUIRE(package);
@@ -260,7 +422,7 @@ void ui_imports_exports_and_reconciles_engineering_authoring_files() {
     }
     REQUIRE(ui.import_engineering_authoring(source_path));
     REQUIRE(!ui.snapshot().engineering.stale);
-    REQUIRE(ui.snapshot().engineering.vanta_admissible);
+    REQUIRE(ui.snapshot().engineering.vanta_contract_admissible);
 
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);
@@ -301,6 +463,7 @@ int main() {
     try {
         fixture_round_trips_with_identity_and_provenance();
         publication_and_vanta_admission_bind_exact_bytes();
+        manual_requirement_authoring_is_revision_bound_and_auditable();
         source_invalidation_preserves_authored_records_and_stales_products();
         step_boundary_never_fakes_a_cad_import();
         application_wires_engineering_authoring_through_persistence_and_history();

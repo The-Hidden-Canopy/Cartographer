@@ -2,6 +2,8 @@
 
 ## End-to-end fixture
 
+- The UV workspace opens a dedicated UV authoring instrument, retains the current mesh selection, and offers bounded lightmap-candidate inputs. Drafting opens the Agent review flow; the plan can run only for multiple unique mesh assets in a complete unlocked scope, and stays speculative until explicit acceptance.
+
 - Create a project with separate mesh objects.
 - Capture exact face targets and queue native inset/extrude steps plus a parameterless face poke.
 - Run the plan on the speculative session.
