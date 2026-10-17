@@ -3207,6 +3207,97 @@ void ui_compiles_material_assignment_for_all_selected_shared_mesh_instances() {
     REQUIRE(accepted.material_assignments.front().material == fixture.material);
 }
 
+void agent_composes_geometry_material_and_uv_in_one_reviewed_task() {
+    using namespace carto;
+    TempDirectory temp;
+    application::ApplicationSession source;
+    const auto fixture = create_material_target(source);
+    REQUIRE(application::HumanApplicationAccess::dispatch(source,
+        application::CreateBoxAction{"Geometry target", {1.0, 1.0, 1.0}}));
+    const auto before = source.snapshot();
+    REQUIRE(before.objects.size() == 2U);
+    const auto geometry_object = before.objects.back().object.id;
+    const auto* before_instance = before.viewport.scene.find(geometry_object);
+    REQUIRE(before_instance != nullptr && before_instance->mesh != nullptr);
+    const geometry::VertexId target_vertex{1U};
+    const auto vertex_position = std::find(
+        before_instance->mesh->vertex_ids.begin(), before_instance->mesh->vertex_ids.end(),
+        target_vertex);
+    REQUIRE(vertex_position != before_instance->mesh->vertex_ids.end());
+    const std::size_t vertex_index = static_cast<std::size_t>(
+        std::distance(before_instance->mesh->vertex_ids.begin(), vertex_position));
+    const auto original_position = before_instance->mesh->positions[vertex_index];
+
+    const std::string material_intent = "assign material " +
+        std::to_string(fixture.material) + " to region 1";
+    const std::vector<scene::ObjectId> scope{fixture.object, geometry_object};
+    auto plan = plan_for(before, scope, {
+        {"step-geometry", {geometry_object, target_vertex}, "move vertex to 4 0 0"},
+        {"step-material", {fixture.object, std::monostate{}}, material_intent,
+            {"step-geometry"}},
+        {"step-uv", {fixture.object, std::monostate{}},
+            "generate lightmap uv set 27 resolution 128 padding 2 tiles 1",
+            {"step-material"}},
+    });
+    auto envelope = envelope_for(scope);
+    envelope.permitted_effects |=
+        agent::effect_mask(agent::Effect::material) | agent::effect_mask(agent::Effect::uv);
+    auto task = agent::AgentTask::begin(source, std::move(plan), envelope);
+    REQUIRE(task);
+
+    const auto review = task.value().run();
+    REQUIRE(review);
+    REQUIRE(review.value().status == agent::TaskStatus::review);
+    REQUIRE(review.value().can_accept);
+    REQUIRE(review.value().steps.size() == 3U);
+    REQUIRE(std::all_of(review.value().steps.begin(), review.value().steps.end(),
+        [](const auto& step) { return step.status == agent::StepStatus::passed; }));
+    REQUIRE(review.value().diff.changed_mesh_count() == 2U);
+    REQUIRE(std::any_of(review.value().diff.meshes.begin(), review.value().diff.meshes.end(),
+        [](const auto& mesh) { return mesh.vertices.size() == 1U; }));
+    REQUIRE(review.value().diff.changed_material_binding_count() == 1U);
+    REQUIRE(std::any_of(review.value().diff.meshes.begin(), review.value().diff.meshes.end(),
+        [](const auto& mesh) {
+            return std::any_of(mesh.uv_sets.begin(), mesh.uv_sets.end(),
+                [](const auto& change) {
+                    return change.id == 27U && !change.before.has_value() &&
+                        change.after.has_value() && change.after->lightmap_candidate;
+                });
+        }));
+
+    const auto still_unmodified = source.snapshot();
+    REQUIRE(still_unmodified.project_revision == before.project_revision);
+    REQUIRE(still_unmodified.material_assignments.empty());
+    const auto* still_unmodified_instance =
+        still_unmodified.viewport.scene.find(geometry_object);
+    REQUIRE(still_unmodified_instance != nullptr && still_unmodified_instance->mesh != nullptr);
+    REQUIRE(still_unmodified_instance->mesh->positions[vertex_index].x == original_position.x);
+    REQUIRE(still_unmodified_instance->mesh->positions[vertex_index].y == original_position.y);
+    REQUIRE(still_unmodified_instance->mesh->positions[vertex_index].z == original_position.z);
+
+    const auto accepted = application::HumanApplicationAccess::accept_agent_task(task.value());
+    REQUIRE(accepted && accepted.value().document_changed);
+    const auto after = source.snapshot();
+    REQUIRE(after.project_revision > before.project_revision);
+    REQUIRE(after.material_assignments.size() == 1U);
+    REQUIRE(after.material_assignments.front().material == fixture.material);
+    const auto* after_instance = after.viewport.scene.find(geometry_object);
+    REQUIRE(after_instance != nullptr && after_instance->mesh != nullptr);
+    REQUIRE(after_instance->mesh->positions[vertex_index].x != original_position.x ||
+        after_instance->mesh->positions[vertex_index].y != original_position.y ||
+        after_instance->mesh->positions[vertex_index].z != original_position.z);
+
+    const auto path = temp.path() / "mixed-agent-task.carto";
+    REQUIRE(application::HumanApplicationAccess::dispatch(
+        source, application::SaveProjectAction{path}));
+    const auto saved = project::ProjectDocument::load(path);
+    REQUIRE(saved);
+    const auto saved_mesh = saved.value().meshes().find(fixture.mesh_asset);
+    REQUIRE(saved_mesh != saved.value().meshes().end());
+    const auto* saved_lightmap = saved_mesh->second.uv_sets().find(27U);
+    REQUIRE(saved_lightmap != nullptr && saved_lightmap->lightmap_candidate);
+}
+
 void agent_material_assignment_fails_closed_on_authority_and_source_boundaries() {
     {
         carto::application::ApplicationSession source;
@@ -7064,6 +7155,7 @@ int main() {
         agent_material_assignment_is_speculative_reviewed_and_checkpointed();
         ui_compiles_and_reviews_an_opt_in_material_assignment();
         ui_compiles_material_assignment_for_all_selected_shared_mesh_instances();
+        agent_composes_geometry_material_and_uv_in_one_reviewed_task();
         agent_material_assignment_fails_closed_on_authority_and_source_boundaries();
         ui_reviews_persists_and_undoes_opt_in_lightmap_uv_generation();
         ui_compiles_lightmap_uv_generation_for_multiple_unique_mesh_targets();
