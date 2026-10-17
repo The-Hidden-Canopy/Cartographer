@@ -14,6 +14,7 @@
 #include <limits>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -2716,6 +2717,74 @@ void saved_acceptance_is_one_durable_application_event() {
     const auto saved = carto::application::ApplicationSession::inspect_recovery(path);
     REQUIRE(saved);
     REQUIRE(saved.value().state == carto::application::RecoveryInspectionState::clean);
+}
+
+void agent_acceptance_rolls_back_when_durable_journal_append_fails() {
+    TempDirectory temp;
+    const auto path = temp.path() / "agent-rollback.carto";
+    carto::application::ApplicationSession source;
+    const auto objects = create_boxes(source, 1U);
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        source, carto::application::SaveProjectAction{path}));
+    const auto baseline_recovery =
+        carto::application::ApplicationSession::inspect_recovery(path);
+    REQUIRE(baseline_recovery);
+    REQUIRE(baseline_recovery.value().state ==
+        carto::application::RecoveryInspectionState::clean);
+
+    const auto read_bytes = [](const std::filesystem::path& file) {
+        std::ifstream input(file, std::ios::binary);
+        REQUIRE(input.good());
+        return std::string(std::istreambuf_iterator<char>(input),
+            std::istreambuf_iterator<char>());
+    };
+    const std::string project_bytes = read_bytes(path);
+    const std::filesystem::path journal_path = baseline_recovery.value().journal_path;
+    REQUIRE(journal_path.parent_path() == temp.path());
+    const std::string journal_bytes = read_bytes(journal_path);
+    const auto before = source.snapshot();
+    auto plan = plan_for(before, objects, {
+        {"step-1", {objects[0], carto::geometry::FaceId{1U}}, "inset face 0.1"},
+    });
+    auto task = carto::agent::AgentTask::begin(
+        source, std::move(plan), envelope_for(objects));
+    REQUIRE(task);
+    REQUIRE(task.value().run());
+    REQUIRE(task.value().snapshot().status == carto::agent::TaskStatus::review);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+
+    std::filesystem::path preserved_journal = journal_path;
+    preserved_journal += ".preserved";
+    std::error_code error;
+    std::filesystem::rename(journal_path, preserved_journal, error);
+    REQUIRE(!error);
+    REQUIRE(std::filesystem::create_directory(journal_path, error));
+    REQUIRE(!error);
+
+    const auto acceptance =
+        carto::application::HumanApplicationAccess::accept_agent_task(task.value());
+    REQUIRE(!acceptance);
+    REQUIRE(task.value().snapshot().status == carto::agent::TaskStatus::blocked);
+    const auto after_failure = source.snapshot();
+    REQUIRE(after_failure.project_revision == before.project_revision);
+    REQUIRE(after_failure.project_generation == before.project_generation);
+    REQUIRE(after_failure.dirty == before.dirty);
+    REQUIRE(after_failure.undo_count == before.undo_count);
+    REQUIRE(after_failure.redo_count == before.redo_count);
+    REQUIRE(read_bytes(path) == project_bytes);
+
+    std::filesystem::remove(journal_path, error);
+    REQUIRE(!error);
+    std::filesystem::rename(preserved_journal, journal_path, error);
+    REQUIRE(!error);
+    REQUIRE(read_bytes(journal_path) == journal_bytes);
+    const auto restored_recovery =
+        carto::application::ApplicationSession::inspect_recovery(path);
+    REQUIRE(restored_recovery);
+    REQUIRE(restored_recovery.value().state ==
+        carto::application::RecoveryInspectionState::clean);
+    REQUIRE(restored_recovery.value().journal_entry_count ==
+        baseline_recovery.value().journal_entry_count);
 }
 
 void agent_material_assignment_is_speculative_reviewed_and_checkpointed() {
@@ -6572,6 +6641,7 @@ int main() {
         bounded_repair_restarts_from_source_and_preserves_attempt_lineage();
         repair_rejects_expansion_stale_source_empty_justification_and_exhaustion();
         saved_acceptance_is_one_durable_application_event();
+        agent_acceptance_rolls_back_when_durable_journal_append_fails();
         agent_material_assignment_is_speculative_reviewed_and_checkpointed();
         ui_compiles_and_reviews_an_opt_in_material_assignment();
         ui_compiles_material_assignment_for_all_selected_shared_mesh_instances();
