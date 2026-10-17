@@ -11,8 +11,17 @@ or rejected. Rejected candidates remain in the authoring record. Requirement
 records keep their source text, acceptance rule, source identity, and topology
 identity; they do not replace imported or extracted claims. The workspace also
 imports a bounded BOM CSV profile and displays source-to-assembly reconciliation
-rows before it exports an admitted `.carto-inspection` package when publication
+rows, and lets an operator add a sensor and access contract to an eligible
+requirement. It exports an admitted `.carto-inspection` package when publication
 gates pass.
+
+Characteristic creation is revision-bound and human-only. The application
+copies the requirement's current topology bindings, checks the requirement to
+characteristic kind mapping, requires explicit sensor, coverage, and allowed
+approach values, and marks dependent path products stale. It does not generate
+targets or claim that a sensor, robot, or motion plan is runtime-validated.
+Material-verification requirements have no supported inspection-kind mapping
+in this profile and remain blocked from characterization.
 
 ## BOM CSV profile
 
@@ -59,6 +68,8 @@ save/reopen, undo/redo, UI publication, revision-bound manual requirement
 authoring, revision-bound accept/reject decisions, AI-proposal rejection,
 invalid source/topology/unit and stale-revision rejection, strict BOM CSV
 parsing, source-preserving BOM re-import, ambiguous/missing reconciliation,
-invalidated BOM evidence, and explicit refusal to fake a CAD import. A newly authored requirement is not
+invalidated BOM evidence, requirement-kind compatibility, missing/contradictory
+access constraints, stale source/topology refusal, journal undo/redo, and
+explicit refusal to fake a CAD import. A newly authored requirement is not
 publication-ready by itself: package publication still requires its linked
 inspection characteristics and all other package gates.

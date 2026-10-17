@@ -160,6 +160,16 @@ void bom_csv_parser_and_reconciliation_fail_closed_on_ambiguous_evidence() {
     REQUIRE(!carto::engineering::parse_bom_csv(
         std::string(carto::engineering::kMaxBomCsvBytes + 1U, 'x'), 3U, 1U));
 
+    REQUIRE(carto::engineering::inspection_kind_compatible(
+        carto::engineering::RequirementKind::diameter,
+        carto::engineering::InspectionKind::diameter));
+    REQUIRE(!carto::engineering::inspection_kind_compatible(
+        carto::engineering::RequirementKind::diameter,
+        carto::engineering::InspectionKind::visual_surface_check));
+    REQUIRE(!carto::engineering::inspection_kind_compatible(
+        carto::engineering::RequirementKind::material_verification,
+        carto::engineering::InspectionKind::feature_presence));
+
     auto cyclic_occurrences = fixture.value();
     cyclic_occurrences.occurrences.at(0U).parent_id = 21U;
     cyclic_occurrences.occurrences.at(1U).parent_id = 20U;
@@ -339,6 +349,120 @@ void manual_requirement_authoring_is_revision_bound_and_auditable() {
     stale_binding.expected_project_revision = session.snapshot().project_revision;
     stale_binding.expected_authoring_revision = session.snapshot().engineering.authored_revision;
     REQUIRE(!carto::application::HumanApplicationAccess::dispatch(session, stale_binding));
+    REQUIRE(session.snapshot().engineering.stale);
+}
+
+void inspection_characteristics_require_current_human_verified_contracts() {
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::NewProjectAction{"Characteristic authoring"}));
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::ImportEngineeringFixtureAction{}));
+    carto::ui::UiController ui(session);
+
+    auto before_requirement = session.snapshot();
+    carto::application::CreateEngineeringRequirementAction requirement;
+    requirement.expected_project_revision = before_requirement.project_revision;
+    requirement.expected_authoring_revision = before_requirement.engineering.authored_revision;
+    requirement.source_id = 1U;
+    requirement.topology_ids = {100U};
+    requirement.kind = carto::engineering::RequirementKind::dimensional_distance;
+    requirement.nominal = 6.0;
+    requirement.plus = 0.1;
+    requirement.minus = 0.1;
+    requirement.unit = "millimeters";
+    requirement.source_section = "Manual inspection plan";
+    requirement.source_callout = "DIST-NEW";
+    requirement.original_text = "6.00 +/- 0.10 mm";
+    requirement.acceptance_rule = "within stated limits";
+    REQUIRE(ui.dispatch(requirement));
+    const auto after_requirement = session.snapshot();
+    REQUIRE(after_requirement.engineering.requirement_count == 4U);
+
+    const auto make_action = [](const carto::application::ApplicationSnapshot& snapshot) {
+        carto::application::CreateEngineeringCharacteristicAction action;
+        action.expected_project_revision = snapshot.project_revision;
+        action.expected_authoring_revision = snapshot.engineering.authored_revision;
+        action.requirement_id = 303U;
+        action.kind = carto::engineering::InspectionKind::distance;
+        action.sensor = {"structured-light", "tool0", 0.10, 0.35, 0.20,
+            25.0, 60.0, 0.05, true, false, 0.5};
+        action.coverage = {"single_point", 0.0};
+        action.access = {{"+z"}, {"-x"}, 0.05, false, false};
+        action.priority = 12U;
+        return action;
+    };
+    auto valid_action = make_action(after_requirement);
+    REQUIRE(!ui.submit_ai_proposal(valid_action));
+    REQUIRE(session.snapshot().project_revision == after_requirement.project_revision);
+
+    auto wrong_kind = valid_action;
+    wrong_kind.kind = carto::engineering::InspectionKind::diameter;
+    REQUIRE(!ui.dispatch(wrong_kind));
+    auto missing_sensor = valid_action;
+    missing_sensor.sensor.sensor_type.clear();
+    REQUIRE(!ui.dispatch(missing_sensor));
+    auto missing_approach = valid_action;
+    missing_approach.access.allowed_approach_directions.clear();
+    REQUIRE(!ui.dispatch(missing_approach));
+    auto contradictory_approach = valid_action;
+    contradictory_approach.access.forbidden_approach_directions = {"+z"};
+    REQUIRE(!ui.dispatch(contradictory_approach));
+    auto unsupported_approach = valid_action;
+    unsupported_approach.access.allowed_approach_directions = {"toward-datum"};
+    REQUIRE(!ui.dispatch(unsupported_approach));
+    auto zero_range_sensor = valid_action;
+    zero_range_sensor.sensor.max_standoff = 0.0;
+    REQUIRE(!ui.dispatch(zero_range_sensor));
+    REQUIRE(session.snapshot().project_revision == after_requirement.project_revision);
+
+    const auto created = ui.create_engineering_characteristic(valid_action);
+    REQUIRE(created && created.value().document_changed);
+    auto after_create = session.snapshot();
+    REQUIRE(after_create.project_revision == after_requirement.project_revision.next());
+    REQUIRE(after_create.engineering.characteristic_count == 4U);
+    const auto characteristic = std::find_if(after_create.engineering.characteristics.begin(),
+        after_create.engineering.characteristics.end(), [](const auto& value) {
+            return value.requirement_id == 303U;
+        });
+    REQUIRE(characteristic != after_create.engineering.characteristics.end());
+    REQUIRE(characteristic->kind == "distance");
+    REQUIRE(characteristic->sensor_type == "structured-light");
+    REQUIRE(characteristic->topology_ids == std::vector<std::uint64_t>{100U});
+    const auto authored_document = session.engineering_authoring();
+    REQUIRE(authored_document);
+    REQUIRE(authored_document.value().path->status ==
+        carto::engineering::DerivedProductStatus::stale);
+    REQUIRE(std::all_of(authored_document.value().path->samples.begin(),
+        authored_document.value().path->samples.end(), [](const auto& sample) {
+            return sample.status == carto::engineering::PathSampleStatus::stale;
+        }));
+    REQUIRE(std::all_of(authored_document.value().derived_products.begin(),
+        authored_document.value().derived_products.end(), [](const auto& product) {
+            return product.status == carto::engineering::DerivedProductStatus::stale &&
+                !product.stale_reason.empty();
+        }));
+    REQUIRE(!ui.snapshot().operations.empty());
+    REQUIRE(ui.snapshot().operations.back().action == "Create Inspection Characteristic");
+    REQUIRE(ui.snapshot().operations.back().category ==
+        carto::ui::OperationCategory::committed_command);
+
+    auto duplicate = make_action(after_create);
+    REQUIRE(!ui.dispatch(duplicate));
+    auto stale = valid_action;
+    REQUIRE(!ui.dispatch(stale));
+    REQUIRE(session.snapshot().project_revision == after_create.project_revision);
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::UndoAction{}));
+    REQUIRE(session.snapshot().engineering.characteristic_count == 3U);
+    REQUIRE(carto::application::HumanApplicationAccess::dispatch(
+        session, carto::application::RedoAction{}));
+    REQUIRE(session.snapshot().engineering.characteristic_count == 4U);
+
+    REQUIRE(ui.dispatch(carto::application::InvalidateEngineeringSourceAction{
+        1U, "DV012-rev-d", digest("dv012-rev-d-characteristic" )}));
+    auto stale_source_action = make_action(session.snapshot());
+    REQUIRE(!ui.dispatch(stale_source_action));
     REQUIRE(session.snapshot().engineering.stale);
 }
 
@@ -804,6 +928,7 @@ int main() {
         bom_csv_parser_and_reconciliation_fail_closed_on_ambiguous_evidence();
         publication_and_vanta_admission_bind_exact_bytes();
         manual_requirement_authoring_is_revision_bound_and_auditable();
+        inspection_characteristics_require_current_human_verified_contracts();
         inspection_target_review_is_human_revision_bound_and_preserves_decisions();
         source_invalidation_preserves_authored_records_and_stales_products();
         step_boundary_never_fakes_a_cad_import();

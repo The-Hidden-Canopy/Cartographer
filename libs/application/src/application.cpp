@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <bit>
 #include <charconv>
+#include <cctype>
 #include <cmath>
 #include <iomanip>
 #include <locale>
@@ -1118,6 +1119,8 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return import_engineering_bom_csv(value);
             } else if constexpr (std::is_same_v<Action, CreateEngineeringRequirementAction>) {
                 return create_engineering_requirement(value);
+            } else if constexpr (std::is_same_v<Action, CreateEngineeringCharacteristicAction>) {
+                return create_engineering_characteristic(value);
             } else if constexpr (std::is_same_v<Action, ReviewEngineeringTargetAction>) {
                 return review_engineering_target(value);
             } else if constexpr (std::is_same_v<Action, InvalidateEngineeringSourceAction>) {
@@ -3192,6 +3195,223 @@ core::Result<DispatchReceipt> ApplicationSession::create_engineering_requirement
         "Create Manual Engineering Requirement");
 }
 
+core::Result<DispatchReceipt> ApplicationSession::create_engineering_characteristic(
+    const CreateEngineeringCharacteristicAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "inspection characteristic authoring requires the explicit human boundary"));
+    }
+    if (action.expected_project_revision != document_.revision()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "inspection characteristic was based on a stale project revision"));
+    }
+    if (action.requirement_id == 0U) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "inspection characteristic requires a non-zero requirement identity"));
+    }
+    const auto current = engineering_authoring();
+    if (!current) return failure(current.error().with_context(
+        "inspection characteristic authoring"));
+    if (current.value().project_revision != action.expected_authoring_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "inspection characteristic was based on a stale authoring revision"));
+    }
+    if (current.value().project_revision.exhausted()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "engineering authoring revision space is exhausted"));
+    }
+    const auto requirement = std::find_if(current.value().requirements.begin(),
+        current.value().requirements.end(), [&action](const auto& candidate) {
+            return candidate.id == action.requirement_id;
+        });
+    if (requirement == current.value().requirements.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "inspection characteristic requirement does not exist"));
+    }
+    if (!requirement->enabled ||
+        requirement->extraction == engineering::ExtractionState::stale ||
+        requirement->extraction == engineering::ExtractionState::rejected ||
+        requirement->extraction == engineering::ExtractionState::machine_extracted_proposed ||
+        requirement->topology_ids.empty() || requirement->topology_ids.size() > 64U) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "inspection characteristic requires an enabled, verified requirement with bounded topology"));
+    }
+
+    if (!engineering::inspection_kind_compatible(requirement->kind, action.kind)) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "inspection characteristic kind does not measure the selected requirement"));
+    }
+    const auto requirement_source = std::find_if(current.value().sources.begin(),
+        current.value().sources.end(), [&requirement](const auto& source) {
+            return source.id == requirement->provenance.source_id;
+        });
+    if (requirement_source == current.value().sources.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "inspection characteristic requirement source is unresolved"));
+    }
+    for (const auto topology_id : requirement->topology_ids) {
+        const auto topology = std::find_if(current.value().topology.begin(),
+            current.value().topology.end(), [topology_id](const auto& binding) {
+                return binding.id == topology_id;
+            });
+        if (topology == current.value().topology.end()) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "inspection characteristic topology binding is unresolved"));
+        }
+        const auto source = std::find_if(current.value().sources.begin(),
+            current.value().sources.end(), [&topology](const auto& candidate) {
+                return candidate.id == topology->source_id;
+            });
+        if (source == current.value().sources.end() ||
+            topology->source_revision != source->revision) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "inspection characteristic topology binding is stale against its source"));
+        }
+    }
+
+    static const std::set<std::string> workcell_axis_directions{
+        "+x", "-x", "+y", "-y", "+z", "-z"};
+    std::set<std::string> unique_directions;
+    for (const auto& direction : action.access.allowed_approach_directions) {
+        if (!workcell_axis_directions.contains(direction) ||
+            !unique_directions.insert(direction).second) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::invalid_argument,
+                "allowed approach directions must be unique workcell axes"));
+        }
+    }
+    for (const auto& direction : action.access.forbidden_approach_directions) {
+        if (!workcell_axis_directions.contains(direction) ||
+            !unique_directions.insert(direction).second) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::invalid_argument,
+                "approach directions must be unique workcell axes without contradictory rules"));
+        }
+    }
+    if (action.access.allowed_approach_directions.empty() ||
+        (!action.sensor.contact_required && action.sensor.max_standoff <= 0.0)) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "inspection characteristic requires an allowed approach and a positive non-contact standoff"));
+    }
+    const auto has_text = [](std::string_view value) {
+        return std::any_of(value.begin(), value.end(), [](unsigned char byte) {
+            return !std::isspace(byte);
+        });
+    };
+    if (!has_text(action.sensor.sensor_type) || !has_text(action.sensor.tool_center_frame) ||
+        !has_text(action.coverage.kind)) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "inspection characteristic requires non-blank sensor, tool frame, and coverage rule"));
+    }
+
+    engineering::InspectionCharacteristic candidate;
+    candidate.requirement_id = requirement->id;
+    candidate.kind = action.kind;
+    candidate.topology_ids = requirement->topology_ids;
+    candidate.sensor = action.sensor;
+    candidate.coverage = action.coverage;
+    candidate.access = action.access;
+    candidate.priority = action.priority;
+    const auto duplicate = std::find_if(current.value().characteristics.begin(),
+        current.value().characteristics.end(), [&candidate](const auto& existing) {
+            return existing.requirement_id == candidate.requirement_id &&
+                existing.kind == candidate.kind && existing.topology_ids == candidate.topology_ids &&
+                existing.sensor.sensor_type == candidate.sensor.sensor_type &&
+                existing.sensor.tool_center_frame == candidate.sensor.tool_center_frame &&
+                existing.sensor.min_standoff == candidate.sensor.min_standoff &&
+                existing.sensor.max_standoff == candidate.sensor.max_standoff &&
+                existing.sensor.preferred_standoff == candidate.sensor.preferred_standoff &&
+                existing.sensor.orientation_cone_degrees == candidate.sensor.orientation_cone_degrees &&
+                existing.sensor.field_of_view_degrees == candidate.sensor.field_of_view_degrees &&
+                existing.sensor.min_clearance == candidate.sensor.min_clearance &&
+                existing.sensor.line_of_sight_required == candidate.sensor.line_of_sight_required &&
+                existing.sensor.contact_required == candidate.sensor.contact_required &&
+                existing.sensor.measurement_duration_seconds ==
+                    candidate.sensor.measurement_duration_seconds &&
+                existing.coverage.kind == candidate.coverage.kind &&
+                existing.coverage.percentage == candidate.coverage.percentage &&
+                existing.access.allowed_approach_directions ==
+                    candidate.access.allowed_approach_directions &&
+                existing.access.forbidden_approach_directions ==
+                    candidate.access.forbidden_approach_directions &&
+                existing.access.minimum_approach_clearance ==
+                    candidate.access.minimum_approach_clearance &&
+                existing.access.fixture_occlusion_allowed ==
+                    candidate.access.fixture_occlusion_allowed &&
+                existing.access.robot_base_reposition_permitted ==
+                    candidate.access.robot_base_reposition_permitted &&
+                existing.priority == candidate.priority &&
+                existing.status == engineering::InspectionStatus::authored;
+        });
+    if (duplicate != current.value().characteristics.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "an identical active inspection characteristic already exists"));
+    }
+    if (current.value().characteristics.size() >=
+        engineering::AuthoringDocument::kMaxCollectionEntries) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "inspection characteristic collection reached its configured limit"));
+    }
+    std::uint64_t next_id = 1U;
+    for (const auto& existing : current.value().characteristics) {
+        if (existing.id == std::numeric_limits<std::uint64_t>::max()) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "inspection characteristic identity space is exhausted"));
+        }
+        next_id = std::max(next_id, existing.id + 1U);
+    }
+
+    auto updated = current.value();
+    candidate.id = next_id;
+    if (auto valid = candidate.validate(); !valid) {
+        return failure(valid.error().with_context("inspection characteristic fields"));
+    }
+    updated.characteristics.push_back(std::move(candidate));
+    if (updated.path.has_value()) {
+        updated.path->status = engineering::DerivedProductStatus::stale;
+        for (auto& sample : updated.path->samples) {
+            sample.status = engineering::PathSampleStatus::stale;
+        }
+    }
+    for (auto& product : updated.derived_products) {
+        product.status = engineering::DerivedProductStatus::stale;
+        product.stale_reason = "inspection characteristic changed; path requires regeneration";
+    }
+    updated.project_revision = updated.project_revision.next();
+    if (auto valid = updated.validate(); !valid) {
+        return failure(valid.error().with_context("inspection characteristic authoring"));
+    }
+    const std::string serialized = updated.serialize();
+    const auto digest = updated.canonical_digest();
+    if (!digest) return failure(digest.error().with_context(
+        "inspection characteristic digest"));
+    const auto before = document_.engineering_authoring();
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectEngineeringAuthoringCommand>(
+            admission,
+            document_,
+            before,
+            project::SerializedEngineeringAuthoring{serialized, digest.value()}),
+        "Create Inspection Characteristic");
+}
+
 core::Result<DispatchReceipt> ApplicationSession::review_engineering_target(
     const ReviewEngineeringTargetAction& action) {
     if (active_source_ != OperationSource::human) {
@@ -4339,6 +4559,7 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
                     requirement.id,
                     requirement.provenance.source_id,
                     requirement.topology_ids,
+                    requirement.kind,
                     engineering::requirement_kind_name(requirement.kind),
                     engineering::extraction_state_name(requirement.extraction),
                     requirement.nominal,
@@ -4347,9 +4568,28 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
                     requirement.unit,
                     requirement.provenance.callout,
                     requirement.provenance.original_text,
-                    requirement.acceptance_rule});
+                    requirement.acceptance_rule,
+                    requirement.enabled});
             }
             result.engineering.characteristic_count = authoring.characteristics.size();
+            result.engineering.characteristics.reserve(authoring.characteristics.size());
+            for (const auto& characteristic : authoring.characteristics) {
+                result.engineering.characteristics.push_back(
+                    EngineeringAuthoringView::Characteristic{
+                        characteristic.id,
+                        characteristic.requirement_id,
+                        characteristic.topology_ids,
+                        engineering::inspection_kind_name(characteristic.kind),
+                        engineering::inspection_status_name(characteristic.status),
+                        characteristic.sensor.sensor_type,
+                        characteristic.sensor.tool_center_frame,
+                        characteristic.coverage.kind,
+                        characteristic.coverage.percentage,
+                        characteristic.priority});
+            }
+            std::sort(result.engineering.characteristics.begin(),
+                result.engineering.characteristics.end(),
+                [](const auto& left, const auto& right) { return left.id < right.id; });
             result.engineering.target_count = authoring.targets.size();
             result.engineering.targets.reserve(authoring.targets.size());
             for (const auto& target : authoring.targets) {

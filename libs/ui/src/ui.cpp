@@ -560,6 +560,7 @@ bool is_operation_action(const application::ApplicationAction& action) {
             std::is_same_v<Action, application::ImportEngineeringAuthoringAction> ||
             std::is_same_v<Action, application::ImportEngineeringBomCsvAction> ||
             std::is_same_v<Action, application::CreateEngineeringRequirementAction> ||
+            std::is_same_v<Action, application::CreateEngineeringCharacteristicAction> ||
             std::is_same_v<Action, application::ReviewEngineeringTargetAction> ||
             std::is_same_v<Action, application::InvalidateEngineeringSourceAction> ||
             std::is_same_v<Action, application::ImportConditionFixtureAction> ||
@@ -4274,6 +4275,11 @@ core::Result<application::DispatchReceipt> UiController::import_engineering_bom_
             path.generic_string(),
             std::move(bytes).value()},
         OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::create_engineering_characteristic(
+    const application::CreateEngineeringCharacteristicAction& action) {
+    return dispatch_with_category(action, OperationCategory::committed_command);
 }
 
 core::Result<void> UiController::export_engineering_authoring(

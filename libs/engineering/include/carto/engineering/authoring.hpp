@@ -56,6 +56,8 @@ enum class PathSampleStatus : std::uint8_t {
 [[nodiscard]] const char* extraction_state_name(ExtractionState value) noexcept;
 [[nodiscard]] const char* reconciliation_status_name(ReconciliationStatus value) noexcept;
 [[nodiscard]] const char* inspection_kind_name(InspectionKind value) noexcept;
+[[nodiscard]] bool inspection_kind_compatible(
+    RequirementKind requirement, InspectionKind characteristic) noexcept;
 [[nodiscard]] const char* inspection_status_name(InspectionStatus value) noexcept;
 [[nodiscard]] const char* target_status_name(TargetStatus value) noexcept;
 [[nodiscard]] const char* workcell_entity_kind_name(WorkcellEntityKind value) noexcept;

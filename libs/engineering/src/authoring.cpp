@@ -339,6 +339,43 @@ const char* inspection_kind_name(InspectionKind value) noexcept {
         {InspectionKind::datum_capture, "datum-capture"},
         {InspectionKind::dimensional_feature_check, "dimensional-feature-check"}});
 }
+bool inspection_kind_compatible(
+    RequirementKind requirement, InspectionKind characteristic) noexcept {
+    using R = RequirementKind;
+    using I = InspectionKind;
+    switch (requirement) {
+    case R::dimensional_distance:
+        return characteristic == I::distance || characteristic == I::point_measurement ||
+            characteristic == I::dimensional_feature_check;
+    case R::diameter:
+        return characteristic == I::diameter || characteristic == I::dimensional_feature_check;
+    case R::radius:
+        return characteristic == I::dimensional_feature_check;
+    case R::angle:
+        return characteristic == I::angle || characteristic == I::dimensional_feature_check;
+    case R::thickness:
+        return characteristic == I::thickness || characteristic == I::dimensional_feature_check;
+    case R::clearance:
+        return characteristic == I::clearance || characteristic == I::distance;
+    case R::position:
+        return characteristic == I::point_measurement ||
+            characteristic == I::dimensional_feature_check;
+    case R::flatness:
+    case R::parallelism:
+    case R::perpendicularity:
+    case R::concentricity:
+        return characteristic == I::dimensional_feature_check;
+    case R::surface_condition:
+    case R::visual_surface:
+        return characteristic == I::surface_scan || characteristic == I::visual_surface_check;
+    case R::presence_absence:
+    case R::assembly_relationship:
+        return characteristic == I::feature_presence;
+    case R::material_verification:
+        return false;
+    }
+    return false;
+}
 const char* inspection_status_name(InspectionStatus value) noexcept {
     return named(value, {{InspectionStatus::authored, "authored"},
         {InspectionStatus::disabled, "disabled"}, {InspectionStatus::stale, "stale"}});

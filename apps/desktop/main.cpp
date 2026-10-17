@@ -1270,6 +1270,27 @@ struct DesktopState {
     std::array<char, 129> engineering_requirement_callout{};
     std::array<char, 1025> engineering_requirement_original_text{};
     std::array<char, 513> engineering_requirement_acceptance{};
+    std::uint64_t engineering_characteristic_requirement_id = 0U;
+    int engineering_characteristic_kind = 0;
+    std::array<char, 129> engineering_characteristic_sensor{};
+    std::array<char, 129> engineering_characteristic_tool_frame{};
+    double engineering_characteristic_min_standoff = 0.0;
+    double engineering_characteristic_max_standoff = 0.0;
+    double engineering_characteristic_preferred_standoff = 0.0;
+    double engineering_characteristic_orientation_cone = 0.0;
+    double engineering_characteristic_field_of_view = 0.0;
+    double engineering_characteristic_min_clearance = 0.0;
+    bool engineering_characteristic_line_of_sight = false;
+    bool engineering_characteristic_contact = false;
+    double engineering_characteristic_duration = 0.0;
+    std::array<char, 129> engineering_characteristic_coverage_kind{};
+    double engineering_characteristic_coverage_percentage = 0.0;
+    std::array<char, 129> engineering_characteristic_allowed_direction{};
+    std::array<char, 129> engineering_characteristic_forbidden_direction{};
+    double engineering_characteristic_approach_clearance = 0.0;
+    bool engineering_characteristic_fixture_occlusion = false;
+    bool engineering_characteristic_base_reposition = false;
+    std::uint32_t engineering_characteristic_priority = 0U;
     std::optional<std::uint64_t> condition_source_update_id;
     std::array<char, 129> condition_source_revision{};
     std::array<char, 65> condition_source_digest{};
@@ -8783,6 +8804,7 @@ struct DesktopState {
             engineering_requirement_callout.fill('\0');
             engineering_requirement_original_text.fill('\0');
             engineering_requirement_acceptance.fill('\0');
+            engineering_characteristic_requirement_id = 0U;
         }
 
         struct RequirementOption {
@@ -9016,6 +9038,265 @@ struct DesktopState {
         }
     }
 
+    void draw_engineering_characteristic_authoring(const UiSnapshot& snapshot) {
+        const auto& engineering = snapshot.engineering;
+        struct KindOption {
+            carto::engineering::InspectionKind kind;
+            const char* label;
+        };
+        static constexpr std::array<KindOption, 11> kind_options{{
+            {carto::engineering::InspectionKind::point_measurement, "Point measurement"},
+            {carto::engineering::InspectionKind::distance, "Distance"},
+            {carto::engineering::InspectionKind::angle, "Angle"},
+            {carto::engineering::InspectionKind::diameter, "Diameter"},
+            {carto::engineering::InspectionKind::thickness, "Thickness"},
+            {carto::engineering::InspectionKind::clearance, "Clearance"},
+            {carto::engineering::InspectionKind::surface_scan, "Surface scan"},
+            {carto::engineering::InspectionKind::visual_surface_check, "Visual surface check"},
+            {carto::engineering::InspectionKind::feature_presence, "Feature presence"},
+            {carto::engineering::InspectionKind::datum_capture, "Datum capture"},
+            {carto::engineering::InspectionKind::dimensional_feature_check,
+                "Dimensional feature check"}}};
+        const auto requirement_eligible = [](const auto& requirement) {
+            return requirement.enabled && requirement.extraction != "stale" &&
+                requirement.extraction != "rejected" &&
+                requirement.extraction != "machine-extracted-proposed" &&
+                !requirement.topology_ids.empty();
+        };
+        if (engineering_characteristic_requirement_id != 0U) {
+            const auto current = std::find_if(engineering.requirements.begin(),
+                engineering.requirements.end(), [this](const auto& requirement) {
+                    return requirement.id == engineering_characteristic_requirement_id;
+                });
+            if (current == engineering.requirements.end() || !requirement_eligible(*current)) {
+                engineering_characteristic_requirement_id = 0U;
+            }
+        }
+
+        ImGui::SeparatorText("Inspection characteristics");
+        ImGui::TextWrapped(
+            "Characteristics translate a verified requirement into an explicit sensor and access "
+            "contract. Values here are operator-authored; no sensor capability or runtime result is inferred.");
+        if (engineering.characteristics.empty()) {
+            ImGui::TextDisabled("No inspection characteristics are authored.");
+        } else {
+            const bool visible = ImGui::BeginChild(
+                "Engineering inspection characteristics", ImVec2(0, 88), true);
+            if (visible) {
+                ImGuiListClipper clipper;
+                clipper.Begin(static_cast<int>(engineering.characteristics.size()), 32.0F);
+                while (clipper.Step()) {
+                    for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
+                        const auto& characteristic =
+                            engineering.characteristics[static_cast<std::size_t>(index)];
+                        ImGui::Text("Characteristic %llu · requirement %llu · %s · %s",
+                            static_cast<unsigned long long>(characteristic.id),
+                            static_cast<unsigned long long>(characteristic.requirement_id),
+                            characteristic.kind.c_str(), characteristic.status.c_str());
+                    }
+                }
+            }
+            ImGui::EndChild();
+        }
+
+        const auto selected_requirement = std::find_if(
+            engineering.requirements.begin(), engineering.requirements.end(), [this](const auto& value) {
+                return value.id == engineering_characteristic_requirement_id &&
+                    value.enabled && value.extraction != "stale" && value.extraction != "rejected" &&
+                    value.extraction != "machine-extracted-proposed" && !value.topology_ids.empty();
+            });
+        const std::string requirement_preview = selected_requirement == engineering.requirements.end()
+            ? "Choose a verified requirement"
+            : "Requirement " + std::to_string(selected_requirement->id) + " · " +
+                selected_requirement->kind + " · " + selected_requirement->extraction;
+        if (ImGui::BeginCombo("Requirement for characteristic", requirement_preview.c_str())) {
+            ImGuiListClipper clipper;
+            clipper.Begin(static_cast<int>(engineering.requirements.size()), 22.0F);
+            while (clipper.Step()) {
+                for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
+                    const auto& requirement =
+                        engineering.requirements[static_cast<std::size_t>(index)];
+                    if (!requirement_eligible(requirement)) continue;
+                    const std::string label = "Requirement " + std::to_string(requirement.id) +
+                        " · " + requirement.kind + " · " + requirement.extraction;
+                    const std::string id = std::to_string(requirement.id);
+                    ImGui::PushID(id.c_str());
+                    if (ImGui::Selectable(label.c_str(),
+                            engineering_characteristic_requirement_id == requirement.id)) {
+                        engineering_characteristic_requirement_id = requirement.id;
+                    }
+                    ImGui::PopID();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        if (selected_requirement == engineering.requirements.end()) {
+            ImGui::TextDisabled("Choose a current enabled requirement to continue.");
+            return;
+        }
+
+        std::vector<const KindOption*> compatible_options;
+        const auto model_requirement = std::find_if(
+            engineering.requirements.begin(), engineering.requirements.end(),
+            [&selected_requirement](const auto& value) {
+                return value.id == selected_requirement->id;
+            });
+        if (model_requirement != engineering.requirements.end()) {
+            for (const auto& option : kind_options) {
+                if (carto::engineering::inspection_kind_compatible(
+                        model_requirement->model_kind, option.kind)) {
+                    compatible_options.push_back(&option);
+                }
+            }
+        }
+        if (compatible_options.empty()) {
+            ImGui::TextDisabled(
+                "This requirement has no supported characteristic mapping in the current authoring profile.");
+            return;
+        }
+        engineering_characteristic_kind = std::clamp(engineering_characteristic_kind, 0,
+            static_cast<int>(compatible_options.size() - 1U));
+        const auto* preview_kind = compatible_options[
+            static_cast<std::size_t>(engineering_characteristic_kind)];
+        if (ImGui::BeginCombo("Inspection kind", preview_kind->label)) {
+            for (std::size_t index = 0U; index < compatible_options.size(); ++index) {
+                const auto* option = compatible_options[index];
+                const std::string id = std::to_string(index);
+                ImGui::PushID(id.c_str());
+                if (ImGui::Selectable(option->label,
+                        static_cast<int>(index) == engineering_characteristic_kind)) {
+                    engineering_characteristic_kind = static_cast<int>(index);
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+        const auto* selected_kind = compatible_options[
+            static_cast<std::size_t>(engineering_characteristic_kind)];
+
+        ImGui::InputText("Sensor type", engineering_characteristic_sensor.data(),
+                         engineering_characteristic_sensor.size());
+        ImGui::InputText("Tool center frame", engineering_characteristic_tool_frame.data(),
+                         engineering_characteristic_tool_frame.size());
+        ImGui::InputDouble("Minimum standoff", &engineering_characteristic_min_standoff,
+                           0.001, 0.01, "%.6g");
+        ImGui::InputDouble("Maximum standoff", &engineering_characteristic_max_standoff,
+                           0.001, 0.01, "%.6g");
+        ImGui::InputDouble("Preferred standoff", &engineering_characteristic_preferred_standoff,
+                           0.001, 0.01, "%.6g");
+        ImGui::InputDouble("Orientation cone degrees", &engineering_characteristic_orientation_cone,
+                           1.0, 5.0, "%.6g");
+        ImGui::InputDouble("Field of view degrees", &engineering_characteristic_field_of_view,
+                           1.0, 5.0, "%.6g");
+        ImGui::InputDouble("Minimum sensor clearance", &engineering_characteristic_min_clearance,
+                           0.001, 0.01, "%.6g");
+        ImGui::Checkbox("Require line of sight", &engineering_characteristic_line_of_sight);
+        ImGui::Checkbox("Require contact", &engineering_characteristic_contact);
+        ImGui::InputDouble("Measurement duration seconds",
+                           &engineering_characteristic_duration, 0.1, 1.0, "%.6g");
+        ImGui::InputText("Coverage rule", engineering_characteristic_coverage_kind.data(),
+                         engineering_characteristic_coverage_kind.size());
+        ImGui::InputDouble("Coverage percent", &engineering_characteristic_coverage_percentage,
+                           1.0, 5.0, "%.6g");
+        ImGui::InputText("Allowed approach directions (+x,-z)",
+                         engineering_characteristic_allowed_direction.data(),
+                         engineering_characteristic_allowed_direction.size());
+        ImGui::InputText("Forbidden approach directions (+x,-z)",
+                         engineering_characteristic_forbidden_direction.data(),
+                         engineering_characteristic_forbidden_direction.size());
+        ImGui::InputDouble("Minimum approach clearance",
+                           &engineering_characteristic_approach_clearance,
+                           0.001, 0.01, "%.6g");
+        ImGui::Checkbox("Fixture occlusion allowed",
+                        &engineering_characteristic_fixture_occlusion);
+        ImGui::Checkbox("Robot base reposition permitted",
+                        &engineering_characteristic_base_reposition);
+        ImGui::InputScalar("Priority", ImGuiDataType_U32,
+                           &engineering_characteristic_priority);
+        ImGui::TextDisabled(
+            "Approach directions use the workcell axes +x, -x, +y, -y, +z, -z. Enter comma-separated values.");
+
+        const auto parse_directions = [](std::string_view input)
+            -> std::optional<std::vector<std::string>> {
+            std::vector<std::string> result;
+            if (input.empty()) return result;
+            while (!input.empty()) {
+                const std::size_t separator = input.find(',');
+                std::string_view item = input.substr(0U, separator);
+                while (!item.empty() && std::isspace(static_cast<unsigned char>(item.front()))) {
+                    item.remove_prefix(1U);
+                }
+                while (!item.empty() && std::isspace(static_cast<unsigned char>(item.back()))) {
+                    item.remove_suffix(1U);
+                }
+                if (item.empty()) return std::nullopt;
+                result.emplace_back(item);
+                if (separator == std::string_view::npos) break;
+                input.remove_prefix(separator + 1U);
+                if (input.empty()) return std::nullopt;
+            }
+            return result;
+        };
+        const auto allowed_directions = parse_directions(
+            engineering_characteristic_allowed_direction.data());
+        const auto forbidden_directions = parse_directions(
+            engineering_characteristic_forbidden_direction.data());
+        carto::engineering::SensorConstraint sensor{
+            engineering_characteristic_sensor.data(),
+            engineering_characteristic_tool_frame.data(),
+            engineering_characteristic_min_standoff,
+            engineering_characteristic_max_standoff,
+            engineering_characteristic_preferred_standoff,
+            engineering_characteristic_orientation_cone,
+            engineering_characteristic_field_of_view,
+            engineering_characteristic_min_clearance,
+            engineering_characteristic_line_of_sight,
+            engineering_characteristic_contact,
+            engineering_characteristic_duration};
+        carto::engineering::CoverageConstraint coverage{
+            engineering_characteristic_coverage_kind.data(),
+            engineering_characteristic_coverage_percentage};
+        carto::engineering::AccessConstraint access;
+        if (allowed_directions.has_value()) {
+            access.allowed_approach_directions = *allowed_directions;
+        }
+        if (forbidden_directions.has_value()) {
+            access.forbidden_approach_directions = *forbidden_directions;
+        }
+        access.minimum_approach_clearance = engineering_characteristic_approach_clearance;
+        access.fixture_occlusion_allowed = engineering_characteristic_fixture_occlusion;
+        access.robot_base_reposition_permitted = engineering_characteristic_base_reposition;
+        const auto has_text = [](std::string_view value) {
+            return std::any_of(value.begin(), value.end(), [](unsigned char byte) {
+                return !std::isspace(byte);
+            });
+        };
+        const bool fields_valid = has_text(sensor.sensor_type) &&
+            has_text(sensor.tool_center_frame) && has_text(coverage.kind) &&
+            allowed_directions.has_value() && !allowed_directions->empty() &&
+            forbidden_directions.has_value() && sensor.validate() && coverage.validate() &&
+            access.validate() &&
+            (sensor.contact_required || sensor.max_standoff > 0.0);
+        ImGui::BeginDisabled(!fields_valid);
+        if (ImGui::Button("Add inspection characteristic", ImVec2(-1, 30))) {
+            carto::application::CreateEngineeringCharacteristicAction action;
+            action.expected_project_revision = snapshot.project_revision;
+            action.expected_authoring_revision = engineering.authored_revision;
+            action.requirement_id = selected_requirement->id;
+            action.kind = selected_kind->kind;
+            action.sensor = std::move(sensor);
+            action.coverage = std::move(coverage);
+            action.access = std::move(access);
+            action.priority = engineering_characteristic_priority;
+            static_cast<void>(dispatch(action));
+        }
+        ImGui::EndDisabled();
+        if (!fields_valid) {
+            ImGui::TextDisabled(
+                "Complete sensor, coverage, allowed approach, and physically valid standoff fields.");
+        }
+    }
+
     void draw_engineering_instrument(const UiSnapshot& snapshot) {
         if (!begin_instrument(snapshot, carto::ui::WorkbenchInstrument::references,
                               "Engineering", workbench.references, ImVec2(250, 90),
@@ -9023,7 +9304,7 @@ struct DesktopState {
         ImGui::TextDisabled("DV012 authoring boundary");
         ImGui::TextWrapped(
             "Engineering records stay authoritative in the project. Source evidence and exact "
-            "topology bindings remain visible while manual requirements are added as separate records.");
+            "topology bindings remain visible while requirements, inspection constraints, and target decisions are authored as separate records.");
         ImGui::Separator();
         if (!snapshot.engineering.present) {
             ImGui::TextDisabled("No engineering authoring is loaded.");
@@ -9181,6 +9462,7 @@ struct DesktopState {
                 }
             }
             draw_engineering_requirement_authoring(snapshot);
+            draw_engineering_characteristic_authoring(snapshot);
             if (engineering.stale) {
                 ImGui::TextColored(color(snapshot.colors.semantic_error),
                     "Source drift is recorded; import reconciled authoring to restore admission.");

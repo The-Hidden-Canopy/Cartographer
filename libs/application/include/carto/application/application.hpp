@@ -309,6 +309,8 @@ struct EngineeringAuthoringView {
         std::uint64_t id = 0U;
         std::uint64_t source_id = 0U;
         std::vector<std::uint64_t> topology_ids;
+        engineering::RequirementKind model_kind =
+            engineering::RequirementKind::dimensional_distance;
         std::string kind;
         std::string extraction;
         double nominal = 0.0;
@@ -318,8 +320,22 @@ struct EngineeringAuthoringView {
         std::string callout;
         std::string original_text;
         std::string acceptance_rule;
+        bool enabled = true;
     };
     std::vector<Requirement> requirements;
+    struct Characteristic {
+        std::uint64_t id = 0U;
+        std::uint64_t requirement_id = 0U;
+        std::vector<std::uint64_t> topology_ids;
+        std::string kind;
+        std::string status;
+        std::string sensor_type;
+        std::string tool_center_frame;
+        std::string coverage_kind;
+        double coverage_percentage = 0.0;
+        std::uint32_t priority = 0U;
+    };
+    std::vector<Characteristic> characteristics;
     struct Target {
         std::uint64_t id = 0U;
         std::uint64_t characteristic_id = 0U;
@@ -726,6 +742,16 @@ struct CreateEngineeringRequirementAction {
     std::string original_text;
     std::string acceptance_rule;
 };
+struct CreateEngineeringCharacteristicAction {
+    core::Revision expected_project_revision;
+    core::Revision expected_authoring_revision;
+    std::uint64_t requirement_id = 0U;
+    engineering::InspectionKind kind = engineering::InspectionKind::point_measurement;
+    engineering::SensorConstraint sensor;
+    engineering::CoverageConstraint coverage;
+    engineering::AccessConstraint access;
+    std::uint32_t priority = 0U;
+};
 struct ReviewEngineeringTargetAction {
     core::Revision expected_project_revision;
     core::Revision expected_authoring_revision;
@@ -863,6 +889,7 @@ using ApplicationAction = std::variant<
     ImportEngineeringAuthoringAction,
     ImportEngineeringBomCsvAction,
     CreateEngineeringRequirementAction,
+    CreateEngineeringCharacteristicAction,
     ReviewEngineeringTargetAction,
     InvalidateEngineeringSourceAction,
     ImportConditionFixtureAction,
@@ -1067,6 +1094,8 @@ private:
         const ImportEngineeringBomCsvAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_engineering_requirement(
         const CreateEngineeringRequirementAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> create_engineering_characteristic(
+        const CreateEngineeringCharacteristicAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> review_engineering_target(
         const ReviewEngineeringTargetAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> invalidate_engineering_source(
