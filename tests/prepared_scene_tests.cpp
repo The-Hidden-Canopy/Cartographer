@@ -46,7 +46,7 @@ public:
     TempDirectory() {
         const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
         path_ = std::filesystem::temp_directory_path() /
-            ("cartographer-prepared-scene-tests-" + std::to_string(stamp));
+            ("p-" + std::to_string(stamp));
         std::filesystem::create_directories(path_);
     }
 

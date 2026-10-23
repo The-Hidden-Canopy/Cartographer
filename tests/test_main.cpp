@@ -794,9 +794,13 @@ void selected_face_tool_adapter_validates_before_delegating() {
         multiple_faces[1].id,
         carto::editor::SelectionOperation::add));
     carto::editor::CommandBus multiple_bus;
-    REQUIRE(!multiple_bus.execute(std::make_unique<carto::editor::ExtrudeSelectedFaceCommand>(
+    REQUIRE(multiple_bus.execute(std::make_unique<carto::editor::ExtrudeSelectedFaceCommand>(
         multiple_selection, multiple_mesh, 0.5)));
-    REQUIRE(multiple_bus.undo_count() == 0U);
+    REQUIRE(multiple_bus.undo_count() == 1U);
+    REQUIRE(multiple_mesh.validate());
+    REQUIRE(multiple_mesh.vertex_count() > 8U);
+    REQUIRE(multiple_mesh.face_count() > 6U);
+    REQUIRE(multiple_bus.undo());
     REQUIRE(multiple_mesh.vertex_count() == 8U);
     REQUIRE(multiple_mesh.face_count() == 6U);
 
