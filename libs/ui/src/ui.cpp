@@ -3369,6 +3369,26 @@ core::Result<application::DispatchReceipt> UiController::commit_preview(
     return result;
 }
 
+core::Result<application::MeshCleanupReview> UiController::review_mesh_cleanup(
+    scene::ObjectId object,
+    std::vector<geometry::VertexId> candidates,
+    application::MeshCleanupOptions options) const {
+    return session_.review_mesh_cleanup(object, std::move(candidates), options);
+}
+
+core::Result<application::DispatchReceipt> UiController::commit_mesh_cleanup(
+    application::MeshCleanupReview& review,
+    std::string justification) {
+    const auto result = application::HumanApplicationAccess::commit_mesh_cleanup(
+        session_, review, std::move(justification));
+    if (result) {
+        record_operation(result.value(), OperationCategory::committed_command);
+    } else {
+        record_ui_problem(result.error().with_context("mesh cleanup review commit"));
+    }
+    return result;
+}
+
 core::Result<ai::Proposal> UiController::propose_ai(std::string_view intent) {
     const auto authoring = session_.authoring_context();
     if (!authoring) {

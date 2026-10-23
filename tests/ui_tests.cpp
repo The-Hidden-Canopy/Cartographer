@@ -365,6 +365,35 @@ void ui_routes_authoritative_actions_and_operation_lineage() {
     REQUIRE(ui.snapshot().operations.back().action == "Invoke Tool: mesh.set-vertex-position");
 }
 
+void ui_routes_mesh_cleanup_review_without_implicit_acceptance() {
+    using namespace carto;
+    application::ApplicationSession session;
+    ui::UiController controller(session);
+    REQUIRE(controller.dispatch(application::CreatePlaneAction{"Cleanup plane", 1.0, 1.0}));
+    const auto before = controller.snapshot();
+    const auto object = before.objects.front().object.id;
+    application::MeshCleanupOptions options;
+    options.merge_distance = 1.01;
+    auto review = controller.review_mesh_cleanup(object, {{1U}, {2U}}, options);
+    REQUIRE(review && review.value().receipt().merged_vertices.size() == 1U);
+    REQUIRE(controller.snapshot().project_revision == before.project_revision);
+    REQUIRE(controller.snapshot().operations.size() == before.operations.size());
+    REQUIRE(!controller.commit_mesh_cleanup(review.value(), ""));
+    REQUIRE(review.value().active());
+    REQUIRE(controller.snapshot().project_revision == before.project_revision);
+    const auto committed = controller.commit_mesh_cleanup(review.value(), "Remove duplicate test seam");
+    REQUIRE(committed && !review.value().active());
+    const auto after = controller.snapshot();
+    REQUIRE(after.operations.size() == before.operations.size() + 1U);
+    REQUIRE(committed.value().source == application::OperationSource::human);
+    REQUIRE(after.operations.back().category == ui::OperationCategory::committed_command);
+    REQUIRE(after.operations.back().action.find("Remove duplicate test seam") != std::string::npos);
+    REQUIRE(!controller.commit_mesh_cleanup(review.value(), "Replay"));
+    REQUIRE(controller.snapshot().operations.size() == after.operations.size());
+    REQUIRE(controller.handle_shortcut(ui::Shortcut::undo));
+    REQUIRE(controller.handle_shortcut(ui::Shortcut::redo));
+}
+
 void ui_routes_spatial_fields_through_the_human_command_boundary() {
     carto::application::ApplicationSession session;
     carto::ui::UiController ui(session);
@@ -3943,6 +3972,7 @@ int main() {
     try {
         preferences_validate_shell_invariants();
         ui_routes_authoritative_actions_and_operation_lineage();
+        ui_routes_mesh_cleanup_review_without_implicit_acceptance();
         ui_routes_spatial_fields_through_the_human_command_boundary();
         ui_distinguishes_unsaved_from_saved_state();
         ui_rejects_unadmitted_ai_proposals();

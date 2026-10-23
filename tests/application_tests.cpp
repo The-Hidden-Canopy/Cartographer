@@ -28,6 +28,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -4984,6 +4985,310 @@ void project_edge_dissolve_patch_is_digest_bound_and_replayable() {
     REQUIRE(reopened_record.source_mesh_digest == record.source_mesh_digest);
     REQUIRE(reopened_record.result_mesh_digest == record.result_mesh_digest);
     REQUIRE(reopened_record.replay(source));
+}
+
+void application_mesh_cleanup_reviews_preserve_authority_and_durable_lineage() {
+    using namespace carto;
+    TempDirectory temp;
+    application::ApplicationSession session;
+    REQUIRE(application::testing::dispatch(session, application::CreateMeshObjectAction{
+        "Cleanup seam", make_application_merge_distance_fixture()}));
+    const auto object = session.snapshot().objects.front().object;
+    REQUIRE(application::testing::dispatch(session, application::SetSelectionModeAction{
+        editor::SelectionMode::vertex}));
+    REQUIRE(application::testing::dispatch(session, application::SelectVertexAction{
+        object.id, geometry::VertexId{1U}}));
+    REQUIRE(application::testing::dispatch(session, application::SelectVertexAction{
+        object.id, geometry::VertexId{5U}, editor::SelectionOperation::add}));
+    auto moved_transform = object.local_transform;
+    moved_transform.translation.x = 2.0;
+    REQUIRE(application::testing::dispatch(session, application::SetObjectTransformAction{
+        object.id, moved_transform, std::nullopt}));
+    REQUIRE(application::testing::dispatch(session, application::UndoAction{}));
+    REQUIRE(session.snapshot().redo_count == 1U);
+    const auto path = temp.path() / "reviewed-cleanup.carto";
+    REQUIRE(application::testing::dispatch(session, application::SaveProjectAction{path}));
+    journal::Journal journal(std::filesystem::path(path.string() + ".journal"));
+    const auto entries_before = journal.read_all();
+    REQUIRE(entries_before);
+    const auto before = session.document_.serialize();
+    const auto before_snapshot = session.snapshot();
+    application::MeshCleanupOptions options;
+    options.merge_distance = 1.0e-4;
+    const std::vector<geometry::VertexId> candidates{{5U}, {2U}, {4U}, {1U}};
+    auto review = session.review_mesh_cleanup(object.id, candidates, options);
+    REQUIRE(review && review.value().active());
+    REQUIRE((review.value().candidates() == std::vector<geometry::VertexId>{{1U}, {2U}, {4U}, {5U}}));
+    REQUIRE(review.value().receipt().merged_vertices.at(geometry::VertexId{5U}) == geometry::VertexId{1U});
+    REQUIRE(review.value().receipt().merged_vertices.at(geometry::VertexId{4U}) == geometry::VertexId{2U});
+    REQUIRE((review.value().modified_faces() == std::vector<geometry::FaceId>{{2U}}));
+    REQUIRE(session.document_.serialize() == before);
+    REQUIRE(session.snapshot().undo_count == before_snapshot.undo_count);
+    REQUIRE(journal.read_all().value().size() == entries_before.value().size());
+    for (const auto* reason : {"", "   ", "reason\nwith control"}) {
+        REQUIRE(!application::HumanApplicationAccess::commit_mesh_cleanup(session, review.value(), reason));
+        REQUIRE(review.value().active() && session.document_.serialize() == before);
+    }
+    session.active_source_ = application::OperationSource::ai_proposal;
+    REQUIRE(!application::HumanApplicationAccess::commit_mesh_cleanup(session, review.value(), "AI cannot approve"));
+    session.active_source_ = application::OperationSource::human;
+    REQUIRE(review.value().active() && session.document_.serialize() == before);
+
+    // Force append failure after an otherwise admissible proposal. The same
+    // token remains usable once the journal configuration is restored.
+    journal::JournalLimits limits;
+    limits.max_payload_bytes = 1U;
+    session.journal_.emplace(journal.path(), limits);
+    const auto selection_before_failure = session.selection_.component_groups();
+    REQUIRE(!application::HumanApplicationAccess::commit_mesh_cleanup(session, review.value(), "Join duplicate seam"));
+    REQUIRE(review.value().active() && session.document_.serialize() == before);
+    REQUIRE(session.snapshot().undo_count == before_snapshot.undo_count);
+    REQUIRE(session.snapshot().redo_count == before_snapshot.redo_count);
+    REQUIRE(session.selection_.component_groups() == selection_before_failure);
+    REQUIRE(journal.read_all().value().size() == entries_before.value().size());
+    session.journal_.emplace(journal.path());
+
+    const auto expected_digest = review.value().result_digest();
+    auto moved = std::move(review.value());
+    REQUIRE(!review.value().active() && moved.active());
+    REQUIRE(!application::HumanApplicationAccess::commit_mesh_cleanup(session, review.value(), "Moved token"));
+    const auto committed = application::HumanApplicationAccess::commit_mesh_cleanup(session, moved, "Join duplicate seam");
+    REQUIRE(committed && !moved.active());
+    REQUIRE(committed.value().source == application::OperationSource::human);
+    REQUIRE(session.snapshot().undo_count == before_snapshot.undo_count + 1U);
+    REQUIRE(session.snapshot().redo_count == 0U);
+    REQUIRE(session.document_.mesh_patches().size() == 1U);
+    REQUIRE(session.document_.topology_receipts().size() == 1U);
+    REQUIRE(application::canonical_mesh_geometry_digest(session.document_.meshes().at(*object.mesh_asset)) == expected_digest);
+    const auto entries = journal.read_all();
+    REQUIRE(entries && entries.value().size() == entries_before.value().size() + 1U);
+    const std::string payload(entries.value().back().payload.begin(), entries.value().back().payload.end());
+    REQUIRE(payload.find("Join duplicate seam") != std::string::npos);
+    REQUIRE(payload.find(expected_digest.hex()) != std::string::npos);
+    REQUIRE(!application::HumanApplicationAccess::commit_mesh_cleanup(session, moved, "Repeated token"));
+    REQUIRE(application::testing::dispatch(session, application::UndoAction{}));
+    REQUIRE(session.document_.meshes().at(*object.mesh_asset).vertex_count() == 6U);
+    REQUIRE(application::testing::dispatch(session, application::RedoAction{}));
+    REQUIRE(application::canonical_mesh_geometry_digest(session.document_.meshes().at(*object.mesh_asset)) == expected_digest);
+    REQUIRE(application::testing::dispatch(session, application::SaveProjectAction{}));
+    const auto reopened = project::ProjectDocument::load(path);
+    REQUIRE(reopened && reopened.value().mesh_patches().size() == 1U);
+    REQUIRE(application::canonical_mesh_geometry_digest(reopened.value().meshes().at(*object.mesh_asset)) == expected_digest);
+}
+
+void application_mesh_cleanup_refuses_stale_foreign_and_overbudget_reviews() {
+    using namespace carto;
+    static_assert(!std::is_constructible_v<application::ApplicationAction, application::MeshCleanupReview>);
+    application::MeshCleanupOptions options;
+    options.merge_distance = 1.0e-4;
+    const std::vector<geometry::VertexId> candidates{{1U}, {2U}, {4U}, {5U}};
+    const auto populate = [](application::ApplicationSession& session) {
+        REQUIRE(application::testing::dispatch(session, application::CreateMeshObjectAction{
+            "Cleanup seam", make_application_merge_distance_fixture()}));
+        return session.snapshot().objects.front().object.id;
+    };
+    application::ApplicationSession session;
+    const auto object = populate(session);
+    const auto before = session.document_.serialize();
+    auto limited = options;
+    limited.max_candidates = 2U;
+    REQUIRE(!session.review_mesh_cleanup(object, candidates, limited));
+    limited = options;
+    limited.max_merged_vertices = 1U;
+    REQUIRE(!session.review_mesh_cleanup(object, candidates, limited));
+    limited = options;
+    limited.merge_distance = std::numeric_limits<double>::infinity();
+    REQUIRE(!session.review_mesh_cleanup(object, candidates, limited));
+    REQUIRE(!session.review_mesh_cleanup(object, {{1U}, {1U}}, options));
+    REQUIRE(!session.review_mesh_cleanup(object, {{1U}, {99999U}}, options));
+    REQUIRE(session.document_.serialize() == before);
+    auto review = session.review_mesh_cleanup(object, candidates, options);
+    REQUIRE(review);
+    application::ApplicationSession foreign;
+    populate(foreign);
+    const auto foreign_before = foreign.document_.serialize();
+    REQUIRE(!application::HumanApplicationAccess::commit_mesh_cleanup(foreign, review.value(), "Wrong session"));
+    REQUIRE(foreign.document_.serialize() == foreign_before && review.value().active());
+    auto cancelled = session.review_mesh_cleanup(object, candidates, options);
+    REQUIRE(cancelled);
+    cancelled.value().cancel();
+    REQUIRE(!application::HumanApplicationAccess::commit_mesh_cleanup(session, cancelled.value(), "Cancelled"));
+    REQUIRE(application::testing::dispatch(session, application::CreatePlaneAction{"Concurrent change"}));
+    const auto changed = session.document_.serialize();
+    REQUIRE(!application::HumanApplicationAccess::commit_mesh_cleanup(session, review.value(), "Stale review"));
+    REQUIRE(session.document_.serialize() == changed);
+
+    std::optional<application::ApplicationSession> reused(std::in_place);
+    const auto first_id = populate(*reused);
+    auto expired = reused->review_mesh_cleanup(first_id, candidates, options);
+    REQUIRE(expired);
+    const auto* address = &*reused;
+    reused.reset();
+    reused.emplace();
+    REQUIRE(&*reused == address);
+    populate(*reused);
+    const auto reused_before = reused->document_.serialize();
+    REQUIRE(!application::HumanApplicationAccess::commit_mesh_cleanup(*reused, expired.value(), "Expired session"));
+    REQUIRE(reused->document_.serialize() == reused_before);
+    application::ApplicationSession identityless;
+    populate(identityless);
+    identityless.cleanup_review_identity_.reset(); // adversarial moved-from identity
+    REQUIRE(!expired.value().session_identity_.lock());
+    REQUIRE(expired.value().project_generation() == identityless.project_generation_);
+    REQUIRE(expired.value().project_revision() == identityless.document_.revision());
+    const auto identityless_before = identityless.document_.serialize();
+    REQUIRE(!identityless.review_mesh_cleanup(
+        identityless.snapshot().objects.front().object.id, candidates, options));
+    REQUIRE(!application::HumanApplicationAccess::commit_mesh_cleanup(
+        identityless, expired.value(), "Two absent identities cannot authorize"));
+    REQUIRE(identityless.document_.serialize() == identityless_before && expired.value().active());
+
+    auto generation_review = foreign.review_mesh_cleanup(
+        foreign.snapshot().objects.front().object.id, candidates, options);
+    REQUIRE(generation_review);
+    ++foreign.project_generation_; // simulate a project replacement at the same revision
+    REQUIRE(!application::HumanApplicationAccess::commit_mesh_cleanup(
+        foreign, generation_review.value(), "Old project generation"));
+    REQUIRE(foreign.document_.serialize() == foreign_before);
+
+    application::ApplicationSession shared;
+    const auto shared_id = populate(shared);
+    auto shared_review = shared.review_mesh_cleanup(shared_id, candidates, options);
+    REQUIRE(shared_review);
+    REQUIRE(application::testing::dispatch(shared, application::DuplicateMeshInstanceAction{
+        shared_id, "Shared instance"}));
+    REQUIRE(!shared.review_mesh_cleanup(shared_id, candidates, options));
+    const auto shared_before = shared.document_.serialize();
+    REQUIRE(!application::HumanApplicationAccess::commit_mesh_cleanup(shared, shared_review.value(), "Shared after review"));
+    REQUIRE(shared.document_.serialize() == shared_before);
+    REQUIRE(application::testing::dispatch(shared, application::SetSelectionModeAction{
+        editor::SelectionMode::vertex}));
+    REQUIRE(application::testing::dispatch(shared, application::SelectVertexAction{
+        shared_id, geometry::VertexId{1U}}));
+    REQUIRE(application::testing::dispatch(shared, application::SelectVertexAction{
+        shared_id, geometry::VertexId{5U}, editor::SelectionOperation::add}));
+    editor::ToolArguments merge_arguments;
+    merge_arguments.distance = options.merge_distance;
+    const auto shared_history = shared.snapshot().undo_count;
+    REQUIRE(!application::testing::dispatch(shared, application::InvokeToolAction{
+        "mesh.merge-by-distance", merge_arguments}));
+    REQUIRE(shared.document_.serialize() == shared_before);
+    REQUIRE(shared.snapshot().undo_count == shared_history);
+    auto locked_review = foreign.review_mesh_cleanup(
+        foreign.snapshot().objects.front().object.id, candidates, options);
+    REQUIRE(locked_review);
+    auto* locked = const_cast<scene::SceneObject*>(foreign.document_.scene().find(foreign.snapshot().objects.front().object.id));
+    locked->locked = true; // adversarial fixture: no revision change
+    const auto locked_before = foreign.document_.serialize();
+    REQUIRE(!foreign.review_mesh_cleanup(locked->id, candidates, options));
+    REQUIRE(!application::HumanApplicationAccess::commit_mesh_cleanup(
+        foreign, locked_review.value(), "Locked after review"));
+    REQUIRE(foreign.document_.serialize() == locked_before);
+    locked->locked = false;
+    auto hidden_review = foreign.review_mesh_cleanup(locked->id, candidates, options);
+    REQUIRE(hidden_review);
+    locked->visible = false; // adversarial fixture: no revision change
+    const auto hidden_before = foreign.document_.serialize();
+    REQUIRE(!foreign.review_mesh_cleanup(locked->id, candidates, options));
+    REQUIRE(!application::HumanApplicationAccess::commit_mesh_cleanup(
+        foreign, hidden_review.value(), "Hidden after review"));
+    REQUIRE(foreign.document_.serialize() == hidden_before && hidden_review.value().active());
+
+    application::ApplicationSession drifted;
+    const auto drifted_id = populate(drifted);
+    auto drifted_review = drifted.review_mesh_cleanup(drifted_id, candidates, options);
+    REQUIRE(drifted_review);
+    auto& drifted_mesh = const_cast<geometry::EditableMesh&>(drifted.document_.meshes().at(
+        *drifted.document_.scene().find(drifted_id)->mesh_asset));
+    const auto old_revision = drifted_mesh.revision();
+    REQUIRE(drifted_mesh.set_vertex_position(geometry::VertexId{6U}, {0.5, -2.0, 0.0}));
+    REQUIRE(drifted_mesh.restore_revision(old_revision)); // adversarial same-revision source drift
+    const auto drifted_before = drifted.document_.serialize();
+    REQUIRE(drifted.review_mesh_cleanup(drifted_id, candidates, options));
+    const auto drifted_commit = application::HumanApplicationAccess::commit_mesh_cleanup(
+        drifted, drifted_review.value(), "Changed source geometry");
+    REQUIRE(!drifted_commit && drifted_commit.error().code == core::ErrorCode::stale_data);
+    REQUIRE(drifted.document_.serialize() == drifted_before && drifted_review.value().active());
+
+    auto attributed = make_application_merge_distance_fixture();
+    attributes::AttributeSet payload({{attributes::AttributeDomain::vertex, attributed.vertex_count()}});
+    REQUIRE(payload.add_layer({{"keep", attributes::AttributeDomain::vertex,
+        attributes::AttributeType::int32}, std::vector<attributes::AttributeValue>(
+            attributed.vertex_count(), std::int32_t{7})}));
+    REQUIRE(attributed.set_attribute_payload(std::move(payload), {}));
+    application::ApplicationSession attributed_session;
+    REQUIRE(application::testing::dispatch(attributed_session, application::CreateMeshObjectAction{
+        "Attributed cleanup source", std::move(attributed)}));
+    const auto attributed_before = attributed_session.document_.serialize();
+    REQUIRE(!attributed_session.review_mesh_cleanup(
+        attributed_session.snapshot().objects.front().object.id, candidates, options));
+    REQUIRE(attributed_session.document_.serialize() == attributed_before);
+
+    application::ApplicationSession oversized;
+    geometry::EditableMesh large;
+    std::vector<geometry::Vertex> vertices;
+    vertices.reserve(application::MeshCleanupOptions::kMaxMeshElements + 1U);
+    for (std::size_t index = 0U; index <= application::MeshCleanupOptions::kMaxMeshElements; ++index) {
+        vertices.push_back({geometry::VertexId{index + 1U}, {static_cast<double>(index), 0.0, 0.0}});
+    }
+    REQUIRE(large.insert_bulk(std::move(vertices), {}));
+    REQUIRE(application::testing::dispatch(oversized, application::CreateMeshObjectAction{
+        "Over budget cleanup", std::move(large)}));
+    const auto over_before = oversized.document_.serialize();
+    REQUIRE(!oversized.review_mesh_cleanup(oversized.snapshot().objects.front().object.id,
+        {{1U}, {2U}}, options));
+    REQUIRE(oversized.document_.serialize() == over_before);
+}
+
+void application_mesh_cleanup_enforces_face_removal_and_corner_budgets() {
+    using namespace carto;
+    geometry::EditableMesh triangle;
+    REQUIRE(triangle.insert_bulk({{{1U}, {0.0, 0.0, 0.0}},
+        {{2U}, {1.0, 0.0, 0.0}}, {{3U}, {0.0, 1.0, 0.0}}},
+        {{{1U}, {{1U}, {2U}, {3U}}}}));
+    application::ApplicationSession session;
+    REQUIRE(application::testing::dispatch(session, application::CreateMeshObjectAction{
+        "Face removal budget", std::move(triangle)}));
+    const auto object = session.snapshot().objects.front().object.id;
+    const auto before = session.document_.serialize();
+    application::MeshCleanupOptions options;
+    options.merge_distance = 1.01;
+    options.max_removed_faces = 0U;
+    const auto refused = session.review_mesh_cleanup(object, {{1U}, {2U}}, options);
+    REQUIRE(!refused && refused.error().code == core::ErrorCode::unsupported);
+    options.max_removed_faces = 1U;
+    const auto accepted = session.review_mesh_cleanup(object, {{1U}, {2U}}, options);
+    REQUIRE(accepted);
+    REQUIRE((accepted.value().receipt().removed_faces == std::vector<geometry::FaceId>{{1U}}));
+    REQUIRE(session.document_.serialize() == before);
+
+    // V/E/F fit under the cap; corners alone put this valid triangle fan over it.
+    constexpr std::size_t ring_count = 15000U;
+    std::vector<geometry::Vertex> vertices{{{1U}, {0.0, 0.0, 0.0}}};
+    std::vector<geometry::Face> faces;
+    vertices.reserve(ring_count + 1U);
+    faces.reserve(ring_count);
+    for (std::size_t index = 0U; index < ring_count; ++index) {
+        const double angle = 6.283185307179586 * static_cast<double>(index) / ring_count;
+        vertices.push_back({geometry::VertexId{index + 2U}, {std::cos(angle), std::sin(angle), 0.0}});
+        faces.push_back({geometry::FaceId{index + 1U}, {{1U},
+            geometry::VertexId{index + 2U}, geometry::VertexId{(index + 1U) % ring_count + 2U}}});
+    }
+    geometry::EditableMesh fan;
+    REQUIRE(fan.insert_bulk(std::move(vertices), std::move(faces)));
+    const auto subtotal = fan.vertex_count() + fan.edge_count() + fan.face_count();
+    REQUIRE(subtotal < application::MeshCleanupOptions::kMaxMeshElements);
+    REQUIRE(subtotal + fan.corners_sorted(application::MeshCleanupOptions::kMaxMeshElements).size() >
+        application::MeshCleanupOptions::kMaxMeshElements);
+    application::ApplicationSession corner_limited;
+    REQUIRE(application::testing::dispatch(corner_limited, application::CreateMeshObjectAction{
+        "Corner budget", std::move(fan)}));
+    const auto corner_before = corner_limited.document_.serialize();
+    const auto corner_refusal = corner_limited.review_mesh_cleanup(
+        corner_limited.snapshot().objects.front().object.id, {{2U}, {3U}}, options);
+    REQUIRE(!corner_refusal && corner_refusal.error().code == core::ErrorCode::unsupported);
+    REQUIRE(corner_refusal.error().message.find("corner budget") != std::string::npos);
+    REQUIRE(corner_limited.document_.serialize() == corner_before);
 }
 
 void project_merge_by_distance_patch_is_digest_bound_and_replayable() {
@@ -11525,6 +11830,9 @@ int main() {
         project_tri_to_quad_patch_is_digest_bound_and_replayable();
         project_edge_dissolve_patch_is_digest_bound_and_replayable();
         project_merge_by_distance_patch_is_digest_bound_and_replayable();
+        application_mesh_cleanup_reviews_preserve_authority_and_durable_lineage();
+        application_mesh_cleanup_refuses_stale_foreign_and_overbudget_reviews();
+        application_mesh_cleanup_enforces_face_removal_and_corner_budgets();
         project_vertex_merge_patch_is_digest_bound_and_replayable();
         project_selected_edge_split_redo_records_a_replayable_patch();
         project_edge_split_across_objects_is_atomic_and_replayable();

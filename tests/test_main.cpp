@@ -1365,6 +1365,77 @@ void command_bus_is_reversible_and_rejects_failed_commands() {
     REQUIRE(!bus.redo());
 }
 
+void command_bus_rollback_restores_redo_until_durable_acceptance() {
+    carto::scene::Scene scene;
+    const auto object = scene.create_object("Durable history");
+    REQUIRE(object);
+    const auto before = scene.find(object.value())->local_transform;
+    auto first = before;
+    first.translation.x = 4.0;
+    auto divergent = before;
+    divergent.translation.x = 8.0;
+    auto invalid = before;
+    invalid.translation.x = std::numeric_limits<double>::quiet_NaN();
+    carto::editor::CommandBus bus;
+    const auto execute = [&](carto::core::Transform source, carto::core::Transform target) {
+        return bus.execute(std::make_unique<carto::editor::SetObjectTransformCommand>(
+            scene, object.value(), source, target));
+    };
+
+    REQUIRE(execute(before, first));
+    bus.finalize_last_execute();
+    REQUIRE(bus.undo());
+    REQUIRE(bus.undo_count() == 0U && bus.redo_count() == 1U);
+    REQUIRE(!execute(before, invalid));
+    REQUIRE(bus.undo_count() == 0U && bus.redo_count() == 1U);
+    REQUIRE(scene.find(object.value())->local_transform.translation.x == 0.0);
+
+    REQUIRE(execute(before, divergent));
+    REQUIRE(bus.undo_count() == 1U && bus.redo_count() == 0U);
+    REQUIRE(!execute(divergent, invalid));
+    REQUIRE(bus.undo_count() == 1U && bus.redo_count() == 0U);
+    REQUIRE(bus.rollback_last_execute());
+    REQUIRE(bus.undo_count() == 0U && bus.redo_count() == 1U);
+    REQUIRE(scene.find(object.value())->local_transform.translation.x == 0.0);
+    REQUIRE(!bus.rollback_last_execute());
+    REQUIRE(bus.redo());
+    REQUIRE(scene.find(object.value())->local_transform.translation.x == 4.0);
+    REQUIRE(!bus.rollback_last_execute());
+
+    REQUIRE(bus.undo());
+    REQUIRE(execute(before, divergent));
+    bus.finalize_last_execute();
+    REQUIRE(!bus.rollback_last_execute());
+    REQUIRE(bus.undo_count() == 1U && bus.redo_count() == 0U);
+    REQUIRE(scene.find(object.value())->local_transform.translation.x == 8.0);
+    REQUIRE(bus.undo());
+    REQUIRE(bus.redo_count() == 1U);
+    REQUIRE(bus.redo());
+    REQUIRE(scene.find(object.value())->local_transform.translation.x == 8.0);
+
+    REQUIRE(bus.undo());
+    REQUIRE(execute(before, first));
+    REQUIRE(execute(first, divergent));
+    REQUIRE(bus.rollback_last_execute());
+    REQUIRE(bus.undo_count() == 1U && bus.redo_count() == 0U);
+    REQUIRE(scene.find(object.value())->local_transform.translation.x == 4.0);
+    REQUIRE(!bus.rollback_last_execute());
+    REQUIRE(bus.undo());
+    REQUIRE(bus.redo_count() == 1U);
+    REQUIRE(execute(before, divergent));
+    REQUIRE(bus.undo());
+    REQUIRE(bus.redo_count() == 1U);
+    REQUIRE(bus.redo());
+    REQUIRE(scene.find(object.value())->local_transform.translation.x == 8.0);
+    REQUIRE(!bus.rollback_last_execute());
+    REQUIRE(bus.undo());
+    REQUIRE(execute(before, first));
+    bus.clear_history();
+    REQUIRE(bus.undo_count() == 0U && bus.redo_count() == 0U);
+    REQUIRE(!bus.rollback_last_execute());
+    REQUIRE(!bus.redo());
+}
+
 void project_transform_command_rejects_stale_undo() {
     auto document = carto::project::ProjectDocument::create("Transform guard");
     REQUIRE(document);
@@ -2343,6 +2414,7 @@ int main() {
         {"vector normalization preserves invalid state", vector_normalization_preserves_invalid_state},
         {"stale render result is rejected", stale_render_result_is_rejected},
         {"command bus is reversible", command_bus_is_reversible_and_rejects_failed_commands},
+        {"command rollback restores redo until durable acceptance", command_bus_rollback_restores_redo_until_durable_acceptance},
         {"project transform command rejects stale undo", project_transform_command_rejects_stale_undo},
         {"vertex edit command is reversible and atomic", vertex_edit_command_is_reversible_and_topology_atomic},
         {"face extrude command is reversible", face_extrude_command_is_reversible_and_validated},

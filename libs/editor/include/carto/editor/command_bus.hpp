@@ -41,6 +41,8 @@ public:
     // The application layer uses this when a durable side effect fails after
     // an in-memory command has already been admitted.
     [[nodiscard]] core::Result<void> rollback_last_execute();
+    // Completes durable admission and discards the superseded redo branch.
+    void finalize_last_execute() noexcept;
     [[nodiscard]] core::Result<void> undo();
     [[nodiscard]] core::Result<void> redo();
 
@@ -51,6 +53,8 @@ public:
 private:
     std::vector<std::unique_ptr<EditorCommand>> undo_stack_;
     std::vector<std::unique_ptr<EditorCommand>> redo_stack_;
+    std::vector<std::unique_ptr<EditorCommand>> previous_redo_stack_;
+    bool rollback_pending_ = false;
 };
 
 // Standalone mesh/scene commands are intentionally lower-level. Application

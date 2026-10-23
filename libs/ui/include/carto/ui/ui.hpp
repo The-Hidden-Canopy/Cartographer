@@ -884,6 +884,13 @@ public:
         editor::PreviewKind kind) const;
     [[nodiscard]] core::Result<application::DispatchReceipt> commit_preview(
         editor::AuthoringPreview& preview);
+    [[nodiscard]] core::Result<application::MeshCleanupReview> review_mesh_cleanup(
+        scene::ObjectId object,
+        std::vector<geometry::VertexId> candidates,
+        application::MeshCleanupOptions options) const;
+    [[nodiscard]] core::Result<application::DispatchReceipt> commit_mesh_cleanup(
+        application::MeshCleanupReview& review,
+        std::string justification);
     // Native AI proposals carry their copied context so a stale selection or
     // project revision cannot be reused. Safe native operations may be
     // auto-applied by policy; the host still uses the typed preview boundary.

@@ -933,6 +933,57 @@ struct InvokeToolAction {
 
 struct RepeatLastToolAction {};
 
+struct MeshCleanupOptions {
+    static constexpr std::size_t kMaxCandidates = 4096U;
+    static constexpr std::size_t kMaxMergedVertices = 4096U;
+    static constexpr std::size_t kMaxRemovedFaces = 64U;
+    static constexpr std::size_t kMaxMeshElements = 100'000U;
+    double merge_distance = 1.0e-6;
+    std::size_t max_candidates = kMaxCandidates;
+    std::size_t max_merged_vertices = kMaxMergedVertices;
+    std::size_t max_removed_faces = kMaxRemovedFaces;
+};
+
+// Ephemeral human review of one exact merge proposal. This cannot be
+// manufactured from caller-authored patch bytes or copied into a second token.
+class MeshCleanupReview final {
+public:
+    MeshCleanupReview(const MeshCleanupReview&) = delete;
+    MeshCleanupReview& operator=(const MeshCleanupReview&) = delete;
+    MeshCleanupReview(MeshCleanupReview&&) noexcept = default;
+    MeshCleanupReview& operator=(MeshCleanupReview&&) noexcept = default;
+    [[nodiscard]] bool active() const noexcept { return active_ != nullptr; }
+    void cancel() noexcept { active_.reset(); }
+    [[nodiscard]] std::uint64_t project_generation() const { return project_generation_; }
+    [[nodiscard]] core::Revision project_revision() const { return project_revision_; }
+    [[nodiscard]] scene::ObjectId object() const { return object_; }
+    [[nodiscard]] std::uint64_t mesh_asset() const { return mesh_asset_; }
+    [[nodiscard]] core::Revision mesh_revision() const { return mesh_revision_; }
+    [[nodiscard]] const assets::Sha256Digest& source_digest() const { return source_digest_; }
+    [[nodiscard]] const assets::Sha256Digest& result_digest() const { return result_digest_; }
+    [[nodiscard]] const MeshCleanupOptions& options() const { return options_; }
+    [[nodiscard]] const std::vector<geometry::VertexId>& candidates() const { return candidates_; }
+    [[nodiscard]] const geometry::TopologyEditReceipt& receipt() const { return receipt_; }
+    [[nodiscard]] const std::vector<geometry::FaceId>& modified_faces() const { return modified_faces_; }
+
+private:
+    friend class ApplicationSession;
+    MeshCleanupReview() = default;
+    std::unique_ptr<bool> active_ = std::make_unique<bool>(true);
+    std::weak_ptr<const std::uint8_t> session_identity_;
+    std::uint64_t project_generation_ = 0U;
+    core::Revision project_revision_;
+    scene::ObjectId object_;
+    std::uint64_t mesh_asset_ = 0U;
+    core::Revision mesh_revision_;
+    assets::Sha256Digest source_digest_;
+    assets::Sha256Digest result_digest_;
+    MeshCleanupOptions options_;
+    std::vector<geometry::VertexId> candidates_;
+    geometry::TopologyEditReceipt receipt_;
+    std::vector<geometry::FaceId> modified_faces_;
+};
+
 // Re-evaluates the previous tool with a complete replacement argument set.
 // The tool identity and authoring selection remain revision-bound session state.
 struct AdjustLastToolAction {
@@ -1445,6 +1496,8 @@ using ApplicationAction = std::variant<
 // be used as a public raw AI mutation route.
 class HumanApplicationAccess final {
 public:
+    [[nodiscard]] static core::Result<DispatchReceipt> commit_mesh_cleanup(
+        ApplicationSession& session, MeshCleanupReview& review, std::string justification);
     [[nodiscard]] static core::Result<DispatchReceipt> dispatch(
         ApplicationSession& session,
         const ApplicationAction& action);
@@ -1588,6 +1641,9 @@ public:
         std::string_view identity) const;
     [[nodiscard]] core::Result<editor::AuthoringPreview> begin_preview(
         editor::PreviewKind kind) const;
+    [[nodiscard]] core::Result<MeshCleanupReview> review_mesh_cleanup(
+        scene::ObjectId object, std::vector<geometry::VertexId> candidates,
+        MeshCleanupOptions options) const;
     [[nodiscard]] core::Result<DispatchReceipt> commit_preview(
         HumanActionAdmission admission,
         editor::AuthoringPreview& preview,
@@ -1618,6 +1674,11 @@ public:
 private:
     friend class ::carto::agent::AgentTask;
     friend class ::carto::agent::SceneQuery;
+    friend class HumanApplicationAccess;
+    [[nodiscard]] core::Result<DispatchReceipt> commit_mesh_cleanup(
+        HumanActionAdmission admission, MeshCleanupReview& review, std::string justification);
+    std::shared_ptr<const std::uint8_t> cleanup_review_identity_ =
+        std::make_shared<const std::uint8_t>(0U);
 
     [[nodiscard]] core::Result<void> set_workspace(WorkspaceState workspace);
     [[nodiscard]] core::Result<DispatchReceipt> new_project(const NewProjectAction& action);

@@ -1901,6 +1901,8 @@ struct DesktopState {
     double edge_split_factor = 0.5;
     double bevel_width = 0.1;
     double merge_distance = 0.001;
+    std::optional<carto::application::MeshCleanupReview> mesh_cleanup_review;
+    std::array<char, 513U> mesh_cleanup_justification{};
     int bevel_segments = 1;
     double vertex_slide_factor = 0.5;
     bool remove_orphaned_vertices = true;
@@ -11383,9 +11385,105 @@ struct DesktopState {
                 static_cast<void>(dispatch(carto::application::InvokeToolAction{
                     "mesh.merge-by-distance", arguments}));
             }
+            const auto& cleanup_groups = snapshot.selection.component_groups;
+            const bool cleanup_scope = cleanup_groups.size() == 1U &&
+                cleanup_groups.front().vertices.size() >= 2U;
+            ImGui::BeginDisabled(!cleanup_scope);
+            if (ImGui::Button("Review merge cleanup", ImVec2(-1, 30))) {
+                mesh_cleanup_review.reset();
+                mesh_cleanup_justification.fill('\0');
+                carto::application::MeshCleanupOptions options;
+                options.merge_distance = merge_distance;
+                auto reviewed = ui.review_mesh_cleanup(
+                    cleanup_groups.front().object,
+                    cleanup_groups.front().vertices, options);
+                action_feedback_error = !reviewed;
+                if (reviewed) {
+                    mesh_cleanup_review.emplace(std::move(reviewed.value()));
+                    action_feedback = "Cleanup proposal ready for review.";
+                } else {
+                    action_feedback = reviewed.error().message;
+                }
+            }
+            ImGui::EndDisabled();
             ImGui::EndDisabled();
             if (!one_vertex && count < 2U) {
                 ImGui::TextDisabled("Select one vertex, or two or more vertices to merge.");
+            }
+        }
+
+        if (mesh_cleanup_review.has_value() && mesh_cleanup_review->active()) {
+            const auto& review = *mesh_cleanup_review;
+            const auto& receipt = review.receipt();
+            const bool current = review.project_generation() == snapshot.project_generation &&
+                review.project_revision() == snapshot.project_revision;
+            ImGui::Separator();
+            ImGui::TextUnformatted("Mesh cleanup review");
+            ImGui::Text("Object %llu · mesh %llu · source R%llu",
+                static_cast<unsigned long long>(review.object().value),
+                static_cast<unsigned long long>(review.mesh_asset()),
+                static_cast<unsigned long long>(review.mesh_revision().value()));
+            ImGui::TextWrapped("%zu candidates · distance %.17g local units",
+                review.candidates().size(), review.options().merge_distance);
+            ImGui::Text("Proposed: %zu vertex merges · %zu removed faces",
+                receipt.merged_vertices.size(), receipt.removed_faces.size());
+            ImGui::TextWrapped("Source %s", review.source_digest().hex().c_str());
+            ImGui::TextWrapped("Result %s", review.result_digest().hex().c_str());
+            ImGui::BeginChild("CleanupStableIds", ImVec2(0, 110), true);
+            for (const auto& [removed, survivor] : receipt.merged_vertices) {
+                ImGui::Text("Vertex %llu -> %llu",
+                    static_cast<unsigned long long>(removed.value),
+                    static_cast<unsigned long long>(survivor.value));
+            }
+            for (const auto face : receipt.removed_faces) {
+                ImGui::Text("Remove face %llu", static_cast<unsigned long long>(face.value));
+            }
+            for (const auto face : review.modified_faces()) {
+                ImGui::Text("Modify face %llu", static_cast<unsigned long long>(face.value));
+            }
+            ImGui::EndChild();
+            if (ImGui::TreeNode("Additional cleanup topology changes")) {
+                const auto draw_ids = [](const char* label, const auto& ids) {
+                    ImGui::PushID(label);
+                    if (ImGui::TreeNode("Changes", "%s (%zu)", label, ids.size())) {
+                        ImGui::BeginChild("StableIds", ImVec2(0, 96), true);
+                        ImGuiListClipper clipper;
+                        clipper.Begin(static_cast<int>(ids.size()));
+                        while (clipper.Step()) {
+                            for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
+                                ImGui::Text("%llu", static_cast<unsigned long long>(
+                                    ids[static_cast<std::size_t>(index)].value));
+                            }
+                        }
+                        ImGui::EndChild();
+                        ImGui::TreePop();
+                    }
+                    ImGui::PopID();
+                };
+                draw_ids("Removed edges", receipt.removed_edges);
+                draw_ids("Removed corners", receipt.removed_corners);
+                draw_ids("Created edges", receipt.created_edges);
+                draw_ids("Created corners", receipt.created_corners);
+                ImGui::TreePop();
+            }
+            if (!current) {
+                ImGui::TextWrapped("The project changed. Discard this proposal and review again.");
+            }
+            ImGui::InputText("Cleanup justification", mesh_cleanup_justification.data(),
+                mesh_cleanup_justification.size());
+            ImGui::BeginDisabled(!current || mesh_cleanup_justification.front() == '\0');
+            if (ImGui::Button("Apply reviewed cleanup", ImVec2(-1, 30))) {
+                const auto applied = ui.commit_mesh_cleanup(
+                    *mesh_cleanup_review, mesh_cleanup_justification.data());
+                action_feedback_error = !applied;
+                action_feedback = applied ? "Reviewed cleanup committed." : applied.error().message;
+                if (applied) mesh_cleanup_review.reset();
+            }
+            ImGui::EndDisabled();
+            if (mesh_cleanup_review.has_value() &&
+                ImGui::Button("Discard cleanup proposal", ImVec2(-1, 26))) {
+                mesh_cleanup_review->cancel();
+                mesh_cleanup_review.reset();
             }
         }
 

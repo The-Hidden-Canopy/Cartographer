@@ -23,12 +23,14 @@ core::Result<void> CommandBus::execute(std::unique_ptr<EditorCommand> command) {
         return result;
     }
     undo_stack_.push_back(std::move(command));
-    redo_stack_.clear();
+    previous_redo_stack_.clear();
+    previous_redo_stack_.swap(redo_stack_);
+    rollback_pending_ = true;
     return core::Result<void>::success();
 }
 
 core::Result<void> CommandBus::rollback_last_execute() {
-    if (undo_stack_.empty()) {
+    if (!rollback_pending_ || undo_stack_.empty()) {
         return core::Result<void>::failure(
             core::Diagnostic(core::ErrorCode::invalid_state,
                              "command history has no accepted command to roll back"));
@@ -39,10 +41,14 @@ core::Result<void> CommandBus::rollback_last_execute() {
         undo_stack_.push_back(std::move(command));
         return result;
     }
-    // The failed admission consumed the redo branch when execute() accepted
-    // the command. It must not become visible as a successful history state.
-    redo_stack_.clear();
+    redo_stack_.swap(previous_redo_stack_);
+    rollback_pending_ = false;
     return core::Result<void>::success();
+}
+
+void CommandBus::finalize_last_execute() noexcept {
+    previous_redo_stack_.clear();
+    rollback_pending_ = false;
 }
 
 core::Result<void> CommandBus::undo() {
@@ -56,6 +62,7 @@ core::Result<void> CommandBus::undo() {
     }
     redo_stack_.push_back(std::move(command));
     undo_stack_.pop_back();
+    finalize_last_execute();
     return core::Result<void>::success();
 }
 
@@ -70,12 +77,14 @@ core::Result<void> CommandBus::redo() {
     }
     undo_stack_.push_back(std::move(command));
     redo_stack_.pop_back();
+    finalize_last_execute();
     return core::Result<void>::success();
 }
 
 void CommandBus::clear_history() noexcept {
     undo_stack_.clear();
     redo_stack_.clear();
+    finalize_last_execute();
 }
 
 SetObjectTransformCommand::SetObjectTransformCommand(
@@ -4580,19 +4589,17 @@ core::Result<void> MergeProjectSelectedVerticesCommand::execute() {
     if (auto result = selection_->validate(document_->scene(), owner_meshes); !result) {
         return result;
     }
-    if (groups.size() > 1U) {
-        std::map<std::uint64_t, std::size_t> mesh_owner_counts;
-        for (const scene::SceneObject& object : document_->scene().objects_sorted()) {
-            if (object.mesh_asset.has_value()) ++mesh_owner_counts[*object.mesh_asset];
-        }
-        for (const auto& [mesh_asset, selected_owner] : asset_owners) {
-            static_cast<void>(selected_owner);
-            const auto uses = mesh_owner_counts.find(mesh_asset);
-            if (uses == mesh_owner_counts.end() || uses->second != 1U) {
-                return core::Result<void>::failure(core::Diagnostic(
-                    core::ErrorCode::unsupported,
-                    "multi-object vertex merge refuses mesh assets shared by other objects"));
-            }
+    std::map<std::uint64_t, std::size_t> mesh_owner_counts;
+    for (const scene::SceneObject& object : document_->scene().objects_sorted()) {
+        if (object.mesh_asset.has_value()) ++mesh_owner_counts[*object.mesh_asset];
+    }
+    for (const auto& [mesh_asset, selected_owner] : asset_owners) {
+        static_cast<void>(selected_owner);
+        const auto uses = mesh_owner_counts.find(mesh_asset);
+        if (uses == mesh_owner_counts.end() || uses->second != 1U) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::unsupported,
+                "project vertex merge refuses mesh assets shared by other objects"));
         }
     }
 

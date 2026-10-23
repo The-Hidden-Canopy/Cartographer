@@ -823,6 +823,173 @@ core::Result<DispatchReceipt> HumanApplicationAccess::dispatch(
     return session.dispatch(HumanActionAdmission{}, action);
 }
 
+core::Result<DispatchReceipt> HumanApplicationAccess::commit_mesh_cleanup(
+    ApplicationSession& session, MeshCleanupReview& review, std::string justification) {
+    return session.commit_mesh_cleanup(HumanActionAdmission{}, review, std::move(justification));
+}
+
+core::Result<MeshCleanupReview> ApplicationSession::review_mesh_cleanup(
+    scene::ObjectId object_id, std::vector<geometry::VertexId> candidates,
+    MeshCleanupOptions options) const {
+    const auto refuse = [](core::ErrorCode code, std::string message) {
+        return core::Result<MeshCleanupReview>::failure(core::Diagnostic(code, std::move(message)));
+    };
+    if (!cleanup_review_identity_) {
+        return refuse(core::ErrorCode::invalid_state, "mesh cleanup requires a live session identity");
+    }
+    if (!std::isfinite(options.merge_distance) || options.merge_distance <= 0.0 ||
+        options.max_candidates < 2U || options.max_candidates > MeshCleanupOptions::kMaxCandidates ||
+        options.max_merged_vertices == 0U ||
+        options.max_merged_vertices > MeshCleanupOptions::kMaxMergedVertices ||
+        options.max_removed_faces > MeshCleanupOptions::kMaxRemovedFaces ||
+        candidates.size() < 2U || candidates.size() > options.max_candidates) {
+        return refuse(core::ErrorCode::invalid_argument, "mesh cleanup options or candidate count exceed bounds");
+    }
+    std::sort(candidates.begin(), candidates.end());
+    if (std::adjacent_find(candidates.begin(), candidates.end()) != candidates.end()) {
+        return refuse(core::ErrorCode::invalid_argument, "mesh cleanup requires distinct vertex identities");
+    }
+    const auto* object = document_.scene().find(object_id);
+    if (object == nullptr || !object->mesh_asset.has_value()) {
+        return refuse(core::ErrorCode::not_found, "mesh cleanup requires an existing mesh object");
+    }
+    if (object->locked || !object->visible) {
+        return refuse(core::ErrorCode::invalid_state, "mesh cleanup requires a visible unlocked object");
+    }
+    if (document_.revision().exhausted() ||
+        document_.scene().size() > MeshCleanupOptions::kMaxMeshElements) {
+        return refuse(core::ErrorCode::unsupported, "mesh cleanup project inspection exceeds bounds");
+    }
+    std::size_t owners = 0U;
+    for (const auto& owner : document_.scene().objects_sorted(MeshCleanupOptions::kMaxMeshElements)) {
+        if (owner.mesh_asset == object->mesh_asset) ++owners;
+    }
+    if (owners != 1U) {
+        return refuse(core::ErrorCode::unsupported, "mesh cleanup refuses shared mesh assets");
+    }
+    const auto found = document_.meshes().find(*object->mesh_asset);
+    if (found == document_.meshes().end()) {
+        return refuse(core::ErrorCode::stale_data, "mesh cleanup source mesh is missing");
+    }
+    const auto& mesh = found->second;
+    std::size_t remaining = MeshCleanupOptions::kMaxMeshElements;
+    for (const auto count : {mesh.vertex_count(), mesh.edge_count(), mesh.face_count()}) {
+        if (count > remaining) {
+            return refuse(core::ErrorCode::unsupported, "mesh cleanup source exceeds the element budget");
+        }
+        remaining -= count;
+    }
+    if (mesh.corners_sorted(remaining + 1U).size() > remaining) {
+        return refuse(core::ErrorCode::unsupported, "mesh cleanup source exceeds the corner budget");
+    }
+    if (mesh.has_attribute_payload()) {
+        return refuse(core::ErrorCode::unsupported,
+            "mesh cleanup requires explicit attribute transfer for attributed meshes");
+    }
+    auto candidate = mesh;
+    auto merged = candidate.merge_by_distance(candidates, options.merge_distance);
+    if (!merged) return core::Result<MeshCleanupReview>::failure(merged.error());
+    if (merged.value().merged_vertices.empty() ||
+        merged.value().merged_vertices.size() > options.max_merged_vertices ||
+        merged.value().removed_faces.size() > options.max_removed_faces) {
+        return refuse(core::ErrorCode::unsupported, "mesh cleanup proposal exceeds the approved removal budget");
+    }
+    if (auto valid = candidate.validate(); !valid) {
+        return core::Result<MeshCleanupReview>::failure(valid.error());
+    }
+    MeshCleanupReview review;
+    review.session_identity_ = cleanup_review_identity_;
+    review.project_generation_ = project_generation_;
+    review.project_revision_ = document_.revision();
+    review.object_ = object_id;
+    review.mesh_asset_ = *object->mesh_asset;
+    review.mesh_revision_ = mesh.revision();
+    review.source_digest_ = canonical_mesh_geometry_digest(mesh);
+    review.result_digest_ = canonical_mesh_geometry_digest(candidate);
+    review.options_ = options;
+    review.candidates_ = std::move(candidates);
+    review.receipt_ = std::move(merged.value());
+    for (const auto& face : mesh.faces_sorted()) {
+        const auto* result_face = candidate.find_face(face.id);
+        if (result_face != nullptr && result_face->vertices != face.vertices) {
+            review.modified_faces_.push_back(face.id);
+        }
+    }
+    return core::Result<MeshCleanupReview>::success(std::move(review));
+}
+
+core::Result<DispatchReceipt> ApplicationSession::commit_mesh_cleanup(
+    HumanActionAdmission, MeshCleanupReview& review, std::string justification) {
+    const auto originating_session = review.session_identity_.lock();
+    if (!review.active() || !originating_session || !cleanup_review_identity_ ||
+        originating_session != cleanup_review_identity_ ||
+        active_source_ != OperationSource::human) {
+        return failure(invalid_state("mesh cleanup requires an active human review from this session"));
+    }
+    if (justification.empty() || justification.size() > 512U ||
+        justification.find_first_not_of(' ') == std::string::npos ||
+        std::any_of(justification.begin(), justification.end(), [](unsigned char value) {
+            return value < 0x20U || value == 0x7fU;
+        })) {
+        return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "mesh cleanup requires a bounded operator justification without control characters"));
+    }
+    if (review.project_generation_ != project_generation_ ||
+        review.project_revision_ != document_.revision()) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "mesh cleanup review belongs to an earlier project state"));
+    }
+    auto checked = review_mesh_cleanup(review.object_, review.candidates_, review.options_);
+    if (!checked) return failure(checked.error());
+    if (checked.value().mesh_asset_ != review.mesh_asset_ ||
+        checked.value().mesh_revision_ != review.mesh_revision_ ||
+        checked.value().source_digest_ != review.source_digest_ ||
+        checked.value().result_digest_ != review.result_digest_ ||
+        checked.value().modified_faces_ != review.modified_faces_ ||
+        checked.value().receipt_.serialize() != review.receipt_.serialize()) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "mesh cleanup proposal no longer reproduces its reviewed result"));
+    }
+    project::ProjectDocument candidate = document_;
+    const geometry::MergeByDistancePatch patch{
+        review.mesh_revision_, review.candidates_, review.options_.merge_distance};
+    if (auto applied = candidate.apply_merge_by_distance_patch(review.mesh_asset_, patch); !applied) {
+        return failure(applied.error());
+    }
+    if (candidate.topology_receipts().empty() ||
+        candidate.topology_receipts().back().receipt.serialize() != review.receipt_.serialize() ||
+        canonical_mesh_geometry_digest(candidate.meshes().at(review.mesh_asset_)) != review.result_digest_) {
+        return failure(invalid_state("mesh cleanup persistent patch disagrees with the reviewed result"));
+    }
+    AffectedSet affected;
+    affected.objects.push_back(review.object_);
+    affected.vertices = review.receipt_.removed_vertices;
+    for (const auto& [removed, survivor] : review.receipt_.merged_vertices) {
+        static_cast<void>(removed);
+        affected.vertices.push_back(survivor);
+    }
+    std::sort(affected.vertices.begin(), affected.vertices.end());
+    affected.vertices.erase(std::unique(affected.vertices.begin(), affected.vertices.end()), affected.vertices.end());
+    affected.edges = review.receipt_.removed_edges;
+    affected.edges.insert(affected.edges.end(), review.receipt_.created_edges.begin(), review.receipt_.created_edges.end());
+    affected.faces = review.receipt_.removed_faces;
+    affected.faces.insert(affected.faces.end(), review.modified_faces_.begin(), review.modified_faces_.end());
+    editor::ProjectCommandAdmission admission;
+    auto result = execute_command(std::make_unique<editor::ReplaceProjectDocumentCommand>(
+        admission, document_, std::move(candidate), "Clean Up Mesh"),
+        "Clean Up Mesh: " + justification + " source=" + review.source_digest_.hex() +
+            " result=" + review.result_digest_.hex(), std::move(affected));
+    if (result) {
+        review.cancel();
+        selection_.clear();
+        last_tool_action_.reset();
+        last_tool_context_.reset();
+        native_operation_trace_.clear();
+        viewport_mesh_cache_.clear();
+    }
+    return result;
+}
+
 core::Result<DispatchReceipt> HumanApplicationAccess::commit_preview(
     ApplicationSession& session,
     editor::AuthoringPreview& preview) {
@@ -3101,6 +3268,7 @@ core::Result<DispatchReceipt> ApplicationSession::accept_command_mutation(
         }
         return failure(result.error().with_context("mutation rolled back"));
     }
+    history_.finalize_last_execute();
     return accepted(
         std::move(action), revision_before, std::move(affected), std::move(parameters));
 }
