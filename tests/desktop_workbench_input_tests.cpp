@@ -170,6 +170,40 @@ ImGuiID draw_docking_frame(carto::studio::DockingWorkspace& workspace) {
     return dock_id;
 }
 
+struct DockingLayoutFrame {
+    ImGuiID root = 0U;
+    std::array<ImGuiID, 5U> panel_nodes{};
+    ImVec2 floating_position{};
+};
+
+DockingLayoutFrame draw_docking_layout_frame(
+    carto::studio::DockingWorkspace& workspace,
+    ImVec2 first_use_floating_position) {
+    ImGui::NewFrame();
+    workspace.begin_root();
+    ImGuiWindow* host = ImGui::FindWindowByName(
+        "Cartographer Studio Dock Host##host");
+    DockingLayoutFrame result;
+    result.root = host == nullptr ? 0U : host->GetID("CartographerStudioDockV1");
+    const std::array<const char*, 5U> names{
+        "Viewport", "Scene", "Inspector", "Assets", "History"};
+    for (std::size_t index = 0U; index < names.size(); ++index) {
+        if (ImGui::Begin(names[index])) ImGui::TextUnformatted("Dock test panel");
+        const ImGuiWindow* panel = ImGui::GetCurrentWindowRead();
+        result.panel_nodes[index] = panel != nullptr && panel->DockNode != nullptr
+            ? panel->DockNode->ID : 0U;
+        ImGui::End();
+    }
+    ImGui::SetNextWindowPos(first_use_floating_position, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(180.0F, 110.0F), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Floating Dock Persistence Probe");
+    result.floating_position = ImGui::GetWindowPos();
+    ImGui::TextUnformatted("Floating instrument");
+    ImGui::End();
+    ImGui::Render();
+    return result;
+}
+
 void require_initial_dock_layout(ImGuiID dock_id) {
     const ImGuiDockNode* const root = ImGui::DockBuilderGetNode(dock_id);
     require(dock_id != 0U && root != nullptr,
@@ -632,6 +666,40 @@ int main() {
     dock_id = draw_docking_frame(docking);
     dock_id = draw_docking_frame(docking);
     require_initial_dock_layout(dock_id);
+
+    const ImGuiWindow* scene_window = ImGui::FindWindowByName("Scene");
+    require(scene_window != nullptr && scene_window->DockNode != nullptr,
+        "the persistence probe requires the initialized Scene dock node");
+    ImGui::DockBuilderDockWindow("Inspector", scene_window->DockNode->ID);
+    ImGui::DockBuilderFinish(dock_id);
+    static_cast<void>(draw_docking_frame(docking));
+    static_cast<void>(draw_docking_frame(docking));
+    const ImGuiWindow* const tabbed_scene = ImGui::FindWindowByName("Scene");
+    const ImGuiWindow* const tabbed_inspector = ImGui::FindWindowByName("Inspector");
+    require(tabbed_scene != nullptr && tabbed_inspector != nullptr &&
+            tabbed_scene->DockNode != nullptr &&
+            tabbed_scene->DockNode == tabbed_inspector->DockNode,
+        "a user-created instrument tab grouping must be represented in the dock tree");
+
+    const DockingLayoutFrame first_saved_layout = draw_docking_layout_frame(
+        docking, ImVec2(460.0F, 290.0F));
+    const DockingLayoutFrame saved_layout_frame = draw_docking_layout_frame(
+        docking, ImVec2(460.0F, 290.0F));
+    require(first_saved_layout.root == dock_id && saved_layout_frame.root == dock_id &&
+            saved_layout_frame.panel_nodes[1] != 0U &&
+            saved_layout_frame.panel_nodes[1] == saved_layout_frame.panel_nodes[2],
+        "the custom tab group and dock root must remain live before persistence");
+    require(std::abs(saved_layout_frame.floating_position.x - 460.0F) < 0.01F &&
+            std::abs(saved_layout_frame.floating_position.y - 290.0F) < 0.01F,
+        "the floating instrument must begin at its requested first-use position");
+    std::size_t persisted_settings_size = 0U;
+    const char* const persisted_settings_data =
+        ImGui::SaveIniSettingsToMemory(&persisted_settings_size);
+    require(persisted_settings_data != nullptr && persisted_settings_size > 0U,
+        "a customized docking and floating layout must produce settings for restart");
+    const std::string persisted_settings(
+        persisted_settings_data, persisted_settings_size);
+
     require_docking_monitor_recovery();
     require_live_docking_monitor_recovery();
     require_unique_docking_layout_write_paths();
@@ -639,5 +707,34 @@ int main() {
     require_docking_capture_loss_is_distinguished();
 
     ImGui::DestroyContext(context);
+
+    ImGuiContext* restored_context = ImGui::CreateContext();
+    require(restored_context != nullptr,
+        "a fresh ImGui context must be available for layout restart acceptance");
+    ImGuiIO& restored_io = ImGui::GetIO();
+    restored_io.DisplaySize = ImVec2(640.0F, 480.0F);
+    restored_io.DeltaTime = 1.0F / 60.0F;
+    restored_io.IniFilename = nullptr;
+    restored_io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    require(restored_io.Fonts->Build(),
+        "the restarted layout test font atlas must build");
+    ImGui::LoadIniSettingsFromMemory(
+        persisted_settings.data(), persisted_settings.size());
+    carto::studio::DockingWorkspace restored_docking;
+    restored_docking.note_saved_layout_loaded();
+    static_cast<void>(draw_docking_layout_frame(
+        restored_docking, ImVec2(20.0F, 24.0F)));
+    const DockingLayoutFrame restored_layout = draw_docking_layout_frame(
+        restored_docking, ImVec2(20.0F, 24.0F));
+    require(restored_layout.root == dock_id &&
+            restored_layout.panel_nodes[1] != 0U &&
+            restored_layout.panel_nodes[1] == restored_layout.panel_nodes[2],
+        "a fresh session must restore the user-created Scene/Inspector tab group");
+    require(std::abs(restored_layout.floating_position.x -
+                     saved_layout_frame.floating_position.x) < 0.01F &&
+            std::abs(restored_layout.floating_position.y -
+                     saved_layout_frame.floating_position.y) < 0.01F,
+        "a fresh session must restore the floating instrument position instead of its default");
+    ImGui::DestroyContext(restored_context);
     return 0;
 }
