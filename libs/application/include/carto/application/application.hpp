@@ -107,6 +107,27 @@ struct SelectionView {
 
 struct ViewportState {
     render::RenderScene scene;
+    struct AttributeLine {
+        core::Vec3d start;
+        core::Vec3d end;
+    };
+    struct MeshAttributeOverlayData {
+        core::Revision evaluated_mesh_revision;
+        std::vector<AttributeLine> hard_edges;
+        std::vector<AttributeLine> corner_normals;
+        bool has_sharp_edge_layer = false;
+        bool has_custom_normal_layer = false;
+        bool hard_edge_scan_capped = false;
+        bool corner_normal_scan_capped = false;
+    };
+    struct MeshAttributeOverlay {
+        scene::ObjectId object;
+        std::uint64_t mesh_asset = 0U;
+        core::Revision source_revision;
+        std::uint64_t project_generation = 0U;
+        std::shared_ptr<const MeshAttributeOverlayData> data;
+    };
+    std::vector<MeshAttributeOverlay> attribute_overlays;
     core::Revision project_revision;
     std::optional<core::Diagnostic> error;
 };
@@ -1529,6 +1550,20 @@ public:
     [[nodiscard]] core::Result<production::DecalProjection> decal_placement_preview(
         const production::DecalPlacement& placement,
         core::Revision expected_project_revision) const;
+    [[nodiscard]] core::Result<geometry::CompiledMesh> decal_placement_source_mesh(
+        const production::DecalPlacement& placement,
+        core::Revision expected_project_revision) const;
+    [[nodiscard]] core::Result<production::DecalPlacement> make_decal_placement(
+        scene::ObjectId target_object,
+        std::uint64_t material_id,
+        core::Vec3d center,
+        core::Vec3d normal,
+        core::Vec3d tangent,
+        double width,
+        double height,
+        double depth,
+        double minimum_normal_dot,
+        core::Revision expected_project_revision) const;
     [[nodiscard]] core::Result<biological::BiologicalAuthoringDocument>
     biological_authoring_source(
         const project::BiologicalAuthoringKey& key,
@@ -1802,6 +1837,8 @@ private:
         core::Revision source_revision;
         std::optional<assets::Sha256Digest> sculpt_stack_digest;
         std::shared_ptr<const geometry::CompiledMesh> mesh;
+        std::shared_ptr<const ViewportState::MeshAttributeOverlayData> attribute_overlay;
+        std::optional<core::Diagnostic> attribute_overlay_error;
     };
 
     project::ProjectDocument document_;

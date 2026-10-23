@@ -33,7 +33,17 @@ the compact radial editor refuses to flatten them into a different profile.
 Viewport drawing is capped at 16,000 edges per frame; the complete generated
 mesh remains bounded by the geometry contract.
 
+The Condition authoring layer can bind each named sweep endpoint (`start` or
+`end`) to a generic `ConnectionPort`. `check_sweep_endpoint_compatibility`
+requires exact sweep identity/revision and port identity, rejects a stale or
+conflicting source recipe, and delegates compatibility to the shared
+namespaced-tag and required/offered-capability contract. Its deterministic
+evidence includes digests for both sweep recipes and both ports. This check is
+read-only: it does not spatially snap a port frame to the curve, persist a
+connection graph, create a fitting, or alter the generated mesh.
+
 This is the first generic solid sweep primitive, not the complete procedural
 geometry kit. Arbitrary profile editing, material regions, UV transfer,
-implicit surfaces, committed derived-mesh placement, and production donor-family
-parity remain unimplemented.
+implicit surfaces, fitting geometry, endpoint frame alignment, supports, sag,
+wall penetrations, branching, committed derived-mesh placement, and production
+donor-family parity remain unimplemented.

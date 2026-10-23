@@ -1322,6 +1322,69 @@ struct ViewportFaceHit {
     std::array<ImVec2, 3> points;
 };
 
+struct NativeDecalSurfaceFrame {
+    carto::core::Vec3d center;
+    carto::core::Vec3d normal;
+    carto::core::Vec3d tangent;
+};
+
+struct NativeDecalProjectionOverlay {
+    carto::scene::ObjectId target_object;
+    std::uint64_t target_mesh_asset = 0U;
+    carto::core::Revision target_mesh_revision;
+    std::uint64_t placement_id = 0U;
+    carto::core::Revision placement_revision;
+    std::uint64_t project_generation = 0U;
+    carto::core::Revision project_revision;
+    std::vector<std::vector<carto::core::Vec3d>> polygons;
+};
+
+[[nodiscard]] carto::core::Result<NativeDecalSurfaceFrame> sample_native_decal_surface(
+    std::span<const carto::ui::SculptViewportTriangle> triangles,
+    carto::scene::ObjectId object,
+    carto::core::Vec2d screen_position) {
+    const auto sample = carto::ui::sample_sculpt_viewport_surface(
+        triangles, object, screen_position);
+    if (!sample) {
+        return carto::core::Result<NativeDecalSurfaceFrame>::failure(sample.error());
+    }
+    if (!sample.value().surface_anchor.has_value()) {
+        return carto::core::Result<NativeDecalSurfaceFrame>::failure(carto::core::Diagnostic(
+            carto::core::ErrorCode::validation_failed,
+            "decal placement hit did not retain a source-surface anchor"));
+    }
+    const auto& anchor = *sample.value().surface_anchor;
+    const auto triangle = std::find_if(triangles.begin(), triangles.end(),
+        [object, &anchor](const auto& candidate) {
+            return candidate.object == object && candidate.face == anchor.face &&
+                candidate.vertices == anchor.vertices;
+        });
+    if (triangle == triangles.end()) {
+        return carto::core::Result<NativeDecalSurfaceFrame>::failure(carto::core::Diagnostic(
+            carto::core::ErrorCode::stale_data,
+            "decal placement hit no longer matches its captured source triangle"));
+    }
+    const auto edge_u = triangle->local_positions[1] - triangle->local_positions[0];
+    const auto edge_v = triangle->local_positions[2] - triangle->local_positions[0];
+    auto normal = carto::core::cross(edge_u, edge_v).normalized();
+    auto tangent = edge_u - normal * carto::core::dot(edge_u, normal);
+    if (normal.length_squared() <= 1.0e-18) {
+        return carto::core::Result<NativeDecalSurfaceFrame>::failure(carto::core::Diagnostic(
+            carto::core::ErrorCode::validation_failed,
+            "decal placement source triangle has no stable local normal"));
+    }
+    if (tangent.length_squared() <= 1.0e-18) {
+        tangent = edge_v - normal * carto::core::dot(edge_v, normal);
+    }
+    if (!tangent.finite() || tangent.length_squared() <= 1.0e-18) {
+        return carto::core::Result<NativeDecalSurfaceFrame>::failure(carto::core::Diagnostic(
+            carto::core::ErrorCode::validation_failed,
+            "decal placement source triangle has no stable local tangent"));
+    }
+    return carto::core::Result<NativeDecalSurfaceFrame>::success(
+        NativeDecalSurfaceFrame{sample.value().position, normal, tangent.normalized()});
+}
+
 struct ViewportVertexHit {
     carto::scene::ObjectId object;
     carto::geometry::VertexId vertex;
@@ -1762,6 +1825,17 @@ struct DesktopState {
     bool work_surface_pan_tool_active = false;
     bool mesh_knife_mode_active = false;
     bool mesh_loop_cut_seed_pick_active = false;
+    bool decal_placement_armed = false;
+    carto::scene::ObjectId decal_placement_target{};
+    carto::core::Revision decal_placement_project_revision{};
+    std::uint64_t decal_placement_project_generation = 0U;
+    std::uint64_t decal_placement_material_id = 0U;
+    std::uint64_t selected_decal_material_id = 0U;
+    double decal_placement_width = 0.25;
+    double decal_placement_height = 0.25;
+    double decal_placement_depth = 0.1;
+    std::optional<NativeDecalProjectionOverlay> decal_projection_overlay;
+    std::string decal_projection_feedback;
     ImVec2 work_surface_camera_last_pointer{};
     std::optional<NativeSculptStrokeCapture> native_sculpt_stroke;
     std::optional<NativeKnifeStrokeCapture> native_knife_stroke;
@@ -4489,9 +4563,106 @@ struct DesktopState {
         return true;
     }
 
+    bool route_native_decal_placement(const carto::ui::NativePointerEvent& event) {
+        if (event.button != carto::ui::NativePointerButton::primary || !event.pressed) {
+            return false;
+        }
+        const auto keep_armed_with_error = [this](std::string message) {
+            action_feedback = std::move(message);
+            action_feedback_error = true;
+            return true;
+        };
+        const auto cancel_with_error = [this](std::string message) {
+            decal_placement_armed = false;
+            decal_placement_target = {};
+            action_feedback = std::move(message);
+            action_feedback_error = true;
+            return true;
+        };
+        const auto snapshot = ui.snapshot();
+        if (surface != ShellSurface::workspace ||
+            snapshot.workspace_kind != carto::ui::Workspace::model ||
+            snapshot.selection.mode != carto::editor::SelectionMode::object ||
+            snapshot.selection.objects.size() != 1U ||
+            snapshot.selection.objects.front() != decal_placement_target) {
+            return cancel_with_error(
+                "Decal placement cancelled because its modeling selection changed.");
+        }
+        if (snapshot.project_generation != decal_placement_project_generation ||
+            snapshot.project_revision != decal_placement_project_revision ||
+            snapshot.project_revision != native_viewport_hits.project_revision) {
+            return cancel_with_error(
+                "Decal placement cancelled because its project snapshot is stale.");
+        }
+        if (!native_viewport_hits.valid || !native_viewport_hits.interactive) {
+            return keep_armed_with_error(
+                "Decal placement needs an interactive viewport; turn off Pan view or preview mode.");
+        }
+        if (native_viewport_hits.sculpt_triangles_truncated) {
+            return keep_armed_with_error(
+                "Decal placement refused because the viewport surface hit set exceeds its bound.");
+        }
+        if (carto::ui::selection_operation_for_native_pointer(event) !=
+            std::optional<carto::editor::SelectionOperation>{
+                carto::editor::SelectionOperation::replace}) {
+            return keep_armed_with_error(
+                "Decal placement requires an unmodified primary click.");
+        }
+        const ImVec2 point{static_cast<float>(event.x), static_cast<float>(event.y)};
+        const ImRect viewport(
+            native_viewport_hits.screen_origin,
+            native_viewport_hits.screen_origin + native_viewport_hits.extent);
+        if (!viewport.Contains(point)) return false;
+        const auto frontmost = carto::ui::resolve_frontmost_viewport_surface(
+            native_viewport_hits.sculpt_triangles,
+            {static_cast<double>(point.x), static_cast<double>(point.y)});
+        if (!frontmost) return keep_armed_with_error(frontmost.error().message);
+        if (frontmost.value().status == carto::ui::ProjectedSurfaceHitStatus::miss) {
+            return keep_armed_with_error(
+                "Decal placement found no visible mesh surface at the pointer.");
+        }
+        if (frontmost.value().status == carto::ui::ProjectedSurfaceHitStatus::ambiguous) {
+            return keep_armed_with_error(
+                "Decal placement refused overlapping equal-depth surfaces.");
+        }
+        if (frontmost.value().object != decal_placement_target) {
+            return keep_armed_with_error(
+                "Decal placement refused because another visible object is in front of the selected mesh.");
+        }
+        const auto frame = sample_native_decal_surface(
+            native_viewport_hits.sculpt_triangles, decal_placement_target,
+            {static_cast<double>(point.x), static_cast<double>(point.y)});
+        if (!frame) return keep_armed_with_error(frame.error().message);
+
+        const auto placement = ui.make_decal_placement(
+            decal_placement_target, decal_placement_material_id,
+            frame.value().center, frame.value().normal, frame.value().tangent,
+            decal_placement_width, decal_placement_height, decal_placement_depth,
+            0.0, snapshot.project_revision);
+        if (!placement) {
+            if (placement.error().code == carto::core::ErrorCode::stale_data) {
+                return cancel_with_error(placement.error().message);
+            }
+            return keep_armed_with_error(placement.error().message);
+        }
+        carto::application::SetDecalPlacementAction action;
+        action.expected_project_revision = snapshot.project_revision;
+        action.expected_placement_revision = carto::core::Revision{};
+        action.placement = placement.value();
+        if (!dispatch(std::move(action))) return true;
+        decal_placement_armed = false;
+        decal_placement_target = {};
+        action_feedback = "Placed a revisioned decal on the exact selected mesh source.";
+        action_feedback_error = false;
+        return true;
+    }
+
     bool route_native_pointer(const carto::ui::NativePointerEvent& event) {
         if (mesh_loop_cut_seed_pick_active) {
             return route_native_loop_cut_seed_pick(event);
+        }
+        if (decal_placement_armed) {
+            return route_native_decal_placement(event);
         }
         const auto selection_operation =
             carto::ui::selection_operation_for_native_pointer(event);
@@ -6380,6 +6551,18 @@ struct DesktopState {
 
     void draw_viewport(const UiSnapshot& snapshot, ImVec2 size = ImVec2(0, 0)) {
         native_viewport_hits.reset();
+        if (decal_placement_armed &&
+            (snapshot.project_revision != decal_placement_project_revision ||
+             snapshot.project_generation != decal_placement_project_generation ||
+             snapshot.workspace_kind != carto::ui::Workspace::model ||
+             snapshot.selection.mode != carto::editor::SelectionMode::object ||
+             snapshot.selection.objects.size() != 1U ||
+             snapshot.selection.objects.front() != decal_placement_target)) {
+            decal_placement_armed = false;
+            decal_placement_target = {};
+            action_feedback = "Decal placement cancelled because its project, workspace, or selection changed.";
+            action_feedback_error = true;
+        }
         const bool showing_agent_preview = snapshot.agent_task.has_value() &&
             agent_preview_mode != 0;
         const bool showing_agent_after = showing_agent_preview && agent_preview_mode == 2;
@@ -7548,6 +7731,12 @@ struct DesktopState {
             } else if (snapshot.selection.objects.size() == 1U) {
                 sculpt_target = snapshot.selection.objects.front();
             }
+        } else if (decal_placement_armed &&
+            snapshot.workspace_kind == carto::ui::Workspace::model &&
+            snapshot.selection.mode == carto::editor::SelectionMode::object &&
+            snapshot.selection.objects.size() == 1U &&
+            snapshot.selection.objects.front() == decal_placement_target) {
+            sculpt_target = decal_placement_target;
         }
         for (const auto& instance : instances) {
             if (instance.mesh == nullptr || !instance.mesh->valid()) {
@@ -7584,7 +7773,8 @@ struct DesktopState {
                 draw->AddTriangleFilled(a, b, c, fill);
                 draw->AddTriangle(a, b, c, rgba(snapshot.colors.border_soft, 0.82F), 1.0F);
                 faces.push_back({instance.object, instance.mesh->triangle_faces[index / 3U], {a, b, c}});
-                if (sculpt_target.has_value() && instance.object == *sculpt_target) {
+                if (sculpt_target.has_value() &&
+                    (instance.object == *sculpt_target || decal_placement_armed)) {
                     if (native_viewport_hits.sculpt_triangles.size() <
                         kMaxNativeSculptTriangles) {
                         carto::ui::SculptViewportTriangle triangle;
@@ -7629,6 +7819,183 @@ struct DesktopState {
                 }
             }
         }
+        if (decal_placement_armed) {
+            const ImU32 decal_color = rgba(snapshot.colors.accent_secondary, 1.0F);
+            draw->AddText(origin + ImVec2(8.0F, 8.0F), decal_color,
+                "DECAL PLACEMENT · plan-view footprint · click to commit");
+            if (native_viewport_hits.sculpt_triangles_truncated) {
+                draw->AddText(origin + ImVec2(8.0F, 28.0F),
+                    rgba(snapshot.colors.semantic_warning, 1.0F),
+                    "Surface hit set exceeds the placement bound");
+            } else if (native_viewport_hits.interactive &&
+                ImGui::IsMouseHoveringRect(origin, origin + extent, true) &&
+                std::isfinite(decal_placement_width) &&
+                std::isfinite(decal_placement_height) &&
+                decal_placement_width > 0.0 && decal_placement_height > 0.0 &&
+                decal_placement_width <= carto::production::DecalPlacement::kMaxExtent &&
+                decal_placement_height <= carto::production::DecalPlacement::kMaxExtent) {
+                const ImVec2 pointer = ImGui::GetIO().MousePos;
+                const carto::core::Vec2d screen_position{
+                    static_cast<double>(pointer.x), static_cast<double>(pointer.y)};
+                const auto frontmost = carto::ui::resolve_frontmost_viewport_surface(
+                    native_viewport_hits.sculpt_triangles, screen_position);
+                const bool occluded = frontmost &&
+                    frontmost.value().status == carto::ui::ProjectedSurfaceHitStatus::hit &&
+                    frontmost.value().object != decal_placement_target;
+                const bool ambiguous = frontmost &&
+                    frontmost.value().status == carto::ui::ProjectedSurfaceHitStatus::ambiguous;
+                if (!frontmost || occluded || ambiguous) {
+                    const char* warning = !frontmost
+                        ? "Surface hit data is invalid"
+                        : (ambiguous ? "Overlapping surfaces are ambiguous"
+                                     : "Another object is in front of the selected mesh");
+                    draw->AddText(origin + ImVec2(8.0F, 28.0F),
+                        rgba(snapshot.colors.semantic_warning, 1.0F), warning);
+                } else if (frontmost.value().status ==
+                        carto::ui::ProjectedSurfaceHitStatus::hit) {
+                    const auto frame = sample_native_decal_surface(
+                        native_viewport_hits.sculpt_triangles, decal_placement_target,
+                        screen_position);
+                    const auto target = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
+                        [this](const auto& candidate) {
+                            return candidate.object.id == decal_placement_target;
+                        });
+                    if (frame && target != snapshot.objects.end()) {
+                        const auto bitangent = carto::core::cross(
+                            frame.value().normal, frame.value().tangent).normalized();
+                        if (bitangent.length_squared() > 1.0e-18) {
+                            const auto half_tangent =
+                                frame.value().tangent * (decal_placement_width * 0.5);
+                            const auto half_bitangent =
+                                bitangent * (decal_placement_height * 0.5);
+                            const std::array<carto::core::Vec3d, 4U> local_corners{
+                                frame.value().center - half_tangent - half_bitangent,
+                                frame.value().center + half_tangent - half_bitangent,
+                                frame.value().center + half_tangent + half_bitangent,
+                                frame.value().center - half_tangent + half_bitangent};
+                            std::array<ImVec2, 4U> screen_corners{};
+                            for (std::size_t corner = 0U; corner < local_corners.size(); ++corner) {
+                                screen_corners[corner] = project(world_point(
+                                    target->world_transform, local_corners[corner]));
+                            }
+                            for (std::size_t corner = 0U; corner < screen_corners.size(); ++corner) {
+                                draw->AddLine(screen_corners[corner],
+                                    screen_corners[(corner + 1U) % screen_corners.size()],
+                                    decal_color, 2.0F);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (decal_projection_overlay.has_value()) {
+            const auto& overlay = *decal_projection_overlay;
+            const auto* source = snapshot.viewport.scene.find(overlay.target_object);
+            const bool selection_matches = snapshot.workspace_kind == carto::ui::Workspace::model &&
+                snapshot.selection.mode == carto::editor::SelectionMode::object &&
+                snapshot.selection.objects.size() == 1U &&
+                snapshot.selection.objects.front() == overlay.target_object;
+            const bool source_matches = source != nullptr && source->mesh != nullptr &&
+                source->mesh_asset == overlay.target_mesh_asset &&
+                source->source_revision == overlay.target_mesh_revision &&
+                source->mesh->source_revision == overlay.target_mesh_revision;
+            if (overlay.project_generation != snapshot.project_generation ||
+                overlay.project_revision != snapshot.project_revision ||
+                !selection_matches || !source_matches) {
+                decal_projection_overlay.reset();
+                decal_projection_feedback =
+                    "Saved projection outline cleared because the project or source changed.";
+            } else {
+                std::vector<std::vector<ImVec2>> screen_polygons;
+                screen_polygons.reserve(overlay.polygons.size());
+                bool projected_outline_valid = true;
+                for (const auto& polygon : overlay.polygons) {
+                    std::vector<ImVec2> screen_polygon;
+                    screen_polygon.reserve(polygon.size());
+                    for (const auto& local_point : polygon) {
+                        const ImVec2 point = project(world_point(
+                            source->world_transform, local_point));
+                        if (!std::isfinite(point.x) || !std::isfinite(point.y)) {
+                            projected_outline_valid = false;
+                            break;
+                        }
+                        screen_polygon.push_back(point);
+                    }
+                    if (!projected_outline_valid) break;
+                    screen_polygons.push_back(std::move(screen_polygon));
+                }
+                if (!projected_outline_valid) {
+                    decal_projection_overlay.reset();
+                    decal_projection_feedback =
+                        "Saved projection outline refused non-finite viewport coordinates.";
+                } else {
+                    const ImU32 outline_color = rgba(snapshot.colors.accent_secondary, 1.0F);
+                    for (const auto& polygon : screen_polygons) {
+                        if (polygon.size() < 3U) continue;
+                        for (std::size_t index = 0U; index < polygon.size(); ++index) {
+                            draw->AddLine(polygon[index], polygon[(index + 1U) % polygon.size()],
+                                outline_color, 2.0F);
+                        }
+                    }
+                    draw->AddText(origin + ImVec2(8.0F, 8.0F), outline_color,
+                        "SAVED DECAL PROJECTION · source-bound outline · no material pixels");
+                }
+            }
+        }
+
+        if (!showing_agent_preview && snapshot.workspace_kind == carto::ui::Workspace::model) {
+            for (const auto& overlay : snapshot.viewport.attribute_overlays) {
+                if (overlay.project_generation != snapshot.project_generation ||
+                    overlay.data == nullptr) {
+                    continue;
+                }
+                const bool selected = snapshot.selection.component_object == overlay.object ||
+                    (snapshot.selection.mode == carto::editor::SelectionMode::object &&
+                     snapshot.selection.objects.size() == 1U &&
+                     snapshot.selection.objects.front() == overlay.object);
+                const auto owner = std::find_if(snapshot.objects.begin(), snapshot.objects.end(),
+                    [&overlay](const auto& candidate) {
+                        return candidate.object.id == overlay.object;
+                    });
+                const auto* instance = snapshot.viewport.scene.find(overlay.object);
+                const bool source_current = owner != snapshot.objects.end() &&
+                    owner->object.mesh_asset == overlay.mesh_asset &&
+                    owner->mesh_revision == overlay.source_revision &&
+                    instance != nullptr && instance->mesh != nullptr &&
+                    instance->mesh_asset == overlay.mesh_asset &&
+                    instance->source_revision == overlay.data->evaluated_mesh_revision &&
+                    instance->mesh->source_revision == overlay.data->evaluated_mesh_revision;
+                if (!selected || !source_current) continue;
+
+                const ImU32 sharp_color = rgba(snapshot.colors.semantic_warning, 0.95F);
+                const ImU32 normal_color = rgba(snapshot.colors.accent_secondary, 0.9F);
+                const auto draw_attribute_lines = [&](
+                    const std::vector<carto::application::ViewportState::AttributeLine>& lines,
+                    ImU32 color,
+                    float thickness) {
+                    for (const auto& line : lines) {
+                        const ImVec2 first = project(world_point(owner->world_transform, line.start));
+                        const ImVec2 second = project(world_point(owner->world_transform, line.end));
+                        if (std::isfinite(first.x) && std::isfinite(first.y) &&
+                            std::isfinite(second.x) && std::isfinite(second.y)) {
+                            draw->AddLine(first, second, color, thickness);
+                        }
+                    }
+                };
+                draw_attribute_lines(overlay.data->hard_edges, sharp_color, 2.5F);
+                draw_attribute_lines(overlay.data->corner_normals, normal_color, 1.25F);
+
+                std::string label = "MESH ATTRIBUTES · " +
+                    std::to_string(overlay.data->hard_edges.size()) + " hard edges · " +
+                    std::to_string(overlay.data->corner_normals.size()) + " corner normals";
+                if (overlay.data->hard_edge_scan_capped) label += " · edge scan capped";
+                if (overlay.data->corner_normal_scan_capped) label += " · normal scan capped";
+                draw->AddText(origin + ImVec2(8.0F, 42.0F),
+                    rgba(snapshot.colors.accent_secondary, 1.0F), label.c_str());
+            }
+        }
+
         if (mesh_loop_cut_seed_pick_active && native_viewport_hits.interactive) {
             const ImVec2 pointer = ImGui::GetIO().MousePos;
             const auto hover_pick = carto::ui::resolve_projected_edge_pick(
@@ -8902,6 +9269,200 @@ struct DesktopState {
         }
     }
 
+    void draw_decal_placement_controls(
+        const UiSnapshot& snapshot,
+        const carto::application::ObjectView& object) {
+        if (decal_projection_overlay.has_value() &&
+            (decal_projection_overlay->project_generation != snapshot.project_generation ||
+             decal_projection_overlay->project_revision != snapshot.project_revision ||
+             decal_projection_overlay->target_object != object.object.id ||
+             !object.object.mesh_asset.has_value() ||
+             decal_projection_overlay->target_mesh_asset != *object.object.mesh_asset)) {
+            decal_projection_overlay.reset();
+            decal_projection_feedback =
+                "Saved projection outline cleared because its source selection changed.";
+        }
+        if (!ImGui::CollapsingHeader("Decal placement", ImGuiTreeNodeFlags_DefaultOpen)) {
+            return;
+        }
+        if (snapshot.materials.empty()) {
+            ImGui::TextDisabled("Add a material to the project catalog before placing a decal.");
+            decal_placement_armed = false;
+            return;
+        }
+        if (std::none_of(snapshot.materials.begin(), snapshot.materials.end(),
+                [this](const auto& material) {
+                    return material.id == selected_decal_material_id;
+                })) {
+            selected_decal_material_id = snapshot.materials.front().id;
+        }
+        const auto selected_material = std::find_if(
+            snapshot.materials.begin(), snapshot.materials.end(),
+            [this](const auto& material) {
+                return material.id == selected_decal_material_id;
+            });
+        const char* material_preview = selected_material == snapshot.materials.end()
+            ? "Select material" : selected_material->name.c_str();
+        if (ImGui::BeginCombo("Decal material", material_preview)) {
+            for (const auto& material : snapshot.materials) {
+                ImGui::PushID(static_cast<int>(material.id & 0x7fffffffU));
+                const std::string label = material.name + " · rev " +
+                    std::to_string(material.revision.value());
+                if (ImGui::Selectable(label.c_str(),
+                        material.id == selected_decal_material_id)) {
+                    selected_decal_material_id = material.id;
+                    if (decal_placement_armed) {
+                        decal_placement_material_id = material.id;
+                    }
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::InputDouble("Decal width", &decal_placement_width);
+        ImGui::InputDouble("Decal height", &decal_placement_height);
+        ImGui::InputDouble("Projection depth", &decal_placement_depth);
+        ImGui::TextDisabled("The plan-view outline is a placement preview; material pixels are not rendered.");
+
+        const bool one_object_selected = snapshot.selection.mode ==
+                carto::editor::SelectionMode::object &&
+            snapshot.selection.objects.size() == 1U &&
+            snapshot.selection.objects.front() == object.object.id;
+        const bool target_eligible = one_object_selected &&
+            snapshot.workspace_kind == carto::ui::Workspace::model &&
+            object.object.visible && !object.object.locked &&
+            object.object.mesh_asset.has_value();
+        const bool dimensions_valid = std::isfinite(decal_placement_width) &&
+            std::isfinite(decal_placement_height) && std::isfinite(decal_placement_depth) &&
+            decal_placement_width > 0.0 && decal_placement_height > 0.0 &&
+            decal_placement_depth > 0.0 &&
+            decal_placement_width <= carto::production::DecalPlacement::kMaxExtent &&
+            decal_placement_height <= carto::production::DecalPlacement::kMaxExtent &&
+            decal_placement_depth <= carto::production::DecalPlacement::kMaxExtent;
+        if (decal_placement_armed &&
+            (decal_placement_target != object.object.id ||
+             decal_placement_project_revision != snapshot.project_revision ||
+             decal_placement_project_generation != snapshot.project_generation)) {
+            decal_placement_armed = false;
+            decal_placement_target = {};
+            action_feedback = "Decal placement cancelled because its selected source changed.";
+            action_feedback_error = true;
+        }
+        if (decal_placement_armed) {
+            if (ImGui::Button("Cancel decal placement", ImVec2(-1, 30))) {
+                decal_placement_armed = false;
+                decal_placement_target = {};
+            }
+            ImGui::TextColored(color(snapshot.colors.accent_secondary),
+                "Click a visible mesh surface in the viewport to commit.");
+        } else {
+            ImGui::BeginDisabled(!target_eligible || !dimensions_valid ||
+                selected_material == snapshot.materials.end());
+            if (ImGui::Button("Arm viewport placement", ImVec2(-1, 30))) {
+                decal_placement_armed = true;
+                decal_placement_target = object.object.id;
+                decal_placement_project_revision = snapshot.project_revision;
+                decal_placement_project_generation = snapshot.project_generation;
+                decal_placement_material_id = selected_decal_material_id;
+            }
+            ImGui::EndDisabled();
+        }
+        if (!target_eligible) {
+            ImGui::TextDisabled("Select one visible, unlocked mesh object in Model workspace.");
+        }
+        const std::size_t saved_count = static_cast<std::size_t>(std::count_if(
+            snapshot.decal_placements.begin(), snapshot.decal_placements.end(),
+            [&object](const auto& placement) {
+                return object.object.mesh_asset.has_value() &&
+                    placement.placement.target_mesh_asset == *object.object.mesh_asset;
+            }));
+        ImGui::TextDisabled("%zu saved placement(s) target this mesh asset.", saved_count);
+        constexpr std::size_t kMaxVisibleDecalPlacements = 32U;
+        if (saved_count > 0U) {
+            ImGui::TextDisabled("Saved projection outline · select one placement to inspect its source polygons.");
+        }
+        std::size_t visible_placements = 0U;
+        for (const auto& placement_view : snapshot.decal_placements) {
+            const auto& placement = placement_view.placement;
+            if (!object.object.mesh_asset.has_value() ||
+                placement.target_mesh_asset != *object.object.mesh_asset) {
+                continue;
+            }
+            if (visible_placements >= kMaxVisibleDecalPlacements) break;
+            ++visible_placements;
+            const std::string label = "Show decal projection #" +
+                std::to_string(placement.id) + " · rev " +
+                std::to_string(placement.revision.value());
+            const bool selected = decal_projection_overlay.has_value() &&
+                decal_projection_overlay->placement_id == placement.id &&
+                decal_projection_overlay->placement_revision == placement.revision;
+            if (!ImGui::Selectable(label.c_str(), selected)) continue;
+            if (selected) {
+                decal_projection_overlay.reset();
+                decal_projection_feedback = "Saved projection outline hidden.";
+                continue;
+            }
+
+            decal_projection_overlay.reset();
+            const auto* source = snapshot.viewport.scene.find(object.object.id);
+            if (source == nullptr || source->mesh == nullptr ||
+                source->mesh_asset != placement.target_mesh_asset ||
+                source->source_revision != placement.target_mesh_revision ||
+                source->mesh->source_revision != placement.target_mesh_revision) {
+                decal_projection_feedback =
+                    "Projection refused: the current viewport mesh does not match the saved source revision.";
+                continue;
+            }
+            if (source->mesh->indices.size() / 3U >
+                carto::ui::kMaxDecalOutlineSourceTriangles) {
+                decal_projection_feedback =
+                    "Projection refused: source mesh exceeds the native outline triangle bound.";
+                continue;
+            }
+            if (!source->mesh->valid()) {
+                decal_projection_feedback =
+                    "Projection refused: the current viewport mesh is invalid.";
+                continue;
+            }
+            const auto projection = ui.preview_decal_placement(
+                placement, snapshot.project_revision);
+            if (!projection) {
+                decal_projection_feedback =
+                    "Projection refused: " + projection.error().message;
+                continue;
+            }
+            const auto exact_source_mesh = ui.decal_placement_source_mesh(
+                placement, snapshot.project_revision);
+            if (!exact_source_mesh) {
+                decal_projection_feedback =
+                    "Projection refused: " + exact_source_mesh.error().message;
+                continue;
+            }
+            const auto outline = carto::ui::resolve_decal_projection_outline(
+                placement, projection.value(), placement.target_mesh_asset,
+                placement.target_mesh_revision, exact_source_mesh.value(), *source->mesh);
+            if (!outline) {
+                decal_projection_feedback =
+                    "Projection refused: " + outline.error().message;
+                continue;
+            }
+            decal_projection_overlay = NativeDecalProjectionOverlay{
+                object.object.id, placement.target_mesh_asset,
+                placement.target_mesh_revision, placement.id, placement.revision,
+                snapshot.project_generation, snapshot.project_revision,
+                std::move(outline.value())};
+            decal_projection_feedback = "Showing the saved source-bound projection outline.";
+        }
+        if (saved_count > kMaxVisibleDecalPlacements) {
+            ImGui::TextDisabled("Showing first %zu saved placements; selection list is bounded.",
+                kMaxVisibleDecalPlacements);
+        }
+        if (!decal_projection_feedback.empty()) {
+            ImGui::TextColored(color(snapshot.colors.semantic_warning), "%s",
+                decal_projection_feedback.c_str());
+        }
+    }
+
     void draw_inspector(const UiSnapshot& snapshot) {
         if (inspector_generation != snapshot.project_generation) {
             inspector_generation = snapshot.project_generation;
@@ -8909,11 +9470,15 @@ struct DesktopState {
             inspector_transform = carto::core::Transform::identity();
             inspector_vertex = {};
             inspector_vertex_position = {};
+            decal_placement_armed = false;
+            decal_placement_target = {};
         }
         heading_text("Inspector");
         ImGui::TextDisabled("Selected object and mesh-element instruments");
         ImGui::Separator();
         if (!snapshot.selection.component_object.has_value() && snapshot.selection.objects.empty()) {
+            decal_placement_armed = false;
+            decal_placement_target = {};
             ImGui::TextDisabled("Select an object or mesh element");
             return;
         }
@@ -8932,6 +9497,7 @@ struct DesktopState {
             if (ImGui::Button("Open Transform Instrument")) workbench.transform = true;
             ImGui::SameLine();
             if (ImGui::Button("Open Fidelity")) workbench.measure = true;
+            draw_decal_placement_controls(snapshot, *object);
         }
         const auto instances = snapshot.viewport.scene.instances();
         const auto instance = std::find_if(instances.begin(), instances.end(),

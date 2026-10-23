@@ -2674,6 +2674,261 @@ core::Result<production::SculptStrokeSample> sample_sculpt_viewport_surface(
     return core::Result<production::SculptStrokeSample>::success(std::move(*best_sample));
 }
 
+core::Result<std::vector<std::vector<core::Vec3d>>> resolve_decal_projection_outline(
+    const production::DecalPlacement& placement,
+    const production::DecalProjection& projection,
+    std::uint64_t current_mesh_asset,
+    core::Revision current_mesh_revision,
+    const geometry::CompiledMesh& source_mesh,
+    const geometry::CompiledMesh& visible_mesh) {
+    if (auto result = placement.validate(); !result) {
+        return core::Result<std::vector<std::vector<core::Vec3d>>>::failure(
+            result.error().with_context("decal outline placement"));
+    }
+    if (placement.id != projection.placement_id ||
+        placement.revision != projection.placement_revision ||
+        placement.target_mesh_asset != current_mesh_asset ||
+        placement.target_mesh_asset != projection.target_mesh_asset ||
+        placement.target_mesh_revision != current_mesh_revision ||
+        placement.target_mesh_revision != projection.target_mesh_revision ||
+        placement.target_mesh_digest != projection.target_mesh_digest ||
+        placement.material_id != projection.material_id ||
+        source_mesh.source_revision != current_mesh_revision ||
+        visible_mesh.source_revision != current_mesh_revision) {
+        return core::Result<std::vector<std::vector<core::Vec3d>>>::failure(stale(
+            "decal outline source, placement, or projection identity changed"));
+    }
+    if (!source_mesh.valid() || !visible_mesh.valid()) {
+        return core::Result<std::vector<std::vector<core::Vec3d>>>::failure(validation(
+            "decal outline source mesh is invalid"));
+    }
+    bool same_positions = source_mesh.positions.size() == visible_mesh.positions.size();
+    for (std::size_t index = 0U; same_positions && index < source_mesh.positions.size(); ++index) {
+        const core::Vec3d& source = source_mesh.positions[index];
+        const core::Vec3d& visible = visible_mesh.positions[index];
+        same_positions = source.x == visible.x && source.y == visible.y && source.z == visible.z;
+    }
+    if (!same_positions || source_mesh.indices != visible_mesh.indices ||
+        source_mesh.vertex_ids != visible_mesh.vertex_ids ||
+        source_mesh.triangle_faces != visible_mesh.triangle_faces) {
+        return core::Result<std::vector<std::vector<core::Vec3d>>>::failure(stale(
+            "visible viewport geometry differs from the exact decal source mesh"));
+    }
+    const std::size_t triangle_count = source_mesh.indices.size() / 3U;
+    if (triangle_count > kMaxDecalOutlineSourceTriangles ||
+        projection.polygons.size() > kMaxDecalOutlinePolygons) {
+        return core::Result<std::vector<std::vector<core::Vec3d>>>::failure(unsupported(
+            "decal outline exceeds the native presentation bound"));
+    }
+
+    std::map<geometry::FaceId, std::vector<std::size_t>> face_triangles;
+    for (std::size_t triangle = 0U; triangle < triangle_count; ++triangle) {
+        face_triangles[source_mesh.triangle_faces[triangle]].push_back(triangle);
+    }
+
+    std::vector<std::vector<core::Vec3d>> outlines;
+    outlines.reserve(projection.polygons.size());
+    std::set<std::pair<geometry::FaceId, std::uint32_t>> seen_source_triangles;
+    constexpr double barycentric_tolerance = 1.0e-9;
+    for (const production::DecalProjectedPolygon& polygon : projection.polygons) {
+        if (!polygon.source_face || polygon.vertices.size() < 3U ||
+            polygon.vertices.size() > kMaxDecalOutlineVerticesPerPolygon ||
+            !seen_source_triangles.emplace(polygon.source_face, polygon.source_triangle).second) {
+            return core::Result<std::vector<std::vector<core::Vec3d>>>::failure(validation(
+                "decal projection contains a malformed or duplicate source polygon"));
+        }
+        const auto face = face_triangles.find(polygon.source_face);
+        if (face == face_triangles.end() || polygon.source_triangle >= face->second.size()) {
+            return core::Result<std::vector<std::vector<core::Vec3d>>>::failure(stale(
+                "decal projection source face or triangle ordinal is absent"));
+        }
+        const std::size_t triangle = face->second[polygon.source_triangle];
+        std::array<core::Vec3d, 3U> source_positions{};
+        for (std::size_t corner = 0U; corner < source_positions.size(); ++corner) {
+            const std::uint32_t index = source_mesh.indices[triangle * 3U + corner];
+            source_positions[corner] = source_mesh.positions[index];
+        }
+
+        std::vector<core::Vec3d> outline;
+        outline.reserve(polygon.vertices.size());
+        for (const production::DecalProjectedVertex& vertex : polygon.vertices) {
+            if (!vertex.uv.finite() || vertex.uv.x < 0.0 || vertex.uv.x > 1.0 ||
+                vertex.uv.y < 0.0 || vertex.uv.y > 1.0) {
+                return core::Result<std::vector<std::vector<core::Vec3d>>>::failure(validation(
+                    "decal projection contains an invalid UV coordinate"));
+            }
+            double total = 0.0;
+            std::array<double, 3U> weights = vertex.source_barycentric;
+            for (const double weight : weights) {
+                if (!std::isfinite(weight) || weight < -barycentric_tolerance ||
+                    weight > 1.0 + barycentric_tolerance) {
+                    return core::Result<std::vector<std::vector<core::Vec3d>>>::failure(validation(
+                        "decal projection contains an invalid source barycentric coordinate"));
+                }
+                total += weight;
+            }
+            if (!std::isfinite(total) || std::abs(total - 1.0) > 1.0e-8) {
+                return core::Result<std::vector<std::vector<core::Vec3d>>>::failure(validation(
+                    "decal projection barycentric coordinates do not sum to one"));
+            }
+            for (double& weight : weights) weight = std::clamp(weight, 0.0, 1.0) / total;
+            const core::Vec3d point = source_positions[0U] * weights[0U] +
+                source_positions[1U] * weights[1U] + source_positions[2U] * weights[2U];
+            if (!point.finite()) {
+                return core::Result<std::vector<std::vector<core::Vec3d>>>::failure(validation(
+                    "decal projection resolved to a non-finite source position"));
+            }
+            outline.push_back(point);
+        }
+        outlines.push_back(std::move(outline));
+    }
+    return core::Result<std::vector<std::vector<core::Vec3d>>>::success(std::move(outlines));
+}
+
+core::Result<ProjectedSurfaceHitResolution> resolve_frontmost_viewport_surface(
+    std::span<const SculptViewportTriangle> triangles,
+    core::Vec2d screen_position) {
+    if (!screen_position.finite()) {
+        return core::Result<ProjectedSurfaceHitResolution>::failure(invalid(
+            "viewport surface pick requires a finite screen point"));
+    }
+
+    std::optional<ProjectedSurfaceHitResolution> best;
+    std::array<std::uint64_t, 5U> best_identity{};
+    bool ambiguous_source_tie = false;
+    for (const SculptViewportTriangle& triangle : triangles) {
+        if (triangle.object.value == 0U || triangle.face.value == 0U ||
+            triangle.vertices[0].value == 0U || triangle.vertices[1].value == 0U ||
+            triangle.vertices[2].value == 0U ||
+            triangle.vertices[0] == triangle.vertices[1] ||
+            triangle.vertices[0] == triangle.vertices[2] ||
+            triangle.vertices[1] == triangle.vertices[2]) {
+            return core::Result<ProjectedSurfaceHitResolution>::failure(validation(
+                "viewport surface triangle has invalid stable source identity"));
+        }
+        for (std::size_t index = 0U; index < triangle.screen_positions.size(); ++index) {
+            if (!triangle.screen_positions[index].finite() ||
+                !triangle.local_positions[index].finite() ||
+                !std::isfinite(triangle.camera_depth[index])) {
+                return core::Result<ProjectedSurfaceHitResolution>::failure(validation(
+                    "viewport surface triangle contains non-finite projected source data"));
+            }
+        }
+
+        const core::Vec2d& a = triangle.screen_positions[0U];
+        const core::Vec2d& b = triangle.screen_positions[1U];
+        const core::Vec2d& c = triangle.screen_positions[2U];
+        const double denominator = (b.y - c.y) * (a.x - c.x) +
+            (c.x - b.x) * (a.y - c.y);
+        if (!std::isfinite(denominator) || std::abs(denominator) <= 1.0e-12) continue;
+        const double first = ((b.y - c.y) * (screen_position.x - c.x) +
+            (c.x - b.x) * (screen_position.y - c.y)) / denominator;
+        const double second = ((c.y - a.y) * (screen_position.x - c.x) +
+            (a.x - c.x) * (screen_position.y - c.y)) / denominator;
+        const double third = 1.0 - first - second;
+        constexpr double barycentric_tolerance = 1.0e-10;
+        if (!std::isfinite(first) || !std::isfinite(second) || !std::isfinite(third) ||
+            first < -barycentric_tolerance || second < -barycentric_tolerance ||
+            third < -barycentric_tolerance) {
+            continue;
+        }
+
+        std::array<double, 3U> weights{
+            std::clamp(first, 0.0, 1.0),
+            std::clamp(second, 0.0, 1.0),
+            std::clamp(third, 0.0, 1.0)};
+        const double total = weights[0U] + weights[1U] + weights[2U];
+        if (!std::isfinite(total) || total <= 0.0) {
+            return core::Result<ProjectedSurfaceHitResolution>::failure(validation(
+                "viewport surface hit produced invalid barycentric coordinates"));
+        }
+        for (double& weight : weights) weight /= total;
+        const double depth = triangle.camera_depth[0U] * weights[0U] +
+            triangle.camera_depth[1U] * weights[1U] +
+            triangle.camera_depth[2U] * weights[2U];
+        if (!std::isfinite(depth)) {
+            return core::Result<ProjectedSurfaceHitResolution>::failure(validation(
+                "viewport surface hit produced non-finite camera depth"));
+        }
+        const double depth_tolerance = 1.0e-12 * std::max({
+            1.0, std::abs(depth), best.has_value() ? std::abs(best->camera_depth) : 0.0});
+        const bool nearer = !best.has_value() ||
+            depth > best->camera_depth + depth_tolerance;
+        if (nearer) {
+            core::Vec3d position{};
+            for (std::size_t index = 0U; index < weights.size(); ++index) {
+                position = position + triangle.local_positions[index] * weights[index];
+            }
+            if (!position.finite()) {
+                return core::Result<ProjectedSurfaceHitResolution>::failure(validation(
+                    "viewport surface hit produced a non-finite source position"));
+            }
+            production::SculptSurfaceAnchor anchor{
+                triangle.face, triangle.vertices, weights};
+            if (auto result = anchor.validate(); !result) {
+                return core::Result<ProjectedSurfaceHitResolution>::failure(result.error());
+            }
+            best = ProjectedSurfaceHitResolution{
+                ProjectedSurfaceHitStatus::hit,
+                triangle.object,
+                production::SculptStrokeSample{
+                    position, 1.0, std::move(anchor), std::nullopt},
+                depth};
+            best_identity = {
+                triangle.object.value,
+                triangle.face.value,
+                triangle.vertices[0U].value,
+                triangle.vertices[1U].value,
+                triangle.vertices[2U].value};
+            ambiguous_source_tie = false;
+            continue;
+        }
+
+        if (std::abs(depth - best->camera_depth) > depth_tolerance) continue;
+        if (triangle.object != best->object ||
+            triangle.face.value != best_identity[1U]) {
+            ambiguous_source_tie = true;
+            continue;
+        }
+        const std::array<std::uint64_t, 5U> identity{
+            triangle.object.value,
+            triangle.face.value,
+            triangle.vertices[0U].value,
+            triangle.vertices[1U].value,
+            triangle.vertices[2U].value};
+        if (identity < best_identity) {
+            core::Vec3d position{};
+            for (std::size_t index = 0U; index < weights.size(); ++index) {
+                position = position + triangle.local_positions[index] * weights[index];
+            }
+            if (!position.finite()) {
+                return core::Result<ProjectedSurfaceHitResolution>::failure(validation(
+                    "viewport surface hit produced a non-finite source position"));
+            }
+            production::SculptSurfaceAnchor anchor{
+                triangle.face, triangle.vertices, weights};
+            if (auto result = anchor.validate(); !result) {
+                return core::Result<ProjectedSurfaceHitResolution>::failure(result.error());
+            }
+            best->sample = production::SculptStrokeSample{
+                position, 1.0, std::move(anchor), std::nullopt};
+            best_identity = identity;
+        }
+    }
+
+    if (!best.has_value()) {
+        return core::Result<ProjectedSurfaceHitResolution>::success(
+            ProjectedSurfaceHitResolution{});
+    }
+    if (ambiguous_source_tie) {
+        best->status = ProjectedSurfaceHitStatus::ambiguous;
+        best->object = {};
+        best->sample = {};
+        return core::Result<ProjectedSurfaceHitResolution>::success(std::move(*best));
+    }
+    return core::Result<ProjectedSurfaceHitResolution>::success(std::move(*best));
+}
+
 core::Result<std::vector<production::SculptStrokeSample>> sample_sculpt_viewport_stroke(
     std::span<const SculptViewportTriangle> triangles,
     scene::ObjectId object,
@@ -3073,6 +3328,28 @@ core::Result<production::DecalProjection> UiController::preview_decal_placement(
     const production::DecalPlacement& placement,
     core::Revision expected_project_revision) const {
     return session_.decal_placement_preview(placement, expected_project_revision);
+}
+
+core::Result<geometry::CompiledMesh> UiController::decal_placement_source_mesh(
+    const production::DecalPlacement& placement,
+    core::Revision expected_project_revision) const {
+    return session_.decal_placement_source_mesh(placement, expected_project_revision);
+}
+
+core::Result<production::DecalPlacement> UiController::make_decal_placement(
+    scene::ObjectId target_object,
+    std::uint64_t material_id,
+    core::Vec3d center,
+    core::Vec3d normal,
+    core::Vec3d tangent,
+    double width,
+    double height,
+    double depth,
+    double minimum_normal_dot,
+    core::Revision expected_project_revision) const {
+    return session_.make_decal_placement(
+        target_object, material_id, center, normal, tangent, width, height, depth,
+        minimum_normal_dot, expected_project_revision);
 }
 
 core::Result<application::DispatchReceipt> UiController::dispatch(

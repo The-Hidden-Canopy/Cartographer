@@ -20,18 +20,30 @@ RWTexture2D<uint4> resolved_color : register(u0);
 static const float kE4M3Max = 448.0f;
 
 // E4M3 (bias 7) shares its bit layout with binary16 (bias 15) shifted by 7 bits,
-// so a code placed in the half exponent/mantissa field is exactly the E4M3
-// value scaled by 2^-8 (subnormals included). Decode is one f16->f32 convert
-// and one multiply; no branches.
+// so finite codes placed in the half exponent/mantissa field are exactly the
+// E4M3 values scaled by 2^-8 (subnormals included). Finite decode is one
+// f16->f32 convert and one multiply; NaNs are handled explicitly below.
 float e4m3_decode(uint v)
 {
+    // E4M3FN reserves both sign encodings of 0x7F for NaN. Do not reinterpret
+    // those payloads as a large finite value and silently clamp them to 448.
+    if ((v & 0x7Fu) == 0x7Fu)
+    {
+        return asfloat(0x7FC00000u);
+    }
     return f16tof32(((v & 0x80u) << 8u) | ((v & 0x7Fu) << 7u)) * 256.0f;
 }
 
-// Round-half-even encode with saturation to +-448, branchless.
+// Canonicalize NaNs, then round finite values half-even with saturation to +-448.
 uint e4m3_encode(float x)
 {
-    const uint sign = (asuint(x) >> 24u) & 0x80u;
+    const uint x_bits = asuint(x);
+    const uint sign = (x_bits >> 24u) & 0x80u;
+    if ((x_bits & 0x7FFFFFFFu) > 0x7F800000u)
+    {
+        // Canonicalize output NaNs to positive E4M3FN 0x7F.
+        return 0x7Fu;
+    }
     const float a = min(abs(x), kE4M3Max);
     const uint bits = asuint(a);
     // Normal range: round the f32 mantissa to 3 bits, rebias the exponent.

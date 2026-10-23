@@ -5934,6 +5934,17 @@ std::vector<EdgeRecord> EditableMesh::edges_sorted(std::size_t limit) const {
     return result;
 }
 
+std::vector<CornerRecord> EditableMesh::corners_sorted(std::size_t limit) const {
+    std::vector<CornerRecord> result;
+    result.reserve(std::min(limit, corners_.size()));
+    for (const auto& [id, corner] : corners_) {
+        if (result.size() >= limit) break;
+        static_cast<void>(id);
+        result.push_back(corner);
+    }
+    return result;
+}
+
 core::Result<void> EditableMesh::validate_vertex_face_index() const {
     for (const auto& [vertex_id, face_ids] : vertex_faces_) {
         if (!vertex_id || !vertices_.contains(vertex_id)) {

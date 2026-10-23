@@ -357,6 +357,16 @@ carto_target(cartographer_sweep_source_project_tests)
 add_test(NAME cartographer_sweep_source_project_tests
     COMMAND cartographer_sweep_source_project_tests)
 
+add_executable(cartographer_sweep_endpoint_tests
+    sweep_endpoint_tests.cpp
+)
+target_link_libraries(cartographer_sweep_endpoint_tests
+    PRIVATE
+        carto_condition_authoring
+)
+carto_target(cartographer_sweep_endpoint_tests)
+add_test(NAME cartographer_sweep_endpoint_tests COMMAND cartographer_sweep_endpoint_tests)
+
 add_executable(cartographer_biological_project_tests
     biological_project_tests.cpp
 )

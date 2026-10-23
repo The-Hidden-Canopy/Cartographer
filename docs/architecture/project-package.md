@@ -30,8 +30,14 @@ the revisioned rig-module library and decal placement table, project authoring
 standards, and monotonic
 source identity lineages including deletion tombstones where deletion is
 supported. Decal placements are project-persistent source bytes validated by
-the production decal codec; a native viewport placement workflow is not
-claimed.
+the production decal codec. The native Model workspace has a guarded placement
+route: it captures a source-anchored hit from the frontmost visible mesh,
+creates a revision-bound draft, and commits through the human authoring action.
+Saved projections can also be shown as a bounded outline resolved from their
+source face, per-face triangle ordinal, and barycentric vertices against the
+digest-checked source mesh and shown only when the visible viewport geometry
+matches it exactly. The preview is an outline only; material pixels are not
+rendered. Live Windows click-through acceptance remains unverified.
 `carto_project::ProjectPackage` now creates and
 validates the human-readable manifest and package directories, while
 `carto_assets` implements the portable content-addressed blob primitive that

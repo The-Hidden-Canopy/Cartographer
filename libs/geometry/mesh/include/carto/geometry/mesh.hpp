@@ -428,6 +428,7 @@ public:
     [[nodiscard]] std::vector<Face> faces_sorted() const;
     [[nodiscard]] std::vector<Face> faces_sorted(std::size_t limit) const;
     [[nodiscard]] std::vector<EdgeRecord> edges_sorted(std::size_t limit) const;
+    [[nodiscard]] std::vector<CornerRecord> corners_sorted(std::size_t limit) const;
 
     [[nodiscard]] core::Result<void> validate() const;
     [[nodiscard]] core::Result<TopologySnapshot> topology() const;

@@ -1285,6 +1285,100 @@ void ui_routes_edge_selection_without_authoring_mutation() {
     REQUIRE(after.ui_problems.empty());
 }
 
+void ui_routes_revision_bound_sweep_authoring_and_refuses_stale_inputs() {
+    TempDirectory temp;
+    const auto project_path = temp.path() / "sweep-ui.carto";
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.dispatch(carto::application::NewProjectAction{"Sweep UI"}));
+
+    carto::geometry::CurvePath centerline;
+    centerline.source_identity = "ui.sweep.centerline";
+    centerline.source_revision = carto::core::Revision{1U};
+    centerline.segments.push_back({
+        {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0},
+        {2.0, 0.0, 0.0}, {3.0, 0.0, 0.0}});
+    carto::project::RoadSource road;
+    road.source_identity = "ui.sweep.path-owner";
+    road.source_revision = carto::core::Revision{1U};
+    road.centerline_identity = centerline.source_identity;
+    road.centerline_revision = centerline.source_revision;
+    road.width_meters = 4.0;
+    REQUIRE(ui.dispatch(carto::application::SetRoadAuthoringAction{
+        ui.snapshot().project_revision, centerline, road}));
+
+    carto::geometry::SweepSource source;
+    source.source_identity = "ui.sweep.pipe";
+    source.centerline_identity = centerline.source_identity;
+    source.centerline_revision = centerline.source_revision;
+    source.reference_up = {0.0, 1.0, 0.0};
+    source.profile = {{-0.1, -0.1}, {0.1, -0.1}, {0.1, 0.1}, {-0.1, 0.1}};
+    source.samples_per_segment = 4U;
+    const auto next_revision = session.next_sweep_source_revision(source.source_identity);
+    REQUIRE(next_revision && next_revision.value() == carto::core::Revision{1U});
+    source.source_revision = next_revision.value();
+    REQUIRE(ui.dispatch(carto::application::SetSweepSourceAction{
+        ui.snapshot().project_revision, source}));
+
+    auto snapshot = ui.snapshot();
+    REQUIRE(snapshot.sweep_sources.size() == 1U);
+    REQUIRE(snapshot.sweep_sources.front().source.source_identity == source.source_identity);
+    REQUIRE(snapshot.sweep_sources.front().source.centerline_identity == centerline.source_identity);
+    REQUIRE(snapshot.sweep_sources.front().source.centerline_revision == centerline.source_revision);
+
+    const auto before_preview = session.snapshot();
+    const auto preview = session.sweep_source_preview(source.source_identity);
+    REQUIRE(preview && preview.value().mesh.validate());
+    REQUIRE(preview.value().source_identity == source.source_identity);
+    REQUIRE(preview.value().source_revision == source.source_revision);
+    const auto after_preview = session.snapshot();
+    REQUIRE(after_preview.project_revision == before_preview.project_revision);
+    REQUIRE(after_preview.undo_count == before_preview.undo_count);
+    REQUIRE(after_preview.dirty == before_preview.dirty);
+
+    auto invalid_recipe = source;
+    invalid_recipe.source_revision = session.next_sweep_source_revision(
+        source.source_identity).value();
+    invalid_recipe.profile.clear();
+    const auto before_invalid = session.snapshot();
+    REQUIRE(!ui.dispatch(carto::application::SetSweepSourceAction{
+        snapshot.project_revision, invalid_recipe}));
+    const auto after_invalid = session.snapshot();
+    REQUIRE(after_invalid.project_revision == before_invalid.project_revision);
+    REQUIRE(after_invalid.undo_count == before_invalid.undo_count);
+    REQUIRE(after_invalid.sweep_sources.size() == before_invalid.sweep_sources.size());
+
+    auto stale_binding = source;
+    stale_binding.source_revision = session.next_sweep_source_revision(
+        source.source_identity).value();
+    stale_binding.centerline_revision = carto::core::Revision{2U};
+    const auto before_stale = session.snapshot();
+    REQUIRE(!ui.dispatch(carto::application::SetSweepSourceAction{
+        before_stale.project_revision, stale_binding}));
+    const auto after_stale = session.snapshot();
+    REQUIRE(after_stale.project_revision == before_stale.project_revision);
+    REQUIRE(after_stale.undo_count == before_stale.undo_count);
+    REQUIRE(after_stale.sweep_sources.front().digest ==
+        before_stale.sweep_sources.front().digest);
+
+    REQUIRE(ui.dispatch(carto::application::UndoAction{}));
+    REQUIRE(ui.snapshot().sweep_sources.empty());
+    REQUIRE(ui.dispatch(carto::application::RedoAction{}));
+    snapshot = ui.snapshot();
+    REQUIRE(snapshot.sweep_sources.size() == 1U);
+    REQUIRE(snapshot.sweep_sources.front().source.centerline_revision == centerline.source_revision);
+
+    REQUIRE(ui.dispatch(carto::application::SaveProjectAction{project_path}));
+    carto::application::ApplicationSession reopened_session;
+    carto::ui::UiController reopened_ui(reopened_session);
+    REQUIRE(reopened_ui.dispatch(carto::application::OpenProjectAction{project_path}));
+    const auto reopened = reopened_ui.snapshot();
+    REQUIRE(reopened.sweep_sources.size() == 1U);
+    REQUIRE(reopened.sweep_sources.front().source.source_identity == source.source_identity);
+    REQUIRE(reopened.sweep_sources.front().source.centerline_identity == centerline.source_identity);
+    REQUIRE(reopened.sweep_sources.front().source.centerline_revision == centerline.source_revision);
+}
+
 void ui_preserves_required_viewport_and_supports_mode_theme_density() {
     carto::application::ApplicationSession session;
     carto::ui::UiController ui(session);
@@ -3257,6 +3351,78 @@ void sculpt_viewport_sampling_preserves_frontmost_surface_and_path_spacing() {
         triangles, object, direct_path, 1.0e-12));
 }
 
+void viewport_surface_pick_resolves_occlusion_and_rejects_ambiguous_source_ties() {
+    using carto::core::Vec2d;
+    using carto::core::Vec3d;
+    using carto::geometry::FaceId;
+    using carto::geometry::VertexId;
+    using carto::scene::ObjectId;
+    using carto::ui::ProjectedSurfaceHitStatus;
+    using carto::ui::SculptViewportTriangle;
+
+    const ObjectId selected{17U};
+    const ObjectId occluder{18U};
+    const auto make_triangle = [](ObjectId owner, FaceId face, std::uint64_t first_id,
+                                  double depth) {
+        return SculptViewportTriangle{
+            owner,
+            face,
+            {Vec2d{0.0, 0.0}, Vec2d{10.0, 0.0}, Vec2d{0.0, 10.0}},
+            {VertexId{first_id}, VertexId{first_id + 1U}, VertexId{first_id + 2U}},
+            {Vec3d{0.0, depth, 0.0}, Vec3d{10.0, depth, 0.0}, Vec3d{0.0, depth, 10.0}},
+            {depth, depth, depth}};
+    };
+
+    std::vector<SculptViewportTriangle> triangles{
+        make_triangle(selected, FaceId{1U}, 1U, 1.0),
+        make_triangle(occluder, FaceId{2U}, 4U, 2.0)};
+    const auto frontmost = carto::ui::resolve_frontmost_viewport_surface(
+        triangles, Vec2d{2.0, 2.0});
+    REQUIRE(frontmost);
+    REQUIRE(frontmost.value().status == ProjectedSurfaceHitStatus::hit);
+    REQUIRE(frontmost.value().object == occluder);
+    REQUIRE(frontmost.value().camera_depth == 2.0);
+    REQUIRE(frontmost.value().sample.surface_anchor.has_value());
+    REQUIRE(frontmost.value().sample.surface_anchor->face == FaceId{2U});
+
+    std::reverse(triangles.begin(), triangles.end());
+    const auto reordered = carto::ui::resolve_frontmost_viewport_surface(
+        triangles, Vec2d{2.0, 2.0});
+    REQUIRE(reordered);
+    REQUIRE(reordered.value().status == ProjectedSurfaceHitStatus::hit);
+    REQUIRE(reordered.value().object == occluder);
+    REQUIRE(reordered.value().sample.surface_anchor == frontmost.value().sample.surface_anchor);
+
+    triangles[0U] = make_triangle(occluder, FaceId{2U}, 4U, 1.0);
+    const auto overlap = carto::ui::resolve_frontmost_viewport_surface(
+        triangles, Vec2d{2.0, 2.0});
+    REQUIRE(overlap);
+    REQUIRE(overlap.value().status == ProjectedSurfaceHitStatus::ambiguous);
+    REQUIRE(overlap.value().object.value == 0U);
+    REQUIRE(!overlap.value().sample.surface_anchor.has_value());
+
+    const std::vector<SculptViewportTriangle> same_object_overlap{
+        make_triangle(selected, FaceId{1U}, 1U, 1.0),
+        make_triangle(selected, FaceId{2U}, 4U, 1.0)};
+    const auto same_object_tie = carto::ui::resolve_frontmost_viewport_surface(
+        same_object_overlap, Vec2d{2.0, 2.0});
+    REQUIRE(same_object_tie);
+    REQUIRE(same_object_tie.value().status == ProjectedSurfaceHitStatus::ambiguous);
+    REQUIRE(same_object_tie.value().object.value == 0U);
+    REQUIRE(!same_object_tie.value().sample.surface_anchor.has_value());
+
+    const auto miss = carto::ui::resolve_frontmost_viewport_surface(
+        triangles, Vec2d{12.0, 12.0});
+    REQUIRE(miss);
+    REQUIRE(miss.value().status == ProjectedSurfaceHitStatus::miss);
+
+    triangles[0U].camera_depth[0U] = std::numeric_limits<double>::quiet_NaN();
+    const auto malformed = carto::ui::resolve_frontmost_viewport_surface(
+        triangles, Vec2d{2.0, 2.0});
+    REQUIRE(!malformed);
+    REQUIRE(malformed.error().code == carto::core::ErrorCode::validation_failed);
+}
+
 void knife_viewport_sampling_snaps_endpoints_and_stays_on_the_selected_face() {
     using carto::core::Vec2d;
     using carto::core::Vec3d;
@@ -3648,6 +3814,129 @@ void sculpt_point_strokes_are_revision_bound_human_commands() {
     REQUIRE(ui.snapshot().project_revision == reopened_enabled.value().revision());
 }
 
+void decal_projection_outlines_require_exact_bounded_source_identity() {
+    using namespace carto;
+
+    geometry::CompiledMesh mesh;
+    mesh.positions = {
+        {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0},
+        {0.0, 0.0, 1.0}, {1.0, 0.0, 1.0}};
+    mesh.normals.assign(mesh.positions.size(), {0.0, 1.0, 0.0});
+    mesh.vertex_ids = {geometry::VertexId{1U}, geometry::VertexId{2U},
+        geometry::VertexId{3U}, geometry::VertexId{4U}};
+    mesh.indices = {0U, 1U, 2U, 1U, 3U, 2U};
+    mesh.triangle_faces = {geometry::FaceId{9U}, geometry::FaceId{9U}};
+    mesh.triangle_edges.resize(2U);
+    mesh.source_revision = core::Revision{7U};
+    for (const auto& position : mesh.positions) mesh.bounds.include(position);
+    REQUIRE(mesh.valid());
+
+    production::DecalPlacement placement;
+    placement.id = 4U;
+    placement.revision = core::Revision{2U};
+    placement.target_mesh_asset = 17U;
+    placement.target_mesh_revision = core::Revision{7U};
+    placement.target_mesh_digest.bytes[0U] = 1U;
+    placement.material_id = 6U;
+    REQUIRE(placement.validate());
+
+    production::DecalProjection projection;
+    projection.placement_id = placement.id;
+    projection.placement_revision = placement.revision;
+    projection.target_mesh_asset = placement.target_mesh_asset;
+    projection.target_mesh_revision = placement.target_mesh_revision;
+    projection.target_mesh_digest = placement.target_mesh_digest;
+    projection.material_id = placement.material_id;
+    production::DecalProjectedPolygon polygon;
+    polygon.source_face = geometry::FaceId{9U};
+    polygon.source_triangle = 1U;
+    polygon.vertices = {
+        {{0.2, 0.3}, {0.2, 0.3, 0.5}},
+        {{0.6, 0.4}, {0.2, 0.3, 0.5}},
+        {{0.8, 0.9}, {0.2, 0.3, 0.5}}};
+    projection.polygons.push_back(polygon);
+
+    const auto outline = ui::resolve_decal_projection_outline(
+        placement, projection, placement.target_mesh_asset,
+        placement.target_mesh_revision, mesh, mesh);
+    REQUIRE(outline);
+    REQUIRE(outline.value().size() == 1U);
+    REQUIRE(outline.value().front().size() == 3U);
+    REQUIRE(std::abs(outline.value().front().front().x - 0.5) < 1.0e-12);
+    REQUIRE(std::abs(outline.value().front().front().z - 0.8) < 1.0e-12);
+
+    auto sculpted_visible_mesh = mesh;
+    sculpted_visible_mesh.positions.front().x = 0.01;
+    const auto rejected_derived_surface = ui::resolve_decal_projection_outline(
+        placement, projection, placement.target_mesh_asset,
+        placement.target_mesh_revision, mesh, sculpted_visible_mesh);
+    REQUIRE(!rejected_derived_surface);
+    REQUIRE(rejected_derived_surface.error().code == core::ErrorCode::stale_data);
+
+    const auto wrong_asset = ui::resolve_decal_projection_outline(
+        placement, projection, placement.target_mesh_asset + 1U,
+        placement.target_mesh_revision, mesh, mesh);
+    REQUIRE(!wrong_asset);
+    REQUIRE(wrong_asset.error().code == core::ErrorCode::stale_data);
+    const auto wrong_revision = ui::resolve_decal_projection_outline(
+        placement, projection, placement.target_mesh_asset,
+        core::Revision{6U}, mesh, mesh);
+    REQUIRE(!wrong_revision);
+    REQUIRE(wrong_revision.error().code == core::ErrorCode::stale_data);
+
+    auto missing_triangle = projection;
+    missing_triangle.polygons.front().source_triangle = 2U;
+    const auto absent_ordinal = ui::resolve_decal_projection_outline(
+        placement, missing_triangle, placement.target_mesh_asset,
+        placement.target_mesh_revision, mesh, mesh);
+    REQUIRE(!absent_ordinal);
+    REQUIRE(absent_ordinal.error().code == core::ErrorCode::stale_data);
+
+    auto malformed_barycentric = projection;
+    malformed_barycentric.polygons.front().vertices.front().source_barycentric =
+        {0.2, 0.3, 0.6};
+    const auto rejected_barycentric = ui::resolve_decal_projection_outline(
+        placement, malformed_barycentric, placement.target_mesh_asset,
+        placement.target_mesh_revision, mesh, mesh);
+    REQUIRE(!rejected_barycentric);
+    REQUIRE(rejected_barycentric.error().code == core::ErrorCode::validation_failed);
+
+    auto mismatched_digest = projection;
+    mismatched_digest.target_mesh_digest.bytes[1U] = 1U;
+    const auto rejected_digest = ui::resolve_decal_projection_outline(
+        placement, mismatched_digest, placement.target_mesh_asset,
+        placement.target_mesh_revision, mesh, mesh);
+    REQUIRE(!rejected_digest);
+    REQUIRE(rejected_digest.error().code == core::ErrorCode::stale_data);
+
+    auto over_budget = projection;
+    over_budget.polygons.resize(ui::kMaxDecalOutlinePolygons + 1U, polygon);
+    const auto rejected_budget = ui::resolve_decal_projection_outline(
+        placement, over_budget, placement.target_mesh_asset,
+        placement.target_mesh_revision, mesh, mesh);
+    REQUIRE(!rejected_budget);
+    REQUIRE(rejected_budget.error().code == core::ErrorCode::unsupported);
+
+    auto over_source_triangle_budget = mesh;
+    const std::size_t source_triangle_count =
+        ui::kMaxDecalOutlineSourceTriangles + 1U;
+    over_source_triangle_budget.indices.clear();
+    over_source_triangle_budget.indices.reserve(source_triangle_count * 3U);
+    for (std::size_t index = 0U; index < source_triangle_count; ++index) {
+        over_source_triangle_budget.indices.insert(
+            over_source_triangle_budget.indices.end(), {0U, 1U, 2U});
+    }
+    over_source_triangle_budget.triangle_faces.assign(
+        source_triangle_count, geometry::FaceId{9U});
+    over_source_triangle_budget.triangle_edges.resize(source_triangle_count);
+    const auto rejected_source_budget = ui::resolve_decal_projection_outline(
+        placement, projection, placement.target_mesh_asset,
+        placement.target_mesh_revision, over_source_triangle_budget,
+        over_source_triangle_budget);
+    REQUIRE(!rejected_source_budget);
+    REQUIRE(rejected_source_budget.error().code == core::ErrorCode::unsupported);
+}
+
 } // namespace
 
 int main() {
@@ -3662,6 +3951,7 @@ int main() {
         ui_imports_reference_images_as_project_bound_revisioned_planes();
         ui_edits_reference_image_view_sets_atomically();
         ui_routes_edge_selection_without_authoring_mutation();
+        ui_routes_revision_bound_sweep_authoring_and_refuses_stale_inputs();
         ui_preserves_required_viewport_and_supports_mode_theme_density();
         cartographer_brand_palette_is_stable();
         ui_persists_preferences_and_resets_corrupt_state();
@@ -3686,9 +3976,11 @@ int main() {
         native_key_contract_maps_core_control_without_imgui();
         workspace_registry_is_canonical_and_fail_closed();
         sculpt_viewport_sampling_preserves_frontmost_surface_and_path_spacing();
+        viewport_surface_pick_resolves_occlusion_and_rejects_ambiguous_source_ties();
         knife_viewport_sampling_snaps_endpoints_and_stays_on_the_selected_face();
         sculpt_surface_strokes_commit_anchored_samples_through_human_commands();
         sculpt_point_strokes_are_revision_bound_human_commands();
+        decal_projection_outlines_require_exact_bounded_source_identity();
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         return 1;

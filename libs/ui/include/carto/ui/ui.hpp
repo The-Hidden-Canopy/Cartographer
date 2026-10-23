@@ -9,6 +9,7 @@
 #include <carto/condition/vegetation_preview.hpp>
 #include <carto/core/math.hpp>
 #include <carto/core/result.hpp>
+#include <carto/geometry/compiled_mesh.hpp>
 #include <carto/editor/observation.hpp>
 #include <carto/engineering/authoring.hpp>
 #include <carto/engineering/cad_provider.hpp>
@@ -261,6 +262,42 @@ struct SculptViewportTriangle {
     std::array<core::Vec3d, 3> local_positions{};
     std::array<double, 3> camera_depth{};
 };
+
+enum class ProjectedSurfaceHitStatus : std::uint8_t {
+    miss,
+    hit,
+    ambiguous,
+};
+
+struct ProjectedSurfaceHitResolution {
+    ProjectedSurfaceHitStatus status = ProjectedSurfaceHitStatus::miss;
+    scene::ObjectId object;
+    production::SculptStrokeSample sample;
+    double camera_depth = 0.0;
+};
+
+inline constexpr std::size_t kMaxDecalOutlineSourceTriangles = 65'536U;
+inline constexpr std::size_t kMaxDecalOutlinePolygons = 1'024U;
+inline constexpr std::size_t kMaxDecalOutlineVerticesPerPolygon = 16U;
+
+// Resolves a persisted projection only against its exact compiled source mesh.
+// This is a bounded presentation outline; it does not render material pixels.
+[[nodiscard]] core::Result<std::vector<std::vector<core::Vec3d>>>
+resolve_decal_projection_outline(
+    const production::DecalPlacement& placement,
+    const production::DecalProjection& projection,
+    std::uint64_t current_mesh_asset,
+    core::Revision current_mesh_revision,
+    const geometry::CompiledMesh& source_mesh,
+    const geometry::CompiledMesh& visible_mesh);
+
+// Resolves the frontmost surface over all visible scene triangles. Equal-depth
+// hits from distinct objects or source faces are ambiguous so a caller cannot
+// place through an overlapping object or choose an arbitrary surface normal.
+[[nodiscard]] core::Result<ProjectedSurfaceHitResolution>
+resolve_frontmost_viewport_surface(
+    std::span<const SculptViewportTriangle> triangles,
+    core::Vec2d screen_position);
 
 inline constexpr std::size_t kMaxKnifeViewportPathPoints = 4096U;
 
@@ -828,6 +865,20 @@ public:
         editor::MaterialGraphAuthoringReview& review);
     [[nodiscard]] core::Result<production::DecalProjection> preview_decal_placement(
         const production::DecalPlacement& placement,
+        core::Revision expected_project_revision) const;
+    [[nodiscard]] core::Result<geometry::CompiledMesh> decal_placement_source_mesh(
+        const production::DecalPlacement& placement,
+        core::Revision expected_project_revision) const;
+    [[nodiscard]] core::Result<production::DecalPlacement> make_decal_placement(
+        scene::ObjectId target_object,
+        std::uint64_t material_id,
+        core::Vec3d center,
+        core::Vec3d normal,
+        core::Vec3d tangent,
+        double width,
+        double height,
+        double depth,
+        double minimum_normal_dot,
         core::Revision expected_project_revision) const;
     [[nodiscard]] core::Result<editor::AuthoringPreview> begin_preview(
         editor::PreviewKind kind) const;

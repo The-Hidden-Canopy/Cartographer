@@ -50,6 +50,112 @@ namespace {
 
 constexpr std::size_t kMaxNativeStructureMeshElements = 100'000U;
 constexpr std::size_t kMaxNativeStructureMatches = 4096U;
+constexpr std::size_t kMaxViewportAttributeOverlaySegments = 4096U;
+
+core::Result<std::shared_ptr<const ViewportState::MeshAttributeOverlayData>>
+build_viewport_attribute_overlay(
+    const geometry::EditableMesh& mesh,
+    const geometry::CompiledMesh& compiled) {
+    using OverlayData = ViewportState::MeshAttributeOverlayData;
+    using AttributeLine = ViewportState::AttributeLine;
+    const auto fail = [](core::ErrorCode code, std::string message) {
+        return core::Result<std::shared_ptr<const OverlayData>>::failure(
+            core::Diagnostic(code, std::move(message)));
+    };
+    if (!compiled.valid() || compiled.source_revision != mesh.revision()) {
+        return fail(core::ErrorCode::stale_data,
+            "viewport attribute overlay compiled mesh does not match its editable source");
+    }
+
+    auto data = std::make_shared<OverlayData>();
+    data->evaluated_mesh_revision = compiled.source_revision;
+    const auto* sharp_layer = mesh.attributes().find("cartographer.edge_sharp");
+    if (sharp_layer != nullptr) {
+        data->has_sharp_edge_layer = true;
+        if (sharp_layer->descriptor.domain != attributes::AttributeDomain::edge ||
+            sharp_layer->descriptor.type != attributes::AttributeType::boolean ||
+            sharp_layer->values.size() != mesh.edge_count()) {
+            return fail(core::ErrorCode::validation_failed,
+                "viewport edge-sharp overlay requires a complete edge-domain boolean layer");
+        }
+        if (auto valid = sharp_layer->validate(mesh.edge_count()); !valid) {
+            return core::Result<std::shared_ptr<const OverlayData>>::failure(valid.error());
+        }
+        data->hard_edge_scan_capped = mesh.edge_count() >
+            kMaxViewportAttributeOverlaySegments;
+        const auto edges = mesh.edges_sorted(kMaxViewportAttributeOverlaySegments);
+        const std::size_t edge_count = std::min(
+            edges.size(), kMaxViewportAttributeOverlaySegments);
+        data->hard_edges.reserve(std::min(edge_count, kMaxViewportAttributeOverlaySegments));
+        for (std::size_t index = 0U; index < edge_count; ++index) {
+            const auto* marked = std::get_if<bool>(&sharp_layer->values[index]);
+            if (marked == nullptr) {
+                return fail(core::ErrorCode::validation_failed,
+                    "viewport edge-sharp overlay contains a non-boolean value");
+            }
+            if (!*marked) continue;
+            const auto& edge = edges[index];
+            const geometry::Vertex* first = mesh.find_vertex(edge.first);
+            const geometry::Vertex* second = mesh.find_vertex(edge.second);
+            if (first == nullptr || second == nullptr) {
+                return fail(core::ErrorCode::stale_data,
+                    "viewport edge-sharp overlay references a missing endpoint");
+            }
+            data->hard_edges.push_back(AttributeLine{first->position, second->position});
+        }
+    }
+
+    const auto* normal_layer = mesh.attributes().find("cartographer.normal0");
+    if (normal_layer != nullptr) {
+        data->has_custom_normal_layer = true;
+        const auto corner_count = mesh.attributes().domain_count(
+            attributes::AttributeDomain::corner);
+        if (normal_layer->descriptor.domain != attributes::AttributeDomain::corner ||
+            normal_layer->descriptor.type != attributes::AttributeType::vec3 ||
+            !corner_count.has_value() || normal_layer->values.size() != corner_count.value()) {
+            return fail(core::ErrorCode::validation_failed,
+                "viewport custom-normal overlay requires a complete corner-domain vec3 layer");
+        }
+        if (auto valid = normal_layer->validate(corner_count.value()); !valid) {
+            return core::Result<std::shared_ptr<const OverlayData>>::failure(valid.error());
+        }
+        data->corner_normal_scan_capped = corner_count.value() >
+            kMaxViewportAttributeOverlaySegments;
+        const auto corners = mesh.corners_sorted(kMaxViewportAttributeOverlaySegments);
+        const std::size_t displayed_corner_count = std::min(
+            corner_count.value(), kMaxViewportAttributeOverlaySegments);
+        if (corners.size() != displayed_corner_count) {
+            return fail(core::ErrorCode::stale_data,
+                "viewport custom-normal overlay corner order does not match its attribute layer");
+        }
+        const auto& bounds = compiled.bounds;
+        const double diagonal = std::hypot(
+            bounds.maximum.x - bounds.minimum.x,
+            bounds.maximum.y - bounds.minimum.y,
+            bounds.maximum.z - bounds.minimum.z);
+        if (!std::isfinite(diagonal) || diagonal <= 0.0) {
+            return fail(core::ErrorCode::validation_failed,
+                "viewport custom-normal overlay requires finite compiled bounds");
+        }
+        const double normal_length = std::clamp(diagonal * 0.035, 0.01, 0.25);
+        data->corner_normals.reserve(displayed_corner_count);
+        for (std::size_t index = 0U; index < displayed_corner_count; ++index) {
+            const auto* normal = std::get_if<core::Vec3d>(&normal_layer->values[index]);
+            if (normal == nullptr || !normal->finite() || normal->length_squared() <= 1.0e-24) {
+                return fail(core::ErrorCode::validation_failed,
+                    "viewport custom-normal overlay contains an invalid corner normal");
+            }
+            const geometry::Vertex* vertex = mesh.find_vertex(corners[index].vertex);
+            if (vertex == nullptr) {
+                return fail(core::ErrorCode::stale_data,
+                    "viewport custom-normal overlay references a missing corner vertex");
+            }
+            data->corner_normals.push_back(AttributeLine{
+                vertex->position, vertex->position + normal->normalized() * normal_length});
+        }
+    }
+    return core::Result<std::shared_ptr<const OverlayData>>::success(std::move(data));
+}
 
 core::Result<std::optional<assets::Sha256Digest>> mesh_material_region_digest(
     const geometry::EditableMesh& mesh) {
@@ -2317,6 +2423,128 @@ core::Result<production::DecalProjection> ApplicationSession::decal_placement_pr
     }
     return production::project_decal(
         placement, mesh->second, placement.target_mesh_asset, mesh_digest);
+}
+
+core::Result<geometry::CompiledMesh> ApplicationSession::decal_placement_source_mesh(
+    const production::DecalPlacement& placement,
+    core::Revision expected_project_revision) const {
+    using SourceMeshResult = core::Result<geometry::CompiledMesh>;
+    if (document_.revision() != expected_project_revision) {
+        return SourceMeshResult::failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "decal source mesh read targets a stale project revision"));
+    }
+    if (auto result = placement.validate(); !result) {
+        return SourceMeshResult::failure(result.error().with_context(
+            "decal source mesh read"));
+    }
+    const auto mesh = document_.meshes().find(placement.target_mesh_asset);
+    if (mesh == document_.meshes().end()) {
+        return SourceMeshResult::failure(core::Diagnostic(core::ErrorCode::not_found,
+            "decal source mesh is not present in the project"));
+    }
+    const auto digest = canonical_mesh_geometry_digest(mesh->second);
+    if (auto result = production::validate_decal_source(
+            placement, placement.target_mesh_asset, mesh->second.revision(), digest);
+        !result) {
+        return SourceMeshResult::failure(result.error().with_context(
+            "decal source mesh binding"));
+    }
+    auto compiled = mesh->second.compile();
+    if (!compiled) return SourceMeshResult::failure(compiled.error().with_context(
+        "decal source mesh compilation"));
+    if (!compiled.value().valid() ||
+        compiled.value().source_revision != placement.target_mesh_revision) {
+        return SourceMeshResult::failure(core::Diagnostic(core::ErrorCode::validation_failed,
+            "decal source mesh compilation does not match its bound revision"));
+    }
+    if (document_.revision() != expected_project_revision) {
+        return SourceMeshResult::failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "project changed while the decal source mesh was compiled"));
+    }
+    return SourceMeshResult::success(std::move(compiled.value()));
+}
+
+core::Result<production::DecalPlacement> ApplicationSession::make_decal_placement(
+    scene::ObjectId target_object,
+    std::uint64_t material_id,
+    core::Vec3d center,
+    core::Vec3d normal,
+    core::Vec3d tangent,
+    double width,
+    double height,
+    double depth,
+    double minimum_normal_dot,
+    core::Revision expected_project_revision) const {
+    if (document_.revision() != expected_project_revision) {
+        return core::Result<production::DecalPlacement>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "decal placement draft targets a stale project revision"));
+    }
+    const auto* object = document_.scene().find(target_object);
+    if (object == nullptr || !object->visible || object->locked ||
+        !object->mesh_asset.has_value()) {
+        return core::Result<production::DecalPlacement>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "decal placement requires a visible, unlocked mesh object in this project"));
+    }
+    const auto mesh = document_.meshes().find(*object->mesh_asset);
+    if (mesh == document_.meshes().end()) {
+        return core::Result<production::DecalPlacement>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "decal placement target mesh is not present in this project"));
+    }
+    const auto material = document_.material_catalog().materials().find(material_id);
+    if (material == document_.material_catalog().materials().end()) {
+        return core::Result<production::DecalPlacement>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "decal placement material is not present in the project catalog"));
+    }
+    if (auto result = document_.material_catalog().resolve_material(material_id); !result) {
+        return core::Result<production::DecalPlacement>::failure(
+            result.error().with_context("decal placement material binding"));
+    }
+
+    std::uint64_t placement_id = 1U;
+    for (const auto& [stored_id, stored] : document_.decal_placements()) {
+        static_cast<void>(stored);
+        if (stored_id < placement_id) continue;
+        if (stored_id > placement_id) break;
+        if (placement_id == std::numeric_limits<std::uint64_t>::max()) {
+            return core::Result<production::DecalPlacement>::failure(core::Diagnostic(
+                core::ErrorCode::unsupported,
+                "decal placement identity space is exhausted"));
+        }
+        ++placement_id;
+    }
+
+    production::DecalPlacement placement;
+    placement.id = placement_id;
+    placement.revision = core::Revision{1U};
+    placement.target_mesh_asset = *object->mesh_asset;
+    placement.target_mesh_revision = mesh->second.revision();
+    placement.target_mesh_digest = canonical_mesh_geometry_digest(mesh->second);
+    placement.material_id = material_id;
+    placement.center = center;
+    placement.normal = normal;
+    placement.tangent = tangent;
+    placement.width = width;
+    placement.height = height;
+    placement.depth = depth;
+    placement.minimum_normal_dot = minimum_normal_dot;
+    if (auto result = placement.validate(); !result) {
+        return core::Result<production::DecalPlacement>::failure(
+            result.error().with_context("decal placement draft"));
+    }
+    const auto preview = decal_placement_preview(placement, expected_project_revision);
+    if (!preview) {
+        return core::Result<production::DecalPlacement>::failure(preview.error());
+    }
+    if (preview.value().polygons.empty()) {
+        return core::Result<production::DecalPlacement>::failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "decal placement does not project onto an admitted target face"));
+    }
+    return core::Result<production::DecalPlacement>::success(std::move(placement));
 }
 
 core::Result<biological::BiologicalAuthoringDocument>
@@ -9204,6 +9432,12 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
     }
     result.viewport.project_revision = document_.revision();
 
+    const auto wants_attribute_overlay = [&result](scene::ObjectId object) {
+        return result.selection.component_object == object ||
+            (result.selection.mode == editor::SelectionMode::object &&
+             result.selection.objects.size() == 1U &&
+             result.selection.objects.front() == object);
+    };
     render::RenderScene viewport_scene;
     for (auto cache = viewport_mesh_cache_.begin(); cache != viewport_mesh_cache_.end();) {
         if (!document_.meshes().contains(cache->first)) {
@@ -9262,11 +9496,22 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
                 result.viewport.error = compiled.error().with_context("viewport compilation");
                 break;
             }
+            auto attribute_overlay = build_viewport_attribute_overlay(
+                viewport_mesh, compiled.value());
+            std::shared_ptr<const ViewportState::MeshAttributeOverlayData> overlay_data;
+            std::optional<core::Diagnostic> overlay_error;
+            if (attribute_overlay) {
+                overlay_data = std::move(attribute_overlay.value());
+            } else {
+                overlay_error = attribute_overlay.error().with_context(
+                    "viewport authored mesh attributes");
+            }
             auto owned_mesh = std::make_shared<geometry::CompiledMesh>(std::move(compiled.value()));
             compiled_mesh = owned_mesh;
             viewport_mesh_cache_[*object.mesh_asset] = ViewportMeshCacheEntry{
                 project_generation_, &mesh->second, source_revision,
-                sculpt_stack_digest, std::move(owned_mesh)};
+                sculpt_stack_digest, std::move(owned_mesh), std::move(overlay_data),
+                std::move(overlay_error)};
         }
         if (auto inserted = viewport_scene.upsert({
                 object.id, compiled_mesh, object_view.world_transform,
@@ -9274,6 +9519,24 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
             !inserted) {
             result.viewport.error = inserted.error().with_context("viewport snapshot");
             break;
+        }
+        if (wants_attribute_overlay(object.id)) {
+            const auto cached_overlay = viewport_mesh_cache_.find(*object.mesh_asset);
+            if (cached_overlay != viewport_mesh_cache_.end()) {
+                if (cached_overlay->second.attribute_overlay_error.has_value()) {
+                    append_problem(*cached_overlay->second.attribute_overlay_error);
+                } else if (cached_overlay->second.attribute_overlay &&
+                    (cached_overlay->second.attribute_overlay->has_sharp_edge_layer ||
+                     cached_overlay->second.attribute_overlay->has_custom_normal_layer)) {
+                    result.viewport.attribute_overlays.push_back(
+                        ViewportState::MeshAttributeOverlay{
+                            object.id,
+                            *object.mesh_asset,
+                            source_revision,
+                            project_generation_,
+                            cached_overlay->second.attribute_overlay});
+                }
+            }
         }
     }
     if (!result.viewport.error.has_value()) {

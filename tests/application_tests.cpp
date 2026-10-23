@@ -2976,6 +2976,31 @@ void application_authors_selected_face_custom_normals_with_revisioned_history() 
     }
     REQUIRE(authored_corner_count == authored_mesh.find_face(selected_face)->vertices.size());
 
+    const auto overlay_snapshot = session.snapshot();
+    REQUIRE(overlay_snapshot.project_revision == applied.value().revision_after);
+    REQUIRE(overlay_snapshot.viewport.attribute_overlays.size() == 1U);
+    const auto& normal_overlay = overlay_snapshot.viewport.attribute_overlays.front();
+    REQUIRE(normal_overlay.object == object.id);
+    REQUIRE(normal_overlay.mesh_asset == *object.mesh_asset);
+    REQUIRE(normal_overlay.source_revision == authored_mesh.revision());
+    REQUIRE(normal_overlay.data);
+    REQUIRE(normal_overlay.data->has_custom_normal_layer);
+    REQUIRE(normal_overlay.data->corner_normals.size() == topology.value().corners.size());
+    REQUIRE(!normal_overlay.data->corner_normal_scan_capped);
+    REQUIRE(normal_overlay.data->evaluated_mesh_revision ==
+        overlay_snapshot.viewport.scene.find(object.id)->mesh->source_revision);
+    bool selected_normal_is_visible = false;
+    for (std::size_t index = 0U; index < topology.value().corners.size(); ++index) {
+        if (topology.value().corners[index].face != selected_face) continue;
+        const auto direction = (normal_overlay.data->corner_normals[index].end -
+            normal_overlay.data->corner_normals[index].start).normalized();
+        REQUIRE(std::abs(direction.x - expected_normal.x) < 1.0e-9);
+        REQUIRE(std::abs(direction.y - expected_normal.y) < 1.0e-9);
+        REQUIRE(std::abs(direction.z - expected_normal.z) < 1.0e-9);
+        selected_normal_is_visible = true;
+    }
+    REQUIRE(selected_normal_is_visible);
+
     REQUIRE(carto::application::testing::dispatch(session,
         carto::application::SaveProjectAction{path}));
     auto reopened = carto::project::ProjectDocument::load(path);
@@ -3069,6 +3094,23 @@ void application_authors_selected_edge_sharp_marks_with_revisioned_history() {
         const auto edge = source_topology.value().edges[index].id;
         REQUIRE(*value == (edge == selected_edges[0] || edge == selected_edges[1]));
     }
+
+    const auto overlay_snapshot = session.snapshot();
+    REQUIRE(overlay_snapshot.viewport.attribute_overlays.size() == 1U);
+    const auto& sharp_overlay = overlay_snapshot.viewport.attribute_overlays.front();
+    REQUIRE(sharp_overlay.object == object.id);
+    REQUIRE(sharp_overlay.source_revision == authored_mesh.revision());
+    REQUIRE(sharp_overlay.data);
+    REQUIRE(sharp_overlay.data->has_sharp_edge_layer);
+    REQUIRE(sharp_overlay.data->hard_edges.size() == selected_edges.size());
+    REQUIRE(sharp_overlay.data->evaluated_mesh_revision ==
+        overlay_snapshot.viewport.scene.find(object.id)->mesh->source_revision);
+    REQUIRE(sharp_overlay.data->hard_edges[0].start.x ==
+        source_mesh.find_vertex(source_topology.value().edges[0].first)->position.x);
+    REQUIRE(sharp_overlay.data->hard_edges[0].end.y ==
+        source_mesh.find_vertex(source_topology.value().edges[0].second)->position.y);
+    REQUIRE(sharp_overlay.data->hard_edges[1].start.z ==
+        source_mesh.find_vertex(source_topology.value().edges[2].first)->position.z);
 
     const auto stale_before = session.snapshot();
     const auto stale_selection = carto::application::testing::dispatch(session,
@@ -8889,6 +8931,13 @@ void application_authors_revision_bound_sweeps_through_history() {
     REQUIRE(carto::application::testing::dispatch(session,
         carto::application::SetRoadAuthoringAction{
             session.snapshot().project_revision, centerline, road}));
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SaveProjectAction{project_path}));
+    const auto journal_path = std::filesystem::path(project_path.string() + ".journal");
+    carto::journal::Journal journal(journal_path);
+    const auto baseline_journal = journal.read_all();
+    REQUIRE(baseline_journal && baseline_journal.value().size() == 1U &&
+            baseline_journal.value().front().event_type == "cartographer.snapshot");
 
     carto::geometry::SweepSource source;
     source.source_identity = "sweep.authoring.pipe";
@@ -8906,6 +8955,58 @@ void application_authors_revision_bound_sweeps_through_history() {
         source.source_identity);
     REQUIRE(next_source_revision);
     source.source_revision = next_source_revision.value();
+
+    const auto expect_rejected_without_mutation = [&session, &journal](
+        const carto::geometry::SweepSource& rejected_source,
+        carto::core::ErrorCode expected_error,
+        carto::application::OperationSource operation_source) {
+        const auto before = session.snapshot();
+        const auto document_before = session.document_.serialize();
+        const auto journal_before = journal.read_all();
+        REQUIRE(journal_before);
+        const carto::application::SetSweepSourceAction action{
+            before.project_revision, rejected_source};
+        const auto result = [&]() {
+            if (operation_source == carto::application::OperationSource::human) {
+                return carto::application::testing::dispatch(session, action);
+            }
+            const auto previous_source = session.active_source_;
+            session.active_source_ = operation_source;
+            auto rejected = session.set_sweep_source(action);
+            session.active_source_ = previous_source;
+            return rejected;
+        }();
+        REQUIRE(!result && result.error().code == expected_error);
+        const auto after = session.snapshot();
+        REQUIRE(after.project_revision == before.project_revision &&
+                after.project_generation == before.project_generation &&
+                after.undo_count == before.undo_count &&
+                after.redo_count == before.redo_count && after.dirty == before.dirty &&
+                after.sweep_sources.size() == before.sweep_sources.size());
+        REQUIRE(session.document_.serialize() == document_before);
+        const auto journal_after = journal.read_all();
+        REQUIRE(journal_after && journal_after.value().size() == journal_before.value().size());
+        REQUIRE(journal_after.value().back().entry_hash ==
+                journal_before.value().back().entry_hash);
+        REQUIRE(journal.verify());
+    };
+
+    auto invalid_recipe = source;
+    invalid_recipe.profile.front().x = std::numeric_limits<double>::quiet_NaN();
+    expect_rejected_without_mutation(
+        invalid_recipe, carto::core::ErrorCode::validation_failed,
+        carto::application::OperationSource::human);
+    auto stale_centerline = source;
+    stale_centerline.centerline_revision = carto::core::Revision{2U};
+    expect_rejected_without_mutation(
+        stale_centerline, carto::core::ErrorCode::stale_data,
+        carto::application::OperationSource::human);
+    expect_rejected_without_mutation(
+        source, carto::core::ErrorCode::unsupported,
+        carto::application::OperationSource::agent_workbench);
+    REQUIRE(session.next_sweep_source_revision(source.source_identity).value() ==
+            carto::core::Revision{1U});
+
     const auto before_create = session.snapshot();
     const auto created = carto::application::testing::dispatch(session,
         carto::application::SetSweepSourceAction{
@@ -8915,7 +9016,19 @@ void application_authors_revision_bound_sweeps_through_history() {
     REQUIRE(snapshot.sweep_sources.size() == 1U &&
             snapshot.sweep_sources.front().source.source_revision ==
                 carto::core::Revision{1U});
+    auto journal_after_create = journal.read_all();
+    REQUIRE(journal_after_create && journal_after_create.value().size() == 2U &&
+            journal_after_create.value().back().event_type ==
+                "cartographer.application_action" &&
+            journal_after_create.value().back().revision_after == snapshot.project_revision);
+    const std::string create_payload(
+        journal_after_create.value().back().payload.begin(),
+        journal_after_create.value().back().payload.end());
+    REQUIRE(create_payload.find("CARTOGRAPHER_SWEEP_SOURCE 1") != std::string::npos &&
+            create_payload.find(source.source_identity) != std::string::npos &&
+            journal.verify());
 
+    const auto journal_before_preview = journal_after_create.value().back().entry_hash;
     const auto preview = session.sweep_source_preview(source.source_identity);
     REQUIRE(preview && preview.value().mesh.validate());
     REQUIRE(preview.value().source_identity == source.source_identity &&
@@ -8926,11 +9039,22 @@ void application_authors_revision_bound_sweeps_through_history() {
     REQUIRE(after_preview.project_revision == snapshot.project_revision &&
             after_preview.undo_count == snapshot.undo_count &&
             after_preview.dirty == snapshot.dirty);
+    journal_after_create = journal.read_all();
+    REQUIRE(journal_after_create && journal_after_create.value().size() == 2U &&
+            journal_after_create.value().back().entry_hash == journal_before_preview);
     REQUIRE(!session.sweep_source_preview("sweep.authoring.missing"));
 
+    const auto before_stale_action = session.snapshot();
+    const auto stale_document_before = session.document_.serialize();
     const auto stale = carto::application::testing::dispatch(session,
         carto::application::SetSweepSourceAction{before_create.project_revision, source});
-    REQUIRE(!stale && session.snapshot().project_revision == snapshot.project_revision);
+    REQUIRE(!stale && stale.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(session.snapshot().project_revision == before_stale_action.project_revision &&
+            session.snapshot().undo_count == before_stale_action.undo_count &&
+            session.document_.serialize() == stale_document_before);
+    journal_after_create = journal.read_all();
+    REQUIRE(journal_after_create && journal_after_create.value().size() == 2U &&
+            journal_after_create.value().back().entry_hash == journal_before_preview);
 
     REQUIRE(carto::application::testing::dispatch(session,
         carto::application::UndoAction{}));
@@ -8969,9 +9093,15 @@ void application_authors_revision_bound_sweeps_through_history() {
 
     REQUIRE(carto::application::testing::dispatch(
         session, carto::application::SaveProjectAction{project_path}));
-    const auto reopened = carto::project::ProjectDocument::load(project_path);
-    REQUIRE(reopened && reopened.value().sweep_sources().at(source.source_identity).
-            source_revision == carto::core::Revision{5U});
+    carto::application::ApplicationSession reopened;
+    REQUIRE(carto::application::testing::dispatch(
+        reopened, carto::application::OpenProjectAction{project_path}));
+    const auto reopened_snapshot = reopened.snapshot();
+    REQUIRE(reopened_snapshot.sweep_sources.size() == 1U &&
+            reopened_snapshot.sweep_sources.front().source.source_revision ==
+                carto::core::Revision{5U} &&
+            reopened_snapshot.sweep_sources.front().source.end_scale == 0.5 &&
+            reopened_snapshot.curve_paths.size() == 1U);
 }
 
 carto::biological::BiologicalAuthoringDocument application_biological_source(
@@ -11119,6 +11249,210 @@ void application_rejects_multi_edge_bevel_over_command_budget_without_mutation()
     REQUIRE(session.document_.mesh_patches().empty());
 }
 
+void application_places_decals_from_a_current_surface_through_human_history() {
+    carto::application::ApplicationSession session;
+    TempDirectory directory;
+    const auto project_path = directory.path() / "decal-placement.carto";
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::NewProjectAction{"Decal placement"}));
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SaveProjectAction{project_path}));
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::CreateBoxAction{"Target", {2.0, 2.0, 2.0}}));
+    auto snapshot = session.snapshot();
+    REQUIRE(snapshot.objects.size() == 1U);
+    const auto target = snapshot.objects.front().object.id;
+    const auto material_created = carto::application::testing::dispatch(session,
+        carto::application::CreateMaterialAction{
+            snapshot.project_revision, "Decal material", carto::render::StandardMaterial{}});
+    REQUIRE(material_created && material_created.value().document_changed);
+    snapshot = session.snapshot();
+    REQUIRE(snapshot.materials.size() == 1U);
+
+    const auto target_mesh = snapshot.objects.front().object.mesh_asset;
+    REQUIRE(target_mesh.has_value());
+    const auto mesh = session.document_.meshes().find(*target_mesh);
+    REQUIRE(mesh != session.document_.meshes().end());
+    const auto before_draft = session.snapshot();
+    const auto invalid_material = session.make_decal_placement(
+        target, std::numeric_limits<std::uint64_t>::max(), {0.0, 1.0, 0.0},
+        {0.0, 1.0, 0.0}, {1.0, 0.0, 0.0}, 0.5, 0.5, 0.1, 0.0,
+        before_draft.project_revision);
+    REQUIRE(!invalid_material && invalid_material.error().code ==
+        carto::core::ErrorCode::not_found);
+    const auto stale_draft = session.make_decal_placement(
+        target, snapshot.materials.front().id, {0.0, 1.0, 0.0},
+        {0.0, 1.0, 0.0}, {1.0, 0.0, 0.0}, 0.5, 0.5, 0.1, 0.0,
+        before_draft.project_revision.next());
+    REQUIRE(!stale_draft && stale_draft.error().code ==
+        carto::core::ErrorCode::stale_data);
+    const auto invalid_extent = session.make_decal_placement(
+        target, snapshot.materials.front().id, {0.0, 1.0, 0.0},
+        {0.0, 1.0, 0.0}, {1.0, 0.0, 0.0}, 0.0, 0.5, 0.1, 0.0,
+        before_draft.project_revision);
+    REQUIRE(!invalid_extent);
+    const auto draft = session.make_decal_placement(
+        target, snapshot.materials.front().id, {0.0, 1.0, 0.0},
+        {0.0, 1.0, 0.0}, {1.0, 0.0, 0.0}, 0.5, 0.5, 0.1, 0.0,
+        before_draft.project_revision);
+    REQUIRE(draft);
+    REQUIRE(draft.value().target_mesh_asset == *target_mesh &&
+        draft.value().target_mesh_revision == mesh->second.revision() &&
+        draft.value().target_mesh_digest ==
+            carto::application::canonical_mesh_geometry_digest(mesh->second));
+    const auto exact_source_mesh = session.decal_placement_source_mesh(
+        draft.value(), before_draft.project_revision);
+    REQUIRE(exact_source_mesh && exact_source_mesh.value().valid() &&
+        exact_source_mesh.value().source_revision == draft.value().target_mesh_revision);
+    auto wrong_source_digest = draft.value();
+    wrong_source_digest.target_mesh_digest.bytes[0U] ^= 1U;
+    const auto stale_source_mesh = session.decal_placement_source_mesh(
+        wrong_source_digest, before_draft.project_revision);
+    REQUIRE(!stale_source_mesh && stale_source_mesh.error().code ==
+        carto::core::ErrorCode::stale_data);
+    const auto stale_project_mesh = session.decal_placement_source_mesh(
+        draft.value(), before_draft.project_revision.next());
+    REQUIRE(!stale_project_mesh && stale_project_mesh.error().code ==
+        carto::core::ErrorCode::stale_data);
+    REQUIRE(session.snapshot().project_revision == before_draft.project_revision &&
+        session.snapshot().undo_count == before_draft.undo_count &&
+        session.snapshot().decal_placements.empty());
+
+    carto::application::SetDecalPlacementAction action;
+    action.expected_project_revision = before_draft.project_revision;
+    action.expected_placement_revision = carto::core::Revision{};
+    action.placement = draft.value();
+    const auto decal_journal_path = std::filesystem::path(project_path.string() + ".journal");
+    carto::journal::Journal journal(decal_journal_path);
+    const auto journal_bytes = [&]() {
+        std::ifstream input(decal_journal_path, std::ios::binary);
+        REQUIRE(input.good());
+        return std::string(std::istreambuf_iterator<char>{input},
+            std::istreambuf_iterator<char>{});
+    };
+    const auto expect_rejected_without_mutation = [&](
+        const carto::application::SetDecalPlacementAction& rejected_action,
+        carto::core::ErrorCode expected_error,
+        carto::application::OperationSource source =
+            carto::application::OperationSource::human) {
+        const auto before = session.snapshot();
+        const auto document_before = session.document_.serialize();
+        const auto entries_before = journal.read_all();
+        REQUIRE(entries_before);
+        const auto journal_before = journal_bytes();
+        const auto rejected = [&]() {
+            if (source == carto::application::OperationSource::human) {
+                return carto::application::testing::dispatch(session, rejected_action);
+            }
+            const auto previous_source = session.active_source_;
+            session.active_source_ = source;
+            auto result = session.set_decal_placement(rejected_action);
+            session.active_source_ = previous_source;
+            return result;
+        }();
+        REQUIRE(!rejected && rejected.error().code == expected_error);
+        const auto after = session.snapshot();
+        REQUIRE(after.project_revision == before.project_revision &&
+            after.undo_count == before.undo_count &&
+            after.redo_count == before.redo_count && after.dirty == before.dirty);
+        REQUIRE(session.document_.serialize() == document_before);
+        const auto entries_after = journal.read_all();
+        REQUIRE(entries_after && entries_after.value().size() == entries_before.value().size());
+        REQUIRE(journal_bytes() == journal_before);
+    };
+
+    auto invalid_catalog_action = action;
+    invalid_catalog_action.placement.material_id =
+        std::numeric_limits<std::uint64_t>::max();
+    expect_rejected_without_mutation(invalid_catalog_action, carto::core::ErrorCode::not_found);
+
+    auto invalid_action = action;
+    invalid_action.expected_project_revision = before_draft.project_revision.next();
+    expect_rejected_without_mutation(invalid_action, carto::core::ErrorCode::stale_data);
+    invalid_action = action;
+    invalid_action.placement.target_mesh_asset = std::numeric_limits<std::uint64_t>::max();
+    expect_rejected_without_mutation(invalid_action, carto::core::ErrorCode::not_found);
+    invalid_action = action;
+    invalid_action.placement.target_mesh_revision = action.placement.target_mesh_revision.next();
+    expect_rejected_without_mutation(invalid_action, carto::core::ErrorCode::stale_data);
+    invalid_action = action;
+    invalid_action.placement.target_mesh_digest.bytes[0U] ^= 1U;
+    expect_rejected_without_mutation(invalid_action, carto::core::ErrorCode::stale_data);
+    invalid_action = action;
+    invalid_action.expected_placement_revision = carto::core::Revision{1U};
+    expect_rejected_without_mutation(invalid_action, carto::core::ErrorCode::stale_data);
+    invalid_action = action;
+    invalid_action.placement.revision = carto::core::Revision{2U};
+    expect_rejected_without_mutation(invalid_action, carto::core::ErrorCode::stale_data);
+    invalid_action = action;
+    invalid_action.placement.revision = carto::core::Revision{};
+    expect_rejected_without_mutation(invalid_action, carto::core::ErrorCode::stale_data);
+
+    for (const auto source : {carto::application::OperationSource::ai_proposal,
+             carto::application::OperationSource::agent_workbench,
+             carto::application::OperationSource::plugin,
+             carto::application::OperationSource::recovery}) {
+        expect_rejected_without_mutation(action, carto::core::ErrorCode::unsupported, source);
+    }
+
+    const auto placed = carto::application::testing::dispatch(session, action);
+    REQUIRE(placed && placed.value().document_changed);
+    auto after_place = session.snapshot();
+    REQUIRE(after_place.decal_placements.size() == 1U);
+    const auto encoded_draft = carto::production::serialize_decal_placement(draft.value());
+    REQUIRE(encoded_draft);
+    const auto encoded_snapshot = carto::production::serialize_decal_placement(
+        after_place.decal_placements.front().placement);
+    REQUIRE(encoded_snapshot);
+    REQUIRE(encoded_snapshot.value() == encoded_draft.value() &&
+        after_place.undo_count == before_draft.undo_count + 1U);
+    expect_rejected_without_mutation(action, carto::core::ErrorCode::stale_data);
+
+    auto edit_action = action;
+    edit_action.expected_project_revision = after_place.project_revision;
+    edit_action.expected_placement_revision = action.placement.revision;
+    edit_action.placement.revision = action.placement.revision.next();
+    edit_action.placement.width = 0.75;
+    invalid_action = edit_action;
+    invalid_action.expected_placement_revision = carto::core::Revision{};
+    expect_rejected_without_mutation(invalid_action, carto::core::ErrorCode::stale_data);
+    invalid_action = edit_action;
+    invalid_action.expected_placement_revision = edit_action.placement.revision;
+    expect_rejected_without_mutation(invalid_action, carto::core::ErrorCode::stale_data);
+    invalid_action = edit_action;
+    invalid_action.placement.revision = action.placement.revision;
+    expect_rejected_without_mutation(invalid_action, carto::core::ErrorCode::invalid_argument);
+    invalid_action = edit_action;
+    invalid_action.placement.revision = edit_action.placement.revision.next();
+    expect_rejected_without_mutation(invalid_action, carto::core::ErrorCode::invalid_argument);
+
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::UndoAction{}));
+    REQUIRE(session.snapshot().decal_placements.empty());
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::RedoAction{}));
+    REQUIRE(session.snapshot().decal_placements.size() == 1U);
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SaveProjectAction{project_path}));
+    const auto reopened = carto::project::ProjectDocument::load(project_path);
+    REQUIRE(reopened);
+    const auto persisted = carto::production::load_decal_placement(
+        reopened.value(), draft.value().id);
+    REQUIRE(persisted);
+    const auto encoded_persisted = carto::production::serialize_decal_placement(
+        persisted.value());
+    REQUIRE(encoded_persisted && encoded_persisted.value() == encoded_draft.value());
+
+    const auto entries = journal.read_all();
+    REQUIRE(entries);
+    const auto decal_events = std::count_if(entries.value().begin(), entries.value().end(),
+        [](const auto& entry) {
+            const std::string payload(entry.payload.begin(), entry.payload.end());
+            return payload.find("Set Decal Placement") != std::string::npos;
+        });
+    REQUIRE(decal_events == 1);
+}
+
 int main() {
     try {
         application_mesh_geometry_digest_is_canonical_and_revision_independent();
@@ -11258,6 +11592,7 @@ int main() {
         application_authors_material_graphs_through_digest_guarded_history();
         application_assigns_material_regions_through_revisioned_history();
         application_authors_presentation_catalog_through_revisioned_history();
+        application_places_decals_from_a_current_surface_through_human_history();
     } catch (const std::exception& error) {
         return (void(std::cerr << "FAIL " << error.what() << '\n'), 1);
     }

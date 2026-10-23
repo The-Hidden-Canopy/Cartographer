@@ -1782,10 +1782,22 @@ void d3d12_temporal_fp8_matches_e4m3_reference_and_motion_path() {
         0x38U, 0x00U,  // pixel 1 moves one pixel left
     }};
     constexpr std::array<std::uint8_t, 4U> zero_motion_pixels{};
+    constexpr std::array<std::uint8_t, 8U> special_current_pixels{{
+        0x7FU, 0xFFU, 0x7EU, 0xFEU,  // both NaN encodings and finite extrema
+        0x01U, 0x81U, 0x38U, 0xB8U,  // signed subnormals, +1, -1
+    }};
+    constexpr std::array<std::uint8_t, 8U> special_history_pixels{{
+        0x7FU, 0xFFU, 0x38U, 0xB8U,  // NaNs must propagate, finite history
+        0x01U, 0x81U, 0xB8U, 0x38U,  // subnormals and reversed unit values
+    }};
     const auto current = upload_fp8_texture(
         gpu::Format::rgba8_e4m3, current_pixels);
     const auto history = upload_fp8_texture(
         gpu::Format::rgba8_e4m3, history_pixels);
+    const auto special_current = upload_fp8_texture(
+        gpu::Format::rgba8_e4m3, special_current_pixels);
+    const auto special_history = upload_fp8_texture(
+        gpu::Format::rgba8_e4m3, special_history_pixels);
     const auto moving_motion = upload_fp8_texture(
         gpu::Format::rg8_e4m3, moving_pixels);
     const auto zero_motion = upload_fp8_texture(
@@ -1842,7 +1854,9 @@ void d3d12_temporal_fp8_matches_e4m3_reference_and_motion_path() {
     };
     bool resolved_initialized = false;
     bool readback_initialized = false;
-    const auto resolve_and_read = [&](gpu::TextureHandle motion,
+    const auto resolve_and_read = [&](gpu::TextureHandle input_current,
+                                      gpu::TextureHandle input_history,
+                                      gpu::TextureHandle motion,
                                       bool explicitly_zero_motion) {
         TemporalConstants constants;
         constants.history_flags[3U] = explicitly_zero_motion ? 1U : 0U;
@@ -1858,9 +1872,9 @@ void d3d12_temporal_fp8_matches_e4m3_reference_and_motion_path() {
         compute.append(device_ir::CmdBindPipeline{pipeline.value()});
         compute.append(device_ir::CmdBindResources{{
             device_ir::ResourceBinding{
-                0U, 0U, device_ir::ResourceHandle{current}, std::nullopt},
+                0U, 0U, device_ir::ResourceHandle{input_current}, std::nullopt},
             device_ir::ResourceBinding{
-                0U, 1U, device_ir::ResourceHandle{history}, std::nullopt},
+                0U, 1U, device_ir::ResourceHandle{input_history}, std::nullopt},
             device_ir::ResourceBinding{
                 0U, 2U, device_ir::ResourceHandle{motion}, std::nullopt},
             device_ir::ResourceBinding{
@@ -1900,7 +1914,8 @@ void d3d12_temporal_fp8_matches_e4m3_reference_and_motion_path() {
         return device.read_buffer(readback.value(), 0U, 8U);
     };
 
-    const auto dynamic_result = resolve_and_read(moving_motion, false);
+    const auto dynamic_result = resolve_and_read(
+        current, history, moving_motion, false);
     REQUIRE(dynamic_result && dynamic_result.value().size() == 8U);
     constexpr std::array<std::uint8_t, 8U> expected_dynamic{{
         0x3CU, 0x3CU, 0x3CU, 0x38U,  // 1.5 RGB, current alpha 1.0
@@ -1910,7 +1925,8 @@ void d3d12_temporal_fp8_matches_e4m3_reference_and_motion_path() {
         expected_dynamic.begin(), expected_dynamic.end(),
         dynamic_result.value().begin()));
 
-    const auto static_result = resolve_and_read(zero_motion, true);
+    const auto static_result = resolve_and_read(
+        current, history, zero_motion, true);
     REQUIRE(static_result && static_result.value().size() == 8U);
     constexpr std::array<std::uint8_t, 8U> expected_static{{
         0x3CU, 0x3CU, 0x3CU, 0x38U,  // 1.5 RGB, current alpha 1.0
@@ -1920,11 +1936,35 @@ void d3d12_temporal_fp8_matches_e4m3_reference_and_motion_path() {
         expected_static.begin(), expected_static.end(),
         static_result.value().begin()));
 
+    const auto special_dynamic_result = resolve_and_read(
+        special_current, special_history, moving_motion, false);
+    REQUIRE(special_dynamic_result && special_dynamic_result.value().size() == 8U);
+    constexpr std::array<std::uint8_t, 8U> expected_special_dynamic{{
+        0x7FU, 0x7FU, 0x76U, 0xFEU,  // NaNs propagate; (448 + 1) / 2 rounds to 224
+        0x7FU, 0x7FU, 0x38U, 0xB8U,  // motion selects the NaN-bearing history pixel
+    }};
+    REQUIRE(std::equal(
+        expected_special_dynamic.begin(), expected_special_dynamic.end(),
+        special_dynamic_result.value().begin()));
+
+    const auto special_static_result = resolve_and_read(
+        special_current, special_history, zero_motion, true);
+    REQUIRE(special_static_result && special_static_result.value().size() == 8U);
+    constexpr std::array<std::uint8_t, 8U> expected_special_static{{
+        0x7FU, 0x7FU, 0x76U, 0xFEU,
+        0x01U, 0x81U, 0x00U, 0xB8U,
+    }};
+    REQUIRE(std::equal(
+        expected_special_static.begin(), expected_special_static.end(),
+        special_static_result.value().begin()));
+
     REQUIRE(device.debug_receipts().empty());
     REQUIRE(device.destroy_buffer(readback.value()));
     REQUIRE(device.destroy_texture(resolved.value()));
     REQUIRE(device.destroy_texture(zero_motion));
     REQUIRE(device.destroy_texture(moving_motion));
+    REQUIRE(device.destroy_texture(special_history));
+    REQUIRE(device.destroy_texture(special_current));
     REQUIRE(device.destroy_texture(history));
     REQUIRE(device.destroy_texture(current));
     REQUIRE(device.destroy_pipeline(pipeline.value()));

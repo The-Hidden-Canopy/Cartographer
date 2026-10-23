@@ -6,6 +6,13 @@ identity/revision binding, invalid/future/trailing input, explicit frame
 singularity, convexity and self-intersection rejection, tangent-discontinuous
 joints, and endpoint taper.
 
+`cartographer_sweep_endpoint_tests` covers source-revision and port-identity
+binding, source/port digest evidence, generic utility-tag and capability
+compatibility, repeatable evidence serialization, and fail-closed stale,
+conflicting, incompatible, malformed, and duplicate endpoint/port inputs. The
+check is read-only and does not establish spatial frame alignment or persist a
+connection graph.
+
 Synthetic geometry fixtures exercise a pipe, a four-part railing, and a tapered
 branch using Cartographer-native `SweepSource` records. They are algorithm
 fixtures, not production CONDITION model-library imports and not a donor-parity
