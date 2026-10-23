@@ -1,0 +1,6 @@
+Dear ImGui v1.93.1 WIP docking branch
+Upstream repository: https://github.com/ocornut/imgui
+Upstream branch: docking
+Upstream commit: d88f238d1d363ef387382b2e29ad12cf96f826ac
+License: MIT (see LICENSE.txt)
+Reason: the desktop workbench requires docking and native multi-viewport tear-off windows.

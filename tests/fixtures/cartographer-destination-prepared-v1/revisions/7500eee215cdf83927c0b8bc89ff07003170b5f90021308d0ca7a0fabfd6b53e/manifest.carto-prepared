@@ -1,0 +1,26 @@
+CARTOGRAPHER_PREPARED_SCENE 1
+SOURCE "cartographer:compatibility-fixture" 7 ba2dfd4354a7c699f0e99432eb6c2cdee6fb17b7c10565b8bba6e17a226b5ab5
+PROFILE "cartographer.portable-prepared-scene.v1" ba1cc9e9ffce5e319ed84461753dd919e57631f0a440a5bb5c06b6cb9f74d910
+COORDINATES 0.01 0 2 1
+PRODUCTS 2
+PRODUCT "mesh.10.render" 0 2 a625bd38f00bcacdbff37181d4acadd1f5e6d532085b52547ad2465c2c89eff6 "products/mesh-10.render-mesh-v2.bin"
+PRODUCT "source.material-catalog" 3 1 72476966c8781e5aa7b5be5cb671ed1ed358ee81d3ea64ac98ff34c6238ad56d "products/material-catalog-v1.txt"
+ASSETS 1
+ASSET 10 "Fixture mesh" "mesh.10.render" "" 231 2 7 8
+NODES 1
+NODE 20 0 10 1 "Fixture root" 1 2 3 0 0 0 1 1 1 1
+MATERIAL_BINDINGS 2
+MATERIAL_BINDING 10 7 300 77
+MATERIAL_BINDING 10 8 301 0
+DEPENDENCIES 2
+DEPENDENCY "mesh.10.render" 1 1 7 a625bd38f00bcacdbff37181d4acadd1f5e6d532085b52547ad2465c2c89eff6 "products/mesh-10.render-mesh-v2.bin"
+DEPENDENCY "source.material-catalog" 1 1 7 72476966c8781e5aa7b5be5cb671ed1ed358ee81d3ea64ac98ff34c6238ad56d "products/material-catalog-v1.txt"
+CAPABILITIES 1
+CAPABILITY "scene.hierarchy" 0 0 "source hierarchy retained"
+CORRESPONDENCES 4
+CORRESPONDENCE 0 10 0 0 10 0
+CORRESPONDENCE 1 20 0 1 20 0
+CORRESPONDENCE 2 10 7 2 10 7
+CORRESPONDENCE 2 10 8 2 10 8
+EXTENSION_BINDINGS 0
+END

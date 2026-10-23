@@ -1,0 +1,453 @@
+#include <carto/editor/viewport_interaction.hpp>
+
+#include <cmath>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <stdexcept>
+#include <vector>
+
+namespace {
+
+class TestFailure final : public std::runtime_error {
+public:
+    explicit TestFailure(const char* message) : std::runtime_error(message) {}
+};
+
+#define REQUIRE(condition) \
+    do { \
+        if (!(condition)) throw TestFailure(#condition); \
+    } while (false)
+
+carto::editor::ViewportHit object_hit(
+    std::uint64_t object,
+    double x,
+    double y,
+    double depth,
+    carto::core::Revision revision) {
+    carto::editor::ViewportHit hit;
+    hit.object = carto::scene::ObjectId{object};
+    hit.screen_position = {x, y};
+    hit.world_position = {x, y, depth};
+    hit.depth = depth;
+    hit.source_revision = revision;
+    return hit;
+}
+
+carto::editor::ViewportHit vertex_hit(
+    std::uint64_t object,
+    std::uint64_t vertex,
+    double x,
+    double y,
+    double depth,
+    carto::core::Revision revision) {
+    auto hit = object_hit(object, x, y, depth, revision);
+    hit.vertex = carto::geometry::VertexId{vertex};
+    return hit;
+}
+
+void hit_validation_rejects_ambiguous_or_unbounded_identity() {
+    using namespace carto;
+    auto hit = object_hit(1U, 10.0, 10.0, 1.0, core::Revision{4U});
+    REQUIRE(hit.validate());
+
+    hit.vertex = geometry::VertexId{2U};
+    hit.edge = geometry::EdgeId{3U};
+    REQUIRE(!hit.validate());
+
+    hit.edge = {};
+    hit.depth = std::numeric_limits<double>::quiet_NaN();
+    REQUIRE(!hit.validate());
+
+    hit.depth = 1.0;
+    hit.world_normal = {};
+    REQUIRE(!hit.validate());
+}
+
+void cpu_pick_is_revision_bound_and_deterministic() {
+    using namespace carto;
+    const core::Revision revision{4U};
+    auto near = object_hit(2U, 20.0, 10.0, 0.25, revision);
+    auto far = object_hit(1U, 20.0, 10.0, 0.75, revision);
+    auto stale = object_hit(3U, 20.0, 10.0, 0.01, core::Revision{3U});
+    stale.front_facing = false;
+    const std::vector<editor::ViewportHit> hits{far, stale, near};
+
+    const auto picked = editor::pick_viewport_hit(hits, revision);
+    REQUIRE(picked && picked.value().has_value());
+    REQUIRE(picked.value()->object == scene::ObjectId{2U});
+
+    editor::ViewportPickSettings include_backfaces;
+    include_backfaces.include_backfaces = true;
+    const auto backface_only = editor::pick_viewport_hit(
+        {stale}, revision, include_backfaces);
+    REQUIRE(backface_only && !backface_only.value().has_value());
+
+    const auto stale_only = editor::pick_viewport_hit(
+        {stale}, core::Revision{3U}, include_backfaces);
+    REQUIRE(stale_only && stale_only.value().has_value());
+
+    near.occluded = true;
+    const auto visible_only = editor::pick_viewport_hit({near}, revision);
+    REQUIRE(visible_only && !visible_only.value().has_value());
+    include_backfaces.select_through = true;
+    const auto through = editor::pick_viewport_hit({near}, revision, include_backfaces);
+    REQUIRE(through && through.value().has_value());
+
+    include_backfaces.minimum_depth = 2.0;
+    const auto filtered = editor::pick_viewport_hit(hits, revision, include_backfaces);
+    REQUIRE(filtered && !filtered.value().has_value());
+}
+
+void box_selection_deduplicates_objects_and_preserves_components() {
+    using namespace carto;
+    const core::Revision revision{8U};
+    const std::vector<editor::ViewportHit> hits{
+        object_hit(2U, 20.0, 20.0, 0.5, revision),
+        object_hit(1U, 10.0, 10.0, 0.4, revision),
+        object_hit(2U, 21.0, 21.0, 0.3, revision),
+        vertex_hit(1U, 12U, 12.0, 12.0, 0.2, revision),
+        vertex_hit(1U, 13U, 18.0, 18.0, 0.1, revision),
+    };
+    const editor::ViewportSelectionBox box{{5.0, 5.0}, {25.0, 25.0}, false};
+
+    editor::ViewportPickSettings objects;
+    objects.target = editor::ViewportPickTarget::object;
+    const auto selected_objects = editor::select_viewport_box(hits, revision, box, objects);
+    REQUIRE(selected_objects && selected_objects.value().size() == 2U);
+    REQUIRE(selected_objects.value()[0].object == scene::ObjectId{1U});
+    REQUIRE(selected_objects.value()[1].object == scene::ObjectId{2U});
+    REQUIRE(selected_objects.value()[1].depth == 0.3);
+
+    const auto reversed_objects = editor::select_viewport_box(
+        {hits[4], hits[3], hits[2], hits[1], hits[0]}, revision, box, objects);
+    REQUIRE(reversed_objects && reversed_objects.value().size() == 2U);
+    REQUIRE(reversed_objects.value()[0].object == scene::ObjectId{1U});
+    REQUIRE(reversed_objects.value()[1].object == scene::ObjectId{2U});
+    REQUIRE(reversed_objects.value()[1].depth == 0.3);
+
+    editor::ViewportPickSettings components;
+    components.target = editor::ViewportPickTarget::component;
+    const auto selected_components = editor::select_viewport_box(
+        hits, revision, box, components);
+    REQUIRE(selected_components && selected_components.value().size() == 2U);
+    REQUIRE(selected_components.value()[0].vertex == geometry::VertexId{12U});
+    REQUIRE(selected_components.value()[1].vertex == geometry::VertexId{13U});
+
+    const auto reversed_components = editor::select_viewport_box(
+        {hits[4], hits[3], hits[2], hits[1], hits[0]}, revision, box, components);
+    REQUIRE(reversed_components && reversed_components.value().size() == 2U);
+    REQUIRE(reversed_components.value()[0].vertex == geometry::VertexId{12U});
+    REQUIRE(reversed_components.value()[1].vertex == geometry::VertexId{13U});
+
+    auto invalid_box = box;
+    invalid_box.first.x = std::numeric_limits<double>::infinity();
+    REQUIRE(!editor::select_viewport_box(hits, revision, invalid_box, objects));
+}
+
+void interaction_session_captures_cancels_and_rejects_revision_changes() {
+    using namespace carto;
+    editor::ViewportInteractionSession session;
+    const editor::ViewportPointerSample start{{10.0, 20.0}, 0U, true, core::Revision{5U}};
+    const editor::ViewportPointerSample moved{{22.0, 30.0}, 1U, true, core::Revision{5U}};
+    REQUIRE(session.begin(start));
+    REQUIRE(session.phase() == editor::ViewportInteractionPhase::captured);
+    REQUIRE(session.update(moved));
+    REQUIRE(session.phase() == editor::ViewportInteractionPhase::dragging);
+    REQUIRE(session.snapshot().start.screen_position.x == 10.0);
+
+    const auto stale = session.update(
+        {{25.0, 35.0}, 1U, true, core::Revision{6U}});
+    REQUIRE(!stale && stale.error().code == core::ErrorCode::stale_data);
+    REQUIRE(session.active());
+
+    const auto completed = session.complete(moved);
+    REQUIRE(completed && completed.value().phase == editor::ViewportInteractionPhase::completed);
+    REQUIRE(!session.active());
+    REQUIRE(!session.cancel());
+
+    editor::ViewportInteractionSession cancelled;
+    REQUIRE(cancelled.begin(start));
+    REQUIRE(cancelled.cancel());
+    REQUIRE(cancelled.phase() == editor::ViewportInteractionPhase::cancelled);
+}
+
+void drawn_world_bounds_normalize_xz_and_preserve_vertical_limits() {
+    using namespace carto;
+    core::Bounds3d current;
+    current.minimum.y = -2.5;
+    current.maximum.y = 8.0;
+
+    const auto reversed = editor::world_bounds_from_xz_drag(
+        current, {5.0, 9.0}, {-1.0, -2.0});
+    REQUIRE(reversed);
+    REQUIRE(reversed.value().minimum.x == -1.0);
+    REQUIRE(reversed.value().maximum.x == 5.0);
+    REQUIRE(reversed.value().minimum.y == -2.5);
+    REQUIRE(reversed.value().maximum.y == 8.0);
+    REQUIRE(reversed.value().minimum.z == -2.0);
+    REQUIRE(reversed.value().maximum.z == 9.0);
+
+    REQUIRE(!editor::world_bounds_from_xz_drag(
+        current, {1.0, 2.0}, {1.0, 5.0}));
+    REQUIRE(!editor::world_bounds_from_xz_drag(
+        current, {1.0, 2.0}, {5.0, 2.0}));
+    REQUIRE(!editor::world_bounds_from_xz_drag(
+        current, {std::numeric_limits<double>::quiet_NaN(), 2.0}, {5.0, 9.0}));
+    auto invalid_y = current;
+    invalid_y.minimum.y = 9.0;
+    REQUIRE(!editor::world_bounds_from_xz_drag(invalid_y, {0.0, 0.0}, {1.0, 1.0}));
+}
+
+void transform_preview_is_axis_constrained_and_revision_bound() {
+    using namespace carto;
+    editor::ViewportTransformSession session;
+    core::Transform initial;
+    initial.translation = {2.0, 3.0, 4.0};
+    const core::Revision revision{17U};
+    REQUIRE(session.begin(scene::ObjectId{5U}, initial, revision,
+        editor::ViewportTranslateAxis::world_x, {100.0, 80.0}, 50.0));
+    REQUIRE(session.object() == scene::ObjectId{5U});
+    const auto preview = session.preview({125.0, 160.0}, revision);
+    REQUIRE(preview && std::abs(preview.value().translation.x - 2.5) < 1e-12);
+    REQUIRE(preview.value().translation.y == 3.0 && preview.value().translation.z == 4.0);
+
+    const auto stale = session.preview({150.0, 80.0}, core::Revision{18U});
+    REQUIRE(!stale && stale.error().code == core::ErrorCode::stale_data);
+    REQUIRE(session.active());
+    const auto completed = session.complete({150.0, 80.0}, revision);
+    REQUIRE(completed && std::abs(completed.value().translation.x - 3.0) < 1e-12);
+    REQUIRE(!session.active());
+
+    REQUIRE(session.begin(scene::ObjectId{5U}, initial, revision,
+        editor::ViewportTranslateAxis::world_z, {100.0, 80.0}, 50.0));
+    const auto z_preview = session.preview({100.0, 55.0}, revision);
+    REQUIRE(z_preview && std::abs(z_preview.value().translation.z - 4.5) < 1e-12);
+    REQUIRE(z_preview.value().translation.x == 2.0 && z_preview.value().translation.y == 3.0);
+    REQUIRE(session.cancel());
+    REQUIRE(!session.active());
+    REQUIRE(!session.begin({}, initial, revision,
+        editor::ViewportTranslateAxis::world_x, {}, 0.0));
+}
+
+void viewport_transform_snap_policy_is_shared_and_source_bound() {
+    using namespace carto;
+    geometry::EditableMesh mesh;
+    const auto first = mesh.add_vertex({0.0, 0.0, 0.0});
+    const auto second = mesh.add_vertex({1.0, 0.0, 0.0});
+    const auto third = mesh.add_vertex({0.0, 1.0, 1.0});
+    REQUIRE(first && second && third && mesh.add_face({
+        first.value(), second.value(), third.value()}));
+    const auto compiled_result = mesh.compile();
+    REQUIRE(compiled_result);
+    const auto compiled = std::make_shared<const geometry::CompiledMesh>(
+        compiled_result.value());
+    render::RenderScene scene;
+    core::Transform target_transform;
+    target_transform.translation = {1.2, 4.0, 0.0};
+    const scene::ObjectId target_object{31U};
+    REQUIRE(scene.upsert({target_object, compiled, target_transform,
+        compiled->source_revision, 9U}));
+
+    const core::Revision revision{8U};
+    editor::SnapSession snap_session;
+    core::Transform preview;
+    preview.translation = {1.15, 20.0, 0.0};
+    const auto geometry = editor::snap_viewport_transform_preview(
+        preview, editor::ViewportTranslateAxis::world_x, scene, revision,
+        false, true, snap_session, scene::ObjectId{32U});
+    REQUIRE(geometry && geometry.value().candidate.has_value());
+    REQUIRE(geometry.value().candidate->kind == editor::SnapKind::vertex);
+    REQUIRE(geometry.value().candidate->object == target_object);
+    REQUIRE(std::abs(geometry.value().transform.translation.x - 1.2) < 1e-12);
+    REQUIRE(geometry.value().transform.translation.y == 20.0);
+    REQUIRE(geometry.value().transform.translation.z == 0.0);
+    REQUIRE(snap_session.locked());
+
+    const auto precedence = editor::snap_viewport_transform_preview(
+        preview, editor::ViewportTranslateAxis::world_x, scene, revision,
+        true, true, snap_session, scene::ObjectId{32U});
+    REQUIRE(precedence && !precedence.value().candidate.has_value());
+    REQUIRE(std::abs(precedence.value().transform.translation.x - 1.25) < 1e-12);
+    REQUIRE(!snap_session.locked());
+
+    const auto reacquired = editor::snap_viewport_transform_preview(
+        preview, editor::ViewportTranslateAxis::world_x, scene, revision,
+        false, true, snap_session, scene::ObjectId{32U});
+    REQUIRE(reacquired && reacquired.value().candidate.has_value());
+    const auto stale = editor::snap_viewport_transform_preview(
+        preview, editor::ViewportTranslateAxis::world_x, scene, revision.next(),
+        false, true, snap_session, scene::ObjectId{32U});
+    REQUIRE(!stale && stale.error().code == core::ErrorCode::stale_data);
+
+    const auto excluded = editor::snap_viewport_transform_preview(
+        preview, editor::ViewportTranslateAxis::world_x, scene, revision,
+        false, true, snap_session, target_object);
+    REQUIRE(excluded && !excluded.value().candidate.has_value());
+    REQUIRE(!snap_session.locked());
+}
+
+void viewport_world_transform_converts_to_parent_local_without_drift() {
+    using namespace carto;
+    constexpr double kHalfSqrt = 0.7071067811865475244;
+    core::Transform parent;
+    parent.translation = {12.0, -3.0, 7.0};
+    parent.rotation = {0.0, kHalfSqrt, 0.0, kHalfSqrt};
+    parent.scale = {2.0, 0.5, 3.0};
+    core::Transform expected_local;
+    expected_local.translation = {1.5, 4.0, -2.25};
+    expected_local.rotation = {kHalfSqrt, 0.0, 0.0, kHalfSqrt};
+    expected_local.scale = {0.75, 2.0, 0.5};
+    const auto expected_world = parent.combine(expected_local);
+
+    const auto converted = editor::viewport_local_transform_from_world(
+        parent, expected_world);
+    REQUIRE(converted);
+    REQUIRE(std::abs(converted.value().translation.x - expected_local.translation.x) < 1e-12);
+    REQUIRE(std::abs(converted.value().translation.y - expected_local.translation.y) < 1e-12);
+    REQUIRE(std::abs(converted.value().translation.z - expected_local.translation.z) < 1e-12);
+    REQUIRE(std::abs(converted.value().rotation.x - expected_local.rotation.x) < 1e-12);
+    REQUIRE(std::abs(converted.value().rotation.y - expected_local.rotation.y) < 1e-12);
+    REQUIRE(std::abs(converted.value().rotation.z - expected_local.rotation.z) < 1e-12);
+    REQUIRE(std::abs(converted.value().rotation.w - expected_local.rotation.w) < 1e-12);
+    REQUIRE(std::abs(converted.value().scale.x - expected_local.scale.x) < 1e-12);
+    REQUIRE(std::abs(converted.value().scale.y - expected_local.scale.y) < 1e-12);
+    REQUIRE(std::abs(converted.value().scale.z - expected_local.scale.z) < 1e-12);
+
+    auto dragged_world = expected_world;
+    dragged_world.translation.x += 1.25;
+    dragged_world.translation.z -= 0.75;
+    const auto dragged_local = editor::viewport_local_transform_from_world(
+        parent, dragged_world);
+    REQUIRE(dragged_local);
+    const auto round_trip_world = parent.combine(dragged_local.value());
+    REQUIRE(std::abs(round_trip_world.translation.x - dragged_world.translation.x) < 1e-12);
+    REQUIRE(std::abs(round_trip_world.translation.y - dragged_world.translation.y) < 1e-12);
+    REQUIRE(std::abs(round_trip_world.translation.z - dragged_world.translation.z) < 1e-12);
+
+    parent.scale.x = 0.0;
+    REQUIRE(!editor::viewport_local_transform_from_world(parent, expected_world));
+}
+
+void work_surface_camera_fits_projects_and_preserves_zoom_anchor() {
+    using namespace carto;
+    editor::WorkSurfaceCamera camera;
+    const core::Vec2d origin{100.0, 50.0};
+    const core::Vec2d extent{800.0, 400.0};
+    REQUIRE(camera.frame({12.0, -4.0}, {16.0, 8.0}, extent));
+    REQUIRE(camera.valid());
+    REQUIRE(camera.target().x == 12.0 && camera.target().y == -4.0);
+    REQUIRE(std::abs(camera.view_height() - 8.96) < 1e-12);
+
+    const core::Vec2d world{15.0, -2.0};
+    const auto screen = camera.world_to_screen(world, origin, extent);
+    REQUIRE(screen);
+    const auto round_trip = camera.screen_to_world(screen.value(), origin, extent);
+    REQUIRE(round_trip);
+    REQUIRE(std::abs(round_trip.value().x - world.x) < 1e-12);
+    REQUIRE(std::abs(round_trip.value().y - world.y) < 1e-12);
+
+    const core::Vec2d pointer{720.0, 150.0};
+    const auto anchor_before = camera.screen_to_world(pointer, origin, extent);
+    REQUIRE(anchor_before);
+    REQUIRE(camera.zoom_at(3.0, pointer, origin, extent));
+    const auto anchor_after = camera.screen_to_world(pointer, origin, extent);
+    REQUIRE(anchor_after);
+    REQUIRE(std::abs(anchor_after.value().x - anchor_before.value().x) < 1e-12);
+    REQUIRE(std::abs(anchor_after.value().y - anchor_before.value().y) < 1e-12);
+    REQUIRE(camera.view_height() < 8.96);
+
+    const auto target_before_pan = camera.target();
+    const auto landmark_before_pan = camera.world_to_screen(world, origin, extent);
+    REQUIRE(landmark_before_pan);
+    REQUIRE(camera.pan_pixels({20.0, -10.0}, extent.y));
+    REQUIRE(camera.target().x < target_before_pan.x);
+    REQUIRE(camera.target().y < target_before_pan.y);
+    const auto landmark_after_pan = camera.world_to_screen(world, origin, extent);
+    REQUIRE(landmark_after_pan);
+    REQUIRE(std::abs(landmark_after_pan.value().x -
+                     landmark_before_pan.value().x - 20.0) < 1e-12);
+    REQUIRE(std::abs(landmark_after_pan.value().y -
+                     landmark_before_pan.value().y + 10.0) < 1e-12);
+}
+
+void work_surface_camera_rejects_invalid_fit_and_pointer_inputs() {
+    using namespace carto;
+    editor::WorkSurfaceCamera camera;
+    const auto original_target = camera.target();
+    const double original_height = camera.view_height();
+    REQUIRE(!camera.frame({}, {1.0, 1.0}, {0.0, 200.0}));
+    REQUIRE(!camera.frame({}, {1.0, 1.0}, {200.0, 100.0}, 0.5));
+    REQUIRE(!camera.frame({}, {1.0e12, 1.0e12}, {200.0, 100.0}));
+    REQUIRE(camera.target().x == original_target.x &&
+        camera.target().y == original_target.y &&
+        camera.view_height() == original_height);
+    REQUIRE(!camera.pan_pixels({std::numeric_limits<double>::infinity(), 0.0}, 100.0));
+    REQUIRE(!camera.zoom_at(1.0, {500.0, 500.0}, {0.0, 0.0}, {100.0, 100.0}));
+    REQUIRE(!camera.world_to_screen({}, {}, {}));
+    REQUIRE(!camera.screen_to_world({}, {}, {}));
+}
+
+void numeric_transform_modal_is_axis_locked_revision_bound_and_confirmed() {
+    using namespace carto;
+    editor::ViewportNumericTransformSession session;
+    const auto source = core::Transform{
+        .translation = {1.0, 2.0, 3.0},
+        .rotation = core::Quaternion::identity(),
+        .scale = {1.0, 1.0, 1.0},
+    };
+    const core::Revision revision{5U};
+    REQUIRE(session.begin(scene::ObjectId{7U}, source, revision,
+        editor::ViewportNumericAxisLock::world_z));
+    REQUIRE(session.active() && session.object() == scene::ObjectId{7U});
+    const auto preview = session.preview("+=50cm", revision);
+    REQUIRE(preview);
+    REQUIRE(preview.value().translation.x == 1.0);
+    REQUIRE(preview.value().translation.y == 2.0);
+    REQUIRE(std::abs(preview.value().translation.z - 3.5) < 1.0e-12);
+    REQUIRE(session.active());
+    REQUIRE(source.translation.x == 1.0 && source.translation.y == 2.0 &&
+        source.translation.z == 3.0);
+
+    const auto stale = session.preview("2m", revision.next());
+    REQUIRE(!stale && stale.error().code == core::ErrorCode::stale_data);
+    const auto malformed = session.preview("nan", revision);
+    REQUIRE(!malformed);
+    const auto confirmed = session.confirm("4m", revision);
+    REQUIRE(confirmed && confirmed.value().translation.z == 4.0);
+    REQUIRE(!session.active());
+
+    REQUIRE(session.begin(scene::ObjectId{8U}, source, revision,
+        editor::ViewportNumericAxisLock::world_x));
+    REQUIRE(!session.confirm("+=1/0m", revision));
+    REQUIRE(session.active());
+    REQUIRE(session.cancel());
+    REQUIRE(!session.active());
+    REQUIRE(!session.begin(scene::ObjectId{}, source, revision,
+        editor::ViewportNumericAxisLock::world_x));
+    REQUIRE(!session.begin(scene::ObjectId{8U}, source, revision,
+        static_cast<editor::ViewportNumericAxisLock>(99U)));
+}
+
+} // namespace
+
+int main() {
+    try {
+        hit_validation_rejects_ambiguous_or_unbounded_identity();
+        cpu_pick_is_revision_bound_and_deterministic();
+        box_selection_deduplicates_objects_and_preserves_components();
+        interaction_session_captures_cancels_and_rejects_revision_changes();
+        drawn_world_bounds_normalize_xz_and_preserve_vertical_limits();
+        transform_preview_is_axis_constrained_and_revision_bound();
+        viewport_transform_snap_policy_is_shared_and_source_bound();
+        viewport_world_transform_converts_to_parent_local_without_drift();
+        work_surface_camera_fits_projects_and_preserves_zoom_anchor();
+        work_surface_camera_rejects_invalid_fit_and_pointer_inputs();
+        numeric_transform_modal_is_axis_locked_revision_bound_and_confirmed();
+    } catch (const std::exception& error) {
+        std::cerr << "FAIL: " << error.what() << '\n';
+        return 1;
+    }
+    std::cout << "viewport interaction tests passed\n";
+    return 0;
+}

@@ -1,0 +1,12 @@
+format=carto-visual-baseline-v1
+fixture=web-geometry-overlay-clusters
+backend=d3d12
+adapter_name=NVIDIA Quadro P5200
+vendor_id=4318
+device_id=7093
+feature_level=D3D_FEATURE_LEVEL_11_0
+driver_label=d3d12-debug-layer
+dimensions=96x96
+pixel_encoding=rgb8-channel-round-nearest
+max_channel_delta=1
+max_changed_pixels=24

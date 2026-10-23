@@ -1,0 +1,39 @@
+{
+  "schema": 2,
+  "purpose": "Owner-reviewed classification of legacy integration roots retained only in reachable public history.",
+  "entries": [
+    {
+      "root_id": "legacy-01",
+      "commits": [
+        "f606cdc378118d388b7884793462904570d303a5",
+        "46837294a4b7541b74c44fc9625a8a86d28e2a70"
+      ],
+      "disposition": "first_party_removed_from_current_public_tree",
+      "license_basis": "repository_apache_2_0",
+      "owner_reviewed": true,
+      "reviewed_on": "2026-10-04"
+    },
+    {
+      "root_id": "legacy-04",
+      "commits": [
+        "f606cdc378118d388b7884793462904570d303a5",
+        "46837294a4b7541b74c44fc9625a8a86d28e2a70"
+      ],
+      "disposition": "first_party_removed_from_current_public_tree",
+      "license_basis": "repository_apache_2_0",
+      "owner_reviewed": true,
+      "reviewed_on": "2026-10-04"
+    },
+    {
+      "root_id": "legacy-05",
+      "commits": [
+        "f606cdc378118d388b7884793462904570d303a5",
+        "46837294a4b7541b74c44fc9625a8a86d28e2a70"
+      ],
+      "disposition": "first_party_removed_from_current_public_tree",
+      "license_basis": "repository_apache_2_0",
+      "owner_reviewed": true,
+      "reviewed_on": "2026-10-04"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+add_library(carto_render_graph STATIC
+    src/graph.cpp
+)
+
+target_include_directories(carto_render_graph
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+)
+
+target_link_libraries(carto_render_graph PUBLIC carto_core carto_gpu)
+carto_target(carto_render_graph)
+
+install(TARGETS carto_render_graph EXPORT CartographerTargets)
+install(DIRECTORY include/ DESTINATION include)

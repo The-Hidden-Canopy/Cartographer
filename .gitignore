@@ -1,0 +1,133 @@
+# Build output and local tool state
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+/install/
+/dist/
+/coverage/
+/Testing/
+/.cache/
+/tmp/
+
+# GitHub Actions is opt-in for this local/public checkout; do not stage
+# workflow definitions unless CI is intentionally re-enabled.
+/.github/workflows/
+
+# Generated build-system state outside a preset build directory
+*.ninja
+.ninja_deps
+.ninja_log
+.ninja_lock
+CMakeUserPresets.json
+
+# IDE files
+.vs/
+.vscode/
+__pycache__/
+*.pyc
+*.user
+*.suo
+
+# CMake-generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+compile_commands.json
+_deps/
+
+# Platform output
+*.obj
+*.o
+*.a
+*.lib
+*.dll
+*.dylib
+*.so
+*.exe
+
+# Local project files and test artifacts
+*.carto.tmp
+*.carto.tmp-*
+*.carto.journal
+*.carto.lock
+*.journal.lock
+*.log
+.carto-assets/
+
+# Local credentials and environment (never commit workstation secrets)
+.env
+.env.*
+!.env.example
+*.env
+!*.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.der
+*.jks
+*.keystore
+*.secret
+*.credentials
+
+# Private model and weight artifacts are kept behind the moat by default.
+*.gguf
+*.safetensors
+*.onnx
+*.pt
+*.pth
+*.ckpt
+
+# Private hub/API adapters are maintained outside the Cartographer checkout
+/.hub/
+/hub-local/
+
+# Only moat material is permanently private. Keep explicit quarantine paths so
+# models, weights, prompts, telemetry, tuning, and private runtime snapshots
+# cannot be staged accidentally; ordinary public kernels, tests, shaders, and
+# benchmarks remain visible to review.
+/.moat/
+/moat/
+/.private-runtime/
+/private-runtime/
+/models-private/
+/weights-private/
+/prompts-private/
+/telemetry-private/
+/tuning-private/
+
+# Private/uncleared integration material must stay out of the public tree
+# until provenance and licensing are cleared.
+/private/
+/.private/
+/.ctest-tmp/
+/docs/anatomy/
+/docs/spec/
+*.o?h.carto
+*.oaw.carto
+*.private.*
+.codex-remote-attachments/
+imgui.ini
+
+# Protected invention-bearing algorithm surfaces stay outside the public tree.
+/libs/web_geometry/certified/
+/libs/polygon/
+# Botanical generation implementation remains private pending owner release review.
+/libs/botany/
+/tests/botany_tests.cpp
+/tests/native_botany_ui_tests.cpp
+/tests/certified_geometry_tests.cpp
+/tests/polygon_tests.cpp
+/benchmarks/certified_geometry.cpp
+/benchmarks/polygon.cpp
+/docs/architecture/consequence-certified-adaptive-geometry.md
+/docs/verification/consequence-certified-adaptive-geometry.md
+/docs/architecture/persistent-polygons.md
+/docs/verification/persistent-polygons.md
+
+# Local-only work queue; never publish workstation task tracking.
+/docs/CARTOGRAPHER_WORK_QUEUE.local.md
