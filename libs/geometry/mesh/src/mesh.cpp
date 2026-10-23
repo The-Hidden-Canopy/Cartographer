@@ -4851,7 +4851,6 @@ core::Result<TopologyEditReceipt> EditableMesh::merge_by_distance(
     // order, absorbs every later unmerged candidate within the threshold of
     // its own authored position. Clustering is not transitive, so a chain of
     // near points never drifts further than the threshold from its target.
-    const double squared_distance = distance * distance;
     std::map<VertexId, VertexId> replacements;
     for (const VertexId target : ordered) {
         if (replacements.contains(target)) {
@@ -4873,7 +4872,9 @@ core::Result<TopologyEditReceipt> EditableMesh::merge_by_distance(
                         }
                         const core::Vec3d delta =
                             vertices_.at(source).position - target_position;
-                        if (core::dot(delta, delta) <= squared_distance) {
+                        // Squaring finite distances can overflow or underflow
+                        // and admit vertices beyond the requested threshold.
+                        if (std::hypot(delta.x, delta.y, delta.z) <= distance) {
                             replacements.emplace(source, target);
                         }
                     }
@@ -4957,26 +4958,25 @@ core::Result<TopologyEditReceipt> EditableMesh::apply_vertex_merges(
         return core::Result<TopologyEditReceipt>::failure(validation(
             "vertex merge receipt topology snapshot failed validation"));
     }
+    // Index merged source corners once. A face can contain several vertices
+    // that collapse onto the same target; only an unambiguous single source
+    // retains the duplicated-from provenance used below.
+    std::map<std::pair<FaceId, VertexId>, std::vector<std::uint64_t>> merged_corner_sources;
+    for (const auto& corner : before_topology.value().corners) {
+        const auto replacement = replacements.find(corner.vertex);
+        if (replacement != replacements.end()) {
+            merged_corner_sources[{corner.face, replacement->second}].push_back(corner.id.value);
+        }
+    }
     for (const auto& corner : after_topology.value().corners) {
         if (!std::binary_search(
                 receipt.created_corners.begin(), receipt.created_corners.end(), corner.id)) {
             continue;
         }
-        std::vector<std::uint64_t> source_corner_ids;
-        for (const auto& [source, target] : replacements) {
-            if (target != corner.vertex) continue;
-            const auto source_corner = std::find_if(
-                before_topology.value().corners.begin(), before_topology.value().corners.end(),
-                [&](const CornerRecord& candidate) {
-                    return candidate.face == corner.face && candidate.vertex == source;
-                });
-            if (source_corner != before_topology.value().corners.end()) {
-                source_corner_ids.push_back(source_corner->id.value);
-            }
-        }
-        if (source_corner_ids.size() == 1U) {
+        const auto source_corners = merged_corner_sources.find({corner.face, corner.vertex});
+        if (source_corners != merged_corner_sources.end() && source_corners->second.size() == 1U) {
             add_origin(receipt.corner_origins, corner.id,
-                OriginKind::duplicated_from, std::move(source_corner_ids));
+                OriginKind::duplicated_from, source_corners->second);
         }
     }
     if (auto result = receipt.validate(); !result) {

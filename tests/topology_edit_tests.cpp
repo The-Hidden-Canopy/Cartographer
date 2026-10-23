@@ -2222,6 +2222,112 @@ void merge_by_distance_stitches_coincident_seam_in_one_receipt() {
     REQUIRE(decoded.value().merged_vertices == merged.value().merged_vertices);
 }
 
+void merge_by_distance_indexes_exact_corner_origins_for_many_sources() {
+    using namespace carto;
+    constexpr std::size_t triangle_count = 512U;
+    std::vector<geometry::Vertex> vertices;
+    std::vector<geometry::Face> faces;
+    std::vector<geometry::VertexId> candidates;
+    vertices.reserve(triangle_count * 3U);
+    faces.reserve(triangle_count);
+    candidates.reserve(triangle_count);
+    for (std::size_t index = 0U; index < triangle_count; ++index) {
+        const geometry::VertexId apex{index * 3U + 1U};
+        const geometry::VertexId second{index * 3U + 2U};
+        const geometry::VertexId third{index * 3U + 3U};
+        const double extent = static_cast<double>(index + 1U);
+        vertices.push_back({apex, {0.0, 0.0, 0.0}});
+        vertices.push_back({second, {extent, 1.0, 0.0}});
+        vertices.push_back({third, {extent, 0.0, 1.0}});
+        faces.push_back({geometry::FaceId{index + 1U}, {apex, second, third}});
+        candidates.push_back(apex);
+    }
+    geometry::EditableMesh mesh;
+    REQUIRE(mesh.insert_bulk(std::move(vertices), std::move(faces)));
+    REQUIRE(mesh.validate());
+    const auto before_revision = mesh.revision();
+    const auto before_digest = application::canonical_mesh_geometry_digest(mesh);
+    const auto before_topology = mesh.topology();
+    REQUIRE(before_topology);
+    std::map<geometry::FaceId, geometry::CornerId> old_apex_corners;
+    for (const auto& corner : before_topology.value().corners) {
+        if (std::binary_search(candidates.begin(), candidates.end(), corner.vertex)) {
+            old_apex_corners.emplace(corner.face, corner.id);
+        }
+    }
+    REQUIRE(old_apex_corners.size() == triangle_count);
+    auto invalid_candidates = candidates;
+    invalid_candidates.push_back(candidates.front());
+    REQUIRE(!mesh.merge_by_distance(invalid_candidates, 1e-6));
+    REQUIRE(mesh.revision() == before_revision);
+    REQUIRE(application::canonical_mesh_geometry_digest(mesh) == before_digest);
+    const auto unchanged_topology = mesh.topology();
+    REQUIRE(unchanged_topology);
+    REQUIRE(unchanged_topology.value().corners.size() == before_topology.value().corners.size());
+    for (std::size_t index = 0U; index < before_topology.value().corners.size(); ++index) {
+        const auto& before = before_topology.value().corners[index];
+        const auto& unchanged = unchanged_topology.value().corners[index];
+        REQUIRE(unchanged.id == before.id);
+        REQUIRE(unchanged.face == before.face);
+        REQUIRE(unchanged.vertex == before.vertex);
+    }
+
+    auto repeated = mesh;
+    const auto merged = mesh.merge_by_distance(candidates, 1e-6);
+    REQUIRE(merged && merged.value().validate());
+    REQUIRE(mesh.validate());
+    REQUIRE(merged.value().merged_vertices.size() == triangle_count - 1U);
+    REQUIRE(merged.value().created_corners.size() == triangle_count - 1U);
+    REQUIRE(merged.value().corner_origins.size() == triangle_count - 1U);
+    REQUIRE(merged.value().removed_faces.empty());
+    REQUIRE(mesh.face_count() == triangle_count);
+    REQUIRE(mesh.vertex_count() == triangle_count * 2U + 1U);
+    const auto after_topology = mesh.topology();
+    REQUIRE(after_topology);
+    std::size_t checked_origins = 0U;
+    for (const auto& corner : after_topology.value().corners) {
+        if (corner.vertex != candidates.front()) continue;
+        if (corner.face == geometry::FaceId{1U}) {
+            REQUIRE(corner.id == old_apex_corners.at(corner.face));
+            REQUIRE(!merged.value().corner_origins.contains(corner.id));
+            continue;
+        }
+        REQUIRE(std::binary_search(merged.value().created_corners.begin(),
+            merged.value().created_corners.end(), corner.id));
+        const auto& origin = merged.value().corner_origins.at(corner.id);
+        REQUIRE(origin.kind == geometry::OriginKind::duplicated_from);
+        REQUIRE(origin.source_ids == std::vector<std::uint64_t>{old_apex_corners.at(corner.face).value});
+        ++checked_origins;
+    }
+    REQUIRE(checked_origins == triangle_count - 1U);
+    std::reverse(candidates.begin(), candidates.end());
+    const auto replayed = repeated.merge_by_distance(candidates, 1e-6);
+    REQUIRE(replayed);
+    REQUIRE(replayed.value().serialize() == merged.value().serialize());
+    const auto decoded = geometry::TopologyEditReceipt::deserialize(merged.value().serialize());
+    REQUIRE(decoded && decoded.value().serialize() == merged.value().serialize());
+}
+
+void merge_by_distance_does_not_guess_ambiguous_corner_origins() {
+    using namespace carto;
+    geometry::EditableMesh mesh;
+    REQUIRE(mesh.insert_bulk(
+        {{geometry::VertexId{1U}, {0.0, 0.0, 0.0}},
+         {geometry::VertexId{2U}, {0.001, 0.0, 0.0}},
+         {geometry::VertexId{3U}, {0.002, 0.001, 0.0}},
+         {geometry::VertexId{4U}, {1.0, 1.0, 0.0}},
+         {geometry::VertexId{5U}, {-1.0, 1.0, 0.0}}},
+        {{geometry::FaceId{1U}, {geometry::VertexId{2U}, geometry::VertexId{3U},
+            geometry::VertexId{4U}, geometry::VertexId{5U}}}}));
+    const auto merged = mesh.merge_by_distance(
+        {geometry::VertexId{1U}, geometry::VertexId{2U}, geometry::VertexId{3U}}, 0.01);
+    REQUIRE(merged && merged.value().validate());
+    REQUIRE(mesh.validate());
+    REQUIRE(merged.value().merged_vertices.size() == 2U);
+    REQUIRE(merged.value().created_corners.size() == 1U);
+    REQUIRE(!merged.value().corner_origins.contains(merged.value().created_corners.front()));
+}
+
 void merge_by_distance_is_not_transitive() {
     carto::geometry::EditableMesh mesh;
     const auto first = mesh.add_vertex({0.0, 0.0, 0.0});
@@ -2239,6 +2345,43 @@ void merge_by_distance_is_not_transitive() {
     REQUIRE(mesh.find_vertex(third.value()) != nullptr);
     REQUIRE(mesh.find_vertex(first.value())->position.x == 0.0);
     REQUIRE(mesh.validate());
+}
+
+void merge_by_distance_preserves_extreme_finite_distance_boundaries() {
+    for (const double distance : {1e200, 1e-200}) {
+        for (const double separation : {
+                distance * 0.5, distance,
+                std::nextafter(distance, std::numeric_limits<double>::infinity()),
+                distance * 1.9}) {
+            carto::geometry::EditableMesh mesh;
+            const auto target = mesh.add_vertex({0.0, 0.0, 0.0});
+            const auto source = mesh.add_vertex({separation, 0.0, 0.0});
+            REQUIRE(target && source);
+            const auto before_revision = mesh.revision();
+
+            const auto merged = mesh.merge_by_distance(
+                {source.value(), target.value()}, distance);
+            if (separation <= distance) {
+                REQUIRE(merged);
+                REQUIRE(mesh.revision() == before_revision.next());
+                REQUIRE(merged.value().merged_vertices.size() == 1U);
+                REQUIRE(merged.value().merged_vertices.at(source.value()) == target.value());
+                REQUIRE(merged.value().removed_vertices ==
+                        std::vector<carto::geometry::VertexId>{source.value()});
+                REQUIRE(mesh.vertex_count() == 1U);
+                REQUIRE(mesh.find_vertex(source.value()) == nullptr);
+                REQUIRE(merged.value().validate());
+            } else {
+                REQUIRE(!merged);
+                REQUIRE(merged.error().code == carto::core::ErrorCode::invalid_state);
+                REQUIRE(mesh.revision() == before_revision);
+                REQUIRE(mesh.vertex_count() == 2U);
+                REQUIRE(mesh.find_vertex(source.value())->position.x == separation);
+            }
+            REQUIRE(mesh.find_vertex(target.value())->position.x == 0.0);
+            REQUIRE(mesh.validate());
+        }
+    }
 }
 
 void merge_by_distance_rejects_invalid_requests_without_mutation() {
@@ -3668,7 +3811,10 @@ int main() {
         center_weld_moves_target_to_midpoint_and_keeps_target_identity();
         center_weld_rejects_ambiguous_collapse_without_moving_target();
         merge_by_distance_stitches_coincident_seam_in_one_receipt();
+        merge_by_distance_indexes_exact_corner_origins_for_many_sources();
+        merge_by_distance_does_not_guess_ambiguous_corner_origins();
         merge_by_distance_is_not_transitive();
+        merge_by_distance_preserves_extreme_finite_distance_boundaries();
         merge_by_distance_rejects_invalid_requests_without_mutation();
         component_selection_conversion_is_deterministic_and_non_mutating();
         component_selection_expansion_is_deterministic_and_non_mutating();
