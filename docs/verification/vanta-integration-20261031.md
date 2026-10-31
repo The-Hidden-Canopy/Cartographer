@@ -7,9 +7,17 @@ asset/editor/runtime boundary, including prepared-scene and glTF fidelity,
 explicit unsupported diagnostics and their real callers. Existing worktree and
 branch changes are not replaced.
 
-The established global build coordinator still records an active lease. No
-build, test, hardware or foreground acceptance has run under this claim; the
-lease must be released or a scoped grant obtained first. This is not evidence
-of appearance preservation, successful reimport, or release readiness.
+CPU acceptance under this claim ran on 2026-10-31 at Cartographer `82b67a2`:
+`cmake --preset default`, `cmake --build build/default --target
+cartographer_gltf_geometry_parity_tests`, and `ctest --test-dir build/default
+-R cartographer_gltf_geometry_parity_tests --output-on-failure` passed, along
+with the aggregate export suites (`cartographer_tests`,
+`cartographer_uv_material_contract_tests`,
+`cartographer_generated_gltf_import_tests`,
+`cartographer_provider_plugin_tests`,
+`cartographer_gltf_glb_cli_export_tests`). These are headless CPU checks of
+authored geometry preservation, explicit loss refusal, and glTF/GLB payload
+parity. They are not evidence of appearance preservation, GPU or native
+visual acceptance, successful Studio reimport, or release readiness.
 
 No fetch, push, publication or deployment is authorized by this record.
