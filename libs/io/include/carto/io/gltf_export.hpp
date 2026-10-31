@@ -44,8 +44,8 @@ struct GltfExportReport {
 // The CONDITION face-domain `condition.material_region` layer is preserved in
 // mesh extras as stable face/region identity; final material realization remains
 // consumer-owned and is reported explicitly. Authored material catalogs,
-// material slots, multiple/inactive UV sets, and rig/deformation records are
-// refused until this export profile can preserve them.
+// material slots, authored tangent/color layers, multiple/inactive UV sets,
+// and rig/deformation records are refused until this profile can preserve them.
 [[nodiscard]] core::Result<GltfExportReport> export_gltf(
     const project::ProjectDocument& document,
     const std::filesystem::path& path);

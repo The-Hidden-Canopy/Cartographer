@@ -346,6 +346,16 @@ static core::Result<GltfExportReport> export_interchange(
             "glTF export cannot preserve the authored rig or deformation records"));
     }
     for (const auto& [mesh_id, mesh] : document.meshes()) {
+        for (const auto& [id, layer] : mesh.attributes().layers()) {
+            if (id.starts_with("cartographer.tangent.") || id.starts_with("cartographer.tangent_uv.")) {
+                return core::Result<GltfExportReport>::failure(validation(
+                    "glTF export cannot preserve authored tangent frames on mesh " + std::to_string(mesh_id)));
+            }
+            if (layer.descriptor.type == attributes::AttributeType::color4) {
+                return core::Result<GltfExportReport>::failure(validation(
+                    "glTF export cannot preserve authored color layers on mesh " + std::to_string(mesh_id)));
+            }
+        }
         if (mesh.attributes().find("cartographer.material_slot") != nullptr) {
             return core::Result<GltfExportReport>::failure(validation(
                 "glTF export cannot preserve authored material slots on mesh " + std::to_string(mesh_id)));

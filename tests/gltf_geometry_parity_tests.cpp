@@ -451,6 +451,32 @@ int main() {
         check(!slot_export && slot_export.error().message.find("material slots") != std::string::npos &&
                   read(good) == before,
               "authored slot loss is refused without replacing prior glTF");
+        auto tangent_mesh = fixture();
+        auto tangent_attributes = tangent_mesh.attributes();
+        okay(tangent_attributes.add_layer({{"cartographer.tangent.7", attributes::AttributeDomain::corner,
+                                           attributes::AttributeType::vec4},
+                                          std::vector<attributes::AttributeValue>(6, core::Vec4d{1, 0, 0, 1})}));
+        okay(tangent_mesh.set_attribute_payload(std::move(tangent_attributes), tangent_mesh.uv_sets()));
+        auto tangent_root = root / "authored-tangent";
+        std::filesystem::create_directory(tangent_root);
+        const auto tangent_scene = make_scene(tangent_mesh, tangent_root);
+        auto tangent_export = io::export_glb(tangent_scene.doc, good_glb);
+        check(!tangent_export && tangent_export.error().message.find("tangent") != std::string::npos &&
+                  read(good_glb) == glb_before,
+              "authored tangent replacement is refused without replacing prior GLB");
+        auto color_mesh = fixture();
+        auto color_attributes = color_mesh.attributes();
+        okay(color_attributes.add_layer({{"color.corner", attributes::AttributeDomain::corner,
+                                         attributes::AttributeType::color4},
+                                        std::vector<attributes::AttributeValue>(6, core::Vec4d{.2, .4, .6, 1})}));
+        okay(color_mesh.set_attribute_payload(std::move(color_attributes), color_mesh.uv_sets()));
+        auto color_root = root / "authored-color";
+        std::filesystem::create_directory(color_root);
+        const auto color_scene = make_scene(color_mesh, color_root);
+        auto color_export = io::export_gltf(color_scene.doc, good);
+        check(!color_export && color_export.error().message.find("color") != std::string::npos &&
+                  read(good) == before,
+              "authored color loss is refused without replacing prior glTF");
         auto multiple_uv = fixture();
         auto uv_attributes = multiple_uv.attributes();
         auto uv_sets = multiple_uv.uv_sets();
