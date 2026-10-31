@@ -1957,3 +1957,8 @@ foreach(CARTO_TEST_NAME IN LISTS CARTO_REGISTERED_TESTS)
         ENVIRONMENT
             "TMP=${CARTO_TEST_TEMP_DIR};TEMP=${CARTO_TEST_TEMP_DIR};TMPDIR=${CARTO_TEST_TEMP_DIR}")
 endforeach()
+
+add_executable(cartographer_uv_relax_tests uv_relax_tests.cpp)
+target_link_libraries(cartographer_uv_relax_tests PRIVATE carto_production)
+carto_target(cartographer_uv_relax_tests)
+add_test(NAME cartographer_uv_relax_tests COMMAND cartographer_uv_relax_tests)

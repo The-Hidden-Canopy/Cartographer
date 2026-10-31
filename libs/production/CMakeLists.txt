@@ -27,6 +27,7 @@ add_library(carto_production STATIC
     src/sculpt_authoring.cpp
     src/uv_island_pack.cpp
     src/uv_planar_projection.cpp
+    src/uv_relax.cpp
 )
 
 target_include_directories(carto_production
