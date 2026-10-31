@@ -17,6 +17,7 @@
 #include "branding.hpp"
 #include "bake_workflow.hpp"
 #include "carto_studio_dock.hpp"
+#include "interchange_export_feedback.hpp"
 #include "reference_image_decoder.hpp"
 #include "reference_image_projection.hpp"
 #include "studio_browser.hpp"
@@ -7542,12 +7543,10 @@ struct DesktopState {
                         L"Cartographer export failed", MB_OK | MB_ICONERROR);
             return;
         }
-        const std::string message = "Exported " + path->string() + "\\n" +
-            std::to_string(report.value().meshes) + " mesh(es), " +
-            std::to_string(report.value().triangles) + " triangle(s).";
+        const std::string message = carto::desktop::interchange_export_feedback(report.value());
         MessageBoxW(window, wide(message).c_str(),
                     binary_container ? L"Cartographer GLB export" : L"Cartographer glTF export",
-                    MB_OK | MB_ICONINFORMATION);
+                    MB_OK | (report.value().warnings.empty() ? MB_ICONINFORMATION : MB_ICONWARNING));
     }
 
     void prepare_content(const UiSnapshot& snapshot, bool selected_only) {

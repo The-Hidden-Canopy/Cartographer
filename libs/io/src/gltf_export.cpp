@@ -1,7 +1,7 @@
 #include <carto/io/gltf_export.hpp>
 
+#include <carto/production/render_mesh.hpp>
 #include <carto/project/project.hpp>
-#include <carto/render/tangent.hpp>
 
 #include <algorithm>
 #include <array>
@@ -227,10 +227,6 @@ core::Result<std::array<float, 2>> finite_vec2(
     return core::Result<std::array<float, 2>>::success({x.value(), y.value()});
 }
 
-struct UvCornerPayload {
-    std::map<std::pair<std::uint64_t, std::uint64_t>, core::Vec2d> values;
-};
-
 using MaterialRegionPayload = std::vector<std::pair<std::uint64_t, std::uint32_t>>;
 
 core::Result<std::optional<MaterialRegionPayload>> condition_material_regions(
@@ -266,54 +262,16 @@ core::Result<std::optional<MaterialRegionPayload>> condition_material_regions(
     return core::Result<std::optional<MaterialRegionPayload>>::success(std::move(payload));
 }
 
-core::Result<std::optional<UvCornerPayload>> active_render_uv(
-    const geometry::EditableMesh& mesh) {
-    const auto* active = mesh.uv_sets().active_for_render();
-    if (active == nullptr) {
-        return core::Result<std::optional<UvCornerPayload>>::success(std::nullopt);
-    }
-    const auto* layer = mesh.attributes().find(active->layer_id);
-    if (layer == nullptr || layer->descriptor.domain != attributes::AttributeDomain::corner ||
-        layer->descriptor.type != attributes::AttributeType::vec2) {
-        return core::Result<std::optional<UvCornerPayload>>::failure(validation(
-            "active render UV set does not reference a corner-domain vec2 layer"));
-    }
-    const auto topology = mesh.topology();
-    if (!topology) {
-        return core::Result<std::optional<UvCornerPayload>>::failure(topology.error());
-    }
-    if (layer->values.size() != topology.value().corners.size()) {
-        return core::Result<std::optional<UvCornerPayload>>::failure(validation(
-            "active render UV layer cardinality does not match mesh corners"));
-    }
-
-    UvCornerPayload payload;
-    for (std::size_t index = 0U; index < topology.value().corners.size(); ++index) {
-        const auto* value = std::get_if<core::Vec2d>(&layer->values[index]);
-        if (value == nullptr || !value->finite()) {
-            return core::Result<std::optional<UvCornerPayload>>::failure(validation(
-                "active render UV layer contains a non-finite or non-vec2 value"));
-        }
-        const auto key = std::make_pair(
-            topology.value().corners[index].face.value,
-            topology.value().corners[index].vertex.value);
-        if (!payload.values.emplace(key, *value).second) {
-            return core::Result<std::optional<UvCornerPayload>>::failure(validation(
-                "active render UV layer contains duplicate face-corner identity"));
-        }
-    }
-    return core::Result<std::optional<UvCornerPayload>>::success(std::move(payload));
-}
-
 core::Result<void> append_transform_json(
     std::ostringstream& json,
     const core::Transform& transform) {
     const auto translation = finite_vec3(transform.translation, "transform translation");
     const auto scale = finite_vec3(transform.scale, "transform scale");
-    const auto rotation_x = finite_float(transform.rotation.x, "transform rotation");
-    const auto rotation_y = finite_float(transform.rotation.y, "transform rotation");
-    const auto rotation_z = finite_float(transform.rotation.z, "transform rotation");
-    const auto rotation_w = finite_float(transform.rotation.w, "transform rotation");
+    const auto rotation = transform.rotation.normalized();
+    const auto rotation_x = finite_float(rotation.x, "transform rotation");
+    const auto rotation_y = finite_float(rotation.y, "transform rotation");
+    const auto rotation_z = finite_float(rotation.z, "transform rotation");
+    const auto rotation_w = finite_float(rotation.w, "transform rotation");
     if (!translation || !scale || !rotation_x || !rotation_y || !rotation_z || !rotation_w) {
         if (!translation) return core::Result<void>::failure(translation.error());
         if (!scale) return core::Result<void>::failure(scale.error());
@@ -377,6 +335,28 @@ static core::Result<GltfExportReport> export_interchange(
         return core::Result<GltfExportReport>::failure(
             validation("glTF export requires at least one mesh asset"));
     }
+    if (!document.material_catalog().empty()) {
+        return core::Result<GltfExportReport>::failure(validation(
+            "glTF export cannot preserve the authored material catalog or texture sources"));
+    }
+    if (!document.kinematic_graphs().empty() || !document.pose_libraries().empty() ||
+        !document.rig_module_templates().empty() || !document.garment_assets().empty() ||
+        !document.sculpt_stacks().empty()) {
+        return core::Result<GltfExportReport>::failure(validation(
+            "glTF export cannot preserve the authored rig or deformation records"));
+    }
+    for (const auto& [mesh_id, mesh] : document.meshes()) {
+        if (mesh.attributes().find("cartographer.material_slot") != nullptr) {
+            return core::Result<GltfExportReport>::failure(validation(
+                "glTF export cannot preserve authored material slots on mesh " + std::to_string(mesh_id)));
+        }
+        const auto& uv_sets = mesh.uv_sets();
+        if (uv_sets.descriptors().size() > 1U ||
+            (!uv_sets.descriptors().empty() && uv_sets.active_for_render() == nullptr)) {
+            return core::Result<GltfExportReport>::failure(validation(
+                "glTF export cannot preserve all authored UV sets on mesh " + std::to_string(mesh_id)));
+        }
+    }
 
     std::vector<std::uint8_t> buffer;
     std::vector<BufferView> views;
@@ -393,126 +373,74 @@ static core::Result<GltfExportReport> export_interchange(
     bool any_missing_tangent = false;
     bool any_material_regions = false;
 
+    // One enclosing-project identity for the shared viewport/export compiler.
+    const auto canonical = document.serialize();
+    if (canonical.size() > 128U * 1024U * 1024U)
+        return core::Result<GltfExportReport>::failure(
+            validation("glTF export source identity exceeds 128 MiB"));
+    const production::AuthoritativeSource source_identity{
+        "gltf.export", document.revision(),
+        assets::sha256(
+            {reinterpret_cast<const std::uint8_t *>(canonical.data()), canonical.size()})};
     for (const auto& [mesh_id, mesh] : document.meshes()) {
-        auto compiled = mesh.compile();
-        if (!compiled) {
-            return core::Result<GltfExportReport>::failure(
-                compiled.error().with_context("mesh asset " + std::to_string(mesh_id)));
+        const auto *active_uv = mesh.uv_sets().active_for_render();
+        const bool has_uv = active_uv != nullptr;
+        production::RenderMeshCompileOptions options;
+        if (active_uv)
+            options.uv_set = active_uv->id;
+        options.generate_tangents = has_uv;
+        auto artifact = production::compile_render_mesh_artifact(source_identity, mesh, options);
+        if (!artifact && has_uv) {
+            // Preserve the existing explicit missing-tangent fallback only if
+            // geometry, UVs and custom normals themselves validate successfully.
+            options.generate_tangents = false;
+            artifact = production::compile_render_mesh_artifact(source_identity, mesh, options);
+            if (artifact)
+                any_missing_tangent = true;
         }
-        const auto& source = compiled.value();
-        if (source.positions.empty() || source.indices.empty() || source.indices.size() % 3U != 0U) {
+        if (!artifact)
             return core::Result<GltfExportReport>::failure(
-                validation("glTF export requires non-empty triangle meshes"));
-        }
-
-        const auto active_uv = active_render_uv(mesh);
-        if (!active_uv) {
-            return core::Result<GltfExportReport>::failure(
-                active_uv.error().with_context("mesh asset " + std::to_string(mesh_id)));
-        }
+                artifact.error().with_context("mesh asset " + std::to_string(mesh_id)));
+        const auto &source = artifact.value();
         const auto material_regions = condition_material_regions(mesh);
         if (!material_regions) {
             return core::Result<GltfExportReport>::failure(
                 material_regions.error().with_context("mesh asset " + std::to_string(mesh_id)));
         }
-        const bool has_uv = active_uv.value().has_value();
         any_active_uv = any_active_uv || has_uv;
         any_missing_uv = any_missing_uv || !has_uv;
         any_material_regions = any_material_regions || material_regions.value().has_value();
 
-        std::vector<core::Vec3d> render_positions = source.positions;
-        std::vector<core::Vec3d> render_normals = source.normals;
-        std::vector<std::uint32_t> render_indices = source.indices;
+        // Consume the same corner-normal/UV seam splitting and tangent domains
+        // used by the authoring viewport, rather than averaged compiled normals.
+        std::vector<core::Vec3d> render_positions, render_normals;
+        const auto &render_indices = source.indices;
         std::vector<std::array<float, 2>> texcoords;
         std::vector<std::array<float, 4>> tangents;
-        if (has_uv) {
-            const auto& uv_payload = *active_uv.value();
-            render_positions.clear();
-            render_normals.clear();
-            render_indices.clear();
-            texcoords.clear();
-            render_positions.reserve(source.indices.size());
-            render_normals.reserve(source.indices.size());
-            texcoords.reserve(source.indices.size());
-            render_indices.reserve(source.indices.size());
-
-            std::map<std::uint64_t, std::uint32_t> compiled_indices;
-            for (std::size_t index = 0U; index < source.vertex_ids.size(); ++index) {
-                compiled_indices.emplace(source.vertex_ids[index].value,
-                    static_cast<std::uint32_t>(index));
+        render_positions.reserve(source.vertices.size());
+        render_normals.reserve(source.vertices.size());
+        for (const auto &vertex : source.vertices) {
+            render_positions.push_back(vertex.position);
+            render_normals.push_back(vertex.normal);
+            if (vertex.uv) {
+                auto uv = finite_vec2(*vertex.uv, "mesh UV");
+                if (!uv)
+                    return core::Result<GltfExportReport>::failure(uv.error());
+                texcoords.push_back(uv.value());
             }
-            const auto append_corner = [&](std::uint64_t face_id,
-                                           geometry::VertexId vertex_id) -> core::Result<void> {
-                const auto compiled_index = compiled_indices.find(vertex_id.value);
-                if (compiled_index == compiled_indices.end()) {
-                    return core::Result<void>::failure(validation(
-                        "active render UV references a vertex missing from compiled geometry"));
+            if (vertex.tangent) {
+                std::array<float, 4> value{};
+                const auto t = *vertex.tangent;
+                const std::array<double, 4> input{t.x, t.y, t.z, t.w};
+                for (unsigned c = 0; c < 4; ++c) {
+                    auto v = finite_float(input[c], "mesh tangent");
+                    if (!v)
+                        return core::Result<GltfExportReport>::failure(v.error());
+                    value[c] = v.value();
                 }
-                const auto uv = uv_payload.values.find(std::make_pair(face_id, vertex_id.value));
-                if (uv == uv_payload.values.end()) {
-                    return core::Result<void>::failure(validation(
-                        "active render UV is missing a face-corner value"));
-                }
-                const auto narrowed_uv = finite_vec2(uv->second, "mesh UV");
-                if (!narrowed_uv) return core::Result<void>::failure(narrowed_uv.error());
-                const std::uint32_t source_index = compiled_index->second;
-                render_positions.push_back(source.positions[source_index]);
-                render_normals.push_back(source.normals[source_index]);
-                texcoords.push_back(narrowed_uv.value());
-                render_indices.push_back(static_cast<std::uint32_t>(render_indices.size()));
-                return core::Result<void>::success();
-            };
-
-            for (const auto& face : mesh.faces_sorted()) {
-                for (std::size_t index = 1U; index + 1U < face.vertices.size(); ++index) {
-                    if (auto result = append_corner(face.id.value, face.vertices.front()); !result) {
-                        return core::Result<GltfExportReport>::failure(result.error());
-                    }
-                    if (auto result = append_corner(face.id.value, face.vertices[index]); !result) {
-                        return core::Result<GltfExportReport>::failure(result.error());
-                    }
-                    if (auto result = append_corner(face.id.value, face.vertices[index + 1U]); !result) {
-                        return core::Result<GltfExportReport>::failure(result.error());
-                    }
-                }
-            }
-            if (render_indices.size() != source.indices.size() ||
-                texcoords.size() != render_positions.size()) {
-                return core::Result<GltfExportReport>::failure(validation(
-                    "corner-domain UV expansion changed the source triangle count"));
-            }
-
-            std::vector<render::TangentVertex> tangent_input;
-            tangent_input.reserve(render_positions.size());
-            for (std::size_t index = 0U; index < render_positions.size(); ++index) {
-                tangent_input.push_back({
-                    render_positions[index],
-                    render_normals[index],
-                    {static_cast<double>(texcoords[index][0]),
-                     static_cast<double>(texcoords[index][1])},
-                });
-            }
-            const auto generated_tangents = render::generate_tangents(
-                tangent_input, render_indices);
-            if (!generated_tangents) {
-                any_missing_tangent = true;
-            } else {
-                tangents.reserve(generated_tangents.value().size());
-                for (const auto tangent : generated_tangents.value()) {
-                    const auto x = finite_float(tangent.x, "mesh tangent");
-                    const auto y = finite_float(tangent.y, "mesh tangent");
-                    const auto z = finite_float(tangent.z, "mesh tangent");
-                    const auto w = finite_float(tangent.w, "mesh tangent handedness");
-                    if (!x || !y || !z || !w) {
-                        any_missing_tangent = true;
-                        tangents.clear();
-                        break;
-                    }
-                    tangents.push_back({x.value(), y.value(), z.value(), w.value()});
-                }
+                tangents.push_back(value);
             }
         }
-
         std::vector<std::array<float, 3>> positions;
         std::vector<std::array<float, 3>> normals;
         positions.reserve(render_positions.size());
@@ -534,6 +462,24 @@ static core::Result<GltfExportReport> export_interchange(
             for (std::size_t axis = 0U; axis < 3U; ++axis) {
                 minimum[axis] = std::min(minimum[axis], narrowed.value()[axis]);
                 maximum[axis] = std::max(maximum[axis], narrowed.value()[axis]);
+            }
+        }
+        // The consumer evaluates triangle area in float32.  A valid authoring
+        // triangle can collapse when large positions are narrowed; exporting it
+        // would otherwise make the consumer silently drop source geometry.
+        for (std::size_t triangle = 0; triangle < render_indices.size(); triangle += 3U) {
+            const auto &a = positions[render_indices[triangle]];
+            const auto &b = positions[render_indices[triangle + 1U]];
+            const auto &c = positions[render_indices[triangle + 2U]];
+            const float abx = b[0] - a[0], aby = b[1] - a[1], abz = b[2] - a[2];
+            const float acx = c[0] - a[0], acy = c[1] - a[1], acz = c[2] - a[2];
+            const float x = aby * acz - abz * acy;
+            const float y = abz * acx - abx * acz;
+            const float z = abx * acy - aby * acx;
+            const float area_squared = x * x + y * y + z * z;
+            if (!std::isfinite(area_squared) || static_cast<double>(area_squared) * 0.25 <= 1.0e-24) {
+                return core::Result<GltfExportReport>::failure(validation(
+                    "glTF float32 narrowing collapses a triangle or makes its area non-finite"));
             }
         }
         for (const auto normal : render_normals) {
@@ -664,7 +610,8 @@ static core::Result<GltfExportReport> export_interchange(
                 "Some Cartographer meshes have no active render UV set; those meshes use the default material path");
         } else {
             report.warnings.push_back(
-                "Cartographer authoring has no UV, tangent, or material channels; consumers must use their default material path");
+                "Meshes without an active render UV set omit UVs and tangents; visual material "
+                "realization remains consumer-owned");
         }
     }
     if (any_active_uv && any_missing_tangent) {
