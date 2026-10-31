@@ -2494,6 +2494,8 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return pack_uv_islands(value);
             } else if constexpr (std::is_same_v<Action, ProjectUvPlanarAction>) {
                 return project_uv_planar(value);
+            } else if constexpr (std::is_same_v<Action, RelaxUvTrianglesAction>) {
+                return relax_uv_triangles(value);
             } else if constexpr (std::is_same_v<Action, SetUvCoordinateAction>) {
                 return set_uv_coordinate(value);
             } else if constexpr (std::is_same_v<Action, SetUvSeamMarkAction>) {
@@ -10384,6 +10386,77 @@ core::Result<DispatchReceipt> ApplicationSession::pack_uv_islands(
             admission, document_, mesh_asset, action.expected_project_revision,
             action.expected_mesh_revision, std::move(updated_mesh.value())),
         "Pack UV Islands " + digest_operation,
+        AffectedSet{{action.object}, {}, {}, {}, {mesh_asset}});
+}
+
+core::Result<DispatchReceipt> ApplicationSession::relax_uv_triangles(
+    const RelaxUvTrianglesAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "UV relaxation requires the human authoring boundary"));
+    }
+    if (!action.object || action.source_uv_set == 0U || action.output_uv_set == 0U ||
+        action.source_uv_set == action.output_uv_set || action.expected_mesh_revision.value() == 0U) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "UV relaxation requires distinct non-zero source and output set identities"));
+    }
+    if (project_generation_ != action.expected_project_generation ||
+        document_.revision() != action.expected_project_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "UV relaxation belongs to an earlier project generation or revision"));
+    }
+    if (selection_.mode() != editor::SelectionMode::object ||
+        selection_.selected_objects().size() != 1U ||
+        selection_.selected_objects().front() != action.object) {
+        return failure(invalid_state(
+            "UV relaxation requires the exact selected mesh object"));
+    }
+    const auto* object = document_.scene().find(action.object);
+    if (object == nullptr || !object->mesh_asset.has_value()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "UV relaxation target no longer has an authored mesh"));
+    }
+    if (object->locked || !object->visible) {
+        return failure(invalid_state(
+            "hidden or locked scene objects cannot receive relaxed UVs"));
+    }
+    const std::uint64_t mesh_asset = *object->mesh_asset;
+    const auto mesh = document_.meshes().find(mesh_asset);
+    if (mesh == document_.meshes().end() ||
+        mesh->second.revision() != action.expected_mesh_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "UV relaxation source mesh revision is stale"));
+    }
+    if (mesh->second.uv_sets().find(action.source_uv_set) == nullptr) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "UV relaxation source set no longer exists"));
+    }
+    for (const auto& instance : document_.scene().objects_sorted()) {
+        if (instance.mesh_asset == object->mesh_asset && instance.locked) {
+            return failure(invalid_state(
+                "UV relaxation would affect a locked shared-mesh instance"));
+        }
+    }
+
+    const std::string suffix = std::to_string(action.output_uv_set);
+    auto updated_mesh = production::relax_uv_triangles(
+        mesh->second, action.source_uv_set, action.output_uv_set,
+        "Relaxed UV " + suffix, "uv.relax." + suffix, action.iterations, action.strength);
+    if (!updated_mesh) {
+        return failure(updated_mesh.error().with_context("UV relaxation"));
+    }
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectMeshCommand>(
+            admission, document_, mesh_asset, action.expected_project_revision,
+            action.expected_mesh_revision, std::move(updated_mesh.value())),
+        "Relax UV Triangles",
         AffectedSet{{action.object}, {}, {}, {}, {mesh_asset}});
 }
 

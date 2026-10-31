@@ -2453,6 +2453,10 @@ struct DesktopState {
     int uv_pack_density_policy = 0;
     double uv_pack_target_density = 0.0;
     bool uv_pack_allow_quarter_turn = false;
+    carto::attributes::UvSetId uv_relax_source_set_id = 0U;
+    carto::attributes::UvSetId uv_relax_output_set_id = 2U;
+    std::uint32_t uv_relax_iterations = 10U;
+    double uv_relax_strength = 0.5;
     carto::attributes::UvSetId uv_projection_output_set_id = 2U;
     int uv_projection_plane = 0;
     double uv_projection_origin_u = 0.0;
@@ -3754,6 +3758,53 @@ struct DesktopState {
             ImGui::TextDisabled(
                 "Use distinct non-zero set IDs, resolution 16–8192, positive bounded padding, 1–100 tiles, and a valid density policy.");
         }
+    }
+
+    void draw_uv_relax_entry(const UiSnapshot& snapshot) {
+        if (!ImGui::CollapsingHeader("Relax triangular UV charts")) return;
+        ImGui::TextWrapped(
+            "Create a separate UV set through project history. Chart boundaries and seams remain fixed; the source and active render sets stay unchanged.");
+        ImGui::TextDisabled(
+            "Shared mesh assets change for every instance. Unlock all instances before applying; triangles only, with no global overlap guarantee.");
+        ImGui::TextDisabled("Confirm the source UV set when changing object or inspected set.");
+        ImGui::InputScalar("Relax source UV set", ImGuiDataType_U64, &uv_relax_source_set_id);
+        ImGui::InputScalar("Relax output UV set", ImGuiDataType_U64, &uv_relax_output_set_id);
+        ImGui::InputScalar("Relax iterations", ImGuiDataType_U32, &uv_relax_iterations);
+        ImGui::InputDouble("Relax strength", &uv_relax_strength, 0.05, 0.1, "%.3f");
+        const auto selected_mesh = snapshot.selection.mode ==
+                carto::editor::SelectionMode::object && snapshot.selection.objects.size() == 1U
+            ? std::find_if(snapshot.objects.begin(), snapshot.objects.end(), [&snapshot](const auto& object) {
+                return object.object.id == snapshot.selection.objects.front();
+            }) : snapshot.objects.end();
+        const bool selected_source = selected_mesh != snapshot.objects.end() &&
+            selected_mesh->object.mesh_asset.has_value() && selected_mesh->object.visible &&
+            !selected_mesh->object.locked && selected_mesh->mesh_revision.has_value() &&
+            selected_mesh->mesh_revision->value() != 0U;
+        const bool locked_shared_instance = selected_source &&
+            std::any_of(snapshot.objects.begin(), snapshot.objects.end(), [&selected_mesh](const auto& object) {
+                return object.object.mesh_asset == selected_mesh->object.mesh_asset && object.object.locked;
+            });
+        const bool settings_valid = uv_relax_source_set_id != 0U && uv_relax_output_set_id != 0U &&
+            uv_relax_source_set_id != uv_relax_output_set_id && uv_relax_iterations >= 1U &&
+            uv_relax_iterations <= 100U && std::isfinite(uv_relax_strength) &&
+            uv_relax_strength > 0.0 && uv_relax_strength <= 1.0;
+        const bool can_relax = selected_source && !locked_shared_instance && settings_valid;
+        ImGui::BeginDisabled(!can_relax);
+        if (ImGui::Button("Relax to new UV set", ImVec2(-1.0F, 28.0F)) && can_relax) {
+            const auto relaxed = ui.relax_uv_triangles(
+                carto::application::RelaxUvTrianglesAction{
+                    snapshot.project_generation, snapshot.project_revision, *selected_mesh->mesh_revision,
+                    selected_mesh->object.id, uv_relax_source_set_id, uv_relax_output_set_id,
+                    uv_relax_iterations, uv_relax_strength}, snapshot.project_generation);
+            action_feedback_error = !relaxed;
+            action_feedback = relaxed
+                ? "Relaxed UV set entered project history. Save before refreshing the source report."
+                : relaxed.error().message;
+        }
+        ImGui::EndDisabled();
+        if (!selected_source) ImGui::TextDisabled("Select one visible, revision-bound mesh object.");
+        else if (locked_shared_instance) ImGui::TextDisabled("Unlock every instance sharing this mesh before relaxing.");
+        else if (!settings_valid) ImGui::TextDisabled("Use distinct non-zero UV set IDs, 1-100 iterations, and strength above 0 and at most 1.");
     }
 
     void draw_uv_planar_projection_entry(const UiSnapshot& snapshot) {
@@ -5109,6 +5160,10 @@ struct DesktopState {
         }
         draw_uv_island_pack_entry(snapshot);
         draw_uv_planar_projection_entry(snapshot);
+        if (uv_relax_source_set_id == 0U && uv_inspection_set_id != 0U) {
+            uv_relax_source_set_id = uv_inspection_set_id;
+        }
+        draw_uv_relax_entry(snapshot);
         draw_lightmap_uv_entry(snapshot, "the UV workspace");
         end_instrument(carto::ui::WorkbenchInstrument::material, workbench.material);
     }

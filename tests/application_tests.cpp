@@ -13428,6 +13428,256 @@ void application_packs_uv_islands_through_human_revisioned_history() {
     REQUIRE(reopened_mesh.uv_sets().active_for_render()->id == 7U);
 }
 
+void application_relaxes_uv_triangles_through_human_revisioned_history() {
+    using namespace carto;
+    geometry::EditableMesh source;
+    const auto a = source.add_vertex({0.0, 0.0, 0.0});
+    const auto b = source.add_vertex({1.0, 0.0, 0.0});
+    const auto c = source.add_vertex({1.0, 1.0, 0.0});
+    const auto d = source.add_vertex({0.0, 1.0, 0.0});
+    const auto center = source.add_vertex({0.5, 0.5, 0.0});
+    REQUIRE(a && b && c && d && center);
+    REQUIRE(source.add_face({a.value(), b.value(), center.value()}));
+    REQUIRE(source.add_face({b.value(), c.value(), center.value()}));
+    REQUIRE(source.add_face({c.value(), d.value(), center.value()}));
+    REQUIRE(source.add_face({d.value(), a.value(), center.value()}));
+    const auto topology = source.topology();
+    REQUIRE(topology);
+    std::vector<attributes::AttributeValue> uv_values;
+    uv_values.reserve(topology.value().corners.size());
+    for (const auto& corner : topology.value().corners) {
+        const auto* vertex = source.find_vertex(corner.vertex);
+        REQUIRE(vertex != nullptr);
+        uv_values.emplace_back(corner.vertex == center.value()
+            ? core::Vec2d{0.25, 0.4} : core::Vec2d{vertex->position.x, vertex->position.y});
+    }
+    attributes::AttributeSet payload({
+        {attributes::AttributeDomain::corner, topology.value().corners.size()},
+        {attributes::AttributeDomain::edge, topology.value().edges.size()}});
+    REQUIRE(payload.add_layer({
+        {"uv.source.corners", attributes::AttributeDomain::corner,
+            attributes::AttributeType::vec2},
+        std::move(uv_values)}));
+    std::vector<attributes::AttributeValue> seam_flags(topology.value().edges.size(), false);
+    bool marked_boundary = false;
+    for (std::size_t i = 0; i < topology.value().edges.size(); ++i) {
+        const auto& edge = topology.value().edges[i];
+        if (!edge.second_half_edge.has_value()) { seam_flags[i] = true; marked_boundary = true; break; }
+    }
+    REQUIRE(marked_boundary);
+    REQUIRE(payload.add_layer({{attributes::uv_seam_attribute_id(7U),
+        attributes::AttributeDomain::edge, attributes::AttributeType::boolean}, std::move(seam_flags)}));
+    attributes::UvSetTable uv_sets;
+    REQUIRE(uv_sets.add({7U, "Source UV", "uv.source.corners", true, true, false, 1U}));
+    REQUIRE(source.set_attribute_payload(std::move(payload), std::move(uv_sets)));
+
+    application::ApplicationSession session;
+    REQUIRE(application::testing::dispatch(session,
+        application::CreateMeshObjectAction{"UV relax target", source}));
+    auto before = session.snapshot();
+    REQUIRE(before.objects.size() == 1U);
+    const auto object = before.objects.front().object.id;
+    const auto mesh_asset = before.objects.front().object.mesh_asset;
+    REQUIRE(mesh_asset.has_value());
+    REQUIRE(application::testing::dispatch(session,
+        application::SelectObjectAction{object}));
+    before = session.snapshot();
+    const auto source_revision = before.objects.front().mesh_revision;
+    REQUIRE(source_revision.has_value());
+    const application::RelaxUvTrianglesAction action{
+        before.project_generation, before.project_revision, *source_revision, object,
+        7U, 8U, 3U, 0.5};
+
+    const auto unchanged = before;
+    auto stale_generation = action;
+    ++stale_generation.expected_project_generation;
+    const auto generation_refusal = application::testing::dispatch(session, stale_generation);
+    REQUIRE(!generation_refusal);
+    REQUIRE(generation_refusal.error().code == core::ErrorCode::stale_data);
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+
+    auto stale_project = action;
+    stale_project.expected_project_revision = core::Revision{
+        action.expected_project_revision.value() + 1U};
+    const auto project_refusal = application::testing::dispatch(session, stale_project);
+    REQUIRE(!project_refusal);
+    REQUIRE(project_refusal.error().code == core::ErrorCode::stale_data);
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+
+    auto stale_mesh = action;
+    stale_mesh.expected_mesh_revision = core::Revision{source_revision->value() + 1U};
+    const auto mesh_refusal = application::testing::dispatch(session, stale_mesh);
+    REQUIRE(!mesh_refusal);
+    REQUIRE(mesh_refusal.error().code == core::ErrorCode::stale_data);
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+
+    auto wrong_owner = action;
+    wrong_owner.object = scene::ObjectId{999U};
+    const auto owner_refusal = application::testing::dispatch(session, wrong_owner);
+    REQUIRE(!owner_refusal);
+    REQUIRE(owner_refusal.error().code == core::ErrorCode::invalid_state);
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+
+    auto missing_set = action;
+    missing_set.source_uv_set = 99U;
+    const auto set_refusal = application::testing::dispatch(session, missing_set);
+    REQUIRE(!set_refusal);
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+
+    auto duplicate_set = action;
+    duplicate_set.output_uv_set = duplicate_set.source_uv_set;
+    const auto identity_refusal = application::testing::dispatch(session, duplicate_set);
+    REQUIRE(!identity_refusal);
+    REQUIRE(identity_refusal.error().code == core::ErrorCode::invalid_argument);
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+
+    auto bad_iterations = action;
+    bad_iterations.iterations = 0U;
+    REQUIRE(!application::testing::dispatch(session, bad_iterations));
+    auto bad_strength = action;
+    bad_strength.strength = 1.5;
+    REQUIRE(!application::testing::dispatch(session, bad_strength));
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+    REQUIRE(session.snapshot().undo_count == unchanged.undo_count);
+
+    session.active_source_ = application::OperationSource::ai_proposal;
+    const auto ai_refusal = session.relax_uv_triangles(action);
+    session.active_source_ = application::OperationSource::human;
+    REQUIRE(!ai_refusal);
+    REQUIRE(ai_refusal.error().code == core::ErrorCode::unsupported);
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+    REQUIRE(session.snapshot().undo_count == unchanged.undo_count);
+
+    const auto packed = application::testing::dispatch(session, action);
+    REQUIRE(packed && packed.value().document_changed);
+    REQUIRE(packed.value().revision_after == core::Revision{
+        unchanged.project_revision.value() + 1U});
+    REQUIRE(session.snapshot().undo_count == unchanged.undo_count + 1U);
+    const auto& packed_mesh = session.document_.meshes().at(*mesh_asset);
+    const auto* source_set = packed_mesh.uv_sets().find(7U);
+    const auto* packed_set = packed_mesh.uv_sets().find(8U);
+    REQUIRE(source_set != nullptr);
+    REQUIRE(packed_set != nullptr);
+    REQUIRE(packed_set->layer_id == "uv.relax.8");
+    REQUIRE(!packed_set->active_for_editing && !packed_set->active_for_render);
+    REQUIRE(packed_mesh.uv_sets().active_for_editing()->id == 7U);
+    REQUIRE(packed_mesh.uv_sets().active_for_render()->id == 7U);
+    REQUIRE(packed_mesh.attributes().find("uv.source.corners") != nullptr);
+    const auto* output_layer = packed_mesh.attributes().find("uv.relax.8");
+    const auto* input_layer = packed_mesh.attributes().find("uv.source.corners");
+    const auto* output_seams = packed_mesh.attributes().find(attributes::uv_seam_attribute_id(8U));
+    REQUIRE(output_layer && input_layer && output_seams);
+    bool moved_center = false;
+    core::Vec2d expected_center{};
+    for (std::size_t i = 0; i < topology.value().corners.size(); ++i) {
+        if (topology.value().corners[i].vertex == center.value()) {
+            const auto original = std::get<core::Vec2d>(input_layer->values[i]);
+            const auto relaxed = std::get<core::Vec2d>(output_layer->values[i]);
+            REQUIRE(original.x == 0.25 && original.y == 0.4);
+            REQUIRE(relaxed.x > original.x && relaxed.y > original.y);
+            expected_center = relaxed;
+            moved_center = true;
+        }
+    }
+    REQUIRE(moved_center);
+    const auto* source_seams = packed_mesh.attributes().find(attributes::uv_seam_attribute_id(7U));
+    REQUIRE(source_seams && source_seams->values.size() == output_seams->values.size());
+    for (std::size_t i = 0; i < output_seams->values.size(); ++i) {
+        REQUIRE(std::get<bool>(output_seams->values[i]) == std::get<bool>(source_seams->values[i]));
+    }
+
+    REQUIRE(application::testing::dispatch(session, application::UndoAction{}));
+    REQUIRE(session.document_.meshes().at(*mesh_asset).uv_sets().find(8U) == nullptr);
+    REQUIRE(application::testing::dispatch(session, application::RedoAction{}));
+    REQUIRE(session.document_.meshes().at(*mesh_asset).uv_sets().find(8U) != nullptr);
+    const auto* redone_uv = session.document_.meshes().at(*mesh_asset).attributes().find("uv.relax.8");
+    REQUIRE(redone_uv != nullptr);
+    for (std::size_t i = 0; i < topology.value().corners.size(); ++i) {
+        if (topology.value().corners[i].vertex == center.value()) {
+            const auto relaxed = std::get<core::Vec2d>(redone_uv->values[i]);
+            REQUIRE(relaxed.x == expected_center.x && relaxed.y == expected_center.y);
+        }
+    }
+
+    TempDirectory directory;
+    const auto path = directory.path() / "uv-relax.carto";
+    REQUIRE(application::testing::dispatch(session, application::SaveProjectAction{path}));
+    const auto reopened = project::ProjectDocument::load(path);
+    REQUIRE(reopened);
+    const auto reopened_mesh = reopened.value().meshes().at(*mesh_asset);
+    REQUIRE(reopened_mesh.uv_sets().find(7U) != nullptr);
+    REQUIRE(reopened_mesh.uv_sets().find(8U) != nullptr);
+    REQUIRE(reopened_mesh.uv_sets().active_for_render()->id == 7U);
+    const auto* reopened_uv = reopened_mesh.attributes().find("uv.relax.8");
+    REQUIRE(reopened_uv != nullptr);
+    for (std::size_t i = 0; i < topology.value().corners.size(); ++i) {
+        if (topology.value().corners[i].vertex == center.value()) {
+            const auto relaxed = std::get<core::Vec2d>(reopened_uv->values[i]);
+            REQUIRE(relaxed.x == expected_center.x && relaxed.y == expected_center.y);
+        }
+    }
+    const auto* reopened_seams = reopened_mesh.attributes().find(attributes::uv_seam_attribute_id(8U));
+    const auto* reopened_source_seams = reopened_mesh.attributes().find(attributes::uv_seam_attribute_id(7U));
+    REQUIRE(reopened_seams && reopened_source_seams && reopened_seams->values.size() == reopened_source_seams->values.size());
+    for (std::size_t i = 0; i < reopened_seams->values.size(); ++i) {
+        REQUIRE(std::get<bool>(reopened_seams->values[i]) == std::get<bool>(reopened_source_seams->values[i]));
+    }
+
+    // A shared locked instance must block the operation even if the selected object is unlocked.
+    application::ApplicationSession locked_session;
+    REQUIRE(application::testing::dispatch(locked_session,
+        application::CreateMeshObjectAction{"UV shared source", source}));
+    const auto locked_initial = locked_session.snapshot();
+    const auto selected = locked_initial.objects.front().object;
+    REQUIRE(selected.mesh_asset.has_value());
+    REQUIRE(locked_session.document_.insert_object(scene::SceneObject{
+        scene::ObjectId{999U}, "Locked shared instance", core::Transform::identity(),
+        std::nullopt, selected.mesh_asset, true, true}));
+    REQUIRE(application::testing::dispatch(locked_session,
+        application::SelectObjectAction{selected.id}));
+    const auto locked_before = locked_session.snapshot();
+    const auto locked_revision = locked_session.document_.meshes().at(*selected.mesh_asset).revision();
+    const application::RelaxUvTrianglesAction locked_action{
+        locked_before.project_generation, locked_before.project_revision, locked_revision,
+        selected.id, 7U, 8U, 3U, 0.5};
+    const auto locked_refusal = application::testing::dispatch(locked_session, locked_action);
+    REQUIRE(!locked_refusal && locked_refusal.error().code == core::ErrorCode::invalid_state);
+    REQUIRE(locked_refusal.error().message.find("locked shared-mesh instance") != std::string::npos);
+    REQUIRE(locked_session.snapshot().project_revision == locked_before.project_revision);
+    REQUIRE(locked_session.snapshot().undo_count == locked_before.undo_count);
+    REQUIRE(locked_session.document_.meshes().at(*selected.mesh_asset).uv_sets().find(8U) == nullptr);
+
+    // A concave UV chart whose averaged center would flip is rejected before history changes.
+    auto concave = source;
+    auto concave_payload = concave.attributes();
+    REQUIRE(concave_payload.remove_layer("uv.source.corners"));
+    std::vector<attributes::AttributeValue> concave_values;
+    for (const auto& corner : topology.value().corners) {
+        if (corner.vertex == a.value()) concave_values.emplace_back(core::Vec2d{0.0, 0.0});
+        else if (corner.vertex == b.value()) concave_values.emplace_back(core::Vec2d{2.0, 0.0});
+        else if (corner.vertex == c.value()) concave_values.emplace_back(core::Vec2d{0.2, 0.2});
+        else if (corner.vertex == d.value()) concave_values.emplace_back(core::Vec2d{0.0, 2.0});
+        else concave_values.emplace_back(core::Vec2d{0.1, 0.1});
+    }
+    REQUIRE(concave_payload.add_layer({{"uv.source.corners", attributes::AttributeDomain::corner,
+        attributes::AttributeType::vec2}, std::move(concave_values)}));
+    REQUIRE(concave.set_attribute_payload(std::move(concave_payload), concave.uv_sets()));
+    application::ApplicationSession concave_session;
+    REQUIRE(application::testing::dispatch(concave_session,
+        application::CreateMeshObjectAction{"Concave UV", concave}));
+    auto concave_snapshot = concave_session.snapshot();
+    const auto concave_object = concave_snapshot.objects.front().object.id;
+    REQUIRE(application::testing::dispatch(concave_session,
+        application::SelectObjectAction{concave_object}));
+    concave_snapshot = concave_session.snapshot();
+    const application::RelaxUvTrianglesAction flip_action{
+        concave_snapshot.project_generation, concave_snapshot.project_revision,
+        *concave_snapshot.objects.front().mesh_revision, concave_object, 7U, 8U, 1U, 1.0};
+    REQUIRE(!application::testing::dispatch(concave_session, flip_action));
+    REQUIRE(concave_session.snapshot().project_revision == concave_snapshot.project_revision);
+    REQUIRE(concave_session.snapshot().undo_count == concave_snapshot.undo_count);
+}
+
 void application_projects_planar_uvs_through_human_revisioned_history() {
     using namespace carto;
     geometry::EditableMesh source;
@@ -13782,6 +14032,7 @@ int main() {
         application_authors_presentation_catalog_through_revisioned_history();
         application_packs_uv_islands_through_human_revisioned_history();
         application_projects_planar_uvs_through_human_revisioned_history();
+        application_relaxes_uv_triangles_through_human_revisioned_history();
         application_places_decals_from_a_current_surface_through_human_history();
         application_rejects_decal_replay_after_same_revision_project_replacement();
     } catch (const std::exception& error) {

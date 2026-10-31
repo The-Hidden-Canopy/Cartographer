@@ -1278,6 +1278,9 @@ public:
     [[nodiscard]] core::Result<application::DispatchReceipt> pack_uv_islands(
         const application::PackUvIslandsAction& action,
         std::uint64_t expected_project_generation);
+    [[nodiscard]] core::Result<application::DispatchReceipt> relax_uv_triangles(
+        const application::RelaxUvTrianglesAction& action,
+        std::uint64_t expected_project_generation);
     [[nodiscard]] core::Result<application::DispatchReceipt> project_uv_planar(
         const application::ProjectUvPlanarAction& action,
         std::uint64_t expected_project_generation);

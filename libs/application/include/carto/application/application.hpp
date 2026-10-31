@@ -30,6 +30,7 @@
 #include <carto/production/sculpt_stack.hpp>
 #include <carto/production/uv_island_pack.hpp>
 #include <carto/production/uv_planar_projection.hpp>
+#include <carto/production/uv_relax.hpp>
 #include <carto/render/render_scene.hpp>
 #include <carto/terrain/terrain_tile.hpp>
 
@@ -1572,6 +1573,17 @@ struct PackUvIslandsAction {
     bool allow_quarter_turn_rotation = false;
 };
 
+struct RelaxUvTrianglesAction {
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    core::Revision expected_mesh_revision;
+    scene::ObjectId object;
+    attributes::UvSetId source_uv_set = 0U;
+    attributes::UvSetId output_uv_set = 0U;
+    std::uint32_t iterations = 10U;
+    double strength = 0.5;
+};
+
 struct ProjectUvPlanarAction {
     std::uint64_t expected_project_generation = 0U;
     core::Revision expected_project_revision;
@@ -1811,6 +1823,7 @@ using ApplicationAction = std::variant<
     GenerateUniqueLightmapUvAction,
     PackUvIslandsAction,
     ProjectUvPlanarAction,
+    RelaxUvTrianglesAction,
     SetUvCoordinateAction,
     SetUvSeamMarkAction,
     AlignUvSeamAction,
@@ -2227,6 +2240,8 @@ private:
         const GenerateUniqueLightmapUvAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> pack_uv_islands(
         const PackUvIslandsAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> relax_uv_triangles(
+        const RelaxUvTrianglesAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> project_uv_planar(
         const ProjectUvPlanarAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> set_uv_coordinate(
