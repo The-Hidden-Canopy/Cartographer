@@ -8,6 +8,7 @@
 #include <carto/project/project.hpp>
 #include <carto/project/transaction.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -277,9 +278,146 @@ void catalog_round_trips_and_resolves_variants_deterministically() {
             stale_reopened.value().material_graphs().at("materials/workshop/paint")
                 .revision != pinned_binding.source_revision,
         "stale graph binding preserves its original pinned evidence across save and reopen");
+
+    auto input_catalog = catalog;
+    auto parameter_graph = input_catalog.material_graphs().at("materials/workshop/paint");
+    auto alpha_input = std::find_if(parameter_graph.nodes.begin(), parameter_graph.nodes.end(),
+        [](const auto& node) { return node.id == 4U; });
+    require(alpha_input != parameter_graph.nodes.end(),
+        "graph fixture has its reachable alpha node");
+    alpha_input->kind = project::MaterialGraphNodeKind::parameter_scalar;
+    alpha_input->constants = {};
+    alpha_input->parameter_name = "opacity";
+    auto surface_input_node = std::find_if(
+        parameter_graph.nodes.begin(), parameter_graph.nodes.end(),
+        [](const auto& node) { return node.id == 5U; });
+    require(surface_input_node != parameter_graph.nodes.end(),
+        "graph fixture has its reachable roughness node");
+    surface_input_node->kind = project::MaterialGraphNodeKind::surface_input;
+    surface_input_node->surface_input = project::MaterialSurfaceInput::authored_mask;
+    surface_input_node->constants = {};
+    parameter_graph.revision = parameter_graph.revision.next();
+    require(static_cast<bool>(input_catalog.replace_material_graph(parameter_graph)) &&
+            static_cast<bool>(input_catalog.bind_material_graph(71U, parameter_graph.identity)),
+        "parameter graph can be explicitly bound before saving its values");
+    project::MaterialGraphEvaluationInputs saved_inputs;
+    project::MaterialGraphValue opacity;
+    opacity.type = project::MaterialGraphValueType::scalar;
+    opacity.components[0] = 0.73;
+    saved_inputs.parameters.emplace("opacity", opacity);
+    saved_inputs.surface_inputs.emplace(
+        project::MaterialSurfaceInput::authored_mask, opacity);
+    const auto parameter_digest = parameter_graph.canonical_digest();
+    require(static_cast<bool>(parameter_digest),
+        "parameterized graph source has an exact digest");
+    auto foreign_inputs = saved_inputs;
+    foreign_inputs.parameters.emplace("unreachable", opacity);
+    require(!input_catalog.set_material_graph_inputs(71U, parameter_graph.identity,
+                parameter_graph.revision, parameter_digest.value(), foreign_inputs) &&
+            input_catalog.material_graph_bindings().at(71U).inputs.parameters.empty(),
+        "unreachable persistent input values fail without mutating the binding");
+    require(static_cast<bool>(input_catalog.set_material_graph_inputs(71U,
+                parameter_graph.identity, parameter_graph.revision,
+                parameter_digest.value(), saved_inputs)),
+        "typed reachable graph input can be persisted against its exact source");
+    const auto input_reopened = project::MaterialCatalog::deserialize(
+        input_catalog.serialize());
+    require(input_reopened &&
+            input_reopened.value().material_graph_bindings().at(71U).inputs == saved_inputs,
+        "typed parameter and surface inputs survive catalog save and reopen");
+    auto different_graph_catalog = input_catalog;
+    auto different_graph = parameter_graph;
+    different_graph.identity = "materials/workshop/alternate-paint";
+    different_graph.revision = core::Revision{1U};
+    require(static_cast<bool>(different_graph_catalog.insert_material_graph(different_graph)) &&
+            static_cast<bool>(different_graph_catalog.bind_material_graph(
+                71U, different_graph.identity)) &&
+            different_graph_catalog.material_graph_bindings().at(71U).inputs.parameters.empty() &&
+            different_graph_catalog.material_graph_bindings().at(71U).inputs.surface_inputs.empty(),
+        "binding a different graph does not carry values across by matching input names");
+    auto stale_input_catalog = input_catalog;
+    auto changed_parameter_graph = stale_input_catalog.material_graphs().at(
+        parameter_graph.identity);
+    changed_parameter_graph.revision = changed_parameter_graph.revision.next();
+    const auto changed_input_graph_node = std::find_if(
+        changed_parameter_graph.nodes.begin(), changed_parameter_graph.nodes.end(),
+        [](const auto& node) { return node.id == 1U; });
+    require(changed_input_graph_node != changed_parameter_graph.nodes.end(),
+        "parameter graph has a constant node for its source revision edit");
+    changed_input_graph_node->constants[0U] += 0.01;
+    require(static_cast<bool>(stale_input_catalog.replace_material_graph(
+                changed_parameter_graph)),
+        "graph source can advance while the saved input binding remains pinned");
+    const auto stale_input_reopened = project::MaterialCatalog::deserialize(
+        stale_input_catalog.serialize());
+    require(stale_input_reopened &&
+            stale_input_reopened.value().material_graph_bindings().at(71U).inputs ==
+                saved_inputs &&
+            stale_input_reopened.value().material_graph_bindings().at(71U).source_revision ==
+                parameter_graph.revision,
+        "stale binding values retain their old source evidence across save and reopen");
+    require(static_cast<bool>(stale_input_catalog.bind_material_graph(
+                71U, parameter_graph.identity)) &&
+            stale_input_catalog.material_graph_bindings().at(71U).inputs == saved_inputs &&
+            stale_input_catalog.material_graph_bindings().at(71U).source_revision ==
+                changed_parameter_graph.revision,
+        "explicit rebind preserves authored values while adopting the current graph pin");
+    auto v3_catalog = bound.serialize();
+    v3_catalog.replace(0U, std::string("CARTOGRAPHER_MATERIAL_CATALOG 4").size(),
+        "CARTOGRAPHER_MATERIAL_CATALOG 3");
+    const auto v3_input_section = v3_catalog.find("MATERIAL_GRAPH_PARAMETERS ");
+    const auto v3_end = v3_catalog.find("END\n", v3_input_section);
+    require(v3_input_section != std::string::npos && v3_end != std::string::npos,
+        "v4 catalog frames persistent graph inputs after each binding");
+    v3_catalog.erase(v3_input_section, v3_end - v3_input_section);
+    const auto reopened_v3 = project::MaterialCatalog::deserialize(v3_catalog);
+    require(reopened_v3 &&
+            reopened_v3.value().material_graph_bindings().at(71U).inputs.parameters.empty() &&
+            reopened_v3.value().material_graph_bindings().at(71U).inputs.surface_inputs.empty(),
+        "v3 graph bindings migrate with an explicit empty input set");
     require(static_cast<bool>(bound.unbind_material_graph(71U)) &&
             bound.material_graph_bindings().empty(),
         "material graph association can be removed without deleting either source");
+}
+
+void texture_source_replacement_advances_revision_and_rejects_stale_edits() {
+    using namespace carto;
+    auto catalog = catalog_fixture(1U);
+    const auto original = catalog.textures().at(501U);
+
+    auto replacement = original;
+    replacement.content_digest = digest("replacement-workshop-image");
+    replacement.format = assets::TextureSourceFormat::tga;
+    replacement.width = 256U;
+    replacement.height = 128U;
+    replacement.relative_locator = "textures/replacement-workshop-image.tga";
+    replacement.revision = original.revision.next();
+    require(static_cast<bool>(catalog.replace_texture(replacement)),
+        "existing texture source can be replaced at an advanced revision");
+    require(catalog.textures().at(501U).content_digest == replacement.content_digest &&
+            catalog.textures().at(501U).revision == original.revision.next() &&
+            catalog.materials().at(71U).definition.base_color.asset == 501U,
+        "texture replacement preserves stable identity and existing material bindings");
+
+    auto stale = replacement;
+    stale.content_digest = digest("stale-workshop-image");
+    stale.revision = original.revision;
+    require(!catalog.replace_texture(stale),
+        "texture replacement cannot reuse an old source revision");
+    require(catalog.textures().at(501U).content_digest == replacement.content_digest &&
+            catalog.textures().at(501U).revision == replacement.revision,
+        "stale texture replacement leaves the catalog unchanged");
+
+    auto missing = replacement;
+    missing.id = 999U;
+    missing.revision = core::Revision{1U};
+    require(!catalog.replace_texture(missing),
+        "texture replacement cannot create an unregistered identity");
+    const auto reopened = project::MaterialCatalog::deserialize(catalog.serialize());
+    require(reopened && reopened.value().textures().at(501U).content_digest ==
+                replacement.content_digest &&
+            reopened.value().materials().at(71U).definition.base_color.asset == 501U,
+        "replacement texture source and stable references survive catalog reopen");
 }
 
 void hostile_catalog_inputs_fail_closed() {
@@ -562,6 +700,7 @@ void failed_catalog_admission_has_no_mutation_or_event() {
 
 int main() {
     catalog_round_trips_and_resolves_variants_deterministically();
+    texture_source_replacement_advances_revision_and_rejects_stale_edits();
     hostile_catalog_inputs_fail_closed();
     project_save_reopen_and_journal_preserve_authoring_truth();
     project_schema_v8_migration_is_explicit();

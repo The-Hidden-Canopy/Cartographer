@@ -5,9 +5,11 @@
 #include <carto/core/result.hpp>
 #include <carto/core/revision.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -67,6 +69,23 @@ struct SourceDomainDigest final {
     [[nodiscard]] bool operator==(const SourceDomainDigest&) const noexcept = default;
 };
 
+// One-based parser product indices mapped to project-local identities. The
+// parser can create a default sampler when the source omits one. These are
+// historical import provenance, not claims about subsequently edited values.
+enum class SourceDocumentProductKind : std::uint8_t {
+    mesh = 0U, node = 1U, material = 2U, texture = 3U, sampler = 4U,
+};
+
+struct SourceDocumentProduct final {
+    SourceDocumentProductKind kind = SourceDocumentProductKind::mesh;
+    std::uint64_t source_index = 0U;
+    std::uint64_t product_id = 0U;
+    [[nodiscard]] bool operator==(const SourceDocumentProduct&) const noexcept = default;
+};
+
+[[nodiscard]] Sha256Digest source_document_product_digest(
+    const Sha256Digest& source_digest, std::span<const SourceDocumentProduct> products);
+
 // Local provenance for an explicitly submitted private botanical job. The
 // serialized record retains only the canonical source and digest bindings; it
 // deliberately omits the service URL, credentials, organization, raw job ID,
@@ -90,10 +109,15 @@ struct BotanicalGenerationReceipt final {
 // source bytes and decoded product. This record never stores absolute paths,
 // decoder state, or external runtime objects.
 struct SourceImportRecord final {
+    static constexpr std::size_t kMaxSerializedBytes = 256U * 1024U;
     static constexpr std::size_t kMaxIdentityBytes = 128U;
     static constexpr std::size_t kMaxRelativePathBytes = 2'048U;
     static constexpr std::size_t kMaxImporterIdentityBytes = 128U;
     static constexpr std::size_t kMaxDomainDigests = 3U;
+    static constexpr std::size_t kMaxAuthoredTags = 64U;
+    static constexpr std::size_t kMaxAuthoredTagBytes = 48U;
+    static constexpr std::size_t kMaxDependencies = 64U;
+    static constexpr std::size_t kMaxDocumentProducts = 8'192U;
 
     std::string identity;
     std::string relative_source_path;
@@ -107,6 +131,15 @@ struct SourceImportRecord final {
     assets::Sha256Digest artifact_digest;
     std::vector<SourceDomainDigest> domain_digests;
     std::optional<BotanicalGenerationReceipt> botanical_generation;
+    // Human-authored annotations. Source reimport advances the same retained
+    // record generation and must preserve these unless a reviewed plan edits them.
+    std::vector<std::string> authored_tags;
+    // Stable source identities this record depends on; edges are explicit and
+    // validated against the active registry as a whole.
+    std::vector<std::string> dependencies;
+    // Present only for an imported document with a single source blob and
+    // several distinct project products, in kind/source-index order.
+    std::vector<SourceDocumentProduct> document_products;
 
     [[nodiscard]] core::Result<void> validate() const;
     [[nodiscard]] std::string serialize() const;

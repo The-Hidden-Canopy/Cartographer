@@ -156,6 +156,13 @@ public:
         ViewportTranslateAxis axis,
         core::Vec2d pointer_start,
         double pixels_per_world_unit);
+    [[nodiscard]] core::Result<void> begin_projected(
+        scene::ObjectId object,
+        core::Transform source_transform,
+        core::Revision source_revision,
+        ViewportTranslateAxis axis,
+        core::Vec2d pointer_start,
+        core::Vec2d screen_axis_per_world_unit);
     [[nodiscard]] core::Result<core::Transform> preview(
         core::Vec2d pointer,
         core::Revision current_revision) const;
@@ -179,7 +186,7 @@ private:
         core::Revision source_revision;
         ViewportTranslateAxis axis = ViewportTranslateAxis::world_x;
         core::Vec2d pointer_start;
-        double pixels_per_world_unit = 0.0;
+        core::Vec2d screen_axis_per_world_unit;
     };
 
     std::optional<State> state_;
@@ -236,6 +243,8 @@ struct ViewportTransformSnapResult final {
 // Applies the native plan-view snapping policy to a revision-bound preview.
 // Ctrl/grid has precedence over Shift/geometry. Geometry targets are queried
 // from the compiled viewport scene and may exclude the object being moved.
+// The perpendicular tolerance bounds cross-axis alignment error in world
+// meters; it must be finite and within [0, 0.5].
 // This is still preview state; the caller must submit the final transform
 // through the application command path.
 [[nodiscard]] core::Result<ViewportTransformSnapResult>
@@ -247,7 +256,8 @@ snap_viewport_transform_preview(
     bool grid_snap,
     bool geometry_snap,
     SnapSession& session,
-    std::optional<scene::ObjectId> excluded_object = std::nullopt);
+    std::optional<scene::ObjectId> excluded_object = std::nullopt,
+    double perpendicular_tolerance = 0.05);
 
 // UI-only orthographic camera for Cartographer's current X/Z plan view. It
 // does not represent a scene camera and cannot mutate project state.

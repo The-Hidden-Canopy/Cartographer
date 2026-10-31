@@ -1,12 +1,17 @@
 #include <carto/agent/workbench.hpp>
 #include <carto/agent/scene_query.hpp>
+#include <carto/biological/authoring.hpp>
+#include <carto/character/rig_module.hpp>
 #include <carto/condition/authoring.hpp>
 #include <carto/geometry/primitives.hpp>
 #include <carto/journal/journal.hpp>
+#include <carto/kinematic/graph.hpp>
 #include <carto/project/transaction.hpp>
+#include <carto/scientific/model.hpp>
 #include <carto/ui/ui.hpp>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <charconv>
@@ -50,6 +55,91 @@ public:
 private:
     std::filesystem::path path_;
 };
+
+carto::assets::Sha256Digest source_diff_digest(std::string_view value) {
+    return carto::assets::sha256(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
+}
+
+carto::biological::BiologicalAuthoringDocument merge_biological_source(
+    std::uint64_t asset_id) {
+    using namespace carto;
+    biological::BiologicalAuthoringDocument source;
+    source.source = biological::AuthoringSourceIdentity{
+        "fixture.condition", asset_id, core::Revision{1U},
+        source_diff_digest("biological-source-" + std::to_string(asset_id))};
+    source.organism_family = "human-proxy";
+    REQUIRE(source.insert_structure(biological::StructureRecord{
+        .id = biological::StructureId{1U},
+        .kind = biological::StructureKind::organism,
+        .parent = std::nullopt,
+        .semantic_type = "human-proxy.organism",
+        .coordinate_frame = "organism.local",
+        .kinematic_joint = std::nullopt,
+        .kinematic_graph_digest = std::nullopt,
+        .geometry_digest = source_diff_digest("biological-geometry"),
+        .proxy_surface = biological::EllipsoidProxyProfile{
+            .center = {0.0, 0.5, 0.0},
+            .radii = {0.75, 1.0, 0.5},
+            .longitude_segments = 12U,
+            .latitude_segments = 6U,
+        },
+    }));
+    REQUIRE(source.validate());
+    return source;
+}
+
+carto::character::RigModuleTemplate merge_rig_module_template(
+    std::string name,
+    std::string semantic_type) {
+    carto::character::RigModuleTemplate module;
+    module.name = std::move(name);
+    carto::kinematic::KinematicNode root;
+    root.id = carto::kinematic::JointId{10U};
+    root.kind = carto::kinematic::JointKind::ball;
+    root.semantic_type = std::move(semantic_type);
+    module.joints.push_back(std::move(root));
+    return module;
+}
+
+std::string serialize_rig_module_template(
+    const carto::character::RigModuleTemplate& module) {
+    const auto serialized = module.serialize();
+    REQUIRE(serialized);
+    return serialized.value();
+}
+
+std::pair<std::string, carto::assets::Sha256Digest> serialize_kinematic_graph(
+    std::string semantic_type) {
+    carto::kinematic::KinematicGraph graph;
+    carto::kinematic::KinematicNode root;
+    root.id = carto::kinematic::JointId{1U};
+    root.semantic_type = std::move(semantic_type);
+    REQUIRE(graph.insert_node(std::move(root)));
+    REQUIRE(graph.validate());
+    const std::string bytes = graph.serialize();
+    return {bytes, source_diff_digest(bytes)};
+}
+
+carto::assets::SourceImportRecord source_diff_record(
+    std::string identity,
+    carto::core::Revision generation = carto::core::Revision{1U},
+    std::vector<std::string> tags = {"canopy", "exterior"}) {
+    carto::assets::SourceImportRecord record;
+    record.identity = std::move(identity);
+    record.relative_source_path = "Assets/" + record.identity + ".glb";
+    record.source_generation = generation;
+    record.kind = carto::assets::SourceAssetKind::mesh;
+    record.source_digest = source_diff_digest(record.identity + ".source");
+    record.importer_identity = "carto.import.gltf";
+    record.importer_version = 1U;
+    record.artifact_identity = "mesh." + record.identity;
+    record.artifact_digest = source_diff_digest(record.identity + ".artifact");
+    record.domain_digests = {{carto::assets::SourceAssetDomain::geometry,
+        record.artifact_digest}};
+    record.authored_tags = std::move(tags);
+    return record;
+}
 
 std::vector<carto::scene::ObjectId> create_boxes(
     carto::application::ApplicationSession& session,
@@ -3740,6 +3830,360 @@ void direct_lightmap_uv_action_rejects_invalid_and_stale_parameters() {
     REQUIRE(source.snapshot().project_revision == before.project_revision);
 }
 
+void human_uv_corner_edit_is_revision_bound_historical_and_persistent() {
+    using namespace carto;
+    TempDirectory temp;
+    application::ApplicationSession source;
+    ui::UiController ui(source);
+    auto mesh = geometry::make_box({1.0, 1.0, 1.0});
+    REQUIRE(mesh);
+    const auto topology = mesh.value().topology();
+    REQUIRE(topology);
+    const std::vector<core::Vec2d> source_uvs(
+        topology.value().corners.size(), core::Vec2d{0.25, 0.5});
+    auto authored_mesh = add_test_uv_set(std::move(mesh.value()), source_uvs);
+    const auto faces = authored_mesh.faces_sorted();
+    REQUIRE(!faces.empty() && !faces.front().vertices.empty());
+    const geometry::FaceId face = faces.front().id;
+    const geometry::VertexId vertex = faces.front().vertices.front();
+    const auto corner = std::find_if(topology.value().corners.begin(),
+        topology.value().corners.end(), [face, vertex](const auto& item) {
+            return item.face == face && item.vertex == vertex;
+        });
+    REQUIRE(corner != topology.value().corners.end());
+    const std::size_t corner_index = static_cast<std::size_t>(
+        std::distance(topology.value().corners.begin(), corner));
+    const core::Vec2d before_uv = source_uvs[corner_index];
+    const core::Vec2d after_uv{0.75, 0.875};
+    REQUIRE(ui.dispatch(application::CreateMeshObjectAction{
+        "UV coordinate target", std::move(authored_mesh)}));
+    auto snapshot = source.snapshot();
+    REQUIRE(snapshot.objects.size() == 1U);
+    const scene::ObjectId object = snapshot.objects.front().object.id;
+    const std::uint64_t mesh_asset = *snapshot.objects.front().object.mesh_asset;
+    const std::filesystem::path project_path = temp.path() / "uv-coordinate-edit.carto";
+    REQUIRE(ui.dispatch(application::SaveProjectAction{project_path}));
+    REQUIRE(ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(application::SelectObjectAction{object}));
+    REQUIRE(ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(application::SelectFaceAction{object, face}));
+
+    snapshot = source.snapshot();
+    REQUIRE(snapshot.objects.front().mesh_revision.has_value());
+    const auto make_action = [&](std::uint64_t project_generation,
+                                 core::Revision project_revision,
+                                 core::Revision mesh_revision,
+                                 core::Vec2d expected,
+                                 core::Vec2d coordinate) {
+        return application::SetUvCoordinateAction{
+            project_generation, project_revision, mesh_revision, object, 7U,
+            face, vertex, expected, coordinate};
+    };
+    const auto before_failures = source.snapshot();
+    const auto invalid_coordinate = application::HumanApplicationAccess::dispatch(
+        source, make_action(before_failures.project_generation,
+            before_failures.project_revision,
+            *before_failures.objects.front().mesh_revision, before_uv,
+            {std::numeric_limits<double>::quiet_NaN(), 0.0}));
+    REQUIRE(!invalid_coordinate &&
+        invalid_coordinate.error().code == core::ErrorCode::invalid_argument);
+    const auto stale_generation = application::HumanApplicationAccess::dispatch(
+        source, make_action(before_failures.project_generation + 1U,
+            before_failures.project_revision,
+            *before_failures.objects.front().mesh_revision, before_uv, after_uv));
+    REQUIRE(!stale_generation &&
+        stale_generation.error().code == core::ErrorCode::stale_data);
+    const auto stale_project = application::HumanApplicationAccess::dispatch(
+        source, make_action(before_failures.project_generation,
+            before_failures.project_revision.next(),
+            *before_failures.objects.front().mesh_revision, before_uv, after_uv));
+    REQUIRE(!stale_project && stale_project.error().code == core::ErrorCode::stale_data);
+    const auto stale_mesh = application::HumanApplicationAccess::dispatch(
+        source, make_action(before_failures.project_generation,
+            before_failures.project_revision,
+            before_failures.objects.front().mesh_revision->next(), before_uv, after_uv));
+    REQUIRE(!stale_mesh && stale_mesh.error().code == core::ErrorCode::invalid_state);
+    const auto stale_corner = application::HumanApplicationAccess::dispatch(
+        source, make_action(before_failures.project_generation,
+            before_failures.project_revision,
+            *before_failures.objects.front().mesh_revision, {0.0, 0.0}, after_uv));
+    REQUIRE(!stale_corner && stale_corner.error().code == core::ErrorCode::stale_data);
+    REQUIRE(faces.size() > 1U);
+    const auto wrong_face = application::HumanApplicationAccess::dispatch(
+        source, application::SetUvCoordinateAction{
+            before_failures.project_generation,
+            before_failures.project_revision,
+            *before_failures.objects.front().mesh_revision,
+            object, 7U, faces.back().id, vertex, before_uv, after_uv});
+    REQUIRE(!wrong_face && wrong_face.error().code == core::ErrorCode::invalid_state);
+    REQUIRE(source.snapshot().project_revision == before_failures.project_revision);
+    REQUIRE(source.snapshot().undo_count == before_failures.undo_count);
+
+    const std::string agent_intent = "set UV set 7 face " +
+        std::to_string(face.value) + " vertex " + std::to_string(vertex.value) +
+        " to 0.75, 0.875";
+    auto plan = plan_for(before_failures, {object}, {
+        {"step-1", {object, std::monostate{}}, agent_intent},
+    });
+    auto agent_task = agent::AgentTask::begin(
+        source, std::move(plan), envelope_for({object}));
+    REQUIRE(agent_task);
+    const auto agent_attempt = agent_task.value().run();
+    REQUIRE(agent_attempt && agent_attempt.value().status == agent::TaskStatus::blocked);
+    REQUIRE(source.snapshot().project_revision == before_failures.project_revision);
+    REQUIRE(source.snapshot().undo_count == before_failures.undo_count);
+
+    REQUIRE(ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(application::SelectObjectAction{object}));
+    REQUIRE(ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(application::SelectFaceAction{object, face}));
+    const auto ready = source.snapshot();
+    REQUIRE(ready.selection.faces.size() == 1U && ready.selection.faces.front() == face);
+    const auto applied = ui.set_uv_coordinate(
+        make_action(ready.project_generation, ready.project_revision,
+            *ready.objects.front().mesh_revision,
+            before_uv, after_uv), ready.project_generation);
+    REQUIRE(applied);
+    REQUIRE(applied.value().action.find("Set UV Coordinate") != std::string::npos);
+    const auto after = source.snapshot();
+    REQUIRE(after.project_revision > ready.project_revision);
+    REQUIRE(after.undo_count == ready.undo_count + 1U);
+    REQUIRE(after.dirty);
+
+    REQUIRE(ui.dispatch(application::SaveProjectAction{project_path}));
+    auto saved = project::ProjectDocument::load(project_path);
+    REQUIRE(saved);
+    const auto read_corner = [&](const project::ProjectDocument& document) {
+        const auto& saved_mesh = document.meshes().at(mesh_asset);
+        const auto saved_topology = saved_mesh.topology();
+        REQUIRE(saved_topology);
+        const auto* layer = saved_mesh.attributes().find("uv.source.corners");
+        REQUIRE(layer != nullptr);
+        for (std::size_t index = 0U; index < saved_topology.value().corners.size(); ++index) {
+            const auto& item = saved_topology.value().corners[index];
+            if (item.face != face || item.vertex != vertex) continue;
+            const auto* coordinate = std::get_if<core::Vec2d>(&layer->values[index]);
+            REQUIRE(coordinate != nullptr);
+            return *coordinate;
+        }
+        throw TestFailure("UV source corner disappeared after persistence");
+    };
+    REQUIRE(read_corner(saved.value()).x == after_uv.x);
+    REQUIRE(read_corner(saved.value()).y == after_uv.y);
+    REQUIRE(saved.value().meshes().at(mesh_asset).uv_sets().find(7U) != nullptr);
+    REQUIRE(saved.value().meshes().at(mesh_asset).attributes().find(
+        "cartographer.material_slot") != nullptr);
+
+    REQUIRE(ui.dispatch(application::UndoAction{}));
+    REQUIRE(ui.dispatch(application::SaveProjectAction{project_path}));
+    const auto saved_undo = project::ProjectDocument::load(project_path);
+    REQUIRE(saved_undo);
+    REQUIRE(read_corner(saved_undo.value()).x == before_uv.x);
+    REQUIRE(read_corner(saved_undo.value()).y == before_uv.y);
+    REQUIRE(ui.dispatch(application::RedoAction{}));
+    REQUIRE(ui.dispatch(application::SaveProjectAction{project_path}));
+    const auto saved_redo = project::ProjectDocument::load(project_path);
+    REQUIRE(saved_redo);
+    REQUIRE(read_corner(saved_redo.value()).x == after_uv.x);
+    REQUIRE(read_corner(saved_redo.value()).y == after_uv.y);
+}
+
+void human_uv_seam_alignment_is_atomic_revision_bound_and_undoable() {
+    using namespace carto;
+    TempDirectory temp;
+    application::ApplicationSession source;
+    ui::UiController ui(source);
+    geometry::EditableMesh mesh;
+    REQUIRE(mesh.insert_bulk(
+        {{geometry::VertexId{1U}, {0.0, 0.0, 0.0}},
+         {geometry::VertexId{2U}, {1.0, 0.0, 0.0}},
+         {geometry::VertexId{3U}, {1.0, 1.0, 0.0}},
+         {geometry::VertexId{4U}, {0.0, 1.0, 0.0}}},
+        {{geometry::FaceId{1U}, {geometry::VertexId{1U}, geometry::VertexId{2U},
+                                geometry::VertexId{3U}}},
+         {geometry::FaceId{2U}, {geometry::VertexId{1U}, geometry::VertexId{3U},
+                                geometry::VertexId{4U}}}}));
+    const auto authored_topology = mesh.topology();
+    REQUIRE(authored_topology);
+    std::vector<core::Vec2d> source_uvs;
+    source_uvs.reserve(authored_topology.value().corners.size());
+    for (const auto& corner : authored_topology.value().corners) {
+        if (corner.face == geometry::FaceId{1U}) {
+            if (corner.vertex == geometry::VertexId{1U}) source_uvs.push_back({0.0, 0.0});
+            else if (corner.vertex == geometry::VertexId{2U}) source_uvs.push_back({1.0, 0.0});
+            else if (corner.vertex == geometry::VertexId{3U}) source_uvs.push_back({1.0, 1.0});
+            else REQUIRE(false);
+        } else {
+            REQUIRE(corner.face == geometry::FaceId{2U});
+            if (corner.vertex == geometry::VertexId{1U}) source_uvs.push_back({2.0, 0.0});
+            else if (corner.vertex == geometry::VertexId{3U}) source_uvs.push_back({2.0, 1.0});
+            else if (corner.vertex == geometry::VertexId{4U}) source_uvs.push_back({3.0, 1.0});
+            else REQUIRE(false);
+        }
+    }
+    auto authored_mesh = add_test_uv_set(std::move(mesh), source_uvs);
+    const auto topology = authored_mesh.topology();
+    REQUIRE(topology);
+    const auto shared_edge = std::find_if(topology.value().edges.begin(),
+        topology.value().edges.end(), [](const geometry::EdgeRecord& edge) {
+            return edge.second_half_edge.has_value();
+        });
+    REQUIRE(shared_edge != topology.value().edges.end());
+    const auto first_half_edge = std::find_if(
+        topology.value().half_edges.begin(), topology.value().half_edges.end(),
+        [&shared_edge](const geometry::HalfEdgeRecord& half_edge) {
+            return half_edge.id == shared_edge->first_half_edge;
+        });
+    const auto second_half_edge = std::find_if(
+        topology.value().half_edges.begin(), topology.value().half_edges.end(),
+        [&shared_edge](const geometry::HalfEdgeRecord& half_edge) {
+            return half_edge.id == *shared_edge->second_half_edge;
+        });
+    REQUIRE(first_half_edge != topology.value().half_edges.end());
+    REQUIRE(second_half_edge != topology.value().half_edges.end());
+    const geometry::FaceId selected_face = first_half_edge->face;
+    const geometry::FaceId adjacent_face = second_half_edge->face;
+    REQUIRE(selected_face != adjacent_face);
+    const auto coordinate_for = [](const geometry::EditableMesh& target,
+                                   geometry::FaceId face,
+                                   geometry::VertexId vertex) {
+        const auto target_topology = target.topology();
+        REQUIRE(target_topology);
+        const auto* layer = target.attributes().find("uv.source.corners");
+        REQUIRE(layer != nullptr);
+        for (std::size_t index = 0U; index < target_topology.value().corners.size(); ++index) {
+            const auto& corner = target_topology.value().corners[index];
+            if (corner.face != face || corner.vertex != vertex) continue;
+            const auto* coordinate = std::get_if<core::Vec2d>(&layer->values[index]);
+            REQUIRE(coordinate != nullptr);
+            return *coordinate;
+        }
+        throw TestFailure("UV seam endpoint corner is missing");
+    };
+    const std::array<core::Vec2d, 4U> expected_coordinates{
+        coordinate_for(authored_mesh, selected_face, shared_edge->first),
+        coordinate_for(authored_mesh, selected_face, shared_edge->second),
+        coordinate_for(authored_mesh, adjacent_face, shared_edge->first),
+        coordinate_for(authored_mesh, adjacent_face, shared_edge->second)};
+
+    REQUIRE(ui.dispatch(application::CreateMeshObjectAction{
+        "UV seam target", std::move(authored_mesh)}));
+    auto snapshot = source.snapshot();
+    REQUIRE(snapshot.objects.size() == 1U);
+    const scene::ObjectId object = snapshot.objects.front().object.id;
+    const std::uint64_t mesh_asset = *snapshot.objects.front().object.mesh_asset;
+    const std::filesystem::path project_path = temp.path() / "uv-seam-alignment.carto";
+    REQUIRE(ui.dispatch(application::SaveProjectAction{project_path}));
+    REQUIRE(ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(application::SelectObjectAction{object}));
+    REQUIRE(ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(application::SelectFaceAction{object, selected_face}));
+    snapshot = source.snapshot();
+    REQUIRE(snapshot.objects.front().mesh_revision.has_value());
+
+    const application::AlignUvSeamAction action{
+        snapshot.project_generation, snapshot.project_revision,
+        *snapshot.objects.front().mesh_revision, object, 7U,
+        selected_face, adjacent_face, shared_edge->id, expected_coordinates};
+    auto stale = action;
+    stale.expected_coordinates[2U].x += 0.5;
+    const auto stale_attempt = ui.align_uv_seam(stale, snapshot.project_generation);
+    REQUIRE(!stale_attempt && stale_attempt.error().code == core::ErrorCode::stale_data);
+    auto stale_mesh = action;
+    stale_mesh.expected_mesh_revision = stale_mesh.expected_mesh_revision.next();
+    const auto stale_mesh_attempt = ui.align_uv_seam(
+        stale_mesh, snapshot.project_generation);
+    REQUIRE(!stale_mesh_attempt &&
+        stale_mesh_attempt.error().code == core::ErrorCode::invalid_state);
+    auto wrong_face = action;
+    wrong_face.selected_face = adjacent_face;
+    const auto wrong_selection = ui.align_uv_seam(wrong_face, snapshot.project_generation);
+    REQUIRE(!wrong_selection &&
+        wrong_selection.error().code == core::ErrorCode::invalid_state);
+    const auto boundary_edge = std::find_if(topology.value().edges.begin(),
+        topology.value().edges.end(), [&topology, selected_face](const geometry::EdgeRecord& edge) {
+            if (edge.second_half_edge.has_value()) return false;
+            const auto half_edge = std::find_if(
+                topology.value().half_edges.begin(), topology.value().half_edges.end(),
+                [&edge](const geometry::HalfEdgeRecord& candidate) {
+                    return candidate.id == edge.first_half_edge;
+                });
+            return half_edge != topology.value().half_edges.end() &&
+                half_edge->face == selected_face;
+        });
+    REQUIRE(boundary_edge != topology.value().edges.end());
+    auto boundary_attempt_action = action;
+    boundary_attempt_action.edge = boundary_edge->id;
+    const auto boundary_attempt = ui.align_uv_seam(
+        boundary_attempt_action, snapshot.project_generation);
+    REQUIRE(!boundary_attempt &&
+        boundary_attempt.error().code == core::ErrorCode::invalid_state);
+    const auto wrong_generation = ui.align_uv_seam(
+        action, snapshot.project_generation + 1U);
+    REQUIRE(!wrong_generation &&
+        wrong_generation.error().code == core::ErrorCode::stale_data);
+    REQUIRE(source.snapshot().project_revision == snapshot.project_revision);
+    REQUIRE(source.snapshot().undo_count == snapshot.undo_count);
+
+    const auto aligned = ui.align_uv_seam(action, snapshot.project_generation);
+    REQUIRE(aligned);
+    REQUIRE(aligned.value().action.find("Align UV Seam") != std::string::npos);
+    auto after = source.snapshot();
+    REQUIRE(after.project_revision > snapshot.project_revision);
+    REQUIRE(after.undo_count == snapshot.undo_count + 1U);
+    REQUIRE(ui.dispatch(application::SaveProjectAction{project_path}));
+    auto saved = project::ProjectDocument::load(project_path);
+    REQUIRE(saved);
+    const auto& saved_mesh = saved.value().meshes().at(mesh_asset);
+    REQUIRE(coordinate_for(saved_mesh, selected_face, shared_edge->first).x ==
+        coordinate_for(saved_mesh, adjacent_face, shared_edge->first).x);
+    REQUIRE(coordinate_for(saved_mesh, selected_face, shared_edge->first).y ==
+        coordinate_for(saved_mesh, adjacent_face, shared_edge->first).y);
+    REQUIRE(coordinate_for(saved_mesh, selected_face, shared_edge->second).x ==
+        coordinate_for(saved_mesh, adjacent_face, shared_edge->second).x);
+    REQUIRE(coordinate_for(saved_mesh, selected_face, shared_edge->second).y ==
+        coordinate_for(saved_mesh, adjacent_face, shared_edge->second).y);
+
+    REQUIRE(ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(application::SelectObjectAction{object}));
+    REQUIRE(ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::face}));
+    REQUIRE(ui.dispatch(application::SelectFaceAction{object, selected_face}));
+    const auto aligned_snapshot = source.snapshot();
+    REQUIRE(aligned_snapshot.objects.front().mesh_revision.has_value());
+    auto no_op = action;
+    no_op.expected_project_generation = aligned_snapshot.project_generation;
+    no_op.expected_project_revision = aligned_snapshot.project_revision;
+    no_op.expected_mesh_revision = *aligned_snapshot.objects.front().mesh_revision;
+    no_op.expected_coordinates = {
+        coordinate_for(saved_mesh, selected_face, shared_edge->first),
+        coordinate_for(saved_mesh, selected_face, shared_edge->second),
+        coordinate_for(saved_mesh, adjacent_face, shared_edge->first),
+        coordinate_for(saved_mesh, adjacent_face, shared_edge->second)};
+    const auto no_op_attempt = ui.align_uv_seam(no_op, aligned_snapshot.project_generation);
+    REQUIRE(!no_op_attempt && no_op_attempt.error().code == core::ErrorCode::invalid_state);
+    REQUIRE(source.snapshot().project_revision == aligned_snapshot.project_revision);
+    REQUIRE(source.snapshot().undo_count == aligned_snapshot.undo_count);
+
+    REQUIRE(ui.dispatch(application::UndoAction{}));
+    REQUIRE(ui.dispatch(application::SaveProjectAction{project_path}));
+    const auto saved_undo = project::ProjectDocument::load(project_path);
+    REQUIRE(saved_undo);
+    const auto& undone_mesh = saved_undo.value().meshes().at(mesh_asset);
+    REQUIRE(coordinate_for(undone_mesh, selected_face, shared_edge->first).x ==
+        expected_coordinates[0U].x);
+    REQUIRE(coordinate_for(undone_mesh, selected_face, shared_edge->first).y ==
+        expected_coordinates[0U].y);
+    REQUIRE(ui.dispatch(application::RedoAction{}));
+    REQUIRE(ui.dispatch(application::SaveProjectAction{project_path}));
+    const auto saved_redo = project::ProjectDocument::load(project_path);
+    REQUIRE(saved_redo);
+    const auto& redone_mesh = saved_redo.value().meshes().at(mesh_asset);
+    REQUIRE(coordinate_for(redone_mesh, selected_face, shared_edge->first).x ==
+        expected_coordinates[2U].x);
+    REQUIRE(coordinate_for(redone_mesh, selected_face, shared_edge->first).y ==
+        expected_coordinates[2U].y);
+}
+
 void material_catalog_checkpoint_rebase_models_region_writes_and_detects_conflicts() {
     TempDirectory temp;
     const auto save_material_checkpoint = [&temp](
@@ -4036,7 +4480,7 @@ void diff_digest_tracks_geometry_values_not_only_change_shape() {
                 !changed_face->after_vertices.empty()));
 }
 
-void project_diff_detects_unclassified_project_source_changes() {
+void project_diff_marks_changed_snapshots_as_partial_projections() {
     using namespace carto;
     const project::ProjectDocument base;
     project::ProjectDocument changed = base;
@@ -4051,13 +4495,879 @@ void project_diff_detects_unclassified_project_source_changes() {
         changed, journal, "project-diff-unclassified-source-test");
     REQUIRE(transaction);
     REQUIRE(transaction.value().set_spatial_field(field.value()));
+    REQUIRE(transaction.value().create_object("Classified plus opaque change"));
     REQUIRE(transaction.value().commit("project-diff.spatial-field-only"));
 
     const agent::ProjectDiff diff = agent::ProjectDiff::between(base, changed);
     REQUIRE(diff.base_digest != diff.digest);
     REQUIRE(diff.has_changes());
-    REQUIRE(diff.has_unclassified_source_changes());
-    REQUIRE(!agent::ProjectDiff::between(base, base).has_unclassified_source_changes());
+    REQUIRE(!diff.objects.empty());
+    REQUIRE(diff.source_projection_is_partial());
+    REQUIRE(!diff.has_unclassified_source_changes());
+    REQUIRE(diff.changed_spatial_field_count() == 1U);
+    REQUIRE(!agent::ProjectDiff::between(base, base).source_projection_is_partial());
+
+    project::ProjectDocument opaque_changed = base;
+    journal::Journal opaque_journal(directory.path() / "opaque-source-diff.journal");
+    auto opaque_transaction = project::ProjectTransaction::begin(
+        opaque_changed, opaque_journal, "project-diff-opaque-source-test");
+    REQUIRE(opaque_transaction);
+    REQUIRE(opaque_transaction.value().set_spatial_field(field.value()));
+    REQUIRE(opaque_transaction.value().commit("project-diff.spatial-field-only"));
+    const agent::ProjectDiff opaque_diff = agent::ProjectDiff::between(base, opaque_changed);
+    REQUIRE(opaque_diff.source_projection_is_partial());
+    REQUIRE(!opaque_diff.has_unclassified_source_changes());
+    REQUIRE(opaque_diff.changed_spatial_field_count() == 1U);
+    REQUIRE(opaque_diff.spatial_fields.size() == 1U);
+    REQUIRE(opaque_diff.spatial_fields.front().identity == "diff-only-moisture");
+    REQUIRE(opaque_diff.spatial_fields.front().added);
+    REQUIRE(!opaque_diff.spatial_fields.front().before.has_value());
+    REQUIRE(opaque_diff.spatial_fields.front().after.has_value());
+    REQUIRE(opaque_diff.spatial_fields.front().after->semantic ==
+        spatial_field::FieldSemantic::moisture);
+    REQUIRE(opaque_diff.spatial_fields.front().after->width == 2U);
+    REQUIRE(opaque_diff.spatial_fields.front().after->height == 2U);
+    REQUIRE(opaque_diff.spatial_fields.front().after->sample_count == 4U);
+    REQUIRE(opaque_diff.spatial_fields.front().after->digest.has_value());
+    REQUIRE(opaque_diff.spatial_fields.front().changed_sample_count == 4U);
+    REQUIRE(opaque_diff.spatial_fields.front().samples.size() == 4U);
+    REQUIRE(opaque_diff.spatial_fields.front().samples.front().u == 0U);
+    REQUIRE(opaque_diff.spatial_fields.front().samples.front().v == 0U);
+    REQUIRE(opaque_diff.spatial_fields.front().samples.front().after == 0.25);
+    REQUIRE(!opaque_diff.spatial_fields.front().samples_truncated);
+
+    journal::Journal missing_history(directory.path() / "missing-field-history.journal");
+    const auto opaque_before = opaque_changed.serialize();
+    const auto refused_history = project::ProjectTransaction::begin(
+        opaque_changed, missing_history, "project-diff-missing-history-test");
+    REQUIRE(!refused_history && refused_history.error().code == core::ErrorCode::stale_data);
+    REQUIRE(opaque_changed.serialize() == opaque_before);
+    const auto missing_events = missing_history.read_all();
+    REQUIRE(missing_events && missing_events.value().empty());
+
+    project::ProjectDocument revised_field_document = opaque_changed;
+    auto revised_field = field.value();
+    spatial_field::FieldBrush field_brush;
+    field_brush.expected_revision = revised_field.source_revision();
+    field_brush.center_uv = {0.0, 0.0};
+    field_brush.radius = 0.1;
+    field_brush.value = 0.75;
+    field_brush.strength = 1.0;
+    REQUIRE(revised_field.paint(field_brush));
+    REQUIRE(std::filesystem::copy_file(
+        directory.path() / "opaque-source-diff.journal",
+        directory.path() / "spatial-field-value-diff.journal"));
+    journal::Journal revised_field_journal(
+        directory.path() / "spatial-field-value-diff.journal");
+    auto revised_field_transaction = project::ProjectTransaction::begin(
+        revised_field_document, revised_field_journal,
+        "project-diff-spatial-field-value-test");
+    REQUIRE(revised_field_transaction);
+    REQUIRE(revised_field_transaction.value().set_spatial_field(revised_field));
+    REQUIRE(revised_field_transaction.value().commit(
+        "project-diff.spatial-field-value-change"));
+    REQUIRE(revised_field_journal.verify());
+    const auto revised_field_events = revised_field_journal.read_all();
+    REQUIRE(revised_field_events && revised_field_events.value().size() == 2U);
+    REQUIRE(revised_field_events.value().back().event_type == "project-diff.spatial-field-value-change");
+    const auto revised_field_diff = agent::ProjectDiff::between(
+        opaque_changed, revised_field_document);
+    REQUIRE(revised_field_diff.spatial_fields.size() == 1U);
+    REQUIRE(!revised_field_diff.spatial_fields.front().added);
+    REQUIRE(!revised_field_diff.spatial_fields.front().removed);
+    REQUIRE(revised_field_diff.spatial_fields.front().before->source_revision ==
+        core::Revision{1U});
+    REQUIRE(revised_field_diff.spatial_fields.front().after->source_revision ==
+        core::Revision{2U});
+    REQUIRE(revised_field_diff.spatial_fields.front().sample_correspondence_available);
+    REQUIRE(revised_field_diff.spatial_fields.front().changed_sample_count == 1U);
+    REQUIRE(revised_field_diff.spatial_fields.front().samples.size() == 1U);
+    REQUIRE(revised_field_diff.spatial_fields.front().samples.front().u == 0U);
+    REQUIRE(revised_field_diff.spatial_fields.front().samples.front().v == 0U);
+    REQUIRE(revised_field_diff.spatial_fields.front().samples.front().before == 0.25);
+    REQUIRE(revised_field_diff.spatial_fields.front().samples.front().after == 0.75);
+
+    auto shifted_field = spatial_field::ScalarField2D::create(
+        "diff-only-moisture", spatial_field::FieldSemantic::moisture,
+        {1.0, 0.0}, 1.0, 2U, 2U, 0.0, 1.0, 0.25);
+    REQUIRE(shifted_field);
+    auto shifted_next_revision = shifted_field.value().at_next_revision(
+        core::Revision{1U});
+    REQUIRE(shifted_next_revision);
+    project::ProjectDocument shifted_field_document = opaque_changed;
+    REQUIRE(std::filesystem::copy_file(
+        directory.path() / "opaque-source-diff.journal",
+        directory.path() / "spatial-field-grid-diff.journal"));
+    journal::Journal shifted_field_journal(
+        directory.path() / "spatial-field-grid-diff.journal");
+    auto shifted_field_transaction = project::ProjectTransaction::begin(
+        shifted_field_document, shifted_field_journal,
+        "project-diff-spatial-field-grid-test");
+    REQUIRE(shifted_field_transaction);
+    REQUIRE(shifted_field_transaction.value().erase_spatial_field(
+        "diff-only-moisture", core::Revision{1U}));
+    REQUIRE(shifted_field_transaction.value().set_spatial_field(
+        std::move(shifted_next_revision.value())));
+    REQUIRE(shifted_field_transaction.value().commit(
+        "project-diff.spatial-field-grid-change"));
+    REQUIRE(shifted_field_journal.verify());
+    const auto shifted_field_events = shifted_field_journal.read_all();
+    REQUIRE(shifted_field_events && shifted_field_events.value().size() == 2U);
+    REQUIRE(shifted_field_events.value().back().event_type == "project-diff.spatial-field-grid-change");
+    const auto shifted_field_diff = agent::ProjectDiff::between(
+        opaque_changed, shifted_field_document);
+    REQUIRE(shifted_field_diff.spatial_fields.size() == 1U);
+    REQUIRE(shifted_field_diff.spatial_fields.front().grid_changed);
+    REQUIRE(!shifted_field_diff.spatial_fields.front().sample_correspondence_available);
+    REQUIRE(shifted_field_diff.spatial_fields.front().changed_sample_count == 0U);
+    REQUIRE(shifted_field_diff.spatial_fields.front().samples.empty());
+
+    const auto large_field = spatial_field::ScalarField2D::create(
+        "diff-bounded-field", spatial_field::FieldSemantic::terrain_elevation,
+        {2.0, 3.0}, 0.5, 16U, 16U, -1.0, 1.0, 0.5);
+    REQUIRE(large_field);
+    project::ProjectDocument bounded_field_document = base;
+    journal::Journal bounded_field_journal(
+        directory.path() / "spatial-field-sample-cap.journal");
+    auto bounded_field_transaction = project::ProjectTransaction::begin(
+        bounded_field_document, bounded_field_journal,
+        "project-diff-spatial-field-bound-test");
+    REQUIRE(bounded_field_transaction);
+    REQUIRE(bounded_field_transaction.value().set_spatial_field(large_field.value()));
+    REQUIRE(bounded_field_transaction.value().commit(
+        "project-diff.spatial-field-sample-cap"));
+    const auto bounded_field_diff = agent::ProjectDiff::between(
+        base, bounded_field_document);
+    REQUIRE(bounded_field_diff.spatial_fields.size() == 1U);
+    REQUIRE(bounded_field_diff.spatial_fields.front().changed_sample_count == 256U);
+    REQUIRE(bounded_field_diff.spatial_fields.front().samples.size() ==
+        agent::kMaxProjectDiffSpatialFieldSamples);
+    REQUIRE(bounded_field_diff.spatial_fields.front().samples_truncated);
+
+    project::ProjectDocument source_registry_document = base;
+    const auto first_source_record = source_diff_record("source.diff.asset");
+    const auto first_source_plan = assets::plan_source_reimport(
+        source_registry_document.source_asset_registry(), {first_source_record});
+    REQUIRE(first_source_plan);
+    journal::Journal source_registry_journal(
+        directory.path() / "source-asset-record-diff.journal");
+    auto source_registry_transaction = project::ProjectTransaction::begin(
+        source_registry_document, source_registry_journal,
+        "project-diff-source-asset-test");
+    REQUIRE(source_registry_transaction);
+    REQUIRE(source_registry_transaction.value().apply_source_reimport_plan(
+        first_source_plan.value()));
+    REQUIRE(source_registry_transaction.value().commit(
+        "project-diff.source-asset-added"));
+    const auto source_registry_diff = agent::ProjectDiff::between(
+        base, source_registry_document);
+    REQUIRE(source_registry_diff.source_asset_registry_changed);
+    REQUIRE(source_registry_diff.source_asset_record_details_available);
+    REQUIRE(source_registry_diff.changed_source_asset_record_count() == 1U);
+    REQUIRE(source_registry_diff.source_asset_records.size() == 1U);
+    REQUIRE(source_registry_diff.source_asset_records.front().added);
+    REQUIRE(source_registry_diff.source_asset_records.front().after.has_value());
+    REQUIRE(source_registry_diff.source_asset_records.front().after->relative_source_path ==
+        "Assets/source.diff.asset.glb");
+    REQUIRE(source_registry_diff.source_asset_records.front().after->authored_tag_count == 2U);
+    REQUIRE((source_registry_diff.source_asset_records.front().after->authored_tag_sample ==
+        std::vector<std::string>{"canopy", "exterior"}));
+    REQUIRE(!source_registry_diff.source_asset_records.front().after->botanical_receipt);
+    REQUIRE(!source_registry_diff.source_asset_records_truncated);
+
+    auto revised_source_record = source_diff_record("source.diff.asset",
+        core::Revision{2U}, {"canopy", "interior"});
+    const auto revised_source_plan = assets::plan_source_reimport(
+        source_registry_document.source_asset_registry(), {revised_source_record});
+    REQUIRE(revised_source_plan);
+    project::ProjectDocument revised_source_document = source_registry_document;
+    REQUIRE(std::filesystem::copy_file(
+        directory.path() / "source-asset-record-diff.journal",
+        directory.path() / "source-asset-metadata-diff.journal"));
+    journal::Journal revised_source_journal(
+        directory.path() / "source-asset-metadata-diff.journal");
+    auto revised_source_transaction = project::ProjectTransaction::begin(
+        revised_source_document, revised_source_journal,
+        "project-diff-source-asset-test");
+    REQUIRE(revised_source_transaction);
+    REQUIRE(revised_source_transaction.value().apply_source_reimport_plan(
+        revised_source_plan.value()));
+    REQUIRE(revised_source_transaction.value().commit(
+        "project-diff.source-asset-metadata"));
+    REQUIRE(revised_source_journal.verify());
+    const auto revised_source_events = revised_source_journal.read_all();
+    REQUIRE(revised_source_events && revised_source_events.value().size() == 2U);
+    REQUIRE(revised_source_events.value().back().event_type == "project-diff.source-asset-metadata");
+    const auto revised_source_diff = agent::ProjectDiff::between(
+        source_registry_document, revised_source_document);
+    REQUIRE(revised_source_diff.changed_source_asset_record_count() == 1U);
+    REQUIRE(revised_source_diff.source_asset_records.front().before->source_generation ==
+        core::Revision{1U});
+    REQUIRE(revised_source_diff.source_asset_records.front().after->source_generation ==
+        core::Revision{2U});
+    REQUIRE((revised_source_diff.source_asset_records.front().before->authored_tag_sample ==
+        std::vector<std::string>{"canopy", "exterior"}));
+    REQUIRE((revised_source_diff.source_asset_records.front().after->authored_tag_sample ==
+        std::vector<std::string>{"canopy", "interior"}));
+
+    std::vector<assets::SourceImportRecord> many_source_records;
+    for (std::size_t index = 0U;
+         index < agent::kMaxProjectDiffSourceAssetRecords + 1U; ++index) {
+        many_source_records.push_back(source_diff_record(
+            "source.diff.asset." + std::to_string(index)));
+    }
+    project::ProjectDocument bounded_source_document = base;
+    const auto many_source_plan = assets::plan_source_reimport(
+        bounded_source_document.source_asset_registry(), std::move(many_source_records));
+    REQUIRE(many_source_plan);
+    journal::Journal bounded_source_journal(
+        directory.path() / "source-asset-record-cap.journal");
+    auto bounded_source_transaction = project::ProjectTransaction::begin(
+        bounded_source_document, bounded_source_journal,
+        "project-diff-source-asset-bound-test");
+    REQUIRE(bounded_source_transaction);
+    REQUIRE(bounded_source_transaction.value().apply_source_reimport_plan(
+        many_source_plan.value()));
+    REQUIRE(bounded_source_transaction.value().commit(
+        "project-diff.source-asset-record-cap"));
+    const auto bounded_source_diff = agent::ProjectDiff::between(
+        base, bounded_source_document);
+    REQUIRE(bounded_source_diff.changed_source_asset_record_count() == 65U);
+    REQUIRE(bounded_source_diff.source_asset_records.size() ==
+        agent::kMaxProjectDiffSourceAssetRecords);
+    REQUIRE(bounded_source_diff.source_asset_records_truncated);
+
+    project::ProjectDocument world_model_document = base;
+    world::WorldModel authored_world;
+    world::SemanticPath authored_path;
+    authored_path.id = world::PathId{1U};
+    authored_path.semantic_type = "review-route";
+    authored_path.control_points = {{0.0, 0.0, 0.0}, {2.0, 0.0, 1.0}};
+    authored_path.width = 1.5;
+    REQUIRE(authored_world.insert_path(std::move(authored_path)));
+    journal::Journal world_model_journal(
+        directory.path() / "world-model-project-diff.journal");
+    auto world_model_transaction = project::ProjectTransaction::begin(
+        world_model_document, world_model_journal, "project-diff-world-model-test");
+    REQUIRE(world_model_transaction);
+    REQUIRE(world_model_transaction.value().set_world_model(std::move(authored_world)));
+    REQUIRE(world_model_transaction.value().commit("project-diff.world-model-change"));
+    const auto world_model_diff = agent::ProjectDiff::between(base, world_model_document);
+    REQUIRE(world_model_diff.world_model.changed);
+    REQUIRE(world_model_diff.world_model.details_available);
+    REQUIRE(world_model_diff.world_model.before.has_value());
+    REQUIRE(world_model_diff.world_model.after.has_value());
+    REQUIRE(world_model_diff.world_model.before->paths == 0U);
+    REQUIRE(world_model_diff.world_model.after->paths == 1U);
+    REQUIRE(world_model_diff.world_model.before->areas == 0U);
+    REQUIRE(world_model_diff.world_model.after->areas == 0U);
+    REQUIRE(world_model_diff.has_changes());
+    REQUIRE(!world_model_diff.has_unclassified_source_changes());
+    REQUIRE(world_model_diff.source_projection_is_partial());
+
+    scientific::ScientificModel authored_scientific_model;
+    const scientific::Provenance scientific_provenance{
+        "fixture://scientific-model", "2026.10", "CC0-1.0",
+        "cartographer-test-provider", "2026-10-03T00:00:00Z", std::nullopt};
+    REQUIRE(authored_scientific_model.insert_region(scientific::Region{
+        scientific::RegionId{1U}, "organ",
+        scientific::GeometryBinding{"mesh", "object:1"}, std::nullopt,
+        "", {"anatomy"}, scientific_provenance}));
+    project::ProjectDocument scientific_document = base;
+    journal::Journal scientific_journal(
+        directory.path() / "scientific-model-project-diff.journal");
+    auto scientific_transaction = project::ProjectTransaction::begin(
+        scientific_document, scientific_journal, "project-diff-scientific-model-test");
+    REQUIRE(scientific_transaction);
+    REQUIRE(scientific_transaction.value().set_scientific_model(
+        std::move(authored_scientific_model)));
+    REQUIRE(scientific_transaction.value().commit(
+        "project-diff.scientific-model-change"));
+    const auto scientific_diff = agent::ProjectDiff::between(base, scientific_document);
+    REQUIRE(scientific_diff.scientific_model.changed);
+    REQUIRE(scientific_diff.scientific_model.details_available);
+    REQUIRE(scientific_diff.scientific_model.before.has_value());
+    REQUIRE(scientific_diff.scientific_model.after.has_value());
+    REQUIRE(scientific_diff.scientific_model.before->regions == 0U);
+    REQUIRE(scientific_diff.scientific_model.after->regions == 1U);
+    REQUIRE(scientific_diff.scientific_model.after->serialized_bytes >
+        scientific_diff.scientific_model.before->serialized_bytes);
+    REQUIRE(!scientific_diff.has_unclassified_source_changes());
+
+    project::ProjectAuthoringStandards many_project_standards;
+    for (std::size_t index = 0U; index < agent::kMaxProjectDiffAuthoringStandards + 1U;
+         ++index) {
+        project::ProjectAuthoringStandard standard;
+        standard.id = "standard.diff." + std::to_string(index);
+        standard.label = "Naming policy " + std::to_string(index);
+        standard.category = project::ProjectStandardCategory::naming_policy;
+        standard.value = "policy-" + std::to_string(index);
+        standard.rationale = "bounded authored standard fixture";
+        REQUIRE(many_project_standards.set(std::move(standard)));
+    }
+    const auto standards_path = directory.path() / "project-authoring-standard-cap.carto";
+    REQUIRE(base.save_atomic(standards_path));
+    application::ApplicationSession standards_session;
+    ui::UiController standards_ui(standards_session);
+    REQUIRE(standards_ui.dispatch(application::OpenProjectAction{standards_path}));
+    REQUIRE(standards_ui.set_project_authoring_standards(std::move(many_project_standards)));
+    REQUIRE(standards_ui.dispatch(application::SaveProjectAction{}));
+    const auto standards_document = project::ProjectDocument::load(standards_path);
+    REQUIRE(standards_document);
+    journal::Journal standards_journal(
+        std::filesystem::path(standards_path.string() + ".journal"));
+    const auto standards_events = standards_journal.read_all();
+    REQUIRE(standards_events && !standards_events.value().empty() && standards_journal.verify());
+    const auto standards_cap_diff = agent::ProjectDiff::between(base, standards_document.value());
+    REQUIRE(standards_cap_diff.authoring_standards.changed);
+    REQUIRE(standards_cap_diff.authoring_standards.details_available);
+    REQUIRE(standards_cap_diff.authoring_standards.changed_record_count == 65U);
+    REQUIRE(standards_cap_diff.authoring_standards.records.size() ==
+        agent::kMaxProjectDiffAuthoringStandards);
+    REQUIRE(standards_cap_diff.authoring_standards.records_truncated);
+
+    project::ProjectDocument presentation_base;
+    journal::Journal presentation_base_journal(
+        directory.path() / "presentation-catalog-diff-base.journal");
+    auto presentation_base_transaction = project::ProjectTransaction::begin(
+        presentation_base, presentation_base_journal,
+        "project-diff-presentation-source-test");
+    REQUIRE(presentation_base_transaction);
+    const auto camera_object = presentation_base_transaction.value().create_object(
+        "Presentation diff camera");
+    REQUIRE(camera_object);
+    const auto light_object = presentation_base_transaction.value().create_object(
+        "Presentation diff light");
+    REQUIRE(light_object);
+    REQUIRE(presentation_base_transaction.value().commit(
+        "project-diff.presentation-base"));
+
+    project::ProjectDocument presentation_changed = presentation_base;
+    auto presentation_transaction = project::ProjectTransaction::begin(
+        presentation_changed, presentation_base_journal,
+        "project-diff-presentation-source-test");
+    REQUIRE(presentation_transaction);
+    project::AuthoredCamera camera;
+    camera.object = camera_object.value();
+    camera.identity = "diff.presentation-camera";
+    camera.bookmark_identity = "diff.presentation-bookmark";
+    camera.revision = core::Revision{1U};
+    project::AuthoredLight light;
+    light.object = light_object.value();
+    light.identity = "diff.presentation-light";
+    light.semantic_class = "task-light";
+    light.fixture_owner = "fixture-A";
+    light.power_owner = "power-A";
+    light.switch_owner = "switch-A";
+    light.kind = project::AuthoredLightKind::area;
+    light.linear_color = {1.0, 0.75, 0.5};
+    light.intensity = 12.0;
+    light.range = 24.0;
+    light.area_width = 0.5;
+    light.area_height = 0.75;
+    light.color_temperature_kelvin = 2'700.0;
+    light.normal_state = project::LightNormalState::switchable;
+    light.failure_state = project::LightFailureState::intermittent;
+    light.casts_shadows = false;
+    light.flicker_eligible = true;
+    light.revision = core::Revision{2U};
+    const std::string reference_bytes = "project-diff-reference-image";
+    const auto reference_digest = assets::sha256(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(reference_bytes.data()),
+        reference_bytes.size()));
+    project::ReferenceImagePlane plane;
+    plane.identity = "diff.reference-plane";
+    plane.source_asset_identity = "source.diff.reference-plane";
+    plane.source_locator = "References/diff-reference-plane.png";
+    plane.source_digest = reference_digest;
+    plane.source_generation = core::Revision{3U};
+    plane.image_width_pixels = 96U;
+    plane.image_height_pixels = 48U;
+    plane.view = project::ReferencePlaneView::perspective;
+    plane.view_set_identity = "diff.reference-set";
+    plane.origin = {1.0, 2.0, 3.0};
+    plane.normal = {0.0, 0.0, 1.0};
+    plane.up = {0.0, 1.0, 0.0};
+    plane.camera_local_placement = false;
+    plane.width_meters = 4.0;
+    plane.opacity = 0.65;
+    plane.visible = false;
+    plane.locked = true;
+    plane.calibration = project::ReferenceImageCalibration{
+        {0.0, 0.0}, {48.0, 0.0}, 2.0};
+    plane.revision = core::Revision{4U};
+    project::PresentationCatalog presentation_catalog;
+    REQUIRE(presentation_catalog.insert_camera(std::move(camera)));
+    REQUIRE(presentation_catalog.insert_light(std::move(light)));
+    REQUIRE(presentation_catalog.insert_reference_plane(std::move(plane)));
+    REQUIRE(presentation_transaction.value().set_presentation_catalog(
+        std::move(presentation_catalog)));
+    REQUIRE(presentation_transaction.value().commit(
+        "project-diff.presentation-catalog"));
+
+    const agent::ProjectDiff presentation_diff = agent::ProjectDiff::between(
+        presentation_base, presentation_changed);
+    REQUIRE(presentation_diff.presentation_catalog_changed);
+    REQUIRE(presentation_diff.has_changes());
+    REQUIRE(presentation_diff.source_projection_is_partial());
+    REQUIRE(!presentation_diff.has_unclassified_source_changes());
+    REQUIRE(presentation_diff.presentation_records_details_available);
+    REQUIRE(presentation_diff.presentation_camera_change_count == 1U);
+    REQUIRE(presentation_diff.presentation_light_change_count == 1U);
+    REQUIRE(presentation_diff.presentation_plane_change_count == 1U);
+    REQUIRE(presentation_diff.presentation_records.size() == 3U);
+    REQUIRE(presentation_diff.presentation_records.front().kind ==
+        agent::PresentationRecordKind::camera);
+    REQUIRE(presentation_diff.presentation_records.front().identity ==
+        std::to_string(camera_object.value().value));
+    REQUIRE(presentation_diff.presentation_records.front().added);
+    const auto added_light = std::find_if(
+        presentation_diff.presentation_records.begin(),
+        presentation_diff.presentation_records.end(), [](const auto& change) {
+            return change.kind == agent::PresentationRecordKind::light;
+        });
+    REQUIRE(added_light != presentation_diff.presentation_records.end());
+    REQUIRE(added_light->object == light_object.value());
+    REQUIRE(added_light->light_after.has_value());
+    REQUIRE(added_light->light_after->fixture_owner == "fixture-A");
+    const auto added_plane = std::find_if(
+        presentation_diff.presentation_records.begin(),
+        presentation_diff.presentation_records.end(), [](const auto& change) {
+            return change.kind == agent::PresentationRecordKind::reference_plane;
+        });
+    REQUIRE(added_plane != presentation_diff.presentation_records.end());
+    REQUIRE(added_plane->identity == "diff.reference-plane");
+    REQUIRE(added_plane->plane_after.has_value());
+    REQUIRE(added_plane->plane_after->calibration.has_value());
+
+    project::ProjectDocument bounded_presentation_base;
+    project::ProjectDocument bounded_presentation_changed = bounded_presentation_base;
+    journal::Journal bounded_presentation_journal(
+        directory.path() / "presentation-catalog-diff-bounded.journal");
+    auto bounded_transaction = project::ProjectTransaction::begin(
+        bounded_presentation_changed, bounded_presentation_journal,
+        "project-diff-presentation-bound-test");
+    REQUIRE(bounded_transaction);
+    project::PresentationCatalog many_reference_planes;
+    for (std::size_t index = 0U; index <
+         agent::kMaxProjectDiffPresentationRecordSamples + 1U; ++index) {
+        const std::string identity = "diff.reference-plane." + std::to_string(index);
+        project::ReferenceImagePlane bounded_plane;
+        bounded_plane.identity = identity;
+        bounded_plane.source_asset_identity = "source." + identity;
+        bounded_plane.source_locator = "References/" + identity + ".png";
+        bounded_plane.source_digest = reference_digest;
+        bounded_plane.source_generation = core::Revision{1U};
+        bounded_plane.image_width_pixels = 96U;
+        bounded_plane.image_height_pixels = 48U;
+        REQUIRE(many_reference_planes.insert_reference_plane(std::move(bounded_plane)));
+    }
+    REQUIRE(bounded_transaction.value().set_presentation_catalog(
+        std::move(many_reference_planes)));
+    REQUIRE(bounded_transaction.value().commit(
+        "project-diff.presentation-record-sample-cap"));
+    const auto bounded_diff = agent::ProjectDiff::between(
+        bounded_presentation_base, bounded_presentation_changed);
+    REQUIRE(bounded_diff.presentation_plane_change_count ==
+        agent::kMaxProjectDiffPresentationRecordSamples + 1U);
+    REQUIRE(bounded_diff.presentation_records.size() ==
+        agent::kMaxProjectDiffPresentationRecordSamples);
+    REQUIRE(bounded_diff.presentation_records_truncated);
+}
+
+void project_diff_tracks_bounded_procedural_source_records() {
+    using namespace carto;
+    TempDirectory directory;
+    project::ProjectDocument base;
+    project::ProjectDocument changed = base;
+    journal::Journal journal(directory.path() / "procedural-source-diff.journal");
+    auto transaction = project::ProjectTransaction::begin(
+        changed, journal, "project-diff-procedural-source-test");
+    REQUIRE(transaction);
+
+    geometry::CurvePath centerline;
+    centerline.source_identity = "diff.centerline";
+    centerline.source_revision = core::Revision{1U};
+    centerline.segments.push_back({
+        {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0},
+        {2.0, 0.0, 0.0}, {3.0, 0.0, 0.0}});
+    REQUIRE(transaction.value().set_curve_path(centerline));
+
+    project::RoadSource road;
+    road.source_identity = "diff.road";
+    road.source_revision = core::Revision{1U};
+    road.centerline_identity = centerline.source_identity;
+    road.centerline_revision = centerline.source_revision;
+    road.width_meters = 8.0;
+    road.shoulder_meters = 1.0;
+    REQUIRE(transaction.value().set_road_source(road));
+
+    geometry::SweepSource sweep;
+    sweep.source_identity = "diff.sweep";
+    sweep.source_revision = core::Revision{1U};
+    sweep.centerline_identity = centerline.source_identity;
+    sweep.centerline_revision = centerline.source_revision;
+    sweep.profile = {{0.1, 0.0}, {0.0, 0.1}, {-0.1, 0.0}, {0.0, -0.1}};
+    sweep.samples_per_segment = 3U;
+    sweep.inner_profile_scale = 0.4;
+    REQUIRE(transaction.value().set_sweep_source(sweep));
+
+    geometry::SignTextSource sign;
+    sign.source_identity = "diff.sign";
+    sign.source_revision = core::Revision{1U};
+    sign.text = "KEEP OUT";
+    sign.board_width = 5.0;
+    REQUIRE(transaction.value().set_sign_text_source(sign));
+    REQUIRE(transaction.value().commit("project.diff.procedural-sources"));
+
+    const auto diff = agent::ProjectDiff::between(base, changed);
+    REQUIRE(diff.procedural_sources.changed);
+    REQUIRE(diff.procedural_sources.changed_record_count == 4U);
+    REQUIRE(diff.procedural_sources.records.size() == 4U);
+    REQUIRE(!diff.procedural_sources.records_truncated);
+    REQUIRE(diff.procedural_sources.before_counts.curve_paths == 0U);
+    REQUIRE(diff.procedural_sources.after_counts.curve_paths == 1U);
+    REQUIRE(diff.procedural_sources.after_counts.roads == 1U);
+    REQUIRE(diff.procedural_sources.after_counts.sweeps == 1U);
+    REQUIRE(diff.procedural_sources.after_counts.sign_texts == 1U);
+    const auto curve_record = std::find_if(
+        diff.procedural_sources.records.begin(), diff.procedural_sources.records.end(),
+        [](const auto& record) {
+            return record.kind == agent::ProceduralSourceKind::curve_path &&
+                record.identity == "diff.centerline";
+        });
+    REQUIRE(curve_record != diff.procedural_sources.records.end());
+    REQUIRE(curve_record->added);
+    REQUIRE(curve_record->after.has_value());
+    const auto* curve_summary =
+        std::get_if<agent::CurvePathSourceSummary>(&*curve_record->after);
+    REQUIRE(curve_summary != nullptr);
+    REQUIRE(curve_summary->segment_count == 1U);
+    const auto road_record = std::find_if(
+        diff.procedural_sources.records.begin(), diff.procedural_sources.records.end(),
+        [](const auto& record) {
+            return record.kind == agent::ProceduralSourceKind::road;
+        });
+    REQUIRE(road_record != diff.procedural_sources.records.end());
+    REQUIRE(road_record->after.has_value());
+    const auto* road_summary =
+        std::get_if<agent::RoadSourceSummary>(&*road_record->after);
+    REQUIRE(road_summary != nullptr);
+    REQUIRE(road_summary->width_meters == 8.0);
+    REQUIRE(road_summary->centerline_identity == "diff.centerline");
+    const auto sweep_record = std::find_if(
+        diff.procedural_sources.records.begin(), diff.procedural_sources.records.end(),
+        [](const auto& record) {
+            return record.kind == agent::ProceduralSourceKind::sweep;
+        });
+    REQUIRE(sweep_record != diff.procedural_sources.records.end());
+    REQUIRE(sweep_record->after.has_value());
+    const auto* sweep_summary =
+        std::get_if<agent::SweepSourceSummary>(&*sweep_record->after);
+    REQUIRE(sweep_summary != nullptr);
+    REQUIRE(sweep_summary->profile_point_count == 4U);
+    REQUIRE(sweep_summary->inner_profile_scale == 0.4);
+    const auto sign_record = std::find_if(
+        diff.procedural_sources.records.begin(), diff.procedural_sources.records.end(),
+        [](const auto& record) {
+            return record.kind == agent::ProceduralSourceKind::sign_text;
+        });
+    REQUIRE(sign_record != diff.procedural_sources.records.end());
+    REQUIRE(sign_record->after.has_value());
+    const auto* sign_summary =
+        std::get_if<agent::SignTextSourceSummary>(&*sign_record->after);
+    REQUIRE(sign_summary != nullptr);
+    REQUIRE(sign_summary->text_bytes == sign.text.size());
+    REQUIRE(sign_summary->text_digest == source_diff_digest(sign.text));
+    REQUIRE(diff.has_changes());
+    REQUIRE(!diff.has_unclassified_source_changes());
+    REQUIRE(diff.source_projection_is_partial());
+
+    project::ProjectDocument updated = changed;
+    auto revised_road = road;
+    revised_road.source_revision = core::Revision{2U};
+    revised_road.width_meters = 10.0;
+    REQUIRE(std::filesystem::copy_file(
+        directory.path() / "procedural-source-diff.journal",
+        directory.path() / "procedural-source-diff-update.journal"));
+    journal::Journal update_journal(
+        directory.path() / "procedural-source-diff-update.journal");
+    auto update_transaction = project::ProjectTransaction::begin(
+        updated, update_journal, "project-diff-procedural-source-update-test");
+    REQUIRE(update_transaction);
+    REQUIRE(update_transaction.value().set_road_source(revised_road));
+    REQUIRE(update_transaction.value().commit("project.diff.road-source-update"));
+    REQUIRE(update_journal.verify());
+    const auto branch_events = update_journal.read_all();
+    REQUIRE(branch_events && branch_events.value().size() == 2U);
+    REQUIRE(branch_events.value().back().event_type == "project.diff.road-source-update");
+    const auto updated_diff = agent::ProjectDiff::between(changed, updated);
+    REQUIRE(updated_diff.procedural_sources.changed_record_count == 1U);
+    REQUIRE(updated_diff.procedural_sources.records.size() == 1U);
+    const auto& updated_road_change = updated_diff.procedural_sources.records.front();
+    REQUIRE(updated_road_change.kind == agent::ProceduralSourceKind::road);
+    REQUIRE(!updated_road_change.added && !updated_road_change.removed);
+    REQUIRE(updated_road_change.before.has_value() && updated_road_change.after.has_value());
+    const auto* previous_road_summary =
+        std::get_if<agent::RoadSourceSummary>(&*updated_road_change.before);
+    const auto* revised_road_summary =
+        std::get_if<agent::RoadSourceSummary>(&*updated_road_change.after);
+    REQUIRE(previous_road_summary != nullptr && revised_road_summary != nullptr);
+    REQUIRE(previous_road_summary->width_meters == 8.0);
+    REQUIRE(revised_road_summary->width_meters == 10.0);
+
+    project::ProjectDocument removed = changed;
+    REQUIRE(std::filesystem::copy_file(
+        directory.path() / "procedural-source-diff.journal",
+        directory.path() / "procedural-source-diff-remove.journal"));
+    journal::Journal remove_journal(
+        directory.path() / "procedural-source-diff-remove.journal");
+    auto remove_transaction = project::ProjectTransaction::begin(
+        removed, remove_journal, "project-diff-procedural-source-remove-test");
+    REQUIRE(remove_transaction);
+    REQUIRE(remove_transaction.value().erase_sign_text_source(
+        "diff.sign", core::Revision{1U}));
+    REQUIRE(remove_transaction.value().commit("project.diff.sign-source-remove"));
+    REQUIRE(remove_journal.verify());
+    const auto remove_branch_events = remove_journal.read_all();
+    REQUIRE(remove_branch_events && remove_branch_events.value().size() == 2U);
+    REQUIRE(remove_branch_events.value().back().event_type == "project.diff.sign-source-remove");
+    const auto removed_diff = agent::ProjectDiff::between(changed, removed);
+    REQUIRE(removed_diff.procedural_sources.changed_record_count == 1U);
+    REQUIRE(removed_diff.procedural_sources.records.size() == 1U);
+    REQUIRE(removed_diff.procedural_sources.records.front().kind ==
+        agent::ProceduralSourceKind::sign_text);
+    REQUIRE(removed_diff.procedural_sources.records.front().removed);
+    REQUIRE(removed_diff.procedural_sources.records.front().before.has_value());
+    REQUIRE(!removed_diff.procedural_sources.records.front().after.has_value());
+
+    project::ProjectDocument bounded = base;
+    journal::Journal bounded_journal(
+        directory.path() / "procedural-source-diff-cap.journal");
+    auto bounded_transaction = project::ProjectTransaction::begin(
+        bounded, bounded_journal, "project-diff-procedural-source-bound-test");
+    REQUIRE(bounded_transaction);
+    for (std::size_t index = 0U;
+         index < agent::kMaxProjectDiffProceduralSources + 1U; ++index) {
+        geometry::CurvePath path;
+        path.source_identity = "diff.centerline." + std::to_string(index);
+        path.source_revision = core::Revision{1U};
+        path.segments.push_back({
+            {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0},
+            {2.0, 0.0, 0.0}, {3.0, 0.0, 0.0}});
+        REQUIRE(bounded_transaction.value().set_curve_path(std::move(path)));
+    }
+    REQUIRE(bounded_transaction.value().commit("project.diff.procedural-source-cap"));
+    const auto bounded_diff = agent::ProjectDiff::between(base, bounded);
+    REQUIRE(bounded_diff.procedural_sources.changed_record_count == 65U);
+    REQUIRE(bounded_diff.procedural_sources.records.size() ==
+        agent::kMaxProjectDiffProceduralSources);
+    REQUIRE(bounded_diff.procedural_sources.records_truncated);
+    REQUIRE(!bounded_diff.has_unclassified_source_changes());
+}
+
+void project_diff_tracks_bounded_biological_authoring_sources() {
+    using namespace carto;
+    TempDirectory directory;
+    project::ProjectDocument base;
+    project::ProjectDocument changed = base;
+    journal::Journal journal(directory.path() / "biological-source-diff.journal");
+    auto transaction = project::ProjectTransaction::begin(
+        changed, journal, "project-diff-biological-source-test");
+    REQUIRE(transaction);
+    constexpr std::size_t kSourceCount =
+        agent::kMaxProjectDiffBiologicalAuthoringSources + 1U;
+    for (std::size_t index = 0U; index < kSourceCount; ++index) {
+        REQUIRE(transaction.value().set_biological_authoring(
+            merge_biological_source(9200U + static_cast<std::uint64_t>(index))));
+    }
+    REQUIRE(transaction.value().commit("project.diff.biological-source-cap"));
+
+    const auto diff = agent::ProjectDiff::between(base, changed);
+    REQUIRE(diff.biological_authoring_sources.changed);
+    REQUIRE(diff.biological_authoring_sources.before_record_count == 0U);
+    REQUIRE(diff.biological_authoring_sources.after_record_count == kSourceCount);
+    REQUIRE(diff.biological_authoring_sources.changed_record_count == kSourceCount);
+    REQUIRE(diff.biological_authoring_sources.records.size() ==
+        agent::kMaxProjectDiffBiologicalAuthoringSources);
+    REQUIRE(diff.biological_authoring_sources.records_truncated);
+    REQUIRE(diff.biological_authoring_sources.records.front().added);
+    REQUIRE(diff.biological_authoring_sources.records.front().after.has_value());
+    REQUIRE(diff.biological_authoring_sources.records.front().after->source_namespace ==
+        "fixture.condition");
+    REQUIRE(diff.biological_authoring_sources.records.front().after->asset_id == 9200U);
+    REQUIRE(diff.has_changes());
+    REQUIRE(!diff.has_unclassified_source_changes());
+}
+
+void project_diff_tracks_bounded_rig_module_template_sources() {
+    using namespace carto;
+    TempDirectory directory;
+    project::ProjectDocument base;
+    project::ProjectDocument inserted = base;
+    const auto original_bytes = serialize_rig_module_template(
+        merge_rig_module_template("arm.left", "arm.root"));
+    journal::Journal insert_journal(directory.path() / "rig-module-diff-insert.journal");
+    auto insert = project::ProjectTransaction::begin(
+        inserted, insert_journal, "project-diff-rig-module-insert-test");
+    REQUIRE(insert);
+    REQUIRE(insert.value().insert_rig_module_template(original_bytes));
+    REQUIRE(insert.value().commit("project.diff.rig-module.insert"));
+
+    const auto added_diff = agent::ProjectDiff::between(base, inserted);
+    REQUIRE(added_diff.rig_module_template_sources.changed);
+    REQUIRE(added_diff.rig_module_template_sources.before_record_count == 0U);
+    REQUIRE(added_diff.rig_module_template_sources.after_record_count == 1U);
+    REQUIRE(added_diff.rig_module_template_sources.changed_record_count == 1U);
+    REQUIRE(added_diff.rig_module_template_sources.records.size() == 1U);
+    const auto& added = added_diff.rig_module_template_sources.records.front();
+    REQUIRE(added.identity == "arm.left");
+    REQUIRE(added.added && !added.removed);
+    REQUIRE(!added.before.has_value() && added.after.has_value());
+    REQUIRE(added.after->revision == core::Revision{1U});
+    REQUIRE(added.after->serialized_bytes == original_bytes.size());
+    REQUIRE(added.after->digest == source_diff_digest(original_bytes));
+    REQUIRE(added_diff.has_changes());
+    REQUIRE(!added_diff.has_unclassified_source_changes());
+
+    project::ProjectDocument replaced = inserted;
+    const auto current = replaced.rig_module_templates().at("arm.left");
+    const auto replacement_bytes = serialize_rig_module_template(
+        merge_rig_module_template("arm.left", "arm.updated"));
+    REQUIRE(std::filesystem::copy_file(
+        directory.path() / "rig-module-diff-insert.journal",
+        directory.path() / "rig-module-diff-replace.journal"));
+    journal::Journal replace_journal(directory.path() / "rig-module-diff-replace.journal");
+    auto replace = project::ProjectTransaction::begin(
+        replaced, replace_journal, "project-diff-rig-module-replace-test");
+    REQUIRE(replace);
+    REQUIRE(replace.value().replace_rig_module_template_if_revision(
+        "arm.left", current.revision, current.digest, replacement_bytes));
+    REQUIRE(replace.value().commit("project.diff.rig-module.replace"));
+    REQUIRE(replace_journal.verify());
+    const auto branch_events = replace_journal.read_all();
+    REQUIRE(branch_events && branch_events.value().size() == 2U);
+    REQUIRE(branch_events.value().back().event_type == "project.diff.rig-module.replace");
+    const auto changed_diff = agent::ProjectDiff::between(inserted, replaced);
+    REQUIRE(changed_diff.rig_module_template_sources.changed_record_count == 1U);
+    REQUIRE(changed_diff.rig_module_template_sources.records.size() == 1U);
+    const auto& changed = changed_diff.rig_module_template_sources.records.front();
+    REQUIRE(!changed.added && !changed.removed);
+    REQUIRE(changed.before.has_value() && changed.after.has_value());
+    REQUIRE(changed.before->revision == core::Revision{1U});
+    REQUIRE(changed.after->revision == core::Revision{2U});
+    REQUIRE(changed.before->digest == source_diff_digest(original_bytes));
+    REQUIRE(changed.after->serialized_bytes == replacement_bytes.size());
+    REQUIRE(changed.after->digest == source_diff_digest(replacement_bytes));
+    REQUIRE(!changed_diff.has_unclassified_source_changes());
+
+    project::ProjectDocument bounded = base;
+    journal::Journal bounded_journal(directory.path() / "rig-module-diff-cap.journal");
+    auto add_many = project::ProjectTransaction::begin(
+        bounded, bounded_journal, "project-diff-rig-module-cap-test");
+    REQUIRE(add_many);
+    constexpr std::size_t kSourceCount =
+        agent::kMaxProjectDiffRigModuleTemplates + 1U;
+    for (std::size_t index = 0U; index < kSourceCount; ++index) {
+        std::string suffix = std::to_string(index);
+        suffix.insert(0U, 3U - suffix.size(), '0');
+        REQUIRE(add_many.value().insert_rig_module_template(
+            serialize_rig_module_template(merge_rig_module_template(
+                "module." + suffix, "arm.root." + suffix))));
+    }
+    REQUIRE(add_many.value().commit("project.diff.rig-module.cap"));
+    const auto bounded_diff = agent::ProjectDiff::between(base, bounded);
+    REQUIRE(bounded_diff.rig_module_template_sources.changed_record_count == kSourceCount);
+    REQUIRE(bounded_diff.rig_module_template_sources.records.size() ==
+        agent::kMaxProjectDiffRigModuleTemplates);
+    REQUIRE(bounded_diff.rig_module_template_sources.records_truncated);
+    REQUIRE(bounded_diff.rig_module_template_sources.records.front().identity ==
+        "module.000");
+    REQUIRE(!bounded_diff.has_unclassified_source_changes());
+}
+
+void project_diff_tracks_bounded_kinematic_graph_records() {
+    using namespace carto;
+    TempDirectory directory;
+    project::ProjectDocument base;
+    project::ProjectDocument inserted = base;
+    const auto [original_bytes, original_digest] =
+        serialize_kinematic_graph("rig.root");
+    journal::Journal insert_journal(directory.path() / "kinematic-diff-insert.journal");
+    auto insert = project::ProjectTransaction::begin(
+        inserted, insert_journal, "project-diff-kinematic-insert-test");
+    REQUIRE(insert);
+    REQUIRE(insert.value().set_kinematic_graph(
+        "rig.primary", core::Revision{}, original_bytes, original_digest));
+    REQUIRE(insert.value().commit("project.diff.kinematic.insert"));
+
+    const auto added_diff = agent::ProjectDiff::between(base, inserted);
+    REQUIRE(added_diff.kinematic_graphs.changed);
+    REQUIRE(added_diff.kinematic_graphs.before_record_count == 0U);
+    REQUIRE(added_diff.kinematic_graphs.after_record_count == 1U);
+    REQUIRE(added_diff.kinematic_graphs.changed_record_count == 1U);
+    REQUIRE(added_diff.kinematic_graphs.records.size() == 1U);
+    const auto& added = added_diff.kinematic_graphs.records.front();
+    REQUIRE(added.identity == "rig.primary");
+    REQUIRE(added.added && !added.removed);
+    REQUIRE(!added.before.has_value() && added.after.has_value());
+    REQUIRE(added.after->revision == core::Revision{1U});
+    REQUIRE(added.after->serialized_bytes == original_bytes.size());
+    REQUIRE(added.after->digest == original_digest);
+    REQUIRE(added_diff.has_changes());
+    REQUIRE(!added_diff.has_unclassified_source_changes());
+
+    project::ProjectDocument replaced = inserted;
+    const auto [replacement_bytes, replacement_digest] =
+        serialize_kinematic_graph("rig.root.authored-update");
+    REQUIRE(std::filesystem::copy_file(
+        directory.path() / "kinematic-diff-insert.journal",
+        directory.path() / "kinematic-diff-replace.journal"));
+    journal::Journal replace_journal(directory.path() / "kinematic-diff-replace.journal");
+    auto replace = project::ProjectTransaction::begin(
+        replaced, replace_journal, "project-diff-kinematic-replace-test");
+    REQUIRE(replace);
+    REQUIRE(replace.value().set_kinematic_graph(
+        "rig.primary", core::Revision{1U}, replacement_bytes, replacement_digest));
+    REQUIRE(replace.value().commit("project.diff.kinematic.replace"));
+    REQUIRE(replace_journal.verify());
+    const auto branch_events = replace_journal.read_all();
+    REQUIRE(branch_events && branch_events.value().size() == 2U);
+    REQUIRE(branch_events.value().back().event_type == "project.diff.kinematic.replace");
+    const auto changed_diff = agent::ProjectDiff::between(inserted, replaced);
+    REQUIRE(changed_diff.kinematic_graphs.changed_record_count == 1U);
+    REQUIRE(changed_diff.kinematic_graphs.records.size() == 1U);
+    const auto& changed = changed_diff.kinematic_graphs.records.front();
+    REQUIRE(!changed.added && !changed.removed);
+    REQUIRE(changed.before.has_value() && changed.after.has_value());
+    REQUIRE(changed.before->revision == core::Revision{1U});
+    REQUIRE(changed.after->revision == core::Revision{2U});
+    REQUIRE(changed.before->digest == original_digest);
+    REQUIRE(changed.after->serialized_bytes == replacement_bytes.size());
+    REQUIRE(changed.after->digest == replacement_digest);
+    REQUIRE(!changed_diff.has_unclassified_source_changes());
+
+    project::ProjectDocument bounded = base;
+    journal::Journal bounded_journal(directory.path() / "kinematic-diff-cap.journal");
+    auto add_many = project::ProjectTransaction::begin(
+        bounded, bounded_journal, "project-diff-kinematic-cap-test");
+    REQUIRE(add_many);
+    constexpr std::size_t kSourceCount =
+        agent::kMaxProjectDiffKinematicGraphs + 1U;
+    for (std::size_t index = 0U; index < kSourceCount; ++index) {
+        std::string suffix = std::to_string(index);
+        suffix.insert(0U, 3U - suffix.size(), '0');
+        REQUIRE(add_many.value().set_kinematic_graph(
+            "rig." + suffix, core::Revision{}, original_bytes, original_digest));
+    }
+    REQUIRE(add_many.value().commit("project.diff.kinematic.cap"));
+    const auto bounded_diff = agent::ProjectDiff::between(base, bounded);
+    REQUIRE(bounded_diff.kinematic_graphs.changed_record_count == kSourceCount);
+    REQUIRE(bounded_diff.kinematic_graphs.records.size() ==
+        agent::kMaxProjectDiffKinematicGraphs);
+    REQUIRE(bounded_diff.kinematic_graphs.records_truncated);
+    REQUIRE(bounded_diff.kinematic_graphs.records.front().identity == "rig.000");
+    REQUIRE(!bounded_diff.has_unclassified_source_changes());
 }
 
 void project_merge_review_is_snapshot_bound_and_requires_contested_choice() {
@@ -4167,6 +5477,551 @@ void project_merge_review_is_snapshot_bound_and_requires_contested_choice() {
     REQUIRE(digest(right) == contested.right_digest);
 }
 
+void ui_agent_project_merge_acceptance_is_fresh_human_gated_and_undoable() {
+    using namespace carto;
+    TempDirectory directory;
+    const auto project_path = directory.path() / "agent-project-merge.carto";
+    application::ApplicationSession source;
+    ui::UiController ui(source);
+    const auto objects = create_boxes(source, 2U);
+    REQUIRE(ui.dispatch(application::SaveProjectAction{project_path}));
+    REQUIRE(ui.dispatch(application::SetSelectionModeAction{
+        editor::SelectionMode::object}));
+    REQUIRE(ui.dispatch(application::SelectObjectAction{objects.front()}));
+    REQUIRE(ui.queue_agent_step("translate object by 0.2 0 0"));
+    auto envelope = translation_envelope({}, 0.5);
+    envelope.scope_objects.clear();
+    const auto task_run = ui.run_agent_plan(
+        "Move the selected object while retaining whole-project review choices",
+        envelope);
+    REQUIRE(task_run);
+    REQUIRE(task_run.value().status == agent::TaskStatus::review);
+    const auto task_base = source.snapshot();
+
+    core::Transform current_only = core::Transform::identity();
+    current_only.translation = {0.6, 0.0, 0.0};
+    REQUIRE(ui.dispatch(application::SetObjectTransformAction{
+        objects.back(), current_only, std::nullopt}));
+    REQUIRE(ui.dispatch(application::CreateSpatialFieldAction{
+        "merge.current-moisture", spatial_field::FieldSemantic::moisture,
+        {0.0, 0.0}, 1.0, 2U, 2U, 0.0, 1.0, 0.25}));
+    auto presentation_snapshot = source.snapshot();
+    project::AuthoredCamera review_camera;
+    review_camera.object = objects.back();
+    review_camera.identity = "merge.presentation-camera";
+    review_camera.bookmark_identity = "merge.presentation-bookmark";
+    review_camera.revision = core::Revision{1U};
+    project::PresentationCatalog review_catalog;
+    REQUIRE(review_catalog.insert_camera(std::move(review_camera)));
+    REQUIRE(ui.dispatch(application::SetPresentationCatalogAction{
+        presentation_snapshot.project_generation,
+        presentation_snapshot.project_revision, std::move(review_catalog)}));
+    const auto source_reimport = ui.preview_source_reimport({
+        source_diff_record("source.merge.asset")});
+    REQUIRE(source_reimport);
+    REQUIRE(ui.apply_source_reimport_plan(source_reimport.value()));
+    connection::ConnectionPortGraph connection_graph;
+    const auto make_merge_port = [](std::uint64_t identity, scene::ObjectId owner) {
+        connection::ConnectionPort port;
+        port.id = connection::PortId{identity};
+        port.owner = owner;
+        port.authoring.kind = world::AuthoringBindingKind::scene_object;
+        port.authoring.identity = owner.value;
+        port.local_frame.frame_identity = "merge-frame-" + std::to_string(identity);
+        port.local_frame.coordinate_convention = "carto.core/v1";
+        port.compatibility_tags = {
+            connection::compatibility::mechanical_hitch::pin_hitch_19mm};
+        port.capability_contract.offered = {"load-bearing"};
+        return port;
+    };
+    constexpr std::uint64_t kMergePortBase = 501U;
+    constexpr std::size_t kMergePortCount = 130U;
+    for (std::size_t index = 0U; index < kMergePortCount; ++index) {
+        const auto owner = index % 2U == 0U ? objects.front() : objects.back();
+        REQUIRE(connection_graph.insert_port(make_merge_port(
+            kMergePortBase + static_cast<std::uint64_t>(index), owner)));
+    }
+    for (std::size_t index = 0U; index < kMergePortCount / 2U; ++index) {
+        const auto first = kMergePortBase + static_cast<std::uint64_t>(index * 2U);
+        REQUIRE(connection_graph.connect(connection::PortId{first},
+            connection::PortId{first + 1U}, connection::ConnectionKind::mechanical));
+    }
+    const auto empty_graph_digest = source.connection_port_graph_digest();
+    REQUIRE(empty_graph_digest);
+    const auto graph_snapshot = source.snapshot();
+    REQUIRE(ui.replace_connection_port_graph(application::ReplaceConnectionPortGraphAction{
+        graph_snapshot.project_generation, graph_snapshot.project_revision,
+        empty_graph_digest.value(), std::move(connection_graph)}));
+    project::ProjectAuthoringStandard door_width_standard;
+    door_width_standard.id = "merge.door-width";
+    door_width_standard.label = "Interior door width";
+    door_width_standard.category = project::ProjectStandardCategory::interior_door_width;
+    door_width_standard.value = "0.9";
+    door_width_standard.unit = "m";
+    door_width_standard.rationale = "internal scheduling note";
+    project::ProjectAuthoringStandards review_standards;
+    REQUIRE(review_standards.set(std::move(door_width_standard)));
+    const auto standards_snapshot = source.snapshot();
+    REQUIRE(ui.dispatch(application::SetProjectAuthoringStandardsAction{
+        standards_snapshot.project_generation, standards_snapshot.project_revision,
+        std::move(review_standards)}));
+    geometry::SignTextSource merge_sign;
+    merge_sign.source_identity = "merge.review-sign";
+    merge_sign.source_revision = core::Revision{1U};
+    merge_sign.text = "KEEP OUT";
+    REQUIRE(!merge_sign.validate()); // Default panel cannot fit this text.
+    merge_sign.board_width = 5.0;
+    REQUIRE(merge_sign.validate());
+    const auto sign_snapshot = source.snapshot();
+    REQUIRE(ui.dispatch(application::SetSignTextSourceAction{
+        sign_snapshot.project_revision, std::move(merge_sign)}));
+    auto merge_biological = merge_biological_source(9101U);
+    const auto biological_snapshot = source.snapshot();
+    REQUIRE(ui.dispatch(application::SetBiologicalAuthoringAction{
+        biological_snapshot.project_revision, std::move(merge_biological)}));
+    auto merge_condition = condition::make_condition_fixture();
+    REQUIRE(merge_condition);
+    merge_condition.value().project_revision =
+        source.snapshot().project_revision.next();
+    REQUIRE(application::HumanApplicationAccess::dispatch(
+        source, application::ImportConditionAuthoringAction{
+            merge_condition.value().serialize()}));
+    const auto live_before_review = source.snapshot();
+    const auto compared = ui.compare_agent_project_merge();
+    REQUIRE(compared);
+    REQUIRE(compared.value().review.disposition == agent::ProjectMergeDisposition::contested);
+    REQUIRE(compared.value().current_diff.changed_objects == 1U);
+    REQUIRE(compared.value().current_diff.changed_spatial_fields == 1U);
+    REQUIRE(compared.value().current_diff.changed_source_assets == 1U);
+    REQUIRE(compared.value().current_diff.changed_connection_ports == kMergePortCount);
+    REQUIRE(compared.value().current_diff.changed_connection_edges ==
+        kMergePortCount / 2U);
+    REQUIRE(compared.value().current_diff.changed_authoring_standards == 1U);
+    REQUIRE(compared.value().current_diff.changed_procedural_sources == 1U);
+    REQUIRE(compared.value().current_diff.changed_biological_sources == 1U);
+    REQUIRE(compared.value().current_diff.changed_condition_sidecars == 1U);
+    REQUIRE(compared.value().speculative_diff.changed_objects == 1U);
+    REQUIRE(compared.value().speculative_diff.changed_source_assets == 0U);
+    REQUIRE(compared.value().speculative_diff.changed_connection_ports == 0U);
+    REQUIRE(compared.value().speculative_diff.changed_connection_edges == 0U);
+    REQUIRE(compared.value().speculative_diff.changed_authoring_standards == 0U);
+    REQUIRE(compared.value().speculative_diff.changed_procedural_sources == 0U);
+    REQUIRE(compared.value().speculative_diff.changed_biological_sources == 0U);
+    REQUIRE(compared.value().speculative_diff.changed_condition_sidecars == 0U);
+    REQUIRE(!compared.value().current_diff.has_unclassified_source_changes);
+    REQUIRE(compared.value().current_diff.source_projection_is_partial);
+    REQUIRE(!compared.value().speculative_diff.has_unclassified_source_changes);
+    REQUIRE(compared.value().speculative_diff.source_projection_is_partial);
+    const auto presentation_detail = std::find_if(
+        compared.value().details.rows.begin(), compared.value().details.rows.end(),
+        [](const auto& row) { return row.record == "Presentation catalog"; });
+    REQUIRE(presentation_detail != compared.value().details.rows.end());
+    REQUIRE(presentation_detail->current_changes.find("camera records 1") !=
+        std::string::npos);
+    REQUIRE(presentation_detail->speculative_changes.empty());
+    const auto spatial_field_detail = std::find_if(
+        compared.value().details.rows.begin(), compared.value().details.rows.end(),
+        [](const auto& row) {
+            return row.record == "Spatial field · merge.current-moisture";
+        });
+    REQUIRE(spatial_field_detail != compared.value().details.rows.end());
+    REQUIRE(spatial_field_detail->current_changes.find("semantic=moisture") !=
+        std::string::npos);
+    REQUIRE(spatial_field_detail->current_changes.find("grid=2x2") !=
+        std::string::npos);
+    REQUIRE(spatial_field_detail->current_changes.find("changed samples 4") !=
+        std::string::npos);
+    REQUIRE(spatial_field_detail->speculative_changes.empty());
+    const auto source_registry_detail = std::find_if(
+        compared.value().details.rows.begin(), compared.value().details.rows.end(),
+        [](const auto& row) { return row.record == "Source asset registry"; });
+    REQUIRE(source_registry_detail != compared.value().details.rows.end());
+    REQUIRE(source_registry_detail->current_changes.find("source records 1") !=
+        std::string::npos);
+    REQUIRE(source_registry_detail->speculative_changes.empty());
+    const auto source_asset_detail = std::find_if(
+        compared.value().details.rows.begin(), compared.value().details.rows.end(),
+        [](const auto& row) { return row.record == "Source asset · source.merge.asset"; });
+    REQUIRE(source_asset_detail != compared.value().details.rows.end());
+    REQUIRE(source_asset_detail->current_changes.find(
+        "Assets/source.merge.asset.glb") != std::string::npos);
+    REQUIRE(source_asset_detail->current_changes.find("carto.import.gltf") !=
+        std::string::npos);
+    REQUIRE(source_asset_detail->current_changes.find("canopy") != std::string::npos);
+    REQUIRE(source_asset_detail->speculative_changes.empty());
+    const auto sign_source_detail = std::find_if(
+        compared.value().details.rows.begin(), compared.value().details.rows.end(),
+        [](const auto& row) {
+            return row.record == "Sign-text source · \"merge.review-sign\"";
+        });
+    REQUIRE(sign_source_detail != compared.value().details.rows.end());
+    REQUIRE(sign_source_detail->current_changes.find("text=8 bytes /") !=
+        std::string::npos);
+    REQUIRE(sign_source_detail->current_changes.find("KEEP OUT") ==
+        std::string::npos);
+    REQUIRE(sign_source_detail->speculative_changes.empty());
+    const auto procedural_collection_detail = std::find_if(
+        compared.value().details.rows.begin(), compared.value().details.rows.end(),
+        [](const auto& row) {
+            return row.record == "Procedural source collections";
+        });
+    REQUIRE(procedural_collection_detail != compared.value().details.rows.end());
+    REQUIRE(procedural_collection_detail->current_changes.find(
+        "sign texts=0} → after {") != std::string::npos);
+    REQUIRE(procedural_collection_detail->current_changes.find("sign texts=1") !=
+        std::string::npos);
+    REQUIRE(procedural_collection_detail->speculative_changes.empty());
+    const auto biological_collection_detail = std::find_if(
+        compared.value().details.rows.begin(), compared.value().details.rows.end(),
+        [](const auto& row) {
+            return row.record == "Biological authoring sources";
+        });
+    REQUIRE(biological_collection_detail != compared.value().details.rows.end());
+    REQUIRE(biological_collection_detail->current_changes.find("changed records=1") !=
+        std::string::npos);
+    REQUIRE(biological_collection_detail->current_changes.find("serialized byte counts and digests only") !=
+        std::string::npos);
+    REQUIRE(biological_collection_detail->speculative_changes.empty());
+    const auto biological_source_detail = std::find_if(
+        compared.value().details.rows.begin(), compared.value().details.rows.end(),
+        [](const auto& row) {
+            return row.record.find(
+                "Biological authoring source · \"fixture.condition · asset #9101\"") == 0U;
+        });
+    REQUIRE(biological_source_detail != compared.value().details.rows.end());
+    REQUIRE(biological_source_detail->current_changes.find("bytes=") !=
+        std::string::npos);
+    REQUIRE(biological_source_detail->current_changes.find("digest=") !=
+        std::string::npos);
+    REQUIRE(biological_source_detail->current_changes.find("human-proxy.organism") ==
+        std::string::npos);
+    REQUIRE(biological_source_detail->speculative_changes.empty());
+    const auto condition_sidecar_detail = std::find_if(
+        compared.value().details.rows.begin(), compared.value().details.rows.end(),
+        [](const auto& row) { return row.record == "CONDITION sidecar"; });
+    REQUIRE(condition_sidecar_detail != compared.value().details.rows.end());
+    REQUIRE(condition_sidecar_detail->current_changes.find(
+        "three-way status=current-only") != std::string::npos);
+    REQUIRE(condition_sidecar_detail->speculative_changes.empty());
+    const auto connection_graph_detail = std::find_if(
+        compared.value().details.rows.begin(), compared.value().details.rows.end(),
+        [](const auto& row) { return row.record == "Connection port graph"; });
+    REQUIRE(connection_graph_detail != compared.value().details.rows.end());
+    REQUIRE(connection_graph_detail->current_changes.find("changed port records 130") !=
+        std::string::npos);
+    REQUIRE(connection_graph_detail->current_changes.find("changed edge records 65") !=
+        std::string::npos);
+    REQUIRE(connection_graph_detail->current_changes.find(
+        "structural compatibility evidence only") != std::string::npos);
+    REQUIRE(connection_graph_detail->current_changes.find("record samples truncated") !=
+        std::string::npos);
+    REQUIRE(connection_graph_detail->current_changes.find(
+        "at most 4 port and 4 edge records per side") != std::string::npos);
+    REQUIRE(connection_graph_detail->speculative_changes.empty());
+    REQUIRE(compared.value().details.current_truncated);
+    const auto connection_port_detail = std::find_if(
+        compared.value().details.rows.begin(), compared.value().details.rows.end(),
+        [](const auto& row) { return row.record == "Connection port · #501"; });
+    REQUIRE(connection_port_detail != compared.value().details.rows.end());
+    REQUIRE(connection_port_detail->current_changes.find("merge-frame-501") !=
+        std::string::npos);
+    REQUIRE(connection_port_detail->current_changes.find("load-bearing") !=
+        std::string::npos);
+    REQUIRE(connection_port_detail->speculative_changes.empty());
+    const auto connection_edge_detail = std::find_if(
+        compared.value().details.rows.begin(), compared.value().details.rows.end(),
+        [](const auto& row) { return row.record == "Connection edge · #1"; });
+    REQUIRE(connection_edge_detail != compared.value().details.rows.end());
+    REQUIRE(connection_edge_detail->current_changes.find("ports=#501/#502") !=
+        std::string::npos);
+    REQUIRE(connection_edge_detail->current_changes.find("kind=mechanical") !=
+        std::string::npos);
+    REQUIRE(connection_edge_detail->speculative_changes.empty());
+    const auto standards_category_detail = std::find_if(
+        compared.value().details.rows.begin(), compared.value().details.rows.end(),
+        [](const auto& row) { return row.record == "Project authoring standards"; });
+    REQUIRE(standards_category_detail != compared.value().details.rows.end());
+    REQUIRE(standards_category_detail->current_changes.find("changed records 1") !=
+        std::string::npos);
+    REQUIRE(standards_category_detail->speculative_changes.empty());
+    const auto standard_detail = std::find_if(
+        compared.value().details.rows.begin(), compared.value().details.rows.end(),
+        [](const auto& row) { return row.record == "Project standard · merge.door-width"; });
+    REQUIRE(standard_detail != compared.value().details.rows.end());
+    REQUIRE(standard_detail->current_changes.find("Interior door width") !=
+        std::string::npos);
+    REQUIRE(standard_detail->current_changes.find("interior door width") !=
+        std::string::npos);
+    REQUIRE(standard_detail->current_changes.find("0.9") != std::string::npos);
+    REQUIRE(standard_detail->current_changes.find("internal scheduling note") ==
+        std::string::npos);
+    REQUIRE(standard_detail->speculative_changes.empty());
+    const auto presentation_camera_detail = std::find_if(
+        compared.value().details.rows.begin(), compared.value().details.rows.end(),
+        [&objects](const auto& row) {
+            return row.record == "Camera · object " +
+                std::to_string(objects.back().value);
+        });
+    REQUIRE(presentation_camera_detail != compared.value().details.rows.end());
+    REQUIRE(presentation_camera_detail->current_changes.find("added") !=
+        std::string::npos);
+    REQUIRE(presentation_camera_detail->current_changes.find("revision (absent) → 1") !=
+        std::string::npos);
+    const auto speculative_object_detail = std::find_if(
+        compared.value().details.rows.begin(), compared.value().details.rows.end(),
+        [&objects](const auto& row) {
+            return row.record == "Object " + std::to_string(objects.front().value);
+        });
+    REQUIRE(speculative_object_detail != compared.value().details.rows.end());
+    REQUIRE(speculative_object_detail->current_changes.empty());
+    REQUIRE(speculative_object_detail->speculative_changes.find("transform") !=
+        std::string::npos);
+    REQUIRE(speculative_object_detail->speculative_changes.find(
+        "transform: T(0,0,0) R(0,0,0,1) S(1,1,1) → T(0.2,0,0)") !=
+        std::string::npos);
+    const auto current_object_detail = std::find_if(
+        compared.value().details.rows.begin(), compared.value().details.rows.end(),
+        [&objects](const auto& row) {
+            return row.record == "Object " + std::to_string(objects.back().value);
+        });
+    REQUIRE(current_object_detail != compared.value().details.rows.end());
+    REQUIRE(current_object_detail->speculative_changes.empty());
+    REQUIRE(current_object_detail->current_changes.find("transform") !=
+        std::string::npos);
+    REQUIRE(current_object_detail->current_changes.find(
+        "T(0,0,0) R(0,0,0,1) S(1,1,1) → T(0.6,0,0)") !=
+        std::string::npos);
+    REQUIRE(source.snapshot().project_revision == live_before_review.project_revision);
+    REQUIRE(!ui.resolve_agent_project_merge());
+    REQUIRE(source.snapshot().project_revision == live_before_review.project_revision);
+
+    REQUIRE(ui.resolve_agent_project_merge(agent::ProjectMergeSource::left));
+    const auto current_candidate_view = ui.snapshot();
+    REQUIRE(current_candidate_view.agent_project_merge.has_value());
+    REQUIRE(current_candidate_view.agent_project_merge->candidate_changed_procedural_sources == 1U);
+    REQUIRE(current_candidate_view.agent_project_merge->candidate_changed_biological_sources ==
+        1U);
+    REQUIRE(current_candidate_view.agent_project_merge->candidate_changed_condition_sidecars ==
+        1U);
+    REQUIRE(current_candidate_view.agent_project_merge->candidate_diff != nullptr);
+    REQUIRE(current_candidate_view.agent_project_merge->candidate_diff->procedural_sources.changed);
+    REQUIRE(current_candidate_view.agent_project_merge->candidate_diff->procedural_sources
+        .before_counts.sign_texts == 0U);
+    REQUIRE(current_candidate_view.agent_project_merge->candidate_diff->procedural_sources
+        .after_counts.sign_texts == 1U);
+    REQUIRE(current_candidate_view.agent_project_merge->candidate_diff->biological_authoring_sources
+        .changed_record_count == 1U);
+    REQUIRE(current_candidate_view.agent_project_merge->candidate_diff
+        ->biological_authoring_sources.records.size() == 1U);
+    REQUIRE(current_candidate_view.agent_project_merge->candidate_diff
+        ->biological_authoring_sources.records.front().identity ==
+        "fixture.condition · asset #9101");
+
+    REQUIRE(ui.resolve_agent_project_merge(agent::ProjectMergeSource::right));
+    const auto resolved_view = ui.snapshot();
+    REQUIRE(resolved_view.agent_project_merge.has_value());
+    REQUIRE(resolved_view.agent_project_merge->details.rows.size() ==
+        compared.value().details.rows.size());
+    REQUIRE(resolved_view.agent_project_merge->candidate_changed_source_assets == 0U);
+    REQUIRE(resolved_view.agent_project_merge->candidate_changed_connection_ports == 0U);
+    REQUIRE(resolved_view.agent_project_merge->candidate_changed_connection_edges == 0U);
+    REQUIRE(resolved_view.agent_project_merge->candidate_changed_authoring_standards == 0U);
+    REQUIRE(resolved_view.agent_project_merge->candidate_changed_procedural_sources == 0U);
+    REQUIRE(resolved_view.agent_project_merge->candidate_changed_biological_sources == 0U);
+    REQUIRE(resolved_view.agent_project_merge->candidate_changed_condition_sidecars == 0U);
+    current_only.translation.x = 0.8;
+    REQUIRE(ui.dispatch(application::SetObjectTransformAction{
+        objects.back(), current_only, std::nullopt}));
+    const auto stale_live = source.snapshot();
+    const auto stale_view = ui.snapshot();
+    REQUIRE(stale_view.agent_project_merge.has_value());
+    REQUIRE(stale_view.agent_project_merge->stale);
+    const auto journal_before_stale_accept =
+        application::ApplicationSession::inspect_recovery(project_path);
+    REQUIRE(journal_before_stale_accept);
+    REQUIRE(!ui.accept_agent_project_merge(
+        "Use the speculative snapshot after comparing both sides."));
+    REQUIRE(source.snapshot().project_revision == stale_live.project_revision);
+    const auto journal_after_stale_rejection =
+        application::ApplicationSession::inspect_recovery(project_path);
+    REQUIRE(journal_after_stale_rejection);
+    REQUIRE(journal_after_stale_rejection.value().journal_entry_count ==
+        journal_before_stale_accept.value().journal_entry_count);
+
+    REQUIRE(ui.compare_agent_project_merge());
+    REQUIRE(ui.resolve_agent_project_merge(agent::ProjectMergeSource::left));
+    const auto before_noop_accept = source.snapshot();
+    const auto journal_before_noop_accept =
+        application::ApplicationSession::inspect_recovery(project_path);
+    REQUIRE(journal_before_noop_accept);
+    REQUIRE(!ui.accept_agent_project_merge(
+        "Keep the current project after reviewing both sides."));
+    REQUIRE(source.snapshot().project_revision == before_noop_accept.project_revision);
+    const auto journal_after_noop_rejection =
+        application::ApplicationSession::inspect_recovery(project_path);
+    REQUIRE(journal_after_noop_rejection);
+    REQUIRE(journal_after_noop_rejection.value().journal_entry_count ==
+        journal_before_noop_accept.value().journal_entry_count);
+    REQUIRE(ui.resolve_agent_project_merge(agent::ProjectMergeSource::right));
+    const auto before_invalid_reasons = source.snapshot();
+    const auto journal_before_accept =
+        application::ApplicationSession::inspect_recovery(project_path);
+    REQUIRE(journal_before_accept);
+    REQUIRE(!ui.accept_agent_project_merge(""));
+    REQUIRE(!ui.accept_agent_project_merge("   "));
+    REQUIRE(source.snapshot().project_revision == before_invalid_reasons.project_revision);
+    const auto journal_after_rejection =
+        application::ApplicationSession::inspect_recovery(project_path);
+    REQUIRE(journal_after_rejection);
+    REQUIRE(journal_after_rejection.value().journal_entry_count ==
+        journal_before_accept.value().journal_entry_count);
+
+    const std::string reason =
+        "Use the speculative snapshot after comparing both sides.";
+    const auto accepted = ui.accept_agent_project_merge(reason);
+    REQUIRE(accepted);
+    REQUIRE(accepted.value().source == application::OperationSource::human);
+    REQUIRE(accepted.value().provenance_id == task_run.value().task_id);
+    REQUIRE(accepted.value().action.find("source=speculative") != std::string::npos);
+    REQUIRE(accepted.value().action.find("justification=" + reason) != std::string::npos);
+    const auto journal_after_accept =
+        application::ApplicationSession::inspect_recovery(project_path);
+    REQUIRE(journal_after_accept);
+    REQUIRE(journal_after_accept.value().journal_entry_count ==
+        journal_after_rejection.value().journal_entry_count + 1U);
+    REQUIRE(journal_after_accept.value().state ==
+        application::RecoveryInspectionState::pending);
+    const auto after_accept = source.snapshot();
+    REQUIRE(after_accept.project_revision == before_invalid_reasons.project_revision.next());
+    REQUIRE(after_accept.undo_count == 1U);
+    const auto accepted_agent_object = std::find_if(
+        after_accept.objects.begin(), after_accept.objects.end(), [&objects](const auto& object) {
+            return object.object.id == objects.front();
+        });
+    const auto accepted_current_only_object = std::find_if(
+        after_accept.objects.begin(), after_accept.objects.end(), [&objects](const auto& object) {
+            return object.object.id == objects.back();
+        });
+    REQUIRE(accepted_agent_object != after_accept.objects.end());
+    REQUIRE(accepted_agent_object->object.local_transform.translation.x == 0.2);
+    REQUIRE(accepted_current_only_object != after_accept.objects.end());
+    REQUIRE(accepted_current_only_object->object.local_transform.translation.x == 0.0);
+
+    REQUIRE(ui.dispatch(application::UndoAction{}));
+    const auto undone = source.snapshot();
+    REQUIRE(undone.project_revision == after_accept.project_revision.next());
+    REQUIRE(undone.objects.front().object.local_transform.translation.x == 0.0);
+    const auto restored_current_only = std::find_if(
+        undone.objects.begin(), undone.objects.end(), [&objects](const auto& object) {
+            return object.object.id == objects.back();
+        });
+    REQUIRE(restored_current_only != undone.objects.end());
+    REQUIRE(restored_current_only->object.local_transform.translation.x == 0.8);
+    REQUIRE(ui.dispatch(application::RedoAction{}));
+    const auto redone = source.snapshot();
+    const auto redone_agent_object = std::find_if(
+        redone.objects.begin(), redone.objects.end(), [&objects](const auto& object) {
+            return object.object.id == objects.front();
+        });
+    REQUIRE(redone_agent_object != redone.objects.end());
+    REQUIRE(redone_agent_object->object.local_transform.translation.x == 0.2);
+    REQUIRE(task_base.project_revision < live_before_review.project_revision);
+}
+
+void ui_project_merge_details_include_bounded_mesh_value_samples() {
+    using namespace carto;
+    TempDirectory directory;
+    journal::Journal fixture_journal(directory.path() / "merge-mesh-details.journal");
+    geometry::EditableMesh mesh;
+    std::array<geometry::VertexId, 9U> vertices{};
+    for (std::size_t z = 0U; z < 3U; ++z) {
+        for (std::size_t x = 0U; x < 3U; ++x) {
+            const auto added = mesh.add_vertex({
+                static_cast<double>(x), 0.0, static_cast<double>(z)});
+            REQUIRE(added);
+            vertices[z * 3U + x] = added.value();
+        }
+    }
+    for (std::size_t z = 0U; z < 2U; ++z) {
+        for (std::size_t x = 0U; x < 2U; ++x) {
+            const std::size_t first = z * 3U + x;
+            REQUIRE(mesh.add_face({vertices[first], vertices[first + 1U],
+                vertices[first + 4U], vertices[first + 3U]}));
+        }
+    }
+    std::uint64_t mesh_asset = 0U;
+    auto document = make_project_with_mesh(
+        fixture_journal, std::move(mesh), mesh_asset);
+    auto insert = project::ProjectTransaction::begin(
+        document, fixture_journal, "agent-project-merge-details-tests");
+    REQUIRE(insert);
+    const scene::ObjectId object{1U};
+    scene::SceneObject instance;
+    instance.id = object;
+    instance.name = "Nine-vertex grid";
+    instance.mesh_asset = mesh_asset;
+    REQUIRE(insert.value().insert_object(instance));
+    REQUIRE(insert.value().commit("project.merge-mesh-details.fixture"));
+    const auto project_path = directory.path() / "merge-mesh-details.carto";
+    REQUIRE(document.save_atomic(project_path));
+
+    application::ApplicationSession source;
+    REQUIRE(application::HumanApplicationAccess::dispatch(
+        source, application::OpenProjectAction{project_path}));
+    REQUIRE(application::HumanApplicationAccess::dispatch(
+        source, application::SaveProjectAction{project_path}));
+    ui::UiController ui(source);
+    const auto before = source.snapshot();
+    const auto* source_instance = before.viewport.scene.find(object);
+    REQUIRE(source_instance != nullptr && source_instance->mesh != nullptr);
+    REQUIRE(!source_instance->mesh->vertex_ids.empty());
+    REQUIRE(source_instance->mesh_asset == std::optional<std::uint64_t>(mesh_asset));
+
+    REQUIRE(ui.dispatch(application::SetSelectionModeAction{
+        editor::SelectionMode::vertex}));
+    for (std::size_t index = 0U; index < vertices.size(); ++index) {
+        const std::size_t x = index % 3U;
+        const std::size_t z = index / 3U;
+        REQUIRE(ui.dispatch(application::SelectVertexAction{object, vertices[index]}));
+        const std::string intent = "move vertex to " +
+            std::to_string(static_cast<double>(x) + 0.1) + " 0 " +
+            std::to_string(static_cast<double>(z));
+        REQUIRE(ui.queue_agent_step(intent));
+    }
+    const auto run = ui.run_agent_plan(
+        "Move the selected grid vertices.");
+    if (!run) std::cerr << run.error().message << '\n';
+    else if (run.value().diagnostic) std::cerr << run.value().diagnostic->message << '\n';
+    REQUIRE(run && run.value().status == agent::TaskStatus::review);
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+    REQUIRE(run.value().diff.changed_mesh_count() == 1U);
+
+    const auto compared = ui.compare_agent_project_merge();
+    REQUIRE(compared);
+    REQUIRE(compared.value().review.disposition ==
+        agent::ProjectMergeDisposition::right_only);
+    const std::string first_identity = "Mesh asset " + std::to_string(mesh_asset) +
+        " / vertex #" + std::to_string(vertices.front().value);
+    const auto row = std::find_if(
+        compared.value().details.rows.begin(), compared.value().details.rows.end(),
+        [&first_identity](const auto& candidate) {
+            return candidate.record == first_identity;
+        });
+    REQUIRE(row != compared.value().details.rows.end());
+    REQUIRE(row->current_changes.empty());
+    REQUIRE(row->speculative_changes.find("position changed") != std::string::npos);
+    REQUIRE(row->speculative_changes.find("(0,0,0) → (0.1,0,0)") != std::string::npos);
+    REQUIRE(!compared.value().details.current_mesh_samples_truncated);
+    REQUIRE(compared.value().details.speculative_mesh_samples_truncated);
+    const std::string omitted_identity = "Mesh asset " + std::to_string(mesh_asset) +
+        " / vertex #" + std::to_string(vertices.back().value);
+    REQUIRE(std::none_of(compared.value().details.rows.begin(),
+        compared.value().details.rows.end(), [&omitted_identity](const auto& candidate) {
+            return candidate.record == omitted_identity;
+        }));
+    REQUIRE(source.snapshot().project_revision == before.project_revision);
+}
+
 void project_diff_reports_uv_layer_and_bounded_corner_changes() {
     using namespace carto;
     TempDirectory directory;
@@ -4182,6 +6037,26 @@ void project_diff_reports_uv_layer_and_bounded_corner_changes() {
     std::uint64_t plane_asset = 0U;
     auto plane_document = make_project_with_mesh(
         journal, add_test_uv_set(std::move(plane).value(), plane_uvs), plane_asset);
+    geometry::EditableMesh descriptor_fixture_mesh = plane_document.meshes().at(plane_asset);
+    attributes::AttributeSet descriptor_fixture_attributes(
+        descriptor_fixture_mesh.attributes().domain_counts());
+    for (const auto& [layer_id, layer] : descriptor_fixture_mesh.attributes().layers()) {
+        static_cast<void>(layer_id);
+        REQUIRE(descriptor_fixture_attributes.add_layer(layer));
+    }
+    std::vector<attributes::AttributeValue> descriptor_values(
+        descriptor_fixture_mesh.faces_sorted().size(), std::uint32_t{7U});
+    REQUIRE(descriptor_fixture_attributes.add_layer(attributes::AttributeLayer{
+        {"test.descriptor", attributes::AttributeDomain::face,
+            attributes::AttributeType::uint32}, std::move(descriptor_values)}));
+    REQUIRE(descriptor_fixture_mesh.set_attribute_payload(
+        std::move(descriptor_fixture_attributes), descriptor_fixture_mesh.uv_sets()));
+    auto descriptor_fixture_update = project::ProjectTransaction::begin(
+        plane_document, journal, "agent-project-diff-tests");
+    REQUIRE(descriptor_fixture_update);
+    REQUIRE(descriptor_fixture_update.value().replace_mesh(
+        plane_asset, std::move(descriptor_fixture_mesh)));
+    REQUIRE(descriptor_fixture_update.value().commit("project.merge-test-descriptor.fixture"));
     const project::ProjectDocument plane_before = plane_document;
 
     geometry::EditableMesh changed_plane = plane_document.meshes().at(plane_asset);
@@ -4193,11 +6068,22 @@ void project_diff_reports_uv_layer_and_bounded_corner_changes() {
             auto* uv = std::get_if<core::Vec2d>(&layer.values.front());
             REQUIRE(uv != nullptr);
             uv->x += 0.25;
+        } else if (layer_id == "test.descriptor") {
+            layer.descriptor.type = attributes::AttributeType::float32;
+            for (auto& value : layer.values) {
+                const auto* region = std::get_if<std::uint32_t>(&value);
+                REQUIRE(region != nullptr);
+                value = static_cast<float>(*region);
+            }
         }
         REQUIRE(changed_plane_attributes.add_layer(std::move(layer)));
     }
+    attributes::UvSetTable changed_uv_sets;
+    auto changed_uv_descriptor = *changed_plane.uv_sets().find(7U);
+    changed_uv_descriptor.name = "Renamed source UV";
+    REQUIRE(changed_uv_sets.add(std::move(changed_uv_descriptor)));
     REQUIRE(changed_plane.set_attribute_payload(
-        std::move(changed_plane_attributes), changed_plane.uv_sets()));
+        std::move(changed_plane_attributes), std::move(changed_uv_sets)));
     auto update = project::ProjectTransaction::begin(
         plane_document, journal, "agent-project-diff-tests");
     REQUIRE(update);
@@ -4217,10 +6103,38 @@ void project_diff_reports_uv_layer_and_bounded_corner_changes() {
         [](const auto& layer) { return layer.layer_id == "uv.source.corners"; });
     REQUIRE(plane_layer_diff != plane_mesh_diff->attribute_layers.end());
     REQUIRE(plane_layer_diff->changed_value_count == 1U);
+    REQUIRE(plane_layer_diff->before_descriptor.has_value());
+    REQUIRE(plane_layer_diff->after_descriptor.has_value());
+    REQUIRE(plane_layer_diff->before_descriptor->domain ==
+        attributes::AttributeDomain::corner);
+    REQUIRE(plane_layer_diff->before_descriptor->type ==
+        attributes::AttributeType::vec2);
+    REQUIRE(plane_layer_diff->after_descriptor->type ==
+        attributes::AttributeType::vec2);
+    const auto material_slot_diff = std::find_if(
+        plane_mesh_diff->attribute_layers.begin(), plane_mesh_diff->attribute_layers.end(),
+        [](const auto& layer) { return layer.layer_id == "test.descriptor"; });
+    REQUIRE(material_slot_diff != plane_mesh_diff->attribute_layers.end());
+    REQUIRE(material_slot_diff->descriptor_changed);
+    REQUIRE(material_slot_diff->before_descriptor.has_value());
+    REQUIRE(material_slot_diff->after_descriptor.has_value());
+    REQUIRE(material_slot_diff->before_descriptor->type ==
+        attributes::AttributeType::uint32);
+    REQUIRE(material_slot_diff->after_descriptor->type ==
+        attributes::AttributeType::float32);
+    REQUIRE(material_slot_diff->before_descriptor->domain ==
+        attributes::AttributeDomain::face);
+    REQUIRE(material_slot_diff->after_descriptor->domain ==
+        attributes::AttributeDomain::face);
     const auto plane_uv_diff = std::find_if(
         plane_mesh_diff->uv_sets.begin(), plane_mesh_diff->uv_sets.end(),
         [](const auto& uv_set) { return uv_set.id == 7U; });
     REQUIRE(plane_uv_diff != plane_mesh_diff->uv_sets.end());
+    REQUIRE(plane_uv_diff->descriptor_changed);
+    REQUIRE(plane_uv_diff->before.has_value());
+    REQUIRE(plane_uv_diff->after.has_value());
+    REQUIRE(plane_uv_diff->before->name == "Source UV");
+    REQUIRE(plane_uv_diff->after->name == "Renamed source UV");
     REQUIRE(plane_uv_diff->details_available);
     REQUIRE(plane_uv_diff->changed_corner_count == 1U);
     REQUIRE(plane_uv_diff->samples.size() == 1U);
@@ -4261,6 +6175,8 @@ void project_diff_reports_uv_layer_and_bounded_corner_changes() {
     REQUIRE(material_added_diff.changed_material_binding_count() == 1U);
     REQUIRE(material_added_diff.changed_material_source_count() == 2U);
     REQUIRE(material_added_diff.material_sources.front().added);
+    REQUIRE(!material_added_diff.material_sources.front().before_definition.has_value());
+    REQUIRE(material_added_diff.material_sources.front().after_definition.has_value());
     REQUIRE(material_added_diff.has_changes());
     REQUIRE(!agent::ProjectDiff::between(material_before, material_before).has_changes());
     REQUIRE(material_added_diff.material_bindings.front().added);
@@ -4454,6 +6370,9 @@ void project_diff_reports_material_and_texture_source_changes() {
         return assets::sha256(std::span<const std::uint8_t>(bytes, value.size()));
     };
     project::MaterialCatalog original_catalog;
+    const project::SamplerIntent source_sampler{
+        .id = 42U, .name = "Source diff sampler", .revision = core::Revision{1U}};
+    REQUIRE(original_catalog.insert_sampler(source_sampler));
     REQUIRE(original_catalog.insert_texture(project::TextureSourceRecord{
         .id = 501U,
         .name = "Albedo source",
@@ -4479,15 +6398,16 @@ void project_diff_reports_material_and_texture_source_changes() {
     const project::ProjectDocument before = document;
 
     project::MaterialCatalog changed_catalog;
+    REQUIRE(changed_catalog.insert_sampler(source_sampler));
     REQUIRE(changed_catalog.insert_texture(project::TextureSourceRecord{
         .id = 501U,
         .name = "Albedo source",
-        .relative_locator = "textures/albedo.png",
+        .relative_locator = "textures/albedo-v2.jpg",
         .content_digest = digest_text("albedo source after"),
-        .format = assets::TextureSourceFormat::png,
-        .width = 1U,
-        .height = 1U,
-        .provenance = "agent-project-diff-fixture",
+        .format = assets::TextureSourceFormat::jpeg,
+        .width = 2U,
+        .height = 3U,
+        .provenance = "agent-project-diff-fixture-v2",
         .revision = core::Revision{2U},
     }));
     REQUIRE(changed_catalog.insert_texture(project::TextureSourceRecord{
@@ -4508,6 +6428,12 @@ void project_diff_reports_material_and_texture_source_changes() {
     changed_material.definition.roughness = 0.35;
     changed_material.definition.base_color.asset = 502U;
     changed_material.definition.base_color.uv_set = 7U;
+    changed_material.definition.base_color.sampler = 42U;
+    changed_material.definition.base_color.transform.offset = {0.125, 0.25};
+    changed_material.definition.base_color.channels.rgba[0] =
+        render::TextureChannel::one_minus_alpha;
+    changed_material.definition.base_color.interpretation =
+        render::TextureInterpretation::srgb;
     REQUIRE(changed_catalog.insert_material(changed_material));
     auto changed_update = project::ProjectTransaction::begin(
         document, journal, "agent-project-diff-tests");
@@ -4528,6 +6454,20 @@ void project_diff_reports_material_and_texture_source_changes() {
     REQUIRE(material->texture_dependencies_changed);
     REQUIRE(material->before_name == std::optional<std::string>("Paint source"));
     REQUIRE(material->after_name == std::optional<std::string>("Paint source updated"));
+    REQUIRE(material->before_definition.has_value());
+    REQUIRE(material->after_definition.has_value());
+    REQUIRE(material->before_definition->roughness == 0.5);
+    REQUIRE(material->after_definition->roughness == 0.35);
+    REQUIRE(material->before_definition->base_color.asset == 501U);
+    REQUIRE(material->after_definition->base_color.asset == 502U);
+    REQUIRE(material->after_definition->base_color.uv_set == 7U);
+    REQUIRE(material->before_definition->base_color.sampler == 0U);
+    REQUIRE(material->after_definition->base_color.sampler == 42U);
+    REQUIRE(material->after_definition->base_color.transform.offset.x == 0.125);
+    REQUIRE(material->after_definition->base_color.channels.rgba[0] ==
+        render::TextureChannel::one_minus_alpha);
+    REQUIRE(material->after_definition->base_color.interpretation ==
+        render::TextureInterpretation::srgb);
     REQUIRE(diff.changed_texture_source_count() == 2U);
     const auto changed_texture = std::find_if(
         diff.texture_sources.begin(), diff.texture_sources.end(),
@@ -4536,12 +6476,27 @@ void project_diff_reports_material_and_texture_source_changes() {
     REQUIRE(changed_texture->source_changed);
     REQUIRE(changed_texture->content_changed);
     REQUIRE(changed_texture->metadata_changed);
+    REQUIRE(changed_texture->before.has_value() && changed_texture->after.has_value());
+    REQUIRE(changed_texture->before->relative_locator == "textures/albedo.png");
+    REQUIRE(changed_texture->after->relative_locator == "textures/albedo-v2.jpg");
+    REQUIRE(changed_texture->before->content_digest == digest_text("albedo source before"));
+    REQUIRE(changed_texture->after->content_digest == digest_text("albedo source after"));
+    REQUIRE(changed_texture->before->revision == core::Revision{1U});
+    REQUIRE(changed_texture->after->revision == core::Revision{2U});
+    REQUIRE(changed_texture->before->format == assets::TextureSourceFormat::png);
+    REQUIRE(changed_texture->after->format == assets::TextureSourceFormat::jpeg);
+    REQUIRE(changed_texture->after->width == 2U && changed_texture->after->height == 3U);
+    REQUIRE(changed_texture->after->provenance == "agent-project-diff-fixture-v2");
     const auto added_texture = std::find_if(
         diff.texture_sources.begin(), diff.texture_sources.end(),
         [](const auto& value) { return value.id == 502U; });
     REQUIRE(added_texture != diff.texture_sources.end());
     REQUIRE(added_texture->added);
     REQUIRE(added_texture->content_changed);
+    REQUIRE(!added_texture->before.has_value() && added_texture->after.has_value());
+    REQUIRE(added_texture->after->name == "Replacement albedo");
+    REQUIRE(added_texture->after->relative_locator == "textures/replacement.png");
+    REQUIRE(added_texture->after->provenance == "agent-project-diff-fixture");
     REQUIRE(diff.has_changes());
     // Blob rows: the old 501 bytes are released, and the new 501 bytes and the
     // 502 replacement bytes are each referenced once.
@@ -4567,6 +6522,7 @@ void project_diff_reports_material_and_texture_source_changes() {
     variant.name = "Surface variant";
     variant.base_material = changed_material.id;
     variant.overrides.roughness = 0.6;
+    variant.permitted_mesh_assets = {mesh_asset};
     REQUIRE(variant_catalog.insert_variant(variant));
     auto variant_update = project::ProjectTransaction::begin(
         document, journal, "agent-project-diff-tests");
@@ -4588,9 +6544,18 @@ void project_diff_reports_material_and_texture_source_changes() {
     REQUIRE(variant_row.after_base_material ==
         std::optional<render::MaterialId>(changed_material.id));
     REQUIRE(variant_row.after_override_count == 1U && variant_row.before_override_count == 0U);
+    REQUIRE(!variant_row.before_overrides.has_value());
+    REQUIRE(variant_row.after_overrides.has_value());
+    REQUIRE(variant_row.after_overrides->roughness == std::optional<double>(0.6));
+    REQUIRE(variant_row.before_mesh_scope_count == 0U);
+    REQUIRE(variant_row.after_mesh_scope_count == 1U);
+    REQUIRE(variant_row.before_mesh_scope_sample.empty());
+    REQUIRE(variant_row.after_mesh_scope_sample == std::vector<std::uint64_t>{mesh_asset});
+    REQUIRE(!variant_row.after_mesh_scope_truncated);
     REQUIRE(unexpanded_catalog_diff.texture_blobs.empty());
 
     project::MaterialCatalog pruned_catalog;
+    REQUIRE(pruned_catalog.insert_sampler(source_sampler));
     REQUIRE(pruned_catalog.insert_texture(
         after_variant.material_catalog().textures().at(502U)));
     REQUIRE(pruned_catalog.insert_material(changed_material));
@@ -4624,10 +6589,14 @@ void project_diff_reports_material_and_texture_source_changes() {
     sample.value_type = project::MaterialGraphValueType::color;
     sample.texture_asset = 502U;
     sample.inputs = {1U, 2U};
+    auto roughness_input = scalar_node(5U, 0.45);
+    roughness_input.kind = project::MaterialGraphNodeKind::parameter_scalar;
+    roughness_input.constants = {};
+    roughness_input.parameter_name = "roughness";
     project::MaterialGraph graph;
     graph.identity = "materials/agent-diff/paint";
     graph.revision = core::Revision{1U};
-    graph.nodes = {scalar_node(5U, 0.45), sample, scalar_node(2U, 0.25), scalar_node(1U, 0.75)};
+    graph.nodes = {roughness_input, sample, scalar_node(2U, 0.25), scalar_node(1U, 0.75)};
     graph.outputs.base_color = 3U;
     graph.outputs.alpha = 1U;
     graph.outputs.roughness = 5U;
@@ -4659,17 +6628,52 @@ void project_diff_reports_material_and_texture_source_changes() {
         graph_added_diff.material_graphs.front().after_node_count == 4U &&
         graph_added_diff.material_graphs.front().added_node_count == 4U &&
         graph_added_diff.material_graphs.front().after_digest.has_value());
+    REQUIRE(graph_added_diff.material_graphs.front().after_outputs.has_value());
+    REQUIRE(graph_added_diff.material_graphs.front().after_outputs->base_color == 3U);
+    REQUIRE(graph_added_diff.material_graphs.front().node_samples.size() == 4U);
+    REQUIRE(!graph_added_diff.material_graphs.front().node_samples_truncated);
+    REQUIRE(graph_added_diff.material_graphs.front().node_samples.front().id == 1U);
+    REQUIRE(graph_added_diff.material_graphs.front().node_samples.front().after.has_value());
+    REQUIRE(graph_added_diff.material_graphs.front().node_samples.front().after->constants[0] == 0.75);
     REQUIRE(graph_added_diff.material_graph_bindings.size() == 1U);
     REQUIRE(graph_added_diff.material_graph_bindings.front().added &&
         graph_added_diff.material_graph_bindings.front().after->graph_identity == graph.identity);
+
+    auto input_catalog = document.material_catalog();
+    const auto input_graph = input_catalog.material_graphs().at(graph.identity);
+    const auto input_graph_digest = input_graph.canonical_digest();
+    REQUIRE(input_graph_digest);
+    project::MaterialGraphEvaluationInputs graph_inputs;
+    project::MaterialGraphValue roughness_value;
+    roughness_value.type = project::MaterialGraphValueType::scalar;
+    roughness_value.components[0U] = 0.65;
+    graph_inputs.parameters.emplace("roughness", roughness_value);
+    REQUIRE(input_catalog.set_material_graph_inputs(changed_material.id, graph.identity,
+        input_graph.revision, input_graph_digest.value(), graph_inputs));
+    auto input_update = project::ProjectTransaction::begin(
+        document, journal, "agent-project-diff.graph-inputs");
+    REQUIRE(input_update);
+    REQUIRE(input_update.value().set_material_catalog(std::move(input_catalog)));
+    REQUIRE(input_update.value().commit("agent-project-diff.graph-inputs"));
+    const project::ProjectDocument input_after = document;
+    const agent::ProjectDiff graph_inputs_diff =
+        agent::ProjectDiff::between(with_graph, input_after);
+    REQUIRE(graph_inputs_diff.material_graph_bindings.size() == 1U);
+    REQUIRE(graph_inputs_diff.material_graph_bindings.front().inputs_changed &&
+        !graph_inputs_diff.material_graph_bindings.front().source_changed &&
+        !graph_inputs_diff.material_graph_bindings.front().graph_changed);
 
     // Rebuild the catalog with one edited graph node, rerouted roughness, and
     // a changed sampler address mode; the binding re-pins the edited graph.
     project::MaterialGraph edited_graph = graph;
     edited_graph.revision = core::Revision{2U};
-    edited_graph.nodes[0].constants[0] = 0.9;
+    const auto edited_node = std::find_if(edited_graph.nodes.begin(), edited_graph.nodes.end(),
+        [](const auto& node) { return node.id == 1U; });
+    REQUIRE(edited_node != edited_graph.nodes.end());
+    edited_node->constants[0] = 0.9;
     edited_graph.outputs.roughness = 2U;
     project::MaterialCatalog rebuilt_catalog;
+    REQUIRE(rebuilt_catalog.insert_sampler(source_sampler));
     for (const auto& [id, texture] : with_graph.material_catalog().textures()) {
         static_cast<void>(id);
         REQUIRE(rebuilt_catalog.insert_texture(texture));
@@ -4697,6 +6701,12 @@ void project_diff_reports_material_and_texture_source_changes() {
     REQUIRE(graph_edit_diff.samplers.front().addressing_changed &&
         !graph_edit_diff.samplers.front().filtering_changed &&
         !graph_edit_diff.samplers.front().name_changed);
+    REQUIRE(graph_edit_diff.samplers.front().before.has_value() &&
+        graph_edit_diff.samplers.front().after.has_value());
+    REQUIRE(graph_edit_diff.samplers.front().before->address_u ==
+        project::SamplerAddressMode::repeat);
+    REQUIRE(graph_edit_diff.samplers.front().after->address_u ==
+        project::SamplerAddressMode::clamp_to_edge);
     REQUIRE(graph_edit_diff.material_graphs.size() == 1U);
     const auto& graph_row = graph_edit_diff.material_graphs.front();
     REQUIRE(!graph_row.added && !graph_row.removed && graph_row.content_changed);
@@ -4704,10 +6714,57 @@ void project_diff_reports_material_and_texture_source_changes() {
         graph_row.removed_node_count == 0U && graph_row.outputs_changed);
     REQUIRE(graph_row.before_revision == std::optional<core::Revision>(core::Revision{1U}) &&
         graph_row.after_revision == std::optional<core::Revision>(core::Revision{2U}));
+    REQUIRE(graph_row.before_outputs.has_value() && graph_row.after_outputs.has_value());
+    REQUIRE(graph_row.before_outputs->roughness == 5U && graph_row.after_outputs->roughness == 2U);
+    REQUIRE(graph_row.node_samples.size() == 1U);
+    REQUIRE(graph_row.node_samples.front().id == 1U);
+    REQUIRE(graph_row.node_samples.front().before.has_value() &&
+        graph_row.node_samples.front().after.has_value());
+    REQUIRE(graph_row.node_samples.front().before->constants[0] == 0.75);
+    REQUIRE(graph_row.node_samples.front().after->constants[0] == 0.9);
+    REQUIRE(!graph_row.node_samples_truncated);
     REQUIRE(graph_edit_diff.material_graph_bindings.size() == 1U &&
         graph_edit_diff.material_graph_bindings.front().source_changed &&
         !graph_edit_diff.material_graph_bindings.front().graph_changed);
     REQUIRE(graph_edit_diff.material_variants.empty());
+
+    const project::ProjectDocument before_bulk_graph = document;
+    project::MaterialGraph bulk_graph;
+    bulk_graph.identity = "materials/agent-diff/bulk";
+    bulk_graph.revision = core::Revision{1U};
+    project::MaterialGraphNode bulk_color;
+    bulk_color.id = 1U;
+    bulk_color.kind = project::MaterialGraphNodeKind::constant_color;
+    bulk_color.value_type = project::MaterialGraphValueType::color;
+    bulk_color.constants = {0.25, 0.5, 0.75, 1.0};
+    bulk_graph.nodes.push_back(bulk_color);
+    bulk_graph.outputs.base_color = bulk_color.id;
+    bulk_graph.outputs.alpha = 2U;
+    bulk_graph.outputs.roughness = 3U;
+    bulk_graph.outputs.metallic = 4U;
+    for (std::uint64_t id = 2U; id <= 40U; ++id) {
+        bulk_graph.nodes.push_back(scalar_node(id, static_cast<double>(id) / 100.0));
+    }
+    project::MaterialCatalog bulk_catalog = document.material_catalog();
+    REQUIRE(bulk_catalog.insert_material_graph(bulk_graph));
+    auto bulk_update = project::ProjectTransaction::begin(
+        document, journal, "agent-project-diff-tests");
+    REQUIRE(bulk_update);
+    REQUIRE(bulk_update.value().set_material_catalog(std::move(bulk_catalog)));
+    REQUIRE(bulk_update.value().commit("agent-project-diff.bulk-graph-added"));
+    const agent::ProjectDiff bulk_graph_diff = agent::ProjectDiff::between(
+        before_bulk_graph, document);
+    const auto bulk_graph_row = std::find_if(
+        bulk_graph_diff.material_graphs.begin(), bulk_graph_diff.material_graphs.end(),
+        [](const auto& value) { return value.identity == "materials/agent-diff/bulk"; });
+    REQUIRE(bulk_graph_row != bulk_graph_diff.material_graphs.end());
+    REQUIRE(bulk_graph_row->added_node_count == 40U);
+    REQUIRE(bulk_graph_row->node_samples.size() ==
+        agent::kMaxProjectDiffMaterialGraphNodeSamples);
+    REQUIRE(bulk_graph_row->node_samples.front().id == 1U);
+    REQUIRE(bulk_graph_row->node_samples.back().id ==
+        agent::kMaxProjectDiffMaterialGraphNodeSamples);
+    REQUIRE(bulk_graph_row->node_samples_truncated);
 }
 
 void shared_mesh_instances_must_be_in_scope_and_within_touch_budget() {
@@ -4764,6 +6821,106 @@ void shared_mesh_instances_must_be_in_scope_and_within_touch_budget() {
     REQUIRE(protected_run.value().diagnostic->message.find("protected by the objective") !=
             std::string::npos);
     REQUIRE(source.snapshot().project_revision == before.project_revision);
+}
+
+void shared_mesh_geometry_respects_locked_instances_before_speculative_mutation() {
+    using namespace carto;
+    for (const bool vertex_edit : {false, true}) {
+        for (const bool locked_sibling : {true, false}) {
+            TempDirectory directory;
+            journal::Journal fixture_journal(directory.path() / "fixture.journal");
+            auto box = geometry::make_box({1.0, 1.0, 1.0});
+            REQUIRE(box);
+            std::uint64_t mesh_asset = 0U;
+            auto document = make_project_with_mesh(
+                fixture_journal, std::move(box.value()), mesh_asset);
+            auto fixture = project::ProjectTransaction::begin(
+                document, fixture_journal, "agent-shared-lock-fixture");
+            REQUIRE(fixture);
+            const scene::ObjectId target{1U};
+            const scene::ObjectId sibling{2U};
+            scene::SceneObject first;
+            first.id = target;
+            first.name = "Unlocked target";
+            first.mesh_asset = mesh_asset;
+            REQUIRE(fixture.value().insert_object(first));
+            scene::SceneObject second = first;
+            second.id = sibling;
+            second.name = "Shared sibling";
+            second.local_transform.translation.x = 2.0;
+            second.locked = locked_sibling;
+            REQUIRE(fixture.value().insert_object(second));
+            REQUIRE(fixture.value().commit("agent-shared-lock.fixture"));
+            const auto project_path = directory.path() / "shared-lock.carto";
+            REQUIRE(document.save_atomic(project_path));
+
+            application::ApplicationSession source;
+            REQUIRE(application::HumanApplicationAccess::dispatch(
+                source, application::OpenProjectAction{project_path}));
+            REQUIRE(application::HumanApplicationAccess::dispatch(
+                source, application::SaveProjectAction{project_path}));
+            const auto before = source.snapshot();
+            const auto recovery_before = application::ApplicationSession::inspect_recovery(
+                project_path);
+            REQUIRE(recovery_before);
+            const auto* before_mesh = before.viewport.scene.find(target)->mesh.get();
+            REQUIRE(before_mesh != nullptr);
+            agent::TargetRef step_target{target, geometry::FaceId{1U}};
+            if (vertex_edit) step_target.component = before_mesh->vertex_ids.front();
+            const auto plan = plan_for(before, {target, sibling}, {{
+                "step-1", step_target,
+                vertex_edit ? "move vertex to 4 0 0" : "inset face 0.1"}});
+            auto task = agent::AgentTask::begin(
+                source, plan, envelope_for({target, sibling}));
+            REQUIRE(task);
+            const auto run = task.value().run();
+            REQUIRE(run);
+            REQUIRE(source.snapshot().project_revision == before.project_revision);
+            REQUIRE(source.snapshot().project_generation == before.project_generation);
+            const auto recovery_after_preview = application::ApplicationSession::inspect_recovery(
+                project_path);
+            REQUIRE(recovery_after_preview);
+            REQUIRE(recovery_after_preview.value().journal_entry_count ==
+                recovery_before.value().journal_entry_count);
+
+            if (locked_sibling) {
+                REQUIRE(run.value().status == agent::TaskStatus::blocked);
+                REQUIRE(!run.value().can_accept);
+                REQUIRE(run.value().steps.size() == 1U);
+                REQUIRE(run.value().steps.front().status == agent::StepStatus::failed);
+                REQUIRE(run.value().steps.front().revision_before ==
+                    run.value().steps.front().revision_after);
+                REQUIRE(run.value().steps.front().diagnostic.has_value());
+                REQUIRE(run.value().steps.front().diagnostic->message.find(
+                    "locked shared-mesh instance") != std::string::npos);
+                REQUIRE(!run.value().diff.has_changes());
+                REQUIRE(!application::HumanApplicationAccess::accept_agent_task(task.value()));
+            } else {
+                REQUIRE(run.value().status == agent::TaskStatus::review);
+                REQUIRE(run.value().can_accept);
+                REQUIRE(run.value().diff.changed_object_count() == 2U);
+                REQUIRE(application::HumanApplicationAccess::accept_agent_task(task.value()));
+                const auto accepted = source.snapshot();
+                REQUIRE(accepted.viewport.scene.find(target)->mesh->source_revision >
+                    before_mesh->source_revision);
+                REQUIRE(accepted.viewport.scene.find(sibling)->mesh->source_revision ==
+                    accepted.viewport.scene.find(target)->mesh->source_revision);
+                const auto recovery_after_accept =
+                    application::ApplicationSession::inspect_recovery(project_path);
+                REQUIRE(recovery_after_accept);
+                REQUIRE(recovery_after_accept.value().journal_entry_count ==
+                    recovery_before.value().journal_entry_count + 1U);
+                REQUIRE(application::HumanApplicationAccess::dispatch(
+                    source, application::UndoAction{}));
+                REQUIRE(source.snapshot().viewport.scene.find(target)->mesh->source_revision ==
+                    before_mesh->source_revision);
+                REQUIRE(application::HumanApplicationAccess::dispatch(
+                    source, application::RedoAction{}));
+                REQUIRE(source.snapshot().viewport.scene.find(target)->mesh->source_revision ==
+                    accepted.viewport.scene.find(target)->mesh->source_revision);
+            }
+        }
+    }
 }
 
 void bounded_mesh_recipe_caps_execution_and_binds_its_acceptance_gate() {
@@ -7885,13 +10042,21 @@ int main() {
         ui_compiles_lightmap_uv_generation_for_multiple_unique_mesh_targets();
         agent_lightmap_uv_fails_closed_without_permission_or_complete_mesh_scope();
         direct_lightmap_uv_action_rejects_invalid_and_stale_parameters();
+        human_uv_corner_edit_is_revision_bound_historical_and_persistent();
+        human_uv_seam_alignment_is_atomic_revision_bound_and_undoable();
         material_catalog_checkpoint_rebase_models_region_writes_and_detects_conflicts();
         ui_material_assignment_rebase_preserves_region_receipt_for_review();
         work_envelope_blocks_topology_effect_before_live_mutation();
         work_envelope_blocks_topology_churn_over_budget();
         diff_digest_tracks_geometry_values_not_only_change_shape();
-        project_diff_detects_unclassified_project_source_changes();
+        project_diff_marks_changed_snapshots_as_partial_projections();
+        project_diff_tracks_bounded_procedural_source_records();
+        project_diff_tracks_bounded_biological_authoring_sources();
+        project_diff_tracks_bounded_rig_module_template_sources();
+        project_diff_tracks_bounded_kinematic_graph_records();
         project_merge_review_is_snapshot_bound_and_requires_contested_choice();
+        ui_agent_project_merge_acceptance_is_fresh_human_gated_and_undoable();
+        ui_project_merge_details_include_bounded_mesh_value_samples();
         project_diff_reports_uv_layer_and_bounded_corner_changes();
         project_diff_reports_material_and_texture_source_changes();
         bounded_mesh_recipe_caps_execution_and_binds_its_acceptance_gate();
@@ -7900,6 +10065,7 @@ int main() {
         transform_recipe_permits_root_translation_and_preserves_meshes();
         surface_finish_recipe_composes_material_and_uv_without_topology();
         shared_mesh_instances_must_be_in_scope_and_within_touch_budget();
+        shared_mesh_geometry_respects_locked_instances_before_speculative_mutation();
         scope_protection_and_stale_revision_fail_closed();
         failed_native_step_and_invalid_task_transitions_do_not_commit();
         missing_goal_and_source_change_after_run_fail_closed();

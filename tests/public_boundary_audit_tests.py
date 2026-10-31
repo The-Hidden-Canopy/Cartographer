@@ -389,6 +389,82 @@ class PublicBoundaryAuditTests(unittest.TestCase):
                 history.stdout,
             )
 
+    def test_sculpt_evaluation_test_target_is_scanned_in_current_staged_and_history(self) -> None:
+        with self.make_repo() as temporary:
+            repo = Path(temporary)
+            path = repo / "CMakeLists.txt"
+            path.write_text(
+                "add_executable(cartographer_sculpt_evaluation_tests fixture.cpp)\n",
+                encoding="utf-8",
+            )
+
+            current = audit(repo)
+            self.assertEqual(current.returncode, 1, current.stdout + current.stderr)
+            self.assertIn(
+                "current file CMakeLists.txt: private production implementation reference",
+                current.stdout,
+            )
+
+            git(repo, "add", "CMakeLists.txt")
+            staged = audit(repo)
+            self.assertEqual(staged.returncode, 1, staged.stdout + staged.stderr)
+            self.assertIn(
+                "staged file CMakeLists.txt: private production implementation reference",
+                staged.stdout,
+            )
+
+            git(repo, "commit", "-q", "-m", "private sculpt evaluation target fixture")
+            path.write_text(
+                "add_executable(cartographer_public_geometry_tests fixture.cpp)\n",
+                encoding="utf-8",
+            )
+            git(repo, "add", "CMakeLists.txt")
+            git(repo, "commit", "-q", "-m", "remove private sculpt evaluation target")
+            history = audit(repo, "--ref", "HEAD")
+            self.assertEqual(history.returncode, 1, history.stdout + history.stderr)
+            self.assertIn(
+                "private production implementation reference",
+                history.stdout,
+            )
+
+    def test_private_production_header_reference_is_scanned_in_current_staged_and_history(self) -> None:
+        with self.make_repo() as temporary:
+            repo = Path(temporary)
+            path = repo / "src" / "public_adapter.cpp"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "#include <carto/production/sculpt_evaluation.hpp>\n",
+                encoding="utf-8",
+            )
+
+            current = audit(repo)
+            self.assertEqual(current.returncode, 1, current.stdout + current.stderr)
+            self.assertIn(
+                "current file src/public_adapter.cpp: private production implementation reference",
+                current.stdout,
+            )
+
+            git(repo, "add", "src/public_adapter.cpp")
+            path.write_text("#include <carto/geometry/mesh.hpp>\n", encoding="utf-8")
+            staged = audit(repo)
+            self.assertEqual(staged.returncode, 1, staged.stdout + staged.stderr)
+            self.assertIn(
+                "staged file src/public_adapter.cpp: private production implementation reference",
+                staged.stdout,
+            )
+
+            git(repo, "commit", "-q", "-m", "private production header fixture")
+            path.write_text("#include <carto/geometry/mesh.hpp>\n", encoding="utf-8")
+            git(repo, "add", "src/public_adapter.cpp")
+            git(repo, "commit", "-q", "-m", "remove private production header reference")
+            history = audit(repo, "--ref", "HEAD")
+            self.assertEqual(history.returncode, 1, history.stdout + history.stderr)
+            self.assertIn("history content", history.stdout)
+            self.assertIn(
+                "private production implementation reference",
+                history.stdout,
+            )
+
     def test_private_out_of_tree_integration_cmake_reference_fails_current_staged_and_history(self) -> None:
         with self.make_repo() as temporary:
             repo = Path(temporary)
@@ -480,6 +556,57 @@ class PublicBoundaryAuditTests(unittest.TestCase):
             history = audit(repo, "--ref", "HEAD")
             self.assertEqual(history.returncode, 1, history.stdout + history.stderr)
             self.assertIn("private/quarantined path", history.stdout)
+
+    def test_private_sculpt_evaluation_paths_fail_current_staged_and_history(self) -> None:
+        for relative in (
+            "libs/production/src/sculpt_evaluation.cpp",
+            "libs/production/include/carto/production/sculpt_evaluation.hpp",
+            "tests/sculpt_evaluation_tests.cpp",
+        ):
+            with self.subTest(path=relative), self.make_repo() as temporary:
+                repo = Path(temporary)
+                path = repo / relative
+                path.parent.mkdir(parents=True)
+                path.write_text("void evaluate_sculpt_stack();\n", encoding="utf-8")
+
+                current = audit(repo)
+                self.assertEqual(current.returncode, 1, current.stdout + current.stderr)
+                self.assertIn(f"untracked path {relative}: private/quarantined path", current.stdout)
+
+                git(repo, "add", "-f", relative)
+                staged = audit(repo)
+                self.assertEqual(staged.returncode, 1, staged.stdout + staged.stderr)
+                self.assertIn(f"staged path {relative}: private/quarantined path", staged.stdout)
+
+                git(repo, "commit", "-q", "-m", "private SculptStack evaluator fixture")
+                path.unlink()
+                git(repo, "add", "-u")
+                git(repo, "commit", "-q", "-m", "remove private evaluator fixture")
+                history = audit(repo, "--ref", "HEAD")
+                self.assertEqual(history.returncode, 1, history.stdout + history.stderr)
+                self.assertIn(
+                    f"selected-ref history path {relative}: private/quarantined path",
+                    history.stdout,
+                )
+
+    def test_public_application_reference_to_sculpt_evaluator_is_blocked(self) -> None:
+        with self.make_repo() as temporary:
+            repo = Path(temporary)
+            path = repo / "libs" / "application" / "src" / "application.cpp"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "auto preview = evaluate_sculpt_stack(source, stack);\n",
+                encoding="utf-8",
+            )
+
+            current = audit(repo)
+            self.assertEqual(current.returncode, 1, current.stdout + current.stderr)
+            self.assertIn("private production API reference", current.stdout)
+
+            git(repo, "add", "libs/application/src/application.cpp")
+            staged = audit(repo)
+            self.assertEqual(staged.returncode, 1, staged.stdout + staged.stderr)
+            self.assertIn("private production API reference", staged.stdout)
 
     def test_private_d3d12_sculpt_preview_path_fails_current_staged_and_history(self) -> None:
         with self.make_repo() as temporary:
@@ -603,6 +730,55 @@ class PublicBoundaryAuditTests(unittest.TestCase):
                 "private runtime-cloth build reference",
                 history.stdout,
             )
+
+    def test_solution_file_private_production_reference_fails_current_staged_and_history(
+        self,
+    ) -> None:
+        for solution_name in ("Cartographer.sln", "Cartographer.slnx"):
+            with self.subTest(solution=solution_name), self.make_repo() as temporary:
+                repo = Path(temporary)
+                path = repo / solution_name
+                if solution_name.endswith(".slnx"):
+                    private_project = (
+                        '<Solution><Project Path="libs\\production\\src\\'
+                        'sculpt_evaluation.cpp" /></Solution>\n'
+                    )
+                else:
+                    private_project = (
+                        'Project("{00000000-0000-0000-0000-000000000000}") = '
+                        '"SculptEvaluation", "libs\\production\\src\\'
+                        'sculpt_evaluation.cpp", "{00000000-0000-0000-0000-000000000001}"\n'
+                    )
+                path.write_text(private_project, encoding="utf-8")
+
+                current = audit(repo)
+                self.assertEqual(current.returncode, 1, current.stdout + current.stderr)
+                self.assertIn(
+                    f"current file {solution_name}: private production implementation reference",
+                    current.stdout,
+                )
+
+                git(repo, "add", solution_name)
+                staged = audit(repo)
+                self.assertEqual(staged.returncode, 1, staged.stdout + staged.stderr)
+                self.assertIn(
+                    f"staged file {solution_name}: private production implementation reference",
+                    staged.stdout,
+                )
+
+                git(repo, "commit", "-q", "-m", "private solution project fixture")
+                path.write_text(
+                    private_project.replace("sculpt_evaluation.cpp", "mesh.cpp"),
+                    encoding="utf-8",
+                )
+                git(repo, "add", solution_name)
+                git(repo, "commit", "-q", "-m", "remove private solution project reference")
+                history = audit(repo, "--ref", "HEAD")
+                self.assertEqual(history.returncode, 1, history.stdout + history.stderr)
+                self.assertIn(
+                    "private production implementation reference",
+                    history.stdout,
+                )
 
     def test_relocated_private_kernel_api_fails_current_staged_and_history(self) -> None:
         with self.make_repo() as temporary:
@@ -1102,6 +1278,24 @@ class PublicBoundaryAuditTests(unittest.TestCase):
             git(repo, "commit", "-q", "-m", "ignore policy")
             result = audit(repo, "--check-ignore-policy")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_ignore_policy_probe_works_when_system_temp_is_unavailable(self) -> None:
+        with self.make_repo() as temporary:
+            repo = Path(temporary)
+            (repo / ".gitignore").write_text(
+                (ROOT / ".gitignore").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            git(repo, "add", ".gitignore")
+            git(repo, "commit", "-q", "-m", "ignore policy")
+            findings: list[str] = []
+            with patch.object(
+                tempfile,
+                "gettempdir",
+                side_effect=PermissionError("system temp unavailable"),
+            ):
+                AUDIT_MODULE.check_ignore_policy(repo, findings)
+        self.assertEqual(findings, [])
 
     def test_ignore_policy_rejects_missing_local_state_guards(self) -> None:
         with self.make_repo() as temporary:

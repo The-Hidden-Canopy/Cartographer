@@ -102,9 +102,12 @@ struct ReferenceImagePlane {
     ReferencePlaneView view = ReferencePlaneView::perspective;
     std::string view_set_identity;
     std::optional<scene::ObjectId> pinned_camera;
+    // World-space placement for unpinned and legacy camera-pinned planes;
+    // camera-local placement for newly pinned planes when this flag is true.
     core::Vec3d origin{};
     core::Vec3d normal{0.0, 0.0, 1.0};
     core::Vec3d up{0.0, 1.0, 0.0};
+    bool camera_local_placement = false;
     double width_meters = 1.0;
     double opacity = 1.0;
     bool visible = true;
@@ -129,9 +132,10 @@ struct ReferenceImagePlanePlanCorners {
     core::Vec2d lower_left{};
 };
 
-// Derives the image quad from the plane's centered origin, physical width,
-// pixel aspect ratio, normal, and up vector. Image-right is cross(up, normal).
-// This is geometry only; it does not resolve or render the source image.
+// Derives the image quad in the plane's authored coordinate space from its
+// centered origin, physical width, pixel aspect ratio, normal, and up vector.
+// Image-right is cross(up, normal). This is geometry only; it does not resolve
+// or render the source image.
 [[nodiscard]] core::Result<ReferenceImagePlaneCorners>
 reference_image_plane_corners(const ReferenceImagePlane& plane);
 
@@ -166,7 +170,7 @@ read_reference_image_source_bytes(
 // exposure, switch state, and runtime light simulation are derived/external.
 class PresentationCatalog final {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 2U;
+    static constexpr std::uint32_t kSchemaVersion = 3U;
     static constexpr std::size_t kMaxSerializedBytes = 8U * 1024U * 1024U;
     static constexpr std::size_t kMaxRecords = 4'096U;
 

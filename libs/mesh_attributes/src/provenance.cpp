@@ -31,6 +31,284 @@ std::vector<std::uint64_t> sorted_ids(
     return ids;
 }
 
+bool supports_interpolation(attributes::AttributeType type) noexcept {
+    switch (type) {
+    case attributes::AttributeType::float32:
+    case attributes::AttributeType::float64:
+    case attributes::AttributeType::vec2:
+    case attributes::AttributeType::vec3:
+    case attributes::AttributeType::vec4:
+    case attributes::AttributeType::color4:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool same_attribute_value(
+    attributes::AttributeType type,
+    const attributes::AttributeValue& left,
+    const attributes::AttributeValue& right) noexcept {
+    switch (type) {
+    case attributes::AttributeType::boolean:
+        return std::get<bool>(left) == std::get<bool>(right);
+    case attributes::AttributeType::int32:
+        return std::get<std::int32_t>(left) == std::get<std::int32_t>(right);
+    case attributes::AttributeType::uint32:
+        return std::get<std::uint32_t>(left) == std::get<std::uint32_t>(right);
+    case attributes::AttributeType::float32:
+        return std::get<float>(left) == std::get<float>(right);
+    case attributes::AttributeType::float64:
+        return std::get<double>(left) == std::get<double>(right);
+    case attributes::AttributeType::vec2: {
+        const auto& a = std::get<core::Vec2d>(left);
+        const auto& b = std::get<core::Vec2d>(right);
+        return a.x == b.x && a.y == b.y;
+    }
+    case attributes::AttributeType::vec3: {
+        const auto& a = std::get<core::Vec3d>(left);
+        const auto& b = std::get<core::Vec3d>(right);
+        return a.x == b.x && a.y == b.y && a.z == b.z;
+    }
+    case attributes::AttributeType::vec4:
+    case attributes::AttributeType::color4: {
+        const auto& a = std::get<core::Vec4d>(left);
+        const auto& b = std::get<core::Vec4d>(right);
+        return a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w;
+    }
+    case attributes::AttributeType::string_id:
+    case attributes::AttributeType::object_id:
+    case attributes::AttributeType::vertex_id:
+        return std::get<std::uint64_t>(left) == std::get<std::uint64_t>(right);
+    default:
+        return false;
+    }
+}
+
+core::Result<void> remap_vertex_reference_layers(
+    attributes::AttributeSet& source,
+    const geometry::EditableMesh& source_mesh,
+    const geometry::TopologyEditReceipt& receipt) {
+    std::vector<std::string> layer_ids;
+    for (const auto& [id, layer] : source.layers()) {
+        if (layer.descriptor.type == attributes::AttributeType::vertex_id) {
+            layer_ids.push_back(id);
+        }
+    }
+    for (const auto& id : layer_ids) {
+        const auto* layer = source.find(id);
+        if (layer == nullptr) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "vertex-reference layer disappeared during transfer preparation"));
+        }
+        std::vector<attributes::AttributeValue> values = layer->values;
+        for (auto& value : values) {
+            auto& referenced_id = std::get<std::uint64_t>(value);
+            if (referenced_id == 0U) continue;
+            const geometry::VertexId source_id{referenced_id};
+            if (source_mesh.find_vertex(source_id) == nullptr) {
+                return core::Result<void>::failure(core::Diagnostic(
+                    core::ErrorCode::stale_data,
+                    "vertex-reference attribute points to a missing source vertex"));
+            }
+            const auto replacement = receipt.merged_vertices.find(source_id);
+            if (replacement != receipt.merged_vertices.end()) {
+                referenced_id = replacement->second.value;
+            }
+        }
+        const attributes::AttributeLayerDescriptor descriptor = layer->descriptor;
+        if (auto result = source.remove_layer(id); !result) return result;
+        if (auto result = source.add_layer({descriptor, std::move(values)}); !result) {
+            return result;
+        }
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> configure_merge_attribute_transfer(
+    const attributes::AttributeSet& source,
+    attributes::TopologyProvenance& provenance,
+    attributes::AttributeTransferPolicy& policy) {
+    for (auto iterator = provenance.source_indices.begin();
+         iterator != provenance.source_indices.end();) {
+        if (source.domain_count(iterator->first).has_value()) {
+            ++iterator;
+        } else {
+            iterator = provenance.source_indices.erase(iterator);
+        }
+    }
+    for (auto iterator = provenance.source_weights.begin();
+         iterator != provenance.source_weights.end();) {
+        if (source.domain_count(iterator->first).has_value()) {
+            ++iterator;
+        } else {
+            iterator = provenance.source_weights.erase(iterator);
+        }
+    }
+    for (auto iterator = provenance.invalidated_destinations.begin();
+         iterator != provenance.invalidated_destinations.end();) {
+        if (source.domain_count(iterator->first).has_value()) {
+            ++iterator;
+        } else {
+            iterator = provenance.invalidated_destinations.erase(iterator);
+        }
+    }
+    for (const auto& [domain, count] : source.domain_counts()) {
+        switch (domain) {
+        case attributes::AttributeDomain::vertex:
+        case attributes::AttributeDomain::edge:
+        case attributes::AttributeDomain::face:
+        case attributes::AttributeDomain::corner:
+            if (!provenance.source_indices.contains(domain)) {
+                return core::Result<void>::failure(core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "mesh merge provenance is missing a topology domain"));
+            }
+            break;
+        case attributes::AttributeDomain::object:
+            if (count > 1U) {
+                return core::Result<void>::failure(core::Diagnostic(
+                    core::ErrorCode::unsupported,
+                    "mesh merge requires a single-element object attribute domain"));
+            }
+            provenance.source_indices.insert_or_assign(
+                domain,
+                count == 1U
+                    ? std::vector<std::vector<std::size_t>>{{0U}}
+                    : std::vector<std::vector<std::size_t>>{});
+            break;
+        default:
+            if (count != 0U) {
+                return core::Result<void>::failure(core::Diagnostic(
+                    core::ErrorCode::unsupported,
+                    "mesh merge cannot transfer a non-empty non-mesh attribute domain"));
+            }
+            provenance.source_indices.insert_or_assign(
+                domain, std::vector<std::vector<std::size_t>>{});
+            break;
+        }
+    }
+
+    const auto vertex_sources = provenance.source_indices.find(
+        attributes::AttributeDomain::vertex);
+    const auto edge_sources = provenance.source_indices.find(
+        attributes::AttributeDomain::edge);
+    const auto face_sources = provenance.source_indices.find(
+        attributes::AttributeDomain::face);
+    const auto corner_sources = provenance.source_indices.find(
+        attributes::AttributeDomain::corner);
+    for (const auto& [id, layer] : source.layers()) {
+        const auto domain = layer.descriptor.domain;
+        if (domain == attributes::AttributeDomain::vertex &&
+            supports_interpolation(layer.descriptor.type)) {
+            policy.per_layer.emplace(id, attributes::TransferMode::interpolate);
+            continue;
+        }
+        if (domain == attributes::AttributeDomain::vertex) {
+            if (vertex_sources == provenance.source_indices.end()) {
+                return core::Result<void>::failure(core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "discrete vertex transfer has no topology provenance"));
+            }
+            for (const auto& sources : vertex_sources->second) {
+                if (sources.empty()) {
+                    return core::Result<void>::failure(core::Diagnostic(
+                        core::ErrorCode::unsupported,
+                        "discrete vertex transfer cannot invent a value for a created vertex"));
+                }
+                const std::size_t first_index = sources.front();
+                if (first_index >= layer.values.size()) {
+                    return core::Result<void>::failure(core::Diagnostic(
+                        core::ErrorCode::validation_failed,
+                        "discrete vertex provenance exceeds the source layer"));
+                }
+                const auto& first_value = layer.values[first_index];
+                for (const std::size_t source_index : sources) {
+                    if (source_index >= layer.values.size()) {
+                        return core::Result<void>::failure(core::Diagnostic(
+                            core::ErrorCode::validation_failed,
+                            "discrete vertex provenance exceeds the source layer"));
+                    }
+                    if (!same_attribute_value(
+                            layer.descriptor.type, first_value, layer.values[source_index])) {
+                        return core::Result<void>::failure(core::Diagnostic(
+                            core::ErrorCode::unsupported,
+                            "mesh merge cannot combine conflicting discrete vertex values"));
+                    }
+                }
+            }
+            // `duplicate` selects one source value. The equality check above
+            // proves every merged source carries that same authored value.
+            policy.per_layer.emplace(id, attributes::TransferMode::duplicate);
+            continue;
+        }
+        if (domain == attributes::AttributeDomain::edge) {
+            if (edge_sources == provenance.source_indices.end()) {
+                return core::Result<void>::failure(core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "edge attribute transfer has no topology provenance"));
+            }
+            for (const auto& sources : edge_sources->second) {
+                if (sources.empty()) {
+                    return core::Result<void>::failure(core::Diagnostic(
+                        core::ErrorCode::unsupported,
+                        "edge attribute transfer cannot invent a value for a created edge"));
+                }
+                const std::size_t first_index = sources.front();
+                if (first_index >= layer.values.size()) {
+                    return core::Result<void>::failure(core::Diagnostic(
+                        core::ErrorCode::validation_failed,
+                        "edge provenance exceeds the source layer"));
+                }
+                const auto& first_value = layer.values[first_index];
+                for (const std::size_t source_index : sources) {
+                    if (source_index >= layer.values.size()) {
+                        return core::Result<void>::failure(core::Diagnostic(
+                            core::ErrorCode::validation_failed,
+                            "edge provenance exceeds the source layer"));
+                    }
+                    if (!same_attribute_value(
+                            layer.descriptor.type, first_value, layer.values[source_index])) {
+                        return core::Result<void>::failure(core::Diagnostic(
+                            core::ErrorCode::unsupported,
+                            "mesh merge cannot combine conflicting edge attribute values"));
+                    }
+                }
+            }
+            policy.per_layer.emplace(id, attributes::TransferMode::duplicate);
+            continue;
+        }
+        const auto require_one_source = [&](
+            const auto& mappings, const char* label) -> core::Result<void> {
+            if (mappings == provenance.source_indices.end()) {
+                return core::Result<void>::failure(core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    std::string(label) + " attribute transfer has no topology provenance"));
+            }
+            for (const auto& sources : mappings->second) {
+                if (sources.size() != 1U || sources.front() >= layer.values.size()) {
+                    return core::Result<void>::failure(core::Diagnostic(
+                        core::ErrorCode::unsupported,
+                        std::string(label) +
+                            " attribute transfer requires exactly one source element"));
+                }
+            }
+            return core::Result<void>::success();
+        };
+        if (domain == attributes::AttributeDomain::face) {
+            if (auto result = require_one_source(face_sources, "face"); !result) return result;
+        } else if (domain == attributes::AttributeDomain::corner) {
+            if (auto result = require_one_source(corner_sources, "corner"); !result) return result;
+        } else if (domain == attributes::AttributeDomain::object) {
+            const auto object_sources = provenance.source_indices.find(domain);
+            if (auto result = require_one_source(object_sources, "object"); !result) return result;
+        }
+        policy.per_layer.emplace(id, attributes::TransferMode::preserve);
+    }
+    return core::Result<void>::success();
+}
+
 } // namespace
 
 core::Result<attributes::StableTopologySnapshot> stable_topology_snapshot(
@@ -364,6 +642,81 @@ core::Result<attributes::TopologyProvenance> provenance_from_receipt(
         return core::Result<attributes::TopologyProvenance>::failure(result.error());
     }
 
+    if (!receipt.merged_vertices.empty()) {
+        const auto source_edge_ids = source_snapshot.value().element_ids.find(
+            attributes::AttributeDomain::edge);
+        const auto destination_edge_ids = destination_snapshot.value().element_ids.find(
+            attributes::AttributeDomain::edge);
+        auto edge_mappings = provenance.value().source_indices.find(
+            attributes::AttributeDomain::edge);
+        if (source_edge_ids == source_snapshot.value().element_ids.end() ||
+            destination_edge_ids == destination_snapshot.value().element_ids.end() ||
+            edge_mappings == provenance.value().source_indices.end() ||
+            edge_mappings->second.size() != destination_edge_ids->second.size()) {
+            return core::Result<attributes::TopologyProvenance>::failure(core::Diagnostic(
+                core::ErrorCode::validation_failed,
+                "mesh vertex merge has incomplete edge provenance"));
+        }
+
+        const auto edge_key = [](geometry::VertexId first, geometry::VertexId second) {
+            if (second < first) std::swap(first, second);
+            return std::pair{first.value, second.value};
+        };
+        std::map<std::pair<std::uint64_t, std::uint64_t>, std::size_t>
+            destination_edges_by_vertices;
+        for (const auto& edge : destination_topology.value().edges) {
+            const auto edge_index = std::lower_bound(
+                destination_edge_ids->second.begin(), destination_edge_ids->second.end(),
+                edge.id.value);
+            if (edge_index == destination_edge_ids->second.end() ||
+                *edge_index != edge.id.value) {
+                return core::Result<attributes::TopologyProvenance>::failure(core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "destination edge is missing from stable topology identities"));
+            }
+            const std::size_t index = static_cast<std::size_t>(
+                std::distance(destination_edge_ids->second.begin(), edge_index));
+            if (!destination_edges_by_vertices.emplace(
+                    edge_key(edge.first, edge.second), index).second) {
+                return core::Result<attributes::TopologyProvenance>::failure(core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "destination topology contains duplicate edge endpoints"));
+            }
+        }
+
+        std::map<std::uint64_t, std::size_t> source_edge_indices;
+        for (std::size_t index = 0U; index < source_edge_ids->second.size(); ++index) {
+            source_edge_indices.emplace(source_edge_ids->second[index], index);
+        }
+        std::vector<std::vector<std::size_t>> merged_edge_sources(
+            destination_edge_ids->second.size());
+        for (const auto& edge : source_topology.value().edges) {
+            const auto source_index = source_edge_indices.find(edge.id.value);
+            if (source_index == source_edge_indices.end()) {
+                return core::Result<attributes::TopologyProvenance>::failure(core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "source edge is missing from stable topology identities"));
+            }
+            const auto map_vertex = [&receipt](geometry::VertexId vertex) {
+                const auto replacement = receipt.merged_vertices.find(vertex);
+                return replacement == receipt.merged_vertices.end()
+                    ? vertex : replacement->second;
+            };
+            const geometry::VertexId first = map_vertex(edge.first);
+            const geometry::VertexId second = map_vertex(edge.second);
+            if (first == second) continue;
+            const auto destination_edge = destination_edges_by_vertices.find(
+                edge_key(first, second));
+            if (destination_edge == destination_edges_by_vertices.end()) continue;
+            merged_edge_sources[destination_edge->second].push_back(source_index->second);
+        }
+        for (auto& sources : merged_edge_sources) {
+            std::sort(sources.begin(), sources.end());
+            sources.erase(std::unique(sources.begin(), sources.end()), sources.end());
+        }
+        edge_mappings->second = std::move(merged_edge_sources);
+    }
+
     const auto source_vertex_ids = source_snapshot.value().element_ids.find(
         attributes::AttributeDomain::vertex);
     const auto destination_vertex_ids = destination_snapshot.value().element_ids.find(
@@ -415,20 +768,6 @@ core::Result<geometry::TopologyEditReceipt> merge_vertices_with_attribute_transf
     geometry::VertexId target,
     geometry::VertexId source,
     geometry::VertexMergeMode mode) {
-    const auto supports_interpolation = [](attributes::AttributeType type) noexcept {
-        switch (type) {
-        case attributes::AttributeType::float32:
-        case attributes::AttributeType::float64:
-        case attributes::AttributeType::vec2:
-        case attributes::AttributeType::vec3:
-        case attributes::AttributeType::vec4:
-        case attributes::AttributeType::color4:
-            return true;
-        default:
-            return false;
-        }
-    };
-
     geometry::EditableMesh after = mesh;
     if (!mesh.has_attribute_payload()) {
         auto merged = after.merge_vertices(target, source, mode);
@@ -440,7 +779,7 @@ core::Result<geometry::TopologyEditReceipt> merge_vertices_with_attribute_transf
             std::move(merged.value()));
     }
 
-    const attributes::AttributeSet source_attributes = mesh.attributes();
+    attributes::AttributeSet source_attributes = mesh.attributes();
     const attributes::UvSetTable source_uv_sets = mesh.uv_sets();
     if (auto result = after.clear_attribute_payload(); !result) {
         return core::Result<geometry::TopologyEditReceipt>::failure(result.error());
@@ -455,17 +794,75 @@ core::Result<geometry::TopologyEditReceipt> merge_vertices_with_attribute_transf
     if (!provenance) {
         return core::Result<geometry::TopologyEditReceipt>::failure(provenance.error());
     }
+    if (auto remapped = remap_vertex_reference_layers(
+            source_attributes, geometry_source, receipt); !remapped) {
+        return core::Result<geometry::TopologyEditReceipt>::failure(remapped.error());
+    }
 
     attributes::AttributeTransferPolicy policy;
     policy.default_mode = attributes::TransferMode::preserve;
-    for (const auto& [id, layer] : source_attributes.layers()) {
-        if (layer.descriptor.domain != attributes::AttributeDomain::vertex) continue;
-        if (!supports_interpolation(layer.descriptor.type)) {
-            return core::Result<geometry::TopologyEditReceipt>::failure(core::Diagnostic(
-                core::ErrorCode::unsupported,
-                "vertex merge cannot transfer a discrete vertex attribute layer"));
+    if (auto configured = configure_merge_attribute_transfer(
+            source_attributes, provenance.value(), policy); !configured) {
+        return core::Result<geometry::TopologyEditReceipt>::failure(configured.error());
+    }
+    auto transferred = attributes::transfer(
+        source_attributes, std::move(provenance.value()), policy);
+    if (!transferred) {
+        return core::Result<geometry::TopologyEditReceipt>::failure(transferred.error());
+    }
+    if (auto result = after.set_attribute_payload(
+            std::move(transferred.value()), source_uv_sets); !result) {
+        return core::Result<geometry::TopologyEditReceipt>::failure(result.error());
+    }
+    receipt.revision_before = mesh.revision();
+    receipt.revision_after = after.revision();
+    if (auto result = receipt.validate(); !result) {
+        return core::Result<geometry::TopologyEditReceipt>::failure(result.error());
+    }
+    mesh = std::move(after);
+    return core::Result<geometry::TopologyEditReceipt>::success(std::move(receipt));
+}
+
+core::Result<geometry::TopologyEditReceipt> merge_by_distance_with_attribute_transfer(
+    geometry::EditableMesh& mesh,
+    const std::vector<geometry::VertexId>& candidates,
+    double distance) {
+    geometry::EditableMesh after = mesh;
+    if (!mesh.has_attribute_payload()) {
+        auto merged = after.merge_by_distance(candidates, distance);
+        if (!merged) {
+            return core::Result<geometry::TopologyEditReceipt>::failure(merged.error());
         }
-        policy.per_layer.emplace(id, attributes::TransferMode::interpolate);
+        mesh = std::move(after);
+        return core::Result<geometry::TopologyEditReceipt>::success(
+            std::move(merged.value()));
+    }
+
+    attributes::AttributeSet source_attributes = mesh.attributes();
+    const attributes::UvSetTable source_uv_sets = mesh.uv_sets();
+    if (auto result = after.clear_attribute_payload(); !result) {
+        return core::Result<geometry::TopologyEditReceipt>::failure(result.error());
+    }
+    const geometry::EditableMesh geometry_source = after;
+    auto merged = after.merge_by_distance(candidates, distance);
+    if (!merged) {
+        return core::Result<geometry::TopologyEditReceipt>::failure(merged.error());
+    }
+    geometry::TopologyEditReceipt receipt = std::move(merged.value());
+    auto provenance = provenance_from_receipt(geometry_source, after, receipt);
+    if (!provenance) {
+        return core::Result<geometry::TopologyEditReceipt>::failure(provenance.error());
+    }
+    if (auto remapped = remap_vertex_reference_layers(
+            source_attributes, geometry_source, receipt); !remapped) {
+        return core::Result<geometry::TopologyEditReceipt>::failure(remapped.error());
+    }
+
+    attributes::AttributeTransferPolicy policy;
+    policy.default_mode = attributes::TransferMode::preserve;
+    if (auto configured = configure_merge_attribute_transfer(
+            source_attributes, provenance.value(), policy); !configured) {
+        return core::Result<geometry::TopologyEditReceipt>::failure(configured.error());
     }
     auto transferred = attributes::transfer(
         source_attributes, std::move(provenance.value()), policy);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <carto/assets/blob_store.hpp>
+#include <carto/assets/source_registry.hpp>
 #include <carto/attributes/uv.hpp>
 #include <carto/core/diagnostic.hpp>
 #include <carto/core/math.hpp>
@@ -8,6 +9,8 @@
 #include <carto/assets/texture_source.hpp>
 #include <carto/biological/proxy_mesh.hpp>
 #include <carto/condition/authoring.hpp>
+#include <carto/condition/sweep_endpoint.hpp>
+#include <carto/connection/graph.hpp>
 #include <carto/condition/effect_preview.hpp>
 #include <carto/condition/vegetation_preview.hpp>
 #include <carto/condition/state_branch.hpp>
@@ -25,6 +28,7 @@
 #include <carto/project/material_catalog.hpp>
 #include <carto/production/decal.hpp>
 #include <carto/production/sculpt_stack.hpp>
+#include <carto/production/uv_island_pack.hpp>
 #include <carto/render/render_scene.hpp>
 #include <carto/terrain/terrain_tile.hpp>
 
@@ -50,7 +54,10 @@ namespace carto::agent {
 class AgentTask;
 class SceneQuery;
 enum class GhostCorrectionKind : std::uint8_t;
+enum class ProjectMergeSource : std::uint8_t;
 struct AgentPlan;
+struct ProjectMergeReview;
+struct ProjectMergeResolution;
 }
 
 namespace carto::application {
@@ -264,6 +271,20 @@ struct BiologicalAuthoringSourceView {
     assets::Sha256Digest payload_digest;
 };
 
+// Caller evidence for one active mesh-reimport review. The application checks
+// the registered source identity, generation, and current digest before using
+// the candidate digest only to suppress orphan classification.
+struct PendingMeshReimportBlobReview final {
+    std::uint64_t project_generation = 0U;
+    core::Revision project_revision;
+    std::string source_identity;
+    core::Revision source_generation;
+    assets::Sha256Digest current_source_digest;
+    assets::Sha256Digest candidate_source_digest;
+
+    [[nodiscard]] bool operator==(const PendingMeshReimportBlobReview&) const = default;
+};
+
 struct SourceAssetView {
     std::string identity;
     std::string relative_source_path;
@@ -272,8 +293,16 @@ struct SourceAssetView {
     assets::Sha256Digest source_digest;
     std::string importer_identity;
     std::uint32_t importer_version = 0U;
+    assets::SourceImportOptions options;
     std::string artifact_identity;
     assets::Sha256Digest artifact_digest;
+    std::vector<assets::SourceDomainDigest> domain_digests;
+    std::optional<std::uint64_t> bound_mesh_asset;
+    std::optional<std::size_t> bound_mesh_vertex_count;
+    std::optional<std::size_t> bound_mesh_face_count;
+    std::vector<std::string> authored_tags;
+    std::vector<std::string> dependencies;
+    std::vector<assets::SourceDocumentProduct> document_products;
 };
 
 struct MaterialGraphView {
@@ -288,6 +317,7 @@ struct MaterialGraphBindingView {
     core::Revision source_revision;
     assets::Sha256Digest source_digest;
     bool source_current = false;
+    project::MaterialGraphEvaluationInputs inputs;
 };
 
 // Ephemeral road authoring output. Both source receipts are required before a
@@ -570,6 +600,8 @@ struct ConditionAuthoringView {
     std::size_t collection_count = 0U;
     std::size_t prefab_count = 0U;
     std::size_t prefab_instance_count = 0U;
+    std::size_t connection_port_count = 0U;
+    std::size_t connection_edge_count = 0U;
     std::size_t region_kit_count = 0U;
     std::size_t audio_source_count = 0U;
     std::size_t acoustic_zone_count = 0U;
@@ -623,6 +655,13 @@ struct ConditionAuthoringView {
         std::size_t member_count = 0U;
         bool current = false;
         std::string status;
+        bool rebase_review_available = false;
+        std::size_t rebase_change_count = 0U;
+        std::vector<std::string> rebase_changes;
+        std::string rebase_status;
+        core::Revision rebase_authoring_revision;
+        assets::Sha256Digest rebase_authoring_digest;
+        std::vector<std::uint64_t> member_asset_ids;
     };
     struct Collection {
         std::uint64_t id = 0U;
@@ -734,6 +773,7 @@ struct ConditionAuthoringView {
 
 struct ApplicationSnapshot {
     std::string project_name;
+    std::string source_namespace;
     std::optional<std::filesystem::path> project_path;
     std::uint64_t project_generation = 0;
     core::Revision project_revision;
@@ -782,6 +822,9 @@ struct RecoveryJournalEntry {
     core::Revision revision_before;
     core::Revision revision_after;
     std::string event_type;
+    std::string operation;
+    std::optional<OperationSource> source;
+    std::string provenance_id;
 };
 
 // Read-only startup evidence. Inspection never mutates the project, journal,
@@ -808,6 +851,9 @@ struct AffectedSet {
     std::vector<geometry::VertexId> vertices;
     std::vector<geometry::EdgeId> edges;
     std::vector<geometry::FaceId> faces;
+    // Mesh identities can remain relevant after their scene objects are
+    // detached or removed by a governed command.
+    std::vector<std::uint64_t> mesh_assets{};
 };
 
 struct ParameterPayload {
@@ -914,6 +960,15 @@ struct SelectFaceAction {
     editor::SelectionOperation operation = editor::SelectionOperation::replace;
 };
 
+struct SelectFaceBatchAction {
+    static constexpr std::size_t kMaxFaces = 65'536U;
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    core::Revision expected_mesh_revision;
+    scene::ObjectId object;
+    std::vector<geometry::FaceId> faces;
+};
+
 struct SelectEdgeAction {
     scene::ObjectId object;
     geometry::EdgeId edge;
@@ -935,13 +990,93 @@ struct RepeatLastToolAction {};
 
 struct MeshCleanupOptions {
     static constexpr std::size_t kMaxCandidates = 4096U;
+    static constexpr std::size_t kMaxCandidatePairChecks = 1'000'000U;
     static constexpr std::size_t kMaxMergedVertices = 4096U;
     static constexpr std::size_t kMaxRemovedFaces = 64U;
     static constexpr std::size_t kMaxMeshElements = 100'000U;
     double merge_distance = 1.0e-6;
     std::size_t max_candidates = kMaxCandidates;
+    std::size_t max_candidate_pair_checks = kMaxCandidatePairChecks;
     std::size_t max_merged_vertices = kMaxMergedVertices;
     std::size_t max_removed_faces = kMaxRemovedFaces;
+};
+
+// Read-only, revision-bound findings that can be displayed for human review.
+// Findings do not authorize cleanup mutation; edits still need a separate
+// explicit review and commit path.
+struct MeshCleanupDisconnectedVertexFan {
+    geometry::VertexId vertex;
+    std::vector<std::vector<geometry::FaceId>> face_components;
+
+    [[nodiscard]] bool operator==(const MeshCleanupDisconnectedVertexFan&) const = default;
+};
+
+struct MeshCleanupBoundaryEdgeComponent {
+    // Edge-connected through shared endpoint vertex IDs. A point-touch can
+    // join otherwise distinct boundary loops; junctions are exposed below.
+    std::vector<geometry::EdgeId> edges;
+    std::vector<geometry::VertexId> endpoints;
+    std::vector<geometry::VertexId> junctions;
+    bool closed_loop = false;
+    // Sorted unique faces adjacent to this component's boundary edges.
+    std::vector<geometry::FaceId> incident_faces;
+
+    [[nodiscard]] bool operator==(const MeshCleanupBoundaryEdgeComponent&) const = default;
+};
+
+struct MeshCleanupCollinearFaceCorner {
+    geometry::FaceId face;
+    geometry::VertexId previous;
+    geometry::VertexId corner;
+    geometry::VertexId next;
+
+    [[nodiscard]] bool operator==(const MeshCleanupCollinearFaceCorner&) const = default;
+};
+
+struct MeshCleanupNonPlanarFace {
+    geometry::FaceId face;
+    // Maximum normalized distance from the plane through the first three
+    // face vertices, expressed as a sine-like relative residual.
+    double maximum_relative_deviation = 0.0;
+
+    [[nodiscard]] bool operator==(const MeshCleanupNonPlanarFace&) const = default;
+};
+
+struct MeshCleanupIssueReport {
+    std::uint64_t project_generation = 0U;
+    core::Revision project_revision;
+    scene::ObjectId object;
+    std::uint64_t mesh_asset = 0U;
+    core::Revision mesh_revision;
+    assets::Sha256Digest source_digest;
+    // Open edge identities. Boundary edges may be intentional on an open
+    // surface; this read-only finding does not imply a repair is required.
+    std::vector<geometry::EdgeId> boundary_edges;
+    std::vector<geometry::VertexId> unreferenced_vertices;
+    // Distinct IDs at identical finite positions, grouped and ordered by the
+    // lowest stable VertexId. Coincidence is diagnostic evidence, not a weld.
+    std::vector<std::vector<geometry::VertexId>> coincident_vertex_groups;
+    // Each exact cycle group is ordered by stable FaceId; rotation and winding
+    // do not affect whether two face loops belong to the same group.
+    std::vector<std::vector<geometry::FaceId>> duplicate_face_groups;
+    // Incident faces separated into edge-connected components at one vertex.
+    // A point contact can be intentional and this finding does not authorize a split.
+    std::vector<MeshCleanupDisconnectedVertexFan> disconnected_vertex_fans;
+    // Whole-mesh face components connected by shared topological edges.
+    // Separate shells may be intentional; this finding is read-only.
+    std::vector<std::vector<geometry::FaceId>> disconnected_face_components;
+    // Boundary edges grouped by shared endpoint IDs. These are diagnostic
+    // summaries only; open boundaries may be intentional.
+    std::vector<MeshCleanupBoundaryEdgeComponent> boundary_edge_components;
+    // Exact collinear consecutive positions where the middle corner lies
+    // between its neighbors. This does not authorize dropping authored data.
+    std::vector<MeshCleanupCollinearFaceCorner> collinear_face_corners;
+    // N-gons with a measurable normalized out-of-plane residual beyond the
+    // arithmetic tolerance. This finding does not authorize triangulation.
+    std::vector<MeshCleanupNonPlanarFace> nonplanar_faces;
+    // N-gons omitted from planarity classification when finite edge
+    // subtraction or the reference plane could not be measured safely.
+    std::vector<geometry::FaceId> unmeasurable_planarity_faces;
 };
 
 // Ephemeral human review of one exact merge proposal. This cannot be
@@ -1008,6 +1143,19 @@ struct CreateMeshObjectAction {
     std::optional<core::Revision> expected_project_revision = std::nullopt;
 };
 
+// Source and every embedded image must already be in this saved project's
+// content-addressed blob store. The action never reads an external URI.
+struct ImportGltfSceneAction {
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    std::string expected_source_namespace;
+    std::string source_identity;
+    core::Revision expected_source_generation;
+    assets::Sha256Digest source_digest;
+    bool rights_confirmed = false;
+    std::string justification;
+};
+
 // Canonical digest for the geometry domain imported by Cartographer's native
 // OBJ/PLY/STL providers. Attributes and presentation data are intentionally
 // excluded until those importers preserve them.
@@ -1017,17 +1165,20 @@ struct CreateMeshObjectAction {
 canonical_mesh_material_region_digest(const geometry::EditableMesh& mesh);
 
 // Appends one deterministic point stroke to the currently selected vertex's
-// project-bound SculptStack. The UI snapshot revision is rechecked before
-// authoring and only the human command boundary may apply this action.
+// project-bound SculptStack. The UI snapshot generation and revision are
+// rechecked before authoring and only the human command boundary may apply
+// this action.
 struct AppendSculptStrokeAction {
     core::Revision expected_project_revision;
     production::SculptStrokeMode mode = production::SculptStrokeMode::add;
     double radius = 0.25;
     double strength = 0.05;
+    std::uint64_t expected_project_generation = 0U;
 };
 
-// Commits samples captured against a viewport snapshot. Each sample must carry
-// a stable source-surface anchor that resolves against the current mesh.
+// Commits samples captured against a viewport generation/revision snapshot.
+// Each sample must carry a stable source-surface anchor that resolves against
+// the current mesh.
 struct AppendSculptSurfaceStrokeAction {
     core::Revision expected_project_revision;
     scene::ObjectId object;
@@ -1036,15 +1187,34 @@ struct AppendSculptSurfaceStrokeAction {
     double radius = 0.25;
     double strength = 0.05;
     std::vector<production::SculptStrokeSample> samples;
+    std::uint64_t expected_project_generation = 0U;
 };
 
-// Updates one layer on the currently selected mesh. Visibility edits are
+// Updates one layer on the currently selected mesh. Layer edits are
 // revision-bound project mutations and may only enter through the human path.
 struct SetSculptLayerVisibilityAction {
     core::Revision expected_project_revision;
     std::uint64_t mesh_asset = 0U;
     std::string layer_identity;
     bool visible = true;
+    std::uint64_t expected_project_generation = 0U;
+};
+
+struct SetSculptLayerWeightAction {
+    core::Revision expected_project_revision;
+    std::uint64_t mesh_asset = 0U;
+    std::string layer_identity;
+    double weight = 1.0;
+    std::uint64_t expected_project_generation = 0U;
+};
+
+// `target_index` is the final zero-based position in the authored stack.
+struct MoveSculptLayerAction {
+    core::Revision expected_project_revision;
+    std::uint64_t mesh_asset = 0U;
+    std::string layer_identity;
+    std::size_t target_index = 0U;
+    std::uint64_t expected_project_generation = 0U;
 };
 
 // Duplicates only an authored mesh instance. The new root object retains the
@@ -1218,6 +1388,72 @@ struct InstantiateConditionPrefabAction {
     std::string name;
     core::Vec3d world_position{};
 };
+enum class ConditionPrefabRebaseMeshChoice : std::uint8_t {
+    keep_instance_snapshot = 0U,
+    use_current_source_snapshot = 1U,
+};
+enum class ConditionPrefabRebasePlacementChoice : std::uint8_t {
+    keep_instance_placement = 0U,
+    use_current_source_placement = 1U,
+};
+enum class ConditionPrefabRemovedMemberChoice : std::uint8_t {
+    detach_scene_object = 0U,
+    delete_scene_object = 1U,
+};
+struct ConditionPrefabRebaseDecision {
+    condition::Id asset_id = 0U;
+    std::optional<ConditionPrefabRebaseMeshChoice> mesh;
+    std::optional<ConditionPrefabRebasePlacementChoice> placement;
+    std::optional<ConditionPrefabRemovedMemberChoice> removed_member;
+    bool include_added_member = false;
+};
+struct RebaseConditionPrefabAction {
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    core::Revision expected_authoring_revision;
+    assets::Sha256Digest expected_authoring_digest;
+    condition::Id instance_id = 0U;
+    std::string justification;
+    std::vector<ConditionPrefabRebaseDecision> decisions;
+};
+struct ReplaceConnectionPortGraphAction {
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    assets::Sha256Digest expected_graph_digest;
+    connection::ConnectionPortGraph graph;
+};
+struct AddConnectionPortAction {
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    assets::Sha256Digest expected_graph_digest;
+    // The application assigns a stable port identity after checking the
+    // reviewed graph. Callers must leave `port.id` empty.
+    connection::ConnectionPort port;
+};
+struct RemoveConnectionPortAction {
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    assets::Sha256Digest expected_graph_digest;
+    connection::PortId port_id;
+};
+struct RemoveConnectionEdgeAction {
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    assets::Sha256Digest expected_graph_digest;
+    std::uint64_t edge_id = 0U;
+};
+struct ConnectConditionPrefabSocketsAction {
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    assets::Sha256Digest expected_graph_digest;
+    core::Revision expected_authoring_revision;
+    assets::Sha256Digest expected_authoring_digest;
+    condition::Id first_instance_id = 0U;
+    std::string first_socket;
+    condition::Id second_instance_id = 0U;
+    std::string second_socket;
+    connection::ConnectionKind kind = connection::ConnectionKind::mechanical;
+};
 struct AddConditionCollectionAction {
     core::Revision expected_project_revision;
     core::Revision expected_authoring_revision;
@@ -1319,6 +1555,59 @@ struct GenerateUniqueLightmapUvAction {
     std::uint32_t maximum_udim_tiles = 0U;
 };
 
+struct PackUvIslandsAction {
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    core::Revision expected_mesh_revision;
+    scene::ObjectId object;
+    attributes::UvSetId source_uv_set = 0U;
+    attributes::UvSetId output_uv_set = 0U;
+    std::uint32_t resolution = 0U;
+    std::uint32_t padding_texels = 0U;
+    std::uint32_t maximum_udim_tiles = 1U;
+    production::UvIslandDensityPolicy density_policy =
+        production::UvIslandDensityPolicy::preserve_source_uv;
+    double target_texels_per_world_unit = 0.0;
+    bool allow_quarter_turn_rotation = false;
+};
+
+struct SetUvCoordinateAction {
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    core::Revision expected_mesh_revision;
+    scene::ObjectId object;
+    attributes::UvSetId uv_set = 0U;
+    geometry::FaceId face;
+    geometry::VertexId vertex;
+    core::Vec2d expected_coordinate;
+    core::Vec2d coordinate;
+};
+
+struct SetUvSeamMarkAction {
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    core::Revision expected_mesh_revision;
+    scene::ObjectId object;
+    attributes::UvSetId uv_set = 0U;
+    geometry::FaceId selected_face;
+    geometry::EdgeId edge;
+    bool expected_marked = false;
+    bool marked = false;
+};
+
+struct AlignUvSeamAction {
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    core::Revision expected_mesh_revision;
+    scene::ObjectId object;
+    attributes::UvSetId uv_set = 0U;
+    geometry::FaceId selected_face;
+    geometry::FaceId adjacent_face;
+    geometry::EdgeId edge;
+    // selected edge endpoints, then adjacent-face endpoints, each in EdgeRecord order.
+    std::array<core::Vec2d, 4U> expected_coordinates{};
+};
+
 struct SetMaterialGraphAction {
     core::Revision expected_project_revision;
     std::optional<core::Revision> expected_graph_revision;
@@ -1335,8 +1624,30 @@ struct SetMaterialGraphBindingAction {
     std::optional<assets::Sha256Digest> expected_graph_digest;
 };
 
+struct SetMaterialGraphInputsAction {
+    core::Revision expected_project_revision;
+    render::MaterialId material_id = 0U;
+    core::Revision expected_material_revision;
+    std::string graph_identity;
+    core::Revision expected_graph_revision;
+    assets::Sha256Digest expected_graph_digest;
+    project::MaterialGraphEvaluationInputs inputs;
+};
+
 struct ImportMaterialTextureSourceAction {
     core::Revision expected_project_revision;
+    assets::Sha256Digest content_digest;
+    assets::TextureSourceFormat format = assets::TextureSourceFormat::png;
+    std::uint32_t width = 0U;
+    std::uint32_t height = 0U;
+};
+
+struct ReimportMaterialTextureSourceAction {
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    assets::TextureAssetId texture_id = 0U;
+    core::Revision expected_texture_revision;
+    assets::Sha256Digest expected_content_digest;
     assets::Sha256Digest content_digest;
     assets::TextureSourceFormat format = assets::TextureSourceFormat::png;
     std::uint32_t width = 0U;
@@ -1398,6 +1709,7 @@ struct SetSignTextSourceAction {
 };
 
 struct SetDecalPlacementAction {
+    std::uint64_t expected_project_generation = 0U;
     core::Revision expected_project_revision;
     core::Revision expected_placement_revision;
     production::DecalPlacement placement;
@@ -1425,6 +1737,7 @@ using ApplicationAction = std::variant<
     SelectObjectAction,
     SelectVertexAction,
     SelectFaceAction,
+    SelectFaceBatchAction,
     SelectEdgeAction,
     SetObjectTransformAction,
     InvokeToolAction,
@@ -1433,9 +1746,12 @@ using ApplicationAction = std::variant<
     CreateBoxAction,
     CreatePlaneAction,
     CreateMeshObjectAction,
+    ImportGltfSceneAction,
     AppendSculptStrokeAction,
     AppendSculptSurfaceStrokeAction,
     SetSculptLayerVisibilityAction,
+    SetSculptLayerWeightAction,
+    MoveSculptLayerAction,
     DuplicateMeshInstanceAction,
     DuplicateMeshInstanceBatchAction,
     CreatePlantScatterBatchAction,
@@ -1460,6 +1776,12 @@ using ApplicationAction = std::variant<
     AddConditionInteractionAnchorAction,
     AddConditionPrefabAction,
     InstantiateConditionPrefabAction,
+    RebaseConditionPrefabAction,
+    ReplaceConnectionPortGraphAction,
+    AddConnectionPortAction,
+    RemoveConnectionPortAction,
+    RemoveConnectionEdgeAction,
+    ConnectConditionPrefabSocketsAction,
     AddConditionCollectionAction,
     AddConditionRegionKitAction,
     AddConditionKinematicAssemblyAction,
@@ -1474,9 +1796,15 @@ using ApplicationAction = std::variant<
     UpdateMaterialAction,
     SetMaterialRegionAssignmentAction,
     GenerateUniqueLightmapUvAction,
+    PackUvIslandsAction,
+    SetUvCoordinateAction,
+    SetUvSeamMarkAction,
+    AlignUvSeamAction,
     SetMaterialGraphAction,
     SetMaterialGraphBindingAction,
+    SetMaterialGraphInputsAction,
     ImportMaterialTextureSourceAction,
+    ReimportMaterialTextureSourceAction,
     SetPresentationCatalogAction,
     SetProjectAuthoringStandardsAction,
     SetRoadAuthoringAction,
@@ -1506,6 +1834,11 @@ public:
         editor::AuthoringPreview& preview);
     [[nodiscard]] static core::Result<DispatchReceipt> accept_agent_task(
         ::carto::agent::AgentTask& task);
+    [[nodiscard]] static core::Result<DispatchReceipt> accept_agent_project_merge(
+        ::carto::agent::AgentTask& task,
+        const ::carto::agent::ProjectMergeReview& review,
+        const ::carto::agent::ProjectMergeResolution& resolution,
+        std::string justification);
     [[nodiscard]] static core::Result<void> answer_agent_clarification(
         ::carto::agent::AgentPlan& plan,
         std::string_view question_id,
@@ -1557,13 +1890,49 @@ public:
     [[nodiscard]] core::Result<editor::AuthoringContext> authoring_context() const;
     [[nodiscard]] core::Result<engineering::AuthoringDocument> engineering_authoring() const;
     [[nodiscard]] core::Result<condition::AuthoringDocument> condition_authoring() const;
+    [[nodiscard]] core::Result<assets::Sha256Digest> connection_port_graph_digest() const;
+    [[nodiscard]] const connection::ConnectionPortGraph& connection_port_graph() const noexcept;
     [[nodiscard]] core::Result<assets::SourceReimportPlan> preview_source_reimport(
         std::vector<assets::SourceImportRecord> incoming) const;
+    // Read-only retained generation, including an undone source's tombstone.
+    // The caller must bind the same project context used for its later action.
+    [[nodiscard]] core::Result<core::Revision> source_asset_generation(
+        std::string_view identity, std::string_view expected_source_namespace,
+        std::uint64_t expected_project_generation,
+        core::Revision expected_project_revision) const;
+    [[nodiscard]] core::Result<assets::SourceReimportPlan> preview_source_asset_metadata(
+        std::string_view identity,
+        core::Revision expected_source_generation,
+        std::uint64_t expected_project_generation,
+        core::Revision expected_project_revision,
+        std::vector<std::string> authored_tags,
+        std::vector<std::string> dependencies) const;
+    // Verifies the project's managed source blob against its recorded digest.
+    // This does not establish whether an original external source file changed.
+    [[nodiscard]] core::Result<void> verify_source_asset_blob(
+        std::string_view identity,
+        core::Revision expected_source_generation,
+        std::uint64_t expected_project_generation,
+        core::Revision expected_project_revision) const;
+    // Reports verified stored digests absent from current catalogs and bounded
+    // durable journal snapshots, plus missing/corrupt durable references.
+    // A current mesh-reimport review protects its candidate digest from
+    // orphan_candidates without treating it as a missing durable reference.
+    // Candidates remain advisory only; no deletion is offered.
+    [[nodiscard]] core::Result<assets::BlobOrphanReport> inspect_source_blob_store(
+        std::uint64_t expected_project_generation,
+        core::Revision expected_project_revision,
+        std::optional<PendingMeshReimportBlobReview> pending_mesh_reimport =
+            std::nullopt) const;
     // Builds a full-registry reimport plan that adds one new source record.
     // The current registry is preserved and the generation is assigned from
     // retained lineage; this method never mutates project state.
     [[nodiscard]] core::Result<assets::SourceReimportPlan> preview_source_asset_addition(
         assets::SourceImportRecord incoming) const;
+    // Reads only the current plane's digest-verified project-local source blob.
+    // Missing, stale, or replaced source bytes fail without fallback or mutation.
+    [[nodiscard]] core::Result<std::vector<std::uint8_t>>
+    read_reference_image_source_bytes(std::string_view identity) const;
     // Decodes only a verified project-local TGA reference source. The result is
     // bounded and digest-bound; unsupported containers and missing/stale bytes
     // fail without fallback or mutation.
@@ -1600,6 +1969,12 @@ public:
         std::uint32_t samples_per_segment = 32U) const;
     [[nodiscard]] core::Result<geometry::SweptMeshProduct> sweep_source_preview(
         std::string_view identity) const;
+    [[nodiscard]] core::Result<condition::SweepEndpointSpatialReview>
+    inspect_sweep_endpoint_spatial_fit(
+        const condition::SweepEndpointPortBinding& binding,
+        const condition::SweepEndpointSpatialPolicy& policy,
+        std::uint64_t expected_project_generation,
+        core::Revision expected_project_revision) const;
     [[nodiscard]] core::Result<production::DecalProjection> decal_placement_preview(
         const production::DecalPlacement& placement,
         core::Revision expected_project_revision) const;
@@ -1644,6 +2019,10 @@ public:
     [[nodiscard]] core::Result<MeshCleanupReview> review_mesh_cleanup(
         scene::ObjectId object, std::vector<geometry::VertexId> candidates,
         MeshCleanupOptions options) const;
+    [[nodiscard]] core::Result<MeshCleanupReview> review_mesh_cleanup_issues(
+        scene::ObjectId object, MeshCleanupOptions options) const;
+    [[nodiscard]] core::Result<MeshCleanupIssueReport> inspect_mesh_cleanup_issues(
+        scene::ObjectId object) const;
     [[nodiscard]] core::Result<DispatchReceipt> commit_preview(
         HumanActionAdmission admission,
         editor::AuthoringPreview& preview,
@@ -1700,6 +2079,8 @@ private:
     [[nodiscard]] core::Result<DispatchReceipt> select_object(const SelectObjectAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> select_vertex(const SelectVertexAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> select_face(const SelectFaceAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> select_face_batch(
+        const SelectFaceBatchAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> select_edge(const SelectEdgeAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> convert_selection(
         const ConvertSelectionAction& action);
@@ -1716,6 +2097,8 @@ private:
     [[nodiscard]] core::Result<DispatchReceipt> create_plane(const CreatePlaneAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> create_mesh_object(
         const CreateMeshObjectAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> import_gltf_scene(
+        const ImportGltfSceneAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> append_sculpt_stroke(
         const AppendSculptStrokeAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> append_sculpt_surface_stroke(
@@ -1729,6 +2112,19 @@ private:
         std::optional<ParameterPayload> parameters = std::nullopt);
     [[nodiscard]] core::Result<DispatchReceipt> set_sculpt_layer_visibility(
         const SetSculptLayerVisibilityAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> set_sculpt_layer_weight(
+        const SetSculptLayerWeightAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> move_sculpt_layer(
+        const MoveSculptLayerAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> update_sculpt_layer(
+        core::Revision expected_project_revision,
+        std::uint64_t expected_project_generation,
+        std::uint64_t mesh_asset,
+        std::string_view layer_identity,
+        std::optional<bool> visible,
+        std::optional<double> weight,
+        std::optional<std::size_t> target_index,
+        std::string action_name);
     [[nodiscard]] core::Result<DispatchReceipt> duplicate_mesh_instance(
         const DuplicateMeshInstanceAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> duplicate_mesh_instance_batch(
@@ -1775,6 +2171,18 @@ private:
         const AddConditionPrefabAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> instantiate_condition_prefab(
         const InstantiateConditionPrefabAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> rebase_condition_prefab(
+        const RebaseConditionPrefabAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> replace_connection_port_graph(
+        const ReplaceConnectionPortGraphAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> add_connection_port(
+        const AddConnectionPortAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> remove_connection_port(
+        const RemoveConnectionPortAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> remove_connection_edge(
+        const RemoveConnectionEdgeAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> connect_condition_prefab_sockets(
+        const ConnectConditionPrefabSocketsAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> add_condition_collection(
         const AddConditionCollectionAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> add_condition_region_kit(
@@ -1803,12 +2211,24 @@ private:
         const SetMaterialRegionAssignmentAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> generate_unique_lightmap_uv(
         const GenerateUniqueLightmapUvAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> pack_uv_islands(
+        const PackUvIslandsAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> set_uv_coordinate(
+        const SetUvCoordinateAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> set_uv_seam_mark(
+        const SetUvSeamMarkAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> align_uv_seam(
+        const AlignUvSeamAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> set_material_graph(
         const SetMaterialGraphAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> set_material_graph_binding(
         const SetMaterialGraphBindingAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> set_material_graph_inputs(
+        const SetMaterialGraphInputsAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> import_material_texture_source(
         const ImportMaterialTextureSourceAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> reimport_material_texture_source(
+        const ReimportMaterialTextureSourceAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> set_presentation_catalog(
         const SetPresentationCatalogAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> set_project_authoring_standards(
@@ -1847,6 +2267,14 @@ private:
         std::string_view task_id,
         std::string_view objective_digest,
         std::string_view diff_digest);
+    [[nodiscard]] core::Result<DispatchReceipt> accept_agent_project_merge(
+        const project::ProjectDocument& candidate,
+        core::Revision expected_revision,
+        std::string_view task_id,
+        std::string_view review_digest,
+        std::string_view candidate_digest,
+        std::string_view selected_source,
+        std::string_view justification);
     [[nodiscard]] core::Result<DispatchReceipt> install_agent_rebase_branch(
         const project::ProjectDocument& candidate,
         core::Revision expected_revision,
@@ -1896,7 +2324,6 @@ private:
         std::uint64_t project_generation = 0U;
         const geometry::EditableMesh* source = nullptr;
         core::Revision source_revision;
-        std::optional<assets::Sha256Digest> sculpt_stack_digest;
         std::shared_ptr<const geometry::CompiledMesh> mesh;
         std::shared_ptr<const ViewportState::MeshAttributeOverlayData> attribute_overlay;
         std::optional<core::Diagnostic> attribute_overlay_error;

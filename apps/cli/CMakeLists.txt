@@ -26,3 +26,10 @@ else()
 endif()
 
 install(TARGETS cartographer_cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+if(TARGET carto_d3d12_scene)
+    add_executable(cartographer_scene_render scene_render.cpp)
+    target_link_libraries(cartographer_scene_render PRIVATE carto_d3d12_scene)
+    carto_target(cartographer_scene_render)
+    install(TARGETS cartographer_scene_render RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()

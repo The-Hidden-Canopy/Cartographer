@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -93,6 +94,42 @@ carto::core::Result<carto::geometry::EditableMesh> make_closed_triangular_fan(
         return core::Result<geometry::EditableMesh>::failure(result.error());
     }
     return core::Result<geometry::EditableMesh>::success(std::move(mesh));
+}
+
+void mesh_face_validation_rejects_nonfinite_derived_area_atomically() {
+    using namespace carto;
+    geometry::EditableMesh mesh;
+    // The finite endpoints overflow subtraction, making the area expression NaN.
+    const auto origin = mesh.add_vertex({-1.0e308, 0.0, 0.0});
+    const auto first = mesh.add_vertex({1.0e308, 0.0, 0.0});
+    const auto second = mesh.add_vertex({1.0e308, 1.0, 0.0});
+    REQUIRE(origin && first && second);
+    const auto before_face_revision = mesh.revision();
+    const auto rejected_face = mesh.add_face(
+        {origin.value(), first.value(), second.value()});
+    REQUIRE(!rejected_face);
+    REQUIRE(rejected_face.error().code == core::ErrorCode::validation_failed);
+    REQUIRE(mesh.revision() == before_face_revision);
+    REQUIRE(mesh.face_count() == 0U);
+    REQUIRE(mesh.validate());
+
+    geometry::EditableMesh patched;
+    const auto patch_origin = patched.add_vertex({0.0, 0.0, 0.0});
+    const auto patch_first = patched.add_vertex({1.0, 0.0, 0.0});
+    const auto patch_second = patched.add_vertex({0.0, 1.0, 0.0});
+    REQUIRE(patch_origin && patch_first && patch_second);
+    REQUIRE(patched.add_face({patch_origin.value(), patch_first.value(),
+        patch_second.value()}));
+    const auto before_patch_revision = patched.revision();
+    const auto rejected_position = patched.set_vertex_position(
+        patch_first.value(), {1.0e308, 0.0, 0.0});
+    REQUIRE(!rejected_position);
+    REQUIRE(rejected_position.error().code == core::ErrorCode::validation_failed);
+    REQUIRE(patched.revision() == before_patch_revision);
+    const auto* restored_vertex = patched.find_vertex(patch_first.value());
+    REQUIRE(restored_vertex != nullptr);
+    REQUIRE(restored_vertex->position.x == 1.0);
+    REQUIRE(patched.validate());
 }
 
 void mesh_patch_serialization_is_canonical_and_bounded() {
@@ -1715,6 +1752,43 @@ void vertex_bevel_supports_bounded_closed_triangular_fans() {
     REQUIRE(skewed.find_vertex(geometry::VertexId{1U}) != nullptr);
     REQUIRE(skewed.validate());
 
+    geometry::EditableMesh self_crossing_fan;
+    const auto self_crossing_apex = self_crossing_fan.add_vertex({0.0, 0.0, 1.0});
+    REQUIRE(self_crossing_apex);
+    constexpr std::array<core::Vec2d, 4U> self_crossing_ring{{
+        {-1.0, 0.0}, {1.0, 0.0}, {0.0, 1.0}, {0.0, -1.0}}};
+    std::vector<geometry::VertexId> self_crossing_ring_ids;
+    self_crossing_ring_ids.reserve(self_crossing_ring.size());
+    for (const auto position : self_crossing_ring) {
+        const auto vertex = self_crossing_fan.add_vertex({position.x, position.y, 0.0});
+        REQUIRE(vertex);
+        self_crossing_ring_ids.push_back(vertex.value());
+    }
+    for (std::size_t index = 0U; index < self_crossing_ring_ids.size(); ++index) {
+        REQUIRE(self_crossing_fan.add_face({
+            self_crossing_apex.value(), self_crossing_ring_ids[index],
+            self_crossing_ring_ids[(index + 1U) % self_crossing_ring_ids.size()]}));
+    }
+    std::vector<geometry::VertexId> self_crossing_base;
+    self_crossing_base.push_back(self_crossing_ring_ids.front());
+    for (std::size_t index = self_crossing_ring_ids.size(); index > 1U; --index) {
+        self_crossing_base.push_back(self_crossing_ring_ids[index - 1U]);
+    }
+    REQUIRE(self_crossing_fan.add_face(std::move(self_crossing_base)));
+    REQUIRE(self_crossing_fan.validate());
+    const auto self_crossing_revision = self_crossing_fan.revision();
+    const auto self_crossing_vertex_count = self_crossing_fan.vertex_count();
+    const auto self_crossing_face_count = self_crossing_fan.face_count();
+    const auto self_crossing_bevel = self_crossing_fan.bevel_vertex(
+        self_crossing_apex.value(), 0.05, 3U);
+    REQUIRE(!self_crossing_bevel);
+    REQUIRE(self_crossing_bevel.error().code == core::ErrorCode::validation_failed);
+    REQUIRE(self_crossing_fan.revision() == self_crossing_revision);
+    REQUIRE(self_crossing_fan.vertex_count() == self_crossing_vertex_count);
+    REQUIRE(self_crossing_fan.face_count() == self_crossing_face_count);
+    REQUIRE(self_crossing_fan.find_vertex(self_crossing_apex.value()) != nullptr);
+    REQUIRE(self_crossing_fan.validate());
+
     geometry::EditableMesh concave_fan;
     const auto concave_apex = concave_fan.add_vertex({0.0, 0.0, 1.0});
     REQUIRE(concave_apex);
@@ -1742,15 +1816,56 @@ void vertex_bevel_supports_bounded_closed_triangular_fans() {
     const auto concave_revision = concave_fan.revision();
     const auto concave_vertex_count = concave_fan.vertex_count();
     const auto concave_face_count = concave_fan.face_count();
-    const auto nonconvex_cap = concave_fan.bevel_vertex(
+    auto concave_segmented = concave_fan;
+    const auto concave_bevel = concave_fan.bevel_vertex(
         concave_apex.value(), 0.05, 1U);
-    REQUIRE(!nonconvex_cap);
-    REQUIRE(nonconvex_cap.error().code == core::ErrorCode::validation_failed);
-    REQUIRE(concave_fan.revision() == concave_revision);
-    REQUIRE(concave_fan.vertex_count() == concave_vertex_count);
-    REQUIRE(concave_fan.face_count() == concave_face_count);
-    REQUIRE(concave_fan.find_vertex(concave_apex.value()) != nullptr);
+    REQUIRE(concave_bevel);
+    REQUIRE(concave_bevel.value().revision_before == concave_revision);
+    REQUIRE(concave_bevel.value().revision_after == concave_revision.next());
+    REQUIRE(concave_bevel.value().created_faces.size() == 1U);
+    REQUIRE(concave_bevel.value().removed_vertices ==
+        std::vector<geometry::VertexId>{concave_apex.value()});
+    double shortest_cut_length = std::numeric_limits<double>::infinity();
+    const core::Vec3d source_apex_position{0.0, 0.0, 1.0};
+    for (const geometry::VertexId created : concave_bevel.value().created_vertices) {
+        const auto* cut = concave_fan.find_vertex(created);
+        REQUIRE(cut != nullptr);
+        shortest_cut_length = std::min(
+            shortest_cut_length, (cut->position - source_apex_position).length());
+    }
+    REQUIRE(std::abs(shortest_cut_length - 0.05) <= 1.0e-12);
+    const auto* concave_cap = concave_fan.find_face(
+        concave_bevel.value().created_faces.front());
+    REQUIRE(concave_cap != nullptr);
+    const core::Vec3d cap_origin = concave_fan.find_vertex(
+        concave_cap->vertices.front())->position;
+    const core::Vec3d cap_normal = core::cross(
+        concave_fan.find_vertex(concave_cap->vertices[1U])->position - cap_origin,
+        concave_fan.find_vertex(concave_cap->vertices[2U])->position - cap_origin).normalized();
+    REQUIRE(cap_normal.length_squared() > 0.99);
+    for (const geometry::VertexId cap_vertex : concave_cap->vertices) {
+        const core::Vec3d position = concave_fan.find_vertex(cap_vertex)->position;
+        REQUIRE(std::abs(core::dot(position - cap_origin, cap_normal)) <= 1.0e-9);
+    }
     REQUIRE(concave_fan.validate());
+    REQUIRE(concave_fan.face_count() == concave_face_count + 1U);
+    REQUIRE(concave_fan.vertex_count() == concave_vertex_count - 1U + 5U);
+    REQUIRE(concave_bevel.value().validate());
+    const auto concave_compiled = concave_fan.compile();
+    REQUIRE(concave_compiled);
+    REQUIRE(concave_compiled.value().source_revision == concave_fan.revision());
+
+    const auto concave_segmented_bevel = concave_segmented.bevel_vertex(
+        concave_apex.value(), 0.05, 3U);
+    REQUIRE(concave_segmented_bevel);
+    REQUIRE(concave_segmented_bevel.value().created_vertices.size() == 15U);
+    REQUIRE(concave_segmented_bevel.value().created_faces.size() == 28U);
+    REQUIRE(concave_segmented_bevel.value().validate());
+    REQUIRE(concave_segmented.validate());
+    const auto concave_segmented_compiled = concave_segmented.compile();
+    REQUIRE(concave_segmented_compiled);
+    REQUIRE(concave_segmented_compiled.value().source_revision ==
+        concave_segmented.revision());
 
     auto maximum_fan_fixture = make_closed_triangular_fan(64U);
     REQUIRE(maximum_fan_fixture);
@@ -2222,6 +2337,355 @@ void merge_by_distance_stitches_coincident_seam_in_one_receipt() {
     REQUIRE(decoded.value().merged_vertices == merged.value().merged_vertices);
 }
 
+void merge_by_distance_attribute_transfer_interpolates_or_refuses_atomically() {
+    using namespace carto;
+    geometry::EditableMesh mesh;
+    const auto a = mesh.add_vertex({0.0, 0.0, 0.0});
+    const auto b = mesh.add_vertex({1.0, 0.0, 0.0});
+    const auto c = mesh.add_vertex({0.0, 1.0, 0.0});
+    const auto b_copy = mesh.add_vertex({1.0, 0.0, 0.0});
+    const auto a_copy = mesh.add_vertex({0.0, 0.0, 0.0});
+    const auto d = mesh.add_vertex({0.5, -1.0, 0.0});
+    REQUIRE(a && b && c && b_copy && a_copy && d);
+    REQUIRE(mesh.add_face({a.value(), b.value(), c.value()}));
+    REQUIRE(mesh.add_face({b_copy.value(), a_copy.value(), d.value()}));
+    attributes::AttributeSet continuous({
+        {attributes::AttributeDomain::vertex, mesh.vertex_count()}});
+    REQUIRE(continuous.add_layer({
+        {"signal", attributes::AttributeDomain::vertex, attributes::AttributeType::float64},
+        {2.0, 10.0, 20.0, 14.0, 6.0, 30.0}}));
+    REQUIRE(mesh.set_attribute_payload(std::move(continuous), {}));
+    const auto source_revision = mesh.revision();
+
+    auto transferred_mesh = mesh;
+    const auto merged = mesh_attributes::merge_by_distance_with_attribute_transfer(
+        transferred_mesh, {a.value(), b.value(), b_copy.value(), a_copy.value()}, 1.0e-4);
+    REQUIRE(merged && merged.value().validate());
+    REQUIRE(merged.value().revision_before == source_revision);
+    REQUIRE(merged.value().revision_after == transferred_mesh.revision());
+    REQUIRE(merged.value().merged_vertices.size() == 2U);
+    const auto* signal = transferred_mesh.attributes().find("signal");
+    REQUIRE(signal && signal->values.size() == 4U);
+    REQUIRE(std::get<double>(signal->values[0U]) == 4.0);
+    REQUIRE(std::get<double>(signal->values[1U]) == 12.0);
+    REQUIRE(std::get<double>(signal->values[2U]) == 20.0);
+    REQUIRE(std::get<double>(signal->values[3U]) == 30.0);
+    REQUIRE(transferred_mesh.validate());
+
+    geometry::EditableMesh discrete_mesh = mesh;
+    REQUIRE(discrete_mesh.clear_attribute_payload());
+    attributes::AttributeSet discrete({
+        {attributes::AttributeDomain::vertex, discrete_mesh.vertex_count()}});
+    REQUIRE(discrete.add_layer({
+        {"classification", attributes::AttributeDomain::vertex, attributes::AttributeType::int32},
+        {std::int32_t{1}, std::int32_t{1}, std::int32_t{2},
+            std::int32_t{1}, std::int32_t{1}, std::int32_t{2}}}));
+    REQUIRE(discrete.add_layer({
+        {"enabled", attributes::AttributeDomain::vertex, attributes::AttributeType::boolean},
+        {true, false, false, false, true, false}}));
+    REQUIRE(discrete.add_layer({
+        {"category", attributes::AttributeDomain::vertex, attributes::AttributeType::uint32},
+        {std::uint32_t{10U}, std::uint32_t{20U}, std::uint32_t{30U},
+            std::uint32_t{20U}, std::uint32_t{10U}, std::uint32_t{60U}}}));
+    REQUIRE(discrete.add_layer({
+        {"stable-label", attributes::AttributeDomain::vertex, attributes::AttributeType::string_id},
+        {std::uint64_t{11U}, std::uint64_t{22U}, std::uint64_t{33U},
+            std::uint64_t{22U}, std::uint64_t{11U}, std::uint64_t{66U}}}));
+    REQUIRE(discrete.add_layer({
+        {"owner-reference", attributes::AttributeDomain::vertex, attributes::AttributeType::object_id},
+        {std::uint64_t{101U}, std::uint64_t{202U}, std::uint64_t{303U},
+            std::uint64_t{202U}, std::uint64_t{101U}, std::uint64_t{606U}}}));
+    REQUIRE(discrete_mesh.set_attribute_payload(std::move(discrete), {}));
+    const auto discrete_revision = discrete_mesh.revision();
+    const auto accepted = mesh_attributes::merge_by_distance_with_attribute_transfer(
+        discrete_mesh, {a.value(), b.value(), b_copy.value(), a_copy.value()}, 1.0e-4);
+    REQUIRE(accepted && accepted.value().validate());
+    REQUIRE(accepted.value().revision_before == discrete_revision);
+    REQUIRE(accepted.value().revision_after == discrete_mesh.revision());
+    REQUIRE(discrete_mesh.revision() > discrete_revision);
+    const auto* classification = discrete_mesh.attributes().find("classification");
+    REQUIRE(classification && classification->values.size() == 4U);
+    REQUIRE(std::get<std::int32_t>(classification->values[0U]) == 1);
+    REQUIRE(std::get<std::int32_t>(classification->values[1U]) == 1);
+    REQUIRE(std::get<std::int32_t>(classification->values[2U]) == 2);
+    REQUIRE(std::get<std::int32_t>(classification->values[3U]) == 2);
+    const auto* enabled = discrete_mesh.attributes().find("enabled");
+    REQUIRE(enabled && enabled->values.size() == 4U);
+    REQUIRE(std::get<bool>(enabled->values[0U]));
+    REQUIRE(!std::get<bool>(enabled->values[1U]));
+    const auto* category = discrete_mesh.attributes().find("category");
+    REQUIRE(category && category->values.size() == 4U);
+    REQUIRE(std::get<std::uint32_t>(category->values[0U]) == 10U);
+    REQUIRE(std::get<std::uint32_t>(category->values[1U]) == 20U);
+    const auto* stable_label = discrete_mesh.attributes().find("stable-label");
+    REQUIRE(stable_label && stable_label->values.size() == 4U);
+    REQUIRE(std::get<std::uint64_t>(stable_label->values[0U]) == 11U);
+    REQUIRE(std::get<std::uint64_t>(stable_label->values[1U]) == 22U);
+    const auto* owner_reference = discrete_mesh.attributes().find("owner-reference");
+    REQUIRE(owner_reference && owner_reference->values.size() == 4U);
+    REQUIRE(std::get<std::uint64_t>(owner_reference->values[0U]) == 101U);
+    REQUIRE(std::get<std::uint64_t>(owner_reference->values[1U]) == 202U);
+    REQUIRE(discrete_mesh.validate());
+
+    geometry::EditableMesh weld_mesh = mesh;
+    REQUIRE(weld_mesh.clear_attribute_payload());
+    attributes::AttributeSet weld_attributes({
+        {attributes::AttributeDomain::vertex, weld_mesh.vertex_count()}});
+    REQUIRE(weld_attributes.add_layer({
+        {"classification", attributes::AttributeDomain::vertex, attributes::AttributeType::int32},
+        {std::int32_t{1}, std::int32_t{1}, std::int32_t{2},
+            std::int32_t{1}, std::int32_t{1}, std::int32_t{2}}}));
+    REQUIRE(weld_mesh.set_attribute_payload(std::move(weld_attributes), {}));
+    const auto weld_revision = weld_mesh.revision();
+    const auto welded = mesh_attributes::merge_vertices_with_attribute_transfer(
+        weld_mesh, a.value(), a_copy.value(), geometry::VertexMergeMode::target);
+    REQUIRE(welded && welded.value().validate());
+    REQUIRE(welded.value().revision_before == weld_revision);
+    REQUIRE(welded.value().revision_after == weld_mesh.revision());
+    REQUIRE(weld_mesh.revision() > weld_revision);
+    const auto* welded_classification = weld_mesh.attributes().find("classification");
+    REQUIRE(welded_classification && welded_classification->values.size() == 5U);
+    REQUIRE(std::get<std::int32_t>(welded_classification->values[0U]) == 1);
+    REQUIRE(weld_mesh.validate());
+
+    geometry::EditableMesh conflicting_mesh = mesh;
+    REQUIRE(conflicting_mesh.clear_attribute_payload());
+    attributes::AttributeSet conflicting({
+        {attributes::AttributeDomain::vertex, conflicting_mesh.vertex_count()}});
+    REQUIRE(conflicting.add_layer({
+        {"classification", attributes::AttributeDomain::vertex, attributes::AttributeType::int32},
+        {std::int32_t{1}, std::int32_t{2}, std::int32_t{2},
+            std::int32_t{1}, std::int32_t{1}, std::int32_t{2}}}));
+    REQUIRE(conflicting_mesh.set_attribute_payload(std::move(conflicting), {}));
+    const auto conflicting_before =
+        project::canonical_mesh_snapshot_digest(conflicting_mesh);
+    const auto conflicting_revision = conflicting_mesh.revision();
+    const auto refused = mesh_attributes::merge_by_distance_with_attribute_transfer(
+        conflicting_mesh, {a.value(), b.value(), b_copy.value(), a_copy.value()}, 1.0e-4);
+    REQUIRE(!refused && refused.error().code == core::ErrorCode::unsupported);
+    REQUIRE(conflicting_mesh.revision() == conflicting_revision);
+    REQUIRE(project::canonical_mesh_snapshot_digest(conflicting_mesh) == conflicting_before);
+
+    geometry::EditableMesh vertex_reference_mesh = mesh;
+    REQUIRE(vertex_reference_mesh.clear_attribute_payload());
+    attributes::AttributeSet vertex_reference({
+        {attributes::AttributeDomain::vertex, vertex_reference_mesh.vertex_count()}});
+    REQUIRE(vertex_reference.add_layer({
+        {"reference", attributes::AttributeDomain::vertex, attributes::AttributeType::vertex_id},
+        {std::uint64_t{4U}, std::uint64_t{5U}, std::uint64_t{3U},
+            std::uint64_t{5U}, std::uint64_t{4U}, std::uint64_t{6U}}}));
+    REQUIRE(vertex_reference_mesh.set_attribute_payload(std::move(vertex_reference), {}));
+    const auto vertex_reference_accepted =
+        mesh_attributes::merge_by_distance_with_attribute_transfer(
+            vertex_reference_mesh,
+            {a.value(), b.value(), b_copy.value(), a_copy.value()}, 1.0e-4);
+    REQUIRE(vertex_reference_accepted && vertex_reference_accepted.value().validate());
+    const auto* remapped_references = vertex_reference_mesh.attributes().find("reference");
+    REQUIRE(remapped_references && remapped_references->values.size() == 4U);
+    REQUIRE(std::get<std::uint64_t>(remapped_references->values[0U]) == 2U);
+    REQUIRE(std::get<std::uint64_t>(remapped_references->values[1U]) == 1U);
+    REQUIRE(std::get<std::uint64_t>(remapped_references->values[2U]) == 3U);
+    REQUIRE(std::get<std::uint64_t>(remapped_references->values[3U]) == 6U);
+
+    geometry::EditableMesh stale_reference_mesh = mesh;
+    REQUIRE(stale_reference_mesh.clear_attribute_payload());
+    attributes::AttributeSet stale_reference({
+        {attributes::AttributeDomain::vertex, stale_reference_mesh.vertex_count()}});
+    REQUIRE(stale_reference.add_layer({
+        {"reference", attributes::AttributeDomain::vertex, attributes::AttributeType::vertex_id},
+        {std::uint64_t{999U}, std::uint64_t{2U}, std::uint64_t{3U},
+            std::uint64_t{2U}, std::uint64_t{1U}, std::uint64_t{6U}}}));
+    REQUIRE(stale_reference_mesh.set_attribute_payload(std::move(stale_reference), {}));
+    const auto stale_reference_before =
+        project::canonical_mesh_snapshot_digest(stale_reference_mesh);
+    const auto stale_reference_revision = stale_reference_mesh.revision();
+    const auto stale_reference_refused =
+        mesh_attributes::merge_by_distance_with_attribute_transfer(
+            stale_reference_mesh,
+            {a.value(), b.value(), b_copy.value(), a_copy.value()}, 1.0e-4);
+    REQUIRE(!stale_reference_refused &&
+        stale_reference_refused.error().code == core::ErrorCode::stale_data);
+    REQUIRE(stale_reference_mesh.revision() == stale_reference_revision);
+    REQUIRE(project::canonical_mesh_snapshot_digest(stale_reference_mesh) ==
+        stale_reference_before);
+}
+
+void merge_by_distance_preserves_unambiguous_nonvertex_attributes_or_refuses_conflicts() {
+    using namespace carto;
+    geometry::EditableMesh mesh;
+    const auto a = mesh.add_vertex({0.0, 0.0, 0.0});
+    const auto b = mesh.add_vertex({1.0, 0.0, 0.0});
+    const auto c = mesh.add_vertex({0.0, 1.0, 0.0});
+    const auto b_copy = mesh.add_vertex({1.0, 0.0, 0.0});
+    const auto a_copy = mesh.add_vertex({0.0, 0.0, 0.0});
+    const auto d = mesh.add_vertex({0.5, -1.0, 0.0});
+    REQUIRE(a && b && c && b_copy && a_copy && d);
+    REQUIRE(mesh.add_face({a.value(), b.value(), c.value()}));
+    REQUIRE(mesh.add_face({b_copy.value(), a_copy.value(), d.value()}));
+    const auto source_topology = mesh.topology();
+    REQUIRE(source_topology);
+
+    std::vector<std::uint64_t> source_edge_ids;
+    for (const auto& edge : source_topology.value().edges) {
+        source_edge_ids.push_back(edge.id.value);
+    }
+    std::sort(source_edge_ids.begin(), source_edge_ids.end());
+    const auto source_edge_index = [&](geometry::VertexId first, geometry::VertexId second) {
+        if (second < first) std::swap(first, second);
+        const auto edge = std::find_if(
+            source_topology.value().edges.begin(), source_topology.value().edges.end(),
+            [&](const geometry::EdgeRecord& candidate) {
+                geometry::VertexId edge_first = candidate.first;
+                geometry::VertexId edge_second = candidate.second;
+                if (edge_second < edge_first) std::swap(edge_first, edge_second);
+                return edge_first == first && edge_second == second;
+            });
+        REQUIRE(edge != source_topology.value().edges.end());
+        const auto id = std::lower_bound(source_edge_ids.begin(), source_edge_ids.end(),
+            edge->id.value);
+        REQUIRE(id != source_edge_ids.end() && *id == edge->id.value);
+        return static_cast<std::size_t>(std::distance(source_edge_ids.begin(), id));
+    };
+    std::vector<attributes::AttributeValue> edge_values;
+    edge_values.reserve(source_edge_ids.size());
+    for (std::size_t index = 0U; index < source_edge_ids.size(); ++index) {
+        edge_values.emplace_back(static_cast<std::int32_t>(100U + index));
+    }
+    const auto shared_target_edge = source_edge_index(a.value(), b.value());
+    const auto shared_source_edge = source_edge_index(a_copy.value(), b_copy.value());
+    edge_values[shared_target_edge] = std::int32_t{77};
+    edge_values[shared_source_edge] = std::int32_t{77};
+    const auto conflicting_edge_values = [&]() {
+        auto values = edge_values;
+        values[shared_source_edge] = std::int32_t{78};
+        return values;
+    }();
+
+    std::vector<std::uint64_t> source_corner_ids;
+    for (const auto& corner : source_topology.value().corners) {
+        source_corner_ids.push_back(corner.id.value);
+    }
+    std::sort(source_corner_ids.begin(), source_corner_ids.end());
+    std::vector<attributes::AttributeValue> corner_values;
+    std::map<std::uint64_t, std::int32_t> source_corner_value_by_id;
+    for (std::size_t index = 0U; index < source_corner_ids.size(); ++index) {
+        const auto value = static_cast<std::int32_t>(300U + index);
+        corner_values.emplace_back(value);
+        source_corner_value_by_id.emplace(source_corner_ids[index], value);
+    }
+
+    attributes::AttributeSet payload({
+        {attributes::AttributeDomain::vertex, mesh.vertex_count()},
+        {attributes::AttributeDomain::edge, source_edge_ids.size()},
+        {attributes::AttributeDomain::face, mesh.face_count()},
+        {attributes::AttributeDomain::corner, source_corner_ids.size()},
+    });
+    REQUIRE(payload.add_layer({
+        {"edge-signal", attributes::AttributeDomain::edge, attributes::AttributeType::int32},
+        edge_values}));
+    REQUIRE(payload.add_layer({
+        {"face-label", attributes::AttributeDomain::face, attributes::AttributeType::int32},
+        {std::int32_t{401}, std::int32_t{402}}}));
+    REQUIRE(payload.add_layer({
+        {"corner-label", attributes::AttributeDomain::corner, attributes::AttributeType::int32},
+        corner_values}));
+    REQUIRE(mesh.set_attribute_payload(std::move(payload), {}));
+
+    auto transferred_mesh = mesh;
+    const auto merged = mesh_attributes::merge_by_distance_with_attribute_transfer(
+        transferred_mesh, {a.value(), b.value(), b_copy.value(), a_copy.value()}, 1.0e-4);
+    REQUIRE(merged && merged.value().validate());
+    const auto destination_topology = transferred_mesh.topology();
+    REQUIRE(destination_topology);
+    const auto* transferred_edges = transferred_mesh.attributes().find("edge-signal");
+    const auto* transferred_faces = transferred_mesh.attributes().find("face-label");
+    const auto* transferred_corners = transferred_mesh.attributes().find("corner-label");
+    REQUIRE(transferred_edges && transferred_faces && transferred_corners);
+
+    std::map<std::pair<std::uint64_t, std::uint64_t>, std::int32_t> expected_edge_values;
+    for (std::size_t index = 0U; index < source_edge_ids.size(); ++index) {
+        const auto source_edge = std::find_if(
+            source_topology.value().edges.begin(), source_topology.value().edges.end(),
+            [&](const geometry::EdgeRecord& edge) {
+                return edge.id.value == source_edge_ids[index];
+            });
+        REQUIRE(source_edge != source_topology.value().edges.end());
+        const auto first_replacement = merged.value().merged_vertices.find(source_edge->first);
+        const auto second_replacement = merged.value().merged_vertices.find(source_edge->second);
+        geometry::VertexId first = first_replacement == merged.value().merged_vertices.end()
+            ? source_edge->first : first_replacement->second;
+        geometry::VertexId second = second_replacement == merged.value().merged_vertices.end()
+            ? source_edge->second : second_replacement->second;
+        if (first == second) continue;
+        if (second < first) std::swap(first, second);
+        const auto [expected, inserted] = expected_edge_values.emplace(
+            std::make_pair(first.value, second.value),
+            std::get<std::int32_t>(edge_values[index]));
+        REQUIRE(inserted || expected->second == std::get<std::int32_t>(edge_values[index]));
+    }
+    std::vector<std::uint64_t> destination_edge_ids;
+    for (const auto& edge : destination_topology.value().edges) {
+        destination_edge_ids.push_back(edge.id.value);
+    }
+    std::sort(destination_edge_ids.begin(), destination_edge_ids.end());
+    REQUIRE(transferred_edges->values.size() == destination_edge_ids.size());
+    for (const auto& edge : destination_topology.value().edges) {
+        geometry::VertexId first = edge.first;
+        geometry::VertexId second = edge.second;
+        if (second < first) std::swap(first, second);
+        const auto expected = expected_edge_values.find({first.value, second.value});
+        REQUIRE(expected != expected_edge_values.end());
+        const auto id = std::lower_bound(
+            destination_edge_ids.begin(), destination_edge_ids.end(), edge.id.value);
+        REQUIRE(id != destination_edge_ids.end() && *id == edge.id.value);
+        const std::size_t index = static_cast<std::size_t>(
+            std::distance(destination_edge_ids.begin(), id));
+        REQUIRE(std::get<std::int32_t>(transferred_edges->values[index]) == expected->second);
+    }
+    REQUIRE(transferred_faces->values.size() == 2U);
+    REQUIRE(std::get<std::int32_t>(transferred_faces->values[0U]) == 401);
+    REQUIRE(std::get<std::int32_t>(transferred_faces->values[1U]) == 402);
+    std::vector<std::uint64_t> destination_corner_ids;
+    for (const auto& corner : destination_topology.value().corners) {
+        destination_corner_ids.push_back(corner.id.value);
+    }
+    std::sort(destination_corner_ids.begin(), destination_corner_ids.end());
+    REQUIRE(transferred_corners->values.size() == destination_corner_ids.size());
+    for (std::size_t index = 0U; index < destination_corner_ids.size(); ++index) {
+        std::uint64_t source_corner_id = destination_corner_ids[index];
+        if (!source_corner_value_by_id.contains(source_corner_id)) {
+            const auto origin = merged.value().corner_origins.find(
+                geometry::CornerId{source_corner_id});
+            REQUIRE(origin != merged.value().corner_origins.end());
+            REQUIRE(origin->second.source_ids.size() == 1U);
+            source_corner_id = origin->second.source_ids.front();
+        }
+        REQUIRE(source_corner_value_by_id.contains(source_corner_id));
+        REQUIRE(std::get<std::int32_t>(transferred_corners->values[index]) ==
+            source_corner_value_by_id.at(source_corner_id));
+    }
+
+    geometry::EditableMesh conflicting_mesh = mesh;
+    REQUIRE(conflicting_mesh.clear_attribute_payload());
+    attributes::AttributeSet conflicting_payload({
+        {attributes::AttributeDomain::vertex, conflicting_mesh.vertex_count()},
+        {attributes::AttributeDomain::edge, source_edge_ids.size()},
+        {attributes::AttributeDomain::face, conflicting_mesh.face_count()},
+        {attributes::AttributeDomain::corner, source_corner_ids.size()},
+    });
+    REQUIRE(conflicting_payload.add_layer({
+        {"edge-signal", attributes::AttributeDomain::edge, attributes::AttributeType::int32},
+        conflicting_edge_values}));
+    REQUIRE(conflicting_mesh.set_attribute_payload(std::move(conflicting_payload), {}));
+    const auto conflicting_before = project::canonical_mesh_snapshot_digest(conflicting_mesh);
+    const auto conflicting_revision = conflicting_mesh.revision();
+    const auto refused = mesh_attributes::merge_by_distance_with_attribute_transfer(
+        conflicting_mesh, {a.value(), b.value(), b_copy.value(), a_copy.value()}, 1.0e-4);
+    REQUIRE(!refused && refused.error().code == core::ErrorCode::unsupported);
+    REQUIRE(conflicting_mesh.revision() == conflicting_revision);
+    REQUIRE(project::canonical_mesh_snapshot_digest(conflicting_mesh) == conflicting_before);
+}
+
 void merge_by_distance_indexes_exact_corner_origins_for_many_sources() {
     using namespace carto;
     constexpr std::size_t triangle_count = 512U;
@@ -2326,6 +2790,48 @@ void merge_by_distance_does_not_guess_ambiguous_corner_origins() {
     REQUIRE(merged.value().merged_vertices.size() == 2U);
     REQUIRE(merged.value().created_corners.size() == 1U);
     REQUIRE(!merged.value().corner_origins.contains(merged.value().created_corners.front()));
+}
+
+void merge_candidate_discovery_is_bounded_deterministic_and_read_only() {
+    using namespace carto;
+    geometry::EditableMesh mesh;
+    REQUIRE(mesh.add_vertex({0.0, 0.0, 0.0}));
+    REQUIRE(mesh.add_vertex({0.25, 0.0, 0.0}));
+    REQUIRE(mesh.add_vertex({2.0, 0.0, 0.0}));
+    REQUIRE(mesh.add_vertex({2.25, 0.0, 0.0}));
+    REQUIRE(mesh.add_vertex({5.0, 0.0, 0.0}));
+    const auto source_revision = mesh.revision();
+    const auto source_vertex_count = mesh.vertex_count();
+
+    const auto discovered = mesh.find_merge_by_distance_candidates(
+        0.25, 4U, 100U, 5U);
+    REQUIRE(discovered);
+    REQUIRE((discovered.value() == std::vector<geometry::VertexId>{
+        {1U}, {2U}, {3U}, {4U}}));
+    REQUIRE(mesh.revision() == source_revision);
+    REQUIRE(mesh.vertex_count() == source_vertex_count);
+
+    const auto candidate_budget = mesh.find_merge_by_distance_candidates(
+        0.25, 3U, 100U, 5U);
+    REQUIRE(!candidate_budget);
+    REQUIRE(candidate_budget.error().code == core::ErrorCode::unsupported);
+    const auto pair_budget = mesh.find_merge_by_distance_candidates(
+        0.25, 4U, 1U, 5U);
+    REQUIRE(!pair_budget);
+    REQUIRE(pair_budget.error().code == core::ErrorCode::unsupported);
+    const auto vertex_budget = mesh.find_merge_by_distance_candidates(
+        0.25, 4U, 100U, 4U);
+    REQUIRE(!vertex_budget);
+    REQUIRE(vertex_budget.error().code == core::ErrorCode::unsupported);
+    const auto invalid_distance = mesh.find_merge_by_distance_candidates(
+        std::numeric_limits<double>::infinity(), 4U, 100U, 5U);
+    REQUIRE(!invalid_distance);
+    REQUIRE(invalid_distance.error().code == core::ErrorCode::invalid_argument);
+    const auto no_pairs = mesh.find_merge_by_distance_candidates(
+        0.1, 4U, 100U, 5U);
+    REQUIRE(no_pairs);
+    REQUIRE(no_pairs.value().empty());
+    REQUIRE(mesh.revision() == source_revision);
 }
 
 void merge_by_distance_is_not_transitive() {
@@ -3770,6 +4276,7 @@ void admitted_vertex_slide_is_undoable_and_revision_bound() {
 
 int main() {
     try {
+        mesh_face_validation_rejects_nonfinite_derived_area_atomically();
         mesh_patch_serialization_is_canonical_and_bounded();
         face_deletion_patch_serialization_is_canonical_and_bounded();
         edge_split_patch_serialization_is_canonical_and_bounded();
@@ -3811,8 +4318,11 @@ int main() {
         center_weld_moves_target_to_midpoint_and_keeps_target_identity();
         center_weld_rejects_ambiguous_collapse_without_moving_target();
         merge_by_distance_stitches_coincident_seam_in_one_receipt();
+        merge_by_distance_attribute_transfer_interpolates_or_refuses_atomically();
+        merge_by_distance_preserves_unambiguous_nonvertex_attributes_or_refuses_conflicts();
         merge_by_distance_indexes_exact_corner_origins_for_many_sources();
         merge_by_distance_does_not_guess_ambiguous_corner_origins();
+        merge_candidate_discovery_is_bounded_deterministic_and_read_only();
         merge_by_distance_is_not_transitive();
         merge_by_distance_preserves_extreme_finite_distance_boundaries();
         merge_by_distance_rejects_invalid_requests_without_mutation();

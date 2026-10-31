@@ -10,7 +10,9 @@
 
 #include <algorithm>
 #include <iostream>
+#include <locale>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -100,6 +102,83 @@ void graph_rejects_cycles_and_preserves_deterministic_order() {
     const auto unsafe_digest = graph.create_node(eval::NodeTypeId{"source_mesh"}, "bad digest");
     REQUIRE(!unsafe_digest);
     REQUIRE(unsafe_digest.error().code == core::ErrorCode::invalid_argument);
+}
+
+void graph_codec_preserves_exact_unsigned_revisions_across_locales() {
+    using namespace carto;
+    const auto encoded = [](std::string_view parameter_revision) {
+        return std::string("CARTOGRAPHER_EVAL_GRAPH 1\nREVISION ") +
+            std::to_string(core::Revision::max_value() - 1U) +
+            "\nTYPES 1\nTYPE source_mesh 1\nPORT mesh 1 2\nNODES 1\n" +
+            "NODE 1234 source_mesh " + std::string(parameter_revision) +
+            " source-v1\nCONNECTIONS 0\nEND\n";
+    };
+    const auto graph = eval::EvaluationGraph::deserialize(
+        encoded(std::to_string(core::Revision::max_value() - 2U)));
+    REQUIRE(graph);
+    REQUIRE(graph.value().find_node(eval::NodeId{1234U})->parameter_revision ==
+        core::Revision{core::Revision::max_value() - 2U});
+    for (const auto token : {"-3", "+1234", "18446744073709551616", "1234x"}) {
+        const auto rejected = eval::EvaluationGraph::deserialize(encoded(token));
+        REQUIRE(!rejected);
+        REQUIRE(rejected.error().code == core::ErrorCode::validation_failed);
+    }
+
+    class ScopedGlobalLocale {
+    public:
+        explicit ScopedGlobalLocale(const std::locale& next)
+            : previous_(std::locale::global(next)) {}
+        ~ScopedGlobalLocale() { std::locale::global(previous_); }
+    private:
+        std::locale previous_;
+    };
+    class GroupedNumbers final : public std::numpunct<char> {
+    protected:
+        char do_thousands_sep() const override { return ','; }
+        std::string do_grouping() const override { return "\3"; }
+    };
+    const ScopedGlobalLocale classic(std::locale::classic());
+    const auto canonical = graph.value().serialize();
+    REQUIRE(canonical);
+    const auto digest = graph.value().content_digest();
+    {
+        const ScopedGlobalLocale grouped(
+            std::locale(std::locale::classic(), new GroupedNumbers));
+        const auto serialized = graph.value().serialize();
+        REQUIRE(serialized && serialized.value() == canonical.value());
+        REQUIRE(graph.value().content_digest() == digest);
+        const auto reopened = eval::EvaluationGraph::deserialize(canonical.value());
+        REQUIRE(reopened && reopened.value().content_digest() == digest);
+    }
+}
+
+void graph_admits_large_fanout_and_rejects_a_late_competing_input() {
+    using namespace carto;
+    constexpr std::size_t outputs = 4'096U;
+    const auto encoded = [](bool competing_input) {
+        std::ostringstream stream;
+        stream.imbue(std::locale::classic());
+        stream << "CARTOGRAPHER_EVAL_GRAPH 1\nREVISION 10000\nTYPES 2\n"
+               << "TYPE source_mesh 1\nPORT mesh 1 2\n"
+               << "TYPE output 1\nPORT mesh 0 2\nNODES " << outputs + 2U << '\n'
+               << "NODE 1 source_mesh 0 source-v1\nNODE 2 source_mesh 0 other-v1\n";
+        for (std::size_t index = 0U; index < outputs; ++index) {
+            stream << "NODE " << index + 3U << " output 0 sink-v1\n";
+        }
+        stream << "CONNECTIONS " << outputs + (competing_input ? 1U : 0U) << '\n';
+        for (std::size_t index = 0U; index < outputs; ++index) {
+            stream << "LINK 1 mesh " << index + 3U << " mesh\n";
+        }
+        if (competing_input) stream << "LINK 2 mesh " << outputs + 2U << " mesh\n";
+        stream << "END\n";
+        return stream.str();
+    };
+    const auto graph = eval::EvaluationGraph::deserialize(encoded(false));
+    REQUIRE(graph && graph.value().connection_count() == outputs);
+    const auto order = graph.value().topological_order();
+    REQUIRE(order && order.value().size() == outputs + 2U);
+    const auto conflict = eval::EvaluationGraph::deserialize(encoded(true));
+    REQUIRE(!conflict && conflict.error().code == core::ErrorCode::validation_failed);
 }
 
 void cache_and_publication_gate_reject_stale_worker_results() {
@@ -447,6 +526,8 @@ void mesh_receipt_provenance_maps_created_elements_and_rejects_stale_states() {
 int main() {
     try {
         graph_rejects_cycles_and_preserves_deterministic_order();
+        graph_codec_preserves_exact_unsigned_revisions_across_locales();
+        graph_admits_large_fanout_and_rejects_a_late_competing_input();
         cache_and_publication_gate_reject_stale_worker_results();
         scheduler_is_bounded_and_only_returns_candidates();
         scheduler_shutdown_rejects_new_work_and_preserves_failure_receipts();

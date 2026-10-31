@@ -12,9 +12,47 @@ namespace carto::editor {
 
 namespace {
 
+bool same_transform(const core::Transform& left, const core::Transform& right) noexcept {
+    return left.translation.x == right.translation.x &&
+        left.translation.y == right.translation.y && left.translation.z == right.translation.z &&
+        left.rotation.x == right.rotation.x && left.rotation.y == right.rotation.y &&
+        left.rotation.z == right.rotation.z && left.rotation.w == right.rotation.w &&
+        left.scale.x == right.scale.x && left.scale.y == right.scale.y && left.scale.z == right.scale.z;
+}
+
+core::Result<void> validate_component_owner(
+    const project::ProjectDocument& document, scene::ObjectId owner, std::uint64_t mesh_asset) {
+    const auto* object = document.scene().find(owner);
+    if (!object || !object->mesh_asset || *object->mesh_asset != mesh_asset) {
+        return core::Result<void>::failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "selected component owner no longer refers to its original mesh asset"));
+    }
+    if (object->locked) return core::Result<void>::failure(core::Diagnostic(
+        core::ErrorCode::invalid_state, "selected component owner is locked"));
+    return core::Result<void>::success();
+}
+
+assets::Sha256Digest source_history_digest(
+    std::string project_state, const assets::ProjectAssetRegistry& registry) {
+    // History restores authored content while retained source generations and
+    // tombstones keep advancing. Normalize only this comparison, never the
+    // live registry or the generation-bound admission of a new command.
+    project_state += "\nSOURCE_HISTORY_RECORDS " + std::to_string(registry.records().size()) + '\n';
+    for (const auto& [identity, stored] : registry.records()) {
+        static_cast<void>(identity);
+        auto record = stored;
+        record.source_generation = core::Revision{1U};
+        project_state += record.serialize();
+    }
+    return assets::sha256(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(project_state.data()), project_state.size()));
+}
+
 } // namespace
 
 core::Result<void> CommandBus::execute(std::unique_ptr<EditorCommand> command) {
+    if (pending_history_ != PendingHistory::none) return core::Result<void>::failure(
+        core::Diagnostic(core::ErrorCode::invalid_state, "durable history operation is pending"));
     if (!command) {
         return core::Result<void>::failure(
             core::Diagnostic(core::ErrorCode::invalid_argument, "command bus cannot execute a null command"));
@@ -52,6 +90,8 @@ void CommandBus::finalize_last_execute() noexcept {
 }
 
 core::Result<void> CommandBus::undo() {
+    if (pending_history_ != PendingHistory::none) return core::Result<void>::failure(
+        core::Diagnostic(core::ErrorCode::invalid_state, "durable history operation is pending"));
     if (undo_stack_.empty()) {
         return core::Result<void>::failure(
             core::Diagnostic(core::ErrorCode::invalid_state, "command history has no undo entry"));
@@ -67,6 +107,8 @@ core::Result<void> CommandBus::undo() {
 }
 
 core::Result<void> CommandBus::redo() {
+    if (pending_history_ != PendingHistory::none) return core::Result<void>::failure(
+        core::Diagnostic(core::ErrorCode::invalid_state, "durable history operation is pending"));
     if (redo_stack_.empty()) {
         return core::Result<void>::failure(
             core::Diagnostic(core::ErrorCode::invalid_state, "command history has no redo entry"));
@@ -81,7 +123,55 @@ core::Result<void> CommandBus::redo() {
     return core::Result<void>::success();
 }
 
+core::Result<void> CommandBus::prepare_durable_undo() {
+    if (pending_history_ != PendingHistory::none || rollback_pending_ || undo_stack_.empty()) {
+        return core::Result<void>::failure(core::Diagnostic(core::ErrorCode::invalid_state,
+            "durable undo requires a current finalized undo entry"));
+    }
+    auto candidate = undo_stack_.back()->checkpoint();
+    if (!candidate) return core::Result<void>::failure(core::Diagnostic(core::ErrorCode::unsupported,
+        "command does not support durable undo checkpointing"));
+    redo_stack_.reserve(redo_stack_.size() + 1U);
+    if (auto result = candidate->undo(); !result) return result;
+    pending_command_ = std::move(candidate);
+    pending_history_ = PendingHistory::undo;
+    return core::Result<void>::success();
+}
+
+core::Result<void> CommandBus::prepare_durable_redo() {
+    if (pending_history_ != PendingHistory::none || rollback_pending_ || redo_stack_.empty()) {
+        return core::Result<void>::failure(core::Diagnostic(core::ErrorCode::invalid_state,
+            "durable redo requires a current finalized redo entry"));
+    }
+    auto candidate = redo_stack_.back()->checkpoint();
+    if (!candidate) return core::Result<void>::failure(core::Diagnostic(core::ErrorCode::unsupported,
+        "command does not support durable redo checkpointing"));
+    undo_stack_.reserve(undo_stack_.size() + 1U);
+    if (auto result = candidate->execute(); !result) return result;
+    pending_command_ = std::move(candidate);
+    pending_history_ = PendingHistory::redo;
+    return core::Result<void>::success();
+}
+
+void CommandBus::commit_durable_history() noexcept {
+    if (pending_history_ == PendingHistory::undo) {
+        undo_stack_.pop_back();
+        redo_stack_.push_back(std::move(pending_command_));
+    } else if (pending_history_ == PendingHistory::redo) {
+        redo_stack_.pop_back();
+        undo_stack_.push_back(std::move(pending_command_));
+    }
+    pending_history_ = PendingHistory::none;
+    finalize_last_execute();
+}
+
+void CommandBus::abort_durable_history() noexcept {
+    pending_command_.reset();
+    pending_history_ = PendingHistory::none;
+}
+
 void CommandBus::clear_history() noexcept {
+    abort_durable_history();
     undo_stack_.clear();
     redo_stack_.clear();
     finalize_last_execute();
@@ -119,21 +209,30 @@ SetProjectObjectTransformCommand::SetProjectObjectTransformCommand(
       expected_project_revision_(document.revision()) {}
 
 core::Result<void> SetProjectObjectTransformCommand::execute() {
-    return apply(after_);
+    return apply(after_, before_);
 }
 
 core::Result<void> SetProjectObjectTransformCommand::undo() {
-    return apply(before_);
+    return apply(before_, after_);
 }
 
-core::Result<void> SetProjectObjectTransformCommand::apply(core::Transform transform) {
+core::Result<void> SetProjectObjectTransformCommand::apply(
+    core::Transform transform, const core::Transform& expected_current) {
     if (!document_) {
         return core::Result<void>::failure(core::Diagnostic(
             core::ErrorCode::invalid_state,
             "project transform command has no document"));
     }
-    const core::Revision expected =
-        current_project_revision_.value_or(expected_project_revision_);
+    const core::Revision expected = document_->revision();
+    // Initial admission remains bound to its captured revision. Ordered
+    // undo/redo can follow other undone commands, which advance the project
+    // revision; require the exact target state instead of a historical counter.
+    const auto* object = document_->scene().find(object_);
+    if ((!current_project_revision_.has_value() && expected != expected_project_revision_) ||
+        object == nullptr || !same_transform(object->local_transform, expected_current)) {
+        return core::Result<void>::failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "project transform target no longer matches the command's expected state"));
+    }
     auto result = document_->set_object_transform_if_revision(object_, expected, transform);
     if (!result) {
         return core::Result<void>::failure(result.error());
@@ -563,6 +662,13 @@ ApplySourceReimportPlanCommand::ApplySourceReimportPlanCommand(
       reviewed_plan_(std::move(reviewed_plan)),
       expected_project_revision_(document.revision()) {}
 
+assets::Sha256Digest ApplySourceReimportPlanCommand::history_state_digest() const {
+    project::ProjectDocument normalized(*document_);
+    normalized.revision_ = core::Revision{};
+    normalized.source_asset_registry_ = {};
+    return source_history_digest(normalized.serialize(), document_->source_asset_registry());
+}
+
 core::Result<assets::SourceReimportPlan>
 ApplySourceReimportPlanCommand::plan_for_records(
     const std::vector<assets::SourceImportRecord>& records) const {
@@ -602,10 +708,11 @@ core::Result<void> ApplySourceReimportPlanCommand::execute() {
             core::ErrorCode::invalid_state,
             "source reimport command has incomplete or already-applied state"));
     }
-    if (document_->revision() != expected_project_revision_) {
+    if ((!initialized_ && document_->revision() != expected_project_revision_) ||
+        (initialized_ && history_state_digest() != expected_history_digest_)) {
         return core::Result<void>::failure(core::Diagnostic(
             core::ErrorCode::stale_data,
-            "source reimport command revision no longer matches the project"));
+            "source reimport command no longer matches the reviewed project state"));
     }
     if (!initialized_) {
         const auto updated = assets::apply_source_reimport_plan(
@@ -635,13 +742,14 @@ core::Result<void> ApplySourceReimportPlanCommand::execute() {
         }
     }
     expected_project_revision_ = document_->revision();
+    expected_history_digest_ = history_state_digest();
     applied_ = true;
     return core::Result<void>::success();
 }
 
 core::Result<void> ApplySourceReimportPlanCommand::undo() {
     if (!document_ || !initialized_ || !applied_ ||
-        document_->revision() != expected_project_revision_) {
+        history_state_digest() != expected_history_digest_) {
         return core::Result<void>::failure(core::Diagnostic(
             core::ErrorCode::stale_data,
             "source reimport command is no longer current and cannot be undone"));
@@ -652,6 +760,7 @@ core::Result<void> ApplySourceReimportPlanCommand::undo() {
         return result;
     }
     expected_project_revision_ = document_->revision();
+    expected_history_digest_ = history_state_digest();
     applied_ = false;
     return core::Result<void>::success();
 }
@@ -1326,6 +1435,9 @@ core::Result<void> SetProjectSelectedVertexPositionCommand::execute() {
             "project vertex command has incomplete context"));
     }
     if (!edits_.empty()) {
+        for (const auto& edit : edits_) {
+            if (auto valid = validate_component_owner(*document_, edit.owner, edit.mesh_asset); !valid) return valid;
+        }
         project::ProjectDocument candidate = *document_;
         auto staged_edits = edits_;
         for (auto& edit : staged_edits) {
@@ -1381,6 +1493,7 @@ core::Result<void> SetProjectSelectedVertexPositionCommand::execute() {
                 "selected vertex owner has no mesh asset"));
         }
         const std::uint64_t mesh_asset = *object->mesh_asset;
+        if (auto valid = validate_component_owner(*document_, group.object, mesh_asset); !valid) return valid;
         const auto mesh = document_->meshes().find(mesh_asset);
         if (mesh == document_->meshes().end()) {
             return core::Result<void>::failure(core::Diagnostic(
@@ -1444,6 +1557,7 @@ core::Result<void> SetProjectSelectedVertexPositionCommand::execute() {
             candidate.meshes().at(mesh_asset),
             std::move(patch),
             replaced.value(),
+            group.object,
         });
     }
     if (auto validation = candidate.validate(); !validation) return validation;
@@ -1457,6 +1571,9 @@ core::Result<void> SetProjectSelectedVertexPositionCommand::undo() {
         return core::Result<void>::failure(core::Diagnostic(
             core::ErrorCode::invalid_state,
             "project vertex command has no completed operation to undo"));
+    }
+    for (const auto& edit : edits_) {
+        if (auto valid = validate_component_owner(*document_, edit.owner, edit.mesh_asset); !valid) return valid;
     }
     project::ProjectDocument candidate = *document_;
     auto staged_edits = edits_;
@@ -1912,6 +2029,9 @@ core::Result<void> ExtrudeProjectSelectedFaceCommand::execute() {
             "project extrusion command has incomplete context"));
     }
     if (!edits_.empty()) {
+        for (const auto& edit : edits_) {
+            if (auto valid = validate_component_owner(*document_, edit.owner, edit.mesh_asset); !valid) return valid;
+        }
         project::ProjectDocument candidate = *document_;
         auto staged_edits = edits_;
         for (auto& edit : staged_edits) {
@@ -1981,6 +2101,7 @@ core::Result<void> ExtrudeProjectSelectedFaceCommand::execute() {
                 "selected face owner has no mesh asset"));
         }
         const std::uint64_t mesh_asset = *object->mesh_asset;
+        if (auto valid = validate_component_owner(*document_, group.object, mesh_asset); !valid) return valid;
         const auto mesh = document_->meshes().find(mesh_asset);
         if (mesh == document_->meshes().end()) {
             return core::Result<void>::failure(core::Diagnostic(
@@ -2049,7 +2170,7 @@ core::Result<void> ExtrudeProjectSelectedFaceCommand::execute() {
         }
         staged_edits.push_back(AppliedMeshEdit{
             mesh_asset, std::move(patches), std::move(before),
-            candidate.meshes().at(mesh_asset), last_receipt, current_mesh_revision});
+            candidate.meshes().at(mesh_asset), last_receipt, current_mesh_revision, group.object});
     }
     if (auto result = candidate.validate(); !result) return result;
     document_->swap(candidate);
@@ -2062,6 +2183,9 @@ core::Result<void> ExtrudeProjectSelectedFaceCommand::undo() {
         return core::Result<void>::failure(core::Diagnostic(
             core::ErrorCode::invalid_state,
             "project extrusion command has no completed operation to undo"));
+    }
+    for (const auto& edit : edits_) {
+        if (auto valid = validate_component_owner(*document_, edit.owner, edit.mesh_asset); !valid) return valid;
     }
     project::ProjectDocument candidate = *document_;
     std::vector<core::Revision> revisions(edits_.size());
@@ -4908,6 +5032,13 @@ ImportSourceMeshCommand::ImportSourceMeshCommand(
       imported_record_(std::move(source_record)),
       expected_project_revision_(document.revision()) {}
 
+assets::Sha256Digest ImportSourceMeshCommand::history_state_digest() const {
+    project::ProjectDocument normalized(*document_);
+    normalized.revision_ = core::Revision{};
+    normalized.source_asset_registry_ = {};
+    return source_history_digest(normalized.serialize(), document_->source_asset_registry());
+}
+
 core::Result<void> ImportSourceMeshCommand::apply_registry_record(
     std::optional<assets::SourceImportRecord> desired) {
     if (!document_) {
@@ -5023,7 +5154,9 @@ core::Result<void> ImportSourceMeshCommand::remove_created_instance() {
 }
 
 core::Result<void> ImportSourceMeshCommand::execute() {
-    if (!document_ || applied_ || document_->revision() != expected_project_revision_) {
+    if (!document_ || applied_ ||
+        (!initialized_ && document_->revision() != expected_project_revision_) ||
+        (initialized_ && history_state_digest() != expected_history_digest_)) {
         return core::Result<void>::failure(core::Diagnostic(
             core::ErrorCode::stale_data,
             "source mesh command is stale, incomplete, or already applied"));
@@ -5063,6 +5196,8 @@ core::Result<void> ImportSourceMeshCommand::execute() {
             previous_mesh_ = current_mesh->second;
             previous_record_ = active->second;
             imported_record_.artifact_identity = active->second.artifact_identity;
+            imported_record_.authored_tags = active->second.authored_tags;
+            imported_record_.dependencies = active->second.dependencies;
             mesh_changed_ = active->second.artifact_digest !=
                 imported_record_.artifact_digest;
             if (mesh_changed_) {
@@ -5107,13 +5242,14 @@ core::Result<void> ImportSourceMeshCommand::execute() {
         }
     }
     expected_project_revision_ = document_->revision();
+    expected_history_digest_ = history_state_digest();
     applied_ = true;
     return core::Result<void>::success();
 }
 
 core::Result<void> ImportSourceMeshCommand::undo() {
     if (!document_ || !initialized_ || !applied_ ||
-        document_->revision() != expected_project_revision_) {
+        history_state_digest() != expected_history_digest_) {
         return core::Result<void>::failure(core::Diagnostic(
             core::ErrorCode::stale_data,
             "source mesh command is no longer current and cannot be undone"));
@@ -5137,6 +5273,132 @@ core::Result<void> ImportSourceMeshCommand::undo() {
         }
     }
     expected_project_revision_ = document_->revision();
+    expected_history_digest_ = history_state_digest();
+    applied_ = false;
+    return core::Result<void>::success();
+}
+
+ImportGltfSceneCommand::ImportGltfSceneCommand(
+    ProjectCommandAdmission, project::ProjectDocument& document,
+    std::vector<std::pair<std::uint64_t, geometry::EditableMesh>> meshes,
+    std::vector<scene::SceneObject> nodes, project::MaterialCatalog catalog,
+    assets::SourceImportRecord source, std::filesystem::path blob_root)
+    : document_(&document), meshes_(std::move(meshes)), nodes_(std::move(nodes)),
+      before_catalog_(document.material_catalog()), after_catalog_(std::move(catalog)),
+      source_(std::move(source)), blob_root_(std::move(blob_root)), initial_revision_(document.revision()) {}
+
+assets::Sha256Digest ImportGltfSceneCommand::history_state_digest() const {
+    project::ProjectDocument normalized(*document_);
+    normalized.revision_ = core::Revision{};
+    normalized.source_asset_registry_ = {};
+    return source_history_digest(normalized.serialize(), document_->source_asset_registry());
+}
+
+core::Result<void> ImportGltfSceneCommand::apply_source(bool present) {
+    const auto& registry = document_->source_asset_registry();
+    std::vector<assets::SourceImportRecord> records;
+    records.reserve(registry.records().size() + (present ? 1U : 0U));
+    for (const auto& [identity, record] : registry.records()) {
+        if (identity != source_.identity) records.push_back(record);
+    }
+    if (present) {
+        if (registry.records().contains(source_.identity)) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data, "glTF source identity is already active"));
+        }
+        const auto lineage = registry.lineage().find(source_.identity);
+        if (lineage != registry.lineage().end() && lineage->second.exhausted()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state, "glTF source generation is exhausted"));
+        }
+        source_.source_generation = lineage == registry.lineage().end()
+            ? core::Revision{1U} : lineage->second.next();
+        records.push_back(source_);
+    } else {
+        const auto active = registry.records().find(source_.identity);
+        if (active == registry.records().end()) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data, "glTF source binding changed before undo"));
+        }
+    }
+    auto plan = assets::plan_source_reimport(registry, std::move(records));
+    if (!plan) return core::Result<void>::failure(plan.error());
+    return document_->apply_source_reimport_plan(plan.value());
+}
+
+core::Result<void> ImportGltfSceneCommand::execute() {
+    if (!document_ || applied_ ||
+        (!initialized_ && document_->revision() != initial_revision_) ||
+        (initialized_ && history_state_digest() != history_digest_)) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data, "glTF scene import no longer matches project history"));
+    }
+    assets::BlobStore store(blob_root_, assets::BlobStoreLimits{128ULL * 1024ULL * 1024ULL, 256U});
+    if (auto verified = store.verify(source_.source_digest); !verified) return verified;
+    for (const auto& product : source_.document_products) {
+        if (product.kind != assets::SourceDocumentProductKind::texture) continue;
+        const auto texture = after_catalog_.textures().find(product.product_id);
+        if (texture == after_catalog_.textures().end()) return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data, "imported glTF texture identity is missing"));
+        if (auto verified = store.verify(texture->second.content_digest); !verified) return verified;
+    }
+    const project::ProjectDocument before = *document_;
+    const auto rollback = [this, &before](core::Diagnostic diagnostic) {
+        *document_ = before;
+        return core::Result<void>::failure(std::move(diagnostic));
+    };
+    for (const auto& [id, mesh] : meshes_) {
+        if (auto result = document_->insert_mesh(id, mesh); !result) return rollback(result.error());
+    }
+    for (const auto& node : nodes_) {
+        auto root = node;
+        root.parent.reset();
+        if (auto result = document_->insert_object(std::move(root)); !result) return rollback(result.error());
+    }
+    for (const auto& node : nodes_) {
+        if (!node.parent) continue;
+        if (document_->revision().exhausted()) return rollback(core::Diagnostic(
+            core::ErrorCode::invalid_state, "project revision is exhausted"));
+        if (auto result = document_->scene_.set_parent(node.id, node.parent); !result) return rollback(result.error());
+        document_->bump_revision();
+    }
+    if (auto result = document_->set_material_catalog(after_catalog_); !result) return rollback(result.error());
+    if (auto result = apply_source(true); !result) return rollback(result.error());
+    if (auto result = document_->validate(); !result) return rollback(result.error());
+    history_digest_ = history_state_digest();
+    initialized_ = true;
+    applied_ = true;
+    return core::Result<void>::success();
+}
+
+core::Result<void> ImportGltfSceneCommand::undo() {
+    if (!document_ || !initialized_ || !applied_ || history_state_digest() != history_digest_) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data, "glTF scene import is no longer current for undo"));
+    }
+    const project::ProjectDocument before = *document_;
+    const auto rollback = [this, &before](core::Diagnostic diagnostic) {
+        *document_ = before;
+        return core::Result<void>::failure(std::move(diagnostic));
+    };
+    if (auto result = apply_source(false); !result) return rollback(result.error());
+    if (auto result = document_->set_material_catalog(before_catalog_); !result) return rollback(result.error());
+    for (const auto& node : nodes_) {
+        if (!node.parent) continue;
+        if (document_->revision().exhausted()) return rollback(core::Diagnostic(
+            core::ErrorCode::invalid_state, "project revision is exhausted"));
+        if (auto result = document_->scene_.set_parent(node.id, std::nullopt); !result) return rollback(result.error());
+        document_->bump_revision();
+    }
+    for (const auto& node : nodes_) {
+        if (auto result = document_->remove_object(node.id); !result) return rollback(result.error());
+    }
+    for (const auto& [id, mesh] : meshes_) {
+        static_cast<void>(mesh);
+        if (auto result = document_->remove_mesh(id); !result) return rollback(result.error());
+    }
+    if (auto result = document_->validate(); !result) return rollback(result.error());
+    history_digest_ = history_state_digest();
     applied_ = false;
     return core::Result<void>::success();
 }

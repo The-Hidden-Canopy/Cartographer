@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <limits>
+#include <locale>
 #include <map>
 #include <set>
 #include <sstream>
@@ -89,6 +90,7 @@ std::string canonical_graph(
     const std::vector<Connection>& connections,
     core::Revision revision) {
     std::ostringstream stream;
+    stream.imbue(std::locale::classic());
     stream << "revision=" << revision.value() << '\n';
     for (const auto& [type_id, type] : types) {
         stream << "type=" << type_id.value << '\n';
@@ -246,18 +248,14 @@ core::Result<void> EvaluationGraph::validate() const {
         if (!types_.contains(node.type)) return validation("evaluation node type is missing");
     }
     std::set<Connection> unique_connections;
+    std::set<std::pair<NodeId, PortId>> occupied_inputs;
     for (const auto& connection : connections_) {
         if (!unique_connections.insert(connection).second) {
             return validation("evaluation graph contains duplicate connections");
         }
         if (auto result = validate_connection(connection); !result) return result;
-    }
-    for (const auto& connection : connections_) {
-        for (const auto& other : connections_) {
-            if (&connection != &other && connection.input_node == other.input_node &&
-                connection.input_port == other.input_port) {
-                return validation("evaluation input port has multiple connections");
-            }
+        if (!occupied_inputs.emplace(connection.input_node, connection.input_port).second) {
+            return validation("evaluation input port has multiple connections");
         }
     }
     const auto order = topological_order();
@@ -334,6 +332,7 @@ core::Result<std::string> EvaluationGraph::serialize() const {
         return core::Result<std::string>::failure(result.error());
     }
     std::ostringstream stream;
+    stream.imbue(std::locale::classic());
     stream << "CARTOGRAPHER_EVAL_GRAPH 1\n";
     stream << "REVISION " << revision_.value() << "\n";
     stream << "TYPES " << types_.size() << "\n";
@@ -371,6 +370,7 @@ core::Result<EvaluationGraph> EvaluationGraph::deserialize(std::string_view text
             "evaluation graph serialization is empty or exceeds the size limit"));
     }
     std::istringstream stream{std::string{text}};
+    stream.imbue(std::locale::classic());
     if (auto result = expect(stream, "CARTOGRAPHER_EVAL_GRAPH"); !result) {
         return core::Result<EvaluationGraph>::failure(result.error());
     }
@@ -457,16 +457,23 @@ core::Result<EvaluationGraph> EvaluationGraph::deserialize(std::string_view text
         const auto id = read_uint(stream, "node id");
         if (!id) return core::Result<EvaluationGraph>::failure(id.error());
         std::string type_id;
-        std::uint64_t parameter_revision = 0U;
         std::string parameters_digest;
-        if (!(stream >> type_id >> parameter_revision >> parameters_digest)) {
+        if (!(stream >> type_id)) {
+            return core::Result<EvaluationGraph>::failure(parse_error(
+                "evaluation graph serialization contains an incomplete node").error());
+        }
+        const auto parameter_revision = read_uint(stream, "parameter revision");
+        if (!parameter_revision) {
+            return core::Result<EvaluationGraph>::failure(parameter_revision.error());
+        }
+        if (!(stream >> parameters_digest)) {
             return core::Result<EvaluationGraph>::failure(parse_error(
                 "evaluation graph serialization contains an incomplete node").error());
         }
         NodeInstance node{
             NodeId{id.value()},
             NodeTypeId{std::move(type_id)},
-            core::Revision{parameter_revision},
+            core::Revision{parameter_revision.value()},
             std::move(parameters_digest),
         };
         if (auto result = node.validate(); !result) {

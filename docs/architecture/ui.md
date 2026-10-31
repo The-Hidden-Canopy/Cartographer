@@ -51,6 +51,32 @@ submits through the same application admission boundary.
 
 ## Public primitives currently implemented
 
+Native Inspector position/transform drafts bind project generation/revision and
+the displayed owner/vertex. Clean fields refresh; edited fields remain visible
+but stale after a source revision changes, until explicit Reload. Source-scoped
+widget IDs also separate active text buffers. Shared UI commit helpers recheck
+the live session and selection immediately before dispatch, retaining existing
+human command/history/journal behavior. See the
+[Inspector draft ledger](../verification/frontend-inspector-drafts.md).
+
+The native studio follows the supplied viewport-first design reference: dark
+blue-black surfaces, cyan interaction, bronze identity, a left scene hierarchy,
+right Inspector, and bottom Assets/History tabs. A single snapshot-driven style
+adapter applies all native colors and Compact/Standard/Touch geometry. It does
+not overwrite high-contrast preferences with the dark palette. Header/footer
+and dock host share fitted density/font-aware bounds; narrow windows retain
+workspace access through a selector. Existing dock IDs and user layouts remain
+unchanged. Scene and asset filters are presentation projections over real IDs;
+they cannot modify project data or invent thumbnails.
+Docked instruments use their tabs for movement; the existing explicit Move/Float
+path remains in the panel's context menu. A bounded navigation rail keeps
+Project/Settings content visible beside it rather than filling the entire page.
+
+The landscape, GIS, weather, and rendering in the supplied mockup remain visual
+references, not implemented runtime claims. See the
+[native design ledger](../verification/frontend-design.md) for attachment
+provenance, tests, and actual native checks.
+
 - centralized dark, light, and high-contrast color tokens;
 - Compact, Standard, and Touch density state;
 - Person-First and bounded native AI-First presentation modes;
@@ -84,7 +110,13 @@ revision-guarded project command path as the other authoring tools; the
 operation is undoable, reports its factor, and clears the removed edge
 selection. A single selected convex face can likewise be inset through the
 same command boundary with distance metadata and guarded undo/redo. Concave
-inset, broader persistent edge authoring, and traversal tools remain deferred.
+inset and broader persistent edge authoring remain deferred. The Modify
+instrument and command palette expose vertex/edge/face conversion, linked,
+grow/shrink/invert, and edge boundary/loop/ring selection. Shortest-path
+selection requires one start vertex and an explicit owner-bound goal. These
+shared UI routes validate project generation/revision and dispatch the existing
+selection actions without changing the document, journal, or history. Numeric
+mode shortcuts retain their existing clear-selection behavior.
 An object-bound selected vertex can slide along a deterministic incident support
 edge (or an explicitly supplied support edge) with a bounded factor; the
 topology remains unchanged and invalid support/factor/geometry inputs fail
@@ -96,6 +128,29 @@ current revision and selection before preview and again before commit; raw AI
 application actions remain rejected. Default auto-approval is limited to the
 native preview-safe operation set. No model service or unrestricted direct AI
 mutation path exists.
+
+The Modify instrument also exposes a bounded instance batch: 1–4,096 copies
+of one visible, unlocked root mesh with finite translation steps. Command
+availability and execution share the same source-eligibility predicate. The
+batch enters through one existing application command, journal event, and undo
+step. UV/Material controls can generate a unique lightmap UV candidate for one
+selected mesh through the human application boundary; the separate Agent draft
+path remains available. A generated candidate is not bake-readiness evidence.
+
+Assets exposes exact-byte moved-source review for a registered source in a
+saved project. Preparation checks the captured project scope and source digest
+and stages immutable bytes in the managed blob store. Confirmation revalidates
+the managed path and digest before the application publishes a registry change
+through its existing command. Restoring bytes to an already registered managed
+path returns an application no-change receipt without a document/history/
+journal change. Discarded preparations can leave unreferenced immutable blobs.
+
+Native decal placement captures the displayed target mesh, live/Agent scene
+source, and project generation/revision. The shared UI admission helper requires
+the live scene and exact displayed/source geometry equality before constructing
+an action. Preview switches invalidate the hit cache and cancel armed placement;
+application admission independently rejects stale generations and nonhuman
+sources. Project format and decal persistence are unchanged.
 
 Repeat and adjust-last retain only the last accepted tool identity, complete
 arguments, and value-level authoring context in session state; they are not a
@@ -166,6 +221,16 @@ preview identity, no-authoring-mutation behavior, and stale-preview
 invalidation.
 These are model and contract tests, not pixel snapshots. Native visual
 acceptance remains a separate gate.
+
+`tests/frontend_selection_wiring_tests.cpp` and
+`tests/frontend_asset_wiring_tests.cpp` exercise the public UI entry points,
+including stale scope, wrong selection, unsupported sources, batch bounds,
+exact-byte relinking, command/journal behavior, undo/redo, and save/reopen.
+The decal tests also cover same-revision project replacement and rejection of
+synthetic altered display geometry; public SculptStack authoring does not
+evaluate the private sculpt runtime. See the
+[wiring repair ledger](../verification/frontend-backend-wiring.md) for executed
+checks and platform-specific gaps.
 
 ## Deliberate non-claims
 

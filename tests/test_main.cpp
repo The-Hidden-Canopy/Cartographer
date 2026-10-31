@@ -682,6 +682,24 @@ void vector_normalization_preserves_invalid_state() {
     REQUIRE(huge.normalized().x == 1.0);
 }
 
+void vector2_arithmetic_preserves_projection_and_nonfinite_evidence() {
+    constexpr carto::core::Vec2d axis{3.0, 4.0};
+    constexpr carto::core::Vec2d perpendicular{-4.0, 3.0};
+    static_assert(carto::core::dot(axis, perpendicular) == 0.0);
+    static_assert((axis + perpendicular).x == -1.0);
+    static_assert((axis - perpendicular).y == 1.0);
+    static_assert((0.5 * axis).x == (axis * 0.5).x);
+    REQUIRE(axis.length_squared() == 25.0);
+    const auto projected = axis + (perpendicular - axis) * 0.25;
+    REQUIRE(projected.x == 1.25 && projected.y == 3.75);
+    const carto::core::Vec2d huge{1.0e308, 1.0e308};
+    REQUIRE(huge.finite() && !std::isfinite(huge.length_squared()));
+    const carto::core::Vec2d invalid{std::numeric_limits<double>::quiet_NaN(), 0.0};
+    REQUIRE(!(invalid + axis).finite() && !std::isfinite(carto::core::dot(invalid, axis)));
+    static_assert(carto::core::dot(carto::core::Vec3d{3.0, 4.0, 12.0},
+        carto::core::Vec3d{3.0, 4.0, 12.0}) == 169.0);
+}
+
 void vertex_edit_command_is_reversible_and_topology_atomic() {
     auto mesh = triangle_mesh();
     const auto vertex = mesh.vertices_sorted().at(2);
@@ -1484,6 +1502,133 @@ void project_transform_command_rejects_stale_undo() {
     REQUIRE(deferred_current != nullptr);
     REQUIRE(deferred_current->local_transform.translation.x == 0.0);
     REQUIRE(deferred_current->local_transform.translation.y == 6.0);
+}
+
+void project_transform_history_accepts_ordered_undo_without_overwriting_other_edits() {
+    auto document = carto::project::ProjectDocument::create("Ordered transform history");
+    REQUIRE(document);
+    const auto first = carto::project::testing::access(document.value()).create_object("First");
+    const auto second = carto::project::testing::access(document.value()).create_object("Second");
+    REQUIRE(first && second);
+    const auto before = document.value().scene().find(first.value())->local_transform;
+    auto after_first = before;
+    after_first.translation.x = 3.0;
+    auto after_second = before;
+    after_second.translation.y = 7.0;
+    carto::editor::CommandBus bus;
+    REQUIRE(bus.execute(carto::project::testing::editor_access(document.value())
+        .set_project_object_transform_command(first.value(), before, after_first)));
+    REQUIRE(bus.execute(carto::project::testing::editor_access(document.value())
+        .set_project_object_transform_command(second.value(), before, after_second)));
+    REQUIRE(bus.undo());
+    const auto after_one_undo = document.value().revision();
+    REQUIRE(bus.undo());
+    REQUIRE(document.value().revision() > after_one_undo);
+    REQUIRE(document.value().scene().find(first.value())->local_transform.translation.x == 0.0);
+    REQUIRE(document.value().scene().find(second.value())->local_transform.translation.y == 0.0);
+    REQUIRE(bus.redo());
+    REQUIRE(bus.redo());
+    REQUIRE(document.value().scene().find(first.value())->local_transform.translation.x == 3.0);
+    REQUIRE(document.value().scene().find(second.value())->local_transform.translation.y == 7.0);
+    REQUIRE(bus.undo());
+    REQUIRE(bus.undo());
+
+    // An unrelated authored object survives replay; a conflicting target edit
+    // still refuses replay without consuming the redo entry.
+    const auto unrelated = carto::project::testing::access(document.value()).create_object("Unrelated");
+    REQUIRE(unrelated);
+    REQUIRE(bus.redo());
+    REQUIRE(document.value().scene().find(unrelated.value()) != nullptr);
+    auto contested = before;
+    contested.translation.z = 9.0;
+    REQUIRE(carto::project::testing::access(document.value()).set_object_transform(second.value(), contested));
+    const auto serialized = document.value().serialize();
+    REQUIRE(!bus.redo());
+    REQUIRE(bus.redo_count() == 1U);
+    REQUIRE(document.value().serialize() == serialized);
+
+    auto deferred_after = after_first;
+    deferred_after.translation.x = 6.0;
+    auto deferred = carto::project::testing::editor_access(document.value())
+        .set_project_object_transform_command(first.value(), after_first, deferred_after);
+    REQUIRE(carto::project::testing::access(document.value()).create_object("Later admission"));
+    const auto before_deferred = document.value().serialize();
+    REQUIRE(!bus.execute(std::move(deferred)));
+    REQUIRE(document.value().serialize() == before_deferred);
+    REQUIRE(bus.redo_count() == 1U);
+}
+
+void source_history_refuses_contested_content_and_stale_initial_admission() {
+    using namespace carto;
+    const auto source_record = [] {
+        assets::SourceImportRecord record;
+        record.identity = "source.history-fixture";
+        record.relative_source_path = "fixtures/triangle.obj";
+        record.source_generation = core::Revision{1U};
+        record.kind = assets::SourceAssetKind::mesh;
+        const std::string bytes = "explicit-source-history-fixture";
+        record.source_digest = assets::sha256(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()));
+        record.importer_identity = "carto.import.obj";
+        record.artifact_identity = "pending.mesh";
+        record.artifact_digest = record.source_digest;
+        return record;
+    };
+    for (const bool redo : {false, true}) {
+        auto document = project::ProjectDocument::create("Contested source history");
+        REQUIRE(document);
+        editor::ProjectCommandAdmission admission;
+        editor::CommandBus bus;
+        REQUIRE(bus.execute(std::make_unique<editor::ImportSourceMeshCommand>(
+            admission, document.value(), "Triangle", triangle_mesh(), source_record())));
+        if (redo) REQUIRE(bus.undo());
+        REQUIRE(project::testing::access(document.value()).create_object("Unreviewed authored object"));
+        const auto before = document.value().serialize();
+        const auto undo_count = bus.undo_count();
+        const auto redo_count = bus.redo_count();
+        REQUIRE(!(redo ? bus.redo() : bus.undo()));
+        REQUIRE(document.value().serialize() == before &&
+            bus.undo_count() == undo_count && bus.redo_count() == redo_count);
+    }
+    for (const bool redo : {false, true}) {
+        auto document = project::ProjectDocument::create("Contested source metadata history");
+        REQUIRE(document);
+        editor::ProjectCommandAdmission admission;
+        editor::CommandBus bus;
+        REQUIRE(bus.execute(std::make_unique<editor::ImportSourceMeshCommand>(
+            admission, document.value(), "Triangle", triangle_mesh(), source_record())));
+        auto record = document.value().source_asset_registry().records().begin()->second;
+        record.source_generation = record.source_generation.next();
+        record.authored_tags = {"reviewed"};
+        const auto reviewed = assets::plan_source_reimport(document.value().source_asset_registry(), {record});
+        REQUIRE(reviewed);
+        REQUIRE(bus.execute(std::make_unique<editor::ApplySourceReimportPlanCommand>(
+            admission, document.value(), reviewed.value())));
+        if (redo) REQUIRE(bus.undo());
+        record = document.value().source_asset_registry().records().begin()->second;
+        record.source_generation = record.source_generation.next();
+        record.authored_tags = {"contested"};
+        const auto contested = assets::plan_source_reimport(document.value().source_asset_registry(), {record});
+        REQUIRE(contested && document.value().apply_source_reimport_plan(contested.value()));
+        const auto before = document.value().serialize();
+        const auto undo_count = bus.undo_count();
+        const auto redo_count = bus.redo_count();
+        REQUIRE(!(redo ? bus.redo() : bus.undo()));
+        REQUIRE(document.value().serialize() == before &&
+            bus.undo_count() == undo_count && bus.redo_count() == redo_count);
+    }
+    auto document = project::ProjectDocument::create("Deferred source admission");
+    REQUIRE(document);
+    editor::ProjectCommandAdmission admission;
+    editor::ImportSourceMeshCommand deferred_import(
+        admission, document.value(), "Triangle", triangle_mesh(), source_record());
+    const auto plan = assets::plan_source_reimport(document.value().source_asset_registry(), {source_record()});
+    REQUIRE(plan);
+    editor::ApplySourceReimportPlanCommand deferred_metadata(admission, document.value(), plan.value());
+    REQUIRE(project::testing::access(document.value()).create_object("Later authored object"));
+    const auto before = document.value().serialize();
+    REQUIRE(!deferred_import.execute() && !deferred_metadata.execute());
+    REQUIRE(document.value().serialize() == before);
 }
 
 void project_round_trips_authoritative_state_and_rejects_future_versions() {
@@ -2412,10 +2557,13 @@ int main() {
         {"mesh patches are revision-bound atomic and invertible", mesh_patches_are_revision_bound_atomic_and_invertible},
         {"primitives are deterministic and validated", primitives_are_deterministic_and_dimension_validated},
         {"vector normalization preserves invalid state", vector_normalization_preserves_invalid_state},
+        {"vector2 arithmetic preserves projection and invalid evidence", vector2_arithmetic_preserves_projection_and_nonfinite_evidence},
         {"stale render result is rejected", stale_render_result_is_rejected},
         {"command bus is reversible", command_bus_is_reversible_and_rejects_failed_commands},
         {"command rollback restores redo until durable acceptance", command_bus_rollback_restores_redo_until_durable_acceptance},
         {"project transform command rejects stale undo", project_transform_command_rejects_stale_undo},
+        {"project transform history preserves ordered replay and conflicting edits", project_transform_history_accepts_ordered_undo_without_overwriting_other_edits},
+        {"source history preserves contested content and initial admission", source_history_refuses_contested_content_and_stale_initial_admission},
         {"vertex edit command is reversible and atomic", vertex_edit_command_is_reversible_and_topology_atomic},
         {"face extrude command is reversible", face_extrude_command_is_reversible_and_validated},
         {"selected face tool adapter validates", selected_face_tool_adapter_validates_before_delegating},

@@ -610,6 +610,8 @@ void project_schema_migration_is_explicit_and_fail_closed() {
     require(mesh_patches != std::string::npos,
             "legacy fixture finds the schema-v29 mesh-patch table");
     legacy.erase(mesh_patches, std::string("MESH_PATCHES 0\n").size());
+    require(legacy.find("KINEMATIC_GRAPHS ") == std::string::npos,
+            "legacy world-tail removal also removes the schema-v35 kinematic graph table");
     const auto namespace_start = legacy.find("SOURCE_NAMESPACE ");
     const auto namespace_end = legacy.find('\n', namespace_start);
     require(namespace_start != std::string::npos && namespace_end != std::string::npos,

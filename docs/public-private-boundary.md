@@ -154,7 +154,9 @@ python scripts/public_boundary_audit.py --check-ignore-policy
 
 It checks tracked files, tracked-but-ignored files, non-ignored working-tree
 files, recognizable credential patterns, workstation-specific paths, required
-quarantine rules, and all reachable Git history. The tracked-but-ignored check
+quarantine rules, private build references in CMake/MSBuild/source build files,
+and all reachable Git history. Visual Studio `.sln` and `.slnx` solution files
+are included in that build-reference scan. The tracked-but-ignored check
 is explicit because
 `.gitignore` is not retroactive. It never rewrites history, expires reflogs,
 deletes files, or contacts a remote. Use `--include-reflog` for a local hygiene
@@ -164,6 +166,9 @@ in-repository donor-name/commit allowlist.
 The audit also scans current text and reachable history for known protected
 field-growth implementation markers, so placing a private preview under a
 generic geometry directory does not bypass the path quarantine.
+Protected production implementation paths, API headers, and build-target names
+are also scanned in reachable history, including references left behind after
+a source or build file is later cleaned up.
 It also rejects build and source references to the quarantined botanical
 generator, including target, include, and namespace references; an ignore rule
 does not make a build-graph dependency private-safe.

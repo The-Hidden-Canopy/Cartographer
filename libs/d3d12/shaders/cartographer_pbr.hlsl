@@ -50,10 +50,19 @@ VertexOutput VSMain(VertexInput input)
     const float4 world_position = mul(model, input.position);
     output.position = mul(view_projection, world_position);
     output.world_position = world_position.xyz;
-    output.world_normal = normalize(mul((float3x3)model, input.normal));
+    // Inverse-transpose via cofactors preserves the 64-DWORD root signature.
+    // The host rejects singular transforms. HLSL indexes rows, so select the
+    // model columns explicitly; mirrored models also reverse tangent parity.
+    const float3 c0 = float3(model[0][0], model[1][0], model[2][0]);
+    const float3 c1 = float3(model[0][1], model[1][1], model[2][1]);
+    const float3 c2 = float3(model[0][2], model[1][2], model[2][2]);
+    const float orientation = dot(c0, cross(c1, c2)) < 0.0 ? -1.0 : 1.0;
+    output.world_normal = normalize(orientation * (
+        cross(c1, c2) * input.normal.x + cross(c2, c0) * input.normal.y +
+        cross(c0, c1) * input.normal.z));
     output.uv = input.uv;
     output.world_tangent = normalize(mul((float3x3)model, input.tangent.xyz));
-    output.tangent_sign = input.tangent.w;
+    output.tangent_sign = input.tangent.w * orientation;
     return output;
 }
 

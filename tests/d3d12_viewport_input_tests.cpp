@@ -1,4 +1,5 @@
 #include <carto/d3d12/viewport_input.hpp>
+#include <carto/d3d12/scene_camera_fit.hpp>
 
 #include <cmath>
 #include <cstdint>
@@ -54,6 +55,12 @@ void navigation_and_dpi_state_is_bounded() {
     require(input.zoom_wheel(std::numeric_limits<std::int32_t>::min()) &&
             input.zoom() == ViewportInputState::kMinimumZoom,
         "hostile negative wheel deltas clamp to minimum zoom");
+    require(input.adjust(ViewportNavigationKey::frame_all) &&
+            input.yaw_degrees() == 0.0 && input.pitch_degrees() == 0.0 &&
+            input.zoom() == 1.0,
+        "frame-all restores the saved scene's fitted camera distance and canonical view");
+    require(!input.adjust(ViewportNavigationKey::frame_all),
+        "frame-all is idempotent when the fitted view is already active");
 
     require(input.set_dpi(144U) && input.dpi() == 144U && input.dpi_scale() == 1.5,
         "per-monitor DPI updates the scale");
@@ -66,11 +73,56 @@ void navigation_and_dpi_state_is_bounded() {
         "invalid DPI values are refused without changing state");
 }
 
+void orbit_sensitivity_tracks_logical_pixels() {
+    using carto::d3d12::ViewportInputState;
+
+    ViewportInputState standard_dpi;
+    require(standard_dpi.begin_orbit(0, 0) &&
+            standard_dpi.move_pointer(96, 48),
+        "standard-DPI pointer motion is accepted");
+
+    ViewportInputState high_dpi;
+    require(high_dpi.set_dpi(144U) && high_dpi.begin_orbit(0, 0) &&
+            high_dpi.move_pointer(144, 72),
+        "scaled high-DPI pointer motion is accepted");
+    require(std::abs(standard_dpi.yaw_degrees() - high_dpi.yaw_degrees()) < 1e-12 &&
+            std::abs(standard_dpi.pitch_degrees() - high_dpi.pitch_degrees()) < 1e-12,
+        "equal logical pointer motion produces equal orbit angles across DPIs");
+}
+
+void scene_camera_fit_tracks_viewport_shape_and_rejects_invalid_inputs() {
+    using carto::d3d12::fit_camera_distance_to_sphere;
+    constexpr double fov = 0.7853981633974483;
+
+    const auto landscape = fit_camera_distance_to_sphere(2.0, fov, 1280U, 800U);
+    const auto portrait = fit_camera_distance_to_sphere(2.0, fov, 400U, 1000U);
+    require(landscape.has_value() && portrait.has_value() &&
+            *portrait > *landscape,
+        "a narrow viewport increases fitted distance to keep the scene in frame");
+
+    const auto no_margin = fit_camera_distance_to_sphere(
+        2.0, fov, 1280U, 800U, 1.0);
+    require(no_margin.has_value() && *no_margin < *landscape,
+        "the framing margin contributes to camera distance");
+    require(!fit_camera_distance_to_sphere(0.0, fov, 1280U, 800U) &&
+            !fit_camera_distance_to_sphere(2.0, fov, 0U, 800U) &&
+            !fit_camera_distance_to_sphere(2.0, fov, 1280U, 0U) &&
+            !fit_camera_distance_to_sphere(2.0, 0.0, 1280U, 800U) &&
+            !fit_camera_distance_to_sphere(
+                2.0, std::numeric_limits<double>::infinity(), 1280U, 800U) &&
+            !fit_camera_distance_to_sphere(
+                std::numeric_limits<double>::max(), fov, 1280U, 800U) &&
+            !fit_camera_distance_to_sphere(2.0, fov, 1280U, 800U, 0.5),
+        "invalid scene size, viewport extent, or field of view is refused");
+}
+
 } // namespace
 
 int main() {
     try {
         navigation_and_dpi_state_is_bounded();
+        orbit_sensitivity_tracks_logical_pixels();
+        scene_camera_fit_tracks_viewport_shape_and_rejects_invalid_inputs();
         std::cout << "PASS D3D12 viewport input bounds and DPI state\n";
         return 0;
     } catch (const std::exception& error) {

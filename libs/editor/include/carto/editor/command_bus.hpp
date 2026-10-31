@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace carto::editor {
@@ -32,6 +33,44 @@ public:
     [[nodiscard]] virtual core::Result<void> execute() = 0;
     [[nodiscard]] virtual core::Result<void> undo() = 0;
     [[nodiscard]] virtual std::string label() const = 0;
+    // A durable history operation runs against an independent command copy.
+    // Unrecognized implementations fail closed rather than replay on rollback.
+    [[nodiscard]] virtual std::unique_ptr<EditorCommand> checkpoint() const { return {}; }
+};
+
+template<class Derived>
+class CheckpointableEditorCommand : public EditorCommand {
+public:
+    [[nodiscard]] std::unique_ptr<EditorCommand> checkpoint() const override {
+        if constexpr (std::is_copy_constructible_v<Derived>) {
+            return std::make_unique<Derived>(static_cast<const Derived&>(*this));
+        }
+        return {};
+    }
+};
+
+// Deep-copy nested command state when taking a transactional checkpoint.
+template<class T>
+class CommandCheckpointPtr {
+public:
+    CommandCheckpointPtr() = default;
+    CommandCheckpointPtr(std::unique_ptr<T> value) : value_(std::move(value)) {}
+    CommandCheckpointPtr(const CommandCheckpointPtr& other)
+        : value_(other.value_ ? std::make_unique<T>(*other.value_) : nullptr) {}
+    CommandCheckpointPtr& operator=(const CommandCheckpointPtr& other) {
+        if (this != &other) value_ = other.value_ ? std::make_unique<T>(*other.value_) : nullptr;
+        return *this;
+    }
+    CommandCheckpointPtr(CommandCheckpointPtr&&) noexcept = default;
+    CommandCheckpointPtr& operator=(CommandCheckpointPtr&&) noexcept = default;
+    CommandCheckpointPtr& operator=(std::unique_ptr<T> value) noexcept {
+        value_ = std::move(value); return *this;
+    }
+    explicit operator bool() const noexcept { return static_cast<bool>(value_); }
+    T* operator->() const noexcept { return value_.get(); }
+    void reset() noexcept { value_.reset(); }
+private:
+    std::unique_ptr<T> value_;
 };
 
 class CommandBus {
@@ -46,6 +85,13 @@ public:
     [[nodiscard]] core::Result<void> undo();
     [[nodiscard]] core::Result<void> redo();
 
+    // Stages on a copy. Caller must restore its document on abort and then
+    // discard the pending copy; no inverse command or external IO is invoked.
+    [[nodiscard]] core::Result<void> prepare_durable_undo();
+    [[nodiscard]] core::Result<void> prepare_durable_redo();
+    void commit_durable_history() noexcept;
+    void abort_durable_history() noexcept;
+
     void clear_history() noexcept;
     [[nodiscard]] std::size_t undo_count() const noexcept { return undo_stack_.size(); }
     [[nodiscard]] std::size_t redo_count() const noexcept { return redo_stack_.size(); }
@@ -55,12 +101,15 @@ private:
     std::vector<std::unique_ptr<EditorCommand>> redo_stack_;
     std::vector<std::unique_ptr<EditorCommand>> previous_redo_stack_;
     bool rollback_pending_ = false;
+    enum class PendingHistory { none, undo, redo };
+    PendingHistory pending_history_ = PendingHistory::none;
+    std::unique_ptr<EditorCommand> pending_command_;
 };
 
 // Standalone mesh/scene commands are intentionally lower-level. Application
 // authoring must use the ProjectDocument-bound command variants below so
 // project revision and asset identity guards cannot be bypassed.
-class SetObjectTransformCommand final : public EditorCommand {
+class SetObjectTransformCommand final : public CheckpointableEditorCommand<SetObjectTransformCommand> {
 public:
     SetObjectTransformCommand(
         scene::Scene& scene,
@@ -81,7 +130,7 @@ private:
     core::Transform after_;
 };
 
-class SetProjectObjectTransformCommand final : public EditorCommand {
+class SetProjectObjectTransformCommand final : public CheckpointableEditorCommand<SetProjectObjectTransformCommand> {
 public:
     SetProjectObjectTransformCommand(
         ProjectCommandAdmission admission,
@@ -100,7 +149,8 @@ private:
     friend class ::carto::application::ApplicationSession;
     friend struct ToolContext;
 
-    [[nodiscard]] core::Result<void> apply(core::Transform transform);
+    [[nodiscard]] core::Result<void> apply(
+        core::Transform transform, const core::Transform& expected_current);
 
     project::ProjectDocument* document_;
     scene::ObjectId object_;
@@ -110,7 +160,7 @@ private:
     std::optional<core::Revision> current_project_revision_;
 };
 
-class SetProjectSculptStackCommand final : public EditorCommand {
+class SetProjectSculptStackCommand final : public CheckpointableEditorCommand<SetProjectSculptStackCommand> {
 public:
     SetProjectSculptStackCommand(
         ProjectCommandAdmission admission,
@@ -135,7 +185,7 @@ private:
 // Binds the validated engineering authoring sidecar through the project
 // command boundary so import, invalidation, undo, and redo share the same
 // revision and journal semantics as ordinary authoring commands.
-class SetProjectEngineeringAuthoringCommand final : public EditorCommand {
+class SetProjectEngineeringAuthoringCommand final : public CheckpointableEditorCommand<SetProjectEngineeringAuthoringCommand> {
 public:
     SetProjectEngineeringAuthoringCommand(
         ProjectCommandAdmission admission,
@@ -162,7 +212,7 @@ private:
 // Replaces a complete project snapshot as one admitted application command.
 // Used for an explicitly accepted speculative result; undo restores the prior
 // source content while keeping project revisions monotonic.
-class ReplaceProjectDocumentCommand final : public EditorCommand {
+class ReplaceProjectDocumentCommand final : public CheckpointableEditorCommand<ReplaceProjectDocumentCommand> {
 public:
     ReplaceProjectDocumentCommand(
         ProjectCommandAdmission admission,
@@ -189,7 +239,7 @@ private:
     bool applied_ = false;
 };
 
-class SetProjectConditionAuthoringCommand final : public EditorCommand {
+class SetProjectConditionAuthoringCommand final : public CheckpointableEditorCommand<SetProjectConditionAuthoringCommand> {
 public:
     SetProjectConditionAuthoringCommand(
         ProjectCommandAdmission admission,
@@ -212,7 +262,7 @@ private:
     bool applied_ = false;
 };
 
-class SetProjectMaterialCatalogCommand final : public EditorCommand {
+class SetProjectMaterialCatalogCommand final : public CheckpointableEditorCommand<SetProjectMaterialCatalogCommand> {
 public:
     SetProjectMaterialCatalogCommand(
         ProjectCommandAdmission admission,
@@ -235,7 +285,7 @@ private:
     bool applied_ = false;
 };
 
-class SetProjectPresentationCatalogCommand final : public EditorCommand {
+class SetProjectPresentationCatalogCommand final : public CheckpointableEditorCommand<SetProjectPresentationCatalogCommand> {
 public:
     SetProjectPresentationCatalogCommand(
         ProjectCommandAdmission admission,
@@ -258,7 +308,7 @@ private:
     bool applied_ = false;
 };
 
-class SetProjectAuthoringStandardsCommand final : public EditorCommand {
+class SetProjectAuthoringStandardsCommand final : public CheckpointableEditorCommand<SetProjectAuthoringStandardsCommand> {
 public:
     SetProjectAuthoringStandardsCommand(
         ProjectCommandAdmission admission,
@@ -281,7 +331,7 @@ private:
     bool applied_ = false;
 };
 
-class ApplySourceReimportPlanCommand final : public EditorCommand {
+class ApplySourceReimportPlanCommand final : public CheckpointableEditorCommand<ApplySourceReimportPlanCommand> {
 public:
     ApplySourceReimportPlanCommand(
         ProjectCommandAdmission admission,
@@ -293,6 +343,7 @@ public:
     [[nodiscard]] std::string label() const override { return "Apply Source Reimport Plan"; }
 
 private:
+    [[nodiscard]] assets::Sha256Digest history_state_digest() const;
     [[nodiscard]] core::Result<assets::SourceReimportPlan> plan_for_records(
         const std::vector<assets::SourceImportRecord>& records) const;
 
@@ -301,11 +352,12 @@ private:
     std::vector<assets::SourceImportRecord> before_records_;
     std::vector<assets::SourceImportRecord> after_records_;
     core::Revision expected_project_revision_;
+    assets::Sha256Digest expected_history_digest_;
     bool initialized_ = false;
     bool applied_ = false;
 };
 
-class SetProjectSpatialFieldCommand final : public EditorCommand {
+class SetProjectSpatialFieldCommand final : public CheckpointableEditorCommand<SetProjectSpatialFieldCommand> {
 public:
     SetProjectSpatialFieldCommand(
         ProjectCommandAdmission admission,
@@ -324,7 +376,7 @@ private:
     bool applied_ = false;
 };
 
-class SetProjectRoadAuthoringCommand final : public EditorCommand {
+class SetProjectRoadAuthoringCommand final : public CheckpointableEditorCommand<SetProjectRoadAuthoringCommand> {
 public:
     SetProjectRoadAuthoringCommand(
         ProjectCommandAdmission admission,
@@ -349,7 +401,7 @@ private:
     bool applied_ = false;
 };
 
-class SetProjectSweepSourceCommand final : public EditorCommand {
+class SetProjectSweepSourceCommand final : public CheckpointableEditorCommand<SetProjectSweepSourceCommand> {
 public:
     SetProjectSweepSourceCommand(
         ProjectCommandAdmission admission,
@@ -370,7 +422,7 @@ private:
     bool applied_ = false;
 };
 
-class SetProjectBiologicalAuthoringCommand final : public EditorCommand {
+class SetProjectBiologicalAuthoringCommand final : public CheckpointableEditorCommand<SetProjectBiologicalAuthoringCommand> {
 public:
     SetProjectBiologicalAuthoringCommand(
         ProjectCommandAdmission admission,
@@ -394,7 +446,7 @@ private:
     bool applied_ = false;
 };
 
-class SetProjectSignTextSourceCommand final : public EditorCommand {
+class SetProjectSignTextSourceCommand final : public CheckpointableEditorCommand<SetProjectSignTextSourceCommand> {
 public:
     SetProjectSignTextSourceCommand(
         ProjectCommandAdmission admission,
@@ -415,7 +467,7 @@ private:
     bool applied_ = false;
 };
 
-class SetVertexPositionCommand final : public EditorCommand {
+class SetVertexPositionCommand final : public CheckpointableEditorCommand<SetVertexPositionCommand> {
 public:
     SetVertexPositionCommand(
         geometry::EditableMesh& mesh,
@@ -436,7 +488,7 @@ private:
     core::Vec3d after_;
 };
 
-class SetProjectSelectedVertexPositionCommand final : public EditorCommand {
+class SetProjectSelectedVertexPositionCommand final : public CheckpointableEditorCommand<SetProjectSelectedVertexPositionCommand> {
 public:
     SetProjectSelectedVertexPositionCommand(
         ProjectCommandAdmission admission,
@@ -463,13 +515,14 @@ private:
         geometry::EditableMesh after;
         geometry::MeshPatch patch;
         core::Revision current_mesh_revision;
+        scene::ObjectId owner;
     };
     std::vector<AppliedMeshEdit> edits_;
 };
 
 // Replaces one validated project mesh revision as an undoable authoring command.
 // The project and mesh revisions are both checked before each execute/undo.
-class SetProjectMeshCommand final : public EditorCommand {
+class SetProjectMeshCommand final : public CheckpointableEditorCommand<SetProjectMeshCommand> {
 public:
     SetProjectMeshCommand(
         ProjectCommandAdmission admission,
@@ -495,7 +548,7 @@ private:
     bool applied_ = false;
 };
 
-class SlideVertexCommand final : public EditorCommand {
+class SlideVertexCommand final : public CheckpointableEditorCommand<SlideVertexCommand> {
 public:
     SlideVertexCommand(
         geometry::EditableMesh& mesh,
@@ -516,7 +569,7 @@ private:
     std::optional<geometry::EditableMesh> after_;
 };
 
-class SlideProjectSelectedVertexCommand final : public EditorCommand {
+class SlideProjectSelectedVertexCommand final : public CheckpointableEditorCommand<SlideProjectSelectedVertexCommand> {
 public:
     SlideProjectSelectedVertexCommand(
         ProjectCommandAdmission admission,
@@ -549,7 +602,7 @@ private:
     std::vector<AppliedMeshEdit> edits_;
 };
 
-class ExtrudeFaceCommand final : public EditorCommand {
+class ExtrudeFaceCommand final : public CheckpointableEditorCommand<ExtrudeFaceCommand> {
 public:
     ExtrudeFaceCommand(geometry::EditableMesh& mesh, geometry::FaceId face, double distance);
 
@@ -565,7 +618,7 @@ private:
     std::optional<geometry::EditableMesh> after_;
 };
 
-class ExtrudeSelectedFaceCommand final : public EditorCommand {
+class ExtrudeSelectedFaceCommand final : public CheckpointableEditorCommand<ExtrudeSelectedFaceCommand> {
 public:
     ExtrudeSelectedFaceCommand(
         const SelectionState& selection,
@@ -584,7 +637,7 @@ private:
     std::optional<geometry::EditableMesh> after_;
 };
 
-class ExtrudeProjectSelectedFaceCommand final : public EditorCommand {
+class ExtrudeProjectSelectedFaceCommand final : public CheckpointableEditorCommand<ExtrudeProjectSelectedFaceCommand> {
 public:
     ExtrudeProjectSelectedFaceCommand(
         ProjectCommandAdmission admission,
@@ -612,11 +665,12 @@ private:
         geometry::EditableMesh after;
         geometry::TopologyEditReceipt receipt;
         core::Revision current_mesh_revision;
+        scene::ObjectId owner;
     };
     std::vector<AppliedMeshEdit> edits_;
 };
 
-class InsetFaceCommand final : public EditorCommand {
+class InsetFaceCommand final : public CheckpointableEditorCommand<InsetFaceCommand> {
 public:
     InsetFaceCommand(
         geometry::EditableMesh& mesh,
@@ -636,7 +690,7 @@ private:
     std::optional<geometry::TopologyEditReceipt> receipt_;
 };
 
-class InsetSelectedFaceCommand final : public EditorCommand {
+class InsetSelectedFaceCommand final : public CheckpointableEditorCommand<InsetSelectedFaceCommand> {
 public:
     InsetSelectedFaceCommand(
         const SelectionState& selection,
@@ -651,10 +705,10 @@ private:
     const SelectionState* selection_;
     geometry::EditableMesh* mesh_;
     double distance_;
-    std::unique_ptr<InsetFaceCommand> delegate_;
+    CommandCheckpointPtr<InsetFaceCommand> delegate_;
 };
 
-class InsetProjectSelectedFaceCommand final : public EditorCommand {
+class InsetProjectSelectedFaceCommand final : public CheckpointableEditorCommand<InsetProjectSelectedFaceCommand> {
 public:
     InsetProjectSelectedFaceCommand(
         ProjectCommandAdmission admission,
@@ -686,7 +740,7 @@ private:
     std::vector<AppliedMeshEdit> edits_;
 };
 
-class PokeFaceCommand final : public EditorCommand {
+class PokeFaceCommand final : public CheckpointableEditorCommand<PokeFaceCommand> {
 public:
     PokeFaceCommand(geometry::EditableMesh& mesh, geometry::FaceId face);
 
@@ -702,7 +756,7 @@ private:
     std::optional<geometry::TopologyEditReceipt> receipt_;
 };
 
-class PokeSelectedFaceCommand final : public EditorCommand {
+class PokeSelectedFaceCommand final : public CheckpointableEditorCommand<PokeSelectedFaceCommand> {
 public:
     PokeSelectedFaceCommand(
         const SelectionState& selection,
@@ -719,7 +773,7 @@ private:
     std::optional<geometry::EditableMesh> after_;
 };
 
-class PokeProjectSelectedFaceCommand final : public EditorCommand {
+class PokeProjectSelectedFaceCommand final : public CheckpointableEditorCommand<PokeProjectSelectedFaceCommand> {
 public:
     PokeProjectSelectedFaceCommand(
         ProjectCommandAdmission admission,
@@ -749,7 +803,7 @@ private:
     std::vector<AppliedMeshEdit> edits_;
 };
 
-class DeleteFaceCommand final : public EditorCommand {
+class DeleteFaceCommand final : public CheckpointableEditorCommand<DeleteFaceCommand> {
 public:
     DeleteFaceCommand(
         geometry::EditableMesh& mesh,
@@ -769,7 +823,7 @@ private:
     std::optional<geometry::TopologyEditReceipt> receipt_;
 };
 
-class DeleteSelectedFaceCommand final : public EditorCommand {
+class DeleteSelectedFaceCommand final : public CheckpointableEditorCommand<DeleteSelectedFaceCommand> {
 public:
     DeleteSelectedFaceCommand(
         const SelectionState& selection,
@@ -784,10 +838,10 @@ private:
     const SelectionState* selection_;
     geometry::EditableMesh* mesh_;
     bool remove_orphaned_vertices_;
-    std::unique_ptr<DeleteFaceCommand> delegate_;
+    CommandCheckpointPtr<DeleteFaceCommand> delegate_;
 };
 
-class DeleteProjectSelectedFaceCommand final : public EditorCommand {
+class DeleteProjectSelectedFaceCommand final : public CheckpointableEditorCommand<DeleteProjectSelectedFaceCommand> {
 public:
     DeleteProjectSelectedFaceCommand(
         ProjectCommandAdmission admission,
@@ -820,7 +874,7 @@ private:
     std::vector<AppliedMeshEdit> edits_;
 };
 
-class SplitEdgeCommand final : public EditorCommand {
+class SplitEdgeCommand final : public CheckpointableEditorCommand<SplitEdgeCommand> {
 public:
     SplitEdgeCommand(
         geometry::EditableMesh& mesh,
@@ -840,7 +894,7 @@ private:
     std::optional<geometry::TopologyEditReceipt> receipt_;
 };
 
-class SplitSelectedEdgeCommand final : public EditorCommand {
+class SplitSelectedEdgeCommand final : public CheckpointableEditorCommand<SplitSelectedEdgeCommand> {
 public:
     SplitSelectedEdgeCommand(
         const SelectionState& selection,
@@ -855,10 +909,10 @@ private:
     const SelectionState* selection_;
     geometry::EditableMesh* mesh_;
     double factor_;
-    std::unique_ptr<SplitEdgeCommand> delegate_;
+    CommandCheckpointPtr<SplitEdgeCommand> delegate_;
 };
 
-class SplitProjectSelectedEdgeCommand final : public EditorCommand {
+class SplitProjectSelectedEdgeCommand final : public CheckpointableEditorCommand<SplitProjectSelectedEdgeCommand> {
 public:
     SplitProjectSelectedEdgeCommand(
         ProjectCommandAdmission admission,
@@ -891,7 +945,7 @@ private:
     std::vector<AppliedMeshEdit> edits_;
 };
 
-class BevelEdgeCommand final : public EditorCommand {
+class BevelEdgeCommand final : public CheckpointableEditorCommand<BevelEdgeCommand> {
 public:
     BevelEdgeCommand(
         geometry::EditableMesh& mesh,
@@ -913,7 +967,7 @@ private:
     std::optional<geometry::TopologyEditReceipt> receipt_;
 };
 
-class BevelSelectedEdgeCommand final : public EditorCommand {
+class BevelSelectedEdgeCommand final : public CheckpointableEditorCommand<BevelSelectedEdgeCommand> {
 public:
     BevelSelectedEdgeCommand(
         const SelectionState& selection,
@@ -930,10 +984,10 @@ private:
     geometry::EditableMesh* mesh_;
     double width_;
     std::uint32_t segments_;
-    std::unique_ptr<BevelEdgeCommand> delegate_;
+    CommandCheckpointPtr<BevelEdgeCommand> delegate_;
 };
 
-class BevelProjectSelectedEdgeCommand final : public EditorCommand {
+class BevelProjectSelectedEdgeCommand final : public CheckpointableEditorCommand<BevelProjectSelectedEdgeCommand> {
 public:
     BevelProjectSelectedEdgeCommand(
         ProjectCommandAdmission admission,
@@ -968,7 +1022,7 @@ private:
     std::vector<AppliedMeshEdit> edits_;
 };
 
-class BevelVertexCommand final : public EditorCommand {
+class BevelVertexCommand final : public CheckpointableEditorCommand<BevelVertexCommand> {
 public:
     BevelVertexCommand(
         geometry::EditableMesh& mesh,
@@ -990,7 +1044,7 @@ private:
     std::optional<geometry::TopologyEditReceipt> receipt_;
 };
 
-class BevelSelectedVertexCommand final : public EditorCommand {
+class BevelSelectedVertexCommand final : public CheckpointableEditorCommand<BevelSelectedVertexCommand> {
 public:
     BevelSelectedVertexCommand(
         const SelectionState& selection,
@@ -1007,10 +1061,10 @@ private:
     geometry::EditableMesh* mesh_;
     double width_;
     std::uint32_t segments_;
-    std::unique_ptr<BevelVertexCommand> delegate_;
+    CommandCheckpointPtr<BevelVertexCommand> delegate_;
 };
 
-class BevelProjectSelectedVertexCommand final : public EditorCommand {
+class BevelProjectSelectedVertexCommand final : public CheckpointableEditorCommand<BevelProjectSelectedVertexCommand> {
 public:
     BevelProjectSelectedVertexCommand(
         ProjectCommandAdmission admission,
@@ -1044,7 +1098,7 @@ private:
     std::vector<AppliedMeshEdit> edits_;
 };
 
-class DissolveEdgeCommand final : public EditorCommand {
+class DissolveEdgeCommand final : public CheckpointableEditorCommand<DissolveEdgeCommand> {
 public:
     DissolveEdgeCommand(
         geometry::EditableMesh& mesh,
@@ -1065,7 +1119,7 @@ private:
     std::optional<geometry::TopologyEditReceipt> receipt_;
 };
 
-class DissolveSelectedEdgeCommand final : public EditorCommand {
+class DissolveSelectedEdgeCommand final : public CheckpointableEditorCommand<DissolveSelectedEdgeCommand> {
 public:
     DissolveSelectedEdgeCommand(
         const SelectionState& selection,
@@ -1078,10 +1132,10 @@ public:
 private:
     const SelectionState* selection_;
     geometry::EditableMesh* mesh_;
-    std::unique_ptr<DissolveEdgeCommand> delegate_;
+    CommandCheckpointPtr<DissolveEdgeCommand> delegate_;
 };
 
-class DissolveProjectSelectedEdgeCommand final : public EditorCommand {
+class DissolveProjectSelectedEdgeCommand final : public CheckpointableEditorCommand<DissolveProjectSelectedEdgeCommand> {
 public:
     DissolveProjectSelectedEdgeCommand(
         ProjectCommandAdmission admission,
@@ -1111,7 +1165,7 @@ private:
     std::vector<AppliedMeshEdit> edits_;
 };
 
-class TriToQuadCommand final : public EditorCommand {
+class TriToQuadCommand final : public CheckpointableEditorCommand<TriToQuadCommand> {
 public:
     TriToQuadCommand(
         geometry::EditableMesh& mesh,
@@ -1131,7 +1185,7 @@ private:
     std::optional<geometry::TopologyEditReceipt> receipt_;
 };
 
-class TriToQuadSelectedFacesCommand final : public EditorCommand {
+class TriToQuadSelectedFacesCommand final : public CheckpointableEditorCommand<TriToQuadSelectedFacesCommand> {
 public:
     TriToQuadSelectedFacesCommand(
         const SelectionState& selection,
@@ -1146,10 +1200,10 @@ public:
 private:
     const SelectionState* selection_;
     geometry::EditableMesh* mesh_;
-    std::unique_ptr<TriToQuadCommand> delegate_;
+    CommandCheckpointPtr<TriToQuadCommand> delegate_;
 };
 
-class TriToQuadProjectSelectedFacesCommand final : public EditorCommand {
+class TriToQuadProjectSelectedFacesCommand final : public CheckpointableEditorCommand<TriToQuadProjectSelectedFacesCommand> {
 public:
     TriToQuadProjectSelectedFacesCommand(
         ProjectCommandAdmission admission,
@@ -1179,7 +1233,7 @@ private:
     std::vector<AppliedMeshEdit> edits_;
 };
 
-class MergeVerticesCommand final : public EditorCommand {
+class MergeVerticesCommand final : public CheckpointableEditorCommand<MergeVerticesCommand> {
 public:
     MergeVerticesCommand(
         geometry::EditableMesh& mesh,
@@ -1201,7 +1255,7 @@ private:
     std::optional<geometry::TopologyEditReceipt> receipt_;
 };
 
-class MergeSelectedVerticesCommand final : public EditorCommand {
+class MergeSelectedVerticesCommand final : public CheckpointableEditorCommand<MergeSelectedVerticesCommand> {
 public:
     MergeSelectedVerticesCommand(
         const SelectionState& selection,
@@ -1216,10 +1270,10 @@ private:
     const SelectionState* selection_;
     geometry::EditableMesh* mesh_;
     geometry::VertexMergeMode mode_;
-    std::unique_ptr<MergeVerticesCommand> delegate_;
+    CommandCheckpointPtr<MergeVerticesCommand> delegate_;
 };
 
-class MergeProjectSelectedVerticesCommand final : public EditorCommand {
+class MergeProjectSelectedVerticesCommand final : public CheckpointableEditorCommand<MergeProjectSelectedVerticesCommand> {
 public:
     // With merge_distance set, every selected vertex (at least two) is a
     // merge-by-distance candidate; otherwise exactly two vertices are welded.
@@ -1258,7 +1312,7 @@ private:
     std::vector<AppliedMeshEdit> edits_;
 };
 
-class CreateMeshObjectCommand final : public EditorCommand {
+class CreateMeshObjectCommand final : public CheckpointableEditorCommand<CreateMeshObjectCommand> {
 public:
     CreateMeshObjectCommand(
         ProjectCommandAdmission admission,
@@ -1299,7 +1353,7 @@ private:
 
 // Imports or reimports one source-backed mesh as a single journaled command.
 // The mesh asset and registry record are restored together on undo/redo.
-class ImportSourceMeshCommand final : public EditorCommand {
+class ImportSourceMeshCommand final : public CheckpointableEditorCommand<ImportSourceMeshCommand> {
 public:
     ImportSourceMeshCommand(
         ProjectCommandAdmission admission,
@@ -1313,6 +1367,7 @@ public:
     [[nodiscard]] std::string label() const override { return "Import Source Mesh"; }
 
 private:
+    [[nodiscard]] assets::Sha256Digest history_state_digest() const;
     [[nodiscard]] core::Result<void> apply_registry_record(
         std::optional<assets::SourceImportRecord> record);
     [[nodiscard]] core::Result<void> apply_imported_mesh();
@@ -1329,8 +1384,39 @@ private:
     std::optional<std::uint64_t> mesh_asset_;
     std::optional<scene::SceneObject> object_;
     core::Revision expected_project_revision_;
+    assets::Sha256Digest expected_history_digest_;
     bool created_instance_ = false;
     bool mesh_changed_ = false;
+    bool initialized_ = false;
+    bool applied_ = false;
+};
+
+// One source-bound scene import through the ordinary command history. Inputs
+// are already mapped and validated by ApplicationSession; execution still
+// rechecks the current project and registry before publishing any product.
+class ImportGltfSceneCommand final : public CheckpointableEditorCommand<ImportGltfSceneCommand> {
+public:
+    ImportGltfSceneCommand(ProjectCommandAdmission admission,
+        project::ProjectDocument& document,
+        std::vector<std::pair<std::uint64_t, geometry::EditableMesh>> meshes,
+        std::vector<scene::SceneObject> nodes,
+        project::MaterialCatalog catalog,
+        assets::SourceImportRecord source, std::filesystem::path blob_root);
+    [[nodiscard]] core::Result<void> execute() override;
+    [[nodiscard]] core::Result<void> undo() override;
+    [[nodiscard]] std::string label() const override { return "Import glTF Scene"; }
+private:
+    [[nodiscard]] assets::Sha256Digest history_state_digest() const;
+    [[nodiscard]] core::Result<void> apply_source(bool present);
+    project::ProjectDocument* document_;
+    std::vector<std::pair<std::uint64_t, geometry::EditableMesh>> meshes_;
+    std::vector<scene::SceneObject> nodes_;
+    project::MaterialCatalog before_catalog_;
+    project::MaterialCatalog after_catalog_;
+    assets::SourceImportRecord source_;
+    std::filesystem::path blob_root_;
+    core::Revision initial_revision_;
+    assets::Sha256Digest history_digest_;
     bool initialized_ = false;
     bool applied_ = false;
 };
@@ -1339,7 +1425,7 @@ private:
 // asset. This deliberately duplicates no geometry and clones no hierarchy:
 // modelling edits to the shared asset remain explicit, while object placement
 // stays independently undoable.
-class DuplicateProjectMeshInstanceCommand final : public EditorCommand {
+class DuplicateProjectMeshInstanceCommand final : public CheckpointableEditorCommand<DuplicateProjectMeshInstanceCommand> {
 public:
     DuplicateProjectMeshInstanceCommand(
         ProjectCommandAdmission admission,
@@ -1383,7 +1469,7 @@ struct MeshInstanceBatchInstance {
 // before the first mutation, and a mid-batch failure reverses the instances
 // already admitted, so the command commits atomically and journals through
 // the same undo/redo path as the single-instance duplicate command.
-class DuplicateProjectMeshInstanceBatchCommand final : public EditorCommand {
+class DuplicateProjectMeshInstanceBatchCommand final : public CheckpointableEditorCommand<DuplicateProjectMeshInstanceBatchCommand> {
 public:
     DuplicateProjectMeshInstanceBatchCommand(
         ProjectCommandAdmission admission,
@@ -1406,13 +1492,13 @@ private:
     ProjectCommandAdmission admission_;
     scene::ObjectId source_;
     std::vector<MeshInstanceBatchInstance> instances_;
-    std::vector<std::unique_ptr<DuplicateProjectMeshInstanceCommand>> delegates_;
+    std::vector<CommandCheckpointPtr<DuplicateProjectMeshInstanceCommand>> delegates_;
 };
 
 // Commits one exact CONDITION vegetation preview as a source-mesh instance
 // batch. Scene objects and their durable placement receipts are inserted,
 // undone, and redone together; partial batches are rolled back atomically.
-class CreatePlantScatterBatchCommand final : public EditorCommand {
+class CreatePlantScatterBatchCommand final : public CheckpointableEditorCommand<CreatePlantScatterBatchCommand> {
 public:
     CreatePlantScatterBatchCommand(
         ProjectCommandAdmission admission,

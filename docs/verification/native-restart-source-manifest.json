@@ -1,0 +1,758 @@
+{
+  "schema_version": 1,
+  "imported_at_utc": "2026-10-28T13:16:25.882314+00:00",
+  "origin_base": "1f84ed65c7020ca4184c34d2bf06503a2993b9d3",
+  "origin_kind": "preserved local dirty working tree",
+  "checkpoint_manifest_sha256": "49465d624c89995be85d410566e5a251dcbbbc4ba12959748a00a5edecb50300",
+  "selection_targets": [
+    "carto_ui",
+    "carto_d3d12_scene"
+  ],
+  "selection_target_closure": [
+    "carto_agent",
+    "carto_ai",
+    "carto_application",
+    "carto_assets",
+    "carto_attributes",
+    "carto_biological",
+    "carto_botanical_contract",
+    "carto_character",
+    "carto_condition_authoring",
+    "carto_connection",
+    "carto_core",
+    "carto_d3d12",
+    "carto_d3d12_scene",
+    "carto_device",
+    "carto_device_ir",
+    "carto_editor",
+    "carto_engineering",
+    "carto_eval",
+    "carto_geometry",
+    "carto_gpu",
+    "carto_hydro",
+    "carto_io",
+    "carto_journal",
+    "carto_kinematic",
+    "carto_market",
+    "carto_mesh_attributes",
+    "carto_motion",
+    "carto_navgraph",
+    "carto_plugin_package",
+    "carto_plugin_protocol",
+    "carto_pose",
+    "carto_production",
+    "carto_project",
+    "carto_providers",
+    "carto_render",
+    "carto_render_graph",
+    "carto_runtime_api",
+    "carto_scene",
+    "carto_scientific",
+    "carto_spatial_field",
+    "carto_surface_core",
+    "carto_temporal",
+    "carto_terrain",
+    "carto_ui",
+    "carto_weights",
+    "carto_world"
+  ],
+  "selection_method": "Existing source records in the transitive library dependency closure of carto_ui and carto_d3d12_scene, plus native/CLI adapters and source format notes. Unrelated tests, desktop work and private queue excluded.",
+  "source_authorship": "Pre-existing Cartographer work preserved with byte hashes; this import does not claim implementation authorship, validation, or promotion.",
+  "prior_realism_reference": "e05fb221050c11338639b2fbac8a852983dec8a3; inspected separately, not blindly merged into schema v35.",
+  "files": [
+    {
+      "path": "apps/cli/CMakeLists.txt",
+      "origin_kind": "tracked_dirty",
+      "bytes": 1061,
+      "sha256": "c9102ebcb567b2d190424fcddea95d98d744190159fd35363c07cc43fb46b5cb",
+      "git_blob_oid": "29f12a0d6d51e363cb73b227765e1087c494ec29"
+    },
+    {
+      "path": "apps/cli/scene_render.cpp",
+      "origin_kind": "untracked",
+      "bytes": 33300,
+      "sha256": "7f7617eef5826325e0baf2cbdcf167563cc7b06742cde3903b4418d7cf2be68e",
+      "git_blob_oid": "4e3231a3e3c0a73e1ad89dc15adf0fcb7227179d"
+    },
+    {
+      "path": "apps/d3d12_desktop/CMakeLists.txt",
+      "origin_kind": "tracked_dirty",
+      "bytes": 495,
+      "sha256": "3384af63293ea5ac4fcd3dbf22926f5b60e858d6f104866667e7b90f25970dc8",
+      "git_blob_oid": "eac1fdd02c8efc8f702a638c667c724ae758ee41"
+    },
+    {
+      "path": "apps/d3d12_desktop/main.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 55836,
+      "sha256": "6fd855ecc83d3a357add85c7723723373504a0471509a014cf909370596d3208",
+      "git_blob_oid": "24606a4191c8a1c9f0608391d4afe8863e1fbac2"
+    },
+    {
+      "path": "docs/format/cartographer-project-v34.md",
+      "origin_kind": "untracked",
+      "bytes": 2817,
+      "sha256": "eb022f1906558c9f382b3615bbdd73bce5149ce061b62cfc64b943e4e1566250",
+      "git_blob_oid": "f42b7374975ff25ce62f600bed0ee249a6e47fb1"
+    },
+    {
+      "path": "docs/format/cartographer-project-v35.md",
+      "origin_kind": "untracked",
+      "bytes": 1533,
+      "sha256": "53c1fd51e4ef3ccab636b32ee39818bc58e335fe02cd8f5c8fdd1224a668f9ef",
+      "git_blob_oid": "ecf06b7c19e4f4ed16ed479d943d7b11643a900c"
+    },
+    {
+      "path": "libs/agent/include/carto/agent/workbench.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 75242,
+      "sha256": "d560c21a67d1cc55565a46435a8d38e367498e2a1b9902dfaa8ec6d5bfeaaf18",
+      "git_blob_oid": "94b0c15edb59ef4c41e95e927e1fb390bdc529fd"
+    },
+    {
+      "path": "libs/agent/src/workbench.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 465263,
+      "sha256": "76a5617ee84169803538fc11f06821583102f891bf3c848ea4a8ecda42f2e981",
+      "git_blob_oid": "b8761a35f5c3f41ebb17dd96b020bdde4c95c8c2"
+    },
+    {
+      "path": "libs/application/CMakeLists.txt",
+      "origin_kind": "tracked_dirty",
+      "bytes": 722,
+      "sha256": "740a2ebaf29c013628952beda6829d8d3ac4bd4bb33526bdf98c27d754b96c84",
+      "git_blob_oid": "f52af0c7abcedcf71cffddfa5c6884c55b98a917"
+    },
+    {
+      "path": "libs/application/include/carto/application/application.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 96028,
+      "sha256": "259b231e04b0bf0e32c7ac1605e60e77d28151a045b7161c57f9a436784a86b5",
+      "git_blob_oid": "9b0148ed7fdb061c0caf51c589f29d2b8de1c5a4"
+    },
+    {
+      "path": "libs/application/src/application.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 673748,
+      "sha256": "d1c6de4772189c5283e68ee0734152a022a2be1bbe8334ff057b81a72a3913bd",
+      "git_blob_oid": "35d4b8c5a419d1f7095e27e1f5bad0e24f966977"
+    },
+    {
+      "path": "libs/assets/CMakeLists.txt",
+      "origin_kind": "tracked_dirty",
+      "bytes": 780,
+      "sha256": "d23426f9ef255f869cfbc726b33f65feebc955273597aec5c85868b4d15cd3ac",
+      "git_blob_oid": "33d22c8b0efbf15819d8493b6ba3a1e19e5fb5e6"
+    },
+    {
+      "path": "libs/assets/include/carto/assets/asset_lock.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 3335,
+      "sha256": "ff7aeb6f070ed4702d749a2a8f1979c0ee9d2c35f2b30f4afd3eadba928a2b23",
+      "git_blob_oid": "058534ba1a6cb75c529c757d02a08584733785e9"
+    },
+    {
+      "path": "libs/assets/include/carto/assets/blob_store.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 3573,
+      "sha256": "6f5a01ee7bc071659a536e2379525734089adf8428662274b0b117a2f530a1f9",
+      "git_blob_oid": "5bc74e9bfaa444e9ef0ce05d3e3439faf9c9be59"
+    },
+    {
+      "path": "libs/assets/include/carto/assets/source_registry.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 8317,
+      "sha256": "8caa16d0ab063e488c9d1a77f5d2629266406965598295cd61136ae62f672a71",
+      "git_blob_oid": "37cbb7776e13935c5c6d38926a76243a101bf2c3"
+    },
+    {
+      "path": "libs/assets/include/carto/assets/texture_image_decoder.hpp",
+      "origin_kind": "untracked",
+      "bytes": 654,
+      "sha256": "5ff53bd779aa68af7a247a2b66b9348355f67f4f39504de9dd28348473ddf963",
+      "git_blob_oid": "5738b20527ce9516a1b555de1268d794991468ad"
+    },
+    {
+      "path": "libs/assets/include/carto/assets/texture_source.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 2959,
+      "sha256": "2987b7ca7ed3a2de511d79733c8aa25caf06b93d0bb9228a9a8eb0ecfd2c8421",
+      "git_blob_oid": "0772294c31e5696e978ebf3b0ceed089a7ddcb85"
+    },
+    {
+      "path": "libs/assets/src/asset_lock.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 9594,
+      "sha256": "0052f842c9bc10f84f25d4d9f4a66de3d247f49d11fb25d07706acff2000bdb8",
+      "git_blob_oid": "264f80cde221ce705b4e948f6a79fa8ae9b49cfc"
+    },
+    {
+      "path": "libs/assets/src/blob_store.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 24303,
+      "sha256": "d5fb85320a24ce0cf9b01468e5e6312f06a5e6096d7759c9f04b8d99e8e7557b",
+      "git_blob_oid": "16ff59bcdacfe7447d9b838c43d23b5283a06714"
+    },
+    {
+      "path": "libs/assets/src/source_registry.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 54651,
+      "sha256": "85b67c68c1c3971d96ccaf3058e3a59b26e466057107a00112e5f8fb97c8ea1b",
+      "git_blob_oid": "f0a62f7c3bc1453a0c9dbcbed33c92066b00b678"
+    },
+    {
+      "path": "libs/assets/src/texture_image_decoder.cpp",
+      "origin_kind": "untracked",
+      "bytes": 35191,
+      "sha256": "d03b96b78b04bf92f0aca8ec526495564e9a992938390bd62aadefb7c8380cfa",
+      "git_blob_oid": "1628e82f5c9ac8c83ae97a8e97d771cee4085708"
+    },
+    {
+      "path": "libs/assets/src/texture_source.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 43543,
+      "sha256": "d72166f56e02a6d4b59337f3335abc09438453035f8ab46c234c1d51ae302b23",
+      "git_blob_oid": "aaa49a1701ee161ee7ea9c320bb94f46db2f8253"
+    },
+    {
+      "path": "libs/attributes/include/carto/attributes/uv.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 1862,
+      "sha256": "a01ea85220624880ba0599df1941ba6e2872300e72012d50ce27bb779e45ad87",
+      "git_blob_oid": "0538f4e7db6e1ede21ed59190ab2604a8eade1b4"
+    },
+    {
+      "path": "libs/condition_authoring/CMakeLists.txt",
+      "origin_kind": "tracked_dirty",
+      "bytes": 842,
+      "sha256": "89ed011fccf6cce43e62d257a35266a15fb0cf1accd0316dc9e507028e8c0d46",
+      "git_blob_oid": "41c36a787adb735790ce1a5063643182967d9308"
+    },
+    {
+      "path": "libs/condition_authoring/include/carto/condition/authoring.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 22882,
+      "sha256": "6495d2e0abb02f3e5c02e262caeb9f541a82323604956d93192d0eca02504fe4",
+      "git_blob_oid": "d24f6c39ef1ecd0f20846e2dee69f90e09d4a98c"
+    },
+    {
+      "path": "libs/condition_authoring/include/carto/condition/prefab_rebase.hpp",
+      "origin_kind": "untracked",
+      "bytes": 2035,
+      "sha256": "dc50689cca9b16d0f7701c8a93c50b0850122675a96ce50903b11619c154466e",
+      "git_blob_oid": "f1a4013adb906bc34dc754993734defdcf91de9b"
+    },
+    {
+      "path": "libs/condition_authoring/include/carto/condition/prefab_socket.hpp",
+      "origin_kind": "untracked",
+      "bytes": 1970,
+      "sha256": "1952f2614f65ae37fe96efc050022d1ba0519432b33ca4461fdcf187eb0c23f2",
+      "git_blob_oid": "140034794aaa818bab0fc5b2a035612912ac0731"
+    },
+    {
+      "path": "libs/condition_authoring/include/carto/condition/sweep_endpoint.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 4796,
+      "sha256": "84fa93909734a2b6fdcc101a76b381db30fa604be5f37e03bce2cf5713474425",
+      "git_blob_oid": "0ce1d0d9a3c1f786e1e1b07458efb1170588e627"
+    },
+    {
+      "path": "libs/condition_authoring/src/authoring.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 144714,
+      "sha256": "0667e8329befee138756f350cabe54cee5a8a1c2b3d4cba1e706a224a3dcfaa0",
+      "git_blob_oid": "a00f28a13ea38aea755a2b5d141a50c915dfa3f1"
+    },
+    {
+      "path": "libs/condition_authoring/src/prefab_rebase.cpp",
+      "origin_kind": "untracked",
+      "bytes": 13285,
+      "sha256": "bcf9ea4eb92511e194fc2ca0f54bd5cb593bacfe92968e0b4615a385066db7a6",
+      "git_blob_oid": "8d31d07f436e9a3119070d520d5966b9f7a5fdac"
+    },
+    {
+      "path": "libs/condition_authoring/src/prefab_socket.cpp",
+      "origin_kind": "untracked",
+      "bytes": 11622,
+      "sha256": "bb51ade51a1f4936197ccdb1336d3677a58f2dfc835236f7aa5b6260b55e696d",
+      "git_blob_oid": "fd525410a5f5a24016e19bba505b8f9a08f1705a"
+    },
+    {
+      "path": "libs/condition_authoring/src/sweep_endpoint.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 28779,
+      "sha256": "1ae9ddf4afc37e1398a26913a505c56579ebd2682ed437193e3226863b80420d",
+      "git_blob_oid": "7ae1176c61d221057ce6bbc84a587db3e0e641f3"
+    },
+    {
+      "path": "libs/connection/include/carto/connection/graph.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 4832,
+      "sha256": "5ecb31ac3956bfc2b6dcea4fea513f9297d63c84b795149ea12eee6515c1cc25",
+      "git_blob_oid": "7ae4778152ff89f53a0cb640bdbad3347cbbeaea"
+    },
+    {
+      "path": "libs/connection/src/graph.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 26688,
+      "sha256": "70161ac99444515f88975106d6600ff84b5d90ede84e3fb47806aef654140cdf",
+      "git_blob_oid": "9a0bb4fc3c34118c5d8f0ca61aa713f1e0cd4d7e"
+    },
+    {
+      "path": "libs/core/include/carto/core/math.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 6595,
+      "sha256": "c7bf0bd3da2c449c8ed3869e2e6b24e509a7cafa7c2eaacc777238c4fcb914db",
+      "git_blob_oid": "94a0d219071813a6c2e9c0dff00bfcb486779608"
+    },
+    {
+      "path": "libs/d3d12/CMakeLists.txt",
+      "origin_kind": "tracked_dirty",
+      "bytes": 2418,
+      "sha256": "1cbc7569d0b06c56bdc9973131775ee438c9e88b4ee57f4fc52d6ab04d24f14d",
+      "git_blob_oid": "11a76fe4b797587fd8f4d31cd1dcc43e71c41d5f"
+    },
+    {
+      "path": "libs/d3d12/include/carto/d3d12/bake_graph.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 10213,
+      "sha256": "b1f3b67f26028ed707c59f5166ddc9e7bdb1667d0868f90f2ef9492b39d114e2",
+      "git_blob_oid": "e944c417ec7c6afa1dd6d2f46da1dbbf02208ecd"
+    },
+    {
+      "path": "libs/d3d12/include/carto/d3d12/detail/render_graph_dispatch.hpp",
+      "origin_kind": "untracked",
+      "bytes": 2140,
+      "sha256": "e60fb78c1052b8949d8924efb17f5a2f068abefbf20dd5dd03838419c1de0bc1",
+      "git_blob_oid": "30d686f0d7d16ca6be071850ff24aa26d0b2c645"
+    },
+    {
+      "path": "libs/d3d12/include/carto/d3d12/device.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 6068,
+      "sha256": "cef4a4ccb27df071016ee0e67814e686a90a83549bde8fb55399e4c87beafda9",
+      "git_blob_oid": "388960e4ab9b88f451d39017d4576040de3d4b83"
+    },
+    {
+      "path": "libs/d3d12/include/carto/d3d12/frame_scheduler.hpp",
+      "origin_kind": "untracked",
+      "bytes": 1462,
+      "sha256": "ed2f7528acb19d4b1adf2430e58b71e4a2ad16d4a31c1130cb1c7cc6b77e35e5",
+      "git_blob_oid": "6f26368927f909b436f34ea194ba48950fe5ebdf"
+    },
+    {
+      "path": "libs/d3d12/include/carto/d3d12/scene_camera_fit.hpp",
+      "origin_kind": "untracked",
+      "bytes": 1541,
+      "sha256": "cf096626881ecb1b40b659d9f00512d1456c4be8fcb2a99a1091f39b9c64a910",
+      "git_blob_oid": "b04688392a1bde43d147a1563584eecdadcd044e"
+    },
+    {
+      "path": "libs/d3d12/include/carto/d3d12/scene_camera_navigation.hpp",
+      "origin_kind": "untracked",
+      "bytes": 3805,
+      "sha256": "df47e6120c728c37dc9894c263707047bb00b00c8ebd2897cf90362b81fb5d7e",
+      "git_blob_oid": "ccaf6da8dc98c401ab178dd9ce7a621e3df9e272"
+    },
+    {
+      "path": "libs/d3d12/include/carto/d3d12/scene_renderer.hpp",
+      "origin_kind": "untracked",
+      "bytes": 24861,
+      "sha256": "54d57d1149a3cd54972febb05a18930f1bae10032f496f0746137eaa4fcf2e57",
+      "git_blob_oid": "b0a89c5a74a220c2ff60c921f36fc9f1ada4d7d3"
+    },
+    {
+      "path": "libs/d3d12/include/carto/d3d12/swapchain.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 1810,
+      "sha256": "d022cd265975ec3a3862400b37a53beae8768fe7add7bce3a4d7df8838dceec3",
+      "git_blob_oid": "c0e332c71533236bf446d54532bca1fe08a1da9d"
+    },
+    {
+      "path": "libs/d3d12/include/carto/d3d12/temporal_sampling.hpp",
+      "origin_kind": "untracked",
+      "bytes": 1692,
+      "sha256": "9f048ab424cf8713be6261f4036d97c7d58012e055578281f9c1dac3611a4066",
+      "git_blob_oid": "dbc9d318b933e299af8441f61273cf9e070a2d79"
+    },
+    {
+      "path": "libs/d3d12/include/carto/d3d12/viewport_input.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 6529,
+      "sha256": "6851925a180713b66c9d4dc685aa9435f8720ffcb53946c92b292f2a68058cd8",
+      "git_blob_oid": "0fed46ead88de33adaae1ff058fa883a1b901997"
+    },
+    {
+      "path": "libs/d3d12/shaders/cartographer_pbr.hlsl",
+      "origin_kind": "tracked_dirty",
+      "bytes": 7201,
+      "sha256": "db49b4988cbfedd625ca4184d7d11fd1ae7960ea642d5af7d6125fd092ec0ce7",
+      "git_blob_oid": "142d43c6324cef6315ba328b6e81208f64bea91e"
+    },
+    {
+      "path": "libs/d3d12/shaders/cartographer_scene_pbr.hlsl",
+      "origin_kind": "untracked",
+      "bytes": 26128,
+      "sha256": "e6ec47277108519a460b9cb4013dabc726f68d523cc8ce43b837409ef8ebc9da",
+      "git_blob_oid": "87886bcc4929dab99429bc9a04bdcb8976f38e6c"
+    },
+    {
+      "path": "libs/d3d12/shaders/cartographer_scene_shadow.hlsl",
+      "origin_kind": "untracked",
+      "bytes": 2168,
+      "sha256": "c4df1214d3017649e6241b7e9ca4f94b13d101cdebc5fed2b1b85792e1aaa20a",
+      "git_blob_oid": "5847f3f1a02161d4294017dc48fc0198a6a390a0"
+    },
+    {
+      "path": "libs/d3d12/shaders/cartographer_temporal.hlsl",
+      "origin_kind": "tracked_dirty",
+      "bytes": 4936,
+      "sha256": "052f5bf8c96cd7232539cb67a45c964732e99a1a5c1492684c44fd05e2aa6c2f",
+      "git_blob_oid": "cf7c8c517e419d44afc18666f7371ebefb6bc17b"
+    },
+    {
+      "path": "libs/d3d12/shaders/cartographer_temporal_fp8.hlsl",
+      "origin_kind": "tracked_dirty",
+      "bytes": 4265,
+      "sha256": "e95e0cb0cf180ed66617b5dc4808771236102ae55425e4ac3998aca347c25d4d",
+      "git_blob_oid": "3882db657a2b6c3031a725711f51bb3b8028b65e"
+    },
+    {
+      "path": "libs/d3d12/shaders/cartographer_tonemap.hlsl",
+      "origin_kind": "tracked_dirty",
+      "bytes": 4160,
+      "sha256": "3412f426a0afd4ce96e572c53403e04d60fca4c7393dabb7304b8b1c58bba04f",
+      "git_blob_oid": "53a5a7f80d52f9741e52a3810b7b911405873022"
+    },
+    {
+      "path": "libs/d3d12/src/bake_graph.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 44132,
+      "sha256": "d3f49036bb54cc516a3d6447dae38b88f1c274b02bdb3ff81fde178eeb60077b",
+      "git_blob_oid": "db3ac4b1d6598cc803854a8a7556762cf82d6b4c"
+    },
+    {
+      "path": "libs/d3d12/src/device.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 161944,
+      "sha256": "74e74c7aa7d5bf008d3466c171674794c99ada7b0d7564f7efc4c9f36cdc53d7",
+      "git_blob_oid": "2f286bfb9b456251c16f4a12ab7ebc4caf47088b"
+    },
+    {
+      "path": "libs/d3d12/src/environment.cpp",
+      "origin_kind": "untracked",
+      "bytes": 38185,
+      "sha256": "d6594ac7cf1934c62ac34a4f48d336d23eef0b12570f5c37296d03fd5b52fc16",
+      "git_blob_oid": "1bfd8a8cd8fb9c4614aca1104d1d614b8154c910"
+    },
+    {
+      "path": "libs/d3d12/src/frame_scheduler.cpp",
+      "origin_kind": "untracked",
+      "bytes": 3744,
+      "sha256": "cad6cd5509e0e96de2948bf2ea029e46f2a7f21ef618ab51cbcc8b829f15d30d",
+      "git_blob_oid": "d02043b31e329d8ad60ad47ce21346a894c9d1b5"
+    },
+    {
+      "path": "libs/d3d12/src/project_scene_renderer.cpp",
+      "origin_kind": "untracked",
+      "bytes": 33810,
+      "sha256": "9069fd405a5b052968b07e44e8804f55622392ba3856d6ebaad849d02a42389c",
+      "git_blob_oid": "0df38ed22b45b9633325b259b3258cd8e94cd919"
+    },
+    {
+      "path": "libs/d3d12/src/project_scene_textures.cpp",
+      "origin_kind": "untracked",
+      "bytes": 12391,
+      "sha256": "e33ba334cfd8c826fa0c86145b9bed5127d66b87d33785fe7628c9b1f369f489",
+      "git_blob_oid": "a6b0494e765c6f639f507aee8504b70683bffca2"
+    },
+    {
+      "path": "libs/d3d12/src/render_graph_dispatch.cpp",
+      "origin_kind": "untracked",
+      "bytes": 11762,
+      "sha256": "87aa289b39fe7901c24c4e8e7f664c8f19b3ffb46edb89d932d4d15182410db6",
+      "git_blob_oid": "d8c3e75aa3cbf6d1e0c016d117104f2a8882e81f"
+    },
+    {
+      "path": "libs/d3d12/src/scene_renderer.cpp",
+      "origin_kind": "untracked",
+      "bytes": 199057,
+      "sha256": "bff90c6d5b9584577b548f3f2df587c4013073f273ae53d4ee2be85cc08e3b16",
+      "git_blob_oid": "042e705a334c4721ada4ce79421636c2e3eec32b"
+    },
+    {
+      "path": "libs/d3d12/src/swapchain.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 9558,
+      "sha256": "2dce5cefb968efb2c3429bf1bcac7d73e59646ff9592d09eed9747992ebe583a",
+      "git_blob_oid": "4768d8e3d569b0ad5ee7b754e7132063cc714c88"
+    },
+    {
+      "path": "libs/editor/include/carto/editor/command_bus.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 52451,
+      "sha256": "ea6e9d88b59765bf8cbdc97abeafe6e6783db7259324c2ccc666c6c8cc7e7576",
+      "git_blob_oid": "355828dce183d9abd20c45da4253e3dd913a94ab"
+    },
+    {
+      "path": "libs/editor/include/carto/editor/editor_camera.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 5060,
+      "sha256": "696090780df58ebdbb8d0953c4b396f3aee37d992b8af3485ac5b0ec4bbb1792",
+      "git_blob_oid": "aaa31d74eccb16913ef5c105ddf3c373bb842ea3"
+    },
+    {
+      "path": "libs/editor/include/carto/editor/viewport_interaction.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 11625,
+      "sha256": "9fac073cfec8aba4885a730b5b7e83ed10399c719a44c7f2f018be39debd82a2",
+      "git_blob_oid": "0c990c12a6240791887ce3080b8aeac4eaa48228"
+    },
+    {
+      "path": "libs/editor/src/command_bus.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 265404,
+      "sha256": "a1950d2f9636a91f16b2c4eb50e21fa8bded1b8411a96c4db89fe59ddcf9793e",
+      "git_blob_oid": "c2fdc26cf2d330d51b01fbbfb291d75b492a72cd"
+    },
+    {
+      "path": "libs/editor/src/editor_camera.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 14399,
+      "sha256": "99f2e637e074f8078c81e6340bf8260600a40791c9fc911ddecfb845f5365ef4",
+      "git_blob_oid": "796286b979f258534cec5c6c7a0acc018a760b5c"
+    },
+    {
+      "path": "libs/editor/src/viewport_interaction.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 33735,
+      "sha256": "1bb6ba9119c1e4df948a95d7588cd753f7b6c268803ce57e4b9eaac6b852b5e7",
+      "git_blob_oid": "e397022a6ce7832512de02c720ed8c9f22374b25"
+    },
+    {
+      "path": "libs/eval/src/graph.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 25621,
+      "sha256": "8407c714aa0ff98cc92f64d77b15b0c0247b639a78f3755ca4cfe18645baf251",
+      "git_blob_oid": "233e9af6cd29cb59e2df651c1ffc084728539b09"
+    },
+    {
+      "path": "libs/geometry/mesh/include/carto/geometry/mesh.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 21114,
+      "sha256": "4c127798d90bd56d922879bf362a94e891762189d43570639b9658f7592cccfc",
+      "git_blob_oid": "c78ea958863854ad560b216fee321938c5681629"
+    },
+    {
+      "path": "libs/geometry/mesh/include/carto/geometry/sweep.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 3107,
+      "sha256": "dfaf0a958e24afbbec88248214da8813612fcf1f90497a362d4149f6c3dff0ed",
+      "git_blob_oid": "8dafc951764db38ef8bc615569d5108209c60865"
+    },
+    {
+      "path": "libs/geometry/mesh/src/mesh.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 334271,
+      "sha256": "e13b3180563d2df9bcdd39c83490b17d1da39e350ba7d05e9e5a59ba48d78011",
+      "git_blob_oid": "947640964565c4a97acbc0a47ebf992ba0d9aa91"
+    },
+    {
+      "path": "libs/geometry/mesh/src/sweep.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 27185,
+      "sha256": "6b38e817284161fb854bd111209db28aa2249c2a3b79161752a90d35067b2f51",
+      "git_blob_oid": "5d4fe165bacdd29e2f3bdadc1c76ae4e3fb85d86"
+    },
+    {
+      "path": "libs/gpu/include/carto/gpu/rhi.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 10170,
+      "sha256": "bb29c626f3a91e207e1f63b51790926b73c3ab894105bd45d62e25ca998291ba",
+      "git_blob_oid": "43fb07977bf796a594bc711abe194c5f4167bc89"
+    },
+    {
+      "path": "libs/gpu/src/gpu.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 11431,
+      "sha256": "d042ac5dcf3cccdf243429cf5c5b97fc626d70fdeb328ce3371911894795b294",
+      "git_blob_oid": "106fba0b305f7cd3014600ac3e5431dc2d34e64d"
+    },
+    {
+      "path": "libs/io/src/generated_mesh.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 39725,
+      "sha256": "965c8da572d34b58d997b06425727217f62037d4444674e3743547b3370f22bf",
+      "git_blob_oid": "3ee5ba6476136944585f1de81a582d48aa06e7f8"
+    },
+    {
+      "path": "libs/mesh_attributes/include/carto/mesh_attributes/provenance.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 2945,
+      "sha256": "cd424dae97b801364373718b4e1d3b7de0a606f5e3cb344577d0f494dc987385",
+      "git_blob_oid": "91f4d3082c15b891091b05294e26d1a6ffd2bbdc"
+    },
+    {
+      "path": "libs/mesh_attributes/src/provenance.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 51066,
+      "sha256": "3dbc2713196530ad95992e382e6ef2422d407e9319bd0911048708f753cbed81",
+      "git_blob_oid": "3f6c8422d19742a52d9d68a20e1bb45a2dcc4b5f"
+    },
+    {
+      "path": "libs/production/include/carto/production/bake_graph.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 51990,
+      "sha256": "529d6298927e4ab0f75176fbf528c286a879887c59ed79c3ba0834be15bff356",
+      "git_blob_oid": "7474553dfe68536e3f5a95071458edce5fc0fee6"
+    },
+    {
+      "path": "libs/production/include/carto/production/render_mesh.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 6910,
+      "sha256": "320247796a9f3b4d688d13a6db371e4e32909bce4ef4502ac2425dab8dedd3c3",
+      "git_blob_oid": "cf592a2aedf73cbc82c01be211e4b2f5c105fd1a"
+    },
+    {
+      "path": "libs/production/include/carto/production/uv_island_pack.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 5035,
+      "sha256": "238572df156670e3918b91b0346abc154f4596382825ee8e6984ba1e1ca116a0",
+      "git_blob_oid": "0c8b611ee22d689d20706f3011406b61934c5a44"
+    },
+    {
+      "path": "libs/production/src/ambient_occlusion_projection.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 1950,
+      "sha256": "519f975e0eeecc3a61cb0a7596330866e0236c9ea59d747c26b20afa70c273dd",
+      "git_blob_oid": "df284beae805dedeb0410b4d3a1ccaa88e030337"
+    },
+    {
+      "path": "libs/production/src/bake_graph.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 273127,
+      "sha256": "bfe0b2528c6bedab2f873780ce2bc63b8b88455e7cc73b8054edc077f2bb9a49",
+      "git_blob_oid": "6b144f2b97a4b918489871b13f90cbf85b392c66"
+    },
+    {
+      "path": "libs/production/src/decal.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 19928,
+      "sha256": "86d30097c9e113f2f0c836d8707b163ca6ca2995452fbae8dd4f1378cd5ad735",
+      "git_blob_oid": "ae816d9d6ce25cb23a77bdeaf10a1ea9e7198a31"
+    },
+    {
+      "path": "libs/production/src/lookdev_draw_package.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 22238,
+      "sha256": "c6f8f24aaa2d073d85dbefad9a07942068fd8035848a052368d9431665814351",
+      "git_blob_oid": "33119004d608a7336cd7a7672a56bda319e25f28"
+    },
+    {
+      "path": "libs/production/src/render_mesh.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 72668,
+      "sha256": "d1e578977d30124a74bbc47729f76c18b32c3f238791a5ec8586f3010f57f89c",
+      "git_blob_oid": "94164d000f74a6cbe1acf5fcfff6a2f8e6ac132f"
+    },
+    {
+      "path": "libs/production/src/uv_island_pack.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 50367,
+      "sha256": "41fa5609e328d9e3039a096ae429718c927c139106095fccb57a0fe407e3923d",
+      "git_blob_oid": "df0b5c2f1709d66ac179e6ca6347aa974b4ece06"
+    },
+    {
+      "path": "libs/project/CMakeLists.txt",
+      "origin_kind": "tracked_dirty",
+      "bytes": 1871,
+      "sha256": "0a1eea0a87d3bb45dc63e83228ee4d0ceac451d98559159632b8e69387fb9e76",
+      "git_blob_oid": "7bfb8694484ba921f1bc098d59781eeb24f3cf3d"
+    },
+    {
+      "path": "libs/project/include/carto/project/material_catalog.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 8070,
+      "sha256": "6e2900b20b452157282043c1f62c537bb793b1e4d5ad44efbeb169ab41ef3cff",
+      "git_blob_oid": "b58c570aa379f796010274c0b87fca440f4fb664"
+    },
+    {
+      "path": "libs/project/include/carto/project/material_graph.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 6564,
+      "sha256": "170abbc449976b76f8a0c9a592db1359ec851100d7973862f43687afc6f79ff9",
+      "git_blob_oid": "6fe197060669d149b16f532a105d61c73b17c19a"
+    },
+    {
+      "path": "libs/project/include/carto/project/presentation_catalog.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 7758,
+      "sha256": "908e8044e93a78e89566387872cd10f7770d18107f278d4767f637d21a461a8f",
+      "git_blob_oid": "04489de3c73e524ff422093fe0f30d8f8d887d8c"
+    },
+    {
+      "path": "libs/project/include/carto/project/project.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 37137,
+      "sha256": "50112804ade6fa66087cf62f5fc1ee0ec48527c31c599ec3e7998677426810c1",
+      "git_blob_oid": "bbec667128679ed3b6bf51b6e397ab58ac325473"
+    },
+    {
+      "path": "libs/project/include/carto/project/transaction.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 7799,
+      "sha256": "4e17c29733e19f7f55942da3a514db4fe370ac265665ec1254935d2ba73f77a2",
+      "git_blob_oid": "cdaa6314bcde219d2beb6a16349a29af3792b14a"
+    },
+    {
+      "path": "libs/project/src/material_catalog.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 57165,
+      "sha256": "26cdc0c8ed07d97afe1a0ae91765f5569b699823b66a2cd11655bd2d3d294385",
+      "git_blob_oid": "82bdec7154da8e52850a9d6094dac1dd94891989"
+    },
+    {
+      "path": "libs/project/src/material_graph_evaluation.cpp",
+      "origin_kind": "untracked",
+      "bytes": 22379,
+      "sha256": "dad0a84356cca3a5b9cbf6a4bbbd8d37738bda352cdc0861ea897efd133e4bf8",
+      "git_blob_oid": "904f2ef1d475bde4fa2fd1cf4b02c9ce23b72a7a"
+    },
+    {
+      "path": "libs/project/src/presentation_catalog.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 41597,
+      "sha256": "b754ee9fb46dcc2a7c66c66a42b1229c259c202671b171d579ab5955e0bf3ca8",
+      "git_blob_oid": "5c38bceb8477a0601a558773b7041d0754232893"
+    },
+    {
+      "path": "libs/project/src/project.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 431917,
+      "sha256": "9533fd8b8abee97bf52fa8447cbb4bf64b5cbb8610535a29487eca799b4ba81f",
+      "git_blob_oid": "d7d8c8917cd96b71aab9b0632a5ec0b0b6a52ce1"
+    },
+    {
+      "path": "libs/project/src/transaction.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 17575,
+      "sha256": "bcfaa73f129b28ec5171d83e35768987da2df27db006ca9c6c146612b15e149a",
+      "git_blob_oid": "3e7e68f7a226df3a56dea8693be832f77d96bf88"
+    },
+    {
+      "path": "libs/ui/include/carto/ui/ui.hpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 75369,
+      "sha256": "1e2c45ee523ea8a16006654dc919ea4bdc42dbcb5cb7c1988e150ded9e70423d",
+      "git_blob_oid": "c9fa3ffce3b7b88394f59d3584c6ec51dc3c8692"
+    },
+    {
+      "path": "libs/ui/src/ui.cpp",
+      "origin_kind": "tracked_dirty",
+      "bytes": 659912,
+      "sha256": "8a71028631641cc749e0c5f4a19b0840aac64df5342c98921c821a04099c81b6",
+      "git_blob_oid": "fcf534d81656a91583f8b061d55483b912e9a0cf"
+    }
+  ],
+  "hash_note": "sha256/bytes describe original checkpoint bytes copied verbatim. git_blob_oid binds repository content after its existing text filters; later validation must hash its actual frozen checkout and binaries separately."
+}

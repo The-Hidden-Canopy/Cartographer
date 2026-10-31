@@ -34,17 +34,27 @@ struct BlobStoreLimits {
     std::uint64_t max_blob_bytes = 256ULL * 1024ULL * 1024ULL;
     std::uint32_t max_media_type_bytes = 256U;
     std::uint32_t max_listed_blobs = 1'048'576U;
+    std::uint64_t max_inventory_verification_bytes = 512ULL * 1024ULL * 1024ULL;
 };
 
 struct BlobOrphanReport {
-    // Stored digests absent from the caller-supplied live set, sorted by
-    // digest. Advisory only: deletion authority stays with the caller and
-    // computing this report never mutates the store.
+    // Stored digests absent from both the caller-supplied live and pending-work
+    // sets, sorted by digest. Advisory only: deletion authority stays with the
+    // caller and computing this report never mutates the store.
     std::vector<Sha256Digest> orphan_candidates;
     // Stored digests excluded from orphan_candidates because their bytes
-    // failed digest re-verification, sorted by digest.
+    // could not be read and digest-verified within configured limits.
+    // Sorted by digest.
     std::vector<Sha256Digest> corrupt;
+    // Caller-supplied live digests absent from the store, sorted and unique.
+    std::vector<Sha256Digest> missing_live_references;
+    // Verified stored digests protected by caller-supplied pending work, sorted
+    // and unique. They are excluded from orphan_candidates but are not treated
+    // as required durable references when computing missing_live_references.
+    std::vector<Sha256Digest> protected_pending_work_digests;
 };
+
+inline constexpr std::size_t kMaxPendingBlobWorkDigests = 65'536U;
 
 class BlobStore {
 public:
@@ -64,8 +74,11 @@ public:
     // caller metadata and are not persisted, so listed entries carry an empty
     // media type. Fails closed if the store exceeds limits_.max_listed_blobs.
     [[nodiscard]] core::Result<std::vector<BlobRef>> list() const;
+    // Pending work suppresses orphan classification only; it does not count
+    // as a durable live reference or contribute to missing_live_references.
     [[nodiscard]] core::Result<BlobOrphanReport> orphan_candidates(
-        std::span<const Sha256Digest> live_digests) const;
+        std::span<const Sha256Digest> live_digests,
+        std::span<const Sha256Digest> pending_work_digests = {}) const;
 
     [[nodiscard]] std::filesystem::path path_for(const Sha256Digest& digest) const;
     [[nodiscard]] const std::filesystem::path& root() const noexcept { return root_; }

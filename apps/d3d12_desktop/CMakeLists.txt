@@ -5,8 +5,10 @@ add_executable(cartographer_d3d12_desktop WIN32
 target_link_libraries(cartographer_d3d12_desktop
     PRIVATE
         carto_d3d12
+        carto_d3d12_scene
         user32
         gdi32
+        shell32
 )
 
 target_compile_definitions(cartographer_d3d12_desktop

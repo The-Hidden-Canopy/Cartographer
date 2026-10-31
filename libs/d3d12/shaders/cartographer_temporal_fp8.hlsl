@@ -86,11 +86,23 @@ void CSMain(uint3 dispatch_id : SV_DISPATCHTHREADID)
     int2 history_pixel = pixel;
     if (history_flags.w == 0)
     {
+        const uint2 motion_raw = motion_vectors.Load(int3(pixel, 0));
         const float2 motion = float2(
-            e4m3_decode(motion_vectors.Load(int3(pixel, 0)).x),
-            e4m3_decode(motion_vectors.Load(int3(pixel, 0)).y));
-        history_pixel = clamp(
-            pixel - int2(round(motion)), int2(0, 0), int2(width - 1, height - 1));
+            e4m3_decode(motion_raw.x), e4m3_decode(motion_raw.y));
+        if (!all(isfinite(motion)) || any(abs(motion) > float2(width, height)))
+        {
+            resolved_color[pixel] = current_raw;
+            return;
+        }
+        // Motion is a current-pixel-to-history-pixel offset, matching the
+        // RGBA32F temporal resolve. Off-frame history falls back to current.
+        history_pixel = pixel + int2(round(motion));
+        if (any(history_pixel < int2(0, 0)) ||
+            any(history_pixel >= int2(width, height)))
+        {
+            resolved_color[pixel] = current_raw;
+            return;
+        }
     }
     const float4 current = decode4(current_raw);
     const float4 history = decode4(history_color.Load(int3(history_pixel, 0)));

@@ -197,15 +197,30 @@ D3D12_FILTER native_filter(const gpu::SamplerDesc& descriptor) {
             ? D3D12_FILTER_COMPARISON_ANISOTROPIC
             : D3D12_FILTER_ANISOTROPIC;
     }
-    const bool linear = descriptor.min_filter == gpu::Filter::linear ||
-        descriptor.mag_filter == gpu::Filter::linear ||
-        descriptor.mip_filter == gpu::MipFilter::linear;
-    if (descriptor.compare) {
-        return linear ? D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR
-                      : D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
-    }
-    return linear ? D3D12_FILTER_MIN_MAG_MIP_LINEAR
-                  : D3D12_FILTER_MIN_MAG_MIP_POINT;
+    const unsigned filter_mode =
+        (descriptor.min_filter == gpu::Filter::linear ? 4U : 0U) |
+        (descriptor.mag_filter == gpu::Filter::linear ? 2U : 0U) |
+        (descriptor.mip_filter == gpu::MipFilter::linear ? 1U : 0U);
+    static constexpr std::array<D3D12_FILTER, 8U> regular_filters{
+        D3D12_FILTER_MIN_MAG_MIP_POINT,
+        D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR,
+        D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT,
+        D3D12_FILTER_MIN_POINT_MAG_MIP_LINEAR,
+        D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT,
+        D3D12_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR,
+        D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT,
+        D3D12_FILTER_MIN_MAG_MIP_LINEAR};
+    static constexpr std::array<D3D12_FILTER, 8U> comparison_filters{
+        D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT,
+        D3D12_FILTER_COMPARISON_MIN_MAG_POINT_MIP_LINEAR,
+        D3D12_FILTER_COMPARISON_MIN_POINT_MAG_LINEAR_MIP_POINT,
+        D3D12_FILTER_COMPARISON_MIN_POINT_MAG_MIP_LINEAR,
+        D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_MIP_POINT,
+        D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_POINT_MIP_LINEAR,
+        D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT,
+        D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR};
+    return descriptor.compare
+        ? comparison_filters[filter_mode] : regular_filters[filter_mode];
 }
 
 D3D12_COMPARISON_FUNC native_compare(gpu::CompareOp operation) {
@@ -508,7 +523,7 @@ struct D3D12Device::Impl {
         std::optional<UINT> sampled_texture_root_index;
         std::vector<UINT> sampled_texture_root_indices;
         std::optional<UINT> storage_texture_root_index;
-        std::optional<UINT> sampler_root_index;
+        std::vector<UINT> sampler_root_indices;
         bool compute = false;
     };
 
@@ -587,6 +602,7 @@ struct D3D12Device::Impl {
     gpu::Registry<gpu::PipelineTag, PipelineResource> pipelines;
     std::map<device_ir::ResourceHandle, device_ir::ResourceState> resource_states;
     gpu::SubmissionSerial next_serial = 0U;
+    gpu::SubmissionSerial last_submitted = 0U;
     mutable gpu::SubmissionSerial completed = 0U;
     mutable std::map<gpu::SubmissionSerial, gpu::QueueType> pending;
 
@@ -1095,6 +1111,15 @@ core::Result<gpu::TextureHandle> D3D12Device::create_texture(const gpu::TextureD
     return handle;
 }
 
+core::Result<gpu::TextureDesc> D3D12Device::describe_texture(
+    gpu::TextureHandle handle) const {
+    const auto texture = impl_->textures.resolve(handle);
+    if (!texture) {
+        return core::Result<gpu::TextureDesc>::failure(texture.error());
+    }
+    return core::Result<gpu::TextureDesc>::success(texture.value()->descriptor);
+}
+
 core::Result<gpu::TextureHandle> D3D12Device::import_swapchain_texture(
     void* native_resource,
     const gpu::TextureDesc& descriptor) {
@@ -1265,9 +1290,9 @@ core::Result<gpu::PipelineHandle> D3D12Device::create_pipeline(
         return core::Result<gpu::PipelineHandle>::failure(unsupported(
             "D3D12 reference pipeline creation currently requires one sample"));
     }
-    if (descriptor.sampled_texture_count > 6U) {
+    if (descriptor.sampled_texture_count > 9U) {
         return core::Result<gpu::PipelineHandle>::failure(unsupported(
-            "D3D12 graphics resource tables support at most six sampled textures"));
+            "D3D12 graphics resource tables support at most nine sampled textures"));
     }
     const bool has_multi_sampled_bindings = descriptor.sampled_texture_count != 0U;
     const bool has_compute_shader = std::any_of(
@@ -1275,6 +1300,14 @@ core::Result<gpu::PipelineHandle> D3D12Device::create_pipeline(
             const auto shader = impl_->shaders.resolve(handle);
             return shader && shader.value()->descriptor.stage == gpu::ShaderStage::compute;
         });
+    if (descriptor.sampled_sampler_count > 7U) {
+        return core::Result<gpu::PipelineHandle>::failure(unsupported(
+            "D3D12 graphics resource tables support at most seven sampled samplers"));
+    }
+    if (has_compute_shader && descriptor.sampled_sampler_count != 0U) {
+        return core::Result<gpu::PipelineHandle>::failure(unsupported(
+            "D3D12 compute pipelines do not support sampled sampler bindings"));
+    }
     const std::size_t expected_binding_count = has_multi_sampled_bindings
         ? static_cast<std::size_t>(descriptor.sampled_texture_count) +
             (has_compute_shader ? 1U : 0U)
@@ -1464,18 +1497,25 @@ core::Result<gpu::PipelineHandle> D3D12Device::create_pipeline(
         descriptor.sampled_texture_count != 0U
         ? descriptor.sampled_texture_count
         : (descriptor.descriptor_bindings.empty() ? 0U : 1U);
+    const std::uint32_t graphics_sampled_sampler_count =
+        descriptor.sampled_sampler_count != 0U
+        ? descriptor.sampled_sampler_count
+        : (graphics_sampled_texture_count == 0U ? 0U : 1U);
     const std::uint32_t root_cost = descriptor.push_constant_bytes /
             static_cast<std::uint32_t>(sizeof(std::uint32_t)) +
         graphics_sampled_texture_count +
-        (graphics_sampled_texture_count == 0U ? 0U : 1U);
+        graphics_sampled_sampler_count;
     if (root_cost > kRootSignatureDwordLimit) {
         return core::Result<gpu::PipelineHandle>::failure(invalid(
             "D3D12 graphics root-signature cost exceeds 64 DWORDs"));
     }
     Impl::PipelineResource value{};
     value.descriptor = descriptor;
-    std::array<D3D12_ROOT_PARAMETER, 8U> root_parameters{};
-    std::array<D3D12_DESCRIPTOR_RANGE, 7U> descriptor_ranges{};
+    // Nine SRV tables, seven sampler tables, and optional root constants fit
+    // in these bounded arrays. Each sampler table maps one texture slot to its
+    // matching shader sampler register.
+    std::array<D3D12_ROOT_PARAMETER, 17U> root_parameters{};
+    std::array<D3D12_DESCRIPTOR_RANGE, 16U> descriptor_ranges{};
     UINT root_parameter_count = 0U;
     D3D12_ROOT_SIGNATURE_DESC root_descriptor{};
     if (descriptor.push_constant_bytes != 0U) {
@@ -1511,15 +1551,17 @@ core::Result<gpu::PipelineHandle> D3D12Device::create_pipeline(
         texture_parameter.DescriptorTable.pDescriptorRanges = &texture_range;
         texture_parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     }
-    if (sampled_texture_count != 0U) {
-        auto& sampler_range = descriptor_ranges.at(sampled_texture_count);
+    for (std::uint32_t sampler_index = 0U;
+         sampler_index < graphics_sampled_sampler_count; ++sampler_index) {
+        auto& sampler_range = descriptor_ranges.at(
+            sampled_texture_count + sampler_index);
         sampler_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
         sampler_range.NumDescriptors = 1U;
-        sampler_range.BaseShaderRegister = 0U;
+        sampler_range.BaseShaderRegister = sampler_index;
         sampler_range.RegisterSpace = 0U;
         sampler_range.OffsetInDescriptorsFromTableStart = 0U;
         const UINT sampler_root_index = root_parameter_count++;
-        value.sampler_root_index = sampler_root_index;
+        value.sampler_root_indices.push_back(sampler_root_index);
         auto& sampler_parameter = root_parameters.at(sampler_root_index);
         sampler_parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         sampler_parameter.DescriptorTable.NumDescriptorRanges = 1U;
@@ -2609,7 +2651,7 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
                         return core::Result<void>::success();
                     }
                     if (pipeline.value()->sampled_texture_root_indices.empty() ||
-                        !pipeline.value()->sampler_root_index.has_value()) {
+                        pipeline.value()->sampler_root_indices.empty()) {
                         return core::Result<void>::failure(validation(
                             "D3D12 resource binding is not declared by the bound pipeline"));
                     }
@@ -2620,10 +2662,8 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
                         return core::Result<void>::failure(validation(
                             "D3D12 graphics resource bindings must match the sampled-texture count"));
                     }
-                    if (!value.bindings.front().sampler.has_value()) {
-                        return core::Result<void>::failure(validation(
-                            "D3D12 sampled graphics bindings require an explicit sampler on binding zero"));
-                    }
+                    const std::size_t sampled_sampler_count =
+                        pipeline.value()->sampler_root_indices.size();
                     ID3D12DescriptorHeap* heaps[] = {
                         impl_->srv_heap.Get(), impl_->sampler_heap.Get()};
                     queue_resource.command_list->SetDescriptorHeaps(2U, heaps);
@@ -2631,10 +2671,11 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
                          sampled_index < sampled_count; ++sampled_index) {
                         const auto& binding = value.bindings.at(sampled_index);
                         if (binding.set != 0U || binding.binding != sampled_index ||
-                            (sampled_index != 0U && binding.sampler.has_value()) ||
+                            (sampled_index < sampled_sampler_count) !=
+                                binding.sampler.has_value() ||
                             !std::holds_alternative<gpu::TextureHandle>(binding.resource)) {
                             return core::Result<void>::failure(validation(
-                                "D3D12 sampled graphics bindings must be consecutive textures with one sampler"));
+                                "D3D12 sampled graphics bindings must match consecutive texture and sampler prefixes"));
                         }
                         const auto texture_handle = std::get<gpu::TextureHandle>(binding.resource);
                         if (auto result = require_state(
@@ -2651,17 +2692,20 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
                         queue_resource.command_list->SetGraphicsRootDescriptorTable(
                             pipeline.value()->sampled_texture_root_indices.at(sampled_index),
                             texture.value()->srv_gpu);
+                        if (sampled_index < sampled_sampler_count) {
+                            auto sampler = impl_->samplers.resolve(
+                                *binding.sampler);
+                            if (!sampler)
+                                return core::Result<void>::failure(sampler.error());
+                            if (!sampler.value()->has_descriptor) {
+                                return core::Result<void>::failure(unsupported(
+                                    "D3D12 sampler has no native descriptor"));
+                            }
+                            queue_resource.command_list->SetGraphicsRootDescriptorTable(
+                                pipeline.value()->sampler_root_indices.at(sampled_index),
+                                sampler.value()->gpu);
+                        }
                     }
-                    auto sampler = impl_->samplers.resolve(
-                        *value.bindings.front().sampler);
-                    if (!sampler) return core::Result<void>::failure(sampler.error());
-                    if (!sampler.value()->has_descriptor) {
-                        return core::Result<void>::failure(unsupported(
-                            "D3D12 sampler has no native descriptor"));
-                    }
-                    queue_resource.command_list->SetGraphicsRootDescriptorTable(
-                        *pipeline.value()->sampler_root_index,
-                        sampler.value()->gpu);
                     bound_sampled_texture = value.bindings.front();
                     return core::Result<void>::success();
                 } else if constexpr (std::is_same_v<T, device_ir::CmdPushConstants>) {
@@ -2881,7 +2925,12 @@ core::Result<gpu::SubmissionSerial> D3D12Device::submit(
     impl_->capture_debug_messages();
     command_context.last_submitted = serial;
     impl_->pending.emplace(serial, queue);
+    impl_->last_submitted = serial;
     return core::Result<gpu::SubmissionSerial>::success(serial);
+}
+
+gpu::SubmissionSerial D3D12Device::last_submitted_serial() const noexcept {
+    return impl_->last_submitted;
 }
 
 gpu::SubmissionSerial D3D12Device::completed_serial() const noexcept {

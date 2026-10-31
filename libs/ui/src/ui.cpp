@@ -3,6 +3,7 @@
 #include <carto/assets/blob_store.hpp>
 #include <carto/assets/texture_source.hpp>
 #include <carto/io/builtin_provider.hpp>
+#include <carto/io/gltf_scene_import.hpp>
 #include <carto/io/obj.hpp>
 #include <carto/io/ply.hpp>
 #include <carto/io/stl.hpp>
@@ -23,6 +24,7 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <initializer_list>
 #include <limits>
 #include <locale>
 #include <map>
@@ -599,12 +601,27 @@ bool is_operation_action(const application::ApplicationAction& action) {
             std::is_same_v<Action, application::SetMaterialRegionAssignmentAction> ||
             std::is_same_v<Action, application::SetMaterialGraphAction> ||
             std::is_same_v<Action, application::SetMaterialGraphBindingAction> ||
+            std::is_same_v<Action, application::SetMaterialGraphInputsAction> ||
+            std::is_same_v<Action, application::ImportMaterialTextureSourceAction> ||
+            std::is_same_v<Action, application::ReimportMaterialTextureSourceAction> ||
             std::is_same_v<Action, application::SetPresentationCatalogAction> ||
             std::is_same_v<Action, application::CreateMeshObjectAction> ||
+            std::is_same_v<Action, application::ImportGltfSceneAction> ||
+            std::is_same_v<Action, application::DuplicateMeshInstanceAction> ||
+            std::is_same_v<Action, application::DuplicateMeshInstanceBatchAction> ||
             std::is_same_v<Action, application::ApplySourceReimportPlanAction> ||
+            std::is_same_v<Action, application::RelinkMovedSourceAction> ||
+            std::is_same_v<Action, application::GenerateUniqueLightmapUvAction> ||
+            std::is_same_v<Action, application::PackUvIslandsAction> ||
+            std::is_same_v<Action, application::SetUvCoordinateAction> ||
+            std::is_same_v<Action, application::SetUvSeamMarkAction> ||
+            std::is_same_v<Action, application::AlignUvSeamAction> ||
+            std::is_same_v<Action, application::SetDecalPlacementAction> ||
             std::is_same_v<Action, application::AppendSculptStrokeAction> ||
             std::is_same_v<Action, application::AppendSculptSurfaceStrokeAction> ||
             std::is_same_v<Action, application::SetSculptLayerVisibilityAction> ||
+            std::is_same_v<Action, application::SetSculptLayerWeightAction> ||
+            std::is_same_v<Action, application::MoveSculptLayerAction> ||
             std::is_same_v<Action, application::CreatePlantScatterBatchAction> ||
             std::is_same_v<Action, application::SetObjectTransformAction> ||
             std::is_same_v<Action, application::ImportEngineeringFixtureAction> ||
@@ -628,6 +645,12 @@ bool is_operation_action(const application::ApplicationAction& action) {
             std::is_same_v<Action, application::AddConditionInteractionAnchorAction> ||
             std::is_same_v<Action, application::AddConditionPrefabAction> ||
             std::is_same_v<Action, application::InstantiateConditionPrefabAction> ||
+            std::is_same_v<Action, application::RebaseConditionPrefabAction> ||
+            std::is_same_v<Action, application::ReplaceConnectionPortGraphAction> ||
+            std::is_same_v<Action, application::AddConnectionPortAction> ||
+            std::is_same_v<Action, application::RemoveConnectionPortAction> ||
+            std::is_same_v<Action, application::RemoveConnectionEdgeAction> ||
+            std::is_same_v<Action, application::ConnectConditionPrefabSocketsAction> ||
             std::is_same_v<Action, application::AddConditionCollectionAction> ||
             std::is_same_v<Action, application::AddConditionRegionKitAction> ||
             std::is_same_v<Action, application::AddConditionKinematicAssemblyAction> ||
@@ -1099,7 +1122,7 @@ core::Result<StagedMeshSource> persist_mesh_source(
         relative, pending.digest});
 }
 
-core::Result<StagedMeshSource> persist_botanical_source_blob(
+core::Result<StagedMeshSource> persist_managed_source_blob(
     const std::filesystem::path& project_path,
     std::span<const std::uint8_t> bytes,
     std::string media_type,
@@ -1133,29 +1156,29 @@ core::Result<StagedMeshSource> persist_botanical_source_blob(
     const auto destination_status = std::filesystem::symlink_status(destination, error);
     if (error && error != std::errc::no_such_file_or_directory) {
         return core::Result<StagedMeshSource>::failure(io_error(
-            "unable to inspect managed botanical source destination"));
+            "unable to inspect managed " + std::string(source_description) + " destination"));
     }
     error.clear();
     if (std::filesystem::is_symlink(destination_status)) {
         return core::Result<StagedMeshSource>::failure(validation(
-            "managed botanical source destination cannot be a symbolic link"));
+            "managed " + std::string(source_description) + " destination cannot be a symbolic link"));
     }
     const auto stored = store.put(bytes, std::move(media_type));
     if (!stored || stored.value().digest != digest) {
         return core::Result<StagedMeshSource>::failure(stored
-            ? validation("botanical source digest changed during persistence")
+            ? validation(std::string(source_description) + " digest changed during persistence")
             : stored.error());
     }
     const auto canonical_destination = std::filesystem::canonical(destination, error);
     if (error || !is_within_directory(project_root, canonical_destination)) {
         return core::Result<StagedMeshSource>::failure(validation(
-            "botanical source resolved outside the saved project directory"));
+            std::string(source_description) + " resolved outside the saved project directory"));
     }
     const auto relative =
         canonical_destination.lexically_relative(project_root).generic_string();
     if (relative.empty() || relative.starts_with("../")) {
         return core::Result<StagedMeshSource>::failure(validation(
-            "botanical source has no safe project-relative path"));
+            std::string(source_description) + " has no safe project-relative path"));
     }
     return core::Result<StagedMeshSource>::success(StagedMeshSource{relative, digest});
 }
@@ -1163,7 +1186,7 @@ core::Result<StagedMeshSource> persist_botanical_source_blob(
 core::Result<StagedMeshSource> persist_generated_botanical_source_blob(
     const std::filesystem::path& project_path,
     std::span<const std::uint8_t> bytes) {
-    return persist_botanical_source_blob(project_path, bytes, "model/gltf+json",
+    return persist_managed_source_blob(project_path, bytes, "model/gltf+json",
         40U * 1024U * 1024U, "generated botanical artifact");
 }
 
@@ -2142,14 +2165,14 @@ UiColorTokens color_tokens(Theme theme) noexcept {
         };
     }
     return {
-        // Cartographer dark: deep earth canvas, slate instruments, ice text,
-        // Carto blue interaction, and bronze navigation detail.
-        {0.031F, 0.059F, 0.078F, 1.0F}, {0.043F, 0.090F, 0.129F, 1.0F},
-        {0.075F, 0.106F, 0.149F, 1.0F}, {0.118F, 0.161F, 0.220F, 1.0F},
-        {0.153F, 0.208F, 0.282F, 1.0F}, {0.184F, 0.510F, 0.965F, 0.20F},
-        {0.898F, 0.906F, 0.922F, 1.0F}, {0.612F, 0.639F, 0.686F, 1.0F},
-        {0.420F, 0.463F, 0.525F, 1.0F}, {0.118F, 0.161F, 0.220F, 1.0F},
-        {0.184F, 0.510F, 0.965F, 1.0F}, {0.184F, 0.510F, 0.965F, 1.0F},
+        // Approved viewport-first studio reference: near-black blue surfaces,
+        // ice text, cyan interaction, and the retained bronze brand detail.
+        {0.031F, 0.059F, 0.078F, 1.0F}, {0.043F, 0.070F, 0.094F, 1.0F},
+        {0.047F, 0.078F, 0.102F, 1.0F}, {0.067F, 0.106F, 0.137F, 1.0F},
+        {0.086F, 0.145F, 0.184F, 1.0F}, {0.145F, 0.741F, 0.914F, 0.18F},
+        {0.898F, 0.929F, 0.949F, 1.0F}, {0.659F, 0.722F, 0.773F, 1.0F},
+        {0.459F, 0.529F, 0.588F, 1.0F}, {0.141F, 0.220F, 0.271F, 1.0F},
+        {0.145F, 0.741F, 0.914F, 1.0F}, {0.145F, 0.741F, 0.914F, 1.0F},
         {0.831F, 0.651F, 0.471F, 1.0F}, {0.133F, 0.773F, 0.369F, 1.0F},
         {0.961F, 0.620F, 0.043F, 1.0F}, {0.937F, 0.267F, 0.267F, 1.0F},
         {0.008F, 0.518F, 0.780F, 1.0F}, {0.545F, 0.361F, 0.965F, 0.20F},
@@ -2570,6 +2593,126 @@ std::optional<editor::SelectionOperation> selection_operation_for_native_pointer
     return editor::SelectionOperation::replace;
 }
 
+namespace {
+
+struct ProjectedTriangleSample final {
+    std::array<double, 3U> source_weights{};
+    double camera_depth = 0.0;
+};
+
+core::Result<std::optional<ProjectedTriangleSample>> sample_projected_triangle(
+    const SculptViewportTriangle& triangle,
+    core::Vec2d screen_position) {
+    const core::Vec2d& a = triangle.screen_positions[0U];
+    const core::Vec2d& b = triangle.screen_positions[1U];
+    const core::Vec2d& c = triangle.screen_positions[2U];
+    const double denominator = (b.y - c.y) * (a.x - c.x) +
+        (c.x - b.x) * (a.y - c.y);
+    if (!std::isfinite(denominator)) {
+        return core::Result<std::optional<ProjectedTriangleSample>>::failure(validation(
+            "viewport surface projection produced a non-finite triangle"));
+    }
+    if (std::abs(denominator) <= 1.0e-12) {
+        return core::Result<std::optional<ProjectedTriangleSample>>::success(std::nullopt);
+    }
+    const double first = ((b.y - c.y) * (screen_position.x - c.x) +
+        (c.x - b.x) * (screen_position.y - c.y)) / denominator;
+    const double second = ((c.y - a.y) * (screen_position.x - c.x) +
+        (a.x - c.x) * (screen_position.y - c.y)) / denominator;
+    const double third = 1.0 - first - second;
+    constexpr double barycentric_tolerance = 1.0e-10;
+    if (!std::isfinite(first) || !std::isfinite(second) || !std::isfinite(third)) {
+        return core::Result<std::optional<ProjectedTriangleSample>>::failure(validation(
+            "viewport surface projection produced non-finite barycentric coordinates"));
+    }
+    if (first < -barycentric_tolerance || second < -barycentric_tolerance ||
+        third < -barycentric_tolerance) {
+        return core::Result<std::optional<ProjectedTriangleSample>>::success(std::nullopt);
+    }
+
+    std::array<double, 3U> screen_weights{
+        std::clamp(first, 0.0, 1.0),
+        std::clamp(second, 0.0, 1.0),
+        std::clamp(third, 0.0, 1.0)};
+    const double screen_total = screen_weights[0U] + screen_weights[1U] +
+        screen_weights[2U];
+    if (!std::isfinite(screen_total) || screen_total <= 0.0) {
+        return core::Result<std::optional<ProjectedTriangleSample>>::failure(validation(
+            "viewport surface hit produced invalid barycentric coordinates"));
+    }
+    for (double& weight : screen_weights) weight /= screen_total;
+
+    double depth = 0.0;
+    if (triangle.perspective_correct) {
+        double reciprocal_depth_sum = 0.0;
+        for (std::size_t index = 0U; index < screen_weights.size(); ++index) {
+            const double view_depth = -triangle.camera_depth[index];
+            if (!std::isfinite(view_depth) || view_depth <= 0.0) {
+                return core::Result<std::optional<ProjectedTriangleSample>>::failure(validation(
+                    "perspective viewport triangle has a non-positive view depth"));
+            }
+            screen_weights[index] /= view_depth;
+            reciprocal_depth_sum += screen_weights[index];
+        }
+        if (!std::isfinite(reciprocal_depth_sum) || reciprocal_depth_sum <= 0.0) {
+            return core::Result<std::optional<ProjectedTriangleSample>>::failure(validation(
+                "perspective viewport hit produced invalid reciprocal depth"));
+        }
+        for (double& weight : screen_weights) weight /= reciprocal_depth_sum;
+        depth = -1.0 / reciprocal_depth_sum;
+    } else {
+        depth = triangle.camera_depth[0U] * screen_weights[0U] +
+            triangle.camera_depth[1U] * screen_weights[1U] +
+            triangle.camera_depth[2U] * screen_weights[2U];
+    }
+    if (!std::isfinite(depth)) {
+        return core::Result<std::optional<ProjectedTriangleSample>>::failure(validation(
+            "viewport surface hit produced a non-finite camera depth"));
+    }
+    std::array<double, 3U> source_weights{};
+    for (std::size_t projected_corner = 0U;
+         projected_corner < screen_weights.size(); ++projected_corner) {
+        double mapping_total = 0.0;
+        for (std::size_t source_corner = 0U;
+             source_corner < source_weights.size(); ++source_corner) {
+            const double mapping =
+                triangle.screen_source_weights[projected_corner][source_corner];
+            if (!std::isfinite(mapping) || mapping < -barycentric_tolerance ||
+                mapping > 1.0 + barycentric_tolerance) {
+                return core::Result<std::optional<ProjectedTriangleSample>>::failure(validation(
+                    "viewport surface triangle has invalid clipped-source weights"));
+            }
+            mapping_total += mapping;
+            source_weights[source_corner] +=
+                screen_weights[projected_corner] * mapping;
+        }
+        if (!std::isfinite(mapping_total) ||
+            std::abs(mapping_total - 1.0) > 1.0e-8) {
+            return core::Result<std::optional<ProjectedTriangleSample>>::failure(validation(
+                "viewport surface triangle has a non-normalized clipped-source mapping"));
+        }
+    }
+    double source_total = 0.0;
+    for (double& weight : source_weights) {
+        if (!std::isfinite(weight) || weight < -barycentric_tolerance ||
+            weight > 1.0 + barycentric_tolerance) {
+            return core::Result<std::optional<ProjectedTriangleSample>>::failure(validation(
+                "viewport surface hit produced invalid source weights"));
+        }
+        weight = std::clamp(weight, 0.0, 1.0);
+        source_total += weight;
+    }
+    if (!std::isfinite(source_total) || source_total <= 0.0) {
+        return core::Result<std::optional<ProjectedTriangleSample>>::failure(validation(
+            "viewport surface hit produced an empty source mapping"));
+    }
+    for (double& weight : source_weights) weight /= source_total;
+    return core::Result<std::optional<ProjectedTriangleSample>>::success(
+        ProjectedTriangleSample{source_weights, depth});
+}
+
+} // namespace
+
 core::Result<production::SculptStrokeSample> sample_sculpt_viewport_surface(
     std::span<const SculptViewportTriangle> triangles,
     scene::ObjectId object,
@@ -2601,41 +2744,14 @@ core::Result<production::SculptStrokeSample> sample_sculpt_viewport_surface(
             }
         }
 
-        const core::Vec2d& a = triangle.screen_positions[0];
-        const core::Vec2d& b = triangle.screen_positions[1];
-        const core::Vec2d& c = triangle.screen_positions[2];
-        const double denominator = (b.y - c.y) * (a.x - c.x) +
-            (c.x - b.x) * (a.y - c.y);
-        if (!std::isfinite(denominator) || std::abs(denominator) <= 1.0e-12) continue;
-        const double first = ((b.y - c.y) * (screen_position.x - c.x) +
-            (c.x - b.x) * (screen_position.y - c.y)) / denominator;
-        const double second = ((c.y - a.y) * (screen_position.x - c.x) +
-            (a.x - c.x) * (screen_position.y - c.y)) / denominator;
-        const double third = 1.0 - first - second;
-        constexpr double barycentric_tolerance = 1.0e-10;
-        if (!std::isfinite(first) || !std::isfinite(second) || !std::isfinite(third) ||
-            first < -barycentric_tolerance || second < -barycentric_tolerance ||
-            third < -barycentric_tolerance) {
-            continue;
+        const auto projected_sample = sample_projected_triangle(triangle, screen_position);
+        if (!projected_sample) {
+            return core::Result<production::SculptStrokeSample>::failure(
+                projected_sample.error());
         }
-
-        std::array<double, 3> weights{
-            std::clamp(first, 0.0, 1.0),
-            std::clamp(second, 0.0, 1.0),
-            std::clamp(third, 0.0, 1.0)};
-        const double total = weights[0] + weights[1] + weights[2];
-        if (!std::isfinite(total) || total <= 0.0) {
-            return core::Result<production::SculptStrokeSample>::failure(validation(
-                "Sculpt viewport hit produced invalid barycentric coordinates"));
-        }
-        for (double& weight : weights) weight /= total;
-        const double depth = triangle.camera_depth[0] * weights[0] +
-            triangle.camera_depth[1] * weights[1] +
-            triangle.camera_depth[2] * weights[2];
-        if (!std::isfinite(depth)) {
-            return core::Result<production::SculptStrokeSample>::failure(validation(
-                "Sculpt viewport hit produced a non-finite camera depth"));
-        }
+        if (!projected_sample.value().has_value()) continue;
+        const auto& weights = projected_sample.value()->source_weights;
+        const double depth = projected_sample.value()->camera_depth;
         const std::array<std::uint64_t, 4> identity{
             triangle.face.value,
             triangle.vertices[0].value,
@@ -2787,7 +2903,8 @@ core::Result<std::vector<std::vector<core::Vec3d>>> resolve_decal_projection_out
 
 core::Result<ProjectedSurfaceHitResolution> resolve_frontmost_viewport_surface(
     std::span<const SculptViewportTriangle> triangles,
-    core::Vec2d screen_position) {
+    core::Vec2d screen_position,
+    bool allow_same_object_face_ties) {
     if (!screen_position.finite()) {
         return core::Result<ProjectedSurfaceHitResolution>::failure(invalid(
             "viewport surface pick requires a finite screen point"));
@@ -2815,41 +2932,14 @@ core::Result<ProjectedSurfaceHitResolution> resolve_frontmost_viewport_surface(
             }
         }
 
-        const core::Vec2d& a = triangle.screen_positions[0U];
-        const core::Vec2d& b = triangle.screen_positions[1U];
-        const core::Vec2d& c = triangle.screen_positions[2U];
-        const double denominator = (b.y - c.y) * (a.x - c.x) +
-            (c.x - b.x) * (a.y - c.y);
-        if (!std::isfinite(denominator) || std::abs(denominator) <= 1.0e-12) continue;
-        const double first = ((b.y - c.y) * (screen_position.x - c.x) +
-            (c.x - b.x) * (screen_position.y - c.y)) / denominator;
-        const double second = ((c.y - a.y) * (screen_position.x - c.x) +
-            (a.x - c.x) * (screen_position.y - c.y)) / denominator;
-        const double third = 1.0 - first - second;
-        constexpr double barycentric_tolerance = 1.0e-10;
-        if (!std::isfinite(first) || !std::isfinite(second) || !std::isfinite(third) ||
-            first < -barycentric_tolerance || second < -barycentric_tolerance ||
-            third < -barycentric_tolerance) {
-            continue;
+        const auto projected_sample = sample_projected_triangle(triangle, screen_position);
+        if (!projected_sample) {
+            return core::Result<ProjectedSurfaceHitResolution>::failure(
+                projected_sample.error());
         }
-
-        std::array<double, 3U> weights{
-            std::clamp(first, 0.0, 1.0),
-            std::clamp(second, 0.0, 1.0),
-            std::clamp(third, 0.0, 1.0)};
-        const double total = weights[0U] + weights[1U] + weights[2U];
-        if (!std::isfinite(total) || total <= 0.0) {
-            return core::Result<ProjectedSurfaceHitResolution>::failure(validation(
-                "viewport surface hit produced invalid barycentric coordinates"));
-        }
-        for (double& weight : weights) weight /= total;
-        const double depth = triangle.camera_depth[0U] * weights[0U] +
-            triangle.camera_depth[1U] * weights[1U] +
-            triangle.camera_depth[2U] * weights[2U];
-        if (!std::isfinite(depth)) {
-            return core::Result<ProjectedSurfaceHitResolution>::failure(validation(
-                "viewport surface hit produced non-finite camera depth"));
-        }
+        if (!projected_sample.value().has_value()) continue;
+        const auto& weights = projected_sample.value()->source_weights;
+        const double depth = projected_sample.value()->camera_depth;
         const double depth_tolerance = 1.0e-12 * std::max({
             1.0, std::abs(depth), best.has_value() ? std::abs(best->camera_depth) : 0.0});
         const bool nearer = !best.has_value() ||
@@ -2885,10 +2975,15 @@ core::Result<ProjectedSurfaceHitResolution> resolve_frontmost_viewport_surface(
         }
 
         if (std::abs(depth - best->camera_depth) > depth_tolerance) continue;
-        if (triangle.object != best->object ||
-            triangle.face.value != best_identity[1U]) {
+        if (triangle.object != best->object) {
             ambiguous_source_tie = true;
             continue;
+        }
+        if (triangle.face.value != best_identity[1U]) {
+            if (!allow_same_object_face_ties) {
+                ambiguous_source_tie = true;
+                continue;
+            }
         }
         const std::array<std::uint64_t, 5U> identity{
             triangle.object.value,
@@ -2927,6 +3022,201 @@ core::Result<ProjectedSurfaceHitResolution> resolve_frontmost_viewport_surface(
         return core::Result<ProjectedSurfaceHitResolution>::success(std::move(*best));
     }
     return core::Result<ProjectedSurfaceHitResolution>::success(std::move(*best));
+}
+
+core::Result<ProjectedSurfaceDepthIndex> build_projected_surface_depth_index(
+    std::span<const SculptViewportTriangle> triangles,
+    core::Vec2d screen_origin,
+    core::Vec2d viewport_extent,
+    std::size_t max_references) {
+    using Output = core::Result<ProjectedSurfaceDepthIndex>;
+    if (!screen_origin.finite() || std::abs(screen_origin.x) > 1.0e9 ||
+        std::abs(screen_origin.y) > 1.0e9 || !viewport_extent.finite() ||
+        viewport_extent.x <= 0.0 || viewport_extent.y <= 0.0 ||
+        viewport_extent.x > 1.0e9 || viewport_extent.y > 1.0e9 ||
+        triangles.size() > std::numeric_limits<std::uint32_t>::max() ||
+        max_references > kMaxProjectedSurfaceDepthReferences) {
+        return Output::failure(validation(
+            "projected surface depth index requires bounded viewport and triangle inputs"));
+    }
+    const double right = screen_origin.x + viewport_extent.x;
+    const double bottom = screen_origin.y + viewport_extent.y;
+    const double columns_value = std::ceil(
+        viewport_extent.x / kProjectedSurfaceDepthTilePixels);
+    const double rows_value = std::ceil(
+        viewport_extent.y / kProjectedSurfaceDepthTilePixels);
+    if (!std::isfinite(right) || !std::isfinite(bottom) ||
+        !std::isfinite(columns_value) || !std::isfinite(rows_value) ||
+        columns_value < 1.0 || rows_value < 1.0 ||
+        columns_value > static_cast<double>(kMaxProjectedSurfaceDepthBuckets) ||
+        rows_value > static_cast<double>(kMaxProjectedSurfaceDepthBuckets) ||
+        columns_value * rows_value >
+            static_cast<double>(kMaxProjectedSurfaceDepthBuckets)) {
+        return Output::failure(core::Diagnostic(core::ErrorCode::unsupported,
+            "projected surface depth index exceeds its viewport bucket bound"));
+    }
+
+    ProjectedSurfaceDepthIndex index;
+    index.screen_origin = screen_origin;
+    index.viewport_extent = viewport_extent;
+    index.columns = static_cast<std::uint32_t>(columns_value);
+    index.rows = static_cast<std::uint32_t>(rows_value);
+    index.source_triangle_count = triangles.size();
+    index.buckets.resize(static_cast<std::size_t>(index.columns) * index.rows);
+
+    const auto tile_coordinate = [](double coordinate, double origin,
+            std::uint32_t count) {
+        const double bounded = std::max(0.0, coordinate - origin);
+        const double tile = std::floor(bounded / kProjectedSurfaceDepthTilePixels);
+        return static_cast<std::uint32_t>(std::clamp(
+            tile, 0.0, static_cast<double>(count - 1U)));
+    };
+    for (std::size_t triangle_index = 0U;
+         triangle_index < triangles.size(); ++triangle_index) {
+        const SculptViewportTriangle& triangle = triangles[triangle_index];
+        if (triangle.object.value == 0U || triangle.face.value == 0U ||
+            triangle.vertices[0U].value == 0U || triangle.vertices[1U].value == 0U ||
+            triangle.vertices[2U].value == 0U ||
+            triangle.vertices[0U] == triangle.vertices[1U] ||
+            triangle.vertices[0U] == triangle.vertices[2U] ||
+            triangle.vertices[1U] == triangle.vertices[2U]) {
+            return Output::failure(validation(
+                "projected surface depth index found invalid source identity"));
+        }
+        double minimum_x = std::numeric_limits<double>::infinity();
+        double minimum_y = std::numeric_limits<double>::infinity();
+        double maximum_x = -std::numeric_limits<double>::infinity();
+        double maximum_y = -std::numeric_limits<double>::infinity();
+        for (std::size_t corner = 0U; corner < triangle.screen_positions.size(); ++corner) {
+            const auto screen = triangle.screen_positions[corner];
+            if (!screen.finite() || std::abs(screen.x) > 1.0e9 ||
+                std::abs(screen.y) > 1.0e9 ||
+                !triangle.local_positions[corner].finite() ||
+                !std::isfinite(triangle.camera_depth[corner])) {
+                return Output::failure(validation(
+                    "projected surface depth index found non-finite triangle data"));
+            }
+            if (triangle.perspective_correct && triangle.camera_depth[corner] >= 0.0) {
+                return Output::failure(validation(
+                    "perspective depth index found a triangle outside the camera"));
+            }
+            double mapping_total = 0.0;
+            for (const double mapping : triangle.screen_source_weights[corner]) {
+                if (!std::isfinite(mapping) || mapping < -1.0e-10 ||
+                    mapping > 1.0 + 1.0e-10) {
+                    return Output::failure(validation(
+                        "projected surface depth index found invalid clipped-source weights"));
+                }
+                mapping_total += mapping;
+            }
+            if (!std::isfinite(mapping_total) ||
+                std::abs(mapping_total - 1.0) > 1.0e-8) {
+                return Output::failure(validation(
+                    "projected surface depth index found non-normalized source weights"));
+            }
+            minimum_x = std::min(minimum_x, screen.x);
+            minimum_y = std::min(minimum_y, screen.y);
+            maximum_x = std::max(maximum_x, screen.x);
+            maximum_y = std::max(maximum_y, screen.y);
+        }
+        if (maximum_x < screen_origin.x || minimum_x > right ||
+            maximum_y < screen_origin.y || minimum_y > bottom) {
+            continue;
+        }
+        const std::uint32_t first_column = tile_coordinate(
+            std::max(minimum_x, screen_origin.x), screen_origin.x, index.columns);
+        const std::uint32_t last_column = tile_coordinate(
+            std::min(maximum_x, right), screen_origin.x, index.columns);
+        const std::uint32_t first_row = tile_coordinate(
+            std::max(minimum_y, screen_origin.y), screen_origin.y, index.rows);
+        const std::uint32_t last_row = tile_coordinate(
+            std::min(maximum_y, bottom), screen_origin.y, index.rows);
+        for (std::uint32_t row = first_row; row <= last_row; ++row) {
+            for (std::uint32_t column = first_column;
+                 column <= last_column; ++column) {
+                if (index.reference_count >= max_references) {
+                    return Output::failure(core::Diagnostic(core::ErrorCode::unsupported,
+                        "projected surface depth index exceeds its triangle-reference budget"));
+                }
+                const std::size_t bucket = static_cast<std::size_t>(row) *
+                    index.columns + column;
+                index.buckets[bucket].push_back(
+                    static_cast<std::uint32_t>(triangle_index));
+                ++index.reference_count;
+            }
+        }
+    }
+    return Output::success(std::move(index));
+}
+
+core::Result<ProjectedSurfaceDepthQuery> resolve_frontmost_viewport_depth(
+    std::span<const SculptViewportTriangle> triangles,
+    const ProjectedSurfaceDepthIndex& index,
+    core::Vec2d screen_position,
+    std::size_t max_candidate_checks) {
+    using Output = core::Result<ProjectedSurfaceDepthQuery>;
+    if (!screen_position.finite() || !index.screen_origin.finite() ||
+        !index.viewport_extent.finite() || index.viewport_extent.x <= 0.0 ||
+        index.viewport_extent.y <= 0.0 || index.viewport_extent.x > 1.0e9 ||
+        index.viewport_extent.y > 1.0e9 || std::abs(index.screen_origin.x) > 1.0e9 ||
+        std::abs(index.screen_origin.y) > 1.0e9 || index.columns == 0U || index.rows == 0U ||
+        index.columns > kMaxProjectedSurfaceDepthBuckets ||
+        index.rows > kMaxProjectedSurfaceDepthBuckets ||
+        static_cast<std::size_t>(index.columns) >
+            kMaxProjectedSurfaceDepthBuckets / index.rows ||
+        index.source_triangle_count != triangles.size() ||
+        static_cast<std::size_t>(index.columns) * index.rows != index.buckets.size() ||
+        index.buckets.size() > kMaxProjectedSurfaceDepthBuckets ||
+        index.reference_count > kMaxProjectedSurfaceDepthReferences) {
+        return Output::failure(validation(
+            "projected surface depth query does not match its captured index"));
+    }
+    const double right = index.screen_origin.x + index.viewport_extent.x;
+    const double bottom = index.screen_origin.y + index.viewport_extent.y;
+    if (!std::isfinite(right) || !std::isfinite(bottom)) {
+        return Output::failure(validation(
+            "projected surface depth index has invalid viewport bounds"));
+    }
+    if (screen_position.x < index.screen_origin.x || screen_position.x > right ||
+        screen_position.y < index.screen_origin.y || screen_position.y > bottom) {
+        return Output::success(ProjectedSurfaceDepthQuery{});
+    }
+    const auto tile_coordinate = [](double coordinate, double origin,
+            std::uint32_t count) {
+        const double bounded = std::max(0.0, coordinate - origin);
+        const double tile = std::floor(bounded / kProjectedSurfaceDepthTilePixels);
+        return static_cast<std::uint32_t>(std::clamp(
+            tile, 0.0, static_cast<double>(count - 1U)));
+    };
+    const std::uint32_t column = tile_coordinate(
+        screen_position.x, index.screen_origin.x, index.columns);
+    const std::uint32_t row = tile_coordinate(
+        screen_position.y, index.screen_origin.y, index.rows);
+    const auto& candidates = index.buckets[
+        static_cast<std::size_t>(row) * index.columns + column];
+    if (candidates.size() > index.reference_count ||
+        candidates.size() > max_candidate_checks) {
+        return Output::failure(core::Diagnostic(core::ErrorCode::unsupported,
+            "projected surface depth query exceeds its candidate-check budget"));
+    }
+    ProjectedSurfaceDepthQuery resolution;
+    resolution.candidates_checked = candidates.size();
+    for (const std::uint32_t candidate : candidates) {
+        if (candidate >= triangles.size()) {
+            return Output::failure(validation(
+                "projected surface depth index contains an invalid triangle reference"));
+        }
+        const auto sample = sample_projected_triangle(
+            triangles[candidate], screen_position);
+        if (!sample) return Output::failure(sample.error());
+        if (!sample.value().has_value()) continue;
+        const double depth = sample.value()->camera_depth;
+        if (!resolution.camera_depth.has_value() ||
+            depth > *resolution.camera_depth) {
+            resolution.camera_depth = depth;
+        }
+    }
+    return Output::success(std::move(resolution));
 }
 
 core::Result<std::vector<production::SculptStrokeSample>> sample_sculpt_viewport_stroke(
@@ -3352,6 +3642,60 @@ core::Result<production::DecalPlacement> UiController::make_decal_placement(
         minimum_normal_dot, expected_project_revision);
 }
 
+core::Result<application::SetDecalPlacementAction>
+UiController::prepare_viewport_decal_placement(
+    const production::DecalPlacement& placement,
+    const ViewportDecalObservation& observation,
+    ViewportSceneSource current_source) const {
+    using ActionResult = core::Result<application::SetDecalPlacementAction>;
+    if (observation.source != ViewportSceneSource::live_project ||
+        current_source != ViewportSceneSource::live_project) {
+        return ActionResult::failure(unsupported(
+            "viewport decal placement requires the live project source"));
+    }
+    const auto current = snapshot();
+    if (observation.project_generation != current.project_generation ||
+        observation.project_revision != current.project_revision) {
+        return ActionResult::failure(stale(
+            "viewport decal placement source belongs to a stale project snapshot"));
+    }
+    const auto& target = observation.target;
+    if (current.workspace_kind != Workspace::model ||
+        current.selection.mode != editor::SelectionMode::object ||
+        current.selection.objects.size() != 1U ||
+        current.selection.objects.front() != target.object) {
+        return ActionResult::failure(stale(
+            "viewport decal placement selection or workspace changed"));
+    }
+    const auto object = std::find_if(current.objects.begin(), current.objects.end(),
+        [&target](const auto& candidate) {
+            return candidate.object.id == target.object;
+        });
+    if (object == current.objects.end() || !object->object.visible ||
+        object->object.locked || !target.mesh || !target.mesh_asset.has_value() ||
+        object->object.mesh_asset != target.mesh_asset ||
+        *target.mesh_asset != placement.target_mesh_asset) {
+        return ActionResult::failure(stale(
+            "viewport decal placement no longer has an eligible displayed target"));
+    }
+    const auto projection = preview_decal_placement(placement, observation.project_revision);
+    if (!projection) return ActionResult::failure(projection.error());
+    const auto exact_source = decal_placement_source_mesh(
+        placement, observation.project_revision);
+    if (!exact_source) return ActionResult::failure(exact_source.error());
+    const auto outline = resolve_decal_projection_outline(
+        placement, projection.value(), *target.mesh_asset, target.source_revision,
+        exact_source.value(), *target.mesh);
+    if (!outline) return ActionResult::failure(outline.error());
+
+    application::SetDecalPlacementAction action;
+    action.expected_project_generation = observation.project_generation;
+    action.expected_project_revision = observation.project_revision;
+    action.expected_placement_revision = core::Revision{};
+    action.placement = placement;
+    return ActionResult::success(std::move(action));
+}
+
 core::Result<application::DispatchReceipt> UiController::dispatch(
     const application::ApplicationAction& action) {
     return dispatch_with_category(action, OperationCategory::committed_command);
@@ -3374,6 +3718,17 @@ core::Result<application::MeshCleanupReview> UiController::review_mesh_cleanup(
     std::vector<geometry::VertexId> candidates,
     application::MeshCleanupOptions options) const {
     return session_.review_mesh_cleanup(object, std::move(candidates), options);
+}
+
+core::Result<application::MeshCleanupReview> UiController::review_mesh_cleanup_issues(
+    scene::ObjectId object,
+    application::MeshCleanupOptions options) const {
+    return session_.review_mesh_cleanup_issues(object, options);
+}
+
+core::Result<application::MeshCleanupIssueReport> UiController::inspect_mesh_cleanup_issues(
+    scene::ObjectId object) const {
+    return session_.inspect_mesh_cleanup_issues(object);
 }
 
 core::Result<application::DispatchReceipt> UiController::commit_mesh_cleanup(
@@ -5779,9 +6134,2800 @@ core::Result<application::DispatchReceipt> UiController::accept_agent_plan() {
             "there is no speculative agent result to accept"));
     }
     auto result = application::HumanApplicationAccess::accept_agent_task(*agent_task_);
-    if (result) record_operation(result.value(), OperationCategory::provider);
-    else record_ui_problem(result.error().with_context("agent result acceptance"));
+    if (result) {
+        clear_agent_project_merge();
+        record_operation(result.value(), OperationCategory::provider);
+    } else {
+        record_ui_problem(result.error().with_context("agent result acceptance"));
+    }
     return result;
+}
+
+core::Result<AgentProjectMergeView> UiController::compare_agent_project_merge() {
+    if (!agent_task_.has_value()) {
+        return core::Result<AgentProjectMergeView>::failure(invalid_state(
+            "there is no retained agent task to compare against the current project"));
+    }
+    const auto compared = agent_task_->compare_current_project_merge();
+    if (!compared) {
+        return core::Result<AgentProjectMergeView>::failure(compared.error());
+    }
+    const auto current_diff = agent_task_->project_merge_source_diff(
+        compared.value(), agent::ProjectMergeSource::left);
+    if (!current_diff) {
+        return core::Result<AgentProjectMergeView>::failure(current_diff.error());
+    }
+    const auto speculative_diff = agent_task_->project_merge_source_diff(
+        compared.value(), agent::ProjectMergeSource::right);
+    if (!speculative_diff) {
+        return core::Result<AgentProjectMergeView>::failure(speculative_diff.error());
+    }
+    const auto summarize_diff = [](const agent::ProjectDiff& diff) {
+        return AgentProjectMergeDiffSummary{
+            diff.changed_object_count(),
+            diff.changed_mesh_count(),
+            diff.changed_material_binding_count(),
+            diff.changed_material_source_count(),
+            diff.changed_texture_source_count(),
+            diff.project_metadata.changed_field_count,
+            diff.has_unclassified_source_changes(),
+            diff.source_projection_is_partial(),
+            diff.changed_spatial_field_count(),
+            diff.changed_source_asset_record_count(),
+            diff.connection_port_graph.changed_port_count,
+            diff.connection_port_graph.changed_edge_count,
+            diff.authoring_standards.changed_record_count,
+            diff.world_model.changed ? 1U : 0U,
+            diff.scientific_model.changed ? 1U : 0U,
+            diff.procedural_sources.changed_record_count,
+            diff.biological_authoring_sources.changed_record_count,
+            diff.rig_module_template_sources.changed_record_count,
+            diff.decal_placement_sources.changed_record_count,
+            diff.pose_libraries.changed_record_count,
+            diff.kinematic_graphs.changed_record_count,
+            diff.edit_receipts.changed_record_count,
+            diff.instance_receipts.changed_record_count,
+            diff.mesh_authoring_sources.changed_record_count,
+            diff.semantic_sidecar_changed ? 1U : 0U,
+            diff.engineering_changed ? 1U : 0U,
+            diff.condition_changed ? 1U : 0U};
+    };
+    const auto compare_details = [](
+            const agent::ProjectDiff& current,
+            const agent::ProjectDiff& speculative) {
+        constexpr std::size_t kMaxRowsPerSide = 64U;
+        AgentProjectMergeDetails result;
+        std::map<std::string, AgentProjectMergeDetailRow> rows;
+        std::size_t current_rows = 0U;
+        std::size_t speculative_rows = 0U;
+        const auto append_detail = [&](bool is_current, std::string record,
+                                       std::string changes) {
+            auto found = rows.find(record);
+            if (found == rows.end()) {
+                auto& count = is_current ? current_rows : speculative_rows;
+                if (count >= kMaxRowsPerSide) {
+                    if (is_current) result.current_truncated = true;
+                    else result.speculative_truncated = true;
+                    return;
+                }
+                AgentProjectMergeDetailRow row;
+                row.record = record;
+                auto [inserted, unused] = rows.emplace(record, std::move(row));
+                static_cast<void>(unused);
+                found = inserted;
+            }
+            std::string& side_changes = is_current
+                ? found->second.current_changes : found->second.speculative_changes;
+            if (side_changes.empty()) {
+                auto& count = is_current ? current_rows : speculative_rows;
+                if (count >= kMaxRowsPerSide) {
+                    if (is_current) result.current_truncated = true;
+                    else result.speculative_truncated = true;
+                    return;
+                }
+                side_changes = std::move(changes);
+                ++count;
+            }
+        };
+        const auto summarize_object = [](const agent::ObjectChange& change) {
+            std::string fields;
+            const auto add = [&fields](bool changed, std::string_view name) {
+                if (!changed) return;
+                if (!fields.empty()) fields += ", ";
+                fields += name;
+            };
+            if (change.added) return std::string{"added"};
+            if (change.removed) return std::string{"removed"};
+            add(change.name_changed, "name");
+            add(change.transform_changed, "transform");
+            add(change.parent_changed, "parent");
+            add(change.mesh_binding_changed, "mesh binding");
+            add(change.mesh_content_changed, "mesh content");
+            add(change.visibility_changed, "visibility");
+            add(change.lock_changed, "lock state");
+            return fields.empty() ? std::string{"record changed"} : fields;
+        };
+        const auto summarize_mesh = [](const agent::MeshChange& change) {
+            if (change.added) return std::string{"added"};
+            if (change.removed) return std::string{"removed"};
+            std::string fields;
+            const auto add_count = [&fields](std::size_t count, std::string_view name) {
+                if (count == 0U) return;
+                if (!fields.empty()) fields += "; ";
+                fields += std::to_string(count);
+                fields += ' ';
+                fields += name;
+            };
+            add_count(change.vertices.size(), "vertex changes");
+            add_count(change.faces.size(), "face changes");
+            add_count(change.attribute_layers.size(), "attribute layers");
+            add_count(change.uv_sets.size(), "UV sets");
+            if (fields.empty()) fields = "source revision/content changed";
+            fields += " · revision ";
+            fields += std::to_string(change.before_revision.value());
+            fields += " → ";
+            fields += std::to_string(change.after_revision.value());
+            fields += " · vertices ";
+            fields += std::to_string(change.before_vertices);
+            fields += " → ";
+            fields += std::to_string(change.after_vertices);
+            fields += " · faces ";
+            fields += std::to_string(change.before_faces);
+            fields += " → ";
+            fields += std::to_string(change.after_faces);
+            return fields;
+        };
+        const auto summarize_fields = [](
+                std::initializer_list<std::pair<bool, std::string_view>> fields) {
+            std::string result;
+            for (const auto& [changed, name] : fields) {
+                if (!changed) continue;
+                if (!result.empty()) result += ", ";
+                result += name;
+            }
+            return result.empty() ? std::string{"record changed"} : result;
+        };
+        const auto presence = [](bool added, bool removed) -> std::string {
+            if (added) return "added";
+            if (removed) return "removed";
+            return {};
+        };
+        const auto digest_prefix = [](
+                const std::optional<assets::Sha256Digest>& digest) {
+            return digest.has_value() ? digest->hex().substr(0U, 12U)
+                                      : std::string{"(absent)"};
+        };
+        const auto optional_id_text = [](const auto& value) {
+            return value.has_value() ? std::to_string(*value) : std::string{"(absent)"};
+        };
+        const auto revision_text = [](const std::optional<core::Revision>& revision) {
+            return revision.has_value()
+                ? std::to_string(revision->value()) : std::string{"(absent)"};
+        };
+        const auto sampler_address_text = [](project::SamplerAddressMode mode) {
+            switch (mode) {
+            case project::SamplerAddressMode::repeat: return std::string{"repeat"};
+            case project::SamplerAddressMode::mirrored_repeat:
+                return std::string{"mirrored repeat"};
+            case project::SamplerAddressMode::clamp_to_edge:
+                return std::string{"clamp to edge"};
+            }
+            return std::string{"(invalid)"};
+        };
+        const auto sampler_filter_text = [](project::SamplerFilter filter) {
+            switch (filter) {
+            case project::SamplerFilter::nearest: return std::string{"nearest"};
+            case project::SamplerFilter::linear: return std::string{"linear"};
+            }
+            return std::string{"(invalid)"};
+        };
+        const auto texture_channel_text = [](render::TextureChannel channel) {
+            switch (channel) {
+            case render::TextureChannel::red: return std::string{"red"};
+            case render::TextureChannel::green: return std::string{"green"};
+            case render::TextureChannel::blue: return std::string{"blue"};
+            case render::TextureChannel::alpha: return std::string{"alpha"};
+            case render::TextureChannel::one_minus_red: return std::string{"1-red"};
+            case render::TextureChannel::one_minus_green: return std::string{"1-green"};
+            case render::TextureChannel::one_minus_blue: return std::string{"1-blue"};
+            case render::TextureChannel::one_minus_alpha: return std::string{"1-alpha"};
+            case render::TextureChannel::constant_zero: return std::string{"zero"};
+            case render::TextureChannel::constant_one: return std::string{"one"};
+            }
+            return std::string{"(invalid)"};
+        };
+        const auto texture_interpretation_text = [](render::TextureInterpretation value) {
+            switch (value) {
+            case render::TextureInterpretation::asset: return std::string{"asset"};
+            case render::TextureInterpretation::linear: return std::string{"linear"};
+            case render::TextureInterpretation::srgb: return std::string{"sRGB"};
+            }
+            return std::string{"(invalid)"};
+        };
+        const auto normal_convention_text = [](render::NormalConvention value) {
+            switch (value) {
+            case render::NormalConvention::directx_y_minus:
+                return std::string{"DirectX Y-"};
+            case render::NormalConvention::opengl_y_plus:
+                return std::string{"OpenGL Y+"};
+            }
+            return std::string{"(invalid)"};
+        };
+        const auto alpha_mode_text = [](render::AlphaMode value) {
+            switch (value) {
+            case render::AlphaMode::opaque: return std::string{"opaque"};
+            case render::AlphaMode::masked: return std::string{"masked"};
+            case render::AlphaMode::blended: return std::string{"blended"};
+            }
+            return std::string{"(invalid)"};
+        };
+        const auto graph_node_kind_text = [](project::MaterialGraphNodeKind kind) {
+            switch (kind) {
+            case project::MaterialGraphNodeKind::constant_scalar:
+                return std::string{"constant scalar"};
+            case project::MaterialGraphNodeKind::constant_color:
+                return std::string{"constant color"};
+            case project::MaterialGraphNodeKind::parameter_scalar:
+                return std::string{"scalar parameter"};
+            case project::MaterialGraphNodeKind::parameter_color:
+                return std::string{"color parameter"};
+            case project::MaterialGraphNodeKind::texture_sample:
+                return std::string{"texture sample"};
+            case project::MaterialGraphNodeKind::surface_input:
+                return std::string{"surface input"};
+            case project::MaterialGraphNodeKind::add: return std::string{"add"};
+            case project::MaterialGraphNodeKind::multiply: return std::string{"multiply"};
+            case project::MaterialGraphNodeKind::mix: return std::string{"mix"};
+            case project::MaterialGraphNodeKind::unsupported:
+                return std::string{"unsupported"};
+            }
+            return std::string{"(invalid)"};
+        };
+        const auto graph_value_type_text = [](project::MaterialGraphValueType type) {
+            switch (type) {
+            case project::MaterialGraphValueType::scalar: return std::string{"scalar"};
+            case project::MaterialGraphValueType::color: return std::string{"color"};
+            case project::MaterialGraphValueType::normal: return std::string{"normal"};
+            }
+            return std::string{"(invalid)"};
+        };
+        const auto graph_surface_input_text = [](project::MaterialSurfaceInput input) {
+            switch (input) {
+            case project::MaterialSurfaceInput::unknown: return std::string{"unknown"};
+            case project::MaterialSurfaceInput::curvature: return std::string{"curvature"};
+            case project::MaterialSurfaceInput::thickness: return std::string{"thickness"};
+            case project::MaterialSurfaceInput::contact: return std::string{"contact"};
+            case project::MaterialSurfaceInput::weathering: return std::string{"weathering"};
+            case project::MaterialSurfaceInput::edge_process:
+                return std::string{"edge process"};
+            case project::MaterialSurfaceInput::surface_domain:
+                return std::string{"surface domain"};
+            case project::MaterialSurfaceInput::material_stratigraphy:
+                return std::string{"material stratigraphy"};
+            case project::MaterialSurfaceInput::authored_mask:
+                return std::string{"authored mask"};
+            }
+            return std::string{"(invalid)"};
+        };
+        const auto attribute_type_text = [](attributes::AttributeType type) {
+            switch (type) {
+            case attributes::AttributeType::boolean: return std::string{"boolean"};
+            case attributes::AttributeType::int32: return std::string{"int32"};
+            case attributes::AttributeType::uint32: return std::string{"uint32"};
+            case attributes::AttributeType::float32: return std::string{"float32"};
+            case attributes::AttributeType::float64: return std::string{"float64"};
+            case attributes::AttributeType::vec2: return std::string{"vec2"};
+            case attributes::AttributeType::vec3: return std::string{"vec3"};
+            case attributes::AttributeType::vec4: return std::string{"vec4"};
+            case attributes::AttributeType::color4: return std::string{"color4"};
+            case attributes::AttributeType::string_id: return std::string{"string_id"};
+            case attributes::AttributeType::object_id: return std::string{"object_id"};
+            case attributes::AttributeType::vertex_id: return std::string{"vertex_id"};
+            }
+            return std::string{"unknown"};
+        };
+        const auto attribute_descriptor_text = [&attribute_type_text](
+                const std::optional<attributes::AttributeLayerDescriptor>& descriptor) {
+            if (!descriptor.has_value()) return std::string{"(absent)"};
+            return std::string{attributes::domain_name(descriptor->domain)} + "/" +
+                attribute_type_text(descriptor->type);
+        };
+        const auto bounded_source_label = [](std::string_view value) {
+            constexpr std::size_t kMaxSourceLabelBytes = 64U;
+            if (value.size() <= kMaxSourceLabelBytes) return std::string{value};
+            std::size_t end = kMaxSourceLabelBytes;
+            while (end > 0U && end < value.size() &&
+                (static_cast<unsigned char>(value[end]) & 0xc0U) == 0x80U) {
+                --end;
+            }
+            return std::string{value.substr(0U, end)} + "… (" +
+                std::to_string(value.size() - end) + " more bytes)";
+        };
+        const auto uv_descriptor_text = [&bounded_source_label](
+                const std::optional<attributes::UvSetDescriptor>& descriptor) {
+            if (!descriptor.has_value()) return std::string{"(absent)"};
+            return "name=" + bounded_source_label(descriptor->name) +
+                " · layer=" + bounded_source_label(descriptor->layer_id) +
+                " · editing=" + (descriptor->active_for_editing ? "yes" : "no") +
+                " · render=" + (descriptor->active_for_render ? "yes" : "no") +
+                " · lightmap=" + (descriptor->lightmap_candidate ? "yes" : "no") +
+                " · tile policy v" + std::to_string(descriptor->tile_policy_version);
+        };
+        const auto append_transition = [](
+                std::string& summary, std::string_view field,
+                const std::string& before, const std::string& after) {
+            summary += " · ";
+            summary += field;
+            summary += ": ";
+            summary += before;
+            summary += " → ";
+            summary += after;
+        };
+        const auto number_text = [](double value) {
+            std::array<char, 64U> buffer{};
+            const auto converted = std::to_chars(
+                buffer.data(), buffer.data() + buffer.size(),
+                value, std::chars_format::general);
+            if (converted.ec != std::errc{}) return std::string{"(unavailable)"};
+            return std::string(buffer.data(), converted.ptr);
+        };
+        const auto transform_value = [&number_text](const core::Transform& transform) {
+            return "T(" + number_text(transform.translation.x) + "," +
+                number_text(transform.translation.y) + "," +
+                number_text(transform.translation.z) + ") R(" +
+                number_text(transform.rotation.x) + "," +
+                number_text(transform.rotation.y) + "," +
+                number_text(transform.rotation.z) + "," +
+                number_text(transform.rotation.w) + ") S(" +
+                number_text(transform.scale.x) + "," +
+                number_text(transform.scale.y) + "," +
+                number_text(transform.scale.z) + ")";
+        };
+        const auto object_field_value = [](const auto& state, auto field_value) {
+            return state.has_value() ? field_value(*state) : std::string{"(absent)"};
+        };
+        const auto object_transform_value = [&transform_value](const agent::ObjectStateDetail& state) {
+            return transform_value(state.local_transform);
+        };
+        const auto object_parent_value = [](const agent::ObjectStateDetail& state) {
+            return state.parent.has_value()
+                ? "#" + std::to_string(state.parent->value) : std::string{"(none)"};
+        };
+        const auto object_mesh_value = [](const agent::ObjectStateDetail& state) {
+            return state.mesh_asset.has_value()
+                ? "#" + std::to_string(*state.mesh_asset) : std::string{"(none)"};
+        };
+        const auto vec2_text = [&number_text](core::Vec2d value) {
+            return "(" + number_text(value.x) + "," + number_text(value.y) + ")";
+        };
+        const auto vec3_text = [&number_text](core::Vec3d value) {
+            return "(" + number_text(value.x) + "," + number_text(value.y) + "," +
+                number_text(value.z) + ")";
+        };
+        const auto vec4_text = [&number_text](core::Vec4d value) {
+            return "(" + number_text(value.x) + "," + number_text(value.y) + "," +
+                number_text(value.z) + "," + number_text(value.w) + ")";
+        };
+        const auto texture_binding_text = [&vec2_text, &number_text,
+                &texture_channel_text, &texture_interpretation_text,
+                &normal_convention_text](const render::TextureRef& binding) {
+            if (binding == render::TextureRef{}) return std::string{"(none)"};
+            std::string channels;
+            for (std::size_t index = 0U; index < binding.channels.rgba.size(); ++index) {
+                if (index != 0U) channels += ",";
+                channels += texture_channel_text(binding.channels.rgba[index]);
+            }
+            return "asset #" + std::to_string(binding.asset) + " · UV #" +
+                std::to_string(binding.uv_set) + " · sampler #" +
+                std::to_string(binding.sampler) + " · offset=" +
+                vec2_text(binding.transform.offset) + " · scale=" +
+                vec2_text(binding.transform.scale) + " · rotation=" +
+                number_text(binding.transform.rotation) + " · pivot=" +
+                vec2_text(binding.transform.pivot) + " · channels=" + channels +
+                " · interpretation=" + texture_interpretation_text(binding.interpretation) +
+                " · normal=" + normal_convention_text(binding.normal_convention);
+        };
+        const auto graph_node_text = [&graph_node_kind_text, &graph_value_type_text,
+                &graph_surface_input_text, &number_text](
+                const std::optional<project::MaterialGraphNode>& node) {
+            if (!node.has_value()) return std::string{"(absent)"};
+            std::string value = graph_node_kind_text(node->kind) + " · " +
+                graph_value_type_text(node->value_type);
+            if (!node->inputs.empty()) {
+                value += " · inputs=[";
+                for (std::size_t index = 0U; index < node->inputs.size(); ++index) {
+                    if (index != 0U) value += ", ";
+                    value += "#" + std::to_string(node->inputs[index]);
+                }
+                value += ']';
+            }
+            switch (node->kind) {
+            case project::MaterialGraphNodeKind::constant_scalar:
+            case project::MaterialGraphNodeKind::constant_color:
+                value += " · constants=(";
+                for (std::size_t index = 0U; index < node->constants.size(); ++index) {
+                    if (index != 0U) value += ",";
+                    value += number_text(node->constants[index]);
+                }
+                value += ')';
+                break;
+            case project::MaterialGraphNodeKind::parameter_scalar:
+            case project::MaterialGraphNodeKind::parameter_color:
+                value += " · parameter=" + node->parameter_name;
+                break;
+            case project::MaterialGraphNodeKind::texture_sample:
+                value += " · texture=#" + std::to_string(node->texture_asset) +
+                    " · UV=#" + std::to_string(node->uv_set);
+                break;
+            case project::MaterialGraphNodeKind::surface_input:
+                value += " · surface=" + graph_surface_input_text(node->surface_input);
+                break;
+            case project::MaterialGraphNodeKind::unsupported:
+                value += " · identity=" + node->unsupported_identity;
+                break;
+            case project::MaterialGraphNodeKind::add:
+            case project::MaterialGraphNodeKind::multiply:
+            case project::MaterialGraphNodeKind::mix:
+                break;
+            }
+            return value;
+        };
+        const auto graph_outputs_text = [](
+                const std::optional<project::MaterialGraphOutputs>& outputs) {
+            if (!outputs.has_value()) return std::string{"(absent)"};
+            const auto reference = [](std::uint64_t node) {
+                return node == 0U ? std::string{"(unbound)"}
+                                 : "#" + std::to_string(node);
+            };
+            const auto& value = *outputs;
+            return "base color=" + reference(value.base_color) +
+                ", alpha=" + reference(value.alpha) +
+                ", roughness=" + reference(value.roughness) +
+                ", metallic=" + reference(value.metallic) +
+                ", normal=" + reference(value.normal) +
+                ", occlusion=" + reference(value.occlusion) +
+                ", emissive=" + reference(value.emissive) +
+                ", transmission=" + reference(value.transmission) +
+                ", subsurface=" + reference(value.subsurface) +
+                ", sheen=" + reference(value.sheen) +
+                ", anisotropy=" + reference(value.anisotropy) +
+                ", clearcoat=" + reference(value.clearcoat) +
+                ", clearcoat roughness=" + reference(value.clearcoat_roughness) +
+                ", opacity=" + reference(value.opacity) +
+                ", displacement=" + reference(value.displacement);
+        };
+        const auto material_binding_value = [](
+                const std::optional<project::MaterialRegionAssignment>& assignment,
+                const std::optional<std::string>& material_name) {
+            if (!assignment.has_value()) return std::string{"(absent)"};
+            std::string result = "#" + std::to_string(assignment->material);
+            if (material_name.has_value()) result += " " + *material_name;
+            result += " / variant ";
+            result += assignment->variant.has_value()
+                ? std::to_string(*assignment->variant) : std::string{"(none)"};
+            return result;
+        };
+        const auto summarize_sidecar = [&digest_prefix](const agent::SidecarChange& change) {
+            const std::string disposition = change.before_present == change.after_present
+                ? "changed" : change.after_present ? "added" : "removed";
+            return disposition + " · " + digest_prefix(change.before_digest) + " → " +
+                digest_prefix(change.after_digest) + " · bytes " +
+                std::to_string(change.before_bytes) + " → " +
+                std::to_string(change.after_bytes);
+        };
+        const auto sidecar_merge_status = [](
+                const std::optional<agent::SidecarChange>& left,
+                const std::optional<agent::SidecarChange>& right) {
+            if (left.has_value() && !right.has_value()) {
+                return std::string{"current-only"};
+            }
+            if (!left.has_value() && right.has_value()) {
+                return std::string{"speculative-only"};
+            }
+            if (!left.has_value()) return std::string{"unchanged"};
+            const bool identical_result =
+                left->after_present == right->after_present &&
+                left->after_digest == right->after_digest &&
+                left->after_bytes == right->after_bytes;
+            return identical_result
+                ? std::string{"identical edits"}
+                : std::string{"contested"};
+        };
+        const auto append_side = [&](const agent::ProjectDiff& diff, bool is_current) {
+            const auto quoted_text = [](std::string_view value) {
+                return std::string{"\""} + std::string(value) + "\"";
+            };
+            if (diff.material_catalog_changed) {
+                append_detail(is_current, "Material catalog",
+                    "changed; record-level detail unavailable");
+            }
+            if (diff.project_metadata.changed) {
+                const auto& metadata = diff.project_metadata;
+                std::string changes;
+                const auto append_transition_text = [&changes](
+                        std::string_view label,
+                        std::string before,
+                        std::string after) {
+                    if (!changes.empty()) changes += "; ";
+                    changes += std::string(label) + " " + before + " → " + after;
+                };
+                if (metadata.name_changed) {
+                    append_transition_text("name", quoted_text(metadata.before_name),
+                        quoted_text(metadata.after_name));
+                }
+                if (metadata.source_namespace_changed) {
+                    append_transition_text("source namespace",
+                        quoted_text(metadata.before_source_namespace),
+                        quoted_text(metadata.after_source_namespace));
+                }
+                if (metadata.evaluation_graph_changed) {
+                    append_transition_text("evaluation graph digest",
+                        metadata.before_evaluation_graph_digest.has_value()
+                            ? digest_prefix(*metadata.before_evaluation_graph_digest)
+                            : std::string{"(none)"},
+                        metadata.after_evaluation_graph_digest.has_value()
+                            ? digest_prefix(*metadata.after_evaluation_graph_digest)
+                            : std::string{"(none)"});
+                }
+                append_detail(is_current, "Project metadata", std::move(changes));
+            }
+            if (diff.presentation_catalog_changed) {
+                std::string changes = "changed · camera records " +
+                    std::to_string(diff.presentation_camera_change_count) +
+                    ", light records " +
+                    std::to_string(diff.presentation_light_change_count) +
+                    ", reference planes " +
+                    std::to_string(diff.presentation_plane_change_count);
+                if (!diff.presentation_records_details_available) {
+                    changes += "; record identities unavailable";
+                }
+                if (diff.presentation_records_truncated) {
+                    changes += "; record sample truncated";
+                }
+                append_detail(is_current, "Presentation catalog",
+                    std::move(changes));
+            }
+            const auto presentation_record_kind_name = [](
+                    agent::PresentationRecordKind kind) {
+                switch (kind) {
+                case agent::PresentationRecordKind::camera:
+                    return std::string{"Camera"};
+                case agent::PresentationRecordKind::light:
+                    return std::string{"Light"};
+                case agent::PresentationRecordKind::reference_plane:
+                    return std::string{"Reference plane"};
+                }
+                return std::string{"Presentation record"};
+            };
+            const auto number_text = [](double value) {
+                char buffer[64]{};
+                const auto converted = std::to_chars(buffer, buffer + sizeof(buffer), value,
+                    std::chars_format::general, std::numeric_limits<double>::max_digits10);
+                return converted.ec == std::errc{}
+                    ? std::string(buffer, converted.ptr) : std::string{"(invalid)"};
+            };
+            const auto vector_text = [&number_text](core::Vec3d value) {
+                return "(" + number_text(value.x) + "," + number_text(value.y) + "," +
+                    number_text(value.z) + ")";
+            };
+            const auto vector2_text = [&number_text](core::Vec2d value) {
+                return "(" + number_text(value.x) + "," + number_text(value.y) + ")";
+            };
+            const auto camera_projection_name = [](project::CameraProjection value) {
+                switch (value) {
+                case project::CameraProjection::perspective: return std::string{"perspective"};
+                case project::CameraProjection::orthographic: return std::string{"orthographic"};
+                }
+                return std::string{"invalid"};
+            };
+            const auto camera_purpose_name = [](project::CameraReviewPurpose value) {
+                switch (value) {
+                case project::CameraReviewPurpose::general: return std::string{"general"};
+                case project::CameraReviewPurpose::familiarity_baseline:
+                    return std::string{"familiarity baseline"};
+                case project::CameraReviewPurpose::silhouette_review:
+                    return std::string{"silhouette review"};
+                case project::CameraReviewPurpose::screenshot_evidence:
+                    return std::string{"screenshot evidence"};
+                }
+                return std::string{"invalid"};
+            };
+            const auto light_kind_name = [](project::AuthoredLightKind value) {
+                switch (value) {
+                case project::AuthoredLightKind::directional: return std::string{"directional"};
+                case project::AuthoredLightKind::point: return std::string{"point"};
+                case project::AuthoredLightKind::spot: return std::string{"spot"};
+                case project::AuthoredLightKind::area: return std::string{"area"};
+                }
+                return std::string{"invalid"};
+            };
+            const auto light_normal_name = [](project::LightNormalState value) {
+                switch (value) {
+                case project::LightNormalState::steady: return std::string{"steady"};
+                case project::LightNormalState::switchable:
+                    return std::string{"switchable"};
+                case project::LightNormalState::intermittent:
+                    return std::string{"intermittent"};
+                }
+                return std::string{"invalid"};
+            };
+            const auto light_failure_name = [](project::LightFailureState value) {
+                switch (value) {
+                case project::LightFailureState::none: return std::string{"none"};
+                case project::LightFailureState::dark: return std::string{"dark"};
+                case project::LightFailureState::intermittent:
+                    return std::string{"intermittent"};
+                }
+                return std::string{"invalid"};
+            };
+            const auto plane_view_name = [](project::ReferencePlaneView value) {
+                switch (value) {
+                case project::ReferencePlaneView::front: return std::string{"front"};
+                case project::ReferencePlaneView::side: return std::string{"side"};
+                case project::ReferencePlaneView::top: return std::string{"top"};
+                case project::ReferencePlaneView::perspective:
+                    return std::string{"perspective"};
+                case project::ReferencePlaneView::camera_pinned:
+                    return std::string{"camera pinned"};
+                }
+                return std::string{"invalid"};
+            };
+            const auto presentation_record_value = [&](
+                    const agent::PresentationRecordChange& change,
+                    bool before) {
+                if (change.kind == agent::PresentationRecordKind::camera) {
+                    const auto& camera = before ? change.camera_before : change.camera_after;
+                    if (!camera.has_value()) return std::string{"(absent)"};
+                    return "identity=" + quoted_text(camera->identity) +
+                        ", bookmark=" + quoted_text(camera->bookmark_identity) +
+                        ", reference=" + quoted_text(camera->reference_image_identity) +
+                        ", projection=" + camera_projection_name(camera->projection) +
+                        ", purpose=" + camera_purpose_name(camera->review_purpose) +
+                        ", fov=" + number_text(camera->vertical_fov_radians) +
+                        ", ortho height=" + number_text(camera->orthographic_height) +
+                        ", near/far=" + number_text(camera->near_plane) + "/" +
+                        number_text(camera->far_plane) +
+                        ", active=" + (camera->active_for_review ? "yes" : "no") +
+                        ", revision=" + std::to_string(camera->revision.value());
+                }
+                if (change.kind == agent::PresentationRecordKind::light) {
+                    const auto& light = before ? change.light_before : change.light_after;
+                    if (!light.has_value()) return std::string{"(absent)"};
+                    return "identity=" + quoted_text(light->identity) +
+                        ", semantic=" + quoted_text(light->semantic_class) +
+                        ", kind=" + light_kind_name(light->kind) +
+                        ", color=" + vector_text(light->linear_color) +
+                        ", intensity=" + number_text(light->intensity) +
+                        ", range=" + number_text(light->range) +
+                        ", cones=" + number_text(light->inner_cone_radians) + "/" +
+                        number_text(light->outer_cone_radians) +
+                        ", area=" + number_text(light->area_width) + "x" +
+                        number_text(light->area_height) +
+                        ", color temperature=" + (light->color_temperature_kelvin.has_value()
+                            ? number_text(*light->color_temperature_kelvin) + " K"
+                            : std::string{"(none)"}) +
+                        ", normal/failure=" + light_normal_name(light->normal_state) + "/" +
+                        light_failure_name(light->failure_state) +
+                        ", fixture/power/switch=" + quoted_text(light->fixture_owner) + "/" +
+                        quoted_text(light->power_owner) + "/" + quoted_text(light->switch_owner) +
+                        ", shadows/flicker=" + (light->casts_shadows ? "yes" : "no") + "/" +
+                        (light->flicker_eligible ? "yes" : "no") +
+                        ", revision=" + std::to_string(light->revision.value());
+                }
+                const auto& plane = before ? change.plane_before : change.plane_after;
+                if (!plane.has_value()) return std::string{"(absent)"};
+                std::string calibration = "(none)";
+                if (plane->calibration.has_value()) {
+                    calibration = "first=" + vector2_text(plane->calibration->first_pixel) +
+                        ", second=" + vector2_text(plane->calibration->second_pixel) +
+                        ", known distance=" +
+                        number_text(plane->calibration->known_distance_meters);
+                }
+                std::string result = "identity=" + quoted_text(plane->identity) +
+                    ", source=" + quoted_text(plane->source_asset_identity) +
+                    ", locator=" + quoted_text(plane->source_locator) +
+                    ", digest=" + plane->source_digest.hex().substr(0U, 12U) +
+                    ", generation=" + std::to_string(plane->source_generation.value()) +
+                    ", pixels=" + std::to_string(plane->image_width_pixels) + "x" +
+                    std::to_string(plane->image_height_pixels) +
+                    ", view=" + plane_view_name(plane->view) +
+                    ", view set=" + quoted_text(plane->view_set_identity) +
+                    ", camera=" + (plane->pinned_camera.has_value()
+                        ? std::to_string(plane->pinned_camera->value)
+                        : std::string{"(none)"}) +
+                    ", origin=" + vector_text(plane->origin) +
+                    ", normal=" + vector_text(plane->normal) +
+                    ", up=" + vector_text(plane->up) +
+                    ", camera local=" + (plane->camera_local_placement ? "yes" : "no") +
+                    ", width=" + number_text(plane->width_meters) +
+                    ", opacity=" + number_text(plane->opacity) +
+                    ", visible/locked=" + (plane->visible ? "yes" : "no") + "/" +
+                    (plane->locked ? "yes" : "no") +
+                    ", calibration=" + calibration +
+                    ", revision=" + std::to_string(plane->revision.value());
+                return result;
+            };
+            for (const auto& change : diff.presentation_records) {
+                std::string record = presentation_record_kind_name(change.kind);
+                record += change.object.has_value()
+                    ? " · object " + std::to_string(change.object->value)
+                    : " · " + change.identity;
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) changes = "changed";
+                changes += " · revision " + revision_text(change.before_revision) +
+                    " → " + revision_text(change.after_revision) +
+                    " · before {" + presentation_record_value(change, true) +
+                    "} → after {" + presentation_record_value(change, false) + "}";
+                append_detail(is_current, std::move(record), std::move(changes));
+            }
+            const auto spatial_field_source_text = [&](
+                    const agent::SpatialFieldSourceSummary& field) {
+                return "semantic=" + std::string(
+                        spatial_field::field_semantic_name(field.semantic)) +
+                    ", grid=" + std::to_string(field.width) + "x" +
+                    std::to_string(field.height) +
+                    ", origin=" + vector2_text(field.origin_uv) +
+                    ", cell=" + number_text(field.cell_size) +
+                    ", range=" + number_text(field.minimum_value) + ".." +
+                    number_text(field.maximum_value) +
+                    ", revision=" + std::to_string(field.source_revision.value()) +
+                    ", digest=" + digest_prefix(field.digest) +
+                    ", samples=" + std::to_string(field.sample_count);
+            };
+            const auto spatial_field_value_text = [](
+                    const std::optional<double>& value,
+                    const auto& number_formatter) {
+                return value.has_value() ? number_formatter(*value)
+                                         : std::string{"(absent)"};
+            };
+            for (const auto& change : diff.spatial_fields) {
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) changes = "changed";
+                changes += "; before {" + (change.before.has_value()
+                    ? spatial_field_source_text(*change.before) : std::string{"(absent)"}) +
+                    "} → after {" + (change.after.has_value()
+                    ? spatial_field_source_text(*change.after) : std::string{"(absent)"}) + "}";
+                if (change.added || change.removed ||
+                    change.sample_correspondence_available) {
+                    changes += "; changed samples " +
+                        std::to_string(change.changed_sample_count);
+                    for (const auto& sample : change.samples) {
+                        changes += "; (" + std::to_string(sample.u) + "," +
+                            std::to_string(sample.v) + ") " +
+                            spatial_field_value_text(sample.before, number_text) + " → " +
+                            spatial_field_value_text(sample.after, number_text);
+                    }
+                    if (change.samples_truncated) {
+                        changes += "; sample values truncated";
+                    }
+                } else {
+                    changes += "; sample comparison unavailable because grid geometry changed";
+                }
+                append_detail(is_current, "Spatial field · " + change.identity,
+                    std::move(changes));
+            }
+            if (diff.source_asset_registry_changed) {
+                std::string registry_changes = "changed · source records " +
+                    std::to_string(diff.changed_source_asset_record_count());
+                if (!diff.source_asset_record_details_available) {
+                    registry_changes += "; active record details unavailable";
+                }
+                if (diff.source_asset_records_truncated) {
+                    registry_changes += "; record sample truncated";
+                }
+                append_detail(is_current, "Source asset registry",
+                    std::move(registry_changes));
+            }
+            const auto source_asset_kind_name = [](assets::SourceAssetKind kind) {
+                switch (kind) {
+                case assets::SourceAssetKind::mesh: return std::string{"mesh"};
+                case assets::SourceAssetKind::material: return std::string{"material"};
+                case assets::SourceAssetKind::texture: return std::string{"texture"};
+                case assets::SourceAssetKind::image: return std::string{"image"};
+                case assets::SourceAssetKind::audio: return std::string{"audio"};
+                case assets::SourceAssetKind::terrain: return std::string{"terrain"};
+                case assets::SourceAssetKind::other: return std::string{"other"};
+                }
+                return std::string{"invalid"};
+            };
+            const auto source_domain_name = [](assets::SourceAssetDomain domain) {
+                switch (domain) {
+                case assets::SourceAssetDomain::geometry:
+                    return std::string{"geometry"};
+                case assets::SourceAssetDomain::hierarchy:
+                    return std::string{"hierarchy"};
+                case assets::SourceAssetDomain::material:
+                    return std::string{"material"};
+                }
+                return std::string{"invalid"};
+            };
+            const auto source_asset_options_text = [&number_text](
+                    const assets::SourceImportOptions& options) {
+                const auto yes_no = [](bool value) {
+                    return value ? std::string{"yes"} : std::string{"no"};
+                };
+                return "units=" + number_text(options.meters_per_source_unit) +
+                    ", up-axis=" + std::to_string(options.up_axis) +
+                    ", right-handed=" + yes_no(options.right_handed) +
+                    ", triangulate=" + yes_no(options.triangulate) +
+                    ", hierarchy/materials/normals=" +
+                    yes_no(options.import_hierarchy) + "/" +
+                    yes_no(options.import_materials) + "/" +
+                    yes_no(options.import_normals) +
+                    ", weld=" + yes_no(options.weld_vertices) +
+                    ", weld tolerance=" + number_text(options.weld_tolerance_meters);
+            };
+            const auto source_asset_record_summary_text = [&] (
+                    const agent::SourceAssetRecordSummary& source) {
+                std::string result = "kind=" + source_asset_kind_name(source.kind) +
+                    ", path=" + quoted_text(source.relative_source_path) +
+                    ", generation=" + std::to_string(source.source_generation.value()) +
+                    ", source=" + source.source_digest.hex().substr(0U, 12U) +
+                    ", importer=" + quoted_text(source.importer_identity) + " v" +
+                    std::to_string(source.importer_version) +
+                    ", options={" + source_asset_options_text(source.options) + "}" +
+                    ", artifact=" + quoted_text(source.artifact_identity) + "/" +
+                    source.artifact_digest.hex().substr(0U, 12U) +
+                    ", record=" + source.record_digest.hex().substr(0U, 12U);
+                if (!source.domain_digests.empty()) {
+                    result += ", domains={";
+                    for (std::size_t index = 0U; index < source.domain_digests.size(); ++index) {
+                        if (index != 0U) result += ", ";
+                        result += source_domain_name(source.domain_digests[index].domain) +
+                            ":" + source.domain_digests[index].digest.hex().substr(0U, 12U);
+                    }
+                    result += "}";
+                }
+                const auto append_labels = [&quoted_text](std::string& output,
+                        std::string_view label,
+                        std::size_t count,
+                        const std::vector<std::string>& sample,
+                        bool truncated) {
+                    output += ", " + std::string(label) + "=" + std::to_string(count) + " [";
+                    for (std::size_t index = 0U; index < sample.size(); ++index) {
+                        if (index != 0U) output += ", ";
+                        output += quoted_text(sample[index]);
+                    }
+                    output += "]";
+                    if (truncated) output += " (sample truncated)";
+                };
+                append_labels(result, "tags", source.authored_tag_count,
+                    source.authored_tag_sample, source.authored_tags_truncated);
+                append_labels(result, "dependencies", source.dependency_count,
+                    source.dependency_sample, source.dependencies_truncated);
+                if (source.botanical_receipt.has_value()) {
+                    result += ", botanical receipt=" +
+                        source.botanical_receipt->job_identity_digest.hex().substr(0U, 12U) +
+                        "/" + source.botanical_receipt->input_artifact_digest.hex().substr(0U, 12U) +
+                        "/" + source.botanical_receipt->output_artifact_digest.hex().substr(0U, 12U);
+                }
+                return result;
+            };
+            for (const auto& change : diff.source_asset_records) {
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) changes = "changed";
+                changes += "; before {" + (change.before.has_value()
+                    ? source_asset_record_summary_text(*change.before)
+                    : std::string{"(absent)"}) +
+                    "} → after {" + (change.after.has_value()
+                    ? source_asset_record_summary_text(*change.after)
+                    : std::string{"(absent)"}) + "}";
+                append_detail(is_current, "Source asset · " + change.identity,
+                    std::move(changes));
+            }
+            const auto compatibility_tags_text = [&quoted_text](
+                    std::size_t count,
+                    const std::vector<connection::PortCompatibilityTag>& sample,
+                    bool truncated) {
+                std::string result = std::to_string(count) + " [";
+                for (std::size_t index = 0U; index < sample.size(); ++index) {
+                    if (index != 0U) result += ", ";
+                    result += quoted_text(sample[index].space) + ":" +
+                        quoted_text(sample[index].term);
+                }
+                result += "]";
+                if (truncated) result += " (sample truncated)";
+                return result;
+            };
+            const auto capability_text = [&quoted_text](
+                    std::size_t count, const std::vector<std::string>& sample,
+                    bool truncated) {
+                std::string result = std::to_string(count) + " [";
+                for (std::size_t index = 0U; index < sample.size(); ++index) {
+                    if (index != 0U) result += ", ";
+                    result += quoted_text(sample[index]);
+                }
+                result += "]";
+                if (truncated) result += " (sample truncated)";
+                return result;
+            };
+            const auto connection_port_text = [&](const agent::ConnectionPortSourceSummary& port) {
+                return "owner=#" + std::to_string(port.owner_object) +
+                    ", frame=" + quoted_text(port.frame_identity) +
+                    ", parent=" + (port.parent_frame.has_value()
+                        ? quoted_text(*port.parent_frame) : std::string{"(root)"}) +
+                    ", local=" + transform_value(port.transform_to_parent) +
+                    ", convention=" + quoted_text(port.coordinate_convention) +
+                    ", compatibility tags=" + compatibility_tags_text(
+                        port.compatibility_tag_count, port.compatibility_tag_sample,
+                        port.compatibility_tags_truncated) +
+                    ", required capabilities=" + capability_text(
+                        port.required_capability_count, port.required_capability_sample,
+                        port.required_capabilities_truncated) +
+                    ", offered capabilities=" + capability_text(
+                        port.offered_capability_count, port.offered_capability_sample,
+                        port.offered_capabilities_truncated) +
+                    ", record=" + port.record_digest.hex().substr(0U, 12U);
+            };
+            const auto connection_edge_text = [&](const agent::ConnectionEdgeSourceSummary& edge) {
+                return "ports=#" + std::to_string(edge.first_port) + "/#" +
+                    std::to_string(edge.second_port) + ", kind=" +
+                    std::string(connection::connection_kind_name(edge.kind)) +
+                    ", shared compatibility tags=" + compatibility_tags_text(
+                        edge.shared_tag_count, edge.shared_tag_sample,
+                        edge.shared_tags_truncated) +
+                    ", first satisfied requirements=" + capability_text(
+                        edge.first_requirement_count, edge.first_requirement_sample,
+                        edge.first_requirements_truncated) +
+                    ", second satisfied requirements=" + capability_text(
+                        edge.second_requirement_count, edge.second_requirement_sample,
+                        edge.second_requirements_truncated) +
+                    ", record=" + edge.record_digest.hex().substr(0U, 12U);
+            };
+            const auto& connection_graph = diff.connection_port_graph;
+            if (connection_graph.changed) {
+                constexpr std::size_t kMaxConnectionPortRowsPerSide = 4U;
+                constexpr std::size_t kMaxConnectionEdgeRowsPerSide = 4U;
+                const bool connection_rows_truncated =
+                    connection_graph.ports.size() > kMaxConnectionPortRowsPerSide ||
+                    connection_graph.edges.size() > kMaxConnectionEdgeRowsPerSide;
+                std::string graph_changes = "changed · ports " +
+                    std::to_string(connection_graph.before_port_count) + " → " +
+                    std::to_string(connection_graph.after_port_count) +
+                    " · edges " + std::to_string(connection_graph.before_edge_count) +
+                    " → " + std::to_string(connection_graph.after_edge_count) +
+                    " · changed port records " +
+                    std::to_string(connection_graph.changed_port_count) +
+                    " · changed edge records " +
+                    std::to_string(connection_graph.changed_edge_count);
+                if (connection_graph.before_digest.has_value() &&
+                    connection_graph.after_digest.has_value()) {
+                    graph_changes += " · digest " +
+                        connection_graph.before_digest->hex().substr(0U, 12U) +
+                        " → " + connection_graph.after_digest->hex().substr(0U, 12U);
+                }
+                if (!connection_graph.details_available) {
+                    graph_changes += " · record-level details unavailable";
+                }
+                if (connection_graph.ports_truncated || connection_graph.edges_truncated) {
+                    graph_changes += " · record samples truncated";
+                    if (is_current) result.current_truncated = true;
+                    else result.speculative_truncated = true;
+                }
+                if (connection_rows_truncated) {
+                    graph_changes += " · this view shows at most 4 port and 4 edge records per side";
+                    if (is_current) result.current_truncated = true;
+                    else result.speculative_truncated = true;
+                }
+                graph_changes += " · structural compatibility evidence only; runtime/game acceptance is separate";
+                append_detail(is_current, "Connection port graph", std::move(graph_changes));
+            }
+            for (std::size_t index = 0U;
+                 index < std::min<std::size_t>(connection_graph.ports.size(), 4U); ++index) {
+                const auto& change = connection_graph.ports[index];
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) changes = "changed";
+                changes += "; before {" + (change.before.has_value()
+                    ? connection_port_text(*change.before) : std::string{"(absent)"}) +
+                    "} → after {" + (change.after.has_value()
+                    ? connection_port_text(*change.after) : std::string{"(absent)"}) + "}";
+                append_detail(is_current, "Connection port · #" +
+                    std::to_string(change.identity), std::move(changes));
+            }
+            for (std::size_t index = 0U;
+                 index < std::min<std::size_t>(connection_graph.edges.size(), 4U); ++index) {
+                const auto& change = connection_graph.edges[index];
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) changes = "changed";
+                changes += "; before {" + (change.before.has_value()
+                    ? connection_edge_text(*change.before) : std::string{"(absent)"}) +
+                    "} → after {" + (change.after.has_value()
+                    ? connection_edge_text(*change.after) : std::string{"(absent)"}) + "}";
+                append_detail(is_current, "Connection edge · #" +
+                    std::to_string(change.identity), std::move(changes));
+            }
+            const auto project_standard_category_name = [](
+                    project::ProjectStandardCategory category) {
+                switch (category) {
+                case project::ProjectStandardCategory::interior_door_width:
+                    return std::string{"interior door width"};
+                case project::ProjectStandardCategory::guest_room_wall_height:
+                    return std::string{"guest room wall height"};
+                case project::ProjectStandardCategory::stair_rise:
+                    return std::string{"stair rise"};
+                case project::ProjectStandardCategory::stair_run:
+                    return std::string{"stair run"};
+                case project::ProjectStandardCategory::bevel_width:
+                    return std::string{"bevel width"};
+                case project::ProjectStandardCategory::texel_density:
+                    return std::string{"texel density"};
+                case project::ProjectStandardCategory::lightmap_density:
+                    return std::string{"lightmap density"};
+                case project::ProjectStandardCategory::grid_increment:
+                    return std::string{"grid increment"};
+                case project::ProjectStandardCategory::material_family:
+                    return std::string{"material family"};
+                case project::ProjectStandardCategory::naming_policy:
+                    return std::string{"naming policy"};
+                case project::ProjectStandardCategory::collision_profile:
+                    return std::string{"collision profile"};
+                case project::ProjectStandardCategory::common_socket:
+                    return std::string{"common socket"};
+                case project::ProjectStandardCategory::unit_convention:
+                    return std::string{"unit convention"};
+                }
+                return std::string{"invalid"};
+            };
+            const auto project_standard_summary_text = [&number_text,
+                    &project_standard_category_name, &quoted_text](
+                    const agent::ProjectAuthoringStandardSummary& standard) {
+                std::string result = "label=" + quoted_text(standard.label) +
+                    ", category=" + project_standard_category_name(standard.category) +
+                    ", value=" + quoted_text(standard.value) +
+                    ", unit=" + quoted_text(standard.unit) +
+                    ", rationale=" + std::to_string(standard.rationale_byte_count) +
+                    " bytes / " + standard.rationale_digest.hex().substr(0U, 12U) +
+                    ", record=" + standard.record_digest.hex().substr(0U, 12U);
+                if (standard.evidence.has_value()) {
+                    const auto& evidence = *standard.evidence;
+                    result += ", evidence revision=" +
+                        std::to_string(evidence.source_revision.value()) +
+                        ", tolerance=" + number_text(evidence.tolerance_meters) +
+                        "m, measurements=" + std::to_string(evidence.measurement_count) +
+                        ", evidence digest=" + evidence.digest.hex().substr(0U, 12U) + " [";
+                    for (std::size_t index = 0U; index < evidence.measurements.size(); ++index) {
+                        if (index != 0U) result += ", ";
+                        const auto& measurement = evidence.measurements[index];
+                        result += "object #" + std::to_string(measurement.object_id) +
+                            "/mesh #" + std::to_string(measurement.mesh_asset) +
+                            " r" + std::to_string(measurement.mesh_revision.value()) +
+                            "=" + number_text(measurement.measured_value_meters) + "m";
+                    }
+                    result += "]";
+                    if (evidence.measurements_truncated) result += " (sample truncated)";
+                }
+                return result;
+            };
+            const auto& standards = diff.authoring_standards;
+            if (standards.changed) {
+                std::string standard_changes = "changed · records " +
+                    std::to_string(standards.before_record_count) + " → " +
+                    std::to_string(standards.after_record_count) +
+                    " · changed records " + std::to_string(standards.changed_record_count);
+                if (standards.before_digest.has_value() && standards.after_digest.has_value()) {
+                    standard_changes += " · digest " +
+                        standards.before_digest->hex().substr(0U, 12U) + " → " +
+                        standards.after_digest->hex().substr(0U, 12U);
+                }
+                if (!standards.details_available) {
+                    standard_changes += " · record-level details unavailable";
+                }
+                if (standards.records_truncated) {
+                    standard_changes += " · record sample truncated";
+                    if (is_current) result.current_truncated = true;
+                    else result.speculative_truncated = true;
+                }
+                append_detail(is_current, "Project authoring standards",
+                    std::move(standard_changes));
+            }
+            for (const auto& change : standards.records) {
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) changes = "changed";
+                changes += "; before {" + (change.before.has_value()
+                    ? project_standard_summary_text(*change.before)
+                    : std::string{"(absent)"}) + "} → after {" +
+                    (change.after.has_value()
+                        ? project_standard_summary_text(*change.after)
+                        : std::string{"(absent)"}) + "}";
+                append_detail(is_current, "Project standard · " + change.identity,
+                    std::move(changes));
+            }
+            if (diff.world_model.changed) {
+                const auto world_model_summary_text = [](const auto& summary) {
+                    return "areas=" + std::to_string(summary.areas) +
+                        ", paths=" + std::to_string(summary.paths) +
+                        ", regions=" + std::to_string(summary.regions) +
+                        ", structure graphs=" + std::to_string(summary.structure_graphs) +
+                        ", instance fields=" + std::to_string(summary.instance_fields) +
+                        ", variant layers=" + std::to_string(summary.variant_layers) +
+                        ", digest=" + summary.digest.hex().substr(0U, 12U);
+                };
+                const auto& world = diff.world_model;
+                std::string world_changes = "changed · before {" +
+                    (world.before.has_value()
+                        ? world_model_summary_text(*world.before)
+                        : std::string{"(unavailable)"}) + "} → after {" +
+                    (world.after.has_value()
+                        ? world_model_summary_text(*world.after)
+                        : std::string{"(unavailable)"}) + "}";
+                if (!world.details_available) {
+                    world_changes += " · canonical model digest unavailable";
+                }
+                world_changes += "; regions changed=" +
+                    std::to_string(world.changed_region_count) + " (" +
+                    std::to_string(world.before_region_count) + "→" +
+                    std::to_string(world.after_region_count) + ")";
+                world_changes += "; areas changed=" +
+                    std::to_string(world.changed_area_count) + " (" +
+                    std::to_string(world.before_area_count) + "→" +
+                    std::to_string(world.after_area_count) + ")";
+                world_changes += "; paths changed=" +
+                    std::to_string(world.changed_path_count) + " (" +
+                    std::to_string(world.before_path_count) + "→" +
+                    std::to_string(world.after_path_count) + ")";
+                world_changes += "; instance fields changed=" +
+                    std::to_string(world.changed_instance_field_count) + " (" +
+                    std::to_string(world.before_instance_field_count) + "→" +
+                    std::to_string(world.after_instance_field_count) + ")";
+                world_changes += "; variant layers changed=" +
+                    std::to_string(world.changed_variant_layer_count) + " (" +
+                    std::to_string(world.before_variant_layer_count) + "→" +
+                    std::to_string(world.after_variant_layer_count) + ")";
+                world_changes += "; structure graphs changed=" +
+                    std::to_string(world.changed_structure_graph_count) + " (" +
+                    std::to_string(world.before_structure_graph_count) + "→" +
+                    std::to_string(world.after_structure_graph_count) + ")";
+                if (world.region_records_truncated) {
+                    world_changes += " · region sample truncated";
+                }
+                if (world.areas_truncated) {
+                    world_changes += " · area sample truncated";
+                }
+                if (world.paths_truncated) {
+                    world_changes += " · path sample truncated";
+                }
+                if (world.instance_fields_truncated) {
+                    world_changes += " · instance-field sample truncated";
+                }
+                if (world.variant_layers_truncated) {
+                    world_changes += " · variant-layer sample truncated";
+                }
+                if (world.structure_graphs_truncated) {
+                    world_changes += " · structure-graph sample truncated";
+                }
+                if (!world.area_details_available) {
+                    world_changes += " · one or more area summaries unavailable";
+                }
+                if (!world.path_details_available) {
+                    world_changes += " · one or more path summaries unavailable";
+                }
+                if (!world.instance_field_details_available) {
+                    world_changes += " · one or more instance-field summaries unavailable";
+                }
+                if (!world.variant_layer_details_available) {
+                    world_changes += " · one or more variant-layer summaries unavailable";
+                }
+                if (!world.structure_graph_details_available) {
+                    world_changes += " · one or more graph summaries unavailable";
+                }
+                append_detail(is_current, "World model", std::move(world_changes));
+                const auto id_sample_text = [](const auto& ids) {
+                    std::string result = "[";
+                    for (std::size_t index = 0U; index < ids.size(); ++index) {
+                        if (index != 0U) result += ", ";
+                        result += "#" + std::to_string(ids[index]);
+                    }
+                    return result + "]";
+                };
+                const auto region_summary_text = [&id_sample_text](const auto& summary) {
+                    std::string result = "revision=" + std::to_string(summary.revision) +
+                        ", cell=(" + std::to_string(summary.cell_x) + "," +
+                        std::to_string(summary.cell_y) + ")" +
+                        ", areas=" + std::to_string(summary.area_count) + " " +
+                        id_sample_text(summary.area_id_sample) +
+                        ", paths=" + std::to_string(summary.path_count) + " " +
+                        id_sample_text(summary.path_id_sample) +
+                        ", neighbors=" + std::to_string(summary.neighbor_count) + " " +
+                        id_sample_text(summary.neighbor_id_sample) +
+                        ", cross-region paths=" +
+                        std::to_string(summary.cross_region_path_count) + " " +
+                        id_sample_text(summary.cross_region_path_id_sample);
+                    if (summary.membership_ids_truncated) {
+                        result += " · membership IDs truncated";
+                    }
+                    return result;
+                };
+                for (const auto& change : world.regions) {
+                    std::string changes = presence(change.added, change.removed);
+                    if (changes.empty()) changes = "changed";
+                    changes += "; before {" + (change.before.has_value()
+                        ? region_summary_text(*change.before) : std::string{"(absent)"}) +
+                        "} → after {" + (change.after.has_value()
+                            ? region_summary_text(*change.after)
+                            : std::string{"(absent)"}) + "}";
+                    append_detail(is_current,
+                        "World region · #" + std::to_string(change.id.value),
+                        std::move(changes));
+                    if ((change.before.has_value() &&
+                            change.before->membership_ids_truncated) ||
+                        (change.after.has_value() &&
+                            change.after->membership_ids_truncated)) {
+                        if (is_current) result.current_truncated = true;
+                        else result.speculative_truncated = true;
+                    }
+                }
+                if (world.region_records_truncated) {
+                    if (is_current) result.current_truncated = true;
+                    else result.speculative_truncated = true;
+                }
+                const auto area_summary_text = [&quoted_text](const auto& summary) {
+                    std::string result = "type=" + quoted_text(summary.semantic_type) +
+                        ", geometry=" + std::string(carto::world::authoring_binding_kind_name(
+                            summary.geometry_kind)) + "#" +
+                        std::to_string(summary.geometry_identity) +
+                        ", parent=" + (summary.parent_id.has_value()
+                            ? "#" + std::to_string(*summary.parent_id)
+                            : std::string{"(none)"}) +
+                        ", tags=" + std::to_string(summary.tag_count) + " [";
+                    for (std::size_t index = 0U; index < summary.tag_sample.size(); ++index) {
+                        if (index != 0U) result += ", ";
+                        result += quoted_text(summary.tag_sample[index]);
+                    }
+                    result += "], bytes=" + std::to_string(summary.serialized_bytes) +
+                        ", digest=" + summary.digest.hex().substr(0U, 12U);
+                    if (summary.tags_truncated) result += " · tags truncated";
+                    return result;
+                };
+                for (const auto& change : world.areas) {
+                    std::string changes = presence(change.added, change.removed);
+                    if (changes.empty()) changes = "changed";
+                    changes += "; before {" + (change.before.has_value()
+                        ? area_summary_text(*change.before)
+                        : std::string{"(absent or unavailable)"}) +
+                        "} → after {" + (change.after.has_value()
+                            ? area_summary_text(*change.after)
+                            : std::string{"(absent or unavailable)"}) + "}";
+                    append_detail(is_current,
+                        "World area · #" + std::to_string(change.id.value),
+                        std::move(changes));
+                    if ((change.before.has_value() && change.before->tags_truncated) ||
+                        (change.after.has_value() && change.after->tags_truncated)) {
+                        if (is_current) result.current_truncated = true;
+                        else result.speculative_truncated = true;
+                    }
+                }
+                if (world.areas_truncated) {
+                    if (is_current) result.current_truncated = true;
+                    else result.speculative_truncated = true;
+                }
+                const auto path_summary_text = [&quoted_text, &vector_text, &number_text](
+                        const auto& summary) {
+                    std::string result = "type=" + quoted_text(summary.semantic_type) +
+                        ", start=" + (summary.start_area_id.has_value()
+                            ? "#" + std::to_string(*summary.start_area_id)
+                            : std::string{"(none)"}) +
+                        ", end=" + (summary.end_area_id.has_value()
+                            ? "#" + std::to_string(*summary.end_area_id)
+                            : std::string{"(none)"}) +
+                        ", width=" + number_text(summary.width) +
+                        ", closed=" + (summary.closed ? "yes" : "no") +
+                        ", points=" + std::to_string(summary.control_point_count) + " [";
+                    for (std::size_t index = 0U;
+                         index < summary.control_point_sample.size(); ++index) {
+                        if (index != 0U) result += ", ";
+                        result += vector_text(summary.control_point_sample[index]);
+                    }
+                    result += "], bytes=" + std::to_string(summary.serialized_bytes) +
+                        ", digest=" + summary.digest.hex().substr(0U, 12U);
+                    if (summary.control_points_truncated) result += " · points truncated";
+                    return result;
+                };
+                for (const auto& change : world.paths) {
+                    std::string changes = presence(change.added, change.removed);
+                    if (changes.empty()) changes = "changed";
+                    changes += "; before {" + (change.before.has_value()
+                        ? path_summary_text(*change.before)
+                        : std::string{"(absent or unavailable)"}) +
+                        "} → after {" + (change.after.has_value()
+                            ? path_summary_text(*change.after)
+                            : std::string{"(absent or unavailable)"}) + "}";
+                    append_detail(is_current,
+                        "World path · #" + std::to_string(change.id.value),
+                        std::move(changes));
+                    if ((change.before.has_value() &&
+                            change.before->control_points_truncated) ||
+                        (change.after.has_value() &&
+                            change.after->control_points_truncated)) {
+                        if (is_current) result.current_truncated = true;
+                        else result.speculative_truncated = true;
+                    }
+                }
+                if (world.paths_truncated) {
+                    if (is_current) result.current_truncated = true;
+                    else result.speculative_truncated = true;
+                }
+                const auto instance_field_summary_text = [
+                        &quoted_text, &vector_text, &id_sample_text](
+                        const auto& summary) {
+                    std::string result = "type=" + quoted_text(summary.semantic_type) +
+                        ", area=" + (summary.area_id.has_value()
+                            ? "#" + std::to_string(*summary.area_id)
+                            : std::string{"(none)"}) +
+                        ", bounds=" + vector_text(summary.bounds_minimum) + "→" +
+                        vector_text(summary.bounds_maximum) +
+                        ", recipe=" + quoted_text(summary.recipe_identity) + "/" +
+                        summary.recipe_digest.hex().substr(0U, 12U) +
+                        ", seed=" + std::to_string(summary.seed) +
+                        ", maximum=" + std::to_string(summary.maximum_instances) +
+                        ", suppressed=" + std::to_string(summary.suppressed_instance_count) +
+                        " " + id_sample_text(summary.suppressed_instance_sample) +
+                        ", geometry evidence=" + (summary.geometry_evidence.has_value()
+                            ? summary.geometry_evidence->hex().substr(0U, 12U)
+                            : std::string{"(none)"}) +
+                        ", material intent=" + quoted_text(summary.physical_material_intent) +
+                        ", construction=" + quoted_text(summary.construction_profile) +
+                        ", surface=" + quoted_text(summary.surface_domain_identity) +
+                        ", bytes=" + std::to_string(summary.serialized_bytes) +
+                        ", digest=" + summary.digest.hex().substr(0U, 12U);
+                    if (summary.suppressed_instances_truncated) {
+                        result += " · suppressed IDs truncated";
+                    }
+                    return result;
+                };
+                for (const auto& change : world.instance_fields) {
+                    std::string changes = presence(change.added, change.removed);
+                    if (changes.empty()) changes = "changed";
+                    changes += "; before {" + (change.before.has_value()
+                        ? instance_field_summary_text(*change.before)
+                        : std::string{"(absent or unavailable)"}) +
+                        "} → after {" + (change.after.has_value()
+                            ? instance_field_summary_text(*change.after)
+                            : std::string{"(absent or unavailable)"}) + "}";
+                    append_detail(is_current,
+                        "World instance field · #" + std::to_string(change.id.value),
+                        std::move(changes));
+                    if ((change.before.has_value() &&
+                            change.before->suppressed_instances_truncated) ||
+                        (change.after.has_value() &&
+                            change.after->suppressed_instances_truncated)) {
+                        if (is_current) result.current_truncated = true;
+                        else result.speculative_truncated = true;
+                    }
+                }
+                if (world.instance_fields_truncated) {
+                    if (is_current) result.current_truncated = true;
+                    else result.speculative_truncated = true;
+                }
+                const auto variant_layer_summary_text = [&quoted_text](const auto& summary) {
+                    std::string result = "name=" + quoted_text(summary.name) +
+                        ", base revision=" +
+                        std::to_string(summary.base_project_revision) +
+                        ", edits=" + std::to_string(summary.edit_count) + " [";
+                    for (std::size_t index = 0U; index < summary.edit_sample.size(); ++index) {
+                        if (index != 0U) result += "; ";
+                        const auto& edit = summary.edit_sample[index];
+                        result += std::string(carto::world::variant_target_kind_name(
+                            edit.target_kind)) + "#" + std::to_string(edit.target_identity) +
+                            " " + std::string(carto::world::variant_operation_name(
+                                edit.operation)) +
+                            " " + quoted_text(edit.property) + "=" +
+                            quoted_text(edit.value_sample) + " (" +
+                            std::to_string(edit.value_bytes) + " bytes, digest=" +
+                            edit.value_digest.hex().substr(0U, 12U) + ")";
+                        if (edit.value_truncated) result += " [value sample truncated]";
+                    }
+                    result += "], bytes=" + std::to_string(summary.serialized_bytes) +
+                        ", digest=" + summary.digest.hex().substr(0U, 12U);
+                    if (summary.edits_truncated) result += " · edit sample truncated";
+                    return result;
+                };
+                for (const auto& change : world.variant_layers) {
+                    std::string changes = presence(change.added, change.removed);
+                    if (changes.empty()) changes = "changed";
+                    changes += "; before {" + (change.before.has_value()
+                        ? variant_layer_summary_text(*change.before)
+                        : std::string{"(absent or unavailable)"}) +
+                        "} → after {" + (change.after.has_value()
+                            ? variant_layer_summary_text(*change.after)
+                            : std::string{"(absent or unavailable)"}) + "}";
+                    append_detail(is_current,
+                        "World variant layer · #" + std::to_string(change.id.value),
+                        std::move(changes));
+                    const auto sample_truncated = [](const auto& summary) {
+                        return summary.has_value() && (summary->edits_truncated ||
+                            std::any_of(summary->edit_sample.begin(),
+                                summary->edit_sample.end(), [](const auto& edit) {
+                                    return edit.value_truncated;
+                                }));
+                    };
+                    if (sample_truncated(change.before) || sample_truncated(change.after)) {
+                        if (is_current) result.current_truncated = true;
+                        else result.speculative_truncated = true;
+                    }
+                }
+                if (world.variant_layers_truncated) {
+                    if (is_current) result.current_truncated = true;
+                    else result.speculative_truncated = true;
+                }
+                const auto graph_summary_text = [&id_sample_text, &quoted_text](
+                        const auto& summary) {
+                    std::string result = "type=" + quoted_text(summary.semantic_type) +
+                        ", bytes=" + std::to_string(summary.serialized_bytes) +
+                        ", nodes=" + std::to_string(summary.node_count) + " " +
+                        id_sample_text(summary.node_id_sample) +
+                        ", edges=" + std::to_string(summary.edge_count) + " " +
+                        id_sample_text(summary.edge_id_sample) +
+                        ", digest=" + summary.digest.hex().substr(0U, 12U);
+                    if (summary.ids_truncated) result += " · IDs truncated";
+                    return result;
+                };
+                for (const auto& change : world.structure_graphs) {
+                    std::string changes = presence(change.added, change.removed);
+                    if (changes.empty()) changes = "changed";
+                    changes += "; before {" + (change.before.has_value()
+                        ? graph_summary_text(*change.before)
+                        : std::string{"(details unavailable or absent)"}) +
+                        "} → after {" + (change.after.has_value()
+                            ? graph_summary_text(*change.after)
+                            : std::string{"(details unavailable or absent)"}) + "}";
+                    append_detail(is_current,
+                        "World structure graph · #" + std::to_string(change.id.value),
+                        std::move(changes));
+                    if ((change.before.has_value() && change.before->ids_truncated) ||
+                        (change.after.has_value() && change.after->ids_truncated)) {
+                        if (is_current) result.current_truncated = true;
+                        else result.speculative_truncated = true;
+                    }
+                }
+                if (world.structure_graphs_truncated) {
+                    if (is_current) result.current_truncated = true;
+                    else result.speculative_truncated = true;
+                }
+            }
+            if (diff.scientific_model.changed) {
+                const auto scientific_summary_text = [](const auto& summary) {
+                    std::string result = "bytes=" + std::to_string(summary.serialized_bytes) +
+                        ", regions=" + std::to_string(summary.regions) +
+                        ", boundaries=" + std::to_string(summary.boundaries) +
+                        ", interfaces=" + std::to_string(summary.interfaces) +
+                        ", sources=" + std::to_string(summary.sources) +
+                        ", loads=" + std::to_string(summary.loads) +
+                        ", parameters=" + std::to_string(summary.parameters) +
+                        ", fields=" + std::to_string(summary.fields) +
+                        ", probes=" + std::to_string(summary.probes) +
+                        ", studies=" + std::to_string(summary.studies) +
+                        ", result sets=" + std::to_string(summary.result_sets) +
+                        ", extensions={";
+                    for (std::size_t index = 0U;
+                         index < summary.populated_extensions.size(); ++index) {
+                        if (index != 0U) result += ", ";
+                        result += summary.populated_extensions[index];
+                    }
+                    result += "}, digest=" + summary.digest.hex().substr(0U, 12U);
+                    return result;
+                };
+                const auto& scientific = diff.scientific_model;
+                std::string scientific_changes = "changed · before {" +
+                    (scientific.before.has_value()
+                        ? scientific_summary_text(*scientific.before)
+                        : std::string{"(unavailable)"}) + "} → after {" +
+                    (scientific.after.has_value()
+                        ? scientific_summary_text(*scientific.after)
+                        : std::string{"(unavailable)"}) +
+                    "} · scientific record values are not projected";
+                append_detail(is_current, "Scientific model", std::move(scientific_changes));
+            }
+            const auto procedural_kind_name = [](agent::ProceduralSourceKind kind) {
+                switch (kind) {
+                case agent::ProceduralSourceKind::curve_path: return std::string{"Curve path"};
+                case agent::ProceduralSourceKind::road: return std::string{"Road source"};
+                case agent::ProceduralSourceKind::sweep: return std::string{"Sweep source"};
+                case agent::ProceduralSourceKind::sign_text: return std::string{"Sign-text source"};
+                }
+                return std::string{"Procedural source"};
+            };
+            const auto road_surface_name = [](project::RoadSurfaceClass value) {
+                switch (value) {
+                case project::RoadSurfaceClass::asphalt: return std::string{"asphalt"};
+                case project::RoadSurfaceClass::concrete: return std::string{"concrete"};
+                case project::RoadSurfaceClass::gravel: return std::string{"gravel"};
+                case project::RoadSurfaceClass::dirt: return std::string{"dirt"};
+                case project::RoadSurfaceClass::trail: return std::string{"trail"};
+                }
+                return std::string{"invalid"};
+            };
+            const auto road_function_name = [](project::RoadFunctionClass value) {
+                switch (value) {
+                case project::RoadFunctionClass::local: return std::string{"local"};
+                case project::RoadFunctionClass::collector: return std::string{"collector"};
+                case project::RoadFunctionClass::arterial: return std::string{"arterial"};
+                case project::RoadFunctionClass::service: return std::string{"service"};
+                case project::RoadFunctionClass::driveway: return std::string{"driveway"};
+                case project::RoadFunctionClass::pedestrian: return std::string{"pedestrian"};
+                }
+                return std::string{"invalid"};
+            };
+            const auto road_access_name = [](project::RoadAccessState value) {
+                switch (value) {
+                case project::RoadAccessState::open: return std::string{"open"};
+                case project::RoadAccessState::restricted: return std::string{"restricted"};
+                case project::RoadAccessState::closed: return std::string{"closed"};
+                }
+                return std::string{"invalid"};
+            };
+            const auto road_drainage_name = [](project::RoadDrainageIntent value) {
+                switch (value) {
+                case project::RoadDrainageIntent::none: return std::string{"none"};
+                case project::RoadDrainageIntent::roadside_ditch:
+                    return std::string{"roadside ditch"};
+                case project::RoadDrainageIntent::culvert: return std::string{"culvert"};
+                case project::RoadDrainageIntent::swale_crossing:
+                    return std::string{"swale crossing"};
+                }
+                return std::string{"invalid"};
+            };
+            const auto sweep_cap_name = [](geometry::SweepCapPolicy value) {
+                switch (value) {
+                case geometry::SweepCapPolicy::open: return std::string{"open"};
+                case geometry::SweepCapPolicy::both: return std::string{"both"};
+                case geometry::SweepCapPolicy::start: return std::string{"start"};
+                case geometry::SweepCapPolicy::end: return std::string{"end"};
+                }
+                return std::string{"invalid"};
+            };
+            const auto sign_alignment_name = [](geometry::SignTextAlignment value) {
+                switch (value) {
+                case geometry::SignTextAlignment::left: return std::string{"left"};
+                case geometry::SignTextAlignment::center: return std::string{"center"};
+                case geometry::SignTextAlignment::right: return std::string{"right"};
+                }
+                return std::string{"invalid"};
+            };
+            const auto procedural_summary_text = [&](const auto& value) {
+                return std::visit([&](const auto& summary) {
+                    using Summary = std::decay_t<decltype(summary)>;
+                    std::string result = "revision=" +
+                        std::to_string(summary.revision.value()) +
+                        ", bytes=" + std::to_string(summary.serialized_bytes) +
+                        ", digest=" + summary.digest.hex().substr(0U, 12U);
+                    if constexpr (std::is_same_v<Summary, agent::CurvePathSourceSummary>) {
+                        result += ", segments=" + std::to_string(summary.segment_count);
+                    } else if constexpr (std::is_same_v<Summary, agent::RoadSourceSummary>) {
+                        result += ", centerline=" + quoted_text(summary.centerline_identity) +
+                            " r" + std::to_string(summary.centerline_revision.value()) +
+                            ", width=" + number_text(summary.width_meters) + "m" +
+                            ", shoulder=" + number_text(summary.shoulder_meters) + "m" +
+                            ", max grade=" + number_text(summary.maximum_grade_ratio) +
+                            ", min curve radius=" +
+                            number_text(summary.minimum_curve_radius_meters) + "m" +
+                            ", surface=" + road_surface_name(summary.surface_class) +
+                            ", function=" + road_function_name(summary.function_class) +
+                            ", access=" + road_access_name(summary.access_state) +
+                            ", drainage=" + road_drainage_name(summary.drainage_intent);
+                    } else if constexpr (std::is_same_v<Summary, agent::SweepSourceSummary>) {
+                        result += ", centerline=" + quoted_text(summary.centerline_identity) +
+                            " r" + std::to_string(summary.centerline_revision.value()) +
+                            ", profile points=" + std::to_string(summary.profile_point_count) +
+                            ", samples/segment=" +
+                            std::to_string(summary.samples_per_segment) +
+                            ", scale=" + number_text(summary.start_scale) + " → " +
+                            number_text(summary.end_scale) +
+                            ", caps=" + sweep_cap_name(summary.cap_policy) +
+                            ", inner scale=" + number_text(summary.inner_profile_scale);
+                    } else if constexpr (std::is_same_v<Summary, agent::SignTextSourceSummary>) {
+                        result += ", text=" + std::to_string(summary.text_bytes) +
+                            " bytes / " + summary.text_digest.hex().substr(0U, 12U) +
+                            ", alignment=" + sign_alignment_name(summary.alignment) +
+                            ", board=" + number_text(summary.board_width) + "×" +
+                            number_text(summary.board_height) + "×" +
+                            number_text(summary.board_depth) + "m" +
+                            ", glyph=" + number_text(summary.glyph_height) + "×" +
+                            number_text(summary.glyph_depth) + "m" +
+                            ", tracking=" + number_text(summary.tracking) +
+                            ", line spacing=" + number_text(summary.line_spacing);
+                    }
+                    return result;
+                }, value);
+            };
+            const auto procedural_counts_text = [](
+                    const agent::ProceduralSourceRecordCounts& counts) {
+                return "curve paths=" + std::to_string(counts.curve_paths) +
+                    ", roads=" + std::to_string(counts.roads) +
+                    ", sweeps=" + std::to_string(counts.sweeps) +
+                    ", sign texts=" + std::to_string(counts.sign_texts);
+            };
+            if (diff.procedural_sources.changed) {
+                const auto& sources = diff.procedural_sources;
+                std::string changes = "changed records=" +
+                    std::to_string(sources.changed_record_count) +
+                    "; collections before {" + procedural_counts_text(sources.before_counts) +
+                    "} → after {" + procedural_counts_text(sources.after_counts) + "}";
+                if (sources.records_truncated) changes += "; record samples truncated";
+                append_detail(is_current, "Procedural source collections", std::move(changes));
+            }
+            for (const auto& change : diff.procedural_sources.records) {
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) changes = "changed";
+                changes += "; before {" + (change.before.has_value()
+                    ? procedural_summary_text(*change.before)
+                    : std::string{"(absent)"}) + "} → after {" +
+                    (change.after.has_value()
+                        ? procedural_summary_text(*change.after)
+                        : std::string{"(absent)"}) + "}";
+                append_detail(is_current,
+                    procedural_kind_name(change.kind) + " · " + quoted_text(change.identity),
+                    std::move(changes));
+            }
+            if (diff.procedural_sources.records_truncated) {
+                if (is_current) result.current_truncated = true;
+                else result.speculative_truncated = true;
+            }
+            if (diff.biological_authoring_sources.changed) {
+                const auto& sources = diff.biological_authoring_sources;
+                std::string changes = "changed records=" +
+                    std::to_string(sources.changed_record_count) +
+                    "; sources " + std::to_string(sources.before_record_count) +
+                    " → " + std::to_string(sources.after_record_count) +
+                    "; review uses serialized byte counts and digests only";
+                if (!sources.details_available) {
+                    changes += "; record-level details unavailable";
+                }
+                if (sources.records_truncated) changes += "; record sample truncated";
+                append_detail(is_current, "Biological authoring sources",
+                    std::move(changes));
+            }
+            const auto biological_summary_text = [&quoted_text](const auto& summary) {
+                return "namespace=" + quoted_text(summary.source_namespace) +
+                    ", asset=#" + std::to_string(summary.asset_id) +
+                    ", bytes=" + std::to_string(summary.serialized_bytes) +
+                    ", digest=" + summary.digest.hex().substr(0U, 12U);
+            };
+            for (const auto& change : diff.biological_authoring_sources.records) {
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) changes = "changed";
+                changes += "; before {" + (change.before.has_value()
+                    ? biological_summary_text(*change.before)
+                    : std::string{"(absent)"}) + "} → after {" +
+                    (change.after.has_value()
+                        ? biological_summary_text(*change.after)
+                        : std::string{"(absent)"}) + "}";
+                append_detail(is_current,
+                    "Biological authoring source · " + quoted_text(change.identity),
+                    std::move(changes));
+            }
+            if (diff.biological_authoring_sources.records_truncated) {
+                if (is_current) result.current_truncated = true;
+                else result.speculative_truncated = true;
+            }
+            if (diff.rig_module_template_sources.changed) {
+                const auto& sources = diff.rig_module_template_sources;
+                std::string changes = "changed templates=" +
+                    std::to_string(sources.changed_record_count) +
+                    "; records " + std::to_string(sources.before_record_count) +
+                    " → " + std::to_string(sources.after_record_count) +
+                    "; review uses revisions, serialized byte counts, and digests only";
+                if (!sources.details_available) {
+                    changes += "; record-level details unavailable";
+                }
+                if (sources.records_truncated) changes += "; record sample truncated";
+                append_detail(is_current, "Rig module templates", std::move(changes));
+            }
+            const auto rig_module_summary_text = [](const auto& summary) {
+                return "revision=" + std::to_string(summary.revision.value()) +
+                    ", bytes=" + std::to_string(summary.serialized_bytes) +
+                    ", digest=" + summary.digest.hex().substr(0U, 12U);
+            };
+            for (const auto& change : diff.rig_module_template_sources.records) {
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) changes = "changed";
+                changes += "; before {" + (change.before.has_value()
+                    ? rig_module_summary_text(*change.before)
+                    : std::string{"(absent)"}) + "} → after {" +
+                    (change.after.has_value()
+                        ? rig_module_summary_text(*change.after)
+                        : std::string{"(absent)"}) + "}";
+                append_detail(is_current,
+                    "Rig module template · " + quoted_text(change.identity),
+                    std::move(changes));
+            }
+            if (diff.rig_module_template_sources.records_truncated) {
+                if (is_current) result.current_truncated = true;
+                else result.speculative_truncated = true;
+            }
+            if (diff.decal_placement_sources.changed) {
+                const auto& placements = diff.decal_placement_sources;
+                std::string changes = "changed placements=" +
+                    std::to_string(placements.changed_record_count) +
+                    "; records " + std::to_string(placements.before_record_count) +
+                    " → " + std::to_string(placements.after_record_count) +
+                    "; review uses revisions, serialized byte counts, and digests only";
+                if (placements.records_truncated) changes += "; record sample truncated";
+                append_detail(is_current, "Decal placements", std::move(changes));
+            }
+            for (const auto& change : diff.decal_placement_sources.records) {
+                const auto summary_text = [](const auto& summary) {
+                    return "revision=" + std::to_string(summary.revision.value()) +
+                        ", bytes=" + std::to_string(summary.serialized_bytes) +
+                        ", digest=" + summary.digest.hex().substr(0U, 12U);
+                };
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) changes = "changed";
+                changes += "; before {" + (change.before.has_value()
+                    ? summary_text(*change.before) : std::string{"(absent)"}) +
+                    "} → after {" + (change.after.has_value()
+                    ? summary_text(*change.after) : std::string{"(absent)"}) + "}";
+                append_detail(is_current,
+                    "Decal placement · #" + std::to_string(change.placement_id),
+                    std::move(changes));
+            }
+            if (diff.decal_placement_sources.records_truncated) {
+                if (is_current) result.current_truncated = true;
+                else result.speculative_truncated = true;
+            }
+            if (diff.pose_libraries.changed) {
+                const auto& libraries = diff.pose_libraries;
+                std::string changes = "changed libraries=" +
+                    std::to_string(libraries.changed_record_count) +
+                    "; records " + std::to_string(libraries.before_record_count) +
+                    " → " + std::to_string(libraries.after_record_count) +
+                    "; review uses revisions, serialized byte counts, and digests only";
+                if (libraries.records_truncated) changes += "; record sample truncated";
+                append_detail(is_current, "Pose libraries", std::move(changes));
+            }
+            for (const auto& change : diff.pose_libraries.records) {
+                const auto summary_text = [](const auto& summary) {
+                    return "revision=" + std::to_string(summary.revision.value()) +
+                        ", bytes=" + std::to_string(summary.serialized_bytes) +
+                        ", digest=" + summary.digest.hex().substr(0U, 12U);
+                };
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) changes = "changed";
+                changes += "; before {" + (change.before.has_value()
+                    ? summary_text(*change.before) : std::string{"(absent)"}) +
+                    "} → after {" + (change.after.has_value()
+                    ? summary_text(*change.after) : std::string{"(absent)"}) + "}";
+                append_detail(is_current,
+                    "Pose library · " + quoted_text(change.identity),
+                    std::move(changes));
+            }
+            if (diff.pose_libraries.records_truncated) {
+                if (is_current) result.current_truncated = true;
+                else result.speculative_truncated = true;
+            }
+            if (diff.kinematic_graphs.changed) {
+                const auto& graphs = diff.kinematic_graphs;
+                std::string changes = "changed graphs=" +
+                    std::to_string(graphs.changed_record_count) +
+                    "; records " + std::to_string(graphs.before_record_count) +
+                    " → " + std::to_string(graphs.after_record_count) +
+                    "; review uses revisions, serialized byte counts, and digests only";
+                if (graphs.records_truncated) changes += "; record sample truncated";
+                append_detail(is_current, "Kinematic graphs", std::move(changes));
+            }
+            for (const auto& change : diff.kinematic_graphs.records) {
+                const auto summary_text = [](const auto& summary) {
+                    return "revision=" + std::to_string(summary.revision.value()) +
+                        ", bytes=" + std::to_string(summary.serialized_bytes) +
+                        ", digest=" + summary.digest.hex().substr(0U, 12U);
+                };
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) changes = "changed";
+                changes += "; before {" + (change.before.has_value()
+                    ? summary_text(*change.before) : std::string{"(absent)"}) +
+                    "} → after {" + (change.after.has_value()
+                    ? summary_text(*change.after) : std::string{"(absent)"}) + "}";
+                append_detail(is_current,
+                    "Kinematic graph · " + quoted_text(change.identity),
+                    std::move(changes));
+            }
+            if (diff.kinematic_graphs.records_truncated) {
+                if (is_current) result.current_truncated = true;
+                else result.speculative_truncated = true;
+            }
+            if (diff.edit_receipts.changed) {
+                const auto& receipts = diff.edit_receipts;
+                std::string changes = "changed receipts=" +
+                    std::to_string(receipts.changed_record_count) +
+                    "; weight " + std::to_string(receipts.before_counts.weight) +
+                    " → " + std::to_string(receipts.after_counts.weight) +
+                    ", keyed curve " +
+                    std::to_string(receipts.before_counts.keyed_curve) + " → " +
+                    std::to_string(receipts.after_counts.keyed_curve) +
+                    ", topology " + std::to_string(receipts.before_counts.topology) +
+                    " → " + std::to_string(receipts.after_counts.topology) +
+                    ", mesh patches " +
+                    std::to_string(receipts.before_counts.mesh_patch) + " → " +
+                    std::to_string(receipts.after_counts.mesh_patch) +
+                    "; receipt payloads remain opaque";
+                if (receipts.records_truncated) changes += "; record sample truncated";
+                append_detail(is_current, "Historical edit receipts", std::move(changes));
+            }
+            const auto edit_receipt_kind_name = [](agent::ProjectEditReceiptKind kind) {
+                switch (kind) {
+                case agent::ProjectEditReceiptKind::weight:
+                    return std::string{"Weight edit receipt"};
+                case agent::ProjectEditReceiptKind::keyed_curve:
+                    return std::string{"Keyed-curve edit receipt"};
+                case agent::ProjectEditReceiptKind::topology:
+                    return std::string{"Topology edit receipt"};
+                case agent::ProjectEditReceiptKind::mesh_patch:
+                    return std::string{"Persistent mesh patch"};
+                }
+                return std::string{"Edit receipt"};
+            };
+            for (const auto& change : diff.edit_receipts.records) {
+                const auto summary_text = [](const auto& summary) {
+                    std::string result = "bytes=" +
+                        std::to_string(summary.serialized_bytes) +
+                        ", digest=" + summary.digest.hex().substr(0U, 12U);
+                    if (summary.mesh_asset != 0U) {
+                        result += ", mesh #" + std::to_string(summary.mesh_asset);
+                    }
+                    if (summary.source_mesh_digest.has_value()) {
+                        result += ", source mesh=" +
+                            summary.source_mesh_digest->hex().substr(0U, 12U);
+                    }
+                    if (summary.result_mesh_digest.has_value()) {
+                        result += ", result mesh=" +
+                            summary.result_mesh_digest->hex().substr(0U, 12U);
+                    }
+                    return result;
+                };
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) changes = "changed";
+                changes += "; before {" + (change.before.has_value()
+                    ? summary_text(*change.before) : std::string{"(absent)"}) +
+                    "} → after {" + (change.after.has_value()
+                    ? summary_text(*change.after) : std::string{"(absent)"}) + "}";
+                append_detail(is_current,
+                    edit_receipt_kind_name(change.kind) + " · sequence #" +
+                        std::to_string(change.sequence_index),
+                    std::move(changes));
+            }
+            if (diff.edit_receipts.records_truncated) {
+                if (is_current) result.current_truncated = true;
+                else result.speculative_truncated = true;
+            }
+            if (diff.instance_receipts.changed) {
+                const auto& receipts = diff.instance_receipts;
+                std::string changes = "changed receipts=" +
+                    std::to_string(receipts.changed_record_count) +
+                    "; changed by kind {sign=" + std::to_string(
+                        receipts.changed_record_counts.sign_text) +
+                    ", road=" + std::to_string(
+                        receipts.changed_record_counts.road_surface) +
+                    ", biological=" + std::to_string(
+                        receipts.changed_record_counts.biological_proxy) +
+                    ", CONDITION vegetation=" + std::to_string(
+                        receipts.changed_record_counts.condition_vegetation) +
+                    "}; collections {sign=" + std::to_string(
+                        receipts.before_counts.sign_text) + "→" +
+                        std::to_string(receipts.after_counts.sign_text) +
+                    ", road=" + std::to_string(receipts.before_counts.road_surface) + "→" +
+                        std::to_string(receipts.after_counts.road_surface) +
+                    ", biological=" + std::to_string(
+                        receipts.before_counts.biological_proxy) + "→" +
+                        std::to_string(receipts.after_counts.biological_proxy) +
+                    ", CONDITION vegetation=" + std::to_string(
+                        receipts.before_counts.condition_vegetation) + "→" +
+                        std::to_string(receipts.after_counts.condition_vegetation) +
+                    "}; provenance summaries only";
+                if (receipts.records_truncated) changes += "; record sample truncated";
+                append_detail(is_current, "Generated instance provenance", std::move(changes));
+            }
+            const auto instance_receipt_kind_name = [](
+                    agent::ProjectInstanceReceiptKind kind) {
+                switch (kind) {
+                case agent::ProjectInstanceReceiptKind::sign_text:
+                    return std::string{"Sign-text instance receipt"};
+                case agent::ProjectInstanceReceiptKind::road_surface:
+                    return std::string{"Road-surface instance receipt"};
+                case agent::ProjectInstanceReceiptKind::biological_proxy:
+                    return std::string{"Biological-proxy instance receipt"};
+                case agent::ProjectInstanceReceiptKind::condition_vegetation:
+                    return std::string{"CONDITION vegetation placement receipt"};
+                }
+                return std::string{"Instance receipt"};
+            };
+            const auto instance_receipt_summary_text = [&](
+                    const agent::ProjectInstanceReceiptSummary& receipt) {
+                return std::visit([&](const auto& summary) {
+                    using Summary = std::decay_t<decltype(summary)>;
+                    if constexpr (std::is_same_v<Summary,
+                            agent::SignTextInstanceReceiptSummary>) {
+                        return "mesh=#" + std::to_string(summary.mesh_asset) +
+                            ", source=" + quoted_text(summary.source_identity) +
+                            " r" + std::to_string(summary.source_revision.value()) +
+                            ", snapshot=" + std::to_string(summary.source_snapshot_bytes) +
+                            " bytes / " + digest_prefix(summary.source_digest);
+                    } else if constexpr (std::is_same_v<Summary,
+                            agent::RoadSurfaceInstanceReceiptSummary>) {
+                        return "mesh=#" + std::to_string(summary.mesh_asset) +
+                            ", surface=" + road_surface_name(summary.surface_class) +
+                            ", road=" + quoted_text(summary.road_identity) + " r" +
+                            std::to_string(summary.road_revision.value()) + " / " +
+                            std::to_string(summary.road_snapshot_bytes) + " bytes / " +
+                            digest_prefix(summary.road_digest) +
+                            ", centerline=" + quoted_text(summary.centerline_identity) +
+                            " r" + std::to_string(summary.centerline_revision.value()) +
+                            " / " + std::to_string(summary.centerline_snapshot_bytes) +
+                            " bytes / " + digest_prefix(summary.centerline_digest) +
+                            ", samples/segment=" +
+                            std::to_string(summary.samples_per_segment) +
+                            ", generated mesh=" + digest_prefix(summary.generated_mesh_digest);
+                    } else if constexpr (std::is_same_v<Summary,
+                            agent::BiologicalProxyInstanceReceiptSummary>) {
+                        return "mesh=#" + std::to_string(summary.mesh_asset) +
+                            ", source=" + quoted_text(summary.source_namespace) +
+                            " / asset #" + std::to_string(summary.source_asset_id) +
+                            " r" + std::to_string(summary.source_revision.value()) +
+                            ", structure #" + std::to_string(summary.structure_id) +
+                            ", snapshot=" + std::to_string(summary.source_snapshot_bytes) +
+                            " bytes / " + digest_prefix(summary.source_snapshot_digest) +
+                            ", product=" + digest_prefix(summary.product_digest);
+                    } else {
+                        std::string fields;
+                        for (std::size_t index = 0U; index < summary.fields.size(); ++index) {
+                            if (index != 0U) fields += "; ";
+                            const auto& field = summary.fields[index];
+                            fields += quoted_text(field.identity) + " · " +
+                                std::string(spatial_field::field_semantic_name(
+                                    field.semantic)) + " r" +
+                                std::to_string(field.source_revision.value()) + " · " +
+                                digest_prefix(field.digest);
+                        }
+                        return "mesh=#" + std::to_string(summary.mesh_asset) +
+                            ", placement #" + std::to_string(summary.stable_placement_id) +
+                            ", recipe/species #" + std::to_string(summary.recipe_id) + "/#" +
+                            std::to_string(summary.species_asset_id) +
+                            ", plant=" + quoted_text(summary.plant_source_identity) +
+                            " r" + std::to_string(summary.plant_source_generation.value()) +
+                            " / " + digest_prefix(summary.plant_source_digest) +
+                            ", project r" +
+                            std::to_string(summary.source_project_revision.value()) +
+                            ", authoring r" + std::to_string(summary.authoring_revision.value()) +
+                            " / " + digest_prefix(summary.authoring_digest) +
+                            ", preview=" + digest_prefix(summary.preview_digest) +
+                            ", fields=[" + fields + "]" +
+                            ", position=" + vector_text(summary.position) +
+                            ", yaw/scale/suitability=" + number_text(summary.yaw_radians) + "/" +
+                            number_text(summary.uniform_scale) + "/" +
+                            number_text(summary.suitability);
+                    }
+                }, receipt);
+            };
+            for (const auto& change : diff.instance_receipts.records) {
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) changes = "changed";
+                changes += "; before {" + (change.before.has_value()
+                    ? instance_receipt_summary_text(*change.before)
+                    : std::string{"(absent)"}) + "} → after {" +
+                    (change.after.has_value()
+                        ? instance_receipt_summary_text(*change.after)
+                        : std::string{"(absent)"}) + "}";
+                append_detail(is_current,
+                    instance_receipt_kind_name(change.kind) + " · object #" +
+                        std::to_string(change.object.value),
+                    std::move(changes));
+            }
+            if (diff.instance_receipts.records_truncated) {
+                if (is_current) result.current_truncated = true;
+                else result.speculative_truncated = true;
+            }
+            if (diff.mesh_authoring_sources.changed) {
+                const auto& sources = diff.mesh_authoring_sources;
+                std::string changes = "changed records=" +
+                    std::to_string(sources.changed_record_count) +
+                    "; changed by kind {SculptStack=" + std::to_string(
+                        sources.changed_record_counts.sculpt_stack) +
+                    ", GarmentAsset=" + std::to_string(
+                        sources.changed_record_counts.garment_asset) +
+                    ", cloth receipt=" + std::to_string(
+                        sources.changed_record_counts.cloth_rest_pose_receipt) +
+                    "}; collections {SculptStack=" + std::to_string(
+                        sources.before_counts.sculpt_stack) + "→" +
+                        std::to_string(sources.after_counts.sculpt_stack) +
+                    ", GarmentAsset=" + std::to_string(
+                        sources.before_counts.garment_asset) + "→" +
+                        std::to_string(sources.after_counts.garment_asset) +
+                    ", cloth receipt=" + std::to_string(
+                        sources.before_counts.cloth_rest_pose_receipt) + "→" +
+                        std::to_string(sources.after_counts.cloth_rest_pose_receipt) +
+                    "}; opaque bytes and digests only";
+                if (sources.records_truncated) changes += "; record sample truncated";
+                append_detail(is_current, "Mesh authoring sources", std::move(changes));
+            }
+            const auto mesh_authoring_source_kind_name = [](
+                    agent::ProjectMeshAuthoringSourceKind kind) {
+                switch (kind) {
+                case agent::ProjectMeshAuthoringSourceKind::sculpt_stack:
+                    return std::string{"SculptStack source"};
+                case agent::ProjectMeshAuthoringSourceKind::garment_asset:
+                    return std::string{"GarmentAsset source"};
+                case agent::ProjectMeshAuthoringSourceKind::cloth_rest_pose_receipt:
+                    return std::string{"Cloth rest-pose receipt"};
+                }
+                return std::string{"Mesh authoring source"};
+            };
+            for (const auto& change : diff.mesh_authoring_sources.records) {
+                const auto summary_text = [](const auto& summary) {
+                    return "bytes=" + std::to_string(summary.serialized_bytes) +
+                        ", digest=" + summary.digest.hex().substr(0U, 12U);
+                };
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) changes = "changed";
+                changes += "; before {" + (change.before.has_value()
+                    ? summary_text(*change.before) : std::string{"(absent)"}) +
+                    "} → after {" + (change.after.has_value()
+                        ? summary_text(*change.after) : std::string{"(absent)"}) + "}";
+                append_detail(is_current,
+                    mesh_authoring_source_kind_name(change.kind) + " · mesh #" +
+                        std::to_string(change.mesh_asset),
+                    std::move(changes));
+            }
+            if (diff.mesh_authoring_sources.records_truncated) {
+                if (is_current) result.current_truncated = true;
+                else result.speculative_truncated = true;
+            }
+            for (const auto& change : diff.objects) {
+                std::string changes = summarize_object(change);
+                const bool all_fields = change.added || change.removed;
+                if (all_fields || change.name_changed) {
+                    append_transition(changes, "name",
+                        object_field_value(change.before_state, [](const auto& state) {
+                            return state.name;
+                        }),
+                        object_field_value(change.after_state, [](const auto& state) {
+                            return state.name;
+                        }));
+                }
+                if (all_fields || change.transform_changed) {
+                    append_transition(changes, "transform",
+                        object_field_value(change.before_state, object_transform_value),
+                        object_field_value(change.after_state, object_transform_value));
+                }
+                if (all_fields || change.parent_changed) {
+                    append_transition(changes, "parent",
+                        object_field_value(change.before_state, object_parent_value),
+                        object_field_value(change.after_state, object_parent_value));
+                }
+                if (all_fields || change.mesh_binding_changed) {
+                    append_transition(changes, "mesh",
+                        object_field_value(change.before_state, object_mesh_value),
+                        object_field_value(change.after_state, object_mesh_value));
+                }
+                if (all_fields || change.visibility_changed) {
+                    append_transition(changes, "visibility",
+                        object_field_value(change.before_state, [](const auto& state) {
+                            return state.visible ? std::string{"visible"}
+                                                 : std::string{"hidden"};
+                        }),
+                        object_field_value(change.after_state, [](const auto& state) {
+                            return state.visible ? std::string{"visible"}
+                                                 : std::string{"hidden"};
+                        }));
+                }
+                if (all_fields || change.lock_changed) {
+                    append_transition(changes, "lock",
+                        object_field_value(change.before_state, [](const auto& state) {
+                            return state.locked ? std::string{"locked"}
+                                                : std::string{"unlocked"};
+                        }),
+                        object_field_value(change.after_state, [](const auto& state) {
+                            return state.locked ? std::string{"locked"}
+                                                : std::string{"unlocked"};
+                        }));
+                }
+                append_detail(is_current,
+                    "Object " + std::to_string(change.id.value), std::move(changes));
+            }
+            for (const auto& change : diff.meshes) {
+                append_detail(is_current,
+                    "Mesh asset " + std::to_string(change.asset_id), summarize_mesh(change));
+
+                constexpr std::size_t kMaxRowsPerMeshValueKind = 8U;
+                const auto mark_mesh_samples_truncated = [&]() {
+                    if (is_current) result.current_mesh_samples_truncated = true;
+                    else result.speculative_mesh_samples_truncated = true;
+                };
+                const auto position_text = [&vec3_text](
+                        const agent::VertexValueChange& vertex, bool before) {
+                    if ((before && vertex.added) || (!before && vertex.removed)) {
+                        return std::string{"(absent)"};
+                    }
+                    return vec3_text(before ? vertex.before_position : vertex.after_position);
+                };
+                for (std::size_t index = 0U;
+                     index < std::min(change.vertices.size(), kMaxRowsPerMeshValueKind);
+                     ++index) {
+                    const auto& vertex = change.vertices[index];
+                    std::string details = vertex.added ? "added"
+                        : vertex.removed ? "removed" : "position changed";
+                    append_transition(details, "position",
+                        position_text(vertex, true), position_text(vertex, false));
+                    append_detail(is_current,
+                        "Mesh asset " + std::to_string(change.asset_id) + " / vertex #" +
+                            std::to_string(vertex.id.value), std::move(details));
+                }
+                if (change.vertices.size() > kMaxRowsPerMeshValueKind) {
+                    mark_mesh_samples_truncated();
+                }
+
+                const auto face_vertices_text = [](const std::vector<geometry::VertexId>& ids) {
+                    constexpr std::size_t kMaxFaceVerticesInDetail = 12U;
+                    std::string value{"["};
+                    const std::size_t count = std::min(ids.size(), kMaxFaceVerticesInDetail);
+                    for (std::size_t index = 0U; index < count; ++index) {
+                        if (index != 0U) value += ", ";
+                        value += "#" + std::to_string(ids[index].value);
+                    }
+                    if (ids.size() > count) {
+                        if (count != 0U) value += ", ";
+                        value += "... +" + std::to_string(ids.size() - count);
+                    }
+                    value += ']';
+                    return value;
+                };
+                for (std::size_t index = 0U;
+                     index < std::min(change.faces.size(), kMaxRowsPerMeshValueKind);
+                     ++index) {
+                    const auto& face = change.faces[index];
+                    std::string details = face.added ? "added"
+                        : face.removed ? "removed" : "connectivity changed";
+                    append_transition(details, "vertices",
+                        face.added ? "(absent)" : face_vertices_text(face.before_vertices),
+                        face.removed ? "(absent)" : face_vertices_text(face.after_vertices));
+                    append_detail(is_current,
+                        "Mesh asset " + std::to_string(change.asset_id) + " / face #" +
+                            std::to_string(face.id.value), std::move(details));
+                }
+                if (change.faces.size() > kMaxRowsPerMeshValueKind) {
+                    mark_mesh_samples_truncated();
+                }
+
+                for (std::size_t index = 0U;
+                     index < std::min(change.attribute_layers.size(),
+                         kMaxRowsPerMeshValueKind); ++index) {
+                    const auto& layer = change.attribute_layers[index];
+                    std::string details = layer.added ? "added"
+                        : layer.removed ? "removed"
+                        : layer.descriptor_changed ? "descriptor changed" : "values changed";
+                    append_transition(details, "value count",
+                        std::to_string(layer.before_value_count),
+                        std::to_string(layer.after_value_count));
+                    if (layer.added || layer.removed || layer.descriptor_changed) {
+                        append_transition(details, "descriptor",
+                            attribute_descriptor_text(layer.before_descriptor),
+                            attribute_descriptor_text(layer.after_descriptor));
+                    }
+                    if (layer.changed_value_count != 0U) {
+                        details += " · ";
+                        details += std::to_string(layer.changed_value_count);
+                        details += " changed values";
+                    }
+                    append_detail(is_current,
+                        "Mesh asset " + std::to_string(change.asset_id) +
+                            " / attribute " + layer.layer_id, std::move(details));
+                }
+                if (change.attribute_layers.size() > kMaxRowsPerMeshValueKind) {
+                    mark_mesh_samples_truncated();
+                }
+
+                for (std::size_t index = 0U;
+                     index < std::min(change.uv_sets.size(), kMaxRowsPerMeshValueKind);
+                     ++index) {
+                    const auto& uv_set = change.uv_sets[index];
+                    std::string set_details = uv_set.descriptor_changed
+                        ? "UV descriptor changed" : "UV values changed";
+                    set_details += " · ";
+                    set_details += std::to_string(uv_set.changed_corner_count);
+                    set_details += " changed corners";
+                    if (uv_set.descriptor_changed) {
+                        append_transition(set_details, "descriptor",
+                            uv_descriptor_text(uv_set.before),
+                            uv_descriptor_text(uv_set.after));
+                    }
+                    if (!uv_set.details_available) {
+                        set_details += " · corner detail unavailable";
+                    }
+                    append_detail(is_current,
+                        "Mesh asset " + std::to_string(change.asset_id) + " / UV set #" +
+                            std::to_string(uv_set.id), std::move(set_details));
+                    if (!uv_set.details_available) continue;
+                    for (std::size_t sample_index = 0U;
+                         sample_index < std::min(uv_set.samples.size(),
+                             kMaxRowsPerMeshValueKind); ++sample_index) {
+                        const auto& corner = uv_set.samples[sample_index];
+                        std::string details = "UV coordinate changed";
+                        append_transition(details, "value",
+                            corner.before.has_value()
+                                ? vec2_text(*corner.before) : "(absent)",
+                            corner.after.has_value()
+                                ? vec2_text(*corner.after) : "(absent)");
+                        append_detail(is_current,
+                            "Mesh asset " + std::to_string(change.asset_id) + " / UV set #" +
+                                std::to_string(uv_set.id) + " / corner #" +
+                                std::to_string(corner.corner.value), std::move(details));
+                    }
+                    if (uv_set.samples_truncated ||
+                        uv_set.samples.size() > kMaxRowsPerMeshValueKind) {
+                        mark_mesh_samples_truncated();
+                    }
+                }
+                if (change.uv_sets.size() > kMaxRowsPerMeshValueKind) {
+                    mark_mesh_samples_truncated();
+                }
+            }
+            for (const auto& change : diff.material_bindings) {
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) {
+                    changes = summarize_fields({
+                        {change.material_changed, "material"},
+                        {change.variant_changed, "variant"}});
+                }
+                append_transition(changes, "binding",
+                    material_binding_value(change.before, change.before_material_name),
+                    material_binding_value(change.after, change.after_material_name));
+                append_detail(is_current,
+                    "Material binding mesh " + std::to_string(change.key.mesh_asset) +
+                        " / region " + std::to_string(change.key.region_id),
+                    std::move(changes));
+            }
+            for (const auto& change : diff.material_sources) {
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) {
+                    changes = summarize_fields({
+                        {change.source_changed, "source"},
+                        {change.definition_changed, "definition"},
+                        {change.texture_dependencies_changed, "texture dependencies"}});
+                }
+                const std::string name = change.after_name.value_or(
+                    change.before_name.value_or("unnamed"));
+                append_transition(changes, "name",
+                    change.before_name.value_or("(absent)"),
+                    change.after_name.value_or("(absent)"));
+                append_transition(changes, "revision",
+                    revision_text(change.before_revision), revision_text(change.after_revision));
+                const auto append_definition_transition = [&](std::string_view field,
+                        const auto& value_for, const auto& format_value) {
+                    if (change.before_definition.has_value() &&
+                        change.after_definition.has_value()) {
+                        const std::string before_value =
+                            format_value(value_for(*change.before_definition));
+                        const std::string after_value =
+                            format_value(value_for(*change.after_definition));
+                        if (before_value != after_value) {
+                            append_transition(changes, field, before_value, after_value);
+                        }
+                        return;
+                    }
+                    const bool added = !change.before_definition.has_value();
+                    const render::StandardMaterial& present = added
+                        ? *change.after_definition : *change.before_definition;
+                    const render::StandardMaterial defaults{};
+                    const std::string present_value = format_value(value_for(present));
+                    if (present_value == format_value(value_for(defaults))) return;
+                    append_transition(changes, field,
+                        added ? "(absent)" : present_value,
+                        added ? present_value : "(absent)");
+                };
+                append_definition_transition("base color", [](const auto& definition) {
+                    return definition.base_color_factor;
+                }, vec4_text);
+                append_definition_transition("metallic", [](const auto& definition) {
+                    return definition.metallic;
+                }, number_text);
+                append_definition_transition("roughness", [](const auto& definition) {
+                    return definition.roughness;
+                }, number_text);
+                append_definition_transition("normal scale", [](const auto& definition) {
+                    return definition.normal_scale;
+                }, number_text);
+                append_definition_transition("occlusion strength", [](const auto& definition) {
+                    return definition.occlusion_strength;
+                }, number_text);
+                append_definition_transition("emissive", [](const auto& definition) {
+                    return definition.emissive_factor;
+                }, vec3_text);
+                append_definition_transition("emissive strength", [](const auto& definition) {
+                    return definition.emissive_strength;
+                }, number_text);
+                append_definition_transition("dielectric F0", [](const auto& definition) {
+                    return definition.dielectric_f0;
+                }, number_text);
+                append_definition_transition("clearcoat", [](const auto& definition) {
+                    return definition.clearcoat;
+                }, number_text);
+                append_definition_transition("clearcoat roughness", [](const auto& definition) {
+                    return definition.clearcoat_roughness;
+                }, number_text);
+                append_definition_transition("alpha mode", [](const auto& definition) {
+                    return definition.alpha_mode;
+                }, alpha_mode_text);
+                append_definition_transition("alpha cutoff", [](const auto& definition) {
+                    return definition.alpha_cutoff;
+                }, number_text);
+                append_definition_transition("base-color texture", [](const auto& definition)
+                    -> const auto& { return definition.base_color; }, texture_binding_text);
+                append_definition_transition("metallic-roughness texture",
+                    [](const auto& definition) -> const auto& {
+                        return definition.metallic_roughness;
+                    }, texture_binding_text);
+                append_definition_transition("normal texture", [](const auto& definition)
+                    -> const auto& { return definition.normal; }, texture_binding_text);
+                append_definition_transition("occlusion texture", [](const auto& definition)
+                    -> const auto& { return definition.occlusion; }, texture_binding_text);
+                append_definition_transition("emissive texture", [](const auto& definition)
+                    -> const auto& { return definition.emissive; }, texture_binding_text);
+                append_detail(is_current,
+                    "Material " + std::to_string(change.id) + " · " + name,
+                    std::move(changes));
+            }
+            for (const auto& change : diff.texture_sources) {
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) {
+                    changes = summarize_fields({
+                        {change.source_changed, "source"},
+                        {change.content_changed, "content"},
+                        {change.metadata_changed, "metadata"}});
+                }
+                const std::string name = change.after_name.value_or(
+                    change.before_name.value_or("unnamed"));
+                const auto append_texture_field = [&](std::string_view field,
+                        const auto& value_for, const auto& format_value) {
+                    const auto format_record = [&](
+                            const std::optional<project::TextureSourceRecord>& record) {
+                        if (!record.has_value()) return std::string{"(absent)"};
+                        return format_value(value_for(*record));
+                    };
+                    const std::string before_value = format_record(change.before);
+                    const std::string after_value = format_record(change.after);
+                    if (change.added || change.removed || before_value != after_value) {
+                        append_transition(changes, field, before_value, after_value);
+                    }
+                };
+                append_texture_field("name", [](const auto& record) -> const auto& {
+                    return record.name;
+                }, bounded_source_label);
+                append_texture_field("locator", [](const auto& record) -> const auto& {
+                    return record.relative_locator;
+                }, bounded_source_label);
+                append_texture_field("content digest", [](const auto& record) -> const auto& {
+                    return record.content_digest;
+                }, [](const assets::Sha256Digest& digest) {
+                    return digest.hex().substr(0U, 12U);
+                });
+                append_texture_field("format", [](const auto& record) {
+                    return record.format;
+                }, [](assets::TextureSourceFormat format) {
+                    return std::string{assets::texture_source_format_name(format)};
+                });
+                append_texture_field("dimensions", [](const auto& record) {
+                    if (record.width == 0U && record.height == 0U) {
+                        return std::string{"(unknown)"};
+                    }
+                    return std::to_string(record.width) + " × " +
+                        std::to_string(record.height);
+                }, [](const std::string& dimensions) {
+                    return dimensions;
+                });
+                append_texture_field("provenance", [](const auto& record) -> const auto& {
+                    return record.provenance;
+                }, bounded_source_label);
+                append_texture_field("revision", [](const auto& record) {
+                    return record.revision;
+                }, [](core::Revision revision) {
+                    return std::to_string(revision.value());
+                });
+                append_detail(is_current,
+                    "Texture " + std::to_string(change.id) + " · " + name,
+                    std::move(changes));
+            }
+            for (const auto& change : diff.material_variants) {
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) {
+                    changes = summarize_fields({
+                        {change.name_changed, "name"},
+                        {change.base_material_changed, "base material"},
+                        {change.overrides_changed, "overrides"},
+                        {change.mesh_scope_changed, "mesh scope"}});
+                }
+                const std::string name = change.after_name.value_or(
+                    change.before_name.value_or("unnamed"));
+                append_transition(changes, "name",
+                    change.before_name.value_or("(absent)"),
+                    change.after_name.value_or("(absent)"));
+                append_transition(changes, "base material",
+                    optional_id_text(change.before_base_material),
+                    optional_id_text(change.after_base_material));
+                if (change.added || change.removed || change.overrides_changed) {
+                    append_transition(changes, "override count",
+                        std::to_string(change.before_override_count),
+                        std::to_string(change.after_override_count));
+                }
+                if (change.added || change.removed || change.mesh_scope_changed) {
+                    append_transition(changes, "mesh scope count",
+                        std::to_string(change.before_mesh_scope_count),
+                        std::to_string(change.after_mesh_scope_count));
+                }
+                append_transition(changes, "revision",
+                    revision_text(change.before_revision),
+                    revision_text(change.after_revision));
+                const auto append_override_transition = [&](std::string_view field,
+                        const auto& value_for, const auto& format_value) {
+                    const auto format_override = [&](const auto& overrides) {
+                        if (!overrides.has_value()) return std::string{"(variant absent)"};
+                        const auto& value = value_for(*overrides);
+                        return value.has_value() ? format_value(*value)
+                                                 : std::string{"(unset)"};
+                    };
+                    const std::string before_value = format_override(change.before_overrides);
+                    const std::string after_value = format_override(change.after_overrides);
+                    if (before_value != after_value) {
+                        append_transition(changes, field, before_value, after_value);
+                    }
+                };
+                append_override_transition("base color", [](const auto& overrides)
+                        -> const auto& { return overrides.base_color_factor; }, vec4_text);
+                append_override_transition("metallic", [](const auto& overrides)
+                        -> const auto& { return overrides.metallic; }, number_text);
+                append_override_transition("roughness", [](const auto& overrides)
+                        -> const auto& { return overrides.roughness; }, number_text);
+                append_override_transition("normal scale", [](const auto& overrides)
+                        -> const auto& { return overrides.normal_scale; }, number_text);
+                append_override_transition("occlusion strength", [](const auto& overrides)
+                        -> const auto& { return overrides.occlusion_strength; }, number_text);
+                append_override_transition("emissive", [](const auto& overrides)
+                        -> const auto& { return overrides.emissive_factor; }, vec3_text);
+                append_override_transition("emissive strength", [](const auto& overrides)
+                        -> const auto& { return overrides.emissive_strength; }, number_text);
+                append_override_transition("dielectric F0", [](const auto& overrides)
+                        -> const auto& { return overrides.dielectric_f0; }, number_text);
+                append_override_transition("clearcoat", [](const auto& overrides)
+                        -> const auto& { return overrides.clearcoat; }, number_text);
+                append_override_transition("clearcoat roughness", [](const auto& overrides)
+                        -> const auto& { return overrides.clearcoat_roughness; }, number_text);
+                append_override_transition("alpha mode", [](const auto& overrides)
+                        -> const auto& { return overrides.alpha_mode; }, alpha_mode_text);
+                append_override_transition("alpha cutoff", [](const auto& overrides)
+                        -> const auto& { return overrides.alpha_cutoff; }, number_text);
+                append_override_transition("base-color texture", [](const auto& overrides)
+                        -> const auto& { return overrides.base_color; }, texture_binding_text);
+                append_override_transition("metallic-roughness texture",
+                    [](const auto& overrides) -> const auto& {
+                        return overrides.metallic_roughness;
+                    }, texture_binding_text);
+                append_override_transition("normal texture", [](const auto& overrides)
+                        -> const auto& { return overrides.normal; }, texture_binding_text);
+                append_override_transition("occlusion texture", [](const auto& overrides)
+                        -> const auto& { return overrides.occlusion; }, texture_binding_text);
+                append_override_transition("emissive texture", [](const auto& overrides)
+                        -> const auto& { return overrides.emissive; }, texture_binding_text);
+                if (change.added || change.removed || change.mesh_scope_changed) {
+                    const auto mesh_scope_text = [](bool present,
+                            const std::vector<std::uint64_t>& sample,
+                            std::size_t total, bool truncated) {
+                        if (!present) return std::string{"(absent)"};
+                        if (total == 0U) return std::string{"(unrestricted)"};
+                        std::string value{"["};
+                        for (std::size_t index = 0U; index < sample.size(); ++index) {
+                            if (index != 0U) value += ", ";
+                            value += "#" + std::to_string(sample[index]);
+                        }
+                        if (truncated) {
+                            if (!sample.empty()) value += ", ";
+                            value += "... + " + std::to_string(total - sample.size()) + " more";
+                        }
+                        value += ']';
+                        return value;
+                    };
+                    append_transition(changes, "permitted meshes",
+                        mesh_scope_text(!change.added, change.before_mesh_scope_sample,
+                            change.before_mesh_scope_count, change.before_mesh_scope_truncated),
+                        mesh_scope_text(!change.removed, change.after_mesh_scope_sample,
+                            change.after_mesh_scope_count, change.after_mesh_scope_truncated));
+                }
+                if (change.before_mesh_scope_truncated || change.after_mesh_scope_truncated) {
+                    if (is_current) result.current_variant_scope_truncated = true;
+                    else result.speculative_variant_scope_truncated = true;
+                }
+                append_detail(is_current,
+                    "Material variant " + std::to_string(change.id) + " · " + name,
+                    std::move(changes));
+            }
+            for (const auto& change : diff.samplers) {
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) {
+                    changes = summarize_fields({
+                        {change.name_changed, "name"},
+                        {change.addressing_changed, "addressing"},
+                        {change.filtering_changed, "filtering"}});
+                }
+                const std::string name = change.after.has_value()
+                    ? change.after->name
+                    : change.before.has_value() ? change.before->name : "unnamed";
+                append_transition(changes, "name",
+                    change.before.has_value() ? change.before->name : "(absent)",
+                    change.after.has_value() ? change.after->name : "(absent)");
+                const auto address_value = [&sampler_address_text](
+                        const std::optional<project::SamplerIntent>& value) {
+                    if (!value.has_value()) return std::string{"(absent)"};
+                    return "U=" + sampler_address_text(value->address_u) + ", V=" +
+                        sampler_address_text(value->address_v) + ", W=" +
+                        sampler_address_text(value->address_w);
+                };
+                if (change.added || change.removed || change.addressing_changed) {
+                    append_transition(changes, "addressing",
+                        address_value(change.before), address_value(change.after));
+                }
+                if (change.added || change.removed || change.filtering_changed) {
+                    const auto filter_value = [&sampler_filter_text](
+                            const std::optional<project::SamplerIntent>& value) {
+                        if (!value.has_value()) return std::string{"(absent)"};
+                        return "min=" + sampler_filter_text(value->minification) +
+                            ", mag=" + sampler_filter_text(value->magnification) +
+                            ", mip=" + sampler_filter_text(value->mip);
+                    };
+                    append_transition(changes, "filtering",
+                        filter_value(change.before), filter_value(change.after));
+                }
+                append_transition(changes, "revision",
+                    change.before.has_value()
+                        ? std::to_string(change.before->revision.value()) : "(absent)",
+                    change.after.has_value()
+                        ? std::to_string(change.after->revision.value()) : "(absent)");
+                append_detail(is_current,
+                    "Sampler " + std::to_string(change.id) + " · " + name,
+                    std::move(changes));
+            }
+            for (const auto& change : diff.material_graphs) {
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) {
+                    changes = summarize_fields({
+                        {change.outputs_changed, "outputs"},
+                        {change.content_changed, "content"}});
+                    if (change.added_node_count != 0U || change.removed_node_count != 0U ||
+                        change.changed_node_count != 0U) {
+                        changes += "; ";
+                        changes += std::to_string(change.added_node_count);
+                        changes += " added, ";
+                        changes += std::to_string(change.removed_node_count);
+                        changes += " removed, ";
+                        changes += std::to_string(change.changed_node_count);
+                        changes += " changed nodes";
+                    }
+                }
+                append_transition(changes, "digest",
+                    digest_prefix(change.before_digest), digest_prefix(change.after_digest));
+                append_transition(changes, "nodes",
+                    std::to_string(change.before_node_count),
+                    std::to_string(change.after_node_count));
+                append_transition(changes, "revision",
+                    revision_text(change.before_revision),
+                    revision_text(change.after_revision));
+                if (change.added || change.removed || change.outputs_changed) {
+                    append_transition(changes, "outputs",
+                        graph_outputs_text(change.before_outputs),
+                        graph_outputs_text(change.after_outputs));
+                }
+                append_detail(is_current,
+                    "Material graph " + change.identity, std::move(changes));
+                for (const auto& node : change.node_samples) {
+                    std::string node_changes = node.added ? "added"
+                        : node.removed ? "removed" : "changed";
+                    append_transition(node_changes, "node",
+                        graph_node_text(node.before), graph_node_text(node.after));
+                    append_detail(is_current,
+                        "Material graph " + change.identity + " / node #" +
+                            std::to_string(node.id), std::move(node_changes));
+                }
+                if (change.node_samples_truncated) {
+                    if (is_current) result.current_graph_samples_truncated = true;
+                    else result.speculative_graph_samples_truncated = true;
+                }
+            }
+            for (const auto& change : diff.material_graph_bindings) {
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) {
+                    changes = summarize_fields({
+                        {change.graph_changed, "graph"},
+                        {change.source_changed, "source"},
+                        {change.inputs_changed, "inputs"}});
+                }
+                append_transition(changes, "graph",
+                    change.before.has_value() ? change.before->graph_identity : "(absent)",
+                    change.after.has_value() ? change.after->graph_identity : "(absent)");
+                append_transition(changes, "source revision",
+                    change.before.has_value()
+                        ? std::to_string(change.before->source_revision.value()) : "(absent)",
+                    change.after.has_value()
+                        ? std::to_string(change.after->source_revision.value()) : "(absent)");
+                append_transition(changes, "source digest",
+                    change.before.has_value()
+                        ? change.before->source_digest.hex().substr(0U, 12U) : "(absent)",
+                    change.after.has_value()
+                        ? change.after->source_digest.hex().substr(0U, 12U) : "(absent)");
+                append_detail(is_current,
+                    "Material graph binding " + std::to_string(change.material),
+                    std::move(changes));
+            }
+            for (const auto& change : diff.texture_blobs) {
+                std::string changes = presence(change.added, change.removed);
+                if (changes.empty()) {
+                    changes = "references changed (" +
+                        std::to_string(change.before_textures.size()) + " → " +
+                        std::to_string(change.after_textures.size()) + " textures)";
+                }
+                append_detail(is_current,
+                    "Texture blob " + change.content_digest.hex().substr(0U, 12U),
+                    std::move(changes));
+            }
+            if (diff.semantic_sidecar.has_value()) {
+                const std::string merge_status = sidecar_merge_status(
+                    current.semantic_sidecar, speculative.semantic_sidecar);
+                append_detail(is_current, "Semantic sidecar",
+                    summarize_sidecar(*diff.semantic_sidecar) +
+                    "; opaque bytes; three-way status=" + merge_status);
+            }
+            if (diff.engineering.has_value()) {
+                const std::string merge_status = sidecar_merge_status(
+                    current.engineering, speculative.engineering);
+                append_detail(is_current, "Engineering sidecar",
+                    summarize_sidecar(*diff.engineering) +
+                    "; three-way status=" + merge_status);
+            }
+            if (diff.condition.has_value()) {
+                const std::string merge_status = sidecar_merge_status(
+                    current.condition, speculative.condition);
+                append_detail(is_current, "CONDITION sidecar",
+                    summarize_sidecar(*diff.condition) +
+                    "; three-way status=" + merge_status);
+            }
+            if (diff.source_projection_is_partial()) {
+                append_detail(is_current, "Snapshot coverage",
+                    "full-project digest binds complete snapshot; category rows are partial");
+            }
+        };
+        append_side(current, true);
+        append_side(speculative, false);
+        result.rows.reserve(rows.size());
+        for (auto& [key, row] : rows) {
+            static_cast<void>(key);
+            result.rows.push_back(std::move(row));
+        }
+        return result;
+    };
+    agent_project_merge_review_ = compared.value();
+    agent_project_merge_current_diff_ = summarize_diff(current_diff.value());
+    agent_project_merge_speculative_diff_ = summarize_diff(speculative_diff.value());
+    agent_project_merge_details_ = compare_details(current_diff.value(), speculative_diff.value());
+    agent_project_merge_resolution_.reset();
+    agent_project_merge_candidate_diff_.reset();
+    agent_project_merge_task_id_ = agent_task_->snapshot().task_id;
+
+    AgentProjectMergeView view;
+    view.task_id = agent_project_merge_task_id_;
+    view.review = *agent_project_merge_review_;
+    view.stale = session_.snapshot().project_revision != view.review.left_revision;
+    view.current_diff = agent_project_merge_current_diff_;
+    view.speculative_diff = agent_project_merge_speculative_diff_;
+    view.details = agent_project_merge_details_;
+    return core::Result<AgentProjectMergeView>::success(std::move(view));
+}
+
+core::Result<AgentProjectMergeView> UiController::resolve_agent_project_merge(
+    std::optional<agent::ProjectMergeSource> contested_choice) {
+    if (!agent_task_.has_value() || !agent_project_merge_review_.has_value() ||
+        agent_project_merge_task_id_ != agent_task_->snapshot().task_id) {
+        return core::Result<AgentProjectMergeView>::failure(invalid_state(
+            "compare the current task before resolving its project merge"));
+    }
+    const auto resolved = agent_task_->resolve_current_project_merge(
+        *agent_project_merge_review_, contested_choice);
+    if (!resolved) {
+        agent_project_merge_resolution_.reset();
+        agent_project_merge_candidate_diff_.reset();
+        return core::Result<AgentProjectMergeView>::failure(resolved.error());
+    }
+    agent_project_merge_resolution_.emplace(std::move(resolved.value()));
+    agent_project_merge_candidate_diff_ = std::make_shared<const agent::ProjectDiff>(
+        agent_project_merge_resolution_->candidate_diff);
+
+    AgentProjectMergeView view;
+    view.task_id = agent_project_merge_task_id_;
+    view.review = *agent_project_merge_review_;
+    view.stale = session_.snapshot().project_revision != view.review.left_revision;
+    view.current_diff = agent_project_merge_current_diff_;
+    view.speculative_diff = agent_project_merge_speculative_diff_;
+    view.details = agent_project_merge_details_;
+    view.selected_source = agent_project_merge_resolution_->selected_source;
+    view.candidate_digest = agent_project_merge_resolution_->source_digest;
+    view.candidate_diff = agent_project_merge_candidate_diff_;
+    const auto& candidate_diff = *agent_project_merge_candidate_diff_;
+    view.candidate_changed_objects = candidate_diff.changed_object_count();
+    view.candidate_changed_meshes = candidate_diff.changed_mesh_count();
+    view.candidate_changed_bindings = candidate_diff.changed_material_binding_count();
+    view.candidate_changed_materials = candidate_diff.changed_material_source_count();
+    view.candidate_changed_textures = candidate_diff.changed_texture_source_count();
+    view.candidate_changed_project_metadata =
+        candidate_diff.project_metadata.changed_field_count;
+    view.candidate_changed_spatial_fields =
+        candidate_diff.changed_spatial_field_count();
+    view.candidate_changed_source_assets =
+        candidate_diff.changed_source_asset_record_count();
+    view.candidate_changed_connection_ports =
+        candidate_diff.connection_port_graph.changed_port_count;
+    view.candidate_changed_connection_edges =
+        candidate_diff.connection_port_graph.changed_edge_count;
+    view.candidate_changed_authoring_standards =
+        candidate_diff.authoring_standards.changed_record_count;
+    view.candidate_changed_world_models = candidate_diff.world_model.changed ? 1U : 0U;
+    view.candidate_changed_scientific_models =
+        candidate_diff.scientific_model.changed ? 1U : 0U;
+    view.candidate_changed_procedural_sources =
+        candidate_diff.procedural_sources.changed_record_count;
+    view.candidate_changed_biological_sources =
+        candidate_diff.biological_authoring_sources.changed_record_count;
+    view.candidate_changed_rig_module_templates =
+        candidate_diff.rig_module_template_sources.changed_record_count;
+    view.candidate_changed_decal_placements =
+        candidate_diff.decal_placement_sources.changed_record_count;
+    view.candidate_changed_pose_libraries =
+        candidate_diff.pose_libraries.changed_record_count;
+    view.candidate_changed_kinematic_graphs =
+        candidate_diff.kinematic_graphs.changed_record_count;
+    view.candidate_changed_edit_receipts =
+        candidate_diff.edit_receipts.changed_record_count;
+    view.candidate_changed_instance_receipts =
+        candidate_diff.instance_receipts.changed_record_count;
+    view.candidate_changed_mesh_authoring_sources =
+        candidate_diff.mesh_authoring_sources.changed_record_count;
+    view.candidate_changed_semantic_sidecars =
+        candidate_diff.semantic_sidecar_changed ? 1U : 0U;
+    view.candidate_changed_engineering_sidecars =
+        candidate_diff.engineering_changed ? 1U : 0U;
+    view.candidate_changed_condition_sidecars =
+        candidate_diff.condition_changed ? 1U : 0U;
+    view.candidate_has_unclassified_source_changes =
+        candidate_diff.has_unclassified_source_changes();
+    view.candidate_source_projection_is_partial =
+        candidate_diff.source_projection_is_partial();
+    return core::Result<AgentProjectMergeView>::success(std::move(view));
+}
+
+core::Result<application::DispatchReceipt> UiController::accept_agent_project_merge(
+    std::string justification) {
+    if (!agent_task_.has_value() || !agent_project_merge_review_.has_value() ||
+        !agent_project_merge_resolution_.has_value() ||
+        agent_project_merge_task_id_ != agent_task_->snapshot().task_id) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "compare and select a project snapshot before accepting the merge"));
+    }
+    const auto current = session_.snapshot();
+    if (current.project_revision != agent_project_merge_review_->left_revision) {
+        return core::Result<application::DispatchReceipt>::failure(stale(
+            "project changed after merge review; compare the snapshots again"));
+    }
+    auto result = application::HumanApplicationAccess::accept_agent_project_merge(
+        *agent_task_, *agent_project_merge_review_, *agent_project_merge_resolution_,
+        std::move(justification));
+    if (result) {
+        clear_agent_project_merge();
+        record_operation(result.value(), OperationCategory::provider);
+    } else {
+        record_ui_problem(result.error().with_context("agent project merge acceptance"));
+    }
+    return result;
+}
+
+void UiController::clear_agent_project_merge() noexcept {
+    agent_project_merge_review_.reset();
+    agent_project_merge_current_diff_ = {};
+    agent_project_merge_speculative_diff_ = {};
+    agent_project_merge_details_ = {};
+    agent_project_merge_resolution_.reset();
+    agent_project_merge_candidate_diff_.reset();
+    agent_project_merge_task_id_.clear();
 }
 
 core::Result<void> UiController::reject_agent_plan() {
@@ -5790,6 +8936,7 @@ core::Result<void> UiController::reject_agent_plan() {
             "there is no speculative agent result to reject"));
     }
     auto result = agent_task_->reject();
+    if (result) clear_agent_project_merge();
     if (!result) record_ui_problem(result.error().with_context("agent result rejection"));
     return result;
 }
@@ -5805,8 +8952,10 @@ core::Result<void> UiController::clear_agent_plan() {
                 "a running agent task cannot be cleared"));
         }
         agent_task_.reset();
+        clear_agent_project_merge();
         agent_condition_inventory_.reset();
     }
+    clear_agent_project_merge();
     agent_condition_inventory_.reset();
     agent_named_target_clarification_.reset();
     agent_named_target_resolution_.reset();
@@ -5829,8 +8978,321 @@ core::Result<void> UiController::clear_agent_plan() {
 core::Result<MeshImportReceipt> UiController::import_mesh(
     const std::filesystem::path& path,
     MeshImportFormat format) {
+    return import_mesh_impl(path, format, std::nullopt);
+}
+
+core::Result<application::DispatchReceipt> UiController::import_static_gltf_scene(
+    const std::filesystem::path& path,
+    std::uint64_t expected_project_generation,
+    core::Revision expected_project_revision,
+    std::string_view expected_source_namespace,
+    bool rights_confirmed, std::string justification) {
     const auto fail = [this](core::Diagnostic diagnostic) {
-        auto surfaced = diagnostic.with_context("native mesh import");
+        auto surfaced = diagnostic.with_context("native static scene import");
+        record_ui_problem(surfaced);
+        return core::Result<application::DispatchReceipt>::failure(std::move(surfaced));
+    };
+    if (!rights_confirmed || justification.empty() || justification.size() > 1024U ||
+        std::any_of(justification.begin(), justification.end(), [](unsigned char c) {
+            return std::iscntrl(c) != 0;
+        }) || std::all_of(justification.begin(), justification.end(), [](unsigned char c) {
+            return std::isspace(c) != 0;
+        })) {
+        return fail(invalid("confirm source reuse rights and enter a single-line import reason"));
+    }
+    const auto context = session_.snapshot();
+    if (!context.project_path || context.project_generation != expected_project_generation ||
+        context.project_revision != expected_project_revision ||
+        context.source_namespace != expected_source_namespace) {
+        return fail(stale("save the project and reopen import after its context changes"));
+    }
+    constexpr std::size_t kMaxStaticSceneBytes = 128U * 1024U * 1024U;
+    const auto encoded = read_bounded_file(path, kMaxStaticSceneBytes, "static scene source");
+    if (!encoded) return fail(encoded.error());
+    const auto* data = reinterpret_cast<const std::uint8_t*>(encoded.value().data());
+    const std::span<const std::uint8_t> source(data, encoded.value().size());
+    const auto parsed = io::import_gltf_scene(source);
+    if (!parsed) return fail(parsed.error());
+    const auto digest = parsed.value().materials.artifact_digest;
+    const auto identity = "gltf.scene." + digest.hex();
+    if (std::any_of(context.source_assets.begin(), context.source_assets.end(),
+            [&identity](const auto& record) { return record.identity == identity; })) {
+        return fail(invalid("this scene source is already imported; reuse its existing assets"));
+    }
+    const auto retained = session_.source_asset_generation(identity, expected_source_namespace,
+        expected_project_generation, expected_project_revision);
+    if (!retained) return fail(retained.error());
+    if (retained.value().exhausted()) return fail(invalid_state("scene source generation is exhausted"));
+
+    // Parse/decode all inputs before any persistence. Only immutable verified
+    // cache additions precede the independently validated application action.
+    const auto staged_source = persist_managed_source_blob(*context.project_path, source,
+        source.size() >= 4U && source[0] == 0x67U && source[1] == 0x6cU &&
+            source[2] == 0x54U && source[3] == 0x46U ? "model/gltf-binary" : "model/gltf+json",
+        kMaxStaticSceneBytes, "static scene source");
+    if (!staged_source) return fail(staged_source.error());
+    const auto& images = parsed.value().materials.encoded_images;
+    const auto& textures = parsed.value().materials.catalog.textures();
+    for (std::size_t i = 0U; i < images.size(); ++i) {
+        const auto texture = textures.find(i + 1U);
+        if (texture == textures.end() || assets::sha256(images[i]) != texture->second.content_digest) {
+            return fail(validation("scene image no longer matches its parsed source binding"));
+        }
+        const auto staged_image = persist_managed_source_blob(*context.project_path, images[i],
+            assets::texture_source_media_type(texture->second.format),
+            32U * 1024U * 1024U, "scene texture source");
+        if (!staged_image) return fail(staged_image.error());
+    }
+    application::ImportGltfSceneAction action;
+    action.expected_project_generation = expected_project_generation;
+    action.expected_project_revision = expected_project_revision;
+    action.expected_source_namespace = expected_source_namespace;
+    action.source_identity = identity;
+    action.expected_source_generation = retained.value();
+    action.source_digest = digest;
+    action.rights_confirmed = rights_confirmed;
+    action.justification = std::move(justification);
+    auto admitted = dispatch(action);
+    if (!admitted) return fail(admitted.error().with_context(
+        "verified source bytes remain in the local asset cache"));
+    return admitted;
+}
+
+core::Result<SourceMeshReimportReview> UiController::preview_source_mesh_reimport(
+    std::string_view source_identity,
+    const std::filesystem::path& path,
+    MeshImportFormat format,
+    std::uint64_t expected_project_generation,
+    core::Revision expected_project_revision) {
+    using Result = core::Result<SourceMeshReimportReview>;
+    const auto fail = [this](core::Diagnostic diagnostic) {
+        auto surfaced = diagnostic.with_context("source mesh reimport review");
+        record_ui_problem(surfaced);
+        return Result::failure(std::move(surfaced));
+    };
+    if (path.empty() || path.filename().empty()) {
+        return fail(invalid("mesh reimport review path must name a file"));
+    }
+    const auto current = session_.snapshot();
+    if (current.project_generation != expected_project_generation ||
+        current.project_revision != expected_project_revision) {
+        return fail(stale(
+            "mesh reimport review belongs to an earlier project generation or revision"));
+    }
+    if (!current.project_path.has_value()) {
+        return fail(invalid_state("mesh reimport review requires a saved project"));
+    }
+    const auto source = std::find_if(current.source_assets.begin(), current.source_assets.end(),
+        [source_identity](const application::SourceAssetView& item) {
+            return item.identity == source_identity;
+        });
+    if (source == current.source_assets.end()) {
+        return fail(core::Diagnostic(core::ErrorCode::not_found,
+            "mesh reimport review source identity is no longer registered"));
+    }
+    if (source->kind != assets::SourceAssetKind::mesh ||
+        source->artifact_identity.empty() || !source->bound_mesh_asset.has_value() ||
+        !source->bound_mesh_vertex_count.has_value() ||
+        !source->bound_mesh_face_count.has_value()) {
+        return fail(core::Diagnostic(core::ErrorCode::unsupported,
+            "mesh reimport review requires a registered mesh artifact with current geometry"));
+    }
+    std::string expected_importer;
+    std::string capability;
+    switch (format) {
+    case MeshImportFormat::obj:
+        expected_importer = "carto.import.obj";
+        capability = "geometry.import.obj";
+        break;
+    case MeshImportFormat::ply:
+        expected_importer = "carto.import.ply";
+        capability = "geometry.import.ply";
+        break;
+    case MeshImportFormat::stl:
+        expected_importer = "carto.import.stl";
+        capability = "geometry.import.stl";
+        break;
+    default:
+        return fail(unsupported("mesh reimport review format is unsupported"));
+    }
+    if (source->importer_identity != expected_importer) {
+        return fail(unsupported(
+            "mesh reimport review must use the source record's existing built-in importer"));
+    }
+    providers::Registry providers;
+    const auto registered = [&]() -> core::Result<void> {
+        switch (format) {
+        case MeshImportFormat::obj: return io::register_builtin_obj_providers(providers);
+        case MeshImportFormat::ply: return io::register_builtin_ply_providers(providers);
+        case MeshImportFormat::stl: return io::register_builtin_stl_providers(providers);
+        }
+        return core::Result<void>::failure(unsupported(
+            "mesh reimport review format is unsupported"));
+    }();
+    if (!registered) return fail(registered.error());
+    if (auto resolved = providers.resolve(capability); !resolved) {
+        return fail(resolved.error());
+    }
+
+    auto pending = stage_mesh_source(path, *current.project_path);
+    if (!pending) return fail(pending.error());
+    const auto fail_staged = [&pending, &fail](core::Diagnostic diagnostic) {
+        remove_pending_mesh_source(pending.value());
+        return fail(std::move(diagnostic));
+    };
+    const auto staged_path = pending.value().staged_path;
+    geometry::EditableMesh candidate_mesh;
+    io::IoReport report;
+    switch (format) {
+    case MeshImportFormat::obj: {
+        auto imported = io::import_obj(staged_path);
+        if (!imported) return fail_staged(imported.error());
+        candidate_mesh = std::move(imported.value().mesh);
+        report = std::move(imported.value().report);
+        break;
+    }
+    case MeshImportFormat::ply: {
+        auto imported = io::import_ply(staged_path);
+        if (!imported) return fail_staged(imported.error());
+        candidate_mesh = std::move(imported.value().mesh);
+        report = std::move(imported.value().report);
+        break;
+    }
+    case MeshImportFormat::stl: {
+        auto imported = io::import_stl(staged_path);
+        if (!imported) return fail_staged(imported.error());
+        candidate_mesh = std::move(imported.value().mesh);
+        report = std::move(imported.value().report);
+        break;
+    }
+    default:
+        return fail_staged(unsupported("mesh reimport review format is unsupported"));
+    }
+    const auto staged_bytes = read_bounded_file(
+        staged_path, 128U * 1024U * 1024U, "staged mesh review source");
+    if (!staged_bytes) return fail_staged(staged_bytes.error());
+    const auto* staged_data = reinterpret_cast<const std::uint8_t*>(staged_bytes.value().data());
+    if (assets::sha256(std::span<const std::uint8_t>(
+            staged_data, staged_bytes.value().size())) != pending.value().digest) {
+        return fail_staged(stale("staged mesh source changed during reimport review"));
+    }
+    auto candidate_material_digest =
+        application::canonical_mesh_material_region_digest(candidate_mesh);
+    if (!candidate_material_digest) {
+        return fail_staged(candidate_material_digest.error());
+    }
+    if (source->importer_identity == "carto.import.obj" &&
+        source->importer_version == 3U &&
+        !candidate_material_digest.value().has_value()) {
+        return fail_staged(validation(
+            "this OBJ source version requires candidate material regions"));
+    }
+    const auto candidate_artifact_digest =
+        application::canonical_mesh_geometry_digest(candidate_mesh);
+    const auto candidate_source_digest = pending.value().digest;
+    std::shared_ptr<const geometry::CompiledMesh> candidate_mesh_preview;
+    if (candidate_mesh.vertex_count() <= 8'192U && report.triangles <= 16'384U) {
+        auto compiled_preview = candidate_mesh.compile();
+        if (!compiled_preview) return fail_staged(compiled_preview.error());
+        candidate_mesh_preview = std::make_shared<const geometry::CompiledMesh>(
+            std::move(compiled_preview.value()));
+    }
+    remove_pending_mesh_source(pending.value());
+    return Result::success(SourceMeshReimportReview{
+        source->identity,
+        current.project_generation,
+        current.project_revision,
+        source->source_generation,
+        source->importer_identity,
+        source->importer_version,
+        source->options,
+        source->artifact_identity,
+        source->source_digest,
+        source->artifact_digest,
+        source->bound_mesh_asset,
+        source->bound_mesh_vertex_count,
+        source->bound_mesh_face_count,
+        candidate_source_digest,
+        candidate_artifact_digest,
+        std::move(candidate_mesh_preview),
+        report.vertices,
+        report.faces,
+        report.triangles,
+    });
+}
+
+core::Result<MeshImportReceipt> UiController::apply_source_mesh_reimport(
+    const SourceMeshReimportReview& review,
+    const std::filesystem::path& path,
+    MeshImportFormat format) {
+    const auto fail = [this](core::Diagnostic diagnostic) {
+        auto surfaced = diagnostic.with_context("apply source mesh reimport review");
+        record_ui_problem(surfaced);
+        return core::Result<MeshImportReceipt>::failure(std::move(surfaced));
+    };
+    const auto current = session_.snapshot();
+    if (current.project_generation != review.project_generation ||
+        current.project_revision != review.project_revision) {
+        return fail(stale("mesh reimport review expired because the project changed"));
+    }
+    const auto source = std::find_if(current.source_assets.begin(), current.source_assets.end(),
+        [&review](const application::SourceAssetView& item) {
+            return item.identity == review.source_identity;
+        });
+    if (source == current.source_assets.end() ||
+        source->source_generation != review.source_generation ||
+        source->importer_identity != review.importer_identity ||
+        source->importer_version != review.importer_version ||
+        source->options != review.options ||
+        source->artifact_identity != review.artifact_identity ||
+        source->source_digest != review.source_digest ||
+        source->artifact_digest != review.artifact_digest ||
+        source->bound_mesh_asset != review.bound_mesh_asset ||
+        source->bound_mesh_vertex_count != review.current_vertex_count ||
+        source->bound_mesh_face_count != review.current_face_count) {
+        return fail(stale("mesh reimport source changed after review"));
+    }
+    if (review.candidate_source_digest.is_zero() ||
+        review.candidate_artifact_digest.is_zero()) {
+        return fail(invalid("mesh reimport review has incomplete candidate digests"));
+    }
+    std::string expected_importer;
+    switch (format) {
+    case MeshImportFormat::obj: expected_importer = "carto.import.obj"; break;
+    case MeshImportFormat::ply: expected_importer = "carto.import.ply"; break;
+    case MeshImportFormat::stl: expected_importer = "carto.import.stl"; break;
+    default: return fail(unsupported("mesh reimport format is unsupported"));
+    }
+    if (review.importer_identity != expected_importer) {
+        return fail(unsupported(
+            "mesh reimport format does not match the reviewed source importer"));
+    }
+    return import_mesh_impl(path, format, SourceMeshReimportBinding{
+        review.source_identity,
+        review.source_generation,
+        review.project_generation,
+        review.project_revision,
+        review.importer_identity,
+        review.importer_version,
+        review.options,
+        review.artifact_identity,
+        review.source_digest,
+        review.artifact_digest,
+        review.candidate_source_digest,
+        review.candidate_artifact_digest,
+        review.candidate_vertex_count,
+        review.candidate_face_count,
+        review.candidate_triangle_count,
+    });
+}
+
+core::Result<MeshImportReceipt> UiController::import_mesh_impl(
+    const std::filesystem::path& path,
+    MeshImportFormat format,
+    std::optional<SourceMeshReimportBinding> reimport_binding) {
+    const auto fail = [this, &reimport_binding](core::Diagnostic diagnostic) {
+        auto surfaced = diagnostic.with_context(reimport_binding.has_value()
+            ? "source-specific mesh reimport" : "native mesh import");
         record_ui_problem(surfaced);
         return core::Result<MeshImportReceipt>::failure(std::move(surfaced));
     };
@@ -5868,6 +9330,35 @@ core::Result<MeshImportReceipt> UiController::import_mesh(
     }
 
     const auto application_snapshot = session_.snapshot();
+    const auto validate_reimport_scope = [this, &reimport_binding]()
+        -> core::Result<void> {
+        if (!reimport_binding.has_value()) return core::Result<void>::success();
+        const auto latest = session_.snapshot();
+        if (latest.project_generation != reimport_binding->project_generation ||
+            latest.project_revision != reimport_binding->project_revision) {
+            return core::Result<void>::failure(stale(
+                "mesh reimport review expired because the project changed"));
+        }
+        const auto active = std::find_if(latest.source_assets.begin(), latest.source_assets.end(),
+            [&reimport_binding](const application::SourceAssetView& item) {
+                return item.identity == reimport_binding->identity;
+            });
+        if (active == latest.source_assets.end() ||
+            active->kind != assets::SourceAssetKind::mesh ||
+            active->source_generation != reimport_binding->source_generation ||
+            active->importer_identity != reimport_binding->importer_identity ||
+            active->importer_version != reimport_binding->importer_version ||
+            active->options != reimport_binding->options ||
+            active->artifact_identity != reimport_binding->artifact_identity ||
+            active->source_digest != reimport_binding->source_digest ||
+            active->artifact_digest != reimport_binding->artifact_digest ||
+            !active->bound_mesh_asset.has_value()) {
+            return core::Result<void>::failure(stale(
+                "mesh reimport source generation or artifact binding changed"));
+        }
+        return core::Result<void>::success();
+    };
+    if (auto scoped = validate_reimport_scope(); !scoped) return fail(scoped.error());
     std::optional<PendingMeshSource> pending_source;
     std::filesystem::path importer_path = path;
     if (application_snapshot.project_path.has_value()) {
@@ -5880,6 +9371,19 @@ core::Result<MeshImportReceipt> UiController::import_mesh(
     const auto cleanup_pending_source = [&pending_source]() {
         if (pending_source.has_value()) remove_pending_mesh_source(*pending_source);
     };
+    if (reimport_binding.has_value()) {
+        if (!pending_source.has_value()) {
+            return fail(invalid_state(
+                "source-specific mesh reimport could not stage its exact source bytes"));
+        }
+        if (reimport_binding->expected_candidate_source_digest.has_value() &&
+            pending_source->digest !=
+                *reimport_binding->expected_candidate_source_digest) {
+            cleanup_pending_source();
+            return fail(stale("selected mesh source changed after its review"));
+        }
+        pending_source->identity = reimport_binding->identity;
+    }
 
     geometry::EditableMesh mesh;
     io::IoReport report;
@@ -5919,6 +9423,62 @@ core::Result<MeshImportReceipt> UiController::import_mesh(
         return fail(unsupported("mesh import format is unsupported"));
     }
 
+    if (auto scoped = validate_reimport_scope(); !scoped) {
+        cleanup_pending_source();
+        return fail(scoped.error());
+    }
+    const auto imported_geometry_digest =
+        application::canonical_mesh_geometry_digest(mesh);
+    if (reimport_binding.has_value() &&
+        reimport_binding->expected_candidate_artifact_digest.has_value() &&
+        imported_geometry_digest !=
+            *reimport_binding->expected_candidate_artifact_digest) {
+        cleanup_pending_source();
+        return fail(stale("imported mesh changed after its source review"));
+    }
+    if (reimport_binding.has_value() &&
+        ((reimport_binding->expected_candidate_vertex_count.has_value() &&
+          report.vertices != *reimport_binding->expected_candidate_vertex_count) ||
+         (reimport_binding->expected_candidate_face_count.has_value() &&
+          report.faces != *reimport_binding->expected_candidate_face_count) ||
+         (reimport_binding->expected_candidate_triangle_count.has_value() &&
+          report.triangles != *reimport_binding->expected_candidate_triangle_count))) {
+        cleanup_pending_source();
+        return fail(stale("imported mesh counts changed after their source review"));
+    }
+    if (!reimport_binding.has_value() && pending_source.has_value()) {
+        const auto existing = std::find_if(
+            application_snapshot.source_assets.begin(),
+            application_snapshot.source_assets.end(),
+            [&pending_source](const application::SourceAssetView& item) {
+                return item.identity == pending_source->identity;
+            });
+        if (existing != application_snapshot.source_assets.end()) {
+            std::string importer_identity;
+            switch (format) {
+            case MeshImportFormat::obj: importer_identity = "carto.import.obj"; break;
+            case MeshImportFormat::ply: importer_identity = "carto.import.ply"; break;
+            case MeshImportFormat::stl: importer_identity = "carto.import.stl"; break;
+            }
+            assets::SourceImportOptions default_options;
+            default_options.import_hierarchy = false;
+            default_options.import_materials = false;
+            default_options.import_normals = false;
+            const std::uint32_t importer_version =
+                format == MeshImportFormat::obj ? 2U : 1U;
+            if (existing->kind != assets::SourceAssetKind::mesh ||
+                existing->importer_identity != importer_identity ||
+                existing->importer_version != importer_version ||
+                existing->options != default_options ||
+                existing->source_digest != pending_source->digest ||
+                existing->artifact_digest != imported_geometry_digest) {
+                cleanup_pending_source();
+                return fail(invalid_state(
+                    "registered source changes require a source-browser reimport review"));
+            }
+        }
+    }
+
     std::optional<StagedMeshSource> staged_source;
     if (pending_source.has_value()) {
         auto persisted = persist_mesh_source(*pending_source, format);
@@ -5942,12 +9502,17 @@ core::Result<MeshImportReceipt> UiController::import_mesh(
         case MeshImportFormat::ply: record.importer_identity = "carto.import.ply"; break;
         case MeshImportFormat::stl: record.importer_identity = "carto.import.stl"; break;
         }
-        record.importer_version = format == MeshImportFormat::obj ? 2U : 1U;
+        record.importer_version = reimport_binding.has_value()
+            ? reimport_binding->importer_version
+            : (format == MeshImportFormat::obj ? 2U : 1U);
         record.options.import_hierarchy = false;
         record.options.import_materials = false;
         record.options.import_normals = false;
+        if (reimport_binding.has_value()) {
+            record.options = reimport_binding->options;
+        }
         record.artifact_identity = "pending.mesh";
-        record.artifact_digest = application::canonical_mesh_geometry_digest(mesh);
+        record.artifact_digest = imported_geometry_digest;
         record.domain_digests.push_back(assets::SourceDomainDigest{
             assets::SourceAssetDomain::geometry, record.artifact_digest});
         auto material_digest = application::canonical_mesh_material_region_digest(mesh);
@@ -5976,6 +9541,10 @@ core::Result<MeshImportReceipt> UiController::import_mesh(
         report.warnings.push_back(
             "This import is not source-linked because the workspace has not been saved; "
             "save the project and import again to bind it.");
+    }
+
+    if (auto scoped = validate_reimport_scope(); !scoped) {
+        return fail(scoped.error());
     }
 
     auto admitted = dispatch(application::CreateMeshObjectAction{
@@ -6147,6 +9716,76 @@ core::Result<application::DispatchReceipt> UiController::import_material_texture
         inspected.value().height});
     if (!imported) return fail(imported.error());
     return imported;
+}
+
+core::Result<application::DispatchReceipt> UiController::reimport_material_texture(
+    assets::TextureAssetId texture_id,
+    const std::filesystem::path& path) {
+    const auto fail = [this](core::Diagnostic diagnostic) {
+        auto surfaced = diagnostic.with_context("native material texture reimport");
+        record_ui_problem(surfaced);
+        return core::Result<application::DispatchReceipt>::failure(std::move(surfaced));
+    };
+    if (texture_id == 0U || path.empty() || path.filename().empty()) {
+        return fail(invalid(
+            "material texture reimport requires a registered identity and source file"));
+    }
+    const auto application_snapshot = session_.snapshot();
+    if (!application_snapshot.project_path.has_value()) {
+        return fail(invalid_state(
+            "save the project before reimporting a managed material texture source"));
+    }
+    const auto current = std::find_if(
+        application_snapshot.texture_sources.begin(),
+        application_snapshot.texture_sources.end(), [texture_id](const auto& source_record) {
+            return source_record.id == texture_id;
+        });
+    if (current == application_snapshot.texture_sources.end()) {
+        return fail(stale(
+            "material texture source is no longer registered in the current project"));
+    }
+
+    const assets::TextureSourceLimits limits;
+    const auto encoded = read_bounded_file(
+        path, static_cast<std::size_t>(limits.max_source_bytes), "material texture source");
+    if (!encoded) return fail(encoded.error());
+    const auto* data = reinterpret_cast<const std::uint8_t*>(encoded.value().data());
+    const std::span<const std::uint8_t> source(data, encoded.value().size());
+    const auto inspected = assets::inspect_texture_source(source, {}, limits);
+    if (!inspected) return fail(inspected.error());
+    if (inspected.value().stage != assets::TextureSourceStage::container_inspected) {
+        return fail(validation(
+            "texture inspection returned an unsupported source stage"));
+    }
+    if (inspected.value().source.digest == current->content_digest) {
+        return fail(invalid(
+            "replacement texture source is identical to the current source bytes"));
+    }
+    if (std::any_of(application_snapshot.texture_sources.begin(),
+            application_snapshot.texture_sources.end(),
+            [texture_id, &inspected](const auto& source_record) {
+                return source_record.id != texture_id &&
+                    source_record.content_digest == inspected.value().source.digest;
+            })) {
+        return fail(invalid(
+            "replacement texture bytes are already registered under another identity"));
+    }
+    const auto locator = persist_texture_source_blob(
+        *application_snapshot.project_path, encoded.value(), inspected.value(), limits);
+    if (!locator) return fail(locator.error());
+
+    auto reimported = dispatch(application::ReimportMaterialTextureSourceAction{
+        application_snapshot.project_generation,
+        application_snapshot.project_revision,
+        texture_id,
+        current->revision,
+        current->content_digest,
+        inspected.value().source.digest,
+        inspected.value().format,
+        inspected.value().width,
+        inspected.value().height});
+    if (!reimported) return fail(reimported.error());
+    return reimported;
 }
 
 core::Result<application::DispatchReceipt> UiController::import_reference_image(
@@ -6418,6 +10057,37 @@ UiController::update_reference_image_plane_views(
 
     std::set<std::string> seen;
     std::map<std::string, project::ReferenceImagePlane> replacements;
+    const auto camera_world_transform = [&](scene::ObjectId camera_object)
+            -> const core::Transform* {
+        if (!before.presentation_catalog.cameras().contains(camera_object)) {
+            return nullptr;
+        }
+        const auto object = std::find_if(before.objects.begin(), before.objects.end(),
+            [camera_object](const application::ObjectView& item) {
+                return item.object.id == camera_object;
+            });
+        return object == before.objects.end() ? nullptr : &object->world_transform;
+    };
+    const auto local_to_world_point = [](
+            const core::Transform& transform, core::Vec3d point) {
+        return transform.translation + transform.rotation.normalized().rotate(point);
+    };
+    const auto local_to_world_direction = [](
+            const core::Transform& transform, core::Vec3d direction) {
+        return transform.rotation.normalized().rotate(direction).normalized();
+    };
+    const auto world_to_local_point = [](
+            const core::Transform& transform, core::Vec3d point) {
+        const auto rotation = transform.rotation.normalized();
+        const core::Quaternion inverse{-rotation.x, -rotation.y, -rotation.z, rotation.w};
+        return inverse.rotate(point - transform.translation);
+    };
+    const auto world_to_local_direction = [](
+            const core::Transform& transform, core::Vec3d direction) {
+        const auto rotation = transform.rotation.normalized();
+        const core::Quaternion inverse{-rotation.x, -rotation.y, -rotation.z, rotation.w};
+        return inverse.rotate(direction).normalized();
+    };
     for (auto& edit : edits) {
         if (!seen.insert(edit.identity).second) {
             return fail(validation(
@@ -6438,6 +10108,54 @@ UiController::update_reference_image_plane_views(
         candidate.view = edit.view;
         candidate.view_set_identity = std::move(edit.view_set_identity);
         candidate.pinned_camera = edit.pinned_camera;
+        if (candidate.view != project::ReferencePlaneView::camera_pinned) {
+            candidate.camera_local_placement = false;
+        }
+
+        const bool same_camera_pin =
+            original.camera_local_placement &&
+            original.view == project::ReferencePlaneView::camera_pinned &&
+            candidate.view == project::ReferencePlaneView::camera_pinned &&
+            original.pinned_camera == candidate.pinned_camera;
+        if (!same_camera_pin &&
+            (original.view == project::ReferencePlaneView::camera_pinned ||
+             candidate.view == project::ReferencePlaneView::camera_pinned)) {
+            core::Vec3d world_origin = original.origin;
+            core::Vec3d world_normal = original.normal;
+            core::Vec3d world_up = original.up;
+            if (original.view == project::ReferencePlaneView::camera_pinned &&
+                original.camera_local_placement) {
+                const auto* old_camera_transform = camera_world_transform(
+                    *original.pinned_camera);
+                if (old_camera_transform == nullptr || !old_camera_transform->finite()) {
+                    return fail(core::Diagnostic(core::ErrorCode::stale_data,
+                        "the reference plane's authored camera transform is unavailable"));
+                }
+                world_origin = local_to_world_point(*old_camera_transform, original.origin);
+                world_normal = local_to_world_direction(*old_camera_transform, original.normal);
+                world_up = local_to_world_direction(*old_camera_transform, original.up);
+            }
+
+            candidate.origin = world_origin;
+            candidate.normal = world_normal;
+            candidate.up = world_up;
+            if (candidate.view == project::ReferencePlaneView::camera_pinned) {
+                if (!candidate.pinned_camera.has_value()) {
+                    return fail(validation(
+                        "camera-pinned reference plane requires an authored camera"));
+                }
+                const auto* new_camera_transform = camera_world_transform(
+                    *candidate.pinned_camera);
+                if (new_camera_transform == nullptr || !new_camera_transform->finite()) {
+                    return fail(core::Diagnostic(core::ErrorCode::stale_data,
+                        "the selected authored camera transform is unavailable"));
+                }
+                candidate.origin = world_to_local_point(*new_camera_transform, world_origin);
+                candidate.normal = world_to_local_direction(*new_camera_transform, world_normal);
+                candidate.up = world_to_local_direction(*new_camera_transform, world_up);
+                candidate.camera_local_placement = true;
+            }
+        }
         switch (candidate.view) {
         case project::ReferencePlaneView::front:
             candidate.normal = {0.0, 0.0, 1.0};
@@ -6461,6 +10179,7 @@ UiController::update_reference_image_plane_views(
         if (candidate.view == original.view &&
             candidate.view_set_identity == original.view_set_identity &&
             candidate.pinned_camera == original.pinned_camera &&
+            candidate.camera_local_placement == original.camera_local_placement &&
             same_vector(candidate.normal, original.normal) &&
             same_vector(candidate.up, original.up)) {
             continue;
@@ -6508,6 +10227,17 @@ UiController::update_reference_image_plane_views(
         std::move(candidate)});
 }
 
+core::Result<std::vector<std::uint8_t>> UiController::read_reference_image_source_bytes(
+    std::string_view identity) {
+    auto source = session_.read_reference_image_source_bytes(identity);
+    if (!source) {
+        auto surfaced = source.error().with_context("native reference-image source read");
+        record_ui_problem(surfaced);
+        return core::Result<std::vector<std::uint8_t>>::failure(std::move(surfaced));
+    }
+    return source;
+}
+
 core::Result<assets::DecodedRgba8Texture> UiController::decode_reference_image_tga(
     std::string_view identity) {
     auto decoded = session_.decode_reference_image_tga(identity);
@@ -6519,9 +10249,270 @@ core::Result<assets::DecodedRgba8Texture> UiController::decode_reference_image_t
     return decoded;
 }
 
+core::Result<application::DispatchReceipt> UiController::apply_inspector_transform(
+    const application::SetObjectTransformAction& action,
+    std::uint64_t expected_project_generation) {
+    const auto current = session_.snapshot();
+    if (current.project_generation != expected_project_generation ||
+        !action.expected_project_revision.has_value() ||
+        current.project_revision != *action.expected_project_revision) {
+        return core::Result<application::DispatchReceipt>::failure(stale(
+            "transform inspector belongs to an earlier project state"));
+    }
+    const auto selected = current.selection.component_object.value_or(
+        current.selection.objects.empty() ? scene::ObjectId{} : current.selection.objects.front());
+    if (!selected || selected != action.object) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "transform inspector selection changed"));
+    }
+    return dispatch(action);
+}
+
+core::Result<application::DispatchReceipt> UiController::apply_inspector_vertex_position(
+    scene::ObjectId object, geometry::VertexId vertex, core::Vec3d position,
+    std::uint64_t expected_project_generation, core::Revision expected_project_revision) {
+    const auto current = session_.snapshot();
+    if (current.project_generation != expected_project_generation ||
+        current.project_revision != expected_project_revision) {
+        return core::Result<application::DispatchReceipt>::failure(stale(
+            "vertex inspector belongs to an earlier project state"));
+    }
+    const auto& groups = current.selection.component_groups;
+    if (current.selection.mode != editor::SelectionMode::vertex || groups.size() != 1U ||
+        groups.front().object != object || groups.front().vertices.size() != 1U ||
+        groups.front().vertices.front() != vertex) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "vertex inspector requires its exact selected owner and vertex"));
+    }
+    editor::ToolArguments arguments;
+    arguments.position = position;
+    return dispatch(application::InvokeToolAction{"mesh.set-vertex-position", arguments});
+}
+
+core::Result<application::DispatchReceipt> UiController::generate_unique_lightmap_uv(
+    const application::GenerateUniqueLightmapUvAction& action,
+    std::uint64_t expected_project_generation) {
+    const auto current = session_.snapshot();
+    if (current.project_generation != expected_project_generation ||
+        current.project_revision != action.expected_project_revision) {
+        return core::Result<application::DispatchReceipt>::failure(stale(
+            "lightmap UV controls belong to an earlier project state"));
+    }
+    if (current.selection.mode != editor::SelectionMode::object ||
+        current.selection.objects.size() != 1U ||
+        current.selection.objects.front() != action.object) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "lightmap UV generation requires one selected mesh object"));
+    }
+    return dispatch(action);
+}
+
+core::Result<application::DispatchReceipt> UiController::pack_uv_islands(
+    const application::PackUvIslandsAction& action,
+    std::uint64_t expected_project_generation) {
+    const auto current = session_.snapshot();
+    if (current.project_generation != expected_project_generation ||
+        action.expected_project_generation != expected_project_generation ||
+        current.project_revision != action.expected_project_revision) {
+        return core::Result<application::DispatchReceipt>::failure(stale(
+            "UV island pack controls belong to an earlier project state"));
+    }
+    if (current.selection.mode != editor::SelectionMode::object ||
+        current.selection.objects.size() != 1U ||
+        current.selection.objects.front() != action.object) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "UV island packing requires one selected mesh object"));
+    }
+    return dispatch(action);
+}
+
+core::Result<application::DispatchReceipt> UiController::set_uv_coordinate(
+    const application::SetUvCoordinateAction& action,
+    std::uint64_t expected_project_generation) {
+    const auto current = session_.snapshot();
+    if (current.project_generation != expected_project_generation ||
+        action.expected_project_generation != expected_project_generation ||
+        current.project_revision != action.expected_project_revision) {
+        return core::Result<application::DispatchReceipt>::failure(stale(
+            "UV coordinate draft belongs to an earlier project state"));
+    }
+    if (current.selection.mode != editor::SelectionMode::face ||
+        current.selection.component_object != action.object ||
+        current.selection.component_mesh_revision != action.expected_mesh_revision ||
+        current.selection.faces.size() != 1U ||
+        current.selection.faces.front() != action.face) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "UV coordinate edit requires its exact selected face and mesh revision"));
+    }
+    return dispatch(action);
+}
+
+core::Result<application::DispatchReceipt> UiController::set_uv_seam_mark(
+    const application::SetUvSeamMarkAction& action,
+    std::uint64_t expected_project_generation) {
+    const auto current = session_.snapshot();
+    if (current.project_generation != expected_project_generation ||
+        action.expected_project_generation != expected_project_generation ||
+        current.project_revision != action.expected_project_revision) {
+        return core::Result<application::DispatchReceipt>::failure(stale(
+            "UV seam marker draft belongs to an earlier project state"));
+    }
+    if (current.selection.mode != editor::SelectionMode::face ||
+        current.selection.component_object != action.object ||
+        current.selection.component_mesh_revision != action.expected_mesh_revision ||
+        current.selection.faces.size() != 1U ||
+        current.selection.faces.front() != action.selected_face) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "UV seam marker requires its exact selected face and mesh revision"));
+    }
+    return dispatch(action);
+}
+
+core::Result<application::DispatchReceipt> UiController::align_uv_seam(
+    const application::AlignUvSeamAction& action,
+    std::uint64_t expected_project_generation) {
+    const auto current = session_.snapshot();
+    if (current.project_generation != expected_project_generation ||
+        action.expected_project_generation != expected_project_generation ||
+        current.project_revision != action.expected_project_revision) {
+        return core::Result<application::DispatchReceipt>::failure(stale(
+            "UV seam draft belongs to an earlier project state"));
+    }
+    if (current.selection.mode != editor::SelectionMode::face ||
+        current.selection.component_object != action.object ||
+        current.selection.component_mesh_revision != action.expected_mesh_revision ||
+        current.selection.faces.size() != 1U ||
+        current.selection.faces.front() != action.selected_face) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "UV seam edit requires its exact selected face and mesh revision"));
+    }
+    return dispatch(action);
+}
+
+core::Result<application::DispatchReceipt> UiController::relink_moved_source(
+    const application::RelinkMovedSourceAction& action,
+    std::uint64_t expected_project_generation,
+    core::Revision expected_project_revision) {
+    const auto current = session_.snapshot();
+    if (current.project_generation != expected_project_generation ||
+        current.project_revision != expected_project_revision) {
+        return core::Result<application::DispatchReceipt>::failure(stale(
+            "source relink controls belong to an earlier project state"));
+    }
+    return dispatch(action);
+}
+
+core::Result<application::RelinkMovedSourceAction> UiController::prepare_moved_source_relink(
+    std::string identity,
+    const std::filesystem::path& path,
+    std::uint64_t expected_project_generation,
+    core::Revision expected_project_revision) {
+    using Result = core::Result<application::RelinkMovedSourceAction>;
+    const auto current = session_.snapshot();
+    if (current.project_generation != expected_project_generation ||
+        current.project_revision != expected_project_revision) {
+        return Result::failure(stale("source relink preparation belongs to an earlier project state"));
+    }
+    if (!current.project_path.has_value()) {
+        return Result::failure(invalid_state("save the project before preparing a moved source"));
+    }
+    const auto source = std::find_if(current.source_assets.begin(), current.source_assets.end(),
+        [&identity](const auto& candidate) { return candidate.identity == identity; });
+    if (source == current.source_assets.end()) {
+        return Result::failure(core::Diagnostic(core::ErrorCode::not_found,
+            "source relink identity is not registered in this project"));
+    }
+    constexpr std::size_t maximum_bytes = 128U * 1024U * 1024U;
+    const auto bytes = read_bounded_file(path, maximum_bytes, "moved source");
+    if (!bytes) return Result::failure(bytes.error());
+    const auto* data = reinterpret_cast<const std::uint8_t*>(bytes.value().data());
+    const auto digest = assets::sha256(std::span<const std::uint8_t>{data, bytes.value().size()});
+    if (digest != source->source_digest) {
+        return Result::failure(validation(
+            "moved source bytes differ from the registered source; use reimport for changed content"));
+    }
+    std::error_code error;
+    const auto requested_root = current.project_path->parent_path().empty()
+        ? std::filesystem::current_path(error) : current.project_path->parent_path();
+    if (error) return Result::failure(io_error("unable to resolve the saved project directory"));
+    const auto project_root = std::filesystem::weakly_canonical(requested_root, error);
+    if (error || project_root.empty()) {
+        return Result::failure(io_error("unable to resolve the saved project directory"));
+    }
+    assets::BlobStore store(project_root / ".carto-assets" / "source-blobs");
+    const auto destination = store.path_for(digest);
+    if (auto checked = validate_managed_directory_chain(project_root, destination.parent_path()); !checked) {
+        return Result::failure(checked.error());
+    }
+    const auto status = std::filesystem::symlink_status(destination, error);
+    if (error && error != std::errc::no_such_file_or_directory) {
+        return Result::failure(io_error("unable to inspect the managed source blob"));
+    }
+    if (std::filesystem::is_symlink(status) ||
+        (std::filesystem::exists(status) && !std::filesystem::is_regular_file(status))) {
+        return Result::failure(validation("managed source blob is a link or non-file"));
+    }
+    const auto stored = store.put(std::string_view{bytes.value()}, "application/octet-stream");
+    if (!stored) return Result::failure(stored.error());
+    if (stored.value().digest != digest) {
+        return Result::failure(validation("moved source digest changed during persistence"));
+    }
+    const auto canonical_destination = std::filesystem::canonical(destination, error);
+    if (error || !is_within_directory(project_root, canonical_destination)) {
+        return Result::failure(validation("moved source blob resolved outside the saved project directory"));
+    }
+    if (auto verified = store.verify(digest); !verified) return Result::failure(verified.error());
+    const auto after = session_.snapshot();
+    if (after.project_generation != expected_project_generation ||
+        after.project_revision != expected_project_revision) {
+        return Result::failure(stale("project changed while the moved source was staged"));
+    }
+    return Result::success(application::RelinkMovedSourceAction{std::move(identity), digest});
+}
+
 core::Result<assets::SourceReimportPlan> UiController::preview_source_reimport(
     std::vector<assets::SourceImportRecord> incoming) const {
     return session_.preview_source_reimport(std::move(incoming));
+}
+
+core::Result<assets::SourceReimportPlan> UiController::preview_source_asset_metadata(
+    std::string_view identity,
+    core::Revision expected_source_generation,
+    std::uint64_t expected_project_generation,
+    core::Revision expected_project_revision,
+    std::vector<std::string> authored_tags,
+    std::vector<std::string> dependencies) const {
+    return session_.preview_source_asset_metadata(
+        identity, expected_source_generation, expected_project_generation,
+        expected_project_revision, std::move(authored_tags), std::move(dependencies));
+}
+
+core::Result<void> UiController::verify_source_asset_blob(
+    std::string_view identity,
+    core::Revision expected_source_generation,
+    std::uint64_t expected_project_generation,
+    core::Revision expected_project_revision) const {
+    return session_.verify_source_asset_blob(identity, expected_source_generation,
+        expected_project_generation, expected_project_revision);
+}
+
+core::Result<assets::BlobOrphanReport> UiController::inspect_source_blob_store(
+    std::uint64_t expected_project_generation,
+    core::Revision expected_project_revision,
+    std::optional<application::PendingMeshReimportBlobReview> pending_mesh_reimport) const {
+    return session_.inspect_source_blob_store(
+        expected_project_generation, expected_project_revision,
+        std::move(pending_mesh_reimport));
+}
+
+core::Result<condition::SweepEndpointSpatialReview>
+UiController::inspect_sweep_endpoint_spatial_fit(
+    const condition::SweepEndpointPortBinding& binding,
+    const condition::SweepEndpointSpatialPolicy& policy,
+    std::uint64_t expected_project_generation,
+    core::Revision expected_project_revision) const {
+    return session_.inspect_sweep_endpoint_spatial_fit(
+        binding, policy, expected_project_generation, expected_project_revision);
 }
 
 core::Result<application::DispatchReceipt> UiController::apply_source_reimport_plan(
@@ -6873,6 +10864,36 @@ core::Result<application::DispatchReceipt> UiController::instantiate_condition_p
         prefab_id,
         std::move(name),
         world_position}, OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::rebase_condition_prefab(
+    application::RebaseConditionPrefabAction action) {
+    return dispatch_with_category(std::move(action), OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::replace_connection_port_graph(
+    application::ReplaceConnectionPortGraphAction action) {
+    return dispatch_with_category(std::move(action), OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::add_connection_port(
+    application::AddConnectionPortAction action) {
+    return dispatch_with_category(std::move(action), OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::remove_connection_port(
+    application::RemoveConnectionPortAction action) {
+    return dispatch_with_category(std::move(action), OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::remove_connection_edge(
+    application::RemoveConnectionEdgeAction action) {
+    return dispatch_with_category(std::move(action), OperationCategory::provider);
+}
+
+core::Result<application::DispatchReceipt> UiController::connect_condition_prefab_sockets(
+    application::ConnectConditionPrefabSocketsAction action) {
+    return dispatch_with_category(std::move(action), OperationCategory::provider);
 }
 
 core::Result<application::DispatchReceipt> UiController::add_condition_collection(
@@ -7787,6 +11808,110 @@ core::Result<void> UiController::set_command_palette_query(std::string query) {
     return core::Result<void>::success();
 }
 
+core::Result<application::DispatchReceipt> UiController::run_selection_command(
+    std::string_view command_id,
+    std::uint64_t expected_project_generation,
+    core::Revision expected_project_revision,
+    geometry::VertexId path_goal,
+    std::optional<scene::ObjectId> path_owner) {
+    const auto refuse = [this](core::Diagnostic diagnostic) {
+        record_ui_problem(diagnostic.with_context("selection command"));
+        return core::Result<application::DispatchReceipt>::failure(std::move(diagnostic));
+    };
+    const auto current = session_.snapshot();
+    if (current.project_generation != expected_project_generation ||
+        current.project_revision != expected_project_revision) {
+        return refuse(stale("selection command belongs to an earlier project snapshot"));
+    }
+
+    static constexpr std::pair<std::string_view, editor::SelectionMode> conversions[]{
+        {selection_commands::to_vertex, editor::SelectionMode::vertex},
+        {selection_commands::to_edge, editor::SelectionMode::edge},
+        {selection_commands::to_face, editor::SelectionMode::face},
+    };
+    for (const auto& [id, mode] : conversions) {
+        if (command_id == id) return dispatch(application::ConvertSelectionAction{mode});
+    }
+    static constexpr std::pair<std::string_view, editor::SelectionExpansion> expansions[]{
+        {selection_commands::linked, editor::SelectionExpansion::linked},
+        {selection_commands::grow, editor::SelectionExpansion::grow},
+        {selection_commands::shrink, editor::SelectionExpansion::shrink},
+        {selection_commands::invert, editor::SelectionExpansion::invert},
+        {selection_commands::loop, editor::SelectionExpansion::loop},
+        {selection_commands::ring, editor::SelectionExpansion::ring},
+        {selection_commands::boundary, editor::SelectionExpansion::boundary},
+    };
+    for (const auto& [id, expansion] : expansions) {
+        if (command_id == id) return dispatch(application::ExpandSelectionAction{expansion});
+    }
+    if (command_id == selection_commands::shortest_path) {
+        if (!path_goal || !path_owner.has_value() || !*path_owner) {
+            return refuse(invalid("shortest path requires an explicit owner and goal vertex"));
+        }
+        return dispatch(application::SelectShortestPathAction{path_goal, path_owner});
+    }
+    return refuse(core::Diagnostic(core::ErrorCode::not_found, "selection command is unknown"));
+}
+
+namespace {
+
+const application::ObjectView* eligible_duplicate_batch_source(
+    const application::ApplicationSnapshot& current, scene::ObjectId source) {
+    if (!source || current.selection.mode != editor::SelectionMode::object ||
+        current.selection.objects.size() != 1U || current.selection.objects.front() != source) {
+        return nullptr;
+    }
+    const auto object = std::find_if(current.objects.begin(), current.objects.end(),
+        [source](const auto& candidate) { return candidate.object.id == source; });
+    if (object == current.objects.end() || !object->object.mesh_asset.has_value() ||
+        object->object.parent.has_value() || object->object.locked || !object->object.visible) {
+        return nullptr;
+    }
+    return &*object;
+}
+
+} // namespace
+
+core::Result<application::DispatchReceipt> UiController::duplicate_mesh_instances(
+    scene::ObjectId source,
+    std::uint32_t copies,
+    core::Vec3d translation_step,
+    std::uint64_t expected_project_generation,
+    core::Revision expected_project_revision) {
+    const auto refuse = [this](core::Diagnostic diagnostic) {
+        record_ui_problem(diagnostic.with_context("duplicate mesh instances"));
+        return core::Result<application::DispatchReceipt>::failure(std::move(diagnostic));
+    };
+    const auto current = session_.snapshot();
+    if (current.project_generation != expected_project_generation ||
+        current.project_revision != expected_project_revision) {
+        return refuse(stale("instance batch belongs to an earlier project snapshot"));
+    }
+    if (current.selection.mode != editor::SelectionMode::object ||
+        current.selection.objects.size() != 1U || current.selection.objects.front() != source) {
+        return refuse(invalid("instance batch requires exactly one selected source object"));
+    }
+    if (copies == 0U || copies > editor::kMaxMeshInstanceBatchInstances ||
+        !translation_step.finite()) {
+        return refuse(invalid("instance count or translation step is outside the supported bounds"));
+    }
+    const auto* object = eligible_duplicate_batch_source(current, source);
+    if (object == nullptr) {
+        return refuse(invalid_state("instance batch requires a visible unlocked root mesh object"));
+    }
+    std::vector<editor::MeshInstanceBatchInstance> instances;
+    instances.reserve(copies);
+    for (std::uint32_t index = 1U; index <= copies; ++index) {
+        const auto offset = translation_step * static_cast<double>(index);
+        if (!offset.finite() || std::hypot(offset.x, offset.y, offset.z) >
+                editor::kMaxMeshInstanceBatchOffsetMagnitude) {
+            return refuse(invalid("instance translation exceeds the bounded authoring extent"));
+        }
+        instances.push_back({object->object.name + " Copy " + std::to_string(index), offset});
+    }
+    return dispatch(application::DuplicateMeshInstanceBatchAction{source, std::move(instances)});
+}
+
 core::Result<editor::PointSightlineResult> UiController::evaluate_point_sightline(
     const editor::PointSightlineQuery& query,
     const editor::PointSightlineOptions& options) const {
@@ -8045,8 +12170,9 @@ core::Result<void> UiController::sync_application_workspace(
     return core::Result<void>::success();
 }
 
-std::vector<CommandView> UiController::command_views() const {
-    return {
+std::vector<CommandView> UiController::command_views(
+    const application::ApplicationSnapshot& current) const {
+    auto commands = std::vector<CommandView>{
         {"project.save", "Save Project", "Ctrl+S", true, {}},
         {"file.import-mesh", "Import Mesh", "Ctrl+I", true, {}},
         {"edit.duplicate", "Duplicate Selected Object", "Ctrl+D", true, {}},
@@ -8066,6 +12192,39 @@ std::vector<CommandView> UiController::command_views() const {
          market_library_ != nullptr, market_library_ == nullptr
              ? "The local market library is not configured" : ""},
     };
+    const bool components = current.selection.mode != editor::SelectionMode::object &&
+        !current.selection.component_groups.empty();
+    const auto add_selection = [&](std::string_view id, const char* label) {
+        commands.push_back({std::string(id), label, {}, components,
+            components ? "" : "Select mesh components first"});
+    };
+    add_selection(selection_commands::to_vertex, "Convert Selection to Vertices");
+    add_selection(selection_commands::to_edge, "Convert Selection to Edges");
+    add_selection(selection_commands::to_face, "Convert Selection to Faces");
+    add_selection(selection_commands::linked, "Select Linked Components");
+    add_selection(selection_commands::grow, "Grow Selection");
+    add_selection(selection_commands::shrink, "Shrink Selection");
+    add_selection(selection_commands::invert, "Invert Component Selection");
+    const bool edges = components && current.selection.mode == editor::SelectionMode::edge;
+    for (const auto& [id, label] : {
+             std::pair{selection_commands::boundary, "Select Component Boundary"},
+             std::pair{selection_commands::loop, "Select Edge Loop"},
+             std::pair{selection_commands::ring, "Select Edge Ring"}}) {
+        commands.push_back({std::string(id), label, {}, edges,
+            edges ? "" : "Select mesh edges first"});
+    }
+    const bool path = components && current.selection.mode == editor::SelectionMode::vertex &&
+        current.selection.component_groups.size() == 1U &&
+        current.selection.component_groups.front().vertices.size() == 1U;
+    commands.push_back({std::string(selection_commands::shortest_path),
+        "Choose Shortest Path Target in Modify", {}, path,
+        path ? "" : "Select one start vertex first"});
+    const bool duplicate = eligible_duplicate_batch_source(current,
+        current.selection.objects.empty() ? scene::ObjectId{} : current.selection.objects.front()) !=
+        nullptr;
+    commands.push_back({"edit.duplicate-batch", "Duplicate Instance Batch in Modify", {}, duplicate,
+        duplicate ? "" : "Select one visible unlocked root mesh object"});
+    return commands;
 }
 
 void UiController::record_operation(
@@ -8193,7 +12352,7 @@ UiSnapshot UiController::snapshot() const {
     result.command_palette_query = command_palette_query_;
     result.visible_panels = preferences_.visible_panels;
     result.operations = operations_;
-    result.commands = command_views();
+    result.commands = command_views(result);
     result.ui_problems = ui_problems_;
     result.colors = color_tokens(preferences_.theme);
     result.ai_available = true;
@@ -8236,6 +12395,81 @@ UiSnapshot UiController::snapshot() const {
     if (agent_task_.has_value()) {
         const auto task = agent_task_->snapshot();
         result.agent_task = task;
+        if (agent_project_merge_review_.has_value() &&
+            agent_project_merge_task_id_ == task.task_id) {
+            AgentProjectMergeView merge_view;
+            merge_view.task_id = task.task_id;
+            merge_view.review = *agent_project_merge_review_;
+            merge_view.stale = result.project_revision != merge_view.review.left_revision;
+            merge_view.current_diff = agent_project_merge_current_diff_;
+            merge_view.speculative_diff = agent_project_merge_speculative_diff_;
+            merge_view.details = agent_project_merge_details_;
+            if (agent_project_merge_resolution_.has_value() &&
+                agent_project_merge_resolution_->review_digest == merge_view.review.digest &&
+                agent_project_merge_candidate_diff_ != nullptr) {
+                merge_view.selected_source =
+                    agent_project_merge_resolution_->selected_source;
+                merge_view.candidate_digest =
+                    agent_project_merge_resolution_->source_digest;
+                merge_view.candidate_diff = agent_project_merge_candidate_diff_;
+                const auto& candidate_diff = *agent_project_merge_candidate_diff_;
+                merge_view.candidate_changed_objects =
+                    candidate_diff.changed_object_count();
+                merge_view.candidate_changed_meshes =
+                    candidate_diff.changed_mesh_count();
+                merge_view.candidate_changed_bindings =
+                    candidate_diff.changed_material_binding_count();
+                merge_view.candidate_changed_materials =
+                    candidate_diff.changed_material_source_count();
+                merge_view.candidate_changed_textures =
+                    candidate_diff.changed_texture_source_count();
+                merge_view.candidate_changed_project_metadata =
+                    candidate_diff.project_metadata.changed_field_count;
+                merge_view.candidate_changed_spatial_fields =
+                    candidate_diff.changed_spatial_field_count();
+                merge_view.candidate_changed_source_assets =
+                    candidate_diff.changed_source_asset_record_count();
+                merge_view.candidate_changed_connection_ports =
+                    candidate_diff.connection_port_graph.changed_port_count;
+                merge_view.candidate_changed_connection_edges =
+                    candidate_diff.connection_port_graph.changed_edge_count;
+                merge_view.candidate_changed_authoring_standards =
+                    candidate_diff.authoring_standards.changed_record_count;
+                merge_view.candidate_changed_world_models =
+                    candidate_diff.world_model.changed ? 1U : 0U;
+                merge_view.candidate_changed_scientific_models =
+                    candidate_diff.scientific_model.changed ? 1U : 0U;
+                merge_view.candidate_changed_procedural_sources =
+                    candidate_diff.procedural_sources.changed_record_count;
+                merge_view.candidate_changed_biological_sources =
+                    candidate_diff.biological_authoring_sources.changed_record_count;
+                merge_view.candidate_changed_rig_module_templates =
+                    candidate_diff.rig_module_template_sources.changed_record_count;
+                merge_view.candidate_changed_decal_placements =
+                    candidate_diff.decal_placement_sources.changed_record_count;
+                merge_view.candidate_changed_pose_libraries =
+                    candidate_diff.pose_libraries.changed_record_count;
+                merge_view.candidate_changed_kinematic_graphs =
+                    candidate_diff.kinematic_graphs.changed_record_count;
+                merge_view.candidate_changed_edit_receipts =
+                    candidate_diff.edit_receipts.changed_record_count;
+                merge_view.candidate_changed_instance_receipts =
+                    candidate_diff.instance_receipts.changed_record_count;
+                merge_view.candidate_changed_mesh_authoring_sources =
+                    candidate_diff.mesh_authoring_sources.changed_record_count;
+                merge_view.candidate_changed_semantic_sidecars =
+                    candidate_diff.semantic_sidecar_changed ? 1U : 0U;
+                merge_view.candidate_changed_engineering_sidecars =
+                    candidate_diff.engineering_changed ? 1U : 0U;
+                merge_view.candidate_changed_condition_sidecars =
+                    candidate_diff.condition_changed ? 1U : 0U;
+                merge_view.candidate_has_unclassified_source_changes =
+                    candidate_diff.has_unclassified_source_changes();
+                merge_view.candidate_source_projection_is_partial =
+                    candidate_diff.source_projection_is_partial();
+            }
+            result.agent_project_merge = std::move(merge_view);
+        }
         if (preferences_.workspace != Workspace::ai &&
             task.status != agent::TaskStatus::accepted &&
             task.status != agent::TaskStatus::rejected) {

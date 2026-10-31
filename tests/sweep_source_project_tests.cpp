@@ -100,8 +100,8 @@ void project_save_reopen_and_lineage_are_governed() {
         "active sweep binding passes full project validation");
 
     const std::string encoded = document.serialize();
-    require(encoded.starts_with("CARTOGRAPHER_PROJECT 33\n"),
-        "project schema 33 preserves current source-authoring format compatibility");
+    require(encoded.starts_with("CARTOGRAPHER_PROJECT 35\n"),
+        "project schema 35 preserves current source-authoring format compatibility");
     const auto reopened = project::ProjectDocument::deserialize(encoded);
     require(reopened && reopened.value().sweep_sources().size() == 1U &&
             reopened.value().sweep_sources().at("fixture.pipe.recipe").serialize() ==
@@ -168,6 +168,90 @@ void project_save_reopen_and_lineage_are_governed() {
         "create, update, delete, and recreation each retain one journal receipt");
 }
 
+void hollow_sources_persist_through_existing_project_transactions() {
+    TempDirectory directory;
+    project::ProjectDocument document;
+    journal::Journal events(directory.path() / "hollow-events.log");
+    auto source = make_source();
+    source.inner_profile_scale = 0.6;
+    const auto committed = commit_source_pair(document, events, make_centerline(), source,
+        "sweep.hollow.create");
+    require(committed && events.verify(), "hollow recipe is admitted by the existing journaled transaction");
+    const auto path = directory.path() / "hollow.carto";
+    require(static_cast<bool>(document.save_atomic(path)), "hollow source project saves atomically");
+    const auto reopened = project::ProjectDocument::load(path);
+    require(reopened && reopened.value().sweep_sources().at(source.source_identity).serialize() ==
+            source.serialize(), "file reopen preserves the exact nested hollow source bytes");
+    const auto built = geometry::build_sweep_mesh(
+        reopened.value().sweep_sources().at(source.source_identity),
+        reopened.value().curve_paths().at(source.centerline_identity));
+    require(built && built.value().mesh.validate(), "reopened hollow source rebuilds deterministically");
+    const auto before = document.serialize();
+    const auto before_events = events.read_all();
+    require(static_cast<bool>(before_events), "journal baseline can be inspected");
+    auto stale = source;
+    stale.inner_profile_scale = 0.4;
+    auto transaction = project::ProjectTransaction::begin(document, events, "hollow-stale-edit");
+    require(transaction && !transaction.value().set_sweep_source(stale) &&
+            transaction.value().rollback(), "same-revision hollow edits refuse before publication");
+    require(document.serialize() == before && events.read_all().value().size() == before_events.value().size(),
+        "rejected hollow edits preserve exact document bytes and journal entries");
+}
+
+void owner_bound_sources_persist_their_local_frame_identity() {
+    TempDirectory directory;
+    project::ProjectDocument document;
+    journal::Journal events(directory.path() / "owned-sweep-events.log");
+    auto transaction = project::ProjectTransaction::begin(
+        document, events, "sweep-owner-binding-tests");
+    require(static_cast<bool>(transaction), "owner-bound sweep transaction begins");
+    const auto owner = transaction.value().create_object("Pipe owner");
+    require(static_cast<bool>(owner), "owner scene object is created in the transaction");
+    auto path = make_centerline();
+    auto source = make_source();
+    source.owner_object_id = owner.value().value;
+    require(static_cast<bool>(transaction.value().set_curve_path(path)),
+        "owner-bound sweep centerline is staged");
+    require(static_cast<bool>(transaction.value().set_sweep_source(source)),
+        "sweep source binds its local frame to the staged owner object");
+    const auto committed = transaction.value().commit("sweep.owner.create");
+    require(static_cast<bool>(committed) && document.validate(),
+        "owner-bound source publishes with valid project lineage");
+    require(source.serialize().starts_with("CARTOGRAPHER_SWEEP_SOURCE 3\n") &&
+            source.serialize().find("OWNER_OBJECT " + std::to_string(owner.value().value) + "\n") !=
+                std::string::npos,
+        "owner object identity is stored in the nested source record");
+
+    const auto path_on_disk = directory.path() / "owned-pipe.carto";
+    require(static_cast<bool>(document.save_atomic(path_on_disk)),
+        "owner-bound source project saves");
+    const auto reopened = project::ProjectDocument::load(path_on_disk);
+    require(reopened && reopened.value().validate() &&
+            reopened.value().sweep_sources().at(source.source_identity).owner_object_id ==
+                owner.value().value,
+        "save/reopen preserves the owner object binding and its scene frame");
+    const auto product = geometry::build_sweep_mesh(
+        reopened.value().sweep_sources().at(source.source_identity),
+        reopened.value().curve_paths().at(source.centerline_identity));
+    require(product && product.value().owner_object_id == owner.value().value,
+        "sweep build product retains the persisted frame owner");
+
+    project::ProjectDocument missing_owner_document;
+    journal::Journal missing_owner_events(directory.path() / "missing-owner.log");
+    auto missing_owner = project::ProjectTransaction::begin(
+        missing_owner_document, missing_owner_events, "sweep-owner-binding-tests");
+    require(static_cast<bool>(missing_owner), "missing-owner transaction begins");
+    require(static_cast<bool>(missing_owner.value().set_curve_path(make_centerline())),
+        "missing-owner fixture centerline is staged");
+    auto dangling = make_source();
+    dangling.owner_object_id = 9001U;
+    const auto refused = missing_owner.value().set_sweep_source(dangling);
+    require(!refused && refused.error().code == core::ErrorCode::not_found,
+        "sweep owner binding refuses a scene object outside the current project");
+    require(static_cast<bool>(missing_owner.value().rollback()),
+        "missing-owner refusal leaves no staged mutation");
+}
+
 void stale_bindings_and_schema_migrations_fail_closed() {
     TempDirectory directory;
     project::ProjectDocument document;
@@ -214,6 +298,8 @@ void stale_bindings_and_schema_migrations_fail_closed() {
         "current schema refuses missing sweep lineage rather than inventing revisions");
 
     std::string legacy_v22 = document.serialize();
+    const std::string current_header = "CARTOGRAPHER_PROJECT " +
+        std::to_string(project::ProjectDocument::kSchemaVersion) + "\n";
     const auto legacy_mesh_patches = legacy_v22.find("MESH_PATCHES 0\n");
     require(legacy_mesh_patches != std::string::npos,
         "schema 22 fixture removes the v29 persistent patch table");
@@ -232,9 +318,11 @@ void stale_bindings_and_schema_migrations_fail_closed() {
         "schema 23 sign-text lineage and receipts can be isolated for schema-22 migration");
     legacy_v22.erase(sign_lineage_start, legacy_registry - sign_lineage_start);
     const auto biological_v22 = legacy_v22.find("BIOLOGICAL_AUTHORING_SOURCES ");
-    const auto end_v22 = legacy_v22.find("END\n", biological_v22);
+    // The current format also has quoted nested records containing END lines;
+    // remove future tables up to the outer project's final terminator.
+    const auto end_v22 = legacy_v22.rfind("END\n");
     legacy_v22.erase(biological_v22, end_v22 - biological_v22);
-    legacy_v22.replace(0U, std::string("CARTOGRAPHER_PROJECT 32\n").size(),
+    legacy_v22.replace(0U, current_header.size(),
         "CARTOGRAPHER_PROJECT 22\n");
     const auto migrated_v22 = project::ProjectDocument::deserialize(legacy_v22);
     require(migrated_v22 && migrated_v22.value().sweep_sources().size() == 1U,
@@ -253,9 +341,9 @@ void stale_bindings_and_schema_migrations_fail_closed() {
     const auto empty_registry = legacy_v21.find("SOURCE_ASSET_REGISTRY_HEX ", empty_sweep_lineage);
     legacy_v21.erase(empty_sweep_lineage, empty_registry - empty_sweep_lineage);
     const auto biological_v21 = legacy_v21.find("BIOLOGICAL_AUTHORING_SOURCES ");
-    const auto end_v21 = legacy_v21.find("END\n", biological_v21);
+    const auto end_v21 = legacy_v21.rfind("END\n");
     legacy_v21.erase(biological_v21, end_v21 - biological_v21);
-    legacy_v21.replace(0U, std::string("CARTOGRAPHER_PROJECT 32\n").size(),
+    legacy_v21.replace(0U, current_header.size(),
         "CARTOGRAPHER_PROJECT 21\n");
     const auto migrated = project::ProjectDocument::deserialize(legacy_v21);
     require(migrated && migrated.value().sweep_sources().empty(),
@@ -267,6 +355,8 @@ void stale_bindings_and_schema_migrations_fail_closed() {
 int main() {
     project_save_reopen_and_lineage_are_governed();
     stale_bindings_and_schema_migrations_fail_closed();
+    hollow_sources_persist_through_existing_project_transactions();
+    owner_bound_sources_persist_their_local_frame_identity();
     std::cout << "All sweep source project tests passed.\n";
     return EXIT_SUCCESS;
 }

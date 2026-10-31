@@ -21,10 +21,10 @@
 namespace carto::production {
 namespace {
 
-constexpr std::string_view kRecipeMagic = "CARTO_UV_ISLAND_PACK_RECIPE 2";
+constexpr std::string_view kRecipeMagic = "CARTO_UV_ISLAND_PACK_RECIPE 3";
 constexpr std::string_view kOutputMagic = "CARTO_UV_ISLAND_PACK_OUTPUT 1";
 constexpr std::string_view kTileMagic = "CARTO_UV_ISLAND_PACK_TILE 1";
-constexpr std::string_view kArtifactMagic = "CARTO_UV_ISLAND_PACK_ARTIFACT 2";
+constexpr std::string_view kArtifactMagic = "CARTO_UV_ISLAND_PACK_ARTIFACT 3";
 constexpr double kGeometryEpsilon = 1e-12;
 
 core::Diagnostic invalid(std::string message) {
@@ -349,7 +349,7 @@ std::string UvIslandPackRecipe::serialize() const {
                 target_texels_per_world_unit == 0.0
                     ? 0.0 : target_texels_per_world_unit)
            << std::dec << '\n'
-           << "island.connectivity=exact-shared-edge-endpoints-v1\n"
+           << "island.connectivity=explicit-seam-or-coordinate-discontinuity-v2\n"
            << "packing.strategy=largest-first-shelf-v1\n"
            << "rotation="
            << (allow_quarter_turn_rotation ? "quarter_turn_90" : "disabled")
@@ -368,7 +368,7 @@ core::Result<assets::Sha256Digest> UvIslandPackRecipe::settings_digest() const {
 
 core::Result<void> UvIslandPackArtifact::refresh_digests() {
     if (auto result = recipe.validate(); !result) return result;
-    if (algorithm != "carto.uv.island-shelf-pack.v2" ||
+    if (algorithm != "carto.uv.island-shelf-pack.v3" ||
         evidence_class != "carto.cpu-reference" ||
         !std::isfinite(pixels_per_uv_unit) || pixels_per_uv_unit <= 0.0 ||
         !std::isfinite(texels_per_world_unit) ||
@@ -592,6 +592,36 @@ core::Result<UvIslandPackArtifact> compile_canonical(
             "UV island source corner count is empty or outside the supported bound"));
     }
 
+    std::set<EdgeKey> explicitly_marked_seams;
+    const std::string seam_layer_id =
+        attributes::uv_seam_attribute_id(recipe.source_uv_set);
+    const attributes::AttributeLayer* seam_layer =
+        source.attributes().find(seam_layer_id);
+    if (seam_layer != nullptr &&
+        (seam_layer->descriptor.domain != attributes::AttributeDomain::edge ||
+         seam_layer->descriptor.type != attributes::AttributeType::boolean ||
+         seam_layer->values.size() != topology.value().edges.size())) {
+        return core::Result<UvIslandPackArtifact>::failure(validation(
+            "UV island seam marker layer does not match the validated edge topology"));
+    }
+    if (seam_layer != nullptr) {
+        if (auto valid = seam_layer->validate(topology.value().edges.size()); !valid) {
+            return core::Result<UvIslandPackArtifact>::failure(
+                valid.error().with_context("UV island seam marker layer"));
+        }
+        for (std::size_t index = 0U; index < topology.value().edges.size(); ++index) {
+            const auto* marked = std::get_if<bool>(&seam_layer->values[index]);
+            if (marked == nullptr) {
+                return core::Result<UvIslandPackArtifact>::failure(validation(
+                    "UV island seam marker layer contains a non-boolean value"));
+            }
+            const geometry::EdgeRecord& edge = topology.value().edges[index];
+            if (*marked && edge.second_half_edge.has_value()) {
+                explicitly_marked_seams.insert(EdgeKey{edge.first, edge.second});
+            }
+        }
+    }
+
     std::map<std::pair<geometry::FaceId, geometry::VertexId>, geometry::CornerId>
         corner_by_face_vertex;
     std::map<geometry::CornerId, core::Vec2d> uv_by_corner;
@@ -643,12 +673,11 @@ core::Result<UvIslandPackArtifact> compile_canonical(
         return value;
     };
     for (const auto& [edge, uses] : uses_by_edge) {
-        static_cast<void>(edge);
         if (uses.size() > 2U) {
             return core::Result<UvIslandPackArtifact>::failure(unsupported(
                 "UV island packing rejects non-manifold shared-edge fans"));
         }
-        if (uses.size() != 2U ||
+        if (uses.size() != 2U || explicitly_marked_seams.contains(edge) ||
             !same_uv(uses[0U].first_uv, uses[1U].first_uv) ||
             !same_uv(uses[0U].second_uv, uses[1U].second_uv)) {
             continue;
@@ -939,6 +968,73 @@ core::Result<UvIslandPackArtifact> compile_uv_island_pack(
     return compile_canonical(recipe, source);
 }
 
+core::Result<geometry::EditableMesh> build_uv_island_packed_mesh(
+    const geometry::EditableMesh& source,
+    const UvIslandPackArtifact& artifact) {
+    using Result = core::Result<geometry::EditableMesh>;
+    if (auto valid = artifact.validate(source); !valid) {
+        return Result::failure(valid.error());
+    }
+    if (source.uv_sets().find(artifact.recipe.output_uv_set) != nullptr ||
+        source.attributes().find(artifact.recipe.output_layer_id) != nullptr) {
+        return Result::failure(validation(
+            "UV island pack target set or corner layer already exists"));
+    }
+    const auto topology = source.topology();
+    if (!topology) return Result::failure(topology.error());
+    std::map<geometry::CornerId, core::Vec2d> coordinates;
+    for (const UvIslandPackCorner& corner : artifact.corners) {
+        coordinates.emplace(corner.corner, corner.uv);
+    }
+    std::vector<attributes::AttributeValue> values;
+    values.reserve(topology.value().corners.size());
+    for (const geometry::CornerRecord& corner : topology.value().corners) {
+        const auto coordinate = coordinates.find(corner.id);
+        if (coordinate == coordinates.end()) {
+            return Result::failure(validation(
+                "UV island pack artifact omits a source mesh corner"));
+        }
+        values.emplace_back(coordinate->second);
+    }
+
+    attributes::AttributeSet attribute_set({
+        {attributes::AttributeDomain::vertex, source.vertex_count()},
+        {attributes::AttributeDomain::edge, topology.value().edges.size()},
+        {attributes::AttributeDomain::face, source.face_count()},
+        {attributes::AttributeDomain::corner, topology.value().corners.size()},
+    });
+    for (const auto& [ignored, layer] : source.attributes().layers()) {
+        static_cast<void>(ignored);
+        if (auto added = attribute_set.add_layer(layer); !added) {
+            return Result::failure(added.error());
+        }
+    }
+    if (auto added = attribute_set.add_layer(attributes::AttributeLayer{
+            {artifact.recipe.output_layer_id, attributes::AttributeDomain::corner,
+                attributes::AttributeType::vec2},
+            std::move(values)}); !added) {
+        return Result::failure(added.error());
+    }
+    attributes::UvSetTable uv_sets = source.uv_sets();
+    if (auto added = uv_sets.add(attributes::UvSetDescriptor{
+            artifact.recipe.output_uv_set,
+            artifact.recipe.output_name,
+            artifact.recipe.output_layer_id,
+            false,
+            false,
+            false,
+            2U}); !added) {
+        return Result::failure(added.error());
+    }
+    geometry::EditableMesh updated = source;
+    if (auto attached = updated.set_attribute_payload(std::move(attribute_set), std::move(uv_sets));
+        !attached) {
+        return Result::failure(attached.error());
+    }
+    if (auto valid = updated.validate(); !valid) return Result::failure(valid.error());
+    return Result::success(std::move(updated));
+}
+
 core::Result<void> apply_uv_island_pack(
     project::ProjectTransaction& transaction,
     std::uint64_t mesh_asset,
@@ -954,63 +1050,9 @@ core::Result<void> apply_uv_island_pack(
         return core::Result<void>::failure(core::Diagnostic(
             core::ErrorCode::not_found, "UV island transaction target mesh does not exist"));
     }
-    if (auto result = artifact.validate(mesh->second); !result) return result;
-    if (mesh->second.uv_sets().find(artifact.recipe.output_uv_set) != nullptr ||
-        mesh->second.attributes().find(artifact.recipe.output_layer_id) != nullptr) {
-        return core::Result<void>::failure(validation(
-            "UV island pack target set or corner layer already exists"));
-    }
-    const auto topology = mesh->second.topology();
-    if (!topology) return core::Result<void>::failure(topology.error());
-    std::map<geometry::CornerId, core::Vec2d> coordinates;
-    for (const UvIslandPackCorner& corner : artifact.corners) {
-        coordinates.emplace(corner.corner, corner.uv);
-    }
-    std::vector<attributes::AttributeValue> values;
-    values.reserve(topology.value().corners.size());
-    for (const geometry::CornerRecord& corner : topology.value().corners) {
-        const auto coordinate = coordinates.find(corner.id);
-        if (coordinate == coordinates.end()) {
-            return core::Result<void>::failure(validation(
-                "UV island pack artifact omits a staged mesh corner"));
-        }
-        values.emplace_back(coordinate->second);
-    }
-
-    attributes::AttributeSet attribute_set({
-        {attributes::AttributeDomain::vertex, mesh->second.vertex_count()},
-        {attributes::AttributeDomain::edge, topology.value().edges.size()},
-        {attributes::AttributeDomain::face, mesh->second.face_count()},
-        {attributes::AttributeDomain::corner, topology.value().corners.size()},
-    });
-    for (const auto& [ignored, layer] : mesh->second.attributes().layers()) {
-        static_cast<void>(ignored);
-        if (auto result = attribute_set.add_layer(layer); !result) return result;
-    }
-    if (auto result = attribute_set.add_layer(attributes::AttributeLayer{
-            {artifact.recipe.output_layer_id, attributes::AttributeDomain::corner,
-                attributes::AttributeType::vec2},
-            std::move(values)}); !result) {
-        return result;
-    }
-    attributes::UvSetTable uv_sets = mesh->second.uv_sets();
-    if (auto result = uv_sets.add(attributes::UvSetDescriptor{
-            artifact.recipe.output_uv_set,
-            artifact.recipe.output_name,
-            artifact.recipe.output_layer_id,
-            false,
-            false,
-            false,
-            2U}); !result) {
-        return result;
-    }
-    geometry::EditableMesh updated = mesh->second;
-    if (auto result = updated.set_attribute_payload(std::move(attribute_set), std::move(uv_sets));
-        !result) {
-        return result;
-    }
-    if (auto result = updated.validate(); !result) return result;
-    return transaction.replace_mesh(mesh_asset, std::move(updated));
+    auto updated = build_uv_island_packed_mesh(mesh->second, artifact);
+    if (!updated) return core::Result<void>::failure(updated.error());
+    return transaction.replace_mesh(mesh_asset, std::move(updated.value()));
 }
 
 std::string uv_island_pack_transaction_operation(const UvIslandPackArtifact& artifact) {

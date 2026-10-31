@@ -17,6 +17,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -88,6 +89,58 @@ void project_file_lock_serializes_writers_in_process() {
     REQUIRE(acquired.load(std::memory_order_acquire));
 }
 
+void blob_store_temporary_name_fits_a_valid_digest_path() {
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto base = std::filesystem::temp_directory_path() /
+        ("bp-" + std::to_string(stamp));
+    REQUIRE(std::filesystem::create_directory(base));
+    const auto base_chars = base.native().size();
+    REQUIRE(base_chars < 159U);
+    const auto root = base / std::string(160U - base_chars - 1U, 'b');
+    carto::assets::BlobStore store(root);
+    const std::string bytes = "bounded atomic blob temporary name";
+    const auto digest = carto::assets::sha256(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()));
+#ifdef _WIN32
+    REQUIRE(store.path_for(digest).native().size() < 260U);
+#endif
+    const auto stored = store.put(bytes, "text/plain");
+    if (!stored) {
+        std::cerr << "bounded blob path: " << stored.error().message
+                  << "; final path chars=" << store.path_for(digest).native().size()
+                  << "; retained fixture=" << base.string() << '\n';
+    }
+    REQUIRE(stored);
+    REQUIRE(stored.value().digest == digest);
+    const auto read = store.read(digest);
+    REQUIRE(read && std::string(read.value().begin(), read.value().end()) == bytes);
+    const auto repeated = store.put(bytes, "text/plain");
+    REQUIRE(repeated && repeated.value().digest == digest);
+    REQUIRE(store.put("second distinct blob", "text/plain"));
+    REQUIRE(!store.put(bytes, "invalid\nmedia"));
+    REQUIRE(store.verify(digest));
+    const auto listed = store.list();
+    REQUIRE(listed && listed.value().size() == 2U);
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+        if (!entry.is_regular_file()) continue;
+        const auto name = entry.path().filename().string();
+        REQUIRE(name.size() == 64U);
+        REQUIRE(carto::assets::Sha256Digest::from_hex(name));
+    }
+    carto::assets::BlobStore unicode_store(base / std::filesystem::path{u8"caf\u00e9"});
+    const auto unicode_blob = unicode_store.put(bytes, "text/plain");
+    REQUIRE(unicode_blob && unicode_blob.value().digest == digest);
+    REQUIRE(unicode_store.verify(digest));
+    const auto blocked = base / "not-a-directory";
+    { std::ofstream sentinel(blocked); sentinel << "preserve"; }
+    REQUIRE(!carto::assets::BlobStore(blocked).put(bytes, "text/plain"));
+    std::ifstream sentinel(blocked);
+    REQUIRE(std::string(std::istreambuf_iterator<char>(sentinel),
+                        std::istreambuf_iterator<char>()) == "preserve");
+    sentinel.close();
+    std::filesystem::remove_all(base);
+}
+
 void blob_store_is_content_addressed_and_integrity_checked() {
     TempDirectory temp;
     carto::assets::BlobStore store(temp.path() / "blobs");
@@ -154,22 +207,60 @@ void blob_store_lists_deterministically_and_reports_orphan_candidates() {
     REQUIRE(all_orphans.value().corrupt.empty());
 
     const std::vector<carto::assets::Sha256Digest> live{
-        first.value().digest, third.value().digest};
+        first.value().digest, third.value().digest,
+        carto::assets::sha256(std::span<const std::uint8_t>{})};
     const auto report = store.orphan_candidates(live);
     REQUIRE(report);
     REQUIRE(report.value().orphan_candidates.size() == 1U);
     REQUIRE(report.value().orphan_candidates.front() == second.value().digest);
     REQUIRE(report.value().corrupt.empty());
+    REQUIRE(report.value().missing_live_references.size() == 1U);
+    REQUIRE(report.value().missing_live_references.front() == live.back());
+
+    const std::vector<carto::assets::Sha256Digest> pending_work{
+        second.value().digest,
+        carto::assets::sha256(std::span<const std::uint8_t>{
+            reinterpret_cast<const std::uint8_t*>("pending-only"), 12U})};
+    const auto pending_report = store.orphan_candidates(live, pending_work);
+    REQUIRE(pending_report);
+    REQUIRE(pending_report.value().orphan_candidates.empty());
+    REQUIRE(pending_report.value().protected_pending_work_digests ==
+        std::vector<carto::assets::Sha256Digest>{second.value().digest});
+    REQUIRE(pending_report.value().missing_live_references ==
+        report.value().missing_live_references);
+    const std::vector<carto::assets::Sha256Digest> invalid_pending{
+        carto::assets::Sha256Digest{}};
+    const auto invalid_pending_report = store.orphan_candidates(live, invalid_pending);
+    REQUIRE(!invalid_pending_report && invalid_pending_report.error().code ==
+        carto::core::ErrorCode::validation_failed);
 
     std::ofstream tamper(store.path_for(second.value().digest), std::ios::binary | std::ios::trunc);
     tamper << "corrupted";
     tamper.close();
     REQUIRE(store.list());
-    const auto corrupt_report = store.orphan_candidates(live);
+    const auto corrupt_report = store.orphan_candidates(live, pending_work);
     REQUIRE(corrupt_report);
     REQUIRE(corrupt_report.value().orphan_candidates.empty());
     REQUIRE(corrupt_report.value().corrupt.size() == 1U);
     REQUIRE(corrupt_report.value().corrupt.front() == second.value().digest);
+    REQUIRE(corrupt_report.value().protected_pending_work_digests.empty());
+    REQUIRE(corrupt_report.value().missing_live_references.size() == 1U);
+
+    std::vector<carto::assets::Sha256Digest> over_budget_pending(
+        carto::assets::kMaxPendingBlobWorkDigests + 1U, second.value().digest);
+    const auto over_budget_report = store.orphan_candidates(live, over_budget_pending);
+    REQUIRE(!over_budget_report && over_budget_report.error().code ==
+        carto::core::ErrorCode::validation_failed);
+
+    carto::assets::BlobStoreLimits inventory_limits;
+    inventory_limits.max_inventory_verification_bytes = 4U;
+    carto::assets::BlobStore inventory_limited(temp.path() / "inventory-limited",
+        inventory_limits);
+    REQUIRE(inventory_limited.put("one", "text/plain"));
+    REQUIRE(inventory_limited.put("two", "text/plain"));
+    const auto inventory_over_budget = inventory_limited.orphan_candidates({});
+    REQUIRE(!inventory_over_budget && inventory_over_budget.error().code ==
+        carto::core::ErrorCode::validation_failed);
 
     carto::assets::BlobStoreLimits limits;
     limits.max_listed_blobs = 1U;
@@ -180,6 +271,129 @@ void blob_store_lists_deterministically_and_reports_orphan_candidates() {
     REQUIRE(!exceeded);
     REQUIRE(exceeded.error().code == carto::core::ErrorCode::validation_failed);
     REQUIRE(!limited.orphan_candidates({}));
+}
+
+void blob_store_rejects_digest_named_entries_outside_canonical_shards() {
+    TempDirectory wrong_depth_temp;
+    const auto wrong_depth_root = wrong_depth_temp.path() / "store";
+    carto::assets::BlobStore wrong_depth_store(wrong_depth_root);
+    const auto digest = carto::assets::sha256(std::span<const std::uint8_t>{});
+    const auto wrong_depth_path = wrong_depth_root / "sha256" / "extra" / digest.hex();
+    std::filesystem::create_directories(wrong_depth_path.parent_path());
+    {
+        std::ofstream file(wrong_depth_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(file));
+    }
+    const auto wrong_depth_listing = wrong_depth_store.list();
+    REQUIRE(!wrong_depth_listing && wrong_depth_listing.error().code ==
+        carto::core::ErrorCode::validation_failed);
+    const auto wrong_depth_inventory = wrong_depth_store.orphan_candidates({});
+    REQUIRE(!wrong_depth_inventory && wrong_depth_inventory.error().code ==
+        carto::core::ErrorCode::validation_failed);
+
+    TempDirectory malformed_temp;
+    const auto malformed_root = malformed_temp.path() / "store";
+    carto::assets::BlobStore malformed_store(malformed_root);
+    const auto malformed_path = malformed_root / "sha256" / "00" / "00" /
+        std::string(64U, 'g');
+    std::filesystem::create_directories(malformed_path.parent_path());
+    {
+        std::ofstream file(malformed_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(file));
+    }
+    const auto malformed_listing = malformed_store.list();
+    REQUIRE(!malformed_listing && malformed_listing.error().code ==
+        carto::core::ErrorCode::validation_failed);
+
+    TempDirectory uppercase_temp;
+    const auto uppercase_root = uppercase_temp.path() / "store";
+    carto::assets::BlobStore uppercase_store(uppercase_root);
+    const auto canonical_hex = digest.hex();
+    std::string uppercase_hex = canonical_hex;
+    for (auto& character : uppercase_hex) {
+        if (character >= 'a' && character <= 'f') {
+            character = static_cast<char>(character - 'a' + 'A');
+        }
+    }
+    const auto uppercase_path = uppercase_root / "sha256" /
+        canonical_hex.substr(0U, 2U) / canonical_hex.substr(2U, 2U) / uppercase_hex;
+    std::filesystem::create_directories(uppercase_path.parent_path());
+    {
+        std::ofstream file(uppercase_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(file));
+    }
+    const auto uppercase_listing = uppercase_store.list();
+    REQUIRE(!uppercase_listing && uppercase_listing.error().code ==
+        carto::core::ErrorCode::validation_failed);
+}
+
+void blob_store_refuses_symlinked_blob_files() {
+    TempDirectory temp;
+    carto::assets::BlobStore store(temp.path() / "store");
+    const std::string payload = "protected blob bytes";
+    const auto stored = store.put(payload, "text/plain");
+    REQUIRE(stored);
+    const auto outside = temp.path() / "outside.bin";
+    {
+        std::ofstream file(outside, std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(file));
+        file << payload;
+        REQUIRE(static_cast<bool>(file));
+    }
+    const auto blob_path = store.path_for(stored.value().digest);
+    std::error_code error;
+    REQUIRE(std::filesystem::remove(blob_path, error));
+    REQUIRE(!error);
+    std::filesystem::create_symlink(outside, blob_path, error);
+    if (error) {
+        std::cout << "SKIP: blob symlink creation is unavailable: " << error.message() << '\n';
+        return;
+    }
+
+    const auto read = store.read(stored.value().digest);
+    REQUIRE(!read && read.error().code == carto::core::ErrorCode::validation_failed);
+    const auto listing = store.list();
+    REQUIRE(!listing && listing.error().code == carto::core::ErrorCode::validation_failed);
+    const auto inventory = store.orphan_candidates({});
+    REQUIRE(!inventory && inventory.error().code == carto::core::ErrorCode::validation_failed);
+    REQUIRE(!store.put(payload, "text/plain"));
+    std::ifstream outside_file(outside, std::ios::binary);
+    const std::string outside_bytes(
+        std::istreambuf_iterator<char>{outside_file}, std::istreambuf_iterator<char>{});
+    REQUIRE(outside_bytes == payload);
+
+    REQUIRE(std::filesystem::remove(blob_path, error));
+    REQUIRE(!error);
+    const auto second_shard = blob_path.parent_path();
+    const auto first_shard = second_shard.parent_path();
+    REQUIRE(std::filesystem::remove(second_shard, error));
+    REQUIRE(!error);
+    REQUIRE(std::filesystem::remove(first_shard, error));
+    REQUIRE(!error);
+    const auto digest_hex = stored.value().digest.hex();
+    const auto external_shard = temp.path() / "outside-shard";
+    const auto external_second_shard = external_shard / digest_hex.substr(2U, 2U);
+    std::filesystem::create_directories(external_second_shard, error);
+    REQUIRE(!error);
+    {
+        std::ofstream file(external_second_shard / digest_hex,
+            std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(file));
+        file << payload;
+        REQUIRE(static_cast<bool>(file));
+    }
+    std::filesystem::create_directory_symlink(external_shard, first_shard, error);
+    if (error) {
+        std::cout << "SKIP: blob shard symlink creation is unavailable: "
+                  << error.message() << '\n';
+        return;
+    }
+    const auto parent_link_read = store.read(stored.value().digest);
+    REQUIRE(!parent_link_read && parent_link_read.error().code ==
+        carto::core::ErrorCode::validation_failed);
+    const auto parent_link_listing = store.list();
+    REQUIRE(!parent_link_listing && parent_link_listing.error().code ==
+        carto::core::ErrorCode::validation_failed);
 }
 
 void json_boundary_decodes_unicode_and_rejects_unpaired_surrogates() {
@@ -951,8 +1165,11 @@ int main(int argc, char** argv) {
     try {
         project_file_lock_serializes_writers_in_process();
         json_boundary_decodes_unicode_and_rejects_unpaired_surrogates();
+        blob_store_temporary_name_fits_a_valid_digest_path();
         blob_store_is_content_addressed_and_integrity_checked();
         blob_store_lists_deterministically_and_reports_orphan_candidates();
+        blob_store_rejects_digest_named_entries_outside_canonical_shards();
+        blob_store_refuses_symlinked_blob_files();
         journal_is_revision_bound_replayable_and_hash_chained();
         journal_serializes_concurrent_appends_in_process();
         journal_serializes_concurrent_appends_across_processes(

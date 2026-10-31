@@ -114,6 +114,11 @@ public:
         core::Revision expected_revision,
         std::string serialized_library,
         assets::Sha256Digest digest);
+    [[nodiscard]] core::Result<core::Revision> set_kinematic_graph(
+        std::string identity,
+        core::Revision expected_revision,
+        std::string serialized_graph,
+        assets::Sha256Digest digest);
     [[nodiscard]] core::Result<void> append_weight_edit_receipt(
         std::string serialized_receipt,
         assets::Sha256Digest digest);

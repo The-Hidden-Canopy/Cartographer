@@ -22,6 +22,17 @@ using carto::connection::ConnectionPort;
 using carto::connection::PortCompatibilityTag;
 using carto::geometry::SweepSource;
 
+carto::geometry::CurvePath straight_centerline() {
+    carto::geometry::CurvePath path;
+    path.source_identity = "route.centerline";
+    path.source_revision = carto::core::Revision{3U};
+    path.segments.push_back({
+        {0.0, 0.0, 0.0}, {0.0, 0.0, 1.0 / 3.0},
+        {0.0, 0.0, 2.0 / 3.0}, {0.0, 0.0, 1.0}});
+    REQUIRE(path.validate());
+    return path;
+}
+
 SweepSource sweep_source(std::string identity, std::uint64_t revision = 1U) {
     SweepSource source;
     source.source_identity = std::move(identity);
@@ -104,6 +115,15 @@ void compatible_endpoint_pair_returns_source_bound_deterministic_evidence() {
     REQUIRE(repeated.value().serialize() == evidence.value().serialize());
     REQUIRE(repeated.value().canonical_digest().value() ==
         evidence.value().canonical_digest().value());
+    auto hollow_source = first_source;
+    hollow_source.inner_profile_scale = 0.5;
+    const auto hollow_evidence = carto::condition::check_sweep_endpoint_compatibility(
+        hollow_source, first_binding, first_port,
+        second_source, second_binding, second_port);
+    REQUIRE(hollow_evidence && hollow_evidence.value().validate());
+    REQUIRE(hollow_evidence.value().first_sweep_digest != evidence.value().first_sweep_digest);
+    REQUIRE(hollow_evidence.value().second_sweep_digest == evidence.value().second_sweep_digest);
+    REQUIRE(hollow_evidence.value().first_port_digest == evidence.value().first_port_digest);
     REQUIRE(first_source.serialize() == first_source_before);
     REQUIRE(second_source.serialize() == second_source_before);
     REQUIRE(first_port.serialize() == first_port_before);
@@ -165,6 +185,34 @@ void incompatible_and_duplicate_endpoint_pairs_fail_closed() {
         first_source, binding(first_source, SweepEndpointSide::end, 31U), water_port,
         first_source, binding(first_source, SweepEndpointSide::end, 32U), electrical_port);
     REQUIRE(!repeated_endpoint);
+}
+
+void owner_bound_sweeps_require_ports_from_the_same_scene_object() {
+    auto source = sweep_source("conduit.owner-bound");
+    source.owner_object_id = 204U;
+    REQUIRE(source.validate());
+
+    const auto matching_port = port(24U, 204U,
+        carto::connection::compatibility::utility::water_25mm);
+    const auto matching_binding = binding(source, SweepEndpointSide::start, 24U);
+    REQUIRE(matching_binding.validate(source, matching_port));
+
+    const auto foreign_port = port(25U, 205U,
+        carto::connection::compatibility::utility::water_25mm);
+    const auto foreign_binding = binding(source, SweepEndpointSide::start, 25U);
+    const auto refused = foreign_binding.validate(source, foreign_port);
+    REQUIRE(!refused);
+    REQUIRE(refused.error().code == carto::core::ErrorCode::validation_failed);
+
+    auto other_source = sweep_source("conduit.owner-bound.other");
+    other_source.owner_object_id = 206U;
+    REQUIRE(other_source.validate());
+    const auto other_port = port(26U, 206U,
+        carto::connection::compatibility::utility::water_25mm);
+    const auto paired = carto::condition::check_sweep_endpoint_compatibility(
+        source, matching_binding, matching_port,
+        other_source, binding(other_source, SweepEndpointSide::end, 26U), other_port);
+    REQUIRE(paired);
 }
 
 void same_source_endpoints_require_one_exact_revision_and_recipe() {
@@ -351,6 +399,184 @@ void malformed_evidence_cannot_receive_a_canonical_digest() {
     REQUIRE(checked.value().canonical_digest());
 }
 
+void spatial_review_resolves_exact_owner_frames_and_explicit_tolerances() {
+    carto::scene::Scene scene;
+    auto owner_transform = carto::core::Transform::identity();
+    owner_transform.translation = {4.0, -2.0, 7.0};
+    const auto owner = scene.create_object("sweep owner", owner_transform);
+    REQUIRE(owner);
+
+    auto source = sweep_source("conduit.spatial");
+    source.owner_object_id = owner.value().value;
+    REQUIRE(source.validate());
+    const auto path = straight_centerline();
+
+    auto endpoint_port = port(61U, owner.value().value,
+        carto::connection::compatibility::utility::water_25mm);
+    endpoint_port.local_frame.transform_to_parent.translation = {0.0, 0.0, 1.0};
+    carto::connection::ConnectionPortGraph graph;
+    REQUIRE(graph.insert_port(endpoint_port));
+
+    carto::condition::SweepEndpointSpatialPolicy policy;
+    policy.maximum_position_error = 0.001;
+    policy.minimum_axis_alignment = 0.99;
+    REQUIRE(!policy.validate());
+    policy.port_outward_axis_local = {0.0, 0.0, 1.0};
+    const auto endpoint_binding = binding(source, SweepEndpointSide::end, 61U);
+    const auto review = carto::condition::review_sweep_endpoint_spatial_fit(
+        source, path, endpoint_binding, graph, scene, policy,
+        5U, carto::core::Revision{12U});
+    REQUIRE(review && review.value().validate() && review.value().aligned);
+    REQUIRE(review.value().position_error == 0.0);
+    REQUIRE(review.value().axis_alignment == 1.0);
+    REQUIRE(review.value().sweep_endpoint_world.x == 4.0);
+    REQUIRE(review.value().sweep_endpoint_world.y == -2.0);
+    REQUIRE(review.value().sweep_endpoint_world.z == 8.0);
+    REQUIRE(review.value().port_origin_world.x == 4.0);
+    REQUIRE(review.value().port_origin_world.y == -2.0);
+    REQUIRE(review.value().port_origin_world.z == 8.0);
+    REQUIRE(review.value().frame_chain_port_ids == std::vector<std::uint64_t>{61U});
+    const auto repeated = carto::condition::review_sweep_endpoint_spatial_fit(
+        source, path, endpoint_binding, graph, scene, policy,
+        5U, carto::core::Revision{12U});
+    REQUIRE(repeated && repeated.value().serialize() == review.value().serialize());
+    REQUIRE(repeated.value().canonical_digest().value() ==
+        review.value().canonical_digest().value());
+
+    auto changed_measurement = review.value();
+    changed_measurement.position_error += 0.25;
+    REQUIRE(!changed_measurement.validate());
+    REQUIRE(!changed_measurement.canonical_digest());
+
+    auto offset_port = endpoint_port;
+    offset_port.local_frame.transform_to_parent.translation.z = 1.25;
+    carto::connection::ConnectionPortGraph offset_graph;
+    REQUIRE(offset_graph.insert_port(offset_port));
+    const auto offset = carto::condition::review_sweep_endpoint_spatial_fit(
+        source, path, endpoint_binding, offset_graph, scene, policy,
+        5U, carto::core::Revision{12U});
+    REQUIRE(offset && !offset.value().aligned &&
+        !offset.value().position_within_tolerance && offset.value().position_error == 0.25);
+
+    auto reversed_port = endpoint_port;
+    reversed_port.local_frame.transform_to_parent.rotation = {1.0, 0.0, 0.0, 0.0};
+    carto::connection::ConnectionPortGraph reversed_graph;
+    REQUIRE(reversed_graph.insert_port(reversed_port));
+    const auto reversed = carto::condition::review_sweep_endpoint_spatial_fit(
+        source, path, endpoint_binding, reversed_graph, scene, policy,
+        5U, carto::core::Revision{12U});
+    REQUIRE(reversed && !reversed.value().aligned &&
+        reversed.value().position_within_tolerance &&
+        !reversed.value().axis_within_tolerance && reversed.value().axis_alignment == -1.0);
+
+    const auto foreign_owner = scene.create_object("foreign port owner");
+    REQUIRE(foreign_owner);
+    const auto foreign_port = port(62U, foreign_owner.value().value,
+        carto::connection::compatibility::utility::water_25mm);
+    carto::connection::ConnectionPortGraph foreign_graph;
+    REQUIRE(foreign_graph.insert_port(foreign_port));
+    REQUIRE(!carto::condition::review_sweep_endpoint_spatial_fit(
+        source, path, binding(source, SweepEndpointSide::end, 62U),
+        foreign_graph, scene, policy, 5U, carto::core::Revision{12U}));
+
+    auto stale_path = path;
+    stale_path.source_revision = carto::core::Revision{4U};
+    REQUIRE(!carto::condition::review_sweep_endpoint_spatial_fit(
+        source, stale_path, endpoint_binding, graph, scene, policy,
+        5U, carto::core::Revision{12U}));
+    auto invalid_policy = policy;
+    invalid_policy.port_outward_axis_local = {0.0, 0.0, 2.0};
+    REQUIRE(!carto::condition::review_sweep_endpoint_spatial_fit(
+        source, path, endpoint_binding, graph, scene, invalid_policy,
+        5U, carto::core::Revision{12U}));
+}
+
+void spatial_review_resolves_parent_frames_and_refuses_ambiguous_chains() {
+    carto::scene::Scene scene;
+    const auto owner = scene.create_object("frame owner");
+    REQUIRE(owner);
+    const auto source = [&] {
+        auto value = sweep_source("conduit.parent-frame");
+        value.owner_object_id = owner.value().value;
+        REQUIRE(value.validate());
+        return value;
+    }();
+    const auto path = straight_centerline();
+
+    auto parent = port(71U, owner.value().value,
+        carto::connection::compatibility::utility::water_25mm);
+    parent.local_frame.frame_identity = "mount";
+    parent.local_frame.transform_to_parent.translation = {0.0, 0.0, 0.5};
+    auto endpoint = port(72U, owner.value().value,
+        carto::connection::compatibility::utility::water_25mm);
+    endpoint.local_frame.frame_identity = "end";
+    endpoint.local_frame.parent_frame = "mount";
+    endpoint.local_frame.transform_to_parent.translation = {0.0, 0.0, 0.5};
+    carto::connection::ConnectionPortGraph graph;
+    REQUIRE(graph.insert_port(parent));
+    REQUIRE(graph.insert_port(endpoint));
+
+    carto::condition::SweepEndpointSpatialPolicy policy;
+    policy.maximum_position_error = 0.001;
+    policy.minimum_axis_alignment = 0.99;
+    REQUIRE(!policy.validate());
+    policy.port_outward_axis_local = {0.0, 0.0, 1.0};
+    const auto endpoint_binding = binding(source, SweepEndpointSide::end, 72U);
+    const auto resolved = carto::condition::review_sweep_endpoint_spatial_fit(
+        source, path, endpoint_binding, graph, scene, policy,
+        0U, carto::core::Revision{8U});
+    REQUIRE(resolved && resolved.value().aligned);
+    REQUIRE(resolved.value().frame_chain_port_ids ==
+        (std::vector<std::uint64_t>{72U, 71U}));
+    REQUIRE(resolved.value().port_origin_world.z == 1.0);
+
+    auto duplicate_parent = port(73U, owner.value().value,
+        carto::connection::compatibility::utility::water_25mm);
+    duplicate_parent.local_frame.frame_identity = "mount";
+    carto::connection::ConnectionPortGraph ambiguous;
+    REQUIRE(ambiguous.insert_port(parent));
+    REQUIRE(ambiguous.insert_port(endpoint));
+    REQUIRE(ambiguous.insert_port(duplicate_parent));
+    const auto refused = carto::condition::review_sweep_endpoint_spatial_fit(
+        source, path, endpoint_binding, ambiguous, scene, policy,
+        0U, carto::core::Revision{8U});
+    REQUIRE(!refused && refused.error().code == carto::core::ErrorCode::validation_failed);
+
+    carto::connection::ConnectionPortGraph missing_parent;
+    REQUIRE(missing_parent.insert_port(endpoint));
+    const auto missing = carto::condition::review_sweep_endpoint_spatial_fit(
+        source, path, endpoint_binding, missing_parent, scene, policy,
+        0U, carto::core::Revision{8U});
+    REQUIRE(!missing && missing.error().code == carto::core::ErrorCode::not_found);
+
+    auto foreign_convention_parent = parent;
+    foreign_convention_parent.local_frame.coordinate_convention = "other.frame/v1";
+    carto::connection::ConnectionPortGraph mixed_conventions;
+    REQUIRE(mixed_conventions.insert_port(foreign_convention_parent));
+    REQUIRE(mixed_conventions.insert_port(endpoint));
+    const auto mixed = carto::condition::review_sweep_endpoint_spatial_fit(
+        source, path, endpoint_binding, mixed_conventions, scene, policy,
+        0U, carto::core::Revision{8U});
+    REQUIRE(!mixed && mixed.error().code == carto::core::ErrorCode::validation_failed);
+
+    auto cycle_first = port(74U, owner.value().value,
+        carto::connection::compatibility::utility::water_25mm);
+    cycle_first.local_frame.frame_identity = "cycle-a";
+    cycle_first.local_frame.parent_frame = "cycle-b";
+    auto cycle_second = port(75U, owner.value().value,
+        carto::connection::compatibility::utility::water_25mm);
+    cycle_second.local_frame.frame_identity = "cycle-b";
+    cycle_second.local_frame.parent_frame = "cycle-a";
+    carto::connection::ConnectionPortGraph cyclic;
+    REQUIRE(cyclic.insert_port(cycle_first));
+    REQUIRE(cyclic.insert_port(cycle_second));
+    const auto refused_cycle = carto::condition::review_sweep_endpoint_spatial_fit(
+        source, path, binding(source, SweepEndpointSide::end, 74U),
+        cyclic, scene, policy, 0U, carto::core::Revision{8U});
+    REQUIRE(!refused_cycle &&
+        refused_cycle.error().code == carto::core::ErrorCode::validation_failed);
+}
+
 } // namespace
 
 int main() {
@@ -363,6 +589,8 @@ int main() {
         second_endpoint_validation_cannot_be_bypassed_by_compatible_tags();
         endpoint_capability_requirements_are_enforced_in_both_directions();
         malformed_evidence_cannot_receive_a_canonical_digest();
+        spatial_review_resolves_exact_owner_frames_and_explicit_tolerances();
+        spatial_review_resolves_parent_frames_and_refuses_ambiguous_chains();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return EXIT_FAILURE;

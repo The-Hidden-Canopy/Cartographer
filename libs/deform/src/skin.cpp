@@ -96,6 +96,11 @@ core::Result<SkinEvaluationResult> evaluate_lbs(const SkinEvaluationInput& input
         const auto influences = input.binding->influences.find(
             static_cast<std::uint32_t>(vertex_index));
         if (influences == input.binding->influences.end()) {
+            if (!base.finite()) {
+                return core::Result<SkinEvaluationResult>::failure(core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "linear blend produced a non-finite position"));
+            }
             result.positions.push_back(base);
             continue;
         }
@@ -160,6 +165,11 @@ core::Result<SkinEvaluationResult> evaluate_dqs(const SkinEvaluationInput& input
         const auto influences = input.binding->influences.find(
             static_cast<std::uint32_t>(vertex_index));
         if (influences == input.binding->influences.end()) {
+            if (!base.finite()) {
+                return core::Result<SkinEvaluationResult>::failure(core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "dual quaternion skinning produced a non-finite position"));
+            }
             result.positions.push_back(base);
             continue;
         }

@@ -81,6 +81,9 @@ public:
 
     // Switching projection preserves the view span at the orbit target.
     void set_projection(EditorProjection projection) noexcept;
+    // Sets bounded orbit angles for named views such as a plan-view preset.
+    // Invalid input leaves the current orientation unchanged.
+    [[nodiscard]] bool set_orientation(double yaw_radians, double pitch_radians) noexcept;
 
     // Pixel deltas use +x right and +y down. Invalid input leaves the camera
     // unchanged and returns false.

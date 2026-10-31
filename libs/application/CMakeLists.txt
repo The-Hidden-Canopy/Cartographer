@@ -1,5 +1,6 @@
 add_library(carto_application STATIC
     src/application.cpp
+    src/gltf_scene_import.cpp
 )
 
 target_include_directories(carto_application
@@ -12,6 +13,7 @@ target_link_libraries(carto_application
     PUBLIC
         carto_core
         carto_condition_authoring
+        carto_connection
         carto_engineering
         carto_geometry
         carto_journal
@@ -20,6 +22,9 @@ target_link_libraries(carto_application
         carto_production
         carto_render
         carto_terrain
+    PRIVATE
+        carto_mesh_attributes
+        carto_io
 )
 
 carto_target(carto_application)

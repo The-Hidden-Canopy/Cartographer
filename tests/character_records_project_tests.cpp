@@ -76,6 +76,27 @@ std::pair<std::string, assets::Sha256Digest> pose_library_record(double wave_hei
     return {bytes, digest_of(bytes)};
 }
 
+std::pair<std::string, assets::Sha256Digest> kinematic_graph_record(double child_height = 0.5) {
+    kinematic::KinematicGraph graph;
+    kinematic::KinematicNode root;
+    root.id = kinematic::JointId{1U};
+    root.semantic_type = "fixture.root";
+    require(static_cast<bool>(graph.insert_node(root)),
+        "fixture kinematic graph accepts its root node");
+    kinematic::KinematicNode child;
+    child.id = kinematic::JointId{2U};
+    child.parent = root.id;
+    child.rest.translation = {0.0, child_height, 0.0};
+    child.kind = kinematic::JointKind::hinge;
+    child.node_class = kinematic::NodeClass::skinned;
+    child.semantic_type = "fixture.hinge";
+    require(static_cast<bool>(graph.insert_node(child)) &&
+            static_cast<bool>(graph.validate()),
+        "fixture kinematic graph accepts its authored child node");
+    const std::string bytes = graph.serialize();
+    return {bytes, digest_of(bytes)};
+}
+
 std::pair<std::string, assets::Sha256Digest> weight_edit_record() {
     weights::WeightEditReceipt receipt;
     receipt.kind = weights::WeightEditKind::flood;
@@ -206,6 +227,55 @@ void character_records_are_transactional_digest_bound_and_persist() {
             document.curve_edit_receipts().front().digest == curve_digest,
         "appended curve edit receipt binds its exact serialized bytes");
 
+    const auto [graph_bytes, graph_digest] = kinematic_graph_record();
+    auto insert_graph = project::ProjectTransaction::begin(
+        document, journal, "character-records-tests");
+    require(insert_graph && insert_graph.value().set_kinematic_graph(
+                "rig.primary", core::Revision{}, graph_bytes, graph_digest),
+        "canonical kinematic graph inserts through a project transaction");
+    const auto graph_inserted = insert_graph.value().commit("kinematic.graph.insert");
+    require(graph_inserted && graph_inserted.value().revision_after >
+                graph_inserted.value().revision_before &&
+            document.kinematic_graphs().at("rig.primary").revision == core::Revision{1U},
+        "kinematic graph insert publishes one journaled project revision");
+
+    auto stale_graph = project::ProjectTransaction::begin(
+        document, journal, "character-records-tests");
+    require(stale_graph && !stale_graph.value().set_kinematic_graph(
+                "rig.primary", core::Revision{}, graph_bytes, graph_digest),
+        "unversioned replacement of an existing kinematic graph is refused");
+    auto bad_graph_digest = project::ProjectTransaction::begin(
+        document, journal, "character-records-tests");
+    require(bad_graph_digest && !bad_graph_digest.value().set_kinematic_graph(
+                "rig.secondary", core::Revision{}, graph_bytes,
+                digest_of("not the serialized kinematic graph")),
+        "kinematic graph digest must bind the exact serialized bytes");
+    auto noncanonical_graph = project::ProjectTransaction::begin(
+        document, journal, "character-records-tests");
+    require(noncanonical_graph && !noncanonical_graph.value().set_kinematic_graph(
+                "rig.secondary", core::Revision{}, graph_bytes + "\n",
+                digest_of(graph_bytes + "\n")),
+        "noncanonical kinematic graph bytes are rejected before publication");
+    require(static_cast<bool>(stale_graph.value().rollback()) &&
+            static_cast<bool>(bad_graph_digest.value().rollback()) &&
+            static_cast<bool>(noncanonical_graph.value().rollback()) &&
+            document.kinematic_graphs().size() == 1U,
+        "kinematic graph refusals leave durable project state unchanged");
+
+    const auto [replacement_graph_bytes, replacement_graph_digest] =
+        kinematic_graph_record(0.9);
+    auto replace_graph = project::ProjectTransaction::begin(
+        document, journal, "character-records-tests");
+    require(static_cast<bool>(replace_graph),
+        "kinematic graph replacement transaction begins");
+    const auto graph_revision = replace_graph.value().set_kinematic_graph(
+        "rig.primary", core::Revision{1U},
+        replacement_graph_bytes, replacement_graph_digest);
+    require(replace_graph && graph_revision && graph_revision.value() == core::Revision{2U},
+        "matching graph revision replaces the record and advances its revision");
+    require(static_cast<bool>(replace_graph.value().commit("kinematic.graph.replace")),
+        "kinematic graph replacement commits through the project journal");
+
     const std::string revision_four = document.serialize();
     const project::ProjectDocument snapshot_after_curve = document;
 
@@ -218,18 +288,21 @@ void character_records_are_transactional_digest_bound_and_persist() {
     require(static_cast<bool>(mesh_commit.value().commit("probe.object")),
         "unrelated object creation commits");
     require(document.pose_libraries().size() == 1U &&
+            document.kinematic_graphs().size() == 1U &&
             document.weight_edit_receipts().size() == 1U &&
             document.curve_edit_receipts().size() == 1U,
-        "historical records ride along an unrelated journaled commit");
+        "historical character records ride along an unrelated journaled commit");
 
     const std::string revision_five = document.serialize();
     const auto undone = project::ProjectDocument::deserialize(revision_four);
     require(undone && undone.value().pose_libraries().at("library.main") ==
                 snapshot_after_curve.pose_libraries().at("library.main") &&
+            undone.value().kinematic_graphs().at("rig.primary").bytes ==
+                replacement_graph_bytes &&
             undone.value().weight_edit_receipts().front().digest == weight_digest &&
             undone.value().curve_edit_receipts().front().bytes == curve_bytes &&
             undone.value().scene().find(scene::ObjectId{1U}) == nullptr,
-        "undo restores the pre-commit snapshot with every historical record intact");
+        "undo restores the pre-commit snapshot with every durable character record intact");
     const auto redone = project::ProjectDocument::deserialize(revision_five);
     require(redone && redone.value().curve_edit_receipts().size() == 1U &&
             redone.value().scene().find(scene::ObjectId{1U}) != nullptr,
@@ -240,14 +313,24 @@ void character_records_are_transactional_digest_bound_and_persist() {
         "character records save as part of the project document");
     const auto reopened = project::ProjectDocument::load(project_path);
     require(reopened && reopened.value().pose_libraries().size() == 1U &&
+            reopened.value().kinematic_graphs().size() == 1U &&
             reopened.value().weight_edit_receipts().size() == 1U &&
             reopened.value().curve_edit_receipts().size() == 1U,
-        "save and reopen preserve all three character record tables");
+        "save and reopen preserve all four character record tables");
     const auto& reopened_library = reopened.value().pose_libraries().at("library.main");
     require(reopened_library.revision == core::Revision{2U} &&
             reopened_library.bytes == second_pose_bytes &&
             reopened_library.digest == second_pose_digest,
         "reopened pose library retains its replaced bytes, revision, and digest");
+    const auto& reopened_graph = reopened.value().kinematic_graphs().at("rig.primary");
+    require(reopened_graph.revision == core::Revision{2U} &&
+            reopened_graph.bytes == replacement_graph_bytes &&
+            reopened_graph.digest == replacement_graph_digest,
+        "reopened kinematic graph retains its replaced bytes, revision, and digest");
+    const auto decoded_graph = kinematic::KinematicGraph::deserialize(reopened_graph.bytes);
+    require(decoded_graph && decoded_graph.value().find(kinematic::JointId{2U}) != nullptr &&
+            decoded_graph.value().find(kinematic::JointId{2U})->rest.translation.y == 0.9,
+        "reopened kinematic graph remains canonical carto_kinematic data");
     const auto decoded_library = pose::PoseLibrary::deserialize(reopened_library.bytes);
     require(decoded_library && decoded_library.value().entries().size() == 2U &&
             decoded_library.value().find("wave.pose") != nullptr,
@@ -266,7 +349,9 @@ void character_records_are_transactional_digest_bound_and_persist() {
         "reopened curve edit receipt still binds its source/result curve digests");
 
     const auto events = journal.read_all();
-    require(events && events.value().size() == 5U,
+    require(events && events.value().size() == 7U &&
+            events.value()[4U].event_type == "kinematic.graph.insert" &&
+            events.value()[5U].event_type == "kinematic.graph.replace",
         "only successful character record transitions produce journal events");
 
     std::string tampered = revision_five;
@@ -283,22 +368,59 @@ void character_records_are_transactional_digest_bound_and_persist() {
     require(!project::ProjectDocument::deserialize(stale_pose_record),
         "a pose library record with a mismatched digest fails closed on load");
 
+    std::string stale_kinematic_graph = revision_five;
+    const auto graph_digest_pos = stale_kinematic_graph.rfind(replacement_graph_digest.hex());
+    require(graph_digest_pos != std::string::npos,
+        "saved text carries the kinematic graph digest");
+    stale_kinematic_graph[graph_digest_pos] =
+        stale_kinematic_graph[graph_digest_pos] == '0' ? '1' : '0';
+    require(!project::ProjectDocument::deserialize(stale_kinematic_graph),
+        "a kinematic graph record with a mismatched digest fails closed on load");
+
     std::string truncated = revision_five;
     const auto curve_table = truncated.rfind("CURVE_EDIT_RECEIPTS ");
     require(curve_table != std::string::npos, "saved text carries the curve receipt table");
     const auto curve_table_end = truncated.find('\n', curve_table);
     truncated.erase(curve_table, curve_table_end - curve_table + 1U);
     require(!project::ProjectDocument::deserialize(truncated),
-        "a schema v33 project missing a mandatory table fails closed on load");
+        "a schema v35 project missing a mandatory record table fails closed on load");
 }
 
 void character_record_tables_migrate_from_v32() {
-    const auto empty_v33 = project::ProjectDocument::deserialize(
+    const auto empty_v35 = project::ProjectDocument::deserialize(
         project::ProjectDocument{}.serialize());
-    require(empty_v33 && empty_v33.value().pose_libraries().empty() &&
-            empty_v33.value().weight_edit_receipts().empty() &&
-            empty_v33.value().curve_edit_receipts().empty(),
-        "an empty schema v33 document round-trips through its mandatory tables");
+    require(empty_v35 && empty_v35.value().pose_libraries().empty() &&
+            empty_v35.value().kinematic_graphs().empty() &&
+            empty_v35.value().weight_edit_receipts().empty() &&
+            empty_v35.value().curve_edit_receipts().empty(),
+        "an empty schema v35 document round-trips through its mandatory tables");
+
+    std::string missing_graph_table = project::ProjectDocument{}.serialize();
+    const auto mandatory_graph_table = missing_graph_table.rfind("KINEMATIC_GRAPHS 0\n");
+    require(mandatory_graph_table != std::string::npos,
+        "current serialization carries the mandatory kinematic graph table");
+    missing_graph_table.erase(mandatory_graph_table,
+        std::string("KINEMATIC_GRAPHS 0\n").size());
+    require(!project::ProjectDocument::deserialize(missing_graph_table),
+        "schema v35 without its kinematic graph table fails closed");
+
+    std::string schema_v34 = project::ProjectDocument{}.serialize();
+    const auto v34_graph_table = schema_v34.rfind("KINEMATIC_GRAPHS 0\n");
+    require(v34_graph_table != std::string::npos,
+        "current serialization carries the mandatory kinematic graph table");
+    schema_v34.erase(v34_graph_table, std::string("KINEMATIC_GRAPHS 0\n").size());
+    schema_v34.replace(0U, std::string("CARTOGRAPHER_PROJECT 35\n").size(),
+        "CARTOGRAPHER_PROJECT 34\n");
+    const auto migrated_v34 = project::ProjectDocument::deserialize(schema_v34);
+    require(migrated_v34 && migrated_v34.value().kinematic_graphs().empty() &&
+            migrated_v34.value().serialize().find("CARTOGRAPHER_PROJECT 35\n") == 0U,
+        "schema v34 migrates to v35 with an empty kinematic graph table");
+
+    std::string mislabeled_graph = project::ProjectDocument{}.serialize();
+    mislabeled_graph.replace(0U, std::string("CARTOGRAPHER_PROJECT 35\n").size(),
+        "CARTOGRAPHER_PROJECT 34\n");
+    require(!project::ProjectDocument::deserialize(mislabeled_graph),
+        "schema v34 cannot carry schema v35 kinematic graph records");
 
     std::string schema_v32 = project::ProjectDocument{}.serialize();
     const auto pose_table = schema_v32.rfind("POSE_LIBRARIES 0\n");
@@ -313,24 +435,29 @@ void character_record_tables_migrate_from_v32() {
     require(curve_table != std::string::npos,
         "current serialization carries the mandatory curve edit receipt table");
     schema_v32.erase(curve_table, std::string("CURVE_EDIT_RECEIPTS 0\n").size());
-    schema_v32.replace(0U, std::string("CARTOGRAPHER_PROJECT 33\n").size(),
+    const auto graph_table = schema_v32.rfind("KINEMATIC_GRAPHS 0\n");
+    require(graph_table != std::string::npos,
+        "current serialization carries the mandatory kinematic graph table");
+    schema_v32.erase(graph_table, std::string("KINEMATIC_GRAPHS 0\n").size());
+    schema_v32.replace(0U, std::string("CARTOGRAPHER_PROJECT 35\n").size(),
         "CARTOGRAPHER_PROJECT 32\n");
     const auto migrated = project::ProjectDocument::deserialize(schema_v32);
     require(migrated && migrated.value().pose_libraries().empty() &&
+            migrated.value().kinematic_graphs().empty() &&
             migrated.value().weight_edit_receipts().empty() &&
             migrated.value().curve_edit_receipts().empty() &&
-            migrated.value().serialize().find("CARTOGRAPHER_PROJECT 33\n") == 0U &&
+            migrated.value().serialize().find("CARTOGRAPHER_PROJECT 35\n") == 0U &&
             migrated.value().serialize().find("POSE_LIBRARIES 0\n") != std::string::npos,
-        "schema v32 migrates to v33 with empty character record tables");
+        "schema v32 migrates to v35 with empty character record tables");
 
     std::string fenced = project::ProjectDocument{}.serialize();
     const auto header_end = fenced.find('\n');
     require(header_end != std::string::npos && fenced.substr(0U, header_end) ==
-                "CARTOGRAPHER_PROJECT 33",
+                "CARTOGRAPHER_PROJECT 35",
         "fixture begins at the expected current schema");
     fenced.replace(0U, header_end, "CARTOGRAPHER_PROJECT 32");
     require(!project::ProjectDocument::deserialize(fenced),
-        "schema v32 files cannot carry schema v33 character record tables");
+        "schema v32 files cannot carry current character record tables");
 }
 
 } // namespace

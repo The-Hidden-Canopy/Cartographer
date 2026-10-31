@@ -2,6 +2,8 @@ add_library(carto_condition_authoring STATIC
     src/authoring.cpp
     src/district_topology.cpp
     src/effect_preview.cpp
+    src/prefab_rebase.cpp
+    src/prefab_socket.cpp
     src/site_parcel.cpp
     src/state_branch.cpp
     src/sweep_endpoint.cpp

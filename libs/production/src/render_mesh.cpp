@@ -23,9 +23,11 @@ constexpr std::uint32_t kFlagTangents = 1U << 1U;
 constexpr std::uint32_t kFlagMaterialSlots = 1U << 2U;
 constexpr std::uint32_t kFlagUv1 = 1U << 3U;
 constexpr std::uint32_t kFlagColor = 1U << 4U;
+constexpr std::uint32_t kFlagAdditionalUvs = 1U << 5U;
 constexpr std::uint32_t kKnownFlagsV1 = kFlagUvs | kFlagTangents | kFlagMaterialSlots;
 constexpr std::uint32_t kKnownFlags =
     kKnownFlagsV1 | kFlagUv1 | kFlagColor;
+constexpr std::uint32_t kKnownFlagsV4 = kKnownFlags | kFlagAdditionalUvs;
 constexpr std::size_t kHeaderBytes = 80U;
 constexpr std::size_t kBaseVertexBytes = 56U;
 
@@ -61,7 +63,8 @@ std::optional<std::size_t> encoded_size(
     std::uint32_t index_count,
     std::uint32_t submesh_count,
     std::uint32_t flags,
-    std::uint32_t version) {
+    std::uint32_t version,
+    std::uint32_t additional_uv_set_count) {
     if (vertex_count == 0U || vertex_count > kMaxRenderMeshArtifactVertices ||
         index_count < 3U || index_count > kMaxRenderMeshArtifactIndices ||
         index_count % 3U != 0U || submesh_count == 0U ||
@@ -70,21 +73,36 @@ std::optional<std::size_t> encoded_size(
     }
     const std::uint32_t known_flags = version == 1U
         ? kKnownFlagsV1
-        : (version == 2U || version == kRenderMeshArtifactFormatVersion)
-            ? kKnownFlags : 0U;
+        : (version == 2U || version == 3U)
+            ? kKnownFlags
+            : version == 4U ? kKnownFlagsV4 : 0U;
+    const std::uint64_t uv_stream_count =
+        ((flags & kFlagUvs) != 0U ? 1ULL : 0ULL) +
+        ((flags & kFlagUv1) != 0U ? 1ULL : 0ULL) + additional_uv_set_count;
     if (known_flags == 0U || (flags & ~known_flags) != 0U ||
-        ((flags & kFlagTangents) != 0U && (flags & kFlagUvs) == 0U)) {
+        ((flags & kFlagTangents) != 0U && (flags & kFlagUvs) == 0U) ||
+        uv_stream_count > kMaxRenderMeshArtifactUvStreams ||
+        (version < 4U && additional_uv_set_count != 0U) ||
+        (version == 4U &&
+            (((flags & kFlagAdditionalUvs) != 0U) !=
+                (additional_uv_set_count != 0U)))) {
         return std::nullopt;
     }
 
     std::uint64_t vertex_bytes = kBaseVertexBytes;
     if ((flags & kFlagUvs) != 0U) vertex_bytes += 16U;
     if ((flags & kFlagUv1) != 0U) vertex_bytes += 16U;
+    vertex_bytes += static_cast<std::uint64_t>(additional_uv_set_count) * 16U;
     if ((flags & kFlagColor) != 0U) vertex_bytes += 32U;
     if ((flags & kFlagTangents) != 0U) vertex_bytes += 32U;
     const std::uint64_t submesh_bytes =
         8U + (((flags & kFlagMaterialSlots) != 0U) ? 4U : 0U);
+    const std::uint64_t additional_uv_metadata_bytes = version == 4U
+        ? sizeof(std::uint32_t) +
+            static_cast<std::uint64_t>(additional_uv_set_count) * sizeof(std::uint32_t)
+        : 0U;
     const std::uint64_t total = static_cast<std::uint64_t>(kHeaderBytes) +
+        additional_uv_metadata_bytes +
         static_cast<std::uint64_t>(vertex_count) * vertex_bytes +
         static_cast<std::uint64_t>(index_count) * sizeof(std::uint32_t) +
         static_cast<std::uint64_t>(index_count / 3U) * sizeof(std::uint64_t) +
@@ -150,6 +168,7 @@ struct RenderVertexKey {
     std::uint64_t color_g = 0U;
     std::uint64_t color_b = 0U;
     std::uint64_t color_a = 0U;
+    std::vector<std::uint64_t> additional_uv_bits;
 
     [[nodiscard]] auto operator<=>(const RenderVertexKey&) const noexcept = default;
 };
@@ -174,7 +193,7 @@ bool same_vec3(core::Vec3d left, core::Vec3d right) {
 }
 
 RenderVertexKey render_vertex_key(const RenderMeshVertex& vertex) {
-    return {
+    RenderVertexKey result{
         vertex.source_vertex.value,
         canonical_f64_bits(vertex.normal.x),
         canonical_f64_bits(vertex.normal.y),
@@ -188,6 +207,12 @@ RenderVertexKey render_vertex_key(const RenderMeshVertex& vertex) {
         vertex.color.has_value() ? canonical_f64_bits(vertex.color->z) : 0U,
         vertex.color.has_value() ? canonical_f64_bits(vertex.color->w) : 0U,
     };
+    result.additional_uv_bits.reserve(vertex.additional_uvs.size() * 2U);
+    for (const auto uv : vertex.additional_uvs) {
+        result.additional_uv_bits.push_back(canonical_f64_bits(uv.x));
+        result.additional_uv_bits.push_back(canonical_f64_bits(uv.y));
+    }
+    return result;
 }
 
 RenderTangentKey render_tangent_key(
@@ -280,13 +305,28 @@ core::Result<void> RenderMeshArtifact::validate() const {
     if (vertices.empty() || vertices.size() > kMaxRenderMeshArtifactVertices ||
         indices.size() < 3U || indices.size() > kMaxRenderMeshArtifactIndices ||
         indices.size() % 3U != 0U || triangle_faces.size() != indices.size() / 3U ||
-        submeshes.empty() || submeshes.size() > kMaxRenderMeshArtifactSubmeshes) {
+        submeshes.empty() || submeshes.size() > kMaxRenderMeshArtifactSubmeshes ||
+        additional_uv_set_ids.size() > kMaxRenderMeshArtifactUvStreams) {
         return core::Result<void>::failure(validation(
             "render-mesh artifact exceeds its bounds or has inconsistent topology"));
+    }
+    if (!std::is_sorted(additional_uv_set_ids.begin(), additional_uv_set_ids.end()) ||
+        std::any_of(additional_uv_set_ids.begin(), additional_uv_set_ids.end(),
+            [](attributes::UvSetId id) { return id == 0U; }) ||
+        std::adjacent_find(additional_uv_set_ids.begin(),
+            additional_uv_set_ids.end()) != additional_uv_set_ids.end()) {
+        return core::Result<void>::failure(validation(
+            "additional render-mesh UV-set identities must be nonzero, unique, and sorted"));
     }
 
     const bool has_uvs = vertices.front().uv.has_value();
     const bool has_uv1 = vertices.front().uv1.has_value();
+    const std::size_t stream_count =
+        (has_uvs ? 1U : 0U) + (has_uv1 ? 1U : 0U) + additional_uv_set_ids.size();
+    if (stream_count > kMaxRenderMeshArtifactUvStreams) {
+        return core::Result<void>::failure(validation(
+            "render-mesh artifact exceeds its authored UV-stream bound"));
+    }
     const bool has_color = vertices.front().color.has_value();
     const bool has_tangents = vertices.front().tangent.has_value();
     if (has_tangents && !has_uvs) {
@@ -300,8 +340,11 @@ core::Result<void> RenderMeshArtifact::validate() const {
             !std::isfinite(normal_length) || std::abs(normal_length - 1.0) > 1e-6 ||
             vertex.uv.has_value() != has_uvs || vertex.tangent.has_value() != has_tangents ||
             vertex.uv1.has_value() != has_uv1 || vertex.color.has_value() != has_color ||
+            vertex.additional_uvs.size() != additional_uv_set_ids.size() ||
             (vertex.uv.has_value() && !vertex.uv->finite()) ||
             (vertex.uv1.has_value() && !vertex.uv1->finite()) ||
+            std::any_of(vertex.additional_uvs.begin(), vertex.additional_uvs.end(),
+                [](core::Vec2d uv) { return !uv.finite(); }) ||
             (vertex.color.has_value() &&
              (!vertex.color->finite() || vertex.color->x < 0.0 || vertex.color->x > 1.0 ||
               vertex.color->y < 0.0 || vertex.color->y > 1.0 ||
@@ -401,12 +444,14 @@ core::Result<void> RenderMeshArtifact::validate() const {
         (has_uv1 ? kFlagUv1 : 0U) |
         (has_color ? kFlagColor : 0U) |
         (has_tangents ? kFlagTangents : 0U) |
-        (has_material_slots ? kFlagMaterialSlots : 0U);
+        (has_material_slots ? kFlagMaterialSlots : 0U) |
+        (!additional_uv_set_ids.empty() ? kFlagAdditionalUvs : 0U);
     if (!encoded_size(
             static_cast<std::uint32_t>(vertices.size()),
             static_cast<std::uint32_t>(indices.size()),
             static_cast<std::uint32_t>(submeshes.size()), flags,
-            kRenderMeshArtifactFormatVersion)) {
+            kRenderMeshArtifactFormatVersion,
+            static_cast<std::uint32_t>(additional_uv_set_ids.size()))) {
         return core::Result<void>::failure(validation(
             "render-mesh artifact exceeds the serialized byte budget"));
     }
@@ -453,12 +498,14 @@ core::Result<std::vector<std::uint8_t>> RenderMeshArtifact::serialize() const {
         (has_uv1 ? kFlagUv1 : 0U) |
         (has_color ? kFlagColor : 0U) |
         (has_tangents ? kFlagTangents : 0U) |
-        (has_material_slots ? kFlagMaterialSlots : 0U);
+        (has_material_slots ? kFlagMaterialSlots : 0U) |
+        (!additional_uv_set_ids.empty() ? kFlagAdditionalUvs : 0U);
     const auto size = encoded_size(
         static_cast<std::uint32_t>(vertices.size()),
         static_cast<std::uint32_t>(indices.size()),
         static_cast<std::uint32_t>(submeshes.size()), flags,
-        kRenderMeshArtifactFormatVersion);
+        kRenderMeshArtifactFormatVersion,
+        static_cast<std::uint32_t>(additional_uv_set_ids.size()));
     if (!size.has_value()) {
         return core::Result<std::vector<std::uint8_t>>::failure(validation(
             "render-mesh artifact exceeds the serialized byte budget"));
@@ -475,6 +522,9 @@ core::Result<std::vector<std::uint8_t>> RenderMeshArtifact::serialize() const {
     append_u32(output, static_cast<std::uint32_t>(vertices.size()));
     append_u32(output, static_cast<std::uint32_t>(indices.size()));
     append_u32(output, static_cast<std::uint32_t>(submeshes.size()));
+    append_u32(output, static_cast<std::uint32_t>(additional_uv_set_ids.size()));
+    for (const auto uv_set : additional_uv_set_ids)
+        append_u32(output, uv_set);
     for (const RenderMeshVertex& vertex : vertices) {
         append_u64(output, vertex.source_vertex.value);
         append_f64(output, vertex.position.x);
@@ -490,6 +540,10 @@ core::Result<std::vector<std::uint8_t>> RenderMeshArtifact::serialize() const {
         if (has_uv1) {
             append_f64(output, vertex.uv1->x);
             append_f64(output, vertex.uv1->y);
+        }
+        for (const auto uv : vertex.additional_uvs) {
+            append_f64(output, uv.x);
+            append_f64(output, uv.y);
         }
         if (has_color) {
             append_f64(output, vertex.color->x);
@@ -535,8 +589,9 @@ core::Result<RenderMeshArtifact> RenderMeshArtifact::deserialize(
     }
     const std::uint32_t known_flags = version == 1U
         ? kKnownFlagsV1
-        : (version == 2U || version == kRenderMeshArtifactFormatVersion)
-            ? kKnownFlags : 0U;
+        : (version == 2U || version == 3U)
+            ? kKnownFlags
+            : version == 4U ? kKnownFlagsV4 : 0U;
     if (known_flags == 0U || (flags & ~known_flags) != 0U ||
         ((flags & kFlagTangents) != 0U && (flags & kFlagUvs) == 0U)) {
         return core::Result<RenderMeshArtifact>::failure(validation(
@@ -562,8 +617,29 @@ core::Result<RenderMeshArtifact> RenderMeshArtifact::deserialize(
         return core::Result<RenderMeshArtifact>::failure(invalid(
             "render-mesh artifact counts are truncated"));
     }
+    std::uint32_t additional_uv_set_count = 0U;
+    if (version == 4U) {
+        if (!read_u32(bytes, cursor, additional_uv_set_count) ||
+            static_cast<std::uint64_t>(additional_uv_set_count) +
+                ((flags & kFlagUvs) != 0U ? 1ULL : 0ULL) +
+                ((flags & kFlagUv1) != 0U ? 1ULL : 0ULL) >
+                    kMaxRenderMeshArtifactUvStreams) {
+            return core::Result<RenderMeshArtifact>::failure(validation(
+                "render-mesh UV-set count is invalid, truncated, or over the stream bound"));
+        }
+        artifact.additional_uv_set_ids.reserve(additional_uv_set_count);
+        for (std::uint32_t index = 0U; index < additional_uv_set_count; ++index) {
+            std::uint32_t uv_set = 0U;
+            if (!read_u32(bytes, cursor, uv_set)) {
+                return core::Result<RenderMeshArtifact>::failure(invalid(
+                    "render-mesh additional UV-set identities are truncated"));
+            }
+            artifact.additional_uv_set_ids.push_back(uv_set);
+        }
+    }
     const auto expected = encoded_size(
-        vertex_count, index_count, submesh_count, flags, version);
+        vertex_count, index_count, submesh_count, flags, version,
+        additional_uv_set_count);
     if (!expected.has_value() || expected.value() != bytes.size()) {
         return core::Result<RenderMeshArtifact>::failure(validation(
             "render-mesh artifact counts disagree with its bounded payload"));
@@ -599,6 +675,16 @@ core::Result<RenderMeshArtifact> RenderMeshArtifact::deserialize(
                     "render-mesh artifact UV1 data is truncated"));
             }
             vertex.uv1 = uv1;
+        }
+        vertex.additional_uvs.reserve(additional_uv_set_count);
+        for (std::uint32_t uv_index = 0U;
+             uv_index < additional_uv_set_count; ++uv_index) {
+            core::Vec2d uv;
+            if (!read_f64(bytes, cursor, uv.x) || !read_f64(bytes, cursor, uv.y)) {
+                return core::Result<RenderMeshArtifact>::failure(invalid(
+                    "render-mesh additional UV coordinate data is truncated"));
+            }
+            vertex.additional_uvs.push_back(uv);
         }
         if ((flags & kFlagColor) != 0U) {
             core::Vec4d color;
@@ -748,7 +834,9 @@ std::uint64_t PbrMeshUpload::resident_bytes() const noexcept {
         static_cast<std::uint64_t>(indices.size()) * sizeof(std::uint32_t);
 }
 
-core::Result<PbrMeshUpload> pack_pbr_mesh_upload(const RenderMeshArtifact& artifact) {
+static core::Result<PbrMeshUpload> pack_pbr_mesh_upload_with_texture_policy(
+    const RenderMeshArtifact& artifact,
+    bool allow_missing_uv_and_tangent) {
     if (auto result = artifact.validate(); !result) {
         return core::Result<PbrMeshUpload>::failure(result.error());
     }
@@ -762,16 +850,26 @@ core::Result<PbrMeshUpload> pack_pbr_mesh_upload(const RenderMeshArtifact& artif
     upload.vertices.reserve(artifact.vertices.size());
 
     for (const RenderMeshVertex& source : artifact.vertices) {
-        if (!source.uv.has_value() || !source.tangent.has_value()) {
+        if ((!source.uv.has_value() || !source.tangent.has_value()) &&
+            !allow_missing_uv_and_tangent) {
             return core::Result<PbrMeshUpload>::failure(validation(
-                "native PBR upload requires authored UV0 and a tangent frame"));
+                "native PBR texture sampling requires authored UV0 and a tangent frame"));
+        }
+        const core::Vec2d uv = source.uv.value_or(core::Vec2d{});
+        core::Vec4d tangent = source.tangent.value_or(core::Vec4d{});
+        if (!source.tangent.has_value()) {
+            const auto normal = source.normal.normalized();
+            const core::Vec3d reference = std::abs(normal.z) < 0.9
+                ? core::Vec3d{0.0, 0.0, 1.0}
+                : core::Vec3d{0.0, 1.0, 0.0};
+            const auto basis = core::cross(reference, normal).normalized();
+            tangent = {basis.x, basis.y, basis.z, 1.0};
         }
         const std::array<double, 13U> values{
             source.position.x, source.position.y, source.position.z, 1.0,
             source.normal.x, source.normal.y, source.normal.z,
-            source.uv->x, source.uv->y,
-            source.tangent->x, source.tangent->y, source.tangent->z,
-            source.tangent->w,
+            uv.x, uv.y,
+            tangent.x, tangent.y, tangent.z, tangent.w,
         };
         std::array<float, 13U> converted{};
         for (std::size_t index = 0U; index < values.size(); ++index) {
@@ -796,6 +894,32 @@ core::Result<PbrMeshUpload> pack_pbr_mesh_upload(const RenderMeshArtifact& artif
     return core::Result<PbrMeshUpload>::success(std::move(upload));
 }
 
+core::Result<PbrMeshUpload> pack_pbr_mesh_upload(
+    const RenderMeshArtifact& artifact) {
+    return pack_pbr_mesh_upload_with_texture_policy(artifact, false);
+}
+
+core::Result<PbrMeshUpload> pack_pbr_mesh_upload(
+    const RenderMeshArtifact& artifact,
+    std::span<const render::GpuMaterialConstants> submesh_materials) {
+    if (submesh_materials.empty() ||
+        submesh_materials.size() != artifact.submeshes.size()) {
+        return core::Result<PbrMeshUpload>::failure(validation(
+            "texture-free PBR packing requires one material proof per submesh"));
+    }
+    bool has_texture_binding = false;
+    for (const auto& material : submesh_materials) {
+        if (auto valid = render::validate(material); !valid) {
+            return core::Result<PbrMeshUpload>::failure(valid.error());
+        }
+        has_texture_binding = has_texture_binding || std::any_of(
+            material.texture_asset_ids.begin(), material.texture_asset_ids.end(),
+            [](std::uint32_t word) { return word != 0U; });
+    }
+    return pack_pbr_mesh_upload_with_texture_policy(
+        artifact, !has_texture_binding);
+}
+
 core::Result<RenderMeshArtifact> compile_render_mesh_artifact(
     const AuthoritativeSource& source,
     const geometry::EditableMesh& mesh,
@@ -815,6 +939,28 @@ core::Result<RenderMeshArtifact> compile_render_mesh_artifact(
         (!options.uv_set.has_value() || options.uv1_set == options.uv_set)) {
         return core::Result<RenderMeshArtifact>::failure(invalid(
             "UV1 requires a distinct explicit UV0-set identity"));
+    }
+    if (options.additional_uv_sets.size() > kMaxRenderMeshArtifactUvStreams) {
+        return core::Result<RenderMeshArtifact>::failure(invalid(
+            "additional UV sets exceed the render-mesh stream bound"));
+    }
+    auto additional_uv_set_ids = options.additional_uv_sets;
+    std::sort(additional_uv_set_ids.begin(), additional_uv_set_ids.end());
+    if (additional_uv_set_ids.size() > kMaxRenderMeshArtifactUvStreams ||
+        additional_uv_set_ids.size() +
+            (options.uv_set.has_value() ? 1U : 0U) +
+            (options.uv1_set.has_value() ? 1U : 0U) >
+                kMaxRenderMeshArtifactUvStreams ||
+        std::adjacent_find(additional_uv_set_ids.begin(),
+            additional_uv_set_ids.end()) != additional_uv_set_ids.end() ||
+        std::any_of(additional_uv_set_ids.begin(), additional_uv_set_ids.end(),
+            [&](attributes::UvSetId id) {
+                return id == 0U ||
+                    (options.uv_set.has_value() && id == *options.uv_set) ||
+                    (options.uv1_set.has_value() && id == *options.uv1_set);
+            })) {
+        return core::Result<RenderMeshArtifact>::failure(invalid(
+            "additional UV sets must be bounded, distinct, and nonzero"));
     }
     if (options.material_slot_layer.has_value() &&
         !safe_layer_id(options.material_slot_layer.value())) {
@@ -905,6 +1051,14 @@ core::Result<RenderMeshArtifact> compile_render_mesh_artifact(
     auto uv1_result = load_uv_set(options.uv1_set, "UV1");
     if (!uv1_result) return core::Result<RenderMeshArtifact>::failure(uv1_result.error());
     CornerUvs uv1_by_corner = std::move(uv1_result).value();
+    std::vector<CornerUvs> additional_uvs_by_corner;
+    additional_uvs_by_corner.reserve(additional_uv_set_ids.size());
+    for (const auto uv_set : additional_uv_set_ids) {
+        auto loaded_uvs = load_uv_set(uv_set, "additional");
+        if (!loaded_uvs)
+            return core::Result<RenderMeshArtifact>::failure(loaded_uvs.error());
+        additional_uvs_by_corner.push_back(std::move(loaded_uvs).value());
+    }
 
     std::map<CornerKey, core::Vec3d> normal_by_corner;
     const std::string_view normal_layer_id = options.normal_layer.has_value()
@@ -1060,6 +1214,7 @@ core::Result<RenderMeshArtifact> compile_render_mesh_artifact(
     artifact.source_revision = source.revision;
     artifact.mesh_revision = mesh.revision();
     artifact.source_digest = source.content_digest;
+    artifact.additional_uv_set_ids = additional_uv_set_ids;
     artifact.indices.reserve(compiled.indices.size());
     artifact.triangle_faces.reserve(compiled.triangle_faces.size());
     std::map<RenderVertexKey, std::uint32_t> vertex_indices;
@@ -1106,6 +1261,22 @@ core::Result<RenderMeshArtifact> compile_render_mesh_artifact(
                 const core::Vec2d uv1 = uv1_iterator == uv1_by_corner.end()
                     ? core::Vec2d{}
                     : uv1_iterator->second;
+                std::vector<core::Vec2d> additional_uv_values;
+                std::vector<std::uint64_t> additional_uv_bits;
+                additional_uv_values.reserve(additional_uvs_by_corner.size());
+                additional_uv_bits.reserve(additional_uvs_by_corner.size() * 2U);
+                for (const auto& uv_by_corner_for_set : additional_uvs_by_corner) {
+                    const auto additional_uv = uv_by_corner_for_set.find(corner_key);
+                    if (additional_uv == uv_by_corner_for_set.end()) {
+                        return core::Result<RenderMeshArtifact>::failure(validation(
+                            "compiled triangle corner has no value in an additional UV set"));
+                    }
+                    additional_uv_values.push_back(additional_uv->second);
+                    additional_uv_bits.push_back(
+                        canonical_f64_bits(additional_uv->second.x));
+                    additional_uv_bits.push_back(
+                        canonical_f64_bits(additional_uv->second.y));
+                }
                 const core::Vec3d normal = normal_iterator == normal_by_corner.end()
                     ? compiled.normals[source_index].normalized()
                     : normal_iterator->second;
@@ -1129,6 +1300,7 @@ core::Result<RenderMeshArtifact> compile_render_mesh_artifact(
                         ? canonical_f64_bits(color.z) : 0U,
                     options.vertex_color_layer.has_value()
                         ? canonical_f64_bits(color.w) : 0U,
+                    std::move(additional_uv_bits),
                 };
                 auto found = vertex_indices.find(vertex_key);
                 if (found == vertex_indices.end()) {
@@ -1156,6 +1328,7 @@ core::Result<RenderMeshArtifact> compile_render_mesh_artifact(
                             : std::nullopt,
                         std::nullopt,
                     };
+                    vertex.additional_uvs = std::move(additional_uv_values);
                     artifact.vertices.push_back(std::move(vertex));
                     found = vertex_indices.emplace(vertex_key, output_index).first;
                 }

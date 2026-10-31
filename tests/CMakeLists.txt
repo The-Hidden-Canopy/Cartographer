@@ -22,6 +22,21 @@ target_link_libraries(cartographer_scene_query_tests
 carto_target(cartographer_scene_query_tests)
 add_test(NAME cartographer_scene_query_tests COMMAND cartographer_scene_query_tests)
 
+add_executable(cartographer_frontend_selection_wiring_tests frontend_selection_wiring_tests.cpp)
+target_link_libraries(cartographer_frontend_selection_wiring_tests PRIVATE carto_ui)
+carto_target(cartographer_frontend_selection_wiring_tests)
+add_test(NAME cartographer_frontend_selection_wiring_tests COMMAND cartographer_frontend_selection_wiring_tests)
+
+add_executable(cartographer_frontend_asset_wiring_tests frontend_asset_wiring_tests.cpp)
+target_link_libraries(cartographer_frontend_asset_wiring_tests PRIVATE carto_ui)
+carto_target(cartographer_frontend_asset_wiring_tests)
+add_test(NAME cartographer_frontend_asset_wiring_tests COMMAND cartographer_frontend_asset_wiring_tests)
+
+add_executable(cartographer_frontend_inspector_wiring_tests frontend_inspector_wiring_tests.cpp)
+target_link_libraries(cartographer_frontend_inspector_wiring_tests PRIVATE carto_ui)
+carto_target(cartographer_frontend_inspector_wiring_tests)
+add_test(NAME cartographer_frontend_inspector_wiring_tests COMMAND cartographer_frontend_inspector_wiring_tests)
+
 add_executable(cartographer_tests
     test_main.cpp
 )
@@ -49,6 +64,53 @@ add_test(NAME cartographer_curve_path_tests COMMAND cartographer_curve_path_test
 add_executable(cartographer_application_tests
     application_tests.cpp
 )
+
+add_executable(cartographer_native_scene_import_tests
+    application_native_import_sprint_tests.cpp
+)
+target_link_libraries(cartographer_native_scene_import_tests PRIVATE
+    carto_application carto_ui carto_io carto_editor carto_project carto_assets)
+carto_target(cartographer_native_scene_import_tests)
+add_test(NAME cartographer_native_scene_import_tests
+    COMMAND cartographer_native_scene_import_tests)
+
+add_executable(cartographer_history_atomicity_sprint2_tests
+    application_history_atomicity_sprint2_tests.cpp)
+target_link_libraries(cartographer_history_atomicity_sprint2_tests PRIVATE
+    carto_application carto_editor carto_project carto_assets carto_journal)
+carto_target(cartographer_history_atomicity_sprint2_tests)
+add_test(NAME cartographer_history_atomicity_sprint2_tests
+    COMMAND cartographer_history_atomicity_sprint2_tests)
+
+add_executable(cartographer_journal_provenance_sprint2_tests
+    application_journal_provenance_sprint2_tests.cpp)
+target_link_libraries(cartographer_journal_provenance_sprint2_tests PRIVATE
+    carto_application carto_project carto_journal)
+carto_target(cartographer_journal_provenance_sprint2_tests)
+add_test(NAME cartographer_journal_provenance_sprint2_tests
+    COMMAND cartographer_journal_provenance_sprint2_tests)
+
+add_executable(cartographer_project_locked_mesh_sprint2_tests
+    project_locked_mesh_sprint2_tests.cpp)
+target_link_libraries(cartographer_project_locked_mesh_sprint2_tests PRIVATE
+    carto_application carto_journal)
+carto_target(cartographer_project_locked_mesh_sprint2_tests)
+add_test(NAME cartographer_project_locked_mesh_sprint2_tests
+    COMMAND cartographer_project_locked_mesh_sprint2_tests)
+
+add_executable(cartographer_source_registry_v4_sprint2_tests
+    source_registry_v4_sprint2_tests.cpp)
+target_link_libraries(cartographer_source_registry_v4_sprint2_tests PRIVATE carto_assets)
+carto_target(cartographer_source_registry_v4_sprint2_tests)
+add_test(NAME cartographer_source_registry_v4_sprint2_tests
+    COMMAND cartographer_source_registry_v4_sprint2_tests)
+
+add_executable(cartographer_texture_image_decoder_sprint2_tests
+    texture_image_decoder_sprint2_tests.cpp)
+target_link_libraries(cartographer_texture_image_decoder_sprint2_tests PRIVATE carto_assets)
+carto_target(cartographer_texture_image_decoder_sprint2_tests)
+add_test(NAME cartographer_texture_image_decoder_sprint2_tests
+    COMMAND cartographer_texture_image_decoder_sprint2_tests)
 
 add_executable(cartographer_render_architecture_tests
     render_architecture_tests.cpp
@@ -157,6 +219,36 @@ target_link_libraries(cartographer_condition_authoring_tests
 carto_target(cartographer_condition_authoring_tests)
 add_test(NAME cartographer_condition_authoring_tests
     COMMAND cartographer_condition_authoring_tests)
+
+add_executable(cartographer_condition_prefab_snapshot_tests
+    condition_prefab_snapshot_tests.cpp
+)
+target_link_libraries(cartographer_condition_prefab_snapshot_tests PRIVATE carto_condition_authoring)
+carto_target(cartographer_condition_prefab_snapshot_tests)
+add_test(NAME cartographer_condition_prefab_snapshot_tests COMMAND cartographer_condition_prefab_snapshot_tests)
+
+add_executable(cartographer_condition_prefab_placement_tests
+    condition_prefab_placement_tests.cpp
+)
+target_link_libraries(cartographer_condition_prefab_placement_tests
+    PRIVATE carto_condition_authoring carto_application carto_ui)
+carto_target(cartographer_condition_prefab_placement_tests)
+add_test(NAME cartographer_condition_prefab_placement_tests
+    COMMAND cartographer_condition_prefab_placement_tests)
+
+add_executable(cartographer_prefab_socket_tests
+    prefab_socket_tests.cpp
+)
+target_link_libraries(cartographer_prefab_socket_tests PRIVATE carto_condition_authoring)
+carto_target(cartographer_prefab_socket_tests)
+add_test(NAME cartographer_prefab_socket_tests COMMAND cartographer_prefab_socket_tests)
+
+add_executable(cartographer_prefab_rebase_tests
+    prefab_rebase_tests.cpp
+)
+target_link_libraries(cartographer_prefab_rebase_tests PRIVATE carto_condition_authoring)
+carto_target(cartographer_prefab_rebase_tests)
+add_test(NAME cartographer_prefab_rebase_tests COMMAND cartographer_prefab_rebase_tests)
 
 add_executable(cartographer_utility_network_tests
     utility_network_tests.cpp
@@ -603,6 +695,7 @@ if(TARGET cartographer_cli)
             "-DCARTO_CLI=$<TARGET_FILE:cartographer_cli>"
             "-DCARTO_FIXTURE=$<TARGET_FILE:cartographer_cli_mesh_fixture>"
             "-DCARTO_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+            "-DCARTO_ENABLE_D3D12=${CARTO_ENABLE_D3D12}"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/run_bake_normal_cli_tests.cmake"
     )
     set_tests_properties(cartographer_bake_normal_cli_tests PROPERTIES RUN_SERIAL TRUE)
@@ -832,6 +925,29 @@ if(CARTO_BUILD_DEVICE_CPU)
 endif()
 
 if(CARTO_ENABLE_D3D12)
+    add_executable(cartographer_d3d12_render_graph_dispatch_tests
+        d3d12_render_graph_dispatch_tests.cpp)
+    target_link_libraries(cartographer_d3d12_render_graph_dispatch_tests
+        PRIVATE carto_d3d12 carto_d3d12_bake)
+    carto_target(cartographer_d3d12_render_graph_dispatch_tests)
+    add_test(NAME cartographer_d3d12_render_graph_dispatch_tests
+        COMMAND cartographer_d3d12_render_graph_dispatch_tests)
+
+    add_executable(cartographer_d3d12_scene_renderer_tests d3d12_scene_renderer_tests.cpp)
+    target_link_libraries(cartographer_d3d12_scene_renderer_tests PRIVATE carto_d3d12_scene)
+    target_compile_definitions(cartographer_d3d12_scene_renderer_tests PRIVATE
+        CARTO_D3D12_SHADER_DIR="${PROJECT_SOURCE_DIR}/libs/d3d12/shaders")
+    carto_target(cartographer_d3d12_scene_renderer_tests)
+    add_test(NAME cartographer_d3d12_scene_renderer_tests COMMAND cartographer_d3d12_scene_renderer_tests)
+    if(TARGET cartographer_scene_render)
+        add_test(NAME cartographer_scene_render_cli_tests COMMAND "${CMAKE_COMMAND}"
+            "-DFIXTURE=$<TARGET_FILE:cartographer_d3d12_scene_renderer_tests>"
+            "-DRENDER=$<TARGET_FILE:cartographer_scene_render>"
+            "-DSHADERS=${PROJECT_SOURCE_DIR}/libs/d3d12/shaders"
+            "-DOUTPUT_ROOT=${CMAKE_BINARY_DIR}/scene-render-acceptance"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/run_scene_render_cli_tests.cmake")
+    endif()
+
     add_executable(cartographer_d3d12_tests
         d3d12_tests.cpp
     )
@@ -889,6 +1005,18 @@ endif()
 add_executable(cartographer_storage_journal_tests
     storage_journal_tests.cpp
 )
+
+# Test-only I/O facade compiles the real journal implementation; no production
+# fault hook or duplicate journal object is linked into this executable.
+add_executable(cartographer_journal_io_uncertainty_tests journal_io_uncertainty_tests.cpp)
+target_include_directories(cartographer_journal_io_uncertainty_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/libs/journal/src ${PROJECT_SOURCE_DIR}/libs/journal/include)
+target_link_libraries(cartographer_journal_io_uncertainty_tests PRIVATE carto_assets)
+carto_target(cartographer_journal_io_uncertainty_tests)
+add_test(NAME cartographer_journal_io_uncertainty_tests
+    COMMAND cartographer_journal_io_uncertainty_tests)
+set_tests_properties(cartographer_journal_io_uncertainty_tests PROPERTIES TIMEOUT 60)
+
 
 add_executable(cartographer_sdk_tests
     sdk_tests.cpp
@@ -996,6 +1124,7 @@ target_link_libraries(cartographer_application_tests
     PRIVATE
         carto_application
         carto_journal
+        carto_mesh_attributes
 )
 
 carto_target(cartographer_application_tests)
@@ -1022,6 +1151,7 @@ target_link_libraries(cartographer_uv_material_contract_tests
         carto_geometry
         carto_io
         carto_project
+        carto_production
         carto_render
 )
 carto_target(cartographer_uv_material_contract_tests)
@@ -1101,7 +1231,60 @@ target_link_libraries(cartographer_ui_tests
 carto_target(cartographer_ui_tests)
 add_test(NAME cartographer_ui_tests COMMAND cartographer_ui_tests)
 
+add_executable(cartographer_desktop_viewshed_tests desktop_viewshed_tests.cpp)
+target_include_directories(cartographer_desktop_viewshed_tests
+    PRIVATE ${PROJECT_SOURCE_DIR}/apps/desktop
+)
+target_link_libraries(cartographer_desktop_viewshed_tests
+    PRIVATE carto_application
+)
+carto_target(cartographer_desktop_viewshed_tests)
+add_test(NAME cartographer_desktop_viewshed_tests
+    COMMAND cartographer_desktop_viewshed_tests)
+
+add_executable(cartographer_desktop_sweep_source_tests
+    desktop_sweep_source_tests.cpp
+)
+target_include_directories(cartographer_desktop_sweep_source_tests
+    PRIVATE ${PROJECT_SOURCE_DIR}/apps/desktop
+)
+target_link_libraries(cartographer_desktop_sweep_source_tests
+    PRIVATE carto_geometry
+)
+carto_target(cartographer_desktop_sweep_source_tests)
+add_test(NAME cartographer_desktop_sweep_source_tests
+    COMMAND cartographer_desktop_sweep_source_tests)
+
 if(TARGET carto_imgui)
+    add_executable(cartographer_reference_image_decoder_tests
+        reference_image_decoder_tests.cpp
+        ${PROJECT_SOURCE_DIR}/apps/desktop/reference_image_decoder.cpp
+    )
+    target_include_directories(cartographer_reference_image_decoder_tests
+        PRIVATE ${PROJECT_SOURCE_DIR}/apps/desktop
+    )
+    target_link_libraries(cartographer_reference_image_decoder_tests
+        PRIVATE carto_assets windowscodecs ole32
+    )
+    carto_target(cartographer_reference_image_decoder_tests)
+    add_test(NAME cartographer_reference_image_decoder_tests
+        COMMAND cartographer_reference_image_decoder_tests)
+
+    add_executable(cartographer_desktop_style_tests desktop_style_tests.cpp)
+    target_link_libraries(cartographer_desktop_style_tests PRIVATE carto_imgui carto_ui)
+    carto_target(cartographer_desktop_style_tests)
+    add_test(NAME cartographer_desktop_style_tests COMMAND cartographer_desktop_style_tests)
+
+    add_executable(cartographer_desktop_chrome_tests desktop_chrome_tests.cpp)
+    target_link_libraries(cartographer_desktop_chrome_tests PRIVATE carto_imgui carto_ui)
+    carto_target(cartographer_desktop_chrome_tests)
+    add_test(NAME cartographer_desktop_chrome_tests COMMAND cartographer_desktop_chrome_tests)
+
+    add_executable(cartographer_desktop_browser_tests desktop_browser_tests.cpp)
+    target_link_libraries(cartographer_desktop_browser_tests PRIVATE carto_imgui carto_ui)
+    carto_target(cartographer_desktop_browser_tests)
+    add_test(NAME cartographer_desktop_browser_tests COMMAND cartographer_desktop_browser_tests)
+
     add_executable(cartographer_desktop_workbench_input_tests
         desktop_workbench_input_tests.cpp
     )
@@ -1113,6 +1296,7 @@ if(TARGET carto_imgui)
     carto_target(cartographer_desktop_workbench_input_tests)
     add_test(NAME cartographer_desktop_workbench_input_tests
         COMMAND cartographer_desktop_workbench_input_tests)
+
 endif()
 
 target_link_libraries(cartographer_viewport_interaction_tests
@@ -1226,6 +1410,7 @@ add_executable(cartographer_decal_tests
 target_link_libraries(cartographer_decal_tests PRIVATE carto_production)
 carto_target(cartographer_decal_tests)
 add_test(NAME cartographer_decal_tests COMMAND cartographer_decal_tests)
+
 
 add_executable(cartographer_semantic_sidecar_tests
     semantic_sidecar_tests.cpp

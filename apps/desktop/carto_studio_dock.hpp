@@ -22,49 +22,6 @@
 
 namespace carto::studio {
 
-inline void apply_vanta_studio_theme(bool dark) noexcept {
-    if (!dark) return;
-    auto& s = ImGui::GetStyle();
-    s.WindowRounding = 4.0F;
-    s.ChildRounding = 4.0F;
-    s.FrameRounding = 4.0F;
-    s.PopupRounding = 4.0F;
-    s.TabRounding = 3.0F;
-    s.GrabRounding = 3.0F;
-    s.WindowBorderSize = 1.0F;
-    s.ChildBorderSize = 1.0F;
-    s.FrameBorderSize = 1.0F;
-    s.WindowPadding = {9.0F, 8.0F};
-    s.FramePadding = {9.0F, 6.0F};
-    s.ItemSpacing = {7.0F, 6.0F};
-    s.ItemInnerSpacing = {6.0F, 5.0F};
-    s.ScrollbarSize = 9.0F;
-    s.Colors[ImGuiCol_WindowBg] = {0.038F, 0.058F, 0.078F, 0.99F};
-    s.Colors[ImGuiCol_ChildBg] = {0.044F, 0.069F, 0.086F, 1.0F};
-    s.Colors[ImGuiCol_PopupBg] = {0.055F, 0.077F, 0.097F, 0.99F};
-    s.Colors[ImGuiCol_MenuBarBg] = {0.038F, 0.058F, 0.078F, 1.0F};
-    s.Colors[ImGuiCol_TitleBg] = {0.045F, 0.064F, 0.081F, 1.0F};
-    s.Colors[ImGuiCol_TitleBgActive] = {0.059F, 0.090F, 0.112F, 1.0F};
-    s.Colors[ImGuiCol_Border] = {0.135F, 0.196F, 0.226F, 0.85F};
-    s.Colors[ImGuiCol_Separator] = {0.132F, 0.193F, 0.219F, 0.72F};
-    s.Colors[ImGuiCol_FrameBg] = {0.067F, 0.097F, 0.122F, 1.0F};
-    s.Colors[ImGuiCol_FrameBgHovered] = {0.094F, 0.150F, 0.177F, 1.0F};
-    s.Colors[ImGuiCol_FrameBgActive] = {0.085F, 0.184F, 0.224F, 1.0F};
-    s.Colors[ImGuiCol_Button] = {0.068F, 0.109F, 0.135F, 1.0F};
-    s.Colors[ImGuiCol_ButtonHovered] = {0.085F, 0.180F, 0.219F, 1.0F};
-    s.Colors[ImGuiCol_ButtonActive] = {0.073F, 0.250F, 0.301F, 1.0F};
-    s.Colors[ImGuiCol_Header] = {0.067F, 0.118F, 0.145F, 1.0F};
-    s.Colors[ImGuiCol_HeaderHovered] = {0.079F, 0.166F, 0.205F, 1.0F};
-    s.Colors[ImGuiCol_HeaderActive] = {0.076F, 0.219F, 0.273F, 1.0F};
-    s.Colors[ImGuiCol_Tab] = {0.054F, 0.080F, 0.098F, 1.0F};
-    s.Colors[ImGuiCol_TabHovered] = {0.075F, 0.175F, 0.216F, 1.0F};
-    s.Colors[ImGuiCol_TabSelected] = {0.074F, 0.181F, 0.224F, 1.0F};
-    s.Colors[ImGuiCol_DockingPreview] = {0.16F, 0.70F, 0.84F, 0.55F};
-    s.Colors[ImGuiCol_DockingEmptyBg] = {0.034F, 0.052F, 0.070F, 1.0F};
-    s.Colors[ImGuiCol_CheckMark] = {0.35F, 0.83F, 0.89F, 1.0F};
-    s.Colors[ImGuiCol_SliderGrab] = {0.23F, 0.67F, 0.82F, 1.0F};
-    s.Colors[ImGuiCol_SliderGrabActive] = {0.44F, 0.86F, 0.96F, 1.0F};
-}
 
 class DockingWorkspace final {
 public:
@@ -226,13 +183,13 @@ public:
                (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0;
     }
 
-    // A 44 px mode bar is reserved immediately below ImGui's standard main menu.
+    // Chrome extents come from the same layout used by the native header/footer.
     // The viewport can always be torn out of its dock node into a native HWND.
-    void begin_root(float mode_bar_height = 44.0F) {
+    void begin_root(float mode_bar_height = 44.0F, float status_bar_height = 22.0F) {
         ImGuiViewport* primary = ImGui::GetMainViewport();
         if (primary == nullptr) return;
         const float reserved = focus_mode_ ? 0.0F : mode_bar_height;
-        const float footer = focus_mode_ ? 0.0F : 22.0F;
+        const float footer = focus_mode_ ? 0.0F : status_bar_height;
         const ImVec2 position{primary->WorkPos.x, primary->WorkPos.y + reserved};
         const ImVec2 extent{
             std::max(1.0F, primary->WorkSize.x),

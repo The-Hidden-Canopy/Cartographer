@@ -5,6 +5,7 @@ add_library(carto_io STATIC
     src/ply.cpp
     src/stl.cpp
     src/gltf_export.cpp
+    src/gltf_material_import.cpp
 )
 
 target_include_directories(carto_io
@@ -14,6 +15,7 @@ target_include_directories(carto_io
 )
 
 target_link_libraries(carto_io PUBLIC carto_core carto_geometry carto_project carto_providers carto_render)
+target_link_libraries(carto_io PRIVATE carto_assets)
 carto_target(carto_io)
 
 install(TARGETS carto_io EXPORT CartographerTargets)

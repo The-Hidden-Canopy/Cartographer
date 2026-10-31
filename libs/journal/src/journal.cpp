@@ -132,6 +132,11 @@ std::uint64_t now_ms() {
 // acquiring a lock cannot make a missing journal look like a malformed one.
 std::mutex g_journal_mutex;
 
+std::filesystem::path uncertainty_marker(std::filesystem::path path) {
+    path += ".uncertain";
+    return path;
+}
+
 class JournalFileLock final {
 public:
     JournalFileLock() = default;
@@ -338,6 +343,14 @@ core::Result<std::vector<JournalEntry>> Journal::read_all() const {
 
 core::Result<std::vector<JournalEntry>> Journal::read_all_unlocked() const {
     std::error_code error;
+    if (std::filesystem::exists(uncertainty_marker(path_), error)) {
+        return core::Result<std::vector<JournalEntry>>::failure(
+            io_error("journal has an unresolved append uncertainty marker"));
+    }
+    if (error) {
+        return core::Result<std::vector<JournalEntry>>::failure(
+            io_error("unable to inspect journal uncertainty marker"));
+    }
     if (!std::filesystem::exists(path_, error)) {
         if (error) {
             return core::Result<std::vector<JournalEntry>>::failure(io_error("unable to inspect journal path"));
@@ -468,8 +481,32 @@ core::Result<JournalEntry> Journal::append(const JournalAppend& request) {
     if (error) {
         return core::Result<JournalEntry>::failure(io_error("unable to record journal append boundary"));
     }
+    // Persist the uncertainty boundary before touching journal bytes. A failed
+    // rollback, close, or cleanup must remain visible to a new process.
+    const auto marker_path = uncertainty_marker(path_);
+    std::ofstream pending(marker_path, std::ios::binary | std::ios::trunc);
+    if (!pending) {
+        return core::Result<JournalEntry>::failure(io_error("unable to create journal uncertainty marker"));
+    }
+    pending << "CARTOGRAPHER_JOURNAL_UNCERTAIN_V1\n";
+    pending.flush();
+    pending.close();
+    if (!pending) {
+        return core::Result<JournalEntry>::failure(io_error("unable to persist journal uncertainty marker"));
+    }
+    const auto clear_marker = [&]() -> core::Result<void> {
+        std::error_code cleanup_error;
+        std::filesystem::remove(marker_path, cleanup_error);
+        if (cleanup_error) {
+            return core::Result<void>::failure(io_error("unable to clear journal uncertainty marker"));
+        }
+        return core::Result<void>::success();
+    };
     std::ofstream stream(path_, std::ios::binary | std::ios::app);
     if (!stream) {
+        if (auto cleared = clear_marker(); !cleared) {
+            return core::Result<JournalEntry>::failure(cleared.error());
+        }
         return core::Result<JournalEntry>::failure(io_error("unable to open journal for append"));
     }
     if (needs_header) {
@@ -477,15 +514,25 @@ core::Result<JournalEntry> Journal::append(const JournalAppend& request) {
     }
     stream << record << '\n';
     stream.flush();
+    stream.close();
     if (!stream) {
-        stream.close();
         std::error_code rollback_error;
-        std::filesystem::resize_file(path_, original_size, rollback_error);
+        if (exists) {
+            std::filesystem::resize_file(path_, original_size, rollback_error);
+        } else {
+            std::filesystem::remove(path_, rollback_error);
+        }
         if (rollback_error) {
             return core::Result<JournalEntry>::failure(
-                io_error("journal append failed and partial-record rollback failed"));
+                io_error("journal append failed and partial-record rollback failed; uncertainty marker retained"));
+        }
+        if (auto cleared = clear_marker(); !cleared) {
+            return core::Result<JournalEntry>::failure(cleared.error());
         }
         return core::Result<JournalEntry>::failure(io_error("unable to append journal record"));
+    }
+    if (auto cleared = clear_marker(); !cleared) {
+        return core::Result<JournalEntry>::failure(cleared.error());
     }
     return core::Result<JournalEntry>::success(std::move(entry));
 }

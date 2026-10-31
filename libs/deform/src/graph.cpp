@@ -21,8 +21,22 @@ std::string_view morph_space_name(MorphSpace space) noexcept {
 core::Result<void> DeformationStage::validate() const {
     switch (kind) {
     case Kind::skin:
-        return core::Result<void>::success();
+        switch (method) {
+        case SkinMethod::linear_blend:
+        case SkinMethod::dual_quaternion:
+            return core::Result<void>::success();
+        }
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument, "unknown skin method"));
     case Kind::morph:
+        switch (space) {
+        case MorphSpace::bind_pre_skin:
+        case MorphSpace::post_skin_model:
+            break;
+        default:
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_argument, "unknown morph space"));
+        }
         if (!morph_target) {
             return core::Result<void>::failure(core::Diagnostic(
                 core::ErrorCode::validation_failed,
@@ -147,10 +161,16 @@ core::Result<DeformationEvaluationResult> evaluate(
                 input.binding,
                 input.poses,
             };
-            const core::Result<SkinEvaluationResult> skinned =
-                stage.method == SkinMethod::linear_blend
-                ? evaluate_lbs(skin_input)
-                : evaluate_dqs(skin_input);
+            const core::Result<SkinEvaluationResult> skinned = [&]() {
+                switch (stage.method) {
+                case SkinMethod::linear_blend:
+                    return evaluate_lbs(skin_input);
+                case SkinMethod::dual_quaternion:
+                    return evaluate_dqs(skin_input);
+                }
+                return core::Result<SkinEvaluationResult>::failure(core::Diagnostic(
+                    core::ErrorCode::invalid_argument, "unknown skin method"));
+            }();
             if (!skinned) {
                 return core::Result<DeformationEvaluationResult>::failure(skinned.error());
             }
@@ -174,6 +194,11 @@ core::Result<DeformationEvaluationResult> evaluate(
             return core::Result<DeformationEvaluationResult>::failure(core::Diagnostic(
                 core::ErrorCode::not_found,
                 "deformation graph references a morph target with no source"));
+        }
+        if (morph_source->second.target->id != stage.morph_target) {
+            return core::Result<DeformationEvaluationResult>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "deformation graph morph source identity does not match the requested target"));
         }
         double weight = stage.morph_weight;
         if (stage.corrective_driver.has_value()) {

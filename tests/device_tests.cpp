@@ -462,6 +462,35 @@ void command_ir_rejects_unbalanced_and_unsupported_shapes_before_execution() {
     REQUIRE(invalid_clear.validate().error().code == core::ErrorCode::invalid_argument);
 }
 
+void gpu_pipeline_sampler_prefix_validation_is_bounded() {
+    using namespace carto;
+    gpu::PipelineDesc descriptor;
+    descriptor.debug_name = "two_texture_sampler_prefix";
+    descriptor.shaders = {gpu::ShaderHandle{1U, 1U}};
+    descriptor.descriptor_bindings = {
+        {0U, 0U, gpu::ShaderStage::fragment},
+        {0U, 1U, gpu::ShaderStage::fragment}};
+    descriptor.sampled_texture_count = 2U;
+    descriptor.sampled_sampler_count = 2U;
+    descriptor.color_format = gpu::Format::rgba32_float;
+    REQUIRE(gpu::validate(descriptor));
+
+    descriptor.sampled_sampler_count = 3U;
+    REQUIRE(!gpu::validate(descriptor));
+
+    descriptor.descriptor_bindings.clear();
+    for (std::uint32_t binding = 0U; binding < 9U; ++binding)
+        descriptor.descriptor_bindings.push_back(
+            {0U, binding, gpu::ShaderStage::fragment});
+    descriptor.sampled_texture_count = 9U;
+    descriptor.sampled_sampler_count = 5U;
+    REQUIRE(gpu::validate(descriptor));
+    descriptor.sampled_sampler_count = 9U;
+    REQUIRE(gpu::validate(descriptor));
+    descriptor.sampled_sampler_count = 10U;
+    REQUIRE(!gpu::validate(descriptor));
+}
+
 } // namespace
 
 int main() {
@@ -476,6 +505,8 @@ int main() {
          cpu_reference_rejects_wrong_resource_state_and_presentation},
         {"command IR rejects unbalanced and invalid shapes",
          command_ir_rejects_unbalanced_and_unsupported_shapes_before_execution},
+        {"GPU pipeline sampler prefix validation is bounded",
+         gpu_pipeline_sampler_prefix_validation_is_bounded},
     };
 
     std::size_t failures = 0U;

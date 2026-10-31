@@ -528,6 +528,16 @@ struct PrefabInstanceMember {
     std::string source_revision;
     assets::Sha256Digest source_digest;
     core::Transform source_world_transform = core::Transform::identity();
+    // Schema v10 separates captured instance geometry from its source
+    // asset. Zero identity/digest and identity local TRS mean legacy shared
+    // geometry; migration never fabricates an isolated historical snapshot.
+    std::uint64_t instance_mesh_asset_id = 0U;
+    assets::Sha256Digest snapshot_mesh_digest;
+    core::Transform instance_local_transform = core::Transform::identity();
+    // Schema v11 separates the accepted source mesh from the independently
+    // accepted instance snapshot, allowing explicit rebase/override choices.
+    assets::Sha256Digest source_snapshot_mesh_digest;
+    core::Revision instance_mesh_revision;
 
     [[nodiscard]] core::Result<void> validate() const;
 };
@@ -543,6 +553,48 @@ struct PrefabInstanceRecord {
     core::Revision source_authoring_revision;
     core::Revision prefab_source_revision;
     std::vector<PrefabInstanceMember> members;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+enum class PrefabRebaseMeshDecision : std::uint8_t {
+    not_applicable = 0U,
+    keep_instance_snapshot = 1U,
+    use_current_source_snapshot = 2U,
+};
+
+enum class PrefabRebasePlacementDecision : std::uint8_t {
+    not_applicable = 0U,
+    keep_instance_placement = 1U,
+    use_current_source_placement = 2U,
+};
+
+enum class PrefabRebaseMembershipDecision : std::uint8_t {
+    retained = 0U,
+    added = 1U,
+    detached = 2U,
+    deleted = 3U,
+};
+
+struct PrefabRebaseMemberDecision {
+    Id asset_id = 0U;
+    PrefabRebaseMeshDecision mesh = PrefabRebaseMeshDecision::not_applicable;
+    PrefabRebasePlacementDecision placement = PrefabRebasePlacementDecision::not_applicable;
+    PrefabRebaseMembershipDecision membership = PrefabRebaseMembershipDecision::retained;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
+// A durable record of the human choices that accepted a revision-bound rebase.
+// The authoring journal provides undo/redo history; this receipt keeps the
+// reviewed input digest, rationale, and member-level decisions in saved state.
+struct PrefabRebaseReceipt {
+    Id instance_id = 0U;
+    core::Revision reviewed_authoring_revision;
+    assets::Sha256Digest reviewed_authoring_digest;
+    core::Revision applied_authoring_revision;
+    std::string justification;
+    std::vector<PrefabRebaseMemberDecision> decisions;
 
     [[nodiscard]] core::Result<void> validate() const;
 };
@@ -563,7 +615,7 @@ struct RegionKitManifest {
 
 class AuthoringDocument final {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 9U;
+    static constexpr std::uint32_t kSchemaVersion = 12U;
     static constexpr std::size_t kMaxSerializedBytes = 32U * 1024U * 1024U;
     static constexpr std::size_t kMaxRecordsPerKind = 65'536U;
     static constexpr std::size_t kMaxAudioRecordsPerKind = 8'192U;
@@ -574,6 +626,8 @@ public:
     static constexpr std::size_t kMaxKinematicAssemblies = 4'096U;
     static constexpr std::size_t kMaxKinematicPartBindings = 4'096U;
     static constexpr std::size_t kMaxPrefabInstanceMembers = 4'096U;
+    static constexpr std::size_t kMaxPrefabRebaseReceipts = 8'192U;
+    static constexpr std::size_t kMaxPrefabRebaseDecisions = 8'192U;
     static constexpr std::size_t kMaxKinematicPayloadBytes = 1U * 1024U * 1024U;
     static constexpr std::size_t kMaxAggregateKinematicPayloadBytes = 8U * 1024U * 1024U;
 
@@ -591,6 +645,7 @@ public:
     std::vector<CollectionRecord> collections;
     std::vector<PrefabRecord> prefabs;
     std::vector<PrefabInstanceRecord> prefab_instances;
+    std::vector<PrefabRebaseReceipt> prefab_rebase_receipts;
     std::vector<RegionKitManifest> region_kits;
     std::vector<AuthoredAudioSource> audio_sources;
     std::vector<AuthoredAcousticZone> acoustic_zones;

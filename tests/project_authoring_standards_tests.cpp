@@ -91,17 +91,59 @@ void erase_v33_character_record_tables(std::string& serialized) {
         REQUIRE(record != std::string::npos);
         serialized.erase(record, table.size());
     }
+    const auto kinematic_table = serialized.find("KINEMATIC_GRAPHS 0\n");
+    if (kinematic_table != std::string::npos) {
+        serialized.erase(kinematic_table, std::string("KINEMATIC_GRAPHS 0\n").size());
+    }
 }
 
-void schema_33_requires_standards_and_migrates_schema_31_empty() {
+void schema_35_preserves_kinematic_graph_table_and_migrates_schema_34() {
     using namespace carto::project;
     ProjectDocument document;
-    REQUIRE(document.schema_version() == 33U);
-    const auto schema33 = document.serialize();
-    REQUIRE(schema33.find("AUTHORING_STANDARDS_HEX ") != std::string::npos);
+    REQUIRE(document.schema_version() == 35U);
+    const auto schema35 = document.serialize();
+    std::ostringstream graph_record_bytes;
+    graph_record_bytes << "CONNECTION_PORT_GRAPH "
+                       << std::quoted(document.connection_port_graph().serialize()) << '\n';
+    const auto empty_graph_record = graph_record_bytes.str();
+    REQUIRE(schema35.find("AUTHORING_STANDARDS_HEX ") != std::string::npos);
+    REQUIRE(schema35.find("CONNECTION_PORT_GRAPH ") != std::string::npos);
+    REQUIRE(schema35.find("KINEMATIC_GRAPHS 0\n") != std::string::npos);
+    auto missing_kinematic_graphs = schema35;
+    const auto kinematic_table = missing_kinematic_graphs.find("KINEMATIC_GRAPHS ");
+    const auto kinematic_table_end = missing_kinematic_graphs.find('\n', kinematic_table);
+    REQUIRE(kinematic_table != std::string::npos && kinematic_table_end != std::string::npos);
+    missing_kinematic_graphs.erase(kinematic_table,
+        kinematic_table_end - kinematic_table + 1U);
+    REQUIRE(!ProjectDocument::deserialize(missing_kinematic_graphs));
 
-    auto schema31 = schema33;
-    schema31.replace(0U, std::string("CARTOGRAPHER_PROJECT 33\n").size(),
+    auto schema34 = schema35;
+    const auto v34_graph_table = schema34.find("KINEMATIC_GRAPHS 0\n");
+    REQUIRE(v34_graph_table != std::string::npos);
+    schema34.erase(v34_graph_table, std::string("KINEMATIC_GRAPHS 0\n").size());
+    schema34.replace(0U, std::string("CARTOGRAPHER_PROJECT 35\n").size(),
+        "CARTOGRAPHER_PROJECT 34\n");
+    const auto migrated_schema34 = ProjectDocument::deserialize(schema34);
+    REQUIRE(migrated_schema34 && migrated_schema34.value().kinematic_graphs().empty());
+    REQUIRE(migrated_schema34.value().serialize().starts_with("CARTOGRAPHER_PROJECT 35\n"));
+
+    auto missing_connection_graph = schema35;
+    const auto graph_record = missing_connection_graph.find(empty_graph_record);
+    REQUIRE(graph_record != std::string::npos);
+    missing_connection_graph.erase(graph_record, empty_graph_record.size());
+    REQUIRE(!ProjectDocument::deserialize(missing_connection_graph));
+
+    auto schema33 = schema34;
+    schema33.replace(0U, std::string("CARTOGRAPHER_PROJECT 34\n").size(),
+        "CARTOGRAPHER_PROJECT 33\n");
+    const auto schema33_graph = schema33.find(empty_graph_record);
+    REQUIRE(schema33_graph != std::string::npos);
+    schema33.erase(schema33_graph, empty_graph_record.size());
+    const auto migrated_schema33 = ProjectDocument::deserialize(schema33);
+    REQUIRE(migrated_schema33 && migrated_schema33.value().connection_port_graph().empty());
+
+    auto schema31 = schema34;
+    schema31.replace(0U, std::string("CARTOGRAPHER_PROJECT 34\n").size(),
         "CARTOGRAPHER_PROJECT 31\n");
     const auto standards_line = schema31.find("AUTHORING_STANDARDS_HEX ");
     REQUIRE(standards_line != std::string::npos);
@@ -180,7 +222,7 @@ void human_update_is_journaled_undoable_stale_checked_and_persistent() {
 
 int main() {
     standards_are_typed_bounded_and_strictly_serialized();
-    schema_33_requires_standards_and_migrates_schema_31_empty();
+    schema_35_preserves_kinematic_graph_table_and_migrates_schema_34();
     human_update_is_journaled_undoable_stale_checked_and_persistent();
     std::cout << "project authoring standards tests passed\n";
     return EXIT_SUCCESS;

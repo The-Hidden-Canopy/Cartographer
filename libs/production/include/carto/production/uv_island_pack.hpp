@@ -14,7 +14,7 @@ class ProjectTransaction;
 
 namespace carto::production {
 
-inline constexpr std::uint32_t kUvIslandPackVersion = 2U;
+inline constexpr std::uint32_t kUvIslandPackVersion = 3U;
 inline constexpr std::uint64_t kMaxUvIslandPackCorners = 1'000'000ULL;
 inline constexpr std::uint32_t kMaxUvIslandPackTiles = 100U;
 inline constexpr std::uint64_t kMaxUvIslandPackCandidates = 1'000'000ULL;
@@ -70,7 +70,7 @@ struct UvIslandPackTileReceipt {
 
 struct UvIslandPackArtifact {
     UvIslandPackRecipe recipe;
-    std::string algorithm{"carto.uv.island-shelf-pack.v2"};
+    std::string algorithm{"carto.uv.island-shelf-pack.v3"};
     std::string evidence_class{"carto.cpu-reference"};
     assets::Sha256Digest settings_digest;
     assets::Sha256Digest output_digest;
@@ -106,13 +106,20 @@ struct UvIslandPackArtifact {
     double target_texels_per_world_unit = 0.0,
     bool allow_quarter_turn_rotation = false);
 
-// Packs connected islands from the selected corner UV set. Faces join one
-// island only when both UV endpoints agree exactly across their shared edge.
-// Corner identity and seam continuity are preserved; the selected density
-// policy may uniformly rescale each island. Non-manifold fans fail closed.
+// Packs connected islands from the selected corner UV set. Explicit per-set
+// seam marks split islands even when endpoint UVs agree; otherwise both UV
+// endpoints must agree exactly across the shared edge. Corner identity and
+// seam continuity are preserved; the selected density policy may uniformly
+// rescale each island. Non-manifold fans fail closed.
 [[nodiscard]] core::Result<UvIslandPackArtifact> compile_uv_island_pack(
     const UvIslandPackRecipe& recipe,
     const geometry::EditableMesh& source);
+
+// Builds the packed mesh payload without mutating a project or transaction.
+// The source UV set and every other attribute layer remain unchanged.
+[[nodiscard]] core::Result<geometry::EditableMesh> build_uv_island_packed_mesh(
+    const geometry::EditableMesh& source,
+    const UvIslandPackArtifact& artifact);
 
 [[nodiscard]] core::Result<void> apply_uv_island_pack(
     project::ProjectTransaction& transaction,

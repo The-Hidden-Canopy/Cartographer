@@ -544,10 +544,7 @@ void condition_authoring_v8_reopens_with_empty_prefab_instances() {
     const auto fixture = carto::condition::make_condition_fixture();
     REQUIRE(fixture);
     std::string legacy = fixture.value().serialize();
-    const std::string instance_section = "PREFAB_INSTANCES 0\n";
-    const auto offset = legacy.find(instance_section);
-    REQUIRE(offset != std::string::npos);
-    legacy.erase(offset, instance_section.size());
+    remove_prefab_instance_section_for_legacy_schema(legacy);
     const auto header_end = legacy.find('\n');
     REQUIRE(header_end != std::string::npos);
     legacy.replace(0U, header_end, "CARTOGRAPHER_CONDITION_AUTHORING 8");
@@ -1059,10 +1056,11 @@ void condition_kinematic_assembly_round_trips_and_rejects_stale_or_unbounded_sou
         std::string::npos);
 
     std::string schema_seven = encoded;
-    const std::string schema_nine_header = "CARTOGRAPHER_CONDITION_AUTHORING 9";
-    const auto schema_header = schema_seven.find(schema_nine_header);
+    const std::string current_header = "CARTOGRAPHER_CONDITION_AUTHORING " +
+        std::to_string(carto::condition::AuthoringDocument::kSchemaVersion);
+    const auto schema_header = schema_seven.find(current_header);
     REQUIRE(schema_header == 0U);
-    schema_seven.replace(schema_header, schema_nine_header.size(),
+    schema_seven.replace(schema_header, current_header.size(),
         "CARTOGRAPHER_CONDITION_AUTHORING 7");
     const auto binding_start = schema_seven.find("KINEMATIC_PART_BINDING ");
     REQUIRE(binding_start != std::string::npos);
@@ -2877,7 +2875,10 @@ void ui_condition_prefab_instances_are_atomic_revision_bound_and_fail_closed() {
         REQUIRE(instance_object != state.objects.end());
         REQUIRE(instance_object->object.parent.has_value());
         REQUIRE(instance_object->object.parent->value == placed.root_object_id);
-        REQUIRE(instance_object->object.mesh_asset == member.mesh_asset_id);
+        REQUIRE(source_object->object.mesh_asset == member.mesh_asset_id);
+        REQUIRE(instance_object->object.mesh_asset == member.instance_mesh_asset_id);
+        REQUIRE(member.instance_mesh_asset_id != member.mesh_asset_id);
+        REQUIRE(!member.snapshot_mesh_digest.is_zero());
         REQUIRE(instance_object->mesh_revision == member.mesh_revision);
         const auto source_asset = std::find_if(
             authoring_after_instance.value().assets.begin(),

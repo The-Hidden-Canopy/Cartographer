@@ -100,6 +100,29 @@ core::Result<void> validate(const TextureDesc& descriptor) {
 }
 
 core::Result<void> validate(const SamplerDesc& descriptor) {
+    const auto valid_filter = [](Filter filter) {
+        return filter == Filter::nearest || filter == Filter::linear;
+    };
+    const auto valid_mip_filter = [](MipFilter filter) {
+        return filter == MipFilter::nearest || filter == MipFilter::linear;
+    };
+    const auto valid_address = [](AddressMode mode) {
+        return mode == AddressMode::repeat || mode == AddressMode::mirror ||
+            mode == AddressMode::clamp_edge || mode == AddressMode::clamp_border;
+    };
+    const auto valid_compare = [](CompareOp operation) {
+        return operation == CompareOp::never || operation == CompareOp::less ||
+            operation == CompareOp::equal || operation == CompareOp::less_or_equal ||
+            operation == CompareOp::greater || operation == CompareOp::not_equal ||
+            operation == CompareOp::greater_or_equal || operation == CompareOp::always;
+    };
+    if (!valid_filter(descriptor.min_filter) || !valid_filter(descriptor.mag_filter) ||
+        !valid_mip_filter(descriptor.mip_filter) || !valid_address(descriptor.u) ||
+        !valid_address(descriptor.v) || !valid_address(descriptor.w) ||
+        !valid_compare(descriptor.compare_op)) {
+        return core::Result<void>::failure(
+            invalid("sampler filter, address, or comparison mode is invalid"));
+    }
     if (!std::isfinite(descriptor.max_anisotropy) || descriptor.max_anisotropy < 1.0F) {
         return core::Result<void>::failure(
             invalid("sampler anisotropy must be finite and at least one"));
@@ -158,6 +181,12 @@ core::Result<void> validate(const PipelineDesc& descriptor) {
     if (descriptor.sampled_texture_count > descriptor.descriptor_bindings.size()) {
         return core::Result<void>::failure(invalid(
             "sampled texture binding count exceeds the declared descriptor bindings"));
+    }
+    if (descriptor.sampled_sampler_count > descriptor.descriptor_bindings.size() ||
+        (descriptor.sampled_texture_count != 0U &&
+         descriptor.sampled_sampler_count > descriptor.sampled_texture_count)) {
+        return core::Result<void>::failure(invalid(
+            "sampled sampler count exceeds the declared sampled texture bindings"));
     }
     if (descriptor.push_constant_bytes > 256U) {
         return core::Result<void>::failure(

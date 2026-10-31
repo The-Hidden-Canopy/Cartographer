@@ -223,6 +223,34 @@ core::Result<void> SweepSource::validate() const {
             }
         }
     }
+    if (!std::isfinite(inner_profile_scale) || inner_profile_scale < 0.0 ||
+        inner_profile_scale >= 1.0) {
+        return core::Result<void>::failure(validation(
+            "sweep inner profile scale must be zero (solid) or strictly between zero and one"));
+    }
+    if (inner_profile_scale > 0.0) {
+        for (std::size_t index = 0U; index < profile.size(); ++index) {
+            const auto a = profile[index];
+            const auto b = profile[(index + 1U) % profile.size()];
+            const double edge_length = std::hypot(b.x - a.x, b.y - a.y);
+            const double origin_distance = (a.x * b.y - a.y * b.x) / edge_length;
+            if (!std::isfinite(origin_distance) ||
+                origin_distance * (1.0 - inner_profile_scale) *
+                    std::min(start_scale, end_scale) <= kFrameEpsilon) {
+                return core::Result<void>::failure(validation(
+                    "hollow sweep requires the profile origin strictly inside with a resolvable wall"));
+            }
+        }
+        SweepSource inner = *this;
+        inner.inner_profile_scale = 0.0;
+        for (auto& point : inner.profile) {
+            point.x *= inner_profile_scale;
+            point.y *= inner_profile_scale;
+        }
+        if (auto result = inner.validate(); !result) {
+            return core::Result<void>::failure(result.error().with_context("sweep inner profile"));
+        }
+    }
     return core::Result<void>::success();
 }
 
@@ -230,16 +258,21 @@ std::string SweepSource::serialize() const {
     std::ostringstream output;
     output.imbue(std::locale::classic());
     output << std::setprecision(std::numeric_limits<double>::max_digits10);
-    output << "CARTOGRAPHER_SWEEP_SOURCE " << kSchemaVersion << '\n';
+    const std::uint32_t version = owner_object_id != 0U ? kSchemaVersion
+        : inner_profile_scale == 0.0 ? 1U : 2U;
+    output << "CARTOGRAPHER_SWEEP_SOURCE "
+           << version << '\n';
     output << "IDENTITY " << std::quoted(source_identity) << ' '
            << source_revision.value() << '\n';
     output << "CENTERLINE " << std::quoted(centerline_identity) << ' '
            << centerline_revision.value() << '\n';
+    if (version >= 3U) output << "OWNER_OBJECT " << owner_object_id << '\n';
     output << "SAMPLING " << samples_per_segment << '\n';
     output << "FRAME " << reference_up.x << ' ' << reference_up.y << ' '
            << reference_up.z << '\n';
     output << "SCALE " << start_scale << ' ' << end_scale << '\n';
     output << "CAPS " << static_cast<unsigned>(cap_policy) << '\n';
+    if (version >= 2U) output << "INNER_SCALE " << inner_profile_scale << '\n';
     output << "PROFILE " << profile.size() << '\n';
     for (const auto point : profile) output << "POINT " << point.x << ' ' << point.y << '\n';
     return output.str();
@@ -255,7 +288,7 @@ core::Result<SweepSource> SweepSource::deserialize(std::string_view text) {
     std::string marker;
     std::uint64_t version = 0U;
     if (!(input >> marker) || marker != "CARTOGRAPHER_SWEEP_SOURCE" ||
-        !read_unsigned(input, version) || version != kSchemaVersion) {
+        !read_unsigned(input, version) || version == 0U || version > kSchemaVersion) {
         return core::Result<SweepSource>::failure(validation(
             "sweep source header or schema version is unsupported"));
     }
@@ -275,6 +308,16 @@ core::Result<SweepSource> SweepSource::deserialize(std::string_view text) {
     }
     source.source_revision = core::Revision{source_revision};
     source.centerline_revision = core::Revision{centerline_revision};
+
+    if (version >= 3U) {
+        std::uint64_t owner_object_id = 0U;
+        if (!(input >> field) || field != "OWNER_OBJECT" ||
+            !read_unsigned(input, owner_object_id) || owner_object_id == 0U) {
+            return core::Result<SweepSource>::failure(validation(
+                "sweep source owner-object binding is malformed"));
+        }
+        source.owner_object_id = owner_object_id;
+    }
 
     std::uint64_t sample_count = 0U;
     if (!(input >> field) || field != "SAMPLING" || !read_unsigned(input, sample_count) ||
@@ -299,6 +342,14 @@ core::Result<SweepSource> SweepSource::deserialize(std::string_view text) {
             "sweep source cap block is malformed"));
     }
     source.cap_policy = static_cast<SweepCapPolicy>(encoded_caps);
+    if (version >= 2U &&
+        (!(input >> field) || field != "INNER_SCALE" ||
+         !read_double(input, source.inner_profile_scale) ||
+         (version == 2U ? source.inner_profile_scale <= 0.0
+                        : source.inner_profile_scale < 0.0))) {
+        return core::Result<SweepSource>::failure(validation(
+            "hollow sweep source inner profile block is malformed"));
+    }
 
     std::uint64_t profile_count = 0U;
     if (!(input >> field) || field != "PROFILE" || !read_unsigned(input, profile_count) ||
@@ -349,12 +400,15 @@ core::Result<SweptMeshProduct> build_sweep_mesh(
     }
     const std::size_t station_budget =
         segment_count * static_cast<std::size_t>(source.samples_per_segment) + 1U;
-    const std::size_t generated_vertices = station_budget * source.profile.size();
-    const std::size_t cap_faces = source.cap_policy == SweepCapPolicy::both ? 2U :
+    const bool hollow = source.inner_profile_scale > 0.0;
+    const std::size_t shell_count = hollow ? 2U : 1U;
+    const std::size_t generated_vertices = station_budget * source.profile.size() * shell_count;
+    const std::size_t cap_ends = source.cap_policy == SweepCapPolicy::both ? 2U :
         ((source.cap_policy == SweepCapPolicy::start ||
           source.cap_policy == SweepCapPolicy::end) ? 1U : 0U);
+    const std::size_t cap_faces = cap_ends * (hollow ? source.profile.size() : 1U);
     const std::size_t generated_faces =
-        (station_budget - 1U) * source.profile.size() + cap_faces;
+        (station_budget - 1U) * source.profile.size() * shell_count + cap_faces;
     if (generated_vertices > SweepSource::kMaxGeneratedElements ||
         generated_faces > SweepSource::kMaxGeneratedElements) {
         return core::Result<SweptMeshProduct>::failure(validation(
@@ -393,8 +447,9 @@ core::Result<SweptMeshProduct> build_sweep_mesh(
         return core::Result<SweptMeshProduct>::failure(validation(
             "sweep station count is outside its supported bound"));
     }
-    const std::size_t station_vertices = stations.size() * source.profile.size();
-    const std::size_t station_faces = (stations.size() - 1U) * source.profile.size() + cap_faces;
+    const std::size_t station_vertices = stations.size() * source.profile.size() * shell_count;
+    const std::size_t station_faces =
+        (stations.size() - 1U) * source.profile.size() * shell_count + cap_faces;
     if (station_vertices > SweepSource::kMaxGeneratedElements ||
         station_faces > SweepSource::kMaxGeneratedElements) {
         return core::Result<SweptMeshProduct>::failure(validation(
@@ -424,6 +479,8 @@ core::Result<SweptMeshProduct> build_sweep_mesh(
     EditableMesh mesh;
     std::vector<std::vector<VertexId>> rings;
     rings.reserve(stations.size());
+    std::vector<std::vector<VertexId>> inner_rings;
+    if (hollow) inner_rings.reserve(stations.size());
     for (std::size_t station_index = 0U; station_index < stations.size(); ++station_index) {
         const double t = static_cast<double>(station_index) /
             static_cast<double>(stations.size() - 1U);
@@ -442,6 +499,20 @@ core::Result<SweptMeshProduct> build_sweep_mesh(
             ring.push_back(added.value());
         }
         rings.push_back(std::move(ring));
+        if (hollow) {
+            std::vector<VertexId> inner_ring;
+            inner_ring.reserve(source.profile.size());
+            for (const auto point : source.profile) {
+                const auto position = stations[station_index].position +
+                    (frames[station_index].binormal * point.x +
+                     frames[station_index].normal * point.y) * (scale * source.inner_profile_scale);
+                auto added = mesh.add_vertex(position);
+                if (!added) return core::Result<SweptMeshProduct>::failure(
+                    added.error().with_context("sweep inner vertex generation"));
+                inner_ring.push_back(added.value());
+            }
+            inner_rings.push_back(std::move(inner_ring));
+        }
     }
 
     for (std::size_t station_index = 0U; station_index + 1U < rings.size(); ++station_index) {
@@ -458,6 +529,15 @@ core::Result<SweptMeshProduct> build_sweep_mesh(
                 return core::Result<SweptMeshProduct>::failure(
                     added.error().with_context("sweep side-face generation"));
             }
+            if (hollow) {
+                auto inner = mesh.add_face({
+                    inner_rings[station_index][profile_index],
+                    inner_rings[station_index][next],
+                    inner_rings[station_index + 1U][next],
+                    inner_rings[station_index + 1U][profile_index]});
+                if (!inner) return core::Result<SweptMeshProduct>::failure(
+                    inner.error().with_context("sweep inner side-face generation"));
+            }
         }
     }
 
@@ -465,14 +545,30 @@ core::Result<SweptMeshProduct> build_sweep_mesh(
         source.cap_policy == SweepCapPolicy::start;
     const bool cap_end = source.cap_policy == SweepCapPolicy::both ||
         source.cap_policy == SweepCapPolicy::end;
-    if (cap_start) {
+    if (hollow) {
+        for (std::size_t index = 0U; index < source.profile.size(); ++index) {
+            const auto next = (index + 1U) % source.profile.size();
+            if (cap_start) {
+                auto rim = mesh.add_face({rings.front()[index], rings.front()[next],
+                    inner_rings.front()[next], inner_rings.front()[index]});
+                if (!rim) return core::Result<SweptMeshProduct>::failure(
+                    rim.error().with_context("sweep start rim generation"));
+            }
+            if (cap_end) {
+                auto rim = mesh.add_face({rings.back()[index], inner_rings.back()[index],
+                    inner_rings.back()[next], rings.back()[next]});
+                if (!rim) return core::Result<SweptMeshProduct>::failure(
+                    rim.error().with_context("sweep end rim generation"));
+            }
+        }
+    } else if (cap_start) {
         auto added = mesh.add_face(rings.front());
         if (!added) {
             return core::Result<SweptMeshProduct>::failure(
                 added.error().with_context("sweep start cap generation"));
         }
     }
-    if (cap_end) {
+    if (cap_end && !hollow) {
         auto end_cap = rings.back();
         std::reverse(end_cap.begin(), end_cap.end());
         auto added = mesh.add_face(std::move(end_cap));
@@ -487,7 +583,8 @@ core::Result<SweptMeshProduct> build_sweep_mesh(
     }
     return core::Result<SweptMeshProduct>::success(SweptMeshProduct{
         std::move(mesh), source.source_identity, source.source_revision,
-        centerline.source_identity, centerline.source_revision});
+        centerline.source_identity, centerline.source_revision,
+        source.owner_object_id, std::nullopt, {}, {}});
 }
 
 } // namespace carto::geometry

@@ -121,6 +121,58 @@ void invalid_scope_and_owner_are_rejected() {
         "invalid requests must not mutate lock state");
 }
 
+void observations_cannot_rewind_a_retained_lease() {
+    AssetLockRegistry registry;
+    const auto original = registry.acquire(scope(), "user-1", 100, 60);
+    require(static_cast<bool>(original), "initial lease should be acquired");
+    const auto renewed = registry.renew(
+        scope(), "user-1", original.value().lease.lease_id, 150, 60);
+    require(renewed && renewed.value().expires_at_utc_seconds == 210,
+        "renewal should retain its latest accepted time observation");
+    require(!registry.renew(scope(), "user-1", renewed.value().lease_id, 120, 60),
+        "renewal must reject a clock rollback after an earlier renewal");
+    const auto unchanged = registry.inspect(scope(), 150);
+    require(unchanged && unchanged.value().has_value() &&
+            unchanged.value()->lease == renewed.value(),
+        "rejected renewal must preserve the exact current lease");
+    require(!registry.inspect(scope(), 149),
+        "inspection must not report state from before the latest observation");
+    require(static_cast<bool>(registry.inspect(scope(), 180)),
+        "inspection may advance a lease's local observation watermark");
+    require(!registry.renew(scope(), "user-1", renewed.value().lease_id, 179, 60),
+        "renewal must not precede an accepted inspection");
+    const auto expired = registry.inspect(scope(), 300);
+    require(expired && expired.value().has_value() &&
+            expired.value()->state == AssetLockState::expired,
+        "inspection must retain the expired state at its supplied time");
+    require(!registry.inspect(scope(), 200),
+        "a rolled-back observation must not revive an expired lease");
+    require(!registry.acquire(scope(), "user-2", 220, 10, renewed.value().lease_id),
+        "an acknowledged takeover must not predate the last observed expired state");
+    require(!registry.acquire(scope(), "user-2", 10000, 10,
+                renewed.value().lease_id + 1U),
+        "a future observation with the wrong acknowledgement must fail");
+    const auto takeover = registry.acquire(
+        scope(), "user-2", 300, 10, renewed.value().lease_id);
+    require(takeover && takeover.value().displaced_expired_lease.has_value() &&
+            *takeover.value().displaced_expired_lease == renewed.value(),
+        "failed requests must not advance time or alter the displaced receipt");
+    require(!registry.renew(scope(), "user-2", takeover.value().lease.lease_id, 10000, 10),
+        "failed expired renewal must not advance the observation watermark");
+    const auto current = registry.inspect(scope(), 301);
+    require(current && current.value().has_value() &&
+            current.value()->state == AssetLockState::active,
+        "failed future renewal must preserve an inspectable active lease");
+    require(static_cast<bool>(registry.acquire(scope("org-independent"), "user-3", 5, 10)),
+        "time observations must remain isolated to their lease scope");
+    require(static_cast<bool>(registry.release(
+        scope(), "user-2", takeover.value().lease.lease_id)),
+        "release remains an owner-and-lease-bound operation without a timestamp");
+    const auto fresh = registry.acquire(scope(), "user-2", 5, 10);
+    require(fresh && fresh.value().lease.lease_id > takeover.value().lease.lease_id,
+        "a released scope starts a new lease and a new observation watermark");
+}
+
 void concurrent_acquisition_has_one_winner() {
     AssetLockRegistry registry;
     std::atomic<unsigned> acquired{0U};
@@ -146,6 +198,7 @@ int main() {
     expiry_requires_exact_acknowledgement_and_keeps_displacement_receipt();
     renew_release_and_bounds_are_checked();
     invalid_scope_and_owner_are_rejected();
+    observations_cannot_rewind_a_retained_lease();
     concurrent_acquisition_has_one_winner();
     std::cout << "asset lock checks passed\n";
     return EXIT_SUCCESS;

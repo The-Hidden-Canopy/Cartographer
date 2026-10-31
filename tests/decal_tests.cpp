@@ -6,7 +6,9 @@
 #include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <locale>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -210,6 +212,54 @@ void placement_serialization_is_locale_independent() {
         "decoder reads canonical decimals independently of the process locale");
 }
 
+void placement_integer_fields_refuse_signed_or_malformed_tokens() {
+    const auto mesh = make_triangle();
+    auto placement = make_placement(mesh);
+    const auto encoded = carto::production::serialize_decal_placement(placement);
+    require(static_cast<bool>(encoded), "integer-boundary placement serializes");
+    const auto identity_begin = encoded.value().find('\n') + 1U;
+    const auto identity_end = encoded.value().find('\n', identity_begin);
+    std::istringstream identity_record(encoded.value().substr(
+        identity_begin, identity_end - identity_begin));
+    std::array<std::string, 6U> identity_tokens;
+    for (auto& token : identity_tokens) {
+        require(static_cast<bool>(identity_record >> token),
+            "canonical placement identity fields are present");
+    }
+    for (const std::size_t field : {0U, 1U, 2U, 3U, 5U}) {
+        for (const char* malformed : {"-18446744073709551615", "-2", "+1",
+                 "18446744073709551616", "1x"}) {
+            auto tokens = identity_tokens;
+            tokens[field] = malformed;
+            std::string identity_line;
+            for (const auto& token : tokens) {
+                if (!identity_line.empty()) identity_line += ' ';
+                identity_line += token;
+            }
+            std::string tampered = encoded.value();
+            tampered.replace(identity_begin, identity_end - identity_begin, identity_line);
+            require(!carto::production::deserialize_decal_placement(tampered),
+                "signed, overflowing, or mixed integer tokens cannot alias decal identities");
+        }
+    }
+
+    placement.id = std::numeric_limits<std::uint64_t>::max();
+    placement.target_mesh_asset = std::numeric_limits<std::uint64_t>::max();
+    placement.material_id = std::numeric_limits<std::uint64_t>::max();
+    placement.revision = Revision(std::numeric_limits<std::uint64_t>::max() - 1U);
+    placement.target_mesh_revision = placement.revision;
+    const auto boundary = carto::production::serialize_decal_placement(placement);
+    require(static_cast<bool>(boundary), "largest valid unsigned identity fields serialize");
+    const auto decoded = carto::production::deserialize_decal_placement(boundary.value());
+    require(decoded && decoded.value().id == placement.id &&
+            decoded.value().target_mesh_asset == placement.target_mesh_asset &&
+            decoded.value().material_id == placement.material_id &&
+            decoded.value().revision == placement.revision &&
+            decoded.value().target_mesh_revision == placement.target_mesh_revision &&
+            carto::production::serialize_decal_placement(decoded.value()).value() == boundary.value(),
+        "full unsigned identity range and nonexhausted revision range round-trip exactly");
+}
+
 void placement_project_transaction_persists_revision_and_journal() {
     TempDirectory directory;
     carto::project::ProjectDocument document;
@@ -291,6 +341,7 @@ int main() {
         stale_identity_and_projection_limits_fail_closed();
         placement_revision_and_serialization_are_fail_closed();
         placement_serialization_is_locale_independent();
+        placement_integer_fields_refuse_signed_or_malformed_tokens();
         placement_project_transaction_persists_revision_and_journal();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace carto::production::detail {
@@ -39,6 +40,16 @@ struct AmbientOcclusionProjectionWork {
 
 [[nodiscard]] AmbientOcclusionExecutionReport compile_ambient_occlusion_from_projection(
     AmbientOcclusionProjectionWork work,
+    std::span<const std::uint8_t> hit_flags);
+
+// Replays the canonical bent-normal raster/ray construction with externally
+// admitted hit flags. The supplied rays must match the canonical order and
+// exact origins/directions produced for these source bindings.
+[[nodiscard]] BentNormalExecutionReport compile_bent_normal_from_projection(
+    const AmbientOcclusionRecipe& recipe,
+    const geometry::EditableMesh& source,
+    const geometry::EditableMesh& target,
+    std::span<const AmbientOcclusionProjectionRay> rays,
     std::span<const std::uint8_t> hit_flags);
 
 } // namespace carto::production::detail

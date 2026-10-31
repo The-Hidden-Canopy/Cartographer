@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <iomanip>
 #include <limits>
@@ -116,8 +117,10 @@ core::Result<std::vector<ClipVertex>> clip_triangle(
 }
 
 bool read_unsigned(std::istream& input, std::uint64_t& value) {
-    input >> value;
-    return static_cast<bool>(input);
+    std::string token;
+    if (!(input >> token)) return false;
+    const auto parsed = std::from_chars(token.data(), token.data() + token.size(), value);
+    return parsed.ec == std::errc{} && parsed.ptr == token.data() + token.size();
 }
 
 bool read_revision(std::istream& input, core::Revision& revision) {

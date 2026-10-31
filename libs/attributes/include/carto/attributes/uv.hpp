@@ -13,6 +13,10 @@ namespace carto::attributes {
 
 using UvSetId = std::uint64_t;
 
+[[nodiscard]] inline std::string uv_seam_attribute_id(UvSetId id) {
+    return "cartographer.uv_seam." + std::to_string(id);
+}
+
 struct UvSetDescriptor {
     UvSetId id = 0U;
     std::string name;

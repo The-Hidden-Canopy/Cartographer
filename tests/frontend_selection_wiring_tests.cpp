@@ -1,0 +1,316 @@
+// Expose application state for read-only assertions in this test translation
+// unit; every exercised operation still uses the public UI entry point.
+#if defined(__clang__)
+#    pragma clang diagnostic push
+#    pragma clang diagnostic ignored "-Wkeyword-macro"
+#endif
+#define private public
+#include "application_access.hpp"
+#undef private
+#if defined(__clang__)
+#    pragma clang diagnostic pop
+#endif
+
+#include "project_document_access.hpp"
+#include <carto/ui/ui.hpp>
+#include <carto/journal/journal.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <iterator>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+#define REQUIRE(condition) \
+    do { if (!(condition)) throw std::runtime_error(#condition); } while (false)
+
+std::string read_bytes(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    REQUIRE(input.good());
+    return {std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+}
+
+carto::geometry::EditableMesh quad() {
+    carto::geometry::EditableMesh mesh;
+    const auto a = mesh.add_vertex({0.0, 0.0, 0.0});
+    const auto b = mesh.add_vertex({1.0, 0.0, 0.0});
+    const auto c = mesh.add_vertex({1.0, 1.0, 0.0});
+    const auto d = mesh.add_vertex({0.0, 1.0, 0.0});
+    REQUIRE(a && b && c && d);
+    REQUIRE(mesh.add_face({a.value(), b.value(), c.value(), d.value()}));
+    return mesh;
+}
+
+struct Truth {
+    carto::application::ApplicationSnapshot snapshot;
+    std::string document;
+    std::string journal;
+    std::size_t events = 0U;
+    std::size_t operations = 0U;
+};
+
+class Fixture {
+public:
+    Fixture() : ui(session) {
+        const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+        directory = std::filesystem::current_path() /
+            ("cartographer-frontend-selection-" + std::to_string(stamp));
+        std::filesystem::create_directories(directory);
+        path = directory / "selection.carto";
+        REQUIRE(ui.dispatch(carto::application::NewProjectAction{"Selection wiring", false}));
+        REQUIRE(ui.dispatch(carto::application::CreateMeshObjectAction{
+            "Quad", quad(), std::nullopt, std::nullopt}));
+        REQUIRE(ui.dispatch(carto::application::SaveProjectAction{path}));
+        source = session.snapshot().objects.front().object.id;
+    }
+    ~Fixture() {
+        std::error_code ignored;
+        std::filesystem::remove_all(directory, ignored);
+    }
+    Truth truth() const {
+        carto::journal::Journal journal(std::filesystem::path(path.string() + ".journal"));
+        const auto events = journal.read_all();
+        REQUIRE(events);
+        return {session.snapshot(), session.document_.serialize(), read_bytes(journal.path()),
+            events.value().size(), ui.snapshot().operations.size()};
+    }
+    void unchanged(const Truth& before, bool selection_unchanged = false) const {
+        const auto after = truth();
+        REQUIRE(after.document == before.document && after.journal == before.journal);
+        REQUIRE(after.events == before.events && after.operations == before.operations);
+        REQUIRE(after.snapshot.project_revision == before.snapshot.project_revision);
+        REQUIRE(after.snapshot.undo_count == before.snapshot.undo_count);
+        REQUIRE(after.snapshot.redo_count == before.snapshot.redo_count);
+        REQUIRE(after.snapshot.dirty == before.snapshot.dirty);
+        if (selection_unchanged) {
+            REQUIRE(after.snapshot.selection.mode == before.snapshot.selection.mode);
+            REQUIRE(after.snapshot.selection.objects == before.snapshot.selection.objects);
+            REQUIRE(after.snapshot.selection.component_groups ==
+                before.snapshot.selection.component_groups);
+        }
+    }
+    carto::core::Result<carto::application::DispatchReceipt> run(
+        std::string_view command, carto::geometry::VertexId goal = {}) {
+        const auto current = session.snapshot();
+        return ui.run_selection_command(command, current.project_generation,
+            current.project_revision, goal, goal ? std::optional{source} : std::nullopt);
+    }
+    void select_vertex(std::uint64_t id) {
+        REQUIRE(ui.dispatch(carto::application::SelectVertexAction{
+            source, carto::geometry::VertexId{id}, carto::editor::SelectionOperation::replace}));
+    }
+    bool offered(std::string_view id) const {
+        const auto commands = ui.snapshot().commands;
+        const auto command = std::find_if(commands.begin(), commands.end(),
+            [id](const auto& candidate) { return candidate.id == id; });
+        REQUIRE(command != commands.end());
+        return command->supported;
+    }
+
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui;
+    std::filesystem::path directory;
+    std::filesystem::path path;
+    carto::scene::ObjectId source;
+};
+
+void shared_selection_commands_convert_and_expand_without_authoring() {
+    using namespace carto;
+    Fixture fixture;
+    REQUIRE(!fixture.offered(ui::selection_commands::to_vertex));
+    REQUIRE(fixture.ui.dispatch(application::SelectFaceAction{
+        fixture.source, geometry::FaceId{1U}, editor::SelectionOperation::replace}));
+    REQUIRE(fixture.offered(ui::selection_commands::to_edge));
+    REQUIRE(!fixture.offered(ui::selection_commands::loop));
+    auto before = fixture.truth();
+    const auto converted = fixture.run(ui::selection_commands::to_edge);
+    REQUIRE(converted && !converted.value().document_changed);
+    REQUIRE(fixture.session.snapshot().selection.edges.size() == 4U);
+    REQUIRE(fixture.offered(ui::selection_commands::loop));
+    fixture.unchanged(before);
+    REQUIRE(fixture.run(ui::selection_commands::to_vertex));
+    REQUIRE(fixture.session.snapshot().selection.vertices.size() == 4U);
+    REQUIRE(!fixture.offered(ui::selection_commands::boundary));
+    fixture.unchanged(before);
+
+    fixture.select_vertex(1U);
+    before = fixture.truth();
+    REQUIRE(fixture.run(ui::selection_commands::grow));
+    REQUIRE((fixture.session.snapshot().selection.vertices ==
+        std::vector<geometry::VertexId>{{1U}, {2U}, {4U}}));
+    fixture.unchanged(before);
+    REQUIRE(fixture.run(ui::selection_commands::linked));
+    REQUIRE(fixture.session.snapshot().selection.vertices.size() == 4U);
+    fixture.unchanged(before);
+
+    // Numeric mode shortcuts continue to clear selection instead of converting.
+    REQUIRE(fixture.ui.handle_shortcut(ui::Shortcut::face_mode));
+    REQUIRE(fixture.session.snapshot().selection.faces.empty());
+    REQUIRE(fixture.session.snapshot().selection.vertices.empty());
+    fixture.unchanged(before);
+}
+
+void shared_shortest_path_keeps_backend_ties_and_refuses_bad_context() {
+    using namespace carto;
+    Fixture fixture;
+    auto before = fixture.truth();
+    REQUIRE(!fixture.run(ui::selection_commands::grow));
+    fixture.unchanged(before, true);
+    REQUIRE(!fixture.run(ui::selection_commands::shortest_path, geometry::VertexId{3U}));
+    fixture.unchanged(before, true);
+    REQUIRE(fixture.ui.dispatch(application::SelectFaceAction{
+        fixture.source, geometry::FaceId{1U}, editor::SelectionOperation::replace}));
+    before = fixture.truth();
+    REQUIRE(!fixture.run(ui::selection_commands::shortest_path, geometry::VertexId{3U}));
+    fixture.unchanged(before, true);
+    fixture.select_vertex(1U);
+    before = fixture.truth();
+    REQUIRE(!fixture.run(ui::selection_commands::shortest_path, geometry::VertexId{999U}));
+    fixture.unchanged(before, true);
+    REQUIRE(!fixture.run(ui::selection_commands::shortest_path));
+    fixture.unchanged(before, true);
+    REQUIRE(!fixture.run("selection.unknown"));
+    fixture.unchanged(before, true);
+    REQUIRE(fixture.offered(ui::selection_commands::shortest_path));
+    REQUIRE(fixture.run(ui::selection_commands::shortest_path, geometry::VertexId{3U}));
+    const auto path = fixture.session.snapshot().selection.component_groups.front();
+    // Opposite corners have two equal-hop routes; the backend's stable-ID tie
+    // chooses vertex 2, and the UI must preserve that exact ordered result.
+    REQUIRE((path.vertex_selection_order ==
+        std::vector<geometry::VertexId>{{1U}, {2U}, {3U}}));
+    fixture.unchanged(before);
+
+    const auto captured = fixture.session.snapshot();
+    REQUIRE(fixture.ui.dispatch(application::CreateBoxAction{"Later edit", {1.0, 1.0, 1.0}}));
+    before = fixture.truth();
+    const auto stale_revision = fixture.ui.run_selection_command(ui::selection_commands::grow,
+        captured.project_generation, captured.project_revision);
+    REQUIRE(!stale_revision && stale_revision.error().code == core::ErrorCode::stale_data);
+    fixture.unchanged(before, true);
+    const auto stale_generation = fixture.ui.run_selection_command(ui::selection_commands::grow,
+        before.snapshot.project_generation + 1U, before.snapshot.project_revision);
+    REQUIRE(!stale_generation && stale_generation.error().code == core::ErrorCode::stale_data);
+    fixture.unchanged(before, true);
+}
+
+void shared_batch_duplicate_is_bounded_journaled_and_undoable() {
+    using namespace carto;
+    Fixture fixture;
+    REQUIRE(fixture.ui.dispatch(application::SelectObjectAction{fixture.source,
+        editor::SelectionOperation::replace}));
+    REQUIRE(fixture.offered("edit.duplicate-batch"));
+    const auto before = fixture.truth();
+    const auto duplicate = [&](std::uint32_t copies, core::Vec3d step) {
+        return fixture.ui.duplicate_mesh_instances(fixture.source, copies, step,
+            before.snapshot.project_generation, before.snapshot.project_revision);
+    };
+    REQUIRE(!duplicate(0U, {1.0, 0.0, 0.0}));
+    fixture.unchanged(before, true);
+    REQUIRE(!duplicate(static_cast<std::uint32_t>(editor::kMaxMeshInstanceBatchInstances + 1U),
+        {1.0, 0.0, 0.0}));
+    fixture.unchanged(before, true);
+    REQUIRE(!duplicate(2U, {std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0}));
+    fixture.unchanged(before, true);
+    REQUIRE(!duplicate(2U, {editor::kMaxMeshInstanceBatchOffsetMagnitude, 0.0, 0.0}));
+    fixture.unchanged(before, true);
+    const auto stale = fixture.ui.duplicate_mesh_instances(fixture.source, 2U, {1.0, 0.0, 0.0},
+        before.snapshot.project_generation + 1U, before.snapshot.project_revision);
+    REQUIRE(!stale && stale.error().code == core::ErrorCode::stale_data);
+    fixture.unchanged(before, true);
+
+    const auto created = duplicate(3U, {1.0, 0.5, -1.0});
+    REQUIRE(created && created.value().document_changed);
+    const auto after = fixture.truth();
+    REQUIRE(after.snapshot.objects.size() == 4U);
+    REQUIRE(after.snapshot.undo_count == before.snapshot.undo_count + 1U);
+    REQUIRE(after.operations == before.operations + 1U && after.events == before.events + 1U);
+    for (std::size_t index = 1U; index < after.snapshot.objects.size(); ++index) {
+        const auto& object = after.snapshot.objects[index].object;
+        REQUIRE(object.mesh_asset == after.snapshot.objects.front().object.mesh_asset);
+        REQUIRE(object.local_transform.translation.x == static_cast<double>(index));
+        REQUIRE(object.local_transform.translation.y == static_cast<double>(index) * 0.5);
+        REQUIRE(object.local_transform.translation.z == -static_cast<double>(index));
+    }
+    REQUIRE(fixture.ui.dispatch(application::UndoAction{}));
+    REQUIRE(fixture.session.snapshot().objects.size() == 1U);
+    REQUIRE(fixture.ui.dispatch(application::RedoAction{}));
+    REQUIRE(fixture.session.snapshot().objects.size() == 4U);
+    REQUIRE(fixture.ui.dispatch(application::SaveProjectAction{fixture.path}));
+    const auto reopened = project::ProjectDocument::load(fixture.path);
+    REQUIRE(reopened && reopened.value().scene().size() == 4U);
+    fixture.select_vertex(1U);
+    const auto wrong_mode = fixture.truth();
+    REQUIRE(!fixture.ui.duplicate_mesh_instances(fixture.source, 2U, {1.0, 0.0, 0.0},
+        wrong_mode.snapshot.project_generation, wrong_mode.snapshot.project_revision));
+    fixture.unchanged(wrong_mode, true);
+}
+
+void batch_availability_matches_refusal_for_ineligible_authored_sources() {
+    using namespace carto;
+    enum class SourceKind { locked, hidden, parented, nonmesh };
+    for (const auto kind : {SourceKind::locked, SourceKind::hidden,
+             SourceKind::parented, SourceKind::nonmesh}) {
+        Fixture fixture;
+        auto authored = project::ProjectDocument::create("Batch eligibility fixture");
+        REQUIRE(authored);
+        auto author = project::testing::access(authored.value());
+        scene::SceneObject source;
+        source.id = scene::ObjectId{2U};
+        source.name = "Ineligible source";
+        source.locked = kind == SourceKind::locked;
+        source.visible = kind != SourceKind::hidden;
+        if (kind != SourceKind::nonmesh) {
+            const auto mesh = author.add_mesh(quad());
+            REQUIRE(mesh);
+            source.mesh_asset = mesh.value();
+        }
+        if (kind == SourceKind::parented) {
+            scene::SceneObject parent;
+            parent.id = scene::ObjectId{1U};
+            parent.name = "Parent";
+            REQUIRE(author.insert_object(parent));
+            source.parent = parent.id;
+        }
+        REQUIRE(author.insert_object(source));
+        REQUIRE(authored.value().validate());
+        fixture.path = fixture.directory / "ineligible.carto";
+        REQUIRE(authored.value().save_atomic(fixture.path));
+        // Admit the authored fixture through the normal application open path;
+        // do not patch the live session to manufacture its eligibility state.
+        REQUIRE(fixture.ui.dispatch(application::OpenProjectAction{fixture.path, true}));
+        fixture.source = source.id;
+        REQUIRE(fixture.ui.dispatch(application::SelectObjectAction{
+            fixture.source, editor::SelectionOperation::replace}));
+        const auto before = fixture.truth();
+        REQUIRE(before.snapshot.selection.objects.size() == 1U);
+        REQUIRE(!fixture.offered("edit.duplicate-batch"));
+        const auto rejected = fixture.ui.duplicate_mesh_instances(
+            fixture.source, 2U, {1.0, 0.0, 0.0},
+            before.snapshot.project_generation, before.snapshot.project_revision);
+        REQUIRE(!rejected && rejected.error().code == core::ErrorCode::invalid_state);
+        fixture.unchanged(before, true);
+    }
+}
+
+} // namespace
+
+int main() {
+    try {
+        shared_selection_commands_convert_and_expand_without_authoring();
+        shared_shortest_path_keeps_backend_ties_and_refuses_bad_context();
+        shared_batch_duplicate_is_bounded_journaled_and_undoable();
+        batch_availability_matches_refusal_for_ineligible_authored_sources();
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}

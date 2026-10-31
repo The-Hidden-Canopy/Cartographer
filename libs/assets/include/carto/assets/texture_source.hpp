@@ -53,6 +53,9 @@ struct TextureSourceAdmission {
     std::uint32_t mip_levels = 1U;
     bool compressed = false;
     bool high_dynamic_range = false;
+    // PNG color chunks, JPEG ICC/EXIF color tags, and TGA 2.0 gamma/correction
+    // fields are recorded so callers without color management can refuse pixels.
+    bool has_color_encoding_metadata = false;
 
     [[nodiscard]] core::Result<void> validate(
         const TextureSourceLimits& limits = {}) const;

@@ -126,7 +126,9 @@ void biological_sources_are_journaled_and_round_trip() {
         "both source identities and their revisions are retained in project state");
 
     const std::string encoded = document.serialize();
-    require(encoded.starts_with("CARTOGRAPHER_PROJECT 33\n") &&
+    const std::string current_header = "CARTOGRAPHER_PROJECT " +
+        std::to_string(project::ProjectDocument::kSchemaVersion) + "\n";
+    require(encoded.starts_with(current_header) &&
             encoded.find("BIOLOGICAL_AUTHORING_SOURCES 2\n") != std::string::npos,
         "schema 33 preserves the biological source table");
     const auto reopened = project::ProjectDocument::deserialize(encoded);
@@ -159,11 +161,13 @@ void biological_sources_are_journaled_and_round_trip() {
         "schema 25 fixture removes the v29 persistent patch table");
     schema_26.erase(schema_26_mesh_patches, std::string("MESH_PATCHES 0\n").size());
     const auto proxy_receipts = schema_26.find("BIOLOGICAL_PROXY_INSTANCE_RECEIPTS ");
-    const auto proxy_receipts_end = schema_26.find("END\n", proxy_receipts);
+    const auto proxy_receipts_end = schema_26.rfind("\nEND\n");
     require(proxy_receipts != std::string::npos && proxy_receipts_end != std::string::npos,
         "schema 28 includes the mandatory proxy receipt table");
-    schema_26.erase(proxy_receipts, proxy_receipts_end - proxy_receipts);
-    schema_26.replace(0U, std::string("CARTOGRAPHER_PROJECT 32\n").size(),
+    require(proxy_receipts_end >= proxy_receipts,
+        "schema 25 fixture frames the final project END");
+    schema_26.erase(proxy_receipts, proxy_receipts_end + 1U - proxy_receipts);
+    schema_26.replace(0U, current_header.size(),
         "CARTOGRAPHER_PROJECT 25\n");
     const auto migrated_schema_26 = project::ProjectDocument::deserialize(schema_26);
     require(migrated_schema_26 &&
@@ -217,7 +221,7 @@ void biological_sources_are_journaled_and_round_trip() {
     require(legacy_mesh_patches != std::string::npos,
         "schema 24 fixture removes the v29 persistent patch table");
     legacy.erase(legacy_mesh_patches, std::string("MESH_PATCHES 0\n").size());
-    legacy.replace(0U, std::string("CARTOGRAPHER_PROJECT 32\n").size(),
+    legacy.replace(0U, current_header.size(),
         "CARTOGRAPHER_PROJECT 24\n");
     const auto legacy_open = project::ProjectDocument::deserialize(legacy);
     if (!legacy_open) {

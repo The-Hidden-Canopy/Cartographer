@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "base_revision": "0f26d9f00f71d35cb2f95d7f3f9112b8e2fe3bf3",
+  "origin_repository": "The Hidden Canopy LLC / Cartographer",
+  "records": [
+    {
+      "path": "libs/io/include/carto/io/gltf_material_import.hpp",
+      "origin_revision": "e05fb221050c11338639b2fbac8a852983dec8a3",
+      "origin_git_blob": "2730cb8c0438035568da5caeace877ef2abadb95",
+      "origin_sha256": "6e5c675a0d4443880c920c8dd5f568c1b9427861832f45ee98eab7848f6164e6",
+      "adapted_working_sha256": "6e5c675a0d4443880c920c8dd5f568c1b9427861832f45ee98eab7848f6164e6",
+      "adapted_git_blob": "2730cb8c0438035568da5caeace877ef2abadb95"
+    },
+    {
+      "path": "libs/io/include/carto/io/gltf_scene_import.hpp",
+      "origin_revision": "e05fb221050c11338639b2fbac8a852983dec8a3",
+      "origin_git_blob": "c0b131e879002fdd10e53768d92f9e164b8e7643",
+      "origin_sha256": "757b4e4d11615006a955d584fa0fc2f0cfc23ea9fc5ad4276245195459680685",
+      "adapted_working_sha256": "757b4e4d11615006a955d584fa0fc2f0cfc23ea9fc5ad4276245195459680685",
+      "adapted_git_blob": "c0b131e879002fdd10e53768d92f9e164b8e7643"
+    },
+    {
+      "path": "libs/io/src/gltf_material_import.cpp",
+      "origin_revision": "e05fb221050c11338639b2fbac8a852983dec8a3",
+      "origin_git_blob": "98c80152ff5b8b599943cda82496910e2c7d4e48",
+      "origin_sha256": "e777248404e93f8bbf49eeab64a2a1ae32f5896be52d7db852d2dac2bd0c8391",
+      "adapted_working_sha256": "9347988a383e28088e13362bba53f9e702aa500808b7e1cc13d7772a4b172ba4",
+      "adapted_git_blob": "e809d5f64e1fe62aa6a32740bf48849616b1075e"
+    }
+  ],
+  "adaptation": "Retain parser and limits; use current digest-bound texture_image_decoder rather than prior renderer-specific authoring cache. Add direct array include. No live authoring adapter.",
+  "validation": "No compiler/test/native execution for this slice; coordinator lease required.",
+  "hash_note": "Working hashes record original imported/adapted bytes; indexed Git blobs bind filtered content. Frozen acceptance must hash its actual checkout and compiled products independently."
+}

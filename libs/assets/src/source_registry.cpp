@@ -1,6 +1,7 @@
 #include <carto/assets/source_registry.hpp>
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <iomanip>
@@ -32,6 +33,13 @@ bool valid_token(std::string_view value, std::size_t maximum) noexcept {
             (character >= 'A' && character <= 'Z');
         const bool digit = character >= '0' && character <= '9';
         return letter || digit || character == '.' || character == '_' || character == '-';
+    });
+}
+
+bool valid_authored_tag(std::string_view value) noexcept {
+    if (!valid_token(value, SourceImportRecord::kMaxAuthoredTagBytes)) return false;
+    return std::none_of(value.begin(), value.end(), [](char character) {
+        return character >= 'A' && character <= 'Z';
     });
 }
 
@@ -142,7 +150,8 @@ SourceReimportChange classify(
     if (previous == nullptr) return SourceReimportChange::added;
     if (incoming == nullptr) return SourceReimportChange::removed;
     if (previous->artifact_identity != incoming->artifact_identity ||
-        previous->kind != incoming->kind) {
+        previous->kind != incoming->kind ||
+        previous->document_products != incoming->document_products) {
         return SourceReimportChange::identity_conflict;
     }
     std::size_t changed_count = 0U;
@@ -163,6 +172,19 @@ SourceReimportChange classify(
 }
 
 } // namespace
+
+Sha256Digest source_document_product_digest(
+    const Sha256Digest& source_digest, std::span<const SourceDocumentProduct> products) {
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << "CARTOGRAPHER_SOURCE_DOCUMENT_PRODUCTS 1\n" << source_digest.hex() << '\n'
+           << products.size() << '\n';
+    for (const auto& product : products) {
+        output << static_cast<unsigned int>(product.kind) << ' ' << product.source_index
+               << ' ' << product.product_id << '\n';
+    }
+    return digest_text(output.str());
+}
 
 core::Result<void> BotanicalGenerationReceipt::validate() const {
     if (source_snapshot.empty() ||
@@ -283,6 +305,60 @@ core::Result<void> SourceImportRecord::validate() const {
         }
         previous_domain = item.domain;
     }
+    if (authored_tags.size() > kMaxAuthoredTags || dependencies.size() > kMaxDependencies) {
+        return core::Result<void>::failure(validation(
+            "source authored tags or dependencies exceed their bounds"));
+    }
+    std::string previous_tag;
+    for (const auto& tag : authored_tags) {
+        if (!valid_authored_tag(tag) || (!previous_tag.empty() && tag <= previous_tag)) {
+            return core::Result<void>::failure(validation(
+                "source authored tags must be canonical, sorted, and unique"));
+        }
+        previous_tag = tag;
+    }
+    std::string previous_dependency;
+    for (const auto& dependency : dependencies) {
+        if (!valid_token(dependency, kMaxIdentityBytes) || dependency == identity ||
+            (!previous_dependency.empty() && dependency <= previous_dependency)) {
+            return core::Result<void>::failure(validation(
+                "source dependencies must be distinct sorted identities other than themselves"));
+        }
+        previous_dependency = dependency;
+    }
+    if (importer_identity == "carto.import.gltf-scene" && document_products.empty()) {
+        return core::Result<void>::failure(validation(
+            "glTF scene source requires its product mapping"));
+    }
+    if (!document_products.empty()) {
+        if (kind != SourceAssetKind::other || importer_identity != "carto.import.gltf-scene" ||
+            importer_version != 1U || botanical_generation.has_value() ||
+            document_products.size() > kMaxDocumentProducts) {
+            return core::Result<void>::failure(validation(
+                "document product bindings require the bounded glTF scene importer"));
+        }
+        std::set<std::pair<std::uint8_t, std::uint64_t>> destinations;
+        std::optional<std::pair<std::uint8_t, std::uint64_t>> previous;
+        std::array<std::uint64_t, 5U> next_index{1U, 1U, 1U, 1U, 1U};
+        for (const auto& product : document_products) {
+            const auto kind_value = static_cast<std::uint8_t>(product.kind);
+            const auto key = std::make_pair(kind_value, product.source_index);
+            if (kind_value > static_cast<std::uint8_t>(SourceDocumentProductKind::sampler) ||
+                product.source_index == 0U || product.product_id == 0U ||
+                (previous && *previous >= key) ||
+                product.source_index != next_index[kind_value]++ ||
+                !destinations.emplace(kind_value, product.product_id).second) {
+                return core::Result<void>::failure(validation(
+                    "document product bindings must be sorted and one-to-one"));
+            }
+            previous = key;
+        }
+        if (next_index[0] == 1U || next_index[1] == 1U || next_index[2] == 1U ||
+            artifact_digest != source_document_product_digest(source_digest, document_products)) {
+            return core::Result<void>::failure(validation(
+                "document product mapping is incomplete or does not match its digest"));
+        }
+    }
     if (botanical_generation.has_value()) {
         if (kind != SourceAssetKind::mesh ||
             (importer_identity != "carto.import.generated-gltf" &&
@@ -301,13 +377,20 @@ core::Result<void> SourceImportRecord::validate() const {
                 "botanical generated mesh receipt lacks its exact geometry digest"));
         }
     }
+    if (serialize().size() > kMaxSerializedBytes) {
+        return core::Result<void>::failure(validation(
+            "source import record exceeds its serialized byte limit"));
+    }
     return core::Result<void>::success();
 }
 
 std::string SourceImportRecord::serialize() const {
     std::ostringstream output;
     output.imbue(std::locale::classic());
-    output << "SOURCE_IMPORT_RECORD " << (botanical_generation.has_value() ? 2 : 1) << '\n';
+    const bool has_authored_metadata = !authored_tags.empty() || !dependencies.empty();
+    const std::uint32_t record_version = !document_products.empty() ? 4U : has_authored_metadata ? 3U
+        : botanical_generation.has_value() ? 2U : 1U;
+    output << "SOURCE_IMPORT_RECORD " << record_version << '\n';
     output << "IDENTITY " << std::quoted(identity) << ' '
         << std::quoted(relative_source_path) << ' ' << source_generation.value() << ' '
         << static_cast<unsigned int>(kind) << '\n';
@@ -321,6 +404,21 @@ std::string SourceImportRecord::serialize() const {
         output << "DOMAIN " << static_cast<unsigned int>(item.domain) << ' '
             << item.digest.hex() << '\n';
     }
+    if (record_version >= 3U) {
+        output << "AUTHORED_TAGS " << authored_tags.size() << '\n';
+        for (const auto& tag : authored_tags) output << "TAG " << std::quoted(tag) << '\n';
+        output << "DEPENDENCIES " << dependencies.size() << '\n';
+        for (const auto& dependency : dependencies) {
+            output << "DEPENDENCY " << std::quoted(dependency) << '\n';
+        }
+    }
+    if (record_version >= 4U) {
+        output << "DOCUMENT_PRODUCTS " << document_products.size() << '\n';
+        for (const auto& product : document_products) {
+            output << "PRODUCT " << static_cast<unsigned int>(product.kind) << ' '
+                   << product.source_index << ' ' << product.product_id << '\n';
+        }
+    }
     if (botanical_generation.has_value()) {
         output << "BOTANICAL_GENERATION "
                << std::quoted(botanical_generation->serialize()) << '\n';
@@ -330,7 +428,7 @@ std::string SourceImportRecord::serialize() const {
 }
 
 core::Result<SourceImportRecord> SourceImportRecord::deserialize(std::string_view text) {
-    if (text.empty() || text.size() > 256U * 1024U) {
+    if (text.empty() || text.size() > kMaxSerializedBytes) {
         return core::Result<SourceImportRecord>::failure(invalid(
             "source import record is empty or exceeds its byte limit"));
     }
@@ -339,7 +437,7 @@ core::Result<SourceImportRecord> SourceImportRecord::deserialize(std::string_vie
     std::string token;
     std::uint64_t number = 0U;
     if (!(input >> token) || token != "SOURCE_IMPORT_RECORD" ||
-        !read_unsigned(input, number) || (number != 1U && number != 2U)) {
+        !read_unsigned(input, number) || (number != 1U && number != 2U && number != 3U && number != 4U)) {
         return core::Result<SourceImportRecord>::failure(validation(
             "source import record header or schema is unsupported"));
     }
@@ -412,20 +510,91 @@ core::Result<SourceImportRecord> SourceImportRecord::deserialize(std::string_vie
         item.domain = static_cast<SourceAssetDomain>(domain);
         result.domain_digests.push_back(item);
     }
+    if (record_version >= 3U) {
+        if (!(input >> token) || token != "AUTHORED_TAGS" ||
+            !read_unsigned(input, number) || number > kMaxAuthoredTags) {
+            return core::Result<SourceImportRecord>::failure(validation(
+                "source authored tag table is malformed"));
+        }
+        result.authored_tags.reserve(static_cast<std::size_t>(number));
+        for (std::uint64_t index = 0U; index < number; ++index) {
+            std::string tag;
+            if (!(input >> token) || token != "TAG" || !(input >> std::quoted(tag))) {
+                return core::Result<SourceImportRecord>::failure(validation(
+                    "source authored tag record is malformed"));
+            }
+            result.authored_tags.push_back(std::move(tag));
+        }
+        if (!(input >> token) || token != "DEPENDENCIES" ||
+            !read_unsigned(input, number) || number > kMaxDependencies) {
+            return core::Result<SourceImportRecord>::failure(validation(
+                "source dependency table is malformed"));
+        }
+        result.dependencies.reserve(static_cast<std::size_t>(number));
+        for (std::uint64_t index = 0U; index < number; ++index) {
+            std::string dependency;
+            if (!(input >> token) || token != "DEPENDENCY" ||
+                !(input >> std::quoted(dependency))) {
+                return core::Result<SourceImportRecord>::failure(validation(
+                    "source dependency record is malformed"));
+            }
+            result.dependencies.push_back(std::move(dependency));
+        }
+        if (record_version == 3U && result.authored_tags.empty() && result.dependencies.empty()) {
+            return core::Result<SourceImportRecord>::failure(validation(
+                "source record version 3 requires authored metadata"));
+        }
+    }
+    if (record_version >= 4U) {
+        if (!(input >> token) || token != "DOCUMENT_PRODUCTS" ||
+            !read_unsigned(input, number) || number == 0U || number > kMaxDocumentProducts) {
+            return core::Result<SourceImportRecord>::failure(validation(
+                "source document product table is malformed"));
+        }
+        result.document_products.reserve(static_cast<std::size_t>(number));
+        for (std::uint64_t index = 0U; index < number; ++index) {
+            std::uint64_t kind_value = 0U, source_index = 0U, product_id = 0U;
+            if (!(input >> token) || token != "PRODUCT" || !read_unsigned(input, kind_value) ||
+                kind_value > static_cast<std::uint64_t>(SourceDocumentProductKind::sampler) ||
+                !read_unsigned(input, source_index) || !read_unsigned(input, product_id)) {
+                return core::Result<SourceImportRecord>::failure(validation(
+                    "source document product record is malformed"));
+            }
+            result.document_products.push_back({static_cast<SourceDocumentProductKind>(kind_value),
+                                                source_index, product_id});
+        }
+    }
     if (record_version >= 2U) {
-        std::string encoded_receipt;
-        if (!(input >> token) || token != "BOTANICAL_GENERATION" ||
-            !(input >> std::quoted(encoded_receipt))) {
+        if (!(input >> token)) {
+            return core::Result<SourceImportRecord>::failure(validation(
+                "source import record is missing its end marker"));
+        }
+        const bool has_botanical_receipt = token == "BOTANICAL_GENERATION";
+        if (record_version == 2U && !has_botanical_receipt) {
             return core::Result<SourceImportRecord>::failure(validation(
                 "source import botanical generation receipt is malformed"));
         }
-        auto receipt = BotanicalGenerationReceipt::deserialize(encoded_receipt);
-        if (!receipt) {
-            return core::Result<SourceImportRecord>::failure(receipt.error());
+        if (has_botanical_receipt) {
+            std::string encoded_receipt;
+            if (!(input >> std::quoted(encoded_receipt))) {
+                return core::Result<SourceImportRecord>::failure(validation(
+                    "source import botanical generation receipt is malformed"));
+            }
+            auto receipt = BotanicalGenerationReceipt::deserialize(encoded_receipt);
+            if (!receipt) {
+                return core::Result<SourceImportRecord>::failure(receipt.error());
+            }
+            result.botanical_generation = std::move(receipt.value());
+            if (!(input >> token)) {
+                return core::Result<SourceImportRecord>::failure(validation(
+                    "source import record is missing its end marker"));
+            }
         }
-        result.botanical_generation = std::move(receipt.value());
+    } else if (!(input >> token)) {
+        return core::Result<SourceImportRecord>::failure(validation(
+            "source import record is missing its end marker"));
     }
-    if (!(input >> token) || token != "END") {
+    if (token != "END") {
         return core::Result<SourceImportRecord>::failure(validation(
             "source import record is missing END"));
     }
@@ -440,6 +609,34 @@ core::Result<SourceImportRecord> SourceImportRecord::deserialize(std::string_vie
     return core::Result<SourceImportRecord>::success(std::move(result));
 }
 
+namespace {
+
+core::Result<void> validate_registry_storage_bounds(const ProjectAssetRegistry& registry) {
+    if (registry.records().size() > ProjectAssetRegistry::kMaxRecords ||
+        registry.lineage().size() > ProjectAssetRegistry::kMaxRecords * 2U) {
+        return core::Result<void>::failure(validation(
+            "project asset registry exceeds its active or lineage record bound"));
+    }
+    std::size_t aggregate_bytes = 0U;
+    for (const auto& [identity, record] : registry.records()) {
+        static_cast<void>(identity);
+        const std::size_t size = record.serialize().size();
+        if (size > SourceImportRecord::kMaxSerializedBytes ||
+            size > ProjectAssetRegistry::kMaxAggregateRecordBytes - aggregate_bytes) {
+            return core::Result<void>::failure(validation(
+                "project asset registry record bytes exceed their serialized bounds"));
+        }
+        aggregate_bytes += size;
+    }
+    if (registry.serialize().size() > ProjectAssetRegistry::kMaxSerializedBytes) {
+        return core::Result<void>::failure(validation(
+            "project asset registry exceeds its serialized byte limit"));
+    }
+    return core::Result<void>::success();
+}
+
+} // namespace
+
 core::Result<void> ProjectAssetRegistry::set_record(SourceImportRecord record) {
     if (auto result = record.validate(); !result) return result;
     const std::string identity = record.identity;
@@ -450,7 +647,8 @@ core::Result<void> ProjectAssetRegistry::set_record(SourceImportRecord record) {
     }
     if (current != records_.end() &&
         (current->second.kind != record.kind ||
-         current->second.artifact_identity != record.artifact_identity)) {
+         current->second.artifact_identity != record.artifact_identity ||
+         current->second.document_products != record.document_products)) {
         return core::Result<void>::failure(core::Diagnostic(
             core::ErrorCode::validation_failed,
             "source reimport cannot silently change kind or imported artifact identity"));
@@ -469,6 +667,10 @@ core::Result<void> ProjectAssetRegistry::set_record(SourceImportRecord record) {
             core::ErrorCode::stale_data,
             "source asset update must advance its retained generation exactly once"));
     }
+    std::set<std::pair<SourceDocumentProductKind, std::uint64_t>> products;
+    for (const auto& product : record.document_products) {
+        products.emplace(product.kind, product.product_id);
+    }
     for (const auto& [other_identity, other] : records_) {
         if (other_identity != identity &&
             (other.relative_source_path == record.relative_source_path ||
@@ -476,13 +678,25 @@ core::Result<void> ProjectAssetRegistry::set_record(SourceImportRecord record) {
             return core::Result<void>::failure(validation(
                 "source path or imported artifact identity is already assigned"));
         }
+        if (other_identity != identity) {
+            for (const auto& product : other.document_products) {
+                if (products.contains({product.kind, product.product_id})) {
+                    return core::Result<void>::failure(validation(
+                        "source document product is already bound to another source"));
+                }
+            }
+        }
     }
     if (records_.size() >= kMaxRecords && current == records_.end()) {
         return core::Result<void>::failure(validation(
             "project asset registry exceeds its record limit"));
     }
-    records_.insert_or_assign(identity, std::move(record));
-    lineage_.insert_or_assign(identity, expected);
+    ProjectAssetRegistry candidate = *this;
+    candidate.records_.insert_or_assign(identity, std::move(record));
+    candidate.lineage_.insert_or_assign(identity, expected);
+    if (auto result = validate_registry_storage_bounds(candidate); !result) return result;
+    records_.swap(candidate.records_);
+    lineage_.swap(candidate.lineage_);
     return core::Result<void>::success();
 }
 
@@ -504,12 +718,10 @@ core::Result<void> ProjectAssetRegistry::erase_record(
 }
 
 core::Result<void> ProjectAssetRegistry::validate() const {
-    if (records_.size() > kMaxRecords || lineage_.size() > kMaxRecords * 2U) {
-        return core::Result<void>::failure(validation(
-            "project asset registry exceeds its active or lineage record bound"));
-    }
+    if (auto result = validate_registry_storage_bounds(*this); !result) return result;
     std::set<std::string> paths;
     std::set<std::string> artifacts;
+    std::set<std::pair<SourceDocumentProductKind, std::uint64_t>> products;
     for (const auto& [identity, record] : records_) {
         if (identity != record.identity) {
             return core::Result<void>::failure(validation(
@@ -525,6 +737,18 @@ core::Result<void> ProjectAssetRegistry::validate() const {
             !artifacts.insert(record.artifact_identity).second) {
             return core::Result<void>::failure(validation(
                 "project asset registry contains duplicate paths or artifact identities"));
+        }
+        for (const auto& product : record.document_products) {
+            if (!products.emplace(product.kind, product.product_id).second) {
+                return core::Result<void>::failure(validation(
+                    "source document product is bound to more than one source"));
+            }
+        }
+        for (const auto& dependency : record.dependencies) {
+            if (!records_.contains(dependency)) {
+                return core::Result<void>::failure(validation(
+                    "source dependency points to an identity outside the active registry"));
+            }
         }
     }
     for (const auto& [identity, generation] : lineage_) {
@@ -584,7 +808,7 @@ core::Result<ProjectAssetRegistry> ProjectAssetRegistry::deserialize(std::string
         std::string encoded;
         if (!(input >> token) || token != "RECORD" ||
             !(input >> std::quoted(identity) >> std::quoted(encoded)) ||
-            encoded.size() > 256U * 1024U ||
+            encoded.size() > SourceImportRecord::kMaxSerializedBytes ||
             encoded.size() > kMaxAggregateRecordBytes - aggregate_bytes) {
             return core::Result<ProjectAssetRegistry>::failure(validation(
                 "source asset registry contains an invalid or oversized record"));
@@ -642,6 +866,7 @@ core::Result<void> SourceReimportPlan::validate() const {
             "source reimport plan digests or entry count are invalid"));
     }
     std::string previous_identity;
+    std::set<std::string> incoming_identities;
     for (const auto& entry : entries) {
         if (!valid_token(entry.identity, SourceImportRecord::kMaxIdentityBytes) ||
             (!previous_identity.empty() && entry.identity <= previous_identity) ||
@@ -655,7 +880,17 @@ core::Result<void> SourceReimportPlan::validate() const {
             return core::Result<void>::failure(validation(
                 "source reimport plan candidate does not match its entry identity"));
         }
+        if (entry.incoming.has_value()) incoming_identities.insert(entry.identity);
         previous_identity = entry.identity;
+    }
+    for (const auto& entry : entries) {
+        if (!entry.incoming.has_value()) continue;
+        for (const auto& dependency : entry.incoming->dependencies) {
+            if (!incoming_identities.contains(dependency)) {
+                return core::Result<void>::failure(validation(
+                    "source reimport dependency is absent from the reviewed candidate registry"));
+            }
+        }
     }
     return core::Result<void>::success();
 }
@@ -694,6 +929,7 @@ core::Result<SourceReimportPlan> plan_source_reimport(
     std::set<std::string> candidate_ids;
     std::set<std::string> candidate_paths;
     std::set<std::string> candidate_artifacts;
+    std::set<std::pair<SourceDocumentProductKind, std::uint64_t>> candidate_products;
     std::ostringstream incoming_canonical;
     incoming_canonical.imbue(std::locale::classic());
     incoming_canonical << "SOURCE_ASSET_CANDIDATE_SET 1\n";
@@ -709,6 +945,12 @@ core::Result<SourceReimportPlan> plan_source_reimport(
             !candidate_artifacts.insert(record.artifact_identity).second) {
             return core::Result<SourceReimportPlan>::failure(validation(
                 "incoming source set contains conflicting paths or artifact identities"));
+        }
+        for (const auto& product : record.document_products) {
+            if (!candidate_products.emplace(product.kind, product.product_id).second) {
+                return core::Result<SourceReimportPlan>::failure(validation(
+                    "incoming source set contains conflicting document products"));
+            }
         }
         const auto active = current.records().find(record.identity);
         const auto lineage = current.lineage().find(record.identity);
@@ -731,6 +973,14 @@ core::Result<SourceReimportPlan> plan_source_reimport(
         }
         incoming_canonical << std::quoted(record.serialize()) << '\n';
     }
+    for (const auto& record : incoming) {
+        for (const auto& dependency : record.dependencies) {
+            if (!candidate_ids.contains(dependency)) {
+                return core::Result<SourceReimportPlan>::failure(validation(
+                    "incoming source dependency is absent from the candidate registry"));
+            }
+        }
+    }
     SourceReimportPlan plan;
     plan.base_registry_digest = base_digest.value();
     plan.incoming_set_digest = digest_text(incoming_canonical.str());
@@ -744,7 +994,20 @@ core::Result<SourceReimportPlan> plan_source_reimport(
     for (const auto& record : incoming) identities.insert(record.identity);
 
     std::set<std::string> conflicting_identities;
+    std::map<std::pair<SourceDocumentProductKind, std::uint64_t>, std::string> product_owners;
+    for (const auto& [identity, existing] : current.records()) {
+        for (const auto& product : existing.document_products) {
+            product_owners.emplace(std::make_pair(product.kind, product.product_id), identity);
+        }
+    }
     for (const auto& record : incoming) {
+        for (const auto& product : record.document_products) {
+            const auto owner = product_owners.find({product.kind, product.product_id});
+            if (owner != product_owners.end() && owner->second != record.identity) {
+                conflicting_identities.insert(owner->second);
+                conflicting_identities.insert(record.identity);
+            }
+        }
         for (const auto& [existing_identity, existing] : current.records()) {
             if (existing_identity != record.identity &&
                 (existing.relative_source_path == record.relative_source_path ||

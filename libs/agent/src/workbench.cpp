@@ -1,4 +1,5 @@
 #include <carto/agent/workbench.hpp>
+#include <carto/assets/blob_store.hpp>
 
 #include <algorithm>
 #include <array>
@@ -391,7 +392,9 @@ assets::Sha256Digest project_merge_resolution_digest(
     append_field(canonical, resolution.review_digest.hex());
     append_number(canonical, static_cast<std::uint64_t>(resolution.selected_source));
     append_number(canonical, resolution.source_revision.value());
+    append_field(canonical, resolution.base_digest.hex());
     append_field(canonical, resolution.source_digest.hex());
+    append_field(canonical, resolution.candidate_diff.digest.hex());
     return assets::sha256(std::span<const std::uint8_t>(
         reinterpret_cast<const std::uint8_t*>(canonical.data()), canonical.size()));
 }
@@ -453,6 +456,70 @@ std::optional<std::map<geometry::CornerId, core::Vec2d>> uv_values_by_corner(
 
 bool same_vec3d(const core::Vec3d& left, const core::Vec3d& right) noexcept {
     return left.x == right.x && left.y == right.y && left.z == right.z;
+}
+
+bool same_presentation_camera(
+    const project::AuthoredCamera& left,
+    const project::AuthoredCamera& right) noexcept {
+    return left.object == right.object && left.identity == right.identity &&
+        left.bookmark_identity == right.bookmark_identity &&
+        left.reference_image_identity == right.reference_image_identity &&
+        left.projection == right.projection && left.review_purpose == right.review_purpose &&
+        left.vertical_fov_radians == right.vertical_fov_radians &&
+        left.orthographic_height == right.orthographic_height &&
+        left.near_plane == right.near_plane && left.far_plane == right.far_plane &&
+        left.active_for_review == right.active_for_review && left.revision == right.revision;
+}
+
+bool same_presentation_light(
+    const project::AuthoredLight& left,
+    const project::AuthoredLight& right) noexcept {
+    return left.object == right.object && left.identity == right.identity &&
+        left.semantic_class == right.semantic_class &&
+        left.fixture_owner == right.fixture_owner && left.power_owner == right.power_owner &&
+        left.switch_owner == right.switch_owner && left.kind == right.kind &&
+        same_vec3d(left.linear_color, right.linear_color) &&
+        left.intensity == right.intensity && left.range == right.range &&
+        left.inner_cone_radians == right.inner_cone_radians &&
+        left.outer_cone_radians == right.outer_cone_radians &&
+        left.area_width == right.area_width && left.area_height == right.area_height &&
+        left.color_temperature_kelvin == right.color_temperature_kelvin &&
+        left.normal_state == right.normal_state && left.failure_state == right.failure_state &&
+        left.casts_shadows == right.casts_shadows &&
+        left.flicker_eligible == right.flicker_eligible && left.revision == right.revision;
+}
+
+bool same_reference_plane_calibration(
+    const std::optional<project::ReferenceImageCalibration>& left,
+    const std::optional<project::ReferenceImageCalibration>& right) noexcept {
+    if (left.has_value() != right.has_value()) return false;
+    if (!left.has_value()) return true;
+    return left->first_pixel.x == right->first_pixel.x &&
+        left->first_pixel.y == right->first_pixel.y &&
+        left->second_pixel.x == right->second_pixel.x &&
+        left->second_pixel.y == right->second_pixel.y &&
+        left->known_distance_meters == right->known_distance_meters;
+}
+
+bool same_reference_image_plane(
+    const project::ReferenceImagePlane& left,
+    const project::ReferenceImagePlane& right) noexcept {
+    return left.identity == right.identity &&
+        left.source_asset_identity == right.source_asset_identity &&
+        left.source_locator == right.source_locator &&
+        left.source_digest == right.source_digest &&
+        left.source_generation == right.source_generation &&
+        left.image_width_pixels == right.image_width_pixels &&
+        left.image_height_pixels == right.image_height_pixels && left.view == right.view &&
+        left.view_set_identity == right.view_set_identity &&
+        left.pinned_camera == right.pinned_camera &&
+        same_vec3d(left.origin, right.origin) && same_vec3d(left.normal, right.normal) &&
+        same_vec3d(left.up, right.up) &&
+        left.camera_local_placement == right.camera_local_placement &&
+        left.width_meters == right.width_meters && left.opacity == right.opacity &&
+        left.visible == right.visible && left.locked == right.locked &&
+        same_reference_plane_calibration(left.calibration, right.calibration) &&
+        left.revision == right.revision;
 }
 
 bool same_vec4d(const core::Vec4d& left, const core::Vec4d& right) noexcept {
@@ -647,16 +714,36 @@ void append_catalog_detail_changes(
         if (!change.added) {
             change.before_name = left->second.name;
             change.before_base_material = left->second.base_material;
+            change.before_overrides = left->second.overrides;
             change.before_revision = left->second.revision;
             change.before_override_count = variant_override_count(left->second.overrides);
             change.before_mesh_scope_count = left->second.permitted_mesh_assets.size();
+            const std::size_t sample_count = std::min(
+                left->second.permitted_mesh_assets.size(),
+                kMaxProjectDiffVariantMeshScopeSamples);
+            change.before_mesh_scope_sample.assign(
+                left->second.permitted_mesh_assets.begin(),
+                left->second.permitted_mesh_assets.begin() +
+                    static_cast<std::ptrdiff_t>(sample_count));
+            change.before_mesh_scope_truncated =
+                left->second.permitted_mesh_assets.size() > sample_count;
         }
         if (!change.removed) {
             change.after_name = right->second.name;
             change.after_base_material = right->second.base_material;
+            change.after_overrides = right->second.overrides;
             change.after_revision = right->second.revision;
             change.after_override_count = variant_override_count(right->second.overrides);
             change.after_mesh_scope_count = right->second.permitted_mesh_assets.size();
+            const std::size_t sample_count = std::min(
+                right->second.permitted_mesh_assets.size(),
+                kMaxProjectDiffVariantMeshScopeSamples);
+            change.after_mesh_scope_sample.assign(
+                right->second.permitted_mesh_assets.begin(),
+                right->second.permitted_mesh_assets.begin() +
+                    static_cast<std::ptrdiff_t>(sample_count));
+            change.after_mesh_scope_truncated =
+                right->second.permitted_mesh_assets.size() > sample_count;
         }
         if (!change.added && !change.removed) {
             change.name_changed = left->second.name != right->second.name;
@@ -712,12 +799,14 @@ void append_catalog_detail_changes(
         std::map<std::uint64_t, const project::MaterialGraphNode*> right_nodes;
         if (!change.added) {
             change.before_revision = left->second.revision;
+            change.before_outputs = left->second.outputs;
             if (auto digest = left->second.canonical_digest()) change.before_digest = digest.value();
             change.before_node_count = left->second.nodes.size();
             for (const auto& node : left->second.nodes) left_nodes.emplace(node.id, &node);
         }
         if (!change.removed) {
             change.after_revision = right->second.revision;
+            change.after_outputs = right->second.outputs;
             if (auto digest = right->second.canonical_digest()) change.after_digest = digest.value();
             change.after_node_count = right->second.nodes.size();
             for (const auto& node : right->second.nodes) right_nodes.emplace(node.id, &node);
@@ -725,12 +814,31 @@ void append_catalog_detail_changes(
         for (const std::uint64_t node : union_keys(left_nodes, right_nodes)) {
             const auto a = left_nodes.find(node);
             const auto b = right_nodes.find(node);
+            bool node_changed = false;
+            MaterialGraphNodeChange node_change;
+            node_change.id = node;
             if (a == left_nodes.end()) {
                 ++change.added_node_count;
+                node_change.added = true;
+                node_change.after = *b->second;
+                node_changed = true;
             } else if (b == right_nodes.end()) {
                 ++change.removed_node_count;
+                node_change.removed = true;
+                node_change.before = *a->second;
+                node_changed = true;
             } else if (!same_material_graph_node(*a->second, *b->second)) {
                 ++change.changed_node_count;
+                node_change.before = *a->second;
+                node_change.after = *b->second;
+                node_changed = true;
+            }
+            if (node_changed) {
+                if (change.node_samples.size() < kMaxProjectDiffMaterialGraphNodeSamples) {
+                    change.node_samples.push_back(std::move(node_change));
+                } else {
+                    change.node_samples_truncated = true;
+                }
             }
         }
         if (!change.added && !change.removed) {
@@ -758,8 +866,10 @@ void append_catalog_detail_changes(
             change.graph_changed = left->second.graph_identity != right->second.graph_identity;
             change.source_changed = left->second.source_revision != right->second.source_revision ||
                 left->second.source_digest != right->second.source_digest;
+            change.inputs_changed = left->second.inputs != right->second.inputs;
         }
-        if (change.added || change.removed || change.graph_changed || change.source_changed) {
+        if (change.added || change.removed || change.graph_changed || change.source_changed ||
+            change.inputs_changed) {
             diff.material_graph_bindings.push_back(std::move(change));
         }
     }
@@ -2530,18 +2640,68 @@ std::size_t ProjectDiff::changed_texture_source_count() const noexcept {
     return texture_sources.size();
 }
 
+std::size_t ProjectDiff::changed_spatial_field_count() const noexcept {
+    return spatial_fields.size();
+}
+
+std::size_t ProjectDiff::changed_source_asset_record_count() const noexcept {
+    return source_asset_record_change_count;
+}
+
 bool ProjectDiff::has_changes() const noexcept {
     return changed_object_count() != 0U || changed_mesh_count() != 0U ||
         changed_material_binding_count() != 0U || changed_material_source_count() != 0U ||
-        changed_texture_source_count() != 0U || material_catalog_changed ||
-        engineering_changed || condition_changed || base_digest != digest;
+        changed_texture_source_count() != 0U || changed_spatial_field_count() != 0U ||
+        changed_source_asset_record_count() != 0U || source_asset_registry_changed ||
+        connection_port_graph.changed ||
+        authoring_standards.changed ||
+        world_model.changed ||
+        scientific_model.changed ||
+        procedural_sources.changed ||
+        biological_authoring_sources.changed ||
+        rig_module_template_sources.changed ||
+        decal_placement_sources.changed ||
+        pose_libraries.changed ||
+        kinematic_graphs.changed ||
+        edit_receipts.changed ||
+        instance_receipts.changed ||
+        mesh_authoring_sources.changed ||
+        project_metadata.changed ||
+        material_catalog_changed ||
+        presentation_catalog_changed || semantic_sidecar_changed ||
+        engineering_changed || condition_changed ||
+        base_digest != digest;
+}
+
+bool ProjectDiff::source_projection_is_partial() const noexcept {
+    // Per-category details intentionally cover only a subset of the full
+    // project snapshot. Any changed snapshot therefore remains partial even
+    // when one or more known categories also changed.
+    return base_digest != digest;
 }
 
 bool ProjectDiff::has_unclassified_source_changes() const noexcept {
     const bool detailed_changes = changed_object_count() != 0U ||
         changed_mesh_count() != 0U || changed_material_binding_count() != 0U ||
         changed_material_source_count() != 0U || changed_texture_source_count() != 0U ||
-        material_catalog_changed || engineering_changed || condition_changed;
+        changed_spatial_field_count() != 0U || source_asset_registry_changed ||
+        connection_port_graph.changed ||
+        authoring_standards.changed ||
+        world_model.changed ||
+        scientific_model.changed ||
+        procedural_sources.changed ||
+        biological_authoring_sources.changed ||
+        rig_module_template_sources.changed ||
+        decal_placement_sources.changed ||
+        pose_libraries.changed ||
+        kinematic_graphs.changed ||
+        edit_receipts.changed ||
+        instance_receipts.changed ||
+        mesh_authoring_sources.changed ||
+        project_metadata.changed ||
+        material_catalog_changed ||
+        presentation_catalog_changed ||
+        semantic_sidecar_changed || engineering_changed || condition_changed;
     return !detailed_changes && base_digest != digest;
 }
 
@@ -2586,7 +2746,7 @@ core::Result<void> ProjectMergeReview::validate() const {
 
 core::Result<void> ProjectMergeResolution::validate() const {
     if (selected_source > ProjectMergeSource::right || source_digest.is_zero() ||
-        review_digest.is_zero() || digest.is_zero() ||
+        base_digest.is_zero() || review_digest.is_zero() || digest.is_zero() ||
         digest != project_merge_resolution_digest(*this)) {
         return core::Result<void>::failure(invalid(
             "project merge resolution has invalid source bindings or digest"));
@@ -2596,6 +2756,12 @@ core::Result<void> ProjectMergeResolution::validate() const {
         project_result_digest(candidate) != source_digest) {
         return core::Result<void>::failure(stale(
             "project merge candidate no longer matches its selected source"));
+    }
+    if (candidate_diff.base_digest != base_digest ||
+        candidate_diff.digest != source_digest ||
+        candidate_diff.speculative_revision != source_revision) {
+        return core::Result<void>::failure(stale(
+            "project merge candidate diff does not match its bound snapshots"));
     }
     return core::Result<void>::success();
 }
@@ -2664,8 +2830,10 @@ core::Result<ProjectMergeResolution> resolve_project_merge(
     if (selected == ProjectMergeSource::right) source = &right;
     ProjectMergeResolution resolution{
         *source,
+        ProjectDiff::between(base, *source),
         selected,
         source->revision(),
+        review.base_digest,
         project_result_digest(*source),
         review.digest,
         {}};
@@ -3065,7 +3233,10 @@ core::Result<void> AgentTask::correct_ghost_transform(
         return core::Result<void>::failure(policy(
             "ghost correction cannot change an object protected by the objective"));
     }
-    if (!safe_text(justification, 1024U)) {
+    if (!safe_text(justification, 1024U) ||
+        std::all_of(justification.begin(), justification.end(), [](unsigned char character) {
+            return character == ' ';
+        })) {
         return core::Result<void>::failure(invalid(
             "ghost correction requires a bounded non-empty operator justification"));
     }
@@ -4075,7 +4246,7 @@ core::Result<void> AgentTask::execute_step(const AgentPlanStep& step) {
                 return fail(policy(
                     "plan target mesh is shared by an object protected by the objective"));
             }
-            if ((material_assignment || lightmap_uv_generation) && object.locked) {
+            if (object.locked) {
                 return fail(policy(
                     "mesh authoring would affect a locked shared-mesh instance"));
             }
@@ -4494,6 +4665,27 @@ ProjectDiff ProjectDiff::between(
     diff.base_revision = base_document_.revision();
     diff.speculative_revision = speculative_document.revision();
     diff.base_digest = project_result_digest(base_document_);
+    diff.project_metadata.before_name = base_document_.name();
+    diff.project_metadata.after_name = speculative_document.name();
+    diff.project_metadata.before_source_namespace = base_document_.source_namespace();
+    diff.project_metadata.after_source_namespace = speculative_document.source_namespace();
+    diff.project_metadata.before_evaluation_graph_digest =
+        base_document_.evaluation_graph_digest();
+    diff.project_metadata.after_evaluation_graph_digest =
+        speculative_document.evaluation_graph_digest();
+    diff.project_metadata.name_changed =
+        diff.project_metadata.before_name != diff.project_metadata.after_name;
+    diff.project_metadata.source_namespace_changed =
+        diff.project_metadata.before_source_namespace !=
+            diff.project_metadata.after_source_namespace;
+    diff.project_metadata.evaluation_graph_changed =
+        diff.project_metadata.before_evaluation_graph_digest !=
+            diff.project_metadata.after_evaluation_graph_digest;
+    diff.project_metadata.changed_field_count =
+        static_cast<std::size_t>(diff.project_metadata.name_changed) +
+        static_cast<std::size_t>(diff.project_metadata.source_namespace_changed) +
+        static_cast<std::size_t>(diff.project_metadata.evaluation_graph_changed);
+    diff.project_metadata.changed = diff.project_metadata.changed_field_count != 0U;
 
     const auto before_objects = base_document_.scene().objects_sorted();
     const auto after_objects = speculative_document.scene().objects_sorted();
@@ -4511,6 +4703,24 @@ ProjectDiff ProjectDiff::between(
         const auto after = after_by_id.find(id);
         change.added = before == before_by_id.end();
         change.removed = after == after_by_id.end();
+        if (before != before_by_id.end()) {
+            change.before_state = ObjectStateDetail{
+                before->second.name,
+                before->second.local_transform,
+                before->second.parent,
+                before->second.mesh_asset,
+                before->second.visible,
+                before->second.locked};
+        }
+        if (after != after_by_id.end()) {
+            change.after_state = ObjectStateDetail{
+                after->second.name,
+                after->second.local_transform,
+                after->second.parent,
+                after->second.mesh_asset,
+                after->second.visible,
+                after->second.locked};
+        }
         if (!change.added && !change.removed) {
             change.name_changed = before->second.name != after->second.name;
             change.transform_changed = !same_transform(
@@ -4641,6 +4851,12 @@ ProjectDiff ProjectDiff::between(
                 layer_change.layer_id = layer_id;
                 layer_change.added = before_layer == nullptr;
                 layer_change.removed = after_layer == nullptr;
+                if (before_layer != nullptr) {
+                    layer_change.before_descriptor = before_layer->descriptor;
+                }
+                if (after_layer != nullptr) {
+                    layer_change.after_descriptor = after_layer->descriptor;
+                }
                 const auto* descriptor_layer = after_layer != nullptr
                     ? after_layer : before_layer;
                 if (descriptor_layer == nullptr) continue;
@@ -4752,6 +4968,8 @@ ProjectDiff ProjectDiff::between(
                 layer_change.layer_id = layer_id;
                 layer_change.domain = layer.descriptor.domain;
                 layer_change.type = layer.descriptor.type;
+                if (change.added) layer_change.after_descriptor = layer.descriptor;
+                else layer_change.before_descriptor = layer.descriptor;
                 layer_change.added = change.added;
                 layer_change.removed = change.removed;
                 layer_change.before_value_count = change.added ? 0U : layer.values.size();
@@ -4813,6 +5031,20 @@ ProjectDiff ProjectDiff::between(
             ObjectChange change;
             change.id = id;
             change.mesh_content_changed = true;
+            change.before_state = ObjectStateDetail{
+                before_object->name,
+                before_object->local_transform,
+                before_object->parent,
+                before_object->mesh_asset,
+                before_object->visible,
+                before_object->locked};
+            change.after_state = ObjectStateDetail{
+                after_object->name,
+                after_object->local_transform,
+                after_object->parent,
+                after_object->mesh_asset,
+                after_object->visible,
+                after_object->locked};
             diff.objects.push_back(std::move(change));
         }
     }
@@ -4885,10 +5117,12 @@ ProjectDiff ProjectDiff::between(
         change.removed = after_material == after_materials.end();
         if (!change.added) {
             change.before_name = before_material->second.name;
+            change.before_definition = before_material->second.definition;
             change.before_revision = before_material->second.revision;
         }
         if (!change.removed) {
             change.after_name = after_material->second.name;
+            change.after_definition = after_material->second.definition;
             change.after_revision = after_material->second.revision;
         }
         if (change.added) {
@@ -4933,10 +5167,12 @@ ProjectDiff ProjectDiff::between(
         change.added = before_texture == before_textures.end();
         change.removed = after_texture == after_textures.end();
         if (!change.added) {
+            change.before = before_texture->second;
             change.before_name = before_texture->second.name;
             change.before_content_digest = before_texture->second.content_digest;
         }
         if (!change.removed) {
+            change.after = after_texture->second;
             change.after_name = after_texture->second.name;
             change.after_content_digest = after_texture->second.content_digest;
         }
@@ -4954,10 +5190,1786 @@ ProjectDiff ProjectDiff::between(
         }
         if (change.source_changed) diff.texture_sources.push_back(std::move(change));
     }
+
+    const auto summarize_spatial_field = [](
+            const spatial_field::ScalarField2D& field) {
+        SpatialFieldSourceSummary summary;
+        summary.identity = field.identity();
+        summary.semantic = field.semantic();
+        summary.origin_uv = field.origin_uv();
+        summary.cell_size = field.cell_size();
+        summary.width = field.width();
+        summary.height = field.height();
+        summary.minimum_value = field.minimum_value();
+        summary.maximum_value = field.maximum_value();
+        summary.source_revision = field.source_revision();
+        summary.sample_count = field.values().size();
+        const auto digest = field.canonical_digest();
+        if (digest) summary.digest = digest.value();
+        return summary;
+    };
+    const auto& before_spatial_fields = base_document_.spatial_fields();
+    const auto& after_spatial_fields = speculative_document.spatial_fields();
+    std::set<std::string> spatial_field_ids;
+    for (const auto& [identity, field] : before_spatial_fields) {
+        static_cast<void>(field);
+        spatial_field_ids.insert(identity);
+    }
+    for (const auto& [identity, field] : after_spatial_fields) {
+        static_cast<void>(field);
+        spatial_field_ids.insert(identity);
+    }
+    for (const auto& identity : spatial_field_ids) {
+        const auto before = before_spatial_fields.find(identity);
+        const auto after = after_spatial_fields.find(identity);
+        SpatialFieldChange change;
+        change.identity = identity;
+        change.added = before == before_spatial_fields.end();
+        change.removed = after == after_spatial_fields.end();
+        if (!change.added) change.before = summarize_spatial_field(before->second);
+        if (!change.removed) change.after = summarize_spatial_field(after->second);
+
+        if (change.added || change.removed) {
+            change.metadata_changed = true;
+            change.sample_correspondence_available = false;
+            const auto& field = change.added ? after->second : before->second;
+            const auto& values = field.values();
+            change.changed_sample_count = values.size();
+            const std::size_t sample_count = std::min(
+                values.size(), kMaxProjectDiffSpatialFieldSamples);
+            for (std::size_t index = 0U; index < sample_count; ++index) {
+                SpatialFieldSampleChange sample;
+                sample.u = static_cast<std::uint32_t>(index % field.width());
+                sample.v = static_cast<std::uint32_t>(index / field.width());
+                if (change.added) sample.after = values[index];
+                else sample.before = values[index];
+                change.samples.push_back(std::move(sample));
+            }
+            change.samples_truncated = values.size() > sample_count;
+            diff.spatial_fields.push_back(std::move(change));
+            continue;
+        }
+
+        const auto& before_field = before->second;
+        const auto& after_field = after->second;
+        change.grid_changed = before_field.origin_uv().x != after_field.origin_uv().x ||
+            before_field.origin_uv().y != after_field.origin_uv().y ||
+            before_field.cell_size() != after_field.cell_size() ||
+            before_field.width() != after_field.width() ||
+            before_field.height() != after_field.height();
+        change.metadata_changed =
+            before_field.semantic() != after_field.semantic() || change.grid_changed ||
+            before_field.minimum_value() != after_field.minimum_value() ||
+            before_field.maximum_value() != after_field.maximum_value();
+        change.sample_correspondence_available = !change.grid_changed;
+
+        if (!change.grid_changed) {
+            const auto& before_values = before_field.values();
+            const auto& after_values = after_field.values();
+            const std::size_t common_count = std::min(
+                before_values.size(), after_values.size());
+            for (std::size_t index = 0U; index < common_count; ++index) {
+                if (before_values[index] == after_values[index]) continue;
+                ++change.changed_sample_count;
+                if (change.samples.size() >= kMaxProjectDiffSpatialFieldSamples) {
+                    change.samples_truncated = true;
+                    continue;
+                }
+                SpatialFieldSampleChange sample;
+                sample.u = static_cast<std::uint32_t>(index % before_field.width());
+                sample.v = static_cast<std::uint32_t>(index / before_field.width());
+                sample.before = before_values[index];
+                sample.after = after_values[index];
+                change.samples.push_back(std::move(sample));
+            }
+        }
+
+        const bool revision_changed =
+            before_field.source_revision() != after_field.source_revision();
+        if (change.metadata_changed || change.changed_sample_count != 0U ||
+            revision_changed) {
+            diff.spatial_fields.push_back(std::move(change));
+        }
+    }
+
+    const auto summarize_source_asset_record = [](
+            const assets::SourceImportRecord& source) {
+        SourceAssetRecordSummary summary;
+        summary.identity = source.identity;
+        summary.relative_source_path = source.relative_source_path;
+        summary.source_generation = source.source_generation;
+        summary.kind = source.kind;
+        summary.source_digest = source.source_digest;
+        summary.importer_identity = source.importer_identity;
+        summary.importer_version = source.importer_version;
+        summary.options = source.options;
+        summary.artifact_identity = source.artifact_identity;
+        summary.artifact_digest = source.artifact_digest;
+        summary.domain_digests = source.domain_digests;
+        if (source.botanical_generation.has_value()) {
+            summary.botanical_receipt = BotanicalSourceReceiptSummary{
+                source.botanical_generation->job_identity_digest,
+                source.botanical_generation->input_artifact_digest,
+                source.botanical_generation->output_artifact_digest};
+        }
+        summary.authored_tag_count = source.authored_tags.size();
+        const std::size_t tag_sample_count = std::min(
+            source.authored_tags.size(), kMaxProjectDiffSourceAssetMetadataSamples);
+        summary.authored_tag_sample.assign(source.authored_tags.begin(),
+            source.authored_tags.begin() + static_cast<std::ptrdiff_t>(tag_sample_count));
+        summary.authored_tags_truncated = source.authored_tags.size() > tag_sample_count;
+        summary.dependency_count = source.dependencies.size();
+        const std::size_t dependency_sample_count = std::min(
+            source.dependencies.size(), kMaxProjectDiffSourceAssetMetadataSamples);
+        summary.dependency_sample.assign(source.dependencies.begin(),
+            source.dependencies.begin() +
+                static_cast<std::ptrdiff_t>(dependency_sample_count));
+        summary.dependencies_truncated = source.dependencies.size() > dependency_sample_count;
+        const std::string serialized = source.serialize();
+        summary.record_digest = assets::sha256(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(serialized.data()), serialized.size()));
+        return summary;
+    };
+    const auto& before_source_registry = base_document_.source_asset_registry();
+    const auto& after_source_registry = speculative_document.source_asset_registry();
+    const auto before_source_registry_digest = before_source_registry.canonical_digest();
+    const auto after_source_registry_digest = after_source_registry.canonical_digest();
+    diff.source_asset_registry_changed = !before_source_registry_digest ||
+        !after_source_registry_digest ||
+        before_source_registry_digest.value() != after_source_registry_digest.value();
+    diff.source_asset_record_details_available =
+        before_source_registry_digest && after_source_registry_digest;
+    const auto& before_source_records = before_source_registry.records();
+    const auto& after_source_records = after_source_registry.records();
+    std::set<std::string> source_record_ids;
+    for (const auto& [identity, source] : before_source_records) {
+        static_cast<void>(source);
+        source_record_ids.insert(identity);
+    }
+    for (const auto& [identity, source] : after_source_records) {
+        static_cast<void>(source);
+        source_record_ids.insert(identity);
+    }
+    for (const auto& identity : source_record_ids) {
+        const auto before = before_source_records.find(identity);
+        const auto after = after_source_records.find(identity);
+        SourceAssetRecordChange change;
+        change.identity = identity;
+        change.added = before == before_source_records.end();
+        change.removed = after == after_source_records.end();
+        if (!change.added && !change.removed &&
+            before->second.serialize() == after->second.serialize()) {
+            continue;
+        }
+        ++diff.source_asset_record_change_count;
+        if (diff.source_asset_records.size() >= kMaxProjectDiffSourceAssetRecords) {
+            diff.source_asset_records_truncated = true;
+            continue;
+        }
+        if (!change.added) change.before = summarize_source_asset_record(before->second);
+        if (!change.removed) change.after = summarize_source_asset_record(after->second);
+        diff.source_asset_records.push_back(std::move(change));
+    }
+    if (diff.source_asset_registry_changed &&
+        diff.source_asset_record_change_count == 0U) {
+        diff.source_asset_record_details_available = false;
+    }
+
+    const auto summarize_connection_port = [](const connection::ConnectionPort& port) {
+        ConnectionPortSourceSummary summary;
+        summary.identity = port.id.value;
+        summary.owner_object = port.owner.value;
+        summary.frame_identity = port.local_frame.frame_identity;
+        summary.parent_frame = port.local_frame.parent_frame;
+        summary.transform_to_parent = port.local_frame.transform_to_parent;
+        summary.coordinate_convention = port.local_frame.coordinate_convention;
+        summary.compatibility_tag_count = port.compatibility_tags.size();
+        const std::size_t tag_sample_count = std::min(
+            port.compatibility_tags.size(), kMaxProjectDiffConnectionMetadataSamples);
+        summary.compatibility_tag_sample.assign(port.compatibility_tags.begin(),
+            port.compatibility_tags.begin() + static_cast<std::ptrdiff_t>(tag_sample_count));
+        summary.compatibility_tags_truncated =
+            port.compatibility_tags.size() > tag_sample_count;
+        summary.required_capability_count = port.capability_contract.required.size();
+        const std::size_t required_sample_count = std::min(
+            port.capability_contract.required.size(), kMaxProjectDiffConnectionMetadataSamples);
+        summary.required_capability_sample.assign(
+            port.capability_contract.required.begin(),
+            port.capability_contract.required.begin() +
+                static_cast<std::ptrdiff_t>(required_sample_count));
+        summary.required_capabilities_truncated =
+            port.capability_contract.required.size() > required_sample_count;
+        summary.offered_capability_count = port.capability_contract.offered.size();
+        const std::size_t offered_sample_count = std::min(
+            port.capability_contract.offered.size(), kMaxProjectDiffConnectionMetadataSamples);
+        summary.offered_capability_sample.assign(port.capability_contract.offered.begin(),
+            port.capability_contract.offered.begin() +
+                static_cast<std::ptrdiff_t>(offered_sample_count));
+        summary.offered_capabilities_truncated =
+            port.capability_contract.offered.size() > offered_sample_count;
+        const auto digest = port.canonical_digest();
+        if (digest) summary.record_digest = digest.value();
+        return summary;
+    };
+    const auto edge_serialization = [](const connection::PortConnectionEdge& edge) {
+        return "cartographer.agent.connection-edge.v1|" +
+            std::to_string(edge.id) + "|" + std::to_string(edge.first_port.value) + "|" +
+            std::to_string(edge.second_port.value) + "|" +
+            std::to_string(static_cast<std::uint64_t>(edge.kind)) + "|" +
+            edge.evidence.serialize();
+    };
+    const auto summarize_connection_edge = [&edge_serialization](
+            const connection::PortConnectionEdge& edge) {
+        ConnectionEdgeSourceSummary summary;
+        summary.identity = edge.id;
+        summary.first_port = edge.first_port.value;
+        summary.second_port = edge.second_port.value;
+        summary.kind = edge.kind;
+        summary.shared_tag_count = edge.evidence.shared_tags.size();
+        const std::size_t tag_sample_count = std::min(
+            edge.evidence.shared_tags.size(), kMaxProjectDiffConnectionMetadataSamples);
+        summary.shared_tag_sample.assign(edge.evidence.shared_tags.begin(),
+            edge.evidence.shared_tags.begin() + static_cast<std::ptrdiff_t>(tag_sample_count));
+        summary.shared_tags_truncated = edge.evidence.shared_tags.size() > tag_sample_count;
+        summary.first_requirement_count = edge.evidence.first_satisfied_requirements.size();
+        const std::size_t first_sample_count = std::min(
+            edge.evidence.first_satisfied_requirements.size(),
+            kMaxProjectDiffConnectionMetadataSamples);
+        summary.first_requirement_sample.assign(
+            edge.evidence.first_satisfied_requirements.begin(),
+            edge.evidence.first_satisfied_requirements.begin() +
+                static_cast<std::ptrdiff_t>(first_sample_count));
+        summary.first_requirements_truncated =
+            edge.evidence.first_satisfied_requirements.size() > first_sample_count;
+        summary.second_requirement_count = edge.evidence.second_satisfied_requirements.size();
+        const std::size_t second_sample_count = std::min(
+            edge.evidence.second_satisfied_requirements.size(),
+            kMaxProjectDiffConnectionMetadataSamples);
+        summary.second_requirement_sample.assign(
+            edge.evidence.second_satisfied_requirements.begin(),
+            edge.evidence.second_satisfied_requirements.begin() +
+                static_cast<std::ptrdiff_t>(second_sample_count));
+        summary.second_requirements_truncated =
+            edge.evidence.second_satisfied_requirements.size() > second_sample_count;
+        const std::string serialized = edge_serialization(edge);
+        summary.record_digest = assets::sha256(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(serialized.data()), serialized.size()));
+        return summary;
+    };
+    const auto& before_connection_graph = base_document_.connection_port_graph();
+    const auto& after_connection_graph = speculative_document.connection_port_graph();
+    const auto before_connection_digest = before_connection_graph.canonical_digest();
+    const auto after_connection_digest = after_connection_graph.canonical_digest();
+    auto& connection_change = diff.connection_port_graph;
+    connection_change.changed = !before_connection_digest || !after_connection_digest ||
+        before_connection_digest.value() != after_connection_digest.value();
+    connection_change.details_available =
+        before_connection_digest.has_value() && after_connection_digest.has_value();
+    connection_change.before_port_count = before_connection_graph.ports().size();
+    connection_change.after_port_count = after_connection_graph.ports().size();
+    connection_change.before_edge_count = before_connection_graph.edges().size();
+    connection_change.after_edge_count = after_connection_graph.edges().size();
+    if (before_connection_digest) {
+        connection_change.before_digest = before_connection_digest.value();
+    }
+    if (after_connection_digest) {
+        connection_change.after_digest = after_connection_digest.value();
+    }
+    std::set<connection::PortId> connection_port_ids;
+    for (const auto& [identity, port] : before_connection_graph.ports()) {
+        static_cast<void>(port);
+        connection_port_ids.insert(identity);
+    }
+    for (const auto& [identity, port] : after_connection_graph.ports()) {
+        static_cast<void>(port);
+        connection_port_ids.insert(identity);
+    }
+    for (const auto identity : connection_port_ids) {
+        const auto before = before_connection_graph.ports().find(identity);
+        const auto after = after_connection_graph.ports().find(identity);
+        ConnectionPortChange change;
+        change.identity = identity.value;
+        change.added = before == before_connection_graph.ports().end();
+        change.removed = after == after_connection_graph.ports().end();
+        if (!change.added && !change.removed &&
+            before->second.serialize() == after->second.serialize()) {
+            continue;
+        }
+        ++connection_change.changed_port_count;
+        if (connection_change.ports.size() >= kMaxProjectDiffConnectionPortSamples) {
+            connection_change.ports_truncated = true;
+            continue;
+        }
+        if (!change.added) change.before = summarize_connection_port(before->second);
+        if (!change.removed) change.after = summarize_connection_port(after->second);
+        connection_change.ports.push_back(std::move(change));
+    }
+    std::set<std::uint64_t> connection_edge_ids;
+    for (const auto& [identity, edge] : before_connection_graph.edges()) {
+        static_cast<void>(edge);
+        connection_edge_ids.insert(identity);
+    }
+    for (const auto& [identity, edge] : after_connection_graph.edges()) {
+        static_cast<void>(edge);
+        connection_edge_ids.insert(identity);
+    }
+    for (const auto identity : connection_edge_ids) {
+        const auto before = before_connection_graph.edges().find(identity);
+        const auto after = after_connection_graph.edges().find(identity);
+        ConnectionEdgeChange change;
+        change.identity = identity;
+        change.added = before == before_connection_graph.edges().end();
+        change.removed = after == after_connection_graph.edges().end();
+        if (!change.added && !change.removed &&
+            edge_serialization(before->second) == edge_serialization(after->second)) {
+            continue;
+        }
+        ++connection_change.changed_edge_count;
+        if (connection_change.edges.size() >= kMaxProjectDiffConnectionEdgeSamples) {
+            connection_change.edges_truncated = true;
+            continue;
+        }
+        if (!change.added) change.before = summarize_connection_edge(before->second);
+        if (!change.removed) change.after = summarize_connection_edge(after->second);
+        connection_change.edges.push_back(std::move(change));
+    }
+    if (connection_change.changed && connection_change.changed_port_count == 0U &&
+        connection_change.changed_edge_count == 0U) {
+        connection_change.details_available = false;
+    }
+
+    const auto summarize_project_standard = [](
+            const project::ProjectAuthoringStandard& standard) {
+        ProjectAuthoringStandardSummary summary;
+        summary.identity = standard.id;
+        summary.label = standard.label;
+        summary.category = standard.category;
+        summary.value = standard.value;
+        summary.unit = standard.unit;
+        summary.rationale_byte_count = standard.rationale.size();
+        summary.rationale_digest = assets::sha256(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(standard.rationale.data()),
+            standard.rationale.size()));
+        if (standard.evidence.has_value()) {
+            ProjectStandardEvidenceSummary evidence;
+            evidence.source_revision = standard.evidence->source_revision;
+            evidence.tolerance_meters = standard.evidence->tolerance_meters;
+            evidence.measurement_count = standard.evidence->measurements.size();
+            const std::size_t measurement_sample_count = std::min(
+                standard.evidence->measurements.size(),
+                kMaxProjectDiffStandardMeasurementSamples);
+            evidence.measurements.reserve(measurement_sample_count);
+            for (std::size_t index = 0U; index < measurement_sample_count; ++index) {
+                const auto& measurement = standard.evidence->measurements[index];
+                evidence.measurements.push_back({measurement.object_id,
+                    measurement.mesh_asset, measurement.mesh_revision,
+                    measurement.measured_value_meters});
+            }
+            evidence.measurements_truncated =
+                standard.evidence->measurements.size() > measurement_sample_count;
+            const auto evidence_digest =
+                standard.evidence->canonical_digest(standard.category);
+            if (evidence_digest) evidence.digest = evidence_digest.value();
+            summary.evidence = std::move(evidence);
+        }
+        project::ProjectAuthoringStandards single_record;
+        const auto inserted = single_record.set(standard);
+        const auto record_digest = inserted
+            ? single_record.canonical_digest()
+            : core::Result<assets::Sha256Digest>::failure(inserted.error());
+        if (record_digest) summary.record_digest = record_digest.value();
+        return summary;
+    };
+    const auto& before_standards = base_document_.authoring_standards();
+    const auto& after_standards = speculative_document.authoring_standards();
+    const auto before_standards_digest = before_standards.canonical_digest();
+    const auto after_standards_digest = after_standards.canonical_digest();
+    auto& standards_change = diff.authoring_standards;
+    standards_change.changed = !before_standards_digest || !after_standards_digest ||
+        before_standards_digest.value() != after_standards_digest.value();
+    standards_change.details_available =
+        before_standards_digest.has_value() && after_standards_digest.has_value();
+    standards_change.before_record_count = before_standards.records().size();
+    standards_change.after_record_count = after_standards.records().size();
+    if (before_standards_digest) {
+        standards_change.before_digest = before_standards_digest.value();
+    }
+    if (after_standards_digest) {
+        standards_change.after_digest = after_standards_digest.value();
+    }
+    std::set<std::string> standard_ids;
+    for (const auto& [identity, standard] : before_standards.records()) {
+        static_cast<void>(standard);
+        standard_ids.insert(identity);
+    }
+    for (const auto& [identity, standard] : after_standards.records()) {
+        static_cast<void>(standard);
+        standard_ids.insert(identity);
+    }
+    for (const auto& identity : standard_ids) {
+        const auto before = before_standards.records().find(identity);
+        const auto after = after_standards.records().find(identity);
+        ProjectAuthoringStandardChange change;
+        change.identity = identity;
+        change.added = before == before_standards.records().end();
+        change.removed = after == after_standards.records().end();
+        if (!change.added && !change.removed && before->second == after->second) {
+            continue;
+        }
+        ++standards_change.changed_record_count;
+        if (standards_change.records.size() >= kMaxProjectDiffAuthoringStandards) {
+            standards_change.records_truncated = true;
+            continue;
+        }
+        if (!change.added) change.before = summarize_project_standard(before->second);
+        if (!change.removed) change.after = summarize_project_standard(after->second);
+        standards_change.records.push_back(std::move(change));
+    }
+    if (standards_change.changed && standards_change.changed_record_count == 0U) {
+        standards_change.details_available = false;
+    }
+
+    const auto summarize_world_model = [](
+            const world::WorldModel& model, assets::Sha256Digest digest) {
+        return WorldModelSourceSummary{digest, model.areas().size(), model.paths().size(),
+            model.regions().size(), model.structure_graphs().size(),
+            model.instance_fields().size(), model.variant_layers().size()};
+    };
+    const auto& before_world_model = base_document_.world_model();
+    const auto& after_world_model = speculative_document.world_model();
+    const auto before_world_digest = before_world_model.canonical_digest();
+    const auto after_world_digest = after_world_model.canonical_digest();
+    auto& world_change = diff.world_model;
+    world_change.changed = !before_world_digest || !after_world_digest ||
+        before_world_digest.value() != after_world_digest.value();
+    world_change.details_available =
+        before_world_digest.has_value() && after_world_digest.has_value();
+    if (before_world_digest) {
+        world_change.before = summarize_world_model(
+            before_world_model, before_world_digest.value());
+    }
+    if (after_world_digest) {
+        world_change.after = summarize_world_model(after_world_model, after_world_digest.value());
+    }
+    const auto& before_world_areas = before_world_model.areas();
+    const auto& after_world_areas = after_world_model.areas();
+    world_change.before_area_count = before_world_areas.size();
+    world_change.after_area_count = after_world_areas.size();
+    const auto same_world_area = [](const world::SemanticArea& left,
+            const world::SemanticArea& right) {
+        return left.id == right.id && left.semantic_type == right.semantic_type &&
+            left.geometry == right.geometry && left.parent == right.parent &&
+            left.tags == right.tags;
+    };
+    const auto summarize_world_area = [](const world::SemanticArea& area)
+            -> std::optional<WorldAreaSourceSummary> {
+        world::WorldModel single_area_model;
+        if (!single_area_model.insert_area(area)) return std::nullopt;
+        const std::string serialized = single_area_model.serialize();
+        WorldAreaSourceSummary summary;
+        summary.semantic_type = area.semantic_type;
+        summary.geometry_kind = area.geometry.kind;
+        summary.geometry_identity = area.geometry.identity;
+        if (area.parent.has_value()) summary.parent_id = area.parent->value;
+        summary.serialized_bytes = serialized.size();
+        summary.digest = assets::sha256(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(serialized.data()), serialized.size()));
+        summary.tag_count = area.tags.size();
+        const std::size_t tag_sample_count = std::min(
+            area.tags.size(), kMaxProjectDiffWorldAreaTags);
+        summary.tag_sample.assign(area.tags.begin(),
+            area.tags.begin() + static_cast<std::ptrdiff_t>(tag_sample_count));
+        summary.tags_truncated = area.tags.size() > tag_sample_count;
+        return summary;
+    };
+    for (const world::AreaId id : union_keys(before_world_areas, after_world_areas)) {
+        const auto before = before_world_areas.find(id);
+        const auto after = after_world_areas.find(id);
+        const bool added = before == before_world_areas.end();
+        const bool removed = after == after_world_areas.end();
+        if (!added && !removed && same_world_area(before->second, after->second)) continue;
+        ++world_change.changed_area_count;
+        if (world_change.areas.size() >= kMaxProjectDiffWorldAreas) {
+            world_change.areas_truncated = true;
+            continue;
+        }
+        WorldAreaSourceChange change;
+        change.id = id;
+        change.added = added;
+        change.removed = removed;
+        if (!added) {
+            change.before = summarize_world_area(before->second);
+            if (!change.before.has_value()) world_change.area_details_available = false;
+        }
+        if (!removed) {
+            change.after = summarize_world_area(after->second);
+            if (!change.after.has_value()) world_change.area_details_available = false;
+        }
+        world_change.areas.push_back(std::move(change));
+    }
+
+    const auto& before_world_paths = before_world_model.paths();
+    const auto& after_world_paths = after_world_model.paths();
+    world_change.before_path_count = before_world_paths.size();
+    world_change.after_path_count = after_world_paths.size();
+    const auto same_world_number = [](double left, double right) {
+        return left == right && (left != 0.0 || std::signbit(left) == std::signbit(right));
+    };
+    const auto same_world_path = [&same_world_number](const world::SemanticPath& left,
+            const world::SemanticPath& right) {
+        if (left.id != right.id || left.semantic_type != right.semantic_type ||
+            left.start_area != right.start_area || left.end_area != right.end_area ||
+            left.closed != right.closed ||
+            left.control_points.size() != right.control_points.size()) {
+            return false;
+        }
+        if (!same_world_number(left.width, right.width)) return false;
+        for (std::size_t index = 0U; index < left.control_points.size(); ++index) {
+            const auto& a = left.control_points[index];
+            const auto& b = right.control_points[index];
+            if (!same_world_number(a.x, b.x) || !same_world_number(a.y, b.y) ||
+                !same_world_number(a.z, b.z)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const auto summarize_world_path = [](const world::SemanticPath& path)
+            -> std::optional<WorldPathSourceSummary> {
+        world::WorldModel single_path_model;
+        if (!single_path_model.insert_path(path)) return std::nullopt;
+        const std::string serialized = single_path_model.serialize();
+        WorldPathSourceSummary summary;
+        summary.semantic_type = path.semantic_type;
+        if (path.start_area.has_value()) summary.start_area_id = path.start_area->value;
+        if (path.end_area.has_value()) summary.end_area_id = path.end_area->value;
+        summary.width = path.width;
+        summary.closed = path.closed;
+        summary.control_point_count = path.control_points.size();
+        const std::size_t point_sample_count = std::min(
+            path.control_points.size(), kMaxProjectDiffWorldControlPoints);
+        summary.control_point_sample.assign(path.control_points.begin(),
+            path.control_points.begin() + static_cast<std::ptrdiff_t>(point_sample_count));
+        summary.control_points_truncated = path.control_points.size() > point_sample_count;
+        summary.serialized_bytes = serialized.size();
+        summary.digest = assets::sha256(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(serialized.data()), serialized.size()));
+        return summary;
+    };
+    for (const world::PathId id : union_keys(before_world_paths, after_world_paths)) {
+        const auto before = before_world_paths.find(id);
+        const auto after = after_world_paths.find(id);
+        const bool added = before == before_world_paths.end();
+        const bool removed = after == after_world_paths.end();
+        if (!added && !removed && same_world_path(before->second, after->second)) continue;
+        ++world_change.changed_path_count;
+        if (world_change.paths.size() >= kMaxProjectDiffWorldPaths) {
+            world_change.paths_truncated = true;
+            continue;
+        }
+        WorldPathSourceChange change;
+        change.id = id;
+        change.added = added;
+        change.removed = removed;
+        if (!added) {
+            change.before = summarize_world_path(before->second);
+            if (!change.before.has_value()) world_change.path_details_available = false;
+        }
+        if (!removed) {
+            change.after = summarize_world_path(after->second);
+            if (!change.after.has_value()) world_change.path_details_available = false;
+        }
+        world_change.paths.push_back(std::move(change));
+    }
+
+    const auto& before_world_instance_fields = before_world_model.instance_fields();
+    const auto& after_world_instance_fields = after_world_model.instance_fields();
+    world_change.before_instance_field_count = before_world_instance_fields.size();
+    world_change.after_instance_field_count = after_world_instance_fields.size();
+    const auto same_world_instance_field = [&same_world_number](
+            const world::InstanceField& left, const world::InstanceField& right) {
+        return left.id == right.id && left.semantic_type == right.semantic_type &&
+            left.area == right.area &&
+            same_world_number(left.bounds.minimum.x, right.bounds.minimum.x) &&
+            same_world_number(left.bounds.minimum.y, right.bounds.minimum.y) &&
+            same_world_number(left.bounds.minimum.z, right.bounds.minimum.z) &&
+            same_world_number(left.bounds.maximum.x, right.bounds.maximum.x) &&
+            same_world_number(left.bounds.maximum.y, right.bounds.maximum.y) &&
+            same_world_number(left.bounds.maximum.z, right.bounds.maximum.z) &&
+            left.recipe_identity == right.recipe_identity &&
+            left.recipe_digest == right.recipe_digest && left.seed == right.seed &&
+            left.maximum_instances == right.maximum_instances &&
+            left.suppressed_instances == right.suppressed_instances &&
+            left.geometry_evidence == right.geometry_evidence &&
+            left.physical_material_intent == right.physical_material_intent &&
+            left.construction_profile == right.construction_profile &&
+            left.surface_domain_identity == right.surface_domain_identity;
+    };
+    const auto summarize_world_instance_field = [](const world::InstanceField& field)
+            -> std::optional<WorldInstanceFieldSourceSummary> {
+        world::WorldModel single_field_model;
+        if (!single_field_model.insert_instance_field(field)) return std::nullopt;
+        const std::string serialized = single_field_model.serialize();
+        WorldInstanceFieldSourceSummary summary;
+        summary.semantic_type = field.semantic_type;
+        if (field.area.has_value()) summary.area_id = field.area->value;
+        summary.bounds_minimum = field.bounds.minimum;
+        summary.bounds_maximum = field.bounds.maximum;
+        summary.recipe_identity = field.recipe_identity;
+        summary.recipe_digest = field.recipe_digest;
+        summary.seed = field.seed;
+        summary.maximum_instances = field.maximum_instances;
+        summary.suppressed_instance_count = field.suppressed_instances.size();
+        const std::size_t suppressed_sample_count = std::min(
+            field.suppressed_instances.size(), kMaxProjectDiffWorldSuppressedInstances);
+        summary.suppressed_instance_sample.assign(field.suppressed_instances.begin(),
+            field.suppressed_instances.begin() +
+                static_cast<std::ptrdiff_t>(suppressed_sample_count));
+        summary.suppressed_instances_truncated =
+            field.suppressed_instances.size() > suppressed_sample_count;
+        summary.geometry_evidence = field.geometry_evidence;
+        summary.physical_material_intent = field.physical_material_intent;
+        summary.construction_profile = field.construction_profile;
+        summary.surface_domain_identity = field.surface_domain_identity;
+        summary.serialized_bytes = serialized.size();
+        summary.digest = assets::sha256(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(serialized.data()), serialized.size()));
+        return summary;
+    };
+    for (const world::InstanceFieldId id :
+            union_keys(before_world_instance_fields, after_world_instance_fields)) {
+        const auto before = before_world_instance_fields.find(id);
+        const auto after = after_world_instance_fields.find(id);
+        const bool added = before == before_world_instance_fields.end();
+        const bool removed = after == after_world_instance_fields.end();
+        if (!added && !removed &&
+            same_world_instance_field(before->second, after->second)) {
+            continue;
+        }
+        ++world_change.changed_instance_field_count;
+        if (world_change.instance_fields.size() >= kMaxProjectDiffWorldInstanceFields) {
+            world_change.instance_fields_truncated = true;
+            continue;
+        }
+        WorldInstanceFieldSourceChange change;
+        change.id = id;
+        change.added = added;
+        change.removed = removed;
+        if (!added) {
+            change.before = summarize_world_instance_field(before->second);
+            if (!change.before.has_value()) {
+                world_change.instance_field_details_available = false;
+            }
+        }
+        if (!removed) {
+            change.after = summarize_world_instance_field(after->second);
+            if (!change.after.has_value()) {
+                world_change.instance_field_details_available = false;
+            }
+        }
+        world_change.instance_fields.push_back(std::move(change));
+    }
+
+    const auto& before_world_variant_layers = before_world_model.variant_layers();
+    const auto& after_world_variant_layers = after_world_model.variant_layers();
+    world_change.before_variant_layer_count = before_world_variant_layers.size();
+    world_change.after_variant_layer_count = after_world_variant_layers.size();
+    const auto same_world_variant_layer = [](const world::VariantLayer& left,
+            const world::VariantLayer& right) {
+        if (left.id != right.id || left.name != right.name ||
+            left.base_project_revision != right.base_project_revision ||
+            left.edits.size() != right.edits.size()) {
+            return false;
+        }
+        for (std::size_t index = 0U; index < left.edits.size(); ++index) {
+            const auto& a = left.edits[index];
+            const auto& b = right.edits[index];
+            if (a.target_kind != b.target_kind || a.target_identity != b.target_identity ||
+                a.operation != b.operation || a.property != b.property ||
+                a.canonical_value != b.canonical_value) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const auto summarize_world_variant_layer = [](const world::VariantLayer& layer)
+            -> std::optional<WorldVariantLayerSourceSummary> {
+        world::WorldModel single_layer_model;
+        if (!single_layer_model.insert_variant_layer(layer)) return std::nullopt;
+        const std::string serialized = single_layer_model.serialize();
+        WorldVariantLayerSourceSummary summary;
+        summary.name = layer.name;
+        summary.base_project_revision = layer.base_project_revision.value();
+        summary.edit_count = layer.edits.size();
+        const std::size_t edit_sample_count = std::min(
+            layer.edits.size(), kMaxProjectDiffWorldVariantEdits);
+        summary.edit_sample.reserve(edit_sample_count);
+        for (std::size_t index = 0U; index < edit_sample_count; ++index) {
+            const auto& edit = layer.edits[index];
+            WorldVariantEditSourceSummary edit_summary;
+            edit_summary.target_kind = edit.target_kind;
+            edit_summary.target_identity = edit.target_identity;
+            edit_summary.operation = edit.operation;
+            edit_summary.property = edit.property;
+            edit_summary.value_bytes = edit.canonical_value.size();
+            std::size_t value_sample_bytes = std::min(edit.canonical_value.size(),
+                kMaxProjectDiffWorldVariantValueSampleBytes);
+            while (value_sample_bytes > 0U && value_sample_bytes < edit.canonical_value.size() &&
+                (static_cast<unsigned char>(edit.canonical_value[value_sample_bytes]) &
+                    0xc0U) == 0x80U) {
+                --value_sample_bytes;
+            }
+            edit_summary.value_sample = edit.canonical_value.substr(0U, value_sample_bytes);
+            edit_summary.value_truncated = edit.canonical_value.size() > value_sample_bytes;
+            edit_summary.value_digest = assets::sha256(std::span<const std::uint8_t>(
+                reinterpret_cast<const std::uint8_t*>(edit.canonical_value.data()),
+                edit.canonical_value.size()));
+            summary.edit_sample.push_back(std::move(edit_summary));
+        }
+        summary.edits_truncated = layer.edits.size() > edit_sample_count;
+        summary.serialized_bytes = serialized.size();
+        summary.digest = assets::sha256(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(serialized.data()), serialized.size()));
+        return summary;
+    };
+    for (const world::VariantLayerId id :
+            union_keys(before_world_variant_layers, after_world_variant_layers)) {
+        const auto before = before_world_variant_layers.find(id);
+        const auto after = after_world_variant_layers.find(id);
+        const bool added = before == before_world_variant_layers.end();
+        const bool removed = after == after_world_variant_layers.end();
+        if (!added && !removed &&
+            same_world_variant_layer(before->second, after->second)) {
+            continue;
+        }
+        ++world_change.changed_variant_layer_count;
+        if (world_change.variant_layers.size() >= kMaxProjectDiffWorldVariantLayers) {
+            world_change.variant_layers_truncated = true;
+            continue;
+        }
+        WorldVariantLayerSourceChange change;
+        change.id = id;
+        change.added = added;
+        change.removed = removed;
+        if (!added) {
+            change.before = summarize_world_variant_layer(before->second);
+            if (!change.before.has_value()) {
+                world_change.variant_layer_details_available = false;
+            }
+        }
+        if (!removed) {
+            change.after = summarize_world_variant_layer(after->second);
+            if (!change.after.has_value()) {
+                world_change.variant_layer_details_available = false;
+            }
+        }
+        world_change.variant_layers.push_back(std::move(change));
+    }
+
+    const auto summarize_world_region = [](const world::WorldRegion& region) {
+        WorldRegionSourceSummary summary;
+        summary.revision = region.revision;
+        summary.cell_x = region.cell_x;
+        summary.cell_y = region.cell_y;
+        summary.area_count = region.area_ids.size();
+        summary.path_count = region.path_ids.size();
+        summary.neighbor_count = region.neighbor_ids.size();
+        summary.cross_region_path_count = region.cross_region_path_ids.size();
+        const auto copy_id_sample = [&summary](const auto& ids, auto& sample) {
+            const std::size_t sample_count = std::min(
+                ids.size(), kMaxProjectDiffWorldRegionMembershipIds);
+            sample.reserve(sample_count);
+            for (std::size_t index = 0U; index < sample_count; ++index) {
+                sample.push_back(ids[index].value);
+            }
+            summary.membership_ids_truncated = summary.membership_ids_truncated ||
+                ids.size() > sample_count;
+        };
+        copy_id_sample(region.area_ids, summary.area_id_sample);
+        copy_id_sample(region.path_ids, summary.path_id_sample);
+        copy_id_sample(region.neighbor_ids, summary.neighbor_id_sample);
+        copy_id_sample(region.cross_region_path_ids, summary.cross_region_path_id_sample);
+        return summary;
+    };
+    const auto& before_world_regions = before_world_model.regions();
+    const auto& after_world_regions = after_world_model.regions();
+    world_change.before_region_count = before_world_regions.size();
+    world_change.after_region_count = after_world_regions.size();
+    for (const world::WorldRegionId id : union_keys(
+            before_world_regions, after_world_regions)) {
+        const auto before = before_world_regions.find(id);
+        const auto after = after_world_regions.find(id);
+        const bool added = before == before_world_regions.end();
+        const bool removed = after == after_world_regions.end();
+        if (!added && !removed && before->second == after->second) continue;
+        ++world_change.changed_region_count;
+        if (world_change.regions.size() >= kMaxProjectDiffWorldRegionRecords) {
+            world_change.region_records_truncated = true;
+            continue;
+        }
+        WorldRegionSourceChange change;
+        change.id = id;
+        change.added = added;
+        change.removed = removed;
+        if (!added) change.before = summarize_world_region(before->second);
+        if (!removed) change.after = summarize_world_region(after->second);
+        world_change.regions.push_back(std::move(change));
+    }
+    const auto& before_structure_graphs = before_world_model.structure_graphs();
+    const auto& after_structure_graphs = after_world_model.structure_graphs();
+    world_change.before_structure_graph_count = before_structure_graphs.size();
+    world_change.after_structure_graph_count = after_structure_graphs.size();
+    const auto same_structure_graph = [](
+            const world::StructureGraph& left,
+            const world::StructureGraph& right) {
+        if (left.id != right.id || left.semantic_type != right.semantic_type ||
+            left.nodes.size() != right.nodes.size() ||
+            left.edges.size() != right.edges.size()) {
+            return false;
+        }
+        auto left_node = left.nodes.begin();
+        auto right_node = right.nodes.begin();
+        for (; left_node != left.nodes.end(); ++left_node, ++right_node) {
+            const auto& a = left_node->second;
+            const auto& b = right_node->second;
+            if (left_node->first != right_node->first || a.id != b.id ||
+                a.semantic_type != b.semantic_type || a.area != b.area) {
+                return false;
+            }
+        }
+        auto left_edge = left.edges.begin();
+        auto right_edge = right.edges.begin();
+        for (; left_edge != left.edges.end(); ++left_edge, ++right_edge) {
+            const auto& a = left_edge->second;
+            const auto& b = right_edge->second;
+            if (left_edge->first != right_edge->first || a.id != b.id ||
+                a.first_node != b.first_node || a.second_node != b.second_node ||
+                a.relationship != b.relationship || a.path != b.path ||
+                a.directed != b.directed) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const auto summarize_structure_graph = [](const world::StructureGraph& graph)
+            -> std::optional<WorldStructureGraphSourceSummary> {
+        world::WorldModel single_graph_model;
+        if (!single_graph_model.insert_structure_graph(graph)) return std::nullopt;
+        const std::string serialized = single_graph_model.serialize();
+        WorldStructureGraphSourceSummary summary;
+        summary.semantic_type = graph.semantic_type;
+        summary.serialized_bytes = serialized.size();
+        summary.digest = assets::sha256(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(serialized.data()), serialized.size()));
+        summary.node_count = graph.nodes.size();
+        summary.edge_count = graph.edges.size();
+        const std::size_t node_sample_count = std::min(
+            graph.nodes.size(), kMaxProjectDiffWorldStructureGraphIds);
+        const std::size_t edge_sample_count = std::min(
+            graph.edges.size(), kMaxProjectDiffWorldStructureGraphIds);
+        summary.node_id_sample.reserve(node_sample_count);
+        summary.edge_id_sample.reserve(edge_sample_count);
+        for (auto node = graph.nodes.begin(); node != graph.nodes.end() &&
+                summary.node_id_sample.size() < node_sample_count; ++node) {
+            summary.node_id_sample.push_back(node->first);
+        }
+        for (auto edge = graph.edges.begin(); edge != graph.edges.end() &&
+                summary.edge_id_sample.size() < edge_sample_count; ++edge) {
+            summary.edge_id_sample.push_back(edge->first);
+        }
+        summary.ids_truncated = graph.nodes.size() > node_sample_count ||
+            graph.edges.size() > edge_sample_count;
+        return summary;
+    };
+    for (const world::StructureGraphId id : union_keys(
+            before_structure_graphs, after_structure_graphs)) {
+        const auto before = before_structure_graphs.find(id);
+        const auto after = after_structure_graphs.find(id);
+        const bool added = before == before_structure_graphs.end();
+        const bool removed = after == after_structure_graphs.end();
+        if (!added && !removed && same_structure_graph(before->second, after->second)) {
+            continue;
+        }
+        ++world_change.changed_structure_graph_count;
+        if (world_change.structure_graphs.size() >=
+            kMaxProjectDiffWorldStructureGraphs) {
+            world_change.structure_graphs_truncated = true;
+            continue;
+        }
+        WorldStructureGraphSourceChange change;
+        change.id = id;
+        change.added = added;
+        change.removed = removed;
+        if (!added) {
+            change.before = summarize_structure_graph(before->second);
+            if (!change.before.has_value()) {
+                world_change.structure_graph_details_available = false;
+            }
+        }
+        if (!removed) {
+            change.after = summarize_structure_graph(after->second);
+            if (!change.after.has_value()) {
+                world_change.structure_graph_details_available = false;
+            }
+        }
+        world_change.structure_graphs.push_back(std::move(change));
+    }
+
+    const auto summarize_scientific_model = [](const scientific::ScientificModel& model) {
+        ScientificModelSourceSummary summary;
+        const std::string serialized = model.serialize();
+        summary.serialized_bytes = serialized.size();
+        summary.digest = assets::sha256(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(serialized.data()), serialized.size()));
+        summary.regions = model.regions().size();
+        summary.boundaries = model.boundaries().size();
+        summary.interfaces = model.interfaces().size();
+        summary.sources = model.sources().size();
+        summary.loads = model.loads().size();
+        summary.parameters = model.parameters().size();
+        summary.fields = model.fields().size();
+        summary.probes = model.probes().size();
+        summary.studies = model.studies().size();
+        summary.result_sets = model.result_sets().size();
+        const auto note_extension = [&summary](bool present, const char* name) {
+            if (present) summary.populated_extensions.emplace_back(name);
+        };
+        note_extension(model.morphology().has_value(), "morphology");
+        note_extension(model.functional_genome().has_value(), "functional genome");
+        note_extension(model.developmental_program().has_value(), "developmental program");
+        note_extension(model.developmental_trace().has_value(), "developmental trace");
+        note_extension(model.lineage_graph().has_value(), "lineage graph");
+        note_extension(model.morphometrics().has_value(), "morphometrics");
+        note_extension(model.sequence_genome().has_value(), "sequence genome");
+        note_extension(model.anatomy().has_value(), "anatomy");
+        note_extension(model.field_visualizations().has_value(), "field visualizations");
+        note_extension(model.import_ledger().has_value(), "import ledger");
+        note_extension(model.phenotype_capabilities().has_value(), "phenotype capabilities");
+        note_extension(model.gene_regulatory_network().has_value(), "gene regulatory network");
+        note_extension(model.anatomy_provider_manifest().has_value(), "anatomy provider manifest");
+        note_extension(model.replay_capsules().has_value(), "replay capsules");
+        return summary;
+    };
+    auto& scientific_change = diff.scientific_model;
+    const auto before_scientific_summary =
+        summarize_scientific_model(base_document_.scientific_model());
+    const auto after_scientific_summary =
+        summarize_scientific_model(speculative_document.scientific_model());
+    scientific_change.changed =
+        before_scientific_summary.digest != after_scientific_summary.digest;
+    scientific_change.before = before_scientific_summary;
+    scientific_change.after = after_scientific_summary;
+
+    auto& procedural_change = diff.procedural_sources;
+    procedural_change.before_counts = {
+        base_document_.curve_paths().size(),
+        base_document_.road_sources().size(),
+        base_document_.sweep_sources().size(),
+        base_document_.sign_text_sources().size()};
+    procedural_change.after_counts = {
+        speculative_document.curve_paths().size(),
+        speculative_document.road_sources().size(),
+        speculative_document.sweep_sources().size(),
+        speculative_document.sign_text_sources().size()};
+    const auto record_digest = [](const std::string& serialized) {
+        return assets::sha256(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(serialized.data()), serialized.size()));
+    };
+    const auto summarize_curve_path = [&record_digest](const geometry::CurvePath& path) {
+        const std::string serialized = path.serialize();
+        return CurvePathSourceSummary{
+            path.source_revision, record_digest(serialized), serialized.size(),
+            path.segments.size()};
+    };
+    const auto summarize_road = [&record_digest](const project::RoadSource& road) {
+        const std::string serialized = road.serialize();
+        return RoadSourceSummary{
+            road.source_revision, record_digest(serialized), serialized.size(),
+            road.centerline_identity, road.centerline_revision, road.width_meters,
+            road.shoulder_meters, road.maximum_grade_ratio,
+            road.minimum_curve_radius_meters, road.surface_class,
+            road.function_class, road.access_state, road.drainage_intent};
+    };
+    const auto summarize_sweep = [&record_digest](const geometry::SweepSource& sweep) {
+        const std::string serialized = sweep.serialize();
+        return SweepSourceSummary{
+            sweep.source_revision, record_digest(serialized), serialized.size(),
+            sweep.centerline_identity, sweep.centerline_revision, sweep.profile.size(),
+            sweep.samples_per_segment, sweep.start_scale, sweep.end_scale,
+            sweep.cap_policy, sweep.inner_profile_scale};
+    };
+    const auto summarize_sign_text = [&record_digest](
+            const geometry::SignTextSource& sign) {
+        const std::string serialized = sign.serialize();
+        return SignTextSourceSummary{
+            sign.source_revision, record_digest(serialized), serialized.size(),
+            sign.text.size(), record_digest(sign.text), sign.alignment,
+            sign.board_width, sign.board_height, sign.board_depth,
+            sign.glyph_height, sign.glyph_depth, sign.tracking, sign.line_spacing};
+    };
+    const auto collect_procedural_sources = [&procedural_change](
+            const auto& before_records,
+            const auto& after_records,
+            ProceduralSourceKind kind,
+            const auto& summarize) {
+        std::set<std::string> identities;
+        for (const auto& [identity, record] : before_records) {
+            static_cast<void>(record);
+            identities.insert(identity);
+        }
+        for (const auto& [identity, record] : after_records) {
+            static_cast<void>(record);
+            identities.insert(identity);
+        }
+        for (const auto& identity : identities) {
+            const auto before = before_records.find(identity);
+            const auto after = after_records.find(identity);
+            const bool added = before == before_records.end();
+            const bool removed = after == after_records.end();
+            if (!added && !removed &&
+                before->second.serialize() == after->second.serialize()) {
+                continue;
+            }
+            ++procedural_change.changed_record_count;
+            if (procedural_change.records.size() >= kMaxProjectDiffProceduralSources) {
+                procedural_change.records_truncated = true;
+                continue;
+            }
+            ProceduralSourceRecordChange change;
+            change.kind = kind;
+            change.identity = identity;
+            change.added = added;
+            change.removed = removed;
+            if (!added) change.before = summarize(before->second);
+            if (!removed) change.after = summarize(after->second);
+            procedural_change.records.push_back(std::move(change));
+        }
+    };
+    collect_procedural_sources(
+        base_document_.curve_paths(), speculative_document.curve_paths(),
+        ProceduralSourceKind::curve_path, summarize_curve_path);
+    collect_procedural_sources(
+        base_document_.road_sources(), speculative_document.road_sources(),
+        ProceduralSourceKind::road, summarize_road);
+    collect_procedural_sources(
+        base_document_.sweep_sources(), speculative_document.sweep_sources(),
+        ProceduralSourceKind::sweep, summarize_sweep);
+    collect_procedural_sources(
+        base_document_.sign_text_sources(), speculative_document.sign_text_sources(),
+        ProceduralSourceKind::sign_text, summarize_sign_text);
+    procedural_change.changed = procedural_change.changed_record_count != 0U;
+
+    auto& biological_change = diff.biological_authoring_sources;
+    const auto& before_biological = base_document_.biological_authoring_sources();
+    const auto& after_biological = speculative_document.biological_authoring_sources();
+    biological_change.before_record_count = before_biological.size();
+    biological_change.after_record_count = after_biological.size();
+    std::set<project::BiologicalAuthoringKey> biological_keys;
+    for (const auto& [key, source] : before_biological) {
+        static_cast<void>(source);
+        biological_keys.insert(key);
+    }
+    for (const auto& [key, source] : after_biological) {
+        static_cast<void>(source);
+        biological_keys.insert(key);
+    }
+    for (const auto& key : biological_keys) {
+        const auto before = before_biological.find(key);
+        const auto after = after_biological.find(key);
+        const bool added = before == before_biological.end();
+        const bool removed = after == after_biological.end();
+        if (!added && !removed && before->second == after->second) continue;
+        ++biological_change.changed_record_count;
+        if (biological_change.records.size() >=
+            kMaxProjectDiffBiologicalAuthoringSources) {
+            biological_change.records_truncated = true;
+            continue;
+        }
+        BiologicalAuthoringSourceChange change;
+        change.identity = key.first + " · asset #" + std::to_string(key.second);
+        change.added = added;
+        change.removed = removed;
+        if (!added) {
+            change.before = BiologicalAuthoringSourceSummary{
+                key.first, key.second, before->second.bytes.size(), before->second.digest};
+        }
+        if (!removed) {
+            change.after = BiologicalAuthoringSourceSummary{
+                key.first, key.second, after->second.bytes.size(), after->second.digest};
+        }
+        biological_change.records.push_back(std::move(change));
+    }
+    biological_change.changed = biological_change.changed_record_count != 0U;
+
+    auto& rig_module_change = diff.rig_module_template_sources;
+    const auto& before_rig_modules = base_document_.rig_module_templates();
+    const auto& after_rig_modules = speculative_document.rig_module_templates();
+    rig_module_change.before_record_count = before_rig_modules.size();
+    rig_module_change.after_record_count = after_rig_modules.size();
+    std::set<std::string> rig_module_identities;
+    for (const auto& [identity, source] : before_rig_modules) {
+        static_cast<void>(source);
+        rig_module_identities.insert(identity);
+    }
+    for (const auto& [identity, source] : after_rig_modules) {
+        static_cast<void>(source);
+        rig_module_identities.insert(identity);
+    }
+    for (const auto& identity : rig_module_identities) {
+        const auto before = before_rig_modules.find(identity);
+        const auto after = after_rig_modules.find(identity);
+        const bool added = before == before_rig_modules.end();
+        const bool removed = after == after_rig_modules.end();
+        if (!added && !removed && before->second == after->second) continue;
+        ++rig_module_change.changed_record_count;
+        if (rig_module_change.records.size() >=
+            kMaxProjectDiffRigModuleTemplates) {
+            rig_module_change.records_truncated = true;
+            continue;
+        }
+        RigModuleTemplateSourceChange change;
+        change.identity = identity;
+        change.added = added;
+        change.removed = removed;
+        if (!added) {
+            change.before = RigModuleTemplateSourceSummary{
+                before->second.revision, before->second.bytes.size(),
+                before->second.digest};
+        }
+        if (!removed) {
+            change.after = RigModuleTemplateSourceSummary{
+                after->second.revision, after->second.bytes.size(),
+                after->second.digest};
+        }
+        rig_module_change.records.push_back(std::move(change));
+    }
+    rig_module_change.changed = rig_module_change.changed_record_count != 0U;
+
+    auto& decal_placement_change = diff.decal_placement_sources;
+    const auto& before_decal_placements = base_document_.decal_placements();
+    const auto& after_decal_placements = speculative_document.decal_placements();
+    decal_placement_change.before_record_count = before_decal_placements.size();
+    decal_placement_change.after_record_count = after_decal_placements.size();
+    std::set<std::uint64_t> decal_placement_ids;
+    for (const auto& [id, source] : before_decal_placements) {
+        static_cast<void>(source);
+        decal_placement_ids.insert(id);
+    }
+    for (const auto& [id, source] : after_decal_placements) {
+        static_cast<void>(source);
+        decal_placement_ids.insert(id);
+    }
+    for (const auto id : decal_placement_ids) {
+        const auto before = before_decal_placements.find(id);
+        const auto after = after_decal_placements.find(id);
+        const bool added = before == before_decal_placements.end();
+        const bool removed = after == after_decal_placements.end();
+        if (!added && !removed && before->second == after->second) continue;
+        ++decal_placement_change.changed_record_count;
+        if (decal_placement_change.records.size() >=
+            kMaxProjectDiffDecalPlacementSources) {
+            decal_placement_change.records_truncated = true;
+            continue;
+        }
+        DecalPlacementSourceChange change;
+        change.placement_id = id;
+        change.added = added;
+        change.removed = removed;
+        if (!added) {
+            change.before = DecalPlacementSourceSummary{
+                before->second.revision, before->second.bytes.size(),
+                before->second.digest};
+        }
+        if (!removed) {
+            change.after = DecalPlacementSourceSummary{
+                after->second.revision, after->second.bytes.size(),
+                after->second.digest};
+        }
+        decal_placement_change.records.push_back(std::move(change));
+    }
+    decal_placement_change.changed =
+        decal_placement_change.changed_record_count != 0U;
+
+    auto& pose_library_change = diff.pose_libraries;
+    const auto& before_pose_libraries = base_document_.pose_libraries();
+    const auto& after_pose_libraries = speculative_document.pose_libraries();
+    pose_library_change.before_record_count = before_pose_libraries.size();
+    pose_library_change.after_record_count = after_pose_libraries.size();
+    std::set<std::string> pose_library_identities;
+    for (const auto& [identity, source] : before_pose_libraries) {
+        static_cast<void>(source);
+        pose_library_identities.insert(identity);
+    }
+    for (const auto& [identity, source] : after_pose_libraries) {
+        static_cast<void>(source);
+        pose_library_identities.insert(identity);
+    }
+    for (const auto& identity : pose_library_identities) {
+        const auto before = before_pose_libraries.find(identity);
+        const auto after = after_pose_libraries.find(identity);
+        const bool added = before == before_pose_libraries.end();
+        const bool removed = after == after_pose_libraries.end();
+        if (!added && !removed && before->second == after->second) continue;
+        ++pose_library_change.changed_record_count;
+        if (pose_library_change.records.size() >= kMaxProjectDiffPoseLibraries) {
+            pose_library_change.records_truncated = true;
+            continue;
+        }
+        PoseLibrarySourceChange change;
+        change.identity = identity;
+        change.added = added;
+        change.removed = removed;
+        if (!added) {
+            change.before = PoseLibrarySourceSummary{
+                before->second.revision, before->second.bytes.size(),
+                before->second.digest};
+        }
+        if (!removed) {
+            change.after = PoseLibrarySourceSummary{
+                after->second.revision, after->second.bytes.size(),
+                after->second.digest};
+        }
+        pose_library_change.records.push_back(std::move(change));
+    }
+    pose_library_change.changed = pose_library_change.changed_record_count != 0U;
+
+    auto& kinematic_graph_change = diff.kinematic_graphs;
+    const auto& before_kinematic_graphs = base_document_.kinematic_graphs();
+    const auto& after_kinematic_graphs = speculative_document.kinematic_graphs();
+    kinematic_graph_change.before_record_count = before_kinematic_graphs.size();
+    kinematic_graph_change.after_record_count = after_kinematic_graphs.size();
+    std::set<std::string> kinematic_graph_identities;
+    for (const auto& [identity, source] : before_kinematic_graphs) {
+        static_cast<void>(source);
+        kinematic_graph_identities.insert(identity);
+    }
+    for (const auto& [identity, source] : after_kinematic_graphs) {
+        static_cast<void>(source);
+        kinematic_graph_identities.insert(identity);
+    }
+    for (const auto& identity : kinematic_graph_identities) {
+        const auto before = before_kinematic_graphs.find(identity);
+        const auto after = after_kinematic_graphs.find(identity);
+        const bool added = before == before_kinematic_graphs.end();
+        const bool removed = after == after_kinematic_graphs.end();
+        if (!added && !removed && before->second == after->second) continue;
+        ++kinematic_graph_change.changed_record_count;
+        if (kinematic_graph_change.records.size() >=
+            kMaxProjectDiffKinematicGraphs) {
+            kinematic_graph_change.records_truncated = true;
+            continue;
+        }
+        KinematicGraphSourceChange change;
+        change.identity = identity;
+        change.added = added;
+        change.removed = removed;
+        if (!added) {
+            change.before = KinematicGraphSourceSummary{
+                before->second.revision, before->second.bytes.size(),
+                before->second.digest};
+        }
+        if (!removed) {
+            change.after = KinematicGraphSourceSummary{
+                after->second.revision, after->second.bytes.size(),
+                after->second.digest};
+        }
+        kinematic_graph_change.records.push_back(std::move(change));
+    }
+    kinematic_graph_change.changed =
+        kinematic_graph_change.changed_record_count != 0U;
+
+    auto& edit_receipt_change = diff.edit_receipts;
+    const auto& before_weight_receipts = base_document_.weight_edit_receipts();
+    const auto& after_weight_receipts = speculative_document.weight_edit_receipts();
+    const auto& before_curve_receipts = base_document_.curve_edit_receipts();
+    const auto& after_curve_receipts = speculative_document.curve_edit_receipts();
+    const auto& before_topology_receipts = base_document_.topology_receipts();
+    const auto& after_topology_receipts = speculative_document.topology_receipts();
+    const auto& before_mesh_patches = base_document_.mesh_patches();
+    const auto& after_mesh_patches = speculative_document.mesh_patches();
+    edit_receipt_change.before_counts = {
+        before_weight_receipts.size(), before_curve_receipts.size(),
+        before_topology_receipts.size(), before_mesh_patches.size()};
+    edit_receipt_change.after_counts = {
+        after_weight_receipts.size(), after_curve_receipts.size(),
+        after_topology_receipts.size(), after_mesh_patches.size()};
+    const auto collect_edit_receipts = [&edit_receipt_change](
+            const auto& before, const auto& after, ProjectEditReceiptKind kind) {
+        const std::size_t receipt_count = std::max(before.size(), after.size());
+        for (std::size_t index = 0U; index < receipt_count; ++index) {
+            const bool added = index >= before.size();
+            const bool removed = index >= after.size();
+            if (!added && !removed && before[index] == after[index]) continue;
+            ++edit_receipt_change.changed_record_count;
+            if (edit_receipt_change.records.size() >= kMaxProjectDiffEditReceipts) {
+                edit_receipt_change.records_truncated = true;
+                continue;
+            }
+            ProjectEditReceiptChange change;
+            change.kind = kind;
+            change.sequence_index = index;
+            change.added = added;
+            change.removed = removed;
+            if (!added) {
+                change.before = ProjectEditReceiptSummary{
+                    before[index].bytes.size(), before[index].digest};
+            }
+            if (!removed) {
+                change.after = ProjectEditReceiptSummary{
+                    after[index].bytes.size(), after[index].digest};
+            }
+            edit_receipt_change.records.push_back(std::move(change));
+        }
+    };
+    collect_edit_receipts(before_weight_receipts, after_weight_receipts,
+        ProjectEditReceiptKind::weight);
+    collect_edit_receipts(before_curve_receipts, after_curve_receipts,
+        ProjectEditReceiptKind::keyed_curve);
+    const auto collect_durable_edit_receipts = [&edit_receipt_change](
+            const auto& before, const auto& after, ProjectEditReceiptKind kind,
+            auto same_record, auto summarize) {
+        const std::size_t receipt_count = std::max(before.size(), after.size());
+        for (std::size_t index = 0U; index < receipt_count; ++index) {
+            const bool added = index >= before.size();
+            const bool removed = index >= after.size();
+            if (!added && !removed && same_record(before[index], after[index])) continue;
+            ++edit_receipt_change.changed_record_count;
+            if (edit_receipt_change.records.size() >= kMaxProjectDiffEditReceipts) {
+                edit_receipt_change.records_truncated = true;
+                continue;
+            }
+            ProjectEditReceiptChange change;
+            change.kind = kind;
+            change.sequence_index = index;
+            change.added = added;
+            change.removed = removed;
+            if (!added) change.before = summarize(before[index]);
+            if (!removed) change.after = summarize(after[index]);
+            edit_receipt_change.records.push_back(std::move(change));
+        }
+    };
+    const auto serialized_receipt_digest = [](std::string_view serialized) {
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(serialized.data());
+        return assets::sha256(std::span<const std::uint8_t>(bytes, serialized.size()));
+    };
+    collect_durable_edit_receipts(
+        before_topology_receipts, after_topology_receipts,
+        ProjectEditReceiptKind::topology,
+        [](const project::TopologyReceiptRecord& left,
+            const project::TopologyReceiptRecord& right) {
+            return left.mesh_asset == right.mesh_asset &&
+                left.receipt.serialize() == right.receipt.serialize();
+        },
+        [&serialized_receipt_digest](const project::TopologyReceiptRecord& receipt) {
+            const std::string serialized = receipt.receipt.serialize();
+            ProjectEditReceiptSummary summary;
+            summary.serialized_bytes = serialized.size();
+            summary.digest = serialized_receipt_digest(serialized);
+            summary.mesh_asset = receipt.mesh_asset;
+            return summary;
+        });
+    collect_durable_edit_receipts(
+        before_mesh_patches, after_mesh_patches,
+        ProjectEditReceiptKind::mesh_patch,
+        [](const project::MeshPatchRecord& left, const project::MeshPatchRecord& right) {
+            return left.mesh_asset == right.mesh_asset &&
+                left.patch_digest == right.patch_digest &&
+                left.source_mesh_digest == right.source_mesh_digest &&
+                left.result_mesh_digest == right.result_mesh_digest &&
+                left.patch_bytes == right.patch_bytes;
+        },
+        [](const project::MeshPatchRecord& patch) {
+            ProjectEditReceiptSummary summary;
+            summary.serialized_bytes = patch.patch_bytes.size();
+            summary.digest = patch.patch_digest;
+            summary.mesh_asset = patch.mesh_asset;
+            summary.source_mesh_digest = patch.source_mesh_digest;
+            summary.result_mesh_digest = patch.result_mesh_digest;
+            return summary;
+        });
+    edit_receipt_change.changed = edit_receipt_change.changed_record_count != 0U;
+
+    auto& instance_receipt_change = diff.instance_receipts;
+    const auto& before_sign_text_receipts =
+        base_document_.sign_text_instance_receipts();
+    const auto& after_sign_text_receipts =
+        speculative_document.sign_text_instance_receipts();
+    const auto& before_road_receipts = base_document_.road_surface_instance_receipts();
+    const auto& after_road_receipts =
+        speculative_document.road_surface_instance_receipts();
+    const auto& before_biological_proxy_receipts =
+        base_document_.biological_proxy_instance_receipts();
+    const auto& after_biological_proxy_receipts =
+        speculative_document.biological_proxy_instance_receipts();
+    const auto& before_vegetation_receipts =
+        base_document_.condition_vegetation_placement_receipts();
+    const auto& after_vegetation_receipts =
+        speculative_document.condition_vegetation_placement_receipts();
+    instance_receipt_change.before_counts = {
+        before_sign_text_receipts.size(), before_road_receipts.size(),
+        before_biological_proxy_receipts.size(), before_vegetation_receipts.size()};
+    instance_receipt_change.after_counts = {
+        after_sign_text_receipts.size(), after_road_receipts.size(),
+        after_biological_proxy_receipts.size(), after_vegetation_receipts.size()};
+
+    const auto same_position = [](core::Vec3d left, core::Vec3d right) {
+        return left.x == right.x && left.y == right.y && left.z == right.z;
+    };
+    const auto same_vegetation_fields = [](const auto& left, const auto& right) {
+        if (left.size() != right.size()) return false;
+        for (std::size_t index = 0U; index < left.size(); ++index) {
+            if (left[index].identity != right[index].identity ||
+                left[index].semantic != right[index].semantic ||
+                left[index].source_revision != right[index].source_revision ||
+                left[index].digest != right[index].digest) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const auto same_sign_text_receipt = [](
+            const project::SignTextInstanceReceipt& left,
+            const project::SignTextInstanceReceipt& right) {
+        return left.object == right.object && left.mesh_asset == right.mesh_asset &&
+            left.source_identity == right.source_identity &&
+            left.source_revision == right.source_revision &&
+            left.source_snapshot == right.source_snapshot &&
+            left.source_digest == right.source_digest;
+    };
+    const auto same_road_receipt = [](
+            const project::RoadSurfaceInstanceReceipt& left,
+            const project::RoadSurfaceInstanceReceipt& right) {
+        return left.object == right.object && left.mesh_asset == right.mesh_asset &&
+            left.road_identity == right.road_identity &&
+            left.road_revision == right.road_revision &&
+            left.surface_class == right.surface_class &&
+            left.road_snapshot == right.road_snapshot &&
+            left.road_digest == right.road_digest &&
+            left.centerline_identity == right.centerline_identity &&
+            left.centerline_revision == right.centerline_revision &&
+            left.centerline_snapshot == right.centerline_snapshot &&
+            left.centerline_digest == right.centerline_digest &&
+            left.samples_per_segment == right.samples_per_segment &&
+            left.generated_mesh_digest == right.generated_mesh_digest;
+    };
+    const auto same_biological_proxy_receipt = [](
+            const project::BiologicalProxyInstanceReceipt& left,
+            const project::BiologicalProxyInstanceReceipt& right) {
+        return left.object == right.object && left.mesh_asset == right.mesh_asset &&
+            left.source_namespace == right.source_namespace &&
+            left.source_asset_id == right.source_asset_id &&
+            left.source_revision == right.source_revision &&
+            left.structure_id == right.structure_id &&
+            left.source_snapshot == right.source_snapshot &&
+            left.source_snapshot_digest == right.source_snapshot_digest &&
+            left.product_digest == right.product_digest;
+    };
+    const auto same_vegetation_receipt = [&same_position, &same_vegetation_fields](
+            const project::ConditionVegetationPlacementReceipt& left,
+            const project::ConditionVegetationPlacementReceipt& right) {
+        return left.object == right.object && left.mesh_asset == right.mesh_asset &&
+            left.stable_placement_id == right.stable_placement_id &&
+            left.recipe_id == right.recipe_id &&
+            left.species_asset_id == right.species_asset_id &&
+            left.plant_source_identity == right.plant_source_identity &&
+            left.plant_source_generation == right.plant_source_generation &&
+            left.plant_source_digest == right.plant_source_digest &&
+            left.source_project_revision == right.source_project_revision &&
+            left.authoring_revision == right.authoring_revision &&
+            left.authoring_digest == right.authoring_digest &&
+            left.preview_digest == right.preview_digest &&
+            same_vegetation_fields(left.fields, right.fields) &&
+            same_position(left.position, right.position) &&
+            left.yaw_radians == right.yaw_radians &&
+            left.uniform_scale == right.uniform_scale &&
+            left.suitability == right.suitability;
+    };
+    const auto collect_instance_receipts = [&instance_receipt_change](
+            const auto& before_records,
+            const auto& after_records,
+            ProjectInstanceReceiptKind kind,
+            auto same_record,
+            auto summarize) {
+        std::set<scene::ObjectId> objects;
+        for (const auto& [object, receipt] : before_records) {
+            static_cast<void>(receipt);
+            objects.insert(object);
+        }
+        for (const auto& [object, receipt] : after_records) {
+            static_cast<void>(receipt);
+            objects.insert(object);
+        }
+        for (const auto object : objects) {
+            const auto before = before_records.find(object);
+            const auto after = after_records.find(object);
+            const bool added = before == before_records.end();
+            const bool removed = after == after_records.end();
+            if (!added && !removed && same_record(before->second, after->second)) continue;
+            ++instance_receipt_change.changed_record_count;
+            switch (kind) {
+            case ProjectInstanceReceiptKind::sign_text:
+                ++instance_receipt_change.changed_record_counts.sign_text;
+                break;
+            case ProjectInstanceReceiptKind::road_surface:
+                ++instance_receipt_change.changed_record_counts.road_surface;
+                break;
+            case ProjectInstanceReceiptKind::biological_proxy:
+                ++instance_receipt_change.changed_record_counts.biological_proxy;
+                break;
+            case ProjectInstanceReceiptKind::condition_vegetation:
+                ++instance_receipt_change.changed_record_counts.condition_vegetation;
+                break;
+            }
+            if (instance_receipt_change.records.size() >=
+                kMaxProjectDiffInstanceReceipts) {
+                instance_receipt_change.records_truncated = true;
+                continue;
+            }
+            ProjectInstanceReceiptChange change;
+            change.kind = kind;
+            change.object = object;
+            change.added = added;
+            change.removed = removed;
+            if (!added) change.before = summarize(before->second);
+            if (!removed) change.after = summarize(after->second);
+            instance_receipt_change.records.push_back(std::move(change));
+        }
+    };
+    collect_instance_receipts(before_sign_text_receipts, after_sign_text_receipts,
+        ProjectInstanceReceiptKind::sign_text, same_sign_text_receipt,
+        [](const project::SignTextInstanceReceipt& receipt) {
+            return ProjectInstanceReceiptSummary{SignTextInstanceReceiptSummary{
+                receipt.mesh_asset, receipt.source_identity, receipt.source_revision,
+                receipt.source_snapshot.size(), receipt.source_digest}};
+        });
+    collect_instance_receipts(before_road_receipts, after_road_receipts,
+        ProjectInstanceReceiptKind::road_surface, same_road_receipt,
+        [](const project::RoadSurfaceInstanceReceipt& receipt) {
+            return ProjectInstanceReceiptSummary{RoadSurfaceInstanceReceiptSummary{
+                receipt.mesh_asset, receipt.surface_class, receipt.road_identity,
+                receipt.road_revision, receipt.road_snapshot.size(), receipt.road_digest,
+                receipt.centerline_identity, receipt.centerline_revision,
+                receipt.centerline_snapshot.size(), receipt.centerline_digest,
+                receipt.samples_per_segment, receipt.generated_mesh_digest}};
+        });
+    collect_instance_receipts(
+        before_biological_proxy_receipts, after_biological_proxy_receipts,
+        ProjectInstanceReceiptKind::biological_proxy,
+        same_biological_proxy_receipt,
+        [](const project::BiologicalProxyInstanceReceipt& receipt) {
+            return ProjectInstanceReceiptSummary{
+                BiologicalProxyInstanceReceiptSummary{
+                    receipt.mesh_asset, receipt.source_namespace, receipt.source_asset_id,
+                    receipt.source_revision, receipt.structure_id,
+                    receipt.source_snapshot.size(), receipt.source_snapshot_digest,
+                    receipt.product_digest}};
+        });
+    collect_instance_receipts(
+        before_vegetation_receipts, after_vegetation_receipts,
+        ProjectInstanceReceiptKind::condition_vegetation,
+        same_vegetation_receipt,
+        [](const project::ConditionVegetationPlacementReceipt& receipt) {
+            ConditionVegetationInstanceReceiptSummary summary;
+            summary.mesh_asset = receipt.mesh_asset;
+            summary.stable_placement_id = receipt.stable_placement_id;
+            summary.recipe_id = receipt.recipe_id;
+            summary.species_asset_id = receipt.species_asset_id;
+            summary.plant_source_identity = receipt.plant_source_identity;
+            summary.plant_source_generation = receipt.plant_source_generation;
+            summary.plant_source_digest = receipt.plant_source_digest;
+            summary.source_project_revision = receipt.source_project_revision;
+            summary.authoring_revision = receipt.authoring_revision;
+            summary.authoring_digest = receipt.authoring_digest;
+            summary.preview_digest = receipt.preview_digest;
+            summary.fields.reserve(receipt.fields.size());
+            for (const auto& field : receipt.fields) {
+                summary.fields.push_back(ConditionVegetationFieldReceiptSummary{
+                    field.identity, field.semantic, field.source_revision, field.digest});
+            }
+            summary.position = receipt.position;
+            summary.yaw_radians = receipt.yaw_radians;
+            summary.uniform_scale = receipt.uniform_scale;
+            summary.suitability = receipt.suitability;
+            return ProjectInstanceReceiptSummary{std::move(summary)};
+        });
+    instance_receipt_change.changed =
+        instance_receipt_change.changed_record_count != 0U;
+
+    auto& mesh_authoring_sources = diff.mesh_authoring_sources;
+    const auto& before_sculpt_stacks = base_document_.sculpt_stacks();
+    const auto& after_sculpt_stacks = speculative_document.sculpt_stacks();
+    const auto& before_garment_assets = base_document_.garment_assets();
+    const auto& after_garment_assets = speculative_document.garment_assets();
+    const auto& before_cloth_receipts = base_document_.cloth_rest_pose_receipts();
+    const auto& after_cloth_receipts = speculative_document.cloth_rest_pose_receipts();
+    mesh_authoring_sources.before_counts = {
+        before_sculpt_stacks.size(), before_garment_assets.size(),
+        before_cloth_receipts.size()};
+    mesh_authoring_sources.after_counts = {
+        after_sculpt_stacks.size(), after_garment_assets.size(),
+        after_cloth_receipts.size()};
+    const auto collect_mesh_authoring_sources = [&mesh_authoring_sources](
+            const auto& before_records,
+            const auto& after_records,
+            ProjectMeshAuthoringSourceKind kind) {
+        using RecordMap = std::decay_t<decltype(before_records)>;
+        using Key = typename RecordMap::key_type;
+        std::set<Key> mesh_assets;
+        for (const auto& [mesh_asset, record] : before_records) {
+            static_cast<void>(record);
+            mesh_assets.insert(mesh_asset);
+        }
+        for (const auto& [mesh_asset, record] : after_records) {
+            static_cast<void>(record);
+            mesh_assets.insert(mesh_asset);
+        }
+        for (const Key mesh_asset : mesh_assets) {
+            const auto before = before_records.find(mesh_asset);
+            const auto after = after_records.find(mesh_asset);
+            const bool added = before == before_records.end();
+            const bool removed = after == after_records.end();
+            if (!added && !removed && before->second == after->second) continue;
+            ++mesh_authoring_sources.changed_record_count;
+            switch (kind) {
+            case ProjectMeshAuthoringSourceKind::sculpt_stack:
+                ++mesh_authoring_sources.changed_record_counts.sculpt_stack;
+                break;
+            case ProjectMeshAuthoringSourceKind::garment_asset:
+                ++mesh_authoring_sources.changed_record_counts.garment_asset;
+                break;
+            case ProjectMeshAuthoringSourceKind::cloth_rest_pose_receipt:
+                ++mesh_authoring_sources.changed_record_counts.cloth_rest_pose_receipt;
+                break;
+            }
+            if (mesh_authoring_sources.records.size() >=
+                kMaxProjectDiffMeshAuthoringSources) {
+                mesh_authoring_sources.records_truncated = true;
+                continue;
+            }
+            ProjectMeshAuthoringSourceChange change;
+            change.kind = kind;
+            change.mesh_asset = static_cast<std::uint64_t>(mesh_asset);
+            change.added = added;
+            change.removed = removed;
+            if (!added) {
+                change.before = ProjectMeshAuthoringSourceSummary{
+                    before->second.bytes.size(), before->second.digest};
+            }
+            if (!removed) {
+                change.after = ProjectMeshAuthoringSourceSummary{
+                    after->second.bytes.size(), after->second.digest};
+            }
+            mesh_authoring_sources.records.push_back(std::move(change));
+        }
+    };
+    collect_mesh_authoring_sources(
+        before_sculpt_stacks, after_sculpt_stacks,
+        ProjectMeshAuthoringSourceKind::sculpt_stack);
+    collect_mesh_authoring_sources(
+        before_garment_assets, after_garment_assets,
+        ProjectMeshAuthoringSourceKind::garment_asset);
+    collect_mesh_authoring_sources(
+        before_cloth_receipts, after_cloth_receipts,
+        ProjectMeshAuthoringSourceKind::cloth_rest_pose_receipt);
+    mesh_authoring_sources.changed =
+        mesh_authoring_sources.changed_record_count != 0U;
+
     append_catalog_detail_changes(
         base_document_.material_catalog(), speculative_document.material_catalog(), diff);
     diff.material_catalog_changed = base_document_.material_catalog().serialize() !=
         speculative_document.material_catalog().serialize();
+    diff.presentation_catalog_changed =
+        base_document_.presentation_catalog().serialize() !=
+        speculative_document.presentation_catalog().serialize();
+    if (diff.presentation_catalog_changed) {
+        const auto format_key = [](const auto& key) -> std::string {
+            if constexpr (std::is_same_v<std::decay_t<decltype(key)>, scene::ObjectId>) {
+                return std::to_string(key.value);
+            } else {
+                return key;
+            }
+        };
+        const auto collect_records = [&diff, &format_key](
+                const auto& before_records,
+                const auto& after_records,
+                PresentationRecordKind kind,
+                auto same_record) {
+            using RecordMap = std::decay_t<decltype(before_records)>;
+            using Key = typename RecordMap::key_type;
+            using Value = typename RecordMap::mapped_type;
+            std::set<Key> keys;
+            for (const auto& [key, value] : before_records) {
+                static_cast<void>(value);
+                keys.insert(key);
+            }
+            for (const auto& [key, value] : after_records) {
+                static_cast<void>(value);
+                keys.insert(key);
+            }
+            for (const auto& key : keys) {
+                const auto before = before_records.find(key);
+                const auto after = after_records.find(key);
+                const bool added = before == before_records.end();
+                const bool removed = after == after_records.end();
+                const bool changed = !added && !removed &&
+                    !same_record(before->second, after->second);
+                if (!added && !removed && !changed) continue;
+
+                switch (kind) {
+                case PresentationRecordKind::camera:
+                    ++diff.presentation_camera_change_count;
+                    break;
+                case PresentationRecordKind::light:
+                    ++diff.presentation_light_change_count;
+                    break;
+                case PresentationRecordKind::reference_plane:
+                    ++diff.presentation_plane_change_count;
+                    break;
+                }
+                if (diff.presentation_records.size() >=
+                    kMaxProjectDiffPresentationRecordSamples) {
+                    diff.presentation_records_truncated = true;
+                    continue;
+                }
+
+                PresentationRecordChange detail;
+                detail.kind = kind;
+                detail.identity = format_key(key);
+                if constexpr (std::is_same_v<Key, scene::ObjectId>) {
+                    detail.object = key;
+                }
+                detail.added = added;
+                detail.removed = removed;
+                if constexpr (std::is_same_v<Value, project::AuthoredCamera>) {
+                    if (!added) detail.camera_before = before->second;
+                    if (!removed) detail.camera_after = after->second;
+                } else if constexpr (std::is_same_v<Value, project::AuthoredLight>) {
+                    if (!added) detail.light_before = before->second;
+                    if (!removed) detail.light_after = after->second;
+                } else if constexpr (std::is_same_v<Value, project::ReferenceImagePlane>) {
+                    if (!added) detail.plane_before = before->second;
+                    if (!removed) detail.plane_after = after->second;
+                }
+                if (!added) detail.before_revision = before->second.revision;
+                if (!removed) detail.after_revision = after->second.revision;
+                diff.presentation_records.push_back(std::move(detail));
+            }
+        };
+        collect_records(base_document_.presentation_catalog().cameras(),
+            speculative_document.presentation_catalog().cameras(),
+            PresentationRecordKind::camera, same_presentation_camera);
+        collect_records(base_document_.presentation_catalog().lights(),
+            speculative_document.presentation_catalog().lights(),
+            PresentationRecordKind::light, same_presentation_light);
+        collect_records(base_document_.presentation_catalog().reference_planes(),
+            speculative_document.presentation_catalog().reference_planes(),
+            PresentationRecordKind::reference_plane, same_reference_image_plane);
+        if (diff.presentation_camera_change_count == 0U &&
+            diff.presentation_light_change_count == 0U &&
+            diff.presentation_plane_change_count == 0U) {
+            diff.presentation_records_details_available = false;
+        }
+    }
     diff.engineering_changed = base_document_.engineering_authoring() !=
         speculative_document.engineering_authoring();
     diff.condition_changed = base_document_.condition_authoring() !=
@@ -4966,6 +6978,26 @@ ProjectDiff ProjectDiff::between(
         base_document_.engineering_authoring(), speculative_document.engineering_authoring());
     diff.condition = sidecar_change(
         base_document_.condition_authoring(), speculative_document.condition_authoring());
+    const auto& before_semantic_bytes = base_document_.semantic_sidecar_bytes();
+    const auto& after_semantic_bytes = speculative_document.semantic_sidecar_bytes();
+    const auto& before_semantic_digest = base_document_.semantic_sidecar_digest();
+    const auto& after_semantic_digest = speculative_document.semantic_sidecar_digest();
+    diff.semantic_sidecar_changed = before_semantic_bytes != after_semantic_bytes ||
+        before_semantic_digest != after_semantic_digest;
+    if (diff.semantic_sidecar_changed) {
+        SidecarChange change;
+        change.before_present = before_semantic_bytes.has_value();
+        change.after_present = after_semantic_bytes.has_value();
+        change.before_digest = before_semantic_digest;
+        change.after_digest = after_semantic_digest;
+        if (before_semantic_bytes.has_value()) {
+            change.before_bytes = before_semantic_bytes->size();
+        }
+        if (after_semantic_bytes.has_value()) {
+            change.after_bytes = after_semantic_bytes->size();
+        }
+        diff.semantic_sidecar = std::move(change);
+    }
     diff.digest = project_result_digest(speculative_document);
     return diff;
 }
@@ -5378,6 +7410,61 @@ AgentTaskSnapshot AgentTask::snapshot() const {
     return view;
 }
 
+core::Result<ProjectMergeReview> AgentTask::compare_current_project_merge() const {
+    if (!source_ || !speculative_ ||
+        (status_ != TaskStatus::review && status_ != TaskStatus::blocked)) {
+        return core::Result<ProjectMergeReview>::failure(invalid_state(
+            "project merge review requires a retained review or blocked task"));
+    }
+    return core::Result<ProjectMergeReview>::success(ProjectMergeReview::between(
+        base_document_, source_->document_, speculative_->document_));
+}
+
+core::Result<ProjectDiff> AgentTask::project_merge_source_diff(
+    const ProjectMergeReview& review,
+    ProjectMergeSource selected_source) const {
+    if (auto checked = review.validate(); !checked) {
+        return core::Result<ProjectDiff>::failure(checked.error());
+    }
+    if (selected_source > ProjectMergeSource::right) {
+        return core::Result<ProjectDiff>::failure(invalid(
+            "project merge diff source is invalid"));
+    }
+    const auto current_review = compare_current_project_merge();
+    if (!current_review) {
+        return core::Result<ProjectDiff>::failure(current_review.error());
+    }
+    if (current_review.value().digest != review.digest) {
+        return core::Result<ProjectDiff>::failure(stale(
+            "project merge sources changed before side-by-side diff creation"));
+    }
+    const project::ProjectDocument* source = &base_document_;
+    if (selected_source == ProjectMergeSource::left) source = &source_->document_;
+    if (selected_source == ProjectMergeSource::right) source = &speculative_->document_;
+    auto diff = ProjectDiff::between(base_document_, *source);
+    const assets::Sha256Digest expected_digest = selected_source == ProjectMergeSource::common
+        ? review.base_digest : selected_source == ProjectMergeSource::left
+            ? review.left_digest : review.right_digest;
+    if (diff.base_digest != review.base_digest || diff.digest != expected_digest) {
+        return core::Result<ProjectDiff>::failure(stale(
+            "project merge side diff does not match its reviewed snapshot"));
+    }
+    return core::Result<ProjectDiff>::success(std::move(diff));
+}
+
+core::Result<ProjectMergeResolution> AgentTask::resolve_current_project_merge(
+    const ProjectMergeReview& review,
+    std::optional<ProjectMergeSource> contested_choice) const {
+    if (!source_ || !speculative_ ||
+        (status_ != TaskStatus::review && status_ != TaskStatus::blocked)) {
+        return core::Result<ProjectMergeResolution>::failure(invalid_state(
+            "project merge resolution requires a retained review or blocked task"));
+    }
+    return ::carto::agent::resolve_project_merge(
+        review, base_document_, source_->document_, speculative_->document_,
+        contested_choice);
+}
+
 AgentTaskSnapshot AgentTask::build_snapshot() const {
     AgentTaskSnapshot view;
     view.status = status_;
@@ -5436,6 +7523,58 @@ core::Result<application::DispatchReceipt> AgentTask::accept(
         diagnostic_ = accepted.error();
         return accepted;
     }
+    status_ = TaskStatus::accepted;
+    return accepted;
+}
+
+core::Result<application::DispatchReceipt> AgentTask::accept_project_merge(
+    application::HumanActionAdmission,
+    const ProjectMergeReview& review,
+    const ProjectMergeResolution& resolution,
+    std::string justification) {
+    if (!source_ || !speculative_ ||
+        (status_ != TaskStatus::review && status_ != TaskStatus::blocked) ||
+        !std::all_of(gates_.begin(), gates_.end(), [](const AcceptanceGateResult& gate) {
+            return !gate.required || gate.passed;
+        })) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "project merge acceptance requires a retained task with all required gates passed"));
+    }
+    if (!safe_text(justification, 1024U)) {
+        return core::Result<application::DispatchReceipt>::failure(invalid(
+            "project merge acceptance requires a printable human justification"));
+    }
+    if (auto checked = resolution.validate(); !checked) {
+        return core::Result<application::DispatchReceipt>::failure(checked.error());
+    }
+    const auto current_review = compare_current_project_merge();
+    if (!current_review) {
+        return core::Result<application::DispatchReceipt>::failure(current_review.error());
+    }
+    if (current_review.value().digest != review.digest ||
+        resolution.review_digest != review.digest ||
+        resolution.base_digest != review.base_digest) {
+        return core::Result<application::DispatchReceipt>::failure(stale(
+            "project merge review changed before human acceptance"));
+    }
+    const auto refreshed = resolve_current_project_merge(review, resolution.selected_source);
+    if (!refreshed) {
+        return core::Result<application::DispatchReceipt>::failure(refreshed.error());
+    }
+    if (refreshed.value().digest != resolution.digest ||
+        refreshed.value().source_digest != resolution.source_digest ||
+        refreshed.value().selected_source != resolution.selected_source) {
+        return core::Result<application::DispatchReceipt>::failure(stale(
+            "selected project snapshot changed after merge review"));
+    }
+
+    const char* selected_source = resolution.selected_source == ProjectMergeSource::common
+        ? "common" : resolution.selected_source == ProjectMergeSource::left
+            ? "current" : "speculative";
+    const auto accepted = source_->accept_agent_project_merge(
+        resolution.candidate, review.left_revision, plan_.id, review.digest.hex(),
+        resolution.source_digest.hex(), selected_source, justification);
+    if (!accepted) return accepted;
     status_ = TaskStatus::accepted;
     return accepted;
 }
@@ -6739,6 +8878,15 @@ namespace carto::application {
 core::Result<DispatchReceipt> HumanApplicationAccess::accept_agent_task(
     ::carto::agent::AgentTask& task) {
     return task.accept(HumanActionAdmission{});
+}
+
+core::Result<DispatchReceipt> HumanApplicationAccess::accept_agent_project_merge(
+    ::carto::agent::AgentTask& task,
+    const ::carto::agent::ProjectMergeReview& review,
+    const ::carto::agent::ProjectMergeResolution& resolution,
+    std::string justification) {
+    return task.accept_project_merge(
+        HumanActionAdmission{}, review, resolution, std::move(justification));
 }
 
 core::Result<void> HumanApplicationAccess::correct_agent_ghost_transform(

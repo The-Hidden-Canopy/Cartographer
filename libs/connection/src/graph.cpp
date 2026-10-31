@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <iomanip>
+#include <limits>
+#include <locale>
 #include <set>
 #include <span>
 #include <sstream>
@@ -41,6 +43,12 @@ bool valid_acceptance_tier(PortGraphAcceptanceTier tier) {
 bool same_edge_endpoints(const PortConnectionEdge& edge, PortId first, PortId second) {
     return (edge.first_port == first && edge.second_port == second) ||
         (edge.first_port == second && edge.second_port == first);
+}
+
+bool evidence_supports_kind(const PortCompatibilityEvidence& evidence, ConnectionKind kind) {
+    const std::string_view required_space = connection_kind_space(kind);
+    return std::any_of(evidence.shared_tags.begin(), evidence.shared_tags.end(),
+        [required_space](const auto& tag) { return tag.space == required_space; });
 }
 
 std::map<PortId, std::vector<PortId>> adjacency_of(
@@ -146,6 +154,27 @@ core::Result<void> ConnectionPortGraph::insert_port(ConnectionPort port) {
     return core::Result<void>::success();
 }
 
+core::Result<void> ConnectionPortGraph::erase_port(PortId id) {
+    if (!id) {
+        return core::Result<void>::failure(detail::invalid_field(
+            "connection port identity is missing"));
+    }
+    if (!ports_.contains(id)) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::not_found, "connection port does not exist"));
+    }
+    const bool connected = std::any_of(edges_.begin(), edges_.end(), [id](const auto& item) {
+        const auto& edge = item.second;
+        return edge.first_port == id || edge.second_port == id;
+    });
+    if (connected) {
+        return core::Result<void>::failure(detail::validation_error(
+            "connected port must be disconnected before it can be removed"));
+    }
+    ports_.erase(id);
+    return core::Result<void>::success();
+}
+
 core::Result<PortConnectionEdge> ConnectionPortGraph::connect(
     PortId first,
     PortId second,
@@ -167,6 +196,11 @@ core::Result<PortConnectionEdge> ConnectionPortGraph::connect(
         return core::Result<PortConnectionEdge>::failure(detail::validation_error(
             "connection port graph has reached its bounded edge capacity"));
     }
+    if (next_edge_id_ == 0U) {
+        return core::Result<PortConnectionEdge>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "connection edge identity space is exhausted"));
+    }
     for (const auto& [identity, edge] : edges_) {
         static_cast<void>(identity);
         if (edge.kind == kind && same_edge_endpoints(edge, first, second)) {
@@ -178,11 +212,7 @@ core::Result<PortConnectionEdge> ConnectionPortGraph::connect(
     if (!evidence) {
         return core::Result<PortConnectionEdge>::failure(evidence.error());
     }
-    const std::string_view required_space = connection_kind_space(kind);
-    const bool namespace_matches = std::any_of(
-        evidence.value().shared_tags.begin(), evidence.value().shared_tags.end(),
-        [required_space](const PortCompatibilityTag& tag) { return tag.space == required_space; });
-    if (!namespace_matches) {
+    if (!evidence_supports_kind(evidence.value(), kind)) {
         return core::Result<PortConnectionEdge>::failure(detail::validation_error(
             "shared compatibility tags do not include the edge-kind namespace"));
     }
@@ -192,7 +222,9 @@ core::Result<PortConnectionEdge> ConnectionPortGraph::connect(
     }
 
     PortConnectionEdge edge;
-    edge.id = next_edge_id_++;
+    edge.id = next_edge_id_;
+    next_edge_id_ = edge.id == std::numeric_limits<std::uint64_t>::max()
+        ? 0U : edge.id + 1U;
     edge.first_port = first;
     edge.second_port = second;
     edge.kind = kind;
@@ -200,6 +232,18 @@ core::Result<PortConnectionEdge> ConnectionPortGraph::connect(
     const auto [iterator, inserted] = edges_.emplace(edge.id, edge);
     static_cast<void>(inserted);
     return core::Result<PortConnectionEdge>::success(iterator->second);
+}
+
+core::Result<void> ConnectionPortGraph::erase_edge(std::uint64_t edge_id) {
+    if (edge_id == 0U) {
+        return core::Result<void>::failure(detail::invalid_field(
+            "connection edge identity is missing"));
+    }
+    if (edges_.erase(edge_id) == 0U) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::not_found, "connection edge does not exist"));
+    }
+    return core::Result<void>::success();
 }
 
 const ConnectionPort* ConnectionPortGraph::find_port(PortId id) const noexcept {
@@ -230,13 +274,24 @@ bool ConnectionPortGraph::would_create_cycle(PortId first, PortId second) const 
 }
 
 void ConnectionPortGraph::refresh_next_edge_id() noexcept {
-    next_edge_id_ = edges_.empty() ? 1U : edges_.rbegin()->first + 1U;
+    if (edges_.empty()) {
+        next_edge_id_ = 1U;
+        return;
+    }
+    const std::uint64_t last_id = edges_.rbegin()->first;
+    next_edge_id_ = last_id == std::numeric_limits<std::uint64_t>::max()
+        ? 0U : last_id + 1U;
 }
 
 core::Result<void> ConnectionPortGraph::validate() const {
     if (ports_.size() > kMaxPortsPerGraph || edges_.size() > kMaxEdgesPerGraph) {
         return core::Result<void>::failure(detail::validation_error(
             "connection port graph exceeds its bounded capacity"));
+    }
+    if (next_edge_id_ != 0U && !edges_.empty() &&
+        next_edge_id_ <= edges_.rbegin()->first) {
+        return core::Result<void>::failure(detail::validation_error(
+            "connection edge allocation state overlaps an existing identity"));
     }
     for (const auto& [identity, port] : ports_) {
         if (identity != port.id) {
@@ -245,6 +300,7 @@ core::Result<void> ConnectionPortGraph::validate() const {
         }
         if (auto result = port.validate(); !result) return result;
     }
+    std::set<std::pair<PortId, PortId>> endpoint_pairs;
     for (const auto& [identity, edge] : edges_) {
         if (identity != edge.id) {
             return core::Result<void>::failure(detail::validation_error(
@@ -256,15 +312,26 @@ core::Result<void> ConnectionPortGraph::validate() const {
                 core::ErrorCode::not_found,
                 "connection edge references a port missing from the graph"));
         }
-    }
-    for (auto left = edges_.begin(); left != edges_.end(); ++left) {
-        for (auto right = std::next(left); right != edges_.end(); ++right) {
-            if (left->second.kind == right->second.kind &&
-                same_edge_endpoints(
-                    left->second, right->second.first_port, right->second.second_port)) {
-                return core::Result<void>::failure(detail::validation_error(
-                    "connection port graph contains duplicate edges"));
-            }
+        const auto expected = check_port_compatibility(
+            ports_.at(edge.first_port), ports_.at(edge.second_port));
+        if (!expected) {
+            return core::Result<void>::failure(expected.error().with_context(
+                "connection edge endpoint compatibility"));
+        }
+        if (!evidence_supports_kind(expected.value(), edge.kind)) {
+            return core::Result<void>::failure(detail::validation_error(
+                "shared compatibility tags do not include the edge-kind namespace"));
+        }
+        if (edge.evidence.shared_tags != expected.value().shared_tags ||
+            edge.evidence.first_satisfied_requirements != expected.value().first_satisfied_requirements ||
+            edge.evidence.second_satisfied_requirements != expected.value().second_satisfied_requirements) {
+            return core::Result<void>::failure(core::Diagnostic(core::ErrorCode::stale_data,
+                "connection edge evidence does not match its exact endpoint contract"));
+        }
+        if (!endpoint_pairs.emplace(std::min(edge.first_port, edge.second_port),
+                std::max(edge.first_port, edge.second_port)).second) {
+            return core::Result<void>::failure(detail::validation_error(
+                "connection port graph contains duplicate attachment endpoints"));
         }
     }
     if (contains_cycle(adjacency_of(edges_))) {
@@ -277,7 +344,15 @@ core::Result<void> ConnectionPortGraph::validate() const {
 
 std::string ConnectionPortGraph::serialize() const {
     std::ostringstream output;
-    output << kGraphMagic << ' ' << kConnectionPortGraphVersion << '\n';
+    output.imbue(std::locale::classic());
+    const auto last_id = edges_.empty() ? 0U : edges_.rbegin()->first;
+    const auto inferred_next = last_id == std::numeric_limits<std::uint64_t>::max()
+        ? 0U : last_id + 1U;
+    // Preserve legacy bytes unless deletion retained allocation history that
+    // cannot be reconstructed from the remaining live edges.
+    const bool retained_allocation = next_edge_id_ != inferred_next;
+    output << kGraphMagic << ' ' << (retained_allocation ? kConnectionPortGraphVersion : 1U)
+           << '\n';
     output << std::setprecision(17);
     output << "PORTS " << ports_.size() << '\n';
     for (const auto& [identity, port] : ports_) {
@@ -291,6 +366,7 @@ std::string ConnectionPortGraph::serialize() const {
         detail::write_evidence_inline(output, edge.evidence);
         output << '\n';
     }
+    if (retained_allocation) output << "NEXT_EDGE_ID " << next_edge_id_ << '\n';
     output << "END\n";
     return output.str();
 }
@@ -305,6 +381,7 @@ core::Result<ConnectionPortGraph> ConnectionPortGraph::deserialize(std::string_v
             "connection port graph text is empty or exceeds its byte bound"));
     }
     std::istringstream input{std::string(text)};
+    input.imbue(std::locale::classic());
     std::string magic;
     std::uint32_t version = 0U;
     if (!(input >> magic) || !detail::read_unsigned(input, version)) {
@@ -315,7 +392,7 @@ core::Result<ConnectionPortGraph> ConnectionPortGraph::deserialize(std::string_v
         return core::Result<ConnectionPortGraph>::failure(
             detail::parse_error("connection port graph framing is invalid"));
     }
-    if (version != kConnectionPortGraphVersion) {
+    if (version != 1U && version != kConnectionPortGraphVersion) {
         return core::Result<ConnectionPortGraph>::failure(core::Diagnostic(
             core::ErrorCode::version_mismatch,
             "connection port graph schema version is not supported"));
@@ -353,6 +430,7 @@ core::Result<ConnectionPortGraph> ConnectionPortGraph::deserialize(std::string_v
             !detail::read_unsigned(input, edge.first_port.value) ||
             !detail::read_unsigned(input, edge.second_port.value) ||
             !detail::read_unsigned(input, kind) ||
+            kind > static_cast<std::uint64_t>(ConnectionKind::utility) ||
             !detail::read_evidence_inline(input, edge.evidence)) {
             return core::Result<ConnectionPortGraph>::failure(detail::parse_error(
                 "connection port graph edge record is malformed"));
@@ -364,6 +442,12 @@ core::Result<ConnectionPortGraph> ConnectionPortGraph::deserialize(std::string_v
         }
     }
     graph.refresh_next_edge_id();
+    if (version >= 2U &&
+        (!detail::require_token(input, "NEXT_EDGE_ID") ||
+         !detail::read_unsigned(input, graph.next_edge_id_))) {
+        return core::Result<ConnectionPortGraph>::failure(detail::parse_error(
+            "connection port graph allocation state is malformed"));
+    }
 
     if (!detail::require_token(input, "END")) {
         return core::Result<ConnectionPortGraph>::failure(detail::parse_error(
@@ -458,6 +542,7 @@ core::Result<PortGraphAcceptanceReceipt> PortGraphAcceptanceReceipt::deserialize
         !(input >> graph_digest) ||
         !detail::require_token(input, "TIER") ||
         !detail::read_unsigned(input, tier) ||
+        tier > static_cast<std::uint64_t>(PortGraphAcceptanceTier::full_game) ||
         !detail::require_token(input, "EVIDENCE") ||
         !detail::read_count(input, kMaxAcceptanceEvidenceDigests, evidence_count)) {
         return core::Result<PortGraphAcceptanceReceipt>::failure(

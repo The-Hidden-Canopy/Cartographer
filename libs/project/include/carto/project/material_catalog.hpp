@@ -122,6 +122,7 @@ struct MaterialGraphBinding {
     std::string graph_identity;
     core::Revision source_revision;
     assets::Sha256Digest source_digest;
+    MaterialGraphEvaluationInputs inputs;
 };
 
 // Provider-neutral authoring truth owned by ProjectDocument. Compiled
@@ -129,12 +130,14 @@ struct MaterialGraphBinding {
 // derived products and cannot replace this catalog.
 class MaterialCatalog final {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 3U;
+    static constexpr std::uint32_t kSchemaVersion = 4U;
     static constexpr std::size_t kMaxSerializedBytes = 32U * 1024U * 1024U;
     static constexpr std::size_t kMaxRecordsPerKind = 65'536U;
     static constexpr std::size_t kMaxVariantMeshScope = 65'536U;
+    static constexpr std::size_t kMaxMaterialGraphBindingInputValues = 65'536U;
 
     [[nodiscard]] core::Result<void> insert_texture(TextureSourceRecord texture);
+    [[nodiscard]] core::Result<void> replace_texture(TextureSourceRecord texture);
     [[nodiscard]] core::Result<void> insert_sampler(SamplerIntent sampler);
     [[nodiscard]] core::Result<void> insert_material(render::MaterialAsset material);
     [[nodiscard]] core::Result<void> replace_material(render::MaterialAsset material);
@@ -146,6 +149,12 @@ public:
     [[nodiscard]] core::Result<void> replace_material_graph(MaterialGraph graph);
     [[nodiscard]] core::Result<void> bind_material_graph(
         render::MaterialId material, std::string graph_identity);
+    [[nodiscard]] core::Result<void> set_material_graph_inputs(
+        render::MaterialId material,
+        std::string_view graph_identity,
+        core::Revision graph_revision,
+        const assets::Sha256Digest& graph_digest,
+        MaterialGraphEvaluationInputs inputs);
     [[nodiscard]] core::Result<void> unbind_material_graph(render::MaterialId material);
 
     [[nodiscard]] const std::map<assets::TextureAssetId, TextureSourceRecord>&

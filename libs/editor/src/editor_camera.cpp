@@ -194,6 +194,19 @@ void EditorCamera::set_projection(EditorProjection projection) noexcept {
     projection_ = projection;
 }
 
+bool EditorCamera::set_orientation(double yaw_radians, double pitch_radians) noexcept {
+    if (!valid() || !std::isfinite(yaw_radians) ||
+        std::abs(yaw_radians) > 1.0e12 || !std::isfinite(pitch_radians) ||
+        pitch_radians < -kMaxPitch || pitch_radians > kMaxPitch) {
+        return false;
+    }
+    const double next_yaw = wrap_angle(yaw_radians);
+    if (!std::isfinite(next_yaw)) return false;
+    yaw_ = next_yaw;
+    pitch_ = pitch_radians;
+    return true;
+}
+
 bool EditorCamera::orbit(double dx_pixels, double dy_pixels) noexcept {
     if (!valid() || !std::isfinite(dx_pixels) || !std::isfinite(dy_pixels) ||
         std::abs(dx_pixels) > 1.0e7 || std::abs(dy_pixels) > 1.0e7) {

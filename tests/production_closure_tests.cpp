@@ -44,7 +44,8 @@ void require(bool condition, const char* message) {
 carto::geometry::EditableMesh render_mesh_fixture(
     bool degenerate_uvs = false,
     bool with_uv_seam = true,
-    bool out_of_range_color = false) {
+    bool out_of_range_color = false,
+    bool with_additional_uv_seam = false) {
     using namespace carto;
     geometry::EditableMesh mesh;
     const auto v0 = mesh.add_vertex({0.0, 0.0, 0.0});
@@ -98,6 +99,22 @@ carto::geometry::EditableMesh render_mesh_fixture(
                  attributes::AttributeType::vec2},
                 std::move(uv1_values)})),
             "render mesh fixture UV1 layer is valid");
+    std::vector<attributes::AttributeValue> detail_uv_values;
+    detail_uv_values.reserve(topology.value().corners.size());
+    for (const auto& corner : topology.value().corners) {
+        core::Vec2d detail_uv = authored_uvs.at(corner.vertex);
+        detail_uv = {detail_uv.x + 0.25, detail_uv.y * 0.75};
+        if (with_additional_uv_seam && corner.face == f1.value() &&
+            corner.vertex == v0.value()) {
+            detail_uv.x += 2.0;
+        }
+        detail_uv_values.emplace_back(detail_uv);
+    }
+    require(static_cast<bool>(attributes.add_layer({
+                {"uv.detail", attributes::AttributeDomain::corner,
+                 attributes::AttributeType::vec2},
+                std::move(detail_uv_values)})),
+            "render mesh fixture additional UV layer is valid");
     std::vector<attributes::AttributeValue> vertex_colors{
         core::Vec4d{1.0, 0.0, 0.0, 1.0},
         core::Vec4d{0.0, 1.0, 0.0, 1.0},
@@ -125,6 +142,9 @@ carto::geometry::EditableMesh render_mesh_fixture(
     require(static_cast<bool>(uv_sets.add({
                 8U, "Lightmap UV", "uv.lightmap", false, false, true, 1U})),
             "render mesh fixture UV1 identity is valid");
+    require(static_cast<bool>(uv_sets.add({
+                9U, "Detail UV", "uv.detail", false, false, false, 1U})),
+            "render mesh fixture additional UV identity is valid");
     require(static_cast<bool>(mesh.set_attribute_payload(std::move(attributes), std::move(uv_sets))),
             "render mesh fixture attributes bind to the mesh topology");
     return mesh;
@@ -887,6 +907,7 @@ void render_mesh_artifact_is_deterministic_and_fail_closed() {
         .material_slot_layer = "cartographer.material_slot",
         .vertex_color_layer = "color.display",
         .normal_layer = std::nullopt,
+        .additional_uv_sets = {9U},
     };
     const auto compiled = compile_render_mesh_artifact(source, mesh, options);
     require(static_cast<bool>(compiled), "authored mesh compiles to a render artifact");
@@ -926,6 +947,13 @@ void render_mesh_artifact_is_deterministic_and_fail_closed() {
     require(artifact.vertices.size() == 5U && artifact.indices.size() == 6U &&
                 artifact.triangle_faces.size() == 2U,
             "artifact splits the authored UV seam and shares seam-compatible vertices");
+    require(artifact.additional_uv_set_ids == std::vector<attributes::UvSetId>{9U} &&
+                std::all_of(artifact.vertices.begin(), artifact.vertices.end(),
+                    [](const auto& vertex) {
+                        return vertex.additional_uvs.size() == 1U &&
+                            vertex.additional_uvs.front().finite();
+                    }),
+            "artifact carries an identity-bound third authored UV stream");
     require(artifact.submeshes.size() == 2U &&
                 artifact.submeshes[0].material_slot == 3U &&
                 artifact.submeshes[1].material_slot == 9U &&
@@ -946,6 +974,14 @@ void render_mesh_artifact_is_deterministic_and_fail_closed() {
                 return vertex.source_vertex == geometry::VertexId{1U};
             }) == 2,
             "one stable source vertex is duplicated at the authored UV seam");
+    const auto additional_uv_seam = compile_render_mesh_artifact(
+        source, render_mesh_fixture(false, false, false, true), options);
+    require(additional_uv_seam && additional_uv_seam.value().vertices.size() == 5U &&
+                std::count_if(additional_uv_seam.value().vertices.begin(),
+                    additional_uv_seam.value().vertices.end(), [](const auto& vertex) {
+                        return vertex.source_vertex == geometry::VertexId{1U};
+                    }) == 2,
+            "an additional UV seam splits the render vertex without losing lineage");
 
     const geometry::EditableMesh normal_seam_mesh = render_mesh_with_normal_seam();
     RenderMeshCompileOptions normal_seam_options;
@@ -979,8 +1015,8 @@ void render_mesh_artifact_is_deterministic_and_fail_closed() {
     const auto normal_seam_bytes = normal_seam_artifact.value().serialize();
     require(static_cast<bool>(normal_seam_bytes),
             "derived normal seam artifact serializes");
-    require(normal_seam_bytes.value()[12U] == 3U,
-            "authored normal seam semantics use render-mesh artifact v3");
+    require(normal_seam_bytes.value()[12U] == 4U,
+            "authored normal seam semantics use render-mesh artifact v4");
     const auto reopened_normal_seam =
         RenderMeshArtifact::deserialize(normal_seam_bytes.value());
     require(static_cast<bool>(reopened_normal_seam),
@@ -1090,6 +1126,25 @@ void render_mesh_artifact_is_deterministic_and_fail_closed() {
     const auto reencoded = decoded.value().serialize();
     require(reencoded && reencoded.value() == encoded.value(),
             "artifact deserialization preserves its canonical bytes");
+    const auto& reopened_additional_uvs =
+        decoded.value().vertices.front().additional_uvs;
+    const auto& source_additional_uvs = artifact.vertices.front().additional_uvs;
+    require(decoded.value().additional_uv_set_ids == artifact.additional_uv_set_ids &&
+                reopened_additional_uvs.size() == source_additional_uvs.size() &&
+                std::equal(reopened_additional_uvs.begin(),
+                    reopened_additional_uvs.end(), source_additional_uvs.begin(),
+                    [](core::Vec2d left, core::Vec2d right) {
+                        return left.x == right.x && left.y == right.y;
+                    }),
+            "additional UV identities and corner-split coordinates survive artifact reopen");
+    auto zero_additional_uv_identity = artifact;
+    zero_additional_uv_identity.additional_uv_set_ids.front() = 0U;
+    require(!zero_additional_uv_identity.validate(),
+            "render artifact rejects zero additional UV-set identities");
+    auto incomplete_additional_uv_vertex = artifact;
+    incomplete_additional_uv_vertex.vertices.front().additional_uvs.clear();
+    require(!incomplete_additional_uv_vertex.validate(),
+            "render artifact rejects vertices missing a declared additional UV value");
 
     auto trailing = encoded.value();
     trailing.push_back(0U);
@@ -1099,6 +1154,27 @@ void render_mesh_artifact_is_deterministic_and_fail_closed() {
     unsupported_flags[16U] |= 0x80U;
     require(!RenderMeshArtifact::deserialize(unsupported_flags),
             "artifact decoder rejects unknown schema flags");
+    auto missing_additional_uv_flag = encoded.value();
+    missing_additional_uv_flag[16U] &= static_cast<std::uint8_t>(~0x20U);
+    require(!RenderMeshArtifact::deserialize(missing_additional_uv_flag),
+            "artifact decoder rejects additional UV metadata without its format flag");
+    auto zero_additional_uv_id = encoded.value();
+    std::fill(zero_additional_uv_id.begin() + 84,
+        zero_additional_uv_id.begin() + 88, std::uint8_t{0U});
+    require(!RenderMeshArtifact::deserialize(zero_additional_uv_id),
+            "artifact decoder rejects a zero serialized additional UV identity");
+    auto hostile_uv_count = encoded.value();
+    std::fill(hostile_uv_count.begin() + 80,
+        hostile_uv_count.begin() + 84, std::uint8_t{0xffU});
+    require(!RenderMeshArtifact::deserialize(hostile_uv_count),
+            "artifact decoder rejects an over-bound UV stream count before allocation");
+    auto hostile_total_uv_count = encoded.value();
+    hostile_total_uv_count[80U] = 8U;
+    hostile_total_uv_count[81U] = 0U;
+    hostile_total_uv_count[82U] = 0U;
+    hostile_total_uv_count[83U] = 0U;
+    require(!RenderMeshArtifact::deserialize(hostile_total_uv_count),
+        "artifact decoder rejects UV metadata that exceeds the total stream bound before reading IDs");
     auto hostile_counts = encoded.value();
     std::fill(hostile_counts.begin() + 68, hostile_counts.begin() + 72, std::uint8_t{0U});
     require(!RenderMeshArtifact::deserialize(hostile_counts),
@@ -1110,11 +1186,13 @@ void render_mesh_artifact_is_deterministic_and_fail_closed() {
     auto non_finite_position = encoded.value();
     constexpr std::array<std::uint8_t, 8U> quiet_nan{
         0U, 0U, 0U, 0U, 0U, 0U, 0xf8U, 0x7fU};
-    std::copy(quiet_nan.begin(), quiet_nan.end(), non_finite_position.begin() + 88);
+    std::copy(quiet_nan.begin(), quiet_nan.end(), non_finite_position.begin() + 96);
     require(!RenderMeshArtifact::deserialize(non_finite_position),
             "artifact decoder rejects non-finite vertex data");
     auto out_of_range_index = encoded.value();
-    const std::size_t first_index_byte = 80U + artifact.vertices.size() * 152U;
+    const std::size_t first_index_byte = 80U + 4U +
+        artifact.additional_uv_set_ids.size() * sizeof(std::uint32_t) +
+        artifact.vertices.size() * 168U;
     std::fill(out_of_range_index.begin() + static_cast<std::ptrdiff_t>(first_index_byte),
               out_of_range_index.begin() + static_cast<std::ptrdiff_t>(first_index_byte + 4U),
               std::uint8_t{0xffU});
@@ -1129,6 +1207,32 @@ void render_mesh_artifact_is_deterministic_and_fail_closed() {
             "omitted UV/material data remains explicitly absent, not fabricated");
     require(!pack_pbr_mesh_upload(no_uv.value()),
             "native PBR upload does not fabricate missing UV or tangent data");
+    const auto untextured_constants = render::pack_material_for_gpu(
+        render::StandardMaterial{});
+    require(static_cast<bool>(untextured_constants),
+        "fixture produces validated texture-free material constants");
+    const std::array untextured_materials{untextured_constants.value()};
+    const auto untextured_upload = pack_pbr_mesh_upload(
+        no_uv.value(), untextured_materials);
+    require(untextured_upload &&
+            std::all_of(untextured_upload.value().vertices.begin(),
+                untextured_upload.value().vertices.end(), [](const auto& vertex) {
+                    return vertex.uv0 == std::array<float, 2U>{0.0F, 0.0F} &&
+                        std::abs(core::dot(
+                            core::Vec3d{vertex.normal[0U], vertex.normal[1U],
+                                vertex.normal[2U]},
+                            core::Vec3d{vertex.tangent[0U], vertex.tangent[1U],
+                                vertex.tangent[2U]})) < 1e-5;
+                }),
+        "explicit texture-free upload supplies neutral UVs and a valid unused tangent frame");
+    render::StandardMaterial textured_material;
+    textured_material.base_color.asset = 7U;
+    const auto textured_constants = render::pack_material_for_gpu(textured_material);
+    require(static_cast<bool>(textured_constants),
+        "fixture produces validated textured material constants");
+    const std::array textured_materials{textured_constants.value()};
+    require(!pack_pbr_mesh_upload(no_uv.value(), textured_materials),
+        "material evidence with a texture cannot enable neutral UV/tangent fallback");
 
     const auto legacy_artifact = compile_render_mesh_artifact(
         source,
@@ -1145,16 +1249,25 @@ void render_mesh_artifact_is_deterministic_and_fail_closed() {
             "legacy-compatible render-mesh fixture compiles");
     auto legacy_bytes = legacy_artifact.value().serialize();
     require(static_cast<bool>(legacy_bytes), "legacy-compatible fixture serializes");
-    auto compatible_v2_bytes = legacy_bytes.value();
+    auto compatible_v3_bytes = legacy_bytes.value();
+    compatible_v3_bytes.erase(compatible_v3_bytes.begin() + 80,
+        compatible_v3_bytes.begin() + 84);
+    compatible_v3_bytes[12U] = 3U;
+    const auto compatible_v3_decoded = RenderMeshArtifact::deserialize(
+        compatible_v3_bytes);
+    require(static_cast<bool>(compatible_v3_decoded),
+            "v3 decoder retains artifacts predating additional UV streams");
+    auto compatible_v2_bytes = compatible_v3_bytes;
     compatible_v2_bytes[12U] = 2U;
     const auto compatible_v2_decoded = RenderMeshArtifact::deserialize(compatible_v2_bytes);
     require(static_cast<bool>(compatible_v2_decoded),
             "v2 decoder retains old artifacts with source-consistent normals");
-    legacy_bytes.value()[12U] = 1U;
-    legacy_bytes.value()[13U] = 0U;
-    legacy_bytes.value()[14U] = 0U;
-    legacy_bytes.value()[15U] = 0U;
-    const auto legacy_decoded = RenderMeshArtifact::deserialize(legacy_bytes.value());
+    auto compatible_v1_bytes = compatible_v3_bytes;
+    compatible_v1_bytes[12U] = 1U;
+    compatible_v1_bytes[13U] = 0U;
+    compatible_v1_bytes[14U] = 0U;
+    compatible_v1_bytes[15U] = 0U;
+    const auto legacy_decoded = RenderMeshArtifact::deserialize(compatible_v1_bytes);
     require(legacy_decoded &&
                 std::all_of(
                     legacy_decoded.value().vertices.begin(),
@@ -1173,6 +1286,23 @@ void render_mesh_artifact_is_deterministic_and_fail_closed() {
     missing_uv1.uv1_set = 99U;
     require(!compile_render_mesh_artifact(source, mesh, missing_uv1),
             "missing requested UV1 set is rejected");
+    auto missing_additional_uv = options;
+    missing_additional_uv.additional_uv_sets = {99U};
+    require(!compile_render_mesh_artifact(source, mesh, missing_additional_uv),
+            "missing additional UV sets are rejected");
+    auto aliased_additional_uv = options;
+    aliased_additional_uv.additional_uv_sets = {7U};
+    require(!compile_render_mesh_artifact(source, mesh, aliased_additional_uv),
+            "additional UV sets cannot alias the primary stream");
+    auto duplicate_additional_uv = options;
+    duplicate_additional_uv.additional_uv_sets = {9U, 9U};
+    require(!compile_render_mesh_artifact(source, mesh, duplicate_additional_uv),
+            "duplicate additional UV identities are rejected");
+    auto over_bound_additional_uv = options;
+    over_bound_additional_uv.additional_uv_sets = {10U, 11U, 12U, 13U, 14U,
+        15U, 16U};
+    require(!compile_render_mesh_artifact(source, mesh, over_bound_additional_uv),
+            "additional UV compilation respects the total stream bound");
     auto aliased_uv1 = options;
     aliased_uv1.uv1_set = aliased_uv1.uv_set;
     require(!compile_render_mesh_artifact(source, mesh, aliased_uv1),

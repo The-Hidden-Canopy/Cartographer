@@ -13,7 +13,29 @@ struct Vec2d {
     [[nodiscard]] bool finite() const noexcept {
         return std::isfinite(x) && std::isfinite(y);
     }
+
+    [[nodiscard]] double length_squared() const noexcept { return x * x + y * y; }
 };
+
+[[nodiscard]] constexpr Vec2d operator+(Vec2d left, Vec2d right) noexcept {
+    return {left.x + right.x, left.y + right.y};
+}
+
+[[nodiscard]] constexpr Vec2d operator-(Vec2d left, Vec2d right) noexcept {
+    return {left.x - right.x, left.y - right.y};
+}
+
+[[nodiscard]] constexpr Vec2d operator*(Vec2d value, double scalar) noexcept {
+    return {value.x * scalar, value.y * scalar};
+}
+
+[[nodiscard]] constexpr Vec2d operator*(double scalar, Vec2d value) noexcept {
+    return value * scalar;
+}
+
+[[nodiscard]] constexpr double dot(Vec2d left, Vec2d right) noexcept {
+    return left.x * right.x + left.y * right.y;
+}
 
 struct Vec3d {
     double x = 0.0;

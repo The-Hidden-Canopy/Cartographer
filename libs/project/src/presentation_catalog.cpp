@@ -269,6 +269,7 @@ core::Result<void> ReferenceImagePlane::validate() const {
         (orthographic_view && view_set_identity.empty()) ||
         (view == ReferencePlaneView::camera_pinned && !pinned_camera.has_value()) ||
         (view != ReferencePlaneView::camera_pinned && pinned_camera.has_value()) ||
+        (camera_local_placement && view != ReferencePlaneView::camera_pinned) ||
         !within_source_bounds(origin) || !normal.finite() || !up.finite() ||
         !std::isfinite(width_meters) || width_meters <= 1.0e-6 ||
         width_meters > kMaxSourceValue || !std::isfinite(opacity) ||
@@ -608,6 +609,7 @@ std::string PresentationCatalog::serialize() const {
             << plane.up.x << ' ' << plane.up.y << ' ' << plane.up.z << ' '
             << plane.width_meters << ' ' << plane.opacity << ' '
             << (plane.visible ? 1U : 0U) << ' ' << (plane.locked ? 1U : 0U) << ' '
+            << (plane.camera_local_placement ? 1U : 0U) << ' '
             << (plane.pinned_camera.has_value() ? plane.pinned_camera->value : 0U) << ' '
             << (plane.calibration.has_value() ? 1U : 0U) << ' '
             << (plane.calibration.has_value() ? plane.calibration->first_pixel.x : 0.0) << ' '
@@ -641,7 +643,7 @@ core::Result<PresentationCatalog> PresentationCatalog::deserialize(std::string_v
     input.imbue(std::locale::classic());
     std::uint32_t version = 0U;
     if (!expect(input, kMagic) || !read_unsigned(input, version) ||
-        (version != 1U && version != kSchemaVersion)) {
+        (version != 1U && version != 2U && version != kSchemaVersion)) {
         return core::Result<PresentationCatalog>::failure({
             core::ErrorCode::version_mismatch, "presentation catalog version is unsupported"});
     }
@@ -734,6 +736,7 @@ core::Result<PresentationCatalog> PresentationCatalog::deserialize(std::string_v
             bool has_calibration = false;
             bool visible = false;
             bool locked = false;
+            bool camera_local_placement = false;
             double first_x = 0.0;
             double first_y = 0.0;
             double second_x = 0.0;
@@ -750,6 +753,7 @@ core::Result<PresentationCatalog> PresentationCatalog::deserialize(std::string_v
                   plane.up.x >> plane.up.y >> plane.up.z >> plane.width_meters >>
                   plane.opacity) ||
                 !read_bool(input, visible) || !read_bool(input, locked) ||
+                (version >= 3U && !read_bool(input, camera_local_placement)) ||
                 !read_unsigned(input, camera_object) || !read_bool(input, has_calibration) ||
                 !(input >> first_x >> first_y >> second_x >> second_y >> known_distance >>
                   encoded_digest >> std::quoted(plane.identity) >>
@@ -767,6 +771,7 @@ core::Result<PresentationCatalog> PresentationCatalog::deserialize(std::string_v
             plane.view = static_cast<ReferencePlaneView>(view);
             plane.visible = visible;
             plane.locked = locked;
+            plane.camera_local_placement = camera_local_placement;
             if (camera_object != 0U) plane.pinned_camera = scene::ObjectId{camera_object};
             if (has_calibration) {
                 plane.calibration = ReferenceImageCalibration{

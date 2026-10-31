@@ -5,6 +5,7 @@
 
 #include <carto/d3d12/device.hpp>
 #include <carto/d3d12/bake_graph.hpp>
+#include <carto/d3d12/frame_scheduler.hpp>
 #include <carto/d3d12/projection_worker.hpp>
 #include <carto/d3d12/swapchain.hpp>
 #include <carto/d3d12/texture_upload.hpp>
@@ -30,6 +31,7 @@
 #include <map>
 #include <span>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -273,6 +275,65 @@ carto::geometry::EditableMesh make_bake_mesh(
             7U, "UV0", "uv0.corners", true, true, false, 1U}));
         REQUIRE(mesh.set_attribute_payload(std::move(attributes), std::move(sets)));
     }
+    REQUIRE(mesh.validate());
+    return mesh;
+}
+
+carto::geometry::EditableMesh make_multi_tile_bake_mesh(bool target) {
+    using namespace carto;
+    geometry::EditableMesh mesh;
+    const double z = target ? 0.0 : 0.05;
+    REQUIRE(mesh.insert_bulk(
+        {{geometry::VertexId{1U}, {0.0, 0.0, z}},
+         {geometry::VertexId{2U}, {1.0, 0.0, z}},
+         {geometry::VertexId{3U}, {0.0, 1.0, z}},
+         {geometry::VertexId{4U}, {2.0, 0.0, z}},
+         {geometry::VertexId{5U}, {3.0, 0.0, z}},
+         {geometry::VertexId{6U}, {2.0, 1.0, z}}},
+        {{geometry::FaceId{1U}, {geometry::VertexId{1U}, geometry::VertexId{2U},
+             geometry::VertexId{3U}}},
+         {geometry::FaceId{2U}, {geometry::VertexId{4U}, geometry::VertexId{5U},
+             geometry::VertexId{6U}}}}));
+    if (target) {
+        const std::vector<core::Vec2d> uvs{
+            {0.05, 0.05}, {0.9, 0.05}, {0.05, 0.9},
+            {1.05, 0.05}, {1.9, 0.05}, {1.05, 0.9},
+        };
+        attributes::AttributeSet attributes({
+            {attributes::AttributeDomain::corner, uvs.size()}});
+        REQUIRE(attributes.add_layer(attributes::AttributeLayer{
+            {"uv0.corners", attributes::AttributeDomain::corner,
+                attributes::AttributeType::vec2},
+            std::vector<attributes::AttributeValue>(uvs.begin(), uvs.end())}));
+        attributes::UvSetTable sets;
+        REQUIRE(sets.add(attributes::UvSetDescriptor{
+            7U, "UV0", "uv0.corners", true, true, false, 1U}));
+        REQUIRE(mesh.set_attribute_payload(std::move(attributes), std::move(sets)));
+    }
+    REQUIRE(mesh.validate());
+    return mesh;
+}
+
+carto::geometry::EditableMesh make_cross_tile_bake_target() {
+    using namespace carto;
+    geometry::EditableMesh mesh;
+    REQUIRE(mesh.insert_bulk(
+        {{geometry::VertexId{1U}, {0.0, 0.0, 0.0}},
+         {geometry::VertexId{2U}, {1.0, 0.0, 0.0}},
+         {geometry::VertexId{3U}, {0.0, 1.0, 0.0}}},
+        {{geometry::FaceId{1U}, {geometry::VertexId{1U}, geometry::VertexId{2U},
+             geometry::VertexId{3U}}}}));
+    const std::vector<core::Vec2d> uvs{{0.8, 0.05}, {1.2, 0.05}, {0.8, 0.9}};
+    attributes::AttributeSet attributes({
+        {attributes::AttributeDomain::corner, uvs.size()}});
+    REQUIRE(attributes.add_layer(attributes::AttributeLayer{
+        {"uv0.corners", attributes::AttributeDomain::corner,
+            attributes::AttributeType::vec2},
+        std::vector<attributes::AttributeValue>(uvs.begin(), uvs.end())}));
+    attributes::UvSetTable sets;
+    REQUIRE(sets.add(attributes::UvSetDescriptor{
+        7U, "UV0", "uv0.corners", true, true, false, 1U}));
+    REQUIRE(mesh.set_attribute_payload(std::move(attributes), std::move(sets)));
     REQUIRE(mesh.validate());
     return mesh;
 }
@@ -611,6 +672,61 @@ void d3d12_reuses_multiple_in_flight_command_contexts() {
         serial = submitted.value();
     }
     for (const auto serial : serials) REQUIRE(device.wait(serial));
+    REQUIRE(device.debug_receipts().empty());
+}
+
+void d3d12_frame_scheduler_bounds_and_tracks_submissions() {
+    using namespace carto;
+
+    const auto created = d3d12::D3D12Device::create(d3d12::D3D12DeviceOptions{
+        {}, false, true});
+    REQUIRE(created);
+    auto& device = *created.value();
+    d3d12::D3D12FrameScheduler scheduler(device, 2U);
+    d3d12::D3D12FrameScheduler zero_limit(device, 0U);
+    d3d12::D3D12FrameScheduler excessive_limit(
+        device, d3d12::D3D12FrameScheduler::kMaximumFramesInFlight + 1U);
+    REQUIRE(!zero_limit.begin_submission());
+    REQUIRE(!excessive_limit.begin_submission());
+    REQUIRE(device.last_submitted_serial() == 0U);
+    REQUIRE(!scheduler.track_submission(1U));
+
+    device_ir::DeviceCommandStream stream;
+    REQUIRE(scheduler.begin_submission());
+    REQUIRE(!scheduler.begin_submission());
+    REQUIRE(!scheduler.wait_idle());
+    const auto first = device.submit(stream, gpu::QueueType::graphics);
+    REQUIRE(first);
+    REQUIRE(device.last_submitted_serial() == first.value());
+    REQUIRE(!scheduler.track_submission(first.value() + 1U));
+    // Refusal leaves the current reservation available for the actual result.
+    REQUIRE(scheduler.track_submission(first.value()));
+    REQUIRE(scheduler.in_flight_count() <= 1U);
+    REQUIRE(!scheduler.track_submission(first.value()));
+
+    REQUIRE(scheduler.begin_submission());
+    scheduler.cancel_submission();
+    REQUIRE(scheduler.begin_submission());
+    const auto second = device.submit(stream, gpu::QueueType::graphics);
+    REQUIRE(second);
+    REQUIRE(scheduler.track_submission(second.value()));
+    REQUIRE(second.value() > first.value());
+    REQUIRE(scheduler.in_flight_count() <= 2U);
+
+    REQUIRE(scheduler.begin_submission());
+    REQUIRE(!scheduler.track_submission(first.value()));
+    scheduler.cancel_submission();
+
+    // The third reservation must remain usable whether completion already
+    // freed a slot or begin_submission had to wait for the oldest serial.
+    REQUIRE(scheduler.begin_submission());
+    const auto third = device.submit(stream, gpu::QueueType::graphics);
+    REQUIRE(third);
+    REQUIRE(scheduler.track_submission(third.value()));
+    REQUIRE(third.value() > second.value());
+    REQUIRE(scheduler.in_flight_count() <= 2U);
+    REQUIRE(scheduler.wait_idle());
+    REQUIRE(scheduler.in_flight_count() == 0U);
     REQUIRE(device.debug_receipts().empty());
 }
 
@@ -1778,8 +1894,16 @@ void d3d12_temporal_fp8_matches_e4m3_reference_and_motion_path() {
         0x50U, 0x50U, 0x50U, 0x38U,  // 8.0 RGB, 1.0 alpha
     }};
     constexpr std::array<std::uint8_t, 4U> moving_pixels{{
-        0x00U, 0x00U,  // pixel 0 has zero motion
-        0x38U, 0x00U,  // pixel 1 moves one pixel left
+        0xB8U, 0x00U,  // pixel 0 points off-frame and falls back to current
+        0xB8U, 0x00U,  // pixel 1's current-to-history offset selects pixel 0
+    }};
+    constexpr std::array<std::uint8_t, 4U> nonfinite_motion_pixels{{
+        0x7FU, 0x00U,  // pixel 0 has NaN X motion and falls back to current
+        0x00U, 0x00U,  // pixel 1 uses zero motion
+    }};
+    constexpr std::array<std::uint8_t, 4U> excessive_motion_pixels{{
+        0x48U, 0x00U,  // pixel 0 exceeds the frame extent and falls back
+        0x00U, 0x00U,  // pixel 1 uses zero motion
     }};
     constexpr std::array<std::uint8_t, 4U> zero_motion_pixels{};
     constexpr std::array<std::uint8_t, 8U> special_current_pixels{{
@@ -1800,6 +1924,10 @@ void d3d12_temporal_fp8_matches_e4m3_reference_and_motion_path() {
         gpu::Format::rgba8_e4m3, special_history_pixels);
     const auto moving_motion = upload_fp8_texture(
         gpu::Format::rg8_e4m3, moving_pixels);
+    const auto nonfinite_motion = upload_fp8_texture(
+        gpu::Format::rg8_e4m3, nonfinite_motion_pixels);
+    const auto excessive_motion = upload_fp8_texture(
+        gpu::Format::rg8_e4m3, excessive_motion_pixels);
     const auto zero_motion = upload_fp8_texture(
         gpu::Format::rg8_e4m3, zero_motion_pixels);
     const auto resolved = device.create_texture(gpu::TextureDesc{
@@ -1918,12 +2046,30 @@ void d3d12_temporal_fp8_matches_e4m3_reference_and_motion_path() {
         current, history, moving_motion, false);
     REQUIRE(dynamic_result && dynamic_result.value().size() == 8U);
     constexpr std::array<std::uint8_t, 8U> expected_dynamic{{
-        0x3CU, 0x3CU, 0x3CU, 0x38U,  // 1.5 RGB, current alpha 1.0
+        0x38U, 0x38U, 0x38U, 0x38U,  // off-frame motion preserves current pixel 0
         0x44U, 0x44U, 0x44U, 0x38U,  // motion selects history pixel 0: 3.0
     }};
     REQUIRE(std::equal(
         expected_dynamic.begin(), expected_dynamic.end(),
         dynamic_result.value().begin()));
+
+    const auto nonfinite_motion_result = resolve_and_read(
+        current, history, nonfinite_motion, false);
+    REQUIRE(nonfinite_motion_result &&
+        nonfinite_motion_result.value().size() == 8U);
+    constexpr std::array<std::uint8_t, 8U> expected_nonfinite_motion{{
+        0x38U, 0x38U, 0x38U, 0x38U,  // NaN motion preserves current pixel 0
+        0x4CU, 0x4CU, 0x4CU, 0x38U,  // zero motion blends pixel 1 with history 1
+    }};
+    REQUIRE(std::equal(expected_nonfinite_motion.begin(),
+        expected_nonfinite_motion.end(), nonfinite_motion_result.value().begin()));
+
+    const auto excessive_motion_result = resolve_and_read(
+        current, history, excessive_motion, false);
+    REQUIRE(excessive_motion_result &&
+        excessive_motion_result.value().size() == 8U);
+    REQUIRE(std::equal(expected_nonfinite_motion.begin(),
+        expected_nonfinite_motion.end(), excessive_motion_result.value().begin()));
 
     const auto static_result = resolve_and_read(
         current, history, zero_motion, true);
@@ -1940,7 +2086,7 @@ void d3d12_temporal_fp8_matches_e4m3_reference_and_motion_path() {
         special_current, special_history, moving_motion, false);
     REQUIRE(special_dynamic_result && special_dynamic_result.value().size() == 8U);
     constexpr std::array<std::uint8_t, 8U> expected_special_dynamic{{
-        0x7FU, 0x7FU, 0x76U, 0xFEU,  // NaNs propagate; (448 + 1) / 2 rounds to 224
+        0x7FU, 0xFFU, 0x7EU, 0xFEU,  // off-frame motion preserves current NaNs/extrema
         0x7FU, 0x7FU, 0x38U, 0xB8U,  // motion selects the NaN-bearing history pixel
     }};
     REQUIRE(std::equal(
@@ -1962,6 +2108,8 @@ void d3d12_temporal_fp8_matches_e4m3_reference_and_motion_path() {
     REQUIRE(device.destroy_buffer(readback.value()));
     REQUIRE(device.destroy_texture(resolved.value()));
     REQUIRE(device.destroy_texture(zero_motion));
+    REQUIRE(device.destroy_texture(excessive_motion));
+    REQUIRE(device.destroy_texture(nonfinite_motion));
     REQUIRE(device.destroy_texture(moving_motion));
     REQUIRE(device.destroy_texture(special_history));
     REQUIRE(device.destroy_texture(special_current));
@@ -2120,7 +2268,10 @@ void d3d12_accepts_8k_temporal_resolve() {
     };
     clear_input(temporal_current.value(), {0.2F, 0.4F, 0.6F, 1.0F});
     clear_input(temporal_history.value(), {0.8F, 0.6F, 0.4F, 1.0F});
-    clear_input(temporal_motion.value(), {0.0F, 0.0F, 0.0F, 0.0F});
+    // Infinite flow must fail closed to current HDR instead of reaching the
+    // float-to-integer reprojection conversion.
+    clear_input(temporal_motion.value(), {
+        std::numeric_limits<float>::infinity(), 0.0F, 0.0F, 0.0F});
     setup.append(device_ir::CmdTransitionResource{
         device_ir::ResourceHandle{temporal_resolved.value()},
         device_ir::ResourceState::undefined,
@@ -2190,9 +2341,9 @@ void d3d12_accepts_8k_temporal_resolve() {
     const auto probe_pixels = device.read_texture_rgba32f(probe.value());
     REQUIRE(probe_pixels);
     REQUIRE(probe_pixels.value().size() == 4U);
-    REQUIRE(probe_pixels.value().at(0U) > 0.48F && probe_pixels.value().at(0U) < 0.52F);
-    REQUIRE(probe_pixels.value().at(1U) > 0.48F && probe_pixels.value().at(1U) < 0.52F);
-    REQUIRE(probe_pixels.value().at(2U) > 0.48F && probe_pixels.value().at(2U) < 0.52F);
+    REQUIRE(probe_pixels.value().at(0U) > 0.19F && probe_pixels.value().at(0U) < 0.21F);
+    REQUIRE(probe_pixels.value().at(1U) > 0.39F && probe_pixels.value().at(1U) < 0.41F);
+    REQUIRE(probe_pixels.value().at(2U) > 0.59F && probe_pixels.value().at(2U) < 0.61F);
     REQUIRE(probe_pixels.value().at(3U) > 0.99F);
 
     REQUIRE(device.destroy_texture(probe.value()));
@@ -3084,6 +3235,19 @@ void d3d12_ambient_occlusion_uses_gpu_rays_and_fails_closed_on_stale_inputs() {
     REQUIRE(gpu.projection->target_digest == recipe.binding.target.content_digest);
     REQUIRE(gpu.projection->settings_digest == recipe.canonical_digest().value());
 
+    const auto bent_reference = production::compile_bent_normal_cpu(recipe, source, target);
+    const auto bent_gpu = d3d12::compile_bent_normal_d3d12(
+        device, recipe, source, target);
+    REQUIRE(bent_reference.succeeded());
+    REQUIRE(bent_gpu.succeeded());
+    REQUIRE(bent_gpu.projection.has_value());
+    REQUIRE(bent_gpu.projection->hits.size() == bent_reference.artifact->rays_cast);
+    REQUIRE(bent_gpu.bake.artifact->rgba8 == bent_reference.artifact->rgba8);
+    REQUIRE(bent_gpu.bake.artifact->artifact_digest ==
+        bent_reference.artifact->artifact_digest);
+    REQUIRE(bent_gpu.cpu_reference_artifact_digest ==
+        bent_reference.artifact->artifact_digest);
+
     TempDirectory publication_directory;
     assets::BlobStore blobs(publication_directory.path() / "blobs");
     production::ProductionArtifactStore store(blobs);
@@ -3163,6 +3327,64 @@ void d3d12_ambient_occlusion_uses_gpu_rays_and_fails_closed_on_stale_inputs() {
         store, recipe, source, target, policy, platform_profile);
     REQUIRE(retained);
     REQUIRE(retained.value().artifact_digest == gpu.bake.artifact->artifact_digest);
+
+    const auto bent_payload = bent_gpu.bake.artifact->serialize();
+    REQUIRE(bent_payload);
+    const auto bent_cook_key = production::bake_bent_normal_cook_key(
+        recipe, platform_profile);
+    REQUIRE(bent_cook_key);
+    production::ProductionArtifactReceipt bent_receipt;
+    bent_receipt.key = bent_cook_key.value();
+    bent_receipt.status = production::ReceiptStatus::admitted;
+    bent_receipt.output_digest = assets::sha256(bent_payload.value());
+    bent_receipt.output_bytes = bent_payload.value().size();
+    bent_receipt.quality.measured_error = 0.0;
+    bent_receipt.quality.importance = 1.0;
+    bent_receipt.quality.confidence = 1.0;
+    bent_receipt.cost.gpu_milliseconds =
+        static_cast<double>(bent_gpu.projection->wall_time_nanoseconds) / 1'000'000.0;
+    bent_receipt.cost.disk_bytes = bent_payload.value().size();
+    REQUIRE(bent_receipt.refresh_digest());
+    REQUIRE(!d3d12::publish_bent_normal_map_d3d12(
+        store, bent_receipt, bent_gpu, source, target, policy, platform_profile + ".wrong"));
+    REQUIRE(d3d12::publish_bent_normal_map_d3d12(
+        store, bent_receipt, bent_gpu, source, target, policy, platform_profile));
+    const auto restored_bent = production::read_bent_normal_map(
+        store, recipe, source, target, policy, platform_profile);
+    REQUIRE(restored_bent);
+    REQUIRE(restored_bent.value().artifact_digest ==
+        bent_gpu.bake.artifact->artifact_digest);
+    auto tampered_bent_projection = bent_gpu;
+    tampered_bent_projection.projection->hits.front().hit =
+        !tampered_bent_projection.projection->hits.front().hit;
+    REQUIRE(!tampered_bent_projection.succeeded());
+    REQUIRE(!d3d12::publish_bent_normal_map_d3d12(
+        store, bent_receipt, tampered_bent_projection, source, target, policy,
+        platform_profile));
+    auto relabelled_bent_worker = bent_gpu;
+    relabelled_bent_worker.projection->driver += ".spoofed";
+    REQUIRE(relabelled_bent_worker.projection->output_digest_matches());
+    REQUIRE(!relabelled_bent_worker.projection->evidence_digest_matches());
+    REQUIRE(!relabelled_bent_worker.succeeded());
+    REQUIRE(!d3d12::publish_bent_normal_map_d3d12(
+        store, bent_receipt, relabelled_bent_worker, source, target, policy,
+        platform_profile));
+    REQUIRE(!d3d12::publish_bent_normal_map_d3d12(
+        store, bent_receipt, bent_gpu, stale_source, target, policy, platform_profile));
+    const auto stale_bent_compile = d3d12::compile_bent_normal_d3d12(
+        device, recipe, stale_source, target);
+    REQUIRE(!stale_bent_compile.succeeded());
+    REQUIRE(!stale_bent_compile.projection.has_value());
+    auto tampered_bent_artifact = bent_gpu;
+    tampered_bent_artifact.bake.artifact->rgba8.front() ^= 0x01U;
+    REQUIRE(!d3d12::publish_bent_normal_map_d3d12(
+        store, bent_receipt, tampered_bent_artifact, source, target, policy,
+        platform_profile));
+    const auto retained_bent = production::read_bent_normal_map(
+        store, recipe, source, target, policy, platform_profile);
+    REQUIRE(retained_bent);
+    REQUIRE(retained_bent.value().artifact_digest ==
+        bent_gpu.bake.artifact->artifact_digest);
     REQUIRE(device.debug_receipts().empty());
 
     geometry::EditableMesh over_budget_source;
@@ -3206,6 +3428,143 @@ void d3d12_ambient_occlusion_uses_gpu_rays_and_fails_closed_on_stale_inputs() {
             return diagnostic.code == "d3d12_ao_projection_failed" && diagnostic.is_error &&
                 diagnostic.message.find("candidate-pair budget") != std::string::npos;
         }));
+}
+
+void d3d12_bake_tile_schedulers_cover_all_tiles_and_reject_cross_tile_faces() {
+    using namespace carto;
+    const geometry::EditableMesh source = make_multi_tile_bake_mesh(false);
+    const geometry::EditableMesh target = make_multi_tile_bake_mesh(true);
+    const auto source_binding = production::bind_bake_source(
+        "project/asset/multi-tile-source", source);
+    const auto target_binding = production::bind_bake_target(
+        "project/asset/multi-tile-target", target, 7U);
+    REQUIRE(source_binding && target_binding);
+
+    production::BakeRecipe normal_recipe;
+    normal_recipe.identity = "bake/multi-tile/normal";
+    normal_recipe.source = source_binding.value();
+    normal_recipe.target = target_binding.value();
+    normal_recipe.target_uv_set = 7U;
+    normal_recipe.width = 8U;
+    normal_recipe.height = 8U;
+    normal_recipe.projection_half_extent = 0.5;
+    normal_recipe.reject_projection_misses = false;
+    REQUIRE(normal_recipe.validate());
+
+    production::AmbientOcclusionRecipe ao_recipe;
+    ao_recipe.binding.identity = "bake/multi-tile/ao";
+    ao_recipe.binding.source = source_binding.value();
+    ao_recipe.binding.target = target_binding.value();
+    ao_recipe.binding.target_uv_set = 7U;
+    ao_recipe.binding.width = 8U;
+    ao_recipe.binding.height = 8U;
+    ao_recipe.sample_count = 4U;
+    ao_recipe.max_distance = 0.5;
+    ao_recipe.origin_bias = 1.0e-4;
+    ao_recipe.seed = 0x6d756c746974696cULL;
+    REQUIRE(ao_recipe.validate());
+
+    const auto created = d3d12::D3D12Device::create(d3d12::D3D12DeviceOptions{
+        {}, false, false});
+    if (!created) throw TestFailure("D3D12 multi-tile bake device: " + created.error().message);
+    auto& device = *created.value();
+
+    std::stop_source cancelled_source;
+    cancelled_source.request_stop();
+    const auto cancelled_normal = d3d12::schedule_tangent_normal_map_tiles_d3d12(
+        device, normal_recipe, source, target, cancelled_source.get_token());
+    REQUIRE(!cancelled_normal);
+    REQUIRE(cancelled_normal.error().code == core::ErrorCode::invalid_state);
+    const auto cancelled_ao = d3d12::schedule_ambient_occlusion_tiles_d3d12(
+        device, ao_recipe, source, target, cancelled_source.get_token());
+    REQUIRE(!cancelled_ao);
+    REQUIRE(cancelled_ao.error().code == core::ErrorCode::invalid_state);
+    const auto cancelled_bent = d3d12::schedule_bent_normal_tiles_d3d12(
+        device, ao_recipe, source, target, cancelled_source.get_token());
+    REQUIRE(!cancelled_bent);
+    REQUIRE(cancelled_bent.error().code == core::ErrorCode::invalid_state);
+    REQUIRE(device.debug_receipts().empty());
+
+    const auto cpu_normal = production::schedule_normal_map_tiles_cpu(
+        normal_recipe, production::BakeNormalSpace::tangent, source, target);
+    const auto gpu_normal = d3d12::schedule_tangent_normal_map_tiles_d3d12(
+        device, normal_recipe, source, target);
+    REQUIRE(cpu_normal && gpu_normal);
+    REQUIRE(gpu_normal.value().entries.size() == 2U);
+    REQUIRE((gpu_normal.value().entries[0U].tile ==
+        production::BakeTileCoordinate{0U, 0U}));
+    REQUIRE((gpu_normal.value().entries[1U].tile ==
+        production::BakeTileCoordinate{1U, 0U}));
+    REQUIRE(std::isfinite(gpu_normal.value().compile_milliseconds));
+    for (std::size_t index = 0U; index < gpu_normal.value().entries.size(); ++index) {
+        REQUIRE(gpu_normal.value().entries[index].bake.succeeded());
+        REQUIRE(gpu_normal.value().entries[index].bake.bake.artifact->artifact_digest ==
+            cpu_normal.value().entries[index].artifact.artifact_digest);
+        REQUIRE(gpu_normal.value().entries[index].compile_milliseconds >= 0.0);
+    }
+
+    const auto cpu_ao = production::schedule_ambient_occlusion_tiles_cpu(
+        ao_recipe, source, target);
+    const auto gpu_ao = d3d12::schedule_ambient_occlusion_tiles_d3d12(
+        device, ao_recipe, source, target);
+    REQUIRE(cpu_ao && gpu_ao);
+    REQUIRE(gpu_ao.value().entries.size() == 2U);
+    REQUIRE((gpu_ao.value().entries[0U].tile ==
+        production::BakeTileCoordinate{0U, 0U}));
+    REQUIRE((gpu_ao.value().entries[1U].tile ==
+        production::BakeTileCoordinate{1U, 0U}));
+    REQUIRE(gpu_ao.value().covered_texels == cpu_ao.value().covered_texels);
+    REQUIRE(gpu_ao.value().rays_cast == cpu_ao.value().rays_cast);
+    for (std::size_t index = 0U; index < gpu_ao.value().entries.size(); ++index) {
+        REQUIRE(gpu_ao.value().entries[index].bake.succeeded());
+        REQUIRE(gpu_ao.value().entries[index].bake.bake.artifact->artifact_digest ==
+            cpu_ao.value().entries[index].artifact.artifact_digest);
+        REQUIRE(gpu_ao.value().entries[index].compile_milliseconds >= 0.0);
+    }
+
+    const auto cpu_bent = production::schedule_bent_normal_tiles_cpu(
+        ao_recipe, source, target);
+    const auto gpu_bent = d3d12::schedule_bent_normal_tiles_d3d12(
+        device, ao_recipe, source, target);
+    REQUIRE(cpu_bent && gpu_bent);
+    REQUIRE(gpu_bent.value().entries.size() == 2U);
+    REQUIRE((gpu_bent.value().entries[0U].tile ==
+        production::BakeTileCoordinate{0U, 0U}));
+    REQUIRE((gpu_bent.value().entries[1U].tile ==
+        production::BakeTileCoordinate{1U, 0U}));
+    REQUIRE(gpu_bent.value().covered_texels == cpu_bent.value().covered_texels);
+    REQUIRE(gpu_bent.value().rays_cast == cpu_bent.value().rays_cast);
+    REQUIRE(gpu_bent.value().occluded_rays == cpu_bent.value().occluded_rays);
+    for (std::size_t index = 0U; index < gpu_bent.value().entries.size(); ++index) {
+        REQUIRE(gpu_bent.value().entries[index].bake.succeeded());
+        REQUIRE(gpu_bent.value().entries[index].bake.bake.artifact->artifact_digest ==
+            cpu_bent.value().entries[index].artifact.artifact_digest);
+        REQUIRE(gpu_bent.value().entries[index].compile_milliseconds >= 0.0);
+    }
+
+    const geometry::EditableMesh crossing_target = make_cross_tile_bake_target();
+    const auto crossing_target_binding = production::bind_bake_target(
+        "project/asset/cross-tile-target", crossing_target, 7U);
+    REQUIRE(crossing_target_binding);
+    auto crossing_normal_recipe = normal_recipe;
+    crossing_normal_recipe.target = crossing_target_binding.value();
+    const auto crossing_normal = d3d12::schedule_tangent_normal_map_tiles_d3d12(
+        device, crossing_normal_recipe, source, crossing_target);
+    REQUIRE(!crossing_normal);
+    REQUIRE(crossing_normal.error().code == core::ErrorCode::unsupported);
+    auto crossing_ao_recipe = ao_recipe;
+    crossing_ao_recipe.binding.target = crossing_target_binding.value();
+    const auto crossing_ao = d3d12::schedule_ambient_occlusion_tiles_d3d12(
+        device, crossing_ao_recipe, source, crossing_target);
+    REQUIRE(!crossing_ao);
+    REQUIRE(crossing_ao.error().code == core::ErrorCode::unsupported);
+    auto crossing_bent_recipe = ao_recipe;
+    crossing_bent_recipe.binding.target = crossing_target_binding.value();
+    const auto crossing_bent = d3d12::schedule_bent_normal_tiles_d3d12(
+        device, crossing_bent_recipe, source, crossing_target);
+    REQUIRE(!crossing_bent);
+    REQUIRE(crossing_bent.error().code == core::ErrorCode::unsupported);
+    REQUIRE(device.debug_receipts().empty());
 }
 
 void d3d12_projection_worker_matches_reference_and_rejects_hostile_inputs() {
@@ -3458,6 +3817,8 @@ int main() {
         std::cout << "PASS D3D12 compute queue shader states\n";
         d3d12_reuses_multiple_in_flight_command_contexts();
         std::cout << "PASS D3D12 in-flight command contexts\n";
+        d3d12_frame_scheduler_bounds_and_tracks_submissions();
+        std::cout << "PASS D3D12 bounded frame scheduler and serial tracking\n";
         d3d12_compiles_dxil_draws_indexed_and_reads_texture();
         std::cout << "PASS D3D12 DXIL indexed draw and texture readback\n";
         d3d12_uploads_and_reads_specific_texture_mips();
@@ -3478,7 +3839,8 @@ int main() {
         std::cout << "PASS D3D12 BakeGraph artifact parity and stale-source rejection\n";
         d3d12_ambient_occlusion_uses_gpu_rays_and_fails_closed_on_stale_inputs();
         std::cout << "PASS D3D12 ambient-occlusion GPU parity and stale-source rejection\n";
-        std::cout << "PASS D3D12 SculptStack preview parity and stale-source rejection\n";
+        d3d12_bake_tile_schedulers_cover_all_tiles_and_reject_cross_tile_faces();
+        std::cout << "PASS D3D12 normal/AO multi-tile parity, cancellation, and cross-tile refusal\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL D3D12 native identity and resource ownership: "

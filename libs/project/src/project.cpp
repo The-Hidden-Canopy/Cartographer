@@ -1,6 +1,7 @@
 #include <carto/project/project.hpp>
 #include <carto/biological/proxy_mesh.hpp>
 #include <carto/character/rig_module.hpp>
+#include <carto/kinematic/graph.hpp>
 #include <carto/mesh_attributes/provenance.hpp>
 #include <carto/motion/curve_edit.hpp>
 #include <carto/pose/pose_library.hpp>
@@ -17,6 +18,7 @@
 #include <functional>
 #include <iomanip>
 #include <limits>
+#include <locale>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -49,6 +51,15 @@ Diagnostic invalid(std::string message) {
 
 Diagnostic parse_error(std::string message) {
     return Diagnostic(ErrorCode::validation_failed, std::move(message));
+}
+
+bool mesh_has_locked_instance(const scene::Scene& scene, std::uint64_t mesh_asset) {
+    for (const auto& object : scene.objects_sorted()) {
+        if (object.locked && object.mesh_asset == mesh_asset) {
+            return true;
+        }
+    }
+    return false;
 }
 
 core::Result<core::Revision> persistent_mesh_patch_revision(std::string_view bytes) {
@@ -183,6 +194,9 @@ constexpr std::uint64_t kMaxSerializedDecalPlacementAggregateBytes =
     64ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaxSerializedPoseLibraries = 4'096U;
 constexpr std::uint64_t kMaxSerializedPoseLibraryAggregateBytes = 64ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaxSerializedKinematicGraphs = 4'096U;
+constexpr std::uint64_t kMaxSerializedKinematicGraphAggregateBytes =
+    64ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaxSerializedWeightEditReceipts = 100'000U;
 constexpr std::uint64_t kMaxSerializedWeightEditReceiptAggregateBytes =
     16ULL * 1024ULL * 1024ULL;
@@ -306,6 +320,15 @@ bool valid_curve_or_road_identity(std::string_view value) {
 // characters of [A-Za-z0-9_.-].
 bool valid_pose_library_identity(std::string_view value) {
     return !value.empty() && value.size() <= pose::PoseLibrary::kMaxNameLength &&
+        std::all_of(value.begin(), value.end(), [](unsigned char byte) {
+            return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+                (byte >= '0' && byte <= '9') || byte == '.' || byte == '_' || byte == '-';
+        });
+}
+
+bool valid_kinematic_graph_identity(std::string_view value) {
+    return !value.empty() && value.size() <= 128U && value.front() != '.' &&
+        value.front() != '-' && value.front() != '_' &&
         std::all_of(value.begin(), value.end(), [](unsigned char byte) {
             return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
                 (byte >= '0' && byte <= '9') || byte == '.' || byte == '_' || byte == '-';
@@ -567,6 +590,7 @@ std::vector<std::size_t> serialized_attribute_value_order(
 
 std::string canonical_mesh_state_bytes(const geometry::EditableMesh& mesh) {
     std::ostringstream output;
+    output.imbue(std::locale::classic());
     output << "MESH_STATE 1\nREVISION " << mesh.revision().value() << '\n'
            << std::setprecision(17);
     const auto vertices = mesh.vertices_sorted();
@@ -767,6 +791,10 @@ bool mesh_declares_material_region(
 }
 
 } // namespace
+
+assets::Sha256Digest canonical_mesh_snapshot_digest(const geometry::EditableMesh& mesh) {
+    return mesh_state_digest(mesh);
+}
 
 core::Result<void> SignTextInstanceReceipt::validate() const {
     if (!object || mesh_asset == 0U || source_identity.empty() ||
@@ -1085,7 +1113,9 @@ core::Result<geometry::EditableMesh> MeshPatchRecord::replay(
                                                     geometry::MergeByDistancePatch::deserialize(
                                                         patch_bytes);
                                                 if (merge_by_distance) {
-                                                    const auto merged = replayed.merge_by_distance(
+                                                    const auto merged =
+                                                        mesh_attributes::merge_by_distance_with_attribute_transfer(
+                                                        replayed,
                                                         merge_by_distance.value().candidates,
                                                         merge_by_distance.value().distance);
                                                     if (!merged) {
@@ -1383,6 +1413,9 @@ core::Result<ProjectDocument> ProjectDocument::merge_disjoint_scene_mesh_changes
             !same_mesh_projection(base, current, asset)) {
             return stale("checkpoint rebase mesh write target changed or disappeared");
         }
+        if (mesh_has_locked_instance(current.scene_, asset)) {
+            return invalid_merge("checkpoint rebase would change a locked mesh instance");
+        }
     }
     if (!mesh_writes.empty()) {
         std::set<scene::ObjectId> source_object_ids;
@@ -1616,6 +1649,9 @@ core::Result<ProjectDocument> ProjectDocument::select_agent_rebase_step_changes(
             return invalid_selection(
                 "checkpoint rebase step changed or removed a mesh write target");
         }
+        if (mesh_has_locked_instance(base.scene_, asset)) {
+            return invalid_selection("checkpoint rebase step would change a locked mesh instance");
+        }
         selected.meshes_[asset] = after->second;
         const auto receipt = speculative.cloth_rest_pose_receipts_.find(asset);
         if (receipt == speculative.cloth_rest_pose_receipts_.end()) {
@@ -1727,6 +1763,15 @@ core::Result<void> ProjectDocument::remove_object(scene::ObjectId object) {
     if (revision_.exhausted()) {
         return core::Result<void>::failure(exhausted_revision());
     }
+    for (const auto& [identity, source] : source_asset_registry_.records()) {
+        static_cast<void>(identity);
+        for (const auto& product : source.document_products) {
+            if (product.kind == assets::SourceDocumentProductKind::node && product.product_id == object.value) {
+                return core::Result<void>::failure(Diagnostic(ErrorCode::invalid_state,
+                    "cannot remove a node bound to an active imported source document"));
+            }
+        }
+    }
     for (const auto& [identity, area] : world_model_.areas()) {
         static_cast<void>(identity);
         if (area.geometry.kind == world::AuthoringBindingKind::scene_object &&
@@ -1741,6 +1786,14 @@ core::Result<void> ProjectDocument::remove_object(scene::ObjectId object) {
         return core::Result<void>::failure(Diagnostic(
             ErrorCode::invalid_state,
             "cannot remove a scene object referenced by authored presentation data"));
+    }
+    if (std::any_of(connection_port_graph_.ports().begin(),
+            connection_port_graph_.ports().end(), [object](const auto& entry) {
+                return entry.second.owner == object;
+            })) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::invalid_state,
+            "remove the object's connection ports and edges through an explicit graph edit first"));
     }
     if (auto result = scene_.remove_object(object); !result) {
         return result;
@@ -1834,6 +1887,11 @@ core::Result<core::Revision> ProjectDocument::replace_mesh_if_revision(
         return core::Result<core::Revision>::failure(Diagnostic(
             ErrorCode::stale_data,
             "mesh replacement revision does not match the current asset"));
+    }
+    if (mesh_has_locked_instance(scene_, mesh_asset)) {
+        return core::Result<core::Revision>::failure(Diagnostic(
+            ErrorCode::invalid_state,
+            "cannot change a mesh asset referenced by a locked scene object"));
     }
     if (receipt.has_value()) {
         if (auto result = receipt->validate(); !result) {
@@ -2218,7 +2276,8 @@ core::Result<core::Revision> ProjectDocument::apply_merge_by_distance_patch(
     }
 
     geometry::EditableMesh after = mesh->second;
-    auto merged = after.merge_by_distance(patch.candidates, patch.distance);
+    auto merged = mesh_attributes::merge_by_distance_with_attribute_transfer(
+        after, patch.candidates, patch.distance);
     if (!merged) return core::Result<core::Revision>::failure(merged.error());
     record.result_mesh_digest = mesh_state_digest(after);
     if (auto result = record.validate(); !result) {
@@ -2845,6 +2904,15 @@ core::Result<void> ProjectDocument::remove_mesh(std::uint64_t mesh_asset) {
     if (revision_.exhausted()) {
         return core::Result<void>::failure(exhausted_revision());
     }
+    for (const auto& [identity, source] : source_asset_registry_.records()) {
+        static_cast<void>(identity);
+        for (const auto& product : source.document_products) {
+            if (product.kind == assets::SourceDocumentProductKind::mesh && product.product_id == mesh_asset) {
+                return core::Result<void>::failure(Diagnostic(ErrorCode::invalid_state,
+                    "cannot remove a mesh bound to an active imported source document"));
+            }
+        }
+    }
     if (!meshes_.contains(mesh_asset)) {
         return core::Result<void>::failure(
             Diagnostic(ErrorCode::not_found, "cannot remove a missing mesh asset"));
@@ -2994,6 +3062,31 @@ core::Result<void> ProjectDocument::set_world_model(world::WorldModel model) {
     return core::Result<void>::success();
 }
 
+core::Result<void> ProjectDocument::set_connection_port_graph(
+    connection::ConnectionPortGraph graph) {
+    if (revision_.exhausted()) {
+        return core::Result<void>::failure(exhausted_revision());
+    }
+    if (auto result = graph.validate(); !result) {
+        return core::Result<void>::failure(result.error().with_context(
+            "connection port graph admission"));
+    }
+    for (const auto& [identity, port] : graph.ports()) {
+        static_cast<void>(identity);
+        if (scene_.find(port.owner) == nullptr) {
+            return core::Result<void>::failure(Diagnostic(
+                ErrorCode::not_found,
+                "connection port references a missing scene object"));
+        }
+    }
+    if (connection_port_graph_.serialize() == graph.serialize()) {
+        return core::Result<void>::success();
+    }
+    connection_port_graph_ = std::move(graph);
+    bump_revision();
+    return core::Result<void>::success();
+}
+
 core::Result<void> ProjectDocument::set_material_catalog(MaterialCatalog catalog) {
     if (revision_.exhausted()) {
         return core::Result<void>::failure(exhausted_revision());
@@ -3001,6 +3094,18 @@ core::Result<void> ProjectDocument::set_material_catalog(MaterialCatalog catalog
     if (auto result = catalog.validate(); !result) {
         return core::Result<void>::failure(result.error().with_context(
             "material catalog admission"));
+    }
+    for (const auto& [identity, source] : source_asset_registry_.records()) {
+        static_cast<void>(identity);
+        for (const auto& product : source.document_products) {
+            using Kind = assets::SourceDocumentProductKind;
+            if ((product.kind == Kind::material && !catalog.materials().contains(product.product_id)) ||
+                (product.kind == Kind::texture && !catalog.textures().contains(product.product_id)) ||
+                (product.kind == Kind::sampler && !catalog.samplers().contains(product.product_id))) {
+                return core::Result<void>::failure(Diagnostic(ErrorCode::invalid_state,
+                    "cannot remove a product bound to an active imported source document"));
+            }
+        }
     }
     for (const auto& [identity, variant] : catalog.variants()) {
         static_cast<void>(identity);
@@ -3304,6 +3409,12 @@ core::Result<void> ProjectDocument::set_sweep_source(geometry::SweepSource sourc
     if (auto result = source.validate(); !result) {
         return core::Result<void>::failure(result.error().with_context(
             "sweep source admission"));
+    }
+    if (source.owner_object_id != 0U &&
+        scene_.find(scene::ObjectId{source.owner_object_id}) == nullptr) {
+        return core::Result<void>::failure(Diagnostic(
+            ErrorCode::not_found,
+            "sweep source references a missing owner scene object"));
     }
     const auto centerline = curve_paths_.find(source.centerline_identity);
     if (centerline == curve_paths_.end()) {
@@ -3945,6 +4056,83 @@ core::Result<core::Revision> ProjectDocument::set_pose_library(
     return core::Result<core::Revision>::success(next_revision);
 }
 
+core::Result<core::Revision> ProjectDocument::set_kinematic_graph(
+    std::string identity,
+    core::Revision expected_revision,
+    std::string serialized_graph,
+    assets::Sha256Digest digest) {
+    if (revision_.exhausted()) {
+        return core::Result<core::Revision>::failure(exhausted_revision());
+    }
+    if (!valid_kinematic_graph_identity(identity) || serialized_graph.empty() ||
+        serialized_graph.size() > kinematic::KinematicGraph::kMaxSerializedBytes ||
+        digest.is_zero()) {
+        return core::Result<core::Revision>::failure(invalid(
+            "kinematic graph identity, bytes, or digest are outside the supported bounds"));
+    }
+    if (auto bound = bind_opaque_record(serialized_graph, digest, "kinematic graph");
+        !bound) {
+        return core::Result<core::Revision>::failure(bound.error());
+    }
+    auto decoded = kinematic::KinematicGraph::deserialize(serialized_graph);
+    if (!decoded) {
+        return core::Result<core::Revision>::failure(decoded.error().with_context(
+            "project kinematic graph"));
+    }
+    if (decoded.value().serialize() != serialized_graph) {
+        return core::Result<core::Revision>::failure(parse_error(
+            "kinematic graph bytes are not canonical"));
+    }
+
+    const auto existing = kinematic_graphs_.find(identity);
+    if (existing == kinematic_graphs_.end()) {
+        if (expected_revision != core::Revision{}) {
+            return core::Result<core::Revision>::failure(Diagnostic(
+                ErrorCode::stale_data,
+                "kinematic graph does not exist at the expected revision"));
+        }
+        if (kinematic_graphs_.size() >= kMaxSerializedKinematicGraphs) {
+            return core::Result<core::Revision>::failure(invalid(
+                "project contains the maximum number of kinematic graphs"));
+        }
+    } else {
+        if (existing->second.revision != expected_revision) {
+            return core::Result<core::Revision>::failure(Diagnostic(
+                ErrorCode::stale_data, "kinematic graph revision no longer matches"));
+        }
+        if (existing->second.bytes == serialized_graph && existing->second.digest == digest) {
+            return core::Result<core::Revision>::success(existing->second.revision);
+        }
+        if (existing->second.revision.exhausted()) {
+            return core::Result<core::Revision>::failure(Diagnostic(
+                ErrorCode::invalid_state, "kinematic graph revision space is exhausted"));
+        }
+    }
+
+    std::uint64_t aggregate_bytes = 0U;
+    for (const auto& [existing_identity, entry] : kinematic_graphs_) {
+        if (existing_identity == identity) continue;
+        if (entry.bytes.size() >
+            kMaxSerializedKinematicGraphAggregateBytes - aggregate_bytes) {
+            return core::Result<core::Revision>::failure(invalid(
+                "kinematic graph bytes exceed their aggregate limit"));
+        }
+        aggregate_bytes += static_cast<std::uint64_t>(entry.bytes.size());
+    }
+    if (serialized_graph.size() >
+        kMaxSerializedKinematicGraphAggregateBytes - aggregate_bytes) {
+        return core::Result<core::Revision>::failure(invalid(
+            "kinematic graph bytes exceed their aggregate limit"));
+    }
+
+    const core::Revision next_revision = existing == kinematic_graphs_.end()
+        ? core::Revision{1U} : existing->second.revision.next();
+    kinematic_graphs_[identity] = SerializedKinematicGraph{
+        next_revision, std::move(serialized_graph), digest};
+    bump_revision();
+    return core::Result<core::Revision>::success(next_revision);
+}
+
 core::Result<void> ProjectDocument::append_weight_edit_receipt(
     std::string serialized_receipt,
     assets::Sha256Digest digest) {
@@ -4361,6 +4549,33 @@ core::Result<void> ProjectDocument::validate() const {
     if (auto result = scene_.validate(); !result) {
         return result;
     }
+    std::set<std::pair<assets::SourceDocumentProductKind, std::uint64_t>> imported_products;
+    for (const auto& [identity, source] : source_asset_registry_.records()) {
+        static_cast<void>(identity);
+        for (const auto& product : source.document_products) {
+            using Kind = assets::SourceDocumentProductKind;
+            const bool present = product.kind == Kind::mesh ? meshes_.contains(product.product_id)
+                : product.kind == Kind::node ? scene_.find(scene::ObjectId{product.product_id}) != nullptr
+                : product.kind == Kind::material ? material_catalog_.materials().contains(product.product_id)
+                : product.kind == Kind::texture ? material_catalog_.textures().contains(product.product_id)
+                : product.kind == Kind::sampler && material_catalog_.samplers().contains(product.product_id);
+            if (!present || !imported_products.emplace(product.kind, product.product_id).second) {
+                return core::Result<void>::failure(parse_error(
+                    "imported source document product is missing or ambiguously bound"));
+            }
+        }
+    }
+    if (auto result = connection_port_graph_.validate(); !result) {
+        return core::Result<void>::failure(result.error().with_context(
+            "project connection port graph"));
+    }
+    for (const auto& [identity, port] : connection_port_graph_.ports()) {
+        static_cast<void>(identity);
+        if (scene_.find(port.owner) == nullptr) {
+            return core::Result<void>::failure(parse_error(
+                "project connection port references a missing scene object"));
+        }
+    }
     for (const auto& [mesh_id, mesh] : meshes_) {
         if (mesh_id == 0) {
             return core::Result<void>::failure(parse_error("project contains a zero mesh asset id"));
@@ -4572,6 +4787,35 @@ core::Result<void> ProjectDocument::validate() const {
             entry.digest) {
             return core::Result<void>::failure(parse_error(
                 "project pose library digest does not bind its bytes"));
+        }
+    }
+    if (kinematic_graphs_.size() > kMaxSerializedKinematicGraphs) {
+        return core::Result<void>::failure(parse_error(
+            "project contains too many kinematic graphs"));
+    }
+    std::uint64_t aggregate_kinematic_graph_bytes = 0U;
+    for (const auto& [identity, entry] : kinematic_graphs_) {
+        if (!valid_kinematic_graph_identity(identity) || entry.revision.value() == 0U ||
+            entry.revision.exhausted() || entry.bytes.empty() ||
+            entry.bytes.size() > kinematic::KinematicGraph::kMaxSerializedBytes ||
+            entry.bytes.size() >
+                kMaxSerializedKinematicGraphAggregateBytes -
+                    aggregate_kinematic_graph_bytes ||
+            entry.digest.is_zero()) {
+            return core::Result<void>::failure(parse_error(
+                "project kinematic graph identity, revision, or bytes exceed their bounds"));
+        }
+        aggregate_kinematic_graph_bytes += static_cast<std::uint64_t>(entry.bytes.size());
+        const auto decoded = kinematic::KinematicGraph::deserialize(entry.bytes);
+        if (!decoded || decoded.value().serialize() != entry.bytes) {
+            return core::Result<void>::failure(parse_error(
+                "project kinematic graph payload is not a canonical graph"));
+        }
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(entry.bytes.data());
+        if (assets::sha256(std::span<const std::uint8_t>(bytes, entry.bytes.size())) !=
+            entry.digest) {
+            return core::Result<void>::failure(parse_error(
+                "project kinematic graph digest does not bind its bytes"));
         }
     }
     if (weight_edit_receipts_.size() > kMaxSerializedWeightEditReceipts) {
@@ -5001,6 +5245,11 @@ core::Result<void> ProjectDocument::validate() const {
             return core::Result<void>::failure(result.error().with_context(
                 "project sweep source"));
         }
+        if (source.owner_object_id != 0U &&
+            scene_.find(scene::ObjectId{source.owner_object_id}) == nullptr) {
+            return core::Result<void>::failure(parse_error(
+                "project sweep source references a missing owner scene object"));
+        }
         const auto lineage = sweep_source_lineage_.find(identity);
         if (lineage == sweep_source_lineage_.end() ||
             lineage->second != source.source_revision) {
@@ -5232,6 +5481,7 @@ void ProjectDocument::swap(ProjectDocument& other) noexcept {
     mesh_patches_.swap(other.mesh_patches_);
     std::swap(scientific_model_, other.scientific_model_);
     std::swap(world_model_, other.world_model_);
+    std::swap(connection_port_graph_, other.connection_port_graph_);
     std::swap(material_catalog_, other.material_catalog_);
     std::swap(presentation_catalog_, other.presentation_catalog_);
     std::swap(authoring_standards_, other.authoring_standards_);
@@ -5262,6 +5512,7 @@ void ProjectDocument::swap(ProjectDocument& other) noexcept {
     rig_module_templates_.swap(other.rig_module_templates_);
     decal_placements_.swap(other.decal_placements_);
     pose_libraries_.swap(other.pose_libraries_);
+    kinematic_graphs_.swap(other.kinematic_graphs_);
     weight_edit_receipts_.swap(other.weight_edit_receipts_);
     curve_edit_receipts_.swap(other.curve_edit_receipts_);
     std::swap(source_asset_registry_, other.source_asset_registry_);
@@ -5558,6 +5809,14 @@ std::string ProjectDocument::serialize() const {
     for (const auto& record : curve_edit_receipts_) {
         output << "CURVE_EDIT_RECEIPT " << record.digest.hex() << ' '
                << std::quoted(record.bytes) << '\n';
+    }
+    output << "CONNECTION_PORT_GRAPH "
+           << std::quoted(connection_port_graph_.serialize()) << '\n';
+    output << "KINEMATIC_GRAPHS " << kinematic_graphs_.size() << '\n';
+    for (const auto& [identity, entry] : kinematic_graphs_) {
+        output << "KINEMATIC_GRAPH " << std::quoted(identity) << ' '
+               << entry.revision.value() << ' ' << entry.digest.hex() << ' '
+               << std::quoted(entry.bytes) << '\n';
     }
     output << "END\n";
     return output.str();
@@ -7947,6 +8206,99 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
     if (version.value() >= 33U && !curve_edit_receipts_seen) {
         return core::Result<ProjectDocument>::failure(parse_error(
             "project schema v33 is missing its curve edit receipts"));
+    }
+    bool connection_port_graph_seen = false;
+    if (terminal_record == "CONNECTION_PORT_GRAPH") {
+        connection_port_graph_seen = true;
+        std::string encoded_graph;
+        if (!(input >> std::quoted(encoded_graph)) || encoded_graph.empty() ||
+            encoded_graph.size() > connection::kMaxConnectionPortGraphBytes) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project connection port graph is invalid or oversized"));
+        }
+        auto graph = connection::ConnectionPortGraph::deserialize(encoded_graph);
+        if (!graph) {
+            return core::Result<ProjectDocument>::failure(graph.error().with_context(
+                "serialized project connection port graph"));
+        }
+        if (version.value() < 34U && !graph.value().empty()) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "connection port graph data requires project schema version 34"));
+        }
+        document.connection_port_graph_ = std::move(graph.value());
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project is missing its END record"));
+        }
+    }
+    if (version.value() >= 34U && !connection_port_graph_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v34 is missing its connection port graph"));
+    }
+    bool kinematic_graphs_seen = false;
+    if (terminal_record == "KINEMATIC_GRAPHS") {
+        if (version.value() < 35U) {
+            return core::Result<ProjectDocument>::failure(Diagnostic(
+                ErrorCode::version_mismatch,
+                "kinematic graph records require project schema version 35"));
+        }
+        kinematic_graphs_seen = true;
+        const auto graph_count = read_uint(input, "kinematic graph count");
+        if (!graph_count || graph_count.value() > kMaxSerializedKinematicGraphs) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project kinematic graph count is invalid"));
+        }
+        std::uint64_t aggregate_bytes = 0U;
+        for (std::uint64_t index = 0U; index < graph_count.value(); ++index) {
+            if (auto result = require_line(input, "KINEMATIC_GRAPH"); !result) {
+                return core::Result<ProjectDocument>::failure(result.error());
+            }
+            std::string identity;
+            std::string encoded_digest;
+            std::string serialized_graph;
+            if (!(input >> std::quoted(identity)) ||
+                !valid_kinematic_graph_identity(identity)) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project kinematic graph identity is malformed"));
+            }
+            const auto graph_revision = read_uint(input, "kinematic graph revision");
+            if (!graph_revision || graph_revision.value() == 0U ||
+                graph_revision.value() == std::numeric_limits<std::uint64_t>::max() ||
+                !(input >> encoded_digest >> std::quoted(serialized_graph)) ||
+                serialized_graph.empty() ||
+                serialized_graph.size() > kinematic::KinematicGraph::kMaxSerializedBytes ||
+                serialized_graph.size() >
+                    kMaxSerializedKinematicGraphAggregateBytes - aggregate_bytes) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project kinematic graph revision or payload is invalid or oversized"));
+            }
+            aggregate_bytes += static_cast<std::uint64_t>(serialized_graph.size());
+            const auto digest = assets::Sha256Digest::from_hex(encoded_digest);
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(serialized_graph.data());
+            const auto decoded = kinematic::KinematicGraph::deserialize(serialized_graph);
+            if (!digest || digest.value().is_zero() ||
+                assets::sha256(std::span<const std::uint8_t>(
+                    bytes, serialized_graph.size())) != digest.value() ||
+                !decoded || decoded.value().serialize() != serialized_graph ||
+                !document.kinematic_graphs_.emplace(
+                    identity,
+                    SerializedKinematicGraph{
+                        core::Revision{graph_revision.value()},
+                        std::move(serialized_graph),
+                        digest.value()}).second) {
+                return core::Result<ProjectDocument>::failure(parse_error(
+                    "project kinematic graph digest, identity, or canonical payload is invalid"));
+            }
+        }
+        if (!(input >> terminal_record)) {
+            return core::Result<ProjectDocument>::failure(parse_error(
+                "project is missing its END record"));
+        }
+    }
+    if (version.value() >= 35U && !kinematic_graphs_seen) {
+        return core::Result<ProjectDocument>::failure(parse_error(
+            "project schema v35 is missing its kinematic graph table"));
     }
     if (terminal_record != "END") {
         return core::Result<ProjectDocument>::failure(

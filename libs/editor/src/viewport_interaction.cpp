@@ -356,19 +356,39 @@ core::Result<void> ViewportTransformSession::begin(
     ViewportTranslateAxis axis,
     core::Vec2d pointer_start,
     double pixels_per_world_unit) {
+    if (!std::isfinite(pixels_per_world_unit) || pixels_per_world_unit <= 0.0) {
+        return core::Result<void>::failure(invalid(
+            "viewport transform source, axis, or pointer scale is invalid"));
+    }
+    const core::Vec2d screen_axis = axis == ViewportTranslateAxis::world_x
+        ? core::Vec2d{pixels_per_world_unit, 0.0}
+        : core::Vec2d{0.0, -pixels_per_world_unit};
+    return begin_projected(object, source_transform, source_revision, axis,
+        pointer_start, screen_axis);
+}
+
+core::Result<void> ViewportTransformSession::begin_projected(
+    scene::ObjectId object,
+    core::Transform source_transform,
+    core::Revision source_revision,
+    ViewportTranslateAxis axis,
+    core::Vec2d pointer_start,
+    core::Vec2d screen_axis_per_world_unit) {
     if (state_.has_value()) {
         return core::Result<void>::failure(invalid_state(
             "viewport transform already owns a pointer capture"));
     }
+    const double projected_scale = screen_axis_per_world_unit.length_squared();
     if (!object || !source_transform.finite() || !pointer_start.finite() ||
-        !std::isfinite(pixels_per_world_unit) || pixels_per_world_unit <= 0.0 ||
+        !screen_axis_per_world_unit.finite() || !std::isfinite(projected_scale) ||
+        projected_scale <= 1.0e-18 ||
         (axis != ViewportTranslateAxis::world_x &&
             axis != ViewportTranslateAxis::world_z)) {
         return core::Result<void>::failure(invalid(
             "viewport transform source, axis, or pointer scale is invalid"));
     }
     state_ = State{object, source_transform, source_revision, axis,
-        pointer_start, pixels_per_world_unit};
+        pointer_start, screen_axis_per_world_unit};
     return core::Result<void>::success();
 }
 
@@ -389,12 +409,18 @@ core::Result<core::Transform> ViewportTransformSession::preview(
     }
 
     core::Transform result = state_->source_transform;
+    const core::Vec2d pointer_delta = pointer - state_->pointer_start;
+    const double axis_scale = state_->screen_axis_per_world_unit.length_squared();
+    const double world_delta = core::dot(
+        pointer_delta, state_->screen_axis_per_world_unit) / axis_scale;
+    if (!std::isfinite(world_delta)) {
+        return core::Result<core::Transform>::failure(invalid(
+            "viewport transform preview produced a non-finite projected delta"));
+    }
     if (state_->axis == ViewportTranslateAxis::world_x) {
-        result.translation.x +=
-            (pointer.x - state_->pointer_start.x) / state_->pixels_per_world_unit;
+        result.translation.x += world_delta;
     } else {
-        result.translation.z -=
-            (pointer.y - state_->pointer_start.y) / state_->pixels_per_world_unit;
+        result.translation.z += world_delta;
     }
     if (!result.finite()) {
         return core::Result<core::Transform>::failure(invalid(
@@ -545,12 +571,15 @@ core::Result<ViewportTransformSnapResult> snap_viewport_transform_preview(
     bool grid_snap,
     bool geometry_snap,
     SnapSession& session,
-    std::optional<scene::ObjectId> excluded_object) {
+    std::optional<scene::ObjectId> excluded_object,
+    double perpendicular_tolerance) {
     if (!preview.finite() || (axis != ViewportTranslateAxis::world_x &&
             axis != ViewportTranslateAxis::world_z) ||
-        (excluded_object.has_value() && !static_cast<bool>(*excluded_object))) {
+        (excluded_object.has_value() && !static_cast<bool>(*excluded_object)) ||
+        !std::isfinite(perpendicular_tolerance) ||
+        perpendicular_tolerance < 0.0 || perpendicular_tolerance > 0.5) {
         return core::Result<ViewportTransformSnapResult>::failure(invalid(
-            "viewport transform snap source or axis is invalid"));
+            "viewport transform snap source, axis, or alignment tolerance is invalid"));
     }
 
     ViewportTransformSnapResult result;
@@ -596,7 +625,8 @@ core::Result<ViewportTransformSnapResult> snap_viewport_transform_preview(
     const auto constraint = axis == ViewportTranslateAxis::world_x
         ? SnapConstraintAxis::world_x : SnapConstraintAxis::world_z;
     const auto decision = acquire_snap(candidates.value(), preview.translation,
-        source_revision, profile, session, {constraint, 0.05});
+        source_revision, profile, session,
+        {constraint, perpendicular_tolerance});
     if (!decision) {
         return core::Result<ViewportTransformSnapResult>::failure(decision.error());
     }

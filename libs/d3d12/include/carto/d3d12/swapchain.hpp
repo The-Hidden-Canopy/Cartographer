@@ -19,9 +19,9 @@ struct D3D12SwapchainOptions {
 };
 
 // Native presentation seam. Back buffers remain owned by DXGI and are imported
-// as typed color attachments with sampled access for GPU presentation checks.
-// Command submission and imported descriptor lifetime remain owned by the
-// D3D12Device.
+// as typed color attachments with sampled and transfer-destination access for
+// GPU presentation checks and direct frame copies. Command submission and
+// imported descriptor lifetime remain owned by the D3D12Device.
 class D3D12Swapchain final {
 public:
     [[nodiscard]] static core::Result<std::unique_ptr<D3D12Swapchain>> create(

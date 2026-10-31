@@ -148,6 +148,21 @@ bool read_enum(std::istream& input, unsigned maximum, Enum& value) {
     return true;
 }
 
+void write_material_graph_value(std::ostream& output, const MaterialGraphValue& value) {
+    output << static_cast<unsigned>(value.type);
+    for (const double component : value.components) output << ' ' << component;
+}
+
+bool read_material_graph_value(std::istream& input, MaterialGraphValue& value) {
+    if (!read_enum(input, static_cast<unsigned>(MaterialGraphValueType::normal), value.type)) {
+        return false;
+    }
+    for (double& component : value.components) {
+        if (!(input >> component)) return false;
+    }
+    return static_cast<bool>(value.validate());
+}
+
 void write_texture_ref(std::ostream& output, const render::TextureRef& value) {
     output << value.asset << ' ' << value.uv_set << ' ' << value.sampler << ' '
            << value.transform.offset.x << ' ' << value.transform.offset.y << ' '
@@ -499,6 +514,22 @@ core::Result<void> MaterialCatalog::insert_texture(TextureSourceRecord texture) 
     return insert_unique(textures_, identity, std::move(texture), "texture source");
 }
 
+core::Result<void> MaterialCatalog::replace_texture(TextureSourceRecord texture) {
+    if (auto result = texture.validate(); !result) return result;
+    const auto found = textures_.find(texture.id);
+    if (found == textures_.end()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::not_found, "cannot replace a missing texture source"));
+    }
+    if (texture.revision <= found->second.revision) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "replacement texture revision must advance its source revision"));
+    }
+    found->second = std::move(texture);
+    return core::Result<void>::success();
+}
+
 core::Result<void> MaterialCatalog::insert_sampler(SamplerIntent sampler) {
     if (auto result = sampler.validate(); !result) return result;
     const auto identity = sampler.id;
@@ -623,8 +654,74 @@ core::Result<void> MaterialCatalog::bind_material_graph(
         return core::Result<void>::failure(invalid(
             "material is already bound to this graph source"));
     }
+    MaterialGraphEvaluationInputs retained_inputs;
+    if (found != material_graph_bindings_.end() &&
+        found->second.graph_identity == graph_identity) {
+        retained_inputs = found->second.inputs;
+    }
     material_graph_bindings_.insert_or_assign(material, MaterialGraphBinding{
-        std::move(graph_identity), graph.revision, graph_digest.value()});
+        std::move(graph_identity), graph.revision, graph_digest.value(),
+        std::move(retained_inputs)});
+    return core::Result<void>::success();
+}
+
+core::Result<void> MaterialCatalog::set_material_graph_inputs(
+    render::MaterialId material,
+    std::string_view graph_identity,
+    core::Revision graph_revision,
+    const assets::Sha256Digest& graph_digest,
+    MaterialGraphEvaluationInputs inputs) {
+    const auto binding = material_graph_bindings_.find(material);
+    if (material == 0U || binding == material_graph_bindings_.end()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "material has no graph binding to receive persistent inputs"));
+    }
+    const auto graph = material_graphs_.find(std::string(graph_identity));
+    if (graph == material_graphs_.end()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "persistent graph inputs reference a missing graph source"));
+    }
+    const auto actual_digest = graph->second.canonical_digest();
+    if (!actual_digest || graph->second.revision != graph_revision ||
+        actual_digest.value() != graph_digest ||
+        binding->second.graph_identity != graph_identity ||
+        binding->second.source_revision != graph_revision ||
+        binding->second.source_digest != graph_digest) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "persistent graph inputs do not match the current pinned graph source"));
+    }
+    if (auto valid = validate_material_graph_input_subset(graph->second, inputs); !valid) {
+        return core::Result<void>::failure(
+            valid.error().with_context("persistent material graph inputs"));
+    }
+    if (binding->second.inputs == inputs) {
+        return core::Result<void>::failure(invalid(
+            "persistent material graph inputs are unchanged"));
+    }
+
+    std::size_t input_count = inputs.parameters.size() + inputs.surface_inputs.size();
+    if (input_count > kMaxMaterialGraphBindingInputValues) {
+        return core::Result<void>::failure(validation(
+            "material graph binding inputs exceed their aggregate catalog bound"));
+    }
+    for (const auto& [other_material, other_binding] : material_graph_bindings_) {
+        if (other_material == material) continue;
+        const std::size_t other_count = other_binding.inputs.parameters.size() +
+            other_binding.inputs.surface_inputs.size();
+        if (other_count > kMaxMaterialGraphBindingInputValues - input_count) {
+            return core::Result<void>::failure(validation(
+                "material graph binding inputs exceed their aggregate catalog bound"));
+        }
+        input_count += other_count;
+    }
+    if (input_count > kMaxMaterialGraphBindingInputValues) {
+        return core::Result<void>::failure(validation(
+            "material graph binding inputs exceed their aggregate catalog bound"));
+    }
+    binding->second.inputs = std::move(inputs);
     return core::Result<void>::success();
 }
 
@@ -770,6 +867,7 @@ core::Result<void> MaterialCatalog::validate() const {
             }
         }
     }
+    std::size_t material_graph_binding_input_count = 0U;
     for (const auto& [material, binding] : material_graph_bindings_) {
         if (!materials_.contains(material) ||
             !material_graphs_.contains(binding.graph_identity) ||
@@ -778,6 +876,15 @@ core::Result<void> MaterialCatalog::validate() const {
             return core::Result<void>::failure(validation(
                 "material graph binding identity, revision, digest, or source is invalid"));
         }
+        if (auto result = binding.inputs.validate(); !result) return result;
+        const std::size_t input_count = binding.inputs.parameters.size() +
+            binding.inputs.surface_inputs.size();
+        if (input_count > kMaxMaterialGraphBindingInputValues -
+                material_graph_binding_input_count) {
+            return core::Result<void>::failure(validation(
+                "material graph binding inputs exceed their aggregate catalog bound"));
+        }
+        material_graph_binding_input_count += input_count;
     }
     return core::Result<void>::success();
 }
@@ -848,6 +955,18 @@ std::string MaterialCatalog::serialize() const {
                << binding.source_revision.value() << ' '
                << binding.source_digest.hex() << ' '
                << std::quoted(binding.graph_identity) << '\n';
+        output << "MATERIAL_GRAPH_PARAMETERS " << binding.inputs.parameters.size() << '\n';
+        for (const auto& [name, value] : binding.inputs.parameters) {
+            output << "MATERIAL_GRAPH_PARAMETER " << std::quoted(name) << ' ';
+            write_material_graph_value(output, value);
+            output << '\n';
+        }
+        output << "MATERIAL_GRAPH_SURFACES " << binding.inputs.surface_inputs.size() << '\n';
+        for (const auto& [surface, value] : binding.inputs.surface_inputs) {
+            output << "MATERIAL_GRAPH_SURFACE " << static_cast<unsigned>(surface) << ' ';
+            write_material_graph_value(output, value);
+            output << '\n';
+        }
     }
     output << "END\n";
     return output.str();
@@ -874,7 +993,7 @@ core::Result<MaterialCatalog> MaterialCatalog::deserialize(std::string_view text
         return core::Result<MaterialCatalog>::failure(parse_error(
             "material catalog header is invalid"));
     }
-    if (version != 1U && version != 2U && version != kSchemaVersion) {
+    if (version != 1U && version != 2U && version != 3U && version != kSchemaVersion) {
         return core::Result<MaterialCatalog>::failure(core::Diagnostic(
             core::ErrorCode::version_mismatch,
             "material catalog schema version is unsupported"));
@@ -1064,6 +1183,54 @@ core::Result<MaterialCatalog> MaterialCatalog::deserialize(std::string_view text
             auto& binding = catalog.material_graph_bindings_.at(material);
             binding.source_revision = core::Revision{graph_revision};
             binding.source_digest = graph_digest.value();
+            if (version >= 4U) {
+                MaterialGraphEvaluationInputs graph_inputs;
+                std::size_t parameter_count = 0U;
+                if (!require_token(input, "MATERIAL_GRAPH_PARAMETERS") ||
+                    !read_count(input, MaterialGraph::kMaxNodes, parameter_count)) {
+                    return core::Result<MaterialCatalog>::failure(parse_error(
+                        "material graph parameter binding count is invalid"));
+                }
+                for (std::size_t parameter_index = 0U;
+                     parameter_index < parameter_count; ++parameter_index) {
+                    std::string name;
+                    MaterialGraphValue value;
+                    if (!require_token(input, "MATERIAL_GRAPH_PARAMETER") ||
+                        !(input >> std::quoted(name)) ||
+                        !read_material_graph_value(input, value) ||
+                        !graph_inputs.parameters.emplace(std::move(name), value).second) {
+                        return core::Result<MaterialCatalog>::failure(parse_error(
+                            "material graph parameter binding is malformed or duplicated"));
+                    }
+                }
+                std::size_t surface_count = 0U;
+                if (!require_token(input, "MATERIAL_GRAPH_SURFACES") ||
+                    !read_count(input,
+                        static_cast<std::size_t>(MaterialSurfaceInput::authored_mask),
+                        surface_count)) {
+                    return core::Result<MaterialCatalog>::failure(parse_error(
+                        "material graph surface binding count is invalid"));
+                }
+                for (std::size_t surface_index = 0U;
+                     surface_index < surface_count; ++surface_index) {
+                    MaterialSurfaceInput surface = MaterialSurfaceInput::unknown;
+                    MaterialGraphValue value;
+                    if (!require_token(input, "MATERIAL_GRAPH_SURFACE") ||
+                        !read_enum(input,
+                            static_cast<unsigned>(MaterialSurfaceInput::authored_mask),
+                            surface) ||
+                        !read_material_graph_value(input, value) ||
+                        !graph_inputs.surface_inputs.emplace(surface, value).second) {
+                        return core::Result<MaterialCatalog>::failure(parse_error(
+                            "material graph surface binding is malformed or duplicated"));
+                    }
+                }
+                if (auto valid = graph_inputs.validate(); !valid) {
+                    return core::Result<MaterialCatalog>::failure(
+                        valid.error().with_context("material graph input binding"));
+                }
+                binding.inputs = std::move(graph_inputs);
+            }
         }
     }
     if (!require_token(input, "END")) {

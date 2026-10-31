@@ -22,7 +22,7 @@ bool same_vec3(core::Vec3d left, core::Vec3d right) noexcept {
 
 } // namespace
 
-class LoopCutProjectSelectedEdgeCommand final : public EditorCommand {
+class LoopCutProjectSelectedEdgeCommand final : public CheckpointableEditorCommand<LoopCutProjectSelectedEdgeCommand> {
 public:
     LoopCutProjectSelectedEdgeCommand(
         ProjectCommandAdmission,
@@ -236,7 +236,7 @@ private:
     std::vector<AppliedEdit> edits_;
 };
 
-class KnifeCutProjectSelectedFaceCommand final : public EditorCommand {
+class KnifeCutProjectSelectedFaceCommand final : public CheckpointableEditorCommand<KnifeCutProjectSelectedFaceCommand> {
 public:
     KnifeCutProjectSelectedFaceCommand(
         ProjectCommandAdmission,

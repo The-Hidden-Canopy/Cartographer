@@ -1,0 +1,206 @@
+{
+  "schema_version": 1,
+  "created_at_utc": "2026-10-28T18:52:08.140774+00:00",
+  "integration_base_revision": "5a4e4ea4f67a9d3e4894c1ce7cdc5120b0687843",
+  "worker_base_revision": "fae4f7d95259ba38e79edc94ae12275df4161cd4",
+  "integration_owner": "01a14cfd-2c2e-7151-9624-5bec7c0ed57e",
+  "source_review_sha256": "cda19649fd6398da6352f89725e30a05cb8d5973cefa2fb6c6aca562b6abdeeb",
+  "review_correction": "Explicit UTF-8 review disproved initial locale-decoding label-change report. No label filtering or unrelated text modification applied. Original raw source and review-r1 retained.",
+  "files": [
+    {
+      "path": "libs/project/src/project.cpp",
+      "producer_sha256": "d88b6c396717d76a3df33a713cefad19be0bf8468f87ce33f1eb2b14a9f890db",
+      "integrated_sha256": "d88b6c396717d76a3df33a713cefad19be0bf8468f87ce33f1eb2b14a9f890db",
+      "bytes": 435733,
+      "source_snapshot": "locks-r1",
+      "decision": "Byte-exact frozen handoff"
+    },
+    {
+      "path": "libs/project/include/carto/project/project.hpp",
+      "producer_sha256": "0d552843fd6253e53a80127b73c9a91d32ce4358f324ec1d5508b913512fa47e",
+      "integrated_sha256": "0d552843fd6253e53a80127b73c9a91d32ce4358f324ec1d5508b913512fa47e",
+      "bytes": 37432,
+      "source_snapshot": "locks-r1",
+      "decision": "Byte-exact frozen handoff"
+    },
+    {
+      "path": "tests/project_locked_mesh_sprint2_tests.cpp",
+      "producer_sha256": "883bae7e0a4a0e485bf81b8f01bc9d6850899165a398639719768c8f05b11d2f",
+      "integrated_sha256": "883bae7e0a4a0e485bf81b8f01bc9d6850899165a398639719768c8f05b11d2f",
+      "bytes": 13806,
+      "source_snapshot": "locks-r1",
+      "decision": "Byte-exact frozen handoff"
+    },
+    {
+      "path": "docs/verification/terra-sprint2-locks-20261028.md",
+      "producer_sha256": "5ca30376d6014431823477db6c9fa6f65fd79af0e6ca2551f58d833c59006d01",
+      "integrated_sha256": "5ca30376d6014431823477db6c9fa6f65fd79af0e6ca2551f58d833c59006d01",
+      "bytes": 6044,
+      "source_snapshot": "locks-r1",
+      "decision": "Byte-exact frozen handoff"
+    },
+    {
+      "path": "libs/assets/include/carto/assets/source_registry.hpp",
+      "producer_sha256": "19d8a8043d7db45d20792f8c2cc6b124c9c66f4008b0889f35bf8670f7554d63",
+      "integrated_sha256": "19d8a8043d7db45d20792f8c2cc6b124c9c66f4008b0889f35bf8670f7554d63",
+      "bytes": 9491,
+      "source_snapshot": "registry-r1",
+      "decision": "Byte-exact frozen handoff"
+    },
+    {
+      "path": "docs/verification/terra-sprint2-source-registry-20261028.md",
+      "producer_sha256": "26eaed1094c81ad2c098e21a089a05f907c9d48d30e5e611e7342f4dd9e50b06",
+      "integrated_sha256": "26eaed1094c81ad2c098e21a089a05f907c9d48d30e5e611e7342f4dd9e50b06",
+      "bytes": 4492,
+      "source_snapshot": "registry-r1",
+      "decision": "Byte-exact frozen handoff"
+    },
+    {
+      "path": "tests/source_registry_v4_sprint2_tests.cpp",
+      "producer_sha256": "d5f1ccb6540a1ea9dc85b1f9c3ec6359f408e18ed081b83ff2496677ef4200b0",
+      "integrated_sha256": "d5f1ccb6540a1ea9dc85b1f9c3ec6359f408e18ed081b83ff2496677ef4200b0",
+      "bytes": 13340,
+      "source_snapshot": "registry-r1",
+      "decision": "Byte-exact frozen handoff"
+    },
+    {
+      "path": "libs/assets/src/source_registry.cpp",
+      "producer_sha256": "ce718abdcb38fb82740375469733f9607e2deafca5369b5f7287cf0db6e2e7c4",
+      "integrated_sha256": "ce718abdcb38fb82740375469733f9607e2deafca5369b5f7287cf0db6e2e7c4",
+      "bytes": 62762,
+      "source_snapshot": "registry-r1",
+      "decision": "Byte-exact frozen handoff"
+    },
+    {
+      "path": "libs/application/src/application.cpp",
+      "producer_sha256": "fd808044385aed7335e8e2090603339134be3ea694edf2ba347743e5ddd76861",
+      "integrated_sha256": "fd808044385aed7335e8e2090603339134be3ea694edf2ba347743e5ddd76861",
+      "bytes": 681184,
+      "source_snapshot": "history-r1",
+      "decision": "Byte-exact frozen handoff"
+    },
+    {
+      "path": "libs/application/include/carto/application/application.hpp",
+      "producer_sha256": "550a5c1681775057602f6987f0e90a1ee0f796fa4ae8f5838a69d52573745c88",
+      "integrated_sha256": "e4cfa92c53632e564cf2cd5f9a2526591e3a3b7b1e007809261f3eaff9b286b0",
+      "bytes": 97323,
+      "source_snapshot": "history-r1",
+      "decision": "Merge only RecoveryJournalEntry evidence hunk; preserve precursor generation query"
+    },
+    {
+      "path": "libs/editor/include/carto/editor/command_bus.hpp",
+      "producer_sha256": "6a55dc96df9a382b568db154ff2bdf75dd72cbc9fa8c14b2abc80cb0ad457f6d",
+      "integrated_sha256": "6a55dc96df9a382b568db154ff2bdf75dd72cbc9fa8c14b2abc80cb0ad457f6d",
+      "bytes": 58778,
+      "source_snapshot": "history-r1",
+      "decision": "Byte-exact frozen handoff"
+    },
+    {
+      "path": "libs/editor/src/command_bus.cpp",
+      "producer_sha256": "8e38cecac33bce5cfd6be6093c0ff5bb51653998a08b499ec2676aaded38dee4",
+      "integrated_sha256": "8e38cecac33bce5cfd6be6093c0ff5bb51653998a08b499ec2676aaded38dee4",
+      "bytes": 276682,
+      "source_snapshot": "history-r1",
+      "decision": "Byte-exact frozen handoff"
+    },
+    {
+      "path": "libs/editor/src/tools.cpp",
+      "producer_sha256": "58cbeda4badf99dbb5549419c8ece935d85bf33d1bc3df4ba6d0028c2049f0b8",
+      "integrated_sha256": "58cbeda4badf99dbb5549419c8ece935d85bf33d1bc3df4ba6d0028c2049f0b8",
+      "bytes": 50076,
+      "source_snapshot": "history-r1",
+      "decision": "Byte-exact frozen handoff"
+    },
+    {
+      "path": "libs/project/src/recovery.cpp",
+      "producer_sha256": "7a41c7b84acecc91e45cdcb8ec8eb84a647bb71383382566924005abca547fab",
+      "integrated_sha256": "7a41c7b84acecc91e45cdcb8ec8eb84a647bb71383382566924005abca547fab",
+      "bytes": 11354,
+      "source_snapshot": "history-r1",
+      "decision": "Byte-exact frozen handoff"
+    },
+    {
+      "path": "tests/application_history_atomicity_sprint2_tests.cpp",
+      "producer_sha256": "fc4a2bf6301341b5038f68ce93d276c93e154f74d61c20803e3ac689e1b5af2b",
+      "integrated_sha256": "6468edffc9d04dc701017b1fb7a628ead68134e3a686f726189d274e12db1473",
+      "bytes": 12804,
+      "source_snapshot": "history-r1",
+      "decision": "Add full serialized document/journal comparisons and caught-error output"
+    },
+    {
+      "path": "tests/application_journal_provenance_sprint2_tests.cpp",
+      "producer_sha256": "a59c9f1cf55c14a9b358f45eca472cf3dad9b3314f4eb297249d782acf45ce39",
+      "integrated_sha256": "590904f5c698a53ddabd36f8d8e391af00a6c01a7187c4c0717e83d1229d6f05",
+      "bytes": 6593,
+      "source_snapshot": "history-r1",
+      "decision": "Print caught test failure diagnostics"
+    },
+    {
+      "path": "docs/verification/terra-sprint2-history-20261028.md",
+      "producer_sha256": "3a28c1045b6e2dc350ab4c09605ae4a11531ad5a4a974a2e80ddfedcbe694afd",
+      "integrated_sha256": "3a28c1045b6e2dc350ab4c09605ae4a11531ad5a4a974a2e80ddfedcbe694afd",
+      "bytes": 3874,
+      "source_snapshot": "history-r1",
+      "decision": "Byte-exact frozen handoff"
+    },
+    {
+      "path": "libs/assets/src/texture_image_decoder.cpp",
+      "producer_sha256": "9ccf91a7a5e1f4318fee15c6861d84e88ec29cffa0fa5d6355a82e9b2642509e",
+      "integrated_sha256": "9ccf91a7a5e1f4318fee15c6861d84e88ec29cffa0fa5d6355a82e9b2642509e",
+      "bytes": 52331,
+      "source_snapshot": "decoder-progressive-r1",
+      "decision": "Byte-exact frozen handoff"
+    },
+    {
+      "path": "tests/texture_image_decoder_sprint2_tests.cpp",
+      "producer_sha256": "17db25653456048d05e4d04ddbdc8b3dc0401c989208c2f8f0870ea60e060ca9",
+      "integrated_sha256": "17db25653456048d05e4d04ddbdc8b3dc0401c989208c2f8f0870ea60e060ca9",
+      "bytes": 12273,
+      "source_snapshot": "decoder-progressive-r1",
+      "decision": "Byte-exact frozen handoff"
+    },
+    {
+      "path": "docs/verification/terra-sprint2-decoder-20261028.md",
+      "producer_sha256": "eb64f5049c2f46717c558c8c82b2fc1b67cd25abd4c43c86e34e27bd491d9cc3",
+      "integrated_sha256": "eb64f5049c2f46717c558c8c82b2fc1b67cd25abd4c43c86e34e27bd491d9cc3",
+      "bytes": 9008,
+      "source_snapshot": "decoder-progressive-r1",
+      "decision": "Byte-exact frozen handoff"
+    },
+    {
+      "path": "tests/CMakeLists.txt",
+      "integrated_sha256": "a297258cc37fa4e2ae78f048fdd2e944ec904c415a56a59425a44a55dd9692f6",
+      "bytes": 61770,
+      "source_snapshot": "root integration",
+      "decision": "Registration, current-writer assertion, public-controller boundary tests or repair ledger; source-only"
+    },
+    {
+      "path": "tests/application_tests.cpp",
+      "integrated_sha256": "9ac67bbf3ac46dc6904231fcd676cf0916da9909a0f0631149a67d41483c1362",
+      "bytes": 686707,
+      "source_snapshot": "root integration",
+      "decision": "Registration, current-writer assertion, public-controller boundary tests or repair ledger; source-only"
+    },
+    {
+      "path": "tests/application_native_import_sprint_tests.cpp",
+      "integrated_sha256": "9e7145915265c3c8e76e6cd2740e3e8427710e5f26eb4f10d7da299de8dbe73b",
+      "bytes": 18545,
+      "source_snapshot": "root integration",
+      "decision": "Registration, current-writer assertion, public-controller boundary tests or repair ledger; source-only"
+    },
+    {
+      "path": "docs/verification/cartographer-alpha-governed-20261028.md",
+      "integrated_sha256": "1ed4de44cca2db429066efb72aff3ed56113e8edfc2c24a2edbcc5e3d6fc8acf",
+      "bytes": 8870,
+      "source_snapshot": "root integration",
+      "decision": "Registration, current-writer assertion, public-controller boundary tests or repair ledger; source-only"
+    }
+  ],
+  "self_reference": "Manifest excludes its own bytes; final commit/tree is recorded by owner status after freeze.",
+  "state": "SOURCE_CANDIDATE_ONLY_NOT_RUNTIME_ACCEPTED",
+  "tests_run": [],
+  "native_launched": false,
+  "images_reviewed": [],
+  "promotion": "unchanged",
+  "full_g1": "open"
+}

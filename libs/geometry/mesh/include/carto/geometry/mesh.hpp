@@ -352,9 +352,14 @@ public:
     // Replaces one closed triangular vertex fan (valence 3..64) with chamfered
     // incident faces and a bounded cap. Segment counts are limited to 1..64;
     // multi-segment caps subdivide their boundary and triangulate the incident
-    // faces with source-face lineage. The cap must remain simple, planar, and
-    // convex. Boundary vertices, non-triangular fans, non-manifold edges, and
-    // collapsing widths are refused.
+    // faces with source-face lineage. The cap must remain simple and planar.
+    // For a simple planar concave source boundary, width is the cut distance
+    // on its shortest incident edge and a shared edge fraction preserves the
+    // planar concave cap; convex inputs retain per-edge distance cuts.
+    // A single-segment concave cap stays a polygon for deterministic compile
+    // triangulation; multi-segment concave caps are ear-clipped here. Boundary
+    // vertices, non-triangular fans, non-manifold edges, and collapsing widths
+    // are refused.
     [[nodiscard]] core::Result<TopologyEditReceipt> bevel_vertex(
         VertexId id,
         double width,
@@ -390,6 +395,15 @@ public:
     // one receipt; no-op requests, non-simple collapses, and candidate sets
     // above kMaxMergeByDistanceCandidates are rejected without mutation.
     static constexpr std::size_t kMaxMergeByDistanceCandidates = 1'000'000U;
+    static constexpr std::size_t kMaxMergeCandidateDiscoveryVertices = 1'000'000U;
+    static constexpr std::size_t kMaxMergeCandidateDiscoveryPairs = 4'000'000U;
+    // Read-only spatial scan. It returns every vertex that participates in at
+    // least one pair within `distance`; it never changes mesh or revision.
+    [[nodiscard]] core::Result<std::vector<VertexId>> find_merge_by_distance_candidates(
+        double distance,
+        std::size_t max_candidates,
+        std::size_t max_pair_checks,
+        std::size_t max_vertices) const;
     [[nodiscard]] core::Result<TopologyEditReceipt> merge_by_distance(
         const std::vector<VertexId>& candidates,
         double distance);

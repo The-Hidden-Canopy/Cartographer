@@ -29,13 +29,25 @@ stable_topology_snapshot(const geometry::EditableMesh& mesh);
     const geometry::TopologyEditReceipt& receipt);
 
 // Applies a two-vertex weld and transfers supported attribute domains from
-// the exact source topology. The mesh is unchanged when transfer is refused.
+// the exact source topology. Vertex references follow the merge receipt;
+// conflicting edge contributors and ambiguous face/corner lineage refuse.
+// The mesh is unchanged when transfer is refused.
 [[nodiscard]] core::Result<geometry::TopologyEditReceipt>
 merge_vertices_with_attribute_transfer(
     geometry::EditableMesh& mesh,
     geometry::VertexId target,
     geometry::VertexId source,
     geometry::VertexMergeMode mode);
+
+// Applies bounded deterministic merge-by-distance and transfers supported
+// mesh attributes from the exact source topology. Vertex references follow the
+// merge receipt; conflicting edge contributors and ambiguous face/corner
+// lineage refuse. The mesh is unchanged when transfer is refused.
+[[nodiscard]] core::Result<geometry::TopologyEditReceipt>
+merge_by_distance_with_attribute_transfer(
+    geometry::EditableMesh& mesh,
+    const std::vector<geometry::VertexId>& candidates,
+    double distance);
 
 // Applies a bounded single-face knife cut and transfers supported mesh
 // attributes. Edge-interior endpoints receive position-weighted vertex and

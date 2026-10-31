@@ -196,7 +196,8 @@ core::Result<gpu::TextureHandle> D3D12Swapchain::acquire_back_buffer() {
             1U,
             impl_->options.format,
             gpu::TextureDimension::texture_2d,
-            gpu::TextureUsage::color_attachment | gpu::TextureUsage::sampled,
+            gpu::TextureUsage::color_attachment | gpu::TextureUsage::sampled |
+                gpu::TextureUsage::transfer_destination,
         });
 }
 

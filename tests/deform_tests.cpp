@@ -532,6 +532,183 @@ carto::deform::DeformationGraph graph_with(
     return graph;
 }
 
+void graph_admits_only_declared_methods_and_spaces() {
+    const std::vector<Vec3d> positions = bend_positions();
+    const Sha256Digest mesh_digest = carto::deform::positions_digest(positions);
+    const auto binding = bend_binding(mesh_digest);
+    auto poses = bend_poses(90.0);
+    const auto binding_digest = binding.canonical_digest();
+    require(static_cast<bool>(binding_digest), "binding digest is available");
+
+    carto::deform::DeformationEvaluationInput input;
+    input.bind_positions = positions;
+    input.mesh_content_digest = mesh_digest;
+    input.binding = &binding;
+    input.poses = &poses;
+    const carto::deform::SkinEvaluationInput direct_input{
+        .bind_positions = positions,
+        .mesh_content_digest = mesh_digest,
+        .binding = &binding,
+        .poses = &poses};
+
+    carto::deform::DeformationStage skin;
+    for (const auto method : {carto::deform::SkinMethod::linear_blend,
+                              carto::deform::SkinMethod::dual_quaternion}) {
+        skin.method = method;
+        const auto graph = graph_with({skin});
+        const auto direct = method == carto::deform::SkinMethod::linear_blend
+            ? carto::deform::evaluate_lbs(direct_input)
+            : carto::deform::evaluate_dqs(direct_input);
+        const auto evaluated = carto::deform::evaluate(graph, input);
+        require(static_cast<bool>(graph.validate()) && static_cast<bool>(direct) &&
+                static_cast<bool>(evaluated), "supported method evaluates");
+        require(evaluated.value().positions.size() == direct.value().positions.size(),
+            "graph and direct skinning return the same point count");
+        for (std::size_t i = 0U; i < direct.value().positions.size(); ++i) {
+            require(near_vec(evaluated.value().positions[i], direct.value().positions[i]),
+                "graph uses the explicitly selected method");
+        }
+        const double s = std::sqrt(0.5);
+        const Vec3d expected = method == carto::deform::SkinMethod::linear_blend
+            ? Vec3d{1.5, 0.5, 0.0} : Vec3d{1.0 + s, s, 0.0};
+        require(near_vec(evaluated.value().positions[2], expected, 1e-9),
+            "selected method retains its hand-computed bend result");
+        require(evaluated.value().receipt.stages.size() == 1U &&
+                evaluated.value().receipt.stages[0].label ==
+                    std::string{"skin:"} + std::string{carto::deform::skin_method_name(method)} &&
+                evaluated.value().receipt.stages[0].output_digest ==
+                    carto::deform::positions_digest(direct.value().positions) &&
+                evaluated.value().receipt.stages[0].policy_digest == binding_digest.value(),
+            "skin receipt identifies the selected method, output and binding");
+    }
+
+    for (const auto raw : {2U, 255U}) {
+        skin.method = static_cast<carto::deform::SkinMethod>(raw);
+        const auto graph = graph_with({skin});
+        const auto stage_valid = skin.validate();
+        const auto graph_valid = graph.validate();
+        const auto evaluated = carto::deform::evaluate(graph, input);
+        require(!stage_valid && !graph_valid && !evaluated &&
+                evaluated.error().code == carto::core::ErrorCode::invalid_argument,
+            "unknown skin method refuses at validation and evaluation");
+    }
+
+    carto::deform::DeformationStage unknown_kind;
+    unknown_kind.kind = static_cast<carto::deform::DeformationStage::Kind>(255U);
+    const auto invalid_kind = carto::deform::evaluate(graph_with({unknown_kind}), input);
+    require(!unknown_kind.validate() && !invalid_kind &&
+            invalid_kind.error().code == carto::core::ErrorCode::invalid_argument,
+        "unknown stage kind refuses without evaluating skin or morph");
+
+    skin.method = carto::deform::SkinMethod::linear_blend;
+    carto::deform::DeformationStage morph;
+    morph.kind = carto::deform::DeformationStage::Kind::morph;
+    morph.morph_target = carto::character::MorphTargetId{5U};
+    skin.method = static_cast<carto::deform::SkinMethod>(255U);
+    const auto invalid_after_morph =
+        carto::deform::evaluate(graph_with({morph, skin}), input);
+    require(!invalid_after_morph &&
+            invalid_after_morph.error().code == carto::core::ErrorCode::invalid_argument,
+        "invalid later skin stage refuses before resolving any morph source");
+    skin.method = carto::deform::SkinMethod::linear_blend;
+    morph.space = static_cast<carto::deform::MorphSpace>(255U);
+    for (const auto& graph : {graph_with({morph, skin}), graph_with({skin, morph})}) {
+        const auto valid = graph.validate();
+        const auto evaluated = carto::deform::evaluate(graph, input);
+        require(!valid && !evaluated &&
+                evaluated.error().code == carto::core::ErrorCode::invalid_argument,
+            "unknown morph space cannot bypass either ordering boundary");
+    }
+
+    input.mesh_content_digest = digest("stale source mesh");
+    const auto stale = carto::deform::evaluate(graph_with({skin}), input);
+    require(!stale && stale.error().code == carto::core::ErrorCode::stale_data,
+        "valid method still refuses a stale binding");
+    input.mesh_content_digest = mesh_digest;
+    skin.method = carto::deform::SkinMethod::dual_quaternion;
+    poses.world_pose[kJoint2].scale = {2.0, 1.0, 1.0};
+    const auto non_rigid = carto::deform::evaluate(graph_with({skin}), input);
+    require(!non_rigid && non_rigid.error().code == carto::core::ErrorCode::unsupported,
+        "DQS still refuses unsupported non-rigid transforms");
+    require(carto::deform::positions_digest(positions) == mesh_digest &&
+            binding.canonical_digest().value() == binding_digest.value() &&
+            near(poses.world_pose[kJoint2].scale.x, 2.0),
+        "refusals preserve source positions, binding and caller poses");
+}
+
+void unweighted_skin_positions_must_remain_finite() {
+    const std::vector<Vec3d> positions{{0.0, 0.0, 0.0}, {1.0, 2.0, 3.0}};
+    const Sha256Digest mesh_digest = carto::deform::positions_digest(positions);
+    carto::kinematic::SkinBinding binding;
+    binding.mesh_asset = 42U;
+    binding.mesh_digest = mesh_digest;
+    binding.graph_digest = digest("unweighted-graph:v1");
+    binding.mesh_bind_transform.translation = {2.0, 3.0, 4.0};
+    const carto::deform::JointPoseSet poses;
+    carto::deform::SkinEvaluationInput input{
+        .bind_positions = positions,
+        .mesh_content_digest = mesh_digest,
+        .binding = &binding,
+        .poses = &poses};
+    for (const auto method : {carto::deform::SkinMethod::linear_blend,
+                              carto::deform::SkinMethod::dual_quaternion}) {
+        const auto result = method == carto::deform::SkinMethod::linear_blend
+            ? carto::deform::evaluate_lbs(input) : carto::deform::evaluate_dqs(input);
+        require(static_cast<bool>(result) && result.value().positions.size() == 2U &&
+                near_vec(result.value().positions[0], {2.0, 3.0, 4.0}) &&
+                near_vec(result.value().positions[1], {3.0, 5.0, 7.0}),
+            "finite unweighted vertices retain mesh-bind transformed positions");
+    }
+
+    // Both the source stream and transform are finite, but the second
+    // unweighted point overflows only after a valid first point was evaluated.
+    const std::vector<Vec3d> huge_positions{
+        {0.0, 0.0, 0.0}, {std::numeric_limits<double>::max(), 0.0, 0.0}};
+    const Sha256Digest huge_digest = carto::deform::positions_digest(huge_positions);
+    binding.mesh_digest = huge_digest;
+    binding.mesh_bind_transform.translation = {std::numeric_limits<double>::max(), 0.0, 0.0};
+    require(static_cast<bool>(binding.validate()), "overflow fixture binding is finite");
+    const auto binding_digest = binding.canonical_digest();
+    require(static_cast<bool>(binding_digest), "overflow fixture binding digest exists");
+    input.bind_positions = huge_positions;
+    input.mesh_content_digest = huge_digest;
+    carto::deform::DeformationEvaluationInput graph_input;
+    graph_input.bind_positions = huge_positions;
+    graph_input.mesh_content_digest = huge_digest;
+    graph_input.binding = &binding;
+    graph_input.poses = &poses;
+    for (const auto method : {carto::deform::SkinMethod::linear_blend,
+                              carto::deform::SkinMethod::dual_quaternion}) {
+        const auto direct = method == carto::deform::SkinMethod::linear_blend
+            ? carto::deform::evaluate_lbs(input) : carto::deform::evaluate_dqs(input);
+        carto::deform::DeformationStage skin;
+        skin.method = method;
+        const auto graph_result = carto::deform::evaluate(graph_with({skin}), graph_input);
+        require(!direct && direct.error().code == carto::core::ErrorCode::validation_failed &&
+                !graph_result && graph_result.error().code == carto::core::ErrorCode::validation_failed,
+            "overflowing unweighted output refuses without a result or graph receipt");
+    }
+    require(carto::deform::positions_digest(huge_positions) == huge_digest &&
+            binding.canonical_digest().value() == binding_digest.value(),
+        "late output refusal preserves source and binding");
+
+    std::vector<Vec3d> poisoned = positions;
+    poisoned[1].x = std::numeric_limits<double>::infinity();
+    input.bind_positions = poisoned;
+    require(!carto::deform::evaluate_lbs(input) && !carto::deform::evaluate_dqs(input),
+        "non-finite source positions remain refused by both methods");
+    binding = bend_binding(mesh_digest);
+    binding.influences.erase(2U);
+    input.bind_positions = positions;
+    input.mesh_content_digest = mesh_digest;
+    const auto missing_joint_lbs = carto::deform::evaluate_lbs(input);
+    const auto missing_joint_dqs = carto::deform::evaluate_dqs(input);
+    require(!missing_joint_lbs && !missing_joint_dqs &&
+            missing_joint_lbs.error().code == carto::core::ErrorCode::not_found &&
+            missing_joint_dqs.error().code == carto::core::ErrorCode::not_found,
+        "missing joint poses remain refused by both methods");
+}
+
 void graph_evaluation_is_ordered_deterministic_and_receipted() {
     MorphFixture fixture = make_morph_fixture();
     carto::kinematic::SkinBinding binding;
@@ -650,6 +827,14 @@ void graph_evaluation_is_ordered_deterministic_and_receipted() {
         graph_with({skin, post_skin_morph});
     require(static_cast<bool>(post_skin.validate()),
         "explicitly declared post-skin morph order validates");
+    input.reference_positions = {};
+    const auto post_result = carto::deform::evaluate(post_skin, input);
+    require(static_cast<bool>(post_result) &&
+            near_vec(post_result.value().positions[4], {1.0, 1.0, 1.0}) &&
+            post_result.value().receipt.stages.size() == 2U &&
+            post_result.value().receipt.stages[0].label == "skin:linear_blend" &&
+            post_result.value().receipt.stages[1].label == "morph:5",
+        "post-skin morph evaluates and records declared stage order");
     const carto::deform::DeformationGraph bad_order =
         graph_with({skin, morph});
     require(!bad_order.validate(),
@@ -663,6 +848,67 @@ void graph_evaluation_is_ordered_deterministic_and_receipted() {
         digest("correspondence:STALE");
     require(!carto::deform::evaluate(driven_graph, stale_input),
         "stale correspondence inside graph evaluation fails closed");
+
+    // Registry keys must attest the actual target, including inactive stages.
+    const auto original_positions = carto::deform::positions_digest(fixture.positions);
+    const auto original_blob = carto::assets::sha256(fixture.blob);
+    auto wrong_identity = fixture.target;
+    wrong_identity.id = carto::character::MorphTargetId{6U};
+    require(static_cast<bool>(wrong_identity.validate()), "identity-only replacement is otherwise valid");
+    auto mismatched = input;
+    mismatched.morphs[fixture.target.id].target = &wrong_identity;
+    const auto identity_refusal = carto::deform::evaluate(graph, mismatched);
+    require(!identity_refusal && identity_refusal.error().code == carto::core::ErrorCode::stale_data,
+        "morph source identity mismatch must refuse instead of emitting a mislabeled receipt");
+
+    auto zero_graph = graph;
+    zero_graph.stages[0U].morph_weight = 0.0;
+    const auto zero_refusal = carto::deform::evaluate(zero_graph, mismatched);
+    require(!zero_refusal && zero_refusal.error().code == carto::core::ErrorCode::stale_data,
+        "zero weight cannot waive morph source identity");
+    auto mismatched_driven = driven_input;
+    mismatched_driven.driver_channels.controls[control] = 0.0;
+    mismatched_driven.morphs[fixture.target.id].target = &wrong_identity;
+    const auto muted_refusal = carto::deform::evaluate(driven_graph, mismatched_driven);
+    require(!muted_refusal && muted_refusal.error().code == carto::core::ErrorCode::stale_data,
+        "zero corrective-driver weight cannot waive morph source identity");
+    const auto post_refusal = carto::deform::evaluate(post_skin, mismatched);
+    require(!post_refusal && post_refusal.error().code == carto::core::ErrorCode::stale_data,
+        "post-skin identity mismatch cannot produce a receipt");
+
+    const auto other_blob = carto::deform::encode_delta_blob({{4U, {0.0, 0.0, 0.25}}});
+    require(static_cast<bool>(other_blob), "distinct valid morph payload encodes");
+    auto other_target = make_morph_target(fixture.mesh_digest, other_blob.value(), fixture.correspondence);
+    other_target.id = wrong_identity.id;
+    auto other_source = input;
+    other_source.morphs[fixture.target.id] = carto::deform::MorphSource{
+        &other_target, other_blob.value(), fixture.correspondence};
+    const auto payload_refusal = carto::deform::evaluate(graph, other_source);
+    require(!payload_refusal && payload_refusal.error().code == carto::core::ErrorCode::stale_data,
+        "a different valid target and payload cannot be aliased under the requested identity");
+
+    auto matching_graph = graph;
+    matching_graph.stages[0U].morph_target = other_target.id;
+    auto matching_input = input;
+    matching_input.morphs.clear();
+    matching_input.morphs[other_target.id] = carto::deform::MorphSource{
+        &other_target, other_blob.value(), fixture.correspondence};
+    const auto matching_other = carto::deform::evaluate(matching_graph, matching_input);
+    require(static_cast<bool>(matching_other) && near_vec(matching_other.value().positions[4U], {1.0, 1.0, 0.25}) &&
+            matching_other.value().receipt.stages[0U].label == "morph:6" &&
+            matching_other.value().receipt.stages[0U].policy_digest != first.value().receipt.stages[0U].policy_digest,
+        "a matching distinct target still evaluates with its own geometry and receipt identity");
+    const auto matching_again = carto::deform::evaluate(graph, input);
+    require(static_cast<bool>(matching_again) &&
+            matching_again.value().receipt.stages[0U].label == first.value().receipt.stages[0U].label &&
+            matching_again.value().receipt.stages[0U].output_digest == first.value().receipt.stages[0U].output_digest &&
+            matching_again.value().receipt.stages[0U].policy_digest == first.value().receipt.stages[0U].policy_digest,
+        "identity refusals preserve the original successful receipt");
+    require(carto::deform::positions_digest(fixture.positions) == original_positions &&
+            carto::assets::sha256(fixture.blob) == original_blob &&
+            fixture.target.id == carto::character::MorphTargetId{5U} &&
+            wrong_identity.id == carto::character::MorphTargetId{6U},
+        "matching and refused evaluations leave source positions, blob and identities untouched");
 }
 
 } // namespace
@@ -793,6 +1039,8 @@ int main() {
     morph_delta_application_is_targeted_and_bounded();
     corrective_driver_interpolates_over_domain_edges();
     corrective_stack_orders_and_chains_deterministically();
+    graph_admits_only_declared_methods_and_spaces();
+    unweighted_skin_positions_must_remain_finite();
     graph_evaluation_is_ordered_deterministic_and_receipted();
     delta_smooth_is_exact_at_rest_equivariant_and_corrective();
     std::cout << "deform tests passed\n";

@@ -19,6 +19,7 @@
 #include <carto/surface/core.hpp>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -226,6 +227,9 @@ struct ProjectedEdgePickCandidate {
     geometry::EdgeId edge;
     core::Vec2d first;
     core::Vec2d second;
+    // Plan snapshots use world Y; perspective snapshots use negated view depth.
+    std::array<double, 2U> camera_depth{};
+    bool perspective_correct = false;
 };
 
 enum class ProjectedEdgePickStatus {
@@ -252,8 +256,8 @@ struct ProjectedEdgePickResult {
     double ambiguity_margin_pixels = 1.0);
 
 // Triangle identity and source positions captured from one viewport snapshot.
-// The desktop's current orthographic view looks down +Y; `camera_depth` stores
-// world Y so overlapping screen-space hits resolve to the frontmost surface.
+// In plan view, `camera_depth` stores world Y. Perspective snapshots store the
+// negated positive view depth and request perspective-correct source weights.
 struct SculptViewportTriangle {
     scene::ObjectId object;
     geometry::FaceId face;
@@ -261,6 +265,32 @@ struct SculptViewportTriangle {
     std::array<geometry::VertexId, 3> vertices{};
     std::array<core::Vec3d, 3> local_positions{};
     std::array<double, 3> camera_depth{};
+    bool perspective_correct = false;
+    // Each projected corner may be a near-plane clip point. These weights map
+    // its source position back to the original source triangle corners.
+    std::array<std::array<double, 3U>, 3U> screen_source_weights{{
+        {{1.0, 0.0, 0.0}}, {{0.0, 1.0, 0.0}}, {{0.0, 0.0, 1.0}}}};
+};
+
+inline constexpr double kProjectedSurfaceDepthTilePixels = 64.0;
+inline constexpr std::size_t kMaxProjectedSurfaceDepthBuckets = 16'384U;
+inline constexpr std::size_t kMaxProjectedSurfaceDepthReferences = 4'194'304U;
+
+// Bounded screen-space broad phase for read-only visibility checks. The index
+// is valid only for the exact triangle span and viewport used to build it.
+struct ProjectedSurfaceDepthIndex {
+    core::Vec2d screen_origin{};
+    core::Vec2d viewport_extent{};
+    std::uint32_t columns = 0U;
+    std::uint32_t rows = 0U;
+    std::size_t source_triangle_count = 0U;
+    std::size_t reference_count = 0U;
+    std::vector<std::vector<std::uint32_t>> buckets;
+};
+
+struct ProjectedSurfaceDepthQuery {
+    std::optional<double> camera_depth;
+    std::size_t candidates_checked = 0U;
 };
 
 enum class ProjectedSurfaceHitStatus : std::uint8_t {
@@ -274,6 +304,21 @@ struct ProjectedSurfaceHitResolution {
     scene::ObjectId object;
     production::SculptStrokeSample sample;
     double camera_depth = 0.0;
+};
+
+enum class ViewportSceneSource : std::uint8_t {
+    unavailable,
+    live_project,
+    agent_preview,
+};
+
+// Captures the source actually displayed when viewport hit triangles were built.
+// Shared mesh ownership keeps the observation stable until admission or reset.
+struct ViewportDecalObservation {
+    ViewportSceneSource source = ViewportSceneSource::unavailable;
+    std::uint64_t project_generation = 0U;
+    core::Revision project_revision;
+    render::RenderInstance target;
 };
 
 inline constexpr std::size_t kMaxDecalOutlineSourceTriangles = 65'536U;
@@ -292,12 +337,31 @@ resolve_decal_projection_outline(
     const geometry::CompiledMesh& visible_mesh);
 
 // Resolves the frontmost surface over all visible scene triangles. Equal-depth
-// hits from distinct objects or source faces are ambiguous so a caller cannot
-// place through an overlapping object or choose an arbitrary surface normal.
+// hits from distinct objects remain ambiguous. Same-object face ties also fail
+// closed by default; callers resolving object/vertex/edge visibility may opt to
+// collapse those ties when a unique source face is not required.
 [[nodiscard]] core::Result<ProjectedSurfaceHitResolution>
 resolve_frontmost_viewport_surface(
     std::span<const SculptViewportTriangle> triangles,
-    core::Vec2d screen_position);
+    core::Vec2d screen_position,
+    bool allow_same_object_face_ties = false);
+
+[[nodiscard]] core::Result<ProjectedSurfaceDepthIndex>
+build_projected_surface_depth_index(
+    std::span<const SculptViewportTriangle> triangles,
+    core::Vec2d screen_origin,
+    core::Vec2d viewport_extent,
+    std::size_t max_references = kMaxProjectedSurfaceDepthReferences);
+
+// Returns the nearest captured scene depth at a screen point. An empty depth
+// means no projected scene triangle covers the point. The per-query candidate
+// limit lets callers bound aggregate work across a larger overlay.
+[[nodiscard]] core::Result<ProjectedSurfaceDepthQuery>
+resolve_frontmost_viewport_depth(
+    std::span<const SculptViewportTriangle> triangles,
+    const ProjectedSurfaceDepthIndex& index,
+    core::Vec2d screen_position,
+    std::size_t max_candidate_checks);
 
 inline constexpr std::size_t kMaxKnifeViewportPathPoints = 4096U;
 
@@ -344,6 +408,20 @@ struct CommandView {
     std::string unavailable_reason;
 };
 
+namespace selection_commands {
+inline constexpr std::string_view to_vertex = "selection.convert.vertex";
+inline constexpr std::string_view to_edge = "selection.convert.edge";
+inline constexpr std::string_view to_face = "selection.convert.face";
+inline constexpr std::string_view linked = "selection.linked";
+inline constexpr std::string_view grow = "selection.grow";
+inline constexpr std::string_view shrink = "selection.shrink";
+inline constexpr std::string_view invert = "selection.invert";
+inline constexpr std::string_view loop = "selection.loop";
+inline constexpr std::string_view ring = "selection.ring";
+inline constexpr std::string_view boundary = "selection.boundary";
+inline constexpr std::string_view shortest_path = "selection.shortest-path";
+} // namespace selection_commands
+
 enum class MeshImportFormat {
     obj,
     ply,
@@ -364,6 +442,31 @@ struct MeshImportReceipt {
     bool source_linked = false;
     std::string source_identity;
     std::string relative_source_path;
+};
+
+// A read-only, generation-bound source comparison. Applying it reparses the
+// selected path and requires both its byte digest and imported geometry digest
+// to match this review before project blob persistence or history dispatch.
+struct SourceMeshReimportReview {
+    std::string source_identity;
+    std::uint64_t project_generation = 0U;
+    core::Revision project_revision;
+    core::Revision source_generation;
+    std::string importer_identity;
+    std::uint32_t importer_version = 0U;
+    assets::SourceImportOptions options;
+    std::string artifact_identity;
+    assets::Sha256Digest source_digest;
+    assets::Sha256Digest artifact_digest;
+    std::optional<std::uint64_t> bound_mesh_asset;
+    std::optional<std::size_t> current_vertex_count;
+    std::optional<std::size_t> current_face_count;
+    assets::Sha256Digest candidate_source_digest;
+    assets::Sha256Digest candidate_artifact_digest;
+    std::shared_ptr<const geometry::CompiledMesh> candidate_mesh_preview;
+    std::size_t candidate_vertex_count = 0U;
+    std::size_t candidate_face_count = 0U;
+    std::size_t candidate_triangle_count = 0U;
 };
 
 enum class MarketStatus {
@@ -705,6 +808,93 @@ struct AgentTaskStripView {
     std::optional<core::Diagnostic> blocker;
 };
 
+struct AgentProjectMergeDiffSummary {
+    std::size_t changed_objects = 0U;
+    std::size_t changed_meshes = 0U;
+    std::size_t changed_bindings = 0U;
+    std::size_t changed_materials = 0U;
+    std::size_t changed_textures = 0U;
+    std::size_t changed_project_metadata = 0U;
+    bool has_unclassified_source_changes = false;
+    bool source_projection_is_partial = false;
+    std::size_t changed_spatial_fields = 0U;
+    std::size_t changed_source_assets = 0U;
+    std::size_t changed_connection_ports = 0U;
+    std::size_t changed_connection_edges = 0U;
+    std::size_t changed_authoring_standards = 0U;
+    std::size_t changed_world_models = 0U;
+    std::size_t changed_scientific_models = 0U;
+    std::size_t changed_procedural_sources = 0U;
+    std::size_t changed_biological_sources = 0U;
+    std::size_t changed_rig_module_templates = 0U;
+    std::size_t changed_decal_placements = 0U;
+    std::size_t changed_pose_libraries = 0U;
+    std::size_t changed_kinematic_graphs = 0U;
+    std::size_t changed_edit_receipts = 0U;
+    std::size_t changed_instance_receipts = 0U;
+    std::size_t changed_mesh_authoring_sources = 0U;
+    std::size_t changed_semantic_sidecars = 0U;
+    std::size_t changed_engineering_sidecars = 0U;
+    std::size_t changed_condition_sidecars = 0U;
+};
+
+struct AgentProjectMergeDetailRow {
+    std::string record;
+    std::string current_changes;
+    std::string speculative_changes;
+};
+
+struct AgentProjectMergeDetails {
+    std::vector<AgentProjectMergeDetailRow> rows;
+    bool current_truncated = false;
+    bool speculative_truncated = false;
+    bool current_mesh_samples_truncated = false;
+    bool speculative_mesh_samples_truncated = false;
+    bool current_graph_samples_truncated = false;
+    bool speculative_graph_samples_truncated = false;
+    bool current_variant_scope_truncated = false;
+    bool speculative_variant_scope_truncated = false;
+};
+
+struct AgentProjectMergeView {
+    std::string task_id;
+    agent::ProjectMergeReview review;
+    bool stale = false;
+    AgentProjectMergeDiffSummary current_diff;
+    AgentProjectMergeDiffSummary speculative_diff;
+    AgentProjectMergeDetails details;
+    std::optional<agent::ProjectMergeSource> selected_source;
+    std::optional<assets::Sha256Digest> candidate_digest;
+    std::shared_ptr<const agent::ProjectDiff> candidate_diff;
+    std::size_t candidate_changed_objects = 0U;
+    std::size_t candidate_changed_meshes = 0U;
+    std::size_t candidate_changed_bindings = 0U;
+    std::size_t candidate_changed_materials = 0U;
+    std::size_t candidate_changed_textures = 0U;
+    std::size_t candidate_changed_project_metadata = 0U;
+    bool candidate_has_unclassified_source_changes = false;
+    bool candidate_source_projection_is_partial = false;
+    std::size_t candidate_changed_spatial_fields = 0U;
+    std::size_t candidate_changed_source_assets = 0U;
+    std::size_t candidate_changed_connection_ports = 0U;
+    std::size_t candidate_changed_connection_edges = 0U;
+    std::size_t candidate_changed_authoring_standards = 0U;
+    std::size_t candidate_changed_world_models = 0U;
+    std::size_t candidate_changed_scientific_models = 0U;
+    std::size_t candidate_changed_procedural_sources = 0U;
+    std::size_t candidate_changed_biological_sources = 0U;
+    std::size_t candidate_changed_rig_module_templates = 0U;
+    std::size_t candidate_changed_decal_placements = 0U;
+    std::size_t candidate_changed_pose_libraries = 0U;
+    std::size_t candidate_changed_kinematic_graphs = 0U;
+    std::size_t candidate_changed_edit_receipts = 0U;
+    std::size_t candidate_changed_instance_receipts = 0U;
+    std::size_t candidate_changed_mesh_authoring_sources = 0U;
+    std::size_t candidate_changed_semantic_sidecars = 0U;
+    std::size_t candidate_changed_engineering_sidecars = 0U;
+    std::size_t candidate_changed_condition_sidecars = 0U;
+};
+
 struct AgentDemonstrationTargetBindingView {
     std::size_t target_set_index = 0U;
     std::uint32_t target_alias = 0U;
@@ -750,6 +940,7 @@ struct UiSnapshot : application::ApplicationSnapshot {
     UiColorTokens colors;
     SurfaceFidelityView surface_fidelity;
     std::optional<AgentTaskStripView> agent_task_strip;
+    std::optional<AgentProjectMergeView> agent_project_merge;
     MarketView market;
     bool ai_available = false;
     bool ai_auto_approve = true;
@@ -880,6 +1071,11 @@ public:
         double depth,
         double minimum_normal_dot,
         core::Revision expected_project_revision) const;
+    [[nodiscard]] core::Result<application::SetDecalPlacementAction>
+    prepare_viewport_decal_placement(
+        const production::DecalPlacement& placement,
+        const ViewportDecalObservation& observation,
+        ViewportSceneSource current_source) const;
     [[nodiscard]] core::Result<editor::AuthoringPreview> begin_preview(
         editor::PreviewKind kind) const;
     [[nodiscard]] core::Result<application::DispatchReceipt> commit_preview(
@@ -888,6 +1084,11 @@ public:
         scene::ObjectId object,
         std::vector<geometry::VertexId> candidates,
         application::MeshCleanupOptions options) const;
+    [[nodiscard]] core::Result<application::MeshCleanupReview> review_mesh_cleanup_issues(
+        scene::ObjectId object,
+        application::MeshCleanupOptions options) const;
+    [[nodiscard]] core::Result<application::MeshCleanupIssueReport>
+    inspect_mesh_cleanup_issues(scene::ObjectId object) const;
     [[nodiscard]] core::Result<application::DispatchReceipt> commit_mesh_cleanup(
         application::MeshCleanupReview& review,
         std::string justification);
@@ -990,12 +1191,39 @@ public:
         double distance,
         std::string justification);
     [[nodiscard]] core::Result<application::DispatchReceipt> accept_agent_plan();
+    [[nodiscard]] core::Result<AgentProjectMergeView> compare_agent_project_merge();
+    [[nodiscard]] core::Result<AgentProjectMergeView> resolve_agent_project_merge(
+        std::optional<agent::ProjectMergeSource> contested_choice = std::nullopt);
+    [[nodiscard]] core::Result<application::DispatchReceipt> accept_agent_project_merge(
+        std::string justification);
+    void clear_agent_project_merge() noexcept;
     [[nodiscard]] core::Result<void> reject_agent_plan();
     [[nodiscard]] core::Result<void> clear_agent_plan();
     // Resolves the built-in provider, parses bounded interchange input, and
     // admits the resulting mesh through the same human application boundary
     // used by native modelling controls. Failures never mutate the project.
     [[nodiscard]] core::Result<MeshImportReceipt> import_mesh(
+        const std::filesystem::path& path,
+        MeshImportFormat format);
+    // Reads and verifies a static embedded glTF/GLB before staging immutable
+    // source/image blobs and invoking one human, source-bound scene action.
+    // Refused input never becomes project truth; staged blobs may remain cached.
+    [[nodiscard]] core::Result<application::DispatchReceipt> import_static_gltf_scene(
+        const std::filesystem::path& path,
+        std::uint64_t expected_project_generation,
+        core::Revision expected_project_revision,
+        std::string_view expected_source_namespace,
+        bool rights_confirmed, std::string justification);
+    // Parses a candidate without project mutation and returns a snapshot-bound
+    // source/geometry comparison for explicit operator review.
+    [[nodiscard]] core::Result<SourceMeshReimportReview> preview_source_mesh_reimport(
+        std::string_view source_identity,
+        const std::filesystem::path& path,
+        MeshImportFormat format,
+        std::uint64_t expected_project_generation,
+        core::Revision expected_project_revision);
+    [[nodiscard]] core::Result<MeshImportReceipt> apply_source_mesh_reimport(
+        const SourceMeshReimportReview& review,
         const std::filesystem::path& path,
         MeshImportFormat format);
     // Promotes only a completed, digest-verified private botanical job. The
@@ -1013,11 +1241,19 @@ public:
     // source metadata. Pixel decoding and viewport shading are not implied.
     [[nodiscard]] core::Result<application::DispatchReceipt> import_material_texture(
         const std::filesystem::path& path);
+    // Replaces the exact source bytes for one current texture identity while
+    // retaining its material bindings. The project command is human-admitted
+    // and revision-bound; pixel decoding and viewport shading are not implied.
+    [[nodiscard]] core::Result<application::DispatchReceipt> reimport_material_texture(
+        assets::TextureAssetId texture_id,
+        const std::filesystem::path& path);
     // Inspects and stores exact image bytes in the saved project's content-
     // addressed asset tree, then registers a revision-bound review plane.
     // Pixel decoding and viewport rendering are not implied.
     [[nodiscard]] core::Result<application::DispatchReceipt> import_reference_image(
         const std::filesystem::path& path);
+    [[nodiscard]] core::Result<std::vector<std::uint8_t>>
+    read_reference_image_source_bytes(std::string_view identity);
     [[nodiscard]] core::Result<assets::DecodedRgba8Texture>
     decode_reference_image_tga(std::string_view identity);
     // Applies human-authored placement/display edits to one existing reference
@@ -1029,13 +1265,70 @@ public:
         project::ReferenceImagePlane plane);
     // Applies one or more view changes atomically so front/side/top sets stay
     // complete and camera-pinned planes always reference an authored camera.
+    // Pin/unpin/re-pin converts placement coordinates through the captured
+    // camera transform while preserving world pose.
     [[nodiscard]] core::Result<application::DispatchReceipt>
     update_reference_image_plane_views(
         std::uint64_t expected_project_generation,
         core::Revision expected_project_revision,
         std::vector<ReferenceImagePlaneViewEdit> edits);
+    [[nodiscard]] core::Result<application::DispatchReceipt> generate_unique_lightmap_uv(
+        const application::GenerateUniqueLightmapUvAction& action,
+        std::uint64_t expected_project_generation);
+    [[nodiscard]] core::Result<application::DispatchReceipt> pack_uv_islands(
+        const application::PackUvIslandsAction& action,
+        std::uint64_t expected_project_generation);
+    [[nodiscard]] core::Result<application::DispatchReceipt> set_uv_coordinate(
+        const application::SetUvCoordinateAction& action,
+        std::uint64_t expected_project_generation);
+    [[nodiscard]] core::Result<application::DispatchReceipt> set_uv_seam_mark(
+        const application::SetUvSeamMarkAction& action,
+        std::uint64_t expected_project_generation);
+    [[nodiscard]] core::Result<application::DispatchReceipt> align_uv_seam(
+        const application::AlignUvSeamAction& action,
+        std::uint64_t expected_project_generation);
+    [[nodiscard]] core::Result<application::DispatchReceipt> apply_inspector_transform(
+        const application::SetObjectTransformAction& action,
+        std::uint64_t expected_project_generation);
+    [[nodiscard]] core::Result<application::DispatchReceipt> apply_inspector_vertex_position(
+        scene::ObjectId object, geometry::VertexId vertex, core::Vec3d position,
+        std::uint64_t expected_project_generation, core::Revision expected_project_revision);
+    [[nodiscard]] core::Result<application::DispatchReceipt> relink_moved_source(
+        const application::RelinkMovedSourceAction& action,
+        std::uint64_t expected_project_generation,
+        core::Revision expected_project_revision);
+    // Stages only bytes matching the registered source. Project admission
+    // remains a separate explicit human relink action.
+    [[nodiscard]] core::Result<application::RelinkMovedSourceAction> prepare_moved_source_relink(
+        std::string identity,
+        const std::filesystem::path& path,
+        std::uint64_t expected_project_generation,
+        core::Revision expected_project_revision);
     [[nodiscard]] core::Result<assets::SourceReimportPlan> preview_source_reimport(
         std::vector<assets::SourceImportRecord> incoming) const;
+    [[nodiscard]] core::Result<assets::SourceReimportPlan> preview_source_asset_metadata(
+        std::string_view identity,
+        core::Revision expected_source_generation,
+        std::uint64_t expected_project_generation,
+        core::Revision expected_project_revision,
+        std::vector<std::string> authored_tags,
+        std::vector<std::string> dependencies) const;
+    [[nodiscard]] core::Result<void> verify_source_asset_blob(
+        std::string_view identity,
+        core::Revision expected_source_generation,
+        std::uint64_t expected_project_generation,
+        core::Revision expected_project_revision) const;
+    [[nodiscard]] core::Result<assets::BlobOrphanReport> inspect_source_blob_store(
+        std::uint64_t expected_project_generation,
+        core::Revision expected_project_revision,
+        std::optional<application::PendingMeshReimportBlobReview> pending_mesh_reimport =
+            std::nullopt) const;
+    [[nodiscard]] core::Result<condition::SweepEndpointSpatialReview>
+    inspect_sweep_endpoint_spatial_fit(
+        const condition::SweepEndpointPortBinding& binding,
+        const condition::SweepEndpointSpatialPolicy& policy,
+        std::uint64_t expected_project_generation,
+        core::Revision expected_project_revision) const;
     [[nodiscard]] core::Result<application::DispatchReceipt> apply_source_reimport_plan(
         assets::SourceReimportPlan plan);
     [[nodiscard]] core::Result<application::DispatchReceipt> import_engineering_fixture();
@@ -1101,6 +1394,18 @@ public:
         core::Vec3d world_position,
         core::Revision expected_project_revision,
         core::Revision expected_authoring_revision);
+    [[nodiscard]] core::Result<application::DispatchReceipt> rebase_condition_prefab(
+        application::RebaseConditionPrefabAction action);
+    [[nodiscard]] core::Result<application::DispatchReceipt> replace_connection_port_graph(
+        application::ReplaceConnectionPortGraphAction action);
+    [[nodiscard]] core::Result<application::DispatchReceipt> add_connection_port(
+        application::AddConnectionPortAction action);
+    [[nodiscard]] core::Result<application::DispatchReceipt> remove_connection_port(
+        application::RemoveConnectionPortAction action);
+    [[nodiscard]] core::Result<application::DispatchReceipt> remove_connection_edge(
+        application::RemoveConnectionEdgeAction action);
+    [[nodiscard]] core::Result<application::DispatchReceipt> connect_condition_prefab_sockets(
+        application::ConnectConditionPrefabSocketsAction action);
     [[nodiscard]] core::Result<application::DispatchReceipt> add_condition_collection(
         condition::CollectionRecord collection,
         core::Revision expected_project_revision,
@@ -1205,6 +1510,20 @@ public:
     [[nodiscard]] core::Result<void> reset_preferences();
     [[nodiscard]] core::Result<void> handle_shortcut(Shortcut shortcut);
     [[nodiscard]] core::Result<void> set_command_palette_query(std::string query);
+    // Shared native/palette route. Selection remains session state, and the
+    // captured project generation/revision must still match before dispatch.
+    [[nodiscard]] core::Result<application::DispatchReceipt> run_selection_command(
+        std::string_view command_id,
+        std::uint64_t expected_project_generation,
+        core::Revision expected_project_revision,
+        geometry::VertexId path_goal = {},
+        std::optional<scene::ObjectId> path_owner = std::nullopt);
+    [[nodiscard]] core::Result<application::DispatchReceipt> duplicate_mesh_instances(
+        scene::ObjectId source,
+        std::uint32_t copies,
+        core::Vec3d translation_step,
+        std::uint64_t expected_project_generation,
+        core::Revision expected_project_revision);
     // Runs a read-only point-sightline query against the exact current viewport
     // snapshot. A stale project/render revision or render error fails closed.
     [[nodiscard]] core::Result<editor::PointSightlineResult> evaluate_point_sightline(
@@ -1256,6 +1575,28 @@ public:
     [[nodiscard]] UiSnapshot snapshot() const;
 
 private:
+    struct SourceMeshReimportBinding {
+        std::string identity;
+        core::Revision source_generation;
+        std::uint64_t project_generation = 0U;
+        core::Revision project_revision;
+        std::string importer_identity;
+        std::uint32_t importer_version = 0U;
+        assets::SourceImportOptions options;
+        std::string artifact_identity;
+        assets::Sha256Digest source_digest;
+        assets::Sha256Digest artifact_digest;
+        std::optional<assets::Sha256Digest> expected_candidate_source_digest;
+        std::optional<assets::Sha256Digest> expected_candidate_artifact_digest;
+        std::optional<std::size_t> expected_candidate_vertex_count;
+        std::optional<std::size_t> expected_candidate_face_count;
+        std::optional<std::size_t> expected_candidate_triangle_count;
+    };
+
+    [[nodiscard]] core::Result<MeshImportReceipt> import_mesh_impl(
+        const std::filesystem::path& path,
+        MeshImportFormat format,
+        std::optional<SourceMeshReimportBinding> reimport_binding);
     struct AgentNamedTargetCandidate {
         std::string id;
         std::string label;
@@ -1296,7 +1637,8 @@ private:
         std::optional<std::string> freeform_answer);
     [[nodiscard]] core::Result<void> sync_application_workspace(
         const std::vector<Panel>& panels);
-    [[nodiscard]] std::vector<CommandView> command_views() const;
+    [[nodiscard]] std::vector<CommandView> command_views(
+        const application::ApplicationSnapshot& current) const;
     void record_operation(
         const application::DispatchReceipt& receipt,
         OperationCategory category);
@@ -1323,6 +1665,13 @@ private:
     std::string agent_recipe_id_;
     std::optional<core::Revision> agent_plan_base_revision_;
     std::optional<agent::AgentTask> agent_task_;
+    std::optional<agent::ProjectMergeReview> agent_project_merge_review_;
+    AgentProjectMergeDiffSummary agent_project_merge_current_diff_;
+    AgentProjectMergeDiffSummary agent_project_merge_speculative_diff_;
+    AgentProjectMergeDetails agent_project_merge_details_;
+    std::optional<agent::ProjectMergeResolution> agent_project_merge_resolution_;
+    std::shared_ptr<const agent::ProjectDiff> agent_project_merge_candidate_diff_;
+    std::string agent_project_merge_task_id_;
     std::optional<agent::SceneQueryResult> agent_condition_inventory_;
     std::vector<scene::ObjectId> agent_condition_inventory_scope_;
     agent::SceneQueryBudget agent_condition_inventory_query_budget_;

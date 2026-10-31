@@ -107,9 +107,10 @@ source-to-target mapping of one bounded selection in a single receipt and
 revision. Poke records the
 centroid vertex and fan faces as interpolated/generated lineage. Edge bevel now
 supports a bounded circular profile with one quad per segment. Vertex bevel
-accepts closed triangular fans with 3..64 incident faces, requires
-the generated cap to be simple, planar, and convex, subdivides the cap boundary,
-and triangulates affected incident faces with source-face lineage. Dissolve admits
+accepts closed triangular fans with 3..64 incident faces and a simple planar
+cap. Planar concave source boundaries use a shared edge fraction; the cap is
+then subdivided and deterministically ear-clipped with source-face lineage. The
+AI tool retains its convexity guard. Dissolve admits
 coplanar simple concave boundaries and validates an ear-clipped triangulation;
 self-intersecting/non-planar boundaries and selected multi-edge dissolves
 refuse atomically. Midpoint loop cut now accepts only validated all-quad edge
@@ -118,7 +119,7 @@ Single-face knife cut accepts a planar simple face, endpoints at existing face
 vertices, and strictly interior path samples; self-intersection, boundary
 crossing, and off-face paths refuse before mutation. These are mesh-kernel
 operators only, not registered viewport tools. Vertex fans above 64 incident
-faces, non-simple/non-planar/non-convex caps, adjustable bevel profile modes,
+faces, non-simple/non-planar caps, AI concave-cap admission, adjustable bevel profile modes,
 last-selected and cursor merge modes, bridge,
 batch dissolve, modifiers, sculpt, animation, and CAD claims remain deferred
 until their operators have receipts, attribute-survival tests, and workflow

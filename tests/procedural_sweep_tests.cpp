@@ -1,8 +1,11 @@
 #include <carto/geometry/sweep.hpp>
 
 #include <cmath>
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -219,6 +222,132 @@ void unsupported_frames_profiles_and_joints_fail_closed() {
     require(!oversized.validate(), "zero sample density is rejected at source admission");
 }
 
+void hollow_sweeps_preserve_the_bore_and_oriented_wall_volume() {
+    const auto path = line_path("hollow.path", {0.0, 0.0, 0.0}, {0.0, 0.0, 2.0});
+    auto source = make_source(path, "hollow.source",
+        {{-1.0, -1.0}, {1.0, -1.0}, {1.0, 1.0}, {-1.0, 1.0}});
+    source.reference_up = {0.0, 1.0, 0.0};
+    const auto solid_bytes = source.serialize();
+    require(solid_bytes.starts_with("CARTOGRAPHER_SWEEP_SOURCE 1\n") &&
+            solid_bytes.find("INNER_SCALE") == std::string::npos,
+        "solid sweeps retain their exact legacy encoding");
+    source.inner_profile_scale = 0.5;
+    const auto bytes = source.serialize();
+    const auto decoded = geometry::SweepSource::deserialize(bytes);
+    require(bytes.starts_with("CARTOGRAPHER_SWEEP_SOURCE 2\n") && decoded &&
+            decoded.value().serialize() == bytes && decoded.value().inner_profile_scale == 0.5,
+        "hollow sweep parameters round-trip in their explicit nested source schema");
+
+    const auto built = geometry::build_sweep_mesh(source, path);
+    const auto repeated = geometry::build_sweep_mesh(source, path);
+    require(built && repeated && built.value().mesh.validate() &&
+            same_mesh(built.value().mesh, repeated.value().mesh),
+        "hollow wall and rim topology is valid and deterministic");
+    const auto& mesh = built.value().mesh;
+    require(mesh.vertex_count() == 40U && mesh.face_count() == 40U &&
+            mesh.vertex_count() + mesh.face_count() == mesh.edge_count(),
+        "annular end rims form one genus-one shell instead of filling the bore");
+    const auto topology = mesh.topology();
+    require(topology && std::all_of(topology.value().edges.begin(), topology.value().edges.end(),
+            [](const auto& edge) { return edge.second_half_edge.has_value(); }),
+        "both annular ends close every wall boundary edge");
+    std::set<geometry::VertexId> reached;
+    std::vector<geometry::VertexId> pending{mesh.vertices_sorted().front().id};
+    while (!pending.empty()) {
+        const auto vertex = pending.back();
+        pending.pop_back();
+        if (!reached.insert(vertex).second) continue;
+        for (const auto& edge : topology.value().edges) {
+            if (edge.first == vertex) pending.push_back(edge.second);
+            else if (edge.second == vertex) pending.push_back(edge.first);
+        }
+    }
+    require(reached.size() == mesh.vertex_count(), "both walls and rims form one connected shell");
+    double volume_times_six = 0.0;
+    for (const auto& face : mesh.faces_sorted()) {
+        require(face.vertices.size() == 4U, "hollow caps are rims, never filled polygons");
+        const auto a = mesh.find_vertex(face.vertices[0U])->position;
+        for (std::size_t index = 1U; index + 1U < face.vertices.size(); ++index) {
+            const auto b = mesh.find_vertex(face.vertices[index])->position;
+            const auto c = mesh.find_vertex(face.vertices[index + 1U])->position;
+            volume_times_six += core::dot(a, core::cross(b, c));
+        }
+    }
+    require(std::abs(volume_times_six / 6.0 - 6.0) < 1.0e-10,
+        "outer and inward-facing inner surfaces retain the exact square-tube material volume");
+    require(built.value().source_identity == source.source_identity &&
+            built.value().source_revision == source.source_revision &&
+            built.value().centerline_identity == path.source_identity &&
+            built.value().centerline_revision == path.source_revision,
+        "hollow products retain source and centerline lineage");
+
+    for (const auto policy : {geometry::SweepCapPolicy::open, geometry::SweepCapPolicy::start,
+                             geometry::SweepCapPolicy::end}) {
+        source.cap_policy = policy;
+        const auto open = geometry::build_sweep_mesh(source, path);
+        require(static_cast<bool>(open), "each supported end-rim policy generates a valid shell");
+        const auto view = open.value().mesh.topology();
+        const auto boundary_count = std::count_if(view.value().edges.begin(), view.value().edges.end(),
+            [](const auto& edge) { return !edge.second_half_edge.has_value(); });
+        require(boundary_count == (policy == geometry::SweepCapPolicy::open ? 16 : 8),
+            "omitted rims leave exactly their authored inner and outer boundary loops");
+    }
+}
+
+void hollow_sweeps_refuse_invalid_walls_stale_sources_and_unbudgeted_shells() {
+    auto path = line_path("hollow.path", {0.0, 0.0, 0.0}, {0.0, 0.0, 2.0});
+    auto source = make_source(path, "hollow.source", regular_profile(8U, 1.0));
+    source.reference_up = {0.0, 1.0, 0.0};
+    for (const double scale : {-0.1, 1.0, 1.1, 1.0e-300,
+            1.0 - std::numeric_limits<double>::epsilon(),
+            std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity()}) {
+        source.inner_profile_scale = scale;
+        require(!source.validate() && !geometry::build_sweep_mesh(source, path),
+            "invalid, collapsed, nonfinite, or numerically unresolved hollow walls refuse admission");
+    }
+    source.inner_profile_scale = 0.5;
+    auto outside = source;
+    for (auto& point : outside.profile) point.x += 5.0;
+    require(!outside.validate(), "an offset convex profile cannot produce a guessed nested inner shell");
+    auto boundary = source;
+    boundary.profile = {{0.0, -1.0}, {2.0, -1.0}, {2.0, 1.0}, {0.0, 1.0}};
+    require(!boundary.validate(), "an origin on the profile edge would collapse a wall and is rejected");
+    auto malformed = source.serialize();
+    const auto marker = malformed.find("INNER_SCALE 0.5");
+    require(marker != std::string::npos, "hollow fixture has its explicit scale field");
+    malformed.replace(marker, std::string("INNER_SCALE 0.5").size(), "INNER_SCALE +0.5");
+    require(!geometry::SweepSource::deserialize(malformed), "signed inner-scale coercion is refused");
+    malformed = source.serialize();
+    malformed.replace(marker, std::string("INNER_SCALE 0.5").size(), "INNER_SCALE 0");
+    require(!geometry::SweepSource::deserialize(malformed), "schema 2 cannot hide a missing hollow profile");
+    auto stale = path;
+    stale.source_revision = path.source_revision.next();
+    require(!geometry::build_sweep_mesh(source, stale), "hollow geometry cannot rebuild from a stale path");
+    auto remote_path = line_path("hollow.path", {1.0e9 - 2.0, 0.0, 0.0},
+        {1.0e9 - 2.0, 0.0, 2.0});
+    auto unresolved = source;
+    unresolved.profile = {{-0.1, -0.1}, {0.1, -0.1}, {0.1, 0.1}, {-0.1, 0.1}};
+    unresolved.inner_profile_scale = 1.0 - 1.0e-8;
+    require(!geometry::build_sweep_mesh(unresolved, remote_path),
+        "a wall lost to world-coordinate precision is refused rather than emitted as collapsed geometry");
+    const auto path_bytes = path.serialize();
+    source.profile = regular_profile(64U, 1.0);
+    source.samples_per_segment = 2048U;
+    const auto source_bytes = source.serialize();
+    require(source.validate() && !geometry::build_sweep_mesh(source, path) &&
+            source.serialize() == source_bytes && path.serialize() == path_bytes,
+        "both shells are budgeted before generation and refusal leaves source inputs unchanged");
+
+    path.segments[0U] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 1.0},
+        {0.3, 0.4, 2.0}, {0.5, 0.7, 3.0}};
+    source.profile = regular_profile(8U, 0.1);
+    source.samples_per_segment = 8U;
+    source.end_scale = 0.5;
+    const auto bent = geometry::build_sweep_mesh(source, path);
+    require(bent && bent.value().mesh.validate(),
+        "supported curved tapered hollow sweeps retain transported frames and topology");
+}
+
 } // namespace
 
 int main() {
@@ -226,6 +355,8 @@ int main() {
     pipe_geometry_is_deterministic_and_revision_bound();
     pipe_railing_and_branch_authoring_fixtures_generate_natively();
     unsupported_frames_profiles_and_joints_fail_closed();
+    hollow_sweeps_preserve_the_bore_and_oriented_wall_volume();
+    hollow_sweeps_refuse_invalid_walls_stale_sources_and_unbudgeted_shells();
     std::cout << "All procedural sweep tests passed.\n";
     return EXIT_SUCCESS;
 }

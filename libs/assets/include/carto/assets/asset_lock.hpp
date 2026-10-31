@@ -77,6 +77,8 @@ public:
         const std::string& owner_id,
         std::uint64_t lease_id);
 
+    // Successful inspection advances this lease's local time watermark;
+    // subsequent earlier timestamps refuse. Supplied time remains untrusted.
     [[nodiscard]] core::Result<std::optional<AssetLockSnapshot>> inspect(
         const AssetLockScope& scope,
         AssetLockUtcSeconds now_utc_seconds) const;
@@ -84,8 +86,15 @@ public:
     [[nodiscard]] std::size_t size() const;
 
 private:
+    struct LeaseRecord final {
+        AssetLockLease lease;
+        // A process-local observation watermark, not an authenticated clock.
+        // Inspection may advance it without changing the lease receipt.
+        mutable AssetLockUtcSeconds last_observed_utc_seconds = 0;
+    };
+
     mutable std::mutex mutex_;
-    std::map<AssetLockScope, AssetLockLease> leases_;
+    std::map<AssetLockScope, LeaseRecord> leases_;
     std::uint64_t next_lease_id_ = 1U;
 };
 

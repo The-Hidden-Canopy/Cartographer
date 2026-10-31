@@ -225,7 +225,26 @@ void transform_preview_is_axis_constrained_and_revision_bound() {
     REQUIRE(z_preview && std::abs(z_preview.value().translation.z - 4.5) < 1e-12);
     REQUIRE(z_preview.value().translation.x == 2.0 && z_preview.value().translation.y == 3.0);
     REQUIRE(session.cancel());
+
+    REQUIRE(session.begin_projected(scene::ObjectId{5U}, initial, revision,
+        editor::ViewportTranslateAxis::world_z, {100.0, 80.0}, {30.0, 40.0}));
+    const auto projected_z_preview = session.preview({103.0, 84.0}, revision);
+    REQUIRE(projected_z_preview &&
+        std::abs(projected_z_preview.value().translation.z - 4.1) < 1e-12);
+    REQUIRE(projected_z_preview.value().translation.x == 2.0 &&
+        projected_z_preview.value().translation.y == 3.0);
+    const auto perpendicular_preview = session.preview({104.0, 77.0}, revision);
+    REQUIRE(perpendicular_preview && perpendicular_preview.value().translation.z == 4.0);
+    REQUIRE(!session.preview({103.0, 84.0}, revision.next()) && session.active());
+    REQUIRE(session.cancel());
     REQUIRE(!session.active());
+    for (const auto projected_axis : {core::Vec2d{}, core::Vec2d{1.0e-12, 0.0},
+            core::Vec2d{1.0e200, 1.0e200},
+            core::Vec2d{std::numeric_limits<double>::infinity(), 0.0}}) {
+        REQUIRE(!session.begin_projected(scene::ObjectId{5U}, initial, revision,
+            editor::ViewportTranslateAxis::world_z, {100.0, 80.0}, projected_axis));
+        REQUIRE(!session.active());
+    }
     REQUIRE(!session.begin({}, initial, revision,
         editor::ViewportTranslateAxis::world_x, {}, 0.0));
 }
@@ -285,6 +304,43 @@ void viewport_transform_snap_policy_is_shared_and_source_bound() {
         false, true, snap_session, target_object);
     REQUIRE(excluded && !excluded.value().candidate.has_value());
     REQUIRE(!snap_session.locked());
+
+    core::Transform slightly_misaligned_transform;
+    slightly_misaligned_transform.translation = {1.2, 4.0, 0.04};
+    const scene::ObjectId slightly_misaligned_object{33U};
+    render::RenderScene slightly_misaligned_scene;
+    REQUIRE(slightly_misaligned_scene.upsert({slightly_misaligned_object,
+        compiled, slightly_misaligned_transform, compiled->source_revision, 10U}));
+    editor::SnapSession strict_alignment_session;
+    const auto strict_alignment = editor::snap_viewport_transform_preview(
+        preview, editor::ViewportTranslateAxis::world_x, slightly_misaligned_scene,
+        revision, false, true, strict_alignment_session, std::nullopt, 0.02);
+    REQUIRE(strict_alignment && !strict_alignment.value().candidate.has_value());
+    editor::SnapSession default_alignment_session;
+    const auto default_alignment = editor::snap_viewport_transform_preview(
+        preview, editor::ViewportTranslateAxis::world_x, slightly_misaligned_scene,
+        revision, false, true, default_alignment_session, std::nullopt, 0.05);
+    REQUIRE(default_alignment && default_alignment.value().candidate.has_value());
+    REQUIRE(default_alignment.value().candidate->object == slightly_misaligned_object);
+
+    editor::SnapSession invalid_tolerance_session;
+    const auto nonfinite_tolerance = editor::snap_viewport_transform_preview(
+        preview, editor::ViewportTranslateAxis::world_x, scene, revision,
+        false, true, invalid_tolerance_session, std::nullopt,
+        std::numeric_limits<double>::quiet_NaN());
+    REQUIRE(!nonfinite_tolerance &&
+        nonfinite_tolerance.error().code == core::ErrorCode::invalid_argument);
+    const auto negative_tolerance = editor::snap_viewport_transform_preview(
+        preview, editor::ViewportTranslateAxis::world_x, scene, revision,
+        false, true, invalid_tolerance_session, std::nullopt, -0.001);
+    REQUIRE(!negative_tolerance &&
+        negative_tolerance.error().code == core::ErrorCode::invalid_argument);
+    const auto excessive_tolerance = editor::snap_viewport_transform_preview(
+        preview, editor::ViewportTranslateAxis::world_x, scene, revision,
+        false, true, invalid_tolerance_session, std::nullopt, 0.5001);
+    REQUIRE(!excessive_tolerance &&
+        excessive_tolerance.error().code == core::ErrorCode::invalid_argument);
+    REQUIRE(!invalid_tolerance_session.locked());
 }
 
 void viewport_world_transform_converts_to_parent_local_without_drift() {

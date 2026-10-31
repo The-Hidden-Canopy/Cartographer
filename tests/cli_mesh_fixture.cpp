@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace {
 
@@ -47,7 +48,68 @@ carto::geometry::EditableMesh make_mesh() {
     return mesh;
 }
 
-int create_fixture(const std::filesystem::path& path) {
+carto::geometry::EditableMesh make_multi_tile_mesh() {
+    using namespace carto;
+    geometry::EditableMesh mesh;
+    const auto inserted = mesh.insert_bulk(
+        {{geometry::VertexId{1U}, {0.0, 0.0, 0.0}},
+         {geometry::VertexId{2U}, {1.0, 0.0, 0.0}},
+         {geometry::VertexId{3U}, {0.0, 1.0, 0.0}},
+         {geometry::VertexId{4U}, {2.0, 0.0, 0.0}},
+         {geometry::VertexId{5U}, {3.0, 0.0, 0.0}},
+         {geometry::VertexId{6U}, {2.0, 1.0, 0.0}}},
+        {{geometry::FaceId{1U}, {geometry::VertexId{1U}, geometry::VertexId{2U},
+             geometry::VertexId{3U}}},
+         {geometry::FaceId{2U}, {geometry::VertexId{4U}, geometry::VertexId{5U},
+             geometry::VertexId{6U}}}});
+    require(static_cast<bool>(inserted), "could not create the multi-tile mesh fixture");
+    attributes::AttributeSet attribute_set({{attributes::AttributeDomain::corner, 6U}});
+    require(static_cast<bool>(attribute_set.add_layer(attributes::AttributeLayer{
+            {"uv0.corners", attributes::AttributeDomain::corner,
+             attributes::AttributeType::vec2},
+            {core::Vec2d{0.1, 0.1}, core::Vec2d{0.9, 0.1}, core::Vec2d{0.5, 0.9},
+             core::Vec2d{1.1, 0.1}, core::Vec2d{1.9, 0.1}, core::Vec2d{1.5, 0.9}}})),
+        "could not create the multi-tile fixture UV layer");
+    attributes::UvSetTable uv_sets;
+    require(static_cast<bool>(uv_sets.add(attributes::UvSetDescriptor{
+            1U, "UV0", "uv0.corners", true, true, false, 1U})),
+        "could not create the multi-tile fixture UV set");
+    require(static_cast<bool>(mesh.set_attribute_payload(
+            std::move(attribute_set), std::move(uv_sets))),
+        "could not attach the multi-tile fixture UV payload");
+    return mesh;
+}
+
+carto::geometry::EditableMesh make_cross_tile_mesh() {
+    using namespace carto;
+    geometry::EditableMesh mesh;
+    const auto inserted = mesh.insert_bulk(
+        {{geometry::VertexId{1U}, {0.0, 0.0, 0.0}},
+         {geometry::VertexId{2U}, {1.0, 0.0, 0.0}},
+         {geometry::VertexId{3U}, {0.0, 1.0, 0.0}}},
+        {{geometry::FaceId{1U}, {geometry::VertexId{1U}, geometry::VertexId{2U},
+             geometry::VertexId{3U}}}});
+    require(static_cast<bool>(inserted), "could not create the cross-tile mesh fixture");
+    attributes::AttributeSet attribute_set({{attributes::AttributeDomain::corner, 3U}});
+    require(static_cast<bool>(attribute_set.add_layer(attributes::AttributeLayer{
+            {"uv0.corners", attributes::AttributeDomain::corner,
+             attributes::AttributeType::vec2},
+            {core::Vec2d{0.8, 0.1}, core::Vec2d{1.2, 0.1},
+             core::Vec2d{0.8, 0.9}}})),
+        "could not create the cross-tile fixture UV layer");
+    attributes::UvSetTable uv_sets;
+    require(static_cast<bool>(uv_sets.add(attributes::UvSetDescriptor{
+            1U, "UV0", "uv0.corners", true, true, false, 1U})),
+        "could not create the cross-tile fixture UV set");
+    require(static_cast<bool>(mesh.set_attribute_payload(
+            std::move(attribute_set), std::move(uv_sets))),
+        "could not attach the cross-tile fixture UV payload");
+    return mesh;
+}
+
+int create_fixture_with_mesh(
+    const std::filesystem::path& path,
+    carto::geometry::EditableMesh mesh) {
     using namespace carto;
     auto created = project::ProjectDocument::create("Mesh CLI Fixture");
     require(static_cast<bool>(created), "could not create the fixture project");
@@ -62,12 +124,24 @@ int create_fixture(const std::filesystem::path& path) {
         "could not anchor the fixture project revision in its journal");
     auto transaction = project::ProjectTransaction::begin(document, journal, "mesh-cli-fixture");
     require(static_cast<bool>(transaction), "could not begin the mesh fixture transaction");
-    require(static_cast<bool>(transaction.value().add_mesh(make_mesh())),
+    require(static_cast<bool>(transaction.value().add_mesh(std::move(mesh))),
         "could not add the fixture mesh");
     require(static_cast<bool>(transaction.value().commit("fixture.mesh.create")),
         "could not commit the fixture mesh");
     require(static_cast<bool>(document.save_atomic(path)), "could not save the fixture project");
     return 0;
+}
+
+int create_fixture(const std::filesystem::path& path) {
+    return create_fixture_with_mesh(path, make_mesh());
+}
+
+int create_multi_tile_fixture(const std::filesystem::path& path) {
+    return create_fixture_with_mesh(path, make_multi_tile_mesh());
+}
+
+int create_cross_tile_fixture(const std::filesystem::path& path) {
+    return create_fixture_with_mesh(path, make_cross_tile_mesh());
 }
 
 int mutate_fixture(const std::filesystem::path& path) {
@@ -97,8 +171,15 @@ int mutate_fixture(const std::filesystem::path& path) {
 int main(int argc, char** argv) {
     try {
         if (argc == 3 && std::string_view(argv[1]) == "create") return create_fixture(argv[2]);
+        if (argc == 3 && std::string_view(argv[1]) == "create-multi-tile") {
+            return create_multi_tile_fixture(argv[2]);
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "create-cross-tile") {
+            return create_cross_tile_fixture(argv[2]);
+        }
         if (argc == 3 && std::string_view(argv[1]) == "mutate") return mutate_fixture(argv[2]);
-        throw std::runtime_error("usage: cli_mesh_fixture create|mutate project.carto");
+        throw std::runtime_error(
+            "usage: cli_mesh_fixture create|create-multi-tile|create-cross-tile|mutate project.carto");
     } catch (const std::exception& error) {
         std::cerr << "FAIL mesh CLI fixture: " << error.what() << '\n';
         return 1;

@@ -262,6 +262,8 @@ struct BakeTileArtifactCacheEntry {
 };
 
 inline constexpr std::size_t kMaxBakeTileScheduleTiles = 100U;
+inline constexpr std::uint64_t kMaxBakeTileScheduleRgbaBytes =
+    512ULL * 1024ULL * 1024ULL;
 
 struct BakeTileCoordinate {
     std::uint32_t tile_u = 0U;
@@ -274,6 +276,8 @@ struct BakeTileScheduleEntry {
     BakeTileCoordinate tile;
     NormalMapArtifact artifact;
     bool reused_from_cache = false;
+    // Wall time for compiling this tile only; cache reuse records zero.
+    double compile_milliseconds = 0.0;
 };
 
 struct BakeTileScheduleResult {
@@ -322,6 +326,21 @@ struct AmbientOcclusionMapArtifact {
         std::span<const std::uint8_t> bytes);
 };
 
+struct AmbientOcclusionTileScheduleEntry {
+    BakeTileCoordinate tile;
+    AmbientOcclusionMapArtifact artifact;
+    // Wall time for compiling this tile only.
+    double compile_milliseconds = 0.0;
+};
+
+struct AmbientOcclusionTileScheduleResult {
+    std::vector<AmbientOcclusionTileScheduleEntry> entries;
+    std::uint64_t covered_texels = 0U;
+    std::uint64_t rays_cast = 0U;
+    std::uint64_t occluded_rays = 0U;
+    double compile_milliseconds = 0.0;
+};
+
 struct BentNormalMapArtifact {
     AmbientOcclusionRecipe recipe;
     std::string algorithm{ kBakeBentNormalAlgorithm };
@@ -340,6 +359,20 @@ struct BentNormalMapArtifact {
     [[nodiscard]] core::Result<std::vector<std::uint8_t>> serialize() const;
     [[nodiscard]] static core::Result<BentNormalMapArtifact> deserialize(
         std::span<const std::uint8_t> bytes);
+};
+
+struct BentNormalTileScheduleEntry {
+    BakeTileCoordinate tile;
+    BentNormalMapArtifact artifact;
+    double compile_milliseconds = 0.0;
+};
+
+struct BentNormalTileScheduleResult {
+    std::vector<BentNormalTileScheduleEntry> entries;
+    std::uint64_t covered_texels = 0U;
+    std::uint64_t rays_cast = 0U;
+    std::uint64_t occluded_rays = 0U;
+    double compile_milliseconds = 0.0;
 };
 
 struct CurvatureRecipe {
@@ -462,6 +495,25 @@ struct HeightDisplacementMapArtifact {
         std::span<const std::uint8_t> bytes);
 };
 
+template <typename Artifact>
+struct BakeMapTileScheduleEntry {
+    BakeTileCoordinate tile;
+    Artifact artifact;
+    double compile_milliseconds = 0.0;
+};
+
+template <typename Artifact>
+struct BakeMapTileScheduleResult {
+    std::vector<BakeMapTileScheduleEntry<Artifact>> entries;
+    std::uint64_t covered_texels = 0U;
+    double compile_milliseconds = 0.0;
+};
+
+using CurvatureTileScheduleResult = BakeMapTileScheduleResult<CurvatureMapArtifact>;
+using ThicknessTileScheduleResult = BakeMapTileScheduleResult<ThicknessMapArtifact>;
+using HeightDisplacementTileScheduleResult =
+    BakeMapTileScheduleResult<HeightDisplacementMapArtifact>;
+
 using BakePaddingInputRef = std::variant<
     std::reference_wrapper<const NormalMapArtifact>,
     std::reference_wrapper<const AmbientOcclusionMapArtifact>,
@@ -561,6 +613,11 @@ struct MaterialSurfaceIdMapArtifact {
     [[nodiscard]] static core::Result<MaterialSurfaceIdMapArtifact> deserialize(
         std::span<const std::uint8_t> bytes);
 };
+
+using WorldPositionTileScheduleResult =
+    BakeMapTileScheduleResult<WorldPositionMapArtifact>;
+using MaterialSurfaceIdTileScheduleResult =
+    BakeMapTileScheduleResult<MaterialSurfaceIdMapArtifact>;
 
 struct AmbientOcclusionExecutionReport {
     std::optional<AmbientOcclusionMapArtifact> artifact;
@@ -774,7 +831,8 @@ struct BakeExecutionReport {
     BakeNormalSpace normal_space,
     const geometry::EditableMesh& source,
     const geometry::EditableMesh& target,
-    std::span<const BakeTileArtifactCacheEntry> reusable_tiles = {});
+    std::span<const BakeTileArtifactCacheEntry> reusable_tiles = {},
+    std::stop_token stop_token = {});
 
 // Uses the shared production cook graph for bake dependencies and invalidation.
 // The recipe digest binds the complete source, target, UV, tile, projection,
@@ -1044,10 +1102,27 @@ struct BakeExecutionReport {
     const AmbientOcclusionRecipe& recipe,
     const geometry::EditableMesh& source,
     const geometry::EditableMesh& target);
+// Compiles every complete target UDIM tile in stable (U,V) order. A failure
+// returns no partial schedule; cross-tile faces and schedules exceeding the
+// bounded aggregate output budget are refused.
+[[nodiscard]] core::Result<AmbientOcclusionTileScheduleResult>
+schedule_ambient_occlusion_tiles_cpu(
+    const AmbientOcclusionRecipe& base_recipe,
+    const geometry::EditableMesh& source,
+    const geometry::EditableMesh& target,
+    std::stop_token stop_token = {});
 [[nodiscard]] BentNormalExecutionReport compile_bent_normal_cpu(
     const AmbientOcclusionRecipe& recipe,
     const geometry::EditableMesh& source,
     const geometry::EditableMesh& target);
+// Compiles bounded CPU bent-normal artifacts for every complete target UDIM
+// tile in stable (U,V) order; failures return no partial schedule.
+[[nodiscard]] core::Result<BentNormalTileScheduleResult>
+schedule_bent_normal_tiles_cpu(
+    const AmbientOcclusionRecipe& base_recipe,
+    const geometry::EditableMesh& source,
+    const geometry::EditableMesh& target,
+    std::stop_token stop_token = {});
 [[nodiscard]] CurvatureExecutionReport compile_curvature_cpu(
     const CurvatureRecipe& recipe,
     const geometry::EditableMesh& source,
@@ -1065,6 +1140,26 @@ struct BakeExecutionReport {
     const HeightDisplacementRecipe& recipe,
     const geometry::EditableMesh& source,
     const geometry::EditableMesh& target);
+// Compiles complete target UDIM tiles in stable order. Each scheduler bounds
+// aggregate RGBA8 output and returns no partial result after a tile failure.
+[[nodiscard]] core::Result<CurvatureTileScheduleResult>
+schedule_curvature_tiles_cpu(
+    const CurvatureRecipe& base_recipe,
+    const geometry::EditableMesh& source,
+    const geometry::EditableMesh& target,
+    std::stop_token stop_token = {});
+[[nodiscard]] core::Result<ThicknessTileScheduleResult>
+schedule_thickness_tiles_cpu(
+    const ThicknessRecipe& base_recipe,
+    const geometry::EditableMesh& source,
+    const geometry::EditableMesh& target,
+    std::stop_token stop_token = {});
+[[nodiscard]] core::Result<HeightDisplacementTileScheduleResult>
+schedule_height_displacement_tiles_cpu(
+    const HeightDisplacementRecipe& base_recipe,
+    const geometry::EditableMesh& source,
+    const geometry::EditableMesh& target,
+    std::stop_token stop_token = {});
 // Rasterizes the bound scene instance's surface positions into its selected
 // UV tile. It emits no product for stale project state, missing/overlapping
 // UVs, cross-tile triangles, or malformed topology.
@@ -1074,5 +1169,17 @@ struct BakeExecutionReport {
 [[nodiscard]] MaterialSurfaceIdExecutionReport compile_material_surface_id_cpu(
     const MaterialSurfaceIdRecipe& recipe,
     const project::ProjectDocument& document);
+// Compiles every target UDIM tile against the exact project snapshot. The
+// aggregate serialized output budget is checked before tile compilation.
+[[nodiscard]] core::Result<WorldPositionTileScheduleResult>
+schedule_world_position_tiles_cpu(
+    const WorldPositionRecipe& base_recipe,
+    const project::ProjectDocument& document,
+    std::stop_token stop_token = {});
+[[nodiscard]] core::Result<MaterialSurfaceIdTileScheduleResult>
+schedule_material_surface_id_tiles_cpu(
+    const MaterialSurfaceIdRecipe& base_recipe,
+    const project::ProjectDocument& document,
+    std::stop_token stop_token = {});
 
 } // namespace carto::production

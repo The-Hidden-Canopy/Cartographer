@@ -48,6 +48,8 @@ constexpr std::uintmax_t kSequenceGenomeGtfMaxBytes = 20U * 1024U * 1024U;
 constexpr std::uintmax_t kLineageNewickMaxBytes = 4U * 1024U * 1024U;
 constexpr std::uintmax_t kAnatomyOntologyTableMaxBytes = 4U * 1024U * 1024U;
 constexpr std::uintmax_t kMorphologyLandmarkSetMaxBytes = 16U * 1024U * 1024U;
+constexpr std::uintmax_t kBakeTileCacheMaxBytes =
+    carto::production::kMaxBakeTextureTexels * 4U + 64U * 1024U;
 
 void print_error(const carto::core::Diagnostic& diagnostic) {
     std::cerr << "error[" << carto::core::error_code_name(diagnostic.code) << "]: "
@@ -90,6 +92,100 @@ Result<std::string> read_bounded_text(
             "failed while reading " + std::string(label)));
     }
     return Result<std::string>::success(std::move(contents));
+}
+
+Result<bool> path_entry_exists_no_follow(
+    const std::filesystem::path& path,
+    std::string_view label) {
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(path, error);
+    if (error == std::errc::no_such_file_or_directory ||
+        (!error && status.type() == std::filesystem::file_type::not_found)) {
+        return Result<bool>::success(false);
+    }
+    if (error) {
+        return Result<bool>::failure(carto::core::Diagnostic(
+            carto::core::ErrorCode::io_error,
+            "unable to inspect " + std::string(label) + " path"));
+    }
+    return Result<bool>::success(true);
+}
+
+Result<void> require_nonsymlink_directory(
+    const std::filesystem::path& path,
+    std::string_view label) {
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(path, error);
+    if (error || status.type() != std::filesystem::file_type::directory ||
+        std::filesystem::is_symlink(status)) {
+        return Result<void>::failure(carto::core::Diagnostic(
+            carto::core::ErrorCode::validation_failed,
+            std::string(label) + " must be a real directory, not a symlink"));
+    }
+    return Result<void>::success();
+}
+
+Result<void> require_nonsymlink_regular_file(
+    const std::filesystem::path& path,
+    std::string_view label) {
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(path, error);
+    if (error || status.type() != std::filesystem::file_type::regular ||
+        std::filesystem::is_symlink(status)) {
+        return Result<void>::failure(carto::core::Diagnostic(
+            carto::core::ErrorCode::validation_failed,
+            std::string(label) + " must be a regular file, not a symlink"));
+    }
+    return Result<void>::success();
+}
+
+Result<std::vector<std::uint8_t>> read_bounded_bytes(
+    const std::filesystem::path& path,
+    std::uintmax_t maximum_bytes,
+    std::string_view label) {
+    std::error_code status_error;
+    const auto file_bytes = std::filesystem::file_size(path, status_error);
+    if (status_error) {
+        return Result<std::vector<std::uint8_t>>::failure(carto::core::Diagnostic(
+            carto::core::ErrorCode::io_error,
+            "unable to inspect " + std::string(label) + " size"));
+    }
+    if (file_bytes > maximum_bytes || file_bytes >
+            std::numeric_limits<std::size_t>::max() || file_bytes >
+            static_cast<std::uintmax_t>(std::numeric_limits<std::streamsize>::max())) {
+        return Result<std::vector<std::uint8_t>>::failure(carto::core::Diagnostic(
+            carto::core::ErrorCode::validation_failed,
+            std::string(label) + " exceeds its safety limit"));
+    }
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        return Result<std::vector<std::uint8_t>>::failure(carto::core::Diagnostic(
+            carto::core::ErrorCode::io_error,
+            "unable to open " + std::string(label) + " for reading"));
+    }
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(file_bytes));
+    if (file_bytes != 0U) {
+        input.read(reinterpret_cast<char*>(bytes.data()),
+            static_cast<std::streamsize>(file_bytes));
+    }
+    if (input.gcount() != static_cast<std::streamsize>(file_bytes) ||
+        (!input.good() && !input.eof())) {
+        return Result<std::vector<std::uint8_t>>::failure(carto::core::Diagnostic(
+            carto::core::ErrorCode::io_error,
+            "failed while reading " + std::string(label)));
+    }
+    const int trailing_byte = input.peek();
+    if (trailing_byte != std::char_traits<char>::eof()) {
+        return Result<std::vector<std::uint8_t>>::failure(carto::core::Diagnostic(
+            carto::core::ErrorCode::stale_data,
+            std::string(label) + " changed size while being read"));
+    }
+    if (input.bad()) {
+        return Result<std::vector<std::uint8_t>>::failure(carto::core::Diagnostic(
+            carto::core::ErrorCode::io_error,
+            "failed while checking " + std::string(label) + " size"));
+    }
+    return Result<std::vector<std::uint8_t>>::success(std::move(bytes));
 }
 
 Result<void> write_new_text_atomically(
@@ -159,6 +255,87 @@ Result<void> write_new_text_atomically(
             "atomic " + std::string(label) + " replacement failed"));
     }
     return Result<void>::success();
+}
+
+Result<void> write_new_bytes_atomically(
+    const std::filesystem::path& path,
+    std::span<const std::uint8_t> bytes,
+    std::string_view label) {
+    const std::string_view contents = bytes.empty()
+        ? std::string_view{}
+        : std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    return write_new_text_atomically(path, contents, label);
+}
+
+Result<std::optional<carto::production::BakeTileArtifactCacheEntry>>
+read_bake_tile_cache_entry(
+    const std::filesystem::path& path,
+    std::uintmax_t maximum_bytes) {
+    std::error_code status_error;
+    const auto status = std::filesystem::symlink_status(path, status_error);
+    if (status_error == std::errc::no_such_file_or_directory ||
+        (!status_error && status.type() == std::filesystem::file_type::not_found)) {
+        return Result<std::optional<carto::production::BakeTileArtifactCacheEntry>>::success(
+            std::nullopt);
+    }
+    if (status_error) {
+        return Result<std::optional<carto::production::BakeTileArtifactCacheEntry>>::failure(
+            carto::core::Diagnostic(carto::core::ErrorCode::io_error,
+                "unable to inspect bake tile cache entry"));
+    }
+    if (std::filesystem::is_symlink(status) || !std::filesystem::is_regular_file(status)) {
+        return Result<std::optional<carto::production::BakeTileArtifactCacheEntry>>::failure(
+            carto::core::Diagnostic(carto::core::ErrorCode::validation_failed,
+                "bake tile cache entry must be a regular, non-symlink file"));
+    }
+    auto bytes = read_bounded_bytes(path, maximum_bytes,
+        "bake tile cache entry");
+    if (!bytes) {
+        return Result<std::optional<carto::production::BakeTileArtifactCacheEntry>>::failure(
+            bytes.error());
+    }
+    auto entry = carto::production::BakeTileArtifactCacheEntry::deserialize(
+        bytes.value());
+    if (!entry) {
+        return Result<std::optional<carto::production::BakeTileArtifactCacheEntry>>::failure(
+            entry.error().with_context("reading bake tile cache entry"));
+    }
+    std::vector<std::uint8_t>().swap(bytes.value());
+    return Result<std::optional<carto::production::BakeTileArtifactCacheEntry>>::success(
+        std::optional<carto::production::BakeTileArtifactCacheEntry>(
+            std::move(entry.value())));
+}
+
+std::filesystem::path::string_type fold_path_component(
+    const std::filesystem::path& component) {
+    auto folded = component.native();
+#if defined(_WIN32)
+    using PathCharacter = std::filesystem::path::value_type;
+    for (PathCharacter& character : folded) {
+        if (character >= static_cast<PathCharacter>('A') &&
+            character <= static_cast<PathCharacter>('Z')) {
+            character = static_cast<PathCharacter>(character +
+                static_cast<PathCharacter>('a' - 'A'));
+        }
+    }
+#endif
+    return folded;
+}
+
+bool paths_overlap(const std::filesystem::path& left,
+    const std::filesystem::path& right) {
+    auto left_part = left.begin();
+    auto right_part = right.begin();
+    const auto left_end = left.end();
+    const auto right_end = right.end();
+    while (left_part != left_end && right_part != right_end) {
+        if (fold_path_component(*left_part) != fold_path_component(*right_part)) {
+            return false;
+        }
+        ++left_part;
+        ++right_part;
+    }
+    return true;
 }
 
 Result<carto::scientific::FunctionalGenomeExchange> load_functional_genome_exchange(
@@ -3104,16 +3281,26 @@ int bake_ambient_occlusion(char** argv, bool use_d3d12_backend = false) {
             "bake output parent directory is unavailable"));
         return EXIT_FAILURE;
     }
-    output_error.clear();
-    if (std::filesystem::exists(output_root, output_error) || output_error) {
+    const auto output_entry = path_entry_exists_no_follow(
+        output_root, "AO bake output directory");
+    if (!output_entry) {
+        print_error(output_entry.error());
+        return EXIT_FAILURE;
+    }
+    if (output_entry.value()) {
         print_error(core::Diagnostic(core::ErrorCode::invalid_state,
             "bake output directory refuses to overwrite an existing path"));
         return EXIT_FAILURE;
     }
     std::filesystem::path staging_root = output_root;
     staging_root += ".pending-" + recipe_digest.value().hex().substr(0U, 16U);
-    output_error.clear();
-    if (std::filesystem::exists(staging_root, output_error) || output_error) {
+    const auto staging_entry = path_entry_exists_no_follow(
+        staging_root, "AO bake staging directory");
+    if (!staging_entry) {
+        print_error(staging_entry.error());
+        return EXIT_FAILURE;
+    }
+    if (staging_entry.value()) {
         print_error(core::Diagnostic(core::ErrorCode::invalid_state,
             "bake staging directory already exists and requires inspection"));
         return EXIT_FAILURE;
@@ -3316,8 +3503,7 @@ int inspect_ambient_occlusion_bake(
         }
         std::cout << "verified"
                   << " kind=ambient-occlusion"
-                  << " evidence=" << (d3d12_profile
-                      ? "carto.d3d12.cpu-reference-parity" : "carto.cpu-reference")
+                  << " verification=artifact-source-receipt-readback"
                   << " platform_profile=" << std::quoted(receipt.key.platform_profile)
                   << " source=" << std::quoted(receipt.key.source.identity)
                   << " source_revision=" << receipt.key.source.revision.value()
@@ -3333,6 +3519,3590 @@ int inspect_ambient_occlusion_bake(
     } catch (const std::exception& error) {
         print_error(core::Diagnostic(core::ErrorCode::io_error,
             std::string("AO bake verification failed: ") + error.what()));
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+carto::production::AmbientOcclusionRecipe make_ambient_occlusion_tile_base_recipe(
+    const carto::production::BakeMeshBinding& source,
+    const carto::production::BakeMeshBinding& target,
+    std::uint32_t uv_set,
+    std::uint32_t width,
+    std::uint32_t height,
+    std::uint32_t sample_count,
+    double max_distance,
+    std::uint64_t seed,
+    std::uint64_t mesh_asset) {
+    carto::production::AmbientOcclusionRecipe recipe;
+    recipe.binding.identity = "bake/ao/mesh/" + std::to_string(mesh_asset) +
+        "/uv/" + std::to_string(uv_set);
+    recipe.binding.source = source;
+    recipe.binding.target = target;
+    recipe.binding.target_uv_set = uv_set;
+    recipe.binding.width = width;
+    recipe.binding.height = height;
+    recipe.sample_count = sample_count;
+    recipe.max_distance = max_distance;
+    recipe.origin_bias = 1e-4;
+    recipe.seed = seed;
+    return recipe;
+}
+
+carto::production::AmbientOcclusionRecipe make_bent_normal_tile_base_recipe(
+    const carto::production::BakeMeshBinding& source,
+    const carto::production::BakeMeshBinding& target,
+    std::uint32_t uv_set,
+    std::uint32_t width,
+    std::uint32_t height,
+    std::uint32_t sample_count,
+    double max_distance,
+    std::uint64_t seed,
+    std::uint64_t mesh_asset) {
+    auto recipe = make_ambient_occlusion_tile_base_recipe(
+        source, target, uv_set, width, height, sample_count, max_distance,
+        seed, mesh_asset);
+    recipe.binding.identity = "bake/bent-normal/mesh/" +
+        std::to_string(mesh_asset) + "/uv/" + std::to_string(uv_set);
+    return recipe;
+}
+
+template <typename Recipe, typename Configure>
+Result<Recipe> make_scalar_tile_base_recipe(
+    const carto::project::ProjectDocument& document,
+    std::uint64_t source_asset,
+    std::uint64_t target_asset,
+    std::uint32_t uv_set,
+    std::uint32_t width,
+    std::uint32_t height,
+    double projection_half_extent,
+    bool reject_projection_misses,
+    std::string_view map_name,
+    Configure&& configure) {
+    const auto source = document.meshes().find(source_asset);
+    const auto target = document.meshes().find(target_asset);
+    if (source == document.meshes().end() || target == document.meshes().end()) {
+        return Result<Recipe>::failure(carto::core::Diagnostic(
+            carto::core::ErrorCode::not_found,
+            "scalar bake source or target mesh asset does not exist in the project"));
+    }
+    const std::string source_identity = document.source_namespace() +
+        "/mesh/" + std::to_string(source_asset);
+    const std::string target_identity = document.source_namespace() +
+        "/mesh/" + std::to_string(target_asset);
+    const auto source_binding = carto::production::bind_bake_source(
+        source_identity, source->second);
+    const auto target_binding = carto::production::bind_bake_target(
+        target_identity, target->second, uv_set);
+    if (!source_binding || !target_binding) {
+        return Result<Recipe>::failure(!source_binding
+            ? source_binding.error() : target_binding.error());
+    }
+    Recipe recipe;
+    recipe.binding.identity = "bake/" + std::string(map_name) + "/source/" +
+        std::to_string(source_asset) + "/target/" + std::to_string(target_asset) +
+        "/uv/" + std::to_string(uv_set);
+    recipe.binding.source = source_binding.value();
+    recipe.binding.target = target_binding.value();
+    recipe.binding.target_uv_set = uv_set;
+    recipe.binding.width = width;
+    recipe.binding.height = height;
+    recipe.binding.projection_half_extent = projection_half_extent;
+    recipe.binding.reject_projection_misses = reject_projection_misses;
+    configure(recipe);
+    if (auto result = recipe.validate(); !result) {
+        return Result<Recipe>::failure(result.error());
+    }
+    return Result<Recipe>::success(std::move(recipe));
+}
+
+template <typename Recipe>
+Recipe scalar_tile_recipe(const Recipe& base, carto::production::BakeTileCoordinate tile) {
+    Recipe recipe = base;
+    recipe.binding.tile_u = tile.tile_u;
+    recipe.binding.tile_v = tile.tile_v;
+    recipe.binding.identity = base.binding.identity + "/tile/" +
+        std::to_string(tile.tile_u) + "/" + std::to_string(tile.tile_v);
+    return recipe;
+}
+
+carto::production::AmbientOcclusionRecipe make_ambient_occlusion_tile_recipe(
+    const carto::production::AmbientOcclusionRecipe& base,
+    carto::production::BakeTileCoordinate tile) {
+    auto recipe = base;
+    recipe.binding.tile_u = tile.tile_u;
+    recipe.binding.tile_v = tile.tile_v;
+    recipe.binding.identity = base.binding.identity + "/tile/" +
+        std::to_string(tile.tile_u) + "/" + std::to_string(tile.tile_v);
+    return recipe;
+}
+
+int bake_ambient_occlusion_tiles_cpu(char** argv) {
+    using namespace carto;
+    const std::filesystem::path project_path(argv[2]);
+    const auto mesh_asset = parse_mesh_asset_id_argument(argv[3]);
+    const auto uv_set = parse_bake_u32_argument(argv[4], "UV set id");
+    const auto width = parse_bake_u32_argument(argv[5], "texture width");
+    const auto height = parse_bake_u32_argument(argv[6], "texture height");
+    const auto sample_count = parse_bake_u32_argument(argv[7], "AO sample count");
+    const auto max_distance = parse_bake_positive_double_argument(
+        argv[8], "AO maximum distance");
+    const auto seed = parse_bake_u64_argument(argv[9], "AO seed");
+    const std::filesystem::path output_root(argv[10]);
+    if (!mesh_asset || !uv_set || !width || !height || !sample_count ||
+        !max_distance || !seed) {
+        const core::Diagnostic error = !mesh_asset ? mesh_asset.error()
+            : !uv_set ? uv_set.error()
+            : !width ? width.error()
+            : !height ? height.error()
+            : !sample_count ? sample_count.error()
+            : !max_distance ? max_distance.error()
+            : seed.error();
+        print_error(error);
+        return EXIT_FAILURE;
+    }
+    if (output_root.empty() || output_root.filename().empty()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "bake output directory must name a new directory"));
+        return EXIT_FAILURE;
+    }
+
+    const auto document = project::ProjectDocument::load(project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto mesh = document.value().meshes().find(mesh_asset.value());
+    if (mesh == document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::not_found,
+            "AO bake mesh asset does not exist in the project"));
+        return EXIT_FAILURE;
+    }
+    const std::string mesh_identity = document.value().source_namespace() +
+        "/mesh/" + std::to_string(mesh_asset.value());
+    const auto source_binding = production::bind_bake_source(mesh_identity, mesh->second);
+    const auto target_binding = production::bind_bake_target(
+        mesh_identity, mesh->second, uv_set.value());
+    if (!source_binding || !target_binding) {
+        print_error(!source_binding ? source_binding.error() : target_binding.error());
+        return EXIT_FAILURE;
+    }
+    const auto base_recipe = make_ambient_occlusion_tile_base_recipe(
+        source_binding.value(), target_binding.value(), uv_set.value(),
+        width.value(), height.value(), sample_count.value(), max_distance.value(),
+        seed.value(), mesh_asset.value());
+    if (auto result = base_recipe.validate(); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    const auto schedule = production::schedule_ambient_occlusion_tiles_cpu(
+        base_recipe, mesh->second, mesh->second);
+    const auto finished = std::chrono::steady_clock::now();
+    if (!schedule) {
+        print_error(schedule.error());
+        return EXIT_FAILURE;
+    }
+    const auto current_document = project::ProjectDocument::load(project_path);
+    if (!current_document) {
+        print_error(current_document.error().with_context(
+            "reloading project before AO tile publication"));
+        return EXIT_FAILURE;
+    }
+    if (current_document.value().source_namespace() !=
+        document.value().source_namespace()) {
+        print_error(core::Diagnostic(core::ErrorCode::stale_data,
+            "project source namespace changed while the AO tile schedule was running"));
+        return EXIT_FAILURE;
+    }
+    const auto current_mesh = current_document.value().meshes().find(mesh_asset.value());
+    if (current_mesh == current_document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::stale_data,
+            "project AO tile mesh disappeared while the schedule was running"));
+        return EXIT_FAILURE;
+    }
+    if (auto result = production::validate_bake_sources(
+            base_recipe.binding, current_mesh->second, current_mesh->second); !result) {
+        print_error(result.error().with_context(
+            "revalidating project mesh before AO tile publication"));
+        return EXIT_FAILURE;
+    }
+
+    std::error_code output_error;
+    const auto parent = output_root.parent_path();
+    if (!parent.empty() &&
+        (!std::filesystem::exists(parent, output_error) || output_error ||
+         !std::filesystem::is_directory(parent, output_error) || output_error)) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            "bake output parent directory is unavailable"));
+        return EXIT_FAILURE;
+    }
+    const auto output_entry = path_entry_exists_no_follow(
+        output_root, "AO tile output directory");
+    if (!output_entry) {
+        print_error(output_entry.error());
+        return EXIT_FAILURE;
+    }
+    if (output_entry.value()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "bake output directory refuses to overwrite an existing path"));
+        return EXIT_FAILURE;
+    }
+    const auto recipe_digest = base_recipe.canonical_digest();
+    if (!recipe_digest) {
+        print_error(recipe_digest.error());
+        return EXIT_FAILURE;
+    }
+    std::filesystem::path staging_root = output_root;
+    staging_root += ".pending-" + recipe_digest.value().hex().substr(0U, 16U);
+    const auto staging_entry = path_entry_exists_no_follow(
+        staging_root, "AO tile staging directory");
+    if (!staging_entry) {
+        print_error(staging_entry.error());
+        return EXIT_FAILURE;
+    }
+    if (staging_entry.value()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "bake staging directory already exists and requires inspection"));
+        return EXIT_FAILURE;
+    }
+    output_error.clear();
+    if (!std::filesystem::create_directory(staging_root, output_error) || output_error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            "unable to create the new bake staging directory"));
+        return EXIT_FAILURE;
+    }
+
+    try {
+        assets::BlobStore blobs(staging_root / "blobs");
+        production::ProductionArtifactStore artifact_store(blobs);
+        const production::AdmissionPolicy policy;
+        for (const auto& entry : schedule.value().entries) {
+            const auto payload = entry.artifact.serialize();
+            const auto cook_key = production::bake_ambient_occlusion_cook_key(
+                entry.artifact.recipe, "carto.cpu-reference.v1");
+            if (!payload || !cook_key) {
+                print_error(!payload ? payload.error() : cook_key.error());
+                return EXIT_FAILURE;
+            }
+            production::ProductionArtifactReceipt receipt;
+            receipt.key = cook_key.value();
+            receipt.status = production::ReceiptStatus::admitted;
+            receipt.output_digest = assets::sha256(payload.value());
+            receipt.output_bytes = payload.value().size();
+            receipt.cost.cook_milliseconds = entry.compile_milliseconds;
+            receipt.cost.disk_bytes = receipt.output_bytes;
+            if (auto result = receipt.refresh_digest(); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            if (auto result = production::publish_ambient_occlusion_map(
+                    artifact_store, receipt, entry.artifact, current_mesh->second,
+                    current_mesh->second, policy, "carto.cpu-reference.v1"); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto reopened = production::read_ambient_occlusion_map(
+                artifact_store, entry.artifact.recipe, current_mesh->second,
+                current_mesh->second, policy, "carto.cpu-reference.v1");
+            if (!reopened || reopened.value().artifact_digest !=
+                    entry.artifact.artifact_digest) {
+                print_error(reopened ? core::Diagnostic(core::ErrorCode::validation_failed,
+                    "published AO tile differs from its compiled artifact")
+                    : reopened.error());
+                return EXIT_FAILURE;
+            }
+        }
+        const std::string ledger_text = artifact_store.ledger().serialize();
+        const auto ledger = production::ProductionReceiptLedger::deserialize(ledger_text);
+        if (!ledger || ledger.value().size() != schedule.value().entries.size()) {
+            print_error(ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+                "AO tile receipt ledger has an unexpected record count") : ledger.error());
+            return EXIT_FAILURE;
+        }
+        const auto manifest_write = write_new_text_atomically(
+            staging_root / "receipts.carto-production-receipts", ledger_text,
+            "AO tile receipt ledger");
+        if (!manifest_write) {
+            print_error(manifest_write.error());
+            return EXIT_FAILURE;
+        }
+        const auto reopened_manifest = read_bounded_text(
+            staging_root / "receipts.carto-production-receipts",
+            production::ProductionReceiptLedger::max_serialized_bytes,
+            "AO tile receipt ledger");
+        const auto manifest_ledger = reopened_manifest
+            ? production::ProductionReceiptLedger::deserialize(reopened_manifest.value())
+            : Result<production::ProductionReceiptLedger>::failure(reopened_manifest.error());
+        if (!manifest_ledger || manifest_ledger.value().size() != schedule.value().entries.size()) {
+            print_error(manifest_ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+                "AO tile receipt manifest failed read-back validation")
+                : manifest_ledger.error());
+            return EXIT_FAILURE;
+        }
+        const auto publication_document = project::ProjectDocument::load(project_path);
+        if (!publication_document || publication_document.value().source_namespace() !=
+                document.value().source_namespace()) {
+            print_error(publication_document ? core::Diagnostic(core::ErrorCode::stale_data,
+                "project source namespace changed before AO tile publication")
+                : publication_document.error().with_context(
+                    "final project check before AO tile publication"));
+            return EXIT_FAILURE;
+        }
+        const auto publication_mesh = publication_document.value().meshes().find(
+            mesh_asset.value());
+        if (publication_mesh == publication_document.value().meshes().end()) {
+            print_error(core::Diagnostic(core::ErrorCode::stale_data,
+                "project AO tile mesh disappeared before final publication"));
+            return EXIT_FAILURE;
+        }
+        if (auto result = production::validate_bake_sources(
+                base_recipe.binding, publication_mesh->second,
+                publication_mesh->second); !result) {
+            print_error(result.error().with_context(
+                "final source check before AO tile publication"));
+            return EXIT_FAILURE;
+        }
+        output_error.clear();
+        std::filesystem::rename(staging_root, output_root, output_error);
+        if (output_error) {
+            print_error(core::Diagnostic(core::ErrorCode::io_error,
+                "atomic bake output publication failed; inspect the staging directory"));
+            return EXIT_FAILURE;
+        }
+        for (const auto& entry : schedule.value().entries) {
+            std::cout << "baked kind=ambient-occlusion"
+                      << " evidence=carto.cpu-reference"
+                      << " platform_profile=\"carto.cpu-reference.v1\""
+                      << " source=" << std::quoted(mesh_identity)
+                      << " source_revision=" << source_binding.value().revision.value()
+                      << " tile=" << entry.tile.tile_u << ',' << entry.tile.tile_v
+                      << " covered_texels=" << entry.artifact.covered_texels
+                      << " rays_cast=" << entry.artifact.rays_cast
+                      << " artifact_digest=" << entry.artifact.artifact_digest.hex()
+                      << " output=" << std::quoted(output_root.string()) << '\n';
+        }
+        std::cout << "bake_schedule kind=ambient-occlusion"
+                  << " tiles=" << schedule.value().entries.size()
+                  << " covered_texels=" << schedule.value().covered_texels
+                  << " rays_cast=" << schedule.value().rays_cast
+                  << " occluded_rays=" << schedule.value().occluded_rays
+                  << " compile_milliseconds=" << schedule.value().compile_milliseconds
+                  << " wall_milliseconds=" << std::chrono::duration<double, std::milli>(
+                      finished - started).count()
+                  << " output=" << std::quoted(output_root.string()) << '\n';
+    } catch (const std::exception& error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            std::string("AO tile bake publication failed: ") + error.what()));
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+int bake_bent_normal_tiles_cpu(char** argv) {
+    using namespace carto;
+    const std::filesystem::path project_path(argv[2]);
+    const auto mesh_asset = parse_mesh_asset_id_argument(argv[3]);
+    const auto uv_set = parse_bake_u32_argument(argv[4], "UV set id");
+    const auto width = parse_bake_u32_argument(argv[5], "texture width");
+    const auto height = parse_bake_u32_argument(argv[6], "texture height");
+    const auto sample_count = parse_bake_u32_argument(argv[7], "bent-normal sample count");
+    const auto max_distance = parse_bake_positive_double_argument(
+        argv[8], "bent-normal maximum distance");
+    const auto seed = parse_bake_u64_argument(argv[9], "bent-normal seed");
+    const std::filesystem::path output_root(argv[10]);
+    if (!mesh_asset || !uv_set || !width || !height || !sample_count ||
+        !max_distance || !seed) {
+        const core::Diagnostic error = !mesh_asset ? mesh_asset.error()
+            : !uv_set ? uv_set.error()
+            : !width ? width.error()
+            : !height ? height.error()
+            : !sample_count ? sample_count.error()
+            : !max_distance ? max_distance.error()
+            : seed.error();
+        print_error(error);
+        return EXIT_FAILURE;
+    }
+    if (output_root.empty() || output_root.filename().empty()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "bake output directory must name a new directory"));
+        return EXIT_FAILURE;
+    }
+    const auto document = project::ProjectDocument::load(project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto mesh = document.value().meshes().find(mesh_asset.value());
+    if (mesh == document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::not_found,
+            "bent-normal bake mesh asset does not exist in the project"));
+        return EXIT_FAILURE;
+    }
+    const std::string mesh_identity = document.value().source_namespace() +
+        "/mesh/" + std::to_string(mesh_asset.value());
+    const auto source_binding = production::bind_bake_source(mesh_identity, mesh->second);
+    const auto target_binding = production::bind_bake_target(
+        mesh_identity, mesh->second, uv_set.value());
+    if (!source_binding || !target_binding) {
+        print_error(!source_binding ? source_binding.error() : target_binding.error());
+        return EXIT_FAILURE;
+    }
+    const auto base_recipe = make_bent_normal_tile_base_recipe(
+        source_binding.value(), target_binding.value(), uv_set.value(),
+        width.value(), height.value(), sample_count.value(), max_distance.value(),
+        seed.value(), mesh_asset.value());
+    if (auto result = base_recipe.validate(); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    const auto schedule = production::schedule_bent_normal_tiles_cpu(
+        base_recipe, mesh->second, mesh->second);
+    const auto finished = std::chrono::steady_clock::now();
+    if (!schedule) {
+        print_error(schedule.error());
+        return EXIT_FAILURE;
+    }
+    const auto current_document = project::ProjectDocument::load(project_path);
+    if (!current_document) {
+        print_error(current_document.error().with_context(
+            "reloading project before bent-normal tile publication"));
+        return EXIT_FAILURE;
+    }
+    if (current_document.value().source_namespace() !=
+        document.value().source_namespace()) {
+        print_error(core::Diagnostic(core::ErrorCode::stale_data,
+            "project source namespace changed while the bent-normal schedule was running"));
+        return EXIT_FAILURE;
+    }
+    const auto current_mesh = current_document.value().meshes().find(mesh_asset.value());
+    if (current_mesh == current_document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::stale_data,
+            "project bent-normal mesh disappeared while the schedule was running"));
+        return EXIT_FAILURE;
+    }
+    if (auto result = production::validate_bake_sources(
+            base_recipe.binding, current_mesh->second, current_mesh->second); !result) {
+        print_error(result.error().with_context(
+            "revalidating project mesh before bent-normal tile publication"));
+        return EXIT_FAILURE;
+    }
+
+    std::error_code output_error;
+    const auto parent = output_root.parent_path();
+    if (!parent.empty() &&
+        (!std::filesystem::exists(parent, output_error) || output_error ||
+         !std::filesystem::is_directory(parent, output_error) || output_error)) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            "bake output parent directory is unavailable"));
+        return EXIT_FAILURE;
+    }
+    const auto output_entry = path_entry_exists_no_follow(
+        output_root, "bent-normal tile output directory");
+    if (!output_entry) {
+        print_error(output_entry.error());
+        return EXIT_FAILURE;
+    }
+    if (output_entry.value()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "bake output directory refuses to overwrite an existing path"));
+        return EXIT_FAILURE;
+    }
+    const auto recipe_digest = base_recipe.canonical_digest();
+    if (!recipe_digest) {
+        print_error(recipe_digest.error());
+        return EXIT_FAILURE;
+    }
+    std::filesystem::path staging_root = output_root;
+    staging_root += ".pending-" + recipe_digest.value().hex().substr(0U, 16U);
+    const auto staging_entry = path_entry_exists_no_follow(
+        staging_root, "bent-normal tile staging directory");
+    if (!staging_entry) {
+        print_error(staging_entry.error());
+        return EXIT_FAILURE;
+    }
+    if (staging_entry.value()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "bake staging directory already exists and requires inspection"));
+        return EXIT_FAILURE;
+    }
+    output_error.clear();
+    if (!std::filesystem::create_directory(staging_root, output_error) || output_error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            "unable to create the new bake staging directory"));
+        return EXIT_FAILURE;
+    }
+
+    try {
+        assets::BlobStore blobs(staging_root / "blobs");
+        production::ProductionArtifactStore artifact_store(blobs);
+        const production::AdmissionPolicy policy;
+        for (const auto& entry : schedule.value().entries) {
+            const auto payload = entry.artifact.serialize();
+            const auto cook_key = production::bake_bent_normal_cook_key(
+                entry.artifact.recipe, "carto.cpu-reference.v1");
+            if (!payload || !cook_key) {
+                print_error(!payload ? payload.error() : cook_key.error());
+                return EXIT_FAILURE;
+            }
+            production::ProductionArtifactReceipt receipt;
+            receipt.key = cook_key.value();
+            receipt.status = production::ReceiptStatus::admitted;
+            receipt.output_digest = assets::sha256(payload.value());
+            receipt.output_bytes = payload.value().size();
+            receipt.cost.cook_milliseconds = entry.compile_milliseconds;
+            receipt.cost.disk_bytes = receipt.output_bytes;
+            if (auto result = receipt.refresh_digest(); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            if (auto result = production::publish_bent_normal_map(
+                    artifact_store, receipt, entry.artifact, current_mesh->second,
+                    current_mesh->second, policy, "carto.cpu-reference.v1"); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto reopened = production::read_bent_normal_map(
+                artifact_store, entry.artifact.recipe, current_mesh->second,
+                current_mesh->second, policy, "carto.cpu-reference.v1");
+            if (!reopened || reopened.value().artifact_digest !=
+                    entry.artifact.artifact_digest) {
+                print_error(reopened ? core::Diagnostic(core::ErrorCode::validation_failed,
+                    "published bent-normal tile differs from its compiled artifact")
+                    : reopened.error());
+                return EXIT_FAILURE;
+            }
+        }
+        const std::string ledger_text = artifact_store.ledger().serialize();
+        const auto ledger = production::ProductionReceiptLedger::deserialize(ledger_text);
+        if (!ledger || ledger.value().size() != schedule.value().entries.size()) {
+            print_error(ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+                "bent-normal tile receipt ledger has an unexpected record count")
+                : ledger.error());
+            return EXIT_FAILURE;
+        }
+        const auto manifest_path = staging_root / "receipts.carto-production-receipts";
+        const auto manifest_write = write_new_text_atomically(
+            manifest_path, ledger_text, "bent-normal tile receipt ledger");
+        if (!manifest_write) {
+            print_error(manifest_write.error());
+            return EXIT_FAILURE;
+        }
+        const auto reopened_manifest = read_bounded_text(
+            manifest_path, production::ProductionReceiptLedger::max_serialized_bytes,
+            "bent-normal tile receipt ledger");
+        const auto manifest_ledger = reopened_manifest
+            ? production::ProductionReceiptLedger::deserialize(reopened_manifest.value())
+            : Result<production::ProductionReceiptLedger>::failure(reopened_manifest.error());
+        if (!manifest_ledger || manifest_ledger.value().size() != schedule.value().entries.size()) {
+            print_error(manifest_ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+                "bent-normal tile receipt manifest failed read-back validation")
+                : manifest_ledger.error());
+            return EXIT_FAILURE;
+        }
+        const auto publication_document = project::ProjectDocument::load(project_path);
+        if (!publication_document || publication_document.value().source_namespace() !=
+                document.value().source_namespace()) {
+            print_error(publication_document ? core::Diagnostic(core::ErrorCode::stale_data,
+                "project source namespace changed before bent-normal tile publication")
+                : publication_document.error().with_context(
+                    "final project check before bent-normal tile publication"));
+            return EXIT_FAILURE;
+        }
+        const auto publication_mesh = publication_document.value().meshes().find(
+            mesh_asset.value());
+        if (publication_mesh == publication_document.value().meshes().end()) {
+            print_error(core::Diagnostic(core::ErrorCode::stale_data,
+                "project bent-normal mesh disappeared before final publication"));
+            return EXIT_FAILURE;
+        }
+        if (auto result = production::validate_bake_sources(
+                base_recipe.binding, publication_mesh->second,
+                publication_mesh->second); !result) {
+            print_error(result.error().with_context(
+                "final source check before bent-normal tile publication"));
+            return EXIT_FAILURE;
+        }
+        output_error.clear();
+        std::filesystem::rename(staging_root, output_root, output_error);
+        if (output_error) {
+            print_error(core::Diagnostic(core::ErrorCode::io_error,
+                "atomic bake output publication failed; inspect the staging directory"));
+            return EXIT_FAILURE;
+        }
+        for (const auto& entry : schedule.value().entries) {
+            std::cout << "baked kind=bent-normal evidence=carto.cpu-reference"
+                      << " platform_profile=\"carto.cpu-reference.v1\""
+                      << " source=" << std::quoted(mesh_identity)
+                      << " source_revision=" << source_binding.value().revision.value()
+                      << " tile=" << entry.tile.tile_u << ',' << entry.tile.tile_v
+                      << " covered_texels=" << entry.artifact.covered_texels
+                      << " rays_cast=" << entry.artifact.rays_cast
+                      << " artifact_digest=" << entry.artifact.artifact_digest.hex()
+                      << " output=" << std::quoted(output_root.string()) << '\n';
+        }
+        std::cout << "bake_schedule kind=bent-normal"
+                  << " tiles=" << schedule.value().entries.size()
+                  << " covered_texels=" << schedule.value().covered_texels
+                  << " rays_cast=" << schedule.value().rays_cast
+                  << " occluded_rays=" << schedule.value().occluded_rays
+                  << " compile_milliseconds=" << schedule.value().compile_milliseconds
+                  << " wall_milliseconds=" << std::chrono::duration<double, std::milli>(
+                      finished - started).count()
+                  << " output=" << std::quoted(output_root.string()) << '\n';
+    } catch (const std::exception& error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            std::string("bent-normal tile publication failed: ") + error.what()));
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+int inspect_bent_normal_tiles(
+    const std::filesystem::path& project_path,
+    std::string_view mesh_id_text,
+    std::string_view uv_set_text,
+    std::string_view width_text,
+    std::string_view height_text,
+    std::string_view sample_count_text,
+    std::string_view max_distance_text,
+    std::string_view seed_text,
+    const std::filesystem::path& output_root,
+    bool d3d12_backend = false) {
+    using namespace carto;
+    const auto mesh_asset = parse_mesh_asset_id_argument(mesh_id_text);
+    const auto uv_set = parse_bake_u32_argument(uv_set_text, "UV set id");
+    const auto width = parse_bake_u32_argument(width_text, "texture width");
+    const auto height = parse_bake_u32_argument(height_text, "texture height");
+    const auto sample_count = parse_bake_u32_argument(
+        sample_count_text, "bent-normal sample count");
+    const auto max_distance = parse_bake_positive_double_argument(
+        max_distance_text, "bent-normal maximum distance");
+    const auto seed = parse_bake_u64_argument(seed_text, "bent-normal seed");
+    if (!mesh_asset || !uv_set || !width || !height || !sample_count ||
+        !max_distance || !seed) {
+        const core::Diagnostic error = !mesh_asset ? mesh_asset.error()
+            : !uv_set ? uv_set.error()
+            : !width ? width.error()
+            : !height ? height.error()
+            : !sample_count ? sample_count.error()
+            : !max_distance ? max_distance.error()
+            : seed.error();
+        print_error(error);
+        return EXIT_FAILURE;
+    }
+    const auto document = project::ProjectDocument::load(project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto mesh = document.value().meshes().find(mesh_asset.value());
+    if (mesh == document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::not_found,
+            "bent-normal bake mesh asset does not exist in the project"));
+        return EXIT_FAILURE;
+    }
+    const std::string mesh_identity = document.value().source_namespace() +
+        "/mesh/" + std::to_string(mesh_asset.value());
+    const auto source_binding = production::bind_bake_source(mesh_identity, mesh->second);
+    const auto target_binding = production::bind_bake_target(
+        mesh_identity, mesh->second, uv_set.value());
+    if (!source_binding || !target_binding) {
+        print_error(!source_binding ? source_binding.error() : target_binding.error());
+        return EXIT_FAILURE;
+    }
+    const auto base_recipe = make_bent_normal_tile_base_recipe(
+        source_binding.value(), target_binding.value(), uv_set.value(),
+        width.value(), height.value(), sample_count.value(), max_distance.value(),
+        seed.value(), mesh_asset.value());
+    if (auto result = base_recipe.validate(); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto tiles = production::enumerate_bake_tiles(mesh->second, uv_set.value());
+    if (!tiles) {
+        print_error(tiles.error());
+        return EXIT_FAILURE;
+    }
+    if (auto result = require_nonsymlink_directory(
+            output_root, "bent-normal tile output"); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto manifest_path = output_root / "receipts.carto-production-receipts";
+    if (auto result = require_nonsymlink_regular_file(
+            manifest_path, "bent-normal tile receipt manifest"); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto ledger_text = read_bounded_text(
+        manifest_path,
+        production::ProductionReceiptLedger::max_serialized_bytes,
+        "bent-normal tile receipt ledger");
+    if (!ledger_text) {
+        print_error(ledger_text.error());
+        return EXIT_FAILURE;
+    }
+    const auto ledger = production::ProductionReceiptLedger::deserialize(ledger_text.value());
+    if (!ledger || ledger.value().size() != tiles.value().size() ||
+        ledger.value().size() == 0U ||
+        ledger.value().size() > production::kMaxBakeTileScheduleTiles) {
+        print_error(ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+            "bent-normal tile receipt ledger is empty, oversized, or does not exactly cover the current tile set")
+            : ledger.error());
+        return EXIT_FAILURE;
+    }
+    const std::string platform_profile =
+        ledger.value().records().front().key.platform_profile;
+    const bool profile_is_d3d12 = platform_profile.rfind("carto.d3d12.", 0U) == 0U;
+    if ((d3d12_backend && !profile_is_d3d12) ||
+        (!d3d12_backend && platform_profile != "carto.cpu-reference.v1")) {
+        print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+            "bent-normal tile receipt platform does not match the requested backend"));
+        return EXIT_FAILURE;
+    }
+
+    struct VerifiedTile {
+        production::BakeTileCoordinate tile;
+        assets::Sha256Digest artifact_digest;
+        assets::Sha256Digest payload_digest;
+        assets::Sha256Digest receipt_digest;
+        std::uint64_t covered_texels = 0U;
+        std::uint64_t rays_cast = 0U;
+    };
+    std::vector<bool> consumed(ledger.value().size(), false);
+    std::vector<VerifiedTile> verified_tiles;
+    verified_tiles.reserve(tiles.value().size());
+    try {
+        const auto blob_root = output_root / "blobs";
+        if (auto result = require_nonsymlink_directory(
+                blob_root, "bent-normal tile blob store"); !result) {
+            print_error(result.error());
+            return EXIT_FAILURE;
+        }
+        assets::BlobStore blobs(blob_root);
+        for (const production::BakeTileCoordinate tile : tiles.value()) {
+            const auto recipe = make_ambient_occlusion_tile_recipe(base_recipe, tile);
+            const auto expected_key = production::bake_bent_normal_cook_key(
+                recipe, platform_profile);
+            if (!expected_key) {
+                print_error(expected_key.error());
+                return EXIT_FAILURE;
+            }
+            std::optional<std::size_t> matching_receipt;
+            for (std::size_t index = 0U; index < ledger.value().records().size(); ++index) {
+                if (ledger.value().records()[index].key != expected_key.value()) continue;
+                if (matching_receipt.has_value()) {
+                    print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                        "bent-normal tile ledger contains duplicate receipts for one tile"));
+                    return EXIT_FAILURE;
+                }
+                matching_receipt = index;
+            }
+            if (!matching_receipt.has_value() || consumed[*matching_receipt]) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "bent-normal tile receipt is missing or duplicated"));
+                return EXIT_FAILURE;
+            }
+            consumed[*matching_receipt] = true;
+            const auto& receipt = ledger.value().records()[*matching_receipt];
+            if (receipt.status != production::ReceiptStatus::admitted ||
+                receipt.key.algorithm != production::kBakeBentNormalAlgorithm ||
+                receipt.key.platform_profile != platform_profile) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "bent-normal tile receipt is not admitted or mixes algorithms/platform profiles"));
+                return EXIT_FAILURE;
+            }
+            const std::string digest_text = receipt.output_digest.hex();
+            const auto hash_root = blob_root / "sha256";
+            const auto first_prefix = hash_root / digest_text.substr(0U, 2U);
+            const auto second_prefix = first_prefix / digest_text.substr(2U, 2U);
+            if (auto result = require_nonsymlink_directory(
+                    hash_root, "bent-normal tile blob hash root"); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            if (auto result = require_nonsymlink_directory(
+                    first_prefix, "bent-normal tile blob prefix"); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            if (auto result = require_nonsymlink_directory(
+                    second_prefix, "bent-normal tile blob prefix"); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto blob_path = blobs.path_for(receipt.output_digest);
+            if (auto result = require_nonsymlink_regular_file(
+                    blob_path, "bent-normal tile payload"); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto payload = blobs.read(receipt.output_digest);
+            if (!payload || payload.value().size() != receipt.output_bytes ||
+                assets::sha256(payload.value()) != receipt.output_digest) {
+                print_error(payload ? core::Diagnostic(core::ErrorCode::validation_failed,
+                    "bent-normal tile payload disagrees with its production receipt")
+                    : payload.error());
+                return EXIT_FAILURE;
+            }
+            const auto artifact = production::BentNormalMapArtifact::deserialize(
+                payload.value());
+            if (!artifact) {
+                print_error(artifact.error());
+                return EXIT_FAILURE;
+            }
+            if (artifact.value().recipe.serialize() != recipe.serialize() ||
+                artifact.value().recipe.binding.source.identity != mesh_identity) {
+                print_error(core::Diagnostic(core::ErrorCode::stale_data,
+                    "bent-normal tile recipe does not match the current project and request"));
+                return EXIT_FAILURE;
+            }
+            if (auto result = production::validate_bake_sources(
+                    artifact.value().recipe.binding, mesh->second, mesh->second); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            verified_tiles.push_back(VerifiedTile{
+                tile, artifact.value().artifact_digest, receipt.output_digest,
+                receipt.receipt_digest, artifact.value().covered_texels,
+                artifact.value().rays_cast});
+        }
+        if (std::find(consumed.begin(), consumed.end(), false) != consumed.end()) {
+            print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                "bent-normal tile ledger contains an unexpected receipt"));
+            return EXIT_FAILURE;
+        }
+    } catch (const std::exception& error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            std::string("bent-normal tile inspection failed: ") + error.what()));
+        return EXIT_FAILURE;
+    }
+    for (const VerifiedTile& tile : verified_tiles) {
+        std::cout << "verified kind=bent-normal"
+                  << " verification=artifact-source-receipt-readback"
+                  << " platform_profile=" << std::quoted(platform_profile)
+                  << " mesh=" << mesh_asset.value()
+                  << " uv_set=" << uv_set.value()
+                  << " tile=" << tile.tile.tile_u << ',' << tile.tile.tile_v
+                  << " covered_texels=" << tile.covered_texels
+                  << " rays_cast=" << tile.rays_cast
+                  << " artifact_digest=" << tile.artifact_digest.hex()
+                  << " payload_digest=" << tile.payload_digest.hex()
+                  << " receipt_digest=" << tile.receipt_digest.hex() << '\n';
+    }
+    std::cout << "verified_schedule kind=bent-normal"
+              << " backend=" << (d3d12_backend ? "d3d12" : "cpu")
+              << " tiles=" << verified_tiles.size()
+              << " source=" << std::quoted(mesh_identity)
+              << " source_revision=" << source_binding.value().revision.value()
+              << " output=" << std::quoted(output_root.string()) << '\n';
+    return EXIT_SUCCESS;
+}
+
+int inspect_ambient_occlusion_tiles(
+    const std::filesystem::path& project_path,
+    std::string_view mesh_id_text,
+    std::string_view uv_set_text,
+    std::string_view width_text,
+    std::string_view height_text,
+    std::string_view sample_count_text,
+    std::string_view max_distance_text,
+    std::string_view seed_text,
+    const std::filesystem::path& output_root,
+    bool d3d12_backend = false) {
+    using namespace carto;
+    const auto mesh_asset = parse_mesh_asset_id_argument(mesh_id_text);
+    const auto uv_set = parse_bake_u32_argument(uv_set_text, "UV set id");
+    const auto width = parse_bake_u32_argument(width_text, "texture width");
+    const auto height = parse_bake_u32_argument(height_text, "texture height");
+    const auto sample_count = parse_bake_u32_argument(sample_count_text, "AO sample count");
+    const auto max_distance = parse_bake_positive_double_argument(
+        max_distance_text, "AO maximum distance");
+    const auto seed = parse_bake_u64_argument(seed_text, "AO seed");
+    if (!mesh_asset || !uv_set || !width || !height || !sample_count ||
+        !max_distance || !seed) {
+        const core::Diagnostic error = !mesh_asset ? mesh_asset.error()
+            : !uv_set ? uv_set.error()
+            : !width ? width.error()
+            : !height ? height.error()
+            : !sample_count ? sample_count.error()
+            : !max_distance ? max_distance.error()
+            : seed.error();
+        print_error(error);
+        return EXIT_FAILURE;
+    }
+    const auto document = project::ProjectDocument::load(project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto mesh = document.value().meshes().find(mesh_asset.value());
+    if (mesh == document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::not_found,
+            "AO bake mesh asset does not exist in the project"));
+        return EXIT_FAILURE;
+    }
+    const std::string mesh_identity = document.value().source_namespace() +
+        "/mesh/" + std::to_string(mesh_asset.value());
+    const auto source_binding = production::bind_bake_source(mesh_identity, mesh->second);
+    const auto target_binding = production::bind_bake_target(
+        mesh_identity, mesh->second, uv_set.value());
+    if (!source_binding || !target_binding) {
+        print_error(!source_binding ? source_binding.error() : target_binding.error());
+        return EXIT_FAILURE;
+    }
+    const auto base_recipe = make_ambient_occlusion_tile_base_recipe(
+        source_binding.value(), target_binding.value(), uv_set.value(),
+        width.value(), height.value(), sample_count.value(), max_distance.value(),
+        seed.value(), mesh_asset.value());
+    if (auto result = base_recipe.validate(); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto tiles = production::enumerate_bake_tiles(mesh->second, uv_set.value());
+    if (!tiles) {
+        print_error(tiles.error());
+        return EXIT_FAILURE;
+    }
+    if (auto result = require_nonsymlink_directory(
+            output_root, "AO tile output"); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto manifest_path = output_root / "receipts.carto-production-receipts";
+    if (auto result = require_nonsymlink_regular_file(
+            manifest_path, "AO tile receipt manifest"); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto ledger_text = read_bounded_text(
+        manifest_path,
+        production::ProductionReceiptLedger::max_serialized_bytes,
+        "AO tile receipt ledger");
+    if (!ledger_text) {
+        print_error(ledger_text.error());
+        return EXIT_FAILURE;
+    }
+    const auto ledger = production::ProductionReceiptLedger::deserialize(ledger_text.value());
+    if (!ledger || ledger.value().size() != tiles.value().size()) {
+        print_error(ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+            "AO tile receipt ledger does not exactly cover the current tile set")
+            : ledger.error());
+        return EXIT_FAILURE;
+    }
+    const std::string platform_profile = ledger.value().records().front().key.platform_profile;
+    const bool profile_is_d3d12 = platform_profile.rfind("carto.d3d12.", 0U) == 0U;
+    if ((d3d12_backend && !profile_is_d3d12) ||
+        (!d3d12_backend && platform_profile != "carto.cpu-reference.v1")) {
+        print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+            "AO tile receipt platform does not match the requested backend"));
+        return EXIT_FAILURE;
+    }
+
+    struct VerifiedTile {
+        production::BakeTileCoordinate tile;
+        assets::Sha256Digest artifact_digest;
+        assets::Sha256Digest payload_digest;
+        assets::Sha256Digest receipt_digest;
+        std::uint64_t covered_texels = 0U;
+        std::uint64_t rays_cast = 0U;
+    };
+    std::vector<bool> consumed(ledger.value().size(), false);
+    std::vector<VerifiedTile> verified_tiles;
+    verified_tiles.reserve(tiles.value().size());
+    try {
+        const auto blob_root = output_root / "blobs";
+        if (auto result = require_nonsymlink_directory(
+                blob_root, "AO tile blob store"); !result) {
+            print_error(result.error());
+            return EXIT_FAILURE;
+        }
+        assets::BlobStore blobs(blob_root);
+        for (const production::BakeTileCoordinate tile : tiles.value()) {
+            const auto recipe = make_ambient_occlusion_tile_recipe(base_recipe, tile);
+            const auto expected_key = production::bake_ambient_occlusion_cook_key(
+                recipe, platform_profile);
+            if (!expected_key) {
+                print_error(expected_key.error());
+                return EXIT_FAILURE;
+            }
+            std::optional<std::size_t> matching_receipt;
+            for (std::size_t index = 0U; index < ledger.value().records().size(); ++index) {
+                if (ledger.value().records()[index].key != expected_key.value()) continue;
+                if (matching_receipt.has_value()) {
+                    print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                        "AO tile ledger contains duplicate receipts for one tile"));
+                    return EXIT_FAILURE;
+                }
+                matching_receipt = index;
+            }
+            if (!matching_receipt.has_value() || consumed[*matching_receipt]) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "AO tile receipt is missing or duplicated"));
+                return EXIT_FAILURE;
+            }
+            consumed[*matching_receipt] = true;
+            const auto& receipt = ledger.value().records()[*matching_receipt];
+            if (receipt.status != production::ReceiptStatus::admitted) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "AO tile receipt is not admitted"));
+                return EXIT_FAILURE;
+            }
+            const auto blob_path = blobs.path_for(receipt.output_digest);
+            if (auto result = require_nonsymlink_regular_file(
+                    blob_path, "AO tile payload"); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto payload = blobs.read(receipt.output_digest);
+            if (!payload || payload.value().size() != receipt.output_bytes ||
+                assets::sha256(payload.value()) != receipt.output_digest) {
+                print_error(payload ? core::Diagnostic(core::ErrorCode::validation_failed,
+                    "AO tile payload disagrees with its production receipt")
+                    : payload.error());
+                return EXIT_FAILURE;
+            }
+            const auto artifact = production::AmbientOcclusionMapArtifact::deserialize(
+                payload.value());
+            if (!artifact) {
+                print_error(artifact.error());
+                return EXIT_FAILURE;
+            }
+            if (artifact.value().recipe.serialize() != recipe.serialize() ||
+                artifact.value().recipe.binding.source.identity != mesh_identity) {
+                print_error(core::Diagnostic(core::ErrorCode::stale_data,
+                    "AO tile recipe does not match the current project and request"));
+                return EXIT_FAILURE;
+            }
+            if (auto result = production::validate_bake_sources(
+                    artifact.value().recipe.binding, mesh->second, mesh->second); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            verified_tiles.push_back(VerifiedTile{
+                tile, artifact.value().artifact_digest, receipt.output_digest,
+                receipt.receipt_digest, artifact.value().covered_texels,
+                artifact.value().rays_cast});
+        }
+        if (std::find(consumed.begin(), consumed.end(), false) != consumed.end()) {
+            print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                "AO tile ledger contains an unexpected receipt"));
+            return EXIT_FAILURE;
+        }
+    } catch (const std::exception& error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            std::string("AO tile inspection failed: ") + error.what()));
+        return EXIT_FAILURE;
+    }
+    for (const VerifiedTile& tile : verified_tiles) {
+        std::cout << "verified kind=ambient-occlusion"
+                  << " verification=artifact-source-receipt-readback"
+                  << " platform_profile=" << std::quoted(platform_profile)
+                  << " mesh=" << mesh_asset.value()
+                  << " uv_set=" << uv_set.value()
+                  << " tile=" << tile.tile.tile_u << ',' << tile.tile.tile_v
+                  << " covered_texels=" << tile.covered_texels
+                  << " rays_cast=" << tile.rays_cast
+                  << " artifact_digest=" << tile.artifact_digest.hex()
+                  << " payload_digest=" << tile.payload_digest.hex()
+                  << " receipt_digest=" << tile.receipt_digest.hex() << '\n';
+    }
+    std::cout << "verified_schedule kind=ambient-occlusion"
+              << " tiles=" << verified_tiles.size()
+              << " source=" << std::quoted(mesh_identity)
+              << " source_revision=" << source_binding.value().revision.value()
+              << " output=" << std::quoted(output_root.string()) << '\n';
+    return EXIT_SUCCESS;
+}
+
+template <typename Recipe, typename Schedule, typename KeyForRecipe,
+    typename PublishArtifact, typename ReadArtifact>
+int publish_scalar_tile_schedule(
+    const std::filesystem::path& project_path,
+    const carto::project::ProjectDocument& original_document,
+    std::uint64_t source_asset,
+    std::uint64_t target_asset,
+    const Recipe& base_recipe,
+    const Schedule& schedule,
+    const std::filesystem::path& output_root,
+    std::string_view map_name,
+    KeyForRecipe&& key_for_recipe,
+    PublishArtifact&& publish_artifact,
+    ReadArtifact&& read_artifact) {
+    using namespace carto;
+    if (schedule.entries.empty()) {
+        print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+            std::string(map_name) + " tile schedule is empty"));
+        return EXIT_FAILURE;
+    }
+    if (output_root.empty() || output_root.filename().empty()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "bake output directory must name a new directory"));
+        return EXIT_FAILURE;
+    }
+    const auto source = original_document.meshes().find(source_asset);
+    const auto target = original_document.meshes().find(target_asset);
+    if (source == original_document.meshes().end() ||
+        target == original_document.meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::stale_data,
+            "scalar bake source or target disappeared before publication"));
+        return EXIT_FAILURE;
+    }
+    const auto current_document = project::ProjectDocument::load(project_path);
+    if (!current_document || current_document.value().source_namespace() !=
+            original_document.source_namespace()) {
+        print_error(current_document ? core::Diagnostic(core::ErrorCode::stale_data,
+            "project source namespace changed while the scalar bake was running")
+            : current_document.error().with_context(
+                "reloading project before scalar tile publication"));
+        return EXIT_FAILURE;
+    }
+    const auto current_source = current_document.value().meshes().find(source_asset);
+    const auto current_target = current_document.value().meshes().find(target_asset);
+    if (current_source == current_document.value().meshes().end() ||
+        current_target == current_document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::stale_data,
+            "scalar bake source or target disappeared while the schedule was running"));
+        return EXIT_FAILURE;
+    }
+    if (auto result = production::validate_bake_sources(
+            base_recipe.binding, current_source->second, current_target->second); !result) {
+        print_error(result.error().with_context(
+            "revalidating scalar bake sources before tile publication"));
+        return EXIT_FAILURE;
+    }
+    std::error_code output_error;
+    const auto parent = output_root.parent_path();
+    if (!parent.empty() &&
+        (!std::filesystem::exists(parent, output_error) || output_error ||
+         !std::filesystem::is_directory(parent, output_error) || output_error)) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            "bake output parent directory is unavailable"));
+        return EXIT_FAILURE;
+    }
+    const auto output_entry = path_entry_exists_no_follow(
+        output_root, std::string(map_name) + " tile output directory");
+    if (!output_entry) {
+        print_error(output_entry.error());
+        return EXIT_FAILURE;
+    }
+    if (output_entry.value()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "bake output directory refuses to overwrite an existing path"));
+        return EXIT_FAILURE;
+    }
+    const auto recipe_digest = base_recipe.canonical_digest();
+    if (!recipe_digest) {
+        print_error(recipe_digest.error());
+        return EXIT_FAILURE;
+    }
+    std::filesystem::path staging_root = output_root;
+    staging_root += ".pending-" + recipe_digest.value().hex().substr(0U, 16U);
+    const auto staging_entry = path_entry_exists_no_follow(
+        staging_root, std::string(map_name) + " tile staging directory");
+    if (!staging_entry) {
+        print_error(staging_entry.error());
+        return EXIT_FAILURE;
+    }
+    if (staging_entry.value()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "bake staging directory already exists and requires inspection"));
+        return EXIT_FAILURE;
+    }
+    output_error.clear();
+    if (!std::filesystem::create_directory(staging_root, output_error) || output_error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            "unable to create the new scalar bake staging directory"));
+        return EXIT_FAILURE;
+    }
+    try {
+        assets::BlobStore blobs(staging_root / "blobs");
+        production::ProductionArtifactStore artifact_store(blobs);
+        const production::AdmissionPolicy policy;
+        for (const auto& entry : schedule.entries) {
+            const auto payload = entry.artifact.serialize();
+            const auto cook_key = key_for_recipe(entry.artifact.recipe);
+            if (!payload || !cook_key) {
+                print_error(!payload ? payload.error() : cook_key.error());
+                return EXIT_FAILURE;
+            }
+            production::ProductionArtifactReceipt receipt;
+            receipt.key = cook_key.value();
+            receipt.status = production::ReceiptStatus::admitted;
+            receipt.output_digest = assets::sha256(payload.value());
+            receipt.output_bytes = payload.value().size();
+            receipt.cost.cook_milliseconds = entry.compile_milliseconds;
+            receipt.cost.disk_bytes = receipt.output_bytes;
+            if (auto result = receipt.refresh_digest(); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            if (auto result = publish_artifact(
+                    artifact_store, receipt, entry.artifact, current_source->second,
+                    current_target->second, policy); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto reopened = read_artifact(artifact_store,
+                entry.artifact.recipe, current_source->second,
+                current_target->second, policy);
+            if (!reopened || reopened.value().artifact_digest !=
+                    entry.artifact.artifact_digest) {
+                print_error(reopened ? core::Diagnostic(core::ErrorCode::validation_failed,
+                    std::string(map_name) +
+                        " tile differs from its compiled artifact after read-back")
+                    : reopened.error());
+                return EXIT_FAILURE;
+            }
+        }
+        const std::string ledger_text = artifact_store.ledger().serialize();
+        const auto ledger = production::ProductionReceiptLedger::deserialize(ledger_text);
+        if (!ledger || ledger.value().size() != schedule.entries.size()) {
+            print_error(ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+                std::string(map_name) + " tile receipt ledger has an unexpected record count")
+                : ledger.error());
+            return EXIT_FAILURE;
+        }
+        const auto manifest_path = staging_root / "receipts.carto-production-receipts";
+        const auto manifest_write = write_new_text_atomically(
+            manifest_path, ledger_text, std::string(map_name) + " tile receipt ledger");
+        if (!manifest_write) {
+            print_error(manifest_write.error());
+            return EXIT_FAILURE;
+        }
+        const auto reopened_manifest = read_bounded_text(
+            manifest_path, production::ProductionReceiptLedger::max_serialized_bytes,
+            std::string(map_name) + " tile receipt ledger");
+        const auto manifest_ledger = reopened_manifest
+            ? production::ProductionReceiptLedger::deserialize(reopened_manifest.value())
+            : Result<production::ProductionReceiptLedger>::failure(reopened_manifest.error());
+        if (!manifest_ledger || manifest_ledger.value().size() != schedule.entries.size()) {
+            print_error(manifest_ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+                std::string(map_name) + " tile receipt manifest failed read-back validation")
+                : manifest_ledger.error());
+            return EXIT_FAILURE;
+        }
+        const auto publication_document = project::ProjectDocument::load(project_path);
+        if (!publication_document || publication_document.value().source_namespace() !=
+                original_document.source_namespace()) {
+            print_error(publication_document ? core::Diagnostic(core::ErrorCode::stale_data,
+                "project source namespace changed before scalar tile publication")
+                : publication_document.error().with_context(
+                    "final project check before scalar tile publication"));
+            return EXIT_FAILURE;
+        }
+        const auto publication_source = publication_document.value().meshes().find(source_asset);
+        const auto publication_target = publication_document.value().meshes().find(target_asset);
+        if (publication_source == publication_document.value().meshes().end() ||
+            publication_target == publication_document.value().meshes().end()) {
+            print_error(core::Diagnostic(core::ErrorCode::stale_data,
+                "scalar bake source or target disappeared before final publication"));
+            return EXIT_FAILURE;
+        }
+        if (auto result = production::validate_bake_sources(
+                base_recipe.binding, publication_source->second,
+                publication_target->second); !result) {
+            print_error(result.error().with_context(
+                "final source check before scalar tile publication"));
+            return EXIT_FAILURE;
+        }
+        output_error.clear();
+        std::filesystem::rename(staging_root, output_root, output_error);
+        if (output_error) {
+            print_error(core::Diagnostic(core::ErrorCode::io_error,
+                "atomic scalar bake output publication failed; inspect the staging directory"));
+            return EXIT_FAILURE;
+        }
+        for (const auto& entry : schedule.entries) {
+            std::cout << "baked kind=" << map_name
+                      << " evidence=carto.cpu-reference"
+                      << " platform_profile=\"carto.cpu-reference.v1\""
+                      << " tile=" << entry.tile.tile_u << ',' << entry.tile.tile_v
+                      << " covered_texels=" << entry.artifact.covered_texels
+                      << " artifact_digest=" << entry.artifact.artifact_digest.hex()
+                      << " output=" << std::quoted(output_root.string()) << '\n';
+        }
+        std::cout << "bake_schedule kind=" << map_name
+                  << " tiles=" << schedule.entries.size()
+                  << " covered_texels=" << schedule.covered_texels
+                  << " compile_milliseconds=" << schedule.compile_milliseconds
+                  << " output=" << std::quoted(output_root.string()) << '\n';
+    } catch (const std::exception& error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            std::string(map_name) + " tile publication failed: " + error.what()));
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+template <typename Recipe, typename Artifact, typename KeyForRecipe,
+    typename DeserializeArtifact>
+int inspect_scalar_tile_outputs(
+    const std::filesystem::path& project_path,
+    const carto::project::ProjectDocument& document,
+    std::uint64_t source_asset,
+    std::uint64_t target_asset,
+    const Recipe& base_recipe,
+    const std::filesystem::path& output_root,
+    std::string_view map_name,
+    KeyForRecipe&& key_for_recipe,
+    DeserializeArtifact&& deserialize_artifact) {
+    using namespace carto;
+    const auto source = document.meshes().find(source_asset);
+    const auto target = document.meshes().find(target_asset);
+    if (source == document.meshes().end() || target == document.meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::not_found,
+            "scalar bake source or target mesh asset does not exist in the project"));
+        return EXIT_FAILURE;
+    }
+    const auto tiles = production::enumerate_bake_tiles(
+        target->second, base_recipe.binding.target_uv_set);
+    if (!tiles) {
+        print_error(tiles.error());
+        return EXIT_FAILURE;
+    }
+    if (auto result = require_nonsymlink_directory(
+            output_root, std::string(map_name) + " tile output"); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto manifest_path = output_root / "receipts.carto-production-receipts";
+    if (auto result = require_nonsymlink_regular_file(
+            manifest_path, std::string(map_name) + " tile receipt manifest"); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto ledger_text = read_bounded_text(manifest_path,
+        production::ProductionReceiptLedger::max_serialized_bytes,
+        std::string(map_name) + " tile receipt ledger");
+    if (!ledger_text) {
+        print_error(ledger_text.error());
+        return EXIT_FAILURE;
+    }
+    const auto ledger = production::ProductionReceiptLedger::deserialize(ledger_text.value());
+    if (!ledger || ledger.value().size() != tiles.value().size()) {
+        print_error(ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+            std::string(map_name) +
+                " tile receipt ledger does not exactly cover the current tile set")
+            : ledger.error());
+        return EXIT_FAILURE;
+    }
+    struct VerifiedScalarTile {
+        production::BakeTileCoordinate tile;
+        assets::Sha256Digest artifact_digest;
+        assets::Sha256Digest payload_digest;
+        assets::Sha256Digest receipt_digest;
+        std::uint64_t covered_texels = 0U;
+    };
+    std::vector<bool> consumed(ledger.value().size(), false);
+    std::vector<VerifiedScalarTile> verified;
+    verified.reserve(tiles.value().size());
+    try {
+        const auto blob_root = output_root / "blobs";
+        if (auto result = require_nonsymlink_directory(
+                blob_root, std::string(map_name) + " tile blob store"); !result) {
+            print_error(result.error());
+            return EXIT_FAILURE;
+        }
+        assets::BlobStore blobs(blob_root);
+        for (const production::BakeTileCoordinate tile : tiles.value()) {
+            const Recipe recipe = scalar_tile_recipe(base_recipe, tile);
+            const auto expected_key = key_for_recipe(recipe);
+            if (!expected_key) {
+                print_error(expected_key.error());
+                return EXIT_FAILURE;
+            }
+            std::optional<std::size_t> matching_receipt;
+            for (std::size_t index = 0U; index < ledger.value().records().size(); ++index) {
+                if (ledger.value().records()[index].key != expected_key.value()) continue;
+                if (matching_receipt.has_value()) {
+                    print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                        std::string(map_name) +
+                            " tile ledger contains duplicate receipts for one tile"));
+                    return EXIT_FAILURE;
+                }
+                matching_receipt = index;
+            }
+            if (!matching_receipt.has_value() || consumed[*matching_receipt]) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    std::string(map_name) + " tile receipt is missing or duplicated"));
+                return EXIT_FAILURE;
+            }
+            consumed[*matching_receipt] = true;
+            const auto& receipt = ledger.value().records()[*matching_receipt];
+            if (receipt.status != production::ReceiptStatus::admitted) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    std::string(map_name) + " tile receipt is not admitted"));
+                return EXIT_FAILURE;
+            }
+            const std::string digest_text = receipt.output_digest.hex();
+            const auto hash_root = blob_root / "sha256";
+            const auto first_prefix = hash_root / digest_text.substr(0U, 2U);
+            const auto second_prefix = first_prefix / digest_text.substr(2U, 2U);
+            if (auto result = require_nonsymlink_directory(
+                    hash_root, std::string(map_name) + " tile blob hash root"); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            if (auto result = require_nonsymlink_directory(
+                    first_prefix, std::string(map_name) + " tile blob prefix"); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            if (auto result = require_nonsymlink_directory(
+                    second_prefix, std::string(map_name) + " tile blob prefix"); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto blob_path = blobs.path_for(receipt.output_digest);
+            if (auto result = require_nonsymlink_regular_file(
+                    blob_path, std::string(map_name) + " tile payload"); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto payload = blobs.read(receipt.output_digest);
+            if (!payload || payload.value().size() != receipt.output_bytes ||
+                assets::sha256(payload.value()) != receipt.output_digest) {
+                print_error(payload ? core::Diagnostic(core::ErrorCode::validation_failed,
+                    std::string(map_name) + " tile payload disagrees with its receipt")
+                    : payload.error());
+                return EXIT_FAILURE;
+            }
+            const auto artifact = deserialize_artifact(payload.value());
+            if (!artifact) {
+                print_error(artifact.error());
+                return EXIT_FAILURE;
+            }
+            if (artifact.value().recipe.serialize() != recipe.serialize()) {
+                print_error(core::Diagnostic(core::ErrorCode::stale_data,
+                    std::string(map_name) +
+                        " tile recipe does not match the current project and request"));
+                return EXIT_FAILURE;
+            }
+            if (auto result = production::validate_bake_sources(
+                    artifact.value().recipe.binding, source->second, target->second); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            verified.push_back(VerifiedScalarTile{
+                tile, artifact.value().artifact_digest, receipt.output_digest,
+                receipt.receipt_digest, artifact.value().covered_texels});
+        }
+        if (std::find(consumed.begin(), consumed.end(), false) != consumed.end()) {
+            print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                std::string(map_name) + " tile ledger contains an unexpected receipt"));
+            return EXIT_FAILURE;
+        }
+    } catch (const std::exception& error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            std::string(map_name) + " tile inspection failed: " + error.what()));
+        return EXIT_FAILURE;
+    }
+    const auto current_document = project::ProjectDocument::load(project_path);
+    if (!current_document || current_document.value().source_namespace() !=
+            document.source_namespace()) {
+        print_error(current_document ? core::Diagnostic(core::ErrorCode::stale_data,
+            "project source namespace changed during scalar tile inspection")
+            : current_document.error().with_context(
+                "final project check after scalar tile inspection"));
+        return EXIT_FAILURE;
+    }
+    const auto current_source = current_document.value().meshes().find(source_asset);
+    const auto current_target = current_document.value().meshes().find(target_asset);
+    if (current_source == current_document.value().meshes().end() ||
+        current_target == current_document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::stale_data,
+            "scalar bake source or target disappeared during inspection"));
+        return EXIT_FAILURE;
+    }
+    if (auto result = production::validate_bake_sources(
+            base_recipe.binding, current_source->second, current_target->second); !result) {
+        print_error(result.error().with_context(
+            "final source check after scalar tile inspection"));
+        return EXIT_FAILURE;
+    }
+    for (const VerifiedScalarTile& tile : verified) {
+        std::cout << "verified kind=" << map_name
+                  << " verification=artifact-source-receipt-readback"
+                  << " platform_profile=\"carto.cpu-reference.v1\""
+                  << " tile=" << tile.tile.tile_u << ',' << tile.tile.tile_v
+                  << " covered_texels=" << tile.covered_texels
+                  << " artifact_digest=" << tile.artifact_digest.hex()
+                  << " payload_digest=" << tile.payload_digest.hex()
+                  << " receipt_digest=" << tile.receipt_digest.hex() << '\n';
+    }
+    std::cout << "verified_schedule kind=" << map_name
+              << " tiles=" << verified.size()
+              << " source=" << std::quoted(base_recipe.binding.source.identity)
+              << " target=" << std::quoted(base_recipe.binding.target.identity)
+              << " output=" << std::quoted(output_root.string()) << '\n';
+    return EXIT_SUCCESS;
+}
+
+struct ScalarTileRequest {
+    std::filesystem::path project_path;
+    std::uint64_t source_asset = 0U;
+    std::uint64_t target_asset = 0U;
+    std::uint32_t uv_set = 0U;
+    std::uint32_t width = 0U;
+    std::uint32_t height = 0U;
+    double projection_half_extent = 0.0;
+    bool reject_projection_misses = false;
+};
+
+Result<ScalarTileRequest> parse_scalar_tile_request(char** argv) {
+    const auto source_asset = parse_mesh_asset_id_argument(argv[3]);
+    const auto target_asset = parse_mesh_asset_id_argument(argv[4]);
+    const auto uv_set = parse_bake_u32_argument(argv[5], "UV set id");
+    const auto width = parse_bake_u32_argument(argv[6], "texture width");
+    const auto height = parse_bake_u32_argument(argv[7], "texture height");
+    const auto half_extent = parse_bake_positive_double_argument(
+        argv[8], "projection half extent");
+    const std::string_view reject_misses(argv[9]);
+    if (!source_asset || !target_asset || !uv_set || !width || !height ||
+        !half_extent || (reject_misses != "0" && reject_misses != "1")) {
+        const carto::core::Diagnostic error = !source_asset ? source_asset.error()
+            : !target_asset ? target_asset.error()
+            : !uv_set ? uv_set.error()
+            : !width ? width.error()
+            : !height ? height.error()
+            : !half_extent ? half_extent.error()
+            : carto::core::Diagnostic(carto::core::ErrorCode::invalid_argument,
+                "reject-projection-misses must be 0 or 1");
+        return Result<ScalarTileRequest>::failure(error);
+    }
+    return Result<ScalarTileRequest>::success(ScalarTileRequest{
+        std::filesystem::path(argv[2]), source_asset.value(), target_asset.value(),
+        uv_set.value(), width.value(), height.value(), half_extent.value(),
+        reject_misses == "1"});
+}
+
+int bake_curvature_tiles_cpu(char** argv) {
+    using namespace carto;
+    const auto request = parse_scalar_tile_request(argv);
+    const auto normalization_scale = parse_bake_positive_double_argument(
+        argv[10], "curvature normalization scale");
+    if (!request || !normalization_scale) {
+        print_error(request ? normalization_scale.error() : request.error());
+        return EXIT_FAILURE;
+    }
+    const std::filesystem::path output_root(argv[11]);
+    const auto document = project::ProjectDocument::load(request.value().project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto base_recipe = make_scalar_tile_base_recipe<production::CurvatureRecipe>(
+        document.value(), request.value().source_asset, request.value().target_asset,
+        request.value().uv_set, request.value().width, request.value().height,
+        request.value().projection_half_extent, request.value().reject_projection_misses,
+        "curvature", [&normalization_scale](auto& recipe) {
+            recipe.normalization_scale = normalization_scale.value();
+        });
+    if (!base_recipe) {
+        print_error(base_recipe.error());
+        return EXIT_FAILURE;
+    }
+    const auto source = document.value().meshes().find(request.value().source_asset);
+    const auto target = document.value().meshes().find(request.value().target_asset);
+    const auto schedule = production::schedule_curvature_tiles_cpu(
+        base_recipe.value(), source->second, target->second);
+    if (!schedule) {
+        print_error(schedule.error());
+        return EXIT_FAILURE;
+    }
+    return publish_scalar_tile_schedule(
+        request.value().project_path, document.value(), request.value().source_asset,
+        request.value().target_asset, base_recipe.value(), schedule.value(),
+        output_root, "curvature",
+        [](const production::CurvatureRecipe& recipe) {
+            return production::bake_curvature_cook_key(
+                recipe, "carto.cpu-reference.v1");
+        },
+        [](production::ProductionArtifactStore& store,
+            production::ProductionArtifactReceipt receipt,
+            const production::CurvatureMapArtifact& artifact,
+            const geometry::EditableMesh& current_source,
+            const geometry::EditableMesh& current_target,
+            const production::AdmissionPolicy& policy) {
+            return production::publish_curvature_map(store, std::move(receipt),
+                artifact, current_source, current_target, policy,
+                "carto.cpu-reference.v1");
+        },
+        [](const production::ProductionArtifactStore& store,
+            const production::CurvatureRecipe& recipe,
+            const geometry::EditableMesh& current_source,
+            const geometry::EditableMesh& current_target,
+            const production::AdmissionPolicy& policy) {
+            return production::read_curvature_map(store, recipe,
+                current_source, current_target, policy, "carto.cpu-reference.v1");
+        });
+}
+
+int inspect_curvature_tiles(char** argv) {
+    using namespace carto;
+    const auto request = parse_scalar_tile_request(argv);
+    const auto normalization_scale = parse_bake_positive_double_argument(
+        argv[10], "curvature normalization scale");
+    if (!request || !normalization_scale) {
+        print_error(request ? normalization_scale.error() : request.error());
+        return EXIT_FAILURE;
+    }
+    const auto document = project::ProjectDocument::load(request.value().project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto base_recipe = make_scalar_tile_base_recipe<production::CurvatureRecipe>(
+        document.value(), request.value().source_asset, request.value().target_asset,
+        request.value().uv_set, request.value().width, request.value().height,
+        request.value().projection_half_extent, request.value().reject_projection_misses,
+        "curvature", [&normalization_scale](auto& recipe) {
+            recipe.normalization_scale = normalization_scale.value();
+        });
+    if (!base_recipe) {
+        print_error(base_recipe.error());
+        return EXIT_FAILURE;
+    }
+    return inspect_scalar_tile_outputs<production::CurvatureRecipe,
+        production::CurvatureMapArtifact>(
+            request.value().project_path, document.value(),
+            request.value().source_asset, request.value().target_asset,
+            base_recipe.value(), argv[11], "curvature",
+            [](const production::CurvatureRecipe& recipe) {
+                return production::bake_curvature_cook_key(
+                    recipe, "carto.cpu-reference.v1");
+            },
+            [](std::span<const std::uint8_t> payload) {
+                return production::CurvatureMapArtifact::deserialize(payload);
+            });
+}
+
+int bake_thickness_tiles_cpu(char** argv) {
+    using namespace carto;
+    const auto request = parse_scalar_tile_request(argv);
+    const auto maximum_distance = parse_bake_positive_double_argument(
+        argv[10], "thickness maximum distance");
+    const auto surface_bias = parse_bake_positive_double_argument(
+        argv[11], "thickness surface bias");
+    const std::string_view reject_misses(argv[12]);
+    if (!request || !maximum_distance || !surface_bias ||
+        (reject_misses != "0" && reject_misses != "1")) {
+        const core::Diagnostic error = !request ? request.error()
+            : !maximum_distance ? maximum_distance.error()
+            : !surface_bias ? surface_bias.error()
+            : core::Diagnostic(core::ErrorCode::invalid_argument,
+                "reject-thickness-misses must be 0 or 1");
+        print_error(error);
+        return EXIT_FAILURE;
+    }
+    const std::filesystem::path output_root(argv[13]);
+    const auto document = project::ProjectDocument::load(request.value().project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto base_recipe = make_scalar_tile_base_recipe<production::ThicknessRecipe>(
+        document.value(), request.value().source_asset, request.value().target_asset,
+        request.value().uv_set, request.value().width, request.value().height,
+        request.value().projection_half_extent, request.value().reject_projection_misses,
+        "thickness", [&maximum_distance, &surface_bias, reject_misses](auto& recipe) {
+            recipe.maximum_distance = maximum_distance.value();
+            recipe.surface_bias = surface_bias.value();
+            recipe.reject_thickness_misses = reject_misses == "1";
+        });
+    if (!base_recipe) {
+        print_error(base_recipe.error());
+        return EXIT_FAILURE;
+    }
+    const auto source = document.value().meshes().find(request.value().source_asset);
+    const auto target = document.value().meshes().find(request.value().target_asset);
+    const auto schedule = production::schedule_thickness_tiles_cpu(
+        base_recipe.value(), source->second, target->second);
+    if (!schedule) {
+        print_error(schedule.error());
+        return EXIT_FAILURE;
+    }
+    return publish_scalar_tile_schedule(
+        request.value().project_path, document.value(), request.value().source_asset,
+        request.value().target_asset, base_recipe.value(), schedule.value(),
+        output_root, "thickness",
+        [](const production::ThicknessRecipe& recipe) {
+            return production::bake_thickness_cook_key(
+                recipe, "carto.cpu-reference.v1");
+        },
+        [](production::ProductionArtifactStore& store,
+            production::ProductionArtifactReceipt receipt,
+            const production::ThicknessMapArtifact& artifact,
+            const geometry::EditableMesh& current_source,
+            const geometry::EditableMesh& current_target,
+            const production::AdmissionPolicy& policy) {
+            return production::publish_thickness_map(store, std::move(receipt),
+                artifact, current_source, current_target, policy,
+                "carto.cpu-reference.v1");
+        },
+        [](const production::ProductionArtifactStore& store,
+            const production::ThicknessRecipe& recipe,
+            const geometry::EditableMesh& current_source,
+            const geometry::EditableMesh& current_target,
+            const production::AdmissionPolicy& policy) {
+            return production::read_thickness_map(store, recipe,
+                current_source, current_target, policy, "carto.cpu-reference.v1");
+        });
+}
+
+int inspect_thickness_tiles(char** argv) {
+    using namespace carto;
+    const auto request = parse_scalar_tile_request(argv);
+    const auto maximum_distance = parse_bake_positive_double_argument(
+        argv[10], "thickness maximum distance");
+    const auto surface_bias = parse_bake_positive_double_argument(
+        argv[11], "thickness surface bias");
+    const std::string_view reject_misses(argv[12]);
+    if (!request || !maximum_distance || !surface_bias ||
+        (reject_misses != "0" && reject_misses != "1")) {
+        const core::Diagnostic error = !request ? request.error()
+            : !maximum_distance ? maximum_distance.error()
+            : !surface_bias ? surface_bias.error()
+            : core::Diagnostic(core::ErrorCode::invalid_argument,
+                "reject-thickness-misses must be 0 or 1");
+        print_error(error);
+        return EXIT_FAILURE;
+    }
+    const auto document = project::ProjectDocument::load(request.value().project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto base_recipe = make_scalar_tile_base_recipe<production::ThicknessRecipe>(
+        document.value(), request.value().source_asset, request.value().target_asset,
+        request.value().uv_set, request.value().width, request.value().height,
+        request.value().projection_half_extent, request.value().reject_projection_misses,
+        "thickness", [&maximum_distance, &surface_bias, reject_misses](auto& recipe) {
+            recipe.maximum_distance = maximum_distance.value();
+            recipe.surface_bias = surface_bias.value();
+            recipe.reject_thickness_misses = reject_misses == "1";
+        });
+    if (!base_recipe) {
+        print_error(base_recipe.error());
+        return EXIT_FAILURE;
+    }
+    return inspect_scalar_tile_outputs<production::ThicknessRecipe,
+        production::ThicknessMapArtifact>(
+            request.value().project_path, document.value(),
+            request.value().source_asset, request.value().target_asset,
+            base_recipe.value(), argv[13], "thickness",
+            [](const production::ThicknessRecipe& recipe) {
+                return production::bake_thickness_cook_key(
+                    recipe, "carto.cpu-reference.v1");
+            },
+            [](std::span<const std::uint8_t> payload) {
+                return production::ThicknessMapArtifact::deserialize(payload);
+            });
+}
+
+int bake_height_displacement_tiles_cpu(char** argv) {
+    using namespace carto;
+    const auto request = parse_scalar_tile_request(argv);
+    const auto normalization_distance = parse_bake_positive_double_argument(
+        argv[10], "height-displacement normalization distance");
+    const std::string_view reject_clamps(argv[11]);
+    if (!request || !normalization_distance ||
+        (reject_clamps != "0" && reject_clamps != "1")) {
+        const core::Diagnostic error = !request ? request.error()
+            : !normalization_distance ? normalization_distance.error()
+            : core::Diagnostic(core::ErrorCode::invalid_argument,
+                "reject-clamped-samples must be 0 or 1");
+        print_error(error);
+        return EXIT_FAILURE;
+    }
+    const std::filesystem::path output_root(argv[12]);
+    const auto document = project::ProjectDocument::load(request.value().project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto base_recipe = make_scalar_tile_base_recipe<
+        production::HeightDisplacementRecipe>(
+            document.value(), request.value().source_asset, request.value().target_asset,
+            request.value().uv_set, request.value().width, request.value().height,
+            request.value().projection_half_extent,
+            request.value().reject_projection_misses, "height-displacement",
+            [&normalization_distance, reject_clamps](auto& recipe) {
+                recipe.normalization_distance = normalization_distance.value();
+                recipe.reject_clamped_samples = reject_clamps == "1";
+            });
+    if (!base_recipe) {
+        print_error(base_recipe.error());
+        return EXIT_FAILURE;
+    }
+    const auto source = document.value().meshes().find(request.value().source_asset);
+    const auto target = document.value().meshes().find(request.value().target_asset);
+    const auto schedule = production::schedule_height_displacement_tiles_cpu(
+        base_recipe.value(), source->second, target->second);
+    if (!schedule) {
+        print_error(schedule.error());
+        return EXIT_FAILURE;
+    }
+    return publish_scalar_tile_schedule(
+        request.value().project_path, document.value(), request.value().source_asset,
+        request.value().target_asset, base_recipe.value(), schedule.value(),
+        output_root, "height-displacement",
+        [](const production::HeightDisplacementRecipe& recipe) {
+            return production::bake_height_displacement_cook_key(
+                recipe, "carto.cpu-reference.v1");
+        },
+        [](production::ProductionArtifactStore& store,
+            production::ProductionArtifactReceipt receipt,
+            const production::HeightDisplacementMapArtifact& artifact,
+            const geometry::EditableMesh& current_source,
+            const geometry::EditableMesh& current_target,
+            const production::AdmissionPolicy& policy) {
+            return production::publish_height_displacement_map(store,
+                std::move(receipt), artifact, current_source, current_target,
+                policy, "carto.cpu-reference.v1");
+        },
+        [](const production::ProductionArtifactStore& store,
+            const production::HeightDisplacementRecipe& recipe,
+            const geometry::EditableMesh& current_source,
+            const geometry::EditableMesh& current_target,
+            const production::AdmissionPolicy& policy) {
+            return production::read_height_displacement_map(store, recipe,
+                current_source, current_target, policy, "carto.cpu-reference.v1");
+        });
+}
+
+int inspect_height_displacement_tiles(char** argv) {
+    using namespace carto;
+    const auto request = parse_scalar_tile_request(argv);
+    const auto normalization_distance = parse_bake_positive_double_argument(
+        argv[10], "height-displacement normalization distance");
+    const std::string_view reject_clamps(argv[11]);
+    if (!request || !normalization_distance ||
+        (reject_clamps != "0" && reject_clamps != "1")) {
+        const core::Diagnostic error = !request ? request.error()
+            : !normalization_distance ? normalization_distance.error()
+            : core::Diagnostic(core::ErrorCode::invalid_argument,
+                "reject-clamped-samples must be 0 or 1");
+        print_error(error);
+        return EXIT_FAILURE;
+    }
+    const auto document = project::ProjectDocument::load(request.value().project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto base_recipe = make_scalar_tile_base_recipe<
+        production::HeightDisplacementRecipe>(
+            document.value(), request.value().source_asset, request.value().target_asset,
+            request.value().uv_set, request.value().width, request.value().height,
+            request.value().projection_half_extent,
+            request.value().reject_projection_misses, "height-displacement",
+            [&normalization_distance, reject_clamps](auto& recipe) {
+                recipe.normalization_distance = normalization_distance.value();
+                recipe.reject_clamped_samples = reject_clamps == "1";
+            });
+    if (!base_recipe) {
+        print_error(base_recipe.error());
+        return EXIT_FAILURE;
+    }
+    return inspect_scalar_tile_outputs<production::HeightDisplacementRecipe,
+        production::HeightDisplacementMapArtifact>(
+            request.value().project_path, document.value(),
+            request.value().source_asset, request.value().target_asset,
+            base_recipe.value(), argv[12], "height-displacement",
+            [](const production::HeightDisplacementRecipe& recipe) {
+                return production::bake_height_displacement_cook_key(
+                    recipe, "carto.cpu-reference.v1");
+            },
+            [](std::span<const std::uint8_t> payload) {
+                return production::HeightDisplacementMapArtifact::deserialize(payload);
+            });
+}
+
+int bake_world_position_tiles_cpu(char** argv) {
+    using namespace carto;
+    const std::filesystem::path project_path(argv[2]);
+    const auto target_node = parse_bake_u64_argument(argv[3], "target scene node ID");
+    const auto uv_set = parse_bake_u32_argument(argv[4], "UV set ID");
+    const auto width = parse_bake_u32_argument(argv[5], "texture width");
+    const auto height = parse_bake_u32_argument(argv[6], "texture height");
+    const std::filesystem::path output_root(argv[7]);
+    if (!target_node || !uv_set || !width || !height) {
+        const core::Diagnostic error = !target_node ? target_node.error()
+            : !uv_set ? uv_set.error()
+            : !width ? width.error() : height.error();
+        print_error(error);
+        return EXIT_FAILURE;
+    }
+    const auto document = project::ProjectDocument::load(project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto base_recipe = production::bind_world_position_recipe(
+        "bake/world-position/node/" + std::to_string(target_node.value()) +
+            "/uv/" + std::to_string(uv_set.value()),
+        document.value(), target_node.value(), uv_set.value(), width.value(),
+        height.value());
+    if (!base_recipe) {
+        print_error(base_recipe.error());
+        return EXIT_FAILURE;
+    }
+    const auto schedule = production::schedule_world_position_tiles_cpu(
+        base_recipe.value(), document.value());
+    if (!schedule) {
+        print_error(schedule.error());
+        return EXIT_FAILURE;
+    }
+    if (output_root.empty() || output_root.filename().empty()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "bake output directory must name a new directory"));
+        return EXIT_FAILURE;
+    }
+    if (auto result = production::validate_world_position_source(
+            base_recipe.value(), document.value()); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    std::error_code output_error;
+    const auto parent = output_root.parent_path();
+    if (!parent.empty() &&
+        (!std::filesystem::exists(parent, output_error) || output_error ||
+         !std::filesystem::is_directory(parent, output_error) || output_error)) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            "bake output parent directory is unavailable"));
+        return EXIT_FAILURE;
+    }
+    const auto output_entry = path_entry_exists_no_follow(
+        output_root, "world-position tile output directory");
+    if (!output_entry) {
+        print_error(output_entry.error());
+        return EXIT_FAILURE;
+    }
+    if (output_entry.value()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "bake output directory refuses to overwrite an existing path"));
+        return EXIT_FAILURE;
+    }
+    const auto recipe_digest = base_recipe.value().canonical_digest();
+    if (!recipe_digest) {
+        print_error(recipe_digest.error());
+        return EXIT_FAILURE;
+    }
+    std::filesystem::path staging_root = output_root;
+    staging_root += ".pending-" + recipe_digest.value().hex().substr(0U, 16U);
+    const auto staging_entry = path_entry_exists_no_follow(
+        staging_root, "world-position tile staging directory");
+    if (!staging_entry) {
+        print_error(staging_entry.error());
+        return EXIT_FAILURE;
+    }
+    if (staging_entry.value()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "bake staging directory already exists and requires inspection"));
+        return EXIT_FAILURE;
+    }
+    output_error.clear();
+    if (!std::filesystem::create_directory(staging_root, output_error) || output_error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            "unable to create the new world-position staging directory"));
+        return EXIT_FAILURE;
+    }
+    try {
+        assets::BlobStore blobs(staging_root / "blobs");
+        production::ProductionArtifactStore artifact_store(blobs);
+        const production::AdmissionPolicy policy;
+        const production::AuthoritativeSource source{
+            base_recipe.value().source_namespace,
+            base_recipe.value().source_revision,
+            base_recipe.value().source_digest};
+        for (const auto& entry : schedule.value().entries) {
+            if (auto result = entry.artifact.validate(); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            if (auto result = production::validate_world_position_source(
+                    entry.artifact.recipe, document.value()); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto payload = entry.artifact.serialize();
+            const auto cook_key = production::world_position_cook_key(
+                entry.artifact.recipe, "carto.cpu-reference.v1");
+            if (!payload || !cook_key) {
+                print_error(!payload ? payload.error() : cook_key.error());
+                return EXIT_FAILURE;
+            }
+            production::ProductionArtifactReceipt receipt;
+            receipt.key = cook_key.value();
+            receipt.status = production::ReceiptStatus::admitted;
+            receipt.output_digest = assets::sha256(payload.value());
+            receipt.output_bytes = payload.value().size();
+            receipt.cost.cook_milliseconds = entry.compile_milliseconds;
+            receipt.cost.disk_bytes = receipt.output_bytes;
+            if (auto result = receipt.refresh_digest(); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            if (auto result = artifact_store.publish(receipt,
+                    std::span<const std::uint8_t>{payload.value()}, source, policy); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto reopened = artifact_store.read(cook_key.value(), source, policy);
+            const auto reopened_artifact = reopened
+                ? production::WorldPositionMapArtifact::deserialize(reopened.value())
+                : Result<production::WorldPositionMapArtifact>::failure(reopened.error());
+            if (!reopened_artifact || reopened_artifact.value().artifact_digest !=
+                    entry.artifact.artifact_digest) {
+                print_error(reopened_artifact ? core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "world-position tile differs after artifact read-back")
+                    : reopened_artifact.error());
+                return EXIT_FAILURE;
+            }
+        }
+        const std::string ledger_text = artifact_store.ledger().serialize();
+        const auto ledger = production::ProductionReceiptLedger::deserialize(ledger_text);
+        if (!ledger || ledger.value().size() != schedule.value().entries.size()) {
+            print_error(ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+                "world-position tile receipt ledger has an unexpected record count")
+                : ledger.error());
+            return EXIT_FAILURE;
+        }
+        const auto manifest_path = staging_root / "receipts.carto-production-receipts";
+        const auto manifest_write = write_new_text_atomically(
+            manifest_path, ledger_text, "world-position tile receipt ledger");
+        if (!manifest_write) {
+            print_error(manifest_write.error());
+            return EXIT_FAILURE;
+        }
+        const auto reopened_manifest = read_bounded_text(
+            manifest_path, production::ProductionReceiptLedger::max_serialized_bytes,
+            "world-position tile receipt ledger");
+        const auto manifest_ledger = reopened_manifest
+            ? production::ProductionReceiptLedger::deserialize(reopened_manifest.value())
+            : Result<production::ProductionReceiptLedger>::failure(reopened_manifest.error());
+        if (!manifest_ledger || manifest_ledger.value().size() != schedule.value().entries.size()) {
+            print_error(manifest_ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+                "world-position tile receipt manifest failed read-back validation")
+                : manifest_ledger.error());
+            return EXIT_FAILURE;
+        }
+        const auto publication_document = project::ProjectDocument::load(project_path);
+        if (!publication_document) {
+            print_error(publication_document.error().with_context(
+                "final project check before world-position tile publication"));
+            return EXIT_FAILURE;
+        }
+        if (auto result = production::validate_world_position_source(
+                base_recipe.value(), publication_document.value()); !result) {
+            print_error(result.error().with_context(
+                "final source check before world-position tile publication"));
+            return EXIT_FAILURE;
+        }
+        output_error.clear();
+        std::filesystem::rename(staging_root, output_root, output_error);
+        if (output_error) {
+            print_error(core::Diagnostic(core::ErrorCode::io_error,
+                "atomic world-position output publication failed; inspect the staging directory"));
+            return EXIT_FAILURE;
+        }
+        std::cout << "bake_schedule kind=world-position"
+                  << " tiles=" << schedule.value().entries.size()
+                  << " covered_texels=" << schedule.value().covered_texels
+                  << " compile_milliseconds=" << schedule.value().compile_milliseconds
+                  << " output=" << std::quoted(output_root.string()) << '\n';
+    } catch (const std::exception& error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            std::string("world-position tile publication failed: ") + error.what()));
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+int inspect_world_position_tiles(char** argv) {
+    using namespace carto;
+    const std::filesystem::path project_path(argv[2]);
+    const auto target_node = parse_bake_u64_argument(argv[3], "target scene node ID");
+    const auto uv_set = parse_bake_u32_argument(argv[4], "UV set ID");
+    const auto width = parse_bake_u32_argument(argv[5], "texture width");
+    const auto height = parse_bake_u32_argument(argv[6], "texture height");
+    const std::filesystem::path output_root(argv[7]);
+    if (!target_node || !uv_set || !width || !height) {
+        const core::Diagnostic error = !target_node ? target_node.error()
+            : !uv_set ? uv_set.error()
+            : !width ? width.error() : height.error();
+        print_error(error);
+        return EXIT_FAILURE;
+    }
+    const auto document = project::ProjectDocument::load(project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto base_recipe = production::bind_world_position_recipe(
+        "bake/world-position/node/" + std::to_string(target_node.value()) +
+            "/uv/" + std::to_string(uv_set.value()),
+        document.value(), target_node.value(), uv_set.value(), width.value(),
+        height.value());
+    if (!base_recipe) {
+        print_error(base_recipe.error());
+        return EXIT_FAILURE;
+    }
+    if (auto result = production::validate_world_position_source(
+            base_recipe.value(), document.value()); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto target = document.value().meshes().find(
+        base_recipe.value().target_mesh_asset);
+    if (target == document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::stale_data,
+            "world-position target mesh is missing"));
+        return EXIT_FAILURE;
+    }
+    const auto tiles = production::enumerate_bake_tiles(
+        target->second, base_recipe.value().target_uv_set);
+    if (!tiles) {
+        print_error(tiles.error());
+        return EXIT_FAILURE;
+    }
+    if (auto result = require_nonsymlink_directory(
+            output_root, "world-position tile output"); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto manifest_path = output_root / "receipts.carto-production-receipts";
+    if (auto result = require_nonsymlink_regular_file(
+            manifest_path, "world-position tile receipt manifest"); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto ledger_text = read_bounded_text(manifest_path,
+        production::ProductionReceiptLedger::max_serialized_bytes,
+        "world-position tile receipt ledger");
+    if (!ledger_text) {
+        print_error(ledger_text.error());
+        return EXIT_FAILURE;
+    }
+    const auto ledger = production::ProductionReceiptLedger::deserialize(ledger_text.value());
+    if (!ledger || ledger.value().size() != tiles.value().size()) {
+        print_error(ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+            "world-position receipt ledger does not exactly cover current target tiles")
+            : ledger.error());
+        return EXIT_FAILURE;
+    }
+    struct VerifiedWorldPositionTile {
+        production::BakeTileCoordinate tile;
+        assets::Sha256Digest artifact_digest;
+        assets::Sha256Digest payload_digest;
+        assets::Sha256Digest receipt_digest;
+        std::uint64_t covered_texels = 0U;
+    };
+    std::vector<bool> consumed(ledger.value().size(), false);
+    std::vector<VerifiedWorldPositionTile> verified;
+    verified.reserve(tiles.value().size());
+    try {
+        const auto blob_root = output_root / "blobs";
+        if (auto result = require_nonsymlink_directory(
+                blob_root, "world-position tile blob store"); !result) {
+            print_error(result.error());
+            return EXIT_FAILURE;
+        }
+        assets::BlobStore blobs(blob_root);
+        for (const production::BakeTileCoordinate tile : tiles.value()) {
+            auto recipe = base_recipe.value();
+            recipe.tile_u = tile.tile_u;
+            recipe.tile_v = tile.tile_v;
+            recipe.identity += "/tile/" + std::to_string(tile.tile_u) + "/" +
+                std::to_string(tile.tile_v);
+            const auto expected_key = production::world_position_cook_key(
+                recipe, "carto.cpu-reference.v1");
+            if (!expected_key) {
+                print_error(expected_key.error());
+                return EXIT_FAILURE;
+            }
+            std::optional<std::size_t> matching_receipt;
+            for (std::size_t index = 0U; index < ledger.value().records().size(); ++index) {
+                if (ledger.value().records()[index].key != expected_key.value()) continue;
+                if (matching_receipt.has_value()) {
+                    print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                        "world-position ledger contains duplicate tile receipts"));
+                    return EXIT_FAILURE;
+                }
+                matching_receipt = index;
+            }
+            if (!matching_receipt.has_value() || consumed[*matching_receipt]) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "world-position tile receipt is missing or duplicated"));
+                return EXIT_FAILURE;
+            }
+            consumed[*matching_receipt] = true;
+            const auto& receipt = ledger.value().records()[*matching_receipt];
+            if (receipt.status != production::ReceiptStatus::admitted) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "world-position tile receipt is not admitted"));
+                return EXIT_FAILURE;
+            }
+            const std::string digest_text = receipt.output_digest.hex();
+            const auto hash_root = blob_root / "sha256";
+            const auto first_prefix = hash_root / digest_text.substr(0U, 2U);
+            const auto second_prefix = first_prefix / digest_text.substr(2U, 2U);
+            if (auto result = require_nonsymlink_directory(
+                    hash_root, "world-position blob hash root"); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            if (auto result = require_nonsymlink_directory(
+                    first_prefix, "world-position blob prefix"); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            if (auto result = require_nonsymlink_directory(
+                    second_prefix, "world-position blob prefix"); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto blob_path = blobs.path_for(receipt.output_digest);
+            if (auto result = require_nonsymlink_regular_file(
+                    blob_path, "world-position tile payload"); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto payload = blobs.read(receipt.output_digest);
+            if (!payload || payload.value().size() != receipt.output_bytes ||
+                assets::sha256(payload.value()) != receipt.output_digest) {
+                print_error(payload ? core::Diagnostic(core::ErrorCode::validation_failed,
+                    "world-position tile payload disagrees with its receipt")
+                    : payload.error());
+                return EXIT_FAILURE;
+            }
+            const auto artifact = production::WorldPositionMapArtifact::deserialize(
+                payload.value());
+            if (!artifact) {
+                print_error(artifact.error());
+                return EXIT_FAILURE;
+            }
+            if (artifact.value().recipe.serialize() != recipe.serialize()) {
+                print_error(core::Diagnostic(core::ErrorCode::stale_data,
+                    "world-position recipe does not match the current project and tile"));
+                return EXIT_FAILURE;
+            }
+            if (auto result = production::validate_world_position_source(
+                    artifact.value().recipe, document.value()); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto expected = production::compile_world_position_cpu(
+                recipe, document.value());
+            if (!expected.succeeded() || !expected.artifact.has_value()) {
+                print_error(core::Diagnostic(core::ErrorCode::stale_data,
+                    "world-position reference no longer produces the inspected tile"));
+                return EXIT_FAILURE;
+            }
+            const auto expected_bytes = expected.artifact->serialize();
+            if (!expected_bytes || expected_bytes.value() != payload.value()) {
+                print_error(expected_bytes ? core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "world-position payload differs from current CPU reference output")
+                    : expected_bytes.error());
+                return EXIT_FAILURE;
+            }
+            verified.push_back(VerifiedWorldPositionTile{
+                tile, artifact.value().artifact_digest, receipt.output_digest,
+                receipt.receipt_digest, artifact.value().covered_texels});
+        }
+        if (std::find(consumed.begin(), consumed.end(), false) != consumed.end()) {
+            print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                "world-position ledger contains an unexpected tile receipt"));
+            return EXIT_FAILURE;
+        }
+    } catch (const std::exception& error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            std::string("world-position tile inspection failed: ") + error.what()));
+        return EXIT_FAILURE;
+    }
+    const auto current_document = project::ProjectDocument::load(project_path);
+    if (!current_document) {
+        print_error(current_document.error().with_context(
+            "final project check after world-position inspection"));
+        return EXIT_FAILURE;
+    }
+    if (auto result = production::validate_world_position_source(
+            base_recipe.value(), current_document.value()); !result) {
+        print_error(result.error().with_context(
+            "final source check after world-position inspection"));
+        return EXIT_FAILURE;
+    }
+    for (const VerifiedWorldPositionTile& tile : verified) {
+        std::cout << "verified kind=world-position"
+                  << " verification=artifact-source-receipt-readback"
+                  << " platform_profile=\"carto.cpu-reference.v1\""
+                  << " tile=" << tile.tile.tile_u << ',' << tile.tile.tile_v
+                  << " covered_texels=" << tile.covered_texels
+                  << " artifact_digest=" << tile.artifact_digest.hex()
+                  << " payload_digest=" << tile.payload_digest.hex()
+                  << " receipt_digest=" << tile.receipt_digest.hex() << '\n';
+    }
+    std::cout << "verified_schedule kind=world-position"
+              << " tiles=" << verified.size()
+              << " output=" << std::quoted(output_root.string()) << '\n';
+    return EXIT_SUCCESS;
+}
+
+int bind_material_surface_id_recipe(char** argv) {
+    using namespace carto;
+    const std::filesystem::path project_path(argv[2]);
+    const auto target_mesh_asset = parse_bake_u64_argument(
+        argv[3], "target mesh asset ID");
+    const auto uv_set = parse_bake_u32_argument(argv[4], "UV set ID");
+    const auto width = parse_bake_u32_argument(argv[5], "texture width");
+    const auto height = parse_bake_u32_argument(argv[6], "texture height");
+    const std::string material_region_layer(argv[7]);
+    const std::filesystem::path assignments_path(argv[8]);
+    const std::filesystem::path recipe_path(argv[9]);
+    if (!target_mesh_asset || target_mesh_asset.value() == 0U || !uv_set ||
+        uv_set.value() == 0U || !width || !height ||
+        material_region_layer.empty()) {
+        const core::Diagnostic error = !target_mesh_asset
+            ? target_mesh_asset.error()
+            : target_mesh_asset.value() == 0U
+                ? core::Diagnostic(core::ErrorCode::invalid_argument,
+                    "target mesh asset ID must be non-zero")
+            : !uv_set ? uv_set.error()
+            : uv_set.value() == 0U
+                ? core::Diagnostic(core::ErrorCode::invalid_argument,
+                    "UV set ID must be non-zero")
+            : !width ? width.error()
+            : !height ? height.error()
+            : core::Diagnostic(core::ErrorCode::invalid_argument,
+                "material region layer must not be empty");
+        print_error(error);
+        return EXIT_FAILURE;
+    }
+    if (auto result = require_nonsymlink_regular_file(
+            assignments_path, "surface-domain assignment file"); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto assignments = read_bounded_text(assignments_path,
+        production::kMaxMaterialSurfaceIdRecipeBytes,
+        "surface-domain assignment file");
+    if (!assignments) {
+        print_error(assignments.error());
+        return EXIT_FAILURE;
+    }
+    constexpr std::string_view kAssignmentsMagic =
+        "carto-surface-domain-assignments-v1";
+    const auto safe_domain_label = [](std::string_view value) {
+        return value.size() <= 256U &&
+            value.find_first_of(";\r\n\t") == std::string_view::npos &&
+            value.find('\0') == std::string_view::npos;
+    };
+    std::vector<surface::SurfaceDomain> domains;
+    std::uint64_t total_faces = 0U;
+    std::size_t line_start = 0U;
+    std::size_t line_number = 0U;
+    while (line_start <= assignments.value().size()) {
+        const auto newline = assignments.value().find('\n', line_start);
+        const std::size_t line_end = newline == std::string::npos
+            ? assignments.value().size() : newline;
+        std::string_view line(assignments.value().data() + line_start,
+            line_end - line_start);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1U);
+        ++line_number;
+        if (line_number == 1U) {
+            if (line != kAssignmentsMagic) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "surface-domain assignment file has an unsupported header"));
+                return EXIT_FAILURE;
+            }
+        } else if (!line.empty()) {
+            const auto first_tab = line.find('\t');
+            const auto second_tab = first_tab == std::string_view::npos
+                ? std::string_view::npos : line.find('\t', first_tab + 1U);
+            const auto third_tab = second_tab == std::string_view::npos
+                ? std::string_view::npos : line.find('\t', second_tab + 1U);
+            if (first_tab == std::string_view::npos ||
+                second_tab == std::string_view::npos ||
+                third_tab == std::string_view::npos ||
+                line.find('\t', third_tab + 1U) != std::string_view::npos) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "surface-domain rows require four tab-separated fields"));
+                return EXIT_FAILURE;
+            }
+            if (domains.size() >= production::kMaxMaterialSurfaceDomains) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "surface-domain assignment file exceeds the domain limit"));
+                return EXIT_FAILURE;
+            }
+            const std::string_view id_text = line.substr(0U, first_tab);
+            const std::string_view semantic_class = line.substr(
+                first_tab + 1U, second_tab - first_tab - 1U);
+            const std::string_view material_class = line.substr(
+                second_tab + 1U, third_tab - second_tab - 1U);
+            const std::string_view face_text = line.substr(third_tab + 1U);
+            const auto id = parse_bake_u64_argument(id_text, "surface domain ID");
+            if (!id || id.value() == 0U || !safe_domain_label(semantic_class) ||
+                !safe_domain_label(material_class) || face_text.empty()) {
+                print_error(!id ? id.error() : core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "surface-domain row has an invalid ID, class, or empty face list"));
+                return EXIT_FAILURE;
+            }
+            surface::SurfaceDomain domain;
+            domain.id = surface::SurfaceDomainId{id.value()};
+            domain.semantic_class = std::string(semantic_class);
+            domain.material_class = std::string(material_class);
+            std::size_t face_start = 0U;
+            while (face_start <= face_text.size()) {
+                const auto comma = face_text.find(',', face_start);
+                const std::size_t face_end = comma == std::string_view::npos
+                    ? face_text.size() : comma;
+                const auto face_id = parse_bake_u64_argument(
+                    face_text.substr(face_start, face_end - face_start),
+                    "surface-domain source face ID");
+                if (!face_id || face_id.value() == 0U ||
+                    total_faces >= production::kMaxBakeSourceTriangles) {
+                    print_error(!face_id ? face_id.error() : core::Diagnostic(
+                        core::ErrorCode::validation_failed,
+                        "surface-domain faces contain zero or exceed the membership limit"));
+                    return EXIT_FAILURE;
+                }
+                domain.source_faces.push_back(geometry::FaceId{face_id.value()});
+                ++total_faces;
+                if (comma == std::string_view::npos) break;
+                face_start = comma + 1U;
+            }
+            std::sort(domain.source_faces.begin(), domain.source_faces.end());
+            domains.push_back(std::move(domain));
+        }
+        if (newline == std::string::npos) break;
+        line_start = newline + 1U;
+    }
+    if (domains.empty()) {
+        print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+            "surface-domain assignment file must contain at least one domain"));
+        return EXIT_FAILURE;
+    }
+    const auto document = project::ProjectDocument::load(project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto mesh = document.value().meshes().find(target_mesh_asset.value());
+    if (mesh == document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::stale_data,
+            "material/surface ID target mesh is missing from the project"));
+        return EXIT_FAILURE;
+    }
+    const auto compiled_mesh = mesh->second.compile();
+    if (!compiled_mesh) {
+        print_error(compiled_mesh.error().with_context(
+            "compile target mesh for explicit surface-domain assignments"));
+        return EXIT_FAILURE;
+    }
+    for (surface::SurfaceDomain& domain : domains) {
+        domain.source_revision = compiled_mesh.value().source_revision;
+        if (auto result = domain.refresh_digest(compiled_mesh.value()); !result) {
+            print_error(result.error().with_context(
+                "refresh explicit surface-domain digest from current target mesh"));
+            return EXIT_FAILURE;
+        }
+    }
+    const auto recipe = production::bind_material_surface_id_recipe(
+        "bake/material-surface-id/mesh/" +
+            std::to_string(target_mesh_asset.value()) + "/uv/" +
+            std::to_string(uv_set.value()),
+        document.value(), target_mesh_asset.value(), uv_set.value(),
+        material_region_layer, width.value(), height.value(), std::move(domains));
+    if (!recipe) {
+        print_error(recipe.error());
+        return EXIT_FAILURE;
+    }
+    const auto current_document = project::ProjectDocument::load(project_path);
+    if (!current_document) {
+        print_error(current_document.error().with_context(
+            "final project check before material/surface ID recipe publication"));
+        return EXIT_FAILURE;
+    }
+    if (auto result = production::validate_material_surface_id_source(
+            recipe.value(), current_document.value()); !result) {
+        print_error(result.error().with_context(
+            "final source check before material/surface ID recipe publication"));
+        return EXIT_FAILURE;
+    }
+    const auto output_entry = path_entry_exists_no_follow(
+        recipe_path, "material/surface ID recipe output");
+    if (!output_entry) {
+        print_error(output_entry.error());
+        return EXIT_FAILURE;
+    }
+    if (output_entry.value()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "material/surface ID recipe output refuses to overwrite an existing path"));
+        return EXIT_FAILURE;
+    }
+    auto temporary_path = recipe_path;
+    temporary_path += ".cartographer-tmp";
+    const auto temporary_entry = path_entry_exists_no_follow(
+        temporary_path, "material/surface ID recipe temporary output");
+    if (!temporary_entry) {
+        print_error(temporary_entry.error());
+        return EXIT_FAILURE;
+    }
+    if (temporary_entry.value()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "material/surface ID recipe temporary output already exists"));
+        return EXIT_FAILURE;
+    }
+    const std::string serialized_recipe = recipe.value().serialize();
+    if (serialized_recipe.empty()) {
+        print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+            "material/surface ID recipe is invalid or exceeds its serialization limit"));
+        return EXIT_FAILURE;
+    }
+    if (auto result = write_new_text_atomically(recipe_path, serialized_recipe,
+            "material/surface ID recipe"); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    if (auto result = require_nonsymlink_regular_file(
+            recipe_path, "material/surface ID recipe read-back"); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto readback_text = read_bounded_text(recipe_path,
+        production::kMaxMaterialSurfaceIdRecipeBytes,
+        "material/surface ID recipe read-back");
+    const auto readback = readback_text
+        ? production::MaterialSurfaceIdRecipe::deserialize(readback_text.value())
+        : Result<production::MaterialSurfaceIdRecipe>::failure(readback_text.error());
+    if (!readback || readback.value().serialize() != serialized_recipe) {
+        print_error(readback ? core::Diagnostic(core::ErrorCode::validation_failed,
+            "material/surface ID recipe differs after publication read-back")
+            : readback.error());
+        return EXIT_FAILURE;
+    }
+    const auto recipe_digest = recipe.value().canonical_digest();
+    if (!recipe_digest) {
+        print_error(recipe_digest.error());
+        return EXIT_FAILURE;
+    }
+    std::cout << "bound_recipe kind=material-surface-id"
+              << " domains=" << recipe.value().surface_domains.size()
+              << " assigned_faces=" << total_faces
+              << " recipe_digest=" << recipe_digest.value().hex()
+              << " output=" << std::quoted(recipe_path.string()) << '\n';
+    return EXIT_SUCCESS;
+}
+
+int bake_material_surface_id_tiles_cpu(char** argv) {
+    using namespace carto;
+    const std::filesystem::path project_path(argv[2]);
+    const std::filesystem::path recipe_path(argv[3]);
+    const std::filesystem::path output_root(argv[4]);
+    if (auto result = require_nonsymlink_regular_file(
+            recipe_path, "material/surface ID recipe"); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto recipe_text = read_bounded_text(
+        recipe_path, production::kMaxMaterialSurfaceIdRecipeBytes,
+        "material/surface ID recipe");
+    if (!recipe_text) {
+        print_error(recipe_text.error());
+        return EXIT_FAILURE;
+    }
+    const auto base_recipe = production::MaterialSurfaceIdRecipe::deserialize(
+        recipe_text.value());
+    if (!base_recipe) {
+        print_error(base_recipe.error());
+        return EXIT_FAILURE;
+    }
+    const auto document = project::ProjectDocument::load(project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    if (auto result = production::validate_material_surface_id_source(
+            base_recipe.value(), document.value()); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto schedule = production::schedule_material_surface_id_tiles_cpu(
+        base_recipe.value(), document.value());
+    if (!schedule) {
+        print_error(schedule.error());
+        return EXIT_FAILURE;
+    }
+    if (output_root.empty() || output_root.filename().empty()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "bake output directory must name a new directory"));
+        return EXIT_FAILURE;
+    }
+    std::error_code output_error;
+    const auto parent = output_root.parent_path();
+    if (!parent.empty() &&
+        (!std::filesystem::exists(parent, output_error) || output_error ||
+         !std::filesystem::is_directory(parent, output_error) || output_error)) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            "bake output parent directory is unavailable"));
+        return EXIT_FAILURE;
+    }
+    const auto output_entry = path_entry_exists_no_follow(
+        output_root, "material/surface ID tile output directory");
+    if (!output_entry) {
+        print_error(output_entry.error());
+        return EXIT_FAILURE;
+    }
+    if (output_entry.value()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "bake output directory refuses to overwrite an existing path"));
+        return EXIT_FAILURE;
+    }
+    const auto recipe_digest = base_recipe.value().canonical_digest();
+    if (!recipe_digest) {
+        print_error(recipe_digest.error());
+        return EXIT_FAILURE;
+    }
+    std::filesystem::path staging_root = output_root;
+    staging_root += ".pending-" + recipe_digest.value().hex().substr(0U, 16U);
+    const auto staging_entry = path_entry_exists_no_follow(
+        staging_root, "material/surface ID tile staging directory");
+    if (!staging_entry) {
+        print_error(staging_entry.error());
+        return EXIT_FAILURE;
+    }
+    if (staging_entry.value()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "bake staging directory already exists and requires inspection"));
+        return EXIT_FAILURE;
+    }
+    output_error.clear();
+    if (!std::filesystem::create_directory(staging_root, output_error) || output_error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            "unable to create the new material/surface ID staging directory"));
+        return EXIT_FAILURE;
+    }
+    try {
+        assets::BlobStore blobs(staging_root / "blobs");
+        production::ProductionArtifactStore artifact_store(blobs);
+        const production::AdmissionPolicy policy;
+        const production::AuthoritativeSource source{
+            base_recipe.value().source_namespace,
+            base_recipe.value().source_revision,
+            base_recipe.value().source_digest};
+        for (const auto& entry : schedule.value().entries) {
+            if (auto result = production::validate_material_surface_id_artifact_source(
+                    entry.artifact, document.value()); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto payload = entry.artifact.serialize();
+            const auto cook_key = production::material_surface_id_cook_key(
+                entry.artifact.recipe, "carto.cpu-reference.v1");
+            if (!payload || !cook_key) {
+                print_error(!payload ? payload.error() : cook_key.error());
+                return EXIT_FAILURE;
+            }
+            production::ProductionArtifactReceipt receipt;
+            receipt.key = cook_key.value();
+            receipt.status = production::ReceiptStatus::admitted;
+            receipt.output_digest = assets::sha256(payload.value());
+            receipt.output_bytes = payload.value().size();
+            receipt.cost.cook_milliseconds = entry.compile_milliseconds;
+            receipt.cost.disk_bytes = receipt.output_bytes;
+            if (auto result = receipt.refresh_digest(); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            if (auto result = artifact_store.publish(receipt,
+                    std::span<const std::uint8_t>{payload.value()}, source, policy); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto reopened = artifact_store.read(cook_key.value(), source, policy);
+            const auto reopened_artifact = reopened
+                ? production::MaterialSurfaceIdMapArtifact::deserialize(reopened.value())
+                : Result<production::MaterialSurfaceIdMapArtifact>::failure(reopened.error());
+            if (!reopened_artifact || reopened_artifact.value().artifact_digest !=
+                    entry.artifact.artifact_digest) {
+                print_error(reopened_artifact ? core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "material/surface ID tile differs after artifact read-back")
+                    : reopened_artifact.error());
+                return EXIT_FAILURE;
+            }
+        }
+        const std::string ledger_text = artifact_store.ledger().serialize();
+        const auto ledger = production::ProductionReceiptLedger::deserialize(ledger_text);
+        if (!ledger || ledger.value().size() != schedule.value().entries.size()) {
+            print_error(ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+                "material/surface ID receipt ledger has an unexpected record count")
+                : ledger.error());
+            return EXIT_FAILURE;
+        }
+        const auto manifest_path = staging_root / "receipts.carto-production-receipts";
+        const auto manifest_write = write_new_text_atomically(
+            manifest_path, ledger_text, "material/surface ID tile receipt ledger");
+        if (!manifest_write) {
+            print_error(manifest_write.error());
+            return EXIT_FAILURE;
+        }
+        const auto reopened_manifest = read_bounded_text(
+            manifest_path, production::ProductionReceiptLedger::max_serialized_bytes,
+            "material/surface ID tile receipt ledger");
+        const auto manifest_ledger = reopened_manifest
+            ? production::ProductionReceiptLedger::deserialize(reopened_manifest.value())
+            : Result<production::ProductionReceiptLedger>::failure(reopened_manifest.error());
+        if (!manifest_ledger || manifest_ledger.value().size() != schedule.value().entries.size()) {
+            print_error(manifest_ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+                "material/surface ID receipt manifest failed read-back validation")
+                : manifest_ledger.error());
+            return EXIT_FAILURE;
+        }
+        const auto publication_document = project::ProjectDocument::load(project_path);
+        if (!publication_document) {
+            print_error(publication_document.error().with_context(
+                "final project check before material/surface ID publication"));
+            return EXIT_FAILURE;
+        }
+        if (auto result = production::validate_material_surface_id_source(
+                base_recipe.value(), publication_document.value()); !result) {
+            print_error(result.error().with_context(
+                "final source check before material/surface ID publication"));
+            return EXIT_FAILURE;
+        }
+        output_error.clear();
+        std::filesystem::rename(staging_root, output_root, output_error);
+        if (output_error) {
+            print_error(core::Diagnostic(core::ErrorCode::io_error,
+                "atomic material/surface ID output publication failed; inspect the staging directory"));
+            return EXIT_FAILURE;
+        }
+        std::cout << "bake_schedule kind=material-surface-id"
+                  << " tiles=" << schedule.value().entries.size()
+                  << " covered_texels=" << schedule.value().covered_texels
+                  << " compile_milliseconds=" << schedule.value().compile_milliseconds
+                  << " output=" << std::quoted(output_root.string()) << '\n';
+    } catch (const std::exception& error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            std::string("material/surface ID tile publication failed: ") + error.what()));
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+int inspect_material_surface_id_tiles(char** argv) {
+    using namespace carto;
+    const std::filesystem::path project_path(argv[2]);
+    const std::filesystem::path recipe_path(argv[3]);
+    const std::filesystem::path output_root(argv[4]);
+    if (auto result = require_nonsymlink_regular_file(
+            recipe_path, "material/surface ID recipe"); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto recipe_text = read_bounded_text(
+        recipe_path, production::kMaxMaterialSurfaceIdRecipeBytes,
+        "material/surface ID recipe");
+    if (!recipe_text) {
+        print_error(recipe_text.error());
+        return EXIT_FAILURE;
+    }
+    const auto base_recipe = production::MaterialSurfaceIdRecipe::deserialize(
+        recipe_text.value());
+    if (!base_recipe) {
+        print_error(base_recipe.error());
+        return EXIT_FAILURE;
+    }
+    const auto document = project::ProjectDocument::load(project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    if (auto result = production::validate_material_surface_id_source(
+            base_recipe.value(), document.value()); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto target = document.value().meshes().find(
+        base_recipe.value().target_mesh_asset);
+    if (target == document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::stale_data,
+            "material/surface ID target mesh is missing"));
+        return EXIT_FAILURE;
+    }
+    const auto tiles = production::enumerate_bake_tiles(
+        target->second, base_recipe.value().target_uv_set);
+    if (!tiles) {
+        print_error(tiles.error());
+        return EXIT_FAILURE;
+    }
+    if (auto result = require_nonsymlink_directory(
+            output_root, "material/surface ID tile output"); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto manifest_path = output_root / "receipts.carto-production-receipts";
+    if (auto result = require_nonsymlink_regular_file(
+            manifest_path, "material/surface ID tile receipt manifest"); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto ledger_text = read_bounded_text(manifest_path,
+        production::ProductionReceiptLedger::max_serialized_bytes,
+        "material/surface ID tile receipt ledger");
+    if (!ledger_text) {
+        print_error(ledger_text.error());
+        return EXIT_FAILURE;
+    }
+    const auto ledger = production::ProductionReceiptLedger::deserialize(ledger_text.value());
+    if (!ledger || ledger.value().size() != tiles.value().size()) {
+        print_error(ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+            "material/surface ID receipt ledger does not exactly cover current target tiles")
+            : ledger.error());
+        return EXIT_FAILURE;
+    }
+    struct VerifiedMaterialSurfaceTile {
+        production::BakeTileCoordinate tile;
+        assets::Sha256Digest artifact_digest;
+        assets::Sha256Digest payload_digest;
+        assets::Sha256Digest receipt_digest;
+        std::uint64_t covered_texels = 0U;
+    };
+    std::vector<bool> consumed(ledger.value().size(), false);
+    std::vector<VerifiedMaterialSurfaceTile> verified;
+    verified.reserve(tiles.value().size());
+    try {
+        const auto blob_root = output_root / "blobs";
+        if (auto result = require_nonsymlink_directory(
+                blob_root, "material/surface ID tile blob store"); !result) {
+            print_error(result.error());
+            return EXIT_FAILURE;
+        }
+        assets::BlobStore blobs(blob_root);
+        for (const production::BakeTileCoordinate tile : tiles.value()) {
+            auto recipe = base_recipe.value();
+            recipe.tile_u = tile.tile_u;
+            recipe.tile_v = tile.tile_v;
+            recipe.identity += "/tile/" + std::to_string(tile.tile_u) + "/" +
+                std::to_string(tile.tile_v);
+            const auto expected_key = production::material_surface_id_cook_key(
+                recipe, "carto.cpu-reference.v1");
+            if (!expected_key) {
+                print_error(expected_key.error());
+                return EXIT_FAILURE;
+            }
+            std::optional<std::size_t> matching_receipt;
+            for (std::size_t index = 0U; index < ledger.value().records().size(); ++index) {
+                if (ledger.value().records()[index].key != expected_key.value()) continue;
+                if (matching_receipt.has_value()) {
+                    print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                        "material/surface ID ledger contains duplicate tile receipts"));
+                    return EXIT_FAILURE;
+                }
+                matching_receipt = index;
+            }
+            if (!matching_receipt.has_value() || consumed[*matching_receipt]) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "material/surface ID tile receipt is missing or duplicated"));
+                return EXIT_FAILURE;
+            }
+            consumed[*matching_receipt] = true;
+            const auto& receipt = ledger.value().records()[*matching_receipt];
+            if (receipt.status != production::ReceiptStatus::admitted) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "material/surface ID tile receipt is not admitted"));
+                return EXIT_FAILURE;
+            }
+            const std::string digest_text = receipt.output_digest.hex();
+            const auto hash_root = blob_root / "sha256";
+            const auto first_prefix = hash_root / digest_text.substr(0U, 2U);
+            const auto second_prefix = first_prefix / digest_text.substr(2U, 2U);
+            if (auto result = require_nonsymlink_directory(
+                    hash_root, "material/surface ID blob hash root"); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            if (auto result = require_nonsymlink_directory(
+                    first_prefix, "material/surface ID blob prefix"); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            if (auto result = require_nonsymlink_directory(
+                    second_prefix, "material/surface ID blob prefix"); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto blob_path = blobs.path_for(receipt.output_digest);
+            if (auto result = require_nonsymlink_regular_file(
+                    blob_path, "material/surface ID tile payload"); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto payload = blobs.read(receipt.output_digest);
+            if (!payload || payload.value().size() != receipt.output_bytes ||
+                assets::sha256(payload.value()) != receipt.output_digest) {
+                print_error(payload ? core::Diagnostic(core::ErrorCode::validation_failed,
+                    "material/surface ID payload disagrees with its receipt")
+                    : payload.error());
+                return EXIT_FAILURE;
+            }
+            const auto artifact = production::MaterialSurfaceIdMapArtifact::deserialize(
+                payload.value());
+            if (!artifact) {
+                print_error(artifact.error());
+                return EXIT_FAILURE;
+            }
+            if (artifact.value().recipe.serialize() != recipe.serialize()) {
+                print_error(core::Diagnostic(core::ErrorCode::stale_data,
+                    "material/surface ID recipe does not match the current project and tile"));
+                return EXIT_FAILURE;
+            }
+            if (auto result = production::validate_material_surface_id_artifact_source(
+                    artifact.value(), document.value()); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            verified.push_back(VerifiedMaterialSurfaceTile{
+                tile, artifact.value().artifact_digest, receipt.output_digest,
+                receipt.receipt_digest, artifact.value().covered_texels});
+        }
+        if (std::find(consumed.begin(), consumed.end(), false) != consumed.end()) {
+            print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                "material/surface ID ledger contains an unexpected tile receipt"));
+            return EXIT_FAILURE;
+        }
+    } catch (const std::exception& error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            std::string("material/surface ID tile inspection failed: ") + error.what()));
+        return EXIT_FAILURE;
+    }
+    const auto current_document = project::ProjectDocument::load(project_path);
+    if (!current_document || !production::validate_material_surface_id_source(
+            base_recipe.value(), current_document.value())) {
+        print_error(current_document ? core::Diagnostic(core::ErrorCode::stale_data,
+            "material/surface ID project changed during inspection")
+            : current_document.error().with_context(
+                "final project check after material/surface ID inspection"));
+        return EXIT_FAILURE;
+    }
+    for (const VerifiedMaterialSurfaceTile& tile : verified) {
+        std::cout << "verified kind=material-surface-id"
+                  << " verification=artifact-source-receipt-readback"
+                  << " platform_profile=\"carto.cpu-reference.v1\""
+                  << " tile=" << tile.tile.tile_u << ',' << tile.tile.tile_v
+                  << " covered_texels=" << tile.covered_texels
+                  << " artifact_digest=" << tile.artifact_digest.hex()
+                  << " payload_digest=" << tile.payload_digest.hex()
+                  << " receipt_digest=" << tile.receipt_digest.hex() << '\n';
+    }
+    std::cout << "verified_schedule kind=material-surface-id"
+              << " tiles=" << verified.size()
+              << " output=" << std::quoted(output_root.string()) << '\n';
+    return EXIT_SUCCESS;
+}
+
+int bake_tangent_normal_map_tiles_cpu(char** argv) {
+    using namespace carto;
+    const std::filesystem::path project_path(argv[2]);
+    const auto source_asset = parse_mesh_asset_id_argument(argv[3]);
+    const auto target_asset = parse_mesh_asset_id_argument(argv[4]);
+    const auto uv_set = parse_bake_u32_argument(argv[5], "UV set id");
+    const auto width = parse_bake_u32_argument(argv[6], "texture width");
+    const auto height = parse_bake_u32_argument(argv[7], "texture height");
+    const auto half_extent = parse_bake_positive_double_argument(
+        argv[8], "projection half extent");
+    const std::string_view reject_misses_text(argv[9]);
+    const std::filesystem::path output_root(argv[10]);
+    std::optional<std::filesystem::path> cache_root;
+    if (argv[11] != nullptr) cache_root.emplace(argv[11]);
+    if (!source_asset || !target_asset || !uv_set || !width || !height ||
+        !half_extent || (reject_misses_text != "0" && reject_misses_text != "1")) {
+        const core::Diagnostic error = !source_asset ? source_asset.error()
+            : !target_asset ? target_asset.error()
+            : !uv_set ? uv_set.error()
+            : !width ? width.error()
+            : !height ? height.error()
+            : !half_extent ? half_extent.error()
+            : core::Diagnostic(core::ErrorCode::invalid_argument,
+                "reject-misses must be 0 or 1");
+        print_error(error);
+        return EXIT_FAILURE;
+    }
+    if (output_root.empty() || output_root.filename().empty()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "bake output directory must name a new directory"));
+        return EXIT_FAILURE;
+    }
+    bool cache_root_exists = false;
+    if (cache_root) {
+        if (cache_root->empty() || cache_root->filename().empty()) {
+            print_error(core::Diagnostic(core::ErrorCode::invalid_argument,
+                "bake cache directory must name a directory"));
+            return EXIT_FAILURE;
+        }
+        std::error_code absolute_error;
+        const auto absolute_output = std::filesystem::absolute(
+            output_root, absolute_error).lexically_normal();
+        if (absolute_error) {
+            print_error(core::Diagnostic(core::ErrorCode::io_error,
+                "unable to resolve bake output directory"));
+            return EXIT_FAILURE;
+        }
+        const auto absolute_cache = std::filesystem::absolute(
+            *cache_root, absolute_error).lexically_normal();
+        if (absolute_error) {
+            print_error(core::Diagnostic(core::ErrorCode::io_error,
+                "unable to resolve bake cache directory"));
+            return EXIT_FAILURE;
+        }
+        if (paths_overlap(absolute_output, absolute_cache)) {
+            print_error(core::Diagnostic(core::ErrorCode::invalid_argument,
+                "bake cache and output directories must not overlap"));
+            return EXIT_FAILURE;
+        }
+
+        std::error_code parent_error;
+        auto cache_parent = cache_root->parent_path();
+        if (cache_parent.empty()) {
+            cache_parent = std::filesystem::current_path(parent_error);
+        }
+        if (parent_error) {
+            print_error(core::Diagnostic(core::ErrorCode::io_error,
+                "unable to resolve bake cache parent directory"));
+            return EXIT_FAILURE;
+        }
+        if (!std::filesystem::exists(cache_parent, parent_error) || parent_error ||
+            !std::filesystem::is_directory(cache_parent, parent_error) || parent_error) {
+            print_error(core::Diagnostic(core::ErrorCode::io_error,
+                "bake cache parent directory is unavailable"));
+            return EXIT_FAILURE;
+        }
+        std::error_code cache_status_error;
+        const auto cache_status = std::filesystem::symlink_status(
+            *cache_root, cache_status_error);
+        if (cache_status_error != std::errc::no_such_file_or_directory &&
+            cache_status_error) {
+            print_error(core::Diagnostic(core::ErrorCode::io_error,
+                "unable to inspect bake cache directory"));
+            return EXIT_FAILURE;
+        }
+        cache_root_exists = !cache_status_error &&
+            cache_status.type() != std::filesystem::file_type::not_found;
+        if (cache_root_exists &&
+            (std::filesystem::is_symlink(cache_status) ||
+             !std::filesystem::is_directory(cache_status))) {
+            print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                "bake cache path must be a directory, not a symlink or file"));
+            return EXIT_FAILURE;
+        }
+    }
+
+    const auto document = project::ProjectDocument::load(project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto source = document.value().meshes().find(source_asset.value());
+    const auto target = document.value().meshes().find(target_asset.value());
+    if (source == document.value().meshes().end() ||
+        target == document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::not_found,
+            "normal bake source or target mesh does not exist in the project"));
+        return EXIT_FAILURE;
+    }
+
+    const std::string source_identity = document.value().source_namespace() +
+        "/mesh/" + std::to_string(source_asset.value());
+    const std::string target_identity = document.value().source_namespace() +
+        "/mesh/" + std::to_string(target_asset.value());
+    const auto source_binding = production::bind_bake_source(source_identity, source->second);
+    const auto target_binding = production::bind_bake_target(
+        target_identity, target->second, uv_set.value());
+    if (!source_binding || !target_binding) {
+        print_error(!source_binding ? source_binding.error() : target_binding.error());
+        return EXIT_FAILURE;
+    }
+
+    production::BakeRecipe base_recipe;
+    base_recipe.identity = "bake/tangent-normal/source/" +
+        std::to_string(source_asset.value()) + "/target/" +
+        std::to_string(target_asset.value()) + "/uv/" + std::to_string(uv_set.value());
+    base_recipe.source = source_binding.value();
+    base_recipe.target = target_binding.value();
+    base_recipe.target_uv_set = uv_set.value();
+    base_recipe.width = width.value();
+    base_recipe.height = height.value();
+    base_recipe.projection_half_extent = half_extent.value();
+    base_recipe.reject_projection_misses = reject_misses_text == "1";
+    if (auto result = base_recipe.validate(); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto base_recipe_digest = base_recipe.canonical_digest();
+    if (!base_recipe_digest) {
+        print_error(base_recipe_digest.error());
+        return EXIT_FAILURE;
+    }
+
+    struct TileCacheTarget {
+        production::BakeTileCoordinate tile;
+        production::BakeTileDependencyKey dependencies;
+        std::filesystem::path path;
+        std::uintmax_t maximum_bytes = 0U;
+    };
+    std::vector<TileCacheTarget> cache_targets;
+    std::vector<production::BakeTileArtifactCacheEntry> reusable_tiles;
+    std::size_t cache_entries_skipped_for_memory = 0U;
+    if (cache_root) {
+        const auto target_tiles = production::enumerate_bake_tiles(
+            target->second, uv_set.value());
+        if (!target_tiles) {
+            print_error(target_tiles.error());
+            return EXIT_FAILURE;
+        }
+        const std::uint64_t tile_pixels =
+            static_cast<std::uint64_t>(base_recipe.width) * base_recipe.height;
+        if (tile_pixels == 0U || tile_pixels >
+                production::kMaxBakeTileScheduleRgbaBytes / 4U) {
+            print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                "bake tile cache lookup exceeds the aggregate RGBA8 memory budget"));
+            return EXIT_FAILURE;
+        }
+        const std::uint64_t tile_bytes = tile_pixels * 4U;
+        if (target_tiles.value().size() >
+                production::kMaxBakeTileScheduleRgbaBytes / tile_bytes) {
+            print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                "bake tile cache lookup exceeds the aggregate RGBA8 memory budget"));
+            return EXIT_FAILURE;
+        }
+        const std::uint64_t schedule_rgba_bytes =
+            static_cast<std::uint64_t>(target_tiles.value().size()) * tile_bytes;
+        const std::uint64_t cache_parse_reserve_bytes =
+            tile_bytes * 2U + 64U * 1024U;
+        const std::uint64_t cache_reuse_budget =
+            schedule_rgba_bytes <= production::kMaxBakeTileScheduleRgbaBytes -
+                    cache_parse_reserve_bytes
+                ? production::kMaxBakeTileScheduleRgbaBytes -
+                    schedule_rgba_bytes - cache_parse_reserve_bytes
+                : 0U;
+        std::uint64_t reusable_cache_bytes = 0U;
+
+        cache_targets.reserve(target_tiles.value().size());
+        reusable_tiles.reserve(target_tiles.value().size());
+        for (const production::BakeTileCoordinate tile : target_tiles.value()) {
+            production::BakeRecipe tile_recipe = base_recipe;
+            tile_recipe.tile_u = tile.tile_u;
+            tile_recipe.tile_v = tile.tile_v;
+            tile_recipe.identity = base_recipe.identity + "/tile/" +
+                std::to_string(tile.tile_u) + "/" + std::to_string(tile.tile_v);
+            const auto dependencies = production::make_bake_tile_dependency_key(
+                tile_recipe, source->second, target->second,
+                production::BakeNormalSpace::tangent);
+            if (!dependencies) {
+                print_error(dependencies.error().with_context(
+                    "building cache key for UDIM tile " +
+                    std::to_string(tile.tile_u) + "," + std::to_string(tile.tile_v)));
+                return EXIT_FAILURE;
+            }
+            const auto cache_path = *cache_root /
+                (dependencies.value().dependency_digest.hex() +
+                    ".carto-bake-tile-cache");
+            const auto maximum_cache_entry_bytes = std::min<std::uint64_t>(
+                tile_bytes + 64U * 1024U, kBakeTileCacheMaxBytes);
+            cache_targets.push_back(TileCacheTarget{
+                tile, dependencies.value(), cache_path,
+                static_cast<std::uintmax_t>(maximum_cache_entry_bytes)});
+            if (!cache_root_exists) continue;
+
+            auto cached = read_bake_tile_cache_entry(
+                cache_path, cache_targets.back().maximum_bytes);
+            if (!cached) {
+                print_error(cached.error().with_context(
+                    "loading cache for UDIM tile " +
+                    std::to_string(tile.tile_u) + "," + std::to_string(tile.tile_v)));
+                return EXIT_FAILURE;
+            }
+            if (!cached.value()) continue;
+            if (!cached.value()->dependencies.same_dependencies(dependencies.value())) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "bake tile cache key does not match its content-addressed path"));
+                return EXIT_FAILURE;
+            }
+            if (tile_bytes > cache_reuse_budget - reusable_cache_bytes) {
+                ++cache_entries_skipped_for_memory;
+                continue;
+            }
+            reusable_cache_bytes += tile_bytes;
+            reusable_tiles.push_back(std::move(*cached.value()));
+        }
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    const auto schedule = production::schedule_normal_map_tiles_cpu(
+        base_recipe, production::BakeNormalSpace::tangent,
+        source->second, target->second, reusable_tiles);
+    reusable_tiles.clear();
+    const auto finished = std::chrono::steady_clock::now();
+    if (!schedule) {
+        print_error(schedule.error());
+        return EXIT_FAILURE;
+    }
+    if (schedule.value().entries.empty() ||
+        schedule.value().entries.size() > production::kMaxBakeTileScheduleTiles) {
+        print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+            "normal bake scheduler returned an empty or over-budget tile set"));
+        return EXIT_FAILURE;
+    }
+
+    const auto current_document = project::ProjectDocument::load(project_path);
+    if (!current_document) {
+        print_error(current_document.error().with_context(
+            "reloading project before normal bake publication"));
+        return EXIT_FAILURE;
+    }
+    if (current_document.value().source_namespace() !=
+        document.value().source_namespace()) {
+        print_error(core::Diagnostic(core::ErrorCode::stale_data,
+            "project source namespace changed while the normal bake was running"));
+        return EXIT_FAILURE;
+    }
+    const auto current_source = current_document.value().meshes().find(source_asset.value());
+    const auto current_target = current_document.value().meshes().find(target_asset.value());
+    if (current_source == current_document.value().meshes().end() ||
+        current_target == current_document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::stale_data,
+            "project source or target mesh disappeared while the normal bake was running"));
+        return EXIT_FAILURE;
+    }
+    for (const auto& entry : schedule.value().entries) {
+        if (entry.artifact.normal_space != production::BakeNormalSpace::tangent ||
+            entry.tile.tile_u != entry.artifact.recipe.tile_u ||
+            entry.tile.tile_v != entry.artifact.recipe.tile_v) {
+            print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                "normal bake schedule contains a mismatched tile artifact"));
+            return EXIT_FAILURE;
+        }
+        if (auto result = production::validate_bake_sources(
+                entry.artifact.recipe, current_source->second, current_target->second); !result) {
+            print_error(result.error().with_context(
+                "revalidating project meshes before normal bake publication"));
+            return EXIT_FAILURE;
+        }
+    }
+
+    std::error_code output_error;
+    const auto parent = output_root.parent_path();
+    if (!parent.empty() &&
+        (!std::filesystem::exists(parent, output_error) || output_error ||
+         !std::filesystem::is_directory(parent, output_error) || output_error)) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            "bake output parent directory is unavailable"));
+        return EXIT_FAILURE;
+    }
+    output_error.clear();
+    if (std::filesystem::exists(output_root, output_error) || output_error) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "bake output directory refuses to overwrite an existing path"));
+        return EXIT_FAILURE;
+    }
+    std::filesystem::path staging_root = output_root;
+    staging_root += ".pending-" + base_recipe_digest.value().hex().substr(0U, 16U);
+    output_error.clear();
+    if (std::filesystem::exists(staging_root, output_error) || output_error) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "bake staging directory already exists and requires inspection"));
+        return EXIT_FAILURE;
+    }
+    output_error.clear();
+    if (!std::filesystem::create_directory(staging_root, output_error) || output_error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            "unable to create the new bake staging directory"));
+        return EXIT_FAILURE;
+    }
+
+    const std::string platform_profile = "carto.cpu-reference.v1";
+    try {
+        assets::BlobStore blobs(staging_root / "blobs");
+        production::ProductionArtifactStore artifact_store(blobs);
+        const production::AdmissionPolicy policy;
+        std::vector<assets::Sha256Digest> receipt_digests;
+        receipt_digests.reserve(schedule.value().entries.size());
+        std::string tile_list;
+        for (const auto& entry : schedule.value().entries) {
+            const auto payload = entry.artifact.serialize();
+            const auto cook_key = production::bake_production_cook_key(
+                entry.artifact.recipe, production::BakeNormalSpace::tangent,
+                platform_profile);
+            if (!payload || !cook_key) {
+                print_error(!payload ? payload.error() : cook_key.error());
+                return EXIT_FAILURE;
+            }
+            production::ProductionArtifactReceipt receipt;
+            receipt.key = cook_key.value();
+            receipt.status = production::ReceiptStatus::admitted;
+            receipt.output_digest = assets::sha256(payload.value());
+            receipt.output_bytes = payload.value().size();
+            receipt.cost.cook_milliseconds = entry.compile_milliseconds;
+            receipt.cost.disk_bytes = receipt.output_bytes;
+            if (auto result = receipt.refresh_digest(); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            if (auto result = production::publish_normal_map(
+                    artifact_store, receipt, entry.artifact,
+                    current_source->second, current_target->second,
+                    policy, platform_profile); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto reopened = production::read_normal_map(
+                artifact_store, entry.artifact.recipe,
+                production::BakeNormalSpace::tangent,
+                current_source->second, current_target->second,
+                policy, platform_profile);
+            if (!reopened || reopened.value().artifact_digest !=
+                    entry.artifact.artifact_digest) {
+                print_error(reopened ? core::Diagnostic(core::ErrorCode::validation_failed,
+                    "published normal tile differs from its compiled artifact")
+                    : reopened.error());
+                return EXIT_FAILURE;
+            }
+            receipt_digests.push_back(receipt.receipt_digest);
+            if (!tile_list.empty()) tile_list += ';';
+            tile_list += std::to_string(entry.tile.tile_u) + ',' +
+                std::to_string(entry.tile.tile_v);
+        }
+
+        const std::string ledger_text = artifact_store.ledger().serialize();
+        const auto ledger = production::ProductionReceiptLedger::deserialize(ledger_text);
+        if (!ledger || ledger.value().size() != receipt_digests.size()) {
+            print_error(ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+                "normal tile receipt ledger did not reopen with every scheduled tile")
+                : ledger.error());
+            return EXIT_FAILURE;
+        }
+        for (std::size_t index = 0U; index < receipt_digests.size(); ++index) {
+            if (ledger.value().records()[index].receipt_digest != receipt_digests[index]) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "normal tile receipt ledger order or identity changed on reopen"));
+                return EXIT_FAILURE;
+            }
+        }
+        const auto manifest_write = write_new_text_atomically(
+            staging_root / "receipts.carto-production-receipts", ledger_text,
+            "normal tile receipt ledger");
+        if (!manifest_write) {
+            print_error(manifest_write.error());
+            return EXIT_FAILURE;
+        }
+        const auto reopened_manifest = read_bounded_text(
+            staging_root / "receipts.carto-production-receipts",
+            production::ProductionReceiptLedger::max_serialized_bytes,
+            "normal tile receipt ledger");
+        if (!reopened_manifest) {
+            print_error(reopened_manifest.error());
+            return EXIT_FAILURE;
+        }
+        const auto verified_manifest = production::ProductionReceiptLedger::deserialize(
+            reopened_manifest.value());
+        if (!verified_manifest || verified_manifest.value().size() != receipt_digests.size()) {
+            print_error(verified_manifest ? core::Diagnostic(core::ErrorCode::validation_failed,
+                "normal tile receipt manifest did not retain every tile")
+                : verified_manifest.error());
+            return EXIT_FAILURE;
+        }
+        for (std::size_t index = 0U; index < receipt_digests.size(); ++index) {
+            if (verified_manifest.value().records()[index].receipt_digest !=
+                    receipt_digests[index]) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "normal tile receipt manifest failed read-back validation"));
+                return EXIT_FAILURE;
+            }
+        }
+        const auto publication_document = project::ProjectDocument::load(project_path);
+        if (!publication_document || publication_document.value().source_namespace() !=
+                document.value().source_namespace()) {
+            print_error(publication_document ? core::Diagnostic(core::ErrorCode::stale_data,
+                "project source namespace changed before multi-tile publication")
+                : publication_document.error().with_context(
+                    "reloading project before multi-tile publication"));
+            return EXIT_FAILURE;
+        }
+        const auto publication_source = publication_document.value().meshes().find(
+            source_asset.value());
+        const auto publication_target = publication_document.value().meshes().find(
+            target_asset.value());
+        if (publication_source == publication_document.value().meshes().end() ||
+            publication_target == publication_document.value().meshes().end()) {
+            print_error(core::Diagnostic(core::ErrorCode::stale_data,
+                "project source or target mesh disappeared before multi-tile publication"));
+            return EXIT_FAILURE;
+        }
+        for (const auto& entry : schedule.value().entries) {
+            if (auto result = production::validate_bake_sources(
+                    entry.artifact.recipe, publication_source->second,
+                    publication_target->second); !result) {
+                print_error(result.error().with_context(
+                    "final source check before multi-tile publication"));
+                return EXIT_FAILURE;
+            }
+        }
+        if (cache_root) {
+            std::error_code cache_status_error;
+            auto cache_status = std::filesystem::symlink_status(
+                *cache_root, cache_status_error);
+            const bool cache_missing =
+                cache_status_error == std::errc::no_such_file_or_directory ||
+                (!cache_status_error && cache_status.type() ==
+                    std::filesystem::file_type::not_found);
+            if (cache_status_error && !cache_missing) {
+                print_error(core::Diagnostic(core::ErrorCode::io_error,
+                    "unable to inspect bake cache directory before publication"));
+                return EXIT_FAILURE;
+            }
+            if (cache_missing) {
+                cache_status_error.clear();
+                std::filesystem::create_directory(*cache_root, cache_status_error);
+                if (cache_status_error) {
+                    print_error(core::Diagnostic(core::ErrorCode::io_error,
+                        "unable to create bake cache directory"));
+                    return EXIT_FAILURE;
+                }
+                cache_status_error.clear();
+                cache_status = std::filesystem::symlink_status(
+                    *cache_root, cache_status_error);
+            }
+            if (cache_status_error || std::filesystem::is_symlink(cache_status) ||
+                !std::filesystem::is_directory(cache_status)) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "bake cache path changed and is not a regular directory"));
+                return EXIT_FAILURE;
+            }
+
+            const auto validate_cache_candidate = [&](
+                const production::BakeTileArtifactCacheEntry& cached,
+                const TileCacheTarget& cache_target,
+                const production::NormalMapArtifact& expected_artifact) -> Result<void> {
+                if (!cached.dependencies.same_dependencies(cache_target.dependencies)) {
+                    return Result<void>::failure(core::Diagnostic(
+                        core::ErrorCode::validation_failed,
+                        "bake tile cache entry does not match its dependency key"));
+                }
+                const auto rebound = production::reuse_bake_tile_artifact(
+                    cached, expected_artifact.recipe,
+                    publication_source->second, publication_target->second);
+                if (!rebound) return Result<void>::failure(rebound.error());
+                if (rebound.value().artifact_digest != expected_artifact.artifact_digest) {
+                    return Result<void>::failure(core::Diagnostic(
+                        core::ErrorCode::validation_failed,
+                        "bake tile cache entry differs from deterministic output"));
+                }
+                return Result<void>::success();
+            };
+
+            for (const auto& entry : schedule.value().entries) {
+                if (entry.reused_from_cache) continue;
+                const auto cache_target = std::find_if(
+                    cache_targets.begin(), cache_targets.end(),
+                    [&](const TileCacheTarget& candidate) {
+                        return candidate.tile == entry.tile;
+                    });
+                if (cache_target == cache_targets.end()) {
+                    print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                        "compiled normal tile has no cache dependency record"));
+                    return EXIT_FAILURE;
+                }
+                const auto cache_entry = production::make_bake_tile_cache_entry(
+                    entry.artifact, publication_source->second,
+                    publication_target->second);
+                if (!cache_entry) {
+                    print_error(cache_entry.error().with_context(
+                        "creating cache entry for UDIM tile " +
+                        std::to_string(entry.tile.tile_u) + "," +
+                        std::to_string(entry.tile.tile_v)));
+                    return EXIT_FAILURE;
+                }
+                if (!cache_entry.value().dependencies.same_dependencies(
+                        cache_target->dependencies)) {
+                    print_error(core::Diagnostic(core::ErrorCode::stale_data,
+                        "bake source bindings changed while creating a cache entry"));
+                    return EXIT_FAILURE;
+                }
+                const auto serialized = cache_entry.value().serialize();
+                if (!serialized) {
+                    print_error(serialized.error());
+                    return EXIT_FAILURE;
+                }
+
+                const auto existing = read_bake_tile_cache_entry(
+                    cache_target->path, cache_target->maximum_bytes);
+                if (!existing) {
+                    print_error(existing.error());
+                    return EXIT_FAILURE;
+                }
+                if (existing.value()) {
+                    if (auto result = validate_cache_candidate(
+                            *existing.value(), *cache_target, entry.artifact); !result) {
+                        print_error(result.error());
+                        return EXIT_FAILURE;
+                    }
+                    continue;
+                }
+
+                const auto written = write_new_bytes_atomically(
+                    cache_target->path, serialized.value(),
+                    "bake tile cache entry");
+                const auto reopened = read_bake_tile_cache_entry(
+                    cache_target->path, cache_target->maximum_bytes);
+                if (!reopened || !reopened.value()) {
+                    print_error(!reopened ? reopened.error() :
+                        written ? core::Diagnostic(core::ErrorCode::io_error,
+                            "bake tile cache entry disappeared after writing")
+                        : written.error());
+                    return EXIT_FAILURE;
+                }
+                if (auto result = validate_cache_candidate(
+                        *reopened.value(), *cache_target, entry.artifact); !result) {
+                    print_error(result.error());
+                    return EXIT_FAILURE;
+                }
+            }
+        }
+        output_error.clear();
+        std::filesystem::rename(staging_root, output_root, output_error);
+        if (output_error) {
+            print_error(core::Diagnostic(core::ErrorCode::io_error,
+                "atomic bake output publication failed; inspect the staging directory"));
+            return EXIT_FAILURE;
+        }
+        const double schedule_milliseconds =
+            std::chrono::duration<double, std::milli>(finished - started).count();
+        std::cout << "baked"
+                  << " kind=tangent-normal-tiles"
+                  << " evidence=carto.cpu-reference"
+                  << " platform_profile=" << platform_profile
+                  << " source=" << std::quoted(source_identity)
+                  << " target=" << std::quoted(target_identity)
+                  << " uv_set=" << uv_set.value()
+                  << " tile_count=" << schedule.value().entries.size()
+                  << " compiled_tiles=" << schedule.value().compiled_tiles
+                  << " reused_tiles=" << schedule.value().reused_tiles
+                  << " cache_skipped_memory_tiles=" << cache_entries_skipped_for_memory
+                  << " tiles=" << std::quoted(tile_list)
+                  << " schedule_milliseconds=" << schedule_milliseconds
+                  << " output=" << std::quoted(output_root.string()) << '\n';
+    } catch (const std::exception& error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            std::string("multi-tile normal bake publication failed: ") + error.what()));
         return EXIT_FAILURE;
     }
     return EXIT_SUCCESS;
@@ -3699,8 +7469,7 @@ int inspect_tangent_normal_map(
         }
         std::cout << "verified"
                   << " kind=tangent-normal"
-                  << " evidence=" << (d3d12_profile
-                      ? "carto.d3d12.cpu-reference-parity" : "carto.cpu-reference")
+                  << " verification=artifact-source-receipt-readback"
                   << " platform_profile=" << receipt.key.platform_profile
                   << " source=" << std::quoted(receipt.key.source.identity)
                   << " source_revision=" << receipt.key.source.revision.value()
@@ -3722,7 +7491,469 @@ int inspect_tangent_normal_map(
     return EXIT_SUCCESS;
 }
 
+int inspect_tangent_normal_map_tiles(
+    const std::filesystem::path& project_path,
+    std::string_view source_id_text,
+    std::string_view target_id_text,
+    const std::filesystem::path& output_root,
+    bool d3d12_backend = false) {
+    using namespace carto;
+    const auto source_asset = parse_mesh_asset_id_argument(source_id_text);
+    const auto target_asset = parse_mesh_asset_id_argument(target_id_text);
+    if (!source_asset || !target_asset) {
+        print_error(!source_asset ? source_asset.error() : target_asset.error());
+        return EXIT_FAILURE;
+    }
+    const auto document = project::ProjectDocument::load(project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto source = document.value().meshes().find(source_asset.value());
+    const auto target = document.value().meshes().find(target_asset.value());
+    if (source == document.value().meshes().end() ||
+        target == document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::not_found,
+            "normal bake source or target mesh does not exist in the project"));
+        return EXIT_FAILURE;
+    }
+    if (auto result = require_nonsymlink_directory(
+            output_root, "normal tile output"); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto manifest_path = output_root / "receipts.carto-production-receipts";
+    if (auto result = require_nonsymlink_regular_file(
+            manifest_path, "normal tile receipt manifest"); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto ledger_text = read_bounded_text(
+        manifest_path,
+        production::ProductionReceiptLedger::max_serialized_bytes,
+        "normal tile receipt ledger");
+    if (!ledger_text) {
+        print_error(ledger_text.error());
+        return EXIT_FAILURE;
+    }
+    const auto ledger = production::ProductionReceiptLedger::deserialize(ledger_text.value());
+    if (!ledger || ledger.value().size() == 0U ||
+        ledger.value().size() > production::kMaxBakeTileScheduleTiles) {
+        print_error(ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+            "normal tile receipt ledger is empty or exceeds the supported tile count")
+            : ledger.error());
+        return EXIT_FAILURE;
+    }
+
+    const std::string expected_source = document.value().source_namespace() +
+        "/mesh/" + std::to_string(source_asset.value());
+    const std::string expected_target = document.value().source_namespace() +
+        "/mesh/" + std::to_string(target_asset.value());
+    std::string tile_list;
+    std::optional<std::string> schedule_platform_profile;
+    std::uint64_t covered_texels = 0U;
+    std::uint64_t projected_texels = 0U;
+    try {
+        const auto blob_root = output_root / "blobs";
+        if (auto result = require_nonsymlink_directory(
+                blob_root, "normal tile blob store"); !result) {
+            print_error(result.error());
+            return EXIT_FAILURE;
+        }
+        assets::BlobStore blobs(blob_root);
+        std::optional<production::BakeRecipe> baseline_recipe;
+        std::vector<production::BakeTileCoordinate> expected_tiles;
+        for (std::size_t index = 0U; index < ledger.value().records().size(); ++index) {
+            const production::ProductionArtifactReceipt& receipt =
+                ledger.value().records()[index];
+            const bool expected_platform = d3d12_backend
+                ? receipt.key.platform_profile.rfind("carto.d3d12.", 0U) == 0U
+                : receipt.key.platform_profile == "carto.cpu-reference.v1";
+            if (receipt.status != production::ReceiptStatus::admitted ||
+                receipt.key.kind != production::ArtifactKind::baked_texture ||
+                receipt.key.algorithm != production::kBakeNormalAlgorithm ||
+                !expected_platform) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "normal tile ledger contains a receipt for the wrong backend or map"));
+                return EXIT_FAILURE;
+            }
+            if (!schedule_platform_profile.has_value()) {
+                schedule_platform_profile = receipt.key.platform_profile;
+            } else if (*schedule_platform_profile != receipt.key.platform_profile) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "normal tile ledger mixes platform profiles"));
+                return EXIT_FAILURE;
+            }
+            const auto blob_path = blobs.path_for(receipt.output_digest);
+            if (auto result = require_nonsymlink_regular_file(
+                    blob_path, "normal tile payload"); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto payload = blobs.read(receipt.output_digest);
+            if (!payload || payload.value().size() != receipt.output_bytes ||
+                assets::sha256(payload.value()) != receipt.output_digest) {
+                print_error(payload ? core::Diagnostic(core::ErrorCode::validation_failed,
+                    "normal tile payload disagrees with its production receipt")
+                    : payload.error());
+                return EXIT_FAILURE;
+            }
+            const auto artifact = production::NormalMapArtifact::deserialize(payload.value());
+            if (!artifact) {
+                print_error(artifact.error());
+                return EXIT_FAILURE;
+            }
+            const auto& recipe = artifact.value().recipe;
+            if (artifact.value().normal_space != production::BakeNormalSpace::tangent ||
+                recipe.source.identity != expected_source ||
+                recipe.target.identity != expected_target) {
+                print_error(core::Diagnostic(core::ErrorCode::stale_data,
+                    "normal tile artifact source identity differs from the current project"));
+                return EXIT_FAILURE;
+            }
+            if (auto result = production::validate_bake_sources(
+                    recipe, source->second, target->second); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto expected_key = production::bake_production_cook_key(
+                recipe, production::BakeNormalSpace::tangent,
+                receipt.key.platform_profile);
+            if (!expected_key || expected_key.value() != receipt.key) {
+                print_error(expected_key ? core::Diagnostic(core::ErrorCode::stale_data,
+                    "normal tile receipt key differs from its current source or recipe")
+                    : expected_key.error());
+                return EXIT_FAILURE;
+            }
+
+            if (!baseline_recipe.has_value()) {
+                baseline_recipe = recipe;
+                const auto tiles = production::enumerate_bake_tiles(
+                    target->second, recipe.target_uv_set);
+                if (!tiles) {
+                    print_error(tiles.error());
+                    return EXIT_FAILURE;
+                }
+                expected_tiles = tiles.value();
+                if (expected_tiles.size() != ledger.value().size()) {
+                    print_error(core::Diagnostic(core::ErrorCode::stale_data,
+                        "normal tile receipt count differs from the current target UV tiles"));
+                    return EXIT_FAILURE;
+                }
+            }
+            const auto& baseline = *baseline_recipe;
+            if (recipe.source != baseline.source || recipe.target != baseline.target ||
+                recipe.target_uv_set != baseline.target_uv_set ||
+                recipe.width != baseline.width || recipe.height != baseline.height ||
+                recipe.normal_convention != baseline.normal_convention ||
+                recipe.backface_policy != baseline.backface_policy ||
+                recipe.projection_half_extent != baseline.projection_half_extent ||
+                recipe.reject_projection_misses != baseline.reject_projection_misses ||
+                index >= expected_tiles.size() ||
+                recipe.tile_u != expected_tiles[index].tile_u ||
+                recipe.tile_v != expected_tiles[index].tile_v) {
+                print_error(core::Diagnostic(core::ErrorCode::stale_data,
+                    "normal tile ledger is incomplete, out of order, or mixes recipes"));
+                return EXIT_FAILURE;
+            }
+            const std::string expected_identity =
+                "bake/tangent-normal/source/" + std::to_string(source_asset.value()) +
+                "/target/" + std::to_string(target_asset.value()) + "/uv/" +
+                std::to_string(recipe.target_uv_set) + "/tile/" +
+                std::to_string(expected_tiles[index].tile_u) + "/" +
+                std::to_string(expected_tiles[index].tile_v);
+            if (recipe.identity != expected_identity) {
+                print_error(core::Diagnostic(core::ErrorCode::stale_data,
+                    "normal tile recipe identity is not canonical for its target tile"));
+                return EXIT_FAILURE;
+            }
+            if (!tile_list.empty()) tile_list += ';';
+            tile_list += std::to_string(recipe.tile_u) + ',' +
+                std::to_string(recipe.tile_v);
+            covered_texels += artifact.value().covered_texels;
+            projected_texels += artifact.value().projected_texels;
+        }
+        std::cout << "verified"
+                  << " kind=tangent-normal-tiles"
+                  << " verification=artifact-source-receipt-readback"
+                  << " source=" << std::quoted(expected_source)
+                  << " target=" << std::quoted(expected_target)
+                  << " uv_set=" << baseline_recipe->target_uv_set
+                  << " tile_count=" << ledger.value().size()
+                  << " tiles=" << std::quoted(tile_list)
+                  << " platform_profile=" << std::quoted(*schedule_platform_profile)
+                  << " covered_texels=" << covered_texels
+                  << " projected_texels=" << projected_texels
+                  << " receipt_count=" << ledger.value().size() << '\n';
+    } catch (const std::exception& error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            std::string("normal tile verification failed: ") + error.what()));
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
 #if CARTO_CLI_HAS_D3D12_BAKE
+template <typename Schedule, typename BaseRecipe, typename ArtifactFor,
+    typename ReportFor, typename ProfileFor, typename KeyForRecipe,
+    typename PublishArtifact, typename ReadArtifact, typename ValidateArtifact>
+int publish_d3d12_tile_schedule(
+    const std::filesystem::path& project_path,
+    const project::ProjectDocument& original_document,
+    std::uint64_t source_asset,
+    std::uint64_t target_asset,
+    const BaseRecipe& base_recipe,
+    const Schedule& schedule,
+    const std::filesystem::path& output_root,
+    std::string_view map_name,
+    ArtifactFor&& artifact_for,
+    ReportFor&& report_for,
+    ProfileFor&& profile_for,
+    KeyForRecipe&& key_for_recipe,
+    PublishArtifact&& publish_artifact,
+    ReadArtifact&& read_artifact,
+    ValidateArtifact&& validate_artifact) {
+    using namespace carto;
+    if (schedule.entries.empty()) {
+        print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+            std::string(map_name) + " D3D12 tile schedule is empty"));
+        return EXIT_FAILURE;
+    }
+    if (output_root.empty() || output_root.filename().empty()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "bake output directory must name a new directory"));
+        return EXIT_FAILURE;
+    }
+    const auto initial_source = original_document.meshes().find(source_asset);
+    const auto initial_target = original_document.meshes().find(target_asset);
+    if (initial_source == original_document.meshes().end() ||
+        initial_target == original_document.meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::stale_data,
+            "D3D12 bake source or target disappeared before publication"));
+        return EXIT_FAILURE;
+    }
+    const auto current_document = project::ProjectDocument::load(project_path);
+    if (!current_document || current_document.value().source_namespace() !=
+            original_document.source_namespace()) {
+        print_error(current_document ? core::Diagnostic(core::ErrorCode::stale_data,
+            "project source namespace changed while the D3D12 tile schedule was running")
+            : current_document.error().with_context(
+                "reloading project before D3D12 tile publication"));
+        return EXIT_FAILURE;
+    }
+    const auto current_source = current_document.value().meshes().find(source_asset);
+    const auto current_target = current_document.value().meshes().find(target_asset);
+    if (current_source == current_document.value().meshes().end() ||
+        current_target == current_document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::stale_data,
+            "D3D12 bake source or target disappeared while the schedule was running"));
+        return EXIT_FAILURE;
+    }
+    if (auto result = validate_artifact(
+            base_recipe, current_source->second, current_target->second); !result) {
+        print_error(result.error().with_context(
+            "revalidating project meshes before D3D12 tile publication"));
+        return EXIT_FAILURE;
+    }
+
+    std::error_code output_error;
+    const auto parent = output_root.parent_path();
+    if (!parent.empty() &&
+        (!std::filesystem::exists(parent, output_error) || output_error ||
+         !std::filesystem::is_directory(parent, output_error) || output_error)) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            "bake output parent directory is unavailable"));
+        return EXIT_FAILURE;
+    }
+    const auto output_entry = path_entry_exists_no_follow(
+        output_root, std::string(map_name) + " D3D12 tile output");
+    if (!output_entry) {
+        print_error(output_entry.error());
+        return EXIT_FAILURE;
+    }
+    if (output_entry.value()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "bake output directory refuses to overwrite an existing path"));
+        return EXIT_FAILURE;
+    }
+    const auto recipe_digest = base_recipe.canonical_digest();
+    if (!recipe_digest) {
+        print_error(recipe_digest.error());
+        return EXIT_FAILURE;
+    }
+    std::filesystem::path staging_root = output_root;
+    staging_root += ".pending-" + recipe_digest.value().hex().substr(0U, 16U);
+    const auto staging_entry = path_entry_exists_no_follow(
+        staging_root, std::string(map_name) + " D3D12 tile staging directory");
+    if (!staging_entry) {
+        print_error(staging_entry.error());
+        return EXIT_FAILURE;
+    }
+    if (staging_entry.value()) {
+        print_error(core::Diagnostic(core::ErrorCode::invalid_state,
+            "D3D12 bake staging directory already exists and requires inspection"));
+        return EXIT_FAILURE;
+    }
+    output_error.clear();
+    if (!std::filesystem::create_directory(staging_root, output_error) || output_error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            "unable to create the new D3D12 bake staging directory"));
+        return EXIT_FAILURE;
+    }
+
+    try {
+        assets::BlobStore blobs(staging_root / "blobs");
+        production::ProductionArtifactStore artifact_store(blobs);
+        const production::AdmissionPolicy policy;
+        std::vector<assets::Sha256Digest> receipt_digests;
+        receipt_digests.reserve(schedule.entries.size());
+        std::optional<std::string> platform_profile;
+        for (const auto& entry : schedule.entries) {
+            const auto& artifact = artifact_for(entry);
+            const auto& tile_report = report_for(entry);
+            const auto profile = profile_for(tile_report);
+            if (!profile) {
+                print_error(profile.error());
+                return EXIT_FAILURE;
+            }
+            if (!tile_report.projection.has_value()) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "D3D12 tile report lacks its projection worker evidence"));
+                return EXIT_FAILURE;
+            }
+            if (!platform_profile.has_value()) {
+                platform_profile = profile.value();
+            } else if (*platform_profile != profile.value()) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "D3D12 tile schedule contains mixed worker platform profiles"));
+                return EXIT_FAILURE;
+            }
+            const auto payload = artifact.serialize();
+            const auto cook_key = key_for_recipe(artifact.recipe, profile.value());
+            if (!payload || !cook_key) {
+                print_error(!payload ? payload.error() : cook_key.error());
+                return EXIT_FAILURE;
+            }
+            production::ProductionArtifactReceipt receipt;
+            receipt.key = cook_key.value();
+            receipt.status = production::ReceiptStatus::admitted;
+            receipt.output_digest = assets::sha256(payload.value());
+            receipt.output_bytes = payload.value().size();
+            receipt.quality.measured_error = 0.0;
+            receipt.quality.importance = 1.0;
+            receipt.quality.confidence = 1.0;
+            receipt.cost.cook_milliseconds = entry.compile_milliseconds;
+            receipt.cost.gpu_milliseconds = static_cast<double>(
+                tile_report.projection->wall_time_nanoseconds) / 1'000'000.0;
+            receipt.cost.disk_bytes = receipt.output_bytes;
+            if (auto result = receipt.refresh_digest(); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            if (auto result = publish_artifact(
+                    artifact_store, receipt, tile_report,
+                    current_source->second, current_target->second,
+                    policy, profile.value()); !result) {
+                print_error(result.error());
+                return EXIT_FAILURE;
+            }
+            const auto reopened = read_artifact(
+                artifact_store, artifact.recipe, current_source->second,
+                current_target->second, policy, profile.value());
+            if (!reopened || reopened.value().artifact_digest != artifact.artifact_digest) {
+                print_error(reopened ? core::Diagnostic(core::ErrorCode::validation_failed,
+                    std::string(map_name) +
+                        " D3D12 tile differs from its compiled artifact after read-back")
+                    : reopened.error());
+                return EXIT_FAILURE;
+            }
+            receipt_digests.push_back(receipt.receipt_digest);
+        }
+
+        const std::string ledger_text = artifact_store.ledger().serialize();
+        const auto ledger = production::ProductionReceiptLedger::deserialize(ledger_text);
+        if (!ledger || ledger.value().size() != receipt_digests.size()) {
+            print_error(ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+                std::string(map_name) + " D3D12 tile ledger lost a scheduled receipt")
+                : ledger.error());
+            return EXIT_FAILURE;
+        }
+        for (std::size_t index = 0U; index < receipt_digests.size(); ++index) {
+            if (ledger.value().records()[index].receipt_digest != receipt_digests[index]) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "D3D12 tile ledger order or receipt identity changed on reopen"));
+                return EXIT_FAILURE;
+            }
+        }
+        const auto manifest_path = staging_root / "receipts.carto-production-receipts";
+        const auto manifest_write = write_new_text_atomically(
+            manifest_path, ledger_text, std::string(map_name) + " D3D12 tile ledger");
+        if (!manifest_write) {
+            print_error(manifest_write.error());
+            return EXIT_FAILURE;
+        }
+        const auto reopened_manifest = read_bounded_text(
+            manifest_path, production::ProductionReceiptLedger::max_serialized_bytes,
+            std::string(map_name) + " D3D12 tile ledger");
+        const auto manifest_ledger = reopened_manifest
+            ? production::ProductionReceiptLedger::deserialize(reopened_manifest.value())
+            : Result<production::ProductionReceiptLedger>::failure(reopened_manifest.error());
+        if (!manifest_ledger || manifest_ledger.value().size() != receipt_digests.size()) {
+            print_error(manifest_ledger ? core::Diagnostic(core::ErrorCode::validation_failed,
+                "D3D12 tile manifest failed exact-count read-back validation")
+                : manifest_ledger.error());
+            return EXIT_FAILURE;
+        }
+        for (std::size_t index = 0U; index < receipt_digests.size(); ++index) {
+            if (manifest_ledger.value().records()[index].receipt_digest !=
+                    receipt_digests[index]) {
+                print_error(core::Diagnostic(core::ErrorCode::validation_failed,
+                    "D3D12 tile manifest failed receipt-order read-back validation"));
+                return EXIT_FAILURE;
+            }
+        }
+
+        const auto publication_document = project::ProjectDocument::load(project_path);
+        if (!publication_document || publication_document.value().source_namespace() !=
+                original_document.source_namespace()) {
+            print_error(publication_document ? core::Diagnostic(core::ErrorCode::stale_data,
+                "project source namespace changed before D3D12 tile publication")
+                : publication_document.error().with_context(
+                    "final project check before D3D12 tile publication"));
+            return EXIT_FAILURE;
+        }
+        const auto publication_source = publication_document.value().meshes().find(source_asset);
+        const auto publication_target = publication_document.value().meshes().find(target_asset);
+        if (publication_source == publication_document.value().meshes().end() ||
+            publication_target == publication_document.value().meshes().end()) {
+            print_error(core::Diagnostic(core::ErrorCode::stale_data,
+                "D3D12 bake source or target disappeared before final publication"));
+            return EXIT_FAILURE;
+        }
+        for (const auto& entry : schedule.entries) {
+            if (auto result = validate_artifact(
+                    artifact_for(entry).recipe, publication_source->second,
+                    publication_target->second); !result) {
+                print_error(result.error().with_context(
+                    "final source check before D3D12 tile publication"));
+                return EXIT_FAILURE;
+            }
+        }
+        output_error.clear();
+        std::filesystem::rename(staging_root, output_root, output_error);
+        if (output_error) {
+            print_error(core::Diagnostic(core::ErrorCode::io_error,
+                "atomic D3D12 bake publication failed; inspect the staging directory"));
+            return EXIT_FAILURE;
+        }
+    } catch (const std::exception& error) {
+        print_error(core::Diagnostic(core::ErrorCode::io_error,
+            std::string(map_name) + " D3D12 tile publication failed: " + error.what()));
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
 int bake_tangent_normal_map_d3d12(char** argv) {
     using namespace carto;
     const std::filesystem::path project_path(argv[2]);
@@ -4103,7 +8334,7 @@ int inspect_tangent_normal_map_d3d12(
         }
         std::cout << "verified"
                   << " kind=tangent-normal"
-                  << " evidence=carto.d3d12.cpu-reference-parity"
+                  << " verification=artifact-source-receipt-readback"
                   << " source=" << std::quoted(receipt.key.source.identity)
                   << " source_revision=" << receipt.key.source.revision.value()
                   << " source_digest=" << receipt.key.source.content_digest.hex()
@@ -4122,6 +8353,442 @@ int inspect_tangent_normal_map_d3d12(
             std::string("D3D12 bake verification failed: ") + error.what()));
         return EXIT_FAILURE;
     }
+    return EXIT_SUCCESS;
+}
+
+int bake_tangent_normal_map_tiles_d3d12(char** argv) {
+    using namespace carto;
+    const std::filesystem::path project_path(argv[2]);
+    const auto source_asset = parse_mesh_asset_id_argument(argv[3]);
+    const auto target_asset = parse_mesh_asset_id_argument(argv[4]);
+    const auto uv_set = parse_bake_u32_argument(argv[5], "UV set id");
+    const auto width = parse_bake_u32_argument(argv[6], "texture width");
+    const auto height = parse_bake_u32_argument(argv[7], "texture height");
+    const auto half_extent = parse_bake_positive_double_argument(
+        argv[8], "projection half extent");
+    const std::string_view reject_misses_text(argv[9]);
+    const std::filesystem::path output_root(argv[10]);
+    if (!source_asset || !target_asset || !uv_set || !width || !height ||
+        !half_extent || (reject_misses_text != "0" && reject_misses_text != "1")) {
+        const core::Diagnostic error = !source_asset ? source_asset.error()
+            : !target_asset ? target_asset.error()
+            : !uv_set ? uv_set.error()
+            : !width ? width.error()
+            : !height ? height.error()
+            : !half_extent ? half_extent.error()
+            : core::Diagnostic(core::ErrorCode::invalid_argument,
+                "reject-misses must be 0 or 1");
+        print_error(error);
+        return EXIT_FAILURE;
+    }
+    const auto document = project::ProjectDocument::load(project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto source = document.value().meshes().find(source_asset.value());
+    const auto target = document.value().meshes().find(target_asset.value());
+    if (source == document.value().meshes().end() ||
+        target == document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::not_found,
+            "normal bake source or target mesh does not exist in the project"));
+        return EXIT_FAILURE;
+    }
+    const std::string source_identity = document.value().source_namespace() +
+        "/mesh/" + std::to_string(source_asset.value());
+    const std::string target_identity = document.value().source_namespace() +
+        "/mesh/" + std::to_string(target_asset.value());
+    const auto source_binding = production::bind_bake_source(source_identity, source->second);
+    const auto target_binding = production::bind_bake_target(
+        target_identity, target->second, uv_set.value());
+    if (!source_binding || !target_binding) {
+        print_error(!source_binding ? source_binding.error() : target_binding.error());
+        return EXIT_FAILURE;
+    }
+    production::BakeRecipe base_recipe;
+    base_recipe.identity = "bake/tangent-normal/source/" +
+        std::to_string(source_asset.value()) + "/target/" +
+        std::to_string(target_asset.value()) + "/uv/" +
+        std::to_string(uv_set.value());
+    base_recipe.source = source_binding.value();
+    base_recipe.target = target_binding.value();
+    base_recipe.target_uv_set = uv_set.value();
+    base_recipe.width = width.value();
+    base_recipe.height = height.value();
+    base_recipe.projection_half_extent = half_extent.value();
+    base_recipe.reject_projection_misses = reject_misses_text == "1";
+    if (auto result = base_recipe.validate(); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto device = d3d12::D3D12Device::create();
+    if (!device) {
+        print_error(device.error().with_context("D3D12 normal-map tile worker"));
+        return EXIT_FAILURE;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    const auto schedule = d3d12::schedule_tangent_normal_map_tiles_d3d12(
+        *device.value(), base_recipe, source->second, target->second);
+    const auto finished = std::chrono::steady_clock::now();
+    if (!schedule) {
+        print_error(schedule.error());
+        return EXIT_FAILURE;
+    }
+    const int publication = publish_d3d12_tile_schedule(
+        project_path, document.value(), source_asset.value(), target_asset.value(),
+        base_recipe, schedule.value(), output_root, "tangent-normal",
+        [](const d3d12::D3D12NormalMapTileScheduleEntry& entry)
+            -> const production::NormalMapArtifact& {
+            return *entry.bake.bake.artifact;
+        },
+        [](const d3d12::D3D12NormalMapTileScheduleEntry& entry)
+            -> const d3d12::D3D12NormalMapBakeReport& { return entry.bake; },
+        [](const d3d12::D3D12NormalMapBakeReport& report) -> Result<std::string> {
+            if (!report.projection.has_value()) {
+                return Result<std::string>::failure(core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "D3D12 normal-map tile lacks projection worker provenance"));
+            }
+            return d3d12::d3d12_bake_platform_profile(*report.projection);
+        },
+        [](const production::BakeRecipe& recipe, std::string_view profile) {
+            return production::bake_production_cook_key(
+                recipe, production::BakeNormalSpace::tangent, profile);
+        },
+        [](production::ProductionArtifactStore& store,
+            production::ProductionArtifactReceipt receipt,
+            const d3d12::D3D12NormalMapBakeReport& report,
+            const geometry::EditableMesh& current_source,
+            const geometry::EditableMesh& current_target,
+            const production::AdmissionPolicy& policy,
+            std::string profile) {
+            return d3d12::publish_tangent_normal_map_d3d12(
+                store, std::move(receipt), report, current_source,
+                current_target, policy, std::move(profile));
+        },
+        [](production::ProductionArtifactStore& store,
+            const production::BakeRecipe& recipe,
+            const geometry::EditableMesh& current_source,
+            const geometry::EditableMesh& current_target,
+            const production::AdmissionPolicy& policy,
+            std::string_view profile) {
+            return production::read_normal_map(
+                store, recipe, production::BakeNormalSpace::tangent,
+                current_source, current_target, policy, profile);
+        },
+        [](const production::BakeRecipe& recipe,
+            const geometry::EditableMesh& current_source,
+            const geometry::EditableMesh& current_target) {
+            return production::validate_bake_sources(
+                recipe, current_source, current_target);
+        });
+    if (publication != EXIT_SUCCESS) return publication;
+
+    for (const auto& entry : schedule.value().entries) {
+        const auto& artifact = *entry.bake.bake.artifact;
+        const auto& worker = *entry.bake.projection;
+        std::cout << "baked kind=tangent-normal"
+                  << " evidence=carto.d3d12.cpu-reference-parity"
+                  << " source=" << std::quoted(source_identity)
+                  << " target=" << std::quoted(target_identity)
+                  << " uv_set=" << uv_set.value()
+                  << " tile=" << entry.tile.tile_u << ',' << entry.tile.tile_v
+                  << " artifact_digest=" << artifact.artifact_digest.hex()
+                  << " adapter_id=" << std::quoted(worker.stable_adapter_id)
+                  << " output=" << std::quoted(output_root.string()) << '\n';
+    }
+    std::cout << "bake_schedule kind=tangent-normal"
+              << " backend=d3d12"
+              << " tiles=" << schedule.value().entries.size()
+              << " compile_milliseconds=" << schedule.value().compile_milliseconds
+              << " wall_milliseconds=" << std::chrono::duration<double, std::milli>(
+                    finished - started).count()
+              << " output=" << std::quoted(output_root.string()) << '\n';
+    return EXIT_SUCCESS;
+}
+
+int bake_ambient_occlusion_tiles_d3d12(char** argv) {
+    using namespace carto;
+    const std::filesystem::path project_path(argv[2]);
+    const auto mesh_asset = parse_mesh_asset_id_argument(argv[3]);
+    const auto uv_set = parse_bake_u32_argument(argv[4], "UV set id");
+    const auto width = parse_bake_u32_argument(argv[5], "texture width");
+    const auto height = parse_bake_u32_argument(argv[6], "texture height");
+    const auto sample_count = parse_bake_u32_argument(argv[7], "AO sample count");
+    const auto max_distance = parse_bake_positive_double_argument(
+        argv[8], "AO maximum distance");
+    const auto seed = parse_bake_u64_argument(argv[9], "AO seed");
+    const std::filesystem::path output_root(argv[10]);
+    if (!mesh_asset || !uv_set || !width || !height || !sample_count ||
+        !max_distance || !seed) {
+        const core::Diagnostic error = !mesh_asset ? mesh_asset.error()
+            : !uv_set ? uv_set.error()
+            : !width ? width.error()
+            : !height ? height.error()
+            : !sample_count ? sample_count.error()
+            : !max_distance ? max_distance.error()
+            : seed.error();
+        print_error(error);
+        return EXIT_FAILURE;
+    }
+    const auto document = project::ProjectDocument::load(project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto mesh = document.value().meshes().find(mesh_asset.value());
+    if (mesh == document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::not_found,
+            "AO bake mesh asset does not exist in the project"));
+        return EXIT_FAILURE;
+    }
+    const std::string mesh_identity = document.value().source_namespace() +
+        "/mesh/" + std::to_string(mesh_asset.value());
+    const auto source_binding = production::bind_bake_source(mesh_identity, mesh->second);
+    const auto target_binding = production::bind_bake_target(
+        mesh_identity, mesh->second, uv_set.value());
+    if (!source_binding || !target_binding) {
+        print_error(!source_binding ? source_binding.error() : target_binding.error());
+        return EXIT_FAILURE;
+    }
+    const production::AmbientOcclusionRecipe base_recipe =
+        make_ambient_occlusion_tile_base_recipe(
+            source_binding.value(), target_binding.value(), uv_set.value(),
+            width.value(), height.value(), sample_count.value(),
+            max_distance.value(), seed.value(), mesh_asset.value());
+    if (auto result = base_recipe.validate(); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto device = d3d12::D3D12Device::create();
+    if (!device) {
+        print_error(device.error().with_context("D3D12 AO tile worker"));
+        return EXIT_FAILURE;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    const auto schedule = d3d12::schedule_ambient_occlusion_tiles_d3d12(
+        *device.value(), base_recipe, mesh->second, mesh->second);
+    const auto finished = std::chrono::steady_clock::now();
+    if (!schedule) {
+        print_error(schedule.error());
+        return EXIT_FAILURE;
+    }
+    const int publication = publish_d3d12_tile_schedule(
+        project_path, document.value(), mesh_asset.value(), mesh_asset.value(),
+        base_recipe, schedule.value(), output_root, "ambient-occlusion",
+        [](const d3d12::D3D12AmbientOcclusionTileScheduleEntry& entry)
+            -> const production::AmbientOcclusionMapArtifact& {
+            return *entry.bake.bake.artifact;
+        },
+        [](const d3d12::D3D12AmbientOcclusionTileScheduleEntry& entry)
+            -> const d3d12::D3D12AmbientOcclusionBakeReport& { return entry.bake; },
+        [](const d3d12::D3D12AmbientOcclusionBakeReport& report)
+            -> Result<std::string> {
+            if (!report.projection.has_value()) {
+                return Result<std::string>::failure(core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "D3D12 AO tile lacks projection worker provenance"));
+            }
+            return d3d12::d3d12_bake_platform_profile(*report.projection);
+        },
+        [](const production::AmbientOcclusionRecipe& recipe,
+            std::string_view profile) {
+            return production::bake_ambient_occlusion_cook_key(recipe, profile);
+        },
+        [](production::ProductionArtifactStore& store,
+            production::ProductionArtifactReceipt receipt,
+            const d3d12::D3D12AmbientOcclusionBakeReport& report,
+            const geometry::EditableMesh& current_source,
+            const geometry::EditableMesh& current_target,
+            const production::AdmissionPolicy& policy,
+            std::string profile) {
+            return d3d12::publish_ambient_occlusion_map_d3d12(
+                store, std::move(receipt), report, current_source,
+                current_target, policy, std::move(profile));
+        },
+        [](production::ProductionArtifactStore& store,
+            const production::AmbientOcclusionRecipe& recipe,
+            const geometry::EditableMesh& current_source,
+            const geometry::EditableMesh& current_target,
+            const production::AdmissionPolicy& policy,
+            std::string_view profile) {
+            return production::read_ambient_occlusion_map(
+                store, recipe, current_source, current_target, policy, profile);
+        },
+        [](const production::AmbientOcclusionRecipe& recipe,
+            const geometry::EditableMesh& current_source,
+            const geometry::EditableMesh& current_target) {
+            return production::validate_bake_sources(
+                recipe.binding, current_source, current_target);
+        });
+    if (publication != EXIT_SUCCESS) return publication;
+
+    for (const auto& entry : schedule.value().entries) {
+        const auto& artifact = *entry.bake.bake.artifact;
+        const auto& worker = *entry.bake.projection;
+        std::cout << "baked kind=ambient-occlusion"
+                  << " evidence=carto.d3d12.cpu-reference-parity"
+                  << " source=" << std::quoted(mesh_identity)
+                  << " uv_set=" << uv_set.value()
+                  << " tile=" << entry.tile.tile_u << ',' << entry.tile.tile_v
+                  << " covered_texels=" << artifact.covered_texels
+                  << " rays_cast=" << artifact.rays_cast
+                  << " artifact_digest=" << artifact.artifact_digest.hex()
+                  << " adapter_id=" << std::quoted(worker.stable_adapter_id)
+                  << " output=" << std::quoted(output_root.string()) << '\n';
+    }
+    std::cout << "bake_schedule kind=ambient-occlusion"
+              << " backend=d3d12"
+              << " tiles=" << schedule.value().entries.size()
+              << " covered_texels=" << schedule.value().covered_texels
+              << " rays_cast=" << schedule.value().rays_cast
+              << " compile_milliseconds=" << schedule.value().compile_milliseconds
+              << " wall_milliseconds=" << std::chrono::duration<double, std::milli>(
+                    finished - started).count()
+              << " output=" << std::quoted(output_root.string()) << '\n';
+    return EXIT_SUCCESS;
+}
+
+int bake_bent_normal_tiles_d3d12(char** argv) {
+    using namespace carto;
+    const std::filesystem::path project_path(argv[2]);
+    const auto mesh_asset = parse_mesh_asset_id_argument(argv[3]);
+    const auto uv_set = parse_bake_u32_argument(argv[4], "UV set id");
+    const auto width = parse_bake_u32_argument(argv[5], "texture width");
+    const auto height = parse_bake_u32_argument(argv[6], "texture height");
+    const auto sample_count = parse_bake_u32_argument(argv[7], "bent-normal sample count");
+    const auto max_distance = parse_bake_positive_double_argument(
+        argv[8], "bent-normal maximum distance");
+    const auto seed = parse_bake_u64_argument(argv[9], "bent-normal seed");
+    const std::filesystem::path output_root(argv[10]);
+    if (!mesh_asset || !uv_set || !width || !height || !sample_count ||
+        !max_distance || !seed) {
+        const core::Diagnostic error = !mesh_asset ? mesh_asset.error()
+            : !uv_set ? uv_set.error()
+            : !width ? width.error()
+            : !height ? height.error()
+            : !sample_count ? sample_count.error()
+            : !max_distance ? max_distance.error()
+            : seed.error();
+        print_error(error);
+        return EXIT_FAILURE;
+    }
+    const auto document = project::ProjectDocument::load(project_path);
+    if (!document) {
+        print_error(document.error());
+        return EXIT_FAILURE;
+    }
+    const auto mesh = document.value().meshes().find(mesh_asset.value());
+    if (mesh == document.value().meshes().end()) {
+        print_error(core::Diagnostic(core::ErrorCode::not_found,
+            "bent-normal bake mesh asset does not exist in the project"));
+        return EXIT_FAILURE;
+    }
+    const std::string mesh_identity = document.value().source_namespace() +
+        "/mesh/" + std::to_string(mesh_asset.value());
+    const auto source_binding = production::bind_bake_source(mesh_identity, mesh->second);
+    const auto target_binding = production::bind_bake_target(
+        mesh_identity, mesh->second, uv_set.value());
+    if (!source_binding || !target_binding) {
+        print_error(!source_binding ? source_binding.error() : target_binding.error());
+        return EXIT_FAILURE;
+    }
+    const auto base_recipe = make_bent_normal_tile_base_recipe(
+        source_binding.value(), target_binding.value(), uv_set.value(),
+        width.value(), height.value(), sample_count.value(), max_distance.value(),
+        seed.value(), mesh_asset.value());
+    if (auto result = base_recipe.validate(); !result) {
+        print_error(result.error());
+        return EXIT_FAILURE;
+    }
+    const auto device = d3d12::D3D12Device::create();
+    if (!device) {
+        print_error(device.error().with_context("D3D12 bent-normal tile worker"));
+        return EXIT_FAILURE;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    const auto schedule = d3d12::schedule_bent_normal_tiles_d3d12(
+        *device.value(), base_recipe, mesh->second, mesh->second);
+    const auto finished = std::chrono::steady_clock::now();
+    if (!schedule) {
+        print_error(schedule.error());
+        return EXIT_FAILURE;
+    }
+    const int publication = publish_d3d12_tile_schedule(
+        project_path, document.value(), mesh_asset.value(), mesh_asset.value(),
+        base_recipe, schedule.value(), output_root, "bent-normal",
+        [](const d3d12::D3D12BentNormalTileScheduleEntry& entry)
+            -> const production::BentNormalMapArtifact& {
+            return *entry.bake.bake.artifact;
+        },
+        [](const d3d12::D3D12BentNormalTileScheduleEntry& entry)
+            -> const d3d12::D3D12BentNormalBakeReport& { return entry.bake; },
+        [](const d3d12::D3D12BentNormalBakeReport& report)
+            -> Result<std::string> {
+            if (!report.projection.has_value()) {
+                return Result<std::string>::failure(core::Diagnostic(
+                    core::ErrorCode::validation_failed,
+                    "D3D12 bent-normal tile lacks projection worker provenance"));
+            }
+            return d3d12::d3d12_bake_platform_profile(*report.projection);
+        },
+        [](const production::AmbientOcclusionRecipe& recipe,
+            std::string_view profile) {
+            return production::bake_bent_normal_cook_key(recipe, profile);
+        },
+        [](production::ProductionArtifactStore& store,
+            production::ProductionArtifactReceipt receipt,
+            const d3d12::D3D12BentNormalBakeReport& report,
+            const geometry::EditableMesh& current_source,
+            const geometry::EditableMesh& current_target,
+            const production::AdmissionPolicy& policy,
+            std::string profile) {
+            return d3d12::publish_bent_normal_map_d3d12(
+                store, std::move(receipt), report, current_source,
+                current_target, policy, std::move(profile));
+        },
+        [](production::ProductionArtifactStore& store,
+            const production::AmbientOcclusionRecipe& recipe,
+            const geometry::EditableMesh& current_source,
+            const geometry::EditableMesh& current_target,
+            const production::AdmissionPolicy& policy,
+            std::string_view profile) {
+            return production::read_bent_normal_map(
+                store, recipe, current_source, current_target, policy, profile);
+        },
+        [](const production::AmbientOcclusionRecipe& recipe,
+            const geometry::EditableMesh& current_source,
+            const geometry::EditableMesh& current_target) {
+            return production::validate_bake_sources(
+                recipe.binding, current_source, current_target);
+        });
+    if (publication != EXIT_SUCCESS) return publication;
+
+    for (const auto& entry : schedule.value().entries) {
+        const auto& artifact = *entry.bake.bake.artifact;
+        const auto& worker = *entry.bake.projection;
+        std::cout << "baked kind=bent-normal"
+                  << " evidence=carto.d3d12.cpu-reference-parity"
+                  << " source=" << std::quoted(mesh_identity)
+                  << " uv_set=" << uv_set.value()
+                  << " tile=" << entry.tile.tile_u << ',' << entry.tile.tile_v
+                  << " covered_texels=" << artifact.covered_texels
+                  << " rays_cast=" << artifact.rays_cast
+                  << " occluded_rays=" << artifact.occluded_rays
+                  << " artifact_digest=" << artifact.artifact_digest.hex()
+                  << " adapter_id=" << std::quoted(worker.stable_adapter_id)
+                  << " output=" << std::quoted(output_root.string()) << '\n';
+    }
+    std::cout << "bake_schedule kind=bent-normal"
+              << " backend=d3d12"
+              << " tiles=" << schedule.value().entries.size()
+              << " covered_texels=" << schedule.value().covered_texels
+              << " rays_cast=" << schedule.value().rays_cast
+              << " occluded_rays=" << schedule.value().occluded_rays
+              << " compile_milliseconds=" << schedule.value().compile_milliseconds
+              << " wall_milliseconds=" << std::chrono::duration<double, std::milli>(
+                    finished - started).count()
+              << " output=" << std::quoted(output_root.string()) << '\n';
     return EXIT_SUCCESS;
 }
 #endif
@@ -4206,12 +8873,36 @@ void usage(std::ostream& output) {
            << "  cartographer_cli inspect-prepared <output-directory>\n"
            << "  cartographer_cli bake-ao <project.carto> <mesh-id> <uv-set-id> <width> <height> <tile-u> <tile-v> <samples> <max-distance> <seed> <output-directory> (mesh is both source and UV target; origin bias is 1e-4)\n"
            << "  cartographer_cli inspect-bake-ao <project.carto> <mesh-id> <output-directory>\n"
+           << "  cartographer_cli bake-ao-tiles <project.carto> <mesh-id> <uv-set-id> <width> <height> <samples> <max-distance> <seed> <output-directory> (CPU; mesh is both source and UV target)\n"
+           << "  cartographer_cli inspect-bake-ao-tiles <project.carto> <mesh-id> <uv-set-id> <width> <height> <samples> <max-distance> <seed> <output-directory>\n"
+           << "  cartographer_cli bake-bent-normal-tiles <project.carto> <mesh-id> <uv-set-id> <width> <height> <samples> <max-distance> <seed> <output-directory> (CPU; mesh is both source and UV target)\n"
+           << "  cartographer_cli inspect-bake-bent-normal-tiles <project.carto> <mesh-id> <uv-set-id> <width> <height> <samples> <max-distance> <seed> <output-directory>\n"
+           << "  cartographer_cli bake-curvature-tiles <project.carto> <source-mesh-id> <target-mesh-id> <uv-set-id> <width> <height> <projection-half-extent> <reject-projection-misses:0|1> <normalization-scale> <output-directory>\n"
+           << "  cartographer_cli inspect-bake-curvature-tiles <project.carto> <source-mesh-id> <target-mesh-id> <uv-set-id> <width> <height> <projection-half-extent> <reject-projection-misses:0|1> <normalization-scale> <output-directory>\n"
+           << "  cartographer_cli bake-thickness-tiles <project.carto> <source-mesh-id> <target-mesh-id> <uv-set-id> <width> <height> <projection-half-extent> <reject-projection-misses:0|1> <maximum-distance> <surface-bias> <reject-thickness-misses:0|1> <output-directory>\n"
+           << "  cartographer_cli inspect-bake-thickness-tiles <project.carto> <source-mesh-id> <target-mesh-id> <uv-set-id> <width> <height> <projection-half-extent> <reject-projection-misses:0|1> <maximum-distance> <surface-bias> <reject-thickness-misses:0|1> <output-directory>\n"
+           << "  cartographer_cli bake-height-displacement-tiles <project.carto> <source-mesh-id> <target-mesh-id> <uv-set-id> <width> <height> <projection-half-extent> <reject-projection-misses:0|1> <normalization-distance> <reject-clamped-samples:0|1> <output-directory>\n"
+           << "  cartographer_cli inspect-bake-height-displacement-tiles <project.carto> <source-mesh-id> <target-mesh-id> <uv-set-id> <width> <height> <projection-half-extent> <reject-projection-misses:0|1> <normalization-distance> <reject-clamped-samples:0|1> <output-directory>\n"
+           << "  cartographer_cli bake-world-position-tiles <project.carto> <target-scene-node-id> <uv-set-id> <width> <height> <output-directory>\n"
+           << "  cartographer_cli inspect-bake-world-position-tiles <project.carto> <target-scene-node-id> <uv-set-id> <width> <height> <output-directory>\n"
+           << "  cartographer_cli bind-material-surface-id-recipe <project.carto> <target-mesh-asset-id> <uv-set-id> <width> <height> <material-region-layer> <surface-domains.tsv> <output.recipe>\n"
+           << "  cartographer_cli bake-material-surface-id-tiles <project.carto> <material-surface-id.recipe> <output-directory>\n"
+           << "  cartographer_cli inspect-bake-material-surface-id-tiles <project.carto> <material-surface-id.recipe> <output-directory>\n"
+           << "  surface-domains.tsv: carto-surface-domain-assignments-v1, then domain_id<TAB>semantic_class<TAB>material_class<TAB>face_id[,face_id...] rows\n"
            << "  cartographer_cli bake-normal <project.carto> <source-mesh-id> <target-mesh-id> <uv-set-id> <width> <height> <tile-u> <tile-v> <projection-half-extent> <reject-misses:0|1> <output-directory>\n"
-           << "  cartographer_cli inspect-bake-normal <project.carto> <source-mesh-id> <target-mesh-id> <output-directory>\n";
+           << "  cartographer_cli inspect-bake-normal <project.carto> <source-mesh-id> <target-mesh-id> <output-directory>\n"
+           << "  cartographer_cli bake-normal-tiles <project.carto> <source-mesh-id> <target-mesh-id> <uv-set-id> <width> <height> <projection-half-extent> <reject-misses:0|1> <output-directory> [cache-directory]\n"
+           << "  cartographer_cli inspect-bake-normal-tiles <project.carto> <source-mesh-id> <target-mesh-id> <output-directory>\n";
 #if CARTO_CLI_HAS_D3D12_BAKE
     output << "  cartographer_cli bake-ao-d3d12 <project.carto> <mesh-id> <uv-set-id> <width> <height> <tile-u> <tile-v> <samples> <max-distance> <seed> <output-directory> (mesh is both source and UV target; origin bias is 1e-4)\n"
+           << "  cartographer_cli bake-ao-tiles-d3d12 <project.carto> <mesh-id> <uv-set-id> <width> <height> <samples> <max-distance> <seed> <output-directory> (mesh is both source and UV target)\n"
+           << "  cartographer_cli inspect-bake-ao-tiles-d3d12 <project.carto> <mesh-id> <uv-set-id> <width> <height> <samples> <max-distance> <seed> <output-directory>\n"
+           << "  cartographer_cli bake-bent-normal-tiles-d3d12 <project.carto> <mesh-id> <uv-set-id> <width> <height> <samples> <max-distance> <seed> <output-directory> (mesh is both source and UV target)\n"
+           << "  cartographer_cli inspect-bake-bent-normal-tiles-d3d12 <project.carto> <mesh-id> <uv-set-id> <width> <height> <samples> <max-distance> <seed> <output-directory>\n"
            << "  cartographer_cli bake-normal-d3d12 <project.carto> <source-mesh-id> <target-mesh-id> <uv-set-id> <width> <height> <tile-u> <tile-v> <projection-half-extent> <reject-misses:0|1> <output-directory>\n"
-           << "  cartographer_cli inspect-bake-normal-d3d12 <project.carto> <source-mesh-id> <target-mesh-id> <output-directory>\n";
+           << "  cartographer_cli inspect-bake-normal-d3d12 <project.carto> <source-mesh-id> <target-mesh-id> <output-directory>\n"
+           << "  cartographer_cli bake-normal-tiles-d3d12 <project.carto> <source-mesh-id> <target-mesh-id> <uv-set-id> <width> <height> <projection-half-extent> <reject-misses:0|1> <output-directory>\n"
+           << "  cartographer_cli inspect-bake-normal-tiles-d3d12 <project.carto> <source-mesh-id> <target-mesh-id> <output-directory>\n";
 #endif
     output << "  cartographer_cli import-obj <mesh.obj> <project.carto>\n"
            << "  cartographer_cli import-ply <mesh.ply> <project.carto>\n"
@@ -4366,21 +9057,98 @@ int main(int argc, char** argv) {
     if (command == "inspect-bake-ao" && argc == 5) {
         return inspect_ambient_occlusion_bake(argv[2], argv[3], argv[4]);
     }
+    if (command == "bake-ao-tiles" && argc == 11) {
+        return bake_ambient_occlusion_tiles_cpu(argv);
+    }
+    if (command == "inspect-bake-ao-tiles" && argc == 11) {
+        return inspect_ambient_occlusion_tiles(
+            argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8],
+            argv[9], argv[10]);
+    }
+    if (command == "bake-bent-normal-tiles" && argc == 11) {
+        return bake_bent_normal_tiles_cpu(argv);
+    }
+    if (command == "inspect-bake-bent-normal-tiles" && argc == 11) {
+        return inspect_bent_normal_tiles(
+            argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8],
+            argv[9], argv[10]);
+    }
+    if (command == "bake-curvature-tiles" && argc == 12) {
+        return bake_curvature_tiles_cpu(argv);
+    }
+    if (command == "inspect-bake-curvature-tiles" && argc == 12) {
+        return inspect_curvature_tiles(argv);
+    }
+    if (command == "bake-thickness-tiles" && argc == 14) {
+        return bake_thickness_tiles_cpu(argv);
+    }
+    if (command == "inspect-bake-thickness-tiles" && argc == 14) {
+        return inspect_thickness_tiles(argv);
+    }
+    if (command == "bake-height-displacement-tiles" && argc == 13) {
+        return bake_height_displacement_tiles_cpu(argv);
+    }
+    if (command == "inspect-bake-height-displacement-tiles" && argc == 13) {
+        return inspect_height_displacement_tiles(argv);
+    }
+    if (command == "bake-world-position-tiles" && argc == 8) {
+        return bake_world_position_tiles_cpu(argv);
+    }
+    if (command == "inspect-bake-world-position-tiles" && argc == 8) {
+        return inspect_world_position_tiles(argv);
+    }
+    if (command == "bind-material-surface-id-recipe" && argc == 10) {
+        return bind_material_surface_id_recipe(argv);
+    }
+    if (command == "bake-material-surface-id-tiles" && argc == 5) {
+        return bake_material_surface_id_tiles_cpu(argv);
+    }
+    if (command == "inspect-bake-material-surface-id-tiles" && argc == 5) {
+        return inspect_material_surface_id_tiles(argv);
+    }
     if (command == "bake-normal" && argc == 13) {
         return bake_tangent_normal_map_cpu(argv);
     }
     if (command == "inspect-bake-normal" && argc == 6) {
         return inspect_tangent_normal_map(argv[2], argv[3], argv[4], argv[5]);
     }
+    if (command == "bake-normal-tiles" && (argc == 11 || argc == 12)) {
+        return bake_tangent_normal_map_tiles_cpu(argv);
+    }
+    if (command == "inspect-bake-normal-tiles" && argc == 6) {
+        return inspect_tangent_normal_map_tiles(argv[2], argv[3], argv[4], argv[5]);
+    }
 #if CARTO_CLI_HAS_D3D12_BAKE
     if (command == "bake-ao-d3d12" && argc == 13) {
         return bake_ambient_occlusion(argv, true);
+    }
+    if (command == "bake-ao-tiles-d3d12" && argc == 11) {
+        return bake_ambient_occlusion_tiles_d3d12(argv);
+    }
+    if (command == "inspect-bake-ao-tiles-d3d12" && argc == 11) {
+        return inspect_ambient_occlusion_tiles(
+            argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8],
+            argv[9], argv[10], true);
+    }
+    if (command == "bake-bent-normal-tiles-d3d12" && argc == 11) {
+        return bake_bent_normal_tiles_d3d12(argv);
+    }
+    if (command == "inspect-bake-bent-normal-tiles-d3d12" && argc == 11) {
+        return inspect_bent_normal_tiles(argv[2], argv[3], argv[4], argv[5],
+            argv[6], argv[7], argv[8], argv[9], argv[10], true);
     }
     if (command == "bake-normal-d3d12" && argc == 13) {
         return bake_tangent_normal_map_d3d12(argv);
     }
     if (command == "inspect-bake-normal-d3d12" && argc == 6) {
         return inspect_tangent_normal_map_d3d12(argv[2], argv[3], argv[4], argv[5]);
+    }
+    if (command == "bake-normal-tiles-d3d12" && argc == 11) {
+        return bake_tangent_normal_map_tiles_d3d12(argv);
+    }
+    if (command == "inspect-bake-normal-tiles-d3d12" && argc == 6) {
+        return inspect_tangent_normal_map_tiles(
+            argv[2], argv[3], argv[4], argv[5], true);
     }
 #endif
     if (command == "import-obj" && argc == 4) {

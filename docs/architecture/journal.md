@@ -29,7 +29,16 @@ across cooperating processes as well as within one process. Project saves and
 package creation also acquire their own cross-process path locks while their
 multi-step publication is in progress, and all temporary outputs use
 per-operation names rather than a fixed destination-adjacent path. Failed
-journal writes roll back to the pre-append byte boundary. Checkpoint filenames
+journal writes roll back to the pre-append byte boundary. Each append first
+creates `<journal>.uncertain` under the existing journal lock. The marker is
+cleared only after a successful flush and close, or a confirmed rollback. An
+unresolved marker blocks reads, verification, replay, recovery and further
+appends in every instance and process, even if the uncertain record has a
+valid hash and complete framing. Failure to clear a marker also fails closed.
+The marker and journal remain evidence for explicit operator review; no API
+silently clears the marker or repairs the journal. Recovery from uncertainty
+requires preserving both files and restoring a trusted, verified pre-failure
+journal or checkpoint through an explicit human decision. Checkpoint filenames
 are bound to their metadata revision. These locks do not form a power-loss/
 fsync guarantee or a transaction across unrelated project, checkpoint, and
 blob stores; those deployment and crash-injection gates remain deferred.

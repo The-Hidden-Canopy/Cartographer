@@ -157,6 +157,28 @@ carto::geometry::EditableMesh make_square(bool seam) {
         {2.0, 0.0}, {3.0, 1.0}, {2.0, 1.0}});
 }
 
+carto::geometry::EditableMesh mark_square_shared_edge_as_seam(
+    carto::geometry::EditableMesh mesh) {
+    using namespace carto;
+    const auto topology = mesh.topology();
+    REQUIRE(topology);
+    const auto shared = std::find_if(topology.value().edges.begin(), topology.value().edges.end(),
+        [](const auto& edge) { return edge.second_half_edge.has_value(); });
+    REQUIRE(shared != topology.value().edges.end());
+    attributes::AttributeSet attributes = mesh.attributes();
+    REQUIRE(attributes.set_domain_count(
+        attributes::AttributeDomain::edge, topology.value().edges.size()));
+    std::vector<attributes::AttributeValue> marks(topology.value().edges.size(), false);
+    const std::size_t edge_index = static_cast<std::size_t>(
+        std::distance(topology.value().edges.begin(), shared));
+    marks[edge_index] = true;
+    REQUIRE(attributes.add_layer({
+        {attributes::uv_seam_attribute_id(7U), attributes::AttributeDomain::edge,
+         attributes::AttributeType::boolean}, std::move(marks)}));
+    REQUIRE(mesh.set_attribute_payload(std::move(attributes), mesh.uv_sets()));
+    return mesh;
+}
+
 carto::project::ProjectDocument make_project(
     carto::journal::Journal& journal,
     carto::geometry::EditableMesh mesh,
@@ -389,7 +411,7 @@ void world_area_density_policy_normalizes_uv_islands_deterministically() {
     const auto uniform = production::compile_uv_island_pack(uniform_recipe, source);
     const auto repeated = production::compile_uv_island_pack(uniform_recipe, source);
     REQUIRE(uniform && repeated);
-    REQUIRE(uniform.value().algorithm == "carto.uv.island-shelf-pack.v2");
+    REQUIRE(uniform.value().algorithm == "carto.uv.island-shelf-pack.v3");
     REQUIRE(uniform.value().validate(source));
     REQUIRE(uniform.value().output_digest == repeated.value().output_digest);
     REQUIRE(uniform.value().artifact_digest == repeated.value().artifact_digest);
@@ -573,6 +595,7 @@ void shared_edge_identity_controls_island_connectivity() {
     TempDirectory directory;
     journal::Journal continuous_journal(directory.path() / "uv-continuous-journal.log");
     journal::Journal seam_journal(directory.path() / "uv-seam-journal.log");
+    journal::Journal marked_journal(directory.path() / "uv-marked-seam-journal.log");
 
     std::uint64_t continuous_asset = 0U;
     project::ProjectDocument continuous_document = make_project(
@@ -611,6 +634,22 @@ void shared_edge_identity_controls_island_connectivity() {
     const double gap_x = std::max({0.0, b[0U] - a[2U], a[0U] - b[2U]});
     const double gap_y = std::max({0.0, b[1U] - a[3U], a[1U] - b[3U]});
     REQUIRE(gap_x > 0.0 || gap_y > 0.0);
+
+    std::uint64_t marked_asset = 0U;
+    project::ProjectDocument marked_document = make_project(
+        marked_journal, mark_square_shared_edge_as_seam(make_square(false)), marked_asset);
+    const auto marked_seam = production::compile_uv_island_pack(
+        make_recipe(marked_document, marked_asset), marked_document.meshes().at(marked_asset));
+    REQUIRE(marked_seam);
+    REQUIRE(marked_seam.value().tiles.front().face_count == 2U);
+    const auto marked_bounds = face_bounds(marked_seam.value());
+    const auto marked_a = marked_bounds.at(geometry::FaceId{10U});
+    const auto marked_b = marked_bounds.at(geometry::FaceId{20U});
+    const double marked_gap_x = std::max({
+        0.0, marked_b[0U] - marked_a[2U], marked_a[0U] - marked_b[2U]});
+    const double marked_gap_y = std::max({
+        0.0, marked_b[1U] - marked_a[3U], marked_a[1U] - marked_b[3U]});
+    REQUIRE(marked_gap_x > 0.0 || marked_gap_y > 0.0);
 }
 
 void stale_and_malformed_sources_fail_closed() {

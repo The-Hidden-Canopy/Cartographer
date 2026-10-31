@@ -2,16 +2,20 @@
 #include <carto/attributes/uv.hpp>
 #include <carto/geometry/mesh.hpp>
 #include <carto/production/bake_graph.hpp>
+#include "../apps/desktop/bake_workflow.hpp"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <system_error>
 #include <iostream>
 #include <stdexcept>
+#include <stop_token>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -52,6 +56,20 @@ carto::geometry::EditableMesh make_source() {
         {{geometry::FaceId{1U}, {geometry::VertexId{1U}, geometry::VertexId{2U},
              geometry::VertexId{3U}}}}));
     return mesh;
+}
+
+void desktop_completion_metrics_report_schedule_counts() {
+    struct Schedule final {
+        std::array<std::uint32_t, 3U> entries{};
+    };
+    const Schedule schedule;
+    const auto metrics = carto::desktop::completed_tile_schedule_metrics(
+        schedule, 256U, 768U, 12.5);
+    REQUIRE(metrics.covered_texels == 256U);
+    REQUIRE(metrics.rays_cast == 768U);
+    REQUIRE(metrics.compile_milliseconds == 12.5);
+    REQUIRE(metrics.compiled_tiles == 3U);
+    REQUIRE(metrics.reused_tiles == 0U);
 }
 
 carto::geometry::EditableMesh make_source_pair() {
@@ -376,6 +394,61 @@ void cache_entry_reuses_only_verified_unchanged_tiles() {
     REQUIRE(!production::BakeTileArtifactCacheEntry::deserialize(corrupted_bytes));
 }
 
+void desktop_cache_file_io_fails_closed() {
+    using namespace carto;
+    const geometry::EditableMesh source = make_source();
+    const geometry::EditableMesh target = make_target(initial_uvs());
+    const production::BakeRecipe recipe = make_recipe(source, target, 0U);
+    const auto baked = production::compile_tangent_normal_map_cpu(
+        recipe, source, target);
+    REQUIRE(baked.succeeded() && baked.artifact.has_value());
+    const auto entry = production::make_bake_tile_cache_entry(
+        *baked.artifact, source, target);
+    REQUIRE(entry);
+    const auto serialized = entry.value().serialize();
+    REQUIRE(serialized);
+
+    TempDirectory directory;
+    const auto path = directory.path() / "normal-tile.carto-bake-tile-cache";
+    const auto missing = desktop::bake_workflow_detail::read_normal_tile_cache_entry(
+        path, static_cast<std::uintmax_t>(serialized.value().size()));
+    REQUIRE(missing && !missing.value().has_value());
+    REQUIRE(desktop::bake_workflow_detail::write_new_normal_tile_cache_entry(
+        path, serialized.value()));
+    REQUIRE(!desktop::bake_workflow_detail::read_normal_tile_cache_entry(
+        path, static_cast<std::uintmax_t>(serialized.value().size() - 1U)));
+    const auto reopened = desktop::bake_workflow_detail::read_normal_tile_cache_entry(
+        path, static_cast<std::uintmax_t>(serialized.value().size()));
+    REQUIRE(reopened && reopened.value().has_value());
+    REQUIRE(reopened.value()->entry_digest == entry.value().entry_digest);
+    REQUIRE(!desktop::bake_workflow_detail::write_new_normal_tile_cache_entry(
+        path, serialized.value()));
+
+    std::error_code link_error;
+    const auto link = directory.path() / "normal-tile-link.carto-bake-tile-cache";
+    std::filesystem::create_symlink(path, link, link_error);
+    if (!link_error) {
+        REQUIRE(!desktop::bake_workflow_detail::read_normal_tile_cache_entry(
+            link, static_cast<std::uintmax_t>(serialized.value().size())));
+    }
+
+    auto corrupted = serialized.value();
+    REQUIRE(!corrupted.empty());
+    corrupted.back() ^= 1U;
+    {
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        REQUIRE(output.good());
+        output.write(reinterpret_cast<const char*>(corrupted.data()),
+            static_cast<std::streamsize>(corrupted.size()));
+        output.close();
+        REQUIRE(output.good());
+    }
+    const auto corrupt_read =
+        desktop::bake_workflow_detail::read_normal_tile_cache_entry(
+            path, static_cast<std::uintmax_t>(serialized.value().size()));
+    REQUIRE(!corrupt_read);
+}
+
 void cache_entry_rejects_changed_dependencies_and_tampered_pixels() {
     using namespace carto;
     const geometry::EditableMesh source = make_source();
@@ -450,6 +523,8 @@ void tile_schedule_compiles_all_tiles_in_stable_order() {
     for (std::size_t index = 0U; index < first.value().entries.size(); ++index) {
         REQUIRE(first.value().entries[index].tile == tiles.value()[index]);
         REQUIRE(first.value().entries[index].artifact.validate());
+        REQUIRE(std::isfinite(first.value().entries[index].compile_milliseconds));
+        REQUIRE(first.value().entries[index].compile_milliseconds >= 0.0);
     }
 
     const auto repeated = production::schedule_normal_map_tiles_cpu(
@@ -470,6 +545,22 @@ void tile_schedule_compiles_all_tiles_in_stable_order() {
         REQUIRE(entry.artifact.normal_space == production::BakeNormalSpace::object);
         REQUIRE(entry.artifact.validate());
     }
+}
+
+void cancelled_tile_schedule_returns_no_partial_result() {
+    using namespace carto;
+    const geometry::EditableMesh source = make_source_pair();
+    const geometry::EditableMesh target = make_target(initial_uvs());
+    const production::BakeRecipe recipe = make_recipe(source, target, 0U);
+    std::stop_source cancellation;
+    REQUIRE(cancellation.request_stop());
+
+    const auto cancelled = production::schedule_normal_map_tiles_cpu(
+        recipe, production::BakeNormalSpace::tangent, source, target, {},
+        cancellation.get_token());
+    REQUIRE(!cancelled);
+    REQUIRE(cancelled.error().code == core::ErrorCode::invalid_state);
+    REQUIRE(cancelled.error().message.find("cancelled") != std::string::npos);
 }
 
 void tile_enumeration_orders_both_axes_and_enforces_bounds() {
@@ -533,7 +624,10 @@ void tile_schedule_reuses_only_matching_cached_tiles() {
     REQUIRE((scheduled.value().entries[0U].tile ==
         production::BakeTileCoordinate{0U, 0U}));
     REQUIRE(scheduled.value().entries[0U].reused_from_cache);
+    REQUIRE(scheduled.value().entries[0U].compile_milliseconds == 0.0);
     REQUIRE(!scheduled.value().entries[1U].reused_from_cache);
+    REQUIRE(std::isfinite(scheduled.value().entries[1U].compile_milliseconds));
+    REQUIRE(scheduled.value().entries[1U].compile_milliseconds >= 0.0);
 
     const auto cold = production::schedule_normal_map_tiles_cpu(
         current_recipe, production::BakeNormalSpace::tangent, source, changed_target);
@@ -569,6 +663,24 @@ void tile_schedule_rejects_cross_tile_faces_and_partial_failure() {
     REQUIRE(partial_failure.error().code == core::ErrorCode::validation_failed);
     REQUIRE(partial_failure.error().context.size() == 1U);
     REQUIRE(partial_failure.error().context.front() == "UDIM tile 1,0");
+}
+
+void tile_schedule_rejects_aggregate_rgba8_over_budget_before_compilation() {
+    using namespace carto;
+    const geometry::EditableMesh source = make_source_pair();
+    const geometry::EditableMesh target = make_tiled_mesh(
+        {{0U, 0U}, {1U, 0U}, {2U, 0U}, {3U, 0U}, {4U, 0U},
+         {5U, 0U}, {6U, 0U}, {7U, 0U}, {8U, 0U}}, 0.1);
+    production::BakeRecipe recipe = make_recipe(source, target, 0U);
+    recipe.width = 4'096U;
+    recipe.height = 4'096U;
+    REQUIRE(recipe.validate());
+    const auto schedule = production::schedule_normal_map_tiles_cpu(
+        recipe, production::BakeNormalSpace::tangent, source, target);
+    REQUIRE(!schedule);
+    REQUIRE(schedule.error().code == core::ErrorCode::unsupported);
+    REQUIRE(schedule.error().message.find("aggregate RGBA8 memory budget") !=
+        std::string::npos);
 }
 
 void tile_schedule_rejects_a_corrupt_matching_cache_entry() {
@@ -983,6 +1095,8 @@ void seam_safe_padding_rejects_overlapping_and_cross_tile_uvs() {
 
 int main() {
     try {
+        desktop_completion_metrics_report_schedule_counts();
+        std::cout << "PASS desktop bake completion metrics report compiled and reused tiles\n";
         tile_uv_changes_invalidate_only_the_affected_uv_tile();
         std::cout << "PASS per-tile dependency reuse survives unrelated UV tile edits\n";
         geometry_and_settings_changes_invalidate_tile_reuse();
@@ -991,16 +1105,22 @@ int main() {
         std::cout << "PASS cross-tile and uncovered bake inputs fail closed\n";
         cache_entry_reuses_only_verified_unchanged_tiles();
         std::cout << "PASS verified unchanged bake tiles survive serialization and revision rebinding\n";
+        desktop_cache_file_io_fails_closed();
+        std::cout << "PASS desktop normal-map cache refuses overwrite and corrupt entries\n";
         cache_entry_rejects_changed_dependencies_and_tampered_pixels();
         std::cout << "PASS changed bake dependencies and tampered cache bytes fail closed\n";
         tile_schedule_compiles_all_tiles_in_stable_order();
         std::cout << "PASS multi-tile bake scheduling is ordered and deterministic\n";
+        cancelled_tile_schedule_returns_no_partial_result();
+        std::cout << "PASS cancelled tile scheduling returns no partial result\n";
         tile_enumeration_orders_both_axes_and_enforces_bounds();
         std::cout << "PASS UDIM tile ordering and schedule bounds fail closed\n";
         tile_schedule_reuses_only_matching_cached_tiles();
         std::cout << "PASS scheduled bake tiles reuse only verified matching cache entries\n";
         tile_schedule_rejects_cross_tile_faces_and_partial_failure();
         std::cout << "PASS cross-tile and partially failed schedules admit no result\n";
+        tile_schedule_rejects_aggregate_rgba8_over_budget_before_compilation();
+        std::cout << "PASS aggregate tile output memory is bounded before compilation\n";
         tile_schedule_rejects_a_corrupt_matching_cache_entry();
         std::cout << "PASS corrupt matching bake tile cache fails closed\n";
         seam_safe_padding_is_deterministic_serializable_and_publishable();

@@ -412,6 +412,98 @@ void require(bool condition, const char* message) {
     std::exit(EXIT_FAILURE);
 }
 
+void require_docking_mouse_snap() {
+    ImGuiContext* const previous_context = ImGui::GetCurrentContext();
+    ImGuiContext* const context = ImGui::CreateContext();
+    require(context != nullptr,
+        "a separate ImGui context must be available for pointer-driven dock acceptance");
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(960.0F, 640.0F);
+    io.DeltaTime = 1.0F / 60.0F;
+    io.IniFilename = nullptr;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    require(io.Fonts->Build(),
+        "the pointer-driven docking test font atlas must build");
+
+    struct PanelState {
+        ImGuiID scene_node = 0U;
+        ImGuiID inspector_node = 0U;
+        ImRect scene_tab{};
+        ImRect inspector_tab{};
+    };
+    carto::studio::DockingWorkspace workspace;
+    bool mouse_down = false;
+    const auto frame = [&](ImVec2 position, bool next_mouse_down) {
+        io.AddMousePosEvent(position.x, position.y);
+        if (mouse_down != next_mouse_down) {
+            io.AddMouseButtonEvent(ImGuiMouseButton_Left, next_mouse_down);
+            mouse_down = next_mouse_down;
+        }
+        ImGui::NewFrame();
+        workspace.begin_root();
+        PanelState state;
+        for (const char* name : {"Viewport", "Scene", "Inspector", "Assets", "History"}) {
+            if (ImGui::Begin(name)) ImGui::TextUnformatted("Dock interaction probe");
+            const ImGuiWindow* const panel = ImGui::GetCurrentWindowRead();
+            if (panel != nullptr && panel->DockNode != nullptr) {
+                const ImGuiID node = panel->DockNode->ID;
+                ImRect tab_rect{};
+                if (panel->DockNode->TabBar != nullptr) {
+                    const ImGuiTabBar* const tab_bar = panel->DockNode->TabBar;
+                    for (const ImGuiTabItem& tab : tab_bar->Tabs) {
+                        if (tab.ID != panel->TabId) continue;
+                        tab_rect = ImRect(
+                            ImVec2(tab_bar->BarRect.Min.x + tab.Offset,
+                                   tab_bar->BarRect.Min.y),
+                            ImVec2(tab_bar->BarRect.Min.x + tab.Offset + tab.Width,
+                                   tab_bar->BarRect.Max.y));
+                        break;
+                    }
+                }
+                if (std::string_view(name) == "Scene") {
+                    state.scene_node = node;
+                    state.scene_tab = tab_rect;
+                } else if (std::string_view(name) == "Inspector") {
+                    state.inspector_node = node;
+                    state.inspector_tab = tab_rect;
+                }
+            }
+            ImGui::End();
+        }
+        ImGui::Render();
+        return state;
+    };
+
+    static_cast<void>(frame(ImVec2(-100.0F, -100.0F), false));
+    const PanelState initial = frame(ImVec2(-100.0F, -100.0F), false);
+    PanelState state = initial;
+    require(state.scene_node != 0U && state.inspector_node != 0U &&
+            state.scene_node != state.inspector_node &&
+            state.scene_tab.GetWidth() > 0.0F && state.inspector_tab.GetWidth() > 0.0F,
+        "the initial layout must expose separate draggable Scene and Inspector tabs");
+
+    const ImVec2 inspector_tab_center(
+        (state.inspector_tab.Min.x + state.inspector_tab.Max.x) * 0.5F,
+        (state.inspector_tab.Min.y + state.inspector_tab.Max.y) * 0.5F);
+    const ImVec2 scene_drop_target(
+        (state.scene_tab.Min.x + state.scene_tab.Max.x) * 0.5F,
+        (state.scene_tab.Min.y + state.scene_tab.Max.y) * 0.5F);
+    static_cast<void>(frame(inspector_tab_center, false));
+    static_cast<void>(frame(inspector_tab_center, true));
+    static_cast<void>(frame(ImVec2(
+        (inspector_tab_center.x + scene_drop_target.x) * 0.5F,
+        (inspector_tab_center.y + scene_drop_target.y) * 0.5F), true));
+    static_cast<void>(frame(scene_drop_target, true));
+    static_cast<void>(frame(scene_drop_target, true));
+    static_cast<void>(frame(scene_drop_target, false));
+    state = frame(scene_drop_target, false);
+    require(state.scene_node != 0U && state.inspector_node == state.scene_node,
+        "dragging the Inspector tab onto Scene must dock both panes into one tab group");
+
+    ImGui::DestroyContext(context);
+    ImGui::SetCurrentContext(previous_context);
+}
+
 } // namespace
 
 int main() {
@@ -705,6 +797,7 @@ int main() {
     require_unique_docking_layout_write_paths();
     require_docking_layout_load_fail_closed();
     require_docking_capture_loss_is_distinguished();
+    require_docking_mouse_snap();
 
     ImGui::DestroyContext(context);
 

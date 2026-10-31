@@ -7,11 +7,14 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace carto::project {
+
+class MaterialGraph;
 
 enum class MaterialGraphValueType : std::uint8_t { scalar, color, normal };
 enum class MaterialGraphNodeKind : std::uint8_t {
@@ -75,6 +78,47 @@ struct MaterialGraphCompileReport {
     [[nodiscard]] core::Result<void> validate() const;
 };
 
+// Typed scalar/color data supplied to the CPU reference evaluator. Normal
+// values remain representable for future graph schemas but no current node
+// kind lowers them.
+struct MaterialGraphValue final {
+    MaterialGraphValueType type = MaterialGraphValueType::scalar;
+    std::array<double, 4U> components{};
+
+    [[nodiscard]] core::Result<void> validate() const;
+    [[nodiscard]] bool operator==(const MaterialGraphValue&) const noexcept = default;
+};
+
+// Caller-supplied, immutable inputs. Missing or output-unreachable parameter
+// and surface values are errors; the evaluator never invents or ignores values.
+struct MaterialGraphEvaluationInputs final {
+    std::map<std::string, MaterialGraphValue> parameters;
+    std::map<MaterialSurfaceInput, MaterialGraphValue> surface_inputs;
+
+    [[nodiscard]] core::Result<void> validate() const;
+    [[nodiscard]] core::Result<assets::Sha256Digest> canonical_digest() const;
+    [[nodiscard]] bool operator==(const MaterialGraphEvaluationInputs&) const noexcept = default;
+};
+
+// Deterministic output values for the graph nodes reachable from assigned
+// outputs. This is a CPU reference receipt, not a shader, GPU material, or
+// viewport-rendering result.
+struct MaterialGraphEvaluation final {
+    std::string graph_identity;
+    core::Revision graph_revision;
+    assets::Sha256Digest graph_digest;
+    assets::Sha256Digest inputs_digest;
+    std::map<std::uint64_t, MaterialGraphValue> node_values;
+
+    // Structural/source validation does not claim that values were computed
+    // from a particular input set. This overload recomputes them exactly.
+    [[nodiscard]] core::Result<void> validate(const MaterialGraph& graph) const;
+    [[nodiscard]] core::Result<void> validate(
+        const MaterialGraph& graph,
+        const MaterialGraphEvaluationInputs& inputs) const;
+    [[nodiscard]] core::Result<assets::Sha256Digest> canonical_digest() const;
+};
+
 class MaterialGraph final {
 public:
     static constexpr std::uint32_t kSchemaVersion = 2U;
@@ -103,6 +147,15 @@ public:
 // report does not claim shader compilation, rendering, or runtime admission.
 [[nodiscard]] core::Result<MaterialGraphCompileReport> compile_material_graph(
     const MaterialGraph& graph);
+[[nodiscard]] core::Result<MaterialGraphEvaluation> evaluate_material_graph(
+    const MaterialGraph& graph,
+    const MaterialGraphEvaluationInputs& inputs);
+// Validates a partial persistent input set against the output-reachable input
+// keys and types of one exact graph source. Missing values are permitted;
+// evaluation remains responsible for refusing incomplete sets.
+[[nodiscard]] core::Result<void> validate_material_graph_input_subset(
+    const MaterialGraph& graph,
+    const MaterialGraphEvaluationInputs& inputs);
 [[nodiscard]] core::Result<void> validate_material_graph_source(
     const MaterialGraph& graph,
     std::string_view current_identity,

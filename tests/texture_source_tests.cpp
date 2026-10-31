@@ -1,4 +1,5 @@
 #include <carto/assets/texture_source.hpp>
+#include <carto/assets/texture_image_decoder.hpp>
 #include <carto/assets/texture_mip.hpp>
 
 #include <algorithm>
@@ -6,9 +7,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <initializer_list>
 #include <cmath>
 #include <span>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -77,16 +80,79 @@ std::vector<std::uint8_t> png_fixture() {
     return bytes;
 }
 
-std::vector<std::uint8_t> jpeg_fixture() {
-    return {
+std::vector<std::uint8_t> png_fixture_with_chunks(
+    std::uint8_t color_type,
+    std::span<const std::pair<std::string_view, std::span<const std::uint8_t>>> before_idat,
+    std::span<const std::pair<std::string_view, std::span<const std::uint8_t>>> after_idat = {}) {
+    std::vector<std::uint8_t> bytes{
+        0x89U, 'P', 'N', 'G', 0x0dU, 0x0aU, 0x1aU, 0x0aU};
+    std::array<std::uint8_t, 13U> ihdr{};
+    ihdr[3U] = 2U;
+    ihdr[7U] = 1U;
+    ihdr[8U] = 8U;
+    ihdr[9U] = color_type;
+    append_png_chunk(bytes, "IHDR", ihdr);
+    for (const auto& [type, payload] : before_idat) {
+        append_png_chunk(bytes, type, payload);
+    }
+    constexpr std::array<std::uint8_t, 1U> idat{0U};
+    append_png_chunk(bytes, "IDAT", idat);
+    for (const auto& [type, payload] : after_idat) {
+        append_png_chunk(bytes, type, payload);
+    }
+    append_png_chunk(bytes, "IEND", std::span<const std::uint8_t>{});
+    return bytes;
+}
+
+std::vector<std::uint8_t> inspection_jpeg_fixture(bool include_scan = true) {
+    std::vector<std::uint8_t> bytes{
         0xffU, 0xd8U,
         0xffU, 0xc0U, 0x00U, 0x11U,
         0x08U, 0x00U, 0x01U, 0x00U, 0x02U, 0x03U,
         0x01U, 0x11U, 0x00U,
         0x02U, 0x11U, 0x00U,
         0x03U, 0x11U, 0x00U,
-        0xffU, 0xd9U,
     };
+    if (include_scan) {
+        bytes.insert(bytes.end(), {
+            0xffU, 0xdaU, 0x00U, 0x0cU,
+            0x03U, 0x01U, 0x00U, 0x02U, 0x11U, 0x03U, 0x11U,
+            0x00U, 0x3fU, 0x00U, 0x00U,
+        });
+    }
+    bytes.insert(bytes.end(), {0xffU, 0xd9U});
+    return bytes;
+}
+
+std::vector<std::uint8_t> jpeg_fixture() {
+    // One 8-bit grayscale block: zero DC difference and EOB, padded with ones.
+    std::vector<std::uint8_t> bytes{0xffU, 0xd8U, 0xffU, 0xdbU, 0U, 67U, 0U};
+    bytes.insert(bytes.end(), 64U, 1U);
+    bytes.insert(bytes.end(), {
+        0xffU, 0xc0U, 0U, 11U, 8U, 0U, 1U, 0U, 1U, 1U, 1U, 0x11U, 0U,
+        0xffU, 0xc4U, 0U, 38U,
+        0U, 1U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U,
+        0x10U, 1U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U,
+        0xffU, 0xdaU, 0U, 8U, 1U, 1U, 0U, 0U, 63U, 0U, 0x3fU, 0xffU, 0xd9U,
+    });
+    return bytes;
+}
+
+std::vector<std::uint8_t> decodable_png_fixture() {
+    std::vector<std::uint8_t> bytes{0x89U, 'P', 'N', 'G', 0x0dU, 0x0aU, 0x1aU, 0x0aU};
+    std::array<std::uint8_t, 13U> ihdr{};
+    ihdr[3U] = 1U;
+    ihdr[7U] = 1U;
+    ihdr[8U] = 8U;
+    ihdr[9U] = 6U;
+    append_png_chunk(bytes, "IHDR", ihdr);
+    // Zlib stored block: filter byte followed by one opaque red RGBA pixel.
+    constexpr std::array<std::uint8_t, 16U> idat{
+        0x78U, 0x01U, 0x01U, 0x05U, 0x00U, 0xfaU, 0xffU, 0x00U,
+        0xffU, 0x00U, 0x00U, 0xffU, 0x05U, 0x00U, 0x01U, 0xffU};
+    append_png_chunk(bytes, "IDAT", idat);
+    append_png_chunk(bytes, "IEND", std::span<const std::uint8_t>{});
+    return bytes;
 }
 
 std::vector<std::uint8_t> tga_fixture() {
@@ -96,6 +162,26 @@ std::vector<std::uint8_t> tga_fixture() {
     bytes[14U] = 1U;
     bytes[16U] = 24U;
     bytes.insert(bytes.end(), {0U, 0U, 255U, 0U, 255U, 0U});
+    return bytes;
+}
+
+std::vector<std::uint8_t> tga_fixture_with_extension(bool has_color_metadata) {
+    auto bytes = tga_fixture();
+    const std::uint32_t extension_offset = static_cast<std::uint32_t>(bytes.size());
+    const std::size_t extension_begin = bytes.size();
+    bytes.resize(bytes.size() + 495U, 0U);
+    bytes[extension_begin] = 0xefU;
+    bytes[extension_begin + 1U] = 0x01U;
+    if (has_color_metadata) {
+        bytes[extension_begin + 478U] = 22U;
+        bytes[extension_begin + 480U] = 10U;
+    }
+    append_le32(bytes, extension_offset);
+    append_le32(bytes, 0U);
+    constexpr std::array<std::uint8_t, 18U> signature{
+        'T', 'R', 'U', 'E', 'V', 'I', 'S', 'I', 'O', 'N', '-',
+        'X', 'F', 'I', 'L', 'E', '.', 0U};
+    bytes.insert(bytes.end(), signature.begin(), signature.end());
     return bytes;
 }
 
@@ -180,7 +266,7 @@ void supported_sources_are_digest_bound_without_decode_claims() {
         std::uint32_t height;
     } cases[] = {
         {png_fixture(), TextureSourceFormat::png, "image/png", 2U, 1U},
-        {jpeg_fixture(), TextureSourceFormat::jpeg, "image/jpeg", 2U, 1U},
+        {jpeg_fixture(), TextureSourceFormat::jpeg, "image/jpeg", 1U, 1U},
         {tga_fixture(), TextureSourceFormat::tga, "image/x-tga", 2U, 1U},
         {dds_fixture(), TextureSourceFormat::dds, "image/vnd-ms.dds", 4U, 4U},
         {exr_fixture(), TextureSourceFormat::exr, "image/x-exr", 2U, 1U},
@@ -220,6 +306,12 @@ void malformed_and_mislabeled_sources_fail_closed() {
     auto jpeg = jpeg_fixture();
     jpeg.pop_back();
     require(!inspect_texture_source(jpeg), "JPEG without a complete EOI is rejected");
+    require(!inspect_texture_source(inspection_jpeg_fixture(false)),
+            "JPEG frame headers without a scan are not admitted as image data");
+    auto malformed_scan = inspection_jpeg_fixture();
+    malformed_scan[24U] = 8U;
+    require(!inspect_texture_source(malformed_scan),
+            "JPEG scan component count must agree with its segment length");
     auto tga = tga_fixture();
     tga.resize(18U);
     require(!inspect_texture_source(tga), "truncated TGA pixel payload is rejected");
@@ -247,6 +339,162 @@ void malformed_and_mislabeled_sources_fail_closed() {
     inspected.value().channels = 0U;
     require(!inspected.value().validate(),
             "container inspection cannot be relabeled as decoded evidence without channels");
+}
+
+void png_chunk_semantics_fail_closed_and_keep_legal_metadata() {
+    using namespace carto::assets;
+    constexpr std::array<std::uint8_t, 1U> payload{0U};
+    const std::array<std::pair<std::string_view, std::span<const std::uint8_t>>, 1U>
+        unknown_critical{{{"ABCD", payload}}};
+    require(!inspect_texture_source(png_fixture_with_chunks(6U, unknown_critical)),
+            "unknown critical PNG chunks are rejected before codec interpretation");
+
+    const std::array<std::pair<std::string_view, std::span<const std::uint8_t>>, 1U>
+        invalid_reserved_bit{{{"abca", payload}}};
+    require(!inspect_texture_source(png_fixture_with_chunks(6U, invalid_reserved_bit)),
+            "PNG chunk types with a lowercase reserved bit are rejected");
+
+    constexpr std::array<std::uint8_t, 8U> animation_control{
+        0U, 0U, 0U, 2U, 0U, 0U, 0U, 0U};
+    const std::array<std::pair<std::string_view, std::span<const std::uint8_t>>, 1U>
+        animated_control{{{"acTL", animation_control}}};
+    require(!inspect_texture_source(png_fixture_with_chunks(6U, animated_control)),
+            "APNG animation control cannot be flattened into a static texture source");
+
+    constexpr std::array<std::uint8_t, 26U> frame_control{
+        0U, 0U, 0U, 0U, 0U, 0U, 0U, 2U, 0U, 0U, 0U, 1U,
+        0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 1U, 0U, 10U, 0U, 0U};
+    const std::array<std::pair<std::string_view, std::span<const std::uint8_t>>, 1U>
+        animated_frame{{{"fcTL", frame_control}}};
+    require(!inspect_texture_source(png_fixture_with_chunks(6U, animated_frame)),
+            "APNG frame controls cannot silently select a decoder-dependent frame");
+
+    constexpr std::array<std::uint8_t, 5U> frame_data{0U, 0U, 0U, 1U, 0U};
+    const std::array<std::pair<std::string_view, std::span<const std::uint8_t>>, 1U>
+        animated_data{{{"fdAT", frame_data}}};
+    require(!inspect_texture_source(png_fixture_with_chunks(6U, {}, animated_data)),
+            "APNG frame data is refused when the source contract is single-frame");
+
+    constexpr std::array<std::uint8_t, 3U> text_payload{'k', 0U, 'v'};
+    const std::array<std::pair<std::string_view, std::span<const std::uint8_t>>, 2U>
+        interleaved_idat{{{"tEXt", text_payload}, {"IDAT", payload}}};
+    require(!inspect_texture_source(png_fixture_with_chunks(6U, {}, interleaved_idat)),
+            "PNG image-data chunks must remain contiguous");
+
+    constexpr std::array<std::uint8_t, 3U> palette{0U, 0U, 0U};
+    require(!inspect_texture_source(png_fixture_with_chunks(3U, {})),
+            "indexed PNG sources require a palette before image data");
+    const std::array<std::pair<std::string_view, std::span<const std::uint8_t>>, 1U>
+        forbidden_palette{{{"PLTE", palette}}};
+    require(!inspect_texture_source(png_fixture_with_chunks(0U, forbidden_palette)),
+            "grayscale PNG sources cannot contain a palette chunk");
+    const std::array<std::pair<std::string_view, std::span<const std::uint8_t>>, 2U>
+        duplicate_palette{{{"PLTE", palette}, {"PLTE", palette}}};
+    require(!inspect_texture_source(png_fixture_with_chunks(3U, duplicate_palette)),
+            "PNG sources cannot contain duplicate palettes");
+    const std::array<std::pair<std::string_view, std::span<const std::uint8_t>>, 1U>
+        valid_palette{{{"PLTE", palette}}};
+    require(static_cast<bool>(inspect_texture_source(
+                png_fixture_with_chunks(3U, valid_palette))),
+            "indexed PNG sources with a legal palette remain admitted");
+
+    const std::array<std::pair<std::string_view, std::span<const std::uint8_t>>, 1U>
+        legal_text{{{"tEXt", text_payload}}};
+    const auto text_source = inspect_texture_source(
+        png_fixture_with_chunks(6U, {}, legal_text));
+    require(static_cast<bool>(text_source),
+            "legal ancillary metadata after contiguous image data remains admitted");
+    require(!text_source.value().has_color_encoding_metadata,
+            "descriptive text metadata is not classified as color encoding");
+
+    const std::array<std::pair<std::string_view, std::span<const std::uint8_t>>, 1U>
+        srgb_metadata{{{"sRGB", payload}}};
+    const auto srgb_source = inspect_texture_source(
+        png_fixture_with_chunks(6U, srgb_metadata));
+    require(srgb_source && srgb_source.value().has_color_encoding_metadata,
+            "PNG color encoding metadata is surfaced for caller policy");
+}
+
+void jpeg_marker_walk_fails_closed_and_preserves_binding() {
+    using namespace carto::assets;
+    const auto source = jpeg_fixture();
+    const auto admission = inspect_texture_source(source, "image/jpeg");
+    require(admission && admission.value().source.digest == sha256(source),
+            "JPEG admission binds the exact source bytes");
+    const auto decoded = decode_texture_image_rgba8(source, sha256(source), 1U, 1U);
+#ifdef _WIN32
+    require(decoded && decoded.value().admission.source.digest == sha256(source) &&
+                decoded.value().pixels.size() == 4U &&
+                decoded.value().pixels[0U] == 128U && decoded.value().pixels[1U] == 128U &&
+                decoded.value().pixels[2U] == 128U && decoded.value().pixels[3U] == 255U,
+            "valid grayscale JPEG decodes its authored pixel with the same source identity");
+#else
+    require(!decoded, "non-Windows JPEG decode remains explicitly unsupported");
+#endif
+    const auto wrong_digest = sha256(std::span<const std::uint8_t>{});
+    require(!decode_texture_image_rgba8(source, wrong_digest, 1U, 1U) &&
+                !decode_texture_image_rgba8(source, sha256(source), 2U, 1U),
+            "stale digest and dimensions refuse before pixels are returned");
+
+    const auto with_tail = [&](std::initializer_list<std::uint8_t> tail) {
+        auto bytes = source;
+        bytes.insert(bytes.end() - 2, tail.begin(), tail.end());
+        return bytes;
+    };
+    const std::vector<std::vector<std::uint8_t>> malformed{
+        with_tail({0xffU, 0xe1U, 0U, 1U}), // invalid segment length
+        with_tail({0xffU, 0xe1U, 0U, 9U, 1U}), // segment exceeds terminal EOI
+        with_tail({0xffU, 0xe1U, 0U}), // truncated length
+        with_tail({0xffU, 0xd9U, 0x11U}), // premature EOI
+        with_tail({0xffU, 0xd8U}), // nested SOI
+        with_tail({0xffU, 0xc0U, 0U, 2U}), // duplicate frame
+        with_tail({0xffU, 0xdaU, 0U, 8U, 1U, 2U, 0U, 0U, 63U, 0U, 0x3fU}),
+        with_tail({0xffU, 0xdaU, 0U, 8U, 1U, 1U, 0U, 0U, 63U, 0U}), // empty scan
+        with_tail({0xffU, 0xe0U, 0U, 2U, 0x11U}), // entropy outside a scan
+        with_tail({0xffU, 0xe2U, 0U, 14U, 'I', 'C', 'C', '_', 'P', 'R', 'O', 'F',
+                   'I', 'L', 'E', 0U, 0xffU, 0xe1U, 0U, 1U}), // bad after ICC
+    };
+    for (const auto& bytes : malformed) {
+        require(!inspect_texture_source(bytes, "image/jpeg"),
+                "malformed post-scan markers fail source admission");
+        require(!decode_texture_image_rgba8(bytes, sha256(bytes), 1U, 1U),
+                "malformed JPEG cannot return decoded pixels even with a matching digest");
+    }
+    auto no_scan = source;
+    no_scan.erase(no_scan.end() - 13, no_scan.end() - 2);
+    require(!inspect_texture_source(no_scan), "frame without a scan is refused");
+    auto bad_first_selector = source;
+    bad_first_selector[bad_first_selector.size() - 8U] = 2U;
+    require(!inspect_texture_source(bad_first_selector) &&
+                !decode_texture_image_rgba8(bad_first_selector, sha256(bad_first_selector), 1U, 1U),
+            "unknown first scan component is refused by inspection and decode");
+    auto stuffed = with_tail({0xffU, 0x00U, 0x3fU});
+    require(static_cast<bool>(inspect_texture_source(stuffed)),
+            "stuffed entropy bytes remain structurally admitted");
+    auto two_scans = with_tail({0xffU, 0xdaU, 0U, 8U, 1U, 1U, 0U, 0U, 63U, 0U, 0x3fU});
+    require(static_cast<bool>(inspect_texture_source(two_scans)),
+            "bounded later scan headers are walked structurally");
+    const auto icc = with_tail({0xffU, 0xe2U, 0U, 14U, 'I', 'C', 'C', '_', 'P', 'R', 'O', 'F',
+                                'I', 'L', 'E', 0U});
+    const auto profiled = inspect_texture_source(icc);
+    require(profiled && profiled.value().has_color_encoding_metadata &&
+                !decode_texture_image_rgba8(icc, sha256(icc), 1U, 1U),
+            "post-scan color metadata remains identified and decode refuses it");
+    TextureSourceLimits limits;
+    limits.max_source_bytes = source.size() - 1U;
+    require(!inspect_texture_source(source, "image/jpeg", limits) &&
+                !decode_texture_image_rgba8(source, sha256(source), 1U, 1U, limits),
+            "source byte limit is enforced by inspection and decode");
+
+    const auto png = decodable_png_fixture();
+    const auto png_decoded = decode_texture_image_rgba8(png, sha256(png), 1U, 1U);
+#ifdef _WIN32
+    require(png_decoded && png_decoded.value().admission.source.digest == sha256(png) &&
+                png_decoded.value().pixels == std::vector<std::uint8_t>({255U, 0U, 0U, 255U}),
+            "valid PNG still decodes exact source-bound pixels");
+#else
+    require(!png_decoded, "non-Windows PNG decode remains explicitly unsupported");
+#endif
 }
 
 void tga_decode_advances_evidence_and_canonicalizes_orientation() {
@@ -311,6 +559,36 @@ void tga_decode_advances_evidence_and_canonicalizes_orientation() {
             "decoded RGBA8 evidence rejects a mismatched byte count");
     require(!decode_tga_rgba8(png_fixture()),
             "TGA decoder rejects a different admitted container format");
+}
+
+void tga_color_metadata_is_exposed_and_not_silently_decoded() {
+    using namespace carto::assets;
+    const auto descriptive = inspect_texture_source(
+        tga_fixture_with_extension(false), "image/x-tga");
+    require(descriptive && !descriptive.value().has_color_encoding_metadata,
+        "TGA 2.0 descriptive extension without gamma or correction remains ordinary");
+
+    const auto gamma_bytes = tga_fixture_with_extension(true);
+    const auto gamma = inspect_texture_source(gamma_bytes, "image/x-tga");
+    require(gamma && gamma.value().has_color_encoding_metadata,
+        "TGA 2.0 gamma metadata is surfaced for caller policy");
+    const auto decoded = decode_tga_rgba8(gamma_bytes);
+    require(!decoded && decoded.error().code == carto::core::ErrorCode::unsupported,
+        "TGA pixel decode refuses gamma metadata it cannot transform");
+    const auto generic_decoded = decode_texture_image_rgba8(
+        gamma_bytes, gamma.value().source.digest, 2U, 1U);
+    require(!generic_decoded &&
+            generic_decoded.error().code == carto::core::ErrorCode::unsupported,
+        "shared RGBA8 decoder refuses TGA gamma metadata before texture use");
+
+    auto invalid_offset = gamma_bytes;
+    const std::size_t footer_offset = invalid_offset.size() - 26U;
+    invalid_offset[footer_offset] = 1U;
+    invalid_offset[footer_offset + 1U] = 0U;
+    invalid_offset[footer_offset + 2U] = 0U;
+    invalid_offset[footer_offset + 3U] = 0U;
+    require(!inspect_texture_source(invalid_offset, "image/x-tga"),
+        "TGA 2.0 extension area cannot overlap the image payload");
 }
 
 void mip_generation_is_semantic_and_color_space_correct() {
@@ -485,7 +763,10 @@ void malformed_mip_chains_fail_closed() {
 int main() {
     supported_sources_are_digest_bound_without_decode_claims();
     malformed_and_mislabeled_sources_fail_closed();
+    png_chunk_semantics_fail_closed_and_keep_legal_metadata();
+    jpeg_marker_walk_fails_closed_and_preserves_binding();
     tga_decode_advances_evidence_and_canonicalizes_orientation();
+    tga_color_metadata_is_exposed_and_not_silently_decoded();
     mip_generation_is_semantic_and_color_space_correct();
     mip_generation_preserves_normals_alpha_and_odd_edges();
     malformed_mip_chains_fail_closed();

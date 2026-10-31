@@ -5,8 +5,11 @@
 #include <carto/render/material.hpp>
 #include <carto/render/tangent.hpp>
 
+#include "../apps/desktop/uv_inspector.hpp"
+
 #include "project_document_access.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -16,6 +19,8 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -80,6 +85,150 @@ void uv_identity_rejects_ambiguous_or_wrong_layers() {
 
     REQUIRE(table.add(UvSetDescriptor{2U, "bad-corner", "corner-missing", false, false, false, 1U}));
     REQUIRE(!table.validate(attributes));
+}
+
+carto::geometry::EditableMesh make_uv_island_fixture(bool split_shared_edge) {
+    using namespace carto;
+    geometry::EditableMesh mesh;
+    REQUIRE(mesh.insert_bulk(
+        {{geometry::VertexId{1U}, {0.0, 0.0, 0.0}},
+         {geometry::VertexId{2U}, {1.0, 0.0, 0.0}},
+         {geometry::VertexId{3U}, {1.0, 1.0, 0.0}},
+         {geometry::VertexId{4U}, {0.0, 1.0, 0.0}},
+         {geometry::VertexId{5U}, {-1.0, 0.0, 0.0}},
+         {geometry::VertexId{6U}, {0.0, -1.0, 0.0}}},
+        {{geometry::FaceId{1U}, {geometry::VertexId{1U}, geometry::VertexId{2U},
+                                geometry::VertexId{3U}}},
+         {geometry::FaceId{2U}, {geometry::VertexId{1U}, geometry::VertexId{3U},
+                                geometry::VertexId{4U}}},
+         {geometry::FaceId{3U}, {geometry::VertexId{1U}, geometry::VertexId{5U},
+                                geometry::VertexId{6U}}}}));
+    const auto topology = mesh.topology();
+    REQUIRE(topology);
+    std::vector<attributes::AttributeValue> values;
+    values.reserve(topology.value().corners.size());
+    for (const auto& corner : topology.value().corners) {
+        core::Vec2d coordinate{};
+        if (corner.face == geometry::FaceId{1U}) {
+            if (corner.vertex == geometry::VertexId{1U}) coordinate = {0.0, 0.0};
+            else if (corner.vertex == geometry::VertexId{2U}) coordinate = {1.0, 0.0};
+            else if (corner.vertex == geometry::VertexId{3U}) coordinate = {1.0, 1.0};
+            else REQUIRE(false);
+        } else if (corner.face == geometry::FaceId{2U}) {
+            if (corner.vertex == geometry::VertexId{1U}) {
+                coordinate = split_shared_edge ? core::Vec2d{2.0, 0.0}
+                                               : core::Vec2d{0.0, 0.0};
+            } else if (corner.vertex == geometry::VertexId{3U}) {
+                coordinate = split_shared_edge ? core::Vec2d{2.0, 1.0}
+                                               : core::Vec2d{1.0, 1.0};
+            } else if (corner.vertex == geometry::VertexId{4U}) {
+                coordinate = split_shared_edge ? core::Vec2d{1.0, 1.0}
+                                               : core::Vec2d{0.0, 1.0};
+            } else {
+                REQUIRE(false);
+            }
+        } else {
+            REQUIRE(corner.face == geometry::FaceId{3U});
+            if (corner.vertex == geometry::VertexId{1U}) coordinate = {0.0, 0.0};
+            else if (corner.vertex == geometry::VertexId{5U}) coordinate = {-1.0, 0.0};
+            else if (corner.vertex == geometry::VertexId{6U}) coordinate = {0.0, -1.0};
+            else REQUIRE(false);
+        }
+        values.emplace_back(coordinate);
+    }
+
+    attributes::AttributeSet attribute_set({{
+        attributes::AttributeDomain::corner, topology.value().corners.size()}});
+    REQUIRE(attribute_set.add_layer({
+        {"uv.island-test", attributes::AttributeDomain::corner,
+         attributes::AttributeType::vec2}, std::move(values)}));
+    attributes::UvSetTable uv_sets;
+    REQUIRE(uv_sets.add({1U, "UV", "uv.island-test", true, true, false, 1U}));
+    REQUIRE(mesh.set_attribute_payload(std::move(attribute_set), std::move(uv_sets)));
+    return mesh;
+}
+
+void uv_inspector_counts_edge_connected_islands_and_refuses_over_budget_meshes() {
+    const auto joined = carto::desktop::inspect_uv_set(make_uv_island_fixture(false), 1U);
+    REQUIRE(joined);
+    REQUIRE(joined.value().seam_edge_count == 0U);
+    REQUIRE(joined.value().uv_island_count == 2U);
+    REQUIRE(joined.value().islands.size() == 2U);
+    REQUIRE(joined.value().islands[0].identity == carto::geometry::FaceId{1U});
+    const std::vector<carto::geometry::FaceId> joined_first_island{
+        carto::geometry::FaceId{1U}, carto::geometry::FaceId{2U}};
+    const std::vector<carto::geometry::FaceId> joined_second_island{
+        carto::geometry::FaceId{3U}};
+    REQUIRE(joined.value().islands[0].faces == joined_first_island);
+    REQUIRE(joined.value().islands[1].faces == joined_second_island);
+    const auto density = carto::desktop::analyze_uv_texel_density(
+        joined.value(), 1024U, 1024U);
+    REQUIRE(density);
+    REQUIRE(density.value().measured_triangle_count == 3U);
+    REQUIRE(std::abs(density.value().minimum_area_equivalent_pixels_per_unit - 1024.0) < 1.0e-9);
+    REQUIRE(std::abs(density.value().maximum_area_equivalent_pixels_per_unit - 1024.0) < 1.0e-9);
+    const auto missing_resolution = carto::desktop::analyze_uv_texel_density(
+        joined.value(), 0U, 1024U);
+    REQUIRE(!missing_resolution);
+    REQUIRE(missing_resolution.error().code == carto::core::ErrorCode::invalid_argument);
+
+    const auto split_mesh = make_uv_island_fixture(true);
+    const auto split = carto::desktop::inspect_uv_set(split_mesh, 1U);
+    REQUIRE(split);
+    REQUIRE(split.value().seam_edge_count == 1U);
+    REQUIRE(split.value().seams.size() == 1U);
+    REQUIRE(split.value().seams.front().first_face !=
+        split.value().seams.front().second_face);
+    REQUIRE(split.value().uv_island_count == 3U);
+    REQUIRE(split.value().islands.size() == 3U);
+    const std::vector<carto::geometry::FaceId> split_first_island{
+        carto::geometry::FaceId{1U}};
+    const std::vector<carto::geometry::FaceId> split_second_island{
+        carto::geometry::FaceId{2U}};
+    const std::vector<carto::geometry::FaceId> split_third_island{
+        carto::geometry::FaceId{3U}};
+    REQUIRE(split.value().islands[0].faces == split_first_island);
+    REQUIRE(split.value().islands[1].faces == split_second_island);
+    REQUIRE(split.value().islands[2].faces == split_third_island);
+
+    const auto over_budget = carto::desktop::inspect_uv_set(split_mesh, 1U, 1U, 1U);
+    REQUIRE(!over_budget);
+    REQUIRE(over_budget.error().code == carto::core::ErrorCode::unsupported);
+}
+
+void uv_inspector_treats_explicit_same_coordinate_marks_as_seams() {
+    auto mesh = make_uv_island_fixture(false);
+    const auto topology = mesh.topology();
+    REQUIRE(topology);
+    const auto shared = std::find_if(topology.value().edges.begin(), topology.value().edges.end(),
+        [](const auto& edge) { return edge.second_half_edge.has_value(); });
+    REQUIRE(shared != topology.value().edges.end());
+
+    auto attributes = mesh.attributes();
+    REQUIRE(attributes.set_domain_count(
+        carto::attributes::AttributeDomain::edge, topology.value().edges.size()));
+    std::vector<carto::attributes::AttributeValue> marks(
+        topology.value().edges.size(), false);
+    const std::size_t edge_index = static_cast<std::size_t>(
+        std::distance(topology.value().edges.begin(), shared));
+    marks[edge_index] = true;
+    REQUIRE(attributes.add_layer({
+        {carto::attributes::uv_seam_attribute_id(1U),
+         carto::attributes::AttributeDomain::edge,
+         carto::attributes::AttributeType::boolean},
+        std::move(marks)}));
+    REQUIRE(mesh.set_attribute_payload(std::move(attributes), mesh.uv_sets()));
+
+    const auto report = carto::desktop::inspect_uv_set(mesh, 1U);
+    REQUIRE(report);
+    REQUIRE(report.value().seam_edge_count == 1U);
+    REQUIRE(report.value().uv_island_count == 3U);
+    REQUIRE(report.value().internal_edges.size() == 1U);
+    REQUIRE(report.value().internal_edges.front().explicitly_marked);
+    REQUIRE(!report.value().internal_edges.front().coordinate_discontinuity);
+    REQUIRE(report.value().seams.size() == 1U);
+    REQUIRE(report.value().seams.front().explicitly_marked);
+    REQUIRE(!report.value().seams.front().coordinate_discontinuity);
 }
 
 void material_bindings_are_explicit_and_gpu_packable() {
@@ -458,6 +607,8 @@ int main() {
     try {
         uv_identity_reuses_corner_attribute_storage();
         uv_identity_rejects_ambiguous_or_wrong_layers();
+        uv_inspector_counts_edge_connected_islands_and_refuses_over_budget_meshes();
+        uv_inspector_treats_explicit_same_coordinate_marks_as_seams();
         material_bindings_are_explicit_and_gpu_packable();
         tangent_generation_is_deterministic_and_fail_closed();
         editable_mesh_owns_validated_uv_payload();

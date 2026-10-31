@@ -153,6 +153,13 @@ record for undo.
   journaled transactions ([schema v33](../format/cartographer-project-v33.md)).
   Pose libraries are revision-checked; the two receipt tables are historical
   ledgers retained across undo/redo and save/reopen.
+- Authored kinematic graphs persist independently in schema v35 as canonical,
+  digest-bound records with project-local revisions. `ProjectTransaction`
+  admits inserts and compare-and-swap replacements; the records participate in
+  project journal snapshots and save/reopen. Agent Workbench diffs and merge
+  details expose bounded identity, revision, byte-count, and digest summaries.
+  See
+  [schema v35](../format/cartographer-project-v35.md).
 - Rig module templates now have a bounded canonical value serializer and
   parser plus a project-local library. Insert refuses an existing stable
   identity; replacement requires both the current entry revision and digest,
@@ -160,9 +167,10 @@ record for undo.
   migrates older files with an empty library. Instantiation grafts a template's joint/control fragment into
 target graphs under fresh stable ids with a digest-bound receipt. The library
 has no delete API or native editor workflow yet.
-- No durable project-format commit path for accepted autorig reviews,
-  complete morphology-class coverage, or transferred weight layers: the
-  cross-topology transfer op produces receipt-bound layers, but no project
-  commit path persists them.
-  `ProjectDocument` still has no complete rig document or acceptance-commit
-  path, so review acceptance must not be represented as a committed rig.
+- A durable kinematic-graph record now exists, but no conversion path commits
+  an accepted autorig candidate into it. Candidate IDs remain preview-local,
+  and the candidate model does not supply all final-node fields. `ProjectDocument`
+  also has no complete rig document or accepted-review commit path. Review
+  acceptance must not be represented as a committed rig. Transferred weight
+  layers likewise remain unpersisted: cross-topology transfer produces
+  receipt-bound layers, but no project commit path stores them.

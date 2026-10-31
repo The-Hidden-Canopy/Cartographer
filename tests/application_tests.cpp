@@ -22,6 +22,7 @@
 #include <carto/assets/source_registry.hpp>
 #include <carto/journal/journal.hpp>
 #include <carto/editor/viewport_interaction.hpp>
+#include <carto/mesh_attributes/provenance.hpp>
 #include <carto/project/presentation_catalog.hpp>
 
 #include <algorithm>
@@ -53,7 +54,8 @@ public:
 #define REQUIRE(condition)                                                               \
     do {                                                                                 \
         if (!(condition)) {                                                              \
-            throw TestFailure(std::string("requirement failed: ") + #condition);         \
+            throw TestFailure(std::string(__func__) + ":" + std::to_string(__LINE__) +    \
+                ": requirement failed: " + #condition);                               \
         }                                                                                \
     } while (false)
 
@@ -125,6 +127,41 @@ carto::core::Result<carto::geometry::EditableMesh> make_application_square_pyram
     const auto base = mesh.add_face({
         first.value(), fourth.value(), third.value(), second.value()});
     if (!base) return core::Result<geometry::EditableMesh>::failure(base.error());
+    if (auto result = mesh.validate(); !result) {
+        return core::Result<geometry::EditableMesh>::failure(result.error());
+    }
+    return core::Result<geometry::EditableMesh>::success(std::move(mesh));
+}
+
+carto::core::Result<carto::geometry::EditableMesh> make_application_concave_fan() {
+    using namespace carto;
+    geometry::EditableMesh mesh;
+    const auto apex = mesh.add_vertex({0.0, 0.0, 1.0});
+    if (!apex) return core::Result<geometry::EditableMesh>::failure(apex.error());
+    constexpr std::array<core::Vec2d, 5U> ring{{
+        {1.0, 0.0}, {0.2, 0.2}, {0.0, 1.0}, {-1.0, 0.0}, {0.0, -1.0}}};
+    std::vector<geometry::VertexId> ring_ids;
+    ring_ids.reserve(ring.size());
+    for (const core::Vec2d position : ring) {
+        const auto vertex = mesh.add_vertex({position.x, position.y, 0.0});
+        if (!vertex) return core::Result<geometry::EditableMesh>::failure(vertex.error());
+        ring_ids.push_back(vertex.value());
+    }
+    for (std::size_t index = 0U; index < ring_ids.size(); ++index) {
+        const auto face = mesh.add_face({
+            apex.value(), ring_ids[index], ring_ids[(index + 1U) % ring_ids.size()]});
+        if (!face) return core::Result<geometry::EditableMesh>::failure(face.error());
+    }
+    std::vector<geometry::VertexId> base;
+    base.reserve(ring_ids.size());
+    base.push_back(ring_ids.front());
+    for (std::size_t index = ring_ids.size(); index > 1U; --index) {
+        base.push_back(ring_ids[index - 1U]);
+    }
+    const auto base_face = mesh.add_face(std::move(base));
+    if (!base_face) {
+        return core::Result<geometry::EditableMesh>::failure(base_face.error());
+    }
     if (auto result = mesh.validate(); !result) {
         return core::Result<geometry::EditableMesh>::failure(result.error());
     }
@@ -790,6 +827,48 @@ void application_merges_uv_attributes_and_persists_payload_through_reopen() {
     REQUIRE(created_object.mesh_asset.has_value());
     const auto object = created_object.id;
     const auto source_mesh = session.document_.meshes().at(*created_object.mesh_asset);
+    auto distance_transferred = source_mesh;
+    const auto distance_receipt = carto::mesh_attributes::merge_by_distance_with_attribute_transfer(
+        distance_transferred, {target.value(), source.value()}, 1.0);
+    REQUIRE(distance_receipt && distance_receipt.value().removed_faces.size() == 1U);
+    const auto source_topology = source_mesh.topology();
+    const auto destination_topology = distance_transferred.topology();
+    REQUIRE(source_topology && destination_topology);
+    const auto source_seam_corner = std::find_if(
+        source_topology.value().corners.begin(), source_topology.value().corners.end(),
+        [&](const auto& corner) {
+            return corner.face == surviving_face.value() && corner.vertex == source.value();
+        });
+    const auto destination_seam_corner = std::find_if(
+        destination_topology.value().corners.begin(), destination_topology.value().corners.end(),
+        [&](const auto& corner) {
+            return corner.face == surviving_face.value() && corner.vertex == target.value();
+        });
+    REQUIRE(source_seam_corner != source_topology.value().corners.end());
+    REQUIRE(destination_seam_corner != destination_topology.value().corners.end());
+    const auto source_corners = source_mesh.corners_sorted(source_topology.value().corners.size());
+    const auto destination_corners = distance_transferred.corners_sorted(destination_topology.value().corners.size());
+    const auto source_corner_index = std::find_if(
+        source_corners.begin(), source_corners.end(), [&](const auto& corner) {
+            return corner.id == source_seam_corner->id;
+        });
+    const auto destination_corner_index = std::find_if(
+        destination_corners.begin(), destination_corners.end(), [&](const auto& corner) {
+            return corner.id == destination_seam_corner->id;
+        });
+    REQUIRE(source_corner_index != source_corners.end());
+    REQUIRE(destination_corner_index != destination_corners.end());
+    const auto* source_uvs = source_mesh.attributes().find("uv0");
+    const auto* distance_uvs = distance_transferred.attributes().find("uv0");
+    REQUIRE(source_uvs && distance_uvs);
+    const auto source_uv_index = static_cast<std::size_t>(
+        std::distance(source_corners.begin(), source_corner_index));
+    const auto destination_uv_index = static_cast<std::size_t>(
+        std::distance(destination_corners.begin(), destination_corner_index));
+    const auto source_uv = std::get<carto::core::Vec2d>(source_uvs->values[source_uv_index]);
+    const auto distance_uv = std::get<carto::core::Vec2d>(
+        distance_uvs->values[destination_uv_index]);
+    REQUIRE(source_uv.x == distance_uv.x && source_uv.y == distance_uv.y);
     REQUIRE(carto::application::testing::dispatch(
         session, carto::application::SetSelectionModeAction{
             carto::editor::SelectionMode::vertex}));
@@ -889,7 +968,7 @@ void application_merges_uv_attributes_and_persists_payload_through_reopen() {
     REQUIRE(saved_uv.y == expected_v);
 }
 
-void application_refuses_unmapped_edge_attributes_atomically_during_weld() {
+void application_refuses_conflicting_edge_attributes_atomically_during_weld() {
     carto::geometry::EditableMesh mesh;
     const auto target = mesh.add_vertex({0.0, 0.0, 0.0});
     const auto source = mesh.add_vertex({1.0, 0.0, 0.0});
@@ -908,17 +987,33 @@ void application_refuses_unmapped_edge_attributes_atomically_during_weld() {
         {carto::attributes::AttributeDomain::edge, topology.value().edges.size()},
         {carto::attributes::AttributeDomain::face, mesh.face_count()},
         {carto::attributes::AttributeDomain::corner, topology.value().corners.size()}});
-    std::vector<carto::attributes::AttributeValue> edge_tags(
-        topology.value().edges.size(), std::int32_t{7});
+    std::vector<carto::attributes::AttributeValue> edge_tags;
+    for (std::size_t index = 0U; index < topology.value().edges.size(); ++index) {
+        edge_tags.emplace_back(std::int32_t{7});
+    }
     REQUIRE(attributes.add_layer({
         {"edge_tag", carto::attributes::AttributeDomain::edge,
             carto::attributes::AttributeType::int32},
         std::move(edge_tags)}));
+    auto compatible_mesh = mesh;
+    REQUIRE(compatible_mesh.set_attribute_payload(attributes, {}));
+    REQUIRE(attributes.remove_layer("edge_tag"));
+    std::vector<carto::attributes::AttributeValue> conflicting_tags;
+    for (std::size_t index = 0U; index < topology.value().edges.size(); ++index) {
+        conflicting_tags.emplace_back(static_cast<std::int32_t>(index + 1U));
+    }
+    REQUIRE(attributes.add_layer({
+        {"edge_tag", carto::attributes::AttributeDomain::edge,
+            carto::attributes::AttributeType::int32}, std::move(conflicting_tags)}));
     REQUIRE(mesh.set_attribute_payload(std::move(attributes), {}));
 
+    TempDirectory directory;
+    const auto path = directory.path() / "attribute-weld.carto";
     carto::application::ApplicationSession session;
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SaveProjectAction{path}));
     REQUIRE(carto::application::testing::dispatch(
-        session, carto::application::CreateMeshObjectAction{"Unsupported Attribute Weld", mesh}));
+        session, carto::application::CreateMeshObjectAction{"Conflicting Attribute Weld", mesh}));
     const auto object = session.snapshot().objects.front().object.id;
     REQUIRE(carto::application::testing::dispatch(
         session, carto::application::SetSelectionModeAction{
@@ -929,11 +1024,22 @@ void application_refuses_unmapped_edge_attributes_atomically_during_weld() {
         session, carto::application::SelectVertexAction{
             object, source.value(), carto::editor::SelectionOperation::add}));
     const auto project_revision = session.snapshot().project_revision;
+    const auto before_document = session.document_.serialize();
+    const auto before_snapshot = session.snapshot();
+    carto::journal::Journal journal(std::filesystem::path(path.string() + ".journal"));
+    const auto before_events = journal.read_all();
+    REQUIRE(before_events);
     const auto rejected = carto::application::testing::dispatch(
         session, carto::application::InvokeToolAction{
             "mesh.merge-vertices", carto::editor::ToolArguments{}});
     REQUIRE(!rejected);
     REQUIRE(session.snapshot().project_revision == project_revision);
+    const auto after_events = journal.read_all();
+    REQUIRE(session.document_.serialize() == before_document &&
+        session.snapshot().undo_count == before_snapshot.undo_count &&
+        session.snapshot().redo_count == before_snapshot.redo_count &&
+        after_events && after_events.value().size() == before_events.value().size());
+    REQUIRE(journal.verify());
     REQUIRE(session.document_.mesh_patches().empty());
     REQUIRE(session.document_.topology_receipts().empty());
     REQUIRE(session.snapshot().viewport.scene.instances().front().mesh->vertex_ids.size() ==
@@ -944,6 +1050,36 @@ void application_refuses_unmapped_edge_attributes_atomically_during_weld() {
     REQUIRE(mesh.revision() == revision_before.next());
     REQUIRE(mesh.vertex_count() == vertices_before);
     REQUIRE(mesh.validate());
+
+    carto::application::ApplicationSession compatible;
+    const auto compatible_path = directory.path() / "compatible-weld.carto";
+    REQUIRE(carto::application::testing::dispatch(compatible,
+        carto::application::SaveProjectAction{compatible_path}));
+    REQUIRE(carto::application::testing::dispatch(compatible,
+        carto::application::CreateMeshObjectAction{"Compatible Attribute Weld", compatible_mesh}));
+    const auto compatible_object = compatible.snapshot().objects.front().object.id;
+    REQUIRE(carto::application::testing::dispatch(compatible,
+        carto::application::SetSelectionModeAction{carto::editor::SelectionMode::vertex}));
+    REQUIRE(carto::application::testing::dispatch(compatible,
+        carto::application::SelectVertexAction{compatible_object, target.value()}));
+    REQUIRE(carto::application::testing::dispatch(compatible,
+        carto::application::SelectVertexAction{compatible_object, source.value(),
+            carto::editor::SelectionOperation::add}));
+    const auto merged = carto::application::testing::dispatch(compatible,
+        carto::application::InvokeToolAction{"mesh.merge-vertices", carto::editor::ToolArguments{}});
+    REQUIRE(merged && merged.value().document_changed);
+    REQUIRE(carto::application::testing::dispatch(compatible, carto::application::UndoAction{}));
+    REQUIRE(carto::application::testing::dispatch(compatible, carto::application::RedoAction{}));
+    const auto& transferred = compatible.document_.meshes().at(
+        *compatible.snapshot().objects.front().object.mesh_asset);
+    REQUIRE(transferred.vertex_count() == vertices_before - 1U);
+    const auto* layer = transferred.attributes().find("edge_tag");
+    REQUIRE(layer && !layer->values.empty() && std::all_of(layer->values.begin(), layer->values.end(),
+        [](const auto& value) { return std::get<std::int32_t>(value) == 7; }));
+    carto::journal::Journal compatible_journal(std::filesystem::path(compatible_path.string() + ".journal"));
+    REQUIRE(compatible_journal.verify());
+    const auto compatible_events = compatible_journal.read_all();
+    REQUIRE(compatible_events && compatible_events.value().back().event_type == "cartographer.application_action");
 }
 
 void application_routes_face_poke_through_history_and_persists_lineage() {
@@ -1855,6 +1991,80 @@ void application_routes_vertex_bevel_through_history_and_persistence() {
     REQUIRE(reopened.snapshot().viewport.scene.instances().front().mesh->vertex_ids.size() == 13U);
     REQUIRE(reopened.document_.topology_receipts().size() == 2U);
     REQUIRE(reopened.document_.mesh_patches().size() == 2U);
+}
+
+void application_routes_concave_vertex_bevel_through_history_and_persistence() {
+    TempDirectory temp;
+    const auto path = temp.path() / "concave-vertex-bevel.carto";
+    auto fixture = make_application_concave_fan();
+    REQUIRE(fixture);
+    const carto::geometry::EditableMesh source = fixture.value();
+
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::CreateMeshObjectAction{
+            "Concave vertex bevel", std::move(fixture.value())}));
+    const auto object = session.snapshot().objects.front().object;
+    REQUIRE(object.mesh_asset.has_value());
+    const auto source_mesh = session.document_.meshes().at(*object.mesh_asset);
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SetSelectionModeAction{
+            carto::editor::SelectionMode::vertex}));
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SelectVertexAction{
+            object.id, carto::geometry::VertexId{1U}}));
+
+    carto::editor::ToolArguments arguments;
+    arguments.distance = 0.05;
+    arguments.segments = 3U;
+    const auto beveled = carto::application::testing::dispatch(
+        session, carto::application::InvokeToolAction{"mesh.bevel-vertex", arguments});
+    REQUIRE(beveled);
+    REQUIRE(session.document_.topology_receipts().size() == 1U);
+    REQUIRE(session.document_.mesh_patches().size() == 1U);
+    const auto& receipt = session.document_.topology_receipts().front().receipt;
+    REQUIRE(receipt.created_vertices.size() == 15U);
+    REQUIRE(receipt.created_faces.size() == 28U);
+    const auto beveled_mesh = session.document_.meshes().at(*object.mesh_asset);
+    REQUIRE(beveled_mesh.validate());
+    REQUIRE(beveled_mesh.compile());
+    const auto replayed = session.document_.mesh_patches().front().replay(source_mesh);
+    REQUIRE(replayed);
+    REQUIRE(replayed.value().vertex_count() == beveled_mesh.vertex_count());
+    REQUIRE(replayed.value().face_count() == beveled_mesh.face_count());
+
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::UndoAction{}));
+    REQUIRE(session.document_.meshes().at(*object.mesh_asset).vertex_count() ==
+        source.vertex_count());
+    REQUIRE(session.document_.meshes().at(*object.mesh_asset).face_count() == source.face_count());
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::RedoAction{}));
+    REQUIRE(session.document_.meshes().at(*object.mesh_asset).vertex_count() ==
+        beveled_mesh.vertex_count());
+    REQUIRE(session.document_.topology_receipts().size() == 2U);
+    REQUIRE(session.document_.mesh_patches().size() == 2U);
+
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::SaveProjectAction{path}));
+    const auto loaded = carto::project::ProjectDocument::load(path);
+    REQUIRE(loaded);
+    REQUIRE(loaded.value().topology_receipts().size() == 2U);
+    REQUIRE(loaded.value().mesh_patches().size() == 2U);
+    REQUIRE(loaded.value().topology_receipts().front().receipt.created_vertices.size() == 15U);
+    REQUIRE(loaded.value().topology_receipts().front().receipt.created_faces.size() == 28U);
+    const auto reopened_replay = loaded.value().mesh_patches().front().replay(source_mesh);
+    REQUIRE(reopened_replay);
+    REQUIRE(reopened_replay.value().vertex_count() ==
+        loaded.value().meshes().at(*object.mesh_asset).vertex_count());
+    REQUIRE(reopened_replay.value().face_count() ==
+        loaded.value().meshes().at(*object.mesh_asset).face_count());
+
+    carto::application::ApplicationSession reopened;
+    REQUIRE(carto::application::testing::dispatch(
+        reopened, carto::application::OpenProjectAction{path}));
+    REQUIRE(reopened.document_.topology_receipts().size() == 2U);
+    REQUIRE(reopened.document_.mesh_patches().size() == 2U);
+    REQUIRE(reopened.snapshot().viewport.scene.instances().front().mesh->vertex_ids.size() ==
+        beveled_mesh.vertex_count());
 }
 
 void application_bevels_selected_vertices_across_objects_atomically_and_persists_lineage() {
@@ -3182,6 +3392,297 @@ void application_authors_selected_edge_sharp_marks_with_revisioned_history() {
         const auto* value = std::get_if<bool>(&cleared_layer->values[index]);
         REQUIRE(value && !*value);
     }
+}
+
+void application_marks_uv_seams_through_human_revisioned_mesh_history() {
+    TempDirectory temp;
+    const auto path = temp.path() / "uv-seam-mark.carto";
+    carto::geometry::EditableMesh mesh;
+    REQUIRE(mesh.insert_bulk(
+        {{carto::geometry::VertexId{1U}, {0.0, 0.0, 0.0}},
+         {carto::geometry::VertexId{2U}, {1.0, 0.0, 0.0}},
+         {carto::geometry::VertexId{3U}, {1.0, 1.0, 0.0}},
+         {carto::geometry::VertexId{4U}, {0.0, 1.0, 0.0}}},
+        {{carto::geometry::FaceId{1U}, {carto::geometry::VertexId{1U},
+            carto::geometry::VertexId{2U}, carto::geometry::VertexId{3U}}},
+         {carto::geometry::FaceId{2U}, {carto::geometry::VertexId{1U},
+            carto::geometry::VertexId{3U}, carto::geometry::VertexId{4U}}}}));
+    const auto topology = mesh.topology();
+    REQUIRE(topology);
+    std::vector<carto::attributes::AttributeValue> uv_values;
+    uv_values.reserve(topology.value().corners.size());
+    for (const auto& corner : topology.value().corners) {
+        if (corner.vertex == carto::geometry::VertexId{1U}) {
+            uv_values.emplace_back(carto::core::Vec2d{0.0, 0.0});
+        } else if (corner.vertex == carto::geometry::VertexId{2U}) {
+            uv_values.emplace_back(carto::core::Vec2d{1.0, 0.0});
+        } else if (corner.vertex == carto::geometry::VertexId{3U}) {
+            uv_values.emplace_back(carto::core::Vec2d{1.0, 1.0});
+        } else {
+            REQUIRE(corner.vertex == carto::geometry::VertexId{4U});
+            uv_values.emplace_back(carto::core::Vec2d{0.0, 1.0});
+        }
+    }
+    carto::attributes::AttributeSet mesh_attributes({
+        {carto::attributes::AttributeDomain::edge, topology.value().edges.size()},
+        {carto::attributes::AttributeDomain::corner, topology.value().corners.size()}});
+    REQUIRE(mesh_attributes.add_layer({
+        {"uv0.corners", carto::attributes::AttributeDomain::corner,
+         carto::attributes::AttributeType::vec2}, std::move(uv_values)}));
+    carto::attributes::UvSetTable uv_sets;
+    REQUIRE(uv_sets.add({1U, "UV0", "uv0.corners", true, true, false, 1U}));
+    REQUIRE(mesh.set_attribute_payload(std::move(mesh_attributes), std::move(uv_sets)));
+
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::CreateMeshObjectAction{"Seam authoring quad", std::move(mesh)}));
+    const auto initial = session.snapshot();
+    REQUIRE(initial.objects.size() == 1U);
+    const auto object = initial.objects.front().object;
+    REQUIRE(object.mesh_asset.has_value());
+    const auto source_mesh = session.document_.meshes().at(*object.mesh_asset);
+    const auto source_topology = source_mesh.topology();
+    REQUIRE(source_topology);
+    const auto shared_edge = std::find_if(source_topology.value().edges.begin(),
+        source_topology.value().edges.end(), [](const auto& edge) {
+            return edge.second_half_edge.has_value();
+        });
+    REQUIRE(shared_edge != source_topology.value().edges.end());
+    const auto boundary_edge = std::find_if(source_topology.value().edges.begin(),
+        source_topology.value().edges.end(), [&source_topology](const auto& edge) {
+            if (edge.second_half_edge.has_value()) return false;
+            const auto half_edge = std::find_if(source_topology.value().half_edges.begin(),
+                source_topology.value().half_edges.end(), [&edge](const auto& candidate) {
+                    return candidate.id == edge.first_half_edge;
+                });
+            return half_edge != source_topology.value().half_edges.end() &&
+                half_edge->face == carto::geometry::FaceId{1U};
+        });
+    REQUIRE(boundary_edge != source_topology.value().edges.end());
+
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SetSelectionModeAction{carto::editor::SelectionMode::face}));
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SelectFaceAction{object.id, carto::geometry::FaceId{1U}}));
+    const auto selected = session.snapshot();
+    REQUIRE(selected.selection.component_mesh_revision.has_value());
+    const carto::application::SetUvSeamMarkAction action{
+        selected.project_generation,
+        selected.project_revision,
+        *selected.selection.component_mesh_revision,
+        object.id,
+        1U,
+        carto::geometry::FaceId{1U},
+        shared_edge->id,
+        false,
+        true};
+
+    const auto before_rejection = session.snapshot();
+    auto no_op = action;
+    no_op.marked = false;
+    const auto rejected_no_op = carto::application::testing::dispatch(session, no_op);
+    REQUIRE(!rejected_no_op);
+    REQUIRE(rejected_no_op.error().code == carto::core::ErrorCode::invalid_argument);
+    auto stale_generation = action;
+    ++stale_generation.expected_project_generation;
+    const auto rejected_generation = carto::application::testing::dispatch(session, stale_generation);
+    REQUIRE(!rejected_generation);
+    REQUIRE(rejected_generation.error().code == carto::core::ErrorCode::stale_data);
+    auto missing_set = action;
+    missing_set.uv_set = 99U;
+    const auto rejected_set = carto::application::testing::dispatch(session, missing_set);
+    REQUIRE(!rejected_set);
+    REQUIRE(rejected_set.error().code == carto::core::ErrorCode::not_found);
+    auto wrong_face = action;
+    wrong_face.selected_face = carto::geometry::FaceId{2U};
+    const auto rejected_face = carto::application::testing::dispatch(session, wrong_face);
+    REQUIRE(!rejected_face);
+    REQUIRE(session.snapshot().project_revision == before_rejection.project_revision);
+    REQUIRE(session.snapshot().undo_count == before_rejection.undo_count);
+
+    auto boundary_attempt = action;
+    boundary_attempt.edge = boundary_edge->id;
+    const auto rejected_boundary = carto::application::testing::dispatch(session, boundary_attempt);
+    REQUIRE(!rejected_boundary);
+    REQUIRE(session.snapshot().project_revision == before_rejection.project_revision);
+    REQUIRE(session.snapshot().undo_count == before_rejection.undo_count);
+
+    session.active_source_ = carto::application::OperationSource::ai_proposal;
+    const auto rejected_ai = session.set_uv_seam_mark(action);
+    session.active_source_ = carto::application::OperationSource::human;
+    REQUIRE(!rejected_ai);
+    REQUIRE(rejected_ai.error().code == carto::core::ErrorCode::unsupported);
+    REQUIRE(session.snapshot().project_revision == before_rejection.project_revision);
+    REQUIRE(session.snapshot().undo_count == before_rejection.undo_count);
+
+    const auto applied = carto::application::testing::dispatch(session, action);
+    REQUIRE(applied && applied.value().document_changed);
+    REQUIRE(applied.value().revision_after > before_rejection.project_revision);
+    REQUIRE(applied.value().source == carto::application::OperationSource::human);
+    const std::string seam_layer_id = carto::attributes::uv_seam_attribute_id(1U);
+    const auto& marked_mesh = session.document_.meshes().at(*object.mesh_asset);
+    const auto* seam_layer = marked_mesh.attributes().find(seam_layer_id);
+    REQUIRE(seam_layer);
+    REQUIRE(seam_layer->descriptor.domain == carto::attributes::AttributeDomain::edge);
+    REQUIRE(seam_layer->descriptor.type == carto::attributes::AttributeType::boolean);
+    const auto edge_index = static_cast<std::size_t>(
+        std::distance(source_topology.value().edges.begin(), shared_edge));
+    const auto* marked = std::get_if<bool>(&seam_layer->values[edge_index]);
+    REQUIRE(marked && *marked);
+
+    const auto stale_snapshot = session.snapshot();
+    auto stale_marker = action;
+    stale_marker.expected_project_generation = stale_snapshot.project_generation;
+    stale_marker.expected_project_revision = stale_snapshot.project_revision;
+    stale_marker.expected_mesh_revision = marked_mesh.revision();
+    const auto rejected_stale_marker = carto::application::testing::dispatch(session, stale_marker);
+    REQUIRE(!rejected_stale_marker);
+    REQUIRE(session.snapshot().project_revision == stale_snapshot.project_revision);
+    REQUIRE(session.snapshot().undo_count == stale_snapshot.undo_count);
+
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SaveProjectAction{path}));
+    const auto reopened = carto::project::ProjectDocument::load(path);
+    REQUIRE(reopened);
+    const auto* reopened_layer = reopened.value().meshes().at(*object.mesh_asset)
+        .attributes().find(seam_layer_id);
+    REQUIRE(reopened_layer);
+    const auto* reopened_mark = std::get_if<bool>(&reopened_layer->values[edge_index]);
+    REQUIRE(reopened_mark && *reopened_mark);
+
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::UndoAction{}));
+    REQUIRE(session.document_.meshes().at(*object.mesh_asset)
+        .attributes().find(seam_layer_id) == nullptr);
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::RedoAction{}));
+    const auto* redone_layer = session.document_.meshes().at(*object.mesh_asset)
+        .attributes().find(seam_layer_id);
+    REQUIRE(redone_layer);
+    const auto* redone_mark = std::get_if<bool>(&redone_layer->values[edge_index]);
+    REQUIRE(redone_mark && *redone_mark);
+
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SelectFaceAction{object.id, carto::geometry::FaceId{1U}}));
+    const auto ready_to_clear = session.snapshot();
+    REQUIRE(ready_to_clear.selection.component_mesh_revision.has_value());
+    const carto::application::SetUvSeamMarkAction clear_action{
+        ready_to_clear.project_generation,
+        ready_to_clear.project_revision,
+        *ready_to_clear.selection.component_mesh_revision,
+        object.id,
+        1U,
+        carto::geometry::FaceId{1U},
+        shared_edge->id,
+        true,
+        false};
+    const auto cleared = carto::application::testing::dispatch(session, clear_action);
+    REQUIRE(cleared && cleared.value().document_changed);
+    const auto* cleared_layer = session.document_.meshes().at(*object.mesh_asset)
+        .attributes().find(seam_layer_id);
+    REQUIRE(cleared_layer);
+    const auto* cleared_mark = std::get_if<bool>(&cleared_layer->values[edge_index]);
+    REQUIRE(cleared_mark && !*cleared_mark);
+
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SelectFaceAction{object.id, carto::geometry::FaceId{1U}}));
+
+    const auto endpoints = [&]() {
+        std::array<carto::core::Vec2d, 4U> coordinates{};
+        const auto& current = session.document_.meshes().at(*object.mesh_asset);
+        const auto* layer = current.attributes().find("uv0.corners");
+        REQUIRE(layer);
+        for (std::size_t index = 0U; index < source_topology.value().corners.size(); ++index) {
+            const auto& corner = source_topology.value().corners[index];
+            const std::size_t face_offset = corner.face == carto::geometry::FaceId{1U} ? 0U : 2U;
+            if (corner.vertex == shared_edge->first) {
+                coordinates[face_offset] = std::get<carto::core::Vec2d>(layer->values[index]);
+            } else if (corner.vertex == shared_edge->second) {
+                coordinates[face_offset + 1U] = std::get<carto::core::Vec2d>(layer->values[index]);
+            }
+        }
+        return coordinates;
+    };
+    auto aligned = endpoints();
+    const auto ready_to_edit = session.snapshot();
+    REQUIRE(ready_to_edit.selection.component_mesh_revision.has_value());
+    const auto uv_coordinate_edit = carto::application::testing::dispatch(session,
+        carto::application::SetUvCoordinateAction{ready_to_edit.project_generation,
+            ready_to_edit.project_revision, *ready_to_edit.selection.component_mesh_revision,
+            object.id, 1U, carto::geometry::FaceId{1U}, shared_edge->first,
+            aligned[0U], {aligned[0U].x + 0.25, aligned[0U].y}});
+    if (!uv_coordinate_edit) std::cerr << uv_coordinate_edit.error().message << '\n';
+    REQUIRE(uv_coordinate_edit);
+    const auto discontinuous = endpoints();
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SelectFaceAction{object.id, carto::geometry::FaceId{1U}}));
+    const auto ready_to_align = session.snapshot();
+    REQUIRE(ready_to_align.selection.component_mesh_revision.has_value());
+    const carto::application::AlignUvSeamAction alignment{
+        ready_to_align.project_generation, ready_to_align.project_revision,
+        *ready_to_align.selection.component_mesh_revision, object.id, 1U,
+        carto::geometry::FaceId{1U}, carto::geometry::FaceId{2U}, shared_edge->id, discontinuous};
+    const auto before_alignment = session.document_.serialize();
+    carto::journal::Journal events(std::filesystem::path(path.string() + ".journal"));
+    const auto before_alignment_events = events.read_all();
+    REQUIRE(before_alignment_events);
+    auto stale_endpoint = alignment;
+    stale_endpoint.expected_coordinates[0U].x += 0.125;
+    REQUIRE(!carto::application::testing::dispatch(session, stale_endpoint));
+    auto stale_project = alignment;
+    ++stale_project.expected_project_generation;
+    REQUIRE(!carto::application::testing::dispatch(session, stale_project));
+    auto wrong_selected_face = alignment;
+    std::swap(wrong_selected_face.selected_face, wrong_selected_face.adjacent_face);
+    REQUIRE(!carto::application::testing::dispatch(session, wrong_selected_face));
+    auto boundary_alignment = alignment;
+    boundary_alignment.edge = boundary_edge->id;
+    REQUIRE(!carto::application::testing::dispatch(session, boundary_alignment));
+    session.active_source_ = carto::application::OperationSource::ai_proposal;
+    const auto ai_alignment = session.align_uv_seam(alignment);
+    session.active_source_ = carto::application::OperationSource::human;
+    REQUIRE(!ai_alignment);
+    carto::journal::JournalLimits limits;
+    limits.max_payload_bytes = 1U;
+    session.journal_.emplace(events.path(), limits);
+    REQUIRE(!carto::application::testing::dispatch(session, alignment));
+    REQUIRE(session.document_.serialize() == before_alignment);
+    REQUIRE(session.snapshot().undo_count == ready_to_align.undo_count &&
+        session.snapshot().redo_count == ready_to_align.redo_count);
+    REQUIRE(events.read_all().value().size() == before_alignment_events.value().size());
+    session.journal_.emplace(events.path());
+    REQUIRE(carto::application::testing::dispatch(session, alignment));
+    aligned = endpoints();
+    REQUIRE(aligned[0U].x == discontinuous[2U].x && aligned[0U].y == discontinuous[2U].y);
+    REQUIRE(aligned[1U].x == discontinuous[3U].x && aligned[1U].y == discontinuous[3U].y);
+    REQUIRE(aligned[2U].x == discontinuous[2U].x && aligned[2U].y == discontinuous[2U].y &&
+        aligned[3U].x == discontinuous[3U].x && aligned[3U].y == discontinuous[3U].y);
+    const auto accepted_events = events.read_all();
+    REQUIRE(accepted_events && accepted_events.value().size() == before_alignment_events.value().size() + 1U);
+    REQUIRE(accepted_events.value().back().event_type == "cartographer.application_action");
+    const std::string alignment_payload(accepted_events.value().back().payload.begin(),
+        accepted_events.value().back().payload.end());
+    REQUIRE(alignment_payload.find("Align UV Seam") != std::string::npos && events.verify());
+    auto already_aligned = alignment;
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SelectFaceAction{object.id, carto::geometry::FaceId{1U}}));
+    const auto after_alignment = session.snapshot();
+    already_aligned.expected_project_revision = after_alignment.project_revision;
+    REQUIRE(after_alignment.selection.component_mesh_revision.has_value());
+    already_aligned.expected_mesh_revision = *after_alignment.selection.component_mesh_revision;
+    already_aligned.expected_coordinates = aligned;
+    REQUIRE(!carto::application::testing::dispatch(session, already_aligned));
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::UndoAction{}));
+    REQUIRE(endpoints()[0U].x == discontinuous[0U].x);
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::RedoAction{}));
+    REQUIRE(endpoints()[0U].x == aligned[0U].x);
+    REQUIRE(events.read_all().value().size() == accepted_events.value().size() + 2U && events.verify());
+    REQUIRE(carto::application::testing::dispatch(session, carto::application::SaveProjectAction{path}));
+    const auto aligned_reopened = carto::project::ProjectDocument::load(path);
+    REQUIRE(aligned_reopened);
+    REQUIRE(carto::project::canonical_mesh_snapshot_digest(
+        aligned_reopened.value().meshes().at(*object.mesh_asset)) ==
+        carto::project::canonical_mesh_snapshot_digest(session.document_.meshes().at(*object.mesh_asset)));
 }
 
 void application_sets_selected_vertex_positions_across_objects_atomically_and_persists_patches() {
@@ -5059,7 +5560,8 @@ void application_mesh_cleanup_reviews_preserve_authority_and_durable_lineage() {
     REQUIRE(session.snapshot().redo_count == 0U);
     REQUIRE(session.document_.mesh_patches().size() == 1U);
     REQUIRE(session.document_.topology_receipts().size() == 1U);
-    REQUIRE(application::canonical_mesh_geometry_digest(session.document_.meshes().at(*object.mesh_asset)) == expected_digest);
+    REQUIRE(project::canonical_mesh_snapshot_digest(
+        session.document_.meshes().at(*object.mesh_asset)) == expected_digest);
     const auto entries = journal.read_all();
     REQUIRE(entries && entries.value().size() == entries_before.value().size() + 1U);
     const std::string payload(entries.value().back().payload.begin(), entries.value().back().payload.end());
@@ -5069,11 +5571,13 @@ void application_mesh_cleanup_reviews_preserve_authority_and_durable_lineage() {
     REQUIRE(application::testing::dispatch(session, application::UndoAction{}));
     REQUIRE(session.document_.meshes().at(*object.mesh_asset).vertex_count() == 6U);
     REQUIRE(application::testing::dispatch(session, application::RedoAction{}));
-    REQUIRE(application::canonical_mesh_geometry_digest(session.document_.meshes().at(*object.mesh_asset)) == expected_digest);
+    REQUIRE(project::canonical_mesh_snapshot_digest(
+        session.document_.meshes().at(*object.mesh_asset)) == expected_digest);
     REQUIRE(application::testing::dispatch(session, application::SaveProjectAction{}));
     const auto reopened = project::ProjectDocument::load(path);
     REQUIRE(reopened && reopened.value().mesh_patches().size() == 1U);
-    REQUIRE(application::canonical_mesh_geometry_digest(reopened.value().meshes().at(*object.mesh_asset)) == expected_digest);
+    REQUIRE(project::canonical_mesh_snapshot_digest(
+        reopened.value().meshes().at(*object.mesh_asset)) == expected_digest);
 }
 
 void application_mesh_cleanup_refuses_stale_foreign_and_overbudget_reviews() {
@@ -5139,6 +5643,8 @@ void application_mesh_cleanup_refuses_stale_foreign_and_overbudget_reviews() {
     const auto identityless_before = identityless.document_.serialize();
     REQUIRE(!identityless.review_mesh_cleanup(
         identityless.snapshot().objects.front().object.id, candidates, options));
+    REQUIRE(!identityless.inspect_mesh_cleanup_issues(
+        identityless.snapshot().objects.front().object.id));
     REQUIRE(!application::HumanApplicationAccess::commit_mesh_cleanup(
         identityless, expired.value(), "Two absent identities cannot authorize"));
     REQUIRE(identityless.document_.serialize() == identityless_before && expired.value().active());
@@ -5158,6 +5664,8 @@ void application_mesh_cleanup_refuses_stale_foreign_and_overbudget_reviews() {
     REQUIRE(application::testing::dispatch(shared, application::DuplicateMeshInstanceAction{
         shared_id, "Shared instance"}));
     REQUIRE(!shared.review_mesh_cleanup(shared_id, candidates, options));
+    REQUIRE(!shared.review_mesh_cleanup_issues(shared_id, options));
+    REQUIRE(!shared.inspect_mesh_cleanup_issues(shared_id));
     const auto shared_before = shared.document_.serialize();
     REQUIRE(!application::HumanApplicationAccess::commit_mesh_cleanup(shared, shared_review.value(), "Shared after review"));
     REQUIRE(shared.document_.serialize() == shared_before);
@@ -5181,6 +5689,8 @@ void application_mesh_cleanup_refuses_stale_foreign_and_overbudget_reviews() {
     locked->locked = true; // adversarial fixture: no revision change
     const auto locked_before = foreign.document_.serialize();
     REQUIRE(!foreign.review_mesh_cleanup(locked->id, candidates, options));
+    REQUIRE(!foreign.review_mesh_cleanup_issues(locked->id, options));
+    REQUIRE(!foreign.inspect_mesh_cleanup_issues(locked->id));
     REQUIRE(!application::HumanApplicationAccess::commit_mesh_cleanup(
         foreign, locked_review.value(), "Locked after review"));
     REQUIRE(foreign.document_.serialize() == locked_before);
@@ -5190,6 +5700,8 @@ void application_mesh_cleanup_refuses_stale_foreign_and_overbudget_reviews() {
     locked->visible = false; // adversarial fixture: no revision change
     const auto hidden_before = foreign.document_.serialize();
     REQUIRE(!foreign.review_mesh_cleanup(locked->id, candidates, options));
+    REQUIRE(!foreign.review_mesh_cleanup_issues(locked->id, options));
+    REQUIRE(!foreign.inspect_mesh_cleanup_issues(locked->id));
     REQUIRE(!application::HumanApplicationAccess::commit_mesh_cleanup(
         foreign, hidden_review.value(), "Hidden after review"));
     REQUIRE(foreign.document_.serialize() == hidden_before && hidden_review.value().active());
@@ -5198,6 +5710,8 @@ void application_mesh_cleanup_refuses_stale_foreign_and_overbudget_reviews() {
     const auto drifted_id = populate(drifted);
     auto drifted_review = drifted.review_mesh_cleanup(drifted_id, candidates, options);
     REQUIRE(drifted_review);
+    auto drifted_discovery_review = drifted.review_mesh_cleanup_issues(drifted_id, options);
+    REQUIRE(drifted_discovery_review);
     auto& drifted_mesh = const_cast<geometry::EditableMesh&>(drifted.document_.meshes().at(
         *drifted.document_.scene().find(drifted_id)->mesh_asset));
     const auto old_revision = drifted_mesh.revision();
@@ -5208,21 +5722,99 @@ void application_mesh_cleanup_refuses_stale_foreign_and_overbudget_reviews() {
     const auto drifted_commit = application::HumanApplicationAccess::commit_mesh_cleanup(
         drifted, drifted_review.value(), "Changed source geometry");
     REQUIRE(!drifted_commit && drifted_commit.error().code == core::ErrorCode::stale_data);
+    const auto drifted_discovery_commit = application::HumanApplicationAccess::commit_mesh_cleanup(
+        drifted, drifted_discovery_review.value(), "Changed discovered source geometry");
+    REQUIRE(!drifted_discovery_commit &&
+        drifted_discovery_commit.error().code == core::ErrorCode::stale_data);
     REQUIRE(drifted.document_.serialize() == drifted_before && drifted_review.value().active());
 
     auto attributed = make_application_merge_distance_fixture();
     attributes::AttributeSet payload({{attributes::AttributeDomain::vertex, attributed.vertex_count()}});
+    std::vector<attributes::AttributeValue> compatible_values(
+        attributed.vertex_count(), std::int32_t{7});
     REQUIRE(payload.add_layer({{"keep", attributes::AttributeDomain::vertex,
-        attributes::AttributeType::int32}, std::vector<attributes::AttributeValue>(
-            attributed.vertex_count(), std::int32_t{7})}));
+        attributes::AttributeType::int32}, std::move(compatible_values)}));
     REQUIRE(attributed.set_attribute_payload(std::move(payload), {}));
+    auto vertex_conflicting = attributed;
+    attributes::AttributeSet minority_payload({
+        {attributes::AttributeDomain::vertex, vertex_conflicting.vertex_count()}});
+    std::vector<attributes::AttributeValue> minority_values;
+    for (const auto& vertex : vertex_conflicting.vertices_sorted()) {
+        minority_values.emplace_back(std::int32_t{vertex.id == geometry::VertexId{5U} ? 8 : 7});
+    }
+    REQUIRE(minority_payload.add_layer({{"keep", attributes::AttributeDomain::vertex,
+        attributes::AttributeType::int32}, std::move(minority_values)}));
+    REQUIRE(vertex_conflicting.set_attribute_payload(std::move(minority_payload), {}));
+    TempDirectory minority_directory;
+    const auto minority_path = minority_directory.path() / "minority-vertex-cleanup.carto";
+    application::ApplicationSession minority_session;
+    REQUIRE(application::testing::dispatch(minority_session, application::SaveProjectAction{minority_path}));
+    REQUIRE(application::testing::dispatch(minority_session, application::CreateMeshObjectAction{
+        "Contested vertex tags", std::move(vertex_conflicting)}));
+    const auto minority_before = minority_session.document_.serialize();
+    const auto minority_snapshot = minority_session.snapshot();
+    journal::Journal minority_journal(std::filesystem::path(minority_path.string() + ".journal"));
+    const auto minority_events_before = minority_journal.read_all();
+    REQUIRE(minority_events_before);
+    const auto minority_review = minority_session.review_mesh_cleanup(
+        minority_snapshot.objects.front().object.id, candidates, options);
+    REQUIRE(!minority_review);
+    const auto minority_events_after = minority_journal.read_all();
+    REQUIRE(minority_session.document_.serialize() == minority_before &&
+        minority_session.snapshot().undo_count == minority_snapshot.undo_count &&
+        minority_session.snapshot().redo_count == minority_snapshot.redo_count &&
+        minority_events_after && minority_events_after.value().size() == minority_events_before.value().size());
+    REQUIRE(minority_journal.verify());
+
+    auto conflicting = attributed;
+    REQUIRE(conflicting.clear_attribute_payload());
+    const auto conflicting_topology = conflicting.topology();
+    REQUIRE(conflicting_topology);
+    attributes::AttributeSet conflicts({{attributes::AttributeDomain::edge,
+        conflicting_topology.value().edges.size()}});
+    std::vector<attributes::AttributeValue> conflict_values;
+    for (std::size_t index = 0U; index < conflicting_topology.value().edges.size(); ++index) {
+        conflict_values.emplace_back(static_cast<std::int32_t>(index + 1U));
+    }
+    REQUIRE(conflicts.add_layer({{"edge_tag", attributes::AttributeDomain::edge,
+        attributes::AttributeType::int32}, std::move(conflict_values)}));
+    REQUIRE(conflicting.set_attribute_payload(std::move(conflicts), {}));
     application::ApplicationSession attributed_session;
     REQUIRE(application::testing::dispatch(attributed_session, application::CreateMeshObjectAction{
         "Attributed cleanup source", std::move(attributed)}));
     const auto attributed_before = attributed_session.document_.serialize();
-    REQUIRE(!attributed_session.review_mesh_cleanup(
-        attributed_session.snapshot().objects.front().object.id, candidates, options));
-    REQUIRE(attributed_session.document_.serialize() == attributed_before);
+    auto attributed_review = attributed_session.review_mesh_cleanup(
+        attributed_session.snapshot().objects.front().object.id, candidates, options);
+    REQUIRE(attributed_review && attributed_session.document_.serialize() == attributed_before);
+    const auto attributed_digest = attributed_review.value().result_digest();
+    REQUIRE(application::HumanApplicationAccess::commit_mesh_cleanup(
+        attributed_session, attributed_review.value(), "Preserve compatible vertex tags"));
+    const auto& cleaned = attributed_session.document_.meshes().begin()->second;
+    REQUIRE(project::canonical_mesh_snapshot_digest(cleaned) == attributed_digest);
+    const auto* kept = cleaned.attributes().find("keep");
+    REQUIRE(kept && !kept->values.empty() && std::all_of(kept->values.begin(), kept->values.end(),
+        [](const auto& value) { return std::get<std::int32_t>(value) == 7; }));
+
+    TempDirectory conflict_directory;
+    const auto conflict_path = conflict_directory.path() / "conflicting-cleanup.carto";
+    application::ApplicationSession conflict_session;
+    REQUIRE(application::testing::dispatch(conflict_session, application::SaveProjectAction{conflict_path}));
+    REQUIRE(application::testing::dispatch(conflict_session, application::CreateMeshObjectAction{
+        "Conflicting cleanup source", std::move(conflicting)}));
+    const auto conflict_before = conflict_session.document_.serialize();
+    const auto conflict_snapshot = conflict_session.snapshot();
+    journal::Journal conflict_journal(std::filesystem::path(conflict_path.string() + ".journal"));
+    const auto conflict_events = conflict_journal.read_all();
+    REQUIRE(conflict_events);
+    const auto refused = conflict_session.review_mesh_cleanup(
+        conflict_snapshot.objects.front().object.id, candidates, options);
+    REQUIRE(!refused && refused.error().code == core::ErrorCode::unsupported);
+    const auto after_conflict_events = conflict_journal.read_all();
+    REQUIRE(conflict_session.document_.serialize() == conflict_before &&
+        conflict_session.snapshot().undo_count == conflict_snapshot.undo_count &&
+        conflict_session.snapshot().redo_count == conflict_snapshot.redo_count &&
+        after_conflict_events && after_conflict_events.value().size() == conflict_events.value().size());
+    REQUIRE(conflict_journal.verify());
 
     application::ApplicationSession oversized;
     geometry::EditableMesh large;
@@ -5237,6 +5829,10 @@ void application_mesh_cleanup_refuses_stale_foreign_and_overbudget_reviews() {
     const auto over_before = oversized.document_.serialize();
     REQUIRE(!oversized.review_mesh_cleanup(oversized.snapshot().objects.front().object.id,
         {{1U}, {2U}}, options));
+    REQUIRE(!oversized.review_mesh_cleanup_issues(
+        oversized.snapshot().objects.front().object.id, options));
+    REQUIRE(!oversized.inspect_mesh_cleanup_issues(
+        oversized.snapshot().objects.front().object.id));
     REQUIRE(oversized.document_.serialize() == over_before);
 }
 
@@ -5289,6 +5885,335 @@ void application_mesh_cleanup_enforces_face_removal_and_corner_budgets() {
     REQUIRE(!corner_refusal && corner_refusal.error().code == core::ErrorCode::unsupported);
     REQUIRE(corner_refusal.error().message.find("corner budget") != std::string::npos);
     REQUIRE(corner_limited.document_.serialize() == corner_before);
+}
+
+void application_mesh_cleanup_issue_discovery_is_reviewed_and_bounded() {
+    using namespace carto;
+    application::ApplicationSession session;
+    REQUIRE(application::testing::dispatch(session, application::CreateMeshObjectAction{
+        "Discover duplicate seam", make_application_merge_distance_fixture()}));
+    const auto object = session.snapshot().objects.front().object.id;
+    const auto before = session.document_.serialize();
+    application::MeshCleanupOptions options;
+    options.merge_distance = 1.0e-4;
+
+    auto review = session.review_mesh_cleanup_issues(object, options);
+    REQUIRE(review && review.value().active());
+    REQUIRE((review.value().candidates() == std::vector<geometry::VertexId>{
+        {1U}, {2U}, {4U}, {5U}}));
+    REQUIRE(review.value().receipt().merged_vertices.size() == 2U);
+    REQUIRE(session.document_.serialize() == before);
+
+    auto too_few_candidates = options;
+    too_few_candidates.max_candidates = 2U;
+    const auto candidate_budget = session.review_mesh_cleanup_issues(object, too_few_candidates);
+    REQUIRE(!candidate_budget && candidate_budget.error().code == core::ErrorCode::unsupported);
+    auto no_pair_budget = options;
+    no_pair_budget.max_candidate_pair_checks = 0U;
+    const auto pair_budget = session.review_mesh_cleanup_issues(object, no_pair_budget);
+    REQUIRE(!pair_budget && pair_budget.error().code == core::ErrorCode::invalid_argument);
+    REQUIRE(session.document_.serialize() == before);
+
+    REQUIRE(!application::HumanApplicationAccess::commit_mesh_cleanup(session, review.value(), " "));
+    REQUIRE(review.value().active() && session.document_.serialize() == before);
+    const auto committed = application::HumanApplicationAccess::commit_mesh_cleanup(
+        session, review.value(), "Review discovered duplicate seam");
+    REQUIRE(committed && !review.value().active());
+    REQUIRE(committed.value().source == application::OperationSource::human);
+    REQUIRE(session.document_.mesh_patches().size() == 1U);
+    REQUIRE(session.document_.topology_receipts().size() == 1U);
+    REQUIRE(session.document_.meshes().at(*session.document_.scene().find(object)->mesh_asset)
+        .vertex_count() == 4U);
+    REQUIRE(application::testing::dispatch(session, application::UndoAction{}));
+    REQUIRE(session.document_.meshes().at(*session.document_.scene().find(object)->mesh_asset)
+        .vertex_count() == 6U);
+    REQUIRE(application::testing::dispatch(session, application::RedoAction{}));
+    REQUIRE(session.document_.meshes().at(*session.document_.scene().find(object)->mesh_asset)
+        .vertex_count() == 4U);
+
+    application::ApplicationSession no_issues;
+    REQUIRE(application::testing::dispatch(no_issues, application::CreateMeshObjectAction{
+        "No nearby vertices", make_application_weld_fixture()}));
+    const auto no_issue_object = no_issues.snapshot().objects.front().object.id;
+    const auto no_issue_before = no_issues.document_.serialize();
+    const auto no_issue_review = no_issues.review_mesh_cleanup_issues(no_issue_object, options);
+    REQUIRE(!no_issue_review && no_issue_review.error().code == core::ErrorCode::invalid_state);
+    REQUIRE(no_issues.document_.serialize() == no_issue_before);
+}
+
+void application_mesh_cleanup_diagnostic_reports_coincident_vertices_duplicate_cycles_and_orphans_read_only() {
+    using namespace carto;
+    application::ApplicationSession session;
+    geometry::EditableMesh mesh;
+    const auto a = mesh.add_vertex({0.0, 0.0, 0.0});
+    const auto b = mesh.add_vertex({1.0, 0.0, 0.0});
+    const auto c = mesh.add_vertex({1.0, 1.0, 0.0});
+    const auto d = mesh.add_vertex({0.0, 1.0, 0.0});
+    const auto orphan = mesh.add_vertex({4.0, 4.0, 4.0});
+    const auto coincident_orphan = mesh.add_vertex({4.0, 4.0, 4.0});
+    const auto negative_zero = mesh.add_vertex({-0.0, 5.0, 5.0});
+    const auto positive_zero = mesh.add_vertex({0.0, 5.0, 5.0});
+    REQUIRE(a && b && c && d && orphan && coincident_orphan &&
+        negative_zero && positive_zero);
+    const auto first_face = mesh.add_face({a.value(), b.value(), c.value(), d.value()});
+    // This is a cyclic rotation of the reversed first loop. The diagnostic
+    // must treat both winding and starting-corner changes as the same cycle.
+    const auto duplicate_face = mesh.add_face({c.value(), b.value(), a.value(), d.value()});
+    REQUIRE(first_face && duplicate_face);
+    const auto e = mesh.add_vertex({8.0, 0.0, 0.0});
+    const auto f = mesh.add_vertex({9.0, 0.0, 0.0});
+    const auto g = mesh.add_vertex({8.0, 1.0, 0.0});
+    REQUIRE(e && f && g);
+    const auto isolated_face = mesh.add_face({e.value(), f.value(), g.value()});
+    REQUIRE(isolated_face);
+    std::vector<geometry::EdgeId> expected_boundary_edges;
+    for (const auto& edge : mesh.edges_sorted(mesh.edge_count())) {
+        if (!edge.second_half_edge.has_value()) expected_boundary_edges.push_back(edge.id);
+    }
+    REQUIRE(expected_boundary_edges.size() == 3U);
+    REQUIRE(application::testing::dispatch(session, application::CreateMeshObjectAction{
+        "Duplicate face diagnostic", std::move(mesh)}));
+    const auto before_snapshot = session.snapshot();
+    const auto object = before_snapshot.objects.front().object.id;
+    const auto before_document = session.document_.serialize();
+
+    const auto report = session.inspect_mesh_cleanup_issues(object);
+    REQUIRE(report);
+    REQUIRE(report.value().project_generation == before_snapshot.project_generation);
+    REQUIRE(report.value().project_revision == before_snapshot.project_revision);
+    REQUIRE(report.value().object == object);
+    REQUIRE(report.value().mesh_asset == *before_snapshot.objects.front().object.mesh_asset);
+    REQUIRE(report.value().mesh_revision == session.document_.meshes().at(
+        report.value().mesh_asset).revision());
+    REQUIRE(report.value().source_digest == project::canonical_mesh_snapshot_digest(
+        session.document_.meshes().at(report.value().mesh_asset)));
+    REQUIRE((report.value().unreferenced_vertices == std::vector<geometry::VertexId>{
+        orphan.value(), coincident_orphan.value(), negative_zero.value(), positive_zero.value()}));
+    REQUIRE((report.value().coincident_vertex_groups ==
+        std::vector<std::vector<geometry::VertexId>>{
+            {orphan.value(), coincident_orphan.value()},
+            {negative_zero.value(), positive_zero.value()}}));
+    REQUIRE((report.value().duplicate_face_groups ==
+        std::vector<std::vector<geometry::FaceId>>{{first_face.value(), duplicate_face.value()}}));
+    REQUIRE((report.value().disconnected_face_components ==
+        std::vector<std::vector<geometry::FaceId>>{
+            {first_face.value(), duplicate_face.value()}, {isolated_face.value()}}));
+    REQUIRE(report.value().boundary_edges == expected_boundary_edges);
+    REQUIRE((report.value().boundary_edge_components ==
+        std::vector<application::MeshCleanupBoundaryEdgeComponent>{
+            {expected_boundary_edges, {}, {}, true, {isolated_face.value()}}}));
+    REQUIRE(session.document_.serialize() == before_document);
+    REQUIRE(session.snapshot().project_revision == before_snapshot.project_revision);
+    REQUIRE(session.snapshot().undo_count == before_snapshot.undo_count);
+
+    const auto repeated = session.inspect_mesh_cleanup_issues(object);
+    REQUIRE(repeated);
+    REQUIRE(repeated.value().unreferenced_vertices == report.value().unreferenced_vertices);
+    REQUIRE(repeated.value().coincident_vertex_groups ==
+        report.value().coincident_vertex_groups);
+    REQUIRE(repeated.value().duplicate_face_groups == report.value().duplicate_face_groups);
+    REQUIRE(repeated.value().disconnected_face_components ==
+        report.value().disconnected_face_components);
+    REQUIRE(repeated.value().boundary_edges == report.value().boundary_edges);
+    REQUIRE(repeated.value().boundary_edge_components ==
+        report.value().boundary_edge_components);
+    REQUIRE(repeated.value().source_digest == report.value().source_digest);
+}
+
+void application_mesh_cleanup_diagnostic_reports_nonplanar_faces_read_only() {
+    using namespace carto;
+    geometry::EditableMesh mesh;
+    const auto twisted_a = mesh.add_vertex({0.0, 0.0, 0.0});
+    const auto twisted_b = mesh.add_vertex({1.0, 0.0, 0.0});
+    const auto twisted_c = mesh.add_vertex({1.0, 1.0, 0.0});
+    const auto twisted_d = mesh.add_vertex({0.0, 1.0, 1.0});
+    const auto planar_a = mesh.add_vertex({0.0, 0.0, 2.0});
+    const auto planar_b = mesh.add_vertex({1.0, 0.0, 2.0});
+    const auto planar_c = mesh.add_vertex({1.0, 1.0, 2.0});
+    const auto planar_d = mesh.add_vertex({0.0, 1.0, 2.0});
+    // Finite, widely scaled coordinates keep raw triangle areas measurable
+    // while the normalized reference normal underflows and must fail closed.
+    const auto extreme_a = mesh.add_vertex({0.0, 0.0, 0.0});
+    const auto extreme_b = mesh.add_vertex({1.0e308, 0.0, 0.0});
+    const auto extreme_c = mesh.add_vertex({1.0e308, 5.0e-155, 0.0});
+    const auto extreme_d = mesh.add_vertex({0.0, 5.0e-155, 5.0e-155});
+    REQUIRE(twisted_a && twisted_b && twisted_c && twisted_d && planar_a &&
+        planar_b && planar_c && planar_d && extreme_a && extreme_b &&
+        extreme_c && extreme_d);
+    const auto nonplanar_face = mesh.add_face({twisted_a.value(), twisted_b.value(),
+        twisted_c.value(), twisted_d.value()});
+    const auto planar_face = mesh.add_face({planar_a.value(), planar_b.value(),
+        planar_c.value(), planar_d.value()});
+    const auto unmeasurable_face = mesh.add_face({extreme_a.value(),
+        extreme_b.value(), extreme_c.value(), extreme_d.value()});
+    REQUIRE(nonplanar_face && planar_face && unmeasurable_face);
+
+    application::ApplicationSession session;
+    REQUIRE(application::testing::dispatch(session,
+        application::CreateMeshObjectAction{"Nonplanar-face diagnostic", std::move(mesh)}));
+    const auto before_snapshot = session.snapshot();
+    const auto object = before_snapshot.objects.front().object.id;
+    const auto before_document = session.document_.serialize();
+    const auto report = session.inspect_mesh_cleanup_issues(object);
+    REQUIRE(report);
+    REQUIRE(report.value().nonplanar_faces.size() == 1U);
+    REQUIRE(report.value().nonplanar_faces.front().face == nonplanar_face.value());
+    REQUIRE(report.value().nonplanar_faces.front().maximum_relative_deviation > 0.70 &&
+        report.value().nonplanar_faces.front().maximum_relative_deviation < 0.71);
+    REQUIRE((report.value().unmeasurable_planarity_faces ==
+        std::vector<geometry::FaceId>{unmeasurable_face.value()}));
+    REQUIRE(session.document_.serialize() == before_document);
+    REQUIRE(session.snapshot().project_revision == before_snapshot.project_revision);
+    const auto repeated = session.inspect_mesh_cleanup_issues(object);
+    REQUIRE(repeated);
+    REQUIRE(repeated.value().nonplanar_faces == report.value().nonplanar_faces);
+    REQUIRE(repeated.value().unmeasurable_planarity_faces ==
+        report.value().unmeasurable_planarity_faces);
+}
+
+void application_mesh_cleanup_diagnostic_reports_disconnected_vertex_fans_read_only() {
+    using namespace carto;
+    geometry::EditableMesh mesh;
+    const auto shared = mesh.add_vertex({0.0, 0.0, 0.0});
+    const auto first_a = mesh.add_vertex({1.0, 0.0, 0.0});
+    const auto first_b = mesh.add_vertex({0.0, 1.0, 0.0});
+    const auto second_a = mesh.add_vertex({-1.0, 0.0, 0.0});
+    const auto second_b = mesh.add_vertex({0.0, -1.0, 0.0});
+    REQUIRE(shared && first_a && first_b && second_a && second_b);
+    const auto first_face = mesh.add_face({shared.value(), first_a.value(), first_b.value()});
+    const auto second_face = mesh.add_face({shared.value(), second_a.value(), second_b.value()});
+    REQUIRE(first_face && second_face);
+
+    application::ApplicationSession session;
+    REQUIRE(application::testing::dispatch(session, application::CreateMeshObjectAction{
+        "Point-contact shells", std::move(mesh)}));
+    const auto snapshot = session.snapshot();
+    const auto object = snapshot.objects.front().object.id;
+    const auto before = session.document_.serialize();
+    const auto report = session.inspect_mesh_cleanup_issues(object);
+    REQUIRE(report);
+    REQUIRE((report.value().disconnected_vertex_fans ==
+        std::vector<application::MeshCleanupDisconnectedVertexFan>{
+            {shared.value(), {{first_face.value()}, {second_face.value()}}}}));
+    REQUIRE((report.value().disconnected_face_components ==
+        std::vector<std::vector<geometry::FaceId>>{
+            {first_face.value()}, {second_face.value()}}));
+    std::vector<geometry::EdgeId> expected_boundary_edges;
+    REQUIRE(snapshot.objects.front().object.mesh_asset.has_value());
+    const auto& source_mesh = session.document_.meshes().at(
+        *snapshot.objects.front().object.mesh_asset);
+    for (const auto& edge : source_mesh.edges_sorted(source_mesh.edge_count())) {
+        if (!edge.second_half_edge.has_value()) expected_boundary_edges.push_back(edge.id);
+    }
+    REQUIRE(expected_boundary_edges.size() == 6U);
+    REQUIRE(report.value().boundary_edge_components.size() == 1U);
+    REQUIRE(report.value().boundary_edge_components.front().edges == expected_boundary_edges);
+    REQUIRE(report.value().boundary_edge_components.front().endpoints.empty());
+    REQUIRE((report.value().boundary_edge_components.front().junctions ==
+        std::vector<geometry::VertexId>{shared.value()}));
+    REQUIRE(!report.value().boundary_edge_components.front().closed_loop);
+    REQUIRE((report.value().boundary_edge_components.front().incident_faces ==
+        std::vector<geometry::FaceId>{first_face.value(), second_face.value()}));
+    REQUIRE(session.document_.serialize() == before);
+    REQUIRE(session.snapshot().project_revision == snapshot.project_revision);
+    const auto repeated = session.inspect_mesh_cleanup_issues(object);
+    REQUIRE(repeated);
+    REQUIRE(repeated.value().disconnected_vertex_fans ==
+        report.value().disconnected_vertex_fans);
+    REQUIRE(repeated.value().disconnected_face_components ==
+        report.value().disconnected_face_components);
+    REQUIRE(repeated.value().boundary_edge_components ==
+        report.value().boundary_edge_components);
+}
+
+void application_mesh_cleanup_transfers_continuous_vertex_attributes() {
+    using namespace carto;
+    TempDirectory temp;
+    const auto path = temp.path() / "cleanup-attribute-transfer.carto";
+    auto mesh = make_application_merge_distance_fixture();
+    attributes::AttributeSet payload({
+        {attributes::AttributeDomain::vertex, mesh.vertex_count()}});
+    REQUIRE(payload.add_layer({
+        {"vertex_signal", attributes::AttributeDomain::vertex,
+            attributes::AttributeType::float64},
+        {2.0, 10.0, 20.0, 14.0, 6.0, 30.0}}));
+    REQUIRE(mesh.set_attribute_payload(std::move(payload), {}));
+
+    application::ApplicationSession attribute_drift;
+    REQUIRE(application::testing::dispatch(attribute_drift,
+        application::CreateMeshObjectAction{"Attribute drift", mesh}));
+    const auto drift_object = attribute_drift.snapshot().objects.front().object;
+    REQUIRE(drift_object.mesh_asset.has_value());
+    application::MeshCleanupOptions drift_options;
+    drift_options.merge_distance = 1.0e-4;
+    auto drift_review = attribute_drift.review_mesh_cleanup_issues(drift_object.id, drift_options);
+    REQUIRE(drift_review);
+    auto& drift_mesh = const_cast<geometry::EditableMesh&>(
+        attribute_drift.document_.meshes().at(*drift_object.mesh_asset));
+    const auto old_mesh_revision = drift_mesh.revision();
+    attributes::AttributeSet changed_payload({
+        {attributes::AttributeDomain::vertex, drift_mesh.vertex_count()}});
+    REQUIRE(changed_payload.add_layer({
+        {"vertex_signal", attributes::AttributeDomain::vertex,
+            attributes::AttributeType::float64},
+        {3.0, 10.0, 20.0, 14.0, 6.0, 30.0}}));
+    REQUIRE(drift_mesh.set_attribute_payload(std::move(changed_payload), {}));
+    REQUIRE(drift_mesh.restore_revision(old_mesh_revision));
+    const auto drifted_bytes = attribute_drift.document_.serialize();
+    const auto stale_attribute_commit = application::HumanApplicationAccess::commit_mesh_cleanup(
+        attribute_drift, drift_review.value(), "Reject same-revision attribute drift");
+    REQUIRE(!stale_attribute_commit &&
+        stale_attribute_commit.error().code == core::ErrorCode::stale_data);
+    REQUIRE(drift_mesh.revision() == old_mesh_revision);
+    REQUIRE(attribute_drift.document_.serialize() == drifted_bytes);
+
+    application::ApplicationSession session;
+    REQUIRE(application::testing::dispatch(session, application::CreateMeshObjectAction{
+        "Transfer cleanup values", std::move(mesh)}));
+    const auto object = session.snapshot().objects.front().object;
+    REQUIRE(object.mesh_asset.has_value());
+    const auto source_mesh = session.document_.meshes().at(*object.mesh_asset);
+    REQUIRE(application::testing::dispatch(session, application::SaveProjectAction{path}));
+
+    application::MeshCleanupOptions options;
+    options.merge_distance = 1.0e-4;
+    auto review = session.review_mesh_cleanup_issues(object.id, options);
+    REQUIRE(review && review.value().receipt().merged_vertices.size() == 2U);
+    const auto reviewed_result_digest = review.value().result_digest();
+    const auto committed = application::HumanApplicationAccess::commit_mesh_cleanup(
+        session, review.value(), "Transfer continuous vertex signals");
+    REQUIRE(committed && committed.value().source == application::OperationSource::human);
+    REQUIRE(session.document_.mesh_patches().size() == 1U);
+    REQUIRE(session.document_.mesh_patches().front().replay(source_mesh));
+
+    const auto& after = session.document_.meshes().at(*object.mesh_asset);
+    const auto* transferred = after.attributes().find("vertex_signal");
+    REQUIRE(transferred != nullptr);
+    REQUIRE(transferred->values.size() == 4U);
+    REQUIRE(std::get<double>(transferred->values[0U]) == 4.0);
+    REQUIRE(std::get<double>(transferred->values[1U]) == 12.0);
+    REQUIRE(std::get<double>(transferred->values[2U]) == 20.0);
+    REQUIRE(std::get<double>(transferred->values[3U]) == 30.0);
+    REQUIRE(project::canonical_mesh_snapshot_digest(after) == reviewed_result_digest);
+
+    REQUIRE(application::testing::dispatch(session, application::UndoAction{}));
+    const auto* restored = session.document_.meshes().at(*object.mesh_asset)
+        .attributes().find("vertex_signal");
+    REQUIRE(restored && restored->values.size() == 6U);
+    REQUIRE(std::get<double>(restored->values[0U]) == 2.0);
+    REQUIRE(application::testing::dispatch(session, application::RedoAction{}));
+    const auto* redone = session.document_.meshes().at(*object.mesh_asset)
+        .attributes().find("vertex_signal");
+    REQUIRE(redone && redone->values.size() == 4U);
+    REQUIRE(std::get<double>(redone->values[0U]) == 4.0);
+    REQUIRE(application::testing::dispatch(session, application::SaveProjectAction{}));
+    const auto reopened = project::ProjectDocument::load(path);
+    REQUIRE(reopened);
+    const auto& reopened_mesh = reopened.value().meshes().at(*object.mesh_asset);
+    const auto* reopened_signal = reopened_mesh.attributes().find("vertex_signal");
+    REQUIRE(reopened_signal && reopened_signal->values.size() == 4U);
+    REQUIRE(std::get<double>(reopened_signal->values[0U]) == 4.0);
+    REQUIRE(project::canonical_mesh_snapshot_digest(reopened_mesh) == reviewed_result_digest);
 }
 
 void project_merge_by_distance_patch_is_digest_bound_and_replayable() {
@@ -6055,6 +6980,77 @@ void application_routes_component_selection_conversion_without_mutation() {
     REQUIRE(snapshot.project_revision == before);
     REQUIRE(snapshot.selection.mode == carto::editor::SelectionMode::vertex);
     REQUIRE(snapshot.selection.vertices.size() == 4U);
+}
+
+void application_selects_face_batches_atomically_without_project_mutation() {
+    using namespace carto;
+    application::ApplicationSession session;
+    REQUIRE(application::testing::dispatch(session,
+        application::CreateBoxAction{"Face batch", {1.0, 1.0, 1.0}}));
+    const auto object = session.snapshot().objects.front().object.id;
+    REQUIRE(application::testing::dispatch(session,
+        application::SelectFaceAction{object, geometry::FaceId{6U}}));
+    const auto before = session.snapshot();
+    const auto mesh_revision = before.objects.front().mesh_revision;
+    REQUIRE(mesh_revision.has_value());
+
+    const auto selected = application::testing::dispatch(session,
+        application::SelectFaceBatchAction{before.project_generation,
+            before.project_revision, *mesh_revision, object,
+            {geometry::FaceId{3U}, geometry::FaceId{1U}, geometry::FaceId{2U}}});
+    REQUIRE(selected);
+    REQUIRE(!selected.value().document_changed);
+    auto snapshot = session.snapshot();
+    REQUIRE(snapshot.project_revision == before.project_revision);
+    REQUIRE(snapshot.undo_count == before.undo_count);
+    REQUIRE(snapshot.redo_count == before.redo_count);
+    REQUIRE(snapshot.dirty == before.dirty);
+    REQUIRE(snapshot.selection.mode == editor::SelectionMode::face);
+    const std::vector<geometry::FaceId> expected_faces{
+        geometry::FaceId{1U}, geometry::FaceId{2U}, geometry::FaceId{3U}};
+    REQUIRE(snapshot.selection.faces == expected_faces);
+
+    const auto make_action = [&](std::vector<geometry::FaceId> faces) {
+        return application::SelectFaceBatchAction{
+            before.project_generation, before.project_revision, *mesh_revision,
+            object, std::move(faces)};
+    };
+    const auto refused_without_change = [&](application::SelectFaceBatchAction action) {
+        const auto current = session.snapshot();
+        REQUIRE(!application::testing::dispatch(session, action));
+        const auto after = session.snapshot();
+        REQUIRE(after.project_revision == current.project_revision);
+        REQUIRE(after.undo_count == current.undo_count);
+        REQUIRE(after.redo_count == current.redo_count);
+        REQUIRE(after.dirty == current.dirty);
+        REQUIRE(after.selection.mode == current.selection.mode);
+        REQUIRE(after.selection.objects == current.selection.objects);
+        REQUIRE(after.selection.vertices == current.selection.vertices);
+        REQUIRE(after.selection.edges == current.selection.edges);
+        REQUIRE(after.selection.faces == current.selection.faces);
+        REQUIRE(after.selection.component_object == current.selection.component_object);
+        REQUIRE(after.selection.component_mesh_revision ==
+            current.selection.component_mesh_revision);
+        REQUIRE(after.selection.component_groups == current.selection.component_groups);
+    };
+    refused_without_change(make_action({}));
+    refused_without_change(make_action({geometry::FaceId{1U}, geometry::FaceId{1U}}));
+    refused_without_change(make_action({geometry::FaceId{1U}, geometry::FaceId{999U}}));
+    std::vector<geometry::FaceId> oversized(
+        application::SelectFaceBatchAction::kMaxFaces + 1U, geometry::FaceId{1U});
+    refused_without_change(make_action(std::move(oversized)));
+    auto wrong_object = make_action({geometry::FaceId{1U}});
+    wrong_object.object = scene::ObjectId{999U};
+    refused_without_change(std::move(wrong_object));
+    auto stale_generation = make_action({geometry::FaceId{1U}});
+    ++stale_generation.expected_project_generation;
+    refused_without_change(std::move(stale_generation));
+    auto stale_revision = make_action({geometry::FaceId{1U}});
+    stale_revision.expected_project_revision = stale_revision.expected_project_revision.next();
+    refused_without_change(std::move(stale_revision));
+    auto stale_mesh = make_action({geometry::FaceId{1U}});
+    stale_mesh.expected_mesh_revision = stale_mesh.expected_mesh_revision.next();
+    refused_without_change(std::move(stale_mesh));
 }
 
 void application_converts_component_selection_per_object_without_flattening_ids() {
@@ -7066,13 +8062,22 @@ void application_merges_selected_vertices_across_objects_atomically() {
         {carto::attributes::AttributeDomain::edge, topology.value().edges.size()},
         {carto::attributes::AttributeDomain::face, unsupported_mesh.face_count()},
         {carto::attributes::AttributeDomain::corner, topology.value().corners.size()}});
-    std::vector<carto::attributes::AttributeValue> edge_tags(
-        topology.value().edges.size(), std::int32_t{7});
+    std::vector<carto::attributes::AttributeValue> edge_tags;
+    for (const auto& edge : topology.value().edges) {
+        const bool merged_edge =
+            (edge.first == carto::geometry::VertexId{2U} && edge.second == carto::geometry::VertexId{3U}) ||
+            (edge.second == carto::geometry::VertexId{2U} && edge.first == carto::geometry::VertexId{3U});
+        edge_tags.emplace_back(std::int32_t{merged_edge ? 8 : 7});
+    }
     REQUIRE(attributes.add_layer({
         {"edge_tag", carto::attributes::AttributeDomain::edge,
             carto::attributes::AttributeType::int32}, std::move(edge_tags)}));
     REQUIRE(unsupported_mesh.set_attribute_payload(std::move(attributes), {}));
+    TempDirectory failing_temp;
+    const auto failing_path = failing_temp.path() / "multi-attribute-conflict.carto";
     carto::application::ApplicationSession failing_session;
+    REQUIRE(carto::application::testing::dispatch(failing_session,
+        carto::application::SaveProjectAction{failing_path}));
     REQUIRE(carto::application::testing::dispatch(failing_session,
         carto::application::CreateMeshObjectAction{
             "First atomic weld", make_application_weld_fixture()}));
@@ -7099,10 +8104,20 @@ void application_merges_selected_vertices_across_objects_atomically() {
                 carto::editor::SelectionOperation::add}));
     }
     const auto before_rejection = failing_session.snapshot();
+    const auto before_rejection_document = failing_session.document_.serialize();
+    carto::journal::Journal failing_journal(std::filesystem::path(failing_path.string() + ".journal"));
+    const auto before_rejection_events = failing_journal.read_all();
+    REQUIRE(before_rejection_events);
     const auto rejected = carto::application::testing::dispatch(failing_session,
         carto::application::InvokeToolAction{"mesh.merge-vertices", {}});
     REQUIRE(!rejected);
-    REQUIRE(rejected.error().code == carto::core::ErrorCode::invalid_argument);
+    REQUIRE(rejected.error().code == carto::core::ErrorCode::unsupported);
+    REQUIRE(rejected.error().message.find("conflicting edge attribute values") != std::string::npos);
+    const auto after_rejection_events = failing_journal.read_all();
+    REQUIRE(failing_session.document_.serialize() == before_rejection_document &&
+        failing_session.snapshot().redo_count == before_rejection.redo_count &&
+        after_rejection_events && after_rejection_events.value().size() == before_rejection_events.value().size());
+    REQUIRE(failing_journal.verify());
     REQUIRE(failing_session.snapshot().project_revision == before_rejection.project_revision);
     REQUIRE(failing_session.snapshot().undo_count == before_rejection.undo_count);
     REQUIRE(failing_session.document_.meshes().at(*first_failing.mesh_asset).revision() ==
@@ -7881,7 +8896,9 @@ void application_journals_committed_mutations_and_rolls_back_failed_append() {
     REQUIRE(after_event.value().back().revision_after == after_create.project_revision);
     const std::string mutation_payload(
         after_event.value().back().payload.begin(), after_event.value().back().payload.end());
-    REQUIRE(mutation_payload.find("CARTOGRAPHER_APPLICATION_MUTATION_V1") == 0U);
+    REQUIRE(mutation_payload.find("CARTOGRAPHER_APPLICATION_MUTATION_V2") == 0U);
+    REQUIRE(mutation_payload.find("\nsource=human\nprovenance_hex=\ndocument_bytes=") !=
+            std::string::npos);
     REQUIRE(mutation_payload.find(
                 "CARTOGRAPHER_PROJECT " +
                 std::to_string(carto::project::ProjectDocument::kSchemaVersion)) !=
@@ -9220,6 +10237,14 @@ void application_authors_revision_bound_sweeps_through_history() {
     carto::application::ApplicationSession session;
     REQUIRE(carto::application::testing::dispatch(
         session, carto::application::NewProjectAction{"Sweep authoring"}));
+    REQUIRE(carto::application::testing::dispatch(
+        session, carto::application::CreateBoxAction{"Pipe owner", {1.0, 1.0, 1.0}}));
+    const auto owner_object = session.snapshot().objects.front().object.id;
+    auto owner_transform = carto::core::Transform::identity();
+    owner_transform.translation = {4.0, -2.0, 7.0};
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SetObjectTransformAction{
+            owner_object, owner_transform, std::nullopt}));
 
     carto::geometry::CurvePath centerline;
     centerline.source_identity = "sweep.authoring.centerline";
@@ -9248,6 +10273,7 @@ void application_authors_revision_bound_sweeps_through_history() {
     source.source_identity = "sweep.authoring.pipe";
     source.centerline_identity = centerline.source_identity;
     source.centerline_revision = centerline.source_revision;
+    source.owner_object_id = owner_object.value;
     source.reference_up = {0.0, 1.0, 0.0};
     source.samples_per_segment = 4U;
     source.profile.reserve(8U);
@@ -9306,6 +10332,11 @@ void application_authors_revision_bound_sweeps_through_history() {
     expect_rejected_without_mutation(
         stale_centerline, carto::core::ErrorCode::stale_data,
         carto::application::OperationSource::human);
+    auto absent_owner = source;
+    absent_owner.owner_object_id = std::numeric_limits<std::uint64_t>::max();
+    expect_rejected_without_mutation(
+        absent_owner, carto::core::ErrorCode::not_found,
+        carto::application::OperationSource::human);
     expect_rejected_without_mutation(
         source, carto::core::ErrorCode::unsupported,
         carto::application::OperationSource::agent_workbench);
@@ -9329,7 +10360,9 @@ void application_authors_revision_bound_sweeps_through_history() {
     const std::string create_payload(
         journal_after_create.value().back().payload.begin(),
         journal_after_create.value().back().payload.end());
-    REQUIRE(create_payload.find("CARTOGRAPHER_SWEEP_SOURCE 1") != std::string::npos &&
+    REQUIRE(create_payload.find("CARTOGRAPHER_SWEEP_SOURCE 3") != std::string::npos &&
+            create_payload.find("OWNER_OBJECT " + std::to_string(owner_object.value)) !=
+                std::string::npos &&
             create_payload.find(source.source_identity) != std::string::npos &&
             journal.verify());
 
@@ -9339,7 +10372,15 @@ void application_authors_revision_bound_sweeps_through_history() {
     REQUIRE(preview.value().source_identity == source.source_identity &&
             preview.value().source_revision == carto::core::Revision{1U} &&
             preview.value().centerline_identity == centerline.source_identity &&
-            preview.value().centerline_revision == centerline.source_revision);
+            preview.value().centerline_revision == centerline.source_revision &&
+            preview.value().owner_object_id == owner_object.value &&
+            preview.value().owner_world_transform.has_value() &&
+            preview.value().owner_world_transform->translation.x == 4.0 &&
+            preview.value().owner_world_transform->translation.y == -2.0 &&
+            preview.value().owner_world_transform->translation.z == 7.0 &&
+            preview.value().source_project_revision == snapshot.project_revision &&
+            preview.value().owner_scene_revision == session.document_.scene().revision());
+
     const auto after_preview = session.snapshot();
     REQUIRE(after_preview.project_revision == snapshot.project_revision &&
             after_preview.undo_count == snapshot.undo_count &&
@@ -9407,6 +10448,85 @@ void application_authors_revision_bound_sweeps_through_history() {
                 carto::core::Revision{5U} &&
             reopened_snapshot.sweep_sources.front().source.end_scale == 0.5 &&
             reopened_snapshot.curve_paths.size() == 1U);
+}
+
+void application_reviews_sweep_endpoint_fit_from_one_current_project_snapshot() {
+    TempDirectory temp;
+    const auto project_path = temp.path() / "sweep-spatial-review.carto";
+    carto::application::ApplicationSession session;
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::NewProjectAction{"Sweep spatial review"}));
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::CreateBoxAction{"Pipe owner", {1.0, 1.0, 1.0}}));
+    const auto owner = session.snapshot().objects.front().object.id;
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SaveProjectAction{project_path}));
+
+    carto::geometry::CurvePath centerline;
+    centerline.source_identity = "fit.centerline";
+    centerline.source_revision = carto::core::Revision{1U};
+    centerline.segments.push_back({
+        {0.0, 0.0, 0.0}, {0.0, 0.0, 1.0 / 3.0},
+        {0.0, 0.0, 2.0 / 3.0}, {0.0, 0.0, 1.0}});
+    carto::project::RoadSource road;
+    road.source_identity = "fit.path-owner";
+    road.source_revision = carto::core::Revision{1U};
+    road.centerline_identity = centerline.source_identity;
+    road.centerline_revision = centerline.source_revision;
+    road.width_meters = 2.0;
+    auto snapshot = session.snapshot();
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SetRoadAuthoringAction{
+            snapshot.project_revision, centerline, road}));
+
+    carto::geometry::SweepSource source;
+    source.source_identity = "fit.sweep";
+    source.centerline_identity = centerline.source_identity;
+    source.centerline_revision = centerline.source_revision;
+    source.owner_object_id = owner.value;
+    source.profile = {{-0.1, -0.1}, {0.1, -0.1}, {0.1, 0.1}, {-0.1, 0.1}};
+    source.reference_up = {0.0, 1.0, 0.0};
+    source.source_revision = session.next_sweep_source_revision(source.source_identity).value();
+    snapshot = session.snapshot();
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SetSweepSourceAction{snapshot.project_revision, source}));
+
+    carto::connection::ConnectionPort endpoint_port;
+    endpoint_port.id = carto::connection::PortId{9001U};
+    endpoint_port.owner = owner;
+    endpoint_port.authoring.kind = carto::world::AuthoringBindingKind::scene_object;
+    endpoint_port.authoring.identity = owner.value;
+    endpoint_port.local_frame.frame_identity = "pipe-end";
+    endpoint_port.local_frame.coordinate_convention = "carto.core/v1";
+    endpoint_port.local_frame.transform_to_parent.translation = {0.0, 0.0, 1.0};
+    carto::connection::ConnectionPortGraph graph;
+    REQUIRE(graph.insert_port(endpoint_port));
+    const auto graph_digest = session.connection_port_graph_digest();
+    REQUIRE(graph_digest);
+    const auto before_graph_edit = session.snapshot();
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::ReplaceConnectionPortGraphAction{
+            before_graph_edit.project_generation, before_graph_edit.project_revision,
+            graph_digest.value(), graph}));
+
+    snapshot = session.snapshot();
+    carto::condition::SweepEndpointSpatialPolicy policy;
+    policy.port_outward_axis_local = {0.0, 0.0, 1.0};
+    policy.maximum_position_error = 0.001;
+    policy.minimum_axis_alignment = 0.99;
+    const carto::condition::SweepEndpointPortBinding binding{
+        source.source_identity, source.source_revision,
+        carto::condition::SweepEndpointSide::end, endpoint_port.id};
+    const auto review = session.inspect_sweep_endpoint_spatial_fit(
+        binding, policy, snapshot.project_generation, snapshot.project_revision);
+    REQUIRE(review && review.value().aligned && review.value().validate());
+    const auto after_review = session.snapshot();
+    REQUIRE(after_review.project_revision == snapshot.project_revision &&
+        after_review.undo_count == snapshot.undo_count &&
+        after_review.dirty == snapshot.dirty);
+    const auto stale_review = session.inspect_sweep_endpoint_spatial_fit(
+        binding, policy, snapshot.project_generation, before_graph_edit.project_revision);
+    REQUIRE(!stale_review && stale_review.error().code == carto::core::ErrorCode::stale_data);
 }
 
 carto::biological::BiologicalAuthoringDocument application_biological_source(
@@ -9678,11 +10798,28 @@ void application_routes_biological_authoring_and_proxy_preview_through_history()
     const auto* pre_sculpt_instance = pre_sculpt.viewport.scene.find(reopened_receipt.object);
     REQUIRE(pre_sculpt_instance && pre_sculpt_instance->mesh);
     const auto original_positions = pre_sculpt_instance->mesh->positions;
-    const auto sculpted = carto::application::testing::dispatch(session,
-        carto::application::AppendSculptSurfaceStrokeAction{
-            pre_sculpt.project_revision, reopened_receipt.object,
-            reopened_receipt.mesh_asset, carto::production::SculptStrokeMode::add,
-            0.75, 0.05, {surface_sample.value()}});
+    const carto::application::AppendSculptSurfaceStrokeAction sculpt_action{
+        pre_sculpt.project_revision, reopened_receipt.object,
+        reopened_receipt.mesh_asset, carto::production::SculptStrokeMode::add,
+        0.75, 0.05, {surface_sample.value()}, pre_sculpt.project_generation};
+    carto::journal::Journal sculpt_journal(
+        std::filesystem::path(project_path.string() + ".journal"));
+    const auto before_events = sculpt_journal.read_all();
+    REQUIRE(before_events);
+    const auto before_document = session.document_.serialize();
+    for (const auto generation : std::array<std::uint64_t, 2>{
+            0U, pre_sculpt.project_generation + 1U}) {
+        auto stale = sculpt_action;
+        stale.expected_project_generation = generation;
+        const auto refused = carto::application::testing::dispatch(session, stale);
+        REQUIRE(!refused && refused.error().code == carto::core::ErrorCode::stale_data);
+        const auto after_events = sculpt_journal.read_all();
+        REQUIRE(session.document_.serialize() == before_document &&
+            session.snapshot().undo_count == pre_sculpt.undo_count &&
+            session.snapshot().redo_count == pre_sculpt.redo_count &&
+            after_events && after_events.value().size() == before_events.value().size());
+    }
+    const auto sculpted = carto::application::testing::dispatch(session, sculpt_action);
     REQUIRE(sculpted && sculpted.value().document_changed);
     const auto post_sculpt = session.snapshot();
     const auto* post_sculpt_instance = post_sculpt.viewport.scene.find(reopened_receipt.object);
@@ -10086,6 +11223,255 @@ void application_routes_source_reimport_through_human_history() {
         .source_generation == carto::core::Revision{2U});
 }
 
+void application_reviews_authored_source_metadata_through_human_history() {
+    carto::application::ApplicationSession session;
+    TempDirectory directory;
+    const auto project_path = directory.path() / "source-metadata.carto";
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SaveProjectAction{project_path}));
+    const auto digest = [](std::string_view value) {
+        return carto::assets::sha256(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
+    };
+    const std::string source_bytes = "source-bytes";
+    carto::assets::BlobStore blob_store(
+        project_path.parent_path() / ".carto-assets" / "source-blobs");
+    const auto stored_source = blob_store.put(source_bytes, "model/obj");
+    REQUIRE(stored_source);
+    carto::assets::SourceImportRecord source;
+    source.identity = "asset.fixture";
+    source.relative_source_path = blob_store.path_for(stored_source.value().digest)
+        .lexically_relative(project_path.parent_path()).generic_string();
+    source.source_generation = carto::core::Revision{1U};
+    source.kind = carto::assets::SourceAssetKind::mesh;
+    source.source_digest = stored_source.value().digest;
+    source.importer_identity = "carto.import.obj";
+    source.importer_version = 1U;
+    source.artifact_identity = "mesh.fixture";
+    source.artifact_digest = digest("mesh-artifact");
+    source.domain_digests = {{
+        carto::assets::SourceAssetDomain::geometry, source.artifact_digest}};
+    const auto imported_plan = session.preview_source_reimport({source});
+    REQUIRE(imported_plan);
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::ApplySourceReimportPlanAction{imported_plan.value()}));
+
+    const auto base = session.snapshot();
+    REQUIRE(session.verify_source_asset_blob(source.identity, source.source_generation,
+        base.project_generation, base.project_revision));
+    REQUIRE(!session.verify_source_asset_blob(source.identity, source.source_generation,
+        base.project_generation + 1U, base.project_revision));
+    const auto unreferenced_blob = blob_store.put(
+        "unreferenced source bytes", "application/octet-stream");
+    REQUIRE(unreferenced_blob);
+    const auto blob_inventory = session.inspect_source_blob_store(
+        base.project_generation, base.project_revision);
+    REQUIRE(blob_inventory);
+    REQUIRE(std::find(blob_inventory.value().orphan_candidates.begin(),
+        blob_inventory.value().orphan_candidates.end(), unreferenced_blob.value().digest) !=
+            blob_inventory.value().orphan_candidates.end());
+    REQUIRE(std::find(blob_inventory.value().orphan_candidates.begin(),
+        blob_inventory.value().orphan_candidates.end(), source.source_digest) ==
+            blob_inventory.value().orphan_candidates.end());
+    const carto::application::PendingMeshReimportBlobReview pending_source_review{
+        base.project_generation, base.project_revision,
+        source.identity, source.source_generation, source.source_digest,
+        unreferenced_blob.value().digest};
+    const auto pending_blob_inventory = session.inspect_source_blob_store(
+        base.project_generation, base.project_revision, pending_source_review);
+    REQUIRE(pending_blob_inventory);
+    REQUIRE(std::find(pending_blob_inventory.value().protected_pending_work_digests.begin(),
+        pending_blob_inventory.value().protected_pending_work_digests.end(),
+        unreferenced_blob.value().digest) !=
+            pending_blob_inventory.value().protected_pending_work_digests.end());
+    REQUIRE(std::find(pending_blob_inventory.value().orphan_candidates.begin(),
+        pending_blob_inventory.value().orphan_candidates.end(), unreferenced_blob.value().digest) ==
+            pending_blob_inventory.value().orphan_candidates.end());
+    REQUIRE(std::find(pending_blob_inventory.value().missing_live_references.begin(),
+        pending_blob_inventory.value().missing_live_references.end(),
+        pending_source_review.candidate_source_digest) ==
+            pending_blob_inventory.value().missing_live_references.end());
+    auto stale_pending_source_review = pending_source_review;
+    stale_pending_source_review.source_generation = carto::core::Revision{2U};
+    const auto stale_pending_blob_inventory = session.inspect_source_blob_store(
+        base.project_generation, base.project_revision, stale_pending_source_review);
+    REQUIRE(!stale_pending_blob_inventory && stale_pending_blob_inventory.error().code ==
+        carto::core::ErrorCode::stale_data);
+    auto stale_pending_project_review = pending_source_review;
+    stale_pending_project_review.project_revision = base.project_revision.next();
+    const auto stale_pending_project_inventory = session.inspect_source_blob_store(
+        base.project_generation, base.project_revision, stale_pending_project_review);
+    REQUIRE(!stale_pending_project_inventory && stale_pending_project_inventory.error().code ==
+        carto::core::ErrorCode::stale_data);
+    const auto after_blob_inventory = session.snapshot();
+    REQUIRE(after_blob_inventory.project_revision == base.project_revision &&
+        after_blob_inventory.undo_count == base.undo_count);
+    const auto stale_blob_inventory = session.inspect_source_blob_store(
+        base.project_generation + 1U, base.project_revision);
+    REQUIRE(!stale_blob_inventory && stale_blob_inventory.error().code ==
+        carto::core::ErrorCode::stale_data);
+    const auto stale_revision_inventory = session.inspect_source_blob_store(
+        base.project_generation, base.project_revision.next());
+    REQUIRE(!stale_revision_inventory && stale_revision_inventory.error().code ==
+        carto::core::ErrorCode::stale_data);
+    const auto metadata_plan = session.preview_source_asset_metadata(
+        source.identity, carto::core::Revision{1U}, base.project_generation,
+        base.project_revision, {"canopy", "exterior"}, {});
+    REQUIRE(metadata_plan && metadata_plan.value().entries.size() == 1U);
+    const auto& incoming = metadata_plan.value().entries.front().incoming;
+    REQUIRE((incoming && incoming->source_generation == carto::core::Revision{2U} &&
+        incoming->authored_tags == std::vector<std::string>{"canopy", "exterior"} &&
+        incoming->source_digest == source.source_digest &&
+        incoming->artifact_digest == source.artifact_digest));
+    REQUIRE(session.snapshot().project_revision == base.project_revision &&
+        session.snapshot().source_assets.front().authored_tags.empty());
+    REQUIRE(!session.preview_source_asset_metadata(source.identity,
+        carto::core::Revision{1U}, base.project_generation, base.project_revision,
+        {"Uppercase"}, {}));
+
+    const auto applied = carto::application::testing::dispatch(session,
+        carto::application::ApplySourceReimportPlanAction{metadata_plan.value()});
+    REQUIRE(applied && applied.value().document_changed &&
+        applied.value().source == carto::application::OperationSource::human);
+    const auto after = session.snapshot();
+    REQUIRE((after.source_assets.front().source_generation == carto::core::Revision{2U} &&
+        after.source_assets.front().authored_tags ==
+            std::vector<std::string>{"canopy", "exterior"}));
+    {
+        std::ofstream corrupted(blob_store.path_for(source.source_digest),
+            std::ios::binary | std::ios::trunc);
+        REQUIRE(static_cast<bool>(corrupted));
+        corrupted << "tampered source bytes";
+    }
+    REQUIRE(!session.verify_source_asset_blob(source.identity,
+        after.source_assets.front().source_generation,
+        after.project_generation, after.project_revision));
+    const auto corrupt_blob_inventory = session.inspect_source_blob_store(
+        after.project_generation, after.project_revision);
+    REQUIRE(corrupt_blob_inventory);
+    REQUIRE(std::find(corrupt_blob_inventory.value().corrupt.begin(),
+        corrupt_blob_inventory.value().corrupt.end(), source.source_digest) !=
+            corrupt_blob_inventory.value().corrupt.end());
+    std::error_code remove_blob_error;
+    REQUIRE(std::filesystem::remove(
+        blob_store.path_for(source.source_digest), remove_blob_error));
+    REQUIRE(!remove_blob_error);
+    const auto missing_blob_inventory = session.inspect_source_blob_store(
+        after.project_generation, after.project_revision);
+    REQUIRE(missing_blob_inventory);
+    REQUIRE(std::find(missing_blob_inventory.value().missing_live_references.begin(),
+        missing_blob_inventory.value().missing_live_references.end(), source.source_digest) !=
+            missing_blob_inventory.value().missing_live_references.end());
+    REQUIRE(!session.preview_source_asset_metadata(source.identity,
+        carto::core::Revision{1U}, base.project_generation, base.project_revision,
+        {"canopy"}, {}));
+
+    const auto journal_entries = carto::journal::Journal(
+        std::filesystem::path(project_path.string() + ".journal")).read_all();
+    REQUIRE(journal_entries && journal_entries.value().size() >= 2U);
+    const std::string journal_payload(journal_entries.value().back().payload.begin(),
+        journal_entries.value().back().payload.end());
+    REQUIRE(journal_payload.find("Apply Source Reimport ") != std::string::npos &&
+        journal_payload.find("SOURCE_ASSET_REGISTRY_HEX") != std::string::npos);
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::UndoAction{}));
+    REQUIRE(session.snapshot().source_assets.front().authored_tags.empty());
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::RedoAction{}));
+    REQUIRE((session.snapshot().source_assets.front().authored_tags ==
+        std::vector<std::string>{"canopy", "exterior"}));
+}
+
+void application_source_blob_inventory_refuses_managed_root_symlinks() {
+    TempDirectory temp;
+    const auto project_root = temp.path() / "project";
+    std::error_code error;
+    std::filesystem::create_directories(project_root, error);
+    REQUIRE(!error);
+    carto::application::ApplicationSession session;
+    const auto project_path = project_root / "symlink-inventory.carto";
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SaveProjectAction{project_path}));
+
+    const auto external_root = temp.path() / "external-assets";
+    carto::assets::BlobStore external_store(external_root / "source-blobs");
+    REQUIRE(external_store.put("external blob", "text/plain"));
+    std::filesystem::create_directory_symlink(
+        external_root, project_root / ".carto-assets", error);
+    if (error) {
+        std::cout << "SKIP: project blob-directory symlink creation is unavailable: "
+                  << error.message() << '\n';
+        return;
+    }
+
+    const auto snapshot = session.snapshot();
+    const auto inventory = session.inspect_source_blob_store(
+        snapshot.project_generation, snapshot.project_revision);
+    REQUIRE(!inventory && inventory.error().code ==
+        carto::core::ErrorCode::validation_failed);
+}
+
+void application_source_blob_inventory_retains_journal_reachable_blobs() {
+    carto::application::ApplicationSession session;
+    TempDirectory temp;
+    const auto project_path = temp.path() / "journal-reachability.carto";
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::SaveProjectAction{project_path}));
+    carto::assets::BlobStore blob_store(
+        project_path.parent_path() / ".carto-assets" / "source-blobs");
+    const auto stored = blob_store.put("historical source bytes", "model/obj");
+    REQUIRE(stored);
+    const auto digest = [](std::string_view value) {
+        return carto::assets::sha256(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
+    };
+    carto::assets::SourceImportRecord source;
+    source.identity = "asset.historical-fixture";
+    source.relative_source_path = blob_store.path_for(stored.value().digest)
+        .lexically_relative(project_path.parent_path()).generic_string();
+    source.source_generation = carto::core::Revision{1U};
+    source.kind = carto::assets::SourceAssetKind::mesh;
+    source.source_digest = stored.value().digest;
+    source.importer_identity = "carto.import.obj";
+    source.importer_version = 1U;
+    source.artifact_identity = "mesh.historical-fixture";
+    source.artifact_digest = digest("historical-mesh-artifact");
+    source.domain_digests = {{
+        carto::assets::SourceAssetDomain::geometry, source.artifact_digest}};
+    const auto add_plan = session.preview_source_reimport({source});
+    REQUIRE(add_plan);
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::ApplySourceReimportPlanAction{add_plan.value()}));
+    const auto remove_plan = session.preview_source_reimport({});
+    REQUIRE(remove_plan && remove_plan.value().entries.size() == 1U &&
+        !remove_plan.value().entries.front().incoming.has_value());
+    REQUIRE(carto::application::testing::dispatch(session,
+        carto::application::ApplySourceReimportPlanAction{remove_plan.value()}));
+    const auto current = session.snapshot();
+    REQUIRE(current.source_assets.empty());
+    const auto inventory = session.inspect_source_blob_store(
+        current.project_generation, current.project_revision);
+    REQUIRE(inventory);
+    REQUIRE(std::find(inventory.value().orphan_candidates.begin(),
+        inventory.value().orphan_candidates.end(), stored.value().digest) ==
+            inventory.value().orphan_candidates.end());
+    REQUIRE(std::find(inventory.value().missing_live_references.begin(),
+        inventory.value().missing_live_references.end(), stored.value().digest) ==
+            inventory.value().missing_live_references.end());
+    {
+        std::ofstream journal_file(
+            std::filesystem::path(project_path.string() + ".journal"),
+            std::ios::binary | std::ios::app);
+        REQUIRE(static_cast<bool>(journal_file));
+        journal_file << "tampered-history-record\n";
+        REQUIRE(static_cast<bool>(journal_file));
+    }
+    const auto corrupt_history = session.inspect_source_blob_store(
+        current.project_generation, current.project_revision);
+    REQUIRE(!corrupt_history && corrupt_history.error().code ==
+        carto::core::ErrorCode::validation_failed);
+}
+
 void application_authors_pbr_materials_through_revisioned_journaled_history() {
     TempDirectory temp;
     carto::application::ApplicationSession session;
@@ -10194,9 +11580,9 @@ void application_authors_material_graphs_through_digest_guarded_history() {
     color.constants = {0.28, 0.32, 0.36, 1.0};
     carto::project::MaterialGraphNode alpha;
     alpha.id = 2U;
-    alpha.kind = carto::project::MaterialGraphNodeKind::constant_scalar;
+    alpha.kind = carto::project::MaterialGraphNodeKind::parameter_scalar;
     alpha.value_type = carto::project::MaterialGraphValueType::scalar;
-    alpha.constants[0] = 1.0;
+    alpha.parameter_name = "opacity";
     carto::project::MaterialGraphNode roughness;
     roughness.id = 3U;
     roughness.kind = carto::project::MaterialGraphNodeKind::constant_scalar;
@@ -10269,6 +11655,37 @@ void application_authors_material_graphs_through_digest_guarded_history() {
             source.value().revision &&
         after_create.materials.front().revision == carto::core::Revision{2U});
 
+    carto::project::MaterialGraphEvaluationInputs saved_graph_inputs;
+    carto::project::MaterialGraphValue opacity_input;
+    opacity_input.type = carto::project::MaterialGraphValueType::scalar;
+    opacity_input.components[0] = 0.35;
+    saved_graph_inputs.parameters.emplace("opacity", opacity_input);
+    auto unreachable_graph_inputs = saved_graph_inputs;
+    unreachable_graph_inputs.parameters.emplace("unreachable", opacity_input);
+    const auto before_graph_input_rejection = session.snapshot();
+    const auto rejected_graph_inputs = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialGraphInputsAction{
+            before_graph_input_rejection.project_revision,
+            before_graph_input_rejection.materials.front().id,
+            before_graph_input_rejection.materials.front().revision,
+            graph.identity, source.value().revision, original_digest.value(),
+            unreachable_graph_inputs});
+    REQUIRE(!rejected_graph_inputs);
+    REQUIRE(session.snapshot().project_revision ==
+        before_graph_input_rejection.project_revision);
+    const auto saved_graph_input_action = carto::application::testing::dispatch(session,
+        carto::application::SetMaterialGraphInputsAction{
+            before_graph_input_rejection.project_revision,
+            before_graph_input_rejection.materials.front().id,
+            before_graph_input_rejection.materials.front().revision,
+            graph.identity, source.value().revision, original_digest.value(),
+            saved_graph_inputs});
+    REQUIRE(saved_graph_input_action &&
+        saved_graph_input_action.value().action == "Set Material Graph Inputs");
+    after_create = session.snapshot();
+    REQUIRE(after_create.material_graph_bindings.front().inputs == saved_graph_inputs);
+    REQUIRE(after_create.materials.front().revision == carto::core::Revision{3U});
+
     auto updated = source.value();
     const auto color_node = std::find_if(updated.nodes.begin(), updated.nodes.end(),
         [](const auto& node) { return node.id == 1U; });
@@ -10330,6 +11747,8 @@ void application_authors_material_graphs_through_digest_guarded_history() {
     REQUIRE(reopened_graph.revision == carto::core::Revision{2U});
     REQUIRE(reopened_graph.nodes.front().constants[0] == 0.44);
     REQUIRE(reopened_graph.nodes.back().unsupported_identity == "donor-noise-node");
+    REQUIRE(reopened.value().material_catalog().material_graph_bindings().at(
+            after_create.materials.front().id).inputs == saved_graph_inputs);
 
     REQUIRE(carto::application::testing::dispatch(session,
         carto::application::UndoAction{}));
@@ -10374,7 +11793,8 @@ void application_authors_material_graphs_through_digest_guarded_history() {
             latest_graph_digest.value()});
     REQUIRE(rebound && rebound.value().action == "Bind Material Graph");
     auto after_rebind = session.snapshot();
-    REQUIRE(after_rebind.material_graph_bindings.front().source_current);
+    REQUIRE(after_rebind.material_graph_bindings.front().source_current &&
+        after_rebind.material_graph_bindings.front().inputs == saved_graph_inputs);
     const auto unbound = carto::application::testing::dispatch(session,
         carto::application::SetMaterialGraphBindingAction{
             after_rebind.project_revision, after_rebind.materials.front().id,
@@ -11624,6 +13044,7 @@ void application_places_decals_from_a_current_surface_through_human_history() {
         session.snapshot().decal_placements.empty());
 
     carto::application::SetDecalPlacementAction action;
+    action.expected_project_generation = before_draft.project_generation;
     action.expected_project_revision = before_draft.project_revision;
     action.expected_placement_revision = carto::core::Revision{};
     action.placement = draft.value();
@@ -11666,6 +13087,13 @@ void application_places_decals_from_a_current_surface_through_human_history() {
         REQUIRE(journal_bytes() == journal_before);
     };
 
+    auto unbound_generation_action = action;
+    unbound_generation_action.expected_project_generation = 0U;
+    expect_rejected_without_mutation(unbound_generation_action, carto::core::ErrorCode::stale_data);
+    auto wrong_generation_action = action;
+    wrong_generation_action.expected_project_generation = before_draft.project_generation + 1U;
+    expect_rejected_without_mutation(wrong_generation_action, carto::core::ErrorCode::stale_data);
+
     auto invalid_catalog_action = action;
     invalid_catalog_action.placement.material_id =
         std::numeric_limits<std::uint64_t>::max();
@@ -11674,6 +13102,9 @@ void application_places_decals_from_a_current_surface_through_human_history() {
     auto invalid_action = action;
     invalid_action.expected_project_revision = before_draft.project_revision.next();
     expect_rejected_without_mutation(invalid_action, carto::core::ErrorCode::stale_data);
+    auto stale_generation_action = action;
+    stale_generation_action.expected_project_generation = before_draft.project_generation + 1U;
+    expect_rejected_without_mutation(stale_generation_action, carto::core::ErrorCode::stale_data);
     invalid_action = action;
     invalid_action.placement.target_mesh_asset = std::numeric_limits<std::uint64_t>::max();
     expect_rejected_without_mutation(invalid_action, carto::core::ErrorCode::not_found);
@@ -11698,6 +13129,8 @@ void application_places_decals_from_a_current_surface_through_human_history() {
              carto::application::OperationSource::plugin,
              carto::application::OperationSource::recovery}) {
         expect_rejected_without_mutation(action, carto::core::ErrorCode::unsupported, source);
+        expect_rejected_without_mutation(
+            stale_generation_action, carto::core::ErrorCode::unsupported, source);
     }
 
     const auto placed = carto::application::testing::dispatch(session, action);
@@ -11758,6 +13191,243 @@ void application_places_decals_from_a_current_surface_through_human_history() {
     REQUIRE(decal_events == 1);
 }
 
+void application_rejects_decal_replay_after_same_revision_project_replacement() {
+    for (const bool reopen : {false, true}) {
+        carto::application::ApplicationSession session;
+        TempDirectory directory;
+        const auto project_path = directory.path() / "decal-generation.carto";
+        const auto populate = [&] {
+            REQUIRE(carto::application::testing::dispatch(session,
+                carto::application::CreateBoxAction{"Target", {2.0, 2.0, 2.0}}));
+            REQUIRE(carto::application::testing::dispatch(session,
+                carto::application::CreateMaterialAction{session.snapshot().project_revision,
+                    "Decal material", carto::render::StandardMaterial{}}));
+        };
+        REQUIRE(carto::application::testing::dispatch(session,
+            carto::application::NewProjectAction{"Decal generation"}));
+        populate();
+        REQUIRE(carto::application::testing::dispatch(session,
+            carto::application::SaveProjectAction{project_path}));
+        const auto source = session.snapshot();
+        REQUIRE(source.objects.size() == 1U && source.materials.size() == 1U);
+        const auto draft = session.make_decal_placement(source.objects.front().object.id,
+            source.materials.front().id, {0.0, 1.0, 0.0}, {0.0, 1.0, 0.0},
+            {1.0, 0.0, 0.0}, 0.5, 0.5, 0.1, 0.0, source.project_revision);
+        REQUIRE(draft);
+        carto::application::SetDecalPlacementAction stale_action;
+        stale_action.expected_project_generation = source.project_generation;
+        stale_action.expected_project_revision = source.project_revision;
+        stale_action.placement = draft.value();
+
+        if (reopen) {
+            REQUIRE(carto::application::testing::dispatch(session,
+                carto::application::OpenProjectAction{project_path}));
+        } else {
+            REQUIRE(carto::application::testing::dispatch(session,
+                carto::application::NewProjectAction{"Decal generation"}));
+            populate();
+            // A new project must not overwrite the first project's journal
+            // namespace. Only generation/revision replay is under test here.
+            const auto replacement_path = directory.path() / "decal-replacement.carto";
+            REQUIRE(carto::application::testing::dispatch(session,
+                carto::application::SaveProjectAction{replacement_path}));
+        }
+        const auto before = session.snapshot();
+        REQUIRE(before.project_generation != source.project_generation);
+        REQUIRE(before.project_revision == source.project_revision);
+        REQUIRE(before.objects.size() == 1U && before.materials.size() == 1U);
+        REQUIRE(before.objects.front().object.id == source.objects.front().object.id);
+        REQUIRE(before.materials.front().id == source.materials.front().id);
+        REQUIRE(before.objects.front().object.mesh_asset ==
+            source.objects.front().object.mesh_asset);
+        REQUIRE(before.decal_placements.empty());
+        REQUIRE(session.decal_placement_preview(stale_action.placement,
+            before.project_revision));
+
+        const auto journal_path = std::filesystem::path(before.project_path->string() + ".journal");
+        carto::journal::Journal journal(journal_path);
+        const auto journal_bytes = [&] {
+            std::ifstream input(journal_path, std::ios::binary);
+            REQUIRE(input.good());
+            return std::string(std::istreambuf_iterator<char>{input},
+                std::istreambuf_iterator<char>{});
+        };
+        const auto command_identities = [](const auto& stack) {
+            std::vector<const carto::editor::EditorCommand*> commands;
+            for (const auto& command : stack) commands.push_back(command.get());
+            return commands;
+        };
+        const std::string document_before = session.document_.serialize();
+        const auto undo_before = command_identities(session.history_.undo_stack_);
+        const auto redo_before = command_identities(session.history_.redo_stack_);
+        const auto pending_redo_before = command_identities(session.history_.previous_redo_stack_);
+        const bool rollback_pending_before = session.history_.rollback_pending_;
+        const auto entries_before = journal.read_all();
+        REQUIRE(entries_before);
+        const auto journal_before = journal_bytes();
+
+        const auto rejected = carto::application::testing::dispatch(session, stale_action);
+        REQUIRE(!rejected && rejected.error().code == carto::core::ErrorCode::stale_data);
+        const auto after = session.snapshot();
+        REQUIRE(after.project_generation == before.project_generation &&
+            after.project_revision == before.project_revision &&
+            after.project_path == before.project_path && after.dirty == before.dirty &&
+            after.undo_count == before.undo_count && after.redo_count == before.redo_count);
+        REQUIRE(session.document_.serialize() == document_before);
+        REQUIRE(command_identities(session.history_.undo_stack_) == undo_before);
+        REQUIRE(command_identities(session.history_.redo_stack_) == redo_before);
+        REQUIRE(command_identities(session.history_.previous_redo_stack_) == pending_redo_before);
+        REQUIRE(session.history_.rollback_pending_ == rollback_pending_before);
+        const auto entries_after = journal.read_all();
+        REQUIRE(entries_after && entries_after.value().size() == entries_before.value().size());
+        REQUIRE(journal_bytes() == journal_before);
+
+        auto current_action = stale_action;
+        current_action.expected_project_generation = before.project_generation;
+        const auto placed = carto::application::testing::dispatch(session, current_action);
+        REQUIRE(placed && placed.value().document_changed);
+        const auto current = session.snapshot();
+        REQUIRE(current.decal_placements.size() == 1U);
+        REQUIRE(current.undo_count == before.undo_count + 1U);
+        const auto entries_current = journal.read_all();
+        REQUIRE(entries_current && entries_current.value().size() > entries_after.value().size());
+        const auto decal_events = std::count_if(
+            entries_current.value().begin(), entries_current.value().end(), [](const auto& entry) {
+                const std::string payload(entry.payload.begin(), entry.payload.end());
+                return payload.find("Set Decal Placement") != std::string::npos;
+            });
+        REQUIRE(decal_events == 1);
+    }
+}
+
+void application_packs_uv_islands_through_human_revisioned_history() {
+    using namespace carto;
+    geometry::EditableMesh source;
+    const auto a = source.add_vertex({0.0, 0.0, 0.0});
+    const auto b = source.add_vertex({1.0, 0.0, 0.0});
+    const auto c = source.add_vertex({0.0, 1.0, 0.0});
+    REQUIRE(a && b && c);
+    REQUIRE(source.add_face({a.value(), b.value(), c.value()}));
+    const auto topology = source.topology();
+    REQUIRE(topology);
+    std::vector<attributes::AttributeValue> uv_values;
+    uv_values.reserve(topology.value().corners.size());
+    for (const auto& corner : topology.value().corners) {
+        const auto* vertex = source.find_vertex(corner.vertex);
+        REQUIRE(vertex != nullptr);
+        uv_values.emplace_back(core::Vec2d{vertex->position.x, vertex->position.y});
+    }
+    attributes::AttributeSet payload({
+        {attributes::AttributeDomain::corner, topology.value().corners.size()}});
+    REQUIRE(payload.add_layer({
+        {"uv.source.corners", attributes::AttributeDomain::corner,
+            attributes::AttributeType::vec2},
+        std::move(uv_values)}));
+    attributes::UvSetTable uv_sets;
+    REQUIRE(uv_sets.add({7U, "Source UV", "uv.source.corners", true, true, false, 1U}));
+    REQUIRE(source.set_attribute_payload(std::move(payload), std::move(uv_sets)));
+
+    application::ApplicationSession session;
+    REQUIRE(application::testing::dispatch(session,
+        application::CreateMeshObjectAction{"UV pack target", source}));
+    auto before = session.snapshot();
+    REQUIRE(before.objects.size() == 1U);
+    const auto object = before.objects.front().object.id;
+    const auto mesh_asset = before.objects.front().object.mesh_asset;
+    REQUIRE(mesh_asset.has_value());
+    REQUIRE(application::testing::dispatch(session,
+        application::SelectObjectAction{object}));
+    before = session.snapshot();
+    const auto source_revision = before.objects.front().mesh_revision;
+    REQUIRE(source_revision.has_value());
+    const application::PackUvIslandsAction action{
+        before.project_generation, before.project_revision, *source_revision, object,
+        7U, 8U, 128U, 2U, 2U,
+        production::UvIslandDensityPolicy::preserve_source_uv, 0.0, false};
+
+    const auto unchanged = before;
+    auto stale_generation = action;
+    ++stale_generation.expected_project_generation;
+    const auto generation_refusal = application::testing::dispatch(session, stale_generation);
+    REQUIRE(!generation_refusal);
+    REQUIRE(generation_refusal.error().code == core::ErrorCode::stale_data);
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+
+    auto stale_project = action;
+    stale_project.expected_project_revision = core::Revision{
+        action.expected_project_revision.value() + 1U};
+    const auto project_refusal = application::testing::dispatch(session, stale_project);
+    REQUIRE(!project_refusal);
+    REQUIRE(project_refusal.error().code == core::ErrorCode::stale_data);
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+
+    auto stale_mesh = action;
+    stale_mesh.expected_mesh_revision = core::Revision{source_revision->value() + 1U};
+    const auto mesh_refusal = application::testing::dispatch(session, stale_mesh);
+    REQUIRE(!mesh_refusal);
+    REQUIRE(mesh_refusal.error().code == core::ErrorCode::stale_data);
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+
+    auto wrong_owner = action;
+    wrong_owner.object = scene::ObjectId{999U};
+    const auto owner_refusal = application::testing::dispatch(session, wrong_owner);
+    REQUIRE(!owner_refusal);
+    REQUIRE(owner_refusal.error().code == core::ErrorCode::invalid_state);
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+
+    auto missing_set = action;
+    missing_set.source_uv_set = 99U;
+    const auto set_refusal = application::testing::dispatch(session, missing_set);
+    REQUIRE(!set_refusal);
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+
+    auto duplicate_set = action;
+    duplicate_set.output_uv_set = duplicate_set.source_uv_set;
+    const auto identity_refusal = application::testing::dispatch(session, duplicate_set);
+    REQUIRE(!identity_refusal);
+    REQUIRE(identity_refusal.error().code == core::ErrorCode::invalid_argument);
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+
+    session.active_source_ = application::OperationSource::ai_proposal;
+    const auto ai_refusal = session.pack_uv_islands(action);
+    session.active_source_ = application::OperationSource::human;
+    REQUIRE(!ai_refusal);
+    REQUIRE(ai_refusal.error().code == core::ErrorCode::unsupported);
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+    REQUIRE(session.snapshot().undo_count == unchanged.undo_count);
+
+    const auto packed = application::testing::dispatch(session, action);
+    REQUIRE(packed && packed.value().document_changed);
+    REQUIRE(packed.value().revision_after == core::Revision{
+        unchanged.project_revision.value() + 1U});
+    REQUIRE(session.snapshot().undo_count == unchanged.undo_count + 1U);
+    const auto& packed_mesh = session.document_.meshes().at(*mesh_asset);
+    const auto* source_set = packed_mesh.uv_sets().find(7U);
+    const auto* packed_set = packed_mesh.uv_sets().find(8U);
+    REQUIRE(source_set != nullptr);
+    REQUIRE(packed_set != nullptr);
+    REQUIRE(packed_set->layer_id == "uv.pack.8");
+    REQUIRE(!packed_set->active_for_editing && !packed_set->active_for_render);
+    REQUIRE(packed_mesh.uv_sets().active_for_editing()->id == 7U);
+    REQUIRE(packed_mesh.uv_sets().active_for_render()->id == 7U);
+    REQUIRE(packed_mesh.attributes().find("uv.source.corners") != nullptr);
+
+    REQUIRE(application::testing::dispatch(session, application::UndoAction{}));
+    REQUIRE(session.document_.meshes().at(*mesh_asset).uv_sets().find(8U) == nullptr);
+    REQUIRE(application::testing::dispatch(session, application::RedoAction{}));
+    REQUIRE(session.document_.meshes().at(*mesh_asset).uv_sets().find(8U) != nullptr);
+
+    TempDirectory directory;
+    const auto path = directory.path() / "uv-island-pack.carto";
+    REQUIRE(application::testing::dispatch(session, application::SaveProjectAction{path}));
+    const auto reopened = project::ProjectDocument::load(path);
+    REQUIRE(reopened);
+    const auto reopened_mesh = reopened.value().meshes().at(*mesh_asset);
+    REQUIRE(reopened_mesh.uv_sets().find(7U) != nullptr);
+    REQUIRE(reopened_mesh.uv_sets().find(8U) != nullptr);
+    REQUIRE(reopened_mesh.uv_sets().active_for_render()->id == 7U);
+}
+
 int main() {
     try {
         application_mesh_geometry_digest_is_canonical_and_revision_independent();
@@ -11770,6 +13440,7 @@ int main() {
         application_builds_bounded_source_bound_road_terrain_cut_fill_previews();
         application_commits_revision_bound_road_mesh_through_history_and_reopen();
         application_authors_revision_bound_sweeps_through_history();
+        application_reviews_sweep_endpoint_fit_from_one_current_project_snapshot();
         application_routes_biological_authoring_and_proxy_preview_through_history();
         application_authors_and_materializes_revision_bound_sign_text();
         application_assigns_sign_panel_and_lettering_materials_through_carto_history();
@@ -11777,7 +13448,7 @@ int main() {
         application_persists_vertex_merge_lineage_through_save_and_reopen();
         application_persists_center_vertex_merge_position_through_save_and_reopen();
         application_merges_uv_attributes_and_persists_payload_through_reopen();
-        application_refuses_unmapped_edge_attributes_atomically_during_weld();
+        application_refuses_conflicting_edge_attributes_atomically_during_weld();
         application_routes_face_poke_through_history_and_persists_lineage();
         application_routes_edge_bevel_through_history_and_persistence();
         application_bevels_selected_edges_across_objects_atomically_and_persists_lineage();
@@ -11788,6 +13459,7 @@ int main() {
         application_rejects_multi_object_triangle_to_quad_atomically_on_stale_or_incompatible_owner();
         application_rejects_edge_bevel_wrong_mode_and_multi_selection();
         application_routes_vertex_bevel_through_history_and_persistence();
+        application_routes_concave_vertex_bevel_through_history_and_persistence();
         application_bevels_selected_vertices_across_objects_atomically_and_persists_lineage();
         application_rejects_multi_object_vertex_bevel_on_shared_mesh_assets();
         application_rejects_single_selected_shared_vertex_bevel_atomically();
@@ -11805,6 +13477,7 @@ int main() {
         application_routes_vertex_edit_and_rejects_stale_reselection();
         application_authors_selected_face_custom_normals_with_revisioned_history();
         application_authors_selected_edge_sharp_marks_with_revisioned_history();
+        application_marks_uv_seams_through_human_revisioned_mesh_history();
         application_sets_selected_vertex_positions_across_objects_atomically_and_persists_patches();
         application_rejects_multi_object_vertex_position_for_shared_stale_and_invalid_owners();
         application_slides_selected_vertices_across_objects_with_owner_local_support_and_history();
@@ -11833,6 +13506,11 @@ int main() {
         application_mesh_cleanup_reviews_preserve_authority_and_durable_lineage();
         application_mesh_cleanup_refuses_stale_foreign_and_overbudget_reviews();
         application_mesh_cleanup_enforces_face_removal_and_corner_budgets();
+        application_mesh_cleanup_issue_discovery_is_reviewed_and_bounded();
+        application_mesh_cleanup_diagnostic_reports_coincident_vertices_duplicate_cycles_and_orphans_read_only();
+        application_mesh_cleanup_diagnostic_reports_nonplanar_faces_read_only();
+        application_mesh_cleanup_diagnostic_reports_disconnected_vertex_fans_read_only();
+        application_mesh_cleanup_transfers_continuous_vertex_attributes();
         project_vertex_merge_patch_is_digest_bound_and_replayable();
         project_selected_edge_split_redo_records_a_replayable_patch();
         project_edge_split_across_objects_is_atomic_and_replayable();
@@ -11844,6 +13522,7 @@ int main() {
         application_rejects_repeat_without_prior_tool();
         application_rejects_repeat_when_saved_component_was_removed();
         application_routes_component_selection_conversion_without_mutation();
+        application_selects_face_batches_atomically_without_project_mutation();
         application_converts_component_selection_per_object_without_flattening_ids();
         application_routes_component_selection_expansion_without_mutation();
         application_expands_component_selection_per_object();
@@ -11896,11 +13575,16 @@ int main() {
         application_routes_spatial_field_creation_and_paint_through_revisioned_history();
         application_authors_revision_bound_roads_through_history_and_journal();
         application_routes_source_reimport_through_human_history();
+        application_reviews_authored_source_metadata_through_human_history();
+        application_source_blob_inventory_refuses_managed_root_symlinks();
+        application_source_blob_inventory_retains_journal_reachable_blobs();
         application_authors_pbr_materials_through_revisioned_journaled_history();
         application_authors_material_graphs_through_digest_guarded_history();
         application_assigns_material_regions_through_revisioned_history();
         application_authors_presentation_catalog_through_revisioned_history();
+        application_packs_uv_islands_through_human_revisioned_history();
         application_places_decals_from_a_current_surface_through_human_history();
+        application_rejects_decal_replay_after_same_revision_project_replacement();
     } catch (const std::exception& error) {
         return (void(std::cerr << "FAIL " << error.what() << '\n'), 1);
     }

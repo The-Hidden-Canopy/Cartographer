@@ -16,6 +16,7 @@ add_library(carto_project STATIC
     src/authoring_standards.cpp
     src/file_lock.cpp
     src/material_graph.cpp
+    src/material_graph_evaluation.cpp
     src/material_catalog.cpp
     src/package.cpp
     src/presentation_catalog.cpp
@@ -36,7 +37,7 @@ target_include_directories(carto_project
 
 target_link_libraries(carto_project
     PUBLIC
-        carto_core carto_scene carto_geometry carto_assets carto_surface_core
+        carto_core carto_scene carto_geometry carto_assets carto_connection carto_surface_core
         carto_biological carto_spatial_field carto_condition_authoring
         carto_engineering carto_render carto_scientific carto_world
         carto_journal carto_eval

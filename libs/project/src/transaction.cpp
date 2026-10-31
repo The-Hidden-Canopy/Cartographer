@@ -337,6 +337,18 @@ core::Result<core::Revision> ProjectTransaction::set_pose_library(
         std::move(identity), expected_revision, std::move(serialized_library), digest);
 }
 
+core::Result<core::Revision> ProjectTransaction::set_kinematic_graph(
+    std::string identity,
+    core::Revision expected_revision,
+    std::string serialized_graph,
+    assets::Sha256Digest digest) {
+    if (auto result = ensure_active(); !result) {
+        return core::Result<core::Revision>::failure(result.error());
+    }
+    return staged_.set_kinematic_graph(
+        std::move(identity), expected_revision, std::move(serialized_graph), digest);
+}
+
 core::Result<void> ProjectTransaction::append_weight_edit_receipt(
     std::string serialized_receipt,
     assets::Sha256Digest digest) {

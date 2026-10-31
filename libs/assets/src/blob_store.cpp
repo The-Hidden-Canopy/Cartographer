@@ -152,6 +152,43 @@ core::Diagnostic validation(std::string message) {
     return core::Diagnostic(core::ErrorCode::validation_failed, std::move(message));
 }
 
+core::Result<void> validate_blob_directory_chain(
+    const std::filesystem::path& root,
+    const std::filesystem::path& directory) {
+    using Result = core::Result<void>;
+    if (root.empty() || directory.empty()) {
+        return Result::failure(invalid("blob directory path is empty"));
+    }
+    const auto relative = directory.lexically_relative(root);
+    if (directory != root && relative.empty()) {
+        return Result::failure(validation("blob directory escaped its store root"));
+    }
+    const auto validate_directory = [](const std::filesystem::path& path) -> Result {
+        std::error_code error;
+        const auto status = std::filesystem::symlink_status(path, error);
+        if (error && error != std::errc::no_such_file_or_directory) {
+            return Result::failure(io_error("unable to inspect blob directory"));
+        }
+        if (std::filesystem::is_symlink(status) ||
+            (std::filesystem::exists(status) && !std::filesystem::is_directory(status))) {
+            return Result::failure(validation(
+                "blob directory chain contains a link or non-directory component"));
+        }
+        return Result::success();
+    };
+    if (auto checked = validate_directory(root); !checked) return checked;
+    auto cursor = root;
+    for (const auto& component : relative) {
+        if (component == "..") {
+            return Result::failure(validation("blob directory escaped its store root"));
+        }
+        if (component == ".") continue;
+        cursor /= component;
+        if (auto checked = validate_directory(cursor); !checked) return checked;
+    }
+    return Result::success();
+}
+
 int hex_value(char value) {
     if (value >= '0' && value <= '9') {
         return value - '0';
@@ -230,18 +267,31 @@ core::Result<BlobRef> BlobStore::put(
     const Sha256Digest digest = sha256(bytes);
     const std::filesystem::path destination = path_for(digest);
     std::error_code error;
+    if (auto checked = validate_blob_directory_chain(root_, destination.parent_path()); !checked) {
+        return core::Result<BlobRef>::failure(checked.error());
+    }
     std::filesystem::create_directories(destination.parent_path(), error);
     if (error) {
         return core::Result<BlobRef>::failure(io_error("unable to create blob directories"));
     }
+    if (auto checked = validate_blob_directory_chain(root_, destination.parent_path()); !checked) {
+        return core::Result<BlobRef>::failure(checked.error());
+    }
 
-    const bool destination_exists = std::filesystem::exists(destination, error);
-    if (error) {
+    const auto destination_status = std::filesystem::symlink_status(destination, error);
+    if (error && error != std::errc::no_such_file_or_directory) {
         return core::Result<BlobRef>::failure(io_error("unable to inspect blob path"));
     }
+    error.clear();
+    if (std::filesystem::is_symlink(destination_status)) {
+        return core::Result<BlobRef>::failure(validation(
+            "blob path may not be a symbolic link"));
+    }
+    const bool destination_exists = std::filesystem::exists(destination_status);
     if (destination_exists) {
-        if (error || !std::filesystem::is_regular_file(destination, error)) {
-            return core::Result<BlobRef>::failure(io_error("blob path is not a regular file"));
+        if (!std::filesystem::is_regular_file(destination_status)) {
+            return core::Result<BlobRef>::failure(validation(
+                "blob path is not a regular file"));
         }
         const auto existing = read(digest);
         if (!existing) {
@@ -251,10 +301,15 @@ core::Result<BlobRef> BlobStore::put(
         const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
         const auto thread = std::hash<std::thread::id>{}(std::this_thread::get_id());
         const auto counter = g_blob_temp_counter.fetch_add(1U, std::memory_order_relaxed);
-        const std::filesystem::path temporary = destination.string() + ".tmp-" +
+        const std::string temporary_nonce = digest.hex() + "-" +
             std::to_string(static_cast<unsigned long long>(stamp)) + "-" +
             std::to_string(static_cast<unsigned long long>(thread)) + "-" +
             std::to_string(static_cast<unsigned long long>(counter));
+        const auto temporary_tag = sha256(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(temporary_nonce.data()),
+            temporary_nonce.size())).hex().substr(0U, 32U);
+        // Keep staging shorter than the final digest and preserve native path encoding.
+        const auto temporary = destination.parent_path() / (".tmp-" + temporary_tag);
         std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
         if (!stream) {
             return core::Result<BlobRef>::failure(io_error("unable to create temporary blob"));
@@ -287,14 +342,26 @@ core::Result<BlobRef> BlobStore::put(
 core::Result<std::vector<std::uint8_t>> BlobStore::read(const Sha256Digest& digest) const {
     const std::filesystem::path path = path_for(digest);
     std::error_code error;
-    const bool regular_file = std::filesystem::is_regular_file(path, error);
-    if (error) {
+    if (auto checked = validate_blob_directory_chain(root_, path.parent_path()); !checked) {
+        return core::Result<std::vector<std::uint8_t>>::failure(checked.error());
+    }
+    const auto status = std::filesystem::symlink_status(path, error);
+    if (error && error != std::errc::no_such_file_or_directory) {
         return core::Result<std::vector<std::uint8_t>>::failure(
             io_error("unable to inspect blob path"));
     }
-    if (!regular_file) {
+    error.clear();
+    if (std::filesystem::is_symlink(status)) {
+        return core::Result<std::vector<std::uint8_t>>::failure(
+            validation("blob path may not be a symbolic link"));
+    }
+    if (!std::filesystem::exists(status)) {
         return core::Result<std::vector<std::uint8_t>>::failure(
             core::Diagnostic(core::ErrorCode::not_found, "blob does not exist"));
+    }
+    if (!std::filesystem::is_regular_file(status)) {
+        return core::Result<std::vector<std::uint8_t>>::failure(
+            validation("blob path is not a regular file"));
     }
     const auto size = std::filesystem::file_size(path, error);
     if (error) {
@@ -331,30 +398,80 @@ core::Result<void> BlobStore::verify(const Sha256Digest& digest) const {
 
 core::Result<std::vector<BlobRef>> BlobStore::list() const {
     std::vector<BlobRef> entries;
-    const std::filesystem::path base = root_ / "sha256";
+    if (auto checked = validate_blob_directory_chain(root_, root_); !checked) {
+        return core::Result<std::vector<BlobRef>>::failure(checked.error());
+    }
     std::error_code error;
-    const bool store_exists = std::filesystem::exists(base, error);
-    if (error) {
+    const auto root_status = std::filesystem::symlink_status(root_, error);
+    if (error && error != std::errc::no_such_file_or_directory) {
         return core::Result<std::vector<BlobRef>>::failure(
             io_error("unable to inspect blob store root"));
     }
-    if (!store_exists) {
+    error.clear();
+    if (!std::filesystem::exists(root_status)) {
         return core::Result<std::vector<BlobRef>>::success(std::move(entries));
+    }
+    if (!std::filesystem::is_directory(root_status)) {
+        return core::Result<std::vector<BlobRef>>::failure(
+            validation("blob store root is not a directory"));
+    }
+    const std::filesystem::path base = root_ / "sha256";
+    if (auto checked = validate_blob_directory_chain(root_, base); !checked) {
+        return core::Result<std::vector<BlobRef>>::failure(checked.error());
+    }
+    const auto base_status = std::filesystem::symlink_status(base, error);
+    if (error && error != std::errc::no_such_file_or_directory) {
+        return core::Result<std::vector<BlobRef>>::failure(
+            io_error("unable to inspect blob store root"));
+    }
+    error.clear();
+    if (!std::filesystem::exists(base_status)) {
+        return core::Result<std::vector<BlobRef>>::success(std::move(entries));
+    }
+    if (!std::filesystem::is_directory(base_status)) {
+        return core::Result<std::vector<BlobRef>>::failure(
+            validation("blob store index is not a directory"));
     }
 
     const std::filesystem::recursive_directory_iterator end;
-    std::filesystem::recursive_directory_iterator iterator(
-        base, std::filesystem::directory_options::skip_permission_denied, error);
+    std::filesystem::recursive_directory_iterator iterator(base, error);
+    if (error) {
+        return core::Result<std::vector<BlobRef>>::failure(
+            io_error("unable to enumerate blob store"));
+    }
     for (; !error && iterator != end; iterator.increment(error)) {
         const std::string name = iterator->path().filename().string();
-        const bool blob_file = iterator->is_regular_file(error) &&
-            iterator.depth() == 2 && name.size() == Sha256Digest{}.bytes.size() * 2U;
-        if (error || !blob_file) {
-            continue;
+        const auto status = iterator->symlink_status(error);
+        if (error) {
+            return core::Result<std::vector<BlobRef>>::failure(
+                io_error("unable to inspect blob store entry"));
+        }
+        if (std::filesystem::is_symlink(status)) {
+            return core::Result<std::vector<BlobRef>>::failure(validation(
+                "blob store contains a symbolic link"));
+        }
+        const bool digest_named_entry =
+            name.size() == Sha256Digest{}.bytes.size() * 2U;
+        if (!digest_named_entry) continue;
+        if (iterator.depth() != 2) {
+            return core::Result<std::vector<BlobRef>>::failure(validation(
+                "blob entry does not match its digest shard path"));
+        }
+        if (!std::filesystem::is_regular_file(status)) {
+            return core::Result<std::vector<BlobRef>>::failure(validation(
+                "blob entry is not a regular file"));
         }
         const auto digest = Sha256Digest::from_hex(name);
-        if (!digest) {
-            continue;
+        if (!digest || digest.value().hex() != name) {
+            return core::Result<std::vector<BlobRef>>::failure(validation(
+                "blob filename is not a canonical SHA-256 digest"));
+        }
+        const auto digest_hex = digest.value().hex();
+        if (iterator->path().parent_path().filename().string() != digest_hex.substr(2U, 2U) ||
+            iterator->path().parent_path().parent_path().filename().string() !=
+                digest_hex.substr(0U, 2U)) {
+            return core::Result<std::vector<BlobRef>>::failure(validation(
+                "blob entry does not match its digest shard path"));
         }
         const auto size = std::filesystem::file_size(iterator->path(), error);
         if (error) {
@@ -377,14 +494,34 @@ core::Result<std::vector<BlobRef>> BlobStore::list() const {
 }
 
 core::Result<BlobOrphanReport> BlobStore::orphan_candidates(
-    std::span<const Sha256Digest> live_digests) const {
+    std::span<const Sha256Digest> live_digests,
+    std::span<const Sha256Digest> pending_work_digests) const {
+    if (pending_work_digests.size() > kMaxPendingBlobWorkDigests) {
+        return core::Result<BlobOrphanReport>::failure(validation(
+            "blob inventory pending-work digest set exceeds its bound"));
+    }
+    const std::set<Sha256Digest> live(live_digests.begin(), live_digests.end());
+    std::set<Sha256Digest> pending(pending_work_digests.begin(), pending_work_digests.end());
+    if (pending.contains(Sha256Digest{})) {
+        return core::Result<BlobOrphanReport>::failure(validation(
+            "blob inventory pending-work digest set contains an empty digest"));
+    }
+    for (const auto& digest : live) pending.erase(digest);
     const auto listing = list();
     if (!listing) {
         return core::Result<BlobOrphanReport>::failure(listing.error());
     }
-    const std::set<Sha256Digest> live(live_digests.begin(), live_digests.end());
     BlobOrphanReport report;
+    std::set<Sha256Digest> stored;
+    std::uint64_t total_verification_bytes = 0U;
     for (const auto& entry : listing.value()) {
+        if (entry.bytes > limits_.max_inventory_verification_bytes -
+                total_verification_bytes) {
+            return core::Result<BlobOrphanReport>::failure(validation(
+                "blob inventory exceeds the configured verification byte limit"));
+        }
+        total_verification_bytes += entry.bytes;
+        stored.insert(entry.digest);
         const auto verified = read(entry.digest);
         if (!verified) {
             if (verified.error().code == core::ErrorCode::validation_failed) {
@@ -393,10 +530,29 @@ core::Result<BlobOrphanReport> BlobStore::orphan_candidates(
             }
             return core::Result<BlobOrphanReport>::failure(verified.error());
         }
-        if (live.find(entry.digest) == live.end()) {
+        if (pending.contains(entry.digest)) {
+            report.protected_pending_work_digests.push_back(entry.digest);
+        } else if (live.find(entry.digest) == live.end()) {
             report.orphan_candidates.push_back(entry.digest);
         }
     }
+    for (const auto& digest : live) {
+        if (stored.find(digest) != stored.end()) continue;
+        const auto verified = read(digest);
+        if (verified) continue;
+        if (verified.error().code == core::ErrorCode::not_found) {
+            report.missing_live_references.push_back(digest);
+            continue;
+        }
+        if (verified.error().code == core::ErrorCode::validation_failed) {
+            report.corrupt.push_back(digest);
+            continue;
+        }
+        return core::Result<BlobOrphanReport>::failure(verified.error());
+    }
+    std::sort(report.corrupt.begin(), report.corrupt.end());
+    report.corrupt.erase(
+        std::unique(report.corrupt.begin(), report.corrupt.end()), report.corrupt.end());
     return core::Result<BlobOrphanReport>::success(std::move(report));
 }
 

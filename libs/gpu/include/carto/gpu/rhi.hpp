@@ -259,11 +259,16 @@ struct PipelineDesc {
     std::vector<ShaderHandle> shaders;
     std::vector<DescriptorBinding> descriptor_bindings;
     // A non-zero value declares a consecutive prefix of sampled texture
-    // bindings. Graphics pipelines use exactly this many SRVs plus one
-    // sampler; compute pipelines may append one storage-texture binding.
-    // Zero preserves the single-sampled-texture compatibility contract when
-    // descriptor_bindings is non-empty.
+    // bindings. Graphics pipelines use exactly this many SRVs; compute
+    // pipelines may append one storage-texture binding. Zero preserves the
+    // single-sampled-texture compatibility contract when descriptor_bindings
+    // is non-empty.
     std::uint32_t sampled_texture_count = 0U;
+    // Graphics pipelines bind this many consecutive sampler registers to the
+    // matching prefix of sampled-texture bindings. Zero preserves the legacy
+    // one-sampler contract when sampled textures exist; compute pipelines do
+    // not bind samplers through this interface.
+    std::uint32_t sampled_sampler_count = 0U;
     PrimitiveTopology topology = PrimitiveTopology::triangle_list;
     PolygonMode polygon_mode = PolygonMode::fill;
     CullMode cull_mode = CullMode::back;

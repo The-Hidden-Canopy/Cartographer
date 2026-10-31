@@ -1898,8 +1898,11 @@ core::Result<void> EditableMesh::validate_patch_geometry(const MeshPatch& patch)
         for (std::size_t index = 1U; index + 1U < face.vertices.size(); ++index) {
             const core::Vec3d second_position = vertices_.at(face.vertices[index]).position;
             const core::Vec3d third_position = vertices_.at(face.vertices[index + 1U]).position;
-            if (triangle_area_squared(first_position, second_position, third_position) <= 1e-24) {
-                return core::Result<void>::failure(validation("mesh face contains a zero-area triangle"));
+            const double area_squared = triangle_area_squared(
+                first_position, second_position, third_position);
+            if (!std::isfinite(area_squared) || area_squared <= 1e-24) {
+                return core::Result<void>::failure(validation(
+                    "mesh face contains a zero-area or numerically invalid triangle"));
             }
         }
     }
@@ -3558,6 +3561,7 @@ core::Result<TopologyEditReceipt> EditableMesh::bevel_vertex(
             "vertex bevel width would collapse an incident face"));
     }
 
+    std::map<VertexId, VertexId> source_boundary_next;
     for (const FaceId face_id : incident_face_ids) {
         const auto face_iterator = faces_.find(face_id);
         if (face_iterator == faces_.end()) {
@@ -3579,6 +3583,12 @@ core::Result<TopologyEditReceipt> EditableMesh::bevel_vertex(
             face.vertices.begin(), std::find(face.vertices.begin(), face.vertices.end(), id)));
         const VertexId previous = face.vertices[(vertex_index + 2U) % 3U];
         const VertexId next = face.vertices[(vertex_index + 1U) % 3U];
+        const auto [boundary, inserted] = source_boundary_next.emplace(next, previous);
+        if (!inserted && boundary->second != previous) {
+            return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                ErrorCode::stale_data,
+                "vertex bevel source fan has conflicting boundary directions"));
+        }
         const EdgeRecord* previous_edge = find_incident_edge(id, previous);
         const EdgeRecord* next_edge = find_incident_edge(id, next);
         if (!previous_edge || !next_edge || previous_edge->id == next_edge->id) {
@@ -3597,6 +3607,71 @@ core::Result<TopologyEditReceipt> EditableMesh::bevel_vertex(
         if (!previous_cut || !next_cut) {
             return core::Result<TopologyEditReceipt>::failure(Diagnostic(
                 ErrorCode::stale_data, "vertex bevel could not resolve an incident edge cut"));
+        }
+    }
+
+    bool concave_planar_source_boundary = false;
+    if (source_boundary_next.size() == incident_edges.size()) {
+        std::vector<VertexId> boundary_vertices;
+        boundary_vertices.reserve(source_boundary_next.size());
+        const VertexId boundary_start = source_boundary_next.begin()->first;
+        VertexId boundary_current = boundary_start;
+        for (std::size_t count = 0U; count < source_boundary_next.size(); ++count) {
+            if (std::find(
+                    boundary_vertices.begin(), boundary_vertices.end(), boundary_current) !=
+                boundary_vertices.end()) {
+                boundary_vertices.clear();
+                break;
+            }
+            boundary_vertices.push_back(boundary_current);
+            const auto next = source_boundary_next.find(boundary_current);
+            if (next == source_boundary_next.end()) {
+                boundary_vertices.clear();
+                break;
+            }
+            boundary_current = next->second;
+        }
+        if (boundary_current != boundary_start ||
+            boundary_vertices.size() != source_boundary_next.size()) {
+            boundary_vertices.clear();
+        }
+        if (!boundary_vertices.empty()) {
+            std::vector<core::Vec3d> boundary_positions;
+            boundary_positions.reserve(boundary_vertices.size());
+            for (const VertexId boundary_vertex : boundary_vertices) {
+                const auto found = vertices_.find(boundary_vertex);
+                if (found == vertices_.end()) {
+                    return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                        ErrorCode::stale_data,
+                        "vertex bevel source boundary references a missing vertex"));
+                }
+                boundary_positions.push_back(found->second.position);
+            }
+            const auto projected_boundary =
+                project_simple_planar_polygon(boundary_positions);
+            concave_planar_source_boundary = projected_boundary &&
+                is_concave_polygon(projected_boundary.value());
+        }
+    }
+    if (concave_planar_source_boundary) {
+        // Equal-distance cuts lie on a sphere and generally warp a concave
+        // planar source boundary. A shared fraction preserves its plane and
+        // concavity; width remains the cut distance on the shortest incident
+        // edge. Convex inputs keep the established per-edge distance rule.
+        const double cut_fraction = width / minimum_length;
+        for (auto& cut : cuts) {
+            const auto other = vertices_.find(cut.other);
+            if (other == vertices_.end()) {
+                return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                    ErrorCode::stale_data,
+                    "vertex bevel source boundary references a missing edge endpoint"));
+            }
+            cut.position = vertex_iterator->second.position +
+                (other->second.position - vertex_iterator->second.position) * cut_fraction;
+            if (!cut.position.finite()) {
+                return core::Result<TopologyEditReceipt>::failure(validation(
+                    "vertex bevel proportional edge cut is non-finite"));
+            }
         }
     }
 
@@ -3733,10 +3808,16 @@ core::Result<TopologyEditReceipt> EditableMesh::bevel_vertex(
         cap_positions.push_back(vertices_.at(cap_vertex).position);
     }
     const auto projected_cap = project_simple_planar_polygon(cap_positions);
-    if (!projected_cap || is_concave_polygon(projected_cap.value())) {
+    if (!projected_cap) {
         *this = before;
         return core::Result<TopologyEditReceipt>::failure(validation(
-            "vertex bevel requires a simple, planar, convex chamfer cap"));
+            "vertex bevel requires a simple, planar chamfer cap"));
+    }
+    if (is_concave_polygon(projected_cap.value()) &&
+        !triangulate_simple_polygon(projected_cap.value())) {
+        *this = before;
+        return core::Result<TopologyEditReceipt>::failure(validation(
+            "vertex bevel concave chamfer cap could not be triangulated"));
     }
 
     std::vector<FaceId> bevel_faces;
@@ -3853,36 +3934,93 @@ core::Result<TopologyEditReceipt> EditableMesh::bevel_vertex(
             return core::Result<TopologyEditReceipt>::failure(validation(
                 "vertex bevel produced an invalid subdivided cap boundary"));
         }
-        core::Vec3d center_position{};
-        for (const VertexId cap_vertex : cap_vertices) {
-            center_position = center_position + vertices_.at(cap_vertex).position;
+        std::vector<core::Vec3d> boundary_positions;
+        boundary_positions.reserve(boundary_loop.size());
+        for (const VertexId boundary_vertex : boundary_loop) {
+            boundary_positions.push_back(vertices_.at(boundary_vertex).position);
         }
-        center_position = center_position * (1.0 / static_cast<double>(cap_vertices.size()));
-        if (!center_position.finite()) {
+        const auto projected_boundary =
+            project_simple_planar_polygon(boundary_positions);
+        if (!projected_boundary) {
             *this = before;
-            return core::Result<TopologyEditReceipt>::failure(validation(
-                "vertex bevel produced a non-finite cap center"));
+            return core::Result<TopologyEditReceipt>::failure(
+                projected_boundary.error());
         }
-        cap_center = VertexId{next_vertex_id_++};
-        vertices_.emplace(*cap_center, Vertex{*cap_center, center_position});
-        bevel_faces.reserve(boundary_loop.size());
-        for (std::size_t index = 0U; index < boundary_loop.size(); ++index) {
-            const VertexId current_vertex = boundary_loop[index];
-            const VertexId next_vertex = boundary_loop[(index + 1U) % boundary_loop.size()];
-            const core::Vec3d current_position = vertices_.at(current_vertex).position;
-            const core::Vec3d next_position = vertices_.at(next_vertex).position;
-            const double triangle_area = core::cross(
-                next_position - current_position,
-                center_position - current_position).length();
-            if (!std::isfinite(triangle_area) || triangle_area <= 1e-12) {
+        if (is_concave_polygon(projected_boundary.value())) {
+            const auto cap_triangles =
+                triangulate_simple_polygon(projected_boundary.value());
+            if (!cap_triangles) {
                 *this = before;
                 return core::Result<TopologyEditReceipt>::failure(validation(
-                    "vertex bevel produced a degenerate cap segment"));
+                    "vertex bevel concave chamfer cap could not be triangulated"));
             }
-            const FaceId bevel_face{next_face_id_++};
-            faces_.emplace(bevel_face, Face{
-                bevel_face, {current_vertex, next_vertex, *cap_center}});
-            bevel_faces.push_back(bevel_face);
+            bevel_faces.reserve(cap_triangles.value().size());
+            for (const auto& triangle : cap_triangles.value()) {
+                if (triangle[0U] >= boundary_loop.size() ||
+                    triangle[1U] >= boundary_loop.size() ||
+                    triangle[2U] >= boundary_loop.size()) {
+                    *this = before;
+                    return core::Result<TopologyEditReceipt>::failure(Diagnostic(
+                        ErrorCode::stale_data,
+                        "vertex bevel cap triangulation escaped its boundary"));
+                }
+                const VertexId first = boundary_loop[triangle[0U]];
+                const VertexId second = boundary_loop[triangle[1U]];
+                const VertexId third = boundary_loop[triangle[2U]];
+                const core::Vec3d first_position = vertices_.at(first).position;
+                const core::Vec3d second_position = vertices_.at(second).position;
+                const core::Vec3d third_position = vertices_.at(third).position;
+                const double triangle_area = core::cross(
+                    second_position - first_position,
+                    third_position - first_position).length();
+                if (!std::isfinite(triangle_area) || triangle_area <= 1e-12) {
+                    *this = before;
+                    return core::Result<TopologyEditReceipt>::failure(validation(
+                        "vertex bevel produced a degenerate cap triangle"));
+                }
+                const FaceId bevel_face{next_face_id_++};
+                faces_.emplace(bevel_face, Face{
+                    bevel_face, {first, second, third}});
+                bevel_faces.push_back(bevel_face);
+            }
+        } else {
+            // Preserve the established convex-cap topology and its replay
+            // digest. Concave caps use the deterministic triangulation above.
+            core::Vec3d center_position{};
+            for (const VertexId cap_vertex : cap_vertices) {
+                center_position = center_position + vertices_.at(cap_vertex).position;
+            }
+            center_position = center_position *
+                (1.0 / static_cast<double>(cap_vertices.size()));
+            if (!center_position.finite()) {
+                *this = before;
+                return core::Result<TopologyEditReceipt>::failure(validation(
+                    "vertex bevel produced a non-finite cap center"));
+            }
+            cap_center = VertexId{next_vertex_id_++};
+            vertices_.emplace(*cap_center, Vertex{*cap_center, center_position});
+            bevel_faces.reserve(boundary_loop.size());
+            for (std::size_t index = 0U; index < boundary_loop.size(); ++index) {
+                const VertexId current_vertex = boundary_loop[index];
+                const VertexId next_vertex =
+                    boundary_loop[(index + 1U) % boundary_loop.size()];
+                const core::Vec3d current_position =
+                    vertices_.at(current_vertex).position;
+                const core::Vec3d next_position =
+                    vertices_.at(next_vertex).position;
+                const double triangle_area = core::cross(
+                    next_position - current_position,
+                    center_position - current_position).length();
+                if (!std::isfinite(triangle_area) || triangle_area <= 1e-12) {
+                    *this = before;
+                    return core::Result<TopologyEditReceipt>::failure(validation(
+                        "vertex bevel produced a degenerate cap segment"));
+                }
+                const FaceId bevel_face{next_face_id_++};
+                faces_.emplace(bevel_face, Face{
+                    bevel_face, {current_vertex, next_vertex, *cap_center}});
+                bevel_faces.push_back(bevel_face);
+            }
         }
     }
     if (auto result = rebuild_topology(); !result) {
@@ -3911,7 +4049,8 @@ core::Result<TopologyEditReceipt> EditableMesh::bevel_vertex(
             {parents.first.value, parents.second.value});
     }
     if (cap_center.has_value()) {
-        add_origin(receipt.vertex_origins, *cap_center, OriginKind::generated_from_vertex, {id.value});
+        add_origin(receipt.vertex_origins, *cap_center,
+            OriginKind::generated_from_vertex, {id.value});
     }
     for (const auto& [child_face, source_face] : incident_face_children) {
         add_origin(receipt.face_origins, child_face, OriginKind::generated_from_face,
@@ -4888,6 +5027,90 @@ core::Result<TopologyEditReceipt> EditableMesh::merge_by_distance(
             "no candidate vertices lie within the merge distance; no mutation was published"));
     }
     return apply_vertex_merges(replacements, {});
+}
+
+core::Result<std::vector<VertexId>> EditableMesh::find_merge_by_distance_candidates(
+    double distance,
+    std::size_t max_candidates,
+    std::size_t max_pair_checks,
+    std::size_t max_vertices) const {
+    if (!std::isfinite(distance) || distance <= 0.0) {
+        return core::Result<std::vector<VertexId>>::failure(invalid(
+            "merge candidate discovery distance must be finite and strictly positive"));
+    }
+    if (max_candidates < 2U || max_candidates > kMaxMergeByDistanceCandidates ||
+        max_pair_checks == 0U || max_pair_checks > kMaxMergeCandidateDiscoveryPairs ||
+        max_vertices == 0U || max_vertices > kMaxMergeCandidateDiscoveryVertices) {
+        return core::Result<std::vector<VertexId>>::failure(invalid(
+            "merge candidate discovery limits are invalid or exceed the bounded limits"));
+    }
+    if (vertices_.size() > max_vertices) {
+        return core::Result<std::vector<VertexId>>::failure(core::Diagnostic(
+            ErrorCode::unsupported,
+            "merge candidate discovery source exceeds the vertex inspection budget"));
+    }
+
+    // Match merge_by_distance's uniform-cell partition and exact hypot check.
+    // Each pair is considered once in stable-ID order. Dense clusters are
+    // bounded by max_pair_checks, and candidates are rejected rather than
+    // silently truncated when the caller's review budget would be exceeded.
+    using CellKey = std::array<std::int64_t, 3>;
+    constexpr double kMaxCellCoordinate = 4.0e18;
+    const auto vertices = vertices_sorted();
+    std::map<CellKey, std::vector<VertexId>> cells;
+    std::map<VertexId, CellKey> vertex_cells;
+    for (const auto& vertex : vertices) {
+        const std::array<double, 3> coordinates{
+            vertex.position.x, vertex.position.y, vertex.position.z};
+        CellKey key{};
+        for (std::size_t axis = 0U; axis < coordinates.size(); ++axis) {
+            const double cell = std::floor(coordinates[axis] / distance);
+            if (!std::isfinite(cell) || std::abs(cell) > kMaxCellCoordinate) {
+                return core::Result<std::vector<VertexId>>::failure(core::Diagnostic(
+                    ErrorCode::unsupported,
+                    "merge candidate discovery threshold is too small for the vertex coordinates"));
+            }
+            key[axis] = static_cast<std::int64_t>(cell);
+        }
+        cells[key].push_back(vertex.id);
+        vertex_cells.emplace(vertex.id, key);
+    }
+
+    std::set<VertexId> candidate_set;
+    std::size_t pair_checks = 0U;
+    for (const auto& target : vertices) {
+        const CellKey& center = vertex_cells.at(target.id);
+        for (std::int64_t dx = -1; dx <= 1; ++dx) {
+            for (std::int64_t dy = -1; dy <= 1; ++dy) {
+                for (std::int64_t dz = -1; dz <= 1; ++dz) {
+                    const auto cell = cells.find(
+                        CellKey{center[0] + dx, center[1] + dy, center[2] + dz});
+                    if (cell == cells.end()) continue;
+                    for (const VertexId other_id : cell->second) {
+                        if (other_id <= target.id) continue;
+                        if (pair_checks == max_pair_checks) {
+                            return core::Result<std::vector<VertexId>>::failure(core::Diagnostic(
+                                ErrorCode::unsupported,
+                                "merge candidate discovery exceeded the pair inspection budget"));
+                        }
+                        ++pair_checks;
+                        const auto& other = vertices_.at(other_id).position;
+                        const core::Vec3d delta = other - target.position;
+                        if (std::hypot(delta.x, delta.y, delta.z) > distance) continue;
+                        candidate_set.insert(target.id);
+                        candidate_set.insert(other_id);
+                        if (candidate_set.size() > max_candidates) {
+                            return core::Result<std::vector<VertexId>>::failure(core::Diagnostic(
+                                ErrorCode::unsupported,
+                                "merge candidate discovery exceeded the review candidate budget"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return core::Result<std::vector<VertexId>>::success(
+        std::vector<VertexId>(candidate_set.begin(), candidate_set.end()));
 }
 
 core::Result<TopologyEditReceipt> EditableMesh::apply_vertex_merges(
@@ -6006,8 +6229,11 @@ core::Result<void> EditableMesh::validate() const {
         for (std::size_t index = 1U; index + 1U < face.vertices.size(); ++index) {
             const core::Vec3d second_position = vertices_.at(face.vertices[index]).position;
             const core::Vec3d third_position = vertices_.at(face.vertices[index + 1U]).position;
-            if (triangle_area_squared(first_position, second_position, third_position) <= 1e-24) {
-                return core::Result<void>::failure(validation("mesh face contains a zero-area triangle"));
+            const double area_squared = triangle_area_squared(
+                first_position, second_position, third_position);
+            if (!std::isfinite(area_squared) || area_squared <= 1e-24) {
+                return core::Result<void>::failure(validation(
+                    "mesh face contains a zero-area or numerically invalid triangle"));
             }
         }
 

@@ -430,6 +430,11 @@ static core::Result<GeneratedMeshImport> import_generated_botanical_gltf_impl(
 
     auto mesh_fields = object(meshes.value().front(), "glTF mesh");
     if (!mesh_fields) return core::Result<GeneratedMeshImport>::failure(mesh_fields.error());
+    if (member(mesh_fields.value(), "weights") != nullptr ||
+        member(mesh_fields.value(), "extensions") != nullptr) {
+        return core::Result<GeneratedMeshImport>::failure(invalid(
+            "generated glTF mesh contains unsupported weights or extensions"));
+    }
     const auto* primitives_raw = member(mesh_fields.value(), "primitives");
     if (primitives_raw == nullptr) return core::Result<GeneratedMeshImport>::failure(invalid(
         "generated glTF mesh has no primitives"));

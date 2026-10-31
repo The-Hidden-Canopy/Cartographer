@@ -296,8 +296,6 @@ core::Result<LookdevDrawPackage> compile_lookdev_draw_package(
     if (auto result = mesh.validate(); !result) {
         return core::Result<LookdevDrawPackage>::failure(result.error());
     }
-    const auto upload = pack_pbr_mesh_upload(mesh);
-    if (!upload) return core::Result<LookdevDrawPackage>::failure(upload.error());
     if (bindings.size() != mesh.submeshes.size() || bindings.empty()) {
         return core::Result<LookdevDrawPackage>::failure(invalid(
             "lookdev compilation requires exactly one material binding per submesh"));
@@ -324,6 +322,22 @@ core::Result<LookdevDrawPackage> compile_lookdev_draw_package(
                 "lookdev compilation rejects duplicate material-slot bindings"));
         }
     }
+
+    std::vector<render::GpuMaterialConstants> submesh_materials;
+    submesh_materials.reserve(mesh.submeshes.size());
+    for (const RenderMeshSubmesh& submesh : mesh.submeshes) {
+        const auto binding = std::find_if(
+            ordered.begin(), ordered.end(), [&submesh](const auto* candidate) {
+                return same_slot(candidate->material_slot, submesh.material_slot);
+            });
+        if (binding == ordered.end()) {
+            return core::Result<LookdevDrawPackage>::failure(invalid(
+                "lookdev compilation is missing a render-mesh material slot"));
+        }
+        submesh_materials.push_back((*binding)->material.gpu_constants);
+    }
+    const auto upload = pack_pbr_mesh_upload(mesh, submesh_materials);
+    if (!upload) return core::Result<LookdevDrawPackage>::failure(upload.error());
 
     const auto mesh_bytes = mesh.serialize();
     if (!mesh_bytes) return core::Result<LookdevDrawPackage>::failure(mesh_bytes.error());

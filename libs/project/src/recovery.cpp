@@ -1,5 +1,6 @@
 #include <carto/project/recovery.hpp>
 
+#include <algorithm>
 #include <charconv>
 #include <limits>
 #include <optional>
@@ -37,7 +38,8 @@ core::Result<std::string> snapshot_from_entry(const journal::JournalEntry& entry
     }
     const std::string_view header(payload.data(), header_end);
     const bool project_snapshot = header == "CARTOGRAPHER_PROJECT_SNAPSHOT_V1";
-    const bool application_mutation = header == "CARTOGRAPHER_APPLICATION_MUTATION_V1";
+    const bool mutation_v2 = header == "CARTOGRAPHER_APPLICATION_MUTATION_V2";
+    const bool application_mutation = header == "CARTOGRAPHER_APPLICATION_MUTATION_V1" || mutation_v2;
     const bool project_transaction = header == "CARTOGRAPHER_PROJECT_TRANSACTION_V1";
     if (!project_snapshot && !application_mutation && !project_transaction) {
         return core::Result<std::string>::failure(
@@ -48,6 +50,10 @@ core::Result<std::string> snapshot_from_entry(const journal::JournalEntry& entry
     cursor = header_end + 1U;
     bool actor_seen = false;
     bool operation_seen = false;
+    bool source_seen = false;
+    bool provenance_seen = false;
+    bool source_requires_provenance = false;
+    unsigned v2_stage = 0U;
     bool document_bytes_seen = false;
     std::uint64_t declared_bytes = 0U;
     std::size_t document_start = 0U;
@@ -72,13 +78,37 @@ core::Result<std::string> snapshot_from_entry(const journal::JournalEntry& entry
             }
             actor_seen = true;
         } else if (key == "operation") {
-            if (operation_seen || project_snapshot || !safe_metadata_value(value)) {
+            if (operation_seen || project_snapshot || !safe_metadata_value(value) ||
+                (mutation_v2 && (v2_stage != 0U || value.size() > 4096U ||
+                    std::any_of(value.begin(), value.end(), [](unsigned char c) {
+                        return c < 0x20U || c == 0x7fU;
+                    })))) {
                 return core::Result<std::string>::failure(
                     validation("journal snapshot envelope operation metadata is invalid"));
             }
             operation_seen = true;
+            if (mutation_v2) v2_stage = 1U;
+        } else if (key == "source") {
+            if (!mutation_v2 || source_seen || v2_stage != 1U ||
+                (value != "human" && value != "ai_proposal" && value != "agent_workbench" &&
+                 value != "plugin" && value != "recovery")) {
+                return core::Result<std::string>::failure(validation("journal mutation source is invalid"));
+            }
+            source_seen = true;
+            source_requires_provenance = value == "ai_proposal" || value == "agent_workbench";
+            v2_stage = 2U;
+        } else if (key == "provenance_hex") {
+            if (!mutation_v2 || provenance_seen || v2_stage != 2U || value.size() > 8192U ||
+                value.size() % 2U != 0U || (source_requires_provenance && value.empty()) ||
+                !std::all_of(value.begin(), value.end(), [](char c) {
+                    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+                })) {
+                return core::Result<std::string>::failure(validation("journal mutation provenance is invalid"));
+            }
+            provenance_seen = true;
+            v2_stage = 3U;
         } else if (key == "document_bytes") {
-            if (document_bytes_seen || value.empty()) {
+            if (document_bytes_seen || value.empty() || (mutation_v2 && v2_stage != 3U)) {
                 return core::Result<std::string>::failure(
                     validation("journal snapshot envelope byte count is invalid"));
             }
@@ -99,7 +129,7 @@ core::Result<std::string> snapshot_from_entry(const journal::JournalEntry& entry
     }
 
     if ((project_transaction && (!actor_seen || !operation_seen)) ||
-        (application_mutation && !operation_seen) ||
+        (application_mutation && (!operation_seen || (mutation_v2 && (!source_seen || !provenance_seen)))) ||
         (project_snapshot && (actor_seen || operation_seen))) {
         return core::Result<std::string>::failure(
             validation("journal snapshot envelope metadata does not match its header"));

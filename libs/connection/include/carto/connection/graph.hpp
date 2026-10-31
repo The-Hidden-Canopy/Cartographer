@@ -18,7 +18,7 @@ namespace carto::connection {
 // acyclic attachment forest. Structural validation never implies runtime,
 // native, or full-game acceptance; see PortGraphAcceptanceReceipt.
 
-inline constexpr std::uint32_t kConnectionPortGraphVersion = 1U;
+inline constexpr std::uint32_t kConnectionPortGraphVersion = 2U;
 inline constexpr std::uint32_t kPortGraphAcceptanceVersion = 1U;
 inline constexpr std::size_t kMaxConnectionPortGraphBytes = 32U * 1024U * 1024U;
 inline constexpr std::size_t kMaxPortGraphAcceptanceBytes = 256U * 1024U;
@@ -51,12 +51,16 @@ struct PortConnectionEdge {
 class ConnectionPortGraph final {
 public:
     [[nodiscard]] core::Result<void> insert_port(ConnectionPort port);
+    // Removal is explicit and fail-closed: connected ports must be
+    // disconnected before the port record can be removed.
+    [[nodiscard]] core::Result<void> erase_port(PortId id);
     // Fail-closed join: every check (existence, compatibility, edge-kind
     // namespace, duplicates, cycles, bounds) runs before any state change.
     [[nodiscard]] core::Result<PortConnectionEdge> connect(
         PortId first,
         PortId second,
         ConnectionKind kind);
+    [[nodiscard]] core::Result<void> erase_edge(std::uint64_t edge_id);
 
     [[nodiscard]] const std::map<PortId, ConnectionPort>& ports() const noexcept {
         return ports_;

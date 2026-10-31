@@ -512,7 +512,8 @@ void run_biological_condition_fixture(const std::filesystem::path& fixture_root)
     snapshot = session.snapshot();
     require(static_cast<bool>(ui.dispatch(carto::application::AppendSculptSurfaceStrokeAction{
                 snapshot.project_revision, receipt.object, receipt.mesh_asset,
-                carto::production::SculptStrokeMode::add, 0.75, 0.05, {sample.value()}})),
+                carto::production::SculptStrokeMode::add, 0.75, 0.05, {sample.value()},
+                snapshot.project_generation})),
         "native SculptStack could not edit the biological proxy");
     snapshot = session.snapshot();
     require(static_cast<bool>(ui.dispatch(carto::application::SaveProjectAction{std::nullopt})),

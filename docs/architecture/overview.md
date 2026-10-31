@@ -104,7 +104,9 @@ reselection. Edge selection consumes persistent topology identity.
 Single-edge splitting, bounded coplanar internal-edge dissolve with simple
 concave-boundary triangulation, bounded
 single- and multi-segment internal-edge bevel and closed triangular-fan vertex
-bevel for 3..64 incident faces with a simple planar convex cap, and
+bevel for 3..64 incident faces with a simple planar cap; planar concave source
+boundaries use a shared edge fraction and deterministic ear clipping, while
+convex inputs retain their established cut positions; and
 project-level batches of up to 64 selected edges or vertices on unique mesh
 owners in stable ID order; compatible triangle-to-quad conversion, convex-face inset,
 convex-face poke, and single-face deletion are now
@@ -132,8 +134,8 @@ available on one validated mesh. The
 two-vertex weld path preserves the lower stable vertex
 ID, removes only unambiguous degenerate faces, and records source-to-target
 merge lineage; its target mode keeps the surviving position and its center
-mode moves it to the midpoint. Non-simple, non-planar, or non-convex vertex-bevel
-caps, non-convex poke/inset,
+mode moves it to the midpoint. Non-simple or non-planar vertex-bevel caps,
+non-convex poke/inset,
 broader edge traversal, and merge modes beyond target and center remain deferred.
 Multi-vertex slide, multi-face poke, extrusion, inset, and bounded edge/vertex bevel are explicit
 grouped operations; other multi-selection shapes remain governed by each tool's
@@ -161,8 +163,9 @@ builders for selected-face extrusion, convex-face inset, single-face deletion,
 single-edge splitting, bounded internal-edge dissolve, compatible triangle-to-quad
 conversion, convex-face poke, bounded single- and multi-vertex incident-edge
 sliding (up to 64 vertices per command), bounded
-closed-fan vertex bevel for 3..64 incident faces with a simple planar convex
-cap, two-vertex target/center welding, selection merge-by-distance, and single-vertex
+closed-fan vertex bevel for 3..64 incident faces with a simple planar cap,
+including deterministic concave-cap triangulation, two-vertex target/center
+welding, selection merge-by-distance, and single-vertex
 position editing.
 Additional tool builders must preserve the same boundary and leave context
 routing out of panel code.

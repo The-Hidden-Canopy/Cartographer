@@ -4,11 +4,13 @@
 #include "ambient_occlusion_projection.hpp"
 
 #include <carto/render/tangent.hpp>
+#include <carto/project/project.hpp>
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -75,6 +77,11 @@ core::Diagnostic stale(std::string message) {
 
 core::Diagnostic unsupported(std::string message) {
     return core::Diagnostic(core::ErrorCode::unsupported, std::move(message));
+}
+
+core::Diagnostic bake_cancelled(std::string_view map_name) {
+    return core::Diagnostic(core::ErrorCode::invalid_state,
+        std::string(map_name) + " tile schedule cancelled; no partial schedule was returned");
 }
 
 bool safe_identity(std::string_view value) {
@@ -1638,7 +1645,12 @@ core::Result<BakeTileScheduleResult> schedule_normal_map_tiles_cpu(
     BakeNormalSpace normal_space,
     const geometry::EditableMesh& source,
     const geometry::EditableMesh& target,
-    std::span<const BakeTileArtifactCacheEntry> reusable_tiles) {
+    std::span<const BakeTileArtifactCacheEntry> reusable_tiles,
+    std::stop_token stop_token) {
+    if (stop_token.stop_requested()) {
+        return core::Result<BakeTileScheduleResult>::failure(
+            bake_cancelled("normal-map"));
+    }
     if (auto result = base_recipe.validate(); !result) {
         return core::Result<BakeTileScheduleResult>::failure(result.error());
     }
@@ -1649,10 +1661,21 @@ core::Result<BakeTileScheduleResult> schedule_normal_map_tiles_cpu(
     if (!tiles) {
         return core::Result<BakeTileScheduleResult>::failure(tiles.error());
     }
+    const std::uint64_t tile_bytes =
+        static_cast<std::uint64_t>(base_recipe.width) * base_recipe.height * 4ULL;
+    if (tile_bytes == 0U || tiles.value().size() >
+            kMaxBakeTileScheduleRgbaBytes / tile_bytes) {
+        return core::Result<BakeTileScheduleResult>::failure(unsupported(
+            "bake tile schedule exceeds its aggregate RGBA8 memory budget"));
+    }
 
     BakeTileScheduleResult schedule;
     schedule.entries.reserve(tiles.value().size());
     for (const BakeTileCoordinate tile : tiles.value()) {
+        if (stop_token.stop_requested()) {
+            return core::Result<BakeTileScheduleResult>::failure(
+                bake_cancelled("normal-map"));
+        }
         BakeRecipe tile_recipe = base_recipe;
         tile_recipe.tile_u = tile.tile_u;
         tile_recipe.tile_v = tile.tile_v;
@@ -1683,7 +1706,7 @@ core::Result<BakeTileScheduleResult> schedule_normal_map_tiles_cpu(
             cached = &candidate;
         }
         if (cached != nullptr) {
-            const auto reused = reuse_bake_tile_artifact(
+            auto reused = reuse_bake_tile_artifact(
                 *cached, tile_recipe, source, target);
             if (!reused) {
                 return core::Result<BakeTileScheduleResult>::failure(
@@ -1692,14 +1715,20 @@ core::Result<BakeTileScheduleResult> schedule_normal_map_tiles_cpu(
                         std::to_string(tile.tile_v)));
             }
             schedule.entries.push_back(BakeTileScheduleEntry{
-                tile, reused.value(), true});
+                tile, std::move(reused.value()), true, 0.0});
             ++schedule.reused_tiles;
             continue;
         }
 
+        const auto compile_started = std::chrono::steady_clock::now();
         const BakeExecutionReport report = normal_space == BakeNormalSpace::tangent
             ? compile_tangent_normal_map_cpu(tile_recipe, source, target)
             : compile_object_space_normal_map_cpu(tile_recipe, source, target);
+        const auto compile_finished = std::chrono::steady_clock::now();
+        if (stop_token.stop_requested()) {
+            return core::Result<BakeTileScheduleResult>::failure(
+                bake_cancelled("normal-map"));
+        }
         if (!report.succeeded() || !report.artifact.has_value()) {
             const auto diagnostic = std::find_if(
                 report.diagnostics.begin(), report.diagnostics.end(),
@@ -1713,8 +1742,14 @@ core::Result<BakeTileScheduleResult> schedule_normal_map_tiles_cpu(
                     std::to_string(tile.tile_v)));
         }
         schedule.entries.push_back(BakeTileScheduleEntry{
-            tile, *report.artifact, false});
+            tile, std::move(*report.artifact), false,
+            std::chrono::duration<double, std::milli>(
+                compile_finished - compile_started).count()});
         ++schedule.compiled_tiles;
+    }
+    if (stop_token.stop_requested()) {
+        return core::Result<BakeTileScheduleResult>::failure(
+            bake_cancelled("normal-map"));
     }
     return core::Result<BakeTileScheduleResult>::success(std::move(schedule));
 }
@@ -3800,6 +3835,22 @@ void report_error(
     }
 }
 
+void report_error(
+    BentNormalExecutionReport& report,
+    std::string code,
+    std::string message) {
+    if (report.diagnostics.size() < kMaxBakeDiagnostics) {
+        report.diagnostics.push_back(BakeDiagnostic{
+            std::move(code), std::move(message), true,
+            std::nullopt, std::nullopt, std::nullopt, std::nullopt});
+    } else if (report.diagnostics.back().code != "diagnostics_truncated") {
+        report.diagnostics.back() = BakeDiagnostic{
+            "diagnostics_truncated",
+            "additional bent-normal diagnostics were omitted after the bounded report limit",
+            true, std::nullopt, std::nullopt, std::nullopt, std::nullopt};
+    }
+}
+
 std::uint64_t mix_ao_seed(std::uint64_t value) {
     value += 0x9e3779b97f4a7c15ULL;
     value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
@@ -4776,6 +4827,73 @@ detail::AmbientOcclusionProjectionWork detail::prepare_ambient_occlusion_project
     return work;
 }
 
+BentNormalExecutionReport detail::compile_bent_normal_from_projection(
+    const AmbientOcclusionRecipe& recipe,
+    const geometry::EditableMesh& source,
+    const geometry::EditableMesh& target,
+    std::span<const detail::AmbientOcclusionProjectionRay> expected_rays,
+    std::span<const std::uint8_t> hit_flags) {
+    BentNormalExecutionReport result;
+    if (expected_rays.size() != hit_flags.size() || expected_rays.empty()) {
+        report_error(result, "d3d12_bent_normal_projection_result_count_invalid",
+            "D3D12 bent-normal hit flags do not match a nonempty canonical ray set");
+        return result;
+    }
+
+    std::size_t ray_index = 0U;
+    bool ray_identity_valid = true;
+    BentNormalMapArtifact artifact;
+    const auto execution = compile_ambient_occlusion_cpu_reference(
+        recipe, source, target, &artifact,
+        [&expected_rays, hit_flags, &ray_index, &ray_identity_valid, &recipe](
+            geometry::FaceId face,
+            std::uint32_t x,
+            std::uint32_t y,
+            std::uint32_t sample,
+            core::Vec3d origin,
+            core::Vec3d direction,
+            double maximum_distance) {
+            if (ray_index >= expected_rays.size()) {
+                ray_identity_valid = false;
+                return false;
+            }
+            const auto& expected = expected_rays[ray_index];
+            const auto same_vector = [](core::Vec3d left, core::Vec3d right) {
+                return left.x == right.x && left.y == right.y && left.z == right.z;
+            };
+            if (hit_flags[ray_index] > 1U || expected.target_face != face ||
+                expected.texel_x != x || expected.texel_y != y ||
+                expected.sample_index != sample ||
+                !same_vector(expected.origin, origin) ||
+                !same_vector(expected.direction, direction) ||
+                maximum_distance != recipe.max_distance) {
+                ray_identity_valid = false;
+                return false;
+            }
+            return hit_flags[ray_index++] != 0U;
+        });
+    result.diagnostics = execution.diagnostics;
+    result.target_texels_visited = execution.target_texels_visited;
+    result.covered_texels = execution.covered_texels;
+    result.rays_cast = execution.rays_cast;
+    result.occluded_rays = execution.occluded_rays;
+    if (!ray_identity_valid || ray_index != expected_rays.size()) {
+        report_error(result, "d3d12_bent_normal_projection_identity_invalid",
+            "D3D12 bent-normal rays differ from the canonical source-bound ray sequence");
+        return result;
+    }
+    if (std::any_of(result.diagnostics.begin(), result.diagnostics.end(),
+            [](const BakeDiagnostic& diagnostic) { return diagnostic.is_error; })) {
+        return result;
+    }
+    if (auto valid = artifact.validate(); !valid) {
+        report_error(result, "d3d12_bent_normal_artifact_invalid", valid.error().message);
+        return result;
+    }
+    result.artifact = std::move(artifact);
+    return result;
+}
+
 AmbientOcclusionExecutionReport detail::compile_ambient_occlusion_from_projection(
     AmbientOcclusionProjectionWork work,
     std::span<const std::uint8_t> hit_flags) {
@@ -4873,6 +4991,101 @@ AmbientOcclusionExecutionReport compile_ambient_occlusion_cpu(
     return compile_ambient_occlusion_cpu_reference(recipe, source, target, nullptr);
 }
 
+core::Result<AmbientOcclusionTileScheduleResult>
+schedule_ambient_occlusion_tiles_cpu(
+    const AmbientOcclusionRecipe& base_recipe,
+    const geometry::EditableMesh& source,
+    const geometry::EditableMesh& target,
+    std::stop_token stop_token) {
+    using Output = core::Result<AmbientOcclusionTileScheduleResult>;
+    if (stop_token.stop_requested()) {
+        return Output::failure(bake_cancelled("ambient-occlusion"));
+    }
+    if (auto result = base_recipe.validate(); !result) {
+        return Output::failure(result.error());
+    }
+    if (auto result = validate_bake_sources(base_recipe.binding, source, target); !result) {
+        return Output::failure(result.error());
+    }
+    const auto tiles = enumerate_bake_tiles(target, base_recipe.binding.target_uv_set);
+    if (!tiles) return Output::failure(tiles.error());
+
+    const std::uint64_t tile_pixels =
+        static_cast<std::uint64_t>(base_recipe.binding.width) *
+        base_recipe.binding.height;
+    const std::uint64_t tile_bytes = tile_pixels * 4ULL;
+    const std::uint64_t tile_rays = tile_pixels * base_recipe.sample_count;
+    if (tile_bytes == 0U || tile_rays == 0U ||
+        tiles.value().size() > kMaxBakeTileScheduleRgbaBytes / tile_bytes ||
+        tiles.value().size() > kMaxBakeAmbientOcclusionRays / tile_rays) {
+        return Output::failure(unsupported(
+            "ambient-occlusion tile schedule exceeds its aggregate output or ray budget"));
+    }
+
+    AmbientOcclusionTileScheduleResult schedule;
+    schedule.entries.reserve(tiles.value().size());
+    for (const BakeTileCoordinate tile : tiles.value()) {
+        if (stop_token.stop_requested()) {
+            return Output::failure(bake_cancelled("ambient-occlusion"));
+        }
+        AmbientOcclusionRecipe tile_recipe = base_recipe;
+        tile_recipe.binding.tile_u = tile.tile_u;
+        tile_recipe.binding.tile_v = tile.tile_v;
+        tile_recipe.binding.identity = base_recipe.binding.identity + "/tile/" +
+            std::to_string(tile.tile_u) + "/" + std::to_string(tile.tile_v);
+        if (auto result = tile_recipe.validate(); !result) {
+            return Output::failure(result.error().with_context(
+                "UDIM tile " + std::to_string(tile.tile_u) + "," +
+                std::to_string(tile.tile_v)));
+        }
+
+        const auto compile_started = std::chrono::steady_clock::now();
+        AmbientOcclusionExecutionReport report = compile_ambient_occlusion_cpu(
+            tile_recipe, source, target);
+        const auto compile_finished = std::chrono::steady_clock::now();
+        if (stop_token.stop_requested()) {
+            return Output::failure(bake_cancelled("ambient-occlusion"));
+        }
+        if (!report.succeeded() || !report.artifact.has_value()) {
+            const auto diagnostic = std::find_if(
+                report.diagnostics.begin(), report.diagnostics.end(),
+                [](const BakeDiagnostic& value) { return value.is_error; });
+            const std::string detail = diagnostic == report.diagnostics.end()
+                ? "CPU ambient-occlusion tile compilation failed without a diagnostic"
+                : diagnostic->code + ": " + diagnostic->message;
+            return Output::failure(validation(detail).with_context(
+                "UDIM tile " + std::to_string(tile.tile_u) + "," +
+                std::to_string(tile.tile_v)));
+        }
+        const double compile_milliseconds = std::chrono::duration<double, std::milli>(
+            compile_finished - compile_started).count();
+        if (!std::isfinite(compile_milliseconds) || compile_milliseconds < 0.0 ||
+            report.covered_texels > std::numeric_limits<std::uint64_t>::max() -
+                schedule.covered_texels ||
+            report.rays_cast > std::numeric_limits<std::uint64_t>::max() -
+                schedule.rays_cast ||
+            report.occluded_rays > std::numeric_limits<std::uint64_t>::max() -
+                schedule.occluded_rays) {
+            return Output::failure(validation(
+                "ambient-occlusion tile schedule totals are invalid"));
+        }
+        schedule.covered_texels += report.covered_texels;
+        schedule.rays_cast += report.rays_cast;
+        schedule.occluded_rays += report.occluded_rays;
+        schedule.compile_milliseconds += compile_milliseconds;
+        schedule.entries.push_back(AmbientOcclusionTileScheduleEntry{
+            tile, std::move(*report.artifact), compile_milliseconds});
+    }
+    if (!std::isfinite(schedule.compile_milliseconds)) {
+        return Output::failure(validation(
+            "ambient-occlusion tile schedule compile duration is not finite"));
+    }
+    if (stop_token.stop_requested()) {
+        return Output::failure(bake_cancelled("ambient-occlusion"));
+    }
+    return Output::success(std::move(schedule));
+}
+
 BentNormalExecutionReport compile_bent_normal_cpu(
     const AmbientOcclusionRecipe& recipe,
     const geometry::EditableMesh& source,
@@ -4892,6 +5105,418 @@ BentNormalExecutionReport compile_bent_normal_cpu(
         report.artifact = std::move(artifact);
     }
     return report;
+}
+
+core::Result<BentNormalTileScheduleResult> schedule_bent_normal_tiles_cpu(
+    const AmbientOcclusionRecipe& base_recipe,
+    const geometry::EditableMesh& source,
+    const geometry::EditableMesh& target,
+    std::stop_token stop_token) {
+    using Output = core::Result<BentNormalTileScheduleResult>;
+    if (stop_token.stop_requested()) {
+        return Output::failure(bake_cancelled("bent-normal"));
+    }
+    if (auto result = base_recipe.validate(); !result) {
+        return Output::failure(result.error());
+    }
+    if (auto result = validate_bake_sources(base_recipe.binding, source, target); !result) {
+        return Output::failure(result.error());
+    }
+    const auto tiles = enumerate_bake_tiles(target, base_recipe.binding.target_uv_set);
+    if (!tiles) return Output::failure(tiles.error());
+
+    const std::uint64_t tile_pixels =
+        static_cast<std::uint64_t>(base_recipe.binding.width) *
+        base_recipe.binding.height;
+    const std::uint64_t tile_bytes = tile_pixels * 4ULL;
+    const std::uint64_t tile_rays = tile_pixels * base_recipe.sample_count;
+    if (tile_bytes == 0U || tile_rays == 0U ||
+        tiles.value().size() > kMaxBakeTileScheduleRgbaBytes / tile_bytes ||
+        tiles.value().size() > kMaxBakeAmbientOcclusionRays / tile_rays) {
+        return Output::failure(unsupported(
+            "bent-normal tile schedule exceeds its aggregate output or ray budget"));
+    }
+
+    BentNormalTileScheduleResult schedule;
+    schedule.entries.reserve(tiles.value().size());
+    for (const BakeTileCoordinate tile : tiles.value()) {
+        if (stop_token.stop_requested()) {
+            return Output::failure(bake_cancelled("bent-normal"));
+        }
+        AmbientOcclusionRecipe tile_recipe = base_recipe;
+        tile_recipe.binding.tile_u = tile.tile_u;
+        tile_recipe.binding.tile_v = tile.tile_v;
+        tile_recipe.binding.identity = base_recipe.binding.identity + "/tile/" +
+            std::to_string(tile.tile_u) + "/" + std::to_string(tile.tile_v);
+        if (auto result = tile_recipe.validate(); !result) {
+            return Output::failure(result.error().with_context(
+                "UDIM tile " + std::to_string(tile.tile_u) + "," +
+                std::to_string(tile.tile_v)));
+        }
+
+        const auto compile_started = std::chrono::steady_clock::now();
+        BentNormalExecutionReport report = compile_bent_normal_cpu(
+            tile_recipe, source, target);
+        const auto compile_finished = std::chrono::steady_clock::now();
+        if (stop_token.stop_requested()) {
+            return Output::failure(bake_cancelled("bent-normal"));
+        }
+        if (!report.succeeded() || !report.artifact.has_value()) {
+            const auto diagnostic = std::find_if(
+                report.diagnostics.begin(), report.diagnostics.end(),
+                [](const BakeDiagnostic& value) { return value.is_error; });
+            const std::string detail = diagnostic == report.diagnostics.end()
+                ? "CPU bent-normal tile compilation failed without a diagnostic"
+                : diagnostic->code + ": " + diagnostic->message;
+            return Output::failure(validation(detail).with_context(
+                "UDIM tile " + std::to_string(tile.tile_u) + "," +
+                std::to_string(tile.tile_v)));
+        }
+        const double compile_milliseconds = std::chrono::duration<double, std::milli>(
+            compile_finished - compile_started).count();
+        if (!std::isfinite(compile_milliseconds) || compile_milliseconds < 0.0 ||
+            report.covered_texels > std::numeric_limits<std::uint64_t>::max() -
+                schedule.covered_texels ||
+            report.rays_cast > std::numeric_limits<std::uint64_t>::max() -
+                schedule.rays_cast ||
+            report.occluded_rays > std::numeric_limits<std::uint64_t>::max() -
+                schedule.occluded_rays) {
+            return Output::failure(validation(
+                "bent-normal tile schedule totals are invalid"));
+        }
+        schedule.covered_texels += report.covered_texels;
+        schedule.rays_cast += report.rays_cast;
+        schedule.occluded_rays += report.occluded_rays;
+        schedule.compile_milliseconds += compile_milliseconds;
+        schedule.entries.push_back(BentNormalTileScheduleEntry{
+            tile, std::move(*report.artifact), compile_milliseconds});
+    }
+    if (!std::isfinite(schedule.compile_milliseconds)) {
+        return Output::failure(validation(
+            "bent-normal tile schedule compile duration is not finite"));
+    }
+    if (stop_token.stop_requested()) {
+        return Output::failure(bake_cancelled("bent-normal"));
+    }
+    return Output::success(std::move(schedule));
+}
+
+namespace {
+
+template <typename Artifact, typename Recipe, typename Report, typename Compile>
+core::Result<BakeMapTileScheduleResult<Artifact>> schedule_scalar_map_tiles_cpu(
+    const Recipe& base_recipe,
+    const geometry::EditableMesh& source,
+    const geometry::EditableMesh& target,
+    std::string_view map_name,
+    Compile&& compile,
+    std::stop_token stop_token) {
+    using Schedule = BakeMapTileScheduleResult<Artifact>;
+    using Output = core::Result<Schedule>;
+    if (stop_token.stop_requested()) {
+        return Output::failure(bake_cancelled(map_name));
+    }
+    if (auto result = base_recipe.validate(); !result) {
+        return Output::failure(result.error());
+    }
+    if (auto result = validate_bake_sources(base_recipe.binding, source, target); !result) {
+        return Output::failure(result.error());
+    }
+    const auto tiles = enumerate_bake_tiles(
+        target, base_recipe.binding.target_uv_set);
+    if (!tiles) return Output::failure(tiles.error());
+
+    const std::uint64_t tile_pixels =
+        static_cast<std::uint64_t>(base_recipe.binding.width) *
+        base_recipe.binding.height;
+    const std::uint64_t tile_bytes = tile_pixels * 4ULL;
+    if (tile_bytes == 0U || tiles.value().size() >
+            kMaxBakeTileScheduleRgbaBytes / tile_bytes) {
+        return Output::failure(unsupported(std::string(map_name) +
+            " tile schedule exceeds its aggregate RGBA8 output budget"));
+    }
+
+    Schedule schedule;
+    schedule.entries.reserve(tiles.value().size());
+    for (const BakeTileCoordinate tile : tiles.value()) {
+        if (stop_token.stop_requested()) {
+            return Output::failure(bake_cancelled(map_name));
+        }
+        Recipe tile_recipe = base_recipe;
+        tile_recipe.binding.tile_u = tile.tile_u;
+        tile_recipe.binding.tile_v = tile.tile_v;
+        tile_recipe.binding.identity = base_recipe.binding.identity + "/tile/" +
+            std::to_string(tile.tile_u) + "/" + std::to_string(tile.tile_v);
+        if (auto result = tile_recipe.validate(); !result) {
+            return Output::failure(result.error().with_context(
+                "UDIM tile " + std::to_string(tile.tile_u) + "," +
+                std::to_string(tile.tile_v)));
+        }
+
+        const auto compile_started = std::chrono::steady_clock::now();
+        Report report = compile(tile_recipe, source, target);
+        const auto compile_finished = std::chrono::steady_clock::now();
+        if (stop_token.stop_requested()) {
+            return Output::failure(bake_cancelled(map_name));
+        }
+        if (!report.succeeded() || !report.artifact.has_value()) {
+            const auto diagnostic = std::find_if(
+                report.diagnostics.begin(), report.diagnostics.end(),
+                [](const BakeDiagnostic& value) { return value.is_error; });
+            const std::string detail = diagnostic == report.diagnostics.end()
+                ? "CPU " + std::string(map_name) +
+                    " tile compilation failed without a diagnostic"
+                : diagnostic->code + ": " + diagnostic->message;
+            return Output::failure(validation(detail).with_context(
+                "UDIM tile " + std::to_string(tile.tile_u) + "," +
+                std::to_string(tile.tile_v)));
+        }
+        const double compile_milliseconds = std::chrono::duration<double, std::milli>(
+            compile_finished - compile_started).count();
+        if (!std::isfinite(compile_milliseconds) || compile_milliseconds < 0.0 ||
+            report.covered_texels > std::numeric_limits<std::uint64_t>::max() -
+                schedule.covered_texels) {
+            return Output::failure(validation(std::string(map_name) +
+                " tile schedule totals are invalid"));
+        }
+        schedule.covered_texels += report.covered_texels;
+        schedule.compile_milliseconds += compile_milliseconds;
+        schedule.entries.push_back(BakeMapTileScheduleEntry<Artifact>{
+            tile, std::move(*report.artifact), compile_milliseconds});
+    }
+    if (!std::isfinite(schedule.compile_milliseconds)) {
+        return Output::failure(validation(std::string(map_name) +
+            " tile schedule compile duration is not finite"));
+    }
+    if (stop_token.stop_requested()) {
+        return Output::failure(bake_cancelled(map_name));
+    }
+    return Output::success(std::move(schedule));
+}
+
+} // namespace
+
+core::Result<CurvatureTileScheduleResult> schedule_curvature_tiles_cpu(
+    const CurvatureRecipe& base_recipe,
+    const geometry::EditableMesh& source,
+    const geometry::EditableMesh& target,
+    std::stop_token stop_token) {
+    return schedule_scalar_map_tiles_cpu<CurvatureMapArtifact,
+        CurvatureRecipe, CurvatureExecutionReport>(
+            base_recipe, source, target, "curvature",
+            [](const CurvatureRecipe& recipe,
+                const geometry::EditableMesh& current_source,
+                const geometry::EditableMesh& current_target) {
+                return compile_curvature_cpu(recipe, current_source, current_target);
+            }, stop_token);
+}
+
+core::Result<ThicknessTileScheduleResult> schedule_thickness_tiles_cpu(
+    const ThicknessRecipe& base_recipe,
+    const geometry::EditableMesh& source,
+    const geometry::EditableMesh& target,
+    std::stop_token stop_token) {
+    return schedule_scalar_map_tiles_cpu<ThicknessMapArtifact,
+        ThicknessRecipe, ThicknessExecutionReport>(
+            base_recipe, source, target, "thickness",
+            [](const ThicknessRecipe& recipe,
+                const geometry::EditableMesh& current_source,
+                const geometry::EditableMesh& current_target) {
+                return compile_thickness_cpu(recipe, current_source, current_target);
+            }, stop_token);
+}
+
+core::Result<HeightDisplacementTileScheduleResult>
+schedule_height_displacement_tiles_cpu(
+    const HeightDisplacementRecipe& base_recipe,
+    const geometry::EditableMesh& source,
+    const geometry::EditableMesh& target,
+    std::stop_token stop_token) {
+    return schedule_scalar_map_tiles_cpu<HeightDisplacementMapArtifact,
+        HeightDisplacementRecipe, HeightDisplacementExecutionReport>(
+            base_recipe, source, target, "height-displacement",
+            [](const HeightDisplacementRecipe& recipe,
+                const geometry::EditableMesh& current_source,
+                const geometry::EditableMesh& current_target) {
+                return compile_height_displacement_cpu(
+                    recipe, current_source, current_target);
+            }, stop_token);
+}
+
+namespace {
+
+template <typename Artifact, typename Recipe, typename Report,
+    typename ValidateSource, typename Compile, typename EstimateBytes>
+core::Result<BakeMapTileScheduleResult<Artifact>> schedule_document_map_tiles_cpu(
+    const Recipe& base_recipe,
+    const project::ProjectDocument& document,
+    std::string_view map_name,
+    ValidateSource&& validate_source,
+    Compile&& compile,
+    EstimateBytes&& estimate_bytes,
+    std::stop_token stop_token) {
+    using Schedule = BakeMapTileScheduleResult<Artifact>;
+    using Output = core::Result<Schedule>;
+    if (stop_token.stop_requested()) {
+        return Output::failure(bake_cancelled(map_name));
+    }
+    if (auto result = base_recipe.validate(); !result) {
+        return Output::failure(result.error());
+    }
+    if (auto result = validate_source(base_recipe, document); !result) {
+        return Output::failure(result.error());
+    }
+    const auto target = document.meshes().find(base_recipe.target_mesh_asset);
+    if (target == document.meshes().end()) {
+        return Output::failure(validation(std::string(map_name) +
+            " target mesh asset is missing from the project"));
+    }
+    const auto tiles = enumerate_bake_tiles(target->second, base_recipe.target_uv_set);
+    if (!tiles) return Output::failure(tiles.error());
+
+    std::uint64_t total_output_bytes = 0U;
+    for (const BakeTileCoordinate tile : tiles.value()) {
+        Recipe tile_recipe = base_recipe;
+        tile_recipe.tile_u = tile.tile_u;
+        tile_recipe.tile_v = tile.tile_v;
+        tile_recipe.identity = base_recipe.identity + "/tile/" +
+            std::to_string(tile.tile_u) + "/" + std::to_string(tile.tile_v);
+        if (auto result = tile_recipe.validate(); !result) {
+            return Output::failure(result.error().with_context(
+                "UDIM tile " + std::to_string(tile.tile_u) + "," +
+                std::to_string(tile.tile_v)));
+        }
+        const auto byte_estimate = estimate_bytes(tile_recipe);
+        if (!byte_estimate) return Output::failure(byte_estimate.error());
+        if (byte_estimate.value() == 0U || byte_estimate.value() >
+                kMaxBakeTileScheduleRgbaBytes - total_output_bytes) {
+            return Output::failure(unsupported(std::string(map_name) +
+                " tile schedule exceeds its aggregate serialized output budget"));
+        }
+        total_output_bytes += byte_estimate.value();
+    }
+
+    Schedule schedule;
+    schedule.entries.reserve(tiles.value().size());
+    for (const BakeTileCoordinate tile : tiles.value()) {
+        if (stop_token.stop_requested()) {
+            return Output::failure(bake_cancelled(map_name));
+        }
+        Recipe tile_recipe = base_recipe;
+        tile_recipe.tile_u = tile.tile_u;
+        tile_recipe.tile_v = tile.tile_v;
+        tile_recipe.identity = base_recipe.identity + "/tile/" +
+            std::to_string(tile.tile_u) + "/" + std::to_string(tile.tile_v);
+        if (auto result = validate_source(tile_recipe, document); !result) {
+            return Output::failure(result.error().with_context(
+                "UDIM tile " + std::to_string(tile.tile_u) + "," +
+                std::to_string(tile.tile_v)));
+        }
+        const auto compile_started = std::chrono::steady_clock::now();
+        Report report = compile(tile_recipe, document);
+        const auto compile_finished = std::chrono::steady_clock::now();
+        if (stop_token.stop_requested()) {
+            return Output::failure(bake_cancelled(map_name));
+        }
+        if (!report.succeeded() || !report.artifact.has_value()) {
+            const auto diagnostic = std::find_if(
+                report.diagnostics.begin(), report.diagnostics.end(),
+                [](const BakeDiagnostic& value) { return value.is_error; });
+            const std::string detail = diagnostic == report.diagnostics.end()
+                ? "CPU " + std::string(map_name) +
+                    " tile compilation failed without a diagnostic"
+                : diagnostic->code + ": " + diagnostic->message;
+            return Output::failure(validation(detail).with_context(
+                "UDIM tile " + std::to_string(tile.tile_u) + "," +
+                std::to_string(tile.tile_v)));
+        }
+        const double compile_milliseconds = std::chrono::duration<double, std::milli>(
+            compile_finished - compile_started).count();
+        if (!std::isfinite(compile_milliseconds) || compile_milliseconds < 0.0 ||
+            report.covered_texels > std::numeric_limits<std::uint64_t>::max() -
+                schedule.covered_texels) {
+            return Output::failure(validation(std::string(map_name) +
+                " tile schedule totals are invalid"));
+        }
+        schedule.covered_texels += report.covered_texels;
+        schedule.compile_milliseconds += compile_milliseconds;
+        schedule.entries.push_back(BakeMapTileScheduleEntry<Artifact>{
+            tile, std::move(*report.artifact), compile_milliseconds});
+    }
+    if (!std::isfinite(schedule.compile_milliseconds)) {
+        return Output::failure(validation(std::string(map_name) +
+            " tile schedule compile duration is not finite"));
+    }
+    if (stop_token.stop_requested()) {
+        return Output::failure(bake_cancelled(map_name));
+    }
+    return Output::success(std::move(schedule));
+}
+
+template <typename Recipe>
+core::Result<std::uint64_t> estimate_document_map_tile_bytes(
+    const Recipe& recipe,
+    std::uint64_t texel_bytes) {
+    if (recipe.width == 0U || recipe.height == 0U || texel_bytes == 0U) {
+        return core::Result<std::uint64_t>::failure(invalid(
+            "document bake tile has invalid dimensions or texel size"));
+    }
+    const std::uint64_t texels = static_cast<std::uint64_t>(recipe.width) *
+        recipe.height;
+    const std::string serialized_recipe = recipe.serialize();
+    constexpr std::uint64_t kArtifactEnvelopeBytes = 4096U;
+    if (texels > (std::numeric_limits<std::uint64_t>::max() -
+            serialized_recipe.size() - kArtifactEnvelopeBytes) / texel_bytes) {
+        return core::Result<std::uint64_t>::failure(validation(
+            "document bake tile output size overflows its budget counter"));
+    }
+    return core::Result<std::uint64_t>::success(texels * texel_bytes +
+        serialized_recipe.size() + kArtifactEnvelopeBytes);
+}
+
+} // namespace
+
+core::Result<WorldPositionTileScheduleResult> schedule_world_position_tiles_cpu(
+    const WorldPositionRecipe& base_recipe,
+    const project::ProjectDocument& document,
+    std::stop_token stop_token) {
+    return schedule_document_map_tiles_cpu<WorldPositionMapArtifact,
+        WorldPositionRecipe, WorldPositionExecutionReport>(
+            base_recipe, document, "world-position",
+            [](const WorldPositionRecipe& recipe,
+                const project::ProjectDocument& current_document) {
+                return validate_world_position_source(recipe, current_document);
+            },
+            [](const WorldPositionRecipe& recipe,
+                const project::ProjectDocument& current_document) {
+                return compile_world_position_cpu(recipe, current_document);
+            },
+            [](const WorldPositionRecipe& recipe) {
+                return estimate_document_map_tile_bytes<WorldPositionRecipe>(
+                    recipe, 32U);
+            }, stop_token);
+}
+
+core::Result<MaterialSurfaceIdTileScheduleResult>
+schedule_material_surface_id_tiles_cpu(
+    const MaterialSurfaceIdRecipe& base_recipe,
+    const project::ProjectDocument& document,
+    std::stop_token stop_token) {
+    return schedule_document_map_tiles_cpu<MaterialSurfaceIdMapArtifact,
+        MaterialSurfaceIdRecipe, MaterialSurfaceIdExecutionReport>(
+            base_recipe, document, "material-surface-id",
+            [](const MaterialSurfaceIdRecipe& recipe,
+                const project::ProjectDocument& current_document) {
+                return validate_material_surface_id_source(recipe, current_document);
+            },
+            [](const MaterialSurfaceIdRecipe& recipe,
+                const project::ProjectDocument& current_document) {
+                return compile_material_surface_id_cpu(recipe, current_document);
+            },
+            [](const MaterialSurfaceIdRecipe& recipe) {
+                return estimate_document_map_tile_bytes<MaterialSurfaceIdRecipe>(
+                        recipe, kMaterialSurfaceIdTexelBytes);
+            }, stop_token);
 }
 
 } // namespace carto::production

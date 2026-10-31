@@ -53,6 +53,9 @@ FORBIDDEN_PREFIXES = (
     "docs/verification/persistent-polygons.md",
     # Public authoring schemas remain reviewable; implementation kernels and
     # algorithm-specific conformance suites are moat material.
+    "libs/production/src/sculpt_evaluation.cpp",
+    "libs/production/include/carto/production/sculpt_evaluation.hpp",
+    "tests/sculpt_evaluation_tests.cpp",
     "libs/production/src/cloth_solver.cpp",
     "libs/production/src/sculpt_stack.cpp",
     "libs/production/src/local_remesh.cpp",
@@ -197,7 +200,8 @@ PROTECTED_CONTENT_PATTERN = re.compile(
     r"PlantRepresentationKind|build_plant_growth)\b"
 )
 PROTECTED_PRODUCTION_CONTENT_PATTERN = re.compile(
-    r"\b(?:compile_cloth_cpu|compile_sculpt_stack|stage_local_remesh_patch|"
+    r"\b(?:compile_cloth_cpu|compile_sculpt_stack|evaluate_sculpt_stack|"
+    r"stage_local_remesh_patch|"
     r"compile_multires_surface_hierarchy|MultiresSurfaceHierarchy|MultiresSettings|"
     r"run_d3d12_sculpt_preview|carto_d3d12_sculpt_preview)\b",
     re.IGNORECASE,
@@ -212,14 +216,16 @@ HISTORY_CONTENT_MARKER_PATTERN = re.compile(
     r"[A-Z]:[\\/](?:Users[\\/]|HiddenCanopy[\\/])|"
     r"/home/[A-Za-z0-9._-]+/|PlantGrowthRecipe|PlantSpeciesSource|"
     r"PlantGrowthProduct|PlantBranch|PlantRepresentationKind|build_plant_growth|"
-    r"compile_cloth_cpu|compile_sculpt_stack|stage_local_remesh_patch|"
+    r"compile_cloth_cpu|compile_sculpt_stack|evaluate_sculpt_stack|"
+    r"stage_local_remesh_patch|"
+    r"carto[/\\]production[/\\](?:cloth_solver|sculpt_evaluation|local_remesh|multires)\.hpp|"
     r"compile_multires_surface_hierarchy|MultiresSurfaceHierarchy|MultiresSettings|"
     r"run_d3d12_sculpt_preview|carto_d3d12_sculpt_preview|carto_multires_tests|"
     r"carto[/\\]representation|carto::representation|carto_representation|"
     r"cartographer_representation(?:_continuity)?_tests|"
     r"carto[/\\]sim[/\\]cloth\.hpp|src[/\\]cloth\.cpp|"
-    r"src[/\\](?:cloth_solver|sculpt_stack|local_remesh)\.cpp|"
-    r"cartographer_(?:cloth_solver|sculpt_stack|local_remesh)_tests|"
+    r"src[/\\](?:cloth_solver|sculpt_stack|sculpt_evaluation|local_remesh)\.cpp|"
+    r"cartographer_(?:cloth_solver|sculpt_stack|sculpt_evaluation|local_remesh)_tests|"
     r"CARTO_BUILD_PRIVATE_INTEGRATIONS|CARTO_PRIVATE_SOURCE_ROOT|"
     r"CARTO_BUILD_GMIB_(?:GRAPHICS|GAME)|CARTO_GMIB_ROOT|"
     r"private_extensions\.cmake|"
@@ -241,9 +247,9 @@ PRIVATE_BUILD_REFERENCE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 PRIVATE_PRODUCTION_BUILD_REFERENCE_PATTERN = re.compile(
-    r"(?:src[/\\](?:cloth_solver|sculpt_stack|local_remesh|multires)\.cpp|"
-    r"carto[/\\]production[/\\](?:cloth_solver|local_remesh|multires)\.hpp|"
-    r"cartographer_(?:cloth_solver|sculpt_stack|local_remesh|multires)_tests|"
+    r"(?:src[/\\](?:cloth_solver|sculpt_stack|sculpt_evaluation|local_remesh|multires)\.cpp|"
+    r"carto[/\\]production[/\\](?:cloth_solver|sculpt_evaluation|local_remesh|multires)\.hpp|"
+    r"cartographer_(?:cloth_solver|sculpt_stack|sculpt_evaluation|local_remesh|multires)_tests|"
     r"carto_d3d12_sculpt_preview|run_d3d12_sculpt_preview|"
     r"d3d12[/\\]sculpt_preview\.hpp|d3d12[/\\]src[/\\]sculpt_preview\.cpp)",
     re.IGNORECASE,
@@ -268,6 +274,7 @@ PRIVATE_INTEGRATION_CMAKE_REFERENCE_PATTERN = re.compile(
 PRIVATE_BUILD_FILE_SUFFIXES = frozenset({
     ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".ixx",
     ".cmake", ".bzl", ".bat", ".cmd", ".ps1", ".sh", ".json", ".xml",
+    ".sln", ".slnx",
     ".yaml", ".yml", ".toml",
 })
 PRIVATE_BUILD_FILE_NAMES = frozenset({
@@ -850,7 +857,11 @@ def check_ignore_policy(root: Path, findings: list[str]) -> None:
         # Evaluate Git's actual ignore semantics against the policy under review,
         # independent of the repository's worktree copy or local Git excludes.
         with tempfile.TemporaryDirectory(
-            prefix="cartographer-ignore-audit-"
+            prefix="cartographer-ignore-audit-",
+            # Sandboxed hosts may deny writes to their configured system temp
+            # directory. Keep this disposable probe inside the writable audit
+            # workspace; TemporaryDirectory removes it before the audit exits.
+            dir=root,
         ) as temporary:
             policy_root = Path(temporary)
             (policy_root / ".gitignore").write_bytes(ignore_text.encode("utf-8"))

@@ -3,6 +3,9 @@
 #include <carto/project/project.hpp>
 #include <carto/project/transaction.hpp>
 
+#include "../apps/desktop/reference_image_projection.hpp"
+
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -11,6 +14,7 @@
 #include <iostream>
 #include <limits>
 #include <locale>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <span>
@@ -218,6 +222,7 @@ void reference_image_planes_are_bounded_calibrated_and_fail_closed() {
     top.up = {0.0, 0.0, 1.0};
     auto camera_pinned = reference_plane_source(
         "motel.camera", project::ReferencePlaneView::camera_pinned, {}, camera.object);
+    camera_pinned.camera_local_placement = true;
     auto perspective = reference_plane_source(
         "motel.perspective", project::ReferencePlaneView::perspective);
     require(catalog.insert_reference_plane(front) &&
@@ -248,19 +253,114 @@ void reference_image_planes_are_bounded_calibrated_and_fail_closed() {
         "X/Z plan projection preserves top-plane world placement and image orientation");
     require(!project::reference_image_plane_xz_corners(front),
         "front references are not flattened into the X/Z plan work surface");
+    const auto top_viewport_corners = desktop::reference_image_viewport_corners(top, false);
+    const auto front_perspective_corners =
+        desktop::reference_image_viewport_corners(front, true);
+    const auto side_perspective_corners =
+        desktop::reference_image_viewport_corners(side, true);
+    const auto perspective_viewport_corners =
+        desktop::reference_image_viewport_corners(perspective, true);
+    const double quarter_turn = std::acos(-1.0) * 0.25;
+    const core::Transform camera_world_transform{
+        {12.0, -3.0, 8.0},
+        {0.0, std::sin(quarter_turn), 0.0, std::cos(quarter_turn)},
+        {2.0, 1.0, 1.0}};
+    const auto camera_local_corners =
+        project::reference_image_plane_corners(camera_pinned);
+    const auto camera_pinned_viewport_corners =
+        desktop::reference_image_camera_pinned_corners(
+            camera_pinned, camera, camera_world_transform);
+    const auto camera_point_to_world = [&](core::Vec3d point) {
+        return camera_world_transform.translation +
+            camera_world_transform.rotation.rotate(point);
+    };
+    const auto nearly_same_point = [](core::Vec3d first, core::Vec3d second) {
+        return (first - second).length() < 1.0e-9;
+    };
+    require(top_viewport_corners && front_perspective_corners &&
+            side_perspective_corners && perspective_viewport_corners &&
+            top_viewport_corners.value().upper_left.x == top_corners.value().upper_left.x &&
+            top_viewport_corners.value().upper_left.y == top_corners.value().upper_left.y &&
+            top_viewport_corners.value().upper_left.z == top_corners.value().upper_left.z,
+        "plan top and perspective front/side/free planes resolve authored world corners");
+    require(camera_local_corners && camera_pinned_viewport_corners &&
+            nearly_same_point(camera_pinned_viewport_corners.value().upper_left,
+                camera_point_to_world(camera_local_corners.value().upper_left)) &&
+            nearly_same_point(camera_pinned_viewport_corners.value().lower_right,
+                camera_point_to_world(camera_local_corners.value().lower_right)),
+        "camera-pinned geometry follows its exact camera world translation and rotation");
+    auto unrelated_camera = camera;
+    unrelated_camera.object = scene::ObjectId{41U};
+    auto invalid_camera_transform = camera_world_transform;
+    invalid_camera_transform.translation.x =
+        std::numeric_limits<double>::quiet_NaN();
+    auto legacy_camera_pinned = camera_pinned;
+    legacy_camera_pinned.camera_local_placement = false;
+    require(!desktop::reference_image_camera_pinned_corners(
+                camera_pinned, unrelated_camera, camera_world_transform) &&
+            !desktop::reference_image_camera_pinned_corners(
+                camera_pinned, camera, invalid_camera_transform) &&
+            !desktop::reference_image_camera_pinned_corners(
+                legacy_camera_pinned, camera, camera_world_transform),
+        "camera-pinned projection rejects mismatched, stale, and legacy world-space bindings");
+    require(!desktop::reference_image_viewport_corners(front, false) &&
+            !desktop::reference_image_viewport_corners(camera_pinned, true),
+        "front planes stay out of plan and camera-pinned planes require a resolved camera");
 
     auto out_of_bounds = top;
     out_of_bounds.origin.x = 1.0e9;
     require(!project::reference_image_plane_corners(out_of_bounds),
         "reference plane geometry rejects extents outside project placement bounds");
+    auto misplaced_camera_local_flag = perspective;
+    misplaced_camera_local_flag.camera_local_placement = true;
+    require(!misplaced_camera_local_flag.validate(),
+        "camera-local placement cannot be marked on an unpinned world-space plane");
 
     const auto encoded = catalog.serialize();
     const auto reopened = project::PresentationCatalog::deserialize(encoded);
     require(reopened && reopened.value().serialize() == encoded &&
             reopened.value().reference_planes().size() == 5U &&
             reopened.value().reference_planes().at("motel.front").width_meters == 20.0 &&
-            reopened.value().reference_planes().at("motel.camera").pinned_camera == camera.object,
+            reopened.value().reference_planes().at("motel.camera").pinned_camera == camera.object &&
+            reopened.value().reference_planes().at("motel.camera").camera_local_placement,
         "source digest, calibration, placement, visibility, lock, and view binding round-trip");
+
+    auto legacy_v2 = encoded;
+    const std::string schema_three = "CARTOGRAPHER_PRESENTATION_CATALOG 3\n";
+    const std::string schema_two = "CARTOGRAPHER_PRESENTATION_CATALOG 2\n";
+    require(legacy_v2.starts_with(schema_three),
+        "current presentation records use schema v3");
+    legacy_v2.replace(0U, schema_three.size(), schema_two);
+    std::size_t record_start = legacy_v2.find("REFERENCE_PLANE ");
+    while (record_start != std::string::npos) {
+        const auto record_end = legacy_v2.find('\n', record_start);
+        require(record_end != std::string::npos,
+            "serialized reference-plane record is line terminated");
+        std::istringstream fields_input(legacy_v2.substr(record_start,
+            record_end - record_start));
+        std::vector<std::string> fields;
+        for (std::string field; fields_input >> field;) fields.push_back(std::move(field));
+        require(fields.size() == 32U,
+            "schema-v3 reference plane includes the camera-local placement field");
+        fields.erase(fields.begin() + 19);
+        std::string legacy_record;
+        for (const auto& field : fields) {
+            if (!legacy_record.empty()) legacy_record.push_back(' ');
+            legacy_record += field;
+        }
+        legacy_v2.replace(record_start, record_end - record_start, legacy_record);
+        record_start = legacy_v2.find("REFERENCE_PLANE ",
+            record_start + legacy_record.size() + 1U);
+    }
+    const auto migrated_v2 = project::PresentationCatalog::deserialize(legacy_v2);
+    require(migrated_v2 &&
+            !migrated_v2.value().reference_planes().at("motel.camera").camera_local_placement &&
+            migrated_v2.value().reference_planes().at("motel.camera").origin.x ==
+                camera_pinned.origin.x &&
+            migrated_v2.value().reference_planes().at("motel.camera").normal.z ==
+                camera_pinned.normal.z &&
+            migrated_v2.value().serialize().starts_with(schema_three),
+        "schema-v2 camera pins retain legacy world placement when upgraded to schema v3");
     const auto first_digest = catalog.canonical_digest();
     const auto reopened_digest = reopened.value().canonical_digest();
     require(first_digest && reopened_digest && first_digest.value() == reopened_digest.value(),
@@ -350,6 +450,49 @@ void reference_image_planes_are_bounded_calibrated_and_fail_closed() {
                 front, wrong_kind_registry, front.source_digest) ==
                 project::ReferenceImageSourceState::stale,
         "a non-image source cannot satisfy a reference-plane binding");
+}
+
+void reference_image_near_plane_clipping_preserves_uvs() {
+    const project::ReferenceImagePlaneCorners corners{
+        {0.0, 1.0, 0.0}, {1.0, 1.0, 0.0},
+        {1.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
+    const auto partial = desktop::clip_reference_image_plane_to_near(
+        corners, {-2.0, -2.0, 1.0, -2.0}, -0.5);
+    require(partial && partial.value().size() == 5U,
+        "a quad crossing the near plane is clipped to a bounded polygon");
+    bool found_right_intersection = false;
+    bool found_bottom_intersection = false;
+    for (const auto& vertex : partial.value()) {
+        require(vertex.world_position.finite() && vertex.uv.finite() &&
+                vertex.camera_depth <= -0.5 + 1.0e-12,
+            "near-plane clipping retains finite in-front positions and UVs");
+        found_right_intersection = found_right_intersection ||
+            (std::abs(vertex.uv.x - 1.0) < 1.0e-12 &&
+             std::abs(vertex.uv.y - 0.5) < 1.0e-12 &&
+             std::abs(vertex.world_position.y - 0.5) < 1.0e-12);
+        found_bottom_intersection = found_bottom_intersection ||
+            (std::abs(vertex.uv.x - 0.5) < 1.0e-12 &&
+             std::abs(vertex.uv.y - 1.0) < 1.0e-12 &&
+             std::abs(vertex.world_position.x - 0.5) < 1.0e-12);
+    }
+    require(found_right_intersection && found_bottom_intersection,
+        "near-plane intersections interpolate world coordinates and image UVs together");
+
+    const auto full_quad = desktop::clip_reference_image_plane_to_near(
+        corners, {-2.0, -2.0, -2.0, -2.0}, -0.5);
+    const auto fully_clipped = desktop::clip_reference_image_plane_to_near(
+        corners, {1.0, 1.0, 1.0, 1.0}, -0.5);
+    require(full_quad && full_quad.value().size() == 4U &&
+            fully_clipped && fully_clipped.value().empty(),
+        "fully visible and fully clipped planes have explicit outcomes");
+
+    auto invalid_depths = std::array<double, 4U>{-2.0, -2.0, -2.0, -2.0};
+    invalid_depths[2U] = std::numeric_limits<double>::quiet_NaN();
+    require(!desktop::clip_reference_image_plane_to_near(
+                corners, invalid_depths, -0.5) &&
+            !desktop::clip_reference_image_plane_to_near(
+                corners, {-2.0, -2.0, -2.0, -2.0}, 0.0),
+        "non-finite camera data and a behind-camera clip plane are refused");
 }
 
 void reference_image_source_reads_only_verified_project_blobs() {
@@ -524,7 +667,7 @@ void schema_v17_migrates_and_current_schema_requires_spatial_field_table() {
     const auto migrated_catalog = project::PresentationCatalog::deserialize(v1_catalog);
     require(migrated_catalog && migrated_catalog.value().reference_planes().empty() &&
             migrated_catalog.value().serialize().find(
-                "CARTOGRAPHER_PRESENTATION_CATALOG 2\n") == 0U,
+                "CARTOGRAPHER_PRESENTATION_CATALOG 3\n") == 0U,
         "schema-v1 presentation catalogs migrate with an explicit empty plane table");
     const std::string v2_without_planes =
         "CARTOGRAPHER_PRESENTATION_CATALOG 2\nCAMERAS 0\nLIGHTS 0\nEND\n";
@@ -619,6 +762,7 @@ void schema_v17_migrates_and_current_schema_requires_spatial_field_table() {
 int main() {
     typed_records_round_trip_and_reject_invalid_intent();
     reference_image_planes_are_bounded_calibrated_and_fail_closed();
+    reference_image_near_plane_clipping_preserves_uvs();
     reference_image_source_reads_only_verified_project_blobs();
     project_transaction_binds_presentation_to_scene_and_journal();
     schema_v17_migrates_and_current_schema_requires_spatial_field_table();

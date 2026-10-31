@@ -4,11 +4,16 @@ add_library(carto_assets STATIC
     src/texture.cpp
     src/texture_atlas.cpp
     src/texture_channel_pack.cpp
+    src/texture_image_decoder.cpp
     src/texture_mip.cpp
     src/texture_paint.cpp
     src/texture_source.cpp
     src/source_registry.cpp
 )
+
+if(WIN32)
+    target_link_libraries(carto_assets PRIVATE windowscodecs ole32)
+endif()
 
 target_include_directories(carto_assets
     PUBLIC

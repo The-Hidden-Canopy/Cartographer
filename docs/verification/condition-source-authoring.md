@@ -1,5 +1,11 @@
 # CONDITION source-authoring boundary
 
+CONDITION authoring schema 10 now records independent editable geometry
+snapshots for new prefab placements. Source edits and local edits remain
+separate; legacy unisolated instances stay readable but cannot be published.
+See [prefab snapshot bindings and compatibility](condition-prefab-snapshots.md)
+for exact preservation, bounds, and remaining rebase/socket acceptance.
+
 This verification note records the public Cartographer slice derived from the CONDITION source-authoring gap review.
 
 ## Public capability

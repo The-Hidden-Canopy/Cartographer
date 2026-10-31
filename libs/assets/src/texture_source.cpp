@@ -19,6 +19,7 @@ struct HeaderInfo {
     std::uint32_t mip_levels = 1U;
     bool compressed = false;
     bool high_dynamic_range = false;
+    bool has_color_encoding_metadata = false;
 };
 
 core::Diagnostic invalid(std::string message) {
@@ -85,7 +86,10 @@ core::Result<HeaderInfo> inspect_png(std::span<const std::uint8_t> bytes) {
     info.format = TextureSourceFormat::png;
     bool first = true;
     bool saw_idat = false;
+    bool idat_ended = false;
+    bool saw_plte = false;
     bool saw_iend = false;
+    std::uint8_t color_type = 0U;
     std::size_t cursor = signature.size();
     while (cursor < bytes.size()) {
         if (bytes.size() - cursor < 12U) {
@@ -100,10 +104,38 @@ core::Result<HeaderInfo> inspect_png(std::span<const std::uint8_t> bytes) {
         const std::size_t crc_offset = data_offset + length;
         const std::string_view type{
             reinterpret_cast<const char*>(bytes.data() + type_offset), 4U};
+        for (std::size_t index = 0U; index < 4U; ++index) {
+            const std::uint8_t value = bytes[type_offset + index];
+            const bool ascii_letter = (value >= 'A' && value <= 'Z') ||
+                (value >= 'a' && value <= 'z');
+            if (!ascii_letter) {
+                return core::Result<HeaderInfo>::failure(validation(
+                    "PNG chunk type contains a non-letter byte"));
+            }
+        }
+        if (bytes[type_offset + 2U] >= 'a' && bytes[type_offset + 2U] <= 'z') {
+            return core::Result<HeaderInfo>::failure(validation(
+                "PNG chunk type uses the reserved lowercase bit"));
+        }
+        const bool critical = bytes[type_offset] >= 'A' && bytes[type_offset] <= 'Z';
+        if (critical && type != "IHDR" && type != "PLTE" &&
+            type != "IDAT" && type != "IEND") {
+            return core::Result<HeaderInfo>::failure(validation(
+                "PNG contains an unsupported critical chunk"));
+        }
         const std::uint32_t expected_crc = read_be32(bytes, crc_offset);
         const std::uint32_t actual_crc = png_crc32(bytes.subspan(type_offset, 4U + length));
         if (expected_crc != actual_crc) {
             return core::Result<HeaderInfo>::failure(validation("PNG chunk CRC mismatch"));
+        }
+        if (type == "acTL" || type == "fcTL" || type == "fdAT") {
+            return core::Result<HeaderInfo>::failure(validation(
+                "animated PNG chunks are unsupported by the single-frame texture source contract"));
+        }
+        if (type == "cHRM" || type == "gAMA" || type == "iCCP" ||
+            type == "sBIT" || type == "sRGB" || type == "cICP" ||
+            type == "mDCv" || type == "cLLi") {
+            info.has_color_encoding_metadata = true;
         }
         if (first) {
             if (type != "IHDR" || length != 13U) {
@@ -113,7 +145,7 @@ core::Result<HeaderInfo> inspect_png(std::span<const std::uint8_t> bytes) {
             info.width = read_be32(bytes, data_offset);
             info.height = read_be32(bytes, data_offset + 4U);
             info.bit_depth = bytes[data_offset + 8U];
-            const std::uint8_t color_type = bytes[data_offset + 9U];
+            color_type = bytes[data_offset + 9U];
             switch (color_type) {
             case 0U: info.channels = 1U; break;
             case 2U: info.channels = 3U; break;
@@ -142,11 +174,28 @@ core::Result<HeaderInfo> inspect_png(std::span<const std::uint8_t> bytes) {
         } else if (type == "IHDR") {
             return core::Result<HeaderInfo>::failure(validation("PNG contains duplicate IHDR"));
         }
-        if (type == "IDAT") saw_idat = true;
-        if (type == "IEND") {
-            if (length != 0U || !saw_idat) {
+        if (saw_idat && type != "IDAT") idat_ended = true;
+        if (type == "PLTE") {
+            if (saw_plte || saw_idat || color_type == 0U || color_type == 4U ||
+                length == 0U || length > 768U || length % 3U != 0U ||
+                (color_type == 3U && length / 3U > (1U << info.bit_depth))) {
                 return core::Result<HeaderInfo>::failure(validation(
-                    "PNG IEND requires prior image data and an empty payload"));
+                    "PNG palette chunk is duplicate, misplaced, or invalid"));
+            }
+            saw_plte = true;
+        }
+        if (type == "IDAT") {
+            if (idat_ended || (color_type == 3U && !saw_plte)) {
+                return core::Result<HeaderInfo>::failure(validation(
+                    "PNG image-data chunks are noncontiguous or lack a required palette"));
+            }
+            saw_idat = true;
+        }
+        if (type == "IEND") {
+            if (length != 0U || !saw_idat || (color_type == 3U && !saw_plte)) {
+                return core::Result<HeaderInfo>::failure(validation(
+                    "PNG IEND requires prior image data, a required palette, "
+                    "and an empty payload"));
             }
             saw_iend = true;
             cursor = crc_offset + 4U;
@@ -173,6 +222,100 @@ bool jpeg_sof_marker(std::uint8_t marker) {
     }
 }
 
+core::Result<bool> inspect_exif_color_metadata(
+    std::span<const std::uint8_t> app1_payload) {
+    constexpr std::array<std::uint8_t, 6U> exif_signature{
+        'E', 'x', 'i', 'f', 0U, 0U};
+    if (app1_payload.size() < exif_signature.size() ||
+        !std::equal(exif_signature.begin(), exif_signature.end(), app1_payload.begin())) {
+        return core::Result<bool>::success(false);
+    }
+
+    const auto tiff = app1_payload.subspan(exif_signature.size());
+    if (tiff.size() < 8U) {
+        return core::Result<bool>::failure(validation(
+            "JPEG EXIF TIFF header is truncated"));
+    }
+    const bool little_endian = tiff[0U] == 'I' && tiff[1U] == 'I';
+    const bool big_endian = tiff[0U] == 'M' && tiff[1U] == 'M';
+    if (!little_endian && !big_endian) {
+        return core::Result<bool>::failure(validation(
+            "JPEG EXIF TIFF byte order is invalid"));
+    }
+    const auto read_tiff_u16 = [tiff, little_endian](std::size_t offset)
+        -> std::uint16_t {
+        if (little_endian) {
+            return static_cast<std::uint16_t>(tiff[offset]) |
+                static_cast<std::uint16_t>(
+                    static_cast<std::uint16_t>(tiff[offset + 1U]) << 8U);
+        }
+        return static_cast<std::uint16_t>(
+            (static_cast<std::uint16_t>(tiff[offset]) << 8U) | tiff[offset + 1U]);
+    };
+    const auto read_tiff_u32 = [tiff, little_endian](std::size_t offset) {
+        std::uint32_t value = 0U;
+        for (unsigned index = 0U; index < 4U; ++index) {
+            const unsigned shift = little_endian ? index * 8U : (3U - index) * 8U;
+            value |= static_cast<std::uint32_t>(tiff[offset + index]) << shift;
+        }
+        return value;
+    };
+    if (read_tiff_u16(2U) != 42U) {
+        return core::Result<bool>::failure(validation(
+            "JPEG EXIF TIFF magic is unsupported"));
+    }
+
+    struct DirectoryInfo {
+        bool has_color_metadata = false;
+        std::optional<std::size_t> exif_ifd_offset;
+    };
+    const auto inspect_ifd = [&](std::size_t offset, bool exif_ifd)
+        -> core::Result<DirectoryInfo> {
+        if (offset < 8U || offset > tiff.size() || tiff.size() - offset < 2U) {
+            return core::Result<DirectoryInfo>::failure(validation(
+                "JPEG EXIF IFD offset exceeds its APP1 segment"));
+        }
+        const std::uint16_t entry_count = read_tiff_u16(offset);
+        const std::size_t entries_offset = offset + 2U;
+        if (tiff.size() - entries_offset < 4U ||
+            entry_count > (tiff.size() - entries_offset - 4U) / 12U) {
+            return core::Result<DirectoryInfo>::failure(validation(
+                "JPEG EXIF IFD entries exceed their APP1 segment"));
+        }
+
+        DirectoryInfo result;
+        for (std::size_t index = 0U; index < entry_count; ++index) {
+            const std::size_t entry_offset = entries_offset + index * 12U;
+            const std::uint16_t tag = read_tiff_u16(entry_offset);
+            const std::uint16_t type = read_tiff_u16(entry_offset + 2U);
+            const std::uint32_t count = read_tiff_u32(entry_offset + 4U);
+            if (tag == 0x012dU || tag == 0x013eU || tag == 0x013fU ||
+                tag == 0x0211U || tag == 0x0214U ||
+                (exif_ifd && (tag == 0xa001U || tag == 0xa500U))) {
+                result.has_color_metadata = true;
+            }
+            if (!exif_ifd && tag == 0x8769U) {
+                if (type != 4U || count != 1U || result.exif_ifd_offset.has_value()) {
+                    return core::Result<DirectoryInfo>::failure(validation(
+                        "JPEG EXIF IFD pointer is malformed or duplicated"));
+                }
+                result.exif_ifd_offset = read_tiff_u32(entry_offset + 8U);
+            }
+        }
+        return core::Result<DirectoryInfo>::success(std::move(result));
+    };
+
+    const auto ifd0 = inspect_ifd(read_tiff_u32(4U), false);
+    if (!ifd0) return core::Result<bool>::failure(ifd0.error());
+    if (!ifd0.value().exif_ifd_offset.has_value()) {
+        return core::Result<bool>::success(ifd0.value().has_color_metadata);
+    }
+    const auto exif_ifd = inspect_ifd(*ifd0.value().exif_ifd_offset, true);
+    if (!exif_ifd) return core::Result<bool>::failure(exif_ifd.error());
+    return core::Result<bool>::success(
+        ifd0.value().has_color_metadata || exif_ifd.value().has_color_metadata);
+}
+
 core::Result<HeaderInfo> inspect_jpeg(std::span<const std::uint8_t> bytes) {
     if (bytes.size() < 6U || bytes[0U] != 0xffU || bytes[1U] != 0xd8U ||
         bytes[bytes.size() - 2U] != 0xffU || bytes.back() != 0xd9U) {
@@ -181,7 +324,12 @@ core::Result<HeaderInfo> inspect_jpeg(std::span<const std::uint8_t> bytes) {
     }
     HeaderInfo info;
     info.format = TextureSourceFormat::jpeg;
+    constexpr std::array<std::uint8_t, 12U> icc_profile_signature{
+        'I', 'C', 'C', '_', 'P', 'R', 'O', 'F', 'I', 'L', 'E', 0U};
     bool found_sof = false;
+    bool found_sos = false;
+    std::array<bool, 256U> frame_components{};
+    std::size_t first_scan_data_offset = 0U;
     std::size_t cursor = 2U;
     while (cursor + 1U < bytes.size() - 2U) {
         if (bytes[cursor] != 0xffU) {
@@ -191,10 +339,42 @@ core::Result<HeaderInfo> inspect_jpeg(std::span<const std::uint8_t> bytes) {
         while (cursor < bytes.size() && bytes[cursor] == 0xffU) ++cursor;
         if (cursor >= bytes.size()) break;
         const std::uint8_t marker = bytes[cursor++];
-        if (marker == 0xdaU) break;
-        if (marker == 0xd8U || marker == 0xd9U || (marker >= 0xd0U && marker <= 0xd7U) ||
-            marker == 0x01U) {
-            continue;
+        if (marker == 0xdaU) {
+            if (!found_sof || cursor + 2U > bytes.size() - 2U) {
+                return core::Result<HeaderInfo>::failure(validation(
+                    "JPEG scan begins without a complete frame and scan header"));
+            }
+            const std::uint16_t length = static_cast<std::uint16_t>(bytes[cursor] << 8U) |
+                bytes[cursor + 1U];
+            if (length < 8U || length > bytes.size() - 2U - cursor) {
+                return core::Result<HeaderInfo>::failure(validation(
+                    "JPEG scan header exceeds source bytes"));
+            }
+            const std::uint8_t scan_components = bytes[cursor + 2U];
+            const std::uint32_t expected_length = 6U +
+                static_cast<std::uint32_t>(scan_components) * 2U;
+            const std::size_t scan_data_offset = cursor + length;
+            if (scan_components == 0U || scan_components > info.channels ||
+                length != expected_length || scan_data_offset >= bytes.size() - 2U) {
+                return core::Result<HeaderInfo>::failure(validation(
+                    "JPEG scan header is malformed or has no scan data"));
+            }
+            std::array<bool, 256U> selected{};
+            for (std::size_t index = 0U; index < scan_components; ++index) {
+                const auto id = bytes[cursor + 3U + index * 2U];
+                if (!frame_components[id] || selected[id]) {
+                    return core::Result<HeaderInfo>::failure(validation(
+                        "JPEG scan selects an unknown or duplicate frame component"));
+                }
+                selected[id] = true;
+            }
+            first_scan_data_offset = scan_data_offset;
+            found_sos = true;
+            break;
+        }
+        if (marker < 0xc0U || marker == 0xd8U || marker == 0xd9U ||
+            (marker >= 0xd0U && marker <= 0xd7U)) {
+            return core::Result<HeaderInfo>::failure(validation("JPEG marker is misplaced"));
         }
         if (cursor + 2U > bytes.size()) {
             return core::Result<HeaderInfo>::failure(invalid("JPEG segment length is truncated"));
@@ -205,10 +385,24 @@ core::Result<HeaderInfo> inspect_jpeg(std::span<const std::uint8_t> bytes) {
             return core::Result<HeaderInfo>::failure(validation(
                 "JPEG segment exceeds source bytes"));
         }
+        if (marker == 0xe2U && length >= icc_profile_signature.size() + 2U &&
+            std::equal(icc_profile_signature.begin(), icc_profile_signature.end(),
+                bytes.begin() + static_cast<std::ptrdiff_t>(cursor + 2U))) {
+            info.has_color_encoding_metadata = true;
+        }
+        if (marker == 0xe1U) {
+            const auto exif_metadata = inspect_exif_color_metadata(
+                bytes.subspan(cursor + 2U, length - 2U));
+            if (!exif_metadata) {
+                return core::Result<HeaderInfo>::failure(exif_metadata.error());
+            }
+            info.has_color_encoding_metadata = info.has_color_encoding_metadata ||
+                exif_metadata.value();
+        }
         if (jpeg_sof_marker(marker)) {
-            if (length < 8U) {
+            if (found_sof || length < 8U) {
                 return core::Result<HeaderInfo>::failure(validation(
-                    "JPEG SOF segment is too short"));
+                    "JPEG SOF segment is duplicate or too short"));
             }
             info.bit_depth = bytes[cursor + 2U];
             info.height = static_cast<std::uint32_t>(bytes[cursor + 3U] << 8U) |
@@ -222,15 +416,117 @@ core::Result<HeaderInfo> inspect_jpeg(std::span<const std::uint8_t> bytes) {
                 return core::Result<HeaderInfo>::failure(validation(
                     "JPEG SOF channel or precision contract is unsupported"));
             }
+            for (std::size_t index = 0U; index < info.channels; ++index) {
+                const auto id = bytes[cursor + 8U + index * 3U];
+                if (frame_components[id]) {
+                    return core::Result<HeaderInfo>::failure(validation(
+                        "JPEG frame component is duplicated"));
+                }
+                frame_components[id] = true;
+            }
             found_sof = true;
         }
         cursor += length;
     }
-    if (!found_sof) {
+    if (!found_sof || !found_sos) {
         return core::Result<HeaderInfo>::failure(validation(
-            "JPEG source has no supported start-of-frame segment"));
+            "JPEG source has no supported frame and scan header"));
     }
-    return core::Result<HeaderInfo>::success(info);
+    // Walk every scan and intervening segment through the unique terminal EOI.
+    // This validates marker structure, not the entropy-coded pixel stream.
+    const std::size_t eoi_offset = bytes.size() - 2U;
+    std::size_t scan_cursor = first_scan_data_offset;
+    bool in_scan = true;
+    bool scan_has_data = false;
+    while (scan_cursor < bytes.size()) {
+        if (in_scan && bytes[scan_cursor] != 0xffU) {
+            scan_has_data = true;
+            ++scan_cursor;
+            continue;
+        }
+        if (bytes[scan_cursor] != 0xffU) {
+            return core::Result<HeaderInfo>::failure(validation(
+                "JPEG contains data outside a scan"));
+        }
+        const std::size_t marker_start = scan_cursor;
+        while (scan_cursor < bytes.size() && bytes[scan_cursor] == 0xffU) ++scan_cursor;
+        if (scan_cursor == bytes.size()) {
+            return core::Result<HeaderInfo>::failure(validation("JPEG marker is truncated"));
+        }
+        const std::uint8_t marker = bytes[scan_cursor++];
+        if (marker == 0x00U) {
+            if (!in_scan || scan_cursor - marker_start != 2U) {
+                return core::Result<HeaderInfo>::failure(validation("JPEG byte stuffing is misplaced"));
+            }
+            scan_has_data = true;
+            continue;
+        }
+        if (marker >= 0xd0U && marker <= 0xd7U) {
+            if (!in_scan || !scan_has_data) {
+                return core::Result<HeaderInfo>::failure(validation("JPEG restart marker is misplaced"));
+            }
+            continue;
+        }
+        if (in_scan && !scan_has_data) {
+            return core::Result<HeaderInfo>::failure(validation("JPEG scan has no entropy data"));
+        }
+        in_scan = false;
+        if (marker == 0xd9U) {
+            if (scan_cursor != bytes.size()) {
+                return core::Result<HeaderInfo>::failure(validation("JPEG EOI is premature"));
+            }
+            return core::Result<HeaderInfo>::success(info);
+        }
+        if (marker < 0xc0U || marker == 0xd8U || jpeg_sof_marker(marker)) {
+            return core::Result<HeaderInfo>::failure(validation("JPEG marker is unsupported or misplaced"));
+        }
+        if (scan_cursor > eoi_offset || eoi_offset - scan_cursor < 2U) {
+            return core::Result<HeaderInfo>::failure(validation("JPEG segment length is truncated"));
+        }
+        const std::uint16_t length =
+            static_cast<std::uint16_t>(bytes[scan_cursor] << 8U) |
+            bytes[scan_cursor + 1U];
+        if (length < 2U || length > eoi_offset - scan_cursor) {
+            return core::Result<HeaderInfo>::failure(validation("JPEG segment exceeds source bytes"));
+        }
+        if (marker == 0xe1U) {
+            const auto exif_metadata = inspect_exif_color_metadata(
+                bytes.subspan(scan_cursor + 2U, length - 2U));
+            if (!exif_metadata) {
+                return core::Result<HeaderInfo>::failure(exif_metadata.error());
+            }
+            info.has_color_encoding_metadata = info.has_color_encoding_metadata ||
+                exif_metadata.value();
+        }
+        if (marker == 0xe2U && length >= icc_profile_signature.size() + 2U &&
+            std::equal(icc_profile_signature.begin(), icc_profile_signature.end(),
+                bytes.begin() + static_cast<std::ptrdiff_t>(scan_cursor + 2U))) {
+            info.has_color_encoding_metadata = true;
+        }
+        if (marker == 0xdaU) {
+            if (length < 8U) {
+                return core::Result<HeaderInfo>::failure(validation("JPEG scan header is truncated"));
+            }
+            const auto count = bytes[scan_cursor + 2U];
+            if (count == 0U || count > info.channels ||
+                length != 6U + static_cast<std::uint32_t>(count) * 2U) {
+                return core::Result<HeaderInfo>::failure(validation("JPEG scan header is malformed"));
+            }
+            std::array<bool, 256U> selected{};
+            for (std::size_t index = 0U; index < count; ++index) {
+                const auto id = bytes[scan_cursor + 3U + index * 2U];
+                if (!frame_components[id] || selected[id]) {
+                    return core::Result<HeaderInfo>::failure(validation(
+                        "JPEG scan selects an unknown or duplicate frame component"));
+                }
+                selected[id] = true;
+            }
+            in_scan = true;
+            scan_has_data = false;
+        }
+        scan_cursor += length;
+    }
+    return core::Result<HeaderInfo>::failure(validation("JPEG source has no terminal EOI"));
 }
 
 core::Result<HeaderInfo> inspect_tga(std::span<const std::uint8_t> bytes) {
@@ -263,12 +559,14 @@ core::Result<HeaderInfo> inspect_tga(std::span<const std::uint8_t> bytes) {
     }
     const std::uint64_t pixel_count =
         static_cast<std::uint64_t>(info.width) * info.height;
+    std::size_t image_end = data_offset;
     if (bytes[2U] == 2U) {
         const std::uint64_t required = pixel_count * pixel_bytes;
         if (required > bytes.size() - data_offset) {
             return core::Result<HeaderInfo>::failure(validation(
                 "uncompressed TGA pixel payload is truncated"));
         }
+        image_end += static_cast<std::size_t>(required);
     } else {
         std::uint64_t decoded_pixels = 0U;
         std::size_t cursor = data_offset;
@@ -292,6 +590,35 @@ core::Result<HeaderInfo> inspect_tga(std::span<const std::uint8_t> bytes) {
             }
             cursor += static_cast<std::size_t>(payload);
             decoded_pixels += count;
+        }
+        image_end = cursor;
+    }
+
+    constexpr std::array<std::uint8_t, 18U> tga_2_signature{
+        'T', 'R', 'U', 'E', 'V', 'I', 'S', 'I', 'O', 'N', '-',
+        'X', 'F', 'I', 'L', 'E', '.', 0U};
+    constexpr std::size_t tga_footer_bytes = 26U;
+    constexpr std::size_t tga_extension_bytes = 495U;
+    if (bytes.size() >= tga_footer_bytes) {
+        const std::size_t footer_offset = bytes.size() - tga_footer_bytes;
+        const auto signature_offset = footer_offset + 8U;
+        if (std::equal(tga_2_signature.begin(), tga_2_signature.end(),
+                bytes.begin() + static_cast<std::ptrdiff_t>(signature_offset))) {
+            const std::size_t extension_offset = read_le32(bytes, footer_offset);
+            if (extension_offset != 0U) {
+                if (extension_offset < image_end || extension_offset > footer_offset ||
+                    footer_offset - extension_offset < tga_extension_bytes ||
+                    read_le16(bytes, extension_offset) != tga_extension_bytes) {
+                    return core::Result<HeaderInfo>::failure(validation(
+                        "TGA 2.0 extension area is misplaced, truncated, or unsupported"));
+                }
+                const std::uint16_t gamma_numerator = read_le16(bytes, extension_offset + 478U);
+                const std::uint16_t gamma_denominator = read_le16(bytes, extension_offset + 480U);
+                const std::uint32_t color_correction_offset =
+                    read_le32(bytes, extension_offset + 482U);
+                info.has_color_encoding_metadata = gamma_numerator != 0U ||
+                    gamma_denominator != 0U || color_correction_offset != 0U;
+            }
         }
     }
     return core::Result<HeaderInfo>::success(info);
@@ -559,6 +886,8 @@ core::Result<TextureSourceAdmission> inspect_texture_source(
     admission.mip_levels = inspected.value().mip_levels;
     admission.compressed = inspected.value().compressed;
     admission.high_dynamic_range = inspected.value().high_dynamic_range;
+    admission.has_color_encoding_metadata =
+        inspected.value().has_color_encoding_metadata;
     if (auto result = admission.validate(limits); !result) {
         return core::Result<TextureSourceAdmission>::failure(result.error());
     }
@@ -568,8 +897,12 @@ core::Result<TextureSourceAdmission> inspect_texture_source(
 core::Result<void> DecodedRgba8Texture::validate(
     const TextureSourceLimits& limits) const {
     if (auto result = admission.validate(limits); !result) return result;
+    const bool supported_decoded_format =
+        admission.format == TextureSourceFormat::png ||
+        admission.format == TextureSourceFormat::jpeg ||
+        admission.format == TextureSourceFormat::tga;
     if (admission.stage != TextureSourceStage::decoded || admission.channels != 4U ||
-        admission.bit_depth != 8U || admission.format != TextureSourceFormat::tga) {
+        admission.bit_depth != 8U || !supported_decoded_format) {
         return core::Result<void>::failure(validation(
             "decoded RGBA8 texture admission does not match its pixel contract"));
     }
@@ -592,6 +925,11 @@ core::Result<DecodedRgba8Texture> decode_tga_rgba8(
     if (inspected.value().format != TextureSourceFormat::tga) {
         return core::Result<DecodedRgba8Texture>::failure(validation(
             "TGA decoder received a different admitted source format"));
+    }
+    if (inspected.value().has_color_encoding_metadata) {
+        return core::Result<DecodedRgba8Texture>::failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "TGA color metadata is unsupported by the RGBA8 decode path"));
     }
 
     const std::size_t source_pixel_bytes = inspected.value().bit_depth / 8U;

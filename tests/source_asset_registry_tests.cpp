@@ -90,6 +90,82 @@ void source_records_reject_hostile_paths_and_settings() {
         "unbound trailing source record data is rejected");
 }
 
+void authored_source_metadata_round_trips_and_rejects_invalid_boundaries() {
+    const auto original = record();
+    const std::string legacy = original.serialize();
+    require(legacy.starts_with("SOURCE_IMPORT_RECORD 1\n"),
+        "records without authored metadata retain the legacy format version");
+
+    auto annotated = original;
+    annotated.authored_tags = {"canopy", "exterior"};
+    annotated.dependencies = {"asset.materials"};
+    require(static_cast<bool>(annotated.validate()),
+        "canonical authored tags and stable dependency identity are accepted");
+    const std::string encoded = annotated.serialize();
+    require(encoded.starts_with("SOURCE_IMPORT_RECORD 3\n"),
+        "authored source metadata uses its explicit record schema version");
+    const auto reopened = assets::SourceImportRecord::deserialize(encoded);
+    require(reopened && reopened.value().serialize() == encoded &&
+            reopened.value().authored_tags == annotated.authored_tags &&
+            reopened.value().dependencies == annotated.dependencies,
+        "authored tags and dependency edges round-trip canonically");
+
+    auto invalid = annotated;
+    invalid.authored_tags = {"Exterior"};
+    require(!invalid.validate(), "uppercase tags are rejected instead of silently normalized");
+    invalid = annotated;
+    invalid.authored_tags = {"exterior", "canopy"};
+    require(!invalid.validate(), "unsorted authored tags are rejected");
+    invalid = annotated;
+    invalid.authored_tags = {"canopy", "canopy"};
+    require(!invalid.validate(), "duplicate authored tags are rejected");
+    invalid = annotated;
+    invalid.dependencies = {invalid.identity};
+    require(!invalid.validate(), "self-dependency edges are rejected");
+    invalid = annotated;
+    invalid.dependencies = {"asset:materials"};
+    require(!invalid.validate(), "dependency identity syntax is bounded to registry tokens");
+}
+
+void dependencies_bind_to_the_complete_reviewed_registry() {
+    assets::ProjectAssetRegistry registry;
+    const auto source = record();
+    auto material = record("asset.materials", "Assets/trees/oak-material.mtl");
+    material.artifact_identity = "material.oak-tree";
+    require(static_cast<bool>(registry.set_record(source)) &&
+            static_cast<bool>(registry.set_record(material)),
+        "source and dependency target enter the base registry independently");
+
+    auto updated_source = source;
+    updated_source.source_generation = core::Revision{2U};
+    updated_source.authored_tags = {"canopy", "exterior"};
+    updated_source.dependencies = {"asset.materials"};
+    const auto reviewed = assets::plan_source_reimport(registry,
+        {updated_source, material});
+    require(reviewed && reviewed.value().entries.size() == 2U &&
+            std::any_of(reviewed.value().entries.begin(), reviewed.value().entries.end(),
+                [&source](const auto& entry) {
+                    return entry.identity == source.identity &&
+                        entry.change == assets::SourceReimportChange::metadata_only;
+                }),
+        "reviewed candidate resolves explicit dependencies against the complete active set");
+    const auto adopted = assets::apply_source_reimport_plan(registry, reviewed.value());
+    require(adopted && adopted.value().records().at(source.identity).dependencies ==
+            updated_source.dependencies &&
+            adopted.value().records().at(source.identity).authored_tags ==
+            updated_source.authored_tags,
+        "reviewed metadata is adopted as a new registry without mutating its base");
+    const auto reopened = assets::ProjectAssetRegistry::deserialize(adopted.value().serialize());
+    require(reopened && reopened.value().records().at(source.identity).dependencies ==
+            updated_source.dependencies,
+        "registry persistence retains cross-record dependency edges");
+
+    auto missing_target = updated_source;
+    missing_target.dependencies = {"asset.absent"};
+    require(!assets::plan_source_reimport(registry, {missing_target, material}),
+        "unknown dependency target is refused before adoption");
+}
+
 void botanical_generation_receipts_round_trip_without_private_identifiers() {
     botanical::Source source;
     source.identity = "pine-fixture";
@@ -120,6 +196,27 @@ void botanical_generation_receipts_round_trip_without_private_identifiers() {
             reopened.value().botanical_generation->input_artifact_digest == input_digest &&
             reopened.value().botanical_generation->output_artifact_digest == value.source_digest,
         "project source record round-trips the exact generation receipt and digests");
+
+    auto annotated = value;
+    annotated.authored_tags = {"conifer", "exterior"};
+    annotated.dependencies = {"asset.materials"};
+    const std::string annotated_bytes = annotated.serialize();
+    auto annotated_reopened = assets::SourceImportRecord::deserialize(annotated_bytes);
+    require(annotated_bytes.starts_with("SOURCE_IMPORT_RECORD 3\n") &&
+            annotated_reopened && annotated_reopened.value().serialize() == annotated_bytes &&
+            annotated_reopened.value().authored_tags == annotated.authored_tags &&
+            annotated_reopened.value().dependencies == annotated.dependencies &&
+            annotated_reopened.value().botanical_generation.has_value() &&
+            annotated_reopened.value().botanical_generation->serialize() ==
+                value.botanical_generation->serialize(),
+        "annotating a generated source preserves its complete generation receipt in version 3");
+    annotated_reopened.value().authored_tags.clear();
+    annotated_reopened.value().dependencies.clear();
+    require(annotated_reopened.value().serialize() == encoded,
+        "removing annotations restores the exact version-2 generation record");
+    annotated.botanical_generation->output_artifact_digest = digest("wrong-annotated-output");
+    require(!assets::SourceImportRecord::deserialize(annotated.serialize()),
+        "version-3 annotations cannot hide a mismatched generation receipt");
 
     auto stale_source = value;
     stale_source.botanical_generation->source_snapshot += "\n";
@@ -325,14 +422,57 @@ void moved_source_relink_binds_new_locator_without_changing_identity() {
         "repeated pure moves keep advancing the retained generation monotonically");
 }
 
+void annotated_source_relink_preserves_reviewed_metadata_and_dependency_scope() {
+    assets::ProjectAssetRegistry registry;
+    auto material = record("asset.materials", "Assets/materials/bark.mtl");
+    material.artifact_identity = "material.bark";
+    auto source = record();
+    source.authored_tags = {"conifer", "exterior"};
+    source.dependencies = {material.identity};
+    require(static_cast<bool>(registry.set_record(material)) &&
+            static_cast<bool>(registry.set_record(source)) && registry.validate(),
+        "annotated relink fixture resolves its dependency in the active registry");
+    const std::string base = registry.serialize();
+    const auto plan = assets::plan_source_relink(registry, source.identity,
+        source.source_generation, "Assets/trees/oak-moved.glb", source.source_digest);
+    require(static_cast<bool>(plan), "annotated source can prepare an exact-byte relink");
+    const auto relinked = assets::apply_source_relink_plan(registry, plan.value());
+    require(relinked && registry.serialize() == base &&
+            relinked.value().records().at(source.identity).authored_tags == source.authored_tags &&
+            relinked.value().records().at(source.identity).dependencies == source.dependencies &&
+            relinked.value().records().at(material.identity).serialize() == material.serialize(),
+        "relink preserves authored metadata and the dependency target without changing the base");
+    auto forged = plan.value();
+    forged.incoming.authored_tags = {"unreviewed"};
+    require(!assets::apply_source_relink_plan(registry, forged) && registry.serialize() == base,
+        "a relink cannot smuggle an unreviewed annotation edit into the registry");
+    require(!assets::plan_source_reimport(registry, {source}) && registry.serialize() == base,
+        "removing a still-referenced dependency is refused without mutation");
+    auto detached = source;
+    detached.source_generation = source.source_generation.next();
+    detached.dependencies.clear();
+    const auto removal = assets::plan_source_reimport(registry, {detached});
+    require(static_cast<bool>(removal), "explicitly detaching the edge permits target removal review");
+    const auto adopted = assets::apply_source_reimport_plan(registry, removal.value());
+    require(adopted && adopted.value().validate() && adopted.value().records().size() == 1U &&
+            adopted.value().records().at(source.identity).dependencies.empty() &&
+            adopted.value().records().at(source.identity).authored_tags == source.authored_tags &&
+            adopted.value().lineage().at(material.identity) == material.source_generation &&
+            registry.serialize() == base,
+        "reviewed removal clears only the explicit edge and retains target lineage");
+}
+
 } // namespace
 
 int main() {
     source_records_reject_hostile_paths_and_settings();
+    authored_source_metadata_round_trips_and_rejects_invalid_boundaries();
+    dependencies_bind_to_the_complete_reviewed_registry();
     botanical_generation_receipts_round_trip_without_private_identifiers();
     registry_retains_generation_tombstones_and_plans_without_mutation();
     conflicting_artifact_identity_is_reported_not_adopted();
     moved_source_relink_binds_new_locator_without_changing_identity();
+    annotated_source_relink_preserves_reviewed_metadata_and_dependency_scope();
     std::cout << "source asset registry tests passed\n";
     return EXIT_SUCCESS;
 }

@@ -2,6 +2,7 @@
 
 #include <carto/geometry/mesh.hpp>
 #include <carto/production/closure.hpp>
+#include <carto/render/gpu_abi.hpp>
 
 #include <array>
 #include <cstddef>
@@ -19,11 +20,12 @@ class ProjectDocument;
 
 namespace carto::production {
 
-inline constexpr std::uint32_t kRenderMeshArtifactFormatVersion = 3U;
+inline constexpr std::uint32_t kRenderMeshArtifactFormatVersion = 4U;
 inline constexpr std::size_t kMaxRenderMeshArtifactBytes = 256U * 1024U * 1024U;
 inline constexpr std::size_t kMaxRenderMeshArtifactVertices = 2'000'000U;
 inline constexpr std::size_t kMaxRenderMeshArtifactIndices = 6'000'000U;
 inline constexpr std::size_t kMaxRenderMeshArtifactSubmeshes = 65'536U;
+inline constexpr std::size_t kMaxRenderMeshArtifactUvStreams = 8U;
 
 struct RenderMeshVertex {
     geometry::VertexId source_vertex;
@@ -34,6 +36,8 @@ struct RenderMeshVertex {
     std::optional<core::Vec2d> uv1;
     std::optional<core::Vec4d> color;
     std::optional<core::Vec4d> tangent;
+    // Additional authored UV streams, ordered by RenderMeshArtifact metadata.
+    std::vector<core::Vec2d> additional_uvs;
 };
 
 struct RenderMeshSubmesh {
@@ -62,6 +66,7 @@ struct RenderMeshArtifact {
     std::vector<std::uint32_t> indices;
     std::vector<geometry::FaceId> triangle_faces;
     std::vector<RenderMeshSubmesh> submeshes;
+    std::vector<attributes::UvSetId> additional_uv_set_ids;
 
     [[nodiscard]] core::Result<void> validate() const;
     [[nodiscard]] core::Result<RenderMeshBounds> bounds() const;
@@ -90,6 +95,9 @@ struct RenderMeshCompileOptions {
     // consumes `cartographer.normal0` if present and otherwise derives normals
     // from the source geometry. Normal discontinuities split render vertices.
     std::optional<std::string> normal_layer;
+    // Additional authored corner-domain UV sets beyond uv_set and uv1_set.
+    // The compiler canonicalizes these identities into sorted order.
+    std::vector<attributes::UvSetId> additional_uv_sets;
 };
 
 // Float32 upload ABI consumed by the public native PBR vertex shader. The
@@ -119,10 +127,17 @@ struct PbrMeshUpload {
 };
 
 // Produces the exact interleaved layout consumed by cartographer_pbr.hlsl.
-// Missing authored UV/tangent data and values that cannot be represented as
-// finite float32 fail closed rather than being defaulted or clamped.
+// Missing authored UV/tangent data is rejected by default; the explicit
+// material-constants overload may substitute neutral vertex values only when
+// the caller supplies one validated constants record per submesh, in submesh
+// order, and every record has no texture IDs. The caller must bind those
+// records to the current material sources. Values that cannot be represented
+// as finite float32 always fail closed.
 [[nodiscard]] core::Result<PbrMeshUpload> pack_pbr_mesh_upload(
     const RenderMeshArtifact& artifact);
+[[nodiscard]] core::Result<PbrMeshUpload> pack_pbr_mesh_upload(
+    const RenderMeshArtifact& artifact,
+    std::span<const render::GpuMaterialConstants> submesh_materials);
 
 // Compiles one bounded public render-mesh representation from authoritative
 // Cartographer mesh data. It never edits the source mesh. The caller supplies

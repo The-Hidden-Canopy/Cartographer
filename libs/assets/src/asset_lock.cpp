@@ -86,16 +86,20 @@ core::Result<AssetLockAcquisition> AssetLockRegistry::acquire(
     const auto existing = leases_.find(scope);
     std::optional<AssetLockLease> displaced;
     if (existing != leases_.end()) {
-        if (now_utc_seconds < existing->second.expires_at_utc_seconds) {
+        if (now_utc_seconds < existing->second.last_observed_utc_seconds) {
+            return core::Result<AssetLockAcquisition>::failure(conflict(
+                "asset lease acquisition timestamp predates its latest observation"));
+        }
+        if (now_utc_seconds < existing->second.lease.expires_at_utc_seconds) {
             return core::Result<AssetLockAcquisition>::failure(conflict(
                 "asset already has an active collaboration lease"));
         }
         if (!acknowledge_expired_lease_id.has_value() ||
-            *acknowledge_expired_lease_id != existing->second.lease_id) {
+            *acknowledge_expired_lease_id != existing->second.lease.lease_id) {
             return core::Result<AssetLockAcquisition>::failure(conflict(
                 "expired asset lease requires acknowledgement of its exact lease ID"));
         }
-        displaced = existing->second;
+        displaced = existing->second.lease;
     } else if (acknowledge_expired_lease_id.has_value()) {
         return core::Result<AssetLockAcquisition>::failure(conflict(
             "acknowledged expired asset lease is no longer current"));
@@ -120,9 +124,9 @@ core::Result<AssetLockAcquisition> AssetLockRegistry::acquire(
     };
     AssetLockAcquisition result{lease, displaced};
     if (existing == leases_.end()) {
-        leases_.emplace(lease.scope, lease);
+        leases_.emplace(lease.scope, LeaseRecord{lease, now_utc_seconds});
     } else {
-        existing->second = std::move(lease);
+        existing->second = LeaseRecord{std::move(lease), now_utc_seconds};
     }
     ++next_lease_id_;
     return core::Result<AssetLockAcquisition>::success(std::move(result));
@@ -150,25 +154,25 @@ core::Result<AssetLockLease> AssetLockRegistry::renew(
         return core::Result<AssetLockLease>::failure(core::Diagnostic(
             core::ErrorCode::not_found, "asset has no collaboration lease"));
     }
-    if (existing->second.lease_id != lease_id ||
-        existing->second.owner_id != owner_id) {
+    if (existing->second.lease.lease_id != lease_id ||
+        existing->second.lease.owner_id != owner_id) {
         return core::Result<AssetLockLease>::failure(conflict(
             "asset lease owner or ID changed before renewal"));
     }
-    if (now_utc_seconds >= existing->second.expires_at_utc_seconds) {
+    if (now_utc_seconds >= existing->second.lease.expires_at_utc_seconds) {
         return core::Result<AssetLockLease>::failure(conflict(
             "expired asset lease cannot be renewed"));
     }
-    if (now_utc_seconds < existing->second.acquired_at_utc_seconds) {
+    if (now_utc_seconds < existing->second.last_observed_utc_seconds) {
         return core::Result<AssetLockLease>::failure(conflict(
-            "asset lease renewal timestamp predates acquisition"));
+            "asset lease renewal timestamp predates its latest observation"));
     }
 
-    auto renewed = existing->second;
+    auto renewed = existing->second.lease;
     renewed.expires_at_utc_seconds =
         now_utc_seconds + static_cast<AssetLockUtcSeconds>(duration_seconds);
     auto returned = renewed;
-    existing->second = std::move(renewed);
+    existing->second = LeaseRecord{std::move(renewed), now_utc_seconds};
     return core::Result<AssetLockLease>::success(std::move(returned));
 }
 
@@ -191,8 +195,8 @@ core::Result<void> AssetLockRegistry::release(
         return core::Result<void>::failure(core::Diagnostic(
             core::ErrorCode::not_found, "asset has no collaboration lease"));
     }
-    if (existing->second.lease_id != lease_id ||
-        existing->second.owner_id != owner_id) {
+    if (existing->second.lease.lease_id != lease_id ||
+        existing->second.lease.owner_id != owner_id) {
         return core::Result<void>::failure(conflict(
             "asset lease owner or ID changed before release"));
     }
@@ -214,11 +218,17 @@ core::Result<std::optional<AssetLockSnapshot>> AssetLockRegistry::inspect(
     if (existing == leases_.end()) {
         return core::Result<std::optional<AssetLockSnapshot>>::success(std::nullopt);
     }
-    const auto state = now_utc_seconds < existing->second.expires_at_utc_seconds
+    if (now_utc_seconds < existing->second.last_observed_utc_seconds) {
+        return core::Result<std::optional<AssetLockSnapshot>>::failure(conflict(
+            "asset lease inspection timestamp predates its latest observation"));
+    }
+    const auto state = now_utc_seconds < existing->second.lease.expires_at_utc_seconds
         ? AssetLockState::active
         : AssetLockState::expired;
-    return core::Result<std::optional<AssetLockSnapshot>>::success(
-        AssetLockSnapshot{state, existing->second});
+    auto result = core::Result<std::optional<AssetLockSnapshot>>::success(
+        AssetLockSnapshot{state, existing->second.lease});
+    existing->second.last_observed_utc_seconds = now_utc_seconds;
+    return result;
 }
 
 std::size_t AssetLockRegistry::size() const {

@@ -2,6 +2,9 @@
 #include <carto/editor/viewport_interaction.hpp>
 #include <carto/project/recovery.hpp>
 #include <carto/production/lightmap_uv.hpp>
+#include <carto/condition/prefab_rebase.hpp>
+#include <carto/condition/prefab_socket.hpp>
+#include <carto/mesh_attributes/provenance.hpp>
 
 #include <algorithm>
 #include <bit>
@@ -9,13 +12,16 @@
 #include <cctype>
 #include <cmath>
 #include <iomanip>
+#include <iterator>
 #include <locale>
+#include <map>
 #include <memory>
 #include <limits>
 #include <set>
 #include <span>
 #include <sstream>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -509,10 +515,31 @@ bool same_transform(const core::Transform& left, const core::Transform& right) n
         left.scale.z == right.scale.z;
 }
 
+constexpr std::size_t kMaxPrefabSnapshotMeshElements = 100'000U;
+
+bool consume_prefab_snapshot_budget(const geometry::EditableMesh& mesh, std::size_t& remaining) {
+    const auto consume = [&remaining](std::size_t count) {
+        if (count > remaining) return false;
+        remaining -= count;
+        return true;
+    };
+    if (!consume(mesh.vertex_count()) || !consume(mesh.edge_count()) ||
+        !consume(mesh.face_count()) || !consume(mesh.corners_sorted(remaining + 1U).size()) ||
+        !consume(mesh.attributes().domain_counts().size()) ||
+        !consume(mesh.attributes().layer_count()) ||
+        !consume(mesh.uv_sets().descriptors().size())) return false;
+    for (const auto& [identity, layer] : mesh.attributes().layers()) {
+        static_cast<void>(identity);
+        if (!consume(layer.values.size())) return false;
+    }
+    return true;
+}
+
 bool condition_prefab_instance_bindings_current(
     const condition::PrefabInstanceRecord& instance,
     const condition::AuthoringDocument& authoring,
-    const project::ProjectDocument& document) {
+    const project::ProjectDocument& document,
+    const std::map<std::uint64_t, std::size_t>& snapshot_mesh_owners) {
     const auto prefab = std::lower_bound(authoring.prefabs.begin(), authoring.prefabs.end(),
         instance.prefab_id, [](const auto& item, condition::Id id) {
             return item.id < id;
@@ -524,8 +551,15 @@ bool condition_prefab_instance_bindings_current(
     }
     const auto* root = document.scene().find(scene::ObjectId{instance.root_object_id});
     if (root == nullptr || root->parent.has_value() || root->mesh_asset.has_value()) return false;
+    std::size_t source_budget = kMaxPrefabSnapshotMeshElements;
+    std::size_t instance_budget = kMaxPrefabSnapshotMeshElements;
     for (std::size_t index = 0U; index < instance.members.size(); ++index) {
         const auto& member = instance.members[index];
+        if (member.instance_mesh_asset_id == 0U || member.snapshot_mesh_digest.is_zero() ||
+            member.source_snapshot_mesh_digest.is_zero() ||
+            member.instance_mesh_revision.value() == 0U) return false;
+        const auto owners = snapshot_mesh_owners.find(member.instance_mesh_asset_id);
+        if (owners == snapshot_mesh_owners.end() || owners->second != 1U) return false;
         if (prefab->asset_ids[index] != member.asset_id) return false;
         const auto asset = std::lower_bound(authoring.assets.begin(), authoring.assets.end(),
             member.asset_id, [](const auto& item, condition::Id id) {
@@ -553,7 +587,7 @@ bool condition_prefab_instance_bindings_current(
             scene::ObjectId{member.source_object_id});
         const auto* instance_object = document.scene().find(
             scene::ObjectId{member.instance_object_id});
-        const auto instance_mesh = document.meshes().find(member.mesh_asset_id);
+        const auto instance_mesh = document.meshes().find(member.instance_mesh_asset_id);
         if (source_object == nullptr || !source_object->mesh_asset.has_value() ||
             *source_object->mesh_asset != member.mesh_asset_id ||
             source_mesh == document.meshes().end() ||
@@ -562,9 +596,15 @@ bool condition_prefab_instance_bindings_current(
             instance_object == nullptr || instance_object->parent !=
                 std::optional<scene::ObjectId>{scene::ObjectId{instance.root_object_id}} ||
             instance_object->mesh_asset !=
-                std::optional<std::uint64_t>{member.mesh_asset_id} ||
+                std::optional<std::uint64_t>{member.instance_mesh_asset_id} ||
+            !same_transform(instance_object->local_transform, member.instance_local_transform) ||
             instance_mesh == document.meshes().end() ||
-            instance_mesh->second.revision() != member.mesh_revision) {
+            instance_mesh->second.revision() != member.instance_mesh_revision ||
+            !consume_prefab_snapshot_budget(source_mesh->second, source_budget) ||
+            !consume_prefab_snapshot_budget(instance_mesh->second, instance_budget) ||
+            project::canonical_mesh_snapshot_digest(source_mesh->second) !=
+                member.source_snapshot_mesh_digest ||
+            project::canonical_mesh_snapshot_digest(instance_mesh->second) != member.snapshot_mesh_digest) {
             return false;
         }
     }
@@ -647,7 +687,8 @@ core::Result<std::string> locate_staged_source(
     if (error) return core::Result<std::string>::failure(core::Diagnostic(
         core::ErrorCode::not_found, "staged source bytes are missing"));
     const auto relative_path = stored_path.lexically_relative(project_root);
-    if (relative_path.empty() || relative_path.is_absolute() ||
+    if (stored_path != expected_path.lexically_normal() ||
+        relative_path.empty() || relative_path.is_absolute() ||
         std::any_of(relative_path.begin(), relative_path.end(), [](const auto& component) {
             return component == "..";
         })) {
@@ -764,50 +805,159 @@ std::string document_snapshot_payload(
         std::string(serialized_document);
 }
 
-bool journal_entry_matches_document(
-    const journal::JournalEntry& entry,
+core::Result<std::string> mutation_snapshot_payload_v2(
+    std::string_view operation, OperationSource source, std::string_view provenance,
     std::string_view serialized_document) {
-    const std::string payload(entry.payload.begin(), entry.payload.end());
+    const char* source_name = nullptr;
+    switch (source) {
+    case OperationSource::human: source_name = "human"; break;
+    case OperationSource::ai_proposal: source_name = "ai_proposal"; break;
+    case OperationSource::agent_workbench: source_name = "agent_workbench"; break;
+    case OperationSource::plugin: source_name = "plugin"; break;
+    case OperationSource::recovery: source_name = "recovery"; break;
+    default: break;
+    }
+    if (!source_name || operation.empty() || operation.size() > 4096U || provenance.size() > 4096U ||
+        ((source == OperationSource::ai_proposal || source == OperationSource::agent_workbench) &&
+         provenance.empty()) || std::any_of(operation.begin(), operation.end(), [](unsigned char c) {
+            return c < 0x20U || c == 0x7fU;
+        })) {
+        return core::Result<std::string>::failure(core::Diagnostic(core::ErrorCode::validation_failed,
+            "journal mutation attribution is missing, invalid or exceeds its bounds"));
+    }
+    constexpr char digits[] = "0123456789abcdef";
+    std::string hex;
+    hex.reserve(provenance.size() * 2U);
+    for (const unsigned char c : provenance) {
+        hex.push_back(digits[c >> 4U]);
+        hex.push_back(digits[c & 15U]);
+    }
+    return core::Result<std::string>::success(
+        "CARTOGRAPHER_APPLICATION_MUTATION_V2\noperation=" + std::string(operation) +
+        "\nsource=" + source_name + "\nprovenance_hex=" + hex + "\ndocument_bytes=" +
+        std::to_string(serialized_document.size()) + "\n" + std::string(serialized_document));
+}
+
+core::Result<std::string_view> journal_entry_document_snapshot(
+    const journal::JournalEntry& entry) {
+    using Result = core::Result<std::string_view>;
     const bool is_snapshot = entry.event_type == kSnapshotEvent;
     const bool is_mutation = entry.event_type == kActionEvent;
-    if (!is_snapshot && !is_mutation) return false;
-
+    if ((!is_snapshot && !is_mutation) || entry.payload.empty()) {
+        return Result::failure(core::Diagnostic(core::ErrorCode::validation_failed,
+            "journal entry does not contain a supported project snapshot"));
+    }
+    const std::string_view payload(
+        reinterpret_cast<const char*>(entry.payload.data()), entry.payload.size());
     std::size_t cursor = 0U;
     const auto next_line = [&payload, &cursor]() -> std::optional<std::string_view> {
         const std::size_t end = payload.find('\n', cursor);
-        if (end == std::string::npos) return std::nullopt;
-        const std::string_view line(payload.data() + cursor, end - cursor);
+        if (end == std::string_view::npos) return std::nullopt;
+        const std::string_view line = payload.substr(cursor, end - cursor);
         cursor = end + 1U;
         return line;
     };
     const auto header = next_line();
-    if (!header.has_value() || *header !=
+    const bool mutation_v2 = is_mutation && header.has_value() &&
+        *header == "CARTOGRAPHER_APPLICATION_MUTATION_V2";
+    if (!header.has_value() || (!mutation_v2 && *header !=
             (is_snapshot ? "CARTOGRAPHER_PROJECT_SNAPSHOT_V1"
-                         : "CARTOGRAPHER_APPLICATION_MUTATION_V1")) {
-        return false;
+                         : "CARTOGRAPHER_APPLICATION_MUTATION_V1"))) {
+        return Result::failure(core::Diagnostic(core::ErrorCode::validation_failed,
+            "journal snapshot envelope header is invalid"));
     }
     if (is_mutation) {
         const auto operation = next_line();
         if (!operation.has_value() || !operation->starts_with("operation=") ||
             operation->size() == std::string_view("operation=").size() ||
-            operation->find_first_of("\r\n") != std::string_view::npos) {
-            return false;
+            operation->find_first_of("\r\n") != std::string_view::npos ||
+            (mutation_v2 && (operation->size() > 4106U ||
+                std::any_of(operation->begin(), operation->end(), [](unsigned char c) {
+                    return c < 0x20U || c == 0x7fU;
+                })))) {
+            return Result::failure(core::Diagnostic(core::ErrorCode::validation_failed,
+                "journal snapshot operation field is invalid"));
+        }
+    }
+    if (mutation_v2) {
+        const auto source = next_line();
+        const auto provenance = next_line();
+        constexpr std::string_view source_prefix = "source=";
+        constexpr std::string_view provenance_prefix = "provenance_hex=";
+        if (!source || !source->starts_with(source_prefix) || !provenance ||
+            !provenance->starts_with(provenance_prefix)) {
+            return Result::failure(core::Diagnostic(core::ErrorCode::validation_failed,
+                "journal mutation attribution fields are missing"));
+        }
+        const auto kind = source->substr(source_prefix.size());
+        const auto identity = provenance->substr(provenance_prefix.size());
+        const bool known = kind == "human" || kind == "ai_proposal" ||
+            kind == "agent_workbench" || kind == "plugin" || kind == "recovery";
+        if (!known || identity.size() > 8192U || identity.size() % 2U != 0U ||
+            ((kind == "ai_proposal" || kind == "agent_workbench") && identity.empty()) ||
+            !std::all_of(identity.begin(), identity.end(), [](char c) {
+                return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+            })) {
+            return Result::failure(core::Diagnostic(core::ErrorCode::validation_failed,
+                "journal mutation attribution fields are invalid"));
         }
     }
     const auto document_bytes = next_line();
     constexpr std::string_view kDocumentBytes = "document_bytes=";
     if (!document_bytes.has_value() || !document_bytes->starts_with(kDocumentBytes)) {
-        return false;
+        return Result::failure(core::Diagnostic(core::ErrorCode::validation_failed,
+            "journal snapshot byte count is missing"));
     }
     const std::string_view value = document_bytes->substr(kDocumentBytes.size());
-    if (value.empty()) return false;
     std::uint64_t declared_bytes = 0U;
     const auto parsed = std::from_chars(value.data(), value.data() + value.size(), declared_bytes);
-    if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
-        declared_bytes != serialized_document.size()) {
-        return false;
+    const std::string_view snapshot = payload.substr(cursor);
+    if (value.empty() || parsed.ec != std::errc{} ||
+        parsed.ptr != value.data() + value.size() || declared_bytes != snapshot.size()) {
+        return Result::failure(core::Diagnostic(core::ErrorCode::validation_failed,
+            "journal snapshot byte count does not match its payload"));
     }
-    return std::string_view(payload).substr(cursor) == serialized_document;
+    return Result::success(snapshot);
+}
+
+bool journal_entry_matches_document(
+    const journal::JournalEntry& entry,
+    std::string_view serialized_document) {
+    const auto snapshot = journal_entry_document_snapshot(entry);
+    return snapshot && snapshot.value() == serialized_document;
+}
+
+core::Result<RecoveryJournalEntry> journal_entry_evidence(const journal::JournalEntry& entry) {
+    RecoveryJournalEntry result{entry.revision_before, entry.revision_after, entry.event_type};
+    if (entry.event_type != kActionEvent) return core::Result<RecoveryJournalEntry>::success(std::move(result));
+    const std::string_view payload(reinterpret_cast<const char*>(entry.payload.data()), entry.payload.size());
+    const bool v2 = payload.starts_with("CARTOGRAPHER_APPLICATION_MUTATION_V2\n");
+    const bool v1 = payload.starts_with("CARTOGRAPHER_APPLICATION_MUTATION_V1\n");
+    if (!v1 && !v2) return core::Result<RecoveryJournalEntry>::success(std::move(result));
+    auto verified = journal_entry_document_snapshot(entry);
+    if (!verified) return core::Result<RecoveryJournalEntry>::failure(verified.error());
+    std::size_t cursor = payload.find('\n') + 1U;
+    const auto line = [&]() {
+        const auto end = payload.find('\n', cursor);
+        const auto part = payload.substr(cursor, end - cursor);
+        cursor = end + 1U;
+        return part;
+    };
+    result.operation = std::string(line().substr(std::string_view("operation=").size()));
+    if (v2) {
+        const auto name = line().substr(std::string_view("source=").size());
+        if (name == "human") result.source = OperationSource::human;
+        else if (name == "ai_proposal") result.source = OperationSource::ai_proposal;
+        else if (name == "agent_workbench") result.source = OperationSource::agent_workbench;
+        else if (name == "plugin") result.source = OperationSource::plugin;
+        else if (name == "recovery") result.source = OperationSource::recovery;
+        const auto hex = line().substr(std::string_view("provenance_hex=").size());
+        result.provenance_id.reserve(hex.size() / 2U);
+        const auto nibble = [](char c) -> unsigned { return c <= '9' ? c - '0' : c - 'a' + 10U; };
+        for (std::size_t i = 0; i < hex.size(); i += 2U)
+            result.provenance_id.push_back(static_cast<char>((nibble(hex[i]) << 4U) | nibble(hex[i + 1U])));
+    }
+    return core::Result<RecoveryJournalEntry>::success(std::move(result));
 }
 
 } // namespace
@@ -839,6 +989,8 @@ core::Result<MeshCleanupReview> ApplicationSession::review_mesh_cleanup(
     }
     if (!std::isfinite(options.merge_distance) || options.merge_distance <= 0.0 ||
         options.max_candidates < 2U || options.max_candidates > MeshCleanupOptions::kMaxCandidates ||
+        options.max_candidate_pair_checks == 0U ||
+        options.max_candidate_pair_checks > MeshCleanupOptions::kMaxCandidatePairChecks ||
         options.max_merged_vertices == 0U ||
         options.max_merged_vertices > MeshCleanupOptions::kMaxMergedVertices ||
         options.max_removed_faces > MeshCleanupOptions::kMaxRemovedFaces ||
@@ -882,12 +1034,9 @@ core::Result<MeshCleanupReview> ApplicationSession::review_mesh_cleanup(
     if (mesh.corners_sorted(remaining + 1U).size() > remaining) {
         return refuse(core::ErrorCode::unsupported, "mesh cleanup source exceeds the corner budget");
     }
-    if (mesh.has_attribute_payload()) {
-        return refuse(core::ErrorCode::unsupported,
-            "mesh cleanup requires explicit attribute transfer for attributed meshes");
-    }
     auto candidate = mesh;
-    auto merged = candidate.merge_by_distance(candidates, options.merge_distance);
+    auto merged = mesh_attributes::merge_by_distance_with_attribute_transfer(
+        candidate, candidates, options.merge_distance);
     if (!merged) return core::Result<MeshCleanupReview>::failure(merged.error());
     if (merged.value().merged_vertices.empty() ||
         merged.value().merged_vertices.size() > options.max_merged_vertices ||
@@ -904,8 +1053,8 @@ core::Result<MeshCleanupReview> ApplicationSession::review_mesh_cleanup(
     review.object_ = object_id;
     review.mesh_asset_ = *object->mesh_asset;
     review.mesh_revision_ = mesh.revision();
-    review.source_digest_ = canonical_mesh_geometry_digest(mesh);
-    review.result_digest_ = canonical_mesh_geometry_digest(candidate);
+    review.source_digest_ = project::canonical_mesh_snapshot_digest(mesh);
+    review.result_digest_ = project::canonical_mesh_snapshot_digest(candidate);
     review.options_ = options;
     review.candidates_ = std::move(candidates);
     review.receipt_ = std::move(merged.value());
@@ -916,6 +1065,463 @@ core::Result<MeshCleanupReview> ApplicationSession::review_mesh_cleanup(
         }
     }
     return core::Result<MeshCleanupReview>::success(std::move(review));
+}
+
+core::Result<MeshCleanupReview> ApplicationSession::review_mesh_cleanup_issues(
+    scene::ObjectId object_id, MeshCleanupOptions options) const {
+    const auto refuse = [](core::ErrorCode code, std::string message) {
+        return core::Result<MeshCleanupReview>::failure(core::Diagnostic(code, std::move(message)));
+    };
+    if (!cleanup_review_identity_) {
+        return refuse(core::ErrorCode::invalid_state,
+            "mesh cleanup issue discovery requires a live session identity");
+    }
+    if (!std::isfinite(options.merge_distance) || options.merge_distance <= 0.0 ||
+        options.max_candidates < 2U || options.max_candidates > MeshCleanupOptions::kMaxCandidates ||
+        options.max_candidate_pair_checks == 0U ||
+        options.max_candidate_pair_checks > MeshCleanupOptions::kMaxCandidatePairChecks ||
+        options.max_merged_vertices == 0U ||
+        options.max_merged_vertices > MeshCleanupOptions::kMaxMergedVertices ||
+        options.max_removed_faces > MeshCleanupOptions::kMaxRemovedFaces) {
+        return refuse(core::ErrorCode::invalid_argument,
+            "mesh cleanup issue discovery options exceed bounds");
+    }
+    const auto* object = document_.scene().find(object_id);
+    if (object == nullptr || !object->mesh_asset.has_value()) {
+        return refuse(core::ErrorCode::not_found,
+            "mesh cleanup issue discovery requires an existing mesh object");
+    }
+    if (object->locked || !object->visible) {
+        return refuse(core::ErrorCode::invalid_state,
+            "mesh cleanup issue discovery requires a visible unlocked object");
+    }
+    if (document_.scene().size() > MeshCleanupOptions::kMaxMeshElements) {
+        return refuse(core::ErrorCode::unsupported,
+            "mesh cleanup issue discovery exceeds the scene inspection budget");
+    }
+    std::size_t owners = 0U;
+    for (const auto& owner : document_.scene().objects_sorted(MeshCleanupOptions::kMaxMeshElements)) {
+        if (owner.mesh_asset == object->mesh_asset) ++owners;
+    }
+    if (owners != 1U) {
+        return refuse(core::ErrorCode::unsupported,
+            "mesh cleanup issue discovery refuses shared mesh assets");
+    }
+    const auto found = document_.meshes().find(*object->mesh_asset);
+    if (found == document_.meshes().end()) {
+        return refuse(core::ErrorCode::stale_data,
+            "mesh cleanup issue discovery source mesh is missing");
+    }
+    const auto& mesh = found->second;
+    auto candidates = mesh.find_merge_by_distance_candidates(
+        options.merge_distance,
+        options.max_candidates,
+        options.max_candidate_pair_checks,
+        MeshCleanupOptions::kMaxMeshElements);
+    if (!candidates) return core::Result<MeshCleanupReview>::failure(candidates.error());
+    if (candidates.value().size() < 2U) {
+        return refuse(core::ErrorCode::invalid_state,
+            "mesh cleanup issue discovery found no vertices within the merge distance");
+    }
+    return review_mesh_cleanup(object_id, std::move(candidates.value()), options);
+}
+
+core::Result<MeshCleanupIssueReport> ApplicationSession::inspect_mesh_cleanup_issues(
+    scene::ObjectId object_id) const {
+    const auto refuse = [](core::ErrorCode code, std::string message) {
+        return core::Result<MeshCleanupIssueReport>::failure(
+            core::Diagnostic(code, std::move(message)));
+    };
+    if (!cleanup_review_identity_) {
+        return refuse(core::ErrorCode::invalid_state,
+            "mesh cleanup inspection requires a live session identity");
+    }
+    const auto* object = document_.scene().find(object_id);
+    if (object == nullptr || !object->mesh_asset.has_value()) {
+        return refuse(core::ErrorCode::not_found,
+            "mesh cleanup inspection requires an existing mesh object");
+    }
+    if (object->locked || !object->visible) {
+        return refuse(core::ErrorCode::invalid_state,
+            "mesh cleanup inspection requires a visible unlocked object");
+    }
+    if (document_.scene().size() > MeshCleanupOptions::kMaxMeshElements) {
+        return refuse(core::ErrorCode::unsupported,
+            "mesh cleanup inspection exceeds the scene inspection budget");
+    }
+    std::size_t owners = 0U;
+    for (const auto& owner : document_.scene().objects_sorted(
+             MeshCleanupOptions::kMaxMeshElements)) {
+        if (owner.mesh_asset == object->mesh_asset) ++owners;
+    }
+    if (owners != 1U) {
+        return refuse(core::ErrorCode::unsupported,
+            "mesh cleanup inspection refuses shared mesh assets");
+    }
+    const auto found = document_.meshes().find(*object->mesh_asset);
+    if (found == document_.meshes().end()) {
+        return refuse(core::ErrorCode::stale_data,
+            "mesh cleanup inspection source mesh is missing");
+    }
+    const auto& mesh = found->second;
+    std::size_t remaining = MeshCleanupOptions::kMaxMeshElements;
+    for (const std::size_t count : {mesh.vertex_count(), mesh.edge_count(), mesh.face_count()}) {
+        if (count > remaining) {
+            return refuse(core::ErrorCode::unsupported,
+                "mesh cleanup inspection source exceeds the element budget");
+        }
+        remaining -= count;
+    }
+    if (mesh.corners_sorted(remaining + 1U).size() > remaining) {
+        return refuse(core::ErrorCode::unsupported,
+            "mesh cleanup inspection source exceeds the corner budget");
+    }
+    if (auto valid = mesh.validate(); !valid) {
+        return core::Result<MeshCleanupIssueReport>::failure(
+            valid.error().with_context("mesh cleanup issue inspection"));
+    }
+
+    std::set<geometry::VertexId> referenced_vertices;
+    std::map<std::tuple<double, double, double>, std::vector<geometry::VertexId>>
+        vertex_ids_by_position;
+    std::map<std::vector<std::uint64_t>, std::vector<geometry::FaceId>> face_cycles;
+    std::map<geometry::VertexId, std::set<geometry::FaceId>> faces_at_vertex;
+    std::map<std::pair<geometry::VertexId, geometry::VertexId>,
+        std::vector<geometry::FaceId>> faces_at_edge;
+    const auto faces = mesh.faces_sorted();
+    for (const auto& face : faces) {
+        referenced_vertices.insert(face.vertices.begin(), face.vertices.end());
+        for (const geometry::VertexId vertex_id : face.vertices) {
+            faces_at_vertex[vertex_id].insert(face.id);
+        }
+        for (std::size_t index = 0U; index < face.vertices.size(); ++index) {
+            const geometry::VertexId from = face.vertices[index];
+            const geometry::VertexId to = face.vertices[(index + 1U) % face.vertices.size()];
+            faces_at_edge[{std::min(from, to), std::max(from, to)}].push_back(face.id);
+        }
+        const auto first = std::min_element(face.vertices.begin(), face.vertices.end());
+        const auto first_index = static_cast<std::size_t>(
+            std::distance(face.vertices.begin(), first));
+        std::vector<std::uint64_t> forward;
+        std::vector<std::uint64_t> reverse;
+        forward.reserve(face.vertices.size());
+        reverse.reserve(face.vertices.size());
+        for (std::size_t offset = 0U; offset < face.vertices.size(); ++offset) {
+            forward.push_back(face.vertices[
+                (first_index + offset) % face.vertices.size()].value);
+            reverse.push_back(face.vertices[
+                (first_index + face.vertices.size() - offset) %
+                face.vertices.size()].value);
+        }
+        auto canonical_cycle = std::lexicographical_compare(
+                forward.begin(), forward.end(), reverse.begin(), reverse.end())
+            ? std::move(forward) : std::move(reverse);
+        face_cycles[std::move(canonical_cycle)].push_back(face.id);
+    }
+    MeshCleanupIssueReport report;
+    report.project_generation = project_generation_;
+    report.project_revision = document_.revision();
+    report.object = object_id;
+    report.mesh_asset = *object->mesh_asset;
+    report.mesh_revision = mesh.revision();
+    report.source_digest = project::canonical_mesh_snapshot_digest(mesh);
+    constexpr double kPlanarityArithmeticTolerance =
+        64.0 * std::numeric_limits<double>::epsilon();
+    for (const auto& face : faces) {
+        if (face.vertices.size() < 4U) continue;
+        const auto* origin = mesh.find_vertex(face.vertices[0U]);
+        const auto* second = mesh.find_vertex(face.vertices[1U]);
+        const auto* third = mesh.find_vertex(face.vertices[2U]);
+        if (origin == nullptr || second == nullptr || third == nullptr) {
+            return core::Result<MeshCleanupIssueReport>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "mesh cleanup planarity scan lost a reference-plane vertex"));
+        }
+        core::Vec3d first_edge = second->position - origin->position;
+        core::Vec3d second_edge = third->position - origin->position;
+        bool measurable = first_edge.finite() && second_edge.finite();
+        const double edge_scale = measurable ? std::max({
+            std::abs(first_edge.x), std::abs(first_edge.y), std::abs(first_edge.z),
+            std::abs(second_edge.x), std::abs(second_edge.y), std::abs(second_edge.z)}) : 0.0;
+        if (!measurable || edge_scale == 0.0) {
+            report.unmeasurable_planarity_faces.push_back(face.id);
+            continue;
+        }
+        first_edge = {first_edge.x / edge_scale, first_edge.y / edge_scale,
+            first_edge.z / edge_scale};
+        second_edge = {second_edge.x / edge_scale, second_edge.y / edge_scale,
+            second_edge.z / edge_scale};
+        const core::Vec3d normal = core::cross(first_edge, second_edge);
+        const double normal_length = std::hypot(
+            std::hypot(normal.x, normal.y), normal.z);
+        if (!normal.finite() || !std::isfinite(normal_length) || normal_length == 0.0) {
+            report.unmeasurable_planarity_faces.push_back(face.id);
+            continue;
+        }
+
+        double maximum_relative_deviation = 0.0;
+        for (std::size_t index = 3U; index < face.vertices.size(); ++index) {
+            const auto* vertex = mesh.find_vertex(face.vertices[index]);
+            if (vertex == nullptr) {
+                return core::Result<MeshCleanupIssueReport>::failure(core::Diagnostic(
+                    core::ErrorCode::invalid_state,
+                    "mesh cleanup planarity scan lost a face vertex"));
+            }
+            const core::Vec3d offset = vertex->position - origin->position;
+            if (!offset.finite()) {
+                measurable = false;
+                break;
+            }
+            const double offset_scale = std::max({std::abs(offset.x),
+                std::abs(offset.y), std::abs(offset.z)});
+            if (offset_scale == 0.0) continue;
+            const core::Vec3d normalized_offset{offset.x / offset_scale,
+                offset.y / offset_scale, offset.z / offset_scale};
+            const double offset_length = std::hypot(
+                std::hypot(normalized_offset.x, normalized_offset.y),
+                normalized_offset.z);
+            const double denominator = normal_length * offset_length;
+            const double signed_distance = core::dot(normal, normalized_offset);
+            if (!std::isfinite(denominator) || denominator == 0.0 ||
+                !std::isfinite(signed_distance)) {
+                measurable = false;
+                break;
+            }
+            const double relative_deviation = std::min(1.0,
+                std::abs(signed_distance) / denominator);
+            maximum_relative_deviation = std::max(maximum_relative_deviation,
+                relative_deviation);
+        }
+        if (!measurable) {
+            report.unmeasurable_planarity_faces.push_back(face.id);
+        } else if (maximum_relative_deviation > kPlanarityArithmeticTolerance) {
+            report.nonplanar_faces.push_back({face.id, maximum_relative_deviation});
+        }
+    }
+    for (const auto& face : faces) {
+        for (std::size_t index = 0U; index < face.vertices.size(); ++index) {
+            const geometry::VertexId previous_id = face.vertices[
+                (index + face.vertices.size() - 1U) % face.vertices.size()];
+            const geometry::VertexId corner_id = face.vertices[index];
+            const geometry::VertexId next_id = face.vertices[
+                (index + 1U) % face.vertices.size()];
+            const auto* previous = mesh.find_vertex(previous_id);
+            const auto* corner = mesh.find_vertex(corner_id);
+            const auto* next = mesh.find_vertex(next_id);
+            if (previous == nullptr || corner == nullptr || next == nullptr) {
+                return core::Result<MeshCleanupIssueReport>::failure(core::Diagnostic(
+                    core::ErrorCode::invalid_state,
+                    "mesh cleanup collinear-corner scan lost a face vertex"));
+            }
+            core::Vec3d incoming = corner->position - previous->position;
+            core::Vec3d outgoing = next->position - corner->position;
+            const auto max_component = [](core::Vec3d value) {
+                return std::max({std::abs(value.x), std::abs(value.y),
+                    std::abs(value.z)});
+            };
+            const double incoming_scale = max_component(incoming);
+            const double outgoing_scale = max_component(outgoing);
+            if (!std::isfinite(incoming_scale) || !std::isfinite(outgoing_scale) ||
+                incoming_scale == 0.0 || outgoing_scale == 0.0) {
+                continue;
+            }
+            incoming = {incoming.x / incoming_scale,
+                incoming.y / incoming_scale, incoming.z / incoming_scale};
+            outgoing = {outgoing.x / outgoing_scale,
+                outgoing.y / outgoing_scale, outgoing.z / outgoing_scale};
+            const core::Vec3d cross = core::cross(incoming, outgoing);
+            if (cross.x == 0.0 && cross.y == 0.0 && cross.z == 0.0 &&
+                core::dot(incoming, outgoing) > 0.0) {
+                report.collinear_face_corners.push_back(
+                    {face.id, previous_id, corner_id, next_id});
+            }
+        }
+    }
+    std::map<geometry::EdgeId,
+        std::pair<geometry::VertexId, geometry::VertexId>> boundary_edge_endpoints;
+    std::map<geometry::EdgeId, geometry::FaceId> boundary_edge_faces;
+    std::map<geometry::VertexId, std::vector<geometry::EdgeId>> boundary_edges_at_vertex;
+    for (const auto& edge : mesh.edges_sorted(mesh.edge_count())) {
+        if (edge.second_half_edge.has_value()) continue;
+        const auto incident = faces_at_edge.find({edge.first, edge.second});
+        if (incident == faces_at_edge.end() || incident->second.size() != 1U) {
+            return core::Result<MeshCleanupIssueReport>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "mesh cleanup boundary edge does not resolve to one source face"));
+        }
+        report.boundary_edges.push_back(edge.id);
+        boundary_edge_endpoints.emplace(edge.id, std::pair{edge.first, edge.second});
+        boundary_edge_faces.emplace(edge.id, incident->second.front());
+        boundary_edges_at_vertex[edge.first].push_back(edge.id);
+        boundary_edges_at_vertex[edge.second].push_back(edge.id);
+    }
+    std::set<geometry::EdgeId> remaining_boundary_edges(
+        report.boundary_edges.begin(), report.boundary_edges.end());
+    while (!remaining_boundary_edges.empty()) {
+        std::vector<geometry::EdgeId> pending{*remaining_boundary_edges.begin()};
+        remaining_boundary_edges.erase(remaining_boundary_edges.begin());
+        MeshCleanupBoundaryEdgeComponent component;
+        std::set<geometry::VertexId> visited_vertices;
+        while (!pending.empty()) {
+            const geometry::EdgeId current = pending.back();
+            pending.pop_back();
+            component.edges.push_back(current);
+            const auto incident_face = boundary_edge_faces.find(current);
+            if (incident_face == boundary_edge_faces.end()) {
+                return core::Result<MeshCleanupIssueReport>::failure(core::Diagnostic(
+                    core::ErrorCode::invalid_state,
+                    "mesh cleanup boundary component lost its source face"));
+            }
+            component.incident_faces.push_back(incident_face->second);
+            const auto endpoints = boundary_edge_endpoints.find(current);
+            if (endpoints == boundary_edge_endpoints.end()) continue;
+            for (const geometry::VertexId vertex : {endpoints->second.first,
+                                                     endpoints->second.second}) {
+                if (!visited_vertices.insert(vertex).second) continue;
+                const auto incident = boundary_edges_at_vertex.find(vertex);
+                if (incident == boundary_edges_at_vertex.end()) continue;
+                if (incident->second.size() == 1U) {
+                    component.endpoints.push_back(vertex);
+                } else if (incident->second.size() > 2U) {
+                    component.junctions.push_back(vertex);
+                }
+                for (const geometry::EdgeId neighbor : incident->second) {
+                    const auto remaining = remaining_boundary_edges.find(neighbor);
+                    if (remaining == remaining_boundary_edges.end()) continue;
+                    pending.push_back(neighbor);
+                    remaining_boundary_edges.erase(remaining);
+                }
+            }
+        }
+        std::sort(component.edges.begin(), component.edges.end());
+        std::sort(component.endpoints.begin(), component.endpoints.end());
+        std::sort(component.junctions.begin(), component.junctions.end());
+        std::sort(component.incident_faces.begin(), component.incident_faces.end());
+        component.incident_faces.erase(std::unique(component.incident_faces.begin(),
+            component.incident_faces.end()), component.incident_faces.end());
+        component.closed_loop = component.endpoints.empty() && component.junctions.empty();
+        report.boundary_edge_components.push_back(std::move(component));
+    }
+    for (const auto& vertex : mesh.vertices_sorted()) {
+        if (!referenced_vertices.contains(vertex.id)) {
+            report.unreferenced_vertices.push_back(vertex.id);
+        }
+        const core::Vec3d position = vertex.position;
+        vertex_ids_by_position[{
+            position.x == 0.0 ? 0.0 : position.x,
+            position.y == 0.0 ? 0.0 : position.y,
+            position.z == 0.0 ? 0.0 : position.z}].push_back(vertex.id);
+    }
+    std::map<geometry::VertexId,
+        std::map<geometry::FaceId, std::set<geometry::FaceId>>> fan_adjacency;
+    std::map<geometry::FaceId, std::set<geometry::FaceId>> face_adjacency;
+    for (const auto& [vertex, face_ids] : faces_at_vertex) {
+        for (const geometry::FaceId face_id : face_ids) {
+            fan_adjacency[vertex][face_id];
+        }
+    }
+    for (const auto& face : faces) face_adjacency[face.id];
+    for (const auto& [edge_vertices, face_ids] : faces_at_edge) {
+        const std::set<geometry::FaceId> unique_edge_faces(
+            face_ids.begin(), face_ids.end());
+        if (unique_edge_faces.size() > 1U) {
+            const geometry::FaceId anchor = *unique_edge_faces.begin();
+            for (auto face = std::next(unique_edge_faces.begin());
+                 face != unique_edge_faces.end(); ++face) {
+                face_adjacency[anchor].insert(*face);
+                face_adjacency[*face].insert(anchor);
+            }
+        }
+        if (face_ids.size() != 2U || face_ids[0] == face_ids[1]) continue;
+        for (const geometry::VertexId vertex : {edge_vertices.first, edge_vertices.second}) {
+            fan_adjacency[vertex][face_ids[0]].insert(face_ids[1]);
+            fan_adjacency[vertex][face_ids[1]].insert(face_ids[0]);
+        }
+    }
+    for (const auto& [vertex, incident_faces] : faces_at_vertex) {
+        if (incident_faces.size() < 2U) continue;
+        std::set<geometry::FaceId> remaining_faces = incident_faces;
+        std::vector<std::vector<geometry::FaceId>> components;
+        const auto vertex_adjacency = fan_adjacency.find(vertex);
+        while (!remaining_faces.empty()) {
+            std::vector<geometry::FaceId> pending{*remaining_faces.begin()};
+            remaining_faces.erase(remaining_faces.begin());
+            std::vector<geometry::FaceId> component;
+            while (!pending.empty()) {
+                const geometry::FaceId current = pending.back();
+                pending.pop_back();
+                component.push_back(current);
+                if (vertex_adjacency == fan_adjacency.end()) continue;
+                const auto current_adjacency = vertex_adjacency->second.find(current);
+                if (current_adjacency == vertex_adjacency->second.end()) continue;
+                for (const geometry::FaceId neighbor : current_adjacency->second) {
+                    const auto remaining = remaining_faces.find(neighbor);
+                    if (remaining == remaining_faces.end()) continue;
+                    pending.push_back(neighbor);
+                    remaining_faces.erase(remaining);
+                }
+            }
+            std::sort(component.begin(), component.end());
+            components.push_back(std::move(component));
+        }
+        if (components.size() > 1U) {
+            std::sort(components.begin(), components.end(), [](const auto& first, const auto& second) {
+                return first.front() < second.front();
+            });
+            report.disconnected_vertex_fans.push_back({vertex, std::move(components)});
+        }
+    }
+    std::set<geometry::FaceId> remaining_faces;
+    for (const auto& face : faces) remaining_faces.insert(face.id);
+    std::vector<std::vector<geometry::FaceId>> face_components;
+    while (!remaining_faces.empty()) {
+        std::vector<geometry::FaceId> pending{*remaining_faces.begin()};
+        remaining_faces.erase(remaining_faces.begin());
+        std::vector<geometry::FaceId> component;
+        while (!pending.empty()) {
+            const geometry::FaceId current = pending.back();
+            pending.pop_back();
+            component.push_back(current);
+            const auto adjacent = face_adjacency.find(current);
+            if (adjacent == face_adjacency.end()) continue;
+            for (const geometry::FaceId neighbor : adjacent->second) {
+                const auto remaining = remaining_faces.find(neighbor);
+                if (remaining == remaining_faces.end()) continue;
+                pending.push_back(neighbor);
+                remaining_faces.erase(remaining);
+            }
+        }
+        std::sort(component.begin(), component.end());
+        face_components.push_back(std::move(component));
+    }
+    if (face_components.size() > 1U) {
+        std::sort(face_components.begin(), face_components.end(),
+            [](const auto& first, const auto& second) {
+                return first.front() < second.front();
+            });
+        report.disconnected_face_components = std::move(face_components);
+    }
+    std::sort(report.boundary_edge_components.begin(), report.boundary_edge_components.end(),
+        [](const auto& first, const auto& second) {
+            return first.edges.front() < second.edges.front();
+        });
+    for (auto& [position, vertex_ids] : vertex_ids_by_position) {
+        static_cast<void>(position);
+        if (vertex_ids.size() > 1U) {
+            report.coincident_vertex_groups.push_back(std::move(vertex_ids));
+        }
+    }
+    std::sort(report.coincident_vertex_groups.begin(), report.coincident_vertex_groups.end(),
+        [](const auto& first, const auto& second) {
+            return first.front() < second.front();
+        });
+    for (auto& [cycle, face_ids] : face_cycles) {
+        static_cast<void>(cycle);
+        if (face_ids.size() > 1U) {
+            report.duplicate_face_groups.push_back(std::move(face_ids));
+        }
+    }
+    return core::Result<MeshCleanupIssueReport>::success(std::move(report));
 }
 
 core::Result<DispatchReceipt> ApplicationSession::commit_mesh_cleanup(
@@ -958,7 +1564,8 @@ core::Result<DispatchReceipt> ApplicationSession::commit_mesh_cleanup(
     }
     if (candidate.topology_receipts().empty() ||
         candidate.topology_receipts().back().receipt.serialize() != review.receipt_.serialize() ||
-        canonical_mesh_geometry_digest(candidate.meshes().at(review.mesh_asset_)) != review.result_digest_) {
+        project::canonical_mesh_snapshot_digest(candidate.meshes().at(review.mesh_asset_)) !=
+            review.result_digest_) {
         return failure(invalid_state("mesh cleanup persistent patch disagrees with the reviewed result"));
     }
     AffectedSet affected;
@@ -1149,8 +1756,15 @@ core::Result<RecoveryInspection> inspect_recovery_unlocked(
         inspection.journal_entry_count = entries.value().size();
         inspection.journal_entries.reserve(entries.value().size());
         for (const auto& entry : entries.value()) {
-            inspection.journal_entries.push_back(RecoveryJournalEntry{
-                entry.revision_before, entry.revision_after, entry.event_type});
+            auto evidence = journal_entry_evidence(entry);
+            if (!evidence) {
+                inspection.state = RecoveryInspectionState::blocked;
+                inspection.diagnostic = evidence.error().with_context("recovery journal attribution");
+                inspection.journal_entries.push_back(RecoveryJournalEntry{
+                    entry.revision_before, entry.revision_after, entry.event_type});
+            } else {
+                inspection.journal_entries.push_back(std::move(evidence.value()));
+            }
         }
         if (!entries.value().empty()) {
             inspection.durable_revision = entries.value().back().revision_after;
@@ -1337,8 +1951,10 @@ core::Result<void> ApplicationSession::append_mutation_event(
         return core::Result<void>::success();
     }
     const std::string serialized_document = document_.serialize();
-    const std::string payload_text = document_snapshot_payload(
-        "CARTOGRAPHER_APPLICATION_MUTATION_V1", action, serialized_document);
+    auto encoded = mutation_snapshot_payload_v2(
+        action, active_source_, active_provenance_id_, serialized_document);
+    if (!encoded) return core::Result<void>::failure(encoded.error());
+    const std::string payload_text = std::move(encoded.value());
     if (payload_text.size() > kMaxJournalPayloadBytes) {
         return core::Result<void>::failure(core::Diagnostic(
             core::ErrorCode::validation_failed,
@@ -1414,6 +2030,85 @@ core::Result<DispatchReceipt> ApplicationSession::accept_speculative_result(
             admission, document_, candidate),
         operation);
     active_source_ = previous_source;
+    active_provenance_id_ = std::move(previous_provenance);
+    if (!result) {
+        history_ = std::move(prior_history);
+        return result;
+    }
+
+    selection_.clear();
+    last_tool_action_.reset();
+    last_tool_context_.reset();
+    viewport_mesh_cache_.clear();
+    if (project_generation_ == std::numeric_limits<std::uint64_t>::max()) {
+        project_generation_ = 0U;
+    } else {
+        ++project_generation_;
+    }
+    return result;
+}
+
+core::Result<DispatchReceipt> ApplicationSession::accept_agent_project_merge(
+    const project::ProjectDocument& candidate,
+    core::Revision expected_revision,
+    std::string_view task_id,
+    std::string_view review_digest,
+    std::string_view candidate_digest,
+    std::string_view selected_source,
+    std::string_view justification) {
+    const auto parsed_review_digest = assets::Sha256Digest::from_hex(review_digest);
+    const auto parsed_candidate_digest = assets::Sha256Digest::from_hex(candidate_digest);
+    const auto safe_text = [](std::string_view value, std::size_t limit) {
+        return !value.empty() && value.size() <= limit &&
+            std::all_of(value.begin(), value.end(), [](unsigned char character) {
+                return character >= 0x20U && character != 0x7fU;
+            });
+    };
+    const bool known_source = selected_source == "common" ||
+        selected_source == "current" || selected_source == "speculative";
+    if (active_source_ != OperationSource::human || !safe_text(task_id, 64U) ||
+        !parsed_review_digest || !parsed_candidate_digest || !known_source ||
+        !safe_text(justification, 1024U) ||
+        std::all_of(justification.begin(), justification.end(), [](unsigned char character) {
+            return character == ' ';
+        })) {
+        return core::Result<DispatchReceipt>::failure(invalid_state(
+            "project merge acceptance requires a valid human choice, lineage, and justification"));
+    }
+    if (document_.revision() != expected_revision) {
+        return core::Result<DispatchReceipt>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "project changed after the merge candidate was reviewed"));
+    }
+    if (expected_revision.exhausted()) {
+        return core::Result<DispatchReceipt>::failure(invalid_state(
+            "project revision cannot advance for merge acceptance"));
+    }
+    if (auto result = candidate.validate(); !result) {
+        return core::Result<DispatchReceipt>::failure(
+            result.error().with_context("agent project merge acceptance"));
+    }
+    project::ProjectDocument candidate_at_live_revision(candidate);
+    candidate_at_live_revision.revision_ = expected_revision;
+    if (candidate_at_live_revision.serialize() == document_.serialize()) {
+        return core::Result<DispatchReceipt>::failure(invalid_state(
+            "selected project snapshot already matches the current project"));
+    }
+
+    editor::CommandBus prior_history = std::move(history_);
+    history_ = editor::CommandBus{};
+    editor::ProjectCommandAdmission admission;
+    std::string previous_provenance = std::move(active_provenance_id_);
+    active_provenance_id_ = std::string(task_id);
+    const std::string operation = "Accept Agent Project Merge task=" + std::string(task_id) +
+        " source=" + std::string(selected_source) +
+        " review=" + std::string(review_digest) +
+        " candidate=" + std::string(candidate_digest) +
+        " justification=" + std::string(justification);
+    auto result = execute_command(
+        std::make_unique<editor::ReplaceProjectDocumentCommand>(
+            admission, document_, candidate),
+        operation);
     active_provenance_id_ = std::move(previous_provenance);
     if (!result) {
         history_ = std::move(prior_history);
@@ -1545,6 +2240,10 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
     const ApplicationAction& action,
     OperationSource source,
     std::string_view provenance_id) {
+    if (journal_.has_value()) {
+        const auto valid = mutation_snapshot_payload_v2("dispatch", source, provenance_id, {});
+        if (!valid) return failure(valid.error().with_context("application attribution"));
+    }
     const OperationSource previous_source = active_source_;
     std::string previous_provenance = std::move(active_provenance_id_);
     active_source_ = source;
@@ -1593,6 +2292,8 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return select_vertex(value);
             } else if constexpr (std::is_same_v<Action, SelectFaceAction>) {
                 return select_face(value);
+            } else if constexpr (std::is_same_v<Action, SelectFaceBatchAction>) {
+                return select_face_batch(value);
             } else if constexpr (std::is_same_v<Action, SelectEdgeAction>) {
                 return select_edge(value);
             } else if constexpr (std::is_same_v<Action, SetObjectTransformAction>) {
@@ -1689,12 +2390,18 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return create_plane(value);
             } else if constexpr (std::is_same_v<Action, CreateMeshObjectAction>) {
                 return create_mesh_object(value);
+            } else if constexpr (std::is_same_v<Action, ImportGltfSceneAction>) {
+                return import_gltf_scene(value);
             } else if constexpr (std::is_same_v<Action, AppendSculptStrokeAction>) {
                 return append_sculpt_stroke(value);
             } else if constexpr (std::is_same_v<Action, AppendSculptSurfaceStrokeAction>) {
                 return append_sculpt_surface_stroke(value);
             } else if constexpr (std::is_same_v<Action, SetSculptLayerVisibilityAction>) {
                 return set_sculpt_layer_visibility(value);
+            } else if constexpr (std::is_same_v<Action, SetSculptLayerWeightAction>) {
+                return set_sculpt_layer_weight(value);
+            } else if constexpr (std::is_same_v<Action, MoveSculptLayerAction>) {
+                return move_sculpt_layer(value);
             } else if constexpr (std::is_same_v<Action, DuplicateMeshInstanceAction>) {
                 return duplicate_mesh_instance(value);
             } else if constexpr (std::is_same_v<Action, DuplicateMeshInstanceBatchAction>) {
@@ -1743,6 +2450,18 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return add_condition_prefab(value);
             } else if constexpr (std::is_same_v<Action, InstantiateConditionPrefabAction>) {
                 return instantiate_condition_prefab(value);
+            } else if constexpr (std::is_same_v<Action, RebaseConditionPrefabAction>) {
+                return rebase_condition_prefab(value);
+            } else if constexpr (std::is_same_v<Action, ReplaceConnectionPortGraphAction>) {
+                return replace_connection_port_graph(value);
+            } else if constexpr (std::is_same_v<Action, AddConnectionPortAction>) {
+                return add_connection_port(value);
+            } else if constexpr (std::is_same_v<Action, RemoveConnectionPortAction>) {
+                return remove_connection_port(value);
+            } else if constexpr (std::is_same_v<Action, RemoveConnectionEdgeAction>) {
+                return remove_connection_edge(value);
+            } else if constexpr (std::is_same_v<Action, ConnectConditionPrefabSocketsAction>) {
+                return connect_condition_prefab_sockets(value);
             } else if constexpr (std::is_same_v<Action, AddConditionCollectionAction>) {
                 return add_condition_collection(value);
             } else if constexpr (std::is_same_v<Action, AddConditionRegionKitAction>) {
@@ -1771,12 +2490,25 @@ core::Result<DispatchReceipt> ApplicationSession::dispatch(
                 return set_material_region_assignment(value);
             } else if constexpr (std::is_same_v<Action, GenerateUniqueLightmapUvAction>) {
                 return generate_unique_lightmap_uv(value);
+            } else if constexpr (std::is_same_v<Action, PackUvIslandsAction>) {
+                return pack_uv_islands(value);
+            } else if constexpr (std::is_same_v<Action, SetUvCoordinateAction>) {
+                return set_uv_coordinate(value);
+            } else if constexpr (std::is_same_v<Action, SetUvSeamMarkAction>) {
+                return set_uv_seam_mark(value);
+            } else if constexpr (std::is_same_v<Action, AlignUvSeamAction>) {
+                return align_uv_seam(value);
             } else if constexpr (std::is_same_v<Action, SetMaterialGraphAction>) {
                 return set_material_graph(value);
             } else if constexpr (std::is_same_v<Action, SetMaterialGraphBindingAction>) {
                 return set_material_graph_binding(value);
+            } else if constexpr (std::is_same_v<Action, SetMaterialGraphInputsAction>) {
+                return set_material_graph_inputs(value);
             } else if constexpr (std::is_same_v<Action, ImportMaterialTextureSourceAction>) {
                 return import_material_texture_source(value);
+            } else if constexpr (
+                std::is_same_v<Action, ReimportMaterialTextureSourceAction>) {
+                return reimport_material_texture_source(value);
             } else if constexpr (std::is_same_v<Action, SetPresentationCatalogAction>) {
                 return set_presentation_catalog(value);
             } else if constexpr (std::is_same_v<Action, SetProjectAuthoringStandardsAction>) {
@@ -1908,9 +2640,312 @@ core::Result<condition::AuthoringDocument> ApplicationSession::condition_authori
     return decoded;
 }
 
+core::Result<assets::Sha256Digest> ApplicationSession::connection_port_graph_digest() const {
+    return document_.connection_port_graph().canonical_digest();
+}
+
+const connection::ConnectionPortGraph&
+ApplicationSession::connection_port_graph() const noexcept {
+    return document_.connection_port_graph();
+}
+
 core::Result<assets::SourceReimportPlan> ApplicationSession::preview_source_reimport(
     std::vector<assets::SourceImportRecord> incoming) const {
     return assets::plan_source_reimport(document_.source_asset_registry(), std::move(incoming));
+}
+
+core::Result<assets::SourceReimportPlan> ApplicationSession::preview_source_asset_metadata(
+    std::string_view identity,
+    core::Revision expected_source_generation,
+    std::uint64_t expected_project_generation,
+    core::Revision expected_project_revision,
+    std::vector<std::string> authored_tags,
+    std::vector<std::string> dependencies) const {
+    const auto fail = [](core::Diagnostic diagnostic) {
+        return core::Result<assets::SourceReimportPlan>::failure(std::move(diagnostic));
+    };
+    if (project_generation_ != expected_project_generation ||
+        document_.revision() != expected_project_revision) {
+        return fail(core::Diagnostic(core::ErrorCode::stale_data,
+            "source metadata draft belongs to a stale project snapshot"));
+    }
+    const auto& registry = document_.source_asset_registry();
+    const auto current = registry.records().find(std::string(identity));
+    const auto lineage = registry.lineage().find(std::string(identity));
+    if (current == registry.records().end() || lineage == registry.lineage().end()) {
+        return fail(core::Diagnostic(core::ErrorCode::not_found,
+            "source metadata target is no longer active"));
+    }
+    if (current->second.source_generation != expected_source_generation ||
+        lineage->second != expected_source_generation) {
+        return fail(core::Diagnostic(core::ErrorCode::stale_data,
+            "source metadata draft belongs to a stale source generation"));
+    }
+    assets::SourceImportRecord updated = current->second;
+    updated.authored_tags = std::move(authored_tags);
+    updated.dependencies = std::move(dependencies);
+    if (updated.authored_tags == current->second.authored_tags &&
+        updated.dependencies == current->second.dependencies) {
+        return fail(core::Diagnostic(core::ErrorCode::invalid_state,
+            "source metadata draft has no changes to review"));
+    }
+    if (lineage->second.exhausted()) {
+        return fail(core::Diagnostic(core::ErrorCode::invalid_state,
+            "source metadata cannot advance an exhausted source generation"));
+    }
+    updated.source_generation = lineage->second.next();
+    std::vector<assets::SourceImportRecord> candidate;
+    candidate.reserve(registry.records().size());
+    for (const auto& [active_identity, record] : registry.records()) {
+        candidate.push_back(active_identity == identity ? updated : record);
+    }
+    return assets::plan_source_reimport(registry, std::move(candidate));
+}
+
+core::Result<void> ApplicationSession::verify_source_asset_blob(
+    std::string_view identity,
+    core::Revision expected_source_generation,
+    std::uint64_t expected_project_generation,
+    core::Revision expected_project_revision) const {
+    if (project_generation_ != expected_project_generation ||
+        document_.revision() != expected_project_revision) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "source blob verification belongs to a stale project snapshot"));
+    }
+    const auto& registry = document_.source_asset_registry();
+    const auto record = registry.records().find(std::string(identity));
+    const auto lineage = registry.lineage().find(std::string(identity));
+    if (record == registry.records().end() || lineage == registry.lineage().end()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::not_found, "source blob target is no longer active"));
+    }
+    if (record->second.source_generation != expected_source_generation ||
+        lineage->second != expected_source_generation) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "source blob verification belongs to a stale source generation"));
+    }
+    if (!project_path_.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "source blob verification requires a saved project"));
+    }
+
+    std::error_code error;
+    const auto requested_root = project_path_->parent_path().empty()
+        ? std::filesystem::current_path(error) : project_path_->parent_path();
+    if (error) return core::Result<void>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the saved project directory"));
+    const auto project_root = std::filesystem::weakly_canonical(requested_root, error);
+    if (error || project_root.empty()) return core::Result<void>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the saved project directory"));
+
+    assets::BlobStore store(project_root / ".carto-assets" / "source-blobs");
+    const auto expected_path = store.path_for(record->second.source_digest);
+    const auto stored_path = std::filesystem::canonical(expected_path, error);
+    if (error) return core::Result<void>::failure(core::Diagnostic(
+        core::ErrorCode::not_found, "project-local source blob is missing"));
+    const auto relative_path = stored_path.lexically_relative(project_root);
+    if (stored_path != expected_path.lexically_normal() || relative_path.empty() ||
+        relative_path.is_absolute() ||
+        relative_path.generic_string() != record->second.relative_source_path ||
+        std::any_of(relative_path.begin(), relative_path.end(), [](const auto& component) {
+            return component == "..";
+        })) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::validation_failed,
+            "source blob locator is not the recorded project-local content-addressed path"));
+    }
+    constexpr std::uintmax_t kMaxVerifiedSourceBlobBytes = 256ULL * 1024ULL * 1024ULL;
+    const auto size = std::filesystem::file_size(stored_path, error);
+    if (error || size > kMaxVerifiedSourceBlobBytes) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "source blob is unavailable or exceeds the verification size limit"));
+    }
+    return store.verify(record->second.source_digest);
+}
+
+core::Result<assets::BlobOrphanReport> ApplicationSession::inspect_source_blob_store(
+    std::uint64_t expected_project_generation,
+    core::Revision expected_project_revision,
+    std::optional<PendingMeshReimportBlobReview> pending_mesh_reimport) const {
+    if (project_generation_ != expected_project_generation ||
+        document_.revision() != expected_project_revision) {
+        return core::Result<assets::BlobOrphanReport>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "source blob inventory belongs to a stale project snapshot"));
+    }
+    std::array<assets::Sha256Digest, 1U> pending_digest_storage{};
+    std::span<const assets::Sha256Digest> pending_work_digests;
+    if (pending_mesh_reimport.has_value()) {
+        const auto& pending = *pending_mesh_reimport;
+        if (pending.project_generation != expected_project_generation ||
+            pending.project_revision != expected_project_revision ||
+            pending.source_identity.empty() || pending.source_generation.value() == 0U ||
+            pending.current_source_digest.is_zero() ||
+            pending.candidate_source_digest.is_zero()) {
+            return core::Result<assets::BlobOrphanReport>::failure(core::Diagnostic(
+                pending.project_generation != expected_project_generation ||
+                    pending.project_revision != expected_project_revision
+                    ? core::ErrorCode::stale_data : core::ErrorCode::invalid_argument,
+                "source blob inventory mesh-reimport binding is stale or incomplete"));
+        }
+        const auto& records = document_.source_asset_registry().records();
+        const auto source = records.find(pending.source_identity);
+        if (source == records.end() ||
+            source->second.kind != assets::SourceAssetKind::mesh ||
+            source->second.source_generation != pending.source_generation ||
+            source->second.source_digest != pending.current_source_digest) {
+            return core::Result<assets::BlobOrphanReport>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "source blob inventory mesh-reimport binding is stale"));
+        }
+        pending_digest_storage.front() = pending.candidate_source_digest;
+        pending_work_digests = std::span<const assets::Sha256Digest>{
+            pending_digest_storage};
+    }
+    if (!project_path_.has_value()) {
+        return core::Result<assets::BlobOrphanReport>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "source blob inventory requires a saved project"));
+    }
+    const auto saved_project_path = project_path_;
+
+    constexpr std::size_t kMaxSourceBlobReachabilityDigests = 524'288U;
+    std::set<assets::Sha256Digest> reachable_digests;
+    const auto retain_document_digests = [&reachable_digests](
+            const project::ProjectDocument& document) {
+        for (const auto& [identity, record] : document.source_asset_registry().records()) {
+            static_cast<void>(identity);
+            reachable_digests.insert(record.source_digest);
+        }
+        for (const auto& [identity, texture] : document.material_catalog().textures()) {
+            static_cast<void>(identity);
+            reachable_digests.insert(texture.content_digest);
+        }
+        for (const auto& [identity, plane] : document.presentation_catalog().reference_planes()) {
+            static_cast<void>(identity);
+            reachable_digests.insert(plane.source_digest);
+        }
+        return reachable_digests.size() <= kMaxSourceBlobReachabilityDigests;
+    };
+    if (!retain_document_digests(document_)) {
+        return core::Result<assets::BlobOrphanReport>::failure(core::Diagnostic(
+            core::ErrorCode::validation_failed,
+            "source blob inventory exceeds the bounded reachable-digest count"));
+    }
+
+    std::error_code error;
+    const auto requested_root = saved_project_path->parent_path().empty()
+        ? std::filesystem::current_path(error) : saved_project_path->parent_path();
+    if (error) return core::Result<assets::BlobOrphanReport>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the saved project directory"));
+    const auto project_root = std::filesystem::weakly_canonical(requested_root, error);
+    if (error || project_root.empty()) {
+        return core::Result<assets::BlobOrphanReport>::failure(core::Diagnostic(
+            core::ErrorCode::io_error, "unable to resolve the saved project directory"));
+    }
+
+    project::FileLock project_lock(*saved_project_path);
+    if (auto locked = project_lock.acquire(); !locked) {
+        return core::Result<assets::BlobOrphanReport>::failure(
+            locked.error().with_context("source blob inventory project lock"));
+    }
+
+    auto history_limits = application_journal_limits();
+    history_limits.max_file_bytes = 512ULL * 1024ULL * 1024ULL;
+    history_limits.max_entries = 8'192U;
+    journal::Journal history(journal_path_for(*saved_project_path), history_limits);
+    const auto entries = history.read_all();
+    if (!entries) {
+        return core::Result<assets::BlobOrphanReport>::failure(
+            entries.error().with_context("source blob inventory journal history"));
+    }
+    if (entries.value().empty()) {
+        if (document_.revision().value() != 0U) {
+            return core::Result<assets::BlobOrphanReport>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "source blob inventory cannot establish the saved journal history"));
+        }
+    } else if (entries.value().back().revision_after != expected_project_revision ||
+               !journal_entry_matches_document(
+                   entries.value().back(), document_.serialize())) {
+        return core::Result<assets::BlobOrphanReport>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "source blob inventory journal tail does not match the project snapshot"));
+    }
+    std::uint64_t scanned_history_bytes = 0U;
+    constexpr std::uint64_t kMaxSourceHistorySnapshotBytes = 512ULL * 1024ULL * 1024ULL;
+    for (const auto& entry : entries.value()) {
+        if (entry.payload.size() > kMaxSourceHistorySnapshotBytes - scanned_history_bytes) {
+            return core::Result<assets::BlobOrphanReport>::failure(core::Diagnostic(
+                core::ErrorCode::validation_failed,
+                "source blob inventory exceeds the bounded journal snapshot scan"));
+        }
+        scanned_history_bytes += entry.payload.size();
+        const auto serialized = journal_entry_document_snapshot(entry);
+        if (!serialized) {
+            return core::Result<assets::BlobOrphanReport>::failure(
+                serialized.error().with_context("source blob inventory journal snapshot"));
+        }
+        const auto historical_document = project::ProjectDocument::deserialize(
+            serialized.value());
+        if (!historical_document) {
+            return core::Result<assets::BlobOrphanReport>::failure(
+                historical_document.error().with_context(
+                    "source blob inventory historical project snapshot"));
+        }
+        if (historical_document.value().revision() != entry.revision_after) {
+            return core::Result<assets::BlobOrphanReport>::failure(core::Diagnostic(
+                core::ErrorCode::validation_failed,
+                "source blob inventory journal snapshot revision is inconsistent"));
+        }
+        if (!retain_document_digests(historical_document.value())) {
+            return core::Result<assets::BlobOrphanReport>::failure(core::Diagnostic(
+                core::ErrorCode::validation_failed,
+                "source blob inventory exceeds the bounded reachable-digest count"));
+        }
+    }
+
+    const auto source_blob_root = project_root / ".carto-assets" / "source-blobs";
+    auto managed_directory = project_root;
+    for (const auto component : {".carto-assets", "source-blobs"}) {
+        managed_directory /= component;
+        const auto status = std::filesystem::symlink_status(managed_directory, error);
+        if (error && error != std::errc::no_such_file_or_directory) {
+            return core::Result<assets::BlobOrphanReport>::failure(core::Diagnostic(
+                core::ErrorCode::io_error,
+                "unable to inspect the managed source blob directory"));
+        }
+        error.clear();
+        if (std::filesystem::is_symlink(status) ||
+            (std::filesystem::exists(status) && !std::filesystem::is_directory(status))) {
+            return core::Result<assets::BlobOrphanReport>::failure(core::Diagnostic(
+                core::ErrorCode::validation_failed,
+                "source blob inventory refuses a linked or non-directory project path"));
+        }
+    }
+
+    assets::BlobStoreLimits inventory_limits;
+    inventory_limits.max_listed_blobs = 8'192U;
+    assets::BlobStore store(
+        source_blob_root, inventory_limits);
+    const std::vector<assets::Sha256Digest> live_digests(
+        reachable_digests.begin(), reachable_digests.end());
+    auto report = store.orphan_candidates(live_digests, pending_work_digests);
+    if (!report) {
+        return core::Result<assets::BlobOrphanReport>::failure(report.error());
+    }
+    if (project_path_ != saved_project_path ||
+        project_generation_ != expected_project_generation ||
+        document_.revision() != expected_project_revision) {
+        return core::Result<assets::BlobOrphanReport>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "project changed while the source blob inventory was being read"));
+    }
+    return core::Result<assets::BlobOrphanReport>::success(std::move(report).value());
 }
 
 core::Result<assets::SourceReimportPlan>
@@ -1945,6 +2980,44 @@ ApplicationSession::preview_source_asset_addition(
     return assets::plan_source_reimport(registry, std::move(complete_candidate));
 }
 
+core::Result<std::vector<std::uint8_t>>
+ApplicationSession::read_reference_image_source_bytes(std::string_view identity) const {
+    const auto plane = document_.presentation_catalog().reference_planes().find(
+        std::string(identity));
+    if (plane == document_.presentation_catalog().reference_planes().end()) {
+        return core::Result<std::vector<std::uint8_t>>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "reference-image plane does not exist in the current project"));
+    }
+    if (!project_path_.has_value()) {
+        return core::Result<std::vector<std::uint8_t>>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "reference-image decoding requires a saved project"));
+    }
+    std::error_code error;
+    const auto requested_root = project_path_->parent_path().empty()
+        ? std::filesystem::current_path(error)
+        : project_path_->parent_path();
+    if (error) {
+        return core::Result<std::vector<std::uint8_t>>::failure(core::Diagnostic(
+            core::ErrorCode::io_error,
+            "unable to resolve the current project directory for reference-image decoding"));
+    }
+    const auto project_root = std::filesystem::weakly_canonical(requested_root, error);
+    if (error || project_root.empty()) {
+        return core::Result<std::vector<std::uint8_t>>::failure(core::Diagnostic(
+            core::ErrorCode::io_error,
+            "unable to resolve the current project directory for reference-image decoding"));
+    }
+    auto encoded = project::read_reference_image_source_bytes(
+        project_root, plane->second, document_.source_asset_registry());
+    if (!encoded) {
+        return core::Result<std::vector<std::uint8_t>>::failure(
+            encoded.error().with_context("reference-image source verification"));
+    }
+    return encoded;
+}
+
 core::Result<assets::DecodedRgba8Texture>
 ApplicationSession::decode_reference_image_tga(std::string_view identity) const {
     constexpr std::uint64_t kMaxReferencePreviewPixels = 16'777'216ULL;
@@ -1955,11 +3028,6 @@ ApplicationSession::decode_reference_image_tga(std::string_view identity) const 
             core::ErrorCode::not_found,
             "reference-image plane does not exist in the current project"));
     }
-    if (!project_path_.has_value()) {
-        return core::Result<assets::DecodedRgba8Texture>::failure(core::Diagnostic(
-            core::ErrorCode::invalid_state,
-            "reference-image decoding requires a saved project"));
-    }
     const std::uint64_t pixel_count =
         static_cast<std::uint64_t>(plane->second.image_width_pixels) *
         static_cast<std::uint64_t>(plane->second.image_height_pixels);
@@ -1968,23 +3036,7 @@ ApplicationSession::decode_reference_image_tga(std::string_view identity) const 
             core::ErrorCode::validation_failed,
             "reference-image pixel count exceeds the bounded TGA preview budget"));
     }
-    std::error_code error;
-    const auto requested_root = project_path_->parent_path().empty()
-        ? std::filesystem::current_path(error)
-        : project_path_->parent_path();
-    if (error) {
-        return core::Result<assets::DecodedRgba8Texture>::failure(core::Diagnostic(
-            core::ErrorCode::io_error,
-            "unable to resolve the current project directory for reference-image decoding"));
-    }
-    const auto project_root = std::filesystem::weakly_canonical(requested_root, error);
-    if (error || project_root.empty()) {
-        return core::Result<assets::DecodedRgba8Texture>::failure(core::Diagnostic(
-            core::ErrorCode::io_error,
-            "unable to resolve the current project directory for reference-image decoding"));
-    }
-    auto encoded = project::read_reference_image_source_bytes(
-        project_root, plane->second, document_.source_asset_registry());
+    auto encoded = read_reference_image_source_bytes(identity);
     if (!encoded) {
         return core::Result<assets::DecodedRgba8Texture>::failure(
             encoded.error().with_context("reference-image TGA source verification"));
@@ -2536,6 +3588,8 @@ core::Result<RoadTerrainPreview> ApplicationSession::road_terrain_preview(
 
 core::Result<geometry::SweptMeshProduct> ApplicationSession::sweep_source_preview(
     std::string_view identity) const {
+    const core::Revision project_revision = document_.revision();
+    const core::Revision scene_revision = document_.scene().revision();
     const auto source = document_.sweep_sources().find(std::string(identity));
     if (source == document_.sweep_sources().end()) {
         return core::Result<geometry::SweptMeshProduct>::failure(core::Diagnostic(
@@ -2549,7 +3603,68 @@ core::Result<geometry::SweptMeshProduct> ApplicationSession::sweep_source_previe
             core::ErrorCode::stale_data,
             "sweep preview requires the exact authored centerline revision"));
     }
-    return geometry::build_sweep_mesh(source->second, centerline->second);
+    auto preview = geometry::build_sweep_mesh(source->second, centerline->second);
+    if (!preview) return preview;
+    if (source->second.owner_object_id != 0U) {
+        const auto owner_transform = document_.scene().world_transform(
+            scene::ObjectId{source->second.owner_object_id});
+        if (!owner_transform) {
+            return core::Result<geometry::SweptMeshProduct>::failure(
+                owner_transform.error().with_context("sweep preview owner frame"));
+        }
+        preview.value().owner_world_transform = owner_transform.value();
+        preview.value().owner_scene_revision = scene_revision;
+    }
+    if (document_.revision() != project_revision ||
+        document_.scene().revision() != scene_revision) {
+        return core::Result<geometry::SweptMeshProduct>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "sweep preview project or owner frame changed during resolution"));
+    }
+    preview.value().source_project_revision = project_revision;
+    return preview;
+}
+
+core::Result<condition::SweepEndpointSpatialReview>
+ApplicationSession::inspect_sweep_endpoint_spatial_fit(
+    const condition::SweepEndpointPortBinding& binding,
+    const condition::SweepEndpointSpatialPolicy& policy,
+    std::uint64_t expected_project_generation,
+    core::Revision expected_project_revision) const {
+    if (project_generation_ != expected_project_generation ||
+        document_.revision() != expected_project_revision) {
+        return core::Result<condition::SweepEndpointSpatialReview>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "sweep endpoint spatial review targets a stale project snapshot"));
+    }
+    const auto source = document_.sweep_sources().find(binding.sweep_source_identity);
+    if (source == document_.sweep_sources().end()) {
+        return core::Result<condition::SweepEndpointSpatialReview>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "sweep endpoint spatial review source is absent from the current project"));
+    }
+    const auto centerline = document_.curve_paths().find(
+        source->second.centerline_identity);
+    if (centerline == document_.curve_paths().end()) {
+        return core::Result<condition::SweepEndpointSpatialReview>::failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "sweep endpoint spatial review centerline is absent from the current project"));
+    }
+    const core::Revision captured_scene_revision = document_.scene().revision();
+    auto review = condition::review_sweep_endpoint_spatial_fit(
+        source->second, centerline->second, binding,
+        document_.connection_port_graph(), document_.scene(), policy,
+        project_generation_, document_.revision());
+    if (!review) return review;
+    if (project_generation_ != expected_project_generation ||
+        document_.revision() != expected_project_revision ||
+        document_.scene().revision() != captured_scene_revision ||
+        review.value().scene_revision != captured_scene_revision) {
+        return core::Result<condition::SweepEndpointSpatialReview>::failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "project or scene changed while resolving sweep endpoint spatial fit"));
+    }
+    return review;
 }
 
 core::Result<production::DecalProjection> ApplicationSession::decal_placement_preview(
@@ -3239,6 +4354,10 @@ core::Result<DispatchReceipt> ApplicationSession::execute_command(
     std::string action,
     AffectedSet affected,
     std::optional<ParameterPayload> parameters) {
+    if (journal_.has_value()) {
+        const auto valid = mutation_snapshot_payload_v2(action, active_source_, active_provenance_id_, {});
+        if (!valid) return failure(valid.error().with_context("application mutation attribution"));
+    }
     const core::Revision before = document_.revision();
     project::ProjectDocument before_document = document_;
     if (auto result = history_.execute(std::move(command)); !result) {
@@ -3321,6 +4440,58 @@ core::Result<DispatchReceipt> ApplicationSession::select_face(const SelectFaceAc
         return failure(result.error().with_context("face selection"));
     }
     return accepted("Select Face", before);
+}
+
+core::Result<DispatchReceipt> ApplicationSession::select_face_batch(
+    const SelectFaceBatchAction& action) {
+    if (action.faces.empty() || action.faces.size() > SelectFaceBatchAction::kMaxFaces) {
+        return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "face batch selection must contain 1..65536 face identities"));
+    }
+    if (action.expected_project_generation != project_generation_ ||
+        action.expected_project_revision != document_.revision()) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "face batch selection belongs to a stale project snapshot"));
+    }
+    const auto* object = document_.scene().find(action.object);
+    if (!object) {
+        return failure(core::Diagnostic(core::ErrorCode::not_found,
+            "cannot select faces on a missing object"));
+    }
+    if (!object->mesh_asset.has_value()) {
+        return failure(invalid_state("cannot select faces on an object without a mesh"));
+    }
+    const auto mesh = document_.meshes().find(*object->mesh_asset);
+    if (mesh == document_.meshes().end()) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "object references a missing mesh"));
+    }
+    if (mesh->second.revision() != action.expected_mesh_revision) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "face batch selection belongs to a stale mesh revision"));
+    }
+
+    std::vector<geometry::FaceId> ordered_faces = action.faces;
+    std::sort(ordered_faces.begin(), ordered_faces.end());
+    if (std::adjacent_find(ordered_faces.begin(), ordered_faces.end()) !=
+        ordered_faces.end()) {
+        return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "face batch selection contains duplicate identities"));
+    }
+
+    editor::SelectionState candidate = selection_;
+    for (std::size_t index = 0U; index < ordered_faces.size(); ++index) {
+        const auto selected = candidate.select_face(
+            document_.scene(), action.object, mesh->second, ordered_faces[index],
+            index == 0U ? editor::SelectionOperation::replace
+                        : editor::SelectionOperation::add);
+        if (!selected) {
+            return failure(selected.error().with_context("face batch selection"));
+        }
+    }
+    const core::Revision before = document_.revision();
+    selection_ = std::move(candidate);
+    return accepted("Select Face Batch", before);
 }
 
 core::Result<DispatchReceipt> ApplicationSession::select_edge(const SelectEdgeAction& action) {
@@ -4127,10 +5298,20 @@ core::Result<DispatchReceipt> ApplicationSession::append_sculpt_stroke(
             core::ErrorCode::unsupported,
             "SculptStack authoring requires the human command boundary"));
     }
-    if (action.expected_project_revision != document_.revision()) {
+    if (action.expected_project_generation != project_generation_ ||
+        action.expected_project_revision != document_.revision()) {
         return failure(core::Diagnostic(
             core::ErrorCode::stale_data,
-            "SculptStack authoring snapshot no longer matches the project revision"));
+            "SculptStack authoring snapshot no longer matches the project generation and revision"));
+    }
+    production::SculptStroke request_validation;
+    request_validation.identity = "preview.validation";
+    request_validation.mode = action.mode;
+    request_validation.radius = action.radius;
+    request_validation.strength = action.strength;
+    request_validation.samples.push_back({{}, 1.0});
+    if (auto valid = request_validation.validate(); !valid) {
+        return failure(valid.error().with_context("SculptStack point stroke request"));
     }
     if (selection_.mode() != editor::SelectionMode::vertex ||
         selection_.selected_vertices().size() != 1U ||
@@ -4192,10 +5373,26 @@ core::Result<DispatchReceipt> ApplicationSession::append_sculpt_surface_stroke(
             core::ErrorCode::unsupported,
             "Sculpt surface authoring requires the human command boundary"));
     }
-    if (action.expected_project_revision != document_.revision()) {
+    if (action.expected_project_generation != project_generation_ ||
+        action.expected_project_revision != document_.revision()) {
         return failure(core::Diagnostic(
             core::ErrorCode::stale_data,
-            "Sculpt surface snapshot no longer matches the project revision"));
+            "Sculpt surface snapshot no longer matches the project generation and revision"));
+    }
+    if (action.samples.empty() ||
+        action.samples.size() > production::kMaxSculptSamplesPerStroke) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "Sculpt surface stroke sample count is outside its supported bound"));
+    }
+    production::SculptStroke request_validation;
+    request_validation.identity = "preview.validation";
+    request_validation.mode = action.mode;
+    request_validation.radius = action.radius;
+    request_validation.strength = action.strength;
+    request_validation.samples = action.samples;
+    if (auto valid = request_validation.validate(); !valid) {
+        return failure(valid.error().with_context("Sculpt surface stroke request"));
     }
     const scene::SceneObject* object = document_.scene().find(action.object);
     if (object == nullptr || !object->mesh_asset.has_value() ||
@@ -4214,13 +5411,6 @@ core::Result<DispatchReceipt> ApplicationSession::append_sculpt_surface_stroke(
             core::ErrorCode::stale_data,
             "Sculpt surface target mesh is missing"));
     }
-    if (action.samples.empty() ||
-        action.samples.size() > production::kMaxSculptSamplesPerStroke) {
-        return failure(core::Diagnostic(
-            core::ErrorCode::invalid_argument,
-            "Sculpt surface stroke sample count is outside its supported bound"));
-    }
-
     production::SculptStroke stroke;
     stroke.mode = action.mode;
     stroke.radius = action.radius;
@@ -4240,9 +5430,10 @@ core::Result<DispatchReceipt> ApplicationSession::append_sculpt_surface_stroke(
         if (auto result = anchor.validate(); !result) {
             return failure(result.error().with_context("Sculpt surface stroke anchor"));
         }
-        const auto resolved = production::resolve_sculpt_surface_anchor(mesh->second, anchor);
+        const auto resolved = production::resolve_sculpt_surface_anchor(
+            mesh->second, anchor);
         if (!resolved) {
-            return failure(resolved.error().with_context("Sculpt surface stroke source"));
+            return failure(resolved.error().with_context("Sculpt surface source anchor"));
         }
         if (sample.position.x != resolved.value().x ||
             sample.position.y != resolved.value().y ||
@@ -4314,6 +5505,11 @@ core::Result<DispatchReceipt> ApplicationSession::commit_sculpt_stroke(
         if (!decoded) return failure(decoded.error().with_context("read existing SculptStack"));
         stack = std::move(decoded.value());
     }
+    if (stack.project_namespace != document_.source_namespace() ||
+        stack.mesh_asset != mesh_asset) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "SculptStack belongs to another project or mesh asset"));
+    }
     stack.format_version = production::kSculptStackVersion;
     for (production::SculptLayer& layer : stack.layers) {
         for (production::SculptStroke& existing : layer.strokes) {
@@ -4383,43 +5579,102 @@ core::Result<DispatchReceipt> ApplicationSession::commit_sculpt_stroke(
 
 core::Result<DispatchReceipt> ApplicationSession::set_sculpt_layer_visibility(
     const SetSculptLayerVisibilityAction& action) {
+    return update_sculpt_layer(
+        action.expected_project_revision,
+        action.expected_project_generation,
+        action.mesh_asset,
+        action.layer_identity,
+        action.visible,
+        std::nullopt,
+        std::nullopt,
+        "Set Sculpt Layer Visibility");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::set_sculpt_layer_weight(
+    const SetSculptLayerWeightAction& action) {
+    return update_sculpt_layer(
+        action.expected_project_revision,
+        action.expected_project_generation,
+        action.mesh_asset,
+        action.layer_identity,
+        std::nullopt,
+        action.weight,
+        std::nullopt,
+        "Set Sculpt Layer Weight");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::move_sculpt_layer(
+    const MoveSculptLayerAction& action) {
+    return update_sculpt_layer(
+        action.expected_project_revision,
+        action.expected_project_generation,
+        action.mesh_asset,
+        action.layer_identity,
+        std::nullopt,
+        std::nullopt,
+        action.target_index,
+        "Move Sculpt Layer");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::update_sculpt_layer(
+    core::Revision expected_project_revision,
+    std::uint64_t expected_project_generation,
+    std::uint64_t mesh_asset,
+    std::string_view layer_identity,
+    std::optional<bool> visible,
+    std::optional<double> weight,
+    std::optional<std::size_t> target_index,
+    std::string action_name) {
+    const std::size_t requested_changes =
+        static_cast<std::size_t>(visible.has_value()) +
+        static_cast<std::size_t>(weight.has_value()) +
+        static_cast<std::size_t>(target_index.has_value());
+    if (requested_changes != 1U || layer_identity.empty()) {
+        return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "SculptStack layer edit requires one valid property change and a layer identity"));
+    }
     if (active_source_ != OperationSource::human) {
         return failure(core::Diagnostic(
             core::ErrorCode::unsupported,
-            "SculptStack layer visibility requires the human command boundary"));
+            "SculptStack layer edits require the human command boundary"));
     }
-    if (action.expected_project_revision != document_.revision()) {
+    if (expected_project_revision != document_.revision()) {
         return failure(core::Diagnostic(
             core::ErrorCode::stale_data,
-            "SculptStack layer visibility snapshot no longer matches the project revision"));
+            "SculptStack layer edit snapshot no longer matches the project revision"));
+    }
+    if (expected_project_generation != project_generation_) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "SculptStack layer edit belongs to an earlier project generation"));
     }
     if (!selection_.component_object().has_value()) {
         return failure(core::Diagnostic(
             core::ErrorCode::invalid_state,
-            "SculptStack layer visibility requires a selected mesh component"));
+            "SculptStack layer edits require a selected mesh component"));
     }
     const scene::ObjectId object_id = *selection_.component_object();
     const scene::SceneObject* object = document_.scene().find(object_id);
     if (!object || !object->mesh_asset.has_value() ||
-        *object->mesh_asset != action.mesh_asset) {
+        *object->mesh_asset != mesh_asset) {
         return failure(core::Diagnostic(
             core::ErrorCode::stale_data,
-            "SculptStack layer visibility target no longer matches the selected mesh"));
+            "SculptStack layer edit target no longer matches the selected mesh"));
     }
     if (object->locked || !object->visible) {
         return failure(invalid_state(
             "hidden or locked scene objects cannot edit SculptStack layers"));
     }
-    const auto mesh = document_.meshes().find(action.mesh_asset);
+    const auto mesh = document_.meshes().find(mesh_asset);
     if (mesh == document_.meshes().end()) {
         return failure(core::Diagnostic(
             core::ErrorCode::stale_data,
-            "SculptStack layer visibility target mesh is missing"));
+            "SculptStack layer edit target mesh is missing"));
     }
     if (auto result = selection_.validate(document_.scene(), &mesh->second); !result) {
         return failure(result.error().with_context("SculptStack layer selection"));
     }
-    const auto current = document_.sculpt_stacks().find(action.mesh_asset);
+    const auto current = document_.sculpt_stacks().find(mesh_asset);
     if (current == document_.sculpt_stacks().end()) {
         return failure(core::Diagnostic(
             core::ErrorCode::not_found,
@@ -4430,29 +5685,54 @@ core::Result<DispatchReceipt> ApplicationSession::set_sculpt_layer_visibility(
         return failure(decoded.error().with_context("read SculptStack layers"));
     }
     production::SculptStack stack = std::move(decoded.value());
+    if (stack.project_namespace != document_.source_namespace() ||
+        stack.mesh_asset != mesh_asset) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "SculptStack belongs to another project or mesh asset"));
+    }
     const auto layer = std::find_if(
-        stack.layers.begin(), stack.layers.end(), [&action](const production::SculptLayer& item) {
-            return item.identity == action.layer_identity;
+        stack.layers.begin(), stack.layers.end(), [layer_identity](const production::SculptLayer& item) {
+            return item.identity == layer_identity;
         });
     if (layer == stack.layers.end()) {
         return failure(core::Diagnostic(
             core::ErrorCode::not_found,
             "SculptStack layer identity is not present on the selected mesh"));
     }
-    if (layer->visible == action.visible) {
-        return accepted("Set Sculpt Layer Visibility", document_.revision());
+    if (weight.has_value() &&
+        (!std::isfinite(*weight) || *weight < 0.0 || *weight > 1.0)) {
+        return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "SculptStack layer weight must be finite and within [0, 1]"));
     }
-
-    layer->visible = action.visible;
+    const std::size_t layer_index = static_cast<std::size_t>(
+        std::distance(stack.layers.begin(), layer));
+    if (target_index.has_value() && *target_index >= stack.layers.size()) {
+        return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "SculptStack layer destination index is out of range"));
+    }
+    if ((visible.has_value() && layer->visible == *visible) ||
+        (weight.has_value() && layer->weight == *weight) ||
+        (target_index.has_value() && layer_index == *target_index)) {
+        return accepted(action_name, document_.revision());
+    }
+    if (visible.has_value()) layer->visible = *visible;
+    if (weight.has_value()) layer->weight = *weight;
+    if (target_index.has_value()) {
+        production::SculptLayer moved_layer = std::move(*layer);
+        stack.layers.erase(layer);
+        stack.layers.insert(
+            stack.layers.begin() + static_cast<std::ptrdiff_t>(*target_index),
+            std::move(moved_layer));
+    }
     if (auto result = stack.validate(); !result) {
-        return failure(result.error().with_context("SculptStack layer visibility"));
+        return failure(result.error().with_context("SculptStack layer edit"));
     }
     const std::string serialized = stack.serialize();
     const auto digest = stack.digest();
     if (serialized.empty() || !digest) {
         return failure(core::Diagnostic(
             core::ErrorCode::validation_failed,
-            "SculptStack layer visibility did not produce canonical source bytes"));
+            "SculptStack layer edit did not produce canonical source bytes"));
     }
 
     editor::ProjectCommandAdmission admission;
@@ -4460,10 +5740,10 @@ core::Result<DispatchReceipt> ApplicationSession::set_sculpt_layer_visibility(
         std::make_unique<editor::SetProjectSculptStackCommand>(
             admission,
             document_,
-            action.mesh_asset,
+            mesh_asset,
             current->second,
             project::SerializedSculptStack{serialized, digest.value()}),
-        "Set Sculpt Layer Visibility",
+        std::move(action_name),
         AffectedSet{{object_id}, {}, {}, {}});
 }
 
@@ -7036,9 +8316,11 @@ core::Result<DispatchReceipt> ApplicationSession::instantiate_condition_prefab(
         std::uint64_t mesh_asset_id = 0U;
         core::Revision mesh_revision;
         core::Transform source_world_transform = core::Transform::identity();
+        assets::Sha256Digest snapshot_mesh_digest;
     };
     std::vector<ResolvedMember> resolved_members;
     resolved_members.reserve(prefab->asset_ids.size());
+    std::size_t snapshot_budget = kMaxPrefabSnapshotMeshElements;
     for (const condition::Id asset_id : prefab->asset_ids) {
         const auto asset = std::lower_bound(authoring.value().assets.begin(),
             authoring.value().assets.end(), asset_id,
@@ -7072,12 +8354,22 @@ core::Result<DispatchReceipt> ApplicationSession::instantiate_condition_prefab(
                 core::ErrorCode::stale_data,
                 "CONDITION prefab placement source mesh is missing"));
         }
+        if (document_.sculpt_stacks().contains(*object->mesh_asset) ||
+            document_.garment_assets().contains(*object->mesh_asset) ||
+            document_.cloth_rest_pose_receipts().contains(*object->mesh_asset)) {
+            return failure(core::Diagnostic(core::ErrorCode::unsupported,
+                "CONDITION prefab snapshots require explicit transfer of sculpt or garment authoring"));
+        }
+        if (!consume_prefab_snapshot_budget(mesh->second, snapshot_budget)) {
+            return failure(core::Diagnostic(core::ErrorCode::unsupported,
+                "CONDITION prefab snapshots exceed the aggregate mesh element budget"));
+        }
         const auto source_world = document_.scene().world_transform(source_object);
         if (!source_world) return failure(source_world.error().with_context(
             "CONDITION prefab source world transform"));
         resolved_members.push_back(ResolvedMember{
             &*asset, source_object, *object->mesh_asset, mesh->second.revision(),
-            source_world.value()});
+            source_world.value(), project::canonical_mesh_snapshot_digest(mesh->second)});
     }
 
     const core::Transform source_root_transform =
@@ -7118,6 +8410,12 @@ core::Result<DispatchReceipt> ApplicationSession::instantiate_condition_prefab(
     instance.root_object_id = root_result.value().value;
     AffectedSet affected;
     affected.objects.push_back(root_result.value());
+    auto material_catalog = candidate.material_catalog();
+    std::map<std::uint64_t, std::vector<project::MaterialRegionAssignment>> source_assignments;
+    for (const auto& [key, assignment] : document_.material_catalog().assignments()) {
+        source_assignments[key.mesh_asset].push_back(assignment);
+    }
+    bool copied_assignments = false;
     instance.members.reserve(resolved_members.size());
     for (const auto& resolved : resolved_members) {
         const auto source_local = editor::viewport_local_transform_from_world(
@@ -7135,8 +8433,31 @@ core::Result<DispatchReceipt> ApplicationSession::instantiate_condition_prefab(
             resolved.asset->stable_name, source_local.value());
         if (!member_result) return failure(member_result.error().with_context(
             "CONDITION prefab instance member"));
+        const auto snapshot_mesh = candidate.add_mesh(document_.meshes().at(resolved.mesh_asset_id));
+        if (!snapshot_mesh) return failure(snapshot_mesh.error().with_context(
+            "CONDITION prefab isolated mesh snapshot"));
+        const auto assignments = source_assignments.find(resolved.mesh_asset_id);
+        if (assignments != source_assignments.end()) {
+            for (auto assignment : assignments->second) {
+                if (assignment.variant.has_value()) {
+                    const auto variant = material_catalog.variants().find(*assignment.variant);
+                    if (variant == material_catalog.variants().end() ||
+                        (!variant->second.permitted_mesh_assets.empty() &&
+                         !std::binary_search(variant->second.permitted_mesh_assets.begin(),
+                             variant->second.permitted_mesh_assets.end(), snapshot_mesh.value()))) {
+                        return failure(core::Diagnostic(core::ErrorCode::unsupported,
+                            "CONDITION prefab snapshot cannot expand a material variant's mesh scope"));
+                    }
+                }
+                assignment.key.mesh_asset = snapshot_mesh.value();
+                if (auto copied = material_catalog.insert_assignment(assignment); !copied) {
+                    return failure(copied.error().with_context("CONDITION prefab material assignment"));
+                }
+                copied_assignments = true;
+            }
+        }
         if (auto attached = candidate.scene_.attach_mesh(
-                member_result.value(), resolved.mesh_asset_id); !attached) {
+                member_result.value(), snapshot_mesh.value()); !attached) {
             return failure(attached.error().with_context(
                 "CONDITION prefab instance mesh binding"));
         }
@@ -7154,7 +8475,15 @@ core::Result<DispatchReceipt> ApplicationSession::instantiate_condition_prefab(
             resolved.mesh_revision,
             resolved.asset->source_revision,
             resolved.asset->source_digest,
-            resolved.source_world_transform});
+            resolved.source_world_transform,
+            snapshot_mesh.value(), resolved.snapshot_mesh_digest, source_local.value(),
+            resolved.snapshot_mesh_digest,
+            candidate.meshes().at(snapshot_mesh.value()).revision()});
+    }
+    if (copied_assignments) {
+        if (auto applied = candidate.set_material_catalog(std::move(material_catalog)); !applied) {
+            return failure(applied.error().with_context("CONDITION prefab material snapshot"));
+        }
     }
     if (auto valid = instance.validate(); !valid) {
         return failure(valid.error().with_context("CONDITION prefab instance"));
@@ -7180,6 +8509,934 @@ core::Result<DispatchReceipt> ApplicationSession::instantiate_condition_prefab(
         std::make_unique<editor::ReplaceProjectDocumentCommand>(
             admission, document_, std::move(candidate), "Instantiate CONDITION Prefab"),
         "Instantiate CONDITION Prefab", std::move(affected));
+}
+
+core::Result<DispatchReceipt> ApplicationSession::rebase_condition_prefab(
+    const RebaseConditionPrefabAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(core::ErrorCode::unsupported,
+            "CONDITION prefab rebase requires the explicit human boundary"));
+    }
+    if (action.expected_project_generation != project_generation_ ||
+        action.expected_project_revision != document_.revision()) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "CONDITION prefab rebase used a stale project snapshot"));
+    }
+    const bool valid_justification = !action.justification.empty() &&
+        action.justification.size() <= 1'024U &&
+        std::any_of(action.justification.begin(), action.justification.end(),
+            [](unsigned char byte) { return byte != ' '; }) &&
+        std::all_of(action.justification.begin(), action.justification.end(),
+            [](unsigned char byte) { return byte >= 0x20U && byte != 0x7fU; });
+    if (action.instance_id == 0U || action.expected_authoring_digest.is_zero() ||
+        !valid_justification) {
+        return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "CONDITION prefab rebase requires an instance, review digest, and human justification"));
+    }
+    auto authoring = condition_authoring();
+    if (!authoring) {
+        return failure(authoring.error().with_context("CONDITION prefab rebase"));
+    }
+    if (authoring.value().project_revision != action.expected_authoring_revision) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "CONDITION prefab rebase used a stale authoring revision"));
+    }
+    const auto current_authoring_digest = authoring.value().canonical_digest();
+    if (!current_authoring_digest ||
+        current_authoring_digest.value() != action.expected_authoring_digest) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "CONDITION prefab rebase review digest no longer matches authoring state"));
+    }
+    if (authoring.value().project_revision.value() >= core::Revision::max_value() - 1U ||
+        document_.revision().exhausted()) {
+        return failure(invalid_state(
+            "CONDITION prefab rebase cannot safely advance project and authoring revisions"));
+    }
+    auto instance_position = std::lower_bound(authoring.value().prefab_instances.begin(),
+        authoring.value().prefab_instances.end(), action.instance_id,
+        [](const auto& item, condition::Id id) { return item.id < id; });
+    if (instance_position == authoring.value().prefab_instances.end() ||
+        instance_position->id != action.instance_id) {
+        return failure(core::Diagnostic(core::ErrorCode::not_found,
+            "CONDITION prefab rebase references a missing instance"));
+    }
+    auto prefab_position = std::lower_bound(authoring.value().prefabs.begin(),
+        authoring.value().prefabs.end(), instance_position->prefab_id,
+        [](const auto& item, condition::Id id) { return item.id < id; });
+    if (prefab_position == authoring.value().prefabs.end() ||
+        prefab_position->id != instance_position->prefab_id || prefab_position->asset_ids.empty()) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "CONDITION prefab rebase definition is missing or empty"));
+    }
+    if (instance_position->members.size() > condition::AuthoringDocument::kMaxPrefabInstanceMembers ||
+        prefab_position->asset_ids.size() > condition::AuthoringDocument::kMaxPrefabInstanceMembers) {
+        return failure(core::Diagnostic(core::ErrorCode::unsupported,
+            "CONDITION prefab rebase exceeds the member bound"));
+    }
+
+    std::map<std::uint64_t, std::size_t> snapshot_mesh_owners;
+    for (const auto& existing : authoring.value().prefab_instances) {
+        for (const auto& member : existing.members) {
+            if (member.instance_mesh_asset_id != 0U) {
+                snapshot_mesh_owners.try_emplace(member.instance_mesh_asset_id, 0U);
+            }
+        }
+    }
+    const auto scene_objects = document_.scene().objects_sorted();
+    for (const auto& object : scene_objects) {
+        if (!object.mesh_asset.has_value()) continue;
+        const auto owner = snapshot_mesh_owners.find(*object.mesh_asset);
+        if (owner != snapshot_mesh_owners.end()) ++owner->second;
+    }
+    if (condition_prefab_instance_bindings_current(
+            *instance_position, authoring.value(), document_, snapshot_mesh_owners)) {
+        return failure(core::Diagnostic(core::ErrorCode::invalid_state,
+            "CONDITION prefab instance is already current"));
+    }
+
+    std::vector<condition::Id> required_decision_ids = prefab_position->asset_ids;
+    for (const auto& member : instance_position->members) {
+        required_decision_ids.push_back(member.asset_id);
+    }
+    std::sort(required_decision_ids.begin(), required_decision_ids.end());
+    required_decision_ids.erase(std::unique(required_decision_ids.begin(),
+        required_decision_ids.end()), required_decision_ids.end());
+    if (action.decisions.size() != required_decision_ids.size() ||
+        action.decisions.size() > condition::AuthoringDocument::kMaxPrefabInstanceMembers * 2U ||
+        !std::is_sorted(action.decisions.begin(), action.decisions.end(),
+            [](const auto& left, const auto& right) { return left.asset_id < right.asset_id; })) {
+        return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "CONDITION prefab rebase requires one ordered explicit decision per changed or retained member"));
+    }
+    std::map<condition::Id, const ConditionPrefabRebaseDecision*> decisions;
+    for (std::size_t index = 0U; index < action.decisions.size(); ++index) {
+        const auto& decision = action.decisions[index];
+        if (decision.asset_id == 0U || decision.asset_id != required_decision_ids[index] ||
+            (index > 0U && action.decisions[index - 1U].asset_id == decision.asset_id)) {
+            return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+                "CONDITION prefab rebase decisions do not match the complete member inventory"));
+        }
+        decisions.emplace(decision.asset_id, &decision);
+    }
+
+    struct ResolvedSource {
+        const condition::SourceAsset* asset = nullptr;
+        scene::ObjectId object;
+        std::uint64_t mesh_asset = 0U;
+        core::Revision mesh_revision;
+        core::Transform world_transform = core::Transform::identity();
+        core::Transform prefab_local_transform = core::Transform::identity();
+        assets::Sha256Digest mesh_digest;
+    };
+    std::vector<ResolvedSource> resolved_sources;
+    resolved_sources.reserve(prefab_position->asset_ids.size());
+    std::size_t source_budget = kMaxPrefabSnapshotMeshElements;
+    for (const condition::Id asset_id : prefab_position->asset_ids) {
+        const auto asset = std::lower_bound(authoring.value().assets.begin(),
+            authoring.value().assets.end(), asset_id,
+            [](const auto& item, condition::Id id) { return item.id < id; });
+        if (asset == authoring.value().assets.end() || asset->id != asset_id ||
+            asset->authored_object_id == 0U) {
+            return failure(core::Diagnostic(core::ErrorCode::stale_data,
+                "CONDITION prefab rebase requires every source member to have an object binding"));
+        }
+        const auto evidence = std::lower_bound(authoring.value().sources.begin(),
+            authoring.value().sources.end(), asset->source_id,
+            [](const auto& item, condition::Id id) { return item.id < id; });
+        if (evidence == authoring.value().sources.end() || evidence->id != asset->source_id ||
+            !evidence->current || evidence->revision != asset->source_revision ||
+            evidence->digest != asset->source_digest) {
+            return failure(core::Diagnostic(core::ErrorCode::stale_data,
+                "CONDITION prefab rebase is blocked by stale source evidence"));
+        }
+        const scene::ObjectId object_id{asset->authored_object_id};
+        const auto* object = document_.scene().find(object_id);
+        if (object == nullptr || !object->mesh_asset.has_value()) {
+            return failure(core::Diagnostic(core::ErrorCode::stale_data,
+                "CONDITION prefab rebase source object or mesh binding is missing"));
+        }
+        const auto mesh = document_.meshes().find(*object->mesh_asset);
+        if (mesh == document_.meshes().end()) {
+            return failure(core::Diagnostic(core::ErrorCode::stale_data,
+                "CONDITION prefab rebase source mesh is missing"));
+        }
+        if (document_.sculpt_stacks().contains(*object->mesh_asset) ||
+            document_.garment_assets().contains(*object->mesh_asset) ||
+            document_.cloth_rest_pose_receipts().contains(*object->mesh_asset)) {
+            return failure(core::Diagnostic(core::ErrorCode::unsupported,
+                "CONDITION prefab rebase requires explicit sculpt or garment-state transfer"));
+        }
+        if (!consume_prefab_snapshot_budget(mesh->second, source_budget)) {
+            return failure(core::Diagnostic(core::ErrorCode::unsupported,
+                "CONDITION prefab rebase exceeds the source mesh element budget"));
+        }
+        const auto world = document_.scene().world_transform(object_id);
+        if (!world) return failure(world.error().with_context(
+            "CONDITION prefab rebase source transform"));
+        resolved_sources.push_back(ResolvedSource{
+            &*asset, object_id, *object->mesh_asset, mesh->second.revision(),
+            world.value(), core::Transform::identity(),
+            project::canonical_mesh_snapshot_digest(mesh->second)});
+    }
+    const core::Transform source_root_transform = resolved_sources.front().world_transform;
+    const auto transforms_close = [](const core::Transform& left, const core::Transform& right) {
+        const auto close = [](double a, double b) {
+            const double scale = std::max({1.0, std::abs(a), std::abs(b)});
+            return std::abs(a - b) <= 1.0e-10 * scale;
+        };
+        return close(left.translation.x, right.translation.x) &&
+            close(left.translation.y, right.translation.y) &&
+            close(left.translation.z, right.translation.z) &&
+            close(left.rotation.x, right.rotation.x) &&
+            close(left.rotation.y, right.rotation.y) &&
+            close(left.rotation.z, right.rotation.z) &&
+            close(left.rotation.w, right.rotation.w) &&
+            close(left.scale.x, right.scale.x) && close(left.scale.y, right.scale.y) &&
+            close(left.scale.z, right.scale.z);
+    };
+    for (auto& source : resolved_sources) {
+        const auto local = editor::viewport_local_transform_from_world(
+            source_root_transform, source.world_transform);
+        if (!local || !transforms_close(
+                source_root_transform.combine(local.value()), source.world_transform)) {
+            return failure(local ? core::Diagnostic(core::ErrorCode::unsupported,
+                "CONDITION prefab rebase source layout cannot be represented exactly as local TRS")
+                : local.error().with_context("CONDITION prefab rebase member transform"));
+        }
+        source.prefab_local_transform = local.value();
+    }
+
+    project::ProjectDocument candidate(document_);
+    auto candidate_authoring = authoring.value();
+    auto& instance = *std::lower_bound(candidate_authoring.prefab_instances.begin(),
+        candidate_authoring.prefab_instances.end(), action.instance_id,
+        [](const auto& item, condition::Id id) { return item.id < id; });
+    const auto* root = candidate.scene().find(scene::ObjectId{instance.root_object_id});
+    if (root == nullptr || root->parent.has_value() || root->mesh_asset.has_value()) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "CONDITION prefab rebase root is missing or no longer a detached root"));
+    }
+
+    std::map<std::uint64_t, std::vector<project::MaterialRegionAssignment>> source_assignments;
+    for (const auto& [key, assignment] : document_.material_catalog().assignments()) {
+        source_assignments[key.mesh_asset].push_back(assignment);
+    }
+    auto material_catalog = candidate.material_catalog();
+    bool copied_assignments = false;
+    const auto copy_source_assignments = [&](std::uint64_t source_mesh,
+            std::uint64_t instance_mesh) -> core::Result<void> {
+        const auto assignments = source_assignments.find(source_mesh);
+        if (assignments == source_assignments.end()) return core::Result<void>::success();
+        for (auto assignment : assignments->second) {
+            if (assignment.variant.has_value()) {
+                const auto variant = material_catalog.variants().find(*assignment.variant);
+                if (variant == material_catalog.variants().end() ||
+                    (!variant->second.permitted_mesh_assets.empty() &&
+                     !std::binary_search(variant->second.permitted_mesh_assets.begin(),
+                         variant->second.permitted_mesh_assets.end(), instance_mesh))) {
+                    return core::Result<void>::failure(core::Diagnostic(
+                        core::ErrorCode::unsupported,
+                        "CONDITION prefab rebase cannot expand a material variant's mesh scope"));
+                }
+            }
+            assignment.key.mesh_asset = instance_mesh;
+            if (auto copied = material_catalog.insert_assignment(assignment); !copied) {
+                return core::Result<void>::failure(copied.error().with_context(
+                    "CONDITION prefab rebase member material assignment"));
+            }
+            copied_assignments = true;
+        }
+        return core::Result<void>::success();
+    };
+
+    std::size_t instance_budget = kMaxPrefabSnapshotMeshElements;
+    for (const auto& source : resolved_sources) {
+        const auto decision = decisions.at(source.asset->id);
+        const auto old_member = std::lower_bound(instance.members.begin(), instance.members.end(),
+            source.asset->id, [](const auto& item, condition::Id id) {
+                return item.asset_id < id;
+            });
+        const bool is_new_member = old_member == instance.members.end() ||
+            old_member->asset_id != source.asset->id;
+        if (is_new_member) {
+            if (!decision->include_added_member || decision->mesh.has_value() ||
+                decision->placement.has_value() || decision->removed_member.has_value()) {
+                return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+                    "CONDITION prefab rebase added member requires an explicit include decision"));
+            }
+            continue;
+        }
+        if (decision->include_added_member || decision->removed_member.has_value() ||
+            !decision->mesh.has_value() || !decision->placement.has_value() ||
+            (*decision->mesh != ConditionPrefabRebaseMeshChoice::keep_instance_snapshot &&
+             *decision->mesh != ConditionPrefabRebaseMeshChoice::use_current_source_snapshot) ||
+            (*decision->placement != ConditionPrefabRebasePlacementChoice::keep_instance_placement &&
+             *decision->placement != ConditionPrefabRebasePlacementChoice::use_current_source_placement)) {
+            return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+                "CONDITION prefab rebase retained member requires explicit geometry and placement choices"));
+        }
+        const auto* instance_object = candidate.scene().find(
+            scene::ObjectId{old_member->instance_object_id});
+        const auto old_mesh = old_member->instance_mesh_asset_id == 0U
+            ? candidate.meshes().end()
+            : candidate.meshes().find(old_member->instance_mesh_asset_id);
+        if (instance_object == nullptr || instance_object->parent !=
+                std::optional<scene::ObjectId>{scene::ObjectId{instance.root_object_id}} ||
+            !instance_object->mesh_asset.has_value() ||
+            (old_member->instance_mesh_asset_id != 0U &&
+             (*instance_object->mesh_asset != old_member->instance_mesh_asset_id ||
+              old_mesh == candidate.meshes().end() ||
+              !snapshot_mesh_owners.contains(old_member->instance_mesh_asset_id) ||
+              snapshot_mesh_owners.at(old_member->instance_mesh_asset_id) != 1U))) {
+            return failure(core::Diagnostic(core::ErrorCode::stale_data,
+                "CONDITION prefab rebase instance object or isolated mesh binding is invalid"));
+        }
+        std::uint64_t instance_mesh_id = old_member->instance_mesh_asset_id;
+        core::Revision instance_mesh_revision;
+        assets::Sha256Digest instance_mesh_digest;
+        if (*decision->mesh == ConditionPrefabRebaseMeshChoice::use_current_source_snapshot) {
+            const auto& source_mesh = document_.meshes().at(source.mesh_asset);
+            if (instance_mesh_id == 0U) {
+                const auto cloned = candidate.add_mesh(source_mesh);
+                if (!cloned) return failure(cloned.error().with_context(
+                    "CONDITION prefab rebase legacy snapshot creation"));
+                instance_mesh_id = cloned.value();
+                if (auto attached = candidate.scene_.attach_mesh(
+                        scene::ObjectId{old_member->instance_object_id}, instance_mesh_id); !attached) {
+                    return failure(attached.error().with_context(
+                        "CONDITION prefab rebase legacy snapshot binding"));
+                }
+                if (auto copied = copy_source_assignments(source.mesh_asset, instance_mesh_id);
+                    !copied) {
+                    return failure(copied.error());
+                }
+                if (!consume_prefab_snapshot_budget(source_mesh, instance_budget)) {
+                    return failure(core::Diagnostic(core::ErrorCode::unsupported,
+                        "CONDITION prefab rebase exceeds the instance mesh element budget"));
+                }
+                const auto clone_revision = candidate.meshes().at(instance_mesh_id).revision();
+                instance_mesh_revision = clone_revision;
+                instance_mesh_digest = project::canonical_mesh_snapshot_digest(
+                    candidate.meshes().at(instance_mesh_id));
+            } else {
+                if (document_.sculpt_stacks().contains(instance_mesh_id) ||
+                    document_.garment_assets().contains(instance_mesh_id) ||
+                    document_.cloth_rest_pose_receipts().contains(instance_mesh_id)) {
+                    return failure(core::Diagnostic(core::ErrorCode::unsupported,
+                        "CONDITION prefab rebase cannot overwrite instance sculpt or garment state"));
+                }
+                if (!consume_prefab_snapshot_budget(source_mesh, instance_budget)) {
+                    return failure(core::Diagnostic(core::ErrorCode::unsupported,
+                        "CONDITION prefab rebase exceeds the instance mesh element budget"));
+                }
+                const auto replaced = candidate.replace_mesh_if_revision(
+                    instance_mesh_id, old_mesh->second.revision(), source_mesh);
+                if (!replaced) return failure(replaced.error().with_context(
+                    "CONDITION prefab rebase source geometry replacement"));
+                instance_mesh_revision = replaced.value();
+                instance_mesh_digest = project::canonical_mesh_snapshot_digest(
+                    candidate.meshes().at(instance_mesh_id));
+            }
+        } else {
+            if (instance_mesh_id == 0U) {
+                return failure(core::Diagnostic(core::ErrorCode::unsupported,
+                    "CONDITION prefab rebase cannot infer legacy instance geometry from the current source"));
+            }
+            if (!consume_prefab_snapshot_budget(old_mesh->second, instance_budget)) {
+                return failure(core::Diagnostic(core::ErrorCode::unsupported,
+                    "CONDITION prefab rebase exceeds the instance mesh element budget"));
+            }
+            instance_mesh_revision = old_mesh->second.revision();
+            instance_mesh_digest = project::canonical_mesh_snapshot_digest(old_mesh->second);
+        }
+        auto* mutable_instance_object = candidate.scene_.find(
+            scene::ObjectId{old_member->instance_object_id});
+        if (mutable_instance_object == nullptr) {
+            return failure(invalid_state("CONDITION prefab rebase lost an instance member"));
+        }
+        core::Transform instance_local = mutable_instance_object->local_transform;
+        if (*decision->placement ==
+                ConditionPrefabRebasePlacementChoice::use_current_source_placement) {
+            instance_local = source.prefab_local_transform;
+            if (auto moved = candidate.scene_.set_local_transform(
+                    scene::ObjectId{old_member->instance_object_id}, instance_local); !moved) {
+                return failure(moved.error().with_context(
+                    "CONDITION prefab rebase placement update"));
+            }
+        }
+        auto& member = *std::lower_bound(instance.members.begin(), instance.members.end(),
+            source.asset->id, [](const auto& item, condition::Id id) {
+                return item.asset_id < id;
+            });
+        member.source_object_id = source.object.value;
+        member.mesh_asset_id = source.mesh_asset;
+        member.mesh_revision = source.mesh_revision;
+        member.source_revision = source.asset->source_revision;
+        member.source_digest = source.asset->source_digest;
+        member.source_world_transform = source.world_transform;
+        member.instance_mesh_asset_id = instance_mesh_id;
+        member.source_snapshot_mesh_digest = source.mesh_digest;
+        member.snapshot_mesh_digest = instance_mesh_digest;
+        member.instance_mesh_revision = instance_mesh_revision;
+        member.instance_local_transform = instance_local;
+    }
+
+    for (const auto& source : resolved_sources) {
+        const auto decision = decisions.at(source.asset->id);
+        const auto old_member = std::lower_bound(instance.members.begin(), instance.members.end(),
+            source.asset->id, [](const auto& item, condition::Id id) {
+                return item.asset_id < id;
+            });
+        if (old_member != instance.members.end() && old_member->asset_id == source.asset->id) continue;
+        const auto& source_mesh = document_.meshes().at(source.mesh_asset);
+        if (!consume_prefab_snapshot_budget(source_mesh, instance_budget)) {
+            return failure(core::Diagnostic(core::ErrorCode::unsupported,
+                "CONDITION prefab rebase exceeds the aggregate added-mesh budget"));
+        }
+        const auto local = source.prefab_local_transform;
+        auto object = candidate.scene_.create_object(source.asset->stable_name, local);
+        if (!object) return failure(object.error().with_context(
+            "CONDITION prefab rebase added member"));
+        const auto clone = candidate.add_mesh(source_mesh);
+        if (!clone) return failure(clone.error().with_context(
+            "CONDITION prefab rebase added member snapshot"));
+        if (auto attached = candidate.scene_.attach_mesh(object.value(), clone.value()); !attached) {
+            return failure(attached.error().with_context(
+                "CONDITION prefab rebase added member mesh binding"));
+        }
+        if (auto parented = candidate.scene_.set_parent(
+                object.value(), scene::ObjectId{instance.root_object_id}); !parented) {
+            return failure(parented.error().with_context(
+                "CONDITION prefab rebase added member hierarchy"));
+        }
+        if (auto copied = copy_source_assignments(source.mesh_asset, clone.value()); !copied) {
+            return failure(copied.error());
+        }
+        condition::PrefabInstanceMember added;
+        added.asset_id = source.asset->id;
+        added.source_object_id = source.object.value;
+        added.instance_object_id = object.value().value;
+        added.mesh_asset_id = source.mesh_asset;
+        added.mesh_revision = source.mesh_revision;
+        added.source_revision = source.asset->source_revision;
+        added.source_digest = source.asset->source_digest;
+        added.source_world_transform = source.world_transform;
+        added.instance_mesh_asset_id = clone.value();
+        added.snapshot_mesh_digest = project::canonical_mesh_snapshot_digest(
+            candidate.meshes().at(clone.value()));
+        added.instance_local_transform = local;
+        added.source_snapshot_mesh_digest = source.mesh_digest;
+        added.instance_mesh_revision = candidate.meshes().at(clone.value()).revision();
+        const auto insertion = std::lower_bound(instance.members.begin(), instance.members.end(),
+            added.asset_id, [](const auto& item, condition::Id id) { return item.asset_id < id; });
+        instance.members.insert(insertion, std::move(added));
+    }
+    if (copied_assignments) {
+        if (auto set = candidate.set_material_catalog(std::move(material_catalog)); !set) {
+            return failure(set.error().with_context(
+                "CONDITION prefab rebase material assignments"));
+        }
+    }
+
+    AffectedSet affected;
+    affected.objects.push_back(scene::ObjectId{instance.root_object_id});
+    affected.mesh_assets.reserve(instance.members.size());
+    for (const auto& source : resolved_sources) {
+        const auto member = std::lower_bound(instance.members.begin(), instance.members.end(),
+            source.asset->id, [](const auto& item, condition::Id id) {
+                return item.asset_id < id;
+            });
+        if (member != instance.members.end() && member->asset_id == source.asset->id) {
+            affected.objects.push_back(scene::ObjectId{member->instance_object_id});
+            affected.mesh_assets.push_back(member->instance_mesh_asset_id);
+        }
+    }
+
+    for (const condition::Id asset_id : required_decision_ids) {
+        if (std::binary_search(prefab_position->asset_ids.begin(),
+                prefab_position->asset_ids.end(), asset_id)) continue;
+        const auto decision = decisions.at(asset_id);
+        if (decision->include_added_member || decision->mesh.has_value() ||
+            decision->placement.has_value() || !decision->removed_member.has_value() ||
+            (*decision->removed_member != ConditionPrefabRemovedMemberChoice::detach_scene_object &&
+             *decision->removed_member != ConditionPrefabRemovedMemberChoice::delete_scene_object)) {
+            return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+                "CONDITION prefab rebase removed member requires an explicit detach or delete choice"));
+        }
+        auto member = std::lower_bound(instance.members.begin(), instance.members.end(), asset_id,
+            [](const auto& item, condition::Id id) { return item.asset_id < id; });
+        if (member == instance.members.end() || member->asset_id != asset_id) {
+            return failure(invalid_state("CONDITION prefab rebase lost a removed member binding"));
+        }
+        const scene::ObjectId object_id{member->instance_object_id};
+        if (*decision->removed_member == ConditionPrefabRemovedMemberChoice::detach_scene_object) {
+            const auto world = candidate.scene().world_transform(object_id);
+            if (!world) return failure(world.error().with_context(
+                "CONDITION prefab rebase detach transform"));
+            if (auto detached = candidate.scene_.set_parent(object_id, std::nullopt); !detached) {
+                return failure(detached.error().with_context(
+                    "CONDITION prefab rebase member detach"));
+            }
+            if (auto transformed = candidate.scene_.set_local_transform(object_id, world.value());
+                !transformed) {
+                return failure(transformed.error().with_context(
+                    "CONDITION prefab rebase detached member transform"));
+            }
+        } else {
+            if (auto removed = candidate.remove_object(object_id); !removed) {
+                return failure(removed.error().with_context(
+                    "CONDITION prefab rebase member deletion"));
+            }
+        }
+        affected.objects.push_back(object_id);
+        if (member->instance_mesh_asset_id != 0U) {
+            affected.mesh_assets.push_back(member->instance_mesh_asset_id);
+        }
+        instance.members.erase(member);
+    }
+    if (instance.members.empty()) {
+        return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "CONDITION prefab rebase cannot leave an empty instance"));
+    }
+    std::sort(affected.mesh_assets.begin(), affected.mesh_assets.end());
+    affected.mesh_assets.erase(std::unique(affected.mesh_assets.begin(),
+        affected.mesh_assets.end()), affected.mesh_assets.end());
+    std::sort(affected.objects.begin(), affected.objects.end());
+    affected.objects.erase(std::unique(affected.objects.begin(), affected.objects.end()),
+        affected.objects.end());
+    condition::PrefabRebaseReceipt receipt;
+    receipt.instance_id = action.instance_id;
+    receipt.reviewed_authoring_revision = action.expected_authoring_revision;
+    receipt.reviewed_authoring_digest = action.expected_authoring_digest;
+    receipt.applied_authoring_revision = candidate_authoring.project_revision.next();
+    receipt.justification = action.justification;
+    receipt.decisions.reserve(action.decisions.size());
+    for (const auto& decision : action.decisions) {
+        condition::PrefabRebaseMemberDecision accepted;
+        accepted.asset_id = decision.asset_id;
+        const bool in_new_prefab = std::binary_search(prefab_position->asset_ids.begin(),
+            prefab_position->asset_ids.end(), decision.asset_id);
+        const auto old_decision_member = std::lower_bound(instance_position->members.begin(),
+            instance_position->members.end(), decision.asset_id,
+            [](const auto& member, condition::Id id) { return member.asset_id < id; });
+        const bool in_old_instance = old_decision_member != instance_position->members.end() &&
+            old_decision_member->asset_id == decision.asset_id;
+        if (in_new_prefab && in_old_instance) {
+            accepted.membership = condition::PrefabRebaseMembershipDecision::retained;
+            accepted.mesh = *decision.mesh == ConditionPrefabRebaseMeshChoice::keep_instance_snapshot
+                ? condition::PrefabRebaseMeshDecision::keep_instance_snapshot
+                : condition::PrefabRebaseMeshDecision::use_current_source_snapshot;
+            accepted.placement = *decision.placement ==
+                    ConditionPrefabRebasePlacementChoice::keep_instance_placement
+                ? condition::PrefabRebasePlacementDecision::keep_instance_placement
+                : condition::PrefabRebasePlacementDecision::use_current_source_placement;
+        } else if (in_new_prefab) {
+            accepted.membership = condition::PrefabRebaseMembershipDecision::added;
+            accepted.mesh = condition::PrefabRebaseMeshDecision::use_current_source_snapshot;
+            accepted.placement = condition::PrefabRebasePlacementDecision::use_current_source_placement;
+        } else {
+            accepted.membership = *decision.removed_member ==
+                    ConditionPrefabRemovedMemberChoice::detach_scene_object
+                ? condition::PrefabRebaseMembershipDecision::detached
+                : condition::PrefabRebaseMembershipDecision::deleted;
+        }
+        receipt.decisions.push_back(std::move(accepted));
+    }
+    instance.source_authoring_revision = receipt.applied_authoring_revision;
+    instance.prefab_source_revision = prefab_position->source_revision;
+    candidate_authoring.project_revision = receipt.applied_authoring_revision;
+    candidate_authoring.prefab_rebase_receipts.push_back(std::move(receipt));
+    if (auto valid = instance.validate(); !valid) {
+        return failure(valid.error().with_context("CONDITION prefab rebase instance"));
+    }
+    if (auto valid = candidate_authoring.validate(); !valid) {
+        return failure(valid.error().with_context("CONDITION prefab rebase authoring"));
+    }
+    const auto authoring_bytes = candidate_authoring.serialize();
+    const auto authoring_digest = candidate_authoring.canonical_digest();
+    if (!authoring_digest) return failure(authoring_digest.error().with_context(
+        "CONDITION prefab rebase authoring digest"));
+    if (auto set = candidate.set_condition_authoring(authoring_bytes, authoring_digest.value()); !set) {
+        return failure(set.error().with_context("CONDITION prefab rebase source binding"));
+    }
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::ReplaceProjectDocumentCommand>(
+            admission, document_, std::move(candidate), "Rebase CONDITION Prefab"),
+        "Rebase CONDITION Prefab", std::move(affected));
+}
+
+core::Result<DispatchReceipt> ApplicationSession::replace_connection_port_graph(
+    const ReplaceConnectionPortGraphAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(core::ErrorCode::unsupported,
+            "connection port graph authoring requires the explicit human boundary"));
+    }
+    if (action.expected_project_generation != project_generation_ ||
+        action.expected_project_revision != document_.revision()) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "connection port graph edit used a stale project snapshot"));
+    }
+    if (action.expected_graph_digest.is_zero()) {
+        return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "connection port graph edit requires the reviewed graph digest"));
+    }
+    const auto current_digest = document_.connection_port_graph().canonical_digest();
+    if (!current_digest || current_digest.value() != action.expected_graph_digest) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "connection port graph changed after it was reviewed"));
+    }
+    if (document_.connection_port_graph().serialize() == action.graph.serialize()) {
+        return failure(core::Diagnostic(core::ErrorCode::invalid_state,
+            "connection port graph edit contains no change"));
+    }
+    project::ProjectDocument candidate(document_);
+    if (auto set = candidate.set_connection_port_graph(action.graph); !set) {
+        return failure(set.error().with_context("connection port graph edit"));
+    }
+    AffectedSet affected;
+    for (const auto& [identity, port] : document_.connection_port_graph().ports()) {
+        static_cast<void>(identity);
+        affected.objects.push_back(port.owner);
+    }
+    for (const auto& [identity, port] : action.graph.ports()) {
+        static_cast<void>(identity);
+        affected.objects.push_back(port.owner);
+    }
+    std::sort(affected.objects.begin(), affected.objects.end());
+    affected.objects.erase(std::unique(affected.objects.begin(), affected.objects.end()),
+        affected.objects.end());
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::ReplaceProjectDocumentCommand>(
+            admission, document_, std::move(candidate), "Edit Connection Port Graph"),
+        "Edit Connection Port Graph", std::move(affected));
+}
+
+core::Result<DispatchReceipt> ApplicationSession::add_connection_port(
+    const AddConnectionPortAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(core::ErrorCode::unsupported,
+            "connection port authoring requires the explicit human boundary"));
+    }
+    if (action.expected_project_generation != project_generation_ ||
+        action.expected_project_revision != document_.revision()) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "connection port authoring used a stale project snapshot"));
+    }
+    if (action.expected_graph_digest.is_zero()) {
+        return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "connection port authoring requires the reviewed graph digest"));
+    }
+    const auto current_digest = document_.connection_port_graph().canonical_digest();
+    if (!current_digest || current_digest.value() != action.expected_graph_digest) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "connection port graph changed after it was reviewed"));
+    }
+    if (action.port.id) {
+        return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "connection port identity is assigned by the application"));
+    }
+    const auto* owner = document_.scene().find(action.port.owner);
+    if (owner == nullptr) {
+        return failure(core::Diagnostic(core::ErrorCode::not_found,
+            "connection port owner does not exist in the current project"));
+    }
+    auto graph = document_.connection_port_graph();
+    const std::uint64_t last_id = graph.ports().empty()
+        ? 0U : graph.ports().rbegin()->first.value;
+    if (last_id == std::numeric_limits<std::uint64_t>::max()) {
+        return failure(core::Diagnostic(core::ErrorCode::invalid_state,
+            "connection port identity space is exhausted"));
+    }
+    auto port = action.port;
+    port.id = connection::PortId{last_id + 1U};
+    if (auto inserted = graph.insert_port(std::move(port)); !inserted) {
+        return failure(inserted.error().with_context("connection port authoring"));
+    }
+    project::ProjectDocument candidate(document_);
+    if (auto set = candidate.set_connection_port_graph(std::move(graph)); !set) {
+        return failure(set.error().with_context("connection port authoring graph"));
+    }
+    editor::ProjectCommandAdmission admission;
+    AffectedSet affected;
+    affected.objects.push_back(action.port.owner);
+    return execute_command(
+        std::make_unique<editor::ReplaceProjectDocumentCommand>(
+            admission, document_, std::move(candidate), "Add Connection Port"),
+        "Add Connection Port", std::move(affected));
+}
+
+core::Result<DispatchReceipt> ApplicationSession::remove_connection_port(
+    const RemoveConnectionPortAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(core::ErrorCode::unsupported,
+            "connection port removal requires the explicit human boundary"));
+    }
+    if (action.expected_project_generation != project_generation_ ||
+        action.expected_project_revision != document_.revision()) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "connection port removal used a stale project snapshot"));
+    }
+    if (action.expected_graph_digest.is_zero()) {
+        return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "connection port removal requires the reviewed graph digest"));
+    }
+    const auto current_digest = document_.connection_port_graph().canonical_digest();
+    if (!current_digest || current_digest.value() != action.expected_graph_digest) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "connection port graph changed after it was reviewed"));
+    }
+    const auto* port = document_.connection_port_graph().find_port(action.port_id);
+    if (port == nullptr) {
+        return failure(core::Diagnostic(core::ErrorCode::not_found,
+            "connection port does not exist"));
+    }
+    const auto owner = port->owner;
+    auto graph = document_.connection_port_graph();
+    if (auto erased = graph.erase_port(action.port_id); !erased) {
+        return failure(erased.error().with_context("connection port removal"));
+    }
+    project::ProjectDocument candidate(document_);
+    if (auto set = candidate.set_connection_port_graph(std::move(graph)); !set) {
+        return failure(set.error().with_context("connection port removal graph"));
+    }
+    editor::ProjectCommandAdmission admission;
+    AffectedSet affected;
+    affected.objects.push_back(owner);
+    return execute_command(
+        std::make_unique<editor::ReplaceProjectDocumentCommand>(
+            admission, document_, std::move(candidate), "Remove Connection Port"),
+        "Remove Connection Port", std::move(affected));
+}
+
+core::Result<DispatchReceipt> ApplicationSession::remove_connection_edge(
+    const RemoveConnectionEdgeAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(core::ErrorCode::unsupported,
+            "connection edge removal requires the explicit human boundary"));
+    }
+    if (action.expected_project_generation != project_generation_ ||
+        action.expected_project_revision != document_.revision()) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "connection edge removal used a stale project snapshot"));
+    }
+    if (action.expected_graph_digest.is_zero()) {
+        return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "connection edge removal requires the reviewed graph digest"));
+    }
+    const auto current_digest = document_.connection_port_graph().canonical_digest();
+    if (!current_digest || current_digest.value() != action.expected_graph_digest) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "connection port graph changed after it was reviewed"));
+    }
+    const auto edge = document_.connection_port_graph().edges().find(action.edge_id);
+    if (edge == document_.connection_port_graph().edges().end()) {
+        return failure(core::Diagnostic(core::ErrorCode::not_found,
+            "connection edge does not exist"));
+    }
+    const auto* first_port = document_.connection_port_graph().find_port(edge->second.first_port);
+    const auto* second_port = document_.connection_port_graph().find_port(edge->second.second_port);
+    if (first_port == nullptr || second_port == nullptr) {
+        return failure(core::Diagnostic(core::ErrorCode::validation_failed,
+            "connection edge has a missing endpoint in the current graph"));
+    }
+    AffectedSet affected;
+    affected.objects = {first_port->owner, second_port->owner};
+    std::sort(affected.objects.begin(), affected.objects.end());
+    affected.objects.erase(std::unique(affected.objects.begin(), affected.objects.end()),
+        affected.objects.end());
+    auto graph = document_.connection_port_graph();
+    if (auto erased = graph.erase_edge(action.edge_id); !erased) {
+        return failure(erased.error().with_context("connection edge removal"));
+    }
+    project::ProjectDocument candidate(document_);
+    if (auto set = candidate.set_connection_port_graph(std::move(graph)); !set) {
+        return failure(set.error().with_context("connection edge removal graph"));
+    }
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::ReplaceProjectDocumentCommand>(
+            admission, document_, std::move(candidate), "Disconnect Connection Ports"),
+        "Disconnect Connection Ports", std::move(affected));
+}
+
+core::Result<DispatchReceipt> ApplicationSession::connect_condition_prefab_sockets(
+    const ConnectConditionPrefabSocketsAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(core::ErrorCode::unsupported,
+            "CONDITION prefab socket connections require the explicit human boundary"));
+    }
+    if (action.expected_project_generation != project_generation_ ||
+        action.expected_project_revision != document_.revision()) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "CONDITION prefab socket connection used a stale project snapshot"));
+    }
+    if (action.first_instance_id == 0U || action.second_instance_id == 0U ||
+        action.expected_graph_digest.is_zero() || action.expected_authoring_digest.is_zero()) {
+        return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "CONDITION prefab socket connection requires two instances and reviewed graph/authoring digests"));
+    }
+    if (action.first_instance_id == action.second_instance_id) {
+        return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "CONDITION prefab socket connection requires two distinct instances"));
+    }
+    const auto current_graph_digest = document_.connection_port_graph().canonical_digest();
+    if (!current_graph_digest || current_graph_digest.value() != action.expected_graph_digest) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "connection port graph changed after prefab sockets were reviewed"));
+    }
+    auto authoring = condition_authoring();
+    if (!authoring) {
+        return failure(authoring.error().with_context("CONDITION prefab socket connection"));
+    }
+    if (authoring.value().project_revision != action.expected_authoring_revision) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "CONDITION prefab socket connection used a stale authoring revision"));
+    }
+    const auto authoring_digest = authoring.value().canonical_digest();
+    if (!authoring_digest || authoring_digest.value() != action.expected_authoring_digest) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "CONDITION prefab socket connection review digest no longer matches authoring state"));
+    }
+    const auto find_instance = [&authoring](condition::Id id)
+            -> const condition::PrefabInstanceRecord* {
+        const auto found = std::lower_bound(authoring.value().prefab_instances.begin(),
+            authoring.value().prefab_instances.end(), id,
+            [](const auto& item, condition::Id expected) { return item.id < expected; });
+        return found == authoring.value().prefab_instances.end() || found->id != id
+            ? nullptr : &*found;
+    };
+    const auto find_prefab = [&authoring](condition::Id id)
+            -> const condition::PrefabRecord* {
+        const auto found = std::lower_bound(authoring.value().prefabs.begin(),
+            authoring.value().prefabs.end(), id,
+            [](const auto& item, condition::Id expected) { return item.id < expected; });
+        return found == authoring.value().prefabs.end() || found->id != id
+            ? nullptr : &*found;
+    };
+    const auto* first_instance = find_instance(action.first_instance_id);
+    const auto* second_instance = find_instance(action.second_instance_id);
+    if (first_instance == nullptr || second_instance == nullptr) {
+        return failure(core::Diagnostic(core::ErrorCode::not_found,
+            "CONDITION prefab socket connection references a missing instance"));
+    }
+    const auto* first_prefab = find_prefab(first_instance->prefab_id);
+    const auto* second_prefab = find_prefab(second_instance->prefab_id);
+    if (first_prefab == nullptr || second_prefab == nullptr) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "CONDITION prefab socket connection references a missing prefab definition"));
+    }
+    std::map<std::uint64_t, std::size_t> snapshot_mesh_owners;
+    for (const auto& existing : authoring.value().prefab_instances) {
+        for (const auto& member : existing.members) {
+            if (member.instance_mesh_asset_id != 0U) {
+                snapshot_mesh_owners.try_emplace(member.instance_mesh_asset_id, 0U);
+            }
+        }
+    }
+    for (const auto& object : document_.scene().objects_sorted()) {
+        if (!object.mesh_asset.has_value()) continue;
+        const auto owner = snapshot_mesh_owners.find(*object.mesh_asset);
+        if (owner != snapshot_mesh_owners.end()) ++owner->second;
+    }
+    if (!condition_prefab_instance_bindings_current(
+            *first_instance, authoring.value(), document_, snapshot_mesh_owners) ||
+        !condition_prefab_instance_bindings_current(
+            *second_instance, authoring.value(), document_, snapshot_mesh_owners)) {
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "CONDITION prefab socket connections require current isolated instances"));
+    }
+    const auto first_resolution = condition::resolve_prefab_socket(
+        *first_prefab, *first_instance, document_.connection_port_graph(), action.first_socket);
+    if (!first_resolution) {
+        return failure(first_resolution.error().with_context("first prefab socket"));
+    }
+    const auto second_resolution = condition::resolve_prefab_socket(
+        *second_prefab, *second_instance, document_.connection_port_graph(), action.second_socket);
+    if (!second_resolution) {
+        return failure(second_resolution.error().with_context("second prefab socket"));
+    }
+
+    auto graph = document_.connection_port_graph();
+    const auto materialize_instance_port = [&graph] (
+            const condition::PrefabSocketResolution& resolution,
+            const condition::PrefabInstanceRecord& instance,
+            std::string_view socket_name) -> core::Result<connection::PortId> {
+        const auto* source_port = graph.find_port(connection::PortId{resolution.source_port_id});
+        if (source_port == nullptr) {
+            return core::Result<connection::PortId>::failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "prefab socket source port disappeared before connection staging"));
+        }
+        const scene::ObjectId root{instance.root_object_id};
+        connection::ConnectionPort instance_port = *source_port;
+        instance_port.owner = root;
+        instance_port.authoring.kind = world::AuthoringBindingKind::scene_object;
+        instance_port.authoring.identity = root.value;
+        instance_port.local_frame.frame_identity = std::string(socket_name);
+        instance_port.local_frame.parent_frame.reset();
+        instance_port.local_frame.transform_to_parent = resolution.local_to_prefab_root;
+
+        const connection::ConnectionPort* existing = nullptr;
+        for (const auto& [identity, candidate] : graph.ports()) {
+            static_cast<void>(identity);
+            if (candidate.owner == root && candidate.authoring.identity == root.value &&
+                candidate.local_frame.frame_identity == socket_name) {
+                if (existing != nullptr) {
+                    return core::Result<connection::PortId>::failure(core::Diagnostic(
+                        core::ErrorCode::validation_failed,
+                        "prefab instance has ambiguous persisted socket ports"));
+                }
+                existing = &candidate;
+            }
+        }
+        if (existing != nullptr) {
+            instance_port.id = existing->id;
+            if (instance_port.serialize() != existing->serialize()) {
+                return core::Result<connection::PortId>::failure(core::Diagnostic(
+                    core::ErrorCode::stale_data,
+                    "persisted prefab socket port differs from current source resolution"));
+            }
+            return core::Result<connection::PortId>::success(existing->id);
+        }
+        const auto last = graph.ports().empty() ? 0U : graph.ports().rbegin()->first.value;
+        if (last == std::numeric_limits<std::uint64_t>::max()) {
+            return core::Result<connection::PortId>::failure(core::Diagnostic(
+                core::ErrorCode::invalid_state,
+                "connection port identity space is exhausted"));
+        }
+        instance_port.id = connection::PortId{last + 1U};
+        const auto inserted_id = instance_port.id;
+        if (auto inserted = graph.insert_port(std::move(instance_port)); !inserted) {
+            return core::Result<connection::PortId>::failure(inserted.error());
+        }
+        return core::Result<connection::PortId>::success(inserted_id);
+    };
+    const auto first_port = materialize_instance_port(
+        first_resolution.value(), *first_instance, action.first_socket);
+    if (!first_port) return failure(first_port.error().with_context("first instance socket"));
+    const auto second_port = materialize_instance_port(
+        second_resolution.value(), *second_instance, action.second_socket);
+    if (!second_port) return failure(second_port.error().with_context("second instance socket"));
+    const auto edge = graph.connect(first_port.value(), second_port.value(), action.kind);
+    if (!edge) return failure(edge.error().with_context("CONDITION prefab socket connection"));
+
+    project::ProjectDocument candidate(document_);
+    if (auto set = candidate.set_connection_port_graph(std::move(graph)); !set) {
+        return failure(set.error().with_context("CONDITION prefab socket connection graph"));
+    }
+    AffectedSet affected;
+    affected.objects = {scene::ObjectId{first_instance->root_object_id},
+        scene::ObjectId{second_instance->root_object_id}};
+    std::sort(affected.objects.begin(), affected.objects.end());
+    affected.objects.erase(std::unique(affected.objects.begin(), affected.objects.end()),
+        affected.objects.end());
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::ReplaceProjectDocumentCommand>(
+            admission, document_, std::move(candidate), "Connect CONDITION Prefab Sockets"),
+        "Connect CONDITION Prefab Sockets", std::move(affected));
 }
 
 core::Result<DispatchReceipt> ApplicationSession::add_condition_collection(
@@ -7697,6 +9954,18 @@ core::Result<DispatchReceipt> ApplicationSession::apply_source_reimport_plan(
     if (auto result = action.plan.validate(); !result) {
         return failure(result.error().with_context("source reimport review"));
     }
+    // A document's product mapping can only be changed together with its
+    // scene and material products by the dedicated import command.
+    for (const auto& entry : action.plan.entries) {
+        if (entry.change == assets::SourceReimportChange::unchanged) continue;
+        const auto current = document_.source_asset_registry().records().find(entry.identity);
+        if ((entry.incoming && !entry.incoming->document_products.empty()) ||
+            (current != document_.source_asset_registry().records().end() &&
+             !current->second.document_products.empty())) {
+            return failure(core::Diagnostic(core::ErrorCode::unsupported,
+                "glTF document mappings require the scene import command"));
+        }
+    }
     const bool has_changes = std::any_of(
         action.plan.entries.begin(), action.plan.entries.end(), [](const auto& entry) {
             return entry.change != assets::SourceReimportChange::unchanged;
@@ -7739,6 +10008,10 @@ core::Result<DispatchReceipt> ApplicationSession::relink_moved_source(
         return failure(core::Diagnostic(
             core::ErrorCode::not_found,
             "source identity is not present in the project registry"));
+    }
+    if (active->second.source_digest == action.staged_digest &&
+        active->second.relative_source_path == staged_path.value()) {
+        return accepted("Relink Moved Source (No Change)", document_.revision());
     }
     const auto relink = assets::plan_source_relink(registry, action.identity,
         active->second.source_generation, staged_path.value(), action.staged_digest);
@@ -8006,7 +10279,8 @@ core::Result<DispatchReceipt> ApplicationSession::generate_unique_lightmap_uv(
     const std::string suffix = std::to_string(action.output_uv_set);
     const auto recipe = production::make_unique_lightmap_uv_recipe(
         document_, mesh_asset, action.output_uv_set,
-        "Agent Lightmap " + suffix, "uv.agent.lightmap." + suffix,
+        (active_source_ == OperationSource::agent_workbench ? "Agent Lightmap " : "Lightmap ") + suffix,
+        (active_source_ == OperationSource::agent_workbench ? "uv.agent.lightmap." : "uv.lightmap.") + suffix,
         action.resolution, action.padding_texels, action.maximum_udim_tiles);
     if (!recipe) return failure(recipe.error().with_context("lightmap UV recipe"));
     const auto artifact = production::compile_unique_lightmap_uv(recipe.value(), mesh->second);
@@ -8027,6 +10301,607 @@ core::Result<DispatchReceipt> ApplicationSession::generate_unique_lightmap_uv(
             mesh->second.revision(), std::move(updated_mesh.value())),
         "Generate Unique Lightmap UVs " + digest_operation,
         AffectedSet{{action.object}, {}, {}, {}});
+}
+
+core::Result<DispatchReceipt> ApplicationSession::pack_uv_islands(
+    const PackUvIslandsAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "UV island packing requires the human authoring boundary"));
+    }
+    if (!action.object || action.source_uv_set == 0U || action.output_uv_set == 0U ||
+        action.source_uv_set == action.output_uv_set || action.expected_mesh_revision.value() == 0U) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "UV island packing requires distinct non-zero source and output set identities"));
+    }
+    if (project_generation_ != action.expected_project_generation ||
+        document_.revision() != action.expected_project_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "UV island packing belongs to an earlier project generation or revision"));
+    }
+    if (selection_.mode() != editor::SelectionMode::object ||
+        selection_.selected_objects().size() != 1U ||
+        selection_.selected_objects().front() != action.object) {
+        return failure(invalid_state(
+            "UV island packing requires the exact selected mesh object"));
+    }
+    const auto* object = document_.scene().find(action.object);
+    if (object == nullptr || !object->mesh_asset.has_value()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "UV island packing target no longer has an authored mesh"));
+    }
+    if (object->locked || !object->visible) {
+        return failure(invalid_state(
+            "hidden or locked scene objects cannot receive packed UVs"));
+    }
+    const std::uint64_t mesh_asset = *object->mesh_asset;
+    const auto mesh = document_.meshes().find(mesh_asset);
+    if (mesh == document_.meshes().end() ||
+        mesh->second.revision() != action.expected_mesh_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "UV island packing source mesh revision is stale"));
+    }
+    if (mesh->second.uv_sets().find(action.source_uv_set) == nullptr) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "UV island packing source set no longer exists"));
+    }
+    for (const auto& instance : document_.scene().objects_sorted()) {
+        if (instance.mesh_asset == object->mesh_asset && instance.locked) {
+            return failure(invalid_state(
+                "UV island packing would affect a locked shared-mesh instance"));
+        }
+    }
+
+    const std::string suffix = std::to_string(action.output_uv_set);
+    const auto recipe = production::make_uv_island_pack_recipe(
+        document_, mesh_asset, action.source_uv_set, action.output_uv_set,
+        "Packed UV " + suffix, "uv.pack." + suffix, action.resolution,
+        action.padding_texels, action.maximum_udim_tiles, action.density_policy,
+        action.target_texels_per_world_unit, action.allow_quarter_turn_rotation);
+    if (!recipe) return failure(recipe.error().with_context("UV island pack recipe"));
+    const auto artifact = production::compile_uv_island_pack(recipe.value(), mesh->second);
+    if (!artifact) return failure(artifact.error().with_context("UV island packing"));
+    auto updated_mesh = production::build_uv_island_packed_mesh(mesh->second, artifact.value());
+    if (!updated_mesh) {
+        return failure(updated_mesh.error().with_context("UV island pack mesh payload"));
+    }
+    const std::string digest_operation =
+        production::uv_island_pack_transaction_operation(artifact.value());
+    if (digest_operation.empty()) {
+        return failure(invalid_state("UV island pack artifact has no transaction digest"));
+    }
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectMeshCommand>(
+            admission, document_, mesh_asset, action.expected_project_revision,
+            action.expected_mesh_revision, std::move(updated_mesh.value())),
+        "Pack UV Islands " + digest_operation,
+        AffectedSet{{action.object}, {}, {}, {}, {mesh_asset}});
+}
+
+core::Result<DispatchReceipt> ApplicationSession::set_uv_coordinate(
+    const SetUvCoordinateAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "UV coordinate editing requires the human authoring boundary"));
+    }
+    if (project_generation_ != action.expected_project_generation) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "UV coordinate draft belongs to an earlier project generation"));
+    }
+    constexpr double kMaximumUvCoordinateMagnitude = 1'000'000.0;
+    const auto coordinate_valid = [=](core::Vec2d coordinate) {
+        return coordinate.finite() &&
+            std::abs(coordinate.x) <= kMaximumUvCoordinateMagnitude &&
+            std::abs(coordinate.y) <= kMaximumUvCoordinateMagnitude;
+    };
+    if (!action.object || action.uv_set == 0U || !action.face || !action.vertex ||
+        !coordinate_valid(action.expected_coordinate) ||
+        !coordinate_valid(action.coordinate)) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "UV coordinate editing requires valid identities and finite bounded coordinates"));
+    }
+    if (document_.revision() != action.expected_project_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "UV coordinate draft no longer matches the project revision"));
+    }
+    const auto groups = selection_.component_groups();
+    const auto selected_faces = selection_.selected_faces();
+    if (selection_.mode() != editor::SelectionMode::face || groups.size() != 1U ||
+        groups.front().object != action.object ||
+        groups.front().mesh_revision != action.expected_mesh_revision ||
+        selected_faces.size() != 1U || selected_faces.front() != action.face) {
+        return failure(invalid_state(
+            "UV coordinate editing requires one exact selected source face"));
+    }
+    const auto* object = document_.scene().find(action.object);
+    if (object == nullptr || !object->mesh_asset.has_value()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "UV coordinate target no longer has an authored mesh"));
+    }
+    if (object->locked || !object->visible) {
+        return failure(invalid_state(
+            "hidden or locked scene objects cannot receive UV coordinate edits"));
+    }
+    const std::uint64_t mesh_asset = *object->mesh_asset;
+    const auto mesh = document_.meshes().find(mesh_asset);
+    if (mesh == document_.meshes().end() ||
+        mesh->second.revision() != action.expected_mesh_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "UV coordinate target no longer matches its source mesh revision"));
+    }
+    for (const auto& instance : document_.scene().objects_sorted()) {
+        if (instance.mesh_asset == object->mesh_asset && instance.locked) {
+            return failure(invalid_state(
+                "UV coordinate editing would affect a locked shared-mesh instance"));
+        }
+    }
+    const auto* descriptor = mesh->second.uv_sets().find(action.uv_set);
+    if (descriptor == nullptr) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "UV coordinate target set no longer exists on the selected mesh"));
+    }
+    const auto* source_layer = mesh->second.attributes().find(descriptor->layer_id);
+    const auto topology = mesh->second.topology();
+    if (!topology) return failure(topology.error());
+    if (source_layer == nullptr ||
+        source_layer->descriptor.domain != attributes::AttributeDomain::corner ||
+        source_layer->descriptor.type != attributes::AttributeType::vec2 ||
+        source_layer->values.size() != topology.value().corners.size()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::validation_failed,
+            "UV corner layer does not match the selected mesh topology"));
+    }
+    std::optional<std::size_t> corner_index;
+    for (std::size_t index = 0U; index < topology.value().corners.size(); ++index) {
+        const auto& corner = topology.value().corners[index];
+        if (corner.face == action.face && corner.vertex == action.vertex) {
+            corner_index = index;
+            break;
+        }
+    }
+    if (!corner_index.has_value()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "selected vertex is not a corner of the selected face"));
+    }
+    const auto* current_coordinate = std::get_if<core::Vec2d>(
+        &source_layer->values[*corner_index]);
+    if (current_coordinate == nullptr || !coordinate_valid(*current_coordinate)) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::validation_failed,
+            "selected UV corner is missing a valid vec2 coordinate"));
+    }
+    if (current_coordinate->x != action.expected_coordinate.x ||
+        current_coordinate->y != action.expected_coordinate.y) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "selected UV corner changed after the edit draft was captured"));
+    }
+    if (current_coordinate->x == action.coordinate.x &&
+        current_coordinate->y == action.coordinate.y) {
+        return failure(invalid_state("UV coordinate already has the requested value"));
+    }
+
+    attributes::AttributeLayer updated_layer = *source_layer;
+    updated_layer.values[*corner_index] = action.coordinate;
+    attributes::AttributeSet updated_attributes = mesh->second.attributes();
+    if (auto removed = updated_attributes.remove_layer(descriptor->layer_id); !removed) {
+        return failure(removed.error().with_context("replace UV corner layer"));
+    }
+    if (auto added = updated_attributes.add_layer(std::move(updated_layer)); !added) {
+        return failure(added.error().with_context("replace UV corner layer"));
+    }
+    geometry::EditableMesh updated_mesh = mesh->second;
+    if (auto payload = updated_mesh.set_attribute_payload(
+            std::move(updated_attributes), mesh->second.uv_sets()); !payload) {
+        return failure(payload.error().with_context("validate UV coordinate edit"));
+    }
+    std::ostringstream operation;
+    operation.imbue(std::locale::classic());
+    operation << "Set UV Coordinate set " << action.uv_set << " face "
+        << action.face.value << " vertex " << action.vertex.value << std::setprecision(
+            std::numeric_limits<double>::max_digits10) << " from ("
+        << action.expected_coordinate.x << ',' << action.expected_coordinate.y
+        << ") to (" << action.coordinate.x << ',' << action.coordinate.y << ')';
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectMeshCommand>(
+            admission, document_, mesh_asset, action.expected_project_revision,
+            action.expected_mesh_revision, std::move(updated_mesh)),
+        operation.str(),
+        AffectedSet{{action.object}, {action.vertex}, {}, {action.face}, {mesh_asset}});
+}
+
+core::Result<DispatchReceipt> ApplicationSession::set_uv_seam_mark(
+    const SetUvSeamMarkAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "UV seam marking requires the human authoring boundary"));
+    }
+    if (project_generation_ != action.expected_project_generation ||
+        document_.revision() != action.expected_project_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "UV seam marker draft belongs to an earlier project generation or revision"));
+    }
+    if (!action.object || action.uv_set == 0U || !action.selected_face || !action.edge ||
+        action.expected_marked == action.marked) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "UV seam marking requires valid identities and a changed marker value"));
+    }
+    const auto groups = selection_.component_groups();
+    const auto selected_faces = selection_.selected_faces();
+    if (selection_.mode() != editor::SelectionMode::face || groups.size() != 1U ||
+        groups.front().object != action.object ||
+        groups.front().mesh_revision != action.expected_mesh_revision ||
+        selected_faces.size() != 1U || selected_faces.front() != action.selected_face) {
+        return failure(invalid_state(
+            "UV seam marking requires its exact selected face and mesh revision"));
+    }
+    const scene::SceneObject* object = document_.scene().find(action.object);
+    if (object == nullptr || !object->mesh_asset.has_value()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "UV seam marker target no longer has an authored mesh"));
+    }
+    if (object->locked || !object->visible) {
+        return failure(invalid_state(
+            "hidden or locked scene objects cannot receive UV seam markers"));
+    }
+    const std::uint64_t mesh_asset = *object->mesh_asset;
+    const auto mesh = document_.meshes().find(mesh_asset);
+    if (mesh == document_.meshes().end() ||
+        mesh->second.revision() != action.expected_mesh_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "UV seam marker target no longer matches its source mesh revision"));
+    }
+    for (const auto& instance : document_.scene().objects_sorted()) {
+        if (instance.mesh_asset == object->mesh_asset && instance.locked) {
+            return failure(invalid_state(
+                "UV seam marking would affect a locked shared-mesh instance"));
+        }
+    }
+    const auto* descriptor = mesh->second.uv_sets().find(action.uv_set);
+    if (descriptor == nullptr) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "UV seam marker target set no longer exists on the selected mesh"));
+    }
+    const auto* uv_layer = mesh->second.attributes().find(descriptor->layer_id);
+    const auto topology = mesh->second.topology();
+    if (!topology) return failure(topology.error());
+    if (uv_layer == nullptr ||
+        uv_layer->descriptor.domain != attributes::AttributeDomain::corner ||
+        uv_layer->descriptor.type != attributes::AttributeType::vec2 ||
+        uv_layer->values.size() != topology.value().corners.size()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::validation_failed,
+            "UV seam marker target does not have a complete corner-domain UV layer"));
+    }
+    const auto edge = std::find_if(topology.value().edges.begin(), topology.value().edges.end(),
+        [&action](const geometry::EdgeRecord& candidate) {
+            return candidate.id == action.edge;
+        });
+    if (edge == topology.value().edges.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "UV seam marker edge no longer exists on the selected mesh"));
+    }
+    if (!edge->second_half_edge.has_value()) {
+        return failure(invalid_state("UV seam marking requires an edge shared by two faces"));
+    }
+    const auto first_half_edge = std::find_if(
+        topology.value().half_edges.begin(), topology.value().half_edges.end(),
+        [&edge](const geometry::HalfEdgeRecord& candidate) {
+            return candidate.id == edge->first_half_edge;
+        });
+    const auto second_half_edge = std::find_if(
+        topology.value().half_edges.begin(), topology.value().half_edges.end(),
+        [&edge](const geometry::HalfEdgeRecord& candidate) {
+            return candidate.id == *edge->second_half_edge;
+        });
+    if (first_half_edge == topology.value().half_edges.end() ||
+        second_half_edge == topology.value().half_edges.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::validation_failed,
+            "UV seam marker edge is missing one of its source half-edges"));
+    }
+    if (first_half_edge->face != action.selected_face &&
+        second_half_edge->face != action.selected_face) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "UV seam marker edge no longer touches the captured selected face"));
+    }
+    const std::size_t edge_index = static_cast<std::size_t>(
+        std::distance(topology.value().edges.begin(), edge));
+    const std::string seam_layer_id = attributes::uv_seam_attribute_id(action.uv_set);
+    const auto* source_seam_layer = mesh->second.attributes().find(seam_layer_id);
+    if (source_seam_layer != nullptr &&
+        (source_seam_layer->descriptor.domain != attributes::AttributeDomain::edge ||
+         source_seam_layer->descriptor.type != attributes::AttributeType::boolean ||
+         source_seam_layer->values.size() != topology.value().edges.size())) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::validation_failed,
+            "UV seam marker layer does not match the selected mesh edge topology"));
+    }
+    if (source_seam_layer != nullptr) {
+        if (auto valid = source_seam_layer->validate(topology.value().edges.size()); !valid) {
+            return failure(valid.error().with_context("UV seam marker layer"));
+        }
+    }
+    bool current_marked = false;
+    if (source_seam_layer != nullptr) {
+        const auto* value = std::get_if<bool>(&source_seam_layer->values[edge_index]);
+        if (value == nullptr) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::validation_failed,
+                "UV seam marker layer contains a non-boolean edge value"));
+        }
+        current_marked = *value;
+    }
+    if (current_marked != action.expected_marked) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "UV seam marker changed after the authoring draft was captured"));
+    }
+
+    attributes::AttributeLayer updated_seam_layer;
+    if (source_seam_layer != nullptr) {
+        updated_seam_layer = *source_seam_layer;
+    } else {
+        updated_seam_layer.descriptor = {
+            seam_layer_id,
+            attributes::AttributeDomain::edge,
+            attributes::AttributeType::boolean};
+        updated_seam_layer.values.assign(topology.value().edges.size(), false);
+    }
+    updated_seam_layer.values[edge_index] = action.marked;
+    attributes::AttributeSet updated_attributes = mesh->second.attributes();
+    if (auto count = updated_attributes.set_domain_count(
+            attributes::AttributeDomain::edge, topology.value().edges.size()); !count) {
+        return failure(count.error().with_context("configure UV seam edge domain"));
+    }
+    if (source_seam_layer != nullptr) {
+        if (auto removed = updated_attributes.remove_layer(seam_layer_id); !removed) {
+            return failure(removed.error().with_context("replace UV seam marker layer"));
+        }
+    }
+    if (auto added = updated_attributes.add_layer(std::move(updated_seam_layer)); !added) {
+        return failure(added.error().with_context("write UV seam marker layer"));
+    }
+    geometry::EditableMesh updated_mesh = mesh->second;
+    if (auto payload = updated_mesh.set_attribute_payload(
+            std::move(updated_attributes), mesh->second.uv_sets()); !payload) {
+        return failure(payload.error().with_context("validate UV seam marker"));
+    }
+    std::ostringstream operation;
+    operation << "Set UV Seam edge " << action.edge.value << " on UV set "
+        << action.uv_set << " from " << (action.expected_marked ? "marked" : "unmarked")
+        << " to " << (action.marked ? "marked" : "unmarked")
+        << " from selected face " << action.selected_face.value;
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectMeshCommand>(
+            admission, document_, mesh_asset, action.expected_project_revision,
+            action.expected_mesh_revision, std::move(updated_mesh)),
+        operation.str(),
+        AffectedSet{{action.object}, {edge->first, edge->second}, {action.edge},
+            {action.selected_face}, {mesh_asset}});
+}
+
+core::Result<DispatchReceipt> ApplicationSession::align_uv_seam(
+    const AlignUvSeamAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "UV seam alignment requires the human authoring boundary"));
+    }
+    if (project_generation_ != action.expected_project_generation ||
+        document_.revision() != action.expected_project_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "UV seam draft belongs to an earlier project generation or revision"));
+    }
+    constexpr double kMaximumUvCoordinateMagnitude = 1'000'000.0;
+    const auto coordinate_valid = [=](core::Vec2d coordinate) {
+        return coordinate.finite() &&
+            std::abs(coordinate.x) <= kMaximumUvCoordinateMagnitude &&
+            std::abs(coordinate.y) <= kMaximumUvCoordinateMagnitude;
+    };
+    if (!action.object || action.uv_set == 0U || !action.selected_face ||
+        !action.adjacent_face || action.selected_face == action.adjacent_face ||
+        !action.edge || !std::all_of(action.expected_coordinates.begin(),
+            action.expected_coordinates.end(), coordinate_valid)) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "UV seam alignment requires valid mesh identities and bounded source coordinates"));
+    }
+    const auto groups = selection_.component_groups();
+    const auto selected_faces = selection_.selected_faces();
+    if (selection_.mode() != editor::SelectionMode::face || groups.size() != 1U ||
+        groups.front().object != action.object ||
+        groups.front().mesh_revision != action.expected_mesh_revision ||
+        selected_faces.size() != 1U || selected_faces.front() != action.selected_face) {
+        return failure(invalid_state(
+            "UV seam alignment requires its exact selected face and mesh revision"));
+    }
+    const scene::SceneObject* object = document_.scene().find(action.object);
+    if (object == nullptr || !object->mesh_asset.has_value()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "UV seam target no longer has an authored mesh"));
+    }
+    if (object->locked || !object->visible) {
+        return failure(invalid_state(
+            "hidden or locked scene objects cannot receive UV seam edits"));
+    }
+    const std::uint64_t mesh_asset = *object->mesh_asset;
+    const auto mesh = document_.meshes().find(mesh_asset);
+    if (mesh == document_.meshes().end() ||
+        mesh->second.revision() != action.expected_mesh_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "UV seam target no longer matches its source mesh revision"));
+    }
+    for (const auto& instance : document_.scene().objects_sorted()) {
+        if (instance.mesh_asset == object->mesh_asset && instance.locked) {
+            return failure(invalid_state(
+                "UV seam editing would affect a locked shared-mesh instance"));
+        }
+    }
+    const auto* descriptor = mesh->second.uv_sets().find(action.uv_set);
+    if (descriptor == nullptr) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "UV seam target set no longer exists on the selected mesh"));
+    }
+    const auto* source_layer = mesh->second.attributes().find(descriptor->layer_id);
+    const auto topology = mesh->second.topology();
+    if (!topology) return failure(topology.error());
+    if (source_layer == nullptr ||
+        source_layer->descriptor.domain != attributes::AttributeDomain::corner ||
+        source_layer->descriptor.type != attributes::AttributeType::vec2 ||
+        source_layer->values.size() != topology.value().corners.size()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::validation_failed,
+            "UV seam corner layer does not match the selected mesh topology"));
+    }
+
+    const auto edge = std::find_if(topology.value().edges.begin(), topology.value().edges.end(),
+        [&action](const geometry::EdgeRecord& candidate) {
+            return candidate.id == action.edge;
+        });
+    if (edge == topology.value().edges.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "UV seam edge no longer exists on the selected mesh"));
+    }
+    if (!edge->second_half_edge.has_value()) {
+        return failure(invalid_state("UV seam alignment requires an edge shared by two faces"));
+    }
+    const auto first_half_edge = std::find_if(
+        topology.value().half_edges.begin(), topology.value().half_edges.end(),
+        [&edge](const geometry::HalfEdgeRecord& candidate) {
+            return candidate.id == edge->first_half_edge;
+        });
+    const auto second_half_edge = std::find_if(
+        topology.value().half_edges.begin(), topology.value().half_edges.end(),
+        [&edge](const geometry::HalfEdgeRecord& candidate) {
+            return candidate.id == *edge->second_half_edge;
+        });
+    if (first_half_edge == topology.value().half_edges.end() ||
+        second_half_edge == topology.value().half_edges.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::validation_failed,
+            "UV seam edge is missing one of its source half-edges"));
+    }
+    const bool faces_match =
+        (first_half_edge->face == action.selected_face &&
+         second_half_edge->face == action.adjacent_face) ||
+        (second_half_edge->face == action.selected_face &&
+         first_half_edge->face == action.adjacent_face);
+    if (!faces_match) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "UV seam edge no longer connects the captured selected and adjacent faces"));
+    }
+
+    std::array<std::optional<std::size_t>, 4U> corner_indices;
+    for (std::size_t index = 0U; index < topology.value().corners.size(); ++index) {
+        const geometry::CornerRecord& corner = topology.value().corners[index];
+        if (corner.face == action.selected_face && corner.vertex == edge->first) {
+            corner_indices[0U] = index;
+        } else if (corner.face == action.selected_face && corner.vertex == edge->second) {
+            corner_indices[1U] = index;
+        } else if (corner.face == action.adjacent_face && corner.vertex == edge->first) {
+            corner_indices[2U] = index;
+        } else if (corner.face == action.adjacent_face && corner.vertex == edge->second) {
+            corner_indices[3U] = index;
+        }
+    }
+    if (std::any_of(corner_indices.begin(), corner_indices.end(),
+            [](const auto& index) { return !index.has_value(); })) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::validation_failed,
+            "UV seam edge is missing one or more source-face endpoint corners"));
+    }
+    std::array<core::Vec2d, 4U> current_coordinates;
+    for (std::size_t index = 0U; index < corner_indices.size(); ++index) {
+        const auto* coordinate = std::get_if<core::Vec2d>(
+            &source_layer->values[*corner_indices[index]]);
+        if (coordinate == nullptr || !coordinate_valid(*coordinate)) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::validation_failed,
+                "UV seam source corner does not contain a valid bounded vec2"));
+        }
+        current_coordinates[index] = *coordinate;
+        if (coordinate->x != action.expected_coordinates[index].x ||
+            coordinate->y != action.expected_coordinates[index].y) {
+            return failure(core::Diagnostic(
+                core::ErrorCode::stale_data,
+                "UV seam endpoint changed after the alignment draft was captured"));
+        }
+    }
+    constexpr double kSeamToleranceSquared = 1.0e-20;
+    const bool is_seam =
+        (current_coordinates[0U] - current_coordinates[2U]).length_squared() >
+            kSeamToleranceSquared ||
+        (current_coordinates[1U] - current_coordinates[3U]).length_squared() >
+            kSeamToleranceSquared;
+    if (!is_seam) {
+        return failure(invalid_state("UV seam edge is already aligned across both endpoints"));
+    }
+
+    attributes::AttributeLayer updated_layer = *source_layer;
+    updated_layer.values[*corner_indices[0U]] = current_coordinates[2U];
+    updated_layer.values[*corner_indices[1U]] = current_coordinates[3U];
+    attributes::AttributeSet updated_attributes = mesh->second.attributes();
+    if (auto removed = updated_attributes.remove_layer(descriptor->layer_id); !removed) {
+        return failure(removed.error().with_context("replace UV seam corner layer"));
+    }
+    if (auto added = updated_attributes.add_layer(std::move(updated_layer)); !added) {
+        return failure(added.error().with_context("replace UV seam corner layer"));
+    }
+    geometry::EditableMesh updated_mesh = mesh->second;
+    if (auto payload = updated_mesh.set_attribute_payload(
+            std::move(updated_attributes), mesh->second.uv_sets()); !payload) {
+        return failure(payload.error().with_context("validate UV seam alignment"));
+    }
+    std::ostringstream operation;
+    operation.imbue(std::locale::classic());
+    operation << "Align UV Seam edge " << action.edge.value << " face "
+        << action.selected_face.value << " to adjacent face " << action.adjacent_face.value
+        << std::setprecision(std::numeric_limits<double>::max_digits10)
+        << "; selected endpoints from [(" << current_coordinates[0U].x << ','
+        << current_coordinates[0U].y << "),(" << current_coordinates[1U].x << ','
+        << current_coordinates[1U].y << ")] to [(" << current_coordinates[2U].x << ','
+        << current_coordinates[2U].y << "),(" << current_coordinates[3U].x << ','
+        << current_coordinates[3U].y << ")]";
+    editor::ProjectCommandAdmission admission;
+    return execute_command(
+        std::make_unique<editor::SetProjectMeshCommand>(
+            admission, document_, mesh_asset, action.expected_project_revision,
+            action.expected_mesh_revision, std::move(updated_mesh)),
+        operation.str(),
+        AffectedSet{{action.object}, {edge->first, edge->second}, {},
+            {action.selected_face}, {mesh_asset}});
 }
 
 core::Result<DispatchReceipt> ApplicationSession::set_material_graph(
@@ -8195,6 +11070,53 @@ core::Result<DispatchReceipt> ApplicationSession::set_material_graph_binding(
         action.graph_identity.has_value() ? "Bind Material Graph" : "Unbind Material Graph");
 }
 
+core::Result<DispatchReceipt> ApplicationSession::set_material_graph_inputs(
+    const SetMaterialGraphInputsAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "persistent material graph inputs require the human authoring boundary"));
+    }
+    if (document_.revision() != action.expected_project_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "material graph input snapshot no longer matches the project revision"));
+    }
+    const auto& materials = document_.material_catalog().materials();
+    const auto material = materials.find(action.material_id);
+    if (material == materials.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "material graph input binding references a missing material"));
+    }
+    if (material->second.revision != action.expected_material_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "material graph input snapshot no longer matches the material source revision"));
+    }
+    if (material->second.revision.exhausted()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "material source revision space is exhausted"));
+    }
+
+    auto catalog = document_.material_catalog();
+    if (auto result = catalog.set_material_graph_inputs(
+            action.material_id, action.graph_identity, action.expected_graph_revision,
+            action.expected_graph_digest, action.inputs); !result) {
+        return failure(result.error().with_context("set persistent material graph inputs"));
+    }
+    auto updated_material = material->second;
+    updated_material.revision = material->second.revision.next();
+    if (auto result = catalog.replace_material(std::move(updated_material)); !result) {
+        return failure(result.error().with_context(
+            "advance material graph input source revision"));
+    }
+    return commit_material_catalog(
+        std::move(catalog), action.expected_project_revision,
+        "Set Material Graph Inputs");
+}
+
 core::Result<DispatchReceipt> ApplicationSession::import_material_texture_source(
     const ImportMaterialTextureSourceAction& action) {
     if (active_source_ != OperationSource::human) {
@@ -8280,6 +11202,102 @@ core::Result<DispatchReceipt> ApplicationSession::import_material_texture_source
     return commit_material_catalog(
         std::move(catalog), action.expected_project_revision,
         "Import Material Texture Source");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::reimport_material_texture_source(
+    const ReimportMaterialTextureSourceAction& action) {
+    if (active_source_ != OperationSource::human) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::unsupported,
+            "material texture reimport requires the human authoring boundary"));
+    }
+    if (project_generation_ != action.expected_project_generation ||
+        document_.revision() != action.expected_project_revision) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "material texture reimport snapshot no longer matches the project generation and revision"));
+    }
+    if (!project_path_.has_value()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "save the project before reimporting a managed material texture source"));
+    }
+    if (action.texture_id == 0U || action.expected_content_digest.is_zero() ||
+        action.content_digest.is_zero()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "material texture reimport requires current identity and non-zero source digests"));
+    }
+
+    const auto& existing = document_.material_catalog().textures();
+    const auto found = existing.find(action.texture_id);
+    if (found == existing.end()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::not_found,
+            "material texture reimport source is no longer registered"));
+    }
+    const auto& current = found->second;
+    if (current.revision != action.expected_texture_revision ||
+        current.content_digest != action.expected_content_digest) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::stale_data,
+            "material texture source changed after reimport review"));
+    }
+    if (current.revision.exhausted()) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "material texture source revision is exhausted"));
+    }
+    if (action.content_digest == current.content_digest) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "material texture reimport contains no new source bytes"));
+    }
+    if (std::any_of(existing.begin(), existing.end(), [&action](const auto& item) {
+            return item.first != action.texture_id &&
+                item.second.content_digest == action.content_digest;
+        })) {
+        return failure(core::Diagnostic(
+            core::ErrorCode::invalid_argument,
+            "replacement texture bytes are already registered under another identity"));
+    }
+
+    const auto inspected = inspect_project_texture_blob(
+        *project_path_, action.content_digest, action.format,
+        action.width, action.height);
+    if (!inspected) {
+        return failure(inspected.error().with_context("reimport material texture source"));
+    }
+
+    std::error_code error;
+    const auto requested_root = project_path_->parent_path().empty()
+        ? std::filesystem::current_path(error)
+        : project_path_->parent_path();
+    if (error) return failure(core::Diagnostic(
+        core::ErrorCode::io_error,
+        "unable to resolve the saved project directory"));
+    const auto project_root = std::filesystem::weakly_canonical(requested_root, error);
+    if (error || project_root.empty()) return failure(core::Diagnostic(
+        core::ErrorCode::io_error,
+        "unable to resolve the saved project directory"));
+    assets::BlobStore store(project_root / ".carto-assets" / "source-blobs");
+
+    auto replacement = current;
+    replacement.relative_locator = store.path_for(action.content_digest)
+        .lexically_relative(project_root).generic_string();
+    replacement.content_digest = action.content_digest;
+    replacement.format = inspected.value().format;
+    replacement.width = inspected.value().width;
+    replacement.height = inspected.value().height;
+    replacement.revision = current.revision.next();
+
+    auto catalog = document_.material_catalog();
+    if (auto result = catalog.replace_texture(std::move(replacement)); !result) {
+        return failure(result.error().with_context("advance material texture source revision"));
+    }
+    return commit_material_catalog(
+        std::move(catalog), action.expected_project_revision,
+        "Reimport Material Texture Source");
 }
 
 core::Result<DispatchReceipt> ApplicationSession::commit_material_catalog(
@@ -8684,10 +11702,11 @@ core::Result<DispatchReceipt> ApplicationSession::set_decal_placement(
             core::ErrorCode::unsupported,
             "decal placement requires explicit human approval"));
     }
-    if (document_.revision() != action.expected_project_revision) {
+    if (project_generation_ != action.expected_project_generation ||
+        document_.revision() != action.expected_project_revision) {
         return failure(core::Diagnostic(
             core::ErrorCode::stale_data,
-            "decal placement targets a stale project revision"));
+            "decal placement targets a stale project generation or revision"));
     }
     if (auto preview = decal_placement_preview(
             action.placement, action.expected_project_revision); !preview) {
@@ -8868,42 +11887,36 @@ core::Result<DispatchReceipt> ApplicationSession::create_biological_proxy_instan
 core::Result<DispatchReceipt> ApplicationSession::undo() {
     const core::Revision before = document_.revision();
     project::ProjectDocument before_document = document_;
-    if (auto result = history_.undo(); !result) {
+    if (auto result = history_.prepare_durable_undo(); !result) {
+        document_ = std::move(before_document);
+        viewport_mesh_cache_.clear();
         return failure(result.error().with_context("undo"));
     }
     if (auto result = append_mutation_event("Undo", before, document_.revision()); !result) {
-        const auto rollback = history_.redo();
+        history_.abort_durable_history();
         document_ = std::move(before_document);
         viewport_mesh_cache_.clear();
-        if (!rollback) {
-            return failure(core::Diagnostic(
-                core::ErrorCode::invalid_state,
-                "durable journal append failed and undo rollback failed: " +
-                    rollback.error().message));
-        }
         return failure(result.error().with_context("undo rolled back"));
     }
+    history_.commit_durable_history();
     return accepted("Undo", before);
 }
 
 core::Result<DispatchReceipt> ApplicationSession::redo() {
     const core::Revision before = document_.revision();
     project::ProjectDocument before_document = document_;
-    if (auto result = history_.redo(); !result) {
+    if (auto result = history_.prepare_durable_redo(); !result) {
+        document_ = std::move(before_document);
+        viewport_mesh_cache_.clear();
         return failure(result.error().with_context("redo"));
     }
     if (auto result = append_mutation_event("Redo", before, document_.revision()); !result) {
-        const auto rollback = history_.undo();
+        history_.abort_durable_history();
         document_ = std::move(before_document);
         viewport_mesh_cache_.clear();
-        if (!rollback) {
-            return failure(core::Diagnostic(
-                core::ErrorCode::invalid_state,
-                "durable journal append failed and redo rollback failed: " +
-                    rollback.error().message));
-        }
         return failure(result.error().with_context("redo rolled back"));
     }
+    history_.commit_durable_history();
     return accepted("Redo", before);
 }
 
@@ -8968,11 +11981,17 @@ void ApplicationSession::reset_editor_state() noexcept {
 
 ApplicationSnapshot ApplicationSession::snapshot() const {
     ApplicationSnapshot result;
+    const auto scene_objects = document_.scene().objects_sorted();
     result.project_name = document_.name();
+    result.source_namespace = document_.source_namespace();
     result.project_path = project_path_;
     result.project_generation = project_generation_;
     result.project_revision = document_.revision();
     result.dirty = document_.revision() != saved_revision_;
+    result.condition.connection_port_count =
+        document_.connection_port_graph().ports().size();
+    result.condition.connection_edge_count =
+        document_.connection_port_graph().edges().size();
     result.presentation_catalog = document_.presentation_catalog();
     result.authoring_standards = document_.authoring_standards();
     result.workspace = workspace_;
@@ -9039,10 +12058,35 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
     }
     result.source_assets.reserve(document_.source_asset_registry().records().size());
     for (const auto& [identity, record] : document_.source_asset_registry().records()) {
+        std::optional<std::uint64_t> bound_mesh_asset;
+        std::optional<std::size_t> bound_mesh_vertex_count;
+        std::optional<std::size_t> bound_mesh_face_count;
+        constexpr std::string_view kMeshArtifactPrefix = "mesh.asset.";
+        const std::string_view artifact_identity = record.artifact_identity;
+        if (record.kind == assets::SourceAssetKind::mesh &&
+            artifact_identity.starts_with(kMeshArtifactPrefix)) {
+            const std::string_view mesh_id_text = artifact_identity.substr(
+                kMeshArtifactPrefix.size());
+            std::uint64_t mesh_asset = 0U;
+            const auto parsed = std::from_chars(
+                mesh_id_text.data(), mesh_id_text.data() + mesh_id_text.size(), mesh_asset);
+            if (!mesh_id_text.empty() && mesh_id_text.front() != '0' &&
+                parsed.ec == std::errc{} &&
+                parsed.ptr == mesh_id_text.data() + mesh_id_text.size() && mesh_asset != 0U &&
+                document_.meshes().contains(mesh_asset)) {
+                bound_mesh_asset = mesh_asset;
+                const auto& mesh = document_.meshes().at(mesh_asset);
+                bound_mesh_vertex_count = mesh.vertex_count();
+                bound_mesh_face_count = mesh.face_count();
+            }
+        }
         result.source_assets.push_back(SourceAssetView{
             identity, record.relative_source_path, record.kind, record.source_generation,
             record.source_digest, record.importer_identity, record.importer_version,
-            record.artifact_identity, record.artifact_digest});
+            record.options,
+            record.artifact_identity, record.artifact_digest, record.domain_digests,
+            bound_mesh_asset, bound_mesh_vertex_count, bound_mesh_face_count,
+            record.authored_tags, record.dependencies, record.document_products});
     }
     result.source_asset_tombstone_count =
         document_.source_asset_registry().lineage().size() -
@@ -9077,7 +12121,7 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
         }
         result.material_graph_bindings.push_back(MaterialGraphBindingView{
             material, graph_identity.graph_identity, graph_identity.source_revision,
-            graph_identity.source_digest, source_current});
+            graph_identity.source_digest, source_current, graph_identity.inputs});
     }
     result.decal_placements.reserve(document_.decal_placements().size());
     for (const auto& [identity, stored] : document_.decal_placements()) {
@@ -9378,16 +12422,89 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
                     prefab.variant_ids, prefab.source_revision});
             }
             result.condition.prefab_instance_count = authoring.prefab_instances.size();
+            std::map<std::uint64_t, std::size_t> prefab_mesh_owners;
+            for (const auto& instance : authoring.prefab_instances) {
+                for (const auto& member : instance.members) {
+                    if (member.instance_mesh_asset_id != 0U) {
+                        prefab_mesh_owners.try_emplace(member.instance_mesh_asset_id, 0U);
+                    }
+                }
+            }
+            for (const auto& object : scene_objects) {
+                if (!object.mesh_asset.has_value()) continue;
+                const auto owners = prefab_mesh_owners.find(*object.mesh_asset);
+                if (owners != prefab_mesh_owners.end()) ++owners->second;
+            }
+            std::vector<condition::PrefabRebaseReview> rebase_review_values;
+            std::string rebase_review_error;
+            if (!authoring.prefab_instances.empty()) {
+                auto reviews = condition::PrefabRebaseReview::all(authoring);
+                if (reviews) {
+                    rebase_review_values = std::move(reviews.value());
+                } else {
+                    rebase_review_error = reviews.error().message;
+                }
+            }
+            const bool rebase_reviews_complete = rebase_review_error.empty() &&
+                rebase_review_values.size() == authoring.prefab_instances.size();
+            std::size_t rebase_review_index = 0U;
             result.condition.prefab_instances.reserve(authoring.prefab_instances.size());
             for (const auto& instance : authoring.prefab_instances) {
                 const bool current = condition_prefab_instance_bindings_current(
-                    instance, authoring, document_);
-                result.condition.prefab_instances.push_back(
-                    ConditionAuthoringView::PrefabInstance{
-                        instance.id, instance.prefab_id, instance.name,
-                        instance.root_object_id, instance.members.size(), current,
-                        current ? "Current · source and mesh revisions match."
-                                : "Stale · prefab, source, or scene binding changed."});
+                    instance, authoring, document_, prefab_mesh_owners);
+                const bool isolated = std::all_of(instance.members.begin(), instance.members.end(),
+                    [](const auto& member) { return member.instance_mesh_asset_id != 0U; });
+                ConditionAuthoringView::PrefabInstance view{
+                    instance.id, instance.prefab_id, instance.name,
+                    instance.root_object_id, instance.members.size(), current,
+                    current ? "Current · isolated mesh snapshot and source bindings match."
+                        : !isolated ? "Legacy/unisolated · no independent geometry snapshot is recorded."
+                        : "Stale · prefab, source, geometry, or local placement changed."};
+                view.member_asset_ids.reserve(instance.members.size());
+                for (const auto& member : instance.members) {
+                    view.member_asset_ids.push_back(member.asset_id);
+                }
+                if (rebase_reviews_complete) {
+                    const auto& rebase_review = rebase_review_values[rebase_review_index++];
+                    view.rebase_review_available = true;
+                    view.rebase_authoring_revision =
+                        rebase_review.captured_authoring_revision;
+                    view.rebase_authoring_digest =
+                        rebase_review.captured_authoring_digest;
+                    view.rebase_change_count = rebase_review.changes.size();
+                    view.rebase_changes.reserve(view.rebase_change_count);
+                    for (const auto& change : rebase_review.changes) {
+                        std::string label;
+                        switch (change.kind) {
+                        case condition::PrefabRebaseChangeKind::member_added:
+                            label = "Member added";
+                            break;
+                        case condition::PrefabRebaseChangeKind::member_removed:
+                            label = "Member removed";
+                            break;
+                        case condition::PrefabRebaseChangeKind::source_binding_changed:
+                            label = "Source binding changed";
+                            break;
+                        case condition::PrefabRebaseChangeKind::source_evidence_stale:
+                            label = "Source evidence stale";
+                            break;
+                        }
+                        view.rebase_changes.push_back(std::move(label) + " · asset #" +
+                            std::to_string(change.asset_id));
+                    }
+                    view.rebase_status = rebase_review.has_changes()
+                        ? "Authoring delta captured. Project mesh, override, and membership choices still require review."
+                        : "No authored source/member delta. Project mesh and local override review still required.";
+                } else {
+                    if (rebase_review_error.empty()) {
+                        view.rebase_status =
+                            "Read-only authoring review inventory did not match prefab instances.";
+                    } else {
+                        view.rebase_status = "Read-only authoring review unavailable: " +
+                            rebase_review_error;
+                    }
+                }
+                result.condition.prefab_instances.push_back(std::move(view));
             }
             result.condition.region_kits.reserve(authoring.region_kits.size());
             for (const auto& kit : authoring.region_kits) {
@@ -9513,9 +12630,9 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
                 });
             const bool prefab_instances_current = std::all_of(
                 authoring.prefab_instances.begin(), authoring.prefab_instances.end(),
-                [this, &authoring](const auto& instance) {
+                [this, &authoring, &prefab_mesh_owners](const auto& instance) {
                     return condition_prefab_instance_bindings_current(
-                        instance, authoring, document_);
+                        instance, authoring, document_, prefab_mesh_owners);
                 });
             result.condition.stale = authoring.has_stale_sources() ||
                 !kinematic_bindings_current || !prefab_instances_current;
@@ -9546,7 +12663,6 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
         }
     }
 
-    const auto scene_objects = document_.scene().objects_sorted();
     result.objects.reserve(scene_objects.size());
     for (const auto& object : scene_objects) {
         auto world = document_.scene().world_transform(object.id);
@@ -9627,38 +12743,18 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
             break;
         }
         const auto source_revision = mesh->second.revision();
-        const auto stored_stack = document_.sculpt_stacks().find(*object.mesh_asset);
-        const std::optional<assets::Sha256Digest> sculpt_stack_digest =
-            stored_stack == document_.sculpt_stacks().end()
-                ? std::nullopt
-                : std::optional<assets::Sha256Digest>{stored_stack->second.digest};
         const auto cached = viewport_mesh_cache_.find(*object.mesh_asset);
         std::shared_ptr<const geometry::CompiledMesh> compiled_mesh;
         if (cached != viewport_mesh_cache_.end() &&
             cached->second.project_generation == project_generation_ &&
             cached->second.source == &mesh->second &&
             cached->second.source_revision == source_revision &&
-            cached->second.sculpt_stack_digest == sculpt_stack_digest &&
             cached->second.mesh != nullptr) {
             compiled_mesh = cached->second.mesh;
         } else {
-            geometry::EditableMesh viewport_mesh = mesh->second;
-            if (stored_stack != document_.sculpt_stacks().end()) {
-                auto stack = production::SculptStack::deserialize(stored_stack->second.bytes);
-                if (!stack) {
-                    result.viewport.error = stack.error().with_context(
-                        "SculptStack viewport source");
-                    break;
-                }
-                const auto digest = stack.value().digest();
-                if (!digest || digest.value() != stored_stack->second.digest) {
-                    result.viewport.error = core::Diagnostic(
-                        core::ErrorCode::validation_failed,
-                        "SculptStack viewport bytes do not match their recorded digest");
-                    break;
-                }
-
-            }
+            // SculptStack is authored source data here; the public viewport
+            // compiles the current mesh without evaluating brush kernels.
+            const geometry::EditableMesh& viewport_mesh = mesh->second;
             auto compiled = viewport_mesh.compile();
             if (!compiled) {
                 result.viewport.error = compiled.error().with_context("viewport compilation");
@@ -9678,7 +12774,7 @@ ApplicationSnapshot ApplicationSession::snapshot() const {
             compiled_mesh = owned_mesh;
             viewport_mesh_cache_[*object.mesh_asset] = ViewportMeshCacheEntry{
                 project_generation_, &mesh->second, source_revision,
-                sculpt_stack_digest, std::move(owned_mesh), std::move(overlay_data),
+                std::move(owned_mesh), std::move(overlay_data),
                 std::move(overlay_error)};
         }
         if (auto inserted = viewport_scene.upsert({

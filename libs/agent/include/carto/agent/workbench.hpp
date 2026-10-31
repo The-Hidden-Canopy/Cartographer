@@ -5,10 +5,14 @@
 #include <carto/agent/scene_query_budget.hpp>
 #include <carto/assets/blob_store.hpp>
 #include <carto/attributes/uv.hpp>
+#include <carto/connection/graph.hpp>
 #include <carto/core/result.hpp>
 #include <carto/geometry/ids.hpp>
 #include <carto/project/project.hpp>
+#include <carto/project/authoring_standards.hpp>
 #include <carto/scene/scene.hpp>
+#include <carto/scientific/model.hpp>
+#include <carto/world/model.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -420,6 +424,15 @@ struct AgentGhostRecomputeReceipt {
     [[nodiscard]] core::Result<void> validate() const;
 };
 
+struct ObjectStateDetail {
+    std::string name;
+    core::Transform local_transform = core::Transform::identity();
+    std::optional<scene::ObjectId> parent;
+    std::optional<std::uint64_t> mesh_asset;
+    bool visible = true;
+    bool locked = false;
+};
+
 struct ObjectChange {
     scene::ObjectId id;
     bool added = false;
@@ -431,6 +444,8 @@ struct ObjectChange {
     bool mesh_content_changed = false;
     bool visibility_changed = false;
     bool lock_changed = false;
+    std::optional<ObjectStateDetail> before_state;
+    std::optional<ObjectStateDetail> after_state;
 };
 
 struct VertexValueChange {
@@ -455,6 +470,8 @@ struct AttributeLayerChange {
     std::string layer_id;
     attributes::AttributeDomain domain = attributes::AttributeDomain::vertex;
     attributes::AttributeType type = attributes::AttributeType::float32;
+    std::optional<attributes::AttributeLayerDescriptor> before_descriptor;
+    std::optional<attributes::AttributeLayerDescriptor> after_descriptor;
     bool added = false;
     bool removed = false;
     bool descriptor_changed = false;
@@ -498,6 +515,8 @@ struct MaterialSourceChange {
     render::MaterialId id = 0U;
     std::optional<std::string> before_name;
     std::optional<std::string> after_name;
+    std::optional<render::StandardMaterial> before_definition;
+    std::optional<render::StandardMaterial> after_definition;
     std::optional<core::Revision> before_revision;
     std::optional<core::Revision> after_revision;
     bool added = false;
@@ -509,6 +528,8 @@ struct MaterialSourceChange {
 
 struct TextureSourceChange {
     assets::TextureAssetId id = 0U;
+    std::optional<project::TextureSourceRecord> before;
+    std::optional<project::TextureSourceRecord> after;
     std::optional<std::string> before_name;
     std::optional<std::string> after_name;
     std::optional<assets::Sha256Digest> before_content_digest;
@@ -520,18 +541,26 @@ struct TextureSourceChange {
     bool metadata_changed = false;
 };
 
+inline constexpr std::size_t kMaxProjectDiffVariantMeshScopeSamples = 16U;
+
 struct MaterialVariantChange {
     project::MaterialVariantId id = 0U;
     std::optional<std::string> before_name;
     std::optional<std::string> after_name;
     std::optional<render::MaterialId> before_base_material;
     std::optional<render::MaterialId> after_base_material;
+    std::optional<project::MaterialVariantOverride> before_overrides;
+    std::optional<project::MaterialVariantOverride> after_overrides;
     std::optional<core::Revision> before_revision;
     std::optional<core::Revision> after_revision;
     std::size_t before_override_count = 0U;
     std::size_t after_override_count = 0U;
     std::size_t before_mesh_scope_count = 0U;
     std::size_t after_mesh_scope_count = 0U;
+    std::vector<std::uint64_t> before_mesh_scope_sample;
+    std::vector<std::uint64_t> after_mesh_scope_sample;
+    bool before_mesh_scope_truncated = false;
+    bool after_mesh_scope_truncated = false;
     bool added = false;
     bool removed = false;
     bool name_changed = false;
@@ -551,10 +580,22 @@ struct SamplerChange {
     bool filtering_changed = false;
 };
 
+inline constexpr std::size_t kMaxProjectDiffMaterialGraphNodeSamples = 32U;
+
+struct MaterialGraphNodeChange {
+    std::uint64_t id = 0U;
+    std::optional<project::MaterialGraphNode> before;
+    std::optional<project::MaterialGraphNode> after;
+    bool added = false;
+    bool removed = false;
+};
+
 struct MaterialGraphChange {
     std::string identity;
     std::optional<core::Revision> before_revision;
     std::optional<core::Revision> after_revision;
+    std::optional<project::MaterialGraphOutputs> before_outputs;
+    std::optional<project::MaterialGraphOutputs> after_outputs;
     std::optional<assets::Sha256Digest> before_digest;
     std::optional<assets::Sha256Digest> after_digest;
     std::size_t before_node_count = 0U;
@@ -562,6 +603,8 @@ struct MaterialGraphChange {
     std::size_t added_node_count = 0U;
     std::size_t removed_node_count = 0U;
     std::size_t changed_node_count = 0U;
+    std::vector<MaterialGraphNodeChange> node_samples;
+    bool node_samples_truncated = false;
     bool added = false;
     bool removed = false;
     bool outputs_changed = false;
@@ -576,6 +619,7 @@ struct MaterialGraphBindingChange {
     bool removed = false;
     bool graph_changed = false;
     bool source_changed = false;
+    bool inputs_changed = false;
 };
 
 // A content-addressed texture blob as referenced by the catalog. The blob
@@ -601,6 +645,864 @@ struct SidecarChange {
     std::size_t after_bytes = 0U;
 };
 
+enum class PresentationRecordKind : std::uint8_t {
+    camera,
+    light,
+    reference_plane,
+};
+
+struct PresentationRecordChange {
+    PresentationRecordKind kind = PresentationRecordKind::camera;
+    std::string identity;
+    std::optional<scene::ObjectId> object;
+    std::optional<project::AuthoredCamera> camera_before;
+    std::optional<project::AuthoredCamera> camera_after;
+    std::optional<project::AuthoredLight> light_before;
+    std::optional<project::AuthoredLight> light_after;
+    std::optional<project::ReferenceImagePlane> plane_before;
+    std::optional<project::ReferenceImagePlane> plane_after;
+    std::optional<core::Revision> before_revision;
+    std::optional<core::Revision> after_revision;
+    bool added = false;
+    bool removed = false;
+};
+
+inline constexpr std::size_t kMaxProjectDiffPresentationRecordSamples = 64U;
+
+struct SpatialFieldSourceSummary {
+    std::string identity;
+    spatial_field::FieldSemantic semantic = spatial_field::FieldSemantic::generic;
+    core::Vec2d origin_uv;
+    double cell_size = 1.0;
+    std::uint32_t width = 0U;
+    std::uint32_t height = 0U;
+    double minimum_value = 0.0;
+    double maximum_value = 1.0;
+    core::Revision source_revision;
+    std::optional<assets::Sha256Digest> digest;
+    std::size_t sample_count = 0U;
+};
+
+struct SpatialFieldSampleChange {
+    std::uint32_t u = 0U;
+    std::uint32_t v = 0U;
+    std::optional<double> before;
+    std::optional<double> after;
+};
+
+inline constexpr std::size_t kMaxProjectDiffSpatialFieldSamples = 64U;
+
+struct SpatialFieldChange {
+    std::string identity;
+    std::optional<SpatialFieldSourceSummary> before;
+    std::optional<SpatialFieldSourceSummary> after;
+    bool added = false;
+    bool removed = false;
+    bool metadata_changed = false;
+    bool grid_changed = false;
+    bool sample_correspondence_available = true;
+    std::size_t changed_sample_count = 0U;
+    std::vector<SpatialFieldSampleChange> samples;
+    bool samples_truncated = false;
+};
+
+struct BotanicalSourceReceiptSummary {
+    assets::Sha256Digest job_identity_digest;
+    assets::Sha256Digest input_artifact_digest;
+    assets::Sha256Digest output_artifact_digest;
+};
+
+struct SourceAssetRecordSummary {
+    std::string identity;
+    std::string relative_source_path;
+    core::Revision source_generation;
+    assets::SourceAssetKind kind = assets::SourceAssetKind::other;
+    assets::Sha256Digest source_digest;
+    std::string importer_identity;
+    std::uint32_t importer_version = 0U;
+    assets::SourceImportOptions options;
+    std::string artifact_identity;
+    assets::Sha256Digest artifact_digest;
+    std::vector<assets::SourceDomainDigest> domain_digests;
+    std::optional<BotanicalSourceReceiptSummary> botanical_receipt;
+    std::size_t authored_tag_count = 0U;
+    std::vector<std::string> authored_tag_sample;
+    bool authored_tags_truncated = false;
+    std::size_t dependency_count = 0U;
+    std::vector<std::string> dependency_sample;
+    bool dependencies_truncated = false;
+    assets::Sha256Digest record_digest;
+};
+
+struct SourceAssetRecordChange {
+    std::string identity;
+    std::optional<SourceAssetRecordSummary> before;
+    std::optional<SourceAssetRecordSummary> after;
+    bool added = false;
+    bool removed = false;
+};
+
+inline constexpr std::size_t kMaxProjectDiffSourceAssetRecords = 64U;
+inline constexpr std::size_t kMaxProjectDiffSourceAssetMetadataSamples = 16U;
+
+struct ConnectionPortSourceSummary {
+    std::uint64_t identity = 0U;
+    std::uint64_t owner_object = 0U;
+    std::string frame_identity;
+    std::optional<std::string> parent_frame;
+    core::Transform transform_to_parent;
+    std::string coordinate_convention;
+    std::size_t compatibility_tag_count = 0U;
+    std::vector<connection::PortCompatibilityTag> compatibility_tag_sample;
+    bool compatibility_tags_truncated = false;
+    std::size_t required_capability_count = 0U;
+    std::vector<std::string> required_capability_sample;
+    bool required_capabilities_truncated = false;
+    std::size_t offered_capability_count = 0U;
+    std::vector<std::string> offered_capability_sample;
+    bool offered_capabilities_truncated = false;
+    assets::Sha256Digest record_digest;
+};
+
+struct ConnectionEdgeSourceSummary {
+    std::uint64_t identity = 0U;
+    std::uint64_t first_port = 0U;
+    std::uint64_t second_port = 0U;
+    connection::ConnectionKind kind = connection::ConnectionKind::mechanical;
+    std::size_t shared_tag_count = 0U;
+    std::vector<connection::PortCompatibilityTag> shared_tag_sample;
+    bool shared_tags_truncated = false;
+    std::size_t first_requirement_count = 0U;
+    std::vector<std::string> first_requirement_sample;
+    bool first_requirements_truncated = false;
+    std::size_t second_requirement_count = 0U;
+    std::vector<std::string> second_requirement_sample;
+    bool second_requirements_truncated = false;
+    assets::Sha256Digest record_digest;
+};
+
+struct ConnectionPortChange {
+    std::uint64_t identity = 0U;
+    bool added = false;
+    bool removed = false;
+    std::optional<ConnectionPortSourceSummary> before;
+    std::optional<ConnectionPortSourceSummary> after;
+};
+
+struct ConnectionEdgeChange {
+    std::uint64_t identity = 0U;
+    bool added = false;
+    bool removed = false;
+    std::optional<ConnectionEdgeSourceSummary> before;
+    std::optional<ConnectionEdgeSourceSummary> after;
+};
+
+struct ConnectionPortGraphChange {
+    bool changed = false;
+    bool details_available = true;
+    std::optional<assets::Sha256Digest> before_digest;
+    std::optional<assets::Sha256Digest> after_digest;
+    std::size_t before_port_count = 0U;
+    std::size_t after_port_count = 0U;
+    std::size_t before_edge_count = 0U;
+    std::size_t after_edge_count = 0U;
+    std::size_t changed_port_count = 0U;
+    std::size_t changed_edge_count = 0U;
+    std::vector<ConnectionPortChange> ports;
+    std::vector<ConnectionEdgeChange> edges;
+    bool ports_truncated = false;
+    bool edges_truncated = false;
+};
+
+inline constexpr std::size_t kMaxProjectDiffConnectionPortSamples = 64U;
+inline constexpr std::size_t kMaxProjectDiffConnectionEdgeSamples = 64U;
+inline constexpr std::size_t kMaxProjectDiffConnectionMetadataSamples = 16U;
+
+struct ProjectStandardMeasurementSummary {
+    std::uint64_t object_id = 0U;
+    std::uint64_t mesh_asset = 0U;
+    core::Revision mesh_revision;
+    double measured_value_meters = 0.0;
+};
+
+struct ProjectStandardEvidenceSummary {
+    core::Revision source_revision;
+    double tolerance_meters = 0.0;
+    std::size_t measurement_count = 0U;
+    std::vector<ProjectStandardMeasurementSummary> measurements;
+    bool measurements_truncated = false;
+    assets::Sha256Digest digest;
+};
+
+struct ProjectAuthoringStandardSummary {
+    std::string identity;
+    std::string label;
+    project::ProjectStandardCategory category =
+        project::ProjectStandardCategory::naming_policy;
+    std::string value;
+    std::string unit;
+    std::size_t rationale_byte_count = 0U;
+    assets::Sha256Digest rationale_digest;
+    std::optional<ProjectStandardEvidenceSummary> evidence;
+    assets::Sha256Digest record_digest;
+};
+
+struct ProjectAuthoringStandardChange {
+    std::string identity;
+    bool added = false;
+    bool removed = false;
+    std::optional<ProjectAuthoringStandardSummary> before;
+    std::optional<ProjectAuthoringStandardSummary> after;
+};
+
+struct ProjectAuthoringStandardsChange {
+    bool changed = false;
+    bool details_available = true;
+    std::optional<assets::Sha256Digest> before_digest;
+    std::optional<assets::Sha256Digest> after_digest;
+    std::size_t before_record_count = 0U;
+    std::size_t after_record_count = 0U;
+    std::size_t changed_record_count = 0U;
+    std::vector<ProjectAuthoringStandardChange> records;
+    bool records_truncated = false;
+};
+
+inline constexpr std::size_t kMaxProjectDiffAuthoringStandards = 64U;
+inline constexpr std::size_t kMaxProjectDiffStandardMeasurementSamples = 16U;
+
+struct WorldModelSourceSummary {
+    assets::Sha256Digest digest;
+    std::size_t areas = 0U;
+    std::size_t paths = 0U;
+    std::size_t regions = 0U;
+    std::size_t structure_graphs = 0U;
+    std::size_t instance_fields = 0U;
+    std::size_t variant_layers = 0U;
+};
+
+struct WorldRegionSourceSummary {
+    std::uint64_t revision = 0U;
+    std::int64_t cell_x = 0;
+    std::int64_t cell_y = 0;
+    std::size_t area_count = 0U;
+    std::size_t path_count = 0U;
+    std::size_t neighbor_count = 0U;
+    std::size_t cross_region_path_count = 0U;
+    std::vector<std::uint64_t> area_id_sample;
+    std::vector<std::uint64_t> path_id_sample;
+    std::vector<std::uint64_t> neighbor_id_sample;
+    std::vector<std::uint64_t> cross_region_path_id_sample;
+    bool membership_ids_truncated = false;
+};
+
+struct WorldRegionSourceChange {
+    world::WorldRegionId id;
+    bool added = false;
+    bool removed = false;
+    std::optional<WorldRegionSourceSummary> before;
+    std::optional<WorldRegionSourceSummary> after;
+};
+
+struct WorldAreaSourceSummary {
+    std::string semantic_type;
+    world::AuthoringBindingKind geometry_kind = world::AuthoringBindingKind::none;
+    std::uint64_t geometry_identity = 0U;
+    std::optional<std::uint64_t> parent_id;
+    std::size_t serialized_bytes = 0U;
+    assets::Sha256Digest digest;
+    std::size_t tag_count = 0U;
+    std::vector<std::string> tag_sample;
+    bool tags_truncated = false;
+};
+
+struct WorldAreaSourceChange {
+    world::AreaId id;
+    bool added = false;
+    bool removed = false;
+    std::optional<WorldAreaSourceSummary> before;
+    std::optional<WorldAreaSourceSummary> after;
+};
+
+struct WorldPathSourceSummary {
+    std::string semantic_type;
+    std::optional<std::uint64_t> start_area_id;
+    std::optional<std::uint64_t> end_area_id;
+    double width = 0.0;
+    bool closed = false;
+    std::size_t control_point_count = 0U;
+    std::vector<core::Vec3d> control_point_sample;
+    bool control_points_truncated = false;
+    std::size_t serialized_bytes = 0U;
+    assets::Sha256Digest digest;
+};
+
+struct WorldPathSourceChange {
+    world::PathId id;
+    bool added = false;
+    bool removed = false;
+    std::optional<WorldPathSourceSummary> before;
+    std::optional<WorldPathSourceSummary> after;
+};
+
+struct WorldInstanceFieldSourceSummary {
+    std::string semantic_type;
+    std::optional<std::uint64_t> area_id;
+    core::Vec3d bounds_minimum;
+    core::Vec3d bounds_maximum;
+    std::string recipe_identity;
+    assets::Sha256Digest recipe_digest;
+    std::uint64_t seed = 0U;
+    std::uint64_t maximum_instances = 0U;
+    std::size_t suppressed_instance_count = 0U;
+    std::vector<std::uint64_t> suppressed_instance_sample;
+    bool suppressed_instances_truncated = false;
+    std::optional<assets::Sha256Digest> geometry_evidence;
+    std::string physical_material_intent;
+    std::string construction_profile;
+    std::string surface_domain_identity;
+    std::size_t serialized_bytes = 0U;
+    assets::Sha256Digest digest;
+};
+
+struct WorldInstanceFieldSourceChange {
+    world::InstanceFieldId id;
+    bool added = false;
+    bool removed = false;
+    std::optional<WorldInstanceFieldSourceSummary> before;
+    std::optional<WorldInstanceFieldSourceSummary> after;
+};
+
+struct WorldVariantEditSourceSummary {
+    world::VariantTargetKind target_kind = world::VariantTargetKind::semantic_area;
+    std::uint64_t target_identity = 0U;
+    world::VariantOperation operation = world::VariantOperation::set_value;
+    std::string property;
+    std::size_t value_bytes = 0U;
+    std::string value_sample;
+    assets::Sha256Digest value_digest;
+    bool value_truncated = false;
+};
+
+struct WorldVariantLayerSourceSummary {
+    std::string name;
+    std::uint64_t base_project_revision = 0U;
+    std::size_t edit_count = 0U;
+    std::vector<WorldVariantEditSourceSummary> edit_sample;
+    bool edits_truncated = false;
+    std::size_t serialized_bytes = 0U;
+    assets::Sha256Digest digest;
+};
+
+struct WorldVariantLayerSourceChange {
+    world::VariantLayerId id;
+    bool added = false;
+    bool removed = false;
+    std::optional<WorldVariantLayerSourceSummary> before;
+    std::optional<WorldVariantLayerSourceSummary> after;
+};
+
+struct WorldStructureGraphSourceSummary {
+    std::string semantic_type;
+    std::size_t serialized_bytes = 0U;
+    assets::Sha256Digest digest;
+    std::size_t node_count = 0U;
+    std::size_t edge_count = 0U;
+    std::vector<std::uint64_t> node_id_sample;
+    std::vector<std::uint64_t> edge_id_sample;
+    bool ids_truncated = false;
+};
+
+struct WorldStructureGraphSourceChange {
+    world::StructureGraphId id;
+    bool added = false;
+    bool removed = false;
+    std::optional<WorldStructureGraphSourceSummary> before;
+    std::optional<WorldStructureGraphSourceSummary> after;
+};
+
+inline constexpr std::size_t kMaxProjectDiffWorldRegionRecords = 64U;
+inline constexpr std::size_t kMaxProjectDiffWorldRegionMembershipIds = 8U;
+inline constexpr std::size_t kMaxProjectDiffWorldAreas = 64U;
+inline constexpr std::size_t kMaxProjectDiffWorldAreaTags = 8U;
+inline constexpr std::size_t kMaxProjectDiffWorldPaths = 64U;
+inline constexpr std::size_t kMaxProjectDiffWorldControlPoints = 8U;
+inline constexpr std::size_t kMaxProjectDiffWorldInstanceFields = 64U;
+inline constexpr std::size_t kMaxProjectDiffWorldSuppressedInstances = 8U;
+inline constexpr std::size_t kMaxProjectDiffWorldVariantLayers = 64U;
+inline constexpr std::size_t kMaxProjectDiffWorldVariantEdits = 8U;
+inline constexpr std::size_t kMaxProjectDiffWorldVariantValueSampleBytes = 64U;
+inline constexpr std::size_t kMaxProjectDiffWorldStructureGraphs = 64U;
+inline constexpr std::size_t kMaxProjectDiffWorldStructureGraphIds = 8U;
+
+struct WorldModelChange {
+    bool changed = false;
+    bool details_available = true;
+    std::optional<WorldModelSourceSummary> before;
+    std::optional<WorldModelSourceSummary> after;
+    std::size_t before_region_count = 0U;
+    std::size_t after_region_count = 0U;
+    std::size_t changed_region_count = 0U;
+    std::vector<WorldRegionSourceChange> regions;
+    bool region_records_truncated = false;
+    std::size_t before_area_count = 0U;
+    std::size_t after_area_count = 0U;
+    std::size_t changed_area_count = 0U;
+    std::vector<WorldAreaSourceChange> areas;
+    bool areas_truncated = false;
+    bool area_details_available = true;
+    std::size_t before_path_count = 0U;
+    std::size_t after_path_count = 0U;
+    std::size_t changed_path_count = 0U;
+    std::vector<WorldPathSourceChange> paths;
+    bool paths_truncated = false;
+    bool path_details_available = true;
+    std::size_t before_instance_field_count = 0U;
+    std::size_t after_instance_field_count = 0U;
+    std::size_t changed_instance_field_count = 0U;
+    std::vector<WorldInstanceFieldSourceChange> instance_fields;
+    bool instance_fields_truncated = false;
+    bool instance_field_details_available = true;
+    std::size_t before_variant_layer_count = 0U;
+    std::size_t after_variant_layer_count = 0U;
+    std::size_t changed_variant_layer_count = 0U;
+    std::vector<WorldVariantLayerSourceChange> variant_layers;
+    bool variant_layers_truncated = false;
+    bool variant_layer_details_available = true;
+    std::size_t before_structure_graph_count = 0U;
+    std::size_t after_structure_graph_count = 0U;
+    std::size_t changed_structure_graph_count = 0U;
+    std::vector<WorldStructureGraphSourceChange> structure_graphs;
+    bool structure_graphs_truncated = false;
+    bool structure_graph_details_available = true;
+};
+
+struct ScientificModelSourceSummary {
+    assets::Sha256Digest digest;
+    std::size_t serialized_bytes = 0U;
+    std::size_t regions = 0U;
+    std::size_t boundaries = 0U;
+    std::size_t interfaces = 0U;
+    std::size_t sources = 0U;
+    std::size_t loads = 0U;
+    std::size_t parameters = 0U;
+    std::size_t fields = 0U;
+    std::size_t probes = 0U;
+    std::size_t studies = 0U;
+    std::size_t result_sets = 0U;
+    std::vector<std::string> populated_extensions;
+};
+
+struct ScientificModelChange {
+    bool changed = false;
+    bool details_available = true;
+    std::optional<ScientificModelSourceSummary> before;
+    std::optional<ScientificModelSourceSummary> after;
+};
+
+enum class ProceduralSourceKind : std::uint8_t {
+    curve_path,
+    road,
+    sweep,
+    sign_text,
+};
+
+struct CurvePathSourceSummary {
+    core::Revision revision;
+    assets::Sha256Digest digest;
+    std::size_t serialized_bytes = 0U;
+    std::size_t segment_count = 0U;
+};
+
+struct RoadSourceSummary {
+    core::Revision revision;
+    assets::Sha256Digest digest;
+    std::size_t serialized_bytes = 0U;
+    std::string centerline_identity;
+    core::Revision centerline_revision;
+    double width_meters = 0.0;
+    double shoulder_meters = 0.0;
+    double maximum_grade_ratio = 0.0;
+    double minimum_curve_radius_meters = 0.0;
+    project::RoadSurfaceClass surface_class = project::RoadSurfaceClass::asphalt;
+    project::RoadFunctionClass function_class = project::RoadFunctionClass::local;
+    project::RoadAccessState access_state = project::RoadAccessState::open;
+    project::RoadDrainageIntent drainage_intent = project::RoadDrainageIntent::none;
+};
+
+struct SweepSourceSummary {
+    core::Revision revision;
+    assets::Sha256Digest digest;
+    std::size_t serialized_bytes = 0U;
+    std::string centerline_identity;
+    core::Revision centerline_revision;
+    std::size_t profile_point_count = 0U;
+    std::uint32_t samples_per_segment = 0U;
+    double start_scale = 0.0;
+    double end_scale = 0.0;
+    geometry::SweepCapPolicy cap_policy = geometry::SweepCapPolicy::both;
+    double inner_profile_scale = 0.0;
+};
+
+struct SignTextSourceSummary {
+    core::Revision revision;
+    assets::Sha256Digest digest;
+    std::size_t serialized_bytes = 0U;
+    std::size_t text_bytes = 0U;
+    assets::Sha256Digest text_digest;
+    geometry::SignTextAlignment alignment = geometry::SignTextAlignment::center;
+    double board_width = 0.0;
+    double board_height = 0.0;
+    double board_depth = 0.0;
+    double glyph_height = 0.0;
+    double glyph_depth = 0.0;
+    double tracking = 0.0;
+    double line_spacing = 0.0;
+};
+
+using ProceduralSourceRecordSummary = std::variant<
+    CurvePathSourceSummary,
+    RoadSourceSummary,
+    SweepSourceSummary,
+    SignTextSourceSummary>;
+
+struct ProceduralSourceRecordChange {
+    ProceduralSourceKind kind = ProceduralSourceKind::curve_path;
+    std::string identity;
+    bool added = false;
+    bool removed = false;
+    std::optional<ProceduralSourceRecordSummary> before;
+    std::optional<ProceduralSourceRecordSummary> after;
+};
+
+struct ProceduralSourceRecordCounts {
+    std::size_t curve_paths = 0U;
+    std::size_t roads = 0U;
+    std::size_t sweeps = 0U;
+    std::size_t sign_texts = 0U;
+};
+
+struct ProceduralSourcesChange {
+    bool changed = false;
+    bool details_available = true;
+    ProceduralSourceRecordCounts before_counts;
+    ProceduralSourceRecordCounts after_counts;
+    std::size_t changed_record_count = 0U;
+    std::vector<ProceduralSourceRecordChange> records;
+    bool records_truncated = false;
+};
+
+inline constexpr std::size_t kMaxProjectDiffProceduralSources = 64U;
+
+struct BiologicalAuthoringSourceSummary {
+    std::string source_namespace;
+    std::uint64_t asset_id = 0U;
+    std::size_t serialized_bytes = 0U;
+    assets::Sha256Digest digest;
+};
+
+struct BiologicalAuthoringSourceChange {
+    std::string identity;
+    bool added = false;
+    bool removed = false;
+    std::optional<BiologicalAuthoringSourceSummary> before;
+    std::optional<BiologicalAuthoringSourceSummary> after;
+};
+
+struct BiologicalAuthoringSourcesChange {
+    bool changed = false;
+    bool details_available = true;
+    std::size_t before_record_count = 0U;
+    std::size_t after_record_count = 0U;
+    std::size_t changed_record_count = 0U;
+    std::vector<BiologicalAuthoringSourceChange> records;
+    bool records_truncated = false;
+};
+
+inline constexpr std::size_t kMaxProjectDiffBiologicalAuthoringSources = 64U;
+
+struct RigModuleTemplateSourceSummary {
+    core::Revision revision;
+    std::size_t serialized_bytes = 0U;
+    assets::Sha256Digest digest;
+};
+
+struct RigModuleTemplateSourceChange {
+    std::string identity;
+    bool added = false;
+    bool removed = false;
+    std::optional<RigModuleTemplateSourceSummary> before;
+    std::optional<RigModuleTemplateSourceSummary> after;
+};
+
+struct RigModuleTemplateSourcesChange {
+    bool changed = false;
+    bool details_available = true;
+    std::size_t before_record_count = 0U;
+    std::size_t after_record_count = 0U;
+    std::size_t changed_record_count = 0U;
+    std::vector<RigModuleTemplateSourceChange> records;
+    bool records_truncated = false;
+};
+
+inline constexpr std::size_t kMaxProjectDiffRigModuleTemplates = 64U;
+
+struct DecalPlacementSourceSummary {
+    core::Revision revision;
+    std::size_t serialized_bytes = 0U;
+    assets::Sha256Digest digest;
+};
+
+struct DecalPlacementSourceChange {
+    std::uint64_t placement_id = 0U;
+    bool added = false;
+    bool removed = false;
+    std::optional<DecalPlacementSourceSummary> before;
+    std::optional<DecalPlacementSourceSummary> after;
+};
+
+struct DecalPlacementSourcesChange {
+    bool changed = false;
+    std::size_t before_record_count = 0U;
+    std::size_t after_record_count = 0U;
+    std::size_t changed_record_count = 0U;
+    std::vector<DecalPlacementSourceChange> records;
+    bool records_truncated = false;
+};
+
+inline constexpr std::size_t kMaxProjectDiffDecalPlacementSources = 64U;
+
+struct PoseLibrarySourceSummary {
+    core::Revision revision;
+    std::size_t serialized_bytes = 0U;
+    assets::Sha256Digest digest;
+};
+
+struct PoseLibrarySourceChange {
+    std::string identity;
+    bool added = false;
+    bool removed = false;
+    std::optional<PoseLibrarySourceSummary> before;
+    std::optional<PoseLibrarySourceSummary> after;
+};
+
+struct PoseLibrarySourcesChange {
+    bool changed = false;
+    std::size_t before_record_count = 0U;
+    std::size_t after_record_count = 0U;
+    std::size_t changed_record_count = 0U;
+    std::vector<PoseLibrarySourceChange> records;
+    bool records_truncated = false;
+};
+
+inline constexpr std::size_t kMaxProjectDiffPoseLibraries = 64U;
+
+struct KinematicGraphSourceSummary {
+    core::Revision revision;
+    std::size_t serialized_bytes = 0U;
+    assets::Sha256Digest digest;
+};
+
+struct KinematicGraphSourceChange {
+    std::string identity;
+    bool added = false;
+    bool removed = false;
+    std::optional<KinematicGraphSourceSummary> before;
+    std::optional<KinematicGraphSourceSummary> after;
+};
+
+struct KinematicGraphSourcesChange {
+    bool changed = false;
+    std::size_t before_record_count = 0U;
+    std::size_t after_record_count = 0U;
+    std::size_t changed_record_count = 0U;
+    std::vector<KinematicGraphSourceChange> records;
+    bool records_truncated = false;
+};
+
+inline constexpr std::size_t kMaxProjectDiffKinematicGraphs = 64U;
+
+enum class ProjectEditReceiptKind : std::uint8_t {
+    weight,
+    keyed_curve,
+    topology,
+    mesh_patch,
+};
+
+struct ProjectEditReceiptSummary {
+    std::size_t serialized_bytes = 0U;
+    assets::Sha256Digest digest;
+    std::uint64_t mesh_asset = 0U;
+    std::optional<assets::Sha256Digest> source_mesh_digest;
+    std::optional<assets::Sha256Digest> result_mesh_digest;
+};
+
+struct ProjectEditReceiptChange {
+    ProjectEditReceiptKind kind = ProjectEditReceiptKind::weight;
+    std::size_t sequence_index = 0U;
+    bool added = false;
+    bool removed = false;
+    std::optional<ProjectEditReceiptSummary> before;
+    std::optional<ProjectEditReceiptSummary> after;
+};
+
+struct ProjectEditReceiptCounts {
+    std::size_t weight = 0U;
+    std::size_t keyed_curve = 0U;
+    std::size_t topology = 0U;
+    std::size_t mesh_patch = 0U;
+};
+
+struct ProjectEditReceiptsChange {
+    bool changed = false;
+    ProjectEditReceiptCounts before_counts;
+    ProjectEditReceiptCounts after_counts;
+    std::size_t changed_record_count = 0U;
+    std::vector<ProjectEditReceiptChange> records;
+    bool records_truncated = false;
+};
+
+inline constexpr std::size_t kMaxProjectDiffEditReceipts = 64U;
+
+enum class ProjectInstanceReceiptKind : std::uint8_t {
+    sign_text,
+    road_surface,
+    biological_proxy,
+    condition_vegetation,
+};
+
+struct SignTextInstanceReceiptSummary {
+    std::uint64_t mesh_asset = 0U;
+    std::string source_identity;
+    core::Revision source_revision;
+    std::size_t source_snapshot_bytes = 0U;
+    assets::Sha256Digest source_digest;
+};
+
+struct RoadSurfaceInstanceReceiptSummary {
+    std::uint64_t mesh_asset = 0U;
+    project::RoadSurfaceClass surface_class = project::RoadSurfaceClass::asphalt;
+    std::string road_identity;
+    core::Revision road_revision;
+    std::size_t road_snapshot_bytes = 0U;
+    assets::Sha256Digest road_digest;
+    std::string centerline_identity;
+    core::Revision centerline_revision;
+    std::size_t centerline_snapshot_bytes = 0U;
+    assets::Sha256Digest centerline_digest;
+    std::uint32_t samples_per_segment = 0U;
+    assets::Sha256Digest generated_mesh_digest;
+};
+
+struct BiologicalProxyInstanceReceiptSummary {
+    std::uint64_t mesh_asset = 0U;
+    std::string source_namespace;
+    std::uint64_t source_asset_id = 0U;
+    core::Revision source_revision;
+    std::uint64_t structure_id = 0U;
+    std::size_t source_snapshot_bytes = 0U;
+    assets::Sha256Digest source_snapshot_digest;
+    assets::Sha256Digest product_digest;
+};
+
+struct ConditionVegetationFieldReceiptSummary {
+    std::string identity;
+    spatial_field::FieldSemantic semantic = spatial_field::FieldSemantic::generic;
+    core::Revision source_revision;
+    assets::Sha256Digest digest;
+};
+
+struct ConditionVegetationInstanceReceiptSummary {
+    std::uint64_t mesh_asset = 0U;
+    std::uint64_t stable_placement_id = 0U;
+    condition::Id recipe_id = 0U;
+    condition::Id species_asset_id = 0U;
+    std::string plant_source_identity;
+    core::Revision plant_source_generation;
+    assets::Sha256Digest plant_source_digest;
+    core::Revision source_project_revision;
+    core::Revision authoring_revision;
+    assets::Sha256Digest authoring_digest;
+    assets::Sha256Digest preview_digest;
+    std::vector<ConditionVegetationFieldReceiptSummary> fields;
+    core::Vec3d position{};
+    double yaw_radians = 0.0;
+    double uniform_scale = 1.0;
+    double suitability = 0.0;
+};
+
+using ProjectInstanceReceiptSummary = std::variant<
+    SignTextInstanceReceiptSummary,
+    RoadSurfaceInstanceReceiptSummary,
+    BiologicalProxyInstanceReceiptSummary,
+    ConditionVegetationInstanceReceiptSummary>;
+
+struct ProjectInstanceReceiptChange {
+    ProjectInstanceReceiptKind kind = ProjectInstanceReceiptKind::sign_text;
+    scene::ObjectId object;
+    bool added = false;
+    bool removed = false;
+    std::optional<ProjectInstanceReceiptSummary> before;
+    std::optional<ProjectInstanceReceiptSummary> after;
+};
+
+struct ProjectInstanceReceiptCounts {
+    std::size_t sign_text = 0U;
+    std::size_t road_surface = 0U;
+    std::size_t biological_proxy = 0U;
+    std::size_t condition_vegetation = 0U;
+};
+
+struct ProjectInstanceReceiptsChange {
+    bool changed = false;
+    ProjectInstanceReceiptCounts before_counts;
+    ProjectInstanceReceiptCounts after_counts;
+    ProjectInstanceReceiptCounts changed_record_counts;
+    std::size_t changed_record_count = 0U;
+    std::vector<ProjectInstanceReceiptChange> records;
+    bool records_truncated = false;
+};
+
+inline constexpr std::size_t kMaxProjectDiffInstanceReceipts = 64U;
+
+enum class ProjectMeshAuthoringSourceKind : std::uint8_t {
+    sculpt_stack,
+    garment_asset,
+    cloth_rest_pose_receipt,
+};
+
+struct ProjectMeshAuthoringSourceCounts {
+    std::size_t sculpt_stack = 0U;
+    std::size_t garment_asset = 0U;
+    std::size_t cloth_rest_pose_receipt = 0U;
+};
+
+struct ProjectMeshAuthoringSourceSummary {
+    std::size_t serialized_bytes = 0U;
+    assets::Sha256Digest digest;
+};
+
+struct ProjectMeshAuthoringSourceChange {
+    ProjectMeshAuthoringSourceKind kind =
+        ProjectMeshAuthoringSourceKind::sculpt_stack;
+    std::uint64_t mesh_asset = 0U;
+    bool added = false;
+    bool removed = false;
+    std::optional<ProjectMeshAuthoringSourceSummary> before;
+    std::optional<ProjectMeshAuthoringSourceSummary> after;
+};
+
+struct ProjectMeshAuthoringSourcesChange {
+    bool changed = false;
+    ProjectMeshAuthoringSourceCounts before_counts;
+    ProjectMeshAuthoringSourceCounts after_counts;
+    ProjectMeshAuthoringSourceCounts changed_record_counts;
+    std::size_t changed_record_count = 0U;
+    std::vector<ProjectMeshAuthoringSourceChange> records;
+    bool records_truncated = false;
+};
+
+inline constexpr std::size_t kMaxProjectDiffMeshAuthoringSources = 64U;
+
 struct MeshChange {
     std::uint64_t asset_id = 0U;
     bool added = false;
@@ -617,11 +1519,26 @@ struct MeshChange {
     std::vector<UvSetChange> uv_sets;
 };
 
+struct ProjectMetadataChange {
+    bool changed = false;
+    bool name_changed = false;
+    bool source_namespace_changed = false;
+    bool evaluation_graph_changed = false;
+    std::string before_name;
+    std::string after_name;
+    std::string before_source_namespace;
+    std::string after_source_namespace;
+    std::optional<assets::Sha256Digest> before_evaluation_graph_digest;
+    std::optional<assets::Sha256Digest> after_evaluation_graph_digest;
+    std::size_t changed_field_count = 0U;
+};
+
 struct ProjectDiff {
     core::Revision base_revision;
     core::Revision speculative_revision;
-    // Canonical full-document source digests bind the complete pair even when
-    // a source domain has no detailed row in this review format yet.
+    // Full-project digests bind exact snapshots.
+    // Source details remain partial per category.
+    bool presentation_catalog_changed = false;
     assets::Sha256Digest base_digest;
     assets::Sha256Digest digest;
     std::vector<ObjectChange> objects;
@@ -629,14 +1546,17 @@ struct ProjectDiff {
     std::vector<MaterialBindingChange> material_bindings;
     std::vector<MaterialSourceChange> material_sources;
     std::vector<TextureSourceChange> texture_sources;
+    ProjectMetadataChange project_metadata;
     std::vector<MaterialVariantChange> material_variants;
     std::vector<SamplerChange> samplers;
     std::vector<MaterialGraphChange> material_graphs;
     std::vector<MaterialGraphBindingChange> material_graph_bindings;
     std::vector<TextureBlobChange> texture_blobs;
+    std::optional<SidecarChange> semantic_sidecar;
     std::optional<SidecarChange> engineering;
     std::optional<SidecarChange> condition;
     bool material_catalog_changed = false;
+    bool semantic_sidecar_changed = false;
     bool engineering_changed = false;
     bool condition_changed = false;
     [[nodiscard]] static ProjectDiff between(
@@ -647,8 +1567,36 @@ struct ProjectDiff {
     [[nodiscard]] std::size_t changed_material_binding_count() const noexcept;
     [[nodiscard]] std::size_t changed_material_source_count() const noexcept;
     [[nodiscard]] std::size_t changed_texture_source_count() const noexcept;
+    [[nodiscard]] std::size_t changed_spatial_field_count() const noexcept;
+    [[nodiscard]] std::size_t changed_source_asset_record_count() const noexcept;
     [[nodiscard]] bool has_changes() const noexcept;
     [[nodiscard]] bool has_unclassified_source_changes() const noexcept;
+    [[nodiscard]] bool source_projection_is_partial() const noexcept;
+    std::vector<PresentationRecordChange> presentation_records;
+    std::size_t presentation_camera_change_count = 0U;
+    std::size_t presentation_light_change_count = 0U;
+    std::size_t presentation_plane_change_count = 0U;
+    bool presentation_records_truncated = false;
+    bool presentation_records_details_available = true;
+    std::vector<SpatialFieldChange> spatial_fields;
+    bool source_asset_registry_changed = false;
+    bool source_asset_record_details_available = true;
+    bool source_asset_records_truncated = false;
+    std::size_t source_asset_record_change_count = 0U;
+    std::vector<SourceAssetRecordChange> source_asset_records;
+    ConnectionPortGraphChange connection_port_graph;
+    ProjectAuthoringStandardsChange authoring_standards;
+    WorldModelChange world_model;
+    ScientificModelChange scientific_model;
+    ProceduralSourcesChange procedural_sources;
+    BiologicalAuthoringSourcesChange biological_authoring_sources;
+    RigModuleTemplateSourcesChange rig_module_template_sources;
+    DecalPlacementSourcesChange decal_placement_sources;
+    PoseLibrarySourcesChange pose_libraries;
+    KinematicGraphSourcesChange kinematic_graphs;
+    ProjectEditReceiptsChange edit_receipts;
+    ProjectInstanceReceiptsChange instance_receipts;
+    ProjectMeshAuthoringSourcesChange mesh_authoring_sources;
 };
 
 enum class ProjectMergeDisposition : std::uint8_t {
@@ -689,8 +1637,10 @@ struct ProjectMergeReview {
 // not commit, journal, or authorize that candidate for the live project.
 struct ProjectMergeResolution {
     project::ProjectDocument candidate;
+    ProjectDiff candidate_diff;
     ProjectMergeSource selected_source = ProjectMergeSource::common;
     core::Revision source_revision;
+    assets::Sha256Digest base_digest;
     assets::Sha256Digest source_digest;
     assets::Sha256Digest review_digest;
     assets::Sha256Digest digest;
@@ -940,6 +1890,13 @@ public:
 
     [[nodiscard]] core::Result<AgentTaskSnapshot> run();
     [[nodiscard]] AgentTaskSnapshot snapshot() const;
+    [[nodiscard]] core::Result<ProjectMergeReview> compare_current_project_merge() const;
+    [[nodiscard]] core::Result<ProjectDiff> project_merge_source_diff(
+        const ProjectMergeReview& review,
+        ProjectMergeSource source) const;
+    [[nodiscard]] core::Result<ProjectMergeResolution> resolve_current_project_merge(
+        const ProjectMergeReview& review,
+        std::optional<ProjectMergeSource> contested_choice = std::nullopt) const;
     [[nodiscard]] core::Result<void> reject();
     [[nodiscard]] core::Result<void> save_checkpoint(
         const std::filesystem::path& path,
@@ -964,6 +1921,11 @@ private:
     friend class ::carto::application::HumanApplicationAccess;
     [[nodiscard]] core::Result<application::DispatchReceipt> accept(
         application::HumanActionAdmission admission);
+    [[nodiscard]] core::Result<application::DispatchReceipt> accept_project_merge(
+        application::HumanActionAdmission admission,
+        const ProjectMergeReview& review,
+        const ProjectMergeResolution& resolution,
+        std::string justification);
     AgentTask(
         application::ApplicationSession& source,
         AgentPlan plan,

@@ -8,6 +8,7 @@
 #include <initializer_list>
 #include <istream>
 #include <limits>
+#include <locale>
 #include <map>
 #include <set>
 #include <sstream>
@@ -949,6 +950,22 @@ core::Result<void> PrefabInstanceMember::validate() const {
         return core::Result<void>::failure(validation(
             "condition prefab instance member source binding is invalid"));
     }
+    const auto& local = instance_local_transform;
+    const bool identity_local = local.translation.x == 0.0 && local.translation.y == 0.0 &&
+        local.translation.z == 0.0 && local.rotation.x == 0.0 && local.rotation.y == 0.0 &&
+        local.rotation.z == 0.0 && local.rotation.w == 1.0 && local.scale.x == 1.0 &&
+        local.scale.y == 1.0 && local.scale.z == 1.0;
+    if (!local.finite() ||
+        (instance_mesh_asset_id == 0U && (!snapshot_mesh_digest.is_zero() ||
+            !source_snapshot_mesh_digest.is_zero() || instance_mesh_revision.value() != 0U ||
+            !identity_local)) ||
+        (instance_mesh_asset_id != 0U &&
+            (snapshot_mesh_digest.is_zero() || source_snapshot_mesh_digest.is_zero() ||
+                instance_mesh_revision.value() == 0U ||
+                instance_mesh_asset_id == mesh_asset_id))) {
+        return core::Result<void>::failure(validation(
+            "condition prefab instance snapshot binding is partial, aliased, or invalid"));
+    }
     return core::Result<void>::success();
 }
 
@@ -974,6 +991,60 @@ core::Result<void> PrefabInstanceRecord::validate() const {
             !instance_objects.insert(member.instance_object_id).second) {
             return core::Result<void>::failure(validation(
                 "condition prefab instance contains duplicate asset or scene-object bindings"));
+        }
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> PrefabRebaseMemberDecision::validate() const {
+    if (asset_id == 0U ||
+        (mesh != PrefabRebaseMeshDecision::not_applicable &&
+            mesh != PrefabRebaseMeshDecision::keep_instance_snapshot &&
+            mesh != PrefabRebaseMeshDecision::use_current_source_snapshot) ||
+        (placement != PrefabRebasePlacementDecision::not_applicable &&
+            placement != PrefabRebasePlacementDecision::keep_instance_placement &&
+            placement != PrefabRebasePlacementDecision::use_current_source_placement) ||
+        (membership != PrefabRebaseMembershipDecision::retained &&
+            membership != PrefabRebaseMembershipDecision::added &&
+            membership != PrefabRebaseMembershipDecision::detached &&
+            membership != PrefabRebaseMembershipDecision::deleted)) {
+        return core::Result<void>::failure(validation(
+            "condition prefab rebase member decision is invalid"));
+    }
+    const bool retained = membership == PrefabRebaseMembershipDecision::retained;
+    const bool added = membership == PrefabRebaseMembershipDecision::added;
+    if ((retained && (mesh == PrefabRebaseMeshDecision::not_applicable ||
+            placement == PrefabRebasePlacementDecision::not_applicable)) ||
+        (added && (mesh != PrefabRebaseMeshDecision::use_current_source_snapshot ||
+            placement != PrefabRebasePlacementDecision::use_current_source_placement)) ||
+        (!retained && !added && (mesh != PrefabRebaseMeshDecision::not_applicable ||
+            placement != PrefabRebasePlacementDecision::not_applicable))) {
+        return core::Result<void>::failure(validation(
+            "condition prefab rebase member decision has inconsistent choices"));
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> PrefabRebaseReceipt::validate() const {
+    const bool has_justification = std::any_of(justification.begin(), justification.end(),
+        [](unsigned char byte) { return byte != ' '; });
+    if (instance_id == 0U || reviewed_authoring_revision.value() == 0U ||
+        reviewed_authoring_revision.exhausted() || reviewed_authoring_digest.is_zero() ||
+        applied_authoring_revision.value() == 0U || applied_authoring_revision.exhausted() ||
+        applied_authoring_revision <= reviewed_authoring_revision ||
+        !safe_text(justification, 1'024U) || !has_justification || decisions.empty() ||
+        decisions.size() > AuthoringDocument::kMaxPrefabRebaseDecisions ||
+        !std::is_sorted(decisions.begin(), decisions.end(), [](const auto& left, const auto& right) {
+            return left.asset_id < right.asset_id;
+        })) {
+        return core::Result<void>::failure(validation(
+            "condition prefab rebase receipt identity, rationale, revision, or decision ordering is invalid"));
+    }
+    for (std::size_t index = 0U; index < decisions.size(); ++index) {
+        if (auto result = decisions[index].validate(); !result) return result;
+        if (index > 0U && decisions[index - 1U].asset_id == decisions[index].asset_id) {
+            return core::Result<void>::failure(validation(
+                "condition prefab rebase receipt contains duplicate member decisions"));
         }
     }
     return core::Result<void>::success();
@@ -1016,6 +1087,10 @@ core::Result<void> AuthoringDocument::validate() const {
     if (auto result = validate_count(collections.size(), "condition collections"); !result) return result;
     if (auto result = validate_count(prefabs.size(), "condition prefabs"); !result) return result;
     if (auto result = validate_count(prefab_instances.size(), "condition prefab instances"); !result) return result;
+    if (prefab_rebase_receipts.size() > kMaxPrefabRebaseReceipts) {
+        return core::Result<void>::failure(validation(
+            "condition prefab rebase receipt count exceeds the configured bound"));
+    }
     if (auto result = validate_count(region_kits.size(), "condition region kits"); !result) return result;
     if (auto result = validate_count(audio_sources.size(), "condition audio sources"); !result) return result;
     if (auto result = validate_count(acoustic_zones.size(), "condition acoustic zones"); !result) return result;
@@ -1092,6 +1167,7 @@ core::Result<void> AuthoringDocument::validate() const {
     std::map<Id, const VariantCandidate*> variant_by_id;
     std::map<Id, const PrefabRecord*> prefab_by_id;
     std::set<std::uint64_t> prefab_instance_scene_objects;
+    std::set<std::uint64_t> prefab_snapshot_meshes;
     std::map<Id, const CollectionRecord*> collection_by_id;
     std::map<Id, const EffectSource*> effect_by_id;
     std::map<Id, const AuthoredStateBranch*> state_branch_by_id;
@@ -1250,10 +1326,33 @@ core::Result<void> AuthoringDocument::validate() const {
         }
         for (const auto& member : instance.members) {
             if (auto result = require_asset(member.asset_id, "prefab instance"); !result) return result;
+            if (member.instance_mesh_asset_id != 0U &&
+                !prefab_snapshot_meshes.insert(member.instance_mesh_asset_id).second) {
+                return core::Result<void>::failure(validation(
+                    "condition prefab snapshots alias another member snapshot mesh"));
+            }
             if (!prefab_instance_scene_objects.insert(member.instance_object_id).second) {
                 return core::Result<void>::failure(validation(
                     "condition prefab instances alias a scene object"));
             }
+        }
+    }
+    for (std::size_t index = 0U; index < prefab_rebase_receipts.size(); ++index) {
+        const auto& receipt = prefab_rebase_receipts[index];
+        if (auto result = receipt.validate(); !result) return result;
+        const auto persisted_instance = std::lower_bound(prefab_instances.begin(),
+            prefab_instances.end(), receipt.instance_id, [](const auto& value, Id id) {
+                return value.id < id;
+            });
+        if (persisted_instance == prefab_instances.end() ||
+            persisted_instance->id != receipt.instance_id ||
+            persisted_instance->source_authoring_revision <
+                receipt.applied_authoring_revision ||
+            receipt.applied_authoring_revision > project_revision ||
+            (index > 0U && prefab_rebase_receipts[index - 1U].applied_authoring_revision >=
+                receipt.applied_authoring_revision)) {
+            return core::Result<void>::failure(validation(
+                "condition prefab rebase receipt references missing lineage or is not chronological"));
         }
     }
     for (const auto& kit : region_kits) {
@@ -1281,6 +1380,14 @@ bool AuthoringDocument::has_stale_sources() const noexcept {
 
 core::Result<void> AuthoringDocument::validate_for_publication() const {
     if (auto result = validate(); !result) return result;
+    if (std::any_of(prefab_instances.begin(), prefab_instances.end(), [](const auto& instance) {
+            return std::any_of(instance.members.begin(), instance.members.end(), [](const auto& member) {
+                return member.instance_mesh_asset_id == 0U;
+            });
+        })) {
+        return core::Result<void>::failure(validation(
+            "condition publication requires an isolated geometry snapshot for every prefab member"));
+    }
     if (std::any_of(kinematic_assemblies.begin(), kinematic_assemblies.end(),
             [](const KinematicAssemblySource& assembly) {
                 return assembly.part_bindings.empty();
@@ -1303,6 +1410,7 @@ core::Result<void> AuthoringDocument::validate_for_publication() const {
 
 std::string AuthoringDocument::serialize() const {
     std::ostringstream output;
+    output.imbue(std::locale::classic());
     output << kAuthoringMagic << ' ' << kSchemaVersion << '\n';
     output << "PROJECT " << std::quoted(project_namespace) << ' ' << project_revision.value() << '\n';
     output << std::setprecision(17);
@@ -1426,7 +1534,25 @@ std::string AuthoringDocument::serialize() const {
                    << member.mesh_asset_id << ' ' << member.mesh_revision.value() << ' '
                    << std::quoted(member.source_revision) << ' ' << member.source_digest.hex() << ' ';
             write_transform(output, member.source_world_transform);
+            output << ' ' << member.instance_mesh_asset_id << ' ' << member.snapshot_mesh_digest.hex() << ' ';
+            write_transform(output, member.instance_local_transform);
+            output << ' ' << member.source_snapshot_mesh_digest.hex() << ' '
+                   << member.instance_mesh_revision.value();
             output << '\n';
+        }
+    }
+    output << "PREFAB_REBASE_RECEIPTS " << prefab_rebase_receipts.size() << '\n';
+    for (const auto& receipt : prefab_rebase_receipts) {
+        output << "PREFAB_REBASE_RECEIPT " << receipt.instance_id << ' '
+               << receipt.reviewed_authoring_revision.value() << ' '
+               << receipt.reviewed_authoring_digest.hex() << ' '
+               << receipt.applied_authoring_revision.value() << ' '
+               << std::quoted(receipt.justification) << ' ' << receipt.decisions.size() << '\n';
+        for (const auto& decision : receipt.decisions) {
+            output << "PREFAB_REBASE_DECISION " << decision.asset_id << ' '
+                   << static_cast<unsigned int>(decision.mesh) << ' '
+                   << static_cast<unsigned int>(decision.placement) << ' '
+                   << static_cast<unsigned int>(decision.membership) << '\n';
         }
     }
     output << "REGION_KITS " << region_kits.size() << '\n';
@@ -1569,6 +1695,7 @@ core::Result<AuthoringDocument> AuthoringDocument::deserialize(std::string_view 
             "condition authoring bytes are empty or exceed the serialized limit"));
     }
     std::istringstream input{std::string(text)};
+    input.imbue(std::locale::classic());
     std::string magic;
     std::uint32_t schema_version = 0U;
     if (!(input >> magic >> schema_version) || magic != kAuthoringMagic ||
@@ -1802,9 +1929,80 @@ core::Result<AuthoringDocument> AuthoringDocument::deserialize(std::string_view 
                         "condition prefab instance member record is invalid"));
                 }
                 member.mesh_revision = core::Revision(mesh_revision);
+                if (schema_version >= 10U &&
+                    (!read_unsigned(input, member.instance_mesh_asset_id) ||
+                        !read_digest(input, member.snapshot_mesh_digest) ||
+                        !read_transform(input, member.instance_local_transform))) {
+                    return core::Result<AuthoringDocument>::failure(parse_error(
+                        "condition prefab instance snapshot record is invalid"));
+                }
+                if (schema_version >= 11U) {
+                    std::uint64_t instance_mesh_revision = 0U;
+                    if (!read_digest(input, member.source_snapshot_mesh_digest) ||
+                        !read_unsigned(input, instance_mesh_revision)) {
+                        return core::Result<AuthoringDocument>::failure(parse_error(
+                            "condition prefab instance rebase binding is invalid"));
+                    }
+                    member.instance_mesh_revision = core::Revision(instance_mesh_revision);
+                } else if (schema_version >= 10U && member.instance_mesh_asset_id != 0U) {
+                    // Schema 10 required source and instance snapshots to be
+                    // identical. Preserve that exact historical receipt.
+                    member.source_snapshot_mesh_digest = member.snapshot_mesh_digest;
+                    member.instance_mesh_revision = member.mesh_revision;
+                }
                 instance.members.push_back(std::move(member));
             }
             result.prefab_instances.push_back(std::move(instance));
+        }
+    }
+    if (schema_version >= 12U) {
+        if (!require_token(input, "PREFAB_REBASE_RECEIPTS") ||
+            !read_count(input, AuthoringDocument::kMaxPrefabRebaseReceipts, count)) {
+            return core::Result<AuthoringDocument>::failure(parse_error(
+                "condition prefab rebase receipt count is invalid"));
+        }
+        result.prefab_rebase_receipts.reserve(count);
+        for (std::size_t index = 0U; index < count; ++index) {
+            PrefabRebaseReceipt receipt;
+            std::uint64_t reviewed_revision = 0U;
+            std::uint64_t applied_revision = 0U;
+            std::size_t decision_count = 0U;
+            if (!require_token(input, "PREFAB_REBASE_RECEIPT") ||
+                !read_unsigned(input, receipt.instance_id) ||
+                !read_unsigned(input, reviewed_revision) ||
+                !read_digest(input, receipt.reviewed_authoring_digest) ||
+                !read_unsigned(input, applied_revision) ||
+                !(input >> std::quoted(receipt.justification)) ||
+                !read_count(input, AuthoringDocument::kMaxPrefabRebaseDecisions,
+                    decision_count)) {
+                return core::Result<AuthoringDocument>::failure(parse_error(
+                    "condition prefab rebase receipt is invalid"));
+            }
+            receipt.reviewed_authoring_revision = core::Revision(reviewed_revision);
+            receipt.applied_authoring_revision = core::Revision(applied_revision);
+            receipt.decisions.reserve(decision_count);
+            for (std::size_t decision_index = 0U; decision_index < decision_count;
+                    ++decision_index) {
+                PrefabRebaseMemberDecision decision;
+                std::uint64_t mesh = 0U;
+                std::uint64_t placement = 0U;
+                std::uint64_t membership = 0U;
+                if (!require_token(input, "PREFAB_REBASE_DECISION") ||
+                    !read_unsigned(input, decision.asset_id) ||
+                    !read_unsigned(input, mesh) || !read_unsigned(input, placement) ||
+                    !read_unsigned(input, membership) ||
+                    mesh > std::numeric_limits<std::uint8_t>::max() ||
+                    placement > std::numeric_limits<std::uint8_t>::max() ||
+                    membership > std::numeric_limits<std::uint8_t>::max()) {
+                    return core::Result<AuthoringDocument>::failure(parse_error(
+                        "condition prefab rebase member decision is invalid"));
+                }
+                decision.mesh = static_cast<PrefabRebaseMeshDecision>(mesh);
+                decision.placement = static_cast<PrefabRebasePlacementDecision>(placement);
+                decision.membership = static_cast<PrefabRebaseMembershipDecision>(membership);
+                receipt.decisions.push_back(std::move(decision));
+            }
+            result.prefab_rebase_receipts.push_back(std::move(receipt));
         }
     }
     if (!read_header_count("REGION_KITS", count)) return core::Result<AuthoringDocument>::failure(parse_error("condition region kit count is invalid"));

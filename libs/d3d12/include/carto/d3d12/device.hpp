@@ -49,6 +49,8 @@ public:
         const gpu::BufferDesc& descriptor) override;
     [[nodiscard]] core::Result<gpu::TextureHandle> create_texture(
         const gpu::TextureDesc& descriptor) override;
+    [[nodiscard]] core::Result<gpu::TextureDesc> describe_texture(
+        gpu::TextureHandle handle) const;
     [[nodiscard]] core::Result<gpu::SamplerHandle> create_sampler(
         const gpu::SamplerDesc& descriptor) override;
     [[nodiscard]] core::Result<gpu::ShaderHandle> create_shader(
@@ -82,8 +84,9 @@ public:
 
     // Adopts a borrowed DXGI back-buffer resource into the generational
     // texture registry. The device takes its own COM reference; the caller
-    // remains responsible for transitioning the returned texture between
-    // present and render_target states and destroying the handle after use.
+    // remains responsible for transitioning the returned texture from present
+    // into a supported use state (render_target or copy_destination), back to
+    // present, and destroying the handle after use.
     [[nodiscard]] core::Result<gpu::TextureHandle> import_swapchain_texture(
         void* native_resource,
         const gpu::TextureDesc& descriptor);
@@ -91,6 +94,8 @@ public:
     [[nodiscard]] core::Result<gpu::SubmissionSerial> submit(
         const device_ir::DeviceCommandStream& stream,
         gpu::QueueType queue = gpu::QueueType::graphics) override;
+    // Highest serial returned by a successful submit on this device.
+    [[nodiscard]] gpu::SubmissionSerial last_submitted_serial() const noexcept;
     [[nodiscard]] gpu::SubmissionSerial completed_serial() const noexcept override;
     [[nodiscard]] core::Result<void> wait(gpu::SubmissionSerial serial) override;
 

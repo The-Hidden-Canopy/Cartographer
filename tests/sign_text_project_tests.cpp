@@ -159,6 +159,8 @@ void schema_tables_are_mandatory_and_legacy_v22_does_not_invent_signs() {
         "schema 23 rejects missing sign-text instance provenance");
 
     std::string legacy_v22 = project::ProjectDocument{}.serialize();
+    const std::string current_header = "CARTOGRAPHER_PROJECT " +
+        std::to_string(project::ProjectDocument::kSchemaVersion) + "\n";
     const auto legacy_mesh_patches = legacy_v22.find("MESH_PATCHES 0\n");
     require(legacy_mesh_patches != std::string::npos,
         "schema v22 fixture removes the v29 persistent patch table");
@@ -175,9 +177,11 @@ void schema_tables_are_mandatory_and_legacy_v22_does_not_invent_signs() {
         "SOURCE_ASSET_REGISTRY_HEX ", legacy_receipt_begin);
     legacy_v22.erase(legacy_receipt_begin, legacy_receipt_end - legacy_receipt_begin);
     const auto biological_v22 = legacy_v22.find("BIOLOGICAL_AUTHORING_SOURCES ");
-    const auto end_v22 = legacy_v22.find("END\n", biological_v22);
-    legacy_v22.erase(biological_v22, end_v22 - biological_v22);
-    legacy_v22.replace(0U, std::string("CARTOGRAPHER_PROJECT 26\n").size(),
+    const auto end_v22 = legacy_v22.rfind("\nEND\n");
+    require(biological_v22 != std::string::npos && end_v22 != std::string::npos &&
+        end_v22 >= biological_v22, "schema v22 fixture frames the final project END");
+    legacy_v22.erase(biological_v22, end_v22 + 1U - biological_v22);
+    legacy_v22.replace(0U, current_header.size(),
         "CARTOGRAPHER_PROJECT 22\n");
     const auto migrated = project::ProjectDocument::deserialize(legacy_v22);
     require(migrated && migrated.value().sign_text_sources().empty() &&

@@ -3,6 +3,7 @@
 #include <carto/assets/blob_store.hpp>
 #include <carto/assets/source_registry.hpp>
 #include <carto/biological/authoring.hpp>
+#include <carto/connection/graph.hpp>
 #include <carto/core/revision.hpp>
 #include <carto/condition/authoring.hpp>
 #include <carto/condition/vegetation_preview.hpp>
@@ -68,10 +69,16 @@ class SetProjectSweepSourceCommand;
 class SetProjectSignTextSourceCommand;
 class ApplySourceReimportPlanCommand;
 class ImportSourceMeshCommand;
+class ImportGltfSceneCommand;
 class ReplaceProjectDocumentCommand;
 }
 
 namespace carto::project {
+
+// Binds the saved editable mesh state: revision, geometry, authored attribute
+// domains/values and UV descriptors in the project's canonical save ordering.
+[[nodiscard]] assets::Sha256Digest canonical_mesh_snapshot_digest(
+    const geometry::EditableMesh& mesh);
 
 class ProjectTransaction;
 
@@ -205,6 +212,17 @@ struct SerializedPoseLibrary {
     [[nodiscard]] bool operator==(const SerializedPoseLibrary&) const noexcept = default;
 };
 
+// Canonical authored kinematic graph bytes pinned to the digest of their
+// exact serialization. The project validates the public graph codec before
+// admission; rig controls and mesh bindings remain separately authored.
+struct SerializedKinematicGraph {
+    core::Revision revision{1U};
+    std::string bytes;
+    assets::Sha256Digest digest;
+
+    [[nodiscard]] bool operator==(const SerializedKinematicGraph&) const noexcept = default;
+};
+
 // Durable provenance for one flood/prune/mirror weight edit. The receipt
 // bytes bind the input and output binding digests; the record digest binds
 // the exact serialized bytes. Receipts are historical: they may describe an
@@ -305,7 +323,7 @@ struct RoadSurfaceInstanceReceipt {
 
 class ProjectDocument {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 33;
+    static constexpr std::uint32_t kSchemaVersion = 35;
     static constexpr std::uint32_t kMinimumReadableSchemaVersion = 1;
     static constexpr std::string_view kMagic = "CARTOGRAPHER_PROJECT";
     static constexpr std::string_view kAuthoringFormat = "cartographer.authoring";
@@ -373,6 +391,9 @@ public:
     [[nodiscard]] const world::WorldModel& world_model() const noexcept {
         return world_model_;
     }
+    [[nodiscard]] const connection::ConnectionPortGraph& connection_port_graph() const noexcept {
+        return connection_port_graph_;
+    }
     [[nodiscard]] const MaterialCatalog& material_catalog() const noexcept {
         return material_catalog_;
     }
@@ -423,6 +444,10 @@ public:
     // is pinned to the digest of its exact canonical serialization.
     [[nodiscard]] const std::map<std::string, SerializedPoseLibrary>&
     pose_libraries() const noexcept { return pose_libraries_; }
+    // Canonical authored kinematic graphs keyed by stable project-local
+    // identity. These are final authored records, not preview candidate IDs.
+    [[nodiscard]] const std::map<std::string, SerializedKinematicGraph>&
+    kinematic_graphs() const noexcept { return kinematic_graphs_; }
     // Historical weight-edit receipts (flood/prune/mirror), in commit order.
     // Each record binds the exact serialized receipt bytes.
     [[nodiscard]] const std::vector<SerializedWeightEditReceipt>&
@@ -471,6 +496,7 @@ private:
     friend class ::carto::editor::SetProjectSignTextSourceCommand;
     friend class ::carto::editor::ApplySourceReimportPlanCommand;
     friend class ::carto::editor::ImportSourceMeshCommand;
+    friend class ::carto::editor::ImportGltfSceneCommand;
     friend class ::carto::editor::ReplaceProjectDocumentCommand;
     friend class ::carto::project::ProjectTransaction;
 
@@ -503,11 +529,14 @@ private:
     [[nodiscard]] core::Result<void> insert_mesh(
         std::uint64_t mesh_asset,
         geometry::EditableMesh mesh);
-    // Replaces a validated asset and advances its source revision.
+    // Replaces a validated asset and advances its source revision. Refuses if
+    // any current scene object referencing the asset is locked, including a
+    // different instance of a shared mesh.
     [[nodiscard]] core::Result<void> replace_mesh(
         std::uint64_t mesh_asset,
         geometry::EditableMesh mesh);
-    // Replaces only when the caller still owns the expected source revision.
+    // Replaces only when the caller still owns the expected source revision;
+    // the same locked-instance rule applies to edits, undo and redo.
     [[nodiscard]] core::Result<core::Revision> replace_mesh_if_revision(
         std::uint64_t mesh_asset,
         core::Revision expected_revision,
@@ -566,6 +595,8 @@ private:
     [[nodiscard]] core::Result<void> set_scientific_model(
         scientific::ScientificModel model);
     [[nodiscard]] core::Result<void> set_world_model(world::WorldModel model);
+    [[nodiscard]] core::Result<void> set_connection_port_graph(
+        connection::ConnectionPortGraph graph);
     [[nodiscard]] core::Result<void> set_material_catalog(MaterialCatalog catalog);
     [[nodiscard]] core::Result<void> set_presentation_catalog(PresentationCatalog catalog);
     [[nodiscard]] core::Result<void> set_authoring_standards(
@@ -627,6 +658,14 @@ private:
         std::string identity,
         core::Revision expected_revision,
         std::string serialized_library,
+        assets::Sha256Digest digest);
+    // Binds a canonical final kinematic graph under a stable identity. Inserts
+    // at revision one with an empty expected revision and replaces only at the
+    // expected record revision; preview-local autorig IDs are not promoted.
+    [[nodiscard]] core::Result<core::Revision> set_kinematic_graph(
+        std::string identity,
+        core::Revision expected_revision,
+        std::string serialized_graph,
         assets::Sha256Digest digest);
     // Appends one digest-bound weight-edit receipt. The receipt bytes must
     // decode through the weights codec and bind their input/output binding
@@ -709,6 +748,7 @@ private:
     std::vector<MeshPatchRecord> mesh_patches_;
     scientific::ScientificModel scientific_model_;
     world::WorldModel world_model_;
+    connection::ConnectionPortGraph connection_port_graph_;
     MaterialCatalog material_catalog_;
     PresentationCatalog presentation_catalog_;
     ProjectAuthoringStandards authoring_standards_;
@@ -727,6 +767,7 @@ private:
     std::map<std::string, SerializedRigModuleTemplate> rig_module_templates_;
     std::map<std::uint64_t, SerializedDecalPlacement> decal_placements_;
     std::map<std::string, SerializedPoseLibrary> pose_libraries_;
+    std::map<std::string, SerializedKinematicGraph> kinematic_graphs_;
     std::vector<SerializedWeightEditReceipt> weight_edit_receipts_;
     std::vector<SerializedCurveEditReceipt> curve_edit_receipts_;
     assets::ProjectAssetRegistry source_asset_registry_;

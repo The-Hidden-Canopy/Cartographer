@@ -87,13 +87,14 @@ std::vector<std::uint8_t> binary_fixture(bool invalid_index = false) {
 
 std::string make_gltf(std::string buffer_data, std::size_t buffer_size,
     std::string scene_node = "{\"mesh\":0}", bool include_uvs = true,
-    std::size_t uv_count = 3U, bool second_primitive_has_uvs = true) {
+    std::size_t uv_count = 3U, bool second_primitive_has_uvs = true,
+    std::string mesh_members = {}) {
     const std::string first_uv_attribute = include_uvs ? ",\"TEXCOORD_0\":6" : "";
     const std::string second_uv_attribute =
         include_uvs && second_primitive_has_uvs ? ",\"TEXCOORD_0\":7" : "";
     return "{\"asset\":{\"version\":\"2.0\",\"generator\":\"Cartographer\"},"
         "\"scene\":0,\"scenes\":[{\"nodes\":[0]}],\"nodes\":[" + scene_node + "],"
-        "\"meshes\":[{\"primitives\":["
+        "\"meshes\":[{" + mesh_members + "\"primitives\":["
         "{\"attributes\":{\"POSITION\":0,\"NORMAL\":1" + first_uv_attribute +
         "},\"indices\":2,\"material\":0,\"mode\":4},"
         "{\"attributes\":{\"POSITION\":3,\"NORMAL\":4" + second_uv_attribute +
@@ -127,12 +128,14 @@ std::string make_gltf(std::string buffer_data, std::size_t buffer_size,
 std::vector<std::uint8_t> make_glb(
     const std::vector<std::uint8_t>& embedded_data,
     std::size_t declared_buffer_length,
-    std::vector<std::uint8_t> binary_chunk = {}) {
+    std::vector<std::uint8_t> binary_chunk = {},
+    std::string mesh_members = {}) {
     constexpr std::uint32_t kGlbMagic = 0x46546c67U;
     constexpr std::uint32_t kJsonChunkType = 0x4e4f534aU;
     constexpr std::uint32_t kBinChunkType = 0x004e4942U;
 
-    std::string json = make_gltf(base64(embedded_data), declared_buffer_length);
+    std::string json = make_gltf(base64(embedded_data), declared_buffer_length,
+        "{\"mesh\":0}", true, 3U, true, std::move(mesh_members));
     const std::string uri_marker =
         ",\"uri\":\"data:application/octet-stream;base64,";
     const std::size_t uri_start = json.find(uri_marker);
@@ -284,6 +287,26 @@ void rejects_stale_tampered_or_unbounded_data() {
         "misaligned binary attribute view is rejected");
 }
 
+void rejects_unsupported_mesh_semantics_with_current_receipts() {
+    const auto buffer = binary_fixture();
+    for (const auto* mesh_members : {
+            "\"extensions\":{\"VENDOR_mesh_semantics\":{\"required\":true}},",
+            "\"weights\":[0.5],"}) {
+        const auto payload = bytes(make_gltf(base64(buffer), buffer.size(),
+            "{\"mesh\":0}", true, 3U, true, mesh_members));
+        require(!carto::io::import_generated_botanical_gltf(
+                payload, "pine-fixture", carto::core::Revision{7U},
+                carto::assets::sha256(payload)),
+            "glTF mesh semantics outside the botanical profile are rejected with a fresh digest");
+
+        const auto glb = make_glb(buffer, buffer.size(), {}, mesh_members);
+        require(!carto::io::import_generated_botanical_glb(
+                glb, "pine-fixture", carto::core::Revision{7U},
+                carto::assets::sha256(glb)),
+            "GLB mesh semantics outside the botanical profile are rejected with a fresh digest");
+    }
+}
+
 void admits_and_rejects_glb_container_boundaries() {
     const auto buffer = binary_fixture();
     const auto valid_glb = make_glb(buffer, buffer.size());
@@ -408,6 +431,7 @@ void admits_actual_botanical_output_when_configured() {
 int main() {
     admits_exact_bounded_mesh_and_material_regions();
     rejects_stale_tampered_or_unbounded_data();
+    rejects_unsupported_mesh_semantics_with_current_receipts();
     admits_and_rejects_glb_container_boundaries();
     admits_actual_botanical_output_when_configured();
     std::cout << "generated glTF import tests passed\n";

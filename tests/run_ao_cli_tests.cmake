@@ -37,7 +37,9 @@ execute_process(
     OUTPUT_VARIABLE cpu_inspect_stdout
     ERROR_VARIABLE cpu_inspect_stderr)
 if(NOT cpu_inspect_result EQUAL 0 OR
-   NOT cpu_inspect_stdout MATCHES "evidence=carto.cpu-reference")
+   NOT cpu_inspect_stdout MATCHES "verification=artifact-source-receipt-readback" OR
+   NOT cpu_inspect_stdout MATCHES "platform_profile=\"carto.cpu-reference.v1" OR
+   cpu_inspect_stdout MATCHES "evidence=")
     message(FATAL_ERROR "CPU AO CLI inspection failed: ${cpu_inspect_stdout}${cpu_inspect_stderr}")
 endif()
 
@@ -93,8 +95,122 @@ if(CARTO_ENABLE_D3D12)
         OUTPUT_VARIABLE gpu_inspect_stdout
         ERROR_VARIABLE gpu_inspect_stderr)
     if(NOT gpu_inspect_result EQUAL 0 OR
-       NOT gpu_inspect_stdout MATCHES "evidence=carto.d3d12.cpu-reference-parity")
+       NOT gpu_inspect_stdout MATCHES "verification=artifact-source-receipt-readback" OR
+       NOT gpu_inspect_stdout MATCHES "platform_profile=\"carto.d3d12." OR
+       gpu_inspect_stdout MATCHES "evidence=")
         message(FATAL_ERROR "D3D12 AO CLI inspection failed: ${gpu_inspect_stdout}${gpu_inspect_stderr}")
+    endif()
+
+    set(multi_project "${work_root}/multi-tile.carto")
+    set(multi_output "${work_root}/d3d12-multi-tile")
+    execute_process(
+        COMMAND "${CARTO_FIXTURE}" create-multi-tile "${multi_project}"
+        RESULT_VARIABLE multi_fixture_result
+        OUTPUT_VARIABLE multi_fixture_stdout
+        ERROR_VARIABLE multi_fixture_stderr)
+    if(NOT multi_fixture_result EQUAL 0)
+        message(FATAL_ERROR "D3D12 multi-tile AO fixture failed: ${multi_fixture_stdout}${multi_fixture_stderr}")
+    endif()
+    file(SHA256 "${multi_project}" multi_source_before)
+    execute_process(
+        COMMAND "${CARTO_CLI}" bake-ao-tiles-d3d12 "${multi_project}" 1 1 8 8 4 1.0 42 "${multi_output}"
+        RESULT_VARIABLE multi_bake_result
+        OUTPUT_VARIABLE multi_bake_stdout
+        ERROR_VARIABLE multi_bake_stderr)
+    if(NOT multi_bake_result EQUAL 0 OR
+       NOT multi_bake_stdout MATCHES "backend=d3d12" OR
+       NOT multi_bake_stdout MATCHES "tiles=2")
+        message(FATAL_ERROR "D3D12 multi-tile AO CLI bake failed: ${multi_bake_stdout}${multi_bake_stderr}")
+    endif()
+    execute_process(
+        COMMAND "${CARTO_CLI}" inspect-bake-ao-tiles-d3d12 "${multi_project}" 1 1 8 8 4 1.0 42 "${multi_output}"
+        RESULT_VARIABLE multi_inspect_result
+        OUTPUT_VARIABLE multi_inspect_stdout
+        ERROR_VARIABLE multi_inspect_stderr)
+    if(NOT multi_inspect_result EQUAL 0 OR
+       NOT multi_inspect_stdout MATCHES "verified_schedule kind=ambient-occlusion tiles=2")
+        message(FATAL_ERROR "D3D12 multi-tile AO inspection failed: ${multi_inspect_stdout}${multi_inspect_stderr}")
+    endif()
+    file(SHA256 "${multi_project}" multi_source_after)
+    if(NOT multi_source_before STREQUAL multi_source_after)
+        message(FATAL_ERROR "D3D12 multi-tile AO bake mutated its source project")
+    endif()
+
+    set(multi_bent_output "${work_root}/d3d12-multi-tile-bent-normal")
+    execute_process(
+        COMMAND "${CARTO_CLI}" bake-bent-normal-tiles-d3d12 "${multi_project}" 1 1 8 8 4 1.0 42 "${multi_bent_output}"
+        RESULT_VARIABLE multi_bent_bake_result
+        OUTPUT_VARIABLE multi_bent_bake_stdout
+        ERROR_VARIABLE multi_bent_bake_stderr)
+    if(NOT multi_bent_bake_result EQUAL 0 OR
+       NOT multi_bent_bake_stdout MATCHES "backend=d3d12" OR
+       NOT multi_bent_bake_stdout MATCHES "tiles=2" OR
+       NOT multi_bent_bake_stdout MATCHES "evidence=carto.d3d12.cpu-reference-parity")
+        message(FATAL_ERROR "D3D12 multi-tile bent-normal CLI bake failed: ${multi_bent_bake_stdout}${multi_bent_bake_stderr}")
+    endif()
+    execute_process(
+        COMMAND "${CARTO_CLI}" inspect-bake-bent-normal-tiles-d3d12 "${multi_project}" 1 1 8 8 4 1.0 42 "${multi_bent_output}"
+        RESULT_VARIABLE multi_bent_inspect_result
+        OUTPUT_VARIABLE multi_bent_inspect_stdout
+        ERROR_VARIABLE multi_bent_inspect_stderr)
+    if(NOT multi_bent_inspect_result EQUAL 0 OR
+       NOT multi_bent_inspect_stdout MATCHES "verified_schedule kind=bent-normal backend=d3d12 tiles=2" OR
+       NOT multi_bent_inspect_stdout MATCHES "verification=artifact-source-receipt-readback" OR
+       multi_bent_inspect_stdout MATCHES "evidence=")
+        message(FATAL_ERROR "D3D12 multi-tile bent-normal inspection failed: ${multi_bent_inspect_stdout}${multi_bent_inspect_stderr}")
+    endif()
+
+    set(cross_project "${work_root}/cross-tile.carto")
+    set(cross_output "${work_root}/d3d12-cross-tile-output")
+    execute_process(
+        COMMAND "${CARTO_FIXTURE}" create-cross-tile "${cross_project}"
+        RESULT_VARIABLE cross_fixture_result
+        OUTPUT_VARIABLE cross_fixture_stdout
+        ERROR_VARIABLE cross_fixture_stderr)
+    if(NOT cross_fixture_result EQUAL 0)
+        message(FATAL_ERROR "D3D12 cross-tile AO fixture failed: ${cross_fixture_stdout}${cross_fixture_stderr}")
+    endif()
+    execute_process(
+        COMMAND "${CARTO_CLI}" bake-ao-tiles-d3d12 "${cross_project}" 1 1 8 8 4 1.0 42 "${cross_output}"
+        RESULT_VARIABLE cross_bake_result
+        OUTPUT_VARIABLE cross_bake_stdout
+        ERROR_VARIABLE cross_bake_stderr)
+    if(cross_bake_result EQUAL 0 OR EXISTS "${cross_output}")
+        message(FATAL_ERROR "D3D12 AO accepted a cross-tile face or published partial output: ${cross_bake_stdout}${cross_bake_stderr}")
+    endif()
+    set(cross_bent_output "${work_root}/d3d12-cross-tile-bent-output")
+    execute_process(
+        COMMAND "${CARTO_CLI}" bake-bent-normal-tiles-d3d12 "${cross_project}" 1 1 8 8 4 1.0 42 "${cross_bent_output}"
+        RESULT_VARIABLE cross_bent_bake_result
+        OUTPUT_VARIABLE cross_bent_bake_stdout
+        ERROR_VARIABLE cross_bent_bake_stderr)
+    if(cross_bent_bake_result EQUAL 0 OR EXISTS "${cross_bent_output}")
+        message(FATAL_ERROR "D3D12 bent-normal accepted a cross-tile face or published partial output: ${cross_bent_bake_stdout}${cross_bent_bake_stderr}")
+    endif()
+
+    execute_process(
+        COMMAND "${CARTO_FIXTURE}" mutate "${multi_project}"
+        RESULT_VARIABLE multi_mutate_result
+        OUTPUT_VARIABLE multi_mutate_stdout
+        ERROR_VARIABLE multi_mutate_stderr)
+    if(NOT multi_mutate_result EQUAL 0)
+        message(FATAL_ERROR "D3D12 multi-tile AO stale-source mutation failed: ${multi_mutate_stdout}${multi_mutate_stderr}")
+    endif()
+    execute_process(
+        COMMAND "${CARTO_CLI}" inspect-bake-ao-tiles-d3d12 "${multi_project}" 1 1 8 8 4 1.0 42 "${multi_output}"
+        RESULT_VARIABLE stale_multi_inspect_result
+        OUTPUT_VARIABLE stale_multi_inspect_stdout
+        ERROR_VARIABLE stale_multi_inspect_stderr)
+    if(stale_multi_inspect_result EQUAL 0)
+        message(FATAL_ERROR "D3D12 multi-tile AO inspector accepted artifacts after source mutation")
+    endif()
+    execute_process(
+        COMMAND "${CARTO_CLI}" inspect-bake-bent-normal-tiles-d3d12 "${multi_project}" 1 1 8 8 4 1.0 42 "${multi_bent_output}"
+        RESULT_VARIABLE stale_bent_inspect_result
+        OUTPUT_VARIABLE stale_bent_inspect_stdout
+        ERROR_VARIABLE stale_bent_inspect_stderr)
+    if(stale_bent_inspect_result EQUAL 0)
+        message(FATAL_ERROR "D3D12 multi-tile bent-normal inspector accepted artifacts after source mutation")
     endif()
 endif()
 
