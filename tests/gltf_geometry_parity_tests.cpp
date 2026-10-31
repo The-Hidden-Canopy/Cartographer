@@ -197,7 +197,8 @@ struct Scene {
     project::ProjectDocument doc;
     std::uint64_t mesh;
 };
-Scene make_scene(const geometry::EditableMesh &mesh, const std::filesystem::path &root) {
+Scene make_scene(const geometry::EditableMesh &mesh, const std::filesystem::path &root,
+                 bool mirrored = true) {
     auto doc = take(project::ProjectDocument::create("Independent export geometry fixture"));
     journal::Journal journal(root / "create.log");
     if (doc.revision() != core::Revision{}) {
@@ -212,8 +213,9 @@ Scene make_scene(const geometry::EditableMesh &mesh, const std::filesystem::path
     auto tx = take(project::ProjectTransaction::begin(doc, journal, "export.geometry.fixture"));
     auto id = take(tx.add_mesh(mesh));
     auto object = take(
-        tx.create_object("Mirrored nonuniform object",
-                         {{1, 2, 3}, {0, .5176380902050415, 0, 1.9318516525781366}, {-2, 3, .5}}));
+        tx.create_object(mirrored ? "Mirrored nonuniform object" : "Positive nonuniform object",
+                         {{1, 2, 3}, {0, .5176380902050415, 0, 1.9318516525781366},
+                          {mirrored ? -2.0 : 2.0, 3, .5}}));
     okay(tx.attach_mesh(object, id));
     static_cast<void>(take(tx.commit()));
     return {std::move(doc), id};
@@ -312,8 +314,9 @@ void add_material(Scene &s, const std::filesystem::path &root) {
     static_cast<void>(take(tx.commit()));
 }
 } // namespace
-int main() {
+int main(int argc, char** argv) {
     try {
+        check(argc == 1 || argc == 2, "expected an optional new artifact directory");
         io::GltfExportReport feedback_report;
         feedback_report.path = "feedback.gltf";
         feedback_report.meshes = 1;
@@ -328,10 +331,11 @@ int main() {
                   warning_feedback.find("authored material omitted") != std::string::npos &&
                   warning_feedback.find("texture unavailable") != std::string::npos,
               "desktop export feedback surfaces every loss warning");
-        const auto root =
+        const auto root = argc == 2 ? std::filesystem::path(argv[1]) :
             std::filesystem::temp_directory_path() /
             ("gltf-geometry-" +
              std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        check(!std::filesystem::exists(root), "fixture directory must be new; prior artifacts are preserved");
         std::filesystem::create_directories(root);
         auto mesh = fixture();
         auto s = make_scene(mesh, root);
@@ -342,6 +346,13 @@ int main() {
         Scene reopened_scene{take(project::ProjectDocument::load(saved)), s.mesh};
         auto reopened = exported(reopened_scene, root, "reopened");
         check(reopened.bytes == p.bytes, "save/reopen keeps full geometry payload");
+        const auto positive_root = root / "positive-placement";
+        std::filesystem::create_directory(positive_root);
+        const auto positive = make_scene(fixture(), positive_root, false);
+        const auto positive_path = positive_root / "source.carto";
+        static_cast<void>(take(positive.doc.save_atomic(positive_path)));
+        check(take(project::ProjectDocument::load(positive_path)).serialize() == positive.doc.serialize(),
+              "separately authored positive-scale fixture survives project save/reopen");
         // Existing standalone command bus provides actual execute/undo/redo; these
         // exports do not claim native UI or application-level undo acceptance.
         editor::CommandBus bus;
