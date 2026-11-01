@@ -1137,6 +1137,68 @@ void render_mesh_artifact_is_deterministic_and_fail_closed() {
                         return left.x == right.x && left.y == right.y;
                     }),
             "additional UV identities and corner-split coordinates survive artifact reopen");
+    // UV authoring uses 64-bit identities, while artifact v4 has 32-bit
+    // additional-stream IDs. Exact maximum values must survive; wider IDs
+    // must never silently become a different, otherwise valid identity.
+    const attributes::UvSetId wire_max_uv =
+        std::numeric_limits<std::uint32_t>::max();
+    auto maximum_uv_identity = artifact;
+    maximum_uv_identity.additional_uv_set_ids.front() = wire_max_uv;
+    const auto maximum_uv_bytes = maximum_uv_identity.serialize();
+    require(static_cast<bool>(maximum_uv_bytes),
+            "maximum wire-width additional UV identity remains supported");
+    const auto maximum_uv_restored = RenderMeshArtifact::deserialize(maximum_uv_bytes.value());
+    require(maximum_uv_restored &&
+                maximum_uv_restored.value().additional_uv_set_ids ==
+                    maximum_uv_identity.additional_uv_set_ids,
+            "maximum wire-width additional UV identity survives exact round trip");
+    const attributes::UvSetId wider_uv = wire_max_uv + 10ULL; // would alias ID 9
+    auto oversized_uv_identity = artifact;
+    oversized_uv_identity.additional_uv_set_ids.front() = wider_uv;
+    const auto oversized_uv_bytes = oversized_uv_identity.serialize();
+    if (oversized_uv_bytes) {
+        const auto restored_wide_uv = RenderMeshArtifact::deserialize(oversized_uv_bytes.value());
+        require(restored_wide_uv &&
+                    restored_wide_uv.value().additional_uv_set_ids ==
+                        oversized_uv_identity.additional_uv_set_ids,
+                "additional UV identity must never silently narrow to a different valid ID");
+    }
+    require(!oversized_uv_identity.validate() && !oversized_uv_identity.serialize(),
+            "artifact v4 refuses additional UV identities beyond its wire width");
+    for (const auto boundary_identity : {wire_max_uv, wider_uv}) {
+        auto boundary_mesh = render_mesh_fixture();
+        auto boundary_payload = boundary_mesh.attributes();
+        auto boundary_layer = *boundary_payload.find("uv.detail");
+        boundary_layer.descriptor.id = "uv.wire-boundary";
+        require(static_cast<bool>(boundary_payload.add_layer(std::move(boundary_layer))),
+                "wire-boundary fixture has a separate authored UV layer");
+        auto boundary_sets = boundary_mesh.uv_sets();
+        require(static_cast<bool>(boundary_sets.add({boundary_identity, "Wire boundary",
+                    "uv.wire-boundary", false, false, false, 1U})),
+                "64-bit authoring preserves the requested boundary identity");
+        require(static_cast<bool>(boundary_mesh.set_attribute_payload(
+                    std::move(boundary_payload), std::move(boundary_sets))),
+                "wire-boundary fixture remains a valid authored mesh");
+        auto boundary_options = options;
+        boundary_options.additional_uv_sets = {boundary_identity};
+        const auto boundary_product = compile_render_mesh_artifact(
+            source, boundary_mesh, boundary_options);
+        if (boundary_identity == wire_max_uv) {
+            require(boundary_product && boundary_product.value().validate(),
+                    "compiler preserves the largest supported additional UV identity");
+            const auto boundary_bytes = boundary_product.value().serialize();
+            require(static_cast<bool>(boundary_bytes), "maximum-ID compiled artifact serializes");
+            const auto boundary_restored = RenderMeshArtifact::deserialize(boundary_bytes.value());
+            require(boundary_restored &&
+                        boundary_restored.value().additional_uv_set_ids ==
+                            std::vector<attributes::UvSetId>{boundary_identity},
+                    "largest supported compiled identity survives consumer decode");
+        } else {
+            require(!boundary_product,
+                    "compiler refuses unrepresentable additional UV identity before publication");
+        }
+    }
+
     auto zero_additional_uv_identity = artifact;
     zero_additional_uv_identity.additional_uv_set_ids.front() = 0U;
     require(!zero_additional_uv_identity.validate(),
