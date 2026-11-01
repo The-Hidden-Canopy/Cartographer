@@ -1942,6 +1942,11 @@ target_link_libraries(cartographer_uv_planar_projection_tests PRIVATE carto_prod
 carto_target(cartographer_uv_planar_projection_tests)
 add_test(NAME cartographer_uv_planar_projection_tests COMMAND cartographer_uv_planar_projection_tests)
 
+add_executable(cartographer_uv_relax_tests uv_relax_tests.cpp)
+target_link_libraries(cartographer_uv_relax_tests PRIVATE carto_production)
+carto_target(cartographer_uv_relax_tests)
+add_test(NAME cartographer_uv_relax_tests COMMAND cartographer_uv_relax_tests)
+
 # Keep test-owned temporary files inside the writable build tree. The default
 # Windows temp directory is outside the workspace sandbox in some developer
 # environments, which turns otherwise valid atomic-save/publication tests into
@@ -1951,14 +1956,9 @@ get_property(CARTO_REGISTERED_TESTS DIRECTORY PROPERTY TESTS)
 set(CARTO_TEST_TEMP_INDEX 0)
 foreach(CARTO_TEST_NAME IN LISTS CARTO_REGISTERED_TESTS)
     math(EXPR CARTO_TEST_TEMP_INDEX "${CARTO_TEST_TEMP_INDEX} + 1")
-    set(CARTO_TEST_TEMP_DIR "${CMAKE_SOURCE_DIR}/.ctest-tmp/${CARTO_TEST_TEMP_INDEX}")
+    set(CARTO_TEST_TEMP_DIR "${CMAKE_CURRENT_BINARY_DIR}/.ctest-tmp/${CARTO_TEST_TEMP_INDEX}")
     file(MAKE_DIRECTORY "${CARTO_TEST_TEMP_DIR}")
     set_tests_properties("${CARTO_TEST_NAME}" PROPERTIES
         ENVIRONMENT
             "TMP=${CARTO_TEST_TEMP_DIR};TEMP=${CARTO_TEST_TEMP_DIR};TMPDIR=${CARTO_TEST_TEMP_DIR}")
 endforeach()
-
-add_executable(cartographer_uv_relax_tests uv_relax_tests.cpp)
-target_link_libraries(cartographer_uv_relax_tests PRIVATE carto_production)
-carto_target(cartographer_uv_relax_tests)
-add_test(NAME cartographer_uv_relax_tests COMMAND cartographer_uv_relax_tests)

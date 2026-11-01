@@ -1968,6 +1968,56 @@ void cartographer_brand_palette_is_stable() {
     REQUIRE(light.accent_secondary.red > light.accent_secondary.blue);
 }
 
+void missing_workspace_preferences_preserve_current_state_and_authority() {
+    TempDirectory temp;
+    carto::application::ApplicationSession session;
+    carto::ui::UiController ui(session);
+    REQUIRE(ui.dispatch(carto::application::NewProjectAction{"Preference absence boundary"}));
+    REQUIRE(ui.set_density(carto::ui::Density::touch));
+    REQUIRE(ui.set_theme(carto::ui::Theme::light));
+    REQUIRE(ui.set_ai_auto_approve(false));
+    const auto before = ui.snapshot();
+    const auto unchanged = [&] {
+        const auto after = ui.snapshot();
+        REQUIRE(after.density == before.density);
+        REQUIRE(after.theme == before.theme);
+        REQUIRE(after.workspace_kind == before.workspace_kind);
+        REQUIRE(after.operator_mode == before.operator_mode);
+        REQUIRE(!after.ai_auto_approve);
+        REQUIRE(after.project_revision == before.project_revision);
+        REQUIRE(after.undo_count == before.undo_count);
+        REQUIRE(after.ui_problems.size() == before.ui_problems.size());
+    };
+    for (const auto& missing_path : {temp.path() / "workspace.prefs",
+                                  temp.path() / "absent-parent" / "workspace.prefs"}) {
+        const auto missing = ui.load_preferences(missing_path);
+        REQUIRE(!missing);
+        REQUIRE(missing.error().code == carto::core::ErrorCode::not_found);
+        REQUIRE(!std::filesystem::exists(missing_path));
+        unchanged();
+    }
+    REQUIRE(!std::filesystem::exists(temp.path() / "absent-parent"));
+    const auto invalid_path = ui.load_preferences({});
+    REQUIRE(!invalid_path);
+    REQUIRE(invalid_path.error().code == carto::core::ErrorCode::invalid_argument);
+    unchanged();
+#ifdef _WIN32
+    const auto unreadable = ui.load_preferences(temp.path() / std::string(300, 'x'));
+    REQUIRE(!unreadable);
+    REQUIRE(unreadable.error().code == carto::core::ErrorCode::io_error);
+    unchanged();
+    const auto invalid_name = ui.load_preferences(temp.path() / "invalid?.prefs");
+    REQUIRE(!invalid_name);
+    REQUIRE(invalid_name.error().code == carto::core::ErrorCode::io_error);
+    unchanged();
+#endif
+    const auto saved_path = temp.path() / "saved.prefs";
+    REQUIRE(ui.save_preferences(saved_path));
+    REQUIRE(ui.set_density(carto::ui::Density::standard));
+    REQUIRE(ui.load_preferences(saved_path));
+    unchanged();
+}
+
 void ui_persists_preferences_and_resets_corrupt_state() {
     TempDirectory temp;
     carto::application::ApplicationSession session;
@@ -5283,6 +5333,7 @@ int main() {
         ui_routes_revision_bound_sweep_authoring_and_refuses_stale_inputs();
         ui_preserves_required_viewport_and_supports_mode_theme_density();
         cartographer_brand_palette_is_stable();
+        missing_workspace_preferences_preserve_current_state_and_authority();
         ui_persists_preferences_and_resets_corrupt_state();
         workbench_preferences_round_trip_and_fail_closed();
         workbench_snap_selects_nearest_target_with_bounded_tolerance();

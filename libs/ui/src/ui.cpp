@@ -12335,7 +12335,27 @@ core::Result<void> UiController::load_preferences(
     }
     std::error_code error;
     if (!std::filesystem::is_regular_file(path, error)) {
-        if (error) return core::Result<void>::failure(io_error("unable to inspect workspace preferences"));
+        if (error) {
+            if (error != std::errc::no_such_file_or_directory)
+                return core::Result<void>::failure(io_error("unable to inspect workspace preferences"));
+#ifdef _WIN32
+            // The standard library also maps invalid/overlong Windows names to
+            // ENOENT. Confirm actual absence without legacy MAX_PATH truncation.
+            std::error_code absolute_error;
+            auto native_path = std::filesystem::absolute(path, absolute_error).lexically_normal().native();
+            if (absolute_error)
+                return core::Result<void>::failure(io_error("unable to inspect workspace preferences"));
+            if (!native_path.starts_with(LR"(\\?\)")) {
+                native_path = native_path.starts_with(LR"(\\)")
+                    ? LR"(\\?\UNC\)" + native_path.substr(2) : LR"(\\?\)" + native_path;
+            }
+            const auto attributes = GetFileAttributesW(native_path.c_str());
+            const auto native_error = GetLastError();
+            if (attributes != INVALID_FILE_ATTRIBUTES ||
+                (native_error != ERROR_FILE_NOT_FOUND && native_error != ERROR_PATH_NOT_FOUND))
+                return core::Result<void>::failure(io_error("unable to inspect workspace preferences"));
+#endif
+        }
         return core::Result<void>::failure(core::Diagnostic(
             core::ErrorCode::not_found, "workspace preferences do not exist"));
     }
