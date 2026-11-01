@@ -371,8 +371,11 @@ public:
         init_info.QueueFamily = queue_family_;
         init_info.Queue = queue_;
         init_info.DescriptorPool = descriptor_pool_;
-        init_info.MinImageCount = image_count_;
-        init_info.ImageCount = image_count_;
+        // The main upload ring follows the two fenced frame slots, not WSI's
+        // independently changing image count. Keep ImGui's minimum stable:
+        // this pinned backend asserts on SetMinImageCount changes.
+        init_info.MinImageCount = static_cast<std::uint32_t>(kFrameContextCount);
+        init_info.ImageCount = static_cast<std::uint32_t>(kFrameContextCount);
         init_info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
         init_info.PipelineInfoMain.RenderPass = render_pass_;
         if (!ImGui_ImplVulkan_Init(&init_info)) {
@@ -1384,6 +1387,12 @@ private:
                 render_pass_ = VK_NULL_HANDLE;
             }
             create_render_pass();
+            if (imgui_initialized_) {
+                ImGui_ImplVulkan_PipelineInfo pipeline{};
+                pipeline.RenderPass = render_pass_;
+                pipeline.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+                ImGui_ImplVulkan_CreateMainPipeline(&pipeline);
+            }
         }
 
         VkSwapchainCreateInfoKHR info{};
@@ -1456,7 +1465,7 @@ private:
         vkDestroySwapchainKHR(device_, swapchain_, nullptr);
         swapchain_ = VK_NULL_HANDLE;
         create_swapchain();
-        ImGui_ImplVulkan_SetMinImageCount(image_count_);
+        ImGui_ImplVulkan_SetMinImageCount(static_cast<std::uint32_t>(kFrameContextCount));
     }
 
 public:
