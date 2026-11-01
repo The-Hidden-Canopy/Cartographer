@@ -1935,20 +1935,20 @@ core::Result<InspectionPackage> InspectionPackage::deserialize(std::string_view 
     return core::Result<InspectionPackage>::success(std::move(package));
 }
 
-core::Result<InspectionPackage> InspectionPackage::publish(
-    const AuthoringDocument& authoring, core::Revision project_revision,
-    std::string project_namespace) {
-    if (auto result = authoring.validate(); !result) return core::Result<InspectionPackage>::failure(result.error());
-    if (project_revision.exhausted() || project_namespace != authoring.project_namespace) return core::Result<InspectionPackage>::failure(invalid("inspection publication project identity is invalid"));
+namespace {
+
+// Publication and consumer admission apply the same reviewed-authoring gates.
+// A well-formed, digest-bound package can be constructed without publish().
+core::Result<void> validate_inspection_readiness(const AuthoringDocument& authoring) {
     for (const auto& requirement : authoring.requirements) {
         if (!requirement.enabled) continue;
         if (requirement.extraction == ExtractionState::stale) {
-            return core::Result<InspectionPackage>::failure(stale(
+            return core::Result<void>::failure(stale(
                 "publication is blocked by a stale engineering requirement"));
         }
         if (requirement.extraction == ExtractionState::rejected ||
             requirement.extraction == ExtractionState::machine_extracted_proposed) {
-            return core::Result<InspectionPackage>::failure(validation(
+            return core::Result<void>::failure(validation(
                 "publication is blocked until every enabled requirement is human accepted or corrected"));
         }
         const bool has_characteristic = std::any_of(
@@ -1959,17 +1959,30 @@ core::Result<InspectionPackage> InspectionPackage::publish(
                     characteristic.status != InspectionStatus::stale;
             });
         if (!has_characteristic) {
-            return core::Result<InspectionPackage>::failure(validation(
+            return core::Result<void>::failure(validation(
                 "publication requires an active inspection characteristic for every enabled requirement"));
         }
     }
     for (const auto& characteristic : authoring.characteristics) {
-        if (characteristic.status == InspectionStatus::stale) return core::Result<InspectionPackage>::failure(stale("publication is blocked by a stale inspection characteristic"));
+        if (characteristic.status == InspectionStatus::stale) return core::Result<void>::failure(stale("publication is blocked by a stale inspection characteristic"));
         if (characteristic.status == InspectionStatus::disabled) continue;
         const bool accepted = std::any_of(authoring.targets.begin(), authoring.targets.end(), [&characteristic](const InspectionTarget& target) { return target.characteristic_id == characteristic.id && (target.status == TargetStatus::accepted || target.status == TargetStatus::runtime_verified); });
-        if (!accepted) return core::Result<InspectionPackage>::failure(validation("publication requires one accepted target for every enabled characteristic"));
+        if (!accepted) return core::Result<void>::failure(validation("publication requires one accepted target for every enabled characteristic"));
     }
-    if (!authoring.workcell.has_value()) return core::Result<InspectionPackage>::failure(validation("publication requires an authored workcell"));
+    if (!authoring.workcell.has_value()) return core::Result<void>::failure(validation("publication requires an authored workcell"));
+    return core::Result<void>::success();
+}
+
+} // namespace
+
+core::Result<InspectionPackage> InspectionPackage::publish(
+    const AuthoringDocument& authoring, core::Revision project_revision,
+    std::string project_namespace) {
+    if (auto result = authoring.validate(); !result) return core::Result<InspectionPackage>::failure(result.error());
+    if (project_revision.exhausted() || project_namespace != authoring.project_namespace) return core::Result<InspectionPackage>::failure(invalid("inspection publication project identity is invalid"));
+    if (auto readiness = validate_inspection_readiness(authoring); !readiness) {
+        return core::Result<InspectionPackage>::failure(readiness.error());
+    }
     AuthoringDocument publication_authoring = authoring;
     publication_authoring.path.reset();
     std::erase_if(publication_authoring.derived_products,
@@ -2013,6 +2026,12 @@ core::Result<PackageAdmissionResult> admit_for_consumer(const InspectionPackage&
     const auto authoring = AuthoringDocument::deserialize(package.authoring_bytes);
     if (!authoring) return core::Result<PackageAdmissionResult>::failure(authoring.error());
     PackageAdmissionResult result; result.admitted_publication_digest = package.publication_digest; result.admitted_authoring_digest = package.authoring_digest;
+    if (package.publication_profile != "dv012-inspection-v1") {
+        result.reasons.push_back("inspection publication profile is unsupported");
+    }
+    if (auto readiness = validate_inspection_readiness(authoring.value()); !readiness) {
+        result.reasons.push_back(readiness.error().message);
+    }
     for (const auto& source : authoring.value().sources) if (source.lossy) result.reasons.push_back("source " + std::to_string(source.id) + " declares lossy import");
     for (const auto& line : authoring.value().bom) if (line.reconciliation == ReconciliationStatus::ambiguous || line.reconciliation == ReconciliationStatus::unresolved) result.reasons.push_back("BOM line " + std::to_string(line.id) + " is unresolved");
     for (const auto& target : authoring.value().targets) if (target.status == TargetStatus::stale) result.reasons.push_back("target " + std::to_string(target.id) + " is stale");
@@ -2030,7 +2049,10 @@ core::Result<PackageAdmissionResult> admit_for_consumer(const InspectionPackage&
                 "derived engineering product " + std::to_string(product.id) + " is stale");
         }
     }
-    if (authoring.value().workcell->active_tool_frame.empty()) result.reasons.push_back("active tool frame is missing");
+    if (authoring.value().workcell.has_value() &&
+        authoring.value().workcell->active_tool_frame.empty()) {
+        result.reasons.push_back("active tool frame is missing");
+    }
     if (!result.reasons.empty()) { result.status = PackageAdmissionStatus::refuse; } else { result.status = PackageAdmissionStatus::admit; }
     if (auto valid_result = result.validate(); !valid_result) return core::Result<PackageAdmissionResult>::failure(valid_result.error());
     return core::Result<PackageAdmissionResult>::success(std::move(result));
