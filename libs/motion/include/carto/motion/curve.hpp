@@ -20,6 +20,9 @@ enum class InterpolationKind : std::uint8_t {
     linear,
     smoothstep,
     cubic_bezier,
+    // Right-continuous discrete hold: each key's value holds until the next
+    // key tick, at which the new key takes effect. Never interpolates modes.
+    step,
 };
 
 [[nodiscard]] std::string_view interpolation_kind_name(InterpolationKind kind) noexcept;
@@ -48,11 +51,14 @@ struct CurveKey {
 // A deterministic keyed scalar curve over exact rational time. Keys are
 // sorted by tick and unique within one timebase. Sampling clamps to the
 // outer keys outside the key range, returns the exact stored value at a key
-// tick, and is a pure function of the curve bytes and the requested tick:
-// identical inputs produce identical doubles on every platform.
+// tick, and is a pure function of the curve bytes and the requested tick.
+// Step curves hold the preceding key between key ticks; they do not infer
+// that a sampled value was applied or observed by a runtime. Identical inputs
+// produce identical doubles on every platform.
 class KeyedCurve final {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 1U;
+    static constexpr std::uint32_t kLegacySchemaVersion = 1U;
+    static constexpr std::uint32_t kSchemaVersion = 2U;
     static constexpr std::size_t kMaxSerializedBytes = 4U * 1024U * 1024U;
     static constexpr std::size_t kMaxKeys = 4'096U;
     static constexpr std::uint32_t kMaxTicksPerSecond =

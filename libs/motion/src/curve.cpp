@@ -4,6 +4,7 @@
 #include <cmath>
 #include <iomanip>
 #include <limits>
+#include <locale>
 #include <sstream>
 #include <utility>
 
@@ -27,6 +28,7 @@ bool valid_interpolation(InterpolationKind kind) {
     case InterpolationKind::linear:
     case InterpolationKind::smoothstep:
     case InterpolationKind::cubic_bezier:
+    case InterpolationKind::step:
         return true;
     }
     return false;
@@ -44,6 +46,7 @@ std::string_view interpolation_kind_name(InterpolationKind kind) noexcept {
     case InterpolationKind::linear: return "linear";
     case InterpolationKind::smoothstep: return "smoothstep";
     case InterpolationKind::cubic_bezier: return "cubic-bezier";
+    case InterpolationKind::step: return "step";
     }
     return "unknown";
 }
@@ -123,11 +126,17 @@ core::Result<double> KeyedCurve::sample(character::RationalTime time) const {
     while (keys[upper].time.tick < time.tick) ++upper;
     const CurveKey& before = keys[upper - 1U];
     const CurveKey& after = keys[upper];
+    if (interpolation == InterpolationKind::step) {
+        return core::Result<double>::success(before.value);
+    }
     const double span_ticks = static_cast<double>(after.time.tick - before.time.tick);
     const double offset_ticks = static_cast<double>(time.tick - before.time.tick);
     const double t = offset_ticks / span_ticks;
     double shaped = t;
     switch (interpolation) {
+    case InterpolationKind::step:
+        // Handled before arithmetic so extreme tick spans cannot overflow.
+        return core::Result<double>::success(before.value);
     case InterpolationKind::linear:
         shaped = t;
         break;
@@ -160,7 +169,11 @@ core::Result<double> KeyedCurve::sample(character::RationalTime time) const {
 
 std::string KeyedCurve::serialize() const {
     std::ostringstream output;
-    output << "CARTO_KEYED_CURVE 1\n";
+    if (interpolation == InterpolationKind::step) output.imbue(std::locale::classic());
+    // Preserve v1 bytes and digests for the existing interpolation modes.
+    // Step is new and uses v2 so old readers fail rather than misinterpret it.
+    output << "CARTO_KEYED_CURVE " <<
+        (interpolation == InterpolationKind::step ? kSchemaVersion : kLegacySchemaVersion) << '\n';
     output << "ID " << id.value << '\n';
     output << "TIMEBASE " << timebase_ticks_per_second << '\n';
     output << "INTERPOLATION " << interpolation_kind_name(interpolation) << '\n';
@@ -190,10 +203,12 @@ core::Result<KeyedCurve> KeyedCurve::deserialize(std::string_view text) {
     std::string magic;
     std::uint32_t version = 0U;
     if (!(input >> magic) || !(input >> version) ||
-        magic != "CARTO_KEYED_CURVE" || version != kSchemaVersion) {
+        magic != "CARTO_KEYED_CURVE" ||
+        (version != kLegacySchemaVersion && version != kSchemaVersion)) {
         return core::Result<KeyedCurve>::failure(parse_error(
             "keyed curve framing or schema version is invalid"));
     }
+    if (version == kSchemaVersion) input.imbue(std::locale::classic());
     KeyedCurve curve;
     std::string token;
     if (!(input >> token) || token != "ID" || !(input >> curve.id.value)) {
@@ -213,9 +228,15 @@ core::Result<KeyedCurve> KeyedCurve::deserialize(std::string_view text) {
     if (kind == "linear") curve.interpolation = InterpolationKind::linear;
     else if (kind == "smoothstep") curve.interpolation = InterpolationKind::smoothstep;
     else if (kind == "cubic-bezier") curve.interpolation = InterpolationKind::cubic_bezier;
+    else if (kind == "step") curve.interpolation = InterpolationKind::step;
     else {
         return core::Result<KeyedCurve>::failure(parse_error(
             "keyed curve interpolation kind is unknown"));
+    }
+    if ((version == kLegacySchemaVersion && curve.interpolation == InterpolationKind::step) ||
+        (version == kSchemaVersion && curve.interpolation != InterpolationKind::step)) {
+        return core::Result<KeyedCurve>::failure(parse_error(
+            "keyed curve interpolation does not belong to its schema version"));
     }
     std::uint64_t key_count = 0U;
     if (!(input >> token) || token != "KEYS" || !(input >> key_count) ||
@@ -245,6 +266,10 @@ core::Result<KeyedCurve> KeyedCurve::deserialize(std::string_view text) {
     }
     if (auto result = curve.validate(); !result) {
         return core::Result<KeyedCurve>::failure(result.error());
+    }
+    if (version == kSchemaVersion && curve.serialize() != text) {
+        return core::Result<KeyedCurve>::failure(parse_error(
+            "version-two keyed curve text is not canonical"));
     }
     return core::Result<KeyedCurve>::success(std::move(curve));
 }

@@ -1964,6 +1964,11 @@ target_link_libraries(cartographer_motion_tests PRIVATE carto_motion)
 carto_target(cartographer_motion_tests)
 add_test(NAME cartographer_motion_tests COMMAND cartographer_motion_tests)
 
+add_executable(cartographer_motion_step_curve_tests motion_step_curve_tests.cpp)
+target_link_libraries(cartographer_motion_step_curve_tests PRIVATE carto_motion)
+carto_target(cartographer_motion_step_curve_tests)
+add_test(NAME cartographer_motion_step_curve_tests COMMAND cartographer_motion_step_curve_tests)
+
 add_executable(cartographer_sim_tests
     sim_tests.cpp
 )

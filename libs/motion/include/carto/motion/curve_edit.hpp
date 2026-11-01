@@ -94,7 +94,8 @@ struct CurveEditResult {
     std::uint32_t numerator,
     std::uint32_t denominator);
 
-// Rewrites the tangents of the selected keys under one mode.
+// Rewrites tangents under one mode; step curves refuse because they do not use
+// tangents. Existing stored tangent values are otherwise retained.
 [[nodiscard]] core::Result<CurveEditResult> set_tangents(
     const KeyedCurve& curve,
     const std::vector<std::int64_t>& ticks,

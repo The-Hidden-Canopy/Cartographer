@@ -336,6 +336,10 @@ core::Result<CurveEditResult> set_tangents(
     if (auto result = curve.validate(); !result) {
         return core::Result<CurveEditResult>::failure(result.error());
     }
+    if (curve.interpolation == InterpolationKind::step) {
+        return core::Result<CurveEditResult>::failure(conflict(
+            "step curves do not use tangents"));
+    }
     if (mode != TangentMode::flat && mode != TangentMode::linear &&
         mode != TangentMode::auto_smooth) {
         return core::Result<CurveEditResult>::failure(invalid(
