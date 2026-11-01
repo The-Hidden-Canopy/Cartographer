@@ -80,7 +80,7 @@ int main() {
     require(static_cast<bool>(prepared_bundle) && doc.serialize() == before,
         "pure preparation validates without changing the published project");
     auto tx = project::ProjectTransaction::begin(doc, journal, "artist");
-    auto accepted = tx.value().accept_autorig("body", {}, request, set, acceptance.value(), nodes, rig, limits,
+    auto accepted = tx.value().accept_autorig("body", doc.source_namespace(), doc.revision(), {}, request, set, acceptance.value(), nodes, rig, limits,
                                               source, layer, correspondence, {}, opts);
     require(accepted && accepted.value() == core::Revision{1}, "stage complete acceptance");
     require(doc.accepted_autorigs().empty(), "staging leaves published document unchanged");
@@ -95,21 +95,21 @@ int main() {
             "decoded bundle retains rig, review and per-vertex weights");
     require(static_cast<bool>(project::validate_accepted_autorig_current(doc, decoded.value())), "current mesh passes readiness");
     auto stale = project::ProjectTransaction::begin(doc, journal, "artist");
-    require(!stale.value().accept_autorig("body", {}, request, set, acceptance.value(), nodes, rig, limits,
+    require(!stale.value().accept_autorig("body", doc.source_namespace(), doc.revision(), {}, request, set, acceptance.value(), nodes, rig, limits,
                                          source, layer, correspondence, {}, opts), "stale CAS refused");
     require(stale.value().staged_document().accepted_autorigs().at("body") == entry, "CAS failure atomic");
     auto wrong = opts; wrong.output_mesh_asset = 52;
     require(!project::prepare_accepted_autorig_bundle(doc, request, set, acceptance.value(), nodes,
         rig, limits, source, layer, correspondence, {}, wrong) && doc.accepted_autorigs().at("body") == entry,
         "pure preparation refuses mismatched target without mutation");
-    require(!stale.value().accept_autorig("body", core::Revision{1}, request, set, acceptance.value(), nodes, rig, limits,
+    require(!stale.value().accept_autorig("body", doc.source_namespace(), doc.revision(), core::Revision{1}, request, set, acceptance.value(), nodes, rig, limits,
                                          source, layer, correspondence, {}, wrong), "wrong target refused");
     weights::WeightCorrespondence out_of_range;
     require(static_cast<bool>(out_of_range.map(3, {{0,1}})), "out of bounds fixture");
-    require(!stale.value().accept_autorig("body", core::Revision{1}, request, set, acceptance.value(), nodes, rig, limits,
+    require(!stale.value().accept_autorig("body", doc.source_namespace(), doc.revision(), core::Revision{1}, request, set, acceptance.value(), nodes, rig, limits,
                                          source, layer, out_of_range, {}, opts), "invalid target index refused");
     auto changed_request = request; changed_request.expected_mesh_revision = core::Revision{1};
-    require(!stale.value().accept_autorig("body", core::Revision{1}, changed_request, set, acceptance.value(), nodes, rig, limits,
+    require(!stale.value().accept_autorig("body", doc.source_namespace(), doc.revision(), core::Revision{1}, changed_request, set, acceptance.value(), nodes, rig, limits,
                                          source, layer, correspondence, {}, opts), "stale source revision refused");
     require(static_cast<bool>(stale.value().rollback()), "rollback refusals");
     const auto existing_events = journal.read_all();
@@ -122,7 +122,7 @@ int main() {
     journal::Journal blocked_journal(path / "events.log", tiny_limits);
     auto blocked = project::ProjectTransaction::begin(doc, blocked_journal, "artist");
     require(static_cast<bool>(blocked), "begin before journal failure");
-    require(static_cast<bool>(blocked.value().accept_autorig("other", {}, request, set, acceptance.value(), nodes, rig, limits,
+    require(static_cast<bool>(blocked.value().accept_autorig("other", doc.source_namespace(), doc.revision(), {}, request, set, acceptance.value(), nodes, rig, limits,
                                                     source, layer, correspondence, {}, opts)), "stage before journal failure");
     require(!blocked.value().commit("accept.autorig") && doc.accepted_autorigs().size() == 1,
             "journal failure does not publish staged bundle");

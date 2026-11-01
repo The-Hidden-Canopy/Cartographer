@@ -975,6 +975,17 @@ core::Result<std::string> prepare_autorig_ik_fk_configuration(
     using Result = core::Result<std::string>;
     if (auto checked = validate_accepted_autorig_current(document, bundle); !checked)
         return Result::failure(checked.error());
+    // Ordinary configuration may edit an explicitly named chain, but it is
+    // not authority to discard previously authored chains. Removal requires
+    // the separate acknowledged historical-clear workflow.
+    for (const auto& old : bundle.ik_fk) {
+        const auto retained = std::find_if(configurations.begin(), configurations.end(), [&old](const auto& item) {
+            return item.chain.root == old.chain.root && item.chain.mid == old.chain.mid &&
+                item.chain.effector == old.chain.effector;
+        });
+        if (retained == configurations.end())
+            return Result::failure(invalid("removing an authored IK/FK chain requires explicit historical clear"));
+    }
     AcceptedAutorigBundle updated = bundle;
     updated.ik_fk = configurations;
     if (auto checked = detail::check_ik_fk(updated); !checked) return Result::failure(checked.error());
@@ -984,6 +995,23 @@ core::Result<std::string> prepare_autorig_ik_fk_configuration(
     for (const auto& config : updated.ik_fk) records.push_back(config.serialize());
     auto bytes = detail::bundle_bytes(updated.reviewed.serialize(), rig.value(),
         updated.limits.serialize(), updated.weights.serialize(), records);
+    if (bytes.size() > kMaxAcceptedAutorigBytes)
+        return Result::failure(parse_error("accepted autorig bundle exceeds its size limit"));
+    return Result::success(std::move(bytes));
+}
+
+core::Result<std::string> prepare_historical_autorig_ik_fk_clear(
+    const AcceptedAutorigBundle& bundle) {
+    using Result = core::Result<std::string>;
+    if (auto checked = detail::check_components(bundle.reviewed, bundle.rig, bundle.limits, bundle.weights); !checked)
+        return Result::failure(checked.error());
+    if (auto checked = detail::check_ik_fk(bundle); !checked) return Result::failure(checked.error());
+    if (bundle.ik_fk.empty())
+        return Result::failure(invalid("historical autorig has no IK/FK configuration to clear"));
+    auto rig = character::serialize_rig_definition(bundle.rig);
+    if (!rig) return Result::failure(rig.error());
+    auto bytes = detail::bundle_bytes(bundle.reviewed.serialize(), rig.value(),
+        bundle.limits.serialize(), bundle.weights.serialize());
     if (bytes.size() > kMaxAcceptedAutorigBytes)
         return Result::failure(parse_error("accepted autorig bundle exceeds its size limit"));
     return Result::success(std::move(bytes));

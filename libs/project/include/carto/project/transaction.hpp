@@ -126,9 +126,15 @@ public:
         assets::Sha256Digest digest);
     // Performs live source/review checks and the weight transfer before staging
     // one bundle; commit publishes it with the project journal. IK/FK switch
-    // authoring is not represented by this record.
+    // authoring is not represented by this record. Callers must provide the
+    // observed source namespace and project revision as well as the row
+    // revision (source API change); branch/session identity remains caller-owned.
+    // These checks assume the existing single-threaded transaction model and
+    // do not provide synchronization or cross-thread atomicity.
     [[nodiscard]] core::Result<core::Revision> accept_autorig(
-        std::string identity, core::Revision expected_revision,
+        std::string identity, std::string_view expected_source_namespace,
+        core::Revision expected_project_revision,
+        core::Revision expected_record_revision,
         const character::AutorigAnalysisRequest& request,
         const character::AutorigCandidateSet& candidates,
         const character::AutorigReviewAcceptance& acceptance,
@@ -141,10 +147,13 @@ public:
         const weights::JointTransferMap& joint_map,
         const weights::WeightTransferOptions& options,
         const weights::WeightLocks* locks = nullptr);
-    // CAS-replaces only explicitly authored IK/FK configuration on a current
-    // accepted bundle. An empty vector clears it and returns to v1 encoding.
+    // Caller must bind the observed source namespace and project revision as well as the record
+    // revision. Existing chain identities cannot be removed here. This is a
+    // source API change: callers must supply the additional project pin.
     [[nodiscard]] core::Result<core::Revision> configure_autorig_ik_fk(
-        std::string identity, core::Revision expected_revision,
+        std::string identity, std::string_view expected_source_namespace,
+        core::Revision expected_project_revision,
+        core::Revision expected_record_revision,
         const std::vector<pose::IkFkAuthoring>& configurations);
     [[nodiscard]] core::Result<void> append_weight_edit_receipt(
         std::string serialized_receipt,

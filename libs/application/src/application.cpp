@@ -988,6 +988,11 @@ core::Result<DispatchReceipt> HumanApplicationAccess::configure_autorig_ik_fk(
     return session.configure_autorig_ik_fk(HumanActionAdmission{}, request);
 }
 
+core::Result<DispatchReceipt> HumanApplicationAccess::clear_historical_autorig_ik_fk(
+    ApplicationSession& session, const ClearHistoricalAutorigIkFkRequest& request) {
+    return session.clear_historical_autorig_ik_fk(HumanActionAdmission{}, request);
+}
+
 core::Result<DispatchReceipt> ApplicationSession::commit_autorig(
     HumanActionAdmission, const AcceptAutorigRequest& request) {
     if (active_source_ != OperationSource::human)
@@ -1005,6 +1010,22 @@ core::Result<DispatchReceipt> ApplicationSession::commit_autorig(
         request.correspondence, request.joint_map, request.transfer_options,
         request.locks ? &*request.locks : nullptr);
     if (!bytes) return failure(bytes.error().with_context("prepare autorig acceptance"));
+    // A fresh acceptance does not authorize silently discarding separately
+    // authored IK/FK settings. Identical source data is a no-op; changed
+    // source data needs an explicit configuration-clear/remap operation.
+    const auto existing = document_.accepted_autorigs().find(request.identity);
+    if (existing != document_.accepted_autorigs().end() &&
+        existing->second.revision == request.expected_record_revision) {
+        auto decoded = project::decode_accepted_autorig_bundle(existing->second.bytes);
+        if (!decoded) return failure(decoded.error());
+        if (!decoded.value().ik_fk.empty()) {
+            auto without_configuration = project::prepare_historical_autorig_ik_fk_clear(decoded.value());
+            if (!without_configuration) return failure(without_configuration.error());
+            if (without_configuration.value() != bytes.value())
+                return failure(invalid_state("replacing a configured autorig requires an explicit IK/FK clear or remap"));
+            return accepted("Accept AutoRig", document_.revision());
+        }
+    }
     const auto* data = reinterpret_cast<const std::uint8_t*>(bytes.value().data());
     const auto digest = assets::sha256(std::span<const std::uint8_t>(data, bytes.value().size()));
     project::ProjectDocument candidate = document_;
@@ -1060,6 +1081,67 @@ core::Result<AcceptedAutorigView> ApplicationSession::accepted_autorig(
     if (auto ready = project::validate_accepted_autorig_current(document_, bundle.value()); !ready)
         return Result::failure(ready.error());
     return Result::success({found->second.revision, std::move(bundle.value())});
+}
+
+core::Result<HistoricalAutorigView> ApplicationSession::historical_autorig(
+    std::string_view identity, std::uint64_t expected_generation,
+    core::Revision expected_revision) const {
+    using Result = core::Result<HistoricalAutorigView>;
+    if (expected_generation != project_generation_ || expected_revision != document_.revision())
+        return Result::failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "historical autorig read belongs to a different project state"));
+    if (identity.empty() || identity.size() > 128U)
+        return Result::failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "historical autorig identity exceeds its bound"));
+    const auto found = document_.accepted_autorigs().find(std::string(identity));
+    if (found == document_.accepted_autorigs().end())
+        return Result::failure(core::Diagnostic(core::ErrorCode::not_found,
+            "historical autorig is absent"));
+    auto bundle = project::decode_accepted_autorig_bundle(found->second.bytes);
+    if (!bundle) return Result::failure(bundle.error());
+    return Result::success({found->second.revision, std::move(bundle.value())});
+}
+
+core::Result<DispatchReceipt> ApplicationSession::clear_historical_autorig_ik_fk(
+    HumanActionAdmission, const ClearHistoricalAutorigIkFkRequest& request) {
+    if (active_source_ != OperationSource::human || !request.acknowledge_configuration_loss ||
+        request.justification.empty() || request.justification.size() > 512U ||
+        request.justification.find_first_not_of(' ') == std::string::npos ||
+        std::any_of(request.justification.begin(), request.justification.end(), [](unsigned char value) {
+            return value < 0x20U || value == 0x7fU;
+        }))
+        return failure(invalid_state("historical IK/FK clear requires explicit human loss acknowledgement and justification"));
+    if (!journal_.has_value())
+        return failure(invalid_state("historical IK/FK clear requires a saved project with a durable journal"));
+    auto historical = historical_autorig(request.identity, request.expected_project_generation,
+                                          request.expected_project_revision);
+    if (!historical) return failure(historical.error());
+    if (historical.value().record_revision != request.expected_record_revision)
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "historical autorig revision changed before clear"));
+    const auto old = document_.accepted_autorigs().find(request.identity);
+    const auto old_digest = old->second.digest;
+    auto bytes = project::prepare_historical_autorig_ik_fk_clear(historical.value().bundle);
+    if (!bytes) return failure(bytes.error());
+    const auto* data = reinterpret_cast<const std::uint8_t*>(bytes.value().data());
+    const auto digest = assets::sha256(std::span<const std::uint8_t>(data, bytes.value().size()));
+    project::ProjectDocument candidate = document_;
+    const auto staged = candidate.set_accepted_autorig(request.identity,
+        request.expected_record_revision, std::move(bytes.value()), digest);
+    if (!staged) return failure(staged.error());
+    editor::ProjectCommandAdmission admission;
+    constexpr char hex_digits[] = "0123456789abcdef";
+    std::string justification_hex;
+    justification_hex.reserve(request.justification.size() * 2U);
+    for (const unsigned char byte : request.justification) {
+        justification_hex.push_back(hex_digits[byte >> 4U]);
+        justification_hex.push_back(hex_digits[byte & 15U]);
+    }
+    return execute_command(std::make_unique<editor::ReplaceProjectDocumentCommand>(
+        admission, document_, std::move(candidate), "Clear Historical AutoRig IK/FK"),
+        "Clear Historical AutoRig IK/FK acknowledge_loss=1 justification_hex=" + justification_hex +
+            " identity=" + request.identity + " record_revision=" +
+            std::to_string(request.expected_record_revision.value()) + " prior=" + old_digest.hex());
 }
 
 core::Result<pose::IkFkSwitchProposal> ApplicationSession::propose_autorig_ik_fk_switch(

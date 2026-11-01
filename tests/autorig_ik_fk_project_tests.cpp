@@ -122,7 +122,7 @@ int main() {
     options.output_mesh_asset = analysis_request.source.asset_id;
     options.output_mesh_digest = analysis_request.source.content_digest;
     auto accept = project::ProjectTransaction::begin(document, journal, "artist");
-    require(accept && accept.value().accept_autorig("body", {}, analysis_request, candidates,
+    require(accept && accept.value().accept_autorig("body", document.source_namespace(), document.revision(), {}, analysis_request, candidates,
         acceptance.value(), nodes, rig, limits, source, source_layer, correspondence, {}, options) &&
         accept.value().commit("accept.autorig"), "persist accepted rig with transferred binding");
     const auto initial = document.accepted_autorigs().at("body");
@@ -140,7 +140,7 @@ int main() {
     config.ik_target = {4}; config.ik_pole = ControlId{5}; config.mode_control = {6};
     auto configure = project::ProjectTransaction::begin(document, journal, "artist");
     require(static_cast<bool>(configure), "begin configuration transaction");
-    const auto revision = configure.value().configure_autorig_ik_fk("body", initial.revision, {config});
+    const auto revision = configure.value().configure_autorig_ik_fk("body", document.source_namespace(), document.revision(), initial.revision, {config});
     require(revision && revision.value() == core::Revision{2} &&
         document.accepted_autorigs().at("body") == initial, "configuration stages atomically");
     require(static_cast<bool>(configure.value().commit("configure.ik-fk")), "journal configuration");
@@ -166,6 +166,57 @@ int main() {
     require(!project::decode_accepted_autorig_bundle(invalid_v2), "over-budget v2 list refused");
     require(!project::decode_accepted_autorig_bundle(current.bytes + "trailing"), "trailing v2 bytes refused");
     require(static_cast<bool>(project::validate_accepted_autorig_current(document, decoded.value())), "current bundle readiness");
+    const auto historical_clear = project::prepare_historical_autorig_ik_fk_clear(decoded.value());
+    require(historical_clear && historical_clear.value() == initial.bytes,
+        "historical clear preserves all non-IK/FK canonical bytes");
+    auto corrupt_historical = decoded.value();
+    corrupt_historical.weights.output.receipt.output_binding_digest = hash("bad-binding");
+    require(!project::prepare_historical_autorig_ik_fk_clear(corrupt_historical),
+        "historical clear refuses internally corrupted binding provenance");
+    auto reaccept = project::ProjectTransaction::begin(document, journal, "artist");
+    require(static_cast<bool>(reaccept), "begin configured reacceptance");
+    const auto before_reaccept = reaccept.value().staged_document().serialize();
+    const project::ProjectDocument other_document;
+    require(other_document.source_namespace() != document.source_namespace(), "different project namespace fixture");
+    require(!reaccept.value().accept_autorig("body", other_document.source_namespace(), document.revision(), current.revision,
+        analysis_request, candidates, acceptance.value(), nodes, rig, limits, source, source_layer, correspondence, {}, options) &&
+        reaccept.value().staged_document().serialize() == before_reaccept,
+        "matching numeric revisions cannot substitute a different project namespace");
+    require(!reaccept.value().accept_autorig("body", document.source_namespace(), core::Revision{}, current.revision, analysis_request,
+        candidates, acceptance.value(), nodes, rig, limits, source, source_layer, correspondence, {}, options) &&
+        reaccept.value().staged_document().serialize() == before_reaccept,
+        "matching row revision does not revive stale project authority for acceptance");
+    const auto same = reaccept.value().accept_autorig("body", document.source_namespace(), document.revision(), current.revision, analysis_request,
+        candidates, acceptance.value(), nodes, rig, limits, source, source_layer, correspondence, {}, options);
+    require(same && same.value() == current.revision &&
+        reaccept.value().staged_document().serialize() == before_reaccept,
+        "identical reacceptance preserves authored IK/FK without a new revision");
+    auto changed_options = options;
+    changed_options.output_layer_id = {88};
+    require(!reaccept.value().accept_autorig("body", document.source_namespace(), document.revision(), current.revision, analysis_request,
+        candidates, acceptance.value(), nodes, rig, limits, source, source_layer, correspondence, {}, changed_options) &&
+        reaccept.value().staged_document().serialize() == before_reaccept,
+        "changed reacceptance refuses to discard authored IK/FK");
+    require(!reaccept.value().accept_autorig("body", document.source_namespace(), document.revision(), initial.revision, analysis_request,
+        candidates, acceptance.value(), nodes, rig, limits, source, source_layer, correspondence, {}, options),
+        "configured reacceptance retains CAS refusal");
+    require(static_cast<bool>(reaccept.value().rollback()), "rollback reacceptance checks");
+    const auto observed_project_revision = document.revision();
+    auto older = project::ProjectTransaction::begin(document, journal, "artist");
+    auto newer = project::ProjectTransaction::begin(document, journal, "artist");
+    require(older && newer && newer.value().insert_mesh(52, mesh) && newer.value().commit("insert.other.mesh"),
+        "interleaving fixture publishes a newer project revision");
+    const auto older_before = older.value().staged_document().serialize();
+    require(!older.value().accept_autorig("body", document.source_namespace(), observed_project_revision,
+        current.revision, analysis_request, candidates, acceptance.value(), nodes, rig, limits,
+        source, source_layer, correspondence, {}, options) &&
+        older.value().staged_document().serialize() == older_before,
+        "interleaved identical acceptance refuses stale live project without staged mutation");
+    require(!older.value().configure_autorig_ik_fk("body", document.source_namespace(),
+        observed_project_revision, current.revision, {config}) &&
+        older.value().staged_document().serialize() == older_before,
+        "interleaved identical configuration refuses stale live project without staged mutation");
+    require(static_cast<bool>(older.value().rollback()), "rollback interleaved transaction");
     const auto decoded_graph = kinematic::KinematicGraph::deserialize(decoded.value().reviewed.graph_bytes);
     require(static_cast<bool>(decoded_graph), "decode stored graph");
     pose::LocalPose fk;
@@ -184,25 +235,35 @@ int main() {
     auto rejected = project::ProjectTransaction::begin(document, journal, "artist");
     require(static_cast<bool>(rejected), "begin rejection checks");
     const auto before_refusals = rejected.value().staged_document().serialize();
-    require(!rejected.value().configure_autorig_ik_fk("body", initial.revision, {config}), "stale CAS refused");
+    require(!rejected.value().configure_autorig_ik_fk("body", other_document.source_namespace(), document.revision(), current.revision, {config}),
+        "configuration refuses a different project namespace with matching numeric revisions");
+    require(!rejected.value().configure_autorig_ik_fk("body", document.source_namespace(), core::Revision{}, current.revision, {config}),
+        "caller project revision pin is required even when the record revision matches");
+    require(!rejected.value().configure_autorig_ik_fk("body", document.source_namespace(), document.revision(), initial.revision, {config}), "stale CAS refused");
     auto bad = config; bad.rig_digest = hash("different rig");
-    require(!rejected.value().configure_autorig_ik_fk("body", current.revision, {bad}), "wrong rig pin refused");
+    require(!rejected.value().configure_autorig_ik_fk("body", document.source_namespace(), document.revision(), current.revision, {bad}), "wrong rig pin refused");
     bad = config; bad.ik_target = {99};
-    require(!rejected.value().configure_autorig_ik_fk("body", current.revision, {bad}), "dangling control refused");
-    require(!rejected.value().configure_autorig_ik_fk("body", current.revision, {config, config}), "duplicate chain refused");
+    require(!rejected.value().configure_autorig_ik_fk("body", document.source_namespace(), document.revision(), current.revision, {bad}), "dangling control refused");
+    require(!rejected.value().configure_autorig_ik_fk("body", document.source_namespace(), document.revision(), current.revision, {config, config}), "duplicate chain refused");
+    require(!rejected.value().configure_autorig_ik_fk("body", document.source_namespace(), document.revision(), current.revision, {}),
+        "ordinary configuration cannot silently clear authored chains");
     auto second = config;
     second.chain = {{2}, {3}, {4}};
     second.fk_root = {7}; second.fk_mid = {8}; second.fk_effector = {9};
     second.ik_target = {10}; second.ik_pole = ControlId{11};
     require(static_cast<bool>(second.validate_against(rig, decoded_graph.value(), limits)),
         "second chain is individually valid with an intentionally shared mode control");
-    const auto shared = rejected.value().configure_autorig_ik_fk("body", current.revision, {config, second});
+    const auto shared = rejected.value().configure_autorig_ik_fk("body", document.source_namespace(), document.revision(), current.revision, {config, second});
     require(!shared && shared.error().message.find("cannot share controls") != std::string::npos,
         "individually valid distinct chains cannot share controls without arbitration");
     second.mode_control = {12};
     require(static_cast<bool>(second.validate_against(rig, decoded_graph.value(), limits)) &&
         static_cast<bool>(project::prepare_autorig_ik_fk_configuration(document, decoded.value(), {config, second})),
         "distinct chains with disjoint controls are admitted");
+    auto two_chains = decoded.value();
+    two_chains.ik_fk = {config, second};
+    require(!project::prepare_autorig_ik_fk_configuration(document, two_chains, {config}),
+        "ordinary configuration cannot silently drop a chain");
     require(rejected.value().staged_document().serialize() == before_refusals &&
         document.accepted_autorigs().at("body") == current, "refusals leave staged and published state unchanged");
     require(static_cast<bool>(rejected.value().rollback()), "roll back refusal checks");
@@ -250,13 +311,6 @@ int main() {
         pose::IkFkMode::fk, {}, reopened_ik.value().match.ik);
     require(reopened_fk && reopened_fk.value().match.position_jump <= config.max_position_jump,
         "reopened IK-to-FK proposal");
-    auto clear = project::ProjectTransaction::begin(document, journal, "artist");
-    require(clear && clear.value().configure_autorig_ik_fk("body", current.revision, {}) &&
-        clear.value().commit("clear.ik-fk"), "clear configuration");
-    const auto cleared = document.accepted_autorigs().at("body");
-    const auto clear_decoded = project::decode_accepted_autorig_bundle(cleared.bytes);
-    require(cleared.bytes == initial.bytes && cleared.revision == core::Revision{3} &&
-        clear_decoded && clear_decoded.value().ik_fk.empty(), "clearing returns to canonical v1 bytes");
     auto changed_mesh = mesh;
     require(static_cast<bool>(changed_mesh.set_vertex_position(side.value(), {0, 1.2, 0})), "change source vertex");
     auto change = project::ProjectTransaction::begin(document, journal, "artist");
@@ -264,7 +318,7 @@ int main() {
         "publish changed source mesh");
     auto stale_mesh = project::ProjectTransaction::begin(document, journal, "artist");
     const auto removed_snapshot = document.serialize();
-    require(stale_mesh && !stale_mesh.value().configure_autorig_ik_fk("body", cleared.revision, {config}) &&
+    require(stale_mesh && !stale_mesh.value().configure_autorig_ik_fk("body", document.source_namespace(), document.revision(), current.revision, {config}) &&
         stale_mesh.value().staged_document().serialize() == removed_snapshot && document.serialize() == removed_snapshot,
         "changed source mesh refuses configuration without mutation");
     require(static_cast<bool>(stale_mesh.value().rollback()), "rollback stale source check");

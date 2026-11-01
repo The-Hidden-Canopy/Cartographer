@@ -1875,7 +1875,25 @@ struct ConfigureAutorigIkFkRequest {
     std::vector<pose::IkFkAuthoring> configurations;
 };
 
+// Explicit loss decision for a historical (possibly stale) record. This
+// clears authoring metadata, not physical or evaluated state.
+struct ClearHistoricalAutorigIkFkRequest {
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    std::string identity;
+    core::Revision expected_record_revision;
+    bool acknowledge_configuration_loss = false;
+    std::string justification;
+};
+
 struct AcceptedAutorigView {
+    core::Revision record_revision;
+    project::AcceptedAutorigBundle bundle;
+};
+
+// Historical source snapshot only: freshness is not evaluated and this is
+// neither an observed nor executed state.
+struct HistoricalAutorigView {
     core::Revision record_revision;
     project::AcceptedAutorigBundle bundle;
 };
@@ -1890,6 +1908,8 @@ public:
         ApplicationSession& session, const AcceptAutorigRequest& request);
     [[nodiscard]] static core::Result<DispatchReceipt> configure_autorig_ik_fk(
         ApplicationSession& session, const ConfigureAutorigIkFkRequest& request);
+    [[nodiscard]] static core::Result<DispatchReceipt> clear_historical_autorig_ik_fk(
+        ApplicationSession& session, const ClearHistoricalAutorigIkFkRequest& request);
     [[nodiscard]] static core::Result<DispatchReceipt> commit_mesh_cleanup(
         ApplicationSession& session, MeshCleanupReview& review, std::string justification);
     [[nodiscard]] static core::Result<DispatchReceipt> dispatch(
@@ -2072,6 +2092,11 @@ public:
     [[nodiscard]] core::Result<AcceptedAutorigView> accepted_autorig(
         std::string_view identity, std::uint64_t expected_project_generation,
         core::Revision expected_project_revision) const;
+    // Historical inspection only: internal integrity is checked, but this is
+    // not a current/evaluable rig or evidence that source geometry is fresh.
+    [[nodiscard]] core::Result<HistoricalAutorigView> historical_autorig(
+        std::string_view identity, std::uint64_t expected_project_generation,
+        core::Revision expected_project_revision) const;
     // Computes a switch proposal only; no control values or mode are applied.
     [[nodiscard]] core::Result<pose::IkFkSwitchProposal> propose_autorig_ik_fk_switch(
         std::string_view identity, std::uint64_t expected_project_generation,
@@ -2134,6 +2159,8 @@ private:
         HumanActionAdmission admission, const AcceptAutorigRequest& request);
     [[nodiscard]] core::Result<DispatchReceipt> configure_autorig_ik_fk(
         HumanActionAdmission admission, const ConfigureAutorigIkFkRequest& request);
+    [[nodiscard]] core::Result<DispatchReceipt> clear_historical_autorig_ik_fk(
+        HumanActionAdmission admission, const ClearHistoricalAutorigIkFkRequest& request);
     [[nodiscard]] core::Result<DispatchReceipt> commit_mesh_cleanup(
         HumanActionAdmission admission, MeshCleanupReview& review, std::string justification);
     std::shared_ptr<const std::uint8_t> cleanup_review_identity_ =

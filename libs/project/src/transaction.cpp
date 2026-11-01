@@ -390,7 +390,9 @@ core::Result<std::string> prepare_accepted_autorig_bundle(
 }
 
 core::Result<core::Revision> ProjectTransaction::accept_autorig(
-    std::string identity, core::Revision expected_revision,
+    std::string identity, std::string_view expected_source_namespace,
+    core::Revision expected_project_revision,
+    core::Revision expected_record_revision,
     const character::AutorigAnalysisRequest& request,
     const character::AutorigCandidateSet& candidates,
     const character::AutorigReviewAcceptance& acceptance,
@@ -405,22 +407,57 @@ core::Result<core::Revision> ProjectTransaction::accept_autorig(
     const weights::WeightLocks* locks) {
     using Result = core::Result<core::Revision>;
     if (auto active = ensure_active(); !active) return Result::failure(active.error());
+    if (expected_source_namespace.empty() || staged_.source_namespace() != expected_source_namespace ||
+        document_.source_namespace() != expected_source_namespace ||
+        expected_revision_ != expected_project_revision || staged_.revision() != expected_project_revision ||
+        document_.revision() != expected_project_revision)
+        return Result::failure(stale("autorig acceptance requires the caller's current project namespace and revision"));
     auto bundle = prepare_accepted_autorig_bundle(staged_, request, candidates, acceptance,
         nodes, rig, limits, source_binding, source_layer, correspondence, joint_map, options, locks);
     if (!bundle) return Result::failure(bundle.error());
+    // Acceptance is not permission to discard separately authored control
+    // configuration. Preserve an identical accepted rig as a no-op; any
+    // changed rig requires an explicit configuration-clear/remap decision.
+    const auto existing = staged_.accepted_autorigs().find(identity);
+    if (existing != staged_.accepted_autorigs().end() &&
+        existing->second.revision == expected_record_revision) {
+        auto decoded = decode_accepted_autorig_bundle(existing->second.bytes);
+        if (!decoded) return Result::failure(decoded.error());
+        if (!decoded.value().ik_fk.empty()) {
+            auto without_configuration = prepare_historical_autorig_ik_fk_clear(decoded.value());
+            if (!without_configuration) return Result::failure(without_configuration.error());
+            if (without_configuration.value() != bundle.value())
+                return Result::failure(core::Diagnostic(core::ErrorCode::invalid_state,
+                    "replacing a configured autorig requires an explicit IK/FK clear or remap"));
+            if (document_.source_namespace() != expected_source_namespace ||
+                document_.revision() != expected_project_revision)
+                return Result::failure(stale("autorig acceptance project changed before no-op"));
+            return Result::success(existing->second.revision);
+        }
+    }
     const auto* ptr = reinterpret_cast<const std::uint8_t*>(bundle.value().data());
     auto digest = assets::sha256(std::span<const std::uint8_t>(ptr, bundle.value().size()));
-    return staged_.set_accepted_autorig(std::move(identity), expected_revision,
+    if (document_.source_namespace() != expected_source_namespace ||
+        document_.revision() != expected_project_revision)
+        return Result::failure(stale("autorig acceptance project changed before staging"));
+    return staged_.set_accepted_autorig(std::move(identity), expected_record_revision,
                                        std::move(bundle.value()), digest);
 }
 
 core::Result<core::Revision> ProjectTransaction::configure_autorig_ik_fk(
-    std::string identity, core::Revision expected_revision,
+    std::string identity, std::string_view expected_source_namespace,
+    core::Revision expected_project_revision,
+    core::Revision expected_record_revision,
     const std::vector<pose::IkFkAuthoring>& configurations) {
     using Result = core::Result<core::Revision>;
     if (auto active = ensure_active(); !active) return Result::failure(active.error());
+    if (expected_source_namespace.empty() || staged_.source_namespace() != expected_source_namespace ||
+        document_.source_namespace() != expected_source_namespace ||
+        expected_revision_ != expected_project_revision || staged_.revision() != expected_project_revision ||
+        document_.revision() != expected_project_revision)
+        return Result::failure(stale("IK/FK configuration requires the caller's current project namespace and revision"));
     const auto current = staged_.accepted_autorigs().find(identity);
-    if (current == staged_.accepted_autorigs().end() || current->second.revision != expected_revision)
+    if (current == staged_.accepted_autorigs().end() || current->second.revision != expected_record_revision)
         return Result::failure(stale("accepted autorig is absent or its revision changed"));
     auto decoded = decode_accepted_autorig_bundle(current->second.bytes);
     if (!decoded) return Result::failure(decoded.error());
@@ -428,7 +465,10 @@ core::Result<core::Revision> ProjectTransaction::configure_autorig_ik_fk(
     if (!bytes) return Result::failure(bytes.error());
     const auto* ptr = reinterpret_cast<const std::uint8_t*>(bytes.value().data());
     const auto digest = assets::sha256(std::span<const std::uint8_t>(ptr, bytes.value().size()));
-    return staged_.set_accepted_autorig(std::move(identity), expected_revision,
+    if (document_.source_namespace() != expected_source_namespace ||
+        document_.revision() != expected_project_revision)
+        return Result::failure(stale("IK/FK configuration project changed before staging"));
+    return staged_.set_accepted_autorig(std::move(identity), expected_record_revision,
                                        std::move(bytes.value()), digest);
 }
 

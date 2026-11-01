@@ -43,10 +43,17 @@ struct AcceptedAutorigBundle {
 };
 [[nodiscard]] core::Result<AcceptedAutorigBundle> decode_accepted_autorig_bundle(std::string_view bytes);
 // Reconfigures a current decoded bundle without re-running weight transfer.
-// Returns canonical bytes only; publication still requires an admitted CAS.
+// Existing chain identities cannot be removed here; explicit historical clear
+// is a separate human-authorized decision. Returns canonical bytes only;
+// publication still requires an admitted CAS.
 [[nodiscard]] core::Result<std::string> prepare_autorig_ik_fk_configuration(
     const ProjectDocument& document, const AcceptedAutorigBundle& bundle,
     const std::vector<pose::IkFkAuthoring>& configurations);
+// Pure historical recovery preparation. Validates internal record integrity,
+// not mesh freshness, and strips only IK/FK authoring. It grants no authority
+// to publish, evaluate a stale rig, or infer a replacement configuration.
+[[nodiscard]] core::Result<std::string> prepare_historical_autorig_ik_fk_clear(
+    const AcceptedAutorigBundle& bundle);
 // Required before using the historical bundle with the current project: checks
 // live source revision, geometry and target index bounds. Source content digest
 // remains caller-asserted; this does not authenticate external source bytes.
