@@ -554,7 +554,11 @@ public:
 
         std::uint32_t image_index = 0;
         const VkResult acquired = vkAcquireNextImageKHR(
-            device_, swapchain_, UINT64_MAX, frame.image_available, VK_NULL_HANDLE, &image_index);
+            device_, swapchain_, 10'000'000U, frame.image_available, VK_NULL_HANDLE, &image_index);
+        // Image availability must not indefinitely block the Win32 message loop.
+        // A timed-out acquire has not signalled the semaphore or admitted a frame;
+        // preserve its fence, image ownership and frame index, then pump messages.
+        if (acquired == VK_TIMEOUT || acquired == VK_NOT_READY) return;
         if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
             resize_pending_ = true;
             destroy_retired_rgba8_textures();
