@@ -1937,6 +1937,11 @@ target_link_libraries(cartographer_gpudef_tests PRIVATE carto_gpudef)
 carto_target(cartographer_gpudef_tests)
 add_test(NAME cartographer_gpudef_tests COMMAND cartographer_gpudef_tests)
 
+add_executable(cartographer_uv_planar_projection_tests uv_planar_projection_tests.cpp)
+target_link_libraries(cartographer_uv_planar_projection_tests PRIVATE carto_production)
+carto_target(cartographer_uv_planar_projection_tests)
+add_test(NAME cartographer_uv_planar_projection_tests COMMAND cartographer_uv_planar_projection_tests)
+
 # Keep test-owned temporary files inside the writable build tree. The default
 # Windows temp directory is outside the workspace sandbox in some developer
 # environments, which turns otherwise valid atomic-save/publication tests into
@@ -1952,8 +1957,3 @@ foreach(CARTO_TEST_NAME IN LISTS CARTO_REGISTERED_TESTS)
         ENVIRONMENT
             "TMP=${CARTO_TEST_TEMP_DIR};TEMP=${CARTO_TEST_TEMP_DIR};TMPDIR=${CARTO_TEST_TEMP_DIR}")
 endforeach()
-
-add_executable(cartographer_uv_planar_projection_tests uv_planar_projection_tests.cpp)
-target_link_libraries(cartographer_uv_planar_projection_tests PRIVATE carto_production)
-carto_target(cartographer_uv_planar_projection_tests)
-add_test(NAME cartographer_uv_planar_projection_tests COMMAND cartographer_uv_planar_projection_tests)

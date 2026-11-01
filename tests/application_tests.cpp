@@ -13428,6 +13428,204 @@ void application_packs_uv_islands_through_human_revisioned_history() {
     REQUIRE(reopened_mesh.uv_sets().active_for_render()->id == 7U);
 }
 
+void application_projects_planar_uvs_through_human_revisioned_history() {
+    using namespace carto;
+    geometry::EditableMesh source;
+    const auto a = source.add_vertex({0.0, 0.0, 0.0});
+    const auto b = source.add_vertex({1.0, 0.0, 0.0});
+    const auto c = source.add_vertex({0.0, 1.0, 0.0});
+    REQUIRE(a && b && c);
+    REQUIRE(source.add_face({a.value(), b.value(), c.value()}));
+    const auto source_without_uv = source;
+    const auto topology = source.topology();
+    REQUIRE(topology);
+    std::vector<attributes::AttributeValue> uv_values;
+    uv_values.reserve(topology.value().corners.size());
+    for (const auto& corner : topology.value().corners) {
+        const auto* vertex = source.find_vertex(corner.vertex);
+        REQUIRE(vertex != nullptr);
+        uv_values.emplace_back(core::Vec2d{vertex->position.x, vertex->position.y});
+    }
+    attributes::AttributeSet payload({
+        {attributes::AttributeDomain::corner, topology.value().corners.size()}});
+    REQUIRE(payload.add_layer({
+        {"uv.source.corners", attributes::AttributeDomain::corner,
+            attributes::AttributeType::vec2},
+        std::move(uv_values)}));
+    attributes::UvSetTable uv_sets;
+    REQUIRE(uv_sets.add({7U, "Source UV", "uv.source.corners", true, true, false, 1U}));
+    REQUIRE(source.set_attribute_payload(std::move(payload), std::move(uv_sets)));
+
+    application::ApplicationSession session;
+    REQUIRE(application::testing::dispatch(session,
+        application::CreateMeshObjectAction{"UV projection target", source}));
+    auto before = session.snapshot();
+    REQUIRE(before.objects.size() == 1U);
+    const auto object = before.objects.front().object.id;
+    const auto mesh_asset = before.objects.front().object.mesh_asset;
+    REQUIRE(mesh_asset.has_value());
+    REQUIRE(application::testing::dispatch(session,
+        application::SelectObjectAction{object}));
+    before = session.snapshot();
+    const auto source_revision = before.objects.front().mesh_revision;
+    REQUIRE(source_revision.has_value());
+    const application::ProjectUvPlanarAction action{
+        before.project_generation, before.project_revision, *source_revision, object,
+        8U, production::UvProjectionPlane::xy, {0.25, 0.5}, 2.0, {0.125, -0.25}};
+
+    const auto unchanged = before;
+    auto stale_generation = action;
+    ++stale_generation.expected_project_generation;
+    const auto generation_refusal = application::testing::dispatch(session, stale_generation);
+    REQUIRE(!generation_refusal);
+    REQUIRE(generation_refusal.error().code == core::ErrorCode::stale_data);
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+
+    auto stale_project = action;
+    stale_project.expected_project_revision = core::Revision{
+        action.expected_project_revision.value() + 1U};
+    const auto project_refusal = application::testing::dispatch(session, stale_project);
+    REQUIRE(!project_refusal);
+    REQUIRE(project_refusal.error().code == core::ErrorCode::stale_data);
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+
+    auto stale_mesh = action;
+    stale_mesh.expected_mesh_revision = core::Revision{source_revision->value() + 1U};
+    const auto mesh_refusal = application::testing::dispatch(session, stale_mesh);
+    REQUIRE(!mesh_refusal);
+    REQUIRE(mesh_refusal.error().code == core::ErrorCode::stale_data);
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+
+    auto wrong_owner = action;
+    wrong_owner.object = scene::ObjectId{999U};
+    const auto owner_refusal = application::testing::dispatch(session, wrong_owner);
+    REQUIRE(!owner_refusal);
+    REQUIRE(owner_refusal.error().code == core::ErrorCode::invalid_state);
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+
+    auto duplicate_set = action;
+    duplicate_set.output_uv_set = 7U;
+    const auto identity_refusal = application::testing::dispatch(session, duplicate_set);
+    REQUIRE(!identity_refusal);
+    REQUIRE(identity_refusal.error().code == core::ErrorCode::validation_failed);
+    auto invalid_scale = action;
+    invalid_scale.scale = 0.0;
+    REQUIRE(!application::testing::dispatch(session, invalid_scale));
+    auto edge_on = action;
+    edge_on.plane = production::UvProjectionPlane::yz;
+    REQUIRE(!application::testing::dispatch(session, edge_on));
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+    REQUIRE(session.snapshot().undo_count == unchanged.undo_count);
+
+    session.active_source_ = application::OperationSource::ai_proposal;
+    const auto ai_refusal = session.project_uv_planar(action);
+    session.active_source_ = application::OperationSource::human;
+    REQUIRE(!ai_refusal);
+    REQUIRE(ai_refusal.error().code == core::ErrorCode::unsupported);
+    REQUIRE(session.snapshot().project_revision == unchanged.project_revision);
+    REQUIRE(session.snapshot().undo_count == unchanged.undo_count);
+
+    const auto packed = application::testing::dispatch(session, action);
+    REQUIRE(packed && packed.value().document_changed);
+    REQUIRE(packed.value().revision_after == core::Revision{
+        unchanged.project_revision.value() + 1U});
+    REQUIRE(session.snapshot().undo_count == unchanged.undo_count + 1U);
+    const auto& packed_mesh = session.document_.meshes().at(*mesh_asset);
+    const auto* source_set = packed_mesh.uv_sets().find(7U);
+    const auto* packed_set = packed_mesh.uv_sets().find(8U);
+    REQUIRE(source_set != nullptr);
+    REQUIRE(packed_set != nullptr);
+    REQUIRE(packed_set->layer_id == "uv.project.8");
+    REQUIRE(!packed_set->active_for_editing && !packed_set->active_for_render);
+    REQUIRE(packed_mesh.uv_sets().active_for_editing()->id == 7U);
+    REQUIRE(packed_mesh.uv_sets().active_for_render()->id == 7U);
+    REQUIRE(packed_mesh.attributes().find("uv.source.corners") != nullptr);
+    const auto* projected_uv = packed_mesh.attributes().find("uv.project.8");
+    REQUIRE(projected_uv != nullptr);
+    for (std::size_t i = 0; i < topology.value().corners.size(); ++i) {
+        const auto* vertex = source.find_vertex(topology.value().corners[i].vertex);
+        REQUIRE(vertex != nullptr);
+        const auto uv = std::get<core::Vec2d>(projected_uv->values[i]);
+        REQUIRE(uv.x == (vertex->position.x - 0.25) * 2.0 + 0.125 &&
+            uv.y == (vertex->position.y - 0.5) * 2.0 - 0.25);
+    }
+
+    REQUIRE(application::testing::dispatch(session, application::UndoAction{}));
+    REQUIRE(session.document_.meshes().at(*mesh_asset).uv_sets().find(8U) == nullptr);
+    REQUIRE(application::testing::dispatch(session, application::RedoAction{}));
+    REQUIRE(session.document_.meshes().at(*mesh_asset).uv_sets().find(8U) != nullptr);
+    const auto* redone_uv = session.document_.meshes().at(*mesh_asset).attributes().find("uv.project.8");
+    REQUIRE(redone_uv != nullptr);
+    for (std::size_t i = 0; i < topology.value().corners.size(); ++i) {
+        const auto* vertex = source.find_vertex(topology.value().corners[i].vertex);
+        REQUIRE(vertex != nullptr);
+        const auto uv = std::get<core::Vec2d>(redone_uv->values[i]);
+        REQUIRE(uv.x == (vertex->position.x - 0.25) * 2.0 + 0.125 &&
+            uv.y == (vertex->position.y - 0.5) * 2.0 - 0.25);
+    }
+
+    TempDirectory directory;
+    const auto path = directory.path() / "uv-planar-projection.carto";
+    REQUIRE(application::testing::dispatch(session, application::SaveProjectAction{path}));
+    const auto reopened = project::ProjectDocument::load(path);
+    REQUIRE(reopened);
+    const auto reopened_mesh = reopened.value().meshes().at(*mesh_asset);
+    REQUIRE(reopened_mesh.uv_sets().find(7U) != nullptr);
+    REQUIRE(reopened_mesh.uv_sets().find(8U) != nullptr);
+    REQUIRE(reopened_mesh.uv_sets().active_for_render()->id == 7U);
+    const auto* reopened_uv = reopened_mesh.attributes().find("uv.project.8");
+    REQUIRE(reopened_uv != nullptr);
+    for (std::size_t i = 0; i < topology.value().corners.size(); ++i) {
+        const auto* vertex = source.find_vertex(topology.value().corners[i].vertex);
+        REQUIRE(vertex != nullptr);
+        const auto uv = std::get<core::Vec2d>(reopened_uv->values[i]);
+        REQUIRE(uv.x == (vertex->position.x - 0.25) * 2.0 + 0.125 &&
+            uv.y == (vertex->position.y - 0.5) * 2.0 - 0.25);
+    }
+
+    // Projection can generate the first UV set without an existing source set.
+    application::ApplicationSession first_uv_session;
+    REQUIRE(application::testing::dispatch(first_uv_session,
+        application::CreateMeshObjectAction{"No UV source", source_without_uv}));
+    const auto first_object = first_uv_session.snapshot().objects.front().object;
+    REQUIRE(first_object.mesh_asset.has_value());
+    REQUIRE(application::testing::dispatch(first_uv_session,
+        application::SelectObjectAction{first_object.id}));
+    const auto first_before = first_uv_session.snapshot();
+    REQUIRE(first_before.objects.front().mesh_revision.has_value());
+    const application::ProjectUvPlanarAction first_action{
+        first_before.project_generation, first_before.project_revision,
+        *first_before.objects.front().mesh_revision, first_object.id, 8U,
+        production::UvProjectionPlane::xy, {0.0, 0.0}, 1.0, {0.0, 0.0}};
+    REQUIRE(application::testing::dispatch(first_uv_session, first_action));
+    const auto& first_result = first_uv_session.document_.meshes().at(*first_object.mesh_asset);
+    REQUIRE(first_result.uv_sets().find(8U) != nullptr);
+    REQUIRE(first_result.uv_sets().active_for_render() == nullptr);
+    REQUIRE(first_result.uv_sets().active_for_editing() == nullptr);
+
+    application::ApplicationSession locked_session;
+    REQUIRE(application::testing::dispatch(locked_session,
+        application::CreateMeshObjectAction{"UV shared source", source}));
+    const auto selected = locked_session.snapshot().objects.front().object;
+    REQUIRE(selected.mesh_asset.has_value());
+    REQUIRE(locked_session.document_.insert_object(scene::SceneObject{
+        scene::ObjectId{999U}, "Locked shared instance", core::Transform::identity(),
+        std::nullopt, selected.mesh_asset, true, true}));
+    REQUIRE(application::testing::dispatch(locked_session,
+        application::SelectObjectAction{selected.id}));
+    const auto locked_before = locked_session.snapshot();
+    const auto locked_revision = locked_session.document_.meshes().at(*selected.mesh_asset).revision();
+    const application::ProjectUvPlanarAction locked_action{
+        locked_before.project_generation, locked_before.project_revision, locked_revision,
+        selected.id, 8U, production::UvProjectionPlane::xy, {0.0, 0.0}, 1.0, {0.0, 0.0}};
+    const auto locked_refusal = application::testing::dispatch(locked_session, locked_action);
+    REQUIRE(!locked_refusal && locked_refusal.error().code == core::ErrorCode::invalid_state);
+    REQUIRE(locked_refusal.error().message.find("locked shared-mesh instance") != std::string::npos);
+    REQUIRE(locked_session.snapshot().project_revision == locked_before.project_revision);
+    REQUIRE(locked_session.snapshot().undo_count == locked_before.undo_count);
+    REQUIRE(locked_session.document_.meshes().at(*selected.mesh_asset).uv_sets().find(8U) == nullptr);
+}
+
 int main() {
     try {
         application_mesh_geometry_digest_is_canonical_and_revision_independent();
@@ -13583,6 +13781,7 @@ int main() {
         application_assigns_material_regions_through_revisioned_history();
         application_authors_presentation_catalog_through_revisioned_history();
         application_packs_uv_islands_through_human_revisioned_history();
+        application_projects_planar_uvs_through_human_revisioned_history();
         application_places_decals_from_a_current_surface_through_human_history();
         application_rejects_decal_replay_after_same_revision_project_replacement();
     } catch (const std::exception& error) {

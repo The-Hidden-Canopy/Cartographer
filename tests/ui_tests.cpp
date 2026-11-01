@@ -5141,11 +5141,73 @@ void ui_routes_uv_island_packing_through_current_selection() {
     REQUIRE(after.operations.back().action.starts_with("Pack UV Islands uvp2."));
 }
 
+void ui_routes_planar_uv_projection_through_current_selection() {
+    using namespace carto;
+    application::ApplicationSession session;
+    ui::UiController ui(session);
+    geometry::EditableMesh mesh;
+    const auto a = mesh.add_vertex({0.0, 0.0, 0.0});
+    const auto b = mesh.add_vertex({1.0, 0.0, 0.0});
+    const auto c = mesh.add_vertex({0.0, 1.0, 0.0});
+    REQUIRE(a && b && c);
+    REQUIRE(mesh.add_face({a.value(), b.value(), c.value()}));
+    const auto topology = mesh.topology();
+    REQUIRE(topology);
+    std::vector<attributes::AttributeValue> coordinates;
+    for (const auto& corner : topology.value().corners) {
+        const auto* vertex = mesh.find_vertex(corner.vertex);
+        REQUIRE(vertex != nullptr);
+        coordinates.emplace_back(core::Vec2d{vertex->position.x, vertex->position.y});
+    }
+    attributes::AttributeSet payload({
+        {attributes::AttributeDomain::corner, topology.value().corners.size()}});
+    REQUIRE(payload.add_layer({
+        {"uv.source.corners", attributes::AttributeDomain::corner,
+            attributes::AttributeType::vec2},
+        std::move(coordinates)}));
+    attributes::UvSetTable uv_sets;
+    REQUIRE(uv_sets.add({7U, "Source UV", "uv.source.corners", true, true, false, 1U}));
+    REQUIRE(mesh.set_attribute_payload(std::move(payload), std::move(uv_sets)));
+    REQUIRE(ui.dispatch(application::CreateMeshObjectAction{"UV projection target", std::move(mesh)}));
+    auto snapshot = ui.snapshot();
+    REQUIRE(snapshot.objects.size() == 1U);
+    const auto object = snapshot.objects.front().object.id;
+    REQUIRE(snapshot.objects.front().object.mesh_asset.has_value());
+    REQUIRE(snapshot.objects.front().mesh_revision.has_value());
+    REQUIRE(ui.dispatch(application::SelectObjectAction{object}));
+    snapshot = ui.snapshot();
+    const application::ProjectUvPlanarAction action{
+        snapshot.project_generation, snapshot.project_revision,
+        *snapshot.objects.front().mesh_revision, object, 8U,
+        production::UvProjectionPlane::xy, {0.0, 0.0}, 1.0, {0.0, 0.0}};
+
+    const auto before = ui.snapshot();
+    const auto stale = ui.project_uv_planar(action, snapshot.project_generation + 1U);
+    REQUIRE(!stale && stale.error().code == core::ErrorCode::stale_data);
+    REQUIRE(ui.snapshot().project_revision == before.project_revision);
+    auto wrong_selection = action;
+    wrong_selection.object = scene::ObjectId{999U};
+    const auto wrong_owner = ui.project_uv_planar(wrong_selection, snapshot.project_generation);
+    REQUIRE(!wrong_owner && wrong_owner.error().code == core::ErrorCode::invalid_state);
+    REQUIRE(ui.snapshot().project_revision == before.project_revision);
+    const auto raw_ai = ui.submit_ai_proposal(action);
+    REQUIRE(!raw_ai);
+    REQUIRE(ui.snapshot().project_revision == before.project_revision);
+
+    const auto packed = ui.project_uv_planar(action, snapshot.project_generation);
+    REQUIRE(packed && packed.value().document_changed);
+    const auto after = ui.snapshot();
+    REQUIRE(after.project_revision == core::Revision{before.project_revision.value() + 1U});
+    REQUIRE(after.operations.size() == before.operations.size() + 1U);
+    REQUIRE(after.operations.back().action.starts_with("Project Planar UVs"));
+}
+
 int main() {
     try {
         preferences_validate_shell_invariants();
         ui_routes_authoritative_actions_and_operation_lineage();
         ui_routes_uv_island_packing_through_current_selection();
+        ui_routes_planar_uv_projection_through_current_selection();
         ui_routes_mesh_cleanup_review_without_implicit_acceptance();
         ui_routes_connection_graph_cleanup_without_condition_authoring();
         ui_routes_spatial_fields_through_the_human_command_boundary();

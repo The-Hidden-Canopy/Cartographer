@@ -1278,6 +1278,9 @@ public:
     [[nodiscard]] core::Result<application::DispatchReceipt> pack_uv_islands(
         const application::PackUvIslandsAction& action,
         std::uint64_t expected_project_generation);
+    [[nodiscard]] core::Result<application::DispatchReceipt> project_uv_planar(
+        const application::ProjectUvPlanarAction& action,
+        std::uint64_t expected_project_generation);
     [[nodiscard]] core::Result<application::DispatchReceipt> set_uv_coordinate(
         const application::SetUvCoordinateAction& action,
         std::uint64_t expected_project_generation);

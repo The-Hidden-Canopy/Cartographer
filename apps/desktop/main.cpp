@@ -2453,6 +2453,13 @@ struct DesktopState {
     int uv_pack_density_policy = 0;
     double uv_pack_target_density = 0.0;
     bool uv_pack_allow_quarter_turn = false;
+    carto::attributes::UvSetId uv_projection_output_set_id = 2U;
+    int uv_projection_plane = 0;
+    double uv_projection_origin_u = 0.0;
+    double uv_projection_origin_v = 0.0;
+    double uv_projection_scale = 1.0;
+    double uv_projection_offset_u = 0.0;
+    double uv_projection_offset_v = 0.0;
     std::uint32_t uv_density_tile_width_pixels = 1024U;
     std::uint32_t uv_density_tile_height_pixels = 1024U;
     std::uint32_t uv_tile_bake_width = 1024U;
@@ -3747,6 +3754,59 @@ struct DesktopState {
             ImGui::TextDisabled(
                 "Use distinct non-zero set IDs, resolution 16–8192, positive bounded padding, 1–100 tiles, and a valid density policy.");
         }
+    }
+
+    void draw_uv_planar_projection_entry(const UiSnapshot& snapshot) {
+        if (!ImGui::CollapsingHeader("Project planar UVs")) return;
+        ImGui::TextWrapped(
+            "Project object-space positions into a new inactive UV set through project history. Shared mesh assets change for every instance; unlock all instances first.");
+        ImGui::TextDisabled(
+            "Triangles only. Noncoplanar geometry can fold or overlap. This is not an overlap-free unwrap or lightmap pack. Choose an unused output set ID.");
+        ImGui::TextDisabled("UV = (plane coordinate - origin) * scale + offset.");
+        ImGui::InputScalar("Projection output UV set", ImGuiDataType_U64, &uv_projection_output_set_id);
+        constexpr const char* kProjectionPlanes[] = {"XY", "YZ", "ZX"};
+        ImGui::Combo("Projection plane", &uv_projection_plane, kProjectionPlanes, IM_ARRAYSIZE(kProjectionPlanes));
+        ImGui::InputDouble("Projection origin U", &uv_projection_origin_u);
+        ImGui::InputDouble("Projection origin V", &uv_projection_origin_v);
+        ImGui::InputDouble("Projection scale", &uv_projection_scale);
+        ImGui::InputDouble("Projection offset U", &uv_projection_offset_u);
+        ImGui::InputDouble("Projection offset V", &uv_projection_offset_v);
+        const auto selected_mesh = snapshot.selection.mode ==
+                carto::editor::SelectionMode::object && snapshot.selection.objects.size() == 1U
+            ? std::find_if(snapshot.objects.begin(), snapshot.objects.end(), [&snapshot](const auto& object) {
+                return object.object.id == snapshot.selection.objects.front();
+            }) : snapshot.objects.end();
+        const bool selected_source = selected_mesh != snapshot.objects.end() &&
+            selected_mesh->object.mesh_asset.has_value() && selected_mesh->object.visible &&
+            !selected_mesh->object.locked && selected_mesh->mesh_revision.has_value() &&
+            selected_mesh->mesh_revision->value() != 0U;
+        const bool locked_shared_instance = selected_source &&
+            std::any_of(snapshot.objects.begin(), snapshot.objects.end(), [&selected_mesh](const auto& object) {
+                return object.object.mesh_asset == selected_mesh->object.mesh_asset && object.object.locked;
+            });
+        const bool settings_valid = uv_projection_output_set_id != 0U && uv_projection_plane >= 0 &&
+            uv_projection_plane <= 2 && std::isfinite(uv_projection_scale) && uv_projection_scale > 0.0 &&
+            std::isfinite(uv_projection_origin_u) && std::isfinite(uv_projection_origin_v) &&
+            std::isfinite(uv_projection_offset_u) && std::isfinite(uv_projection_offset_v);
+        const bool can_project = selected_source && !locked_shared_instance && settings_valid;
+        ImGui::BeginDisabled(!can_project);
+        if (ImGui::Button("Project to new UV set", ImVec2(-1.0F, 28.0F)) && can_project) {
+            const auto projected = ui.project_uv_planar(
+                carto::application::ProjectUvPlanarAction{
+                    snapshot.project_generation, snapshot.project_revision, *selected_mesh->mesh_revision,
+                    selected_mesh->object.id, uv_projection_output_set_id,
+                    static_cast<carto::production::UvProjectionPlane>(uv_projection_plane),
+                    {uv_projection_origin_u, uv_projection_origin_v}, uv_projection_scale,
+                    {uv_projection_offset_u, uv_projection_offset_v}}, snapshot.project_generation);
+            action_feedback_error = !projected;
+            action_feedback = projected
+                ? "Projected UV set entered project history. Save before refreshing the source report."
+                : projected.error().message;
+        }
+        ImGui::EndDisabled();
+        if (!selected_source) ImGui::TextDisabled("Select one visible, revision-bound mesh object.");
+        else if (locked_shared_instance) ImGui::TextDisabled("Unlock every instance sharing this mesh before projecting.");
+        else if (!settings_valid) ImGui::TextDisabled("Use a non-zero output set ID, a valid plane, finite values, and positive scale.");
     }
 
     [[nodiscard]] std::optional<carto::scene::ObjectId> uv_target_object(
@@ -5048,6 +5108,7 @@ struct DesktopState {
             uv_pack_source_set_id = uv_inspection_set_id;
         }
         draw_uv_island_pack_entry(snapshot);
+        draw_uv_planar_projection_entry(snapshot);
         draw_lightmap_uv_entry(snapshot, "the UV workspace");
         end_instrument(carto::ui::WorkbenchInstrument::material, workbench.material);
     }

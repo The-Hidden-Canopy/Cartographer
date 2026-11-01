@@ -29,6 +29,7 @@
 #include <carto/production/decal.hpp>
 #include <carto/production/sculpt_stack.hpp>
 #include <carto/production/uv_island_pack.hpp>
+#include <carto/production/uv_planar_projection.hpp>
 #include <carto/render/render_scene.hpp>
 #include <carto/terrain/terrain_tile.hpp>
 
@@ -1571,6 +1572,18 @@ struct PackUvIslandsAction {
     bool allow_quarter_turn_rotation = false;
 };
 
+struct ProjectUvPlanarAction {
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    core::Revision expected_mesh_revision;
+    scene::ObjectId object;
+    attributes::UvSetId output_uv_set = 0U;
+    production::UvProjectionPlane plane = production::UvProjectionPlane::xy;
+    core::Vec2d origin{};
+    double scale = 1.0;
+    core::Vec2d offset{};
+};
+
 struct SetUvCoordinateAction {
     std::uint64_t expected_project_generation = 0U;
     core::Revision expected_project_revision;
@@ -1797,6 +1810,7 @@ using ApplicationAction = std::variant<
     SetMaterialRegionAssignmentAction,
     GenerateUniqueLightmapUvAction,
     PackUvIslandsAction,
+    ProjectUvPlanarAction,
     SetUvCoordinateAction,
     SetUvSeamMarkAction,
     AlignUvSeamAction,
@@ -2213,6 +2227,8 @@ private:
         const GenerateUniqueLightmapUvAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> pack_uv_islands(
         const PackUvIslandsAction& action);
+    [[nodiscard]] core::Result<DispatchReceipt> project_uv_planar(
+        const ProjectUvPlanarAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> set_uv_coordinate(
         const SetUvCoordinateAction& action);
     [[nodiscard]] core::Result<DispatchReceipt> set_uv_seam_mark(

@@ -613,6 +613,7 @@ bool is_operation_action(const application::ApplicationAction& action) {
             std::is_same_v<Action, application::RelinkMovedSourceAction> ||
             std::is_same_v<Action, application::GenerateUniqueLightmapUvAction> ||
             std::is_same_v<Action, application::PackUvIslandsAction> ||
+            std::is_same_v<Action, application::ProjectUvPlanarAction> ||
             std::is_same_v<Action, application::SetUvCoordinateAction> ||
             std::is_same_v<Action, application::SetUvSeamMarkAction> ||
             std::is_same_v<Action, application::AlignUvSeamAction> ||
@@ -10322,6 +10323,25 @@ core::Result<application::DispatchReceipt> UiController::pack_uv_islands(
         current.selection.objects.front() != action.object) {
         return core::Result<application::DispatchReceipt>::failure(invalid_state(
             "UV island packing requires one selected mesh object"));
+    }
+    return dispatch(action);
+}
+
+core::Result<application::DispatchReceipt> UiController::project_uv_planar(
+    const application::ProjectUvPlanarAction& action,
+    std::uint64_t expected_project_generation) {
+    const auto current = session_.snapshot();
+    if (current.project_generation != expected_project_generation ||
+        action.expected_project_generation != expected_project_generation ||
+        current.project_revision != action.expected_project_revision) {
+        return core::Result<application::DispatchReceipt>::failure(stale(
+            "UV planar projection controls belong to an earlier project state"));
+    }
+    if (current.selection.mode != editor::SelectionMode::object ||
+        current.selection.objects.size() != 1U ||
+        current.selection.objects.front() != action.object) {
+        return core::Result<application::DispatchReceipt>::failure(invalid_state(
+            "UV planar projection requires one selected mesh object"));
     }
     return dispatch(action);
 }
