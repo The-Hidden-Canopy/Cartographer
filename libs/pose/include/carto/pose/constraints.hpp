@@ -34,6 +34,9 @@ namespace carto::pose {
 // referents are solvable on the CPU reference path; a control referent fails
 // closed with unsupported, because control-driven goals must be resolved to
 // joint space by evaluate_controls before constraint evaluation.
+// Mixed pairwise rules in one target group, dependencies that cannot be
+// honored by the current grouping, and blend arbitration (until final-pose
+// residual verification exists) fail closed; they are not full group solving.
 //
 // Per-type semantics:
 // - ik_pin:  source joint is the chain root, target joint the effector; the
@@ -87,9 +90,13 @@ struct PoseReceipt {
     character::RationalTime sampled_time;
     // Number of stage passes that ran with at least one active constraint.
     std::uint32_t stage_passes = 0U;
-    // True when every active constraint converged (superseded constraints do
-    // not count against). False means the receipt is a proposal: commit is
-    // refused until a human decision accepts it (manual supremacy).
+    // True when every unsuperseded active constraint converged and no contact
+    // was superseded. Unsuperseded pin, contact and orient residuals are
+    // remeasured against the final pose; convergence requires both the
+    // original solver outcome and the final measurement to pass. A superseded
+    // contact is unverified, not an inferred hard or soft rule.
+    // False means this receipt is only a proposal. A true value alone is not
+    // owner admission or proof that any physical action was executed.
     bool all_converged = false;
     // Final limit verification: joints whose composed local pose lies outside
     // enabled authored angular/linear limits under the library Euler

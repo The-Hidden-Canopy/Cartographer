@@ -8,7 +8,6 @@
 #include <optional>
 #include <set>
 #include <string>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -41,6 +40,14 @@ core::Transform blend_transform(const core::Transform& from, const core::Transfo
     result.rotation = nlerp(from.rotation, to.rotation, clamped);
     result.scale = from.scale + (to.scale - from.scale) * clamped;
     return result;
+}
+
+// q and -q represent the same orientation. The rotation-angle helper expects
+// the coordinate policy's canonical non-negative-w hemisphere.
+double orientation_residual(core::Quaternion source, core::Quaternion target) {
+    auto delta = (source.normalized() * inverse(target.normalized())).normalized();
+    if (delta.w < 0.0) delta = {-delta.x, -delta.y, -delta.z, -delta.w};
+    return rotation_angle(delta);
 }
 
 struct Evaluator {
@@ -113,9 +120,9 @@ struct Evaluator {
             ConstraintOutcome outcome;
             outcome.residual = solved.value().residual;
             outcome.iterations = solved.value().iterations;
-            outcome.converged = constraint.type == character::ConstraintType::contact
-                ? solved.value().residual <= constraint.tolerance
-                : solved.value().converged;
+            outcome.converged = solved.value().converged &&
+                (constraint.type != character::ConstraintType::contact ||
+                 solved.value().residual <= constraint.tolerance);
             return core::Result<ConstraintOutcome>::success(std::move(outcome));
         }
         case character::ConstraintType::orient: {
@@ -142,8 +149,15 @@ struct Evaluator {
                                      target_local.rotation)
                                         .normalized();
             pose[constraint.target.joint] = solved_local;
+            auto aligned = evaluate_fk(graph, pose);
+            if (!aligned) return core::Result<ConstraintOutcome>::failure(aligned.error());
             ConstraintOutcome outcome;
-            outcome.residual = rotation_angle(delta);
+            outcome.residual = orientation_residual(
+                aligned.value().world.at(constraint.source.joint).rotation,
+                aligned.value().world.at(constraint.target.joint).rotation);
+            if (!std::isfinite(outcome.residual))
+                return core::Result<ConstraintOutcome>::failure(validation(
+                    "orientation solver residual is not finite"));
             outcome.iterations = 1U;
             outcome.converged = outcome.residual <=
                 std::max(constraint.tolerance, context.budget.convergence_tolerance);
@@ -240,28 +254,8 @@ using GroupKey = character::ConstraintTargetRef;
 // Deterministic group order: priority descending, then id ascending.
 bool member_before(const character::ConstraintDefinition& left,
                    const character::ConstraintDefinition& right) {
-    return std::tuple(left.priority, left.id.value) >
-        std::tuple(right.priority, right.id.value);
-}
-
-bool same_transform(const core::Transform& left, const core::Transform& right) {
-    return left.translation.x == right.translation.x &&
-        left.translation.y == right.translation.y &&
-        left.translation.z == right.translation.z &&
-        left.rotation.x == right.rotation.x &&
-        left.rotation.y == right.rotation.y &&
-        left.rotation.z == right.rotation.z &&
-        left.rotation.w == right.rotation.w &&
-        left.scale.x == right.scale.x &&
-        left.scale.y == right.scale.y &&
-        left.scale.z == right.scale.z;
-}
-
-// Looks up a local pose entry, defaulting to the authored rest transform.
-core::Transform lookup_local(const LocalPose& pose, const kinematic::KinematicGraph& graph,
-                             kinematic::JointId joint) {
-    const auto found = pose.find(joint);
-    return found != pose.end() ? found->second : graph.find(joint)->rest;
+    if (left.priority != right.priority) return left.priority > right.priority;
+    return left.id.value < right.id.value;
 }
 
 } // namespace
@@ -316,6 +310,18 @@ core::Result<PoseReceipt> evaluate_constraints(
                     "sampled time must share the constraint window timebase"));
             }
             if (!active_at(constraint, context.time)) continue;
+            // Resolve every active referent before arbitration. A superseded
+            // member must not hide a dangling joint or an unsupported control.
+            if (!constraint.source.is_joint() || !constraint.target.is_joint()) {
+                return core::Result<PoseReceipt>::failure(core::Diagnostic(
+                    core::ErrorCode::unsupported,
+                    "CPU constraint evaluation requires joint referents"));
+            }
+            if (!graph.find(constraint.source.joint) || !graph.find(constraint.target.joint)) {
+                return core::Result<PoseReceipt>::failure(core::Diagnostic(
+                    core::ErrorCode::not_found,
+                    "active constraint references a joint absent from the graph"));
+            }
             // Authored-goal completeness is validated for every active
             // constraint up front, before arbitration: a missing goal is an
             // authoring error and fails closed even when the constraint would
@@ -327,12 +333,23 @@ core::Result<PoseReceipt> evaluate_constraints(
                     core::ErrorCode::not_found,
                     "pin/contact constraint has no authored goal position"));
             }
+            if ((constraint.type == character::ConstraintType::ik_pin ||
+                    constraint.type == character::ConstraintType::contact) &&
+                !context.pin_targets.at(constraint.id).finite()) {
+                return core::Result<PoseReceipt>::failure(invalid(
+                    "pin/contact constraint goal must be finite"));
+            }
             if (constraint.type == character::ConstraintType::fk_blend &&
                 (!context.blend_targets.contains(constraint.id) ||
                     !context.blend_weights.contains(constraint.id))) {
                 return core::Result<PoseReceipt>::failure(core::Diagnostic(
                     core::ErrorCode::not_found,
                     "fk_blend constraint has no authored goal pose and weight"));
+            }
+            if (constraint.type == character::ConstraintType::fk_blend &&
+                !context.blend_targets.at(constraint.id).finite()) {
+                return core::Result<PoseReceipt>::failure(invalid(
+                    "fk_blend constraint goal must be finite"));
             }
             active.push_back(&constraint);
         }
@@ -369,8 +386,7 @@ core::Result<PoseReceipt> evaluate_constraints(
                 [&](character::ConstraintId left, character::ConstraintId right) {
                     const auto& l = *by_id[left];
                     const auto& r = *by_id[right];
-                    return std::tuple(l.priority, l.id.value) >
-                        std::tuple(r.priority, r.id.value);
+                    return member_before(l, r);
                 });
             const character::ConstraintId current_id = ready.front();
             ready.erase(ready.begin());
@@ -392,10 +408,12 @@ core::Result<PoseReceipt> evaluate_constraints(
         }
         std::set<character::ConstraintId> applied;
         const auto arbitration_rule = [&](
-            const std::vector<const character::ConstraintDefinition*>& members) {
-            // Lowest conflicting type pair governs (documented deterministic
-            // choice for groups mixing more than two types).
-            character::ArbitrationRule rule = character::ArbitrationRule::none;
+            const std::vector<const character::ConstraintDefinition*>& members)
+            -> core::Result<character::ArbitrationRule> {
+            // A single atomic group cannot silently discard any of its
+            // declared pairwise rules. Mixed rules need a group policy that
+            // this evaluator does not yet represent.
+            std::optional<character::ArbitrationRule> rule;
             for (std::size_t left = 0U; left < members.size(); ++left) {
                 for (std::size_t right = left + 1U; right < members.size(); ++right) {
                     if (members[left]->type == members[right]->type) continue;
@@ -406,22 +424,55 @@ core::Result<PoseReceipt> evaluate_constraints(
                     for (const character::ConstraintArbitration& arbitration :
                          constraints.arbitrations()) {
                         if (arbitration.first == low && arbitration.second == high) {
+                            if (rule && *rule != arbitration.rule) {
+                                return core::Result<character::ArbitrationRule>::failure(validation(
+                                    "conflicting arbitration rules in one target group, constraints " +
+                                    std::to_string(members[left]->id.value) + " and " +
+                                    std::to_string(members[right]->id.value)));
+                            }
                             rule = arbitration.rule;
                         }
                     }
                 }
             }
-            return rule;
+            return core::Result<character::ArbitrationRule>::success(
+                rule.value_or(character::ArbitrationRule::none));
         };
         for (const character::ConstraintDefinition* constraint : order) {
             if (applied.contains(constraint->id)) continue;
             std::vector<const character::ConstraintDefinition*> members =
                 groups.at(constraint->target);
-            std::sort(members.begin(), members.end(),
-                [](const character::ConstraintDefinition* left,
-                   const character::ConstraintDefinition* right) {
-                    return member_before(*left, *right);
-                });
+            // groups preserve the already computed dependency-aware topo
+            // order. Sorting again by priority could reverse a dependency.
+
+            bool same_type = true;
+            for (std::size_t index = 1U; index < members.size(); ++index) {
+                if (members[index]->type != members.front()->type) same_type = false;
+            }
+            auto selected_rule = arbitration_rule(members);
+            if (!selected_rule) return core::Result<PoseReceipt>::failure(selected_rule.error());
+            const character::ArbitrationRule rule = selected_rule.value();
+
+            for (const auto* member : members) {
+                if (!member->depends_on) continue;
+                const auto& predecessor = constraints.constraints().at(*member->depends_on);
+                const bool same_group = predecessor.stage == stage &&
+                    predecessor.target == member->target && active_ids.contains(predecessor.id);
+                if (same_group) {
+                    if (!same_type && rule != character::ArbitrationRule::sequential) {
+                        return core::Result<PoseReceipt>::failure(validation(
+                            "arbitration cannot supersede or independently blend an in-group dependency"));
+                    }
+                    continue;
+                }
+                const auto prior = receipt.outcomes.find(predecessor.id);
+                if (predecessor.stage > stage || prior == receipt.outcomes.end() || prior->second.superseded) {
+                    return core::Result<PoseReceipt>::failure(validation(
+                        "constraint " + std::to_string(member->id.value) +
+                        " has an inactive, superseded, later-stage or interleaved dependency " +
+                        std::to_string(predecessor.id.value)));
+                }
+            }
 
             if (members.size() == 1U) {
                 auto outcome = evaluator.apply(*members.front(), evaluator.current);
@@ -431,11 +482,6 @@ core::Result<PoseReceipt> evaluate_constraints(
                 continue;
             }
 
-            const character::ArbitrationRule rule = arbitration_rule(members);
-            bool same_type = true;
-            for (std::size_t index = 1U; index < members.size(); ++index) {
-                if (members[index]->type != members.front()->type) same_type = false;
-            }
             if (same_type) {
                 // Same-type members: sequential application in group order.
                 for (const character::ConstraintDefinition* member : members) {
@@ -472,38 +518,54 @@ core::Result<PoseReceipt> evaluate_constraints(
                 }
                 continue;
             }
-            // blend: evaluate each member independently from the group-start
-            // pose, then average the touched locals with equal weight.
-            const LocalPose group_start = evaluator.current;
-            std::vector<ConstraintOutcome> outcomes;
-            std::vector<LocalPose> proposals;
-            for (const character::ConstraintDefinition* member : members) {
-                LocalPose proposal = group_start;
-                auto outcome = evaluator.apply(*member, proposal);
-                if (!outcome) return core::Result<PoseReceipt>::failure(outcome.error());
-                outcomes.push_back(std::move(outcome.value()));
-                proposals.push_back(std::move(proposal));
+            // Individual pre-blend residuals cannot certify the blended
+            // pose. Refuse until final-pose residual revalidation exists.
+            return core::Result<PoseReceipt>::failure(core::Diagnostic(
+                core::ErrorCode::unsupported,
+                "blend arbitration requires final-pose residual revalidation"));
+        }
+    }
+
+    // Later constraints may change an earlier measured goal. Recompute
+    // position and orientation residuals on the returned pose. Preserve a
+    // solver's failure even if another constraint later happens to meet the
+    // goal: the single convergence bit cannot distinguish those two facts.
+    auto final_pose = evaluate_fk(graph, evaluator.current);
+    if (!final_pose) return core::Result<PoseReceipt>::failure(final_pose.error());
+    for (const auto& [joint, transform] : final_pose.value().world) {
+        (void)joint;
+        if (!transform.finite()) return core::Result<PoseReceipt>::failure(validation(
+            "final world pose is not finite"));
+    }
+    for (auto& [identity, outcome] : receipt.outcomes) {
+        const auto& definition = constraints.constraints().at(identity);
+        if (outcome.superseded) continue;
+        if (definition.type == character::ConstraintType::contact ||
+            definition.type == character::ConstraintType::ik_pin) {
+            const auto target = context.pin_targets.find(identity);
+            if (target == context.pin_targets.end() || !target->second.finite()) {
+                return core::Result<PoseReceipt>::failure(validation(
+                    "final pin/contact measurement requires its finite authored target"));
             }
-            std::set<kinematic::JointId> touched;
-            for (const LocalPose& proposal : proposals) {
-                for (const auto& [joint, transform] : proposal) {
-                    if (!same_transform(lookup_local(group_start, graph, joint), transform)) {
-                        touched.insert(joint);
-                    }
-                }
+            const auto position = final_pose.value().world.at(definition.target.joint).translation;
+            outcome.residual = (position - target->second).length();
+            if (!std::isfinite(outcome.residual)) {
+                return core::Result<PoseReceipt>::failure(validation(
+                    "final pin/contact residual is not finite"));
             }
-            for (kinematic::JointId joint : touched) {
-                core::Transform blended = lookup_local(group_start, graph, joint);
-                for (const LocalPose& proposal : proposals) {
-                    blended = blend_transform(blended, lookup_local(proposal, graph, joint),
-                                              1.0 / static_cast<double>(proposals.size()));
-                }
-                evaluator.current[joint] = blended;
+            const double tolerance = definition.type == character::ConstraintType::contact
+                ? definition.tolerance : std::max(context.budget.convergence_tolerance, 1e-12);
+            outcome.converged = outcome.converged && outcome.residual <= tolerance;
+        } else if (definition.type == character::ConstraintType::orient) {
+            const auto source = final_pose.value().world.at(definition.source.joint).rotation;
+            const auto target = final_pose.value().world.at(definition.target.joint).rotation;
+            outcome.residual = orientation_residual(source, target);
+            if (!std::isfinite(outcome.residual)) {
+                return core::Result<PoseReceipt>::failure(validation(
+                    "final orientation residual is not finite"));
             }
-            for (std::size_t index = 0U; index < members.size(); ++index) {
-                receipt.outcomes.emplace(members[index]->id, std::move(outcomes[index]));
-                applied.insert(members[index]->id);
-            }
+            outcome.converged = outcome.converged && outcome.residual <=
+                std::max(definition.tolerance, context.budget.convergence_tolerance);
         }
     }
 
@@ -547,7 +609,10 @@ core::Result<PoseReceipt> evaluate_constraints(
     receipt.all_converged = true;
     for (const auto& [identity, outcome] : receipt.outcomes) {
         static_cast<void>(identity);
-        if (!outcome.converged && !outcome.superseded) receipt.all_converged = false;
+        const bool unverified_contact = outcome.superseded &&
+            constraints.constraints().at(identity).type == character::ConstraintType::contact;
+        if ((!outcome.converged && !outcome.superseded) || unverified_contact)
+            receipt.all_converged = false;
     }
     return core::Result<PoseReceipt>::success(std::move(receipt));
 }

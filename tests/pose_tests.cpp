@@ -424,7 +424,7 @@ void constraint_evaluation_resolves_arbitration_deterministically() {
     require(receipt_fingerprint(receipt.value()) == receipt_fingerprint(again.value()),
         "constraint evaluation is deterministic");
 
-    // Blend arbitration evaluates both members instead of superseding.
+    // Blend arbitration cannot yet certify the resulting pose's residuals.
     carto::character::ConstraintGraph blended;
     require(static_cast<bool>(blended.insert(ik)) &&
         static_cast<bool>(blended.insert(orient)), "blend constraints insert");
@@ -432,10 +432,8 @@ void constraint_evaluation_resolves_arbitration_deterministically() {
     require(static_cast<bool>(blended.declare_arbitration(arbitration)),
         "blend arbitration declares");
     auto blend_receipt = carto::pose::evaluate_constraints(blended, graph, context);
-    require(static_cast<bool>(blend_receipt), "blend evaluation succeeds");
-    require(!blend_receipt.value().outcomes.at(carto::character::ConstraintId{1U}).superseded &&
-        !blend_receipt.value().outcomes.at(carto::character::ConstraintId{2U}).superseded,
-        "blend arbitration evaluates every member");
+    require(!blend_receipt && blend_receipt.error().code == carto::core::ErrorCode::unsupported,
+        "blend arbitration refuses until final-pose residuals can be verified");
 
     // Same-type conflicts apply in deterministic priority order.
     carto::character::ConstraintGraph sequence;

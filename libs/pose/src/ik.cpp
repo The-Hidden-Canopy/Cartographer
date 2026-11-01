@@ -436,7 +436,11 @@ core::Result<IkChainResult> solve_chain_jacobian(
 
     LocalPose solved;
     for (const kinematic::JointId joint : request.chain) {
-        solved.emplace(joint, current_locals.at(joint));
+        // The initial pose may already meet the target, so no iteration has
+        // populated sparse chain overrides. Preserve the same FK semantics as
+        // the input: absent locals use the authored rest transform.
+        const auto current = current_locals.find(joint);
+        solved.emplace(joint, current != current_locals.end() ? current->second : base_local(joint));
     }
     const bool reachable = true; // bounded-DLS posture: residual is the honest measure
     const bool converged = !time_expired &&

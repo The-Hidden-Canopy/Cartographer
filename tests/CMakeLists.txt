@@ -1943,6 +1943,11 @@ target_link_libraries(cartographer_pose_tests PRIVATE carto_pose)
 carto_target(cartographer_pose_tests)
 add_test(NAME cartographer_pose_tests COMMAND cartographer_pose_tests)
 
+add_executable(cartographer_constraint_arbitration_safety_tests constraint_arbitration_safety_tests.cpp)
+target_link_libraries(cartographer_constraint_arbitration_safety_tests PRIVATE carto_pose)
+carto_target(cartographer_constraint_arbitration_safety_tests)
+add_test(NAME cartographer_constraint_arbitration_safety_tests COMMAND cartographer_constraint_arbitration_safety_tests)
+
 add_executable(cartographer_deform_tests
     deform_tests.cpp
 )
