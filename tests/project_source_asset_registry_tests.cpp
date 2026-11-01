@@ -170,7 +170,7 @@ void generated_botanical_import_receipt_is_persistent_and_schema_gated() {
         "generation receipt mutation receives a revisioned project journal entry");
 
     const std::string encoded = document.serialize();
-    require(encoded.starts_with("CARTOGRAPHER_PROJECT 36\n"),
+    require(encoded.starts_with("CARTOGRAPHER_PROJECT 37\n"),
         "generation receipts are marked with the current project schema");
     const auto reopened = project::ProjectDocument::deserialize(encoded);
     require(reopened && reopened.value().source_asset_registry().records().at(
@@ -223,7 +223,7 @@ void generated_botanical_import_receipt_is_persistent_and_schema_gated() {
             "schema 26 fixture removes a later character record table");
         mislabeled_v26.erase(record, table.size());
     }
-    mislabeled_v26.replace(0U, std::string("CARTOGRAPHER_PROJECT 36\n").size(),
+    mislabeled_v26.replace(0U, std::string("CARTOGRAPHER_PROJECT 37\n").size(),
         "CARTOGRAPHER_PROJECT 26\n");
     require(!project::ProjectDocument::deserialize(mislabeled_v26),
         "schema 26 refuses a v2 generation receipt instead of silently ignoring it");

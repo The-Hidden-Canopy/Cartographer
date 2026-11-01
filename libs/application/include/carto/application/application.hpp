@@ -24,6 +24,7 @@
 #include <carto/geometry/road_surface.hpp>
 #include <carto/geometry/sign.hpp>
 #include <carto/journal/journal.hpp>
+#include <carto/project/accepted_autorig.hpp>
 #include <carto/project/project.hpp>
 #include <carto/project/material_catalog.hpp>
 #include <carto/production/decal.hpp>
@@ -1845,12 +1846,50 @@ using ApplicationAction = std::variant<
     UndoAction,
     RedoAction>;
 
+// Complete explicit input for a human-reviewed autorig commit. The source
+// content and source-binding provenance remain caller assertions.
+struct AcceptAutorigRequest {
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    std::string identity;
+    core::Revision expected_record_revision;
+    character::AutorigAnalysisRequest analysis;
+    character::AutorigCandidateSet candidates;
+    character::AutorigReviewAcceptance acceptance;
+    std::vector<character::AutorigFinalNode> nodes;
+    character::RigDefinition rig;
+    kinematic::JointLimitSet limits;
+    kinematic::SkinBinding source_binding;
+    character::SkinWeightLayer source_layer;
+    weights::WeightCorrespondence correspondence;
+    weights::JointTransferMap joint_map;
+    weights::WeightTransferOptions transfer_options;
+    std::optional<weights::WeightLocks> locks;
+};
+
+struct ConfigureAutorigIkFkRequest {
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    std::string identity;
+    core::Revision expected_record_revision;
+    std::vector<pose::IkFkAuthoring> configurations;
+};
+
+struct AcceptedAutorigView {
+    core::Revision record_revision;
+    project::AcceptedAutorigBundle bundle;
+};
+
 // The explicit human/local front-end adapter is the only production factory
 // for HumanActionAdmission. AI proposals use the separate UI proposal API;
 // the source/provenance overload is private to that host boundary and cannot
 // be used as a public raw AI mutation route.
 class HumanApplicationAccess final {
 public:
+    [[nodiscard]] static core::Result<DispatchReceipt> commit_autorig(
+        ApplicationSession& session, const AcceptAutorigRequest& request);
+    [[nodiscard]] static core::Result<DispatchReceipt> configure_autorig_ik_fk(
+        ApplicationSession& session, const ConfigureAutorigIkFkRequest& request);
     [[nodiscard]] static core::Result<DispatchReceipt> commit_mesh_cleanup(
         ApplicationSession& session, MeshCleanupReview& review, std::string justification);
     [[nodiscard]] static core::Result<DispatchReceipt> dispatch(
@@ -2029,6 +2068,16 @@ public:
         biological::StructureId structure) const;
     [[nodiscard]] core::Result<geometry::CurvePath> curve_path_source(
         std::string_view identity) const;
+    // Decodes a committed bundle only after checking the current source mesh.
+    [[nodiscard]] core::Result<AcceptedAutorigView> accepted_autorig(
+        std::string_view identity, std::uint64_t expected_project_generation,
+        core::Revision expected_project_revision) const;
+    // Computes a switch proposal only; no control values or mode are applied.
+    [[nodiscard]] core::Result<pose::IkFkSwitchProposal> propose_autorig_ik_fk_switch(
+        std::string_view identity, std::uint64_t expected_project_generation,
+        core::Revision expected_project_revision, std::size_t chain_index,
+        pose::IkFkMode target_mode, const pose::LocalPose& locals,
+        const std::optional<pose::IkControlState>& world_ik = std::nullopt) const;
     [[nodiscard]] core::Result<core::Revision> next_curve_path_revision(
         std::string_view identity) const;
     [[nodiscard]] core::Result<core::Revision> next_road_source_revision(
@@ -2081,6 +2130,10 @@ private:
     friend class ::carto::agent::AgentTask;
     friend class ::carto::agent::SceneQuery;
     friend class HumanApplicationAccess;
+    [[nodiscard]] core::Result<DispatchReceipt> commit_autorig(
+        HumanActionAdmission admission, const AcceptAutorigRequest& request);
+    [[nodiscard]] core::Result<DispatchReceipt> configure_autorig_ik_fk(
+        HumanActionAdmission admission, const ConfigureAutorigIkFkRequest& request);
     [[nodiscard]] core::Result<DispatchReceipt> commit_mesh_cleanup(
         HumanActionAdmission admission, MeshCleanupReview& review, std::string justification);
     std::shared_ptr<const std::uint8_t> cleanup_review_identity_ =

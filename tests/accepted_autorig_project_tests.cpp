@@ -75,6 +75,10 @@ int main() {
     weights::WeightTransferOptions opts; opts.output_layer_id = RigLayerId{2};
     opts.output_mesh_asset = 51; opts.output_mesh_digest = request.source.content_digest;
     const auto before = doc.serialize();
+    auto prepared_bundle = project::prepare_accepted_autorig_bundle(doc, request, set,
+        acceptance.value(), nodes, rig, limits, source, layer, correspondence, {}, opts);
+    require(static_cast<bool>(prepared_bundle) && doc.serialize() == before,
+        "pure preparation validates without changing the published project");
     auto tx = project::ProjectTransaction::begin(doc, journal, "artist");
     auto accepted = tx.value().accept_autorig("body", {}, request, set, acceptance.value(), nodes, rig, limits,
                                               source, layer, correspondence, {}, opts);
@@ -82,6 +86,7 @@ int main() {
     require(doc.accepted_autorigs().empty(), "staging leaves published document unchanged");
     require(static_cast<bool>(tx.value().commit("accept.autorig")), "journal commit");
     const auto entry = doc.accepted_autorigs().at("body");
+    require(entry.bytes == prepared_bundle.value(), "transaction uses the same prepared bundle");
     auto decoded = project::decode_accepted_autorig_bundle(entry.bytes);
     require(decoded && decoded.value().weights.output.binding.influences.size() == 3 &&
             decoded.value().weights.output.binding.influences.at(2).front().joint == nodes.front().durable_joint &&
@@ -94,6 +99,9 @@ int main() {
                                          source, layer, correspondence, {}, opts), "stale CAS refused");
     require(stale.value().staged_document().accepted_autorigs().at("body") == entry, "CAS failure atomic");
     auto wrong = opts; wrong.output_mesh_asset = 52;
+    require(!project::prepare_accepted_autorig_bundle(doc, request, set, acceptance.value(), nodes,
+        rig, limits, source, layer, correspondence, {}, wrong) && doc.accepted_autorigs().at("body") == entry,
+        "pure preparation refuses mismatched target without mutation");
     require(!stale.value().accept_autorig("body", core::Revision{1}, request, set, acceptance.value(), nodes, rig, limits,
                                          source, layer, correspondence, {}, wrong), "wrong target refused");
     weights::WeightCorrespondence out_of_range;
@@ -121,6 +129,14 @@ int main() {
     auto saved = doc.save_atomic(path / "project.carto");
     auto reopened = project::ProjectDocument::load(path / "project.carto");
     require(saved && reopened && reopened.value().accepted_autorigs().at("body") == entry, "save/reopen");
+    auto populated_v36 = reopened.value().serialize();
+    require(populated_v36.starts_with("CARTOGRAPHER_PROJECT 37\n"), "current project header");
+    populated_v36.replace(0U, std::string("CARTOGRAPHER_PROJECT 37\n").size(),
+                          "CARTOGRAPHER_PROJECT 36\n");
+    const auto migrated_v36 = project::ProjectDocument::deserialize(populated_v36);
+    require(migrated_v36 && migrated_v36.value().accepted_autorigs().at("body") == entry &&
+            migrated_v36.value().serialize().starts_with("CARTOGRAPHER_PROJECT 37\n"),
+            "v36 project with a populated v1 bundle migrates without changing it");
     require(project::ProjectDocument::deserialize(before).value().accepted_autorigs().empty(), "pre-commit snapshot restores without bundle");
     auto remove = project::ProjectTransaction::begin(doc, journal, "artist");
     require(remove && remove.value().remove_mesh(51) && remove.value().commit("remove.mesh"), "remove source mesh");
@@ -129,11 +145,11 @@ int main() {
     require(at != std::string::npos, "digest in project"); text[at] = text[at] == 'a' ? 'b' : 'a';
     require(!project::ProjectDocument::deserialize(text), "tampered bundle digest refused");
     auto old = project::ProjectDocument{}.serialize();
-    old.replace(0, std::string("CARTOGRAPHER_PROJECT 36\n").size(), "CARTOGRAPHER_PROJECT 35\n");
+    old.replace(0, std::string("CARTOGRAPHER_PROJECT 37\n").size(), "CARTOGRAPHER_PROJECT 35\n");
     auto table = old.find("ACCEPTED_AUTORIGS 0\n"); require(table != std::string::npos, "empty table fixture");
     old.erase(table, std::string("ACCEPTED_AUTORIGS 0\n").size());
     auto migrated = project::ProjectDocument::deserialize(old);
-    require(migrated && migrated.value().accepted_autorigs().empty() && migrated.value().schema_version() == 36,
-            "v35 migration to empty v36 table");
+    require(migrated && migrated.value().accepted_autorigs().empty() && migrated.value().schema_version() == 37,
+            "v35 migration to empty v37 table");
     std::error_code ignored; std::filesystem::remove_all(path, ignored);
 }

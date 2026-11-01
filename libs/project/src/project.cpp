@@ -829,13 +829,50 @@ core::Result<void> check_components(
     return core::Result<void>::success();
 }
 std::string bundle_bytes(std::string_view reviewed, std::string_view rig,
-                         std::string_view limits, std::string_view weights) {
+                         std::string_view limits, std::string_view weights,
+                         const std::vector<std::string>& configurations = {}) {
     std::ostringstream out;
     out.imbue(std::locale::classic());
-    out << "CARTO_ACCEPTED_AUTORIG_BUNDLE 1\n" << "REVIEW " << std::quoted(std::string(reviewed))
+    out << "CARTO_ACCEPTED_AUTORIG_BUNDLE " << (configurations.empty() ? 1 : 2)
+        << "\nREVIEW " << std::quoted(std::string(reviewed))
         << "\nRIG " << std::quoted(std::string(rig)) << "\nLIMITS " << std::quoted(std::string(limits))
-        << "\nWEIGHTS " << std::quoted(std::string(weights)) << "\nEND\n";
+        << "\nWEIGHTS " << std::quoted(std::string(weights)) << '\n';
+    if (!configurations.empty()) {
+        out << "IK_FK " << configurations.size() << '\n';
+        for (const auto& config : configurations) out << "CHAIN " << std::quoted(config) << '\n';
+    }
+    out << "END\n";
     return out.str();
+}
+
+core::Result<void> check_ik_fk(const AcceptedAutorigBundle& bundle) {
+    if (bundle.ik_fk.size() > AcceptedAutorigBundle::kMaxIkFkChains)
+        return core::Result<void>::failure(parse_error("too many IK/FK configurations"));
+    if (bundle.ik_fk.empty()) return core::Result<void>::success();
+    auto graph = kinematic::KinematicGraph::deserialize(bundle.reviewed.graph_bytes);
+    if (!graph) return core::Result<void>::failure(graph.error());
+    auto rig_bytes = character::serialize_rig_definition(bundle.rig);
+    if (!rig_bytes) return core::Result<void>::failure(rig_bytes.error());
+    const std::size_t per_chain = bundle.reviewed.graph_bytes.size() +
+        rig_bytes.value().size() + bundle.limits.serialize().size();
+    if (per_chain > AcceptedAutorigBundle::kMaxIkFkValidationBytes / bundle.ik_fk.size())
+        return core::Result<void>::failure(parse_error("IK/FK validation work exceeds its byte budget"));
+    std::optional<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>> previous;
+    std::set<character::ControlId> assigned_controls;
+    for (const auto& config : bundle.ik_fk) {
+        const auto key = std::tuple{config.chain.root.value, config.chain.mid.value, config.chain.effector.value};
+        if (previous && *previous >= key)
+            return core::Result<void>::failure(parse_error("IK/FK chains must be sorted and unique"));
+        for (const auto control : {config.fk_root, config.fk_mid, config.fk_effector,
+                                   config.ik_target, config.mode_control}) {
+            if (!assigned_controls.insert(control).second)
+                return core::Result<void>::failure(parse_error("IK/FK chains cannot share controls without arbitration"));
+        }
+        if (config.ik_pole && !assigned_controls.insert(*config.ik_pole).second)
+            return core::Result<void>::failure(parse_error("IK/FK chains cannot share controls without arbitration"));
+        previous = key;
+    }
+    return pose::validate_ik_fk_authoring_set(bundle.ik_fk, bundle.rig, graph.value(), bundle.limits);
 }
 }
 core::Result<std::string> make_accepted_autorig_bundle(
@@ -859,13 +896,28 @@ core::Result<AcceptedAutorigBundle> decode_bundle(std::string_view bytes) {
     in.imbue(std::locale::classic());
     std::string token, reviewed_text, rig_text, limits_text, weights_text, trailing;
     unsigned version = 0;
-    if (!(in >> token >> version) || token != "CARTO_ACCEPTED_AUTORIG_BUNDLE" || version != 1 ||
+    if (!(in >> token >> version) || token != "CARTO_ACCEPTED_AUTORIG_BUNDLE" || (version != 1 && version != 2) ||
         !(in >> token >> std::quoted(reviewed_text)) || token != "REVIEW" ||
         !(in >> token >> std::quoted(rig_text)) || token != "RIG" ||
         !(in >> token >> std::quoted(limits_text)) || token != "LIMITS" ||
-        !(in >> token >> std::quoted(weights_text)) || token != "WEIGHTS" ||
-        !(in >> token) || token != "END" || (in >> trailing) ||
-        bundle_bytes(reviewed_text, rig_text, limits_text, weights_text) != bytes)
+        !(in >> token >> std::quoted(weights_text)) || token != "WEIGHTS")
+        return Result::failure(parse_error("malformed or noncanonical accepted autorig bundle"));
+    std::vector<std::string> configuration_texts;
+    if (version == 2) {
+        std::size_t count = 0;
+        if (!(in >> token >> count) || token != "IK_FK" || count == 0 ||
+            count > AcceptedAutorigBundle::kMaxIkFkChains)
+            return Result::failure(parse_error("invalid IK/FK configuration count"));
+        for (std::size_t i = 0; i < count; ++i) {
+            std::string config;
+            if (!(in >> token >> std::quoted(config)) || token != "CHAIN" ||
+                config.size() > pose::IkFkAuthoring::kMaxSerializedBytes)
+                return Result::failure(parse_error("invalid IK/FK configuration frame"));
+            configuration_texts.push_back(std::move(config));
+        }
+    }
+    if (!(in >> token) || token != "END" || (in >> trailing) ||
+        bundle_bytes(reviewed_text, rig_text, limits_text, weights_text, configuration_texts) != bytes)
         return Result::failure(parse_error("malformed or noncanonical accepted autorig bundle"));
     auto reviewed = character::AcceptedAutorigGraphRecord::deserialize(reviewed_text);
     auto rig = character::deserialize_rig_definition(rig_text);
@@ -875,8 +927,15 @@ core::Result<AcceptedAutorigBundle> decode_bundle(std::string_view bytes) {
         return Result::failure(parse_error("invalid accepted autorig bundle component"));
     if (auto checked = check_components(reviewed.value(), rig.value(), limits.value(), transferred.value()); !checked)
         return Result::failure(checked.error());
-    return Result::success({std::move(reviewed.value()), std::move(rig.value()),
-                            std::move(limits.value()), std::move(transferred.value())});
+    AcceptedAutorigBundle bundle{std::move(reviewed.value()), std::move(rig.value()),
+                                 std::move(limits.value()), std::move(transferred.value()), {}};
+    for (const auto& text : configuration_texts) {
+        auto config = pose::IkFkAuthoring::deserialize(text);
+        if (!config) return Result::failure(config.error());
+        bundle.ik_fk.push_back(std::move(config.value()));
+    }
+    if (auto checked = check_ik_fk(bundle); !checked) return Result::failure(checked.error());
+    return Result::success(std::move(bundle));
 }
 core::Result<void> validate_accepted_autorig_bundle(std::string_view bytes) {
     auto decoded = decode_bundle(bytes);
@@ -891,6 +950,7 @@ core::Result<void> validate_accepted_autorig_current(
     const ProjectDocument& document, const AcceptedAutorigBundle& bundle) {
     if (auto checked = detail::check_components(bundle.reviewed, bundle.rig, bundle.limits, bundle.weights); !checked)
         return checked;
+    if (auto checked = detail::check_ik_fk(bundle); !checked) return checked;
     const auto& acceptance = bundle.reviewed.acceptance;
     const auto mesh = document.meshes().find(acceptance.source.asset_id);
     if (mesh == document.meshes().end() || mesh->second.revision() != acceptance.mesh_revision)
@@ -907,6 +967,26 @@ core::Result<void> validate_accepted_autorig_current(
             return core::Result<void>::failure(Diagnostic(ErrorCode::stale_data, "accepted skin target vertex is absent"));
     }
     return core::Result<void>::success();
+}
+
+core::Result<std::string> prepare_autorig_ik_fk_configuration(
+    const ProjectDocument& document, const AcceptedAutorigBundle& bundle,
+    const std::vector<pose::IkFkAuthoring>& configurations) {
+    using Result = core::Result<std::string>;
+    if (auto checked = validate_accepted_autorig_current(document, bundle); !checked)
+        return Result::failure(checked.error());
+    AcceptedAutorigBundle updated = bundle;
+    updated.ik_fk = configurations;
+    if (auto checked = detail::check_ik_fk(updated); !checked) return Result::failure(checked.error());
+    auto rig = character::serialize_rig_definition(updated.rig);
+    if (!rig) return Result::failure(rig.error());
+    std::vector<std::string> records;
+    for (const auto& config : updated.ik_fk) records.push_back(config.serialize());
+    auto bytes = detail::bundle_bytes(updated.reviewed.serialize(), rig.value(),
+        updated.limits.serialize(), updated.weights.serialize(), records);
+    if (bytes.size() > kMaxAcceptedAutorigBytes)
+        return Result::failure(parse_error("accepted autorig bundle exceeds its size limit"));
+    return Result::success(std::move(bytes));
 }
 
 
@@ -8497,6 +8577,7 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
             total += static_cast<std::uint64_t>(bytes.size());
             auto digest = assets::Sha256Digest::from_hex(hex);
             if (!digest || digest.value().is_zero() ||
+                (version.value() < 37U && !bytes.starts_with("CARTO_ACCEPTED_AUTORIG_BUNDLE 1\n")) ||
                 !bind_opaque_record(bytes, digest.value(), "accepted autorig") ||
                 !detail::validate_accepted_autorig_bundle(bytes) ||
                 !document.accepted_autorigs_.emplace(identity, SerializedAcceptedAutorig{

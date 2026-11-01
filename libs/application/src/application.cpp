@@ -978,6 +978,107 @@ core::Result<DispatchReceipt> HumanApplicationAccess::commit_mesh_cleanup(
     return session.commit_mesh_cleanup(HumanActionAdmission{}, review, std::move(justification));
 }
 
+core::Result<DispatchReceipt> HumanApplicationAccess::commit_autorig(
+    ApplicationSession& session, const AcceptAutorigRequest& request) {
+    return session.commit_autorig(HumanActionAdmission{}, request);
+}
+
+core::Result<DispatchReceipt> HumanApplicationAccess::configure_autorig_ik_fk(
+    ApplicationSession& session, const ConfigureAutorigIkFkRequest& request) {
+    return session.configure_autorig_ik_fk(HumanActionAdmission{}, request);
+}
+
+core::Result<DispatchReceipt> ApplicationSession::commit_autorig(
+    HumanActionAdmission, const AcceptAutorigRequest& request) {
+    if (active_source_ != OperationSource::human)
+        return failure(invalid_state("autorig acceptance requires the human boundary"));
+    if (request.expected_project_generation != project_generation_ ||
+        request.expected_project_revision != document_.revision())
+        return failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "autorig acceptance belongs to a different project state"));
+    if (request.identity.empty() || request.identity.size() > 128U)
+        return failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "autorig identity exceeds its bound"));
+    auto bytes = project::prepare_accepted_autorig_bundle(
+        document_, request.analysis, request.candidates, request.acceptance, request.nodes,
+        request.rig, request.limits, request.source_binding, request.source_layer,
+        request.correspondence, request.joint_map, request.transfer_options,
+        request.locks ? &*request.locks : nullptr);
+    if (!bytes) return failure(bytes.error().with_context("prepare autorig acceptance"));
+    const auto* data = reinterpret_cast<const std::uint8_t*>(bytes.value().data());
+    const auto digest = assets::sha256(std::span<const std::uint8_t>(data, bytes.value().size()));
+    project::ProjectDocument candidate = document_;
+    const auto staged = candidate.set_accepted_autorig(
+        request.identity, request.expected_record_revision, std::move(bytes.value()), digest);
+    if (!staged) return failure(staged.error().with_context("stage autorig acceptance"));
+    if (candidate.revision() == document_.revision())
+        return accepted("Accept AutoRig", document_.revision());
+    editor::ProjectCommandAdmission admission;
+    return execute_command(std::make_unique<editor::ReplaceProjectDocumentCommand>(
+        admission, document_, std::move(candidate), "Accept AutoRig"), "Accept AutoRig");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::configure_autorig_ik_fk(
+    HumanActionAdmission, const ConfigureAutorigIkFkRequest& request) {
+    if (active_source_ != OperationSource::human)
+        return failure(invalid_state("IK/FK configuration requires the human boundary"));
+    auto current = accepted_autorig(request.identity, request.expected_project_generation,
+                                   request.expected_project_revision);
+    if (!current) return failure(current.error().with_context("configure autorig IK/FK"));
+    auto bytes = project::prepare_autorig_ik_fk_configuration(document_, current.value().bundle, request.configurations);
+    if (!bytes) return failure(bytes.error().with_context("prepare autorig IK/FK"));
+    const auto* data = reinterpret_cast<const std::uint8_t*>(bytes.value().data());
+    const auto digest = assets::sha256(std::span<const std::uint8_t>(data, bytes.value().size()));
+    project::ProjectDocument candidate = document_;
+    const auto staged = candidate.set_accepted_autorig(
+        request.identity, request.expected_record_revision, std::move(bytes.value()), digest);
+    if (!staged) return failure(staged.error().with_context("stage autorig IK/FK"));
+    if (candidate.revision() == document_.revision())
+        return accepted("Configure AutoRig IK/FK", document_.revision());
+    editor::ProjectCommandAdmission admission;
+    return execute_command(std::make_unique<editor::ReplaceProjectDocumentCommand>(
+        admission, document_, std::move(candidate), "Configure AutoRig IK/FK"),
+        "Configure AutoRig IK/FK");
+}
+
+core::Result<AcceptedAutorigView> ApplicationSession::accepted_autorig(
+    std::string_view identity, std::uint64_t expected_generation,
+    core::Revision expected_revision) const {
+    using Result = core::Result<AcceptedAutorigView>;
+    if (expected_generation != project_generation_ || expected_revision != document_.revision())
+        return Result::failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "autorig read belongs to a different project state"));
+    if (identity.empty() || identity.size() > 128U)
+        return Result::failure(core::Diagnostic(core::ErrorCode::invalid_argument,
+            "autorig identity exceeds its bound"));
+    const auto found = document_.accepted_autorigs().find(std::string(identity));
+    if (found == document_.accepted_autorigs().end())
+        return Result::failure(core::Diagnostic(core::ErrorCode::not_found,
+            "accepted autorig is absent"));
+    auto bundle = project::decode_accepted_autorig_bundle(found->second.bytes);
+    if (!bundle) return Result::failure(bundle.error());
+    if (auto ready = project::validate_accepted_autorig_current(document_, bundle.value()); !ready)
+        return Result::failure(ready.error());
+    return Result::success({found->second.revision, std::move(bundle.value())});
+}
+
+core::Result<pose::IkFkSwitchProposal> ApplicationSession::propose_autorig_ik_fk_switch(
+    std::string_view identity, std::uint64_t expected_generation,
+    core::Revision expected_revision, std::size_t chain_index,
+    pose::IkFkMode target_mode, const pose::LocalPose& locals,
+    const std::optional<pose::IkControlState>& world_ik) const {
+    using Result = core::Result<pose::IkFkSwitchProposal>;
+    auto bundle = accepted_autorig(identity, expected_generation, expected_revision);
+    if (!bundle) return Result::failure(bundle.error());
+    if (chain_index >= bundle.value().bundle.ik_fk.size())
+        return Result::failure(core::Diagnostic(core::ErrorCode::not_found,
+            "autorig IK/FK chain is absent"));
+    auto graph = kinematic::KinematicGraph::deserialize(bundle.value().bundle.reviewed.graph_bytes);
+    if (!graph) return Result::failure(graph.error());
+    return pose::propose_ik_fk_switch(bundle.value().bundle.ik_fk[chain_index], bundle.value().bundle.rig,
+        graph.value(), bundle.value().bundle.limits, target_mode, locals, world_ik);
+}
+
 core::Result<MeshCleanupReview> ApplicationSession::review_mesh_cleanup(
     scene::ObjectId object_id, std::vector<geometry::VertexId> candidates,
     MeshCleanupOptions options) const {

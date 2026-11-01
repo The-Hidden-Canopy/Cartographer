@@ -7,6 +7,7 @@
 #include <carto/character/autorig_graph.hpp>
 #include <carto/character/definition.hpp>
 #include <carto/kinematic/limits.hpp>
+#include <carto/pose/ik_fk_authoring.hpp>
 #include <carto/weights/transfer.hpp>
 
 #include <cstdint>
@@ -140,6 +141,11 @@ public:
         const weights::JointTransferMap& joint_map,
         const weights::WeightTransferOptions& options,
         const weights::WeightLocks* locks = nullptr);
+    // CAS-replaces only explicitly authored IK/FK configuration on a current
+    // accepted bundle. An empty vector clears it and returns to v1 encoding.
+    [[nodiscard]] core::Result<core::Revision> configure_autorig_ik_fk(
+        std::string identity, core::Revision expected_revision,
+        const std::vector<pose::IkFkAuthoring>& configurations);
     [[nodiscard]] core::Result<void> append_weight_edit_receipt(
         std::string serialized_receipt,
         assets::Sha256Digest digest);

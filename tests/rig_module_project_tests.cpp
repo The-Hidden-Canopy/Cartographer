@@ -199,15 +199,15 @@ void rig_module_library_is_transactional_revisioned_and_migrates() {
     const auto v30_standards_end = schema_v30.find('\n', v30_standards);
     schema_v30.erase(v30_standards, v30_standards_end - v30_standards + 1U);
     erase_v33_character_record_tables(schema_v30);
-    schema_v30.replace(0U, std::string("CARTOGRAPHER_PROJECT 36\n").size(),
+    schema_v30.replace(0U, std::string("CARTOGRAPHER_PROJECT 37\n").size(),
         "CARTOGRAPHER_PROJECT 30\n");
     const auto migrated_v30 = project::ProjectDocument::deserialize(schema_v30);
     require(migrated_v30 && migrated_v30.value().decal_placements().empty() &&
             migrated_v30.value().authoring_standards().empty() &&
-            migrated_v30.value().serialize().find("CARTOGRAPHER_PROJECT 36\n") == 0U &&
+            migrated_v30.value().serialize().find("CARTOGRAPHER_PROJECT 37\n") == 0U &&
             migrated_v30.value().serialize().find("DECAL_PLACEMENTS 0\n") !=
                 std::string::npos,
-        "schema v30 migrates to v36 with empty decal, standards, and character record tables");
+        "schema v30 migrates to v37 with empty decal, standards, and character record tables");
 
     std::string schema_v29 = project::ProjectDocument{}.serialize();
     const auto table = schema_v29.rfind("RIG_MODULE_TEMPLATES 0\n");
@@ -226,17 +226,17 @@ void rig_module_library_is_transactional_revisioned_and_migrates() {
     erase_v33_character_record_tables(schema_v29);
     const auto header_end = schema_v29.find('\n');
     require(header_end != std::string::npos && schema_v29.substr(0U, header_end) ==
-                "CARTOGRAPHER_PROJECT 36",
+                "CARTOGRAPHER_PROJECT 37",
         "fixture begins at the expected current schema");
     schema_v29.replace(0U, header_end, "CARTOGRAPHER_PROJECT 29");
     const auto migrated = project::ProjectDocument::deserialize(schema_v29);
     require(migrated && migrated.value().rig_module_templates().empty() &&
             migrated.value().decal_placements().empty() &&
             migrated.value().authoring_standards().empty() &&
-            migrated.value().serialize().find("CARTOGRAPHER_PROJECT 36\n") == 0U &&
+            migrated.value().serialize().find("CARTOGRAPHER_PROJECT 37\n") == 0U &&
             migrated.value().serialize().find("RIG_MODULE_TEMPLATES 0\n") !=
                 std::string::npos,
-        "schema v29 migrates to v36 with empty module, decal, standards, and character record tables");
+        "schema v29 migrates to v37 with empty module, decal, standards, and character record tables");
 }
 
 } // namespace

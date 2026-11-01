@@ -47,6 +47,16 @@ record for undo.
   position jump and refuse a switch above the requested bound. Two-bone IK
   does not solve effector orientation, so the effector rotation jump is
   reported, not enforced.
+- **Explicit IK/FK authoring and proposals**
+  (`carto/pose/ik_fk_authoring.hpp`). The in-progress follow-on records a
+  caller-authored contiguous two-bone chain, FK controls, IK target and
+  optional pole controls, mode axis and values, and deterministic solver
+  settings pinned to the exact rig, graph and limits. The proposal API
+  returns a suggested mode value and matched pose data; it does not apply
+  control values or key a switch. It requires the default coordinate policy
+  and refuses posed ancestors outside the chain. Position discontinuity is
+  bounded; effector orientation discontinuity is reported, not enforced.
+  Separate proposals do not arbitrate simultaneous constraints or chains.
 - **Pose library** (`carto/pose/pose_library.hpp`). The library stores named
   local poses with a canonical digest. `apply_library_pose` blends a stored
   pose in by weight, optionally limited by a joint mask. `mirror_pose` swaps
@@ -175,3 +185,45 @@ has no delete API or native editor workflow yet.
   complete persistent IK/FK setup or a native editor workflow. See
   [schema v36](../format/cartographer-project-v36.md) and the
   [handoff](../verification/autorig-durable-handoff-20261031.md).
+- The in-progress schema-v37 follow-on preserves v36 bundle-v1 data and adds
+  bounded, explicitly authored IK/FK chain records in nested bundle v2.
+  Configuration is revision checked, and the human application command uses
+  project history; reads check the current source mesh before returning a
+  bundle. External source digests and binding provenance remain caller
+  assertions. A v36 reader cannot read a v37 project, and a v1-only nested
+  reader cannot read v2. See [schema v37](../format/cartographer-project-v37.md)
+  and the [follow-on handoff](../verification/autorig-ik-fk-follow-on-handoff.md).
+  This source work does not establish native workflow or runtime acceptance.
+
+## Required workflow and remaining gates
+
+The character-production mandate is an artist-controlled path from source
+mesh and optional semantic evidence through analysis, alternatives and
+review, to a source-bound rig, editable skinning and animation, and finally
+validated runtime use. The intended autorig chain starts with topology,
+components, geodesics and symmetry (`AUT-001`), generates and ranks
+alternative hypotheses (`AUT-002`), admits provenance-bearing optional
+landmarks and partonomy (`AUT-003`), and presents preview, locks, edits and
+replanning without project mutation until human acceptance (`AUT-004`).
+Unfamiliar and unriggable inputs must retain ambiguity or refusal (`AUT-005`).
+Mechanical joint kinds, axes and limits must be authored or supported by
+evidence; shape alone does not establish a physical constraint. Manual
+construction remains a supported fallback.
+
+Representation and interaction remain separate gates. The local ledger groups
+`RIG-004/005` around rest symmetry, declared control copies, and reusable
+templates that can be instantiated, edited and migrated without overwriting
+author work; `RIG-006` requires mixed rigid/organic articulation,
+a multi-link fixture and non-skin export. `SKN-003` and `UI-002` require
+native paint, locks and heatmap interaction with undo/reopen; `SKN-004`
+requires certified transfer with seam ambiguity and failure reports. An
+internal sparse transfer record does not by itself meet those gates.
+
+The local `IK-004` gate is no-pose-jump matching; editable poles, aim, spaces
+and native switching remain broader product requirements. `ANI-002` and `UI-003` require human key, tangent
+and retime editing with undo, visual proof and correct pose while scrubbing.
+The current two-bone proposal does not implement the complete control-space,
+orientation, simultaneous-constraint, timeline or runtime behavior. The
+full independent asset corpus, native interaction, undo/reopen, visual and
+external-runtime acceptance remain open; component suites are not equivalent
+to those gates.

@@ -387,31 +387,39 @@ void character_records_are_transactional_digest_bound_and_persist() {
 }
 
 void character_record_tables_migrate_from_v32() {
-    const auto empty_v36 = project::ProjectDocument::deserialize(
+    const auto empty_v37 = project::ProjectDocument::deserialize(
         project::ProjectDocument{}.serialize());
-    require(empty_v36 && empty_v36.value().pose_libraries().empty() &&
-            empty_v36.value().kinematic_graphs().empty() &&
-            empty_v36.value().weight_edit_receipts().empty() &&
-            empty_v36.value().curve_edit_receipts().empty(),
-        "an empty schema v36 document round-trips through its mandatory tables");
+    require(empty_v37 && empty_v37.value().pose_libraries().empty() &&
+            empty_v37.value().kinematic_graphs().empty() &&
+            empty_v37.value().weight_edit_receipts().empty() &&
+            empty_v37.value().curve_edit_receipts().empty(),
+        "an empty schema v37 document round-trips through its mandatory tables");
+
+    std::string schema_v36 = project::ProjectDocument{}.serialize();
+    schema_v36.replace(0U, std::string("CARTOGRAPHER_PROJECT 37\n").size(),
+        "CARTOGRAPHER_PROJECT 36\n");
+    const auto migrated_v36 = project::ProjectDocument::deserialize(schema_v36);
+    require(migrated_v36 && migrated_v36.value().accepted_autorigs().empty() &&
+            migrated_v36.value().serialize().starts_with("CARTOGRAPHER_PROJECT 37\n"),
+        "schema v36 with its accepted-autorig table migrates to v37");
 
     std::string schema_v35 = project::ProjectDocument{}.serialize();
     const std::string accepted_table = "ACCEPTED_AUTORIGS 0\n";
     const auto v35_accepted_table = schema_v35.find(accepted_table);
     require(v35_accepted_table != std::string::npos, "current serialization carries the accepted autorig table");
     schema_v35.erase(v35_accepted_table, accepted_table.size());
-    schema_v35.replace(0U, std::string("CARTOGRAPHER_PROJECT 36\n").size(),
+    schema_v35.replace(0U, std::string("CARTOGRAPHER_PROJECT 37\n").size(),
         "CARTOGRAPHER_PROJECT 35\n");
     const auto migrated_v35 = project::ProjectDocument::deserialize(schema_v35);
-    require(migrated_v35 && migrated_v35.value().serialize().starts_with("CARTOGRAPHER_PROJECT 36\n") &&
+    require(migrated_v35 && migrated_v35.value().serialize().starts_with("CARTOGRAPHER_PROJECT 37\n") &&
             migrated_v35.value().serialize().find(accepted_table) != std::string::npos,
         "schema v35 migrates with an empty accepted autorig table");
     std::string missing_accepted = project::ProjectDocument{}.serialize();
     missing_accepted.erase(missing_accepted.find(accepted_table), accepted_table.size());
     require(!project::ProjectDocument::deserialize(missing_accepted),
-        "schema v36 without its accepted autorig table fails closed");
+        "schema v37 without its accepted autorig table fails closed");
     std::string mislabeled_v35 = project::ProjectDocument{}.serialize();
-    mislabeled_v35.replace(0U, std::string("CARTOGRAPHER_PROJECT 36\n").size(),
+    mislabeled_v35.replace(0U, std::string("CARTOGRAPHER_PROJECT 37\n").size(),
         "CARTOGRAPHER_PROJECT 35\n");
     require(!project::ProjectDocument::deserialize(mislabeled_v35),
         "schema v35 cannot carry the schema v36 accepted autorig table");
@@ -423,7 +431,7 @@ void character_record_tables_migrate_from_v32() {
     missing_graph_table.erase(mandatory_graph_table,
         std::string("KINEMATIC_GRAPHS 0\n").size());
     require(!project::ProjectDocument::deserialize(missing_graph_table),
-        "schema v36 without its kinematic graph table fails closed");
+        "schema v37 without its kinematic graph table fails closed");
 
     std::string schema_v34 = project::ProjectDocument{}.serialize();
     const auto v34_graph_table = schema_v34.rfind("KINEMATIC_GRAPHS 0\n");
@@ -431,16 +439,16 @@ void character_record_tables_migrate_from_v32() {
         "current serialization carries the mandatory kinematic graph table");
     schema_v34.erase(v34_graph_table, std::string("KINEMATIC_GRAPHS 0\n").size());
     schema_v34.erase(schema_v34.find(accepted_table), accepted_table.size());
-    schema_v34.replace(0U, std::string("CARTOGRAPHER_PROJECT 36\n").size(),
+    schema_v34.replace(0U, std::string("CARTOGRAPHER_PROJECT 37\n").size(),
         "CARTOGRAPHER_PROJECT 34\n");
     const auto migrated_v34 = project::ProjectDocument::deserialize(schema_v34);
     require(migrated_v34 && migrated_v34.value().kinematic_graphs().empty() &&
-            migrated_v34.value().serialize().find("CARTOGRAPHER_PROJECT 36\n") == 0U,
-        "schema v34 migrates to v36 with an empty kinematic graph table");
+            migrated_v34.value().serialize().find("CARTOGRAPHER_PROJECT 37\n") == 0U,
+        "schema v34 migrates to v37 with an empty kinematic graph table");
 
     std::string mislabeled_graph = project::ProjectDocument{}.serialize();
     mislabeled_graph.erase(mislabeled_graph.find(accepted_table), accepted_table.size());
-    mislabeled_graph.replace(0U, std::string("CARTOGRAPHER_PROJECT 36\n").size(),
+    mislabeled_graph.replace(0U, std::string("CARTOGRAPHER_PROJECT 37\n").size(),
         "CARTOGRAPHER_PROJECT 34\n");
     require(!project::ProjectDocument::deserialize(mislabeled_graph),
         "schema v34 cannot carry schema v35 kinematic graph records");
@@ -463,21 +471,21 @@ void character_record_tables_migrate_from_v32() {
         "current serialization carries the mandatory kinematic graph table");
     schema_v32.erase(graph_table, std::string("KINEMATIC_GRAPHS 0\n").size());
     schema_v32.erase(schema_v32.find(accepted_table), accepted_table.size());
-    schema_v32.replace(0U, std::string("CARTOGRAPHER_PROJECT 36\n").size(),
+    schema_v32.replace(0U, std::string("CARTOGRAPHER_PROJECT 37\n").size(),
         "CARTOGRAPHER_PROJECT 32\n");
     const auto migrated = project::ProjectDocument::deserialize(schema_v32);
     require(migrated && migrated.value().pose_libraries().empty() &&
             migrated.value().kinematic_graphs().empty() &&
             migrated.value().weight_edit_receipts().empty() &&
             migrated.value().curve_edit_receipts().empty() &&
-            migrated.value().serialize().find("CARTOGRAPHER_PROJECT 36\n") == 0U &&
+            migrated.value().serialize().find("CARTOGRAPHER_PROJECT 37\n") == 0U &&
             migrated.value().serialize().find("POSE_LIBRARIES 0\n") != std::string::npos,
-        "schema v32 migrates to v36 with empty character record tables");
+        "schema v32 migrates to v37 with empty character record tables");
 
     std::string fenced = project::ProjectDocument{}.serialize();
     const auto header_end = fenced.find('\n');
     require(header_end != std::string::npos && fenced.substr(0U, header_end) ==
-                "CARTOGRAPHER_PROJECT 36",
+                "CARTOGRAPHER_PROJECT 37",
         "fixture begins at the expected current schema");
     fenced.replace(0U, header_end, "CARTOGRAPHER_PROJECT 32");
     require(!project::ProjectDocument::deserialize(fenced),

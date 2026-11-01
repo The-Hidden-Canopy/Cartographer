@@ -1,4 +1,5 @@
 #include <carto/project/transaction.hpp>
+#include <carto/project/accepted_autorig.hpp>
 #include "accepted_autorig_internal.hpp"
 
 #include <algorithm>
@@ -350,8 +351,8 @@ core::Result<core::Revision> ProjectTransaction::set_kinematic_graph(
         std::move(identity), expected_revision, std::move(serialized_graph), digest);
 }
 
-core::Result<core::Revision> ProjectTransaction::accept_autorig(
-    std::string identity, core::Revision expected_revision,
+core::Result<std::string> prepare_accepted_autorig_bundle(
+    const ProjectDocument& document,
     const character::AutorigAnalysisRequest& request,
     const character::AutorigCandidateSet& candidates,
     const character::AutorigReviewAcceptance& acceptance,
@@ -364,10 +365,9 @@ core::Result<core::Revision> ProjectTransaction::accept_autorig(
     const weights::JointTransferMap& joint_map,
     const weights::WeightTransferOptions& options,
     const weights::WeightLocks* locks) {
-    using Result = core::Result<core::Revision>;
-    if (auto active = ensure_active(); !active) return Result::failure(active.error());
-    const auto mesh = staged_.meshes().find(acceptance.source.asset_id);
-    if (mesh == staged_.meshes().end())
+    using Result = core::Result<std::string>;
+    const auto mesh = document.meshes().find(acceptance.source.asset_id);
+    if (mesh == document.meshes().end())
         return Result::failure(stale("accepted autorig source mesh is absent from the staged project"));
     if (options.output_mesh_asset != acceptance.source.asset_id ||
         options.output_mesh_digest != acceptance.source.content_digest)
@@ -386,12 +386,50 @@ core::Result<core::Revision> ProjectTransaction::accept_autorig(
                                                 joint_map, options, locks);
     if (!transfer) return Result::failure(transfer.error());
     weights::TransferredWeightRecord record{std::move(transfer.value())};
-    auto bundle = detail::make_accepted_autorig_bundle(reviewed.value(), rig, limits, record);
+    return detail::make_accepted_autorig_bundle(reviewed.value(), rig, limits, record);
+}
+
+core::Result<core::Revision> ProjectTransaction::accept_autorig(
+    std::string identity, core::Revision expected_revision,
+    const character::AutorigAnalysisRequest& request,
+    const character::AutorigCandidateSet& candidates,
+    const character::AutorigReviewAcceptance& acceptance,
+    const std::vector<character::AutorigFinalNode>& nodes,
+    const character::RigDefinition& rig,
+    const kinematic::JointLimitSet& limits,
+    const kinematic::SkinBinding& source_binding,
+    const character::SkinWeightLayer& source_layer,
+    const weights::WeightCorrespondence& correspondence,
+    const weights::JointTransferMap& joint_map,
+    const weights::WeightTransferOptions& options,
+    const weights::WeightLocks* locks) {
+    using Result = core::Result<core::Revision>;
+    if (auto active = ensure_active(); !active) return Result::failure(active.error());
+    auto bundle = prepare_accepted_autorig_bundle(staged_, request, candidates, acceptance,
+        nodes, rig, limits, source_binding, source_layer, correspondence, joint_map, options, locks);
     if (!bundle) return Result::failure(bundle.error());
     const auto* ptr = reinterpret_cast<const std::uint8_t*>(bundle.value().data());
     auto digest = assets::sha256(std::span<const std::uint8_t>(ptr, bundle.value().size()));
     return staged_.set_accepted_autorig(std::move(identity), expected_revision,
                                        std::move(bundle.value()), digest);
+}
+
+core::Result<core::Revision> ProjectTransaction::configure_autorig_ik_fk(
+    std::string identity, core::Revision expected_revision,
+    const std::vector<pose::IkFkAuthoring>& configurations) {
+    using Result = core::Result<core::Revision>;
+    if (auto active = ensure_active(); !active) return Result::failure(active.error());
+    const auto current = staged_.accepted_autorigs().find(identity);
+    if (current == staged_.accepted_autorigs().end() || current->second.revision != expected_revision)
+        return Result::failure(stale("accepted autorig is absent or its revision changed"));
+    auto decoded = decode_accepted_autorig_bundle(current->second.bytes);
+    if (!decoded) return Result::failure(decoded.error());
+    auto bytes = prepare_autorig_ik_fk_configuration(staged_, decoded.value(), configurations);
+    if (!bytes) return Result::failure(bytes.error());
+    const auto* ptr = reinterpret_cast<const std::uint8_t*>(bytes.value().data());
+    const auto digest = assets::sha256(std::span<const std::uint8_t>(ptr, bytes.value().size()));
+    return staged_.set_accepted_autorig(std::move(identity), expected_revision,
+                                       std::move(bytes.value()), digest);
 }
 
 core::Result<void> ProjectTransaction::append_weight_edit_receipt(

@@ -40,10 +40,10 @@ target_link_libraries(carto_project
         carto_core carto_scene carto_geometry carto_assets carto_connection carto_surface_core
         carto_biological carto_spatial_field carto_condition_authoring
         carto_engineering carto_render carto_scientific carto_world
-        carto_journal carto_eval carto_character carto_weights
+        carto_journal carto_eval carto_character carto_weights carto_pose
     PRIVATE
         CartoSQLite3 carto_mesh_attributes
-        carto_pose carto_motion
+        carto_motion
 )
 carto_target(carto_project)
 

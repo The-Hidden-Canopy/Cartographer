@@ -5,6 +5,7 @@ add_library(carto_pose STATIC
     src/fk.cpp
     src/ik.cpp
     src/ik_fk_match.cpp
+    src/ik_fk_authoring.cpp
     src/pose_library.cpp
     src/rotation.cpp
 )
