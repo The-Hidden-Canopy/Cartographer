@@ -1947,6 +1947,11 @@ target_link_libraries(cartographer_uv_relax_tests PRIVATE carto_production)
 carto_target(cartographer_uv_relax_tests)
 add_test(NAME cartographer_uv_relax_tests COMMAND cartographer_uv_relax_tests)
 
+add_executable(cartographer_cad_extraction_adapter_tests cad_extraction_adapter_tests.cpp)
+target_link_libraries(cartographer_cad_extraction_adapter_tests PRIVATE carto_engineering)
+carto_target(cartographer_cad_extraction_adapter_tests)
+add_test(NAME cartographer_cad_extraction_adapter_tests COMMAND cartographer_cad_extraction_adapter_tests)
+
 # Keep test-owned temporary files inside the writable build tree. The default
 # Windows temp directory is outside the workspace sandbox in some developer
 # environments, which turns otherwise valid atomic-save/publication tests into

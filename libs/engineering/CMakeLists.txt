@@ -1,6 +1,7 @@
 add_library(carto_engineering STATIC
     src/authoring.cpp
     src/cad_provider.cpp
+    src/cad_extraction_adapter.cpp
     src/drafting.cpp
     src/topology_correspondence.cpp
 )
