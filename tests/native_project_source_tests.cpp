@@ -168,6 +168,7 @@ template<class F> void reject_mesh_tamper(Fixture& fixture, F change, const char
     auto changed = std::make_shared<geometry::CompiledMesh>(*instance.mesh);
     change(*changed);
     check(changed->valid(), "tampered viewport fixture must remain structurally valid");
+    instance.source_revision = changed->source_revision;
     instance.mesh = std::move(changed);
     okay(viewport.upsert(std::move(instance)));
     check(!read_only(fixture.document, [&] {
@@ -193,11 +194,21 @@ void viewport_requires_exact_current_structure() {
           !native_source::verify_project_viewport_face(
               fixture.document, viewport, fixture.first, geometry::FaceId{999U}),
           "wrong shared instance and absent source face refuse");
+    auto incoherent = *viewport.find(fixture.first);
+    incoherent.source_revision = core::Revision{999U};
+    render::RenderScene rejected_view;
+    check(!rejected_view.upsert(std::move(incoherent)),
+          "renderer itself blocks an incoherent instance/mesh revision");
     for (int field = 0; field != 3; ++field) {
         auto changed_view = fixture.viewport();
         auto changed = *changed_view.find(fixture.first);
         if (field == 0) changed.mesh_asset = 999U;
-        if (field == 1) changed.source_revision = core::Revision{999U};
+        if (field == 1) {
+            auto stale_mesh = std::make_shared<geometry::CompiledMesh>(*changed.mesh);
+            stale_mesh->source_revision = core::Revision{999U};
+            changed.source_revision = stale_mesh->source_revision;
+            changed.mesh = std::move(stale_mesh);
+        }
         if (field == 2) changed.world_transform.translation.x += 0.25;
         okay(changed_view.upsert(std::move(changed)));
         check(!read_only(fixture.document, [&] {
