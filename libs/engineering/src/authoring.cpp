@@ -1886,7 +1886,7 @@ core::Result<std::vector<EngineeringBomLine>> reconcile_bom_lines(
 }
 
 core::Result<void> InspectionPackage::validate() const {
-    if (!safe_text(project_namespace) || authoring_digest.is_zero() || authoring_bytes.empty() || authoring_bytes.size() > AuthoringDocument::kMaxSerializedBytes || !safe_text(publication_profile) || publication_digest.is_zero()) return core::Result<void>::failure(validation("inspection package header is malformed"));
+    if (!safe_text(project_namespace) || project_revision.exhausted() || authoring_digest.is_zero() || authoring_bytes.empty() || authoring_bytes.size() > AuthoringDocument::kMaxSerializedBytes || !safe_text(publication_profile) || publication_digest.is_zero()) return core::Result<void>::failure(validation("inspection package header is malformed"));
     const auto authoring = AuthoringDocument::deserialize(authoring_bytes);
     if (!authoring) return core::Result<void>::failure(authoring.error().with_context("inspection package authoring"));
     if (contains_local_path_reference(authoring.value())) {
@@ -1927,6 +1927,9 @@ core::Result<InspectionPackage> InspectionPackage::deserialize(std::string_view 
     if (!(input >> magic >> version) || magic != kPackageMagic || version != kSchemaVersion) return core::Result<InspectionPackage>::failure(parse_error("inspection package header is invalid"));
     InspectionPackage package; std::uint64_t revision = 0U;
     if (!require_record(input, "PROJECT") || !read_text(input, package.project_namespace, false) || !read_uint(input, revision) || !require_record(input, "AUTHORING") || !read_digest(input, package.authoring_digest) || !(input >> std::quoted(package.authoring_bytes)) || package.authoring_bytes.empty() || package.authoring_bytes.size() > AuthoringDocument::kMaxSerializedBytes || !require_record(input, "PROFILE") || !read_text(input, package.publication_profile, false) || !require_record(input, "PRESERVED") || !read_strings(input, package.evidence.preserved) || !require_record(input, "DERIVED") || !read_strings(input, package.evidence.derived) || !require_record(input, "UNSUPPORTED") || !read_strings(input, package.evidence.unsupported) || !require_record(input, "RUNTIME_VALIDATION") || !read_strings(input, package.evidence.runtime_validation) || !require_record(input, "END") || !require_record(input, "PUBLICATION") || !read_digest(input, package.publication_digest)) return core::Result<InspectionPackage>::failure(parse_error("inspection package records are invalid"));
+    std::string trailing;
+    if (input >> trailing) return core::Result<InspectionPackage>::failure(
+        parse_error("inspection package has unrecognized trailing records"));
     package.project_revision = core::Revision(revision);
     if (auto result = package.validate(); !result) return core::Result<InspectionPackage>::failure(result.error().with_context("inspection package deserialize"));
     return core::Result<InspectionPackage>::success(std::move(package));
