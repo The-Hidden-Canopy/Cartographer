@@ -1896,6 +1896,16 @@ core::Result<void> InspectionPackage::validate() const {
     const auto digest = authoring.value().canonical_digest();
     if (!digest || digest.value() != authoring_digest || authoring.value().project_namespace != project_namespace) return core::Result<void>::failure(validation("inspection package authoring digest or namespace does not match"));
     if (auto result = evidence.validate(); !result) return result;
+    // The outer summary is a projection of the reviewed document, not an
+    // independent source allowed to omit unsupported or runtime limitations.
+    const auto& source_evidence = authoring.value().evidence;
+    if (evidence.preserved != source_evidence.preserved ||
+        evidence.derived != source_evidence.derived ||
+        evidence.unsupported != source_evidence.unsupported ||
+        evidence.runtime_validation != source_evidence.runtime_validation) {
+        return core::Result<void>::failure(validation(
+            "inspection package capability evidence differs from its authoring"));
+    }
     if (publication_digest != digest_text(canonical_without_digest())) return core::Result<void>::failure(validation("inspection package publication digest does not bind its bytes"));
     return core::Result<void>::success();
 }
