@@ -14,6 +14,7 @@
 #include <carto/core/revision.hpp>
 #include <carto/kinematic/graph.hpp>
 #include <carto/kinematic/skin.hpp>
+#include <carto/motion/curve.hpp>
 #include <carto/temporal/channel.hpp>
 
 #include <cstddef>
@@ -25,6 +26,29 @@
 #include <vector>
 
 namespace carto::workspace {
+
+// Explicit authoring labels only: they do not prove that a raw control value
+// maps to an IK point/direction or that any mode was evaluated or admitted.
+// Tracks currently admit only exact-tick step curves; other interpolation
+// needs a locale-stable codec and remains unsupported here.
+enum class ControlTrackRole : std::uint8_t { raw_axis, ik_target, ik_pole, ik_fk_mode };
+enum class ControlTrackSpace : std::uint8_t { raw_control_value };
+
+struct ControlAxisTrack {
+    character::ControlId control;
+    std::uint8_t axis = 0U;
+    ControlTrackRole role = ControlTrackRole::raw_axis;
+    ControlTrackSpace space = ControlTrackSpace::raw_control_value;
+    // Historical caller assertions, not authentication or a currentness claim.
+    std::string source_namespace;
+    core::Revision source_revision;
+    std::string reference_frame;
+    assets::Sha256Digest rig_digest;
+    assets::Sha256Digest graph_digest;
+    motion::KeyedCurve curve;
+    assets::Sha256Digest curve_digest;
+    [[nodiscard]] core::Result<void> validate() const;
+};
 
 // One authored attachment: a source mesh pinned by content digest to one
 // joint, with a joint-local offset and a role token. Attachments are keyed and
@@ -112,6 +136,8 @@ struct CharacterSourceBundle {
     static constexpr std::size_t kMaxBakeJobs = 1'024U;
     static constexpr std::size_t kMaxReviewGates = 256U;
     static constexpr std::size_t kMaxGateIdBytes = 128U;
+    static constexpr std::size_t kMaxControlAxisTracks = 1'024U;
+    static constexpr std::size_t kMaxControlAxisTrackBytes = 32U * 1024U * 1024U;
 
     character::CharacterDefinition definition;
     kinematic::KinematicGraph graph;
@@ -120,6 +146,9 @@ struct CharacterSourceBundle {
     std::optional<character::SkinWeightLayer> skin_layer;
     std::optional<character::MotionDocument> motion;
     std::optional<temporal::TemporalChannel> channel;
+    // Sorted, unique (control, axis) raw component tracks. Their source pins
+    // may become historical; consuming them requires explicit current checks.
+    std::vector<ControlAxisTrack> control_axis_tracks;
     // Sorted and unique by morph target id.
     std::vector<character::MorphTarget> morphs;
     // Sorted and unique by (joint, mesh asset id).
@@ -146,7 +175,7 @@ struct CharacterSourceBundle {
 // deterministic document so save/reopen retains the full workspace state.
 class CharacterSourceStore final {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 1U;
+    static constexpr std::uint32_t kSchemaVersion = 2U;
     static constexpr std::size_t kMaxCharacters = 4'096U;
     static constexpr std::size_t kMaxSerializedBytes = 64U * 1024U * 1024U;
 

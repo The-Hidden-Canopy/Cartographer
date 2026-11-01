@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <limits>
+#include <set>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -1018,6 +1020,24 @@ bool sorted_and_unique(const std::vector<T>& values) {
 
 } // namespace
 
+core::Result<void> ControlAxisTrack::validate() const {
+    if (!control || axis >= character::kAxisCount ||
+        role > ControlTrackRole::ik_fk_mode || space != ControlTrackSpace::raw_control_value ||
+        ((role == ControlTrackRole::ik_target || role == ControlTrackRole::ik_pole) && axis >= 3U) ||
+        !record::safe_text(source_namespace, 256U) || source_revision.value() == 0U ||
+        source_revision.exhausted() || !record::safe_text(reference_frame, 256U) ||
+        rig_digest.is_zero() || graph_digest.is_zero())
+        return core::Result<void>::failure(validation("workspace control axis track has invalid identity, role, frame or source pins"));
+    if (auto result = curve.validate(); !result) return result;
+    if (curve.interpolation != motion::InterpolationKind::step)
+        return core::Result<void>::failure(core::Diagnostic(core::ErrorCode::unsupported,
+            "workspace control axis tracks currently support step curves only"));
+    const auto digest = curve.canonical_digest();
+    if (!digest || curve_digest.is_zero() || digest.value() != curve_digest)
+        return core::Result<void>::failure(validation("workspace control axis track curve digest is invalid"));
+    return core::Result<void>::success();
+}
+
 core::Result<void> CharacterSourceBundle::validate() const {
     if (auto result = definition.validate(); !result) return result;
     if (auto result = graph.validate(); !result) return result;
@@ -1062,6 +1082,26 @@ core::Result<void> CharacterSourceBundle::validate() const {
     }
     if (channel.has_value()) {
         if (auto result = channel->validate(); !result) return result;
+    }
+    if (control_axis_tracks.size() > kMaxControlAxisTracks)
+        return core::Result<void>::failure(validation("workspace control axis track count exceeds bound"));
+    std::size_t track_bytes = 0U;
+    std::set<std::uint64_t> curve_ids;
+    for (std::size_t index = 0; index < control_axis_tracks.size(); ++index) {
+        const auto& track = control_axis_tracks[index];
+        if (auto result = track.validate(); !result) return result;
+        const auto* control = rig.control_graph.find(track.control);
+        if (control == nullptr || (control->allowed_axes & (1U << track.axis)) == 0U)
+            return core::Result<void>::failure(validation("workspace control axis track references an absent or disabled control axis"));
+        if (index && std::tie(control_axis_tracks[index - 1].control.value, control_axis_tracks[index - 1].axis) >=
+                     std::tie(track.control.value, track.axis))
+            return core::Result<void>::failure(validation("workspace control axis tracks must be sorted and unique"));
+        if (!curve_ids.insert(track.curve.id.value).second)
+            return core::Result<void>::failure(validation("workspace control axis curve identity is duplicated"));
+        const auto bytes = track.curve.serialize().size();
+        if (bytes > kMaxControlAxisTrackBytes - track_bytes)
+            return core::Result<void>::failure(validation("workspace control axis track bytes exceed bound"));
+        track_bytes += bytes;
     }
     if (morphs.size() > kMaxMorphTargets ||
         !std::is_sorted(morphs.begin(), morphs.end(),
@@ -1157,6 +1197,27 @@ std::string CharacterSourceBundle::serialize() const {
     } else {
         writer.add_raw("channel", "null");
     }
+    std::string tracks_json = "[";
+    bool first_track = true;
+    for (const auto& track : control_axis_tracks) {
+        if (!first_track) tracks_json.push_back(',');
+        first_track = false;
+        codec::ObjectWriter item;
+        item.add("control", track.control.value);
+        item.add("axis", static_cast<std::uint64_t>(track.axis));
+        item.add("role", static_cast<std::uint64_t>(track.role));
+        item.add("space", static_cast<std::uint64_t>(track.space));
+        item.add("source_namespace", track.source_namespace);
+        item.add("source_revision", track.source_revision.value());
+        item.add("reference_frame", track.reference_frame);
+        item.add("rig_digest", track.rig_digest);
+        item.add("graph_digest", track.graph_digest);
+        item.add("curve", track.curve.serialize());
+        item.add("curve_digest", track.curve_digest);
+        tracks_json += std::move(item).finish();
+    }
+    tracks_json.push_back(']');
+    writer.add_raw("control_axis_tracks", tracks_json);
     std::string morphs_json = "[";
     bool first = true;
     for (const character::MorphTarget& morph : morphs) {
@@ -1422,10 +1483,73 @@ core::Result<CharacterSourceBundle> CharacterSourceBundle::deserialize(
         }
         bundle.review_gates.emplace(member.key, parsed_status.value());
     }
+    // Absent only for the legacy bundle representation. The enclosing v2
+    // store requires the member explicitly, including when it is empty.
+    if (codec::find(members.value(), "control_axis_tracks") != nullptr) {
+        const auto tracks = codec::array_member(members.value(), "control_axis_tracks");
+        if (!tracks || tracks.value().size() > kMaxControlAxisTracks)
+            return core::Result<CharacterSourceBundle>::failure(codec::malformed("invalid workspace control axis track table"));
+        std::size_t total = 0U;
+        for (const auto raw : tracks.value()) {
+            const auto item = core::json::parse_object(raw);
+            if (!item) return core::Result<CharacterSourceBundle>::failure(item.error());
+            const auto control = codec::uint_member(item.value(), "control");
+            const auto axis = codec::uint_member(item.value(), "axis");
+            const auto role = codec::uint_member(item.value(), "role");
+            const auto space = codec::uint_member(item.value(), "space");
+            const auto source = codec::string_member(item.value(), "source_namespace");
+            const auto revision = codec::uint_member(item.value(), "source_revision");
+            const auto frame = codec::string_member(item.value(), "reference_frame");
+            const auto rig_pin = codec::digest_member(item.value(), "rig_digest");
+            const auto graph_pin = codec::digest_member(item.value(), "graph_digest");
+            const auto curve_bytes = codec::string_member(item.value(), "curve");
+            const auto curve_digest = codec::digest_member(item.value(), "curve_digest");
+            if (!control || !axis || axis.value() >= character::kAxisCount || !role ||
+                role.value() > static_cast<std::uint64_t>(ControlTrackRole::ik_fk_mode) ||
+                !space || space.value() != static_cast<std::uint64_t>(ControlTrackSpace::raw_control_value) ||
+                !source || !revision || !frame || !rig_pin || !graph_pin || !curve_bytes || !curve_digest ||
+                curve_bytes.value().size() > kMaxControlAxisTrackBytes - total)
+                return core::Result<CharacterSourceBundle>::failure(codec::malformed("invalid workspace control axis track"));
+            total += curve_bytes.value().size();
+            auto curve = motion::KeyedCurve::deserialize(curve_bytes.value());
+            if (!curve || curve.value().serialize() != curve_bytes.value())
+                return core::Result<CharacterSourceBundle>::failure(codec::malformed("invalid workspace control axis curve"));
+            bundle.control_axis_tracks.push_back(ControlAxisTrack{
+                character::ControlId{control.value()}, static_cast<std::uint8_t>(axis.value()),
+                static_cast<ControlTrackRole>(role.value()), static_cast<ControlTrackSpace>(space.value()),
+                source.value(), core::Revision{revision.value()}, frame.value(), rig_pin.value(), graph_pin.value(),
+                std::move(curve.value()), curve_digest.value()});
+        }
+    }
     if (auto result = bundle.validate(); !result) {
         return core::Result<CharacterSourceBundle>::failure(result.error());
     }
     return core::Result<CharacterSourceBundle>::success(std::move(bundle));
+}
+
+namespace {
+bool workspace_encoding_fits(const std::map<character::CharacterId, CharacterSourceBundle>& bundles,
+                             core::Revision revision, const CharacterSourceBundle* additional = nullptr) {
+    codec::ObjectWriter outer;
+    outer.add("schema", static_cast<std::uint64_t>(CharacterSourceStore::kSchemaVersion));
+    outer.add("revision", revision.value());
+    outer.add_raw("characters", "[]");
+    std::size_t total = std::move(outer).finish().size();
+    std::size_t count = 0U;
+    const auto add = [&](character::CharacterId id, const CharacterSourceBundle& bundle) {
+        codec::ObjectWriter entry;
+        entry.add("id", id.value);
+        entry.add_raw("bundle", bundle.serialize());
+        const auto size = std::move(entry).finish().size() + (count ? 1U : 0U);
+        if (total > CharacterSourceStore::kMaxSerializedBytes ||
+            size > CharacterSourceStore::kMaxSerializedBytes - total) return false;
+        total += size;
+        ++count;
+        return true;
+    };
+    for (const auto& [id, bundle] : bundles) if (!add(id, bundle)) return false;
+    return additional == nullptr || add(additional->definition.id, *additional);
+}
 }
 
 core::Result<void> CharacterSourceStore::insert(CharacterSourceBundle bundle) {
@@ -1442,6 +1566,8 @@ core::Result<void> CharacterSourceStore::insert(CharacterSourceBundle bundle) {
         return core::Result<void>::failure(validation(
             "workspace character identity is already registered"));
     }
+    if (!workspace_encoding_fits(bundles_, revision_, &bundle))
+        return core::Result<void>::failure(validation("workspace store encoded size exceeds its readable bound"));
     bundles_.emplace(bundle.definition.id, std::move(bundle));
     return core::Result<void>::success();
 }
@@ -1483,6 +1609,8 @@ core::Result<void> CharacterSourceStore::validate() const {
         }
         if (auto result = bundle.validate(); !result) return result;
     }
+    if (!workspace_encoding_fits(bundles_, revision_))
+        return core::Result<void>::failure(validation("workspace store encoded size exceeds its readable bound"));
     return core::Result<void>::success();
 }
 
@@ -1525,7 +1653,7 @@ core::Result<CharacterSourceStore> CharacterSourceStore::deserialize(
     }
     const auto schema = codec::uint_member(members.value(), "schema");
     if (!schema) return core::Result<CharacterSourceStore>::failure(schema.error());
-    if (schema.value() != kSchemaVersion) {
+    if (schema.value() != 1U && schema.value() != kSchemaVersion) {
         return core::Result<CharacterSourceStore>::failure(codec::malformed(
             "workspace store schema version is not readable"));
     }
@@ -1552,6 +1680,11 @@ core::Result<CharacterSourceStore> CharacterSourceStore::deserialize(
         if (bundle_member == nullptr) {
             return core::Result<CharacterSourceStore>::failure(codec::missing("bundle"));
         }
+        const auto bundle_members = core::json::parse_object(bundle_member->raw_value);
+        if (!bundle_members) return core::Result<CharacterSourceStore>::failure(bundle_members.error());
+        const bool has_tracks = codec::find(bundle_members.value(), "control_axis_tracks") != nullptr;
+        if ((schema.value() == 1U && has_tracks) || (schema.value() == kSchemaVersion && !has_tracks))
+            return core::Result<CharacterSourceStore>::failure(codec::malformed("workspace track table does not match store schema"));
         const auto bundle = CharacterSourceBundle::deserialize(bundle_member->raw_value);
         if (!bundle) return core::Result<CharacterSourceStore>::failure(bundle.error());
         if (bundle.value().definition.id.value != id.value()) {
@@ -1563,6 +1696,10 @@ core::Result<CharacterSourceStore> CharacterSourceStore::deserialize(
                 "workspace store carries a duplicate character identity"));
         }
     }
+    // Migration can expand a near-limit v1 encoding. Refuse rather than
+    // returning a v2 store whose own serialized form cannot be reopened.
+    if (auto result = store.validate(); !result)
+        return core::Result<CharacterSourceStore>::failure(result.error());
     return core::Result<CharacterSourceStore>::success(std::move(store));
 }
 

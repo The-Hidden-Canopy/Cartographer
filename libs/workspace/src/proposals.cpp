@@ -382,6 +382,7 @@ ProposalEffect command_effect(WorkspaceCommandKind kind) noexcept {
         return ProposalEffect::skin_weights;
     case WorkspaceCommandKind::animate_set_key:
     case WorkspaceCommandKind::animate_remove_key:
+    case WorkspaceCommandKind::animate_edit_control_tracks:
         return ProposalEffect::motion_keys;
     case WorkspaceCommandKind::animate_set_root_motion:
         return ProposalEffect::motion_policy;
@@ -854,7 +855,7 @@ core::Result<void> ProposalReview::validate() const {
         }
         previous_index = application.operation_index;
         if (static_cast<std::uint8_t>(application.kind) >
-            static_cast<std::uint8_t>(WorkspaceCommandKind::review_record_gate)) {
+            static_cast<std::uint8_t>(WorkspaceCommandKind::animate_edit_control_tracks)) {
             return core::Result<void>::failure(invalid(
                 "workspace proposal review application kind is unknown"));
         }
@@ -989,7 +990,7 @@ core::Result<ProposalReview> ProposalReview::deserialize(std::string_view text) 
         }
         const auto parsed_kind = record::scan_enum(
             kind_text.value(), WorkspaceCommandKind::rig_add_joint,
-            WorkspaceCommandKind::review_record_gate, workspace_command_kind_name);
+            WorkspaceCommandKind::animate_edit_control_tracks, workspace_command_kind_name);
         if (!parsed_kind) {
             return core::Result<ProposalReview>::failure(parsed_kind.error());
         }

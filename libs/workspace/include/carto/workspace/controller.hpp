@@ -11,6 +11,7 @@
 
 #include <array>
 #include <filesystem>
+#include <optional>
 #include <vector>
 
 namespace carto::workspace {
@@ -65,7 +66,13 @@ private:
     journal::Journal journal_;
     // Inverses recorded at apply time, in commit order. Computing the exact
     // inverse requires the pre-mutation state, so it can only happen here.
-    std::vector<WorkspaceCommand> undo_stack_;
+    struct UndoFrame {
+        WorkspaceCommand inverse;
+        // Multi-track inverses may rebind the global revision/digest only if
+        // the complete store content still matches the post-command state.
+        std::optional<assets::Sha256Digest> expected_content_digest;
+    };
+    std::vector<UndoFrame> undo_stack_;
 };
 
 } // namespace carto::workspace

@@ -129,6 +129,30 @@ struct AnimateRemoveKey {
     character::RationalTime time;
 };
 
+// An insert or exact erase on an existing raw control-axis track. For erase,
+// key carries the exact stored key, including tangents and signed values.
+struct ControlTrackKeyEdit {
+    character::ControlId control;
+    std::uint8_t axis = 0U;
+    assets::Sha256Digest expected_curve_digest;
+    motion::CurveKey key;
+    bool insert = true;
+};
+
+// One bounded atomic authoring command. Tracks must be sorted uniquely by
+// (control, axis). The store and per-curve digests are independent CAS pins.
+struct AnimateEditControlTracks {
+    static constexpr std::size_t kMaxEdits = 64U;
+    core::Revision expected_source_revision;
+    assets::Sha256Digest expected_store_digest;
+    std::vector<ControlTrackKeyEdit> edits;
+};
+
+// Applies to a caller-owned working copy and returns the exact inverse edits.
+// On failure the working copy may be partial and must be discarded.
+[[nodiscard]] core::Result<AnimateEditControlTracks> apply_control_track_edits(
+    CharacterSourceBundle& working, const AnimateEditControlTracks& command);
+
 struct AnimateSetRootMotion {
     core::Revision expected_source_revision;
     character::RootMotionPolicy policy = character::RootMotionPolicy::none;
@@ -225,6 +249,7 @@ enum class WorkspaceCommandKind : std::uint8_t {
     sim_attach_bake_receipt,
     sim_clear_bake_receipt,
     review_record_gate,
+    animate_edit_control_tracks,
 };
 
 [[nodiscard]] std::string_view workspace_command_kind_name(
@@ -254,7 +279,8 @@ using WorkspaceCommandPayload = std::variant<
     SimDiscardBake,
     SimAttachBakeReceipt,
     SimClearBakeReceipt,
-    ReviewRecordGate>;
+    ReviewRecordGate,
+    AnimateEditControlTracks>;
 
 // One typed workspace command: the domain it belongs to, the character it
 // addresses, and a bounded payload. Payload-level validation is pure (no

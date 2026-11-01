@@ -49,6 +49,7 @@ core::Result<WorkspaceDomain> domain_of(WorkspaceCommandKind kind) {
     case WorkspaceCommandKind::animate_set_key:
     case WorkspaceCommandKind::animate_remove_key:
     case WorkspaceCommandKind::animate_set_root_motion:
+    case WorkspaceCommandKind::animate_edit_control_tracks:
         return core::Result<WorkspaceDomain>::success(WorkspaceDomain::animate);
     case WorkspaceCommandKind::face_add_morph_target:
     case WorkspaceCommandKind::face_remove_morph_target:
@@ -72,6 +73,19 @@ void rewrite_expected_revision(WorkspaceCommand& command, core::Revision revisio
     std::visit(
         [revision](auto& payload) { payload.expected_source_revision = revision; },
         command.payload);
+}
+
+// Revision-independent fingerprint of all source bundles in canonical map
+// order, used to refuse stale multi-track undo, not to authenticate authors.
+assets::Sha256Digest workspace_content_digest(const CharacterSourceStore& store) {
+    std::string bytes = "CARTO_WORKSPACE_CONTENT_1\n";
+    for (const auto& [id, bundle] : store.bundles()) {
+        const auto encoded = bundle.serialize();
+        bytes += std::to_string(id.value) + ":" + std::to_string(encoded.size()) + ":";
+        bytes += encoded;
+    }
+    const auto* data = reinterpret_cast<const std::uint8_t*>(bytes.data());
+    return assets::sha256(std::span<const std::uint8_t>(data, bytes.size()));
 }
 
 // ---- canonical digest emission -------------------------------------------
@@ -398,6 +412,9 @@ core::Result<void> validate_referential(
         }
         return core::Result<void>::success();
     }
+    case WorkspaceCommandKind::animate_edit_control_tracks:
+        // The pure working-copy edit checks each exact curve pin and key.
+        return core::Result<void>::success();
     case WorkspaceCommandKind::animate_set_key: {
         const auto& payload = std::get<AnimateSetKey>(command.payload);
         if (!bundle.channel.has_value() || bundle.channel->id != payload.channel) {
@@ -727,6 +744,11 @@ core::Result<void> mutate_bundle(
         }
         return core::Result<void>::success();
     }
+    case WorkspaceCommandKind::animate_edit_control_tracks: {
+        auto applied = apply_control_track_edits(bundle, std::get<AnimateEditControlTracks>(command.payload));
+        if (!applied) return core::Result<void>::failure(applied.error());
+        return core::Result<void>::success();
+    }
     case WorkspaceCommandKind::animate_set_key: {
         const auto& payload = std::get<AnimateSetKey>(command.payload);
         temporal::TemporalChannel& channel = bundle.channel.value();
@@ -912,9 +934,20 @@ core::Result<WorkspaceApplyReceipt> WorkspaceController::apply_impl(
             "workspace session is bound to a different target character"));
     }
     const core::Revision revision_before = store_.revision();
+    if (revision_before.exhausted())
+        return core::Result<WorkspaceApplyReceipt>::failure(validation(
+            "workspace source revision is exhausted"));
     if (command.expected_source_revision() != revision_before) {
         return core::Result<WorkspaceApplyReceipt>::failure(stale(
             "workspace command was authored against a stale source revision"));
+    }
+    if (command.kind() == WorkspaceCommandKind::animate_edit_control_tracks) {
+        if (auto valid = store_.validate(); !valid)
+            return core::Result<WorkspaceApplyReceipt>::failure(valid.error());
+        const auto digest = store_.canonical_digest();
+        if (!digest) return core::Result<WorkspaceApplyReceipt>::failure(digest.error());
+        if (digest.value() != std::get<AnimateEditControlTracks>(command.payload).expected_store_digest)
+            return core::Result<WorkspaceApplyReceipt>::failure(stale("workspace track batch store digest changed"));
     }
     CharacterSourceBundle* bundle = store_.find(command.target_character);
     if (bundle == nullptr) {
@@ -927,7 +960,7 @@ core::Result<WorkspaceApplyReceipt> WorkspaceController::apply_impl(
     // The exact inverse is computed against the pre-mutation state; a
     // command without an exact inverse is not admissible, so undo stays a
     // forward journal entry for every committed command.
-    const auto inverse = invert_command(command, store_);
+    auto inverse = invert_command(command, store_);
     if (!inverse) {
         return core::Result<WorkspaceApplyReceipt>::failure(inverse.error());
     }
@@ -936,11 +969,26 @@ core::Result<WorkspaceApplyReceipt> WorkspaceController::apply_impl(
     if (auto result = mutate_bundle(working, command); !result) {
         return core::Result<WorkspaceApplyReceipt>::failure(result.error());
     }
-    if (auto result = refresh_digest_refs(working); !result) {
-        return core::Result<WorkspaceApplyReceipt>::failure(result.error());
-    }
+    if (command.kind() != WorkspaceCommandKind::animate_edit_control_tracks)
+        if (auto result = refresh_digest_refs(working); !result)
+            return core::Result<WorkspaceApplyReceipt>::failure(result.error());
     if (auto result = working.validate(); !result) {
         return core::Result<WorkspaceApplyReceipt>::failure(result.error());
+    }
+
+    // Validate the complete serialized candidate, including aggregate bounds,
+    // before appending. No live bundle changes until the journal succeeds.
+    CharacterSourceStore candidate = store_;
+    *candidate.find(command.target_character) = std::move(working);
+    candidate.advance_revision();
+    if (auto result = candidate.validate(); !result)
+        return core::Result<WorkspaceApplyReceipt>::failure(result.error());
+    std::optional<assets::Sha256Digest> undo_content_digest;
+    if (command.kind() == WorkspaceCommandKind::animate_edit_control_tracks) {
+        const auto candidate_digest = candidate.canonical_digest();
+        if (!candidate_digest) return core::Result<WorkspaceApplyReceipt>::failure(candidate_digest.error());
+        std::get<AnimateEditControlTracks>(inverse.value().payload).expected_store_digest = candidate_digest.value();
+        undo_content_digest = workspace_content_digest(candidate);
     }
 
     const std::string serialized = command.serialize();
@@ -959,13 +1007,12 @@ core::Result<WorkspaceApplyReceipt> WorkspaceController::apply_impl(
         return core::Result<WorkspaceApplyReceipt>::failure(entry.error());
     }
 
-    *bundle = std::move(working);
-    store_.advance_revision();
+    store_ = std::move(candidate);
     if (!target_session.target_character) {
         target_session.target_character = command.target_character;
     }
     if (record_undo) {
-        undo_stack_.push_back(inverse.value());
+        undo_stack_.push_back({std::move(inverse.value()), undo_content_digest});
     }
     return core::Result<WorkspaceApplyReceipt>::success(WorkspaceApplyReceipt{
         entry.value().revision_after, entry.value().entry_hash});
@@ -976,10 +1023,21 @@ core::Result<WorkspaceApplyReceipt> WorkspaceController::undo() {
         return core::Result<WorkspaceApplyReceipt>::failure(core::Diagnostic(
             core::ErrorCode::invalid_state, "workspace has nothing to undo"));
     }
-    WorkspaceCommand inverse = std::move(undo_stack_.back());
-    undo_stack_.pop_back();
+    // Keep the inverse until the forward undo entry has actually committed.
+    // Failed validation or journal append must leave the operation retryable.
+    const auto& frame = undo_stack_.back();
+    if (frame.expected_content_digest && workspace_content_digest(store_) != *frame.expected_content_digest)
+        return core::Result<WorkspaceApplyReceipt>::failure(stale("workspace content changed before track undo"));
+    WorkspaceCommand inverse = frame.inverse;
     rewrite_expected_revision(inverse, store_.revision());
-    return apply_impl(inverse, false);
+    if (frame.expected_content_digest) {
+        const auto current_digest = store_.canonical_digest();
+        if (!current_digest) return core::Result<WorkspaceApplyReceipt>::failure(current_digest.error());
+        std::get<AnimateEditControlTracks>(inverse.payload).expected_store_digest = current_digest.value();
+    }
+    auto result = apply_impl(inverse, false);
+    if (result) undo_stack_.pop_back();
+    return result;
 }
 
 } // namespace carto::workspace

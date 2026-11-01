@@ -1,9 +1,11 @@
 #include <carto/workspace/commands.hpp>
+#include <carto/motion/curve_edit.hpp>
 
 #include "codec.hpp"
 #include "record_codec.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -11,6 +13,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -18,6 +21,7 @@ namespace carto::workspace {
 namespace {
 
 constexpr std::uint32_t kCommandSchemaVersion = 1U;
+constexpr std::uint32_t kTrackCommandSchemaVersion = 2U;
 
 core::Diagnostic invalid(std::string message) {
     return core::Diagnostic(core::ErrorCode::invalid_argument, std::move(message));
@@ -163,7 +167,7 @@ core::Result<WorkspaceDomain> domain_from(std::string_view name) {
 
 core::Result<WorkspaceCommandKind> kind_from(std::string_view name) {
     for (std::uint8_t raw = 0U;
-         raw <= static_cast<std::uint8_t>(WorkspaceCommandKind::review_record_gate);
+         raw <= static_cast<std::uint8_t>(WorkspaceCommandKind::animate_edit_control_tracks);
          ++raw) {
         const auto kind = static_cast<WorkspaceCommandKind>(raw);
         if (workspace_command_kind_name(kind) == name) {
@@ -192,6 +196,7 @@ WorkspaceDomain kind_domain(WorkspaceCommandKind kind) noexcept {
     case WorkspaceCommandKind::animate_set_key:
     case WorkspaceCommandKind::animate_remove_key:
     case WorkspaceCommandKind::animate_set_root_motion:
+    case WorkspaceCommandKind::animate_edit_control_tracks:
         return WorkspaceDomain::animate;
     case WorkspaceCommandKind::face_add_morph_target:
     case WorkspaceCommandKind::face_remove_morph_target:
@@ -677,6 +682,22 @@ core::Result<void> validate_payload(const SkinRebindLayer& payload) {
     return core::Result<void>::success();
 }
 
+core::Result<void> validate_payload(const AnimateEditControlTracks& payload) {
+    if (payload.expected_source_revision.exhausted() || payload.expected_store_digest.is_zero() ||
+        payload.edits.empty() || payload.edits.size() > AnimateEditControlTracks::kMaxEdits)
+        return core::Result<void>::failure(invalid("workspace track edit has invalid store pin or edit count"));
+    for (std::size_t i = 0; i < payload.edits.size(); ++i) {
+        const auto& edit = payload.edits[i];
+        if (!edit.control || edit.axis >= character::kAxisCount || edit.expected_curve_digest.is_zero())
+            return core::Result<void>::failure(invalid("workspace track edit has invalid track identity or curve pin"));
+        if (auto valid = edit.key.validate(); !valid) return valid;
+        if (i != 0U && std::tie(payload.edits[i - 1].control.value, payload.edits[i - 1].axis) >=
+                         std::tie(edit.control.value, edit.axis))
+            return core::Result<void>::failure(invalid("workspace track edits must be sorted and unique"));
+    }
+    return core::Result<void>::success();
+}
+
 core::Result<void> validate_payload(const AnimateSetKey& payload) {
     if (!payload.channel) {
         return core::Result<void>::failure(invalid(
@@ -911,6 +932,31 @@ std::string payload_json(const WorkspaceCommandPayload& payload) {
         }
         writer.add_raw("previous_joint_graph_digest",
                        nullable_digest_json(typed.previous_joint_graph_digest));
+        return std::move(writer).finish();
+    }
+    case WorkspaceCommandKind::animate_edit_control_tracks: {
+        const auto& typed = std::get<AnimateEditControlTracks>(payload);
+        codec::ObjectWriter writer;
+        add_expected(writer, typed.expected_source_revision);
+        writer.add_raw("expected_store_digest", quoted_digest(typed.expected_store_digest));
+        std::string edits = "[";
+        bool first = true;
+        for (const auto& edit : typed.edits) {
+            if (!first) edits.push_back(',');
+            first = false;
+            codec::ObjectWriter item;
+            item.add("control", edit.control.value);
+            item.add("axis", static_cast<std::uint64_t>(edit.axis));
+            item.add_raw("expected_curve_digest", quoted_digest(edit.expected_curve_digest));
+            item.add("time", character::serialize(edit.key.time));
+            item.add("value", edit.key.value);
+            item.add("tangent_in", edit.key.tangent_in);
+            item.add("tangent_out", edit.key.tangent_out);
+            item.add("insert", edit.insert);
+            edits += std::move(item).finish();
+        }
+        edits.push_back(']');
+        writer.add_raw("edits", edits);
         return std::move(writer).finish();
     }
     case WorkspaceCommandKind::animate_set_key: {
@@ -1247,6 +1293,50 @@ core::Result<WorkspaceCommandPayload> payload_from(
         return core::Result<WorkspaceCommandPayload>::success(
             WorkspaceCommandPayload{std::move(payload)});
     }
+    case WorkspaceCommandKind::animate_edit_control_tracks: {
+        using Result = core::Result<WorkspaceCommandPayload>;
+        if (members.size() != 3U)
+            return Result::failure(codec::malformed("workspace track batch has unknown or missing fields"));
+        AnimateEditControlTracks payload;
+        const auto revision = expected_revision_member(members);
+        if (!revision) return Result::failure(revision.error());
+        payload.expected_source_revision = revision.value();
+        const auto store_digest = digest_from(members, "expected_store_digest");
+        if (!store_digest) return Result::failure(store_digest.error());
+        payload.expected_store_digest = store_digest.value();
+        const auto elements = codec::array_member(members, "edits");
+        if (!elements) return Result::failure(elements.error());
+        if (elements.value().empty() || elements.value().size() > AnimateEditControlTracks::kMaxEdits)
+            return Result::failure(codec::malformed("workspace track edit count exceeds its bound"));
+        payload.edits.reserve(elements.value().size());
+        for (const auto element : elements.value()) {
+            const auto fields = core::json::parse_object(element);
+            if (!fields) return Result::failure(fields.error());
+            if (fields.value().size() != 8U)
+                return Result::failure(codec::malformed("workspace track edit has unknown or missing fields"));
+            const auto control = codec::uint_member(fields.value(), "control");
+            if (!control) return Result::failure(control.error());
+            const auto axis = codec::uint_member(fields.value(), "axis");
+            if (!axis) return Result::failure(axis.error());
+            if (axis.value() >= character::kAxisCount)
+                return Result::failure(codec::malformed("workspace track edit axis is out of range"));
+            const auto curve = digest_from(fields.value(), "expected_curve_digest");
+            if (!curve) return Result::failure(curve.error());
+            const auto time = time_member(fields.value(), "time");
+            if (!time) return Result::failure(time.error());
+            const auto value = codec::double_member(fields.value(), "value");
+            if (!value) return Result::failure(value.error());
+            const auto tangent_in = codec::double_member(fields.value(), "tangent_in");
+            if (!tangent_in) return Result::failure(tangent_in.error());
+            const auto tangent_out = codec::double_member(fields.value(), "tangent_out");
+            if (!tangent_out) return Result::failure(tangent_out.error());
+            const auto insert = codec::bool_member(fields.value(), "insert");
+            if (!insert) return Result::failure(insert.error());
+            payload.edits.push_back({character::ControlId{control.value()}, static_cast<std::uint8_t>(axis.value()),
+                curve.value(), {time.value(), value.value(), tangent_in.value(), tangent_out.value()}, insert.value()});
+        }
+        return Result::success(WorkspaceCommandPayload{std::move(payload)});
+    }
     case WorkspaceCommandKind::animate_set_key: {
         AnimateSetKey payload;
         const auto revision = expected_revision_member(members);
@@ -1465,6 +1555,7 @@ std::string_view workspace_command_kind_name(WorkspaceCommandKind kind) noexcept
     case WorkspaceCommandKind::sim_attach_bake_receipt: return "sim-attach-bake-receipt";
     case WorkspaceCommandKind::sim_clear_bake_receipt: return "sim-clear-bake-receipt";
     case WorkspaceCommandKind::review_record_gate: return "review-record-gate";
+    case WorkspaceCommandKind::animate_edit_control_tracks: return "animate-edit-control-tracks";
     }
     return "unknown";
 }
@@ -1495,7 +1586,8 @@ core::Result<void> WorkspaceCommand::validate() const {
 
 std::string WorkspaceCommand::serialize() const {
     codec::ObjectWriter writer;
-    writer.add("schema", static_cast<std::uint64_t>(kCommandSchemaVersion));
+    writer.add("schema", static_cast<std::uint64_t>(kind() == WorkspaceCommandKind::animate_edit_control_tracks
+        ? kTrackCommandSchemaVersion : kCommandSchemaVersion));
     writer.add("domain", workspace_domain_name(domain));
     writer.add("target_character", target_character.value);
     writer.add("kind", workspace_command_kind_name(kind()));
@@ -1510,7 +1602,7 @@ core::Result<WorkspaceCommand> WorkspaceCommand::deserialize(std::string_view te
     }
     const auto schema = codec::uint_member(members.value(), "schema");
     if (!schema) return core::Result<WorkspaceCommand>::failure(schema.error());
-    if (schema.value() != kCommandSchemaVersion) {
+    if (schema.value() != kCommandSchemaVersion && schema.value() != kTrackCommandSchemaVersion) {
         return core::Result<WorkspaceCommand>::failure(codec::malformed(
             "workspace command schema version is not readable"));
     }
@@ -1530,6 +1622,11 @@ core::Result<WorkspaceCommand> WorkspaceCommand::deserialize(std::string_view te
     if (!parsed_kind) {
         return core::Result<WorkspaceCommand>::failure(parsed_kind.error());
     }
+    if ((parsed_kind.value() == WorkspaceCommandKind::animate_edit_control_tracks) !=
+            (schema.value() == kTrackCommandSchemaVersion) ||
+        (parsed_kind.value() == WorkspaceCommandKind::animate_edit_control_tracks && members.value().size() != 5U))
+        return core::Result<WorkspaceCommand>::failure(codec::malformed(
+            "workspace track batch requires schema 2 with exact command fields"));
     const auto payload = codec::object_member(members.value(), "payload");
     if (!payload) return core::Result<WorkspaceCommand>::failure(payload.error());
     const auto parsed_payload = payload_from(parsed_kind.value(), payload.value());
@@ -1544,6 +1641,44 @@ core::Result<WorkspaceCommand> WorkspaceCommand::deserialize(std::string_view te
         return core::Result<WorkspaceCommand>::failure(result.error());
     }
     return core::Result<WorkspaceCommand>::success(std::move(command));
+}
+
+core::Result<AnimateEditControlTracks> apply_control_track_edits(
+    CharacterSourceBundle& working, const AnimateEditControlTracks& command) {
+    using Result = core::Result<AnimateEditControlTracks>;
+    if (auto valid = validate_payload(command); !valid) return Result::failure(valid.error());
+    AnimateEditControlTracks inverse;
+    inverse.expected_source_revision = command.expected_source_revision;
+    inverse.expected_store_digest = command.expected_store_digest;
+    for (const auto& edit : command.edits) {
+        auto track = std::find_if(working.control_axis_tracks.begin(), working.control_axis_tracks.end(),
+            [&edit](const auto& item) { return item.control == edit.control && item.axis == edit.axis; });
+        if (track == working.control_axis_tracks.end())
+            return Result::failure(not_found("workspace control-axis track is absent"));
+        const auto current = track->curve.canonical_digest();
+        if (!current || current.value() != track->curve_digest || current.value() != edit.expected_curve_digest)
+            return Result::failure(core::Diagnostic(core::ErrorCode::stale_data, "workspace control-axis curve pin changed"));
+        if (!edit.insert) {
+            const auto key = std::find_if(track->curve.keys.begin(), track->curve.keys.end(),
+                [&edit](const auto& existing) { return existing.time.tick == edit.key.time.tick; });
+            const auto same_bits = [](double left, double right) {
+                return std::bit_cast<std::uint64_t>(left) == std::bit_cast<std::uint64_t>(right);
+            };
+            if (key == track->curve.keys.end() || key->time.ticks_per_second != edit.key.time.ticks_per_second ||
+                !same_bits(key->value, edit.key.value) || !same_bits(key->tangent_in, edit.key.tangent_in) ||
+                !same_bits(key->tangent_out, edit.key.tangent_out))
+                return Result::failure(core::Diagnostic(core::ErrorCode::stale_data, "workspace erase key does not match stored key"));
+        }
+        auto changed = edit.insert ? motion::insert_key(track->curve, edit.key, false)
+                                   : motion::delete_keys(track->curve, {edit.key.time.tick});
+        if (!changed) return Result::failure(changed.error());
+        const auto updated = changed.value().curve.canonical_digest();
+        if (!updated) return Result::failure(updated.error());
+        inverse.edits.push_back({edit.control, edit.axis, updated.value(), edit.key, !edit.insert});
+        track->curve = std::move(changed.value().curve);
+        track->curve_digest = updated.value();
+    }
+    return Result::success(std::move(inverse));
 }
 
 core::Result<WorkspaceCommand> invert_command(
@@ -1664,8 +1799,30 @@ core::Result<WorkspaceCommand> invert_command(
                                        layer.staleness, layer.stale_since,
                                        layer.joint_graph_digest});
     }
+    case WorkspaceCommandKind::animate_edit_control_tracks: {
+        auto working = *bundle;
+        auto edits = apply_control_track_edits(working, std::get<AnimateEditControlTracks>(command.payload));
+        if (!edits) return core::Result<WorkspaceCommand>::failure(edits.error());
+        return inverse(std::move(edits.value()));
+    }
     case WorkspaceCommandKind::animate_set_key: {
         const auto& applied = std::get<AnimateSetKey>(command.payload);
+        if (!bundle->channel.has_value() || bundle->channel->id != applied.channel) {
+            return core::Result<WorkspaceCommand>::failure(not_found(
+                "workspace channel is not present in the character bundle"));
+        }
+        // Setting a key replaces any key at the same stored seconds. Preserve
+        // its old value instead of deleting it when this command is undone.
+        const double seconds = character::to_seconds(applied.time).seconds;
+        for (const temporal::ScalarKeyframe& key : bundle->channel->scalar_keyframes) {
+            if (key.time == seconds) {
+                if (key.time == 0.0 && std::signbit(key.time))
+                    return core::Result<WorkspaceCommand>::failure(core::Diagnostic(
+                        core::ErrorCode::unsupported,
+                        "workspace key edit cannot exactly restore a negative-zero timestamp"));
+                return inverse(AnimateSetKey{revision, applied.channel, applied.time, key.value});
+            }
+        }
         return inverse(
             AnimateRemoveKey{revision, applied.channel, applied.time});
     }
@@ -1689,6 +1846,10 @@ core::Result<WorkspaceCommand> invert_command(
             return core::Result<WorkspaceCommand>::failure(not_found(
                 "workspace channel carries no stored key at the removed time"));
         }
+        if (stored->time == 0.0 && std::signbit(stored->time))
+            return core::Result<WorkspaceCommand>::failure(core::Diagnostic(
+                core::ErrorCode::unsupported,
+                "workspace key edit cannot exactly restore a negative-zero timestamp"));
         return inverse(AnimateSetKey{
             revision, applied.channel, applied.time, stored->value});
     }

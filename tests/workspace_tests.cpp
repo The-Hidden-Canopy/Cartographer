@@ -7,6 +7,7 @@
 #include <carto/workspace/proposals.hpp>
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -358,6 +359,165 @@ void workspace_applies_and_undoes_animate_commands() {
     REQUIRE(controller.undo());
     bundle = controller.store().find(character::CharacterId{7U});
     REQUIRE(bundle->motion->root_motion == character::RootMotionPolicy::none);
+}
+
+void workspace_undo_retries_after_journal_refusal_and_restores_key_edits() {
+    namespace workspace = carto::workspace;
+    namespace character = carto::character;
+    namespace journal = carto::journal;
+    TempDirectory temp;
+    const auto path = temp.path() / "undo-failure.journal";
+    workspace::WorkspaceController controller(path);
+    const character::CharacterId id{7U};
+    const auto original = make_bundle(id);
+    REQUIRE(controller.store().insert(original));
+
+    workspace::AnimateSetKey key;
+    key.expected_source_revision = carto::core::Revision{0U};
+    key.channel = carto::temporal::ChannelId{1U};
+    key.time = character::RationalTime{0, 24U};
+    key.value = 3.0;
+    REQUIRE(controller.apply(make_command(workspace::WorkspaceDomain::animate, id, key)));
+    const auto* changed = controller.store().find(id);
+    REQUIRE(changed && changed->channel && changed->channel->scalar_keyframes.size() == 1U &&
+        changed->channel->scalar_keyframes.front().value == 3.0);
+    const auto before_failure = changed->serialize();
+    const auto before_digest = controller.store().canonical_digest();
+    REQUIRE(before_digest);
+    const auto before_entries = controller.journal().read_all();
+    REQUIRE(before_entries && before_entries.value().size() == 1U);
+
+    journal::JournalLimits limits;
+    limits.max_payload_bytes = 1U;
+    controller.journal() = journal::Journal(path, limits);
+    const auto refused = controller.undo();
+    REQUIRE(!refused && refused.error().message.find("journal payload exceeds") != std::string::npos);
+    REQUIRE(controller.store().revision() == carto::core::Revision{1U});
+    REQUIRE(controller.store().find(id)->serialize() == before_failure);
+    REQUIRE(controller.store().canonical_digest().value() == before_digest.value());
+    controller.journal() = journal::Journal(path);
+    const auto after_failure = controller.journal().read_all();
+    REQUIRE(after_failure && after_failure.value().size() == 1U &&
+        after_failure.value().front().entry_hash == before_entries.value().front().entry_hash);
+
+    const auto retried = controller.undo();
+    REQUIRE(retried && retried.value().applied_revision == carto::core::Revision{2U});
+    const auto* restored = controller.store().find(id);
+    REQUIRE(restored && restored->channel && restored->channel->scalar_keyframes.size() == 1U &&
+        restored->channel->scalar_keyframes.front().value == 0.0 &&
+        restored->serialize() == original.serialize());
+    REQUIRE(!controller.undo());
+    const auto after_retry = controller.journal().read_all();
+    REQUIRE(after_retry && after_retry.value().size() == 2U && controller.journal().verify());
+
+    // A newly inserted key has a distinct inverse: removal, not restoration.
+    key.expected_source_revision = carto::core::Revision{2U};
+    key.time = character::RationalTime{12, 24U};
+    key.value = 7.0;
+    REQUIRE(controller.apply(make_command(workspace::WorkspaceDomain::animate, id, key)));
+    const auto* inserted = controller.store().find(id);
+    REQUIRE(inserted && inserted->channel && inserted->channel->scalar_keyframes.size() == 2U &&
+        inserted->channel->scalar_keyframes[1U].time == 0.5 &&
+        inserted->channel->scalar_keyframes[1U].value == 7.0);
+    REQUIRE(controller.undo());
+    restored = controller.store().find(id);
+    REQUIRE(restored && restored->serialize() == original.serialize());
+    const auto final_entries = controller.journal().read_all();
+    REQUIRE(final_entries && final_entries.value().size() == 4U && controller.journal().verify());
+    workspace::WorkspaceController recovery(temp.path() / "undo-replay.journal");
+    REQUIRE(recovery.store().insert(original));
+    const auto replayed = controller.journal().replay_from(
+        carto::core::Revision{}, [&](const journal::JournalEntry& entry) {
+            const std::string payload(reinterpret_cast<const char*>(entry.payload.data()), entry.payload.size());
+            const auto command = workspace::WorkspaceCommand::deserialize(payload);
+            if (!command) return carto::core::Result<void>::failure(command.error());
+            const auto applied = recovery.apply(command.value());
+            if (!applied) return carto::core::Result<void>::failure(applied.error());
+            return carto::core::Result<void>::success();
+        });
+    REQUIRE(replayed && recovery.store().revision() == controller.store().revision());
+    const auto final_digest = controller.store().canonical_digest();
+    const auto replay_digest = recovery.store().canonical_digest();
+    REQUIRE(final_digest && replay_digest && final_digest.value() == replay_digest.value());
+}
+
+void workspace_preserves_signed_zero_keys() {
+    namespace workspace = carto::workspace;
+    namespace character = carto::character;
+    namespace journal = carto::journal;
+    TempDirectory temp;
+    const character::CharacterId id{7U};
+    auto original = make_bundle(id);
+    original.channel->scalar_keyframes.front().time = -0.0;
+    original.channel->scalar_keyframes.push_back({1.0, 2.0});
+    REQUIRE(original.validate());
+    REQUIRE(std::signbit(original.channel->scalar_keyframes.front().time));
+    REQUIRE(original.channel->serialize().find("SCALAR_KEY -0 0\n") != std::string::npos);
+    workspace::WorkspaceController refused(temp.path() / "negative-time.journal");
+    REQUIRE(refused.store().insert(original));
+    const auto original_bytes = original.serialize();
+    const auto digest = refused.store().canonical_digest();
+    REQUIRE(digest);
+    const auto before = refused.journal().read_all();
+    REQUIRE(before && before.value().empty());
+    workspace::AnimateSetKey set;
+    set.expected_source_revision = carto::core::Revision{0U};
+    set.channel = carto::temporal::ChannelId{1U};
+    set.time = character::RationalTime{0, 24U};
+    set.value = 3.0;
+    const auto refused_set = refused.apply(make_command(workspace::WorkspaceDomain::animate, id, set));
+    REQUIRE(!refused_set && refused_set.error().code == carto::core::ErrorCode::unsupported &&
+        refused_set.error().message.find("negative-zero timestamp") != std::string::npos);
+    workspace::AnimateRemoveKey remove;
+    remove.expected_source_revision = carto::core::Revision{0U};
+    remove.channel = set.channel;
+    remove.time = set.time;
+    const auto refused_remove = refused.apply(make_command(workspace::WorkspaceDomain::animate, id, remove));
+    REQUIRE(!refused_remove && refused_remove.error().code == carto::core::ErrorCode::unsupported &&
+        refused_remove.error().message.find("negative-zero timestamp") != std::string::npos);
+    REQUIRE(refused.store().revision() == carto::core::Revision{0U} &&
+        refused.store().find(id)->serialize() == original_bytes &&
+        refused.store().canonical_digest().value() == digest.value());
+    const auto after = refused.journal().read_all();
+    REQUIRE(after && after.value().empty());
+    REQUIRE(!refused.undo());
+
+    // A negative-zero value is representable by the command codec, unlike
+    // negative-zero time. Both replacement and removal must restore it exactly.
+    auto negative_value = make_bundle(id);
+    negative_value.channel->scalar_keyframes.front().value = -0.0;
+    negative_value.channel->scalar_keyframes.push_back({1.0, 2.0});
+    REQUIRE(negative_value.validate());
+    REQUIRE(std::signbit(negative_value.channel->scalar_keyframes.front().value));
+    REQUIRE(negative_value.channel->serialize().find("SCALAR_KEY 0 -0\n") != std::string::npos);
+    workspace::WorkspaceController accepted(temp.path() / "negative-value.journal");
+    REQUIRE(accepted.store().insert(negative_value));
+    REQUIRE(accepted.apply(make_command(workspace::WorkspaceDomain::animate, id, set)));
+    REQUIRE(accepted.undo());
+    auto* restored = accepted.store().find(id);
+    REQUIRE(restored && std::signbit(restored->channel->scalar_keyframes.front().value) &&
+        restored->serialize() == negative_value.serialize());
+    remove.expected_source_revision = carto::core::Revision{2U};
+    REQUIRE(accepted.apply(make_command(workspace::WorkspaceDomain::animate, id, remove)));
+    REQUIRE(accepted.undo());
+    restored = accepted.store().find(id);
+    REQUIRE(restored && std::signbit(restored->channel->scalar_keyframes.front().value) &&
+        restored->serialize() == negative_value.serialize());
+    workspace::WorkspaceController recovery(temp.path() / "negative-value-replay.journal");
+    REQUIRE(recovery.store().insert(negative_value));
+    const auto replayed = accepted.journal().replay_from(
+        carto::core::Revision{}, [&](const journal::JournalEntry& entry) {
+            const std::string payload(reinterpret_cast<const char*>(entry.payload.data()), entry.payload.size());
+            const auto command = workspace::WorkspaceCommand::deserialize(payload);
+            if (!command) return carto::core::Result<void>::failure(command.error());
+            const auto applied = recovery.apply(command.value());
+            if (!applied) return carto::core::Result<void>::failure(applied.error());
+            return carto::core::Result<void>::success();
+        });
+    const auto live_digest = accepted.store().canonical_digest();
+    const auto replay_digest = recovery.store().canonical_digest();
+    REQUIRE(replayed && recovery.store().revision() == accepted.store().revision() &&
+        live_digest && replay_digest && live_digest.value() == replay_digest.value());
 }
 
 void workspace_refuses_stale_revisions_without_mutation() {
@@ -1212,6 +1372,8 @@ int main() {
         workspace_applies_and_undoes_rig_commands();
         workspace_applies_and_undoes_skin_commands();
         workspace_applies_and_undoes_animate_commands();
+        workspace_undo_retries_after_journal_refusal_and_restores_key_edits();
+        workspace_preserves_signed_zero_keys();
         workspace_refuses_stale_revisions_without_mutation();
         workspace_refuses_referential_violations();
         workspace_refuses_session_domain_mismatch();

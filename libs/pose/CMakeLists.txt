@@ -4,6 +4,7 @@ add_library(carto_pose STATIC
     src/controls.cpp
     src/fk.cpp
     src/ik.cpp
+    src/ik_control_frame.cpp
     src/ik_fk_match.cpp
     src/ik_fk_authoring.cpp
     src/ik_fk_mode_key_intent.cpp

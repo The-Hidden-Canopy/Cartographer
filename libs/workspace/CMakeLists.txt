@@ -17,6 +17,7 @@ target_link_libraries(carto_workspace
         carto_core
         carto_character
         carto_kinematic
+        carto_motion
         carto_temporal
         carto_project
         carto_journal
