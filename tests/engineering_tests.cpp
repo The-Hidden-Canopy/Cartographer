@@ -221,6 +221,144 @@ void requirement_csv_parser_accepts_only_the_declared_dimensional_profile() {
     REQUIRE(!carto::engineering::parse_requirement_csv(oversized_annotation));
 }
 
+void direct_consumer_admission_reapplies_publication_readiness() {
+    using namespace carto::engineering;
+    const auto fixture = make_dv012_fixture();
+    REQUIRE(fixture);
+    const auto published = InspectionPackage::publish(fixture.value(),
+        fixture.value().project_revision, fixture.value().project_namespace);
+    REQUIRE(published);
+    const auto projection = AuthoringDocument::deserialize(published.value().authoring_bytes);
+    REQUIRE(projection);
+    const auto original_bytes = projection.value().serialize();
+
+    const auto refuse_direct = [&](auto mutate, std::string_view expected_reason) {
+        auto authoring = projection.value();
+        mutate(authoring);
+        REQUIRE(authoring.validate());
+        InspectionPackage direct;
+        direct.project_revision = authoring.project_revision;
+        direct.authoring_bytes = authoring.serialize();
+        direct.evidence = authoring.evidence;
+        REQUIRE(direct.refresh_digest());
+        REQUIRE(direct.validate());
+        const auto before = direct.serialize();
+        const auto admission = admit_for_consumer(direct);
+        REQUIRE(admission);
+        if (admission.value().status != PackageAdmissionStatus::refuse) {
+            throw TestFailure("direct admission bypassed publication readiness: " +
+                std::string(expected_reason));
+        }
+        REQUIRE(std::find(admission.value().reasons.begin(), admission.value().reasons.end(),
+            expected_reason) != admission.value().reasons.end());
+        REQUIRE(direct.serialize() == before);
+        REQUIRE(projection.value().serialize() == original_bytes);
+        REQUIRE(!InspectionPackage::publish(authoring,
+            authoring.project_revision, authoring.project_namespace));
+    };
+    for (const auto state : {ExtractionState::machine_extracted_proposed,
+                            ExtractionState::rejected, ExtractionState::stale}) {
+        refuse_direct([state](auto& authoring) {
+            authoring.requirements.front().extraction = state;
+            authoring.requirements.front().human_review_justification.clear();
+        }, state == ExtractionState::stale
+            ? "publication is blocked by a stale engineering requirement"
+            : "publication is blocked until every enabled requirement is human accepted or corrected");
+    }
+    refuse_direct([](auto& authoring) {
+        authoring.characteristics.front().status = InspectionStatus::disabled;
+    }, "publication requires an active inspection characteristic for every enabled requirement");
+    refuse_direct([](auto& authoring) {
+        authoring.characteristics.front().status = InspectionStatus::stale;
+    }, "publication requires an active inspection characteristic for every enabled requirement");
+    refuse_direct([](auto& authoring) {
+        for (auto& target : authoring.targets) {
+            if (target.characteristic_id == authoring.characteristics.front().id) {
+                target.status = TargetStatus::proposed;
+            }
+        }
+    }, "publication requires one accepted target for every enabled characteristic");
+    refuse_direct([](auto& authoring) {
+        authoring.workcell.reset();
+        authoring.workcell_revision_history.clear();
+    }, "publication requires an authored workcell");
+
+    auto unknown_profile = published.value();
+    unknown_profile.publication_profile = "unreviewed-inspection-v99";
+    REQUIRE(unknown_profile.refresh_digest());
+    REQUIRE(unknown_profile.validate());
+    const auto unsupported = admit_for_consumer(unknown_profile);
+    REQUIRE(unsupported);
+    REQUIRE(unsupported.value().status == PackageAdmissionStatus::refuse);
+    REQUIRE(std::find(unsupported.value().reasons.begin(), unsupported.value().reasons.end(),
+        "inspection publication profile is unsupported") != unsupported.value().reasons.end());
+
+    // A direct, ready, correctly bound package remains admissible without
+    // claiming that its digest authenticates a sender or runtime result.
+    InspectionPackage direct_ready;
+    direct_ready.project_revision = projection.value().project_revision;
+    direct_ready.authoring_bytes = original_bytes;
+    direct_ready.evidence = projection.value().evidence;
+    REQUIRE(direct_ready.refresh_digest());
+    const auto ready = admit_for_consumer(direct_ready);
+    REQUIRE(ready);
+    REQUIRE(ready.value().status == PackageAdmissionStatus::admit);
+    REQUIRE(ready.value().reasons.empty());
+    REQUIRE(ready.value().admitted_authoring_digest == published.value().authoring_digest);
+    REQUIRE(ready.value().admitted_publication_digest == published.value().publication_digest);
+}
+
+void inspection_package_envelope_cannot_hide_evidence_or_trailing_records() {
+    using namespace carto::engineering;
+    auto fixture = make_dv012_fixture();
+    REQUIRE(fixture);
+    // Preserve explicit limitations in both layers, including their order.
+    fixture.value().evidence.unsupported.push_back("unsupported boundary marker");
+    fixture.value().evidence.runtime_validation.push_back("runtime boundary marker");
+    const auto package = InspectionPackage::publish(fixture.value(),
+        fixture.value().project_revision, fixture.value().project_namespace);
+    REQUIRE(package);
+    const auto bytes = package.value().serialize();
+    REQUIRE(InspectionPackage::deserialize(bytes + " \r\n\t"));
+    REQUIRE(!InspectionPackage::deserialize(bytes + "UNREVIEWED extra-record\n"));
+    REQUIRE(!InspectionPackage::deserialize(bytes + bytes));
+
+    for (const auto member : {&CapabilityEvidence::preserved, &CapabilityEvidence::derived,
+                             &CapabilityEvidence::unsupported,
+                             &CapabilityEvidence::runtime_validation}) {
+        auto altered = package.value();
+        (altered.evidence.*member).push_back("outer-only claim");
+        REQUIRE(altered.refresh_digest());
+        REQUIRE(!altered.validate());
+        REQUIRE(!InspectionPackage::deserialize(altered.serialize()));
+        REQUIRE(!admit_for_consumer(altered));
+    }
+    auto omitted = package.value();
+    omitted.evidence.unsupported.pop_back();
+    REQUIRE(omitted.refresh_digest());
+    REQUIRE(!omitted.validate());
+    auto reordered = package.value();
+    REQUIRE(reordered.evidence.runtime_validation.size() >= 2U);
+    std::swap(reordered.evidence.runtime_validation.front(),
+        reordered.evidence.runtime_validation.back());
+    REQUIRE(reordered.refresh_digest());
+    REQUIRE(!reordered.validate());
+
+    auto exhausted = package.value();
+    exhausted.project_revision = carto::core::Revision(
+        std::numeric_limits<std::uint64_t>::max());
+    REQUIRE(exhausted.refresh_digest());
+    REQUIRE(!exhausted.validate());
+    REQUIRE(!InspectionPackage::deserialize(exhausted.serialize()));
+    REQUIRE(!admit_for_consumer(exhausted));
+    auto foreign_namespace = package.value();
+    foreign_namespace.project_namespace = "other-project";
+    foreign_namespace.publication_digest = digest(foreign_namespace.canonical_without_digest());
+    REQUIRE(!foreign_namespace.validate());
+    REQUIRE(!admit_for_consumer(foreign_namespace));
+    REQUIRE(package.value().serialize() == bytes);
+}
+
 void publication_and_consumer_admission_bind_exact_bytes() {
     const auto fixture = carto::engineering::make_dv012_fixture();
     REQUIRE(fixture);
@@ -2617,6 +2755,8 @@ int main() {
         bom_csv_parser_and_reconciliation_fail_closed_on_ambiguous_evidence();
         requirement_csv_parser_accepts_only_the_declared_dimensional_profile();
         publication_and_consumer_admission_bind_exact_bytes();
+        direct_consumer_admission_reapplies_publication_readiness();
+        inspection_package_envelope_cannot_hide_evidence_or_trailing_records();
         vanta_path_result_exchange_is_digest_bound_and_backward_compatible();
         manual_requirement_authoring_is_revision_bound_and_auditable();
         inspection_characteristics_require_current_human_verified_contracts();
