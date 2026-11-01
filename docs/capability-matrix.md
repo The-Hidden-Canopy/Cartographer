@@ -1,5 +1,20 @@
 # Capability matrix
 
+Local integration checkpoint (2026-11-01): twenty selected native CPU suites
+pass at `3e5639d`, covering the combined planar/relax UV history routes,
+native selected-instance and straight-sweep candidate producers, CAD extraction
+adapter, inspection exchange, and prepared/render-mesh regressions. Additional
+UV identities above the artifact's 32-bit bound refuse instead of narrowing.
+Direct inspection admission reapplies publication readiness, binds outer
+capability evidence to embedded authoring, and refuses trailing records and
+exhausted revisions. The admission bypass was reproduced before repair.
+
+These tests use an explicit short absolute scratch root; the original deep-path
+failures remain unresolved as general long-path support. Native desktop
+interaction remains unaccepted, and the unproven acquisition-wait proposal was
+reverted. Candidate producers do not admit STEP, physical/runtime results or
+authenticated display ownership. Broader worker scopes and promotion stay open.
+
 Code-only continuation (2026-10-26): the saved-project D3D12 adapter now
 evaluates current constant/arithmetic material graphs with explicit typed
 parameter/surface values from a durable material binding or a revision/digest-
