@@ -8,6 +8,7 @@
 #include <carto/mesh_attributes/provenance.hpp>
 #include <carto/motion/curve_edit.hpp>
 #include <carto/pose/pose_library.hpp>
+#include <carto/pose/ik_fk_mode_key_record.hpp>
 #include <carto/weights/paint.hpp>
 
 #include <algorithm>
@@ -199,6 +200,28 @@ constexpr std::uint64_t kMaxSerializedPoseLibraries = 4'096U;
 constexpr std::uint64_t kMaxSerializedPoseLibraryAggregateBytes = 64ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaxAcceptedAutorigBundles = 512U;
 constexpr std::uint64_t kMaxAcceptedAutorigBytes = 64ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaxUnadmittedModeKeyDrafts = 512U;
+constexpr std::uint64_t kMaxUnadmittedModeKeyDraftAggregateBytes = 64ULL * 1024ULL * 1024ULL;
+
+assets::Sha256Digest mode_key_draft_envelope_digest(
+    std::string_view identity, const SerializedUnadmittedModeKeyDraft& entry) {
+    // Each field is length-delimited; the checksum is integrity evidence only.
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    const auto field = [&out](std::string_view value) { out << value.size() << ':' << value; };
+    field("CARTO_UNADMITTED_MODE_KEY_ENVELOPE_1");
+    field(identity);
+    field(entry.checked_project_namespace);
+    field(std::to_string(entry.checked_project_revision.value()));
+    field(entry.checked_rig_identity);
+    field(std::to_string(entry.checked_rig_revision.value()));
+    field(entry.checked_rig_digest.hex());
+    field(std::to_string(entry.revision.value()));
+    field(entry.digest.hex());
+    const auto bytes = out.str();
+    return assets::sha256(std::span<const std::uint8_t>{
+        reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()});
+}
 constexpr std::uint64_t kMaxSerializedKinematicGraphs = 4'096U;
 constexpr std::uint64_t kMaxSerializedKinematicGraphAggregateBytes =
     64ULL * 1024ULL * 1024ULL;
@@ -4282,6 +4305,50 @@ core::Result<core::Revision> ProjectDocument::set_pose_library(
     return core::Result<core::Revision>::success(next_revision);
 }
 
+core::Result<core::Revision> ProjectDocument::insert_unadmitted_mode_key_draft(
+    std::string identity, core::Revision expected_revision,
+    std::string checked_project_namespace, core::Revision checked_project_revision,
+    std::string checked_rig_identity,
+    core::Revision checked_rig_revision, assets::Sha256Digest checked_rig_digest,
+    std::string bytes, assets::Sha256Digest digest) {
+    using Result = core::Result<core::Revision>;
+    if (revision_.exhausted()) return Result::failure(exhausted_revision());
+    if (!valid_kinematic_graph_identity(identity) || bytes.empty() ||
+        bytes.size() > pose::IkFkModeKeyRecord::kMaxSerializedBytes || digest.is_zero())
+        return Result::failure(invalid("unadmitted mode-key draft identity or payload is invalid"));
+    if (expected_revision != core::Revision{})
+        return Result::failure(Diagnostic(ErrorCode::stale_data, "draft insertion requires an absent revision"));
+    const auto rig = accepted_autorigs_.find(checked_rig_identity);
+    if (!valid_source_namespace(checked_project_namespace) || checked_project_namespace != source_namespace_ ||
+        checked_project_revision.value() == 0U || checked_project_revision != revision_ || checked_project_revision.exhausted() ||
+        !valid_kinematic_graph_identity(checked_rig_identity) || checked_rig_revision.value() == 0U ||
+        checked_rig_revision.exhausted() || checked_rig_digest.is_zero() || rig == accepted_autorigs_.end() ||
+        rig->second.revision != checked_rig_revision || rig->second.digest != checked_rig_digest)
+        return Result::failure(Diagnostic(ErrorCode::stale_data, "draft insertion rig or project pin changed"));
+    if (unadmitted_mode_key_drafts_.contains(identity))
+        return Result::failure(Diagnostic(ErrorCode::stale_data, "unadmitted mode-key draft identity already exists"));
+    if (unadmitted_mode_key_drafts_.size() >= kMaxUnadmittedModeKeyDrafts)
+        return Result::failure(invalid("too many unadmitted mode-key drafts"));
+    if (auto bound = bind_opaque_record(bytes, digest, "unadmitted mode-key draft"); !bound)
+        return Result::failure(bound.error());
+    auto record = pose::IkFkModeKeyRecord::deserialize(bytes);
+    if (!record || record.value().serialize() != bytes)
+        return Result::failure(invalid("unadmitted mode-key draft is invalid or noncanonical"));
+    std::uint64_t total = 0U;
+    for (const auto& [key, entry] : unadmitted_mode_key_drafts_) {
+        (void)key;
+        total += static_cast<std::uint64_t>(entry.bytes.size());
+    }
+    if (bytes.size() > kMaxUnadmittedModeKeyDraftAggregateBytes - total)
+        return Result::failure(invalid("unadmitted mode-key draft aggregate exceeds its bound"));
+    SerializedUnadmittedModeKeyDraft entry{std::move(checked_project_namespace), checked_project_revision, std::move(checked_rig_identity),
+        checked_rig_revision, checked_rig_digest, core::Revision{1U}, std::move(bytes), digest, {}};
+    entry.envelope_digest = mode_key_draft_envelope_digest(identity, entry);
+    unadmitted_mode_key_drafts_.emplace(std::move(identity), std::move(entry));
+    bump_revision();
+    return Result::success(core::Revision{1U});
+}
+
 core::Result<core::Revision> ProjectDocument::set_accepted_autorig(
     std::string identity, core::Revision expected_revision,
     std::string bytes, assets::Sha256Digest digest) {
@@ -5096,6 +5163,25 @@ core::Result<void> ProjectDocument::validate() const {
         if (auto checked = detail::validate_accepted_autorig_bundle(entry.bytes); !checked)
             return checked;
     }
+    if (unadmitted_mode_key_drafts_.size() > kMaxUnadmittedModeKeyDrafts)
+        return core::Result<void>::failure(parse_error("too many unadmitted mode-key drafts"));
+    std::uint64_t draft_bytes = 0U;
+    for (const auto& [identity, entry] : unadmitted_mode_key_drafts_) {
+        if (!valid_kinematic_graph_identity(identity) || !valid_source_namespace(entry.checked_project_namespace) ||
+            entry.checked_project_revision.value() == 0U || entry.checked_project_revision.exhausted() ||
+            !valid_kinematic_graph_identity(entry.checked_rig_identity) || entry.checked_rig_revision.value() == 0U ||
+            entry.checked_rig_revision.exhausted() || entry.checked_rig_digest.is_zero() || entry.revision != core::Revision{1U} ||
+            entry.bytes.empty() || entry.bytes.size() > pose::IkFkModeKeyRecord::kMaxSerializedBytes ||
+            entry.bytes.size() > kMaxUnadmittedModeKeyDraftAggregateBytes - draft_bytes || entry.digest.is_zero() ||
+            entry.envelope_digest.is_zero() || mode_key_draft_envelope_digest(identity, entry) != entry.envelope_digest)
+            return core::Result<void>::failure(parse_error("unadmitted mode-key draft exceeds bounds"));
+        draft_bytes += static_cast<std::uint64_t>(entry.bytes.size());
+        if (auto bound = bind_opaque_record(entry.bytes, entry.digest, "unadmitted mode-key draft"); !bound)
+            return core::Result<void>::failure(bound.error());
+        auto record = pose::IkFkModeKeyRecord::deserialize(entry.bytes);
+        if (!record || record.value().serialize() != entry.bytes)
+            return core::Result<void>::failure(parse_error("invalid unadmitted mode-key draft"));
+    }
     if (weight_edit_receipts_.size() > kMaxSerializedWeightEditReceipts) {
         return core::Result<void>::failure(parse_error(
             "project contains too many weight edit receipts"));
@@ -5792,6 +5878,7 @@ void ProjectDocument::swap(ProjectDocument& other) noexcept {
     pose_libraries_.swap(other.pose_libraries_);
     kinematic_graphs_.swap(other.kinematic_graphs_);
     accepted_autorigs_.swap(other.accepted_autorigs_);
+    unadmitted_mode_key_drafts_.swap(other.unadmitted_mode_key_drafts_);
     weight_edit_receipts_.swap(other.weight_edit_receipts_);
     curve_edit_receipts_.swap(other.curve_edit_receipts_);
     std::swap(source_asset_registry_, other.source_asset_registry_);
@@ -6101,6 +6188,14 @@ std::string ProjectDocument::serialize() const {
     for (const auto& [identity, entry] : accepted_autorigs_)
         output << "ACCEPTED_AUTORIG " << std::quoted(identity) << ' ' << entry.revision.value()
                << ' ' << entry.digest.hex() << ' ' << std::quoted(entry.bytes) << '\n';
+    output << "UNADMITTED_MODE_KEY_DRAFTS " << unadmitted_mode_key_drafts_.size() << '\n';
+    for (const auto& [identity, entry] : unadmitted_mode_key_drafts_)
+        output << "UNADMITTED_MODE_KEY_DRAFT " << std::quoted(identity) << ' ' << entry.revision.value()
+               << ' ' << entry.digest.hex() << ' ' << std::quoted(entry.checked_project_namespace) << ' '
+               << entry.checked_project_revision.value() << ' '
+               << std::quoted(entry.checked_rig_identity) << ' ' << entry.checked_rig_revision.value() << ' '
+               << entry.checked_rig_digest.hex() << ' ' << entry.envelope_digest.hex() << ' '
+               << std::quoted(entry.bytes) << '\n';
     output << "END\n";
     return output.str();
 }
@@ -8617,6 +8712,58 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
     }
     if (version.value() >= 36U && !accepted_autorigs_seen)
         return core::Result<ProjectDocument>::failure(parse_error("project schema v36 is missing accepted autorigs"));
+    bool mode_key_drafts_seen = false;
+    if (terminal_record == "UNADMITTED_MODE_KEY_DRAFTS") {
+        if (version.value() < 38U)
+            return core::Result<ProjectDocument>::failure(parse_error("unadmitted mode-key drafts require schema v38"));
+        mode_key_drafts_seen = true;
+        const auto count = read_uint(input, "unadmitted mode-key draft count");
+        if (!count || count.value() > kMaxUnadmittedModeKeyDrafts)
+            return core::Result<ProjectDocument>::failure(parse_error("invalid unadmitted mode-key draft count"));
+        std::uint64_t total = 0U;
+        for (std::uint64_t i = 0; i < count.value(); ++i) {
+            if (auto line = require_line(input, "UNADMITTED_MODE_KEY_DRAFT"); !line)
+                return core::Result<ProjectDocument>::failure(line.error());
+            std::string identity, hex, bytes, checked_namespace, checked_rig, rig_hex, envelope_hex;
+            if (!(input >> std::quoted(identity)) || !valid_kinematic_graph_identity(identity))
+                return core::Result<ProjectDocument>::failure(parse_error("invalid unadmitted mode-key draft identity"));
+            const auto revision = read_uint(input, "unadmitted mode-key draft revision");
+            if (!revision || revision.value() != 1U || !(input >> hex >> std::quoted(checked_namespace)) ||
+                !valid_source_namespace(checked_namespace))
+                return core::Result<ProjectDocument>::failure(parse_error("invalid historical mode-key draft pins"));
+            const auto project_revision = read_uint(input, "mode-key draft project revision");
+            if (!project_revision || project_revision.value() == 0U ||
+                project_revision.value() == std::numeric_limits<std::uint64_t>::max() ||
+                !(input >> std::quoted(checked_rig)) || !valid_kinematic_graph_identity(checked_rig))
+                return core::Result<ProjectDocument>::failure(parse_error("invalid historical mode-key project pin"));
+            const auto rig_revision = read_uint(input, "mode-key draft rig revision");
+            if (!rig_revision || rig_revision.value() == 0U || rig_revision.value() == std::numeric_limits<std::uint64_t>::max() ||
+                !(input >> rig_hex >> envelope_hex >> std::quoted(bytes)) ||
+                bytes.empty() || bytes.size() > pose::IkFkModeKeyRecord::kMaxSerializedBytes ||
+                bytes.size() > kMaxUnadmittedModeKeyDraftAggregateBytes - total)
+                return core::Result<ProjectDocument>::failure(parse_error("invalid unadmitted mode-key draft payload"));
+            total += static_cast<std::uint64_t>(bytes.size());
+            auto digest = assets::Sha256Digest::from_hex(hex);
+            auto rig_digest = assets::Sha256Digest::from_hex(rig_hex);
+            auto envelope_digest = assets::Sha256Digest::from_hex(envelope_hex);
+            if (!digest || digest.value().is_zero() || !rig_digest || rig_digest.value().is_zero() ||
+                !envelope_digest || envelope_digest.value().is_zero() ||
+                !bind_opaque_record(bytes, digest.value(), "unadmitted mode-key draft"))
+                return core::Result<ProjectDocument>::failure(parse_error("invalid unadmitted mode-key draft digest"));
+            auto record = pose::IkFkModeKeyRecord::deserialize(bytes);
+            SerializedUnadmittedModeKeyDraft entry{std::move(checked_namespace), core::Revision{project_revision.value()},
+                std::move(checked_rig), core::Revision{rig_revision.value()}, rig_digest.value(), core::Revision{1U},
+                std::move(bytes), digest.value(), envelope_digest.value()};
+            if (!record || record.value().serialize() != entry.bytes ||
+                mode_key_draft_envelope_digest(identity, entry) != entry.envelope_digest ||
+                !document.unadmitted_mode_key_drafts_.emplace(std::move(identity), std::move(entry)).second)
+                return core::Result<ProjectDocument>::failure(parse_error("invalid unadmitted mode-key draft record"));
+        }
+        if (!(input >> terminal_record))
+            return core::Result<ProjectDocument>::failure(parse_error("project is missing END"));
+    }
+    if (version.value() >= 38U && !mode_key_drafts_seen)
+        return core::Result<ProjectDocument>::failure(parse_error("project schema v38 is missing unadmitted mode-key drafts"));
     if (terminal_record != "END") {
         return core::Result<ProjectDocument>::failure(
             parse_error("project is missing its END record"));

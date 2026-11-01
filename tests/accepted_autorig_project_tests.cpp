@@ -130,12 +130,15 @@ int main() {
     auto reopened = project::ProjectDocument::load(path / "project.carto");
     require(saved && reopened && reopened.value().accepted_autorigs().at("body") == entry, "save/reopen");
     auto populated_v36 = reopened.value().serialize();
-    require(populated_v36.starts_with("CARTOGRAPHER_PROJECT 37\n"), "current project header");
-    populated_v36.replace(0U, std::string("CARTOGRAPHER_PROJECT 37\n").size(),
+    const auto populated_v36_drafts = populated_v36.find("UNADMITTED_MODE_KEY_DRAFTS 0\n");
+    require(populated_v36_drafts != std::string::npos, "fixture has the v38 draft table");
+    populated_v36.erase(populated_v36_drafts, std::string("UNADMITTED_MODE_KEY_DRAFTS 0\n").size());
+    require(populated_v36.starts_with("CARTOGRAPHER_PROJECT 38\n"), "current project header");
+    populated_v36.replace(0U, std::string("CARTOGRAPHER_PROJECT 38\n").size(),
                           "CARTOGRAPHER_PROJECT 36\n");
     const auto migrated_v36 = project::ProjectDocument::deserialize(populated_v36);
     require(migrated_v36 && migrated_v36.value().accepted_autorigs().at("body") == entry &&
-            migrated_v36.value().serialize().starts_with("CARTOGRAPHER_PROJECT 37\n"),
+            migrated_v36.value().serialize().starts_with("CARTOGRAPHER_PROJECT 38\n"),
             "v36 project with a populated v1 bundle migrates without changing it");
     require(project::ProjectDocument::deserialize(before).value().accepted_autorigs().empty(), "pre-commit snapshot restores without bundle");
     auto remove = project::ProjectTransaction::begin(doc, journal, "artist");
@@ -145,11 +148,14 @@ int main() {
     require(at != std::string::npos, "digest in project"); text[at] = text[at] == 'a' ? 'b' : 'a';
     require(!project::ProjectDocument::deserialize(text), "tampered bundle digest refused");
     auto old = project::ProjectDocument{}.serialize();
-    old.replace(0, std::string("CARTOGRAPHER_PROJECT 37\n").size(), "CARTOGRAPHER_PROJECT 35\n");
+    const auto old_drafts = old.find("UNADMITTED_MODE_KEY_DRAFTS 0\n");
+    require(old_drafts != std::string::npos, "fixture has the v38 draft table");
+    old.erase(old_drafts, std::string("UNADMITTED_MODE_KEY_DRAFTS 0\n").size());
+    old.replace(0, std::string("CARTOGRAPHER_PROJECT 38\n").size(), "CARTOGRAPHER_PROJECT 35\n");
     auto table = old.find("ACCEPTED_AUTORIGS 0\n"); require(table != std::string::npos, "empty table fixture");
     old.erase(table, std::string("ACCEPTED_AUTORIGS 0\n").size());
     auto migrated = project::ProjectDocument::deserialize(old);
-    require(migrated && migrated.value().accepted_autorigs().empty() && migrated.value().schema_version() == 37,
-            "v35 migration to empty v37 table");
+    require(migrated && migrated.value().accepted_autorigs().empty() && migrated.value().schema_version() == 38,
+            "v35 migration to empty v38 table");
     std::error_code ignored; std::filesystem::remove_all(path, ignored);
 }

@@ -988,6 +988,11 @@ core::Result<DispatchReceipt> HumanApplicationAccess::configure_autorig_ik_fk(
     return session.configure_autorig_ik_fk(HumanActionAdmission{}, request);
 }
 
+core::Result<DispatchReceipt> HumanApplicationAccess::store_unadmitted_mode_key_draft(
+    ApplicationSession& session, const StoreUnadmittedModeKeyDraftRequest& request) {
+    return session.store_unadmitted_mode_key_draft(HumanActionAdmission{}, request);
+}
+
 core::Result<DispatchReceipt> HumanApplicationAccess::clear_historical_autorig_ik_fk(
     ApplicationSession& session, const ClearHistoricalAutorigIkFkRequest& request) {
     return session.clear_historical_autorig_ik_fk(HumanActionAdmission{}, request);
@@ -1060,6 +1065,107 @@ core::Result<DispatchReceipt> ApplicationSession::configure_autorig_ik_fk(
     return execute_command(std::make_unique<editor::ReplaceProjectDocumentCommand>(
         admission, document_, std::move(candidate), "Configure AutoRig IK/FK"),
         "Configure AutoRig IK/FK");
+}
+
+core::Result<DispatchReceipt> ApplicationSession::store_unadmitted_mode_key_draft(
+    HumanActionAdmission, const StoreUnadmittedModeKeyDraftRequest& request) {
+    if (active_source_ != OperationSource::human || !request.acknowledge_unadmitted_assertions ||
+        request.justification.empty() || request.justification.size() > 512U ||
+        request.justification.find_first_not_of(' ') == std::string::npos ||
+        std::any_of(request.justification.begin(), request.justification.end(), [](unsigned char value) {
+            return value < 0x20U || value == 0x7fU;
+        }))
+        return failure(invalid_state("unadmitted mode-key draft requires human acknowledgement and justification"));
+    if (!journal_.has_value())
+        return failure(invalid_state("unadmitted mode-key draft requires a saved project with a durable journal"));
+    if (request.expected_source_namespace != document_.source_namespace())
+        return failure(core::Diagnostic(core::ErrorCode::stale_data, "project source namespace changed"));
+    auto current = accepted_autorig(request.rig_identity, request.expected_project_generation,
+                                   request.expected_project_revision);
+    if (!current) return failure(current.error().with_context("mode-key draft current rig"));
+    const auto row = document_.accepted_autorigs().find(request.rig_identity);
+    if (current.value().record_revision != request.expected_rig_record_revision ||
+        row->second.digest != request.expected_rig_record_digest)
+        return failure(core::Diagnostic(core::ErrorCode::stale_data, "mode-key draft rig pin changed"));
+
+    const pose::IkFkAuthoring* authoring = nullptr;
+    for (const auto& config : current.value().bundle.ik_fk) {
+        const auto digest = config.canonical_digest();
+        if (!digest) return failure(digest.error());
+        if (digest.value() == request.context.authoring_digest) {
+            if (authoring != nullptr)
+                return failure(invalid_state("mode-key authoring digest is not unique"));
+            authoring = &config;
+        }
+    }
+    if (authoring == nullptr)
+        return failure(core::Diagnostic(core::ErrorCode::stale_data, "mode-key authoring is not current"));
+    auto graph = kinematic::KinematicGraph::deserialize(current.value().bundle.reviewed.graph_bytes);
+    if (!graph) return failure(graph.error());
+    auto proposal = pose::propose_ik_fk_mode_key_intent(
+        request.document, request.clip, request.channel, request.layer, request.context,
+        request.crosswalk, *authoring, current.value().bundle.rig, graph.value(),
+        current.value().bundle.limits, request.source_mode, request.target_mode,
+        request.source_locals, request.source_ik);
+    if (!proposal) return failure(proposal.error().with_context("recompute unadmitted mode-key draft"));
+    auto record = pose::make_ik_fk_mode_key_record(proposal.value());
+    if (!record) return failure(record.error());
+    const auto digest = record.value().canonical_digest();
+    const auto expected_digest = request.expected_record.canonical_digest();
+    if (!digest) return failure(digest.error());
+    if (!expected_digest) return failure(expected_digest.error());
+    auto bytes = record.value().serialize();
+    auto decoded = pose::IkFkModeKeyRecord::deserialize(bytes);
+    if (!decoded || decoded.value().serialize() != bytes ||
+        expected_digest.value() != digest.value() || request.expected_record.serialize() != bytes)
+        return failure(core::Diagnostic(core::ErrorCode::stale_data, "mode-key draft differs from recomputed canonical record"));
+    project::ProjectDocument candidate = document_;
+    const auto staged = candidate.insert_unadmitted_mode_key_draft(
+        request.draft_identity, request.expected_draft_revision, document_.source_namespace(), document_.revision(),
+        row->first, row->second.revision, row->second.digest, std::move(bytes), digest.value());
+    if (!staged) return failure(staged.error().with_context("stage unadmitted mode-key draft"));
+
+    const auto hex = [](std::string_view input) {
+        constexpr char digits[] = "0123456789abcdef";
+        std::string output;
+        output.reserve(input.size() * 2U);
+        for (const unsigned char byte : input) {
+            output.push_back(digits[byte >> 4U]);
+            output.push_back(digits[byte & 15U]);
+        }
+        return output;
+    };
+    editor::ProjectCommandAdmission admission;
+    return execute_command(std::make_unique<editor::ReplaceProjectDocumentCommand>(
+        admission, document_, std::move(candidate), "Store Unadmitted Mode-Key Draft"),
+        "Store Unadmitted Mode-Key Draft acknowledge_unadmitted_assertions=1 justification_hex=" +
+            hex(request.justification) + " draft_hex=" + hex(request.draft_identity) +
+            " rig_hex=" + hex(request.rig_identity) + " rig_revision=" +
+            std::to_string(request.expected_rig_record_revision.value()) + " rig_digest=" +
+            request.expected_rig_record_digest.hex() + " draft_digest=" + digest.value().hex());
+}
+
+core::Result<UnadmittedModeKeyDraftView> ApplicationSession::unadmitted_mode_key_draft(
+    std::string_view identity, std::uint64_t expected_generation,
+    std::string_view expected_namespace, core::Revision expected_revision) const {
+    using Result = core::Result<UnadmittedModeKeyDraftView>;
+    if (expected_generation != project_generation_ || expected_namespace != document_.source_namespace() ||
+        expected_revision != document_.revision())
+        return Result::failure(core::Diagnostic(core::ErrorCode::stale_data, "draft read belongs to a different project state"));
+    if (identity.empty() || identity.size() > 128U)
+        return Result::failure(core::Diagnostic(core::ErrorCode::invalid_argument, "draft identity exceeds its bound"));
+    const auto found = document_.unadmitted_mode_key_drafts().find(std::string(identity));
+    if (found == document_.unadmitted_mode_key_drafts().end())
+        return Result::failure(core::Diagnostic(core::ErrorCode::not_found, "unadmitted mode-key draft is absent"));
+    auto record = pose::IkFkModeKeyRecord::deserialize(found->second.bytes);
+    if (!record) return Result::failure(record.error());
+    const auto digest = record.value().canonical_digest();
+    if (!digest || digest.value() != found->second.digest || record.value().serialize() != found->second.bytes)
+        return Result::failure(core::Diagnostic(core::ErrorCode::invalid_state, "unadmitted mode-key draft integrity failed"));
+    return Result::success({found->second.checked_project_namespace, found->second.checked_project_revision,
+        found->second.checked_rig_identity,
+        found->second.checked_rig_revision, found->second.checked_rig_digest,
+        found->second.revision, found->second.digest, found->second.envelope_digest, std::move(record.value())});
 }
 
 core::Result<AcceptedAutorigView> ApplicationSession::accepted_autorig(

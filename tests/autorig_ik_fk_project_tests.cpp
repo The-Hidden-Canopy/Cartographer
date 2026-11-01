@@ -151,8 +151,11 @@ int main() {
         decoded.value().weights.output.binding.serialize() == old.value().weights.output.binding.serialize(),
         "v2 retains authored configuration and full transferred binding");
     auto mislabeled_v36 = document.serialize();
-    require(mislabeled_v36.starts_with("CARTOGRAPHER_PROJECT 37\n"), "current v37 header");
-    mislabeled_v36.replace(0U, std::string("CARTOGRAPHER_PROJECT 37\n").size(),
+    const auto mislabeled_v36_drafts = mislabeled_v36.find("UNADMITTED_MODE_KEY_DRAFTS 0\n");
+    require(mislabeled_v36_drafts != std::string::npos, "fixture has the v38 draft table");
+    mislabeled_v36.erase(mislabeled_v36_drafts, std::string("UNADMITTED_MODE_KEY_DRAFTS 0\n").size());
+    require(mislabeled_v36.starts_with("CARTOGRAPHER_PROJECT 38\n"), "current v38 header");
+    mislabeled_v36.replace(0U, std::string("CARTOGRAPHER_PROJECT 38\n").size(),
                            "CARTOGRAPHER_PROJECT 36\n");
     require(!project::ProjectDocument::deserialize(mislabeled_v36),
         "v36 refuses a v2 accepted-autorig bundle");

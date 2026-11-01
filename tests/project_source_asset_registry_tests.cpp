@@ -170,7 +170,7 @@ void generated_botanical_import_receipt_is_persistent_and_schema_gated() {
         "generation receipt mutation receives a revisioned project journal entry");
 
     const std::string encoded = document.serialize();
-    require(encoded.starts_with("CARTOGRAPHER_PROJECT 37\n"),
+    require(encoded.starts_with("CARTOGRAPHER_PROJECT 38\n"),
         "generation receipts are marked with the current project schema");
     const auto reopened = project::ProjectDocument::deserialize(encoded);
     require(reopened && reopened.value().source_asset_registry().records().at(
@@ -217,13 +217,14 @@ void generated_botanical_import_receipt_is_persistent_and_schema_gated() {
             "WEIGHT_EDIT_RECEIPTS 0\n",
             "CURVE_EDIT_RECEIPTS 0\n",
             "KINEMATIC_GRAPHS 0\n",
-            "ACCEPTED_AUTORIGS 0\n"}) {
+            "ACCEPTED_AUTORIGS 0\n",
+            "UNADMITTED_MODE_KEY_DRAFTS 0\n"}) {
         const auto record = mislabeled_v26.find(table);
         require(record != std::string::npos,
             "schema 26 fixture removes a later character record table");
         mislabeled_v26.erase(record, table.size());
     }
-    mislabeled_v26.replace(0U, std::string("CARTOGRAPHER_PROJECT 37\n").size(),
+    mislabeled_v26.replace(0U, std::string("CARTOGRAPHER_PROJECT 38\n").size(),
         "CARTOGRAPHER_PROJECT 26\n");
     require(!project::ProjectDocument::deserialize(mislabeled_v26),
         "schema 26 refuses a v2 generation receipt instead of silently ignoring it");
@@ -333,7 +334,8 @@ void schema_twenty_migrates_to_an_empty_registry() {
             "WEIGHT_EDIT_RECEIPTS 0\n",
             "CURVE_EDIT_RECEIPTS 0\n",
             "KINEMATIC_GRAPHS 0\n",
-            "ACCEPTED_AUTORIGS 0\n"}) {
+            "ACCEPTED_AUTORIGS 0\n",
+            "UNADMITTED_MODE_KEY_DRAFTS 0\n"}) {
         const auto record = schema_twenty.find(table);
         require(record != std::string::npos,
             "schema 20 fixture removes a later source table");

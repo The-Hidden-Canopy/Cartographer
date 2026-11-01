@@ -24,6 +24,7 @@
 #include <carto/geometry/road_surface.hpp>
 #include <carto/geometry/sign.hpp>
 #include <carto/journal/journal.hpp>
+#include <carto/pose/ik_fk_mode_key_record.hpp>
 #include <carto/project/accepted_autorig.hpp>
 #include <carto/project/project.hpp>
 #include <carto/project/material_catalog.hpp>
@@ -1875,6 +1876,53 @@ struct ConfigureAutorigIkFkRequest {
     std::vector<pose::IkFkAuthoring> configurations;
 };
 
+// Stores only an unadmitted raw curve draft. The selected layer is not a
+// complete layer snapshot or a CAS on evaluated/current mode. The record does
+// not retain the matched pose or certify human approval of a particular match.
+// Supplied pose, source, frame, clock and crosswalk assertions are not authenticated.
+struct StoreUnadmittedModeKeyDraftRequest {
+    std::uint64_t expected_project_generation = 0U;
+    std::string expected_source_namespace;
+    core::Revision expected_project_revision;
+    std::string rig_identity;
+    core::Revision expected_rig_record_revision;
+    assets::Sha256Digest expected_rig_record_digest;
+    std::string draft_identity;
+    core::Revision expected_draft_revision;
+    bool acknowledge_unadmitted_assertions = false;
+    std::string justification;
+    character::MotionDocument document;
+    temporal::MotionClip clip;
+    temporal::TemporalChannel channel;
+    motion::AnimationLayer layer;
+    pose::ModeKeyIntentContext context;
+    pose::ModeIntentCrosswalk crosswalk;
+    pose::IkFkMode source_mode = pose::IkFkMode::fk;
+    pose::IkFkMode target_mode = pose::IkFkMode::fk;
+    pose::LocalPose source_locals;
+    std::optional<pose::IkControlState> source_ik;
+    pose::IkFkModeKeyRecord expected_record;
+};
+
+// Historical unadmitted raw curve data; this is not an evaluated mode or a
+// complete layer snapshot and does not establish source, pose, frame, clock
+// or crosswalk authority, nor execution or physical effect. Checked pins are
+// historical insertion-time claims, not currentness. The envelope digest checks
+// integrity; it does not authenticate its claims. Undo may remove a draft
+// and permit its identity and row revision to be reused; references must also
+// bind project generation/revision, digest and asserted branch/restore lineage.
+struct UnadmittedModeKeyDraftView {
+    std::string checked_project_namespace;
+    core::Revision checked_project_revision;
+    std::string checked_rig_identity;
+    core::Revision checked_rig_revision;
+    assets::Sha256Digest checked_rig_digest;
+    core::Revision record_revision;
+    assets::Sha256Digest digest;
+    assets::Sha256Digest envelope_digest;
+    pose::IkFkModeKeyRecord record;
+};
+
 // Explicit loss decision for a historical (possibly stale) record. This
 // clears authoring metadata, not physical or evaluated state.
 struct ClearHistoricalAutorigIkFkRequest {
@@ -1908,6 +1956,8 @@ public:
         ApplicationSession& session, const AcceptAutorigRequest& request);
     [[nodiscard]] static core::Result<DispatchReceipt> configure_autorig_ik_fk(
         ApplicationSession& session, const ConfigureAutorigIkFkRequest& request);
+    [[nodiscard]] static core::Result<DispatchReceipt> store_unadmitted_mode_key_draft(
+        ApplicationSession& session, const StoreUnadmittedModeKeyDraftRequest& request);
     [[nodiscard]] static core::Result<DispatchReceipt> clear_historical_autorig_ik_fk(
         ApplicationSession& session, const ClearHistoricalAutorigIkFkRequest& request);
     [[nodiscard]] static core::Result<DispatchReceipt> commit_mesh_cleanup(
@@ -2097,6 +2147,9 @@ public:
     [[nodiscard]] core::Result<HistoricalAutorigView> historical_autorig(
         std::string_view identity, std::uint64_t expected_project_generation,
         core::Revision expected_project_revision) const;
+    [[nodiscard]] core::Result<UnadmittedModeKeyDraftView> unadmitted_mode_key_draft(
+        std::string_view identity, std::uint64_t expected_project_generation,
+        std::string_view expected_source_namespace, core::Revision expected_project_revision) const;
     // Computes a switch proposal only; no control values or mode are applied.
     [[nodiscard]] core::Result<pose::IkFkSwitchProposal> propose_autorig_ik_fk_switch(
         std::string_view identity, std::uint64_t expected_project_generation,
@@ -2159,6 +2212,8 @@ private:
         HumanActionAdmission admission, const AcceptAutorigRequest& request);
     [[nodiscard]] core::Result<DispatchReceipt> configure_autorig_ik_fk(
         HumanActionAdmission admission, const ConfigureAutorigIkFkRequest& request);
+    [[nodiscard]] core::Result<DispatchReceipt> store_unadmitted_mode_key_draft(
+        HumanActionAdmission admission, const StoreUnadmittedModeKeyDraftRequest& request);
     [[nodiscard]] core::Result<DispatchReceipt> clear_historical_autorig_ik_fk(
         HumanActionAdmission admission, const ClearHistoricalAutorigIkFkRequest& request);
     [[nodiscard]] core::Result<DispatchReceipt> commit_mesh_cleanup(

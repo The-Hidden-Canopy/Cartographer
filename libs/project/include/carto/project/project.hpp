@@ -222,6 +222,23 @@ struct SerializedAcceptedAutorig {
     [[nodiscard]] bool operator==(const SerializedAcceptedAutorig&) const noexcept = default;
 };
 
+// An unadmitted authored-intent draft. Bytes contain caller assertions, not
+// an authoritative motion channel, current pose, or execution evidence.
+struct SerializedUnadmittedModeKeyDraft {
+    // These were checked at insertion; they do not assert present currentness.
+    std::string checked_project_namespace;
+    core::Revision checked_project_revision;
+    std::string checked_rig_identity;
+    core::Revision checked_rig_revision;
+    assets::Sha256Digest checked_rig_digest;
+    core::Revision revision{1U};
+    std::string bytes;
+    assets::Sha256Digest digest;
+    // Integrity checksum over the full insertion envelope; not attestation.
+    assets::Sha256Digest envelope_digest;
+    [[nodiscard]] bool operator==(const SerializedUnadmittedModeKeyDraft&) const noexcept = default;
+};
+
 struct SerializedKinematicGraph {
     core::Revision revision{1U};
     std::string bytes;
@@ -330,7 +347,7 @@ struct RoadSurfaceInstanceReceipt {
 
 class ProjectDocument {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 37;
+    static constexpr std::uint32_t kSchemaVersion = 38;
     static constexpr std::uint32_t kMinimumReadableSchemaVersion = 1;
     static constexpr std::string_view kMagic = "CARTOGRAPHER_PROJECT";
     static constexpr std::string_view kAuthoringFormat = "cartographer.authoring";
@@ -458,6 +475,9 @@ public:
     // Internally validated accepted rig bundles; historical review assertions are not authenticated.
     [[nodiscard]] const std::map<std::string, SerializedAcceptedAutorig>&
     accepted_autorigs() const noexcept { return accepted_autorigs_; }
+    // Historical, unadmitted drafts; cold read conveys no currentness or authority.
+    [[nodiscard]] const std::map<std::string, SerializedUnadmittedModeKeyDraft>&
+    unadmitted_mode_key_drafts() const noexcept { return unadmitted_mode_key_drafts_; }
     // Historical weight-edit receipts (flood/prune/mirror), in commit order.
     // Each record binds the exact serialized receipt bytes.
     [[nodiscard]] const std::vector<SerializedWeightEditReceipt>&
@@ -680,6 +700,14 @@ private:
     [[nodiscard]] core::Result<core::Revision> set_accepted_autorig(
         std::string identity, core::Revision expected_revision,
         std::string bytes, assets::Sha256Digest digest);
+    // Insert only. The human application boundary must perform live checks
+    // and explicit admission; this primitive grants no motion authority.
+    [[nodiscard]] core::Result<core::Revision> insert_unadmitted_mode_key_draft(
+        std::string identity, core::Revision expected_revision,
+        std::string checked_project_namespace, core::Revision checked_project_revision,
+        std::string checked_rig_identity,
+        core::Revision checked_rig_revision, assets::Sha256Digest checked_rig_digest,
+        std::string bytes, assets::Sha256Digest digest);
     // Appends one digest-bound weight-edit receipt. The receipt bytes must
     // decode through the weights codec and bind their input/output binding
     // digests; receipts are historical and never revised in place.
@@ -782,6 +810,7 @@ private:
     std::map<std::string, SerializedPoseLibrary> pose_libraries_;
     std::map<std::string, SerializedKinematicGraph> kinematic_graphs_;
     std::map<std::string, SerializedAcceptedAutorig> accepted_autorigs_;
+    std::map<std::string, SerializedUnadmittedModeKeyDraft> unadmitted_mode_key_drafts_;
     std::vector<SerializedWeightEditReceipt> weight_edit_receipts_;
     std::vector<SerializedCurveEditReceipt> curve_edit_receipts_;
     assets::ProjectAssetRegistry source_asset_registry_;

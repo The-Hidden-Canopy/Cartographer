@@ -687,8 +687,11 @@ void prefab_socket_connections_are_revision_bound_persisted_and_undoable() {
         f.session.document_.serialize());
     REQUIRE(reopened && reopened.value().connection_port_graph().edges().size() == 1U);
     auto mislabeled_schema33 = f.session.document_.serialize();
+    const auto mislabeled_schema33_drafts = mislabeled_schema33.find("UNADMITTED_MODE_KEY_DRAFTS 0\n");
+    REQUIRE(mislabeled_schema33_drafts != std::string::npos);
+    mislabeled_schema33.erase(mislabeled_schema33_drafts, std::string("UNADMITTED_MODE_KEY_DRAFTS 0\n").size());
     mislabeled_schema33.replace(0U,
-        std::string("CARTOGRAPHER_PROJECT 37\n").size(), "CARTOGRAPHER_PROJECT 33\n");
+        std::string("CARTOGRAPHER_PROJECT 38\n").size(), "CARTOGRAPHER_PROJECT 33\n");
     const std::string accepted_table = "ACCEPTED_AUTORIGS 0\n";
     const auto accepted_pos = mislabeled_schema33.find(accepted_table);
     REQUIRE(accepted_pos != std::string::npos);

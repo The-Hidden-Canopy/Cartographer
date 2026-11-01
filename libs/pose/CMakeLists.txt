@@ -6,6 +6,8 @@ add_library(carto_pose STATIC
     src/ik.cpp
     src/ik_fk_match.cpp
     src/ik_fk_authoring.cpp
+    src/ik_fk_mode_key_intent.cpp
+    src/ik_fk_mode_key_record.cpp
     src/pose_library.cpp
     src/rotation.cpp
 )
@@ -21,6 +23,7 @@ target_link_libraries(carto_pose
         carto_core
         carto_kinematic
         carto_character
+        carto_motion
 )
 carto_target(carto_pose)
 
