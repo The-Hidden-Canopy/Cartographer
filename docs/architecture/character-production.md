@@ -167,10 +167,11 @@ record for undo.
   migrates older files with an empty library. Instantiation grafts a template's joint/control fragment into
 target graphs under fresh stable ids with a digest-bound receipt. The library
 has no delete API or native editor workflow yet.
-- A durable kinematic-graph record now exists, but no conversion path commits
-  an accepted autorig candidate into it. Candidate IDs remain preview-local,
-  and the candidate model does not supply all final-node fields. `ProjectDocument`
-  also has no complete rig document or accepted-review commit path. Review
-  acceptance must not be represented as a committed rig. Transferred weight
-  layers likewise remain unpersisted: cross-topology transfer produces
-  receipt-bound layers, but no project commit path stores them.
+- Schema v36 adds a journaled accepted-autorig bundle containing the reviewed
+  graph mapping, explicitly authored rig and controls, joint limits, and a
+  transferred binding with its full per-vertex weights and receipt. Candidate
+  IDs remain preview-local; callers supply durable IDs and final node fields.
+  Cold records need a current-mesh readiness check before use. This is not a
+  complete persistent IK/FK setup or a native editor workflow. See
+  [schema v36](../format/cartographer-project-v36.md) and the
+  [handoff](../verification/autorig-durable-handoff-20261031.md).

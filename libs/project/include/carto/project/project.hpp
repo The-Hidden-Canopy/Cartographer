@@ -215,6 +215,13 @@ struct SerializedPoseLibrary {
 // Canonical authored kinematic graph bytes pinned to the digest of their
 // exact serialization. The project validates the public graph codec before
 // admission; rig controls and mesh bindings remain separately authored.
+struct SerializedAcceptedAutorig {
+    core::Revision revision{1U};
+    std::string bytes;
+    assets::Sha256Digest digest;
+    [[nodiscard]] bool operator==(const SerializedAcceptedAutorig&) const noexcept = default;
+};
+
 struct SerializedKinematicGraph {
     core::Revision revision{1U};
     std::string bytes;
@@ -323,7 +330,7 @@ struct RoadSurfaceInstanceReceipt {
 
 class ProjectDocument {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 35;
+    static constexpr std::uint32_t kSchemaVersion = 36;
     static constexpr std::uint32_t kMinimumReadableSchemaVersion = 1;
     static constexpr std::string_view kMagic = "CARTOGRAPHER_PROJECT";
     static constexpr std::string_view kAuthoringFormat = "cartographer.authoring";
@@ -448,6 +455,9 @@ public:
     // identity. These are final authored records, not preview candidate IDs.
     [[nodiscard]] const std::map<std::string, SerializedKinematicGraph>&
     kinematic_graphs() const noexcept { return kinematic_graphs_; }
+    // Internally validated accepted rig bundles; historical review assertions are not authenticated.
+    [[nodiscard]] const std::map<std::string, SerializedAcceptedAutorig>&
+    accepted_autorigs() const noexcept { return accepted_autorigs_; }
     // Historical weight-edit receipts (flood/prune/mirror), in commit order.
     // Each record binds the exact serialized receipt bytes.
     [[nodiscard]] const std::vector<SerializedWeightEditReceipt>&
@@ -667,6 +677,9 @@ private:
         core::Revision expected_revision,
         std::string serialized_graph,
         assets::Sha256Digest digest);
+    [[nodiscard]] core::Result<core::Revision> set_accepted_autorig(
+        std::string identity, core::Revision expected_revision,
+        std::string bytes, assets::Sha256Digest digest);
     // Appends one digest-bound weight-edit receipt. The receipt bytes must
     // decode through the weights codec and bind their input/output binding
     // digests; receipts are historical and never revised in place.
@@ -768,6 +781,7 @@ private:
     std::map<std::uint64_t, SerializedDecalPlacement> decal_placements_;
     std::map<std::string, SerializedPoseLibrary> pose_libraries_;
     std::map<std::string, SerializedKinematicGraph> kinematic_graphs_;
+    std::map<std::string, SerializedAcceptedAutorig> accepted_autorigs_;
     std::vector<SerializedWeightEditReceipt> weight_edit_receipts_;
     std::vector<SerializedCurveEditReceipt> curve_edit_receipts_;
     assets::ProjectAssetRegistry source_asset_registry_;

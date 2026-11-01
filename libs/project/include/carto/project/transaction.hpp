@@ -4,6 +4,10 @@
 #include <carto/core/result.hpp>
 #include <carto/journal/journal.hpp>
 #include <carto/project/project.hpp>
+#include <carto/character/autorig_graph.hpp>
+#include <carto/character/definition.hpp>
+#include <carto/kinematic/limits.hpp>
+#include <carto/weights/transfer.hpp>
 
 #include <cstdint>
 #include <optional>
@@ -119,6 +123,23 @@ public:
         core::Revision expected_revision,
         std::string serialized_graph,
         assets::Sha256Digest digest);
+    // Performs live source/review checks and the weight transfer before staging
+    // one bundle; commit publishes it with the project journal. IK/FK switch
+    // authoring is not represented by this record.
+    [[nodiscard]] core::Result<core::Revision> accept_autorig(
+        std::string identity, core::Revision expected_revision,
+        const character::AutorigAnalysisRequest& request,
+        const character::AutorigCandidateSet& candidates,
+        const character::AutorigReviewAcceptance& acceptance,
+        const std::vector<character::AutorigFinalNode>& nodes,
+        const character::RigDefinition& rig,
+        const kinematic::JointLimitSet& limits,
+        const kinematic::SkinBinding& source_binding,
+        const character::SkinWeightLayer& source_layer,
+        const weights::WeightCorrespondence& correspondence,
+        const weights::JointTransferMap& joint_map,
+        const weights::WeightTransferOptions& options,
+        const weights::WeightLocks* locks = nullptr);
     [[nodiscard]] core::Result<void> append_weight_edit_receipt(
         std::string serialized_receipt,
         assets::Sha256Digest digest);

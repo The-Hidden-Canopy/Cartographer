@@ -4,6 +4,7 @@ add_library(carto_weights STATIC
     src/lowering.cpp
     src/paint.cpp
     src/transfer.cpp
+    src/transfer_record.cpp
 )
 
 target_include_directories(carto_weights

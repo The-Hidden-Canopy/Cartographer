@@ -281,6 +281,25 @@ core::Result<void> AutorigFeatureAnalysis::validate() const {
     return core::Result<void>::success();
 }
 
+core::Result<assets::Sha256Digest> autorig_mesh_geometry_digest(
+    const geometry::EditableMesh& mesh) {
+    using Result = core::Result<assets::Sha256Digest>;
+    if (auto checked = mesh.validate(); !checked) return Result::failure(checked.error());
+    const auto vertices = mesh.vertices_sorted();
+    if (vertices.empty() || vertices.size() > AutorigAnalysisBudget::kHardMaxVertices)
+        return Result::failure(invalid("autorig mesh vertex count exceeds its hard budget"));
+    auto topology = mesh.topology();
+    if (!topology) return Result::failure(topology.error());
+    if (topology.value().edges.size() > AutorigAnalysisBudget::kHardMaxEdges)
+        return Result::failure(invalid("autorig mesh edge count exceeds its hard budget"));
+    for (const auto& vertex : vertices) {
+        if (!vertex.position.finite() || std::abs(vertex.position.x) > kMaxCoordinate ||
+            std::abs(vertex.position.y) > kMaxCoordinate || std::abs(vertex.position.z) > kMaxCoordinate)
+            return Result::failure(invalid("autorig mesh contains a non-finite or over-range vertex"));
+    }
+    return Result::success(geometry_digest(vertices, mesh.faces_sorted()));
+}
+
 core::Result<AutorigFeatureAnalysis> analyze_autorig_features(
     const geometry::EditableMesh& mesh,
     const AutorigAnalysisRequest& request) {

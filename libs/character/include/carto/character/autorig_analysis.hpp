@@ -90,6 +90,12 @@ struct AutorigFeatureAnalysis final {
     [[nodiscard]] core::Result<void> validate() const;
 };
 
+// Computes the same source geometry pin as feature analysis without running
+// symmetry or geodesic analysis. The validated mesh and hard geometry budgets
+// are checked, but this does not verify an external source content digest.
+[[nodiscard]] core::Result<assets::Sha256Digest> autorig_mesh_geometry_digest(
+    const geometry::EditableMesh& mesh);
+
 // Deterministic, source-bound geometry analysis for later review-only autorig
 // proposals. It reports topology, edge-length geodesics, and geometric
 // symmetry evidence. It does not infer anatomy, create a skeleton, or mutate

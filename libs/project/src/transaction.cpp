@@ -1,4 +1,5 @@
 #include <carto/project/transaction.hpp>
+#include "accepted_autorig_internal.hpp"
 
 #include <algorithm>
 #include <exception>
@@ -347,6 +348,50 @@ core::Result<core::Revision> ProjectTransaction::set_kinematic_graph(
     }
     return staged_.set_kinematic_graph(
         std::move(identity), expected_revision, std::move(serialized_graph), digest);
+}
+
+core::Result<core::Revision> ProjectTransaction::accept_autorig(
+    std::string identity, core::Revision expected_revision,
+    const character::AutorigAnalysisRequest& request,
+    const character::AutorigCandidateSet& candidates,
+    const character::AutorigReviewAcceptance& acceptance,
+    const std::vector<character::AutorigFinalNode>& nodes,
+    const character::RigDefinition& rig,
+    const kinematic::JointLimitSet& limits,
+    const kinematic::SkinBinding& source_binding,
+    const character::SkinWeightLayer& source_layer,
+    const weights::WeightCorrespondence& correspondence,
+    const weights::JointTransferMap& joint_map,
+    const weights::WeightTransferOptions& options,
+    const weights::WeightLocks* locks) {
+    using Result = core::Result<core::Revision>;
+    if (auto active = ensure_active(); !active) return Result::failure(active.error());
+    const auto mesh = staged_.meshes().find(acceptance.source.asset_id);
+    if (mesh == staged_.meshes().end())
+        return Result::failure(stale("accepted autorig source mesh is absent from the staged project"));
+    if (options.output_mesh_asset != acceptance.source.asset_id ||
+        options.output_mesh_digest != acceptance.source.content_digest)
+        return Result::failure(invalid("transfer target is not the reviewed source mesh"));
+    auto reviewed = character::make_accepted_autorig_graph_record(
+        mesh->second, request, candidates, acceptance, nodes);
+    if (!reviewed) return Result::failure(reviewed.error());
+    auto compiled = mesh->second.compile();
+    if (!compiled) return Result::failure(compiled.error());
+    for (const auto& [target, samples] : correspondence.entries()) {
+        (void)samples;
+        if (target >= compiled.value().positions.size())
+            return Result::failure(invalid("transfer target vertex is absent from the current compiled mesh"));
+    }
+    auto transfer = weights::transfer_weights(source_binding, source_layer, correspondence,
+                                                joint_map, options, locks);
+    if (!transfer) return Result::failure(transfer.error());
+    weights::TransferredWeightRecord record{std::move(transfer.value())};
+    auto bundle = detail::make_accepted_autorig_bundle(reviewed.value(), rig, limits, record);
+    if (!bundle) return Result::failure(bundle.error());
+    const auto* ptr = reinterpret_cast<const std::uint8_t*>(bundle.value().data());
+    auto digest = assets::sha256(std::span<const std::uint8_t>(ptr, bundle.value().size()));
+    return staged_.set_accepted_autorig(std::move(identity), expected_revision,
+                                       std::move(bundle.value()), digest);
 }
 
 core::Result<void> ProjectTransaction::append_weight_edit_receipt(

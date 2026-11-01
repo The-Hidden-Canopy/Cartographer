@@ -1,6 +1,9 @@
 add_library(carto_character STATIC
     src/autorig_analysis.cpp
     src/autorig_candidates.cpp
+    src/autorig_graph.cpp
+    src/autorig_graph_record.cpp
+    src/rig_record.cpp
     src/autorig_constraints.cpp
     src/bindings.cpp
     src/constraints_record.cpp

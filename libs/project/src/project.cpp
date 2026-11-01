@@ -1,4 +1,7 @@
 #include <carto/project/project.hpp>
+#include "accepted_autorig_internal.hpp"
+#include <carto/project/accepted_autorig.hpp>
+#include <carto/character/rig_record.hpp>
 #include <carto/biological/proxy_mesh.hpp>
 #include <carto/character/rig_module.hpp>
 #include <carto/kinematic/graph.hpp>
@@ -194,6 +197,8 @@ constexpr std::uint64_t kMaxSerializedDecalPlacementAggregateBytes =
     64ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaxSerializedPoseLibraries = 4'096U;
 constexpr std::uint64_t kMaxSerializedPoseLibraryAggregateBytes = 64ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaxAcceptedAutorigBundles = 512U;
+constexpr std::uint64_t kMaxAcceptedAutorigBytes = 64ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaxSerializedKinematicGraphs = 4'096U;
 constexpr std::uint64_t kMaxSerializedKinematicGraphAggregateBytes =
     64ULL * 1024ULL * 1024ULL;
@@ -791,6 +796,119 @@ bool mesh_declares_material_region(
 }
 
 } // namespace
+
+namespace detail {
+namespace {
+core::Result<void> check_components(
+    const character::AcceptedAutorigGraphRecord& reviewed,
+    const character::RigDefinition& rig, const kinematic::JointLimitSet& limits,
+    const weights::TransferredWeightRecord& weights) {
+    if (auto checked = reviewed.validate(); !checked) return checked;
+    if (auto checked = rig.validate(); !checked) return checked;
+    const auto graph = kinematic::KinematicGraph::deserialize(reviewed.graph_bytes);
+    if (!graph) return core::Result<void>::failure(graph.error());
+    const auto limit_digest = limits.canonical_digest();
+    if (!limit_digest) return core::Result<void>::failure(limit_digest.error());
+    if (rig.kinematic_graph_digest != reviewed.graph_digest ||
+        rig.joint_limits.digest != limit_digest.value())
+        return core::Result<void>::failure(parse_error("accepted rig graph or limits digest does not match"));
+    if (auto checked = limits.validate_for_graph(graph.value()); !checked) return checked;
+    for (const auto& [id, control] : rig.control_graph.nodes()) {
+        (void)id;
+        for (auto joint : control.affected_joints)
+            if (!graph.value().find(joint))
+                return core::Result<void>::failure(parse_error("rig control references an absent joint"));
+    }
+    for (const auto& pair : rig.symmetry)
+        if (!graph.value().find(pair.left_joint) || !graph.value().find(pair.right_joint))
+            return core::Result<void>::failure(parse_error("rig symmetry references an absent joint"));
+    if (auto checked = weights.validate_against_graph(graph.value()); !checked) return checked;
+    if (weights.output.binding.mesh_asset != reviewed.acceptance.source.asset_id ||
+        weights.output.binding.mesh_digest != reviewed.acceptance.source.content_digest)
+        return core::Result<void>::failure(parse_error("transferred weights do not target the reviewed mesh"));
+    return core::Result<void>::success();
+}
+std::string bundle_bytes(std::string_view reviewed, std::string_view rig,
+                         std::string_view limits, std::string_view weights) {
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << "CARTO_ACCEPTED_AUTORIG_BUNDLE 1\n" << "REVIEW " << std::quoted(std::string(reviewed))
+        << "\nRIG " << std::quoted(std::string(rig)) << "\nLIMITS " << std::quoted(std::string(limits))
+        << "\nWEIGHTS " << std::quoted(std::string(weights)) << "\nEND\n";
+    return out.str();
+}
+}
+core::Result<std::string> make_accepted_autorig_bundle(
+    const character::AcceptedAutorigGraphRecord& reviewed, const character::RigDefinition& rig,
+    const kinematic::JointLimitSet& limits, const weights::TransferredWeightRecord& weights) {
+    using Result = core::Result<std::string>;
+    if (auto checked = check_components(reviewed, rig, limits, weights); !checked)
+        return Result::failure(checked.error());
+    auto rig_text = character::serialize_rig_definition(rig);
+    if (!rig_text) return Result::failure(rig_text.error());
+    auto result = bundle_bytes(reviewed.serialize(), rig_text.value(), limits.serialize(), weights.serialize());
+    if (result.size() > kMaxAcceptedAutorigBytes)
+        return Result::failure(parse_error("accepted autorig bundle exceeds its size limit"));
+    return Result::success(std::move(result));
+}
+core::Result<AcceptedAutorigBundle> decode_bundle(std::string_view bytes) {
+    using Result = core::Result<AcceptedAutorigBundle>;
+    if (bytes.empty() || bytes.size() > kMaxAcceptedAutorigBytes)
+        return Result::failure(parse_error("invalid accepted autorig bundle size"));
+    std::istringstream in{std::string(bytes)};
+    in.imbue(std::locale::classic());
+    std::string token, reviewed_text, rig_text, limits_text, weights_text, trailing;
+    unsigned version = 0;
+    if (!(in >> token >> version) || token != "CARTO_ACCEPTED_AUTORIG_BUNDLE" || version != 1 ||
+        !(in >> token >> std::quoted(reviewed_text)) || token != "REVIEW" ||
+        !(in >> token >> std::quoted(rig_text)) || token != "RIG" ||
+        !(in >> token >> std::quoted(limits_text)) || token != "LIMITS" ||
+        !(in >> token >> std::quoted(weights_text)) || token != "WEIGHTS" ||
+        !(in >> token) || token != "END" || (in >> trailing) ||
+        bundle_bytes(reviewed_text, rig_text, limits_text, weights_text) != bytes)
+        return Result::failure(parse_error("malformed or noncanonical accepted autorig bundle"));
+    auto reviewed = character::AcceptedAutorigGraphRecord::deserialize(reviewed_text);
+    auto rig = character::deserialize_rig_definition(rig_text);
+    auto limits = kinematic::JointLimitSet::deserialize(limits_text);
+    auto transferred = weights::TransferredWeightRecord::deserialize(weights_text);
+    if (!reviewed || !rig || !limits || !transferred || limits.value().serialize() != limits_text)
+        return Result::failure(parse_error("invalid accepted autorig bundle component"));
+    if (auto checked = check_components(reviewed.value(), rig.value(), limits.value(), transferred.value()); !checked)
+        return Result::failure(checked.error());
+    return Result::success({std::move(reviewed.value()), std::move(rig.value()),
+                            std::move(limits.value()), std::move(transferred.value())});
+}
+core::Result<void> validate_accepted_autorig_bundle(std::string_view bytes) {
+    auto decoded = decode_bundle(bytes);
+    if (!decoded) return core::Result<void>::failure(decoded.error());
+    return core::Result<void>::success();
+}
+} // namespace detail
+core::Result<AcceptedAutorigBundle> decode_accepted_autorig_bundle(std::string_view bytes) {
+    return detail::decode_bundle(bytes);
+}
+core::Result<void> validate_accepted_autorig_current(
+    const ProjectDocument& document, const AcceptedAutorigBundle& bundle) {
+    if (auto checked = detail::check_components(bundle.reviewed, bundle.rig, bundle.limits, bundle.weights); !checked)
+        return checked;
+    const auto& acceptance = bundle.reviewed.acceptance;
+    const auto mesh = document.meshes().find(acceptance.source.asset_id);
+    if (mesh == document.meshes().end() || mesh->second.revision() != acceptance.mesh_revision)
+        return core::Result<void>::failure(Diagnostic(ErrorCode::stale_data, "accepted autorig source mesh is missing or stale"));
+    auto digest = character::autorig_mesh_geometry_digest(mesh->second);
+    if (!digest) return core::Result<void>::failure(digest.error());
+    if (digest.value() != acceptance.mesh_geometry_digest)
+        return core::Result<void>::failure(Diagnostic(ErrorCode::stale_data, "accepted autorig geometry changed"));
+    auto compiled = mesh->second.compile();
+    if (!compiled) return core::Result<void>::failure(compiled.error());
+    for (const auto& [vertex, influences] : bundle.weights.output.binding.influences) {
+        (void)influences;
+        if (vertex >= compiled.value().positions.size())
+            return core::Result<void>::failure(Diagnostic(ErrorCode::stale_data, "accepted skin target vertex is absent"));
+    }
+    return core::Result<void>::success();
+}
+
 
 assets::Sha256Digest canonical_mesh_snapshot_digest(const geometry::EditableMesh& mesh) {
     return mesh_state_digest(mesh);
@@ -4056,6 +4174,44 @@ core::Result<core::Revision> ProjectDocument::set_pose_library(
     return core::Result<core::Revision>::success(next_revision);
 }
 
+core::Result<core::Revision> ProjectDocument::set_accepted_autorig(
+    std::string identity, core::Revision expected_revision,
+    std::string bytes, assets::Sha256Digest digest) {
+    using Result = core::Result<core::Revision>;
+    if (revision_.exhausted()) return Result::failure(exhausted_revision());
+    if (!valid_kinematic_graph_identity(identity) || bytes.empty() ||
+        bytes.size() > kMaxAcceptedAutorigBytes || digest.is_zero())
+        return Result::failure(invalid("accepted autorig identity or payload is invalid"));
+    if (auto bound = bind_opaque_record(bytes, digest, "accepted autorig"); !bound)
+        return Result::failure(bound.error());
+    if (auto checked = detail::validate_accepted_autorig_bundle(bytes); !checked)
+        return Result::failure(checked.error());
+    const auto existing = accepted_autorigs_.find(identity);
+    if (existing == accepted_autorigs_.end()) {
+        if (expected_revision != core::Revision{})
+            return Result::failure(Diagnostic(ErrorCode::stale_data, "accepted autorig is absent"));
+        if (accepted_autorigs_.size() >= kMaxAcceptedAutorigBundles)
+            return Result::failure(invalid("too many accepted autorig bundles"));
+    } else {
+        if (existing->second.revision != expected_revision)
+            return Result::failure(Diagnostic(ErrorCode::stale_data, "accepted autorig revision changed"));
+        if (existing->second.bytes == bytes && existing->second.digest == digest)
+            return Result::success(existing->second.revision);
+        if (existing->second.revision.exhausted())
+            return Result::failure(exhausted_revision());
+    }
+    std::uint64_t total = 0U;
+    for (const auto& [key, entry] : accepted_autorigs_) {
+        if (key != identity) total += static_cast<std::uint64_t>(entry.bytes.size());
+    }
+    if (bytes.size() > kMaxAcceptedAutorigBytes - total)
+        return Result::failure(invalid("accepted autorig aggregate exceeds its bound"));
+    const auto revision = existing == accepted_autorigs_.end() ? core::Revision{1U} : existing->second.revision.next();
+    accepted_autorigs_[identity] = SerializedAcceptedAutorig{revision, std::move(bytes), digest};
+    bump_revision();
+    return Result::success(revision);
+}
+
 core::Result<core::Revision> ProjectDocument::set_kinematic_graph(
     std::string identity,
     core::Revision expected_revision,
@@ -4818,6 +4974,20 @@ core::Result<void> ProjectDocument::validate() const {
                 "project kinematic graph digest does not bind its bytes"));
         }
     }
+    if (accepted_autorigs_.size() > kMaxAcceptedAutorigBundles)
+        return core::Result<void>::failure(parse_error("too many accepted autorig bundles"));
+    std::uint64_t accepted_bytes = 0U;
+    for (const auto& [identity, entry] : accepted_autorigs_) {
+        if (!valid_kinematic_graph_identity(identity) || entry.revision.value() == 0U ||
+            entry.revision.exhausted() || entry.bytes.empty() || entry.digest.is_zero() ||
+            entry.bytes.size() > kMaxAcceptedAutorigBytes - accepted_bytes)
+            return core::Result<void>::failure(parse_error("accepted autorig record exceeds bounds"));
+        accepted_bytes += static_cast<std::uint64_t>(entry.bytes.size());
+        if (auto bound = bind_opaque_record(entry.bytes, entry.digest, "accepted autorig"); !bound)
+            return core::Result<void>::failure(bound.error());
+        if (auto checked = detail::validate_accepted_autorig_bundle(entry.bytes); !checked)
+            return checked;
+    }
     if (weight_edit_receipts_.size() > kMaxSerializedWeightEditReceipts) {
         return core::Result<void>::failure(parse_error(
             "project contains too many weight edit receipts"));
@@ -5513,6 +5683,7 @@ void ProjectDocument::swap(ProjectDocument& other) noexcept {
     decal_placements_.swap(other.decal_placements_);
     pose_libraries_.swap(other.pose_libraries_);
     kinematic_graphs_.swap(other.kinematic_graphs_);
+    accepted_autorigs_.swap(other.accepted_autorigs_);
     weight_edit_receipts_.swap(other.weight_edit_receipts_);
     curve_edit_receipts_.swap(other.curve_edit_receipts_);
     std::swap(source_asset_registry_, other.source_asset_registry_);
@@ -5818,6 +5989,10 @@ std::string ProjectDocument::serialize() const {
                << entry.revision.value() << ' ' << entry.digest.hex() << ' '
                << std::quoted(entry.bytes) << '\n';
     }
+    output << "ACCEPTED_AUTORIGS " << accepted_autorigs_.size() << '\n';
+    for (const auto& [identity, entry] : accepted_autorigs_)
+        output << "ACCEPTED_AUTORIG " << std::quoted(identity) << ' ' << entry.revision.value()
+               << ' ' << entry.digest.hex() << ' ' << std::quoted(entry.bytes) << '\n';
     output << "END\n";
     return output.str();
 }
@@ -8300,6 +8475,39 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
         return core::Result<ProjectDocument>::failure(parse_error(
             "project schema v35 is missing its kinematic graph table"));
     }
+    bool accepted_autorigs_seen = false;
+    if (terminal_record == "ACCEPTED_AUTORIGS") {
+        if (version.value() < 36U)
+            return core::Result<ProjectDocument>::failure(parse_error("accepted autorigs require schema v36"));
+        accepted_autorigs_seen = true;
+        const auto count = read_uint(input, "accepted autorig count");
+        if (!count || count.value() > kMaxAcceptedAutorigBundles)
+            return core::Result<ProjectDocument>::failure(parse_error("invalid accepted autorig count"));
+        std::uint64_t total = 0U;
+        for (std::uint64_t i = 0; i < count.value(); ++i) {
+            if (auto line = require_line(input, "ACCEPTED_AUTORIG"); !line)
+                return core::Result<ProjectDocument>::failure(line.error());
+            std::string identity, hex, bytes;
+            if (!(input >> std::quoted(identity)) || !valid_kinematic_graph_identity(identity))
+                return core::Result<ProjectDocument>::failure(parse_error("invalid accepted autorig identity"));
+            const auto rev = read_uint(input, "accepted autorig revision");
+            if (!rev || rev.value() == 0U || rev.value() == std::numeric_limits<std::uint64_t>::max() ||
+                !(input >> hex >> std::quoted(bytes)) || bytes.empty() || bytes.size() > kMaxAcceptedAutorigBytes - total)
+                return core::Result<ProjectDocument>::failure(parse_error("invalid accepted autorig payload"));
+            total += static_cast<std::uint64_t>(bytes.size());
+            auto digest = assets::Sha256Digest::from_hex(hex);
+            if (!digest || digest.value().is_zero() ||
+                !bind_opaque_record(bytes, digest.value(), "accepted autorig") ||
+                !detail::validate_accepted_autorig_bundle(bytes) ||
+                !document.accepted_autorigs_.emplace(identity, SerializedAcceptedAutorig{
+                    core::Revision{rev.value()}, std::move(bytes), digest.value()}).second)
+                return core::Result<ProjectDocument>::failure(parse_error("invalid accepted autorig record"));
+        }
+        if (!(input >> terminal_record))
+            return core::Result<ProjectDocument>::failure(parse_error("project is missing END"));
+    }
+    if (version.value() >= 36U && !accepted_autorigs_seen)
+        return core::Result<ProjectDocument>::failure(parse_error("project schema v36 is missing accepted autorigs"));
     if (terminal_record != "END") {
         return core::Result<ProjectDocument>::failure(
             parse_error("project is missing its END record"));
