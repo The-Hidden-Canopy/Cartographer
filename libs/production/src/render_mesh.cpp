@@ -312,11 +312,13 @@ core::Result<void> RenderMeshArtifact::validate() const {
     }
     if (!std::is_sorted(additional_uv_set_ids.begin(), additional_uv_set_ids.end()) ||
         std::any_of(additional_uv_set_ids.begin(), additional_uv_set_ids.end(),
-            [](attributes::UvSetId id) { return id == 0U; }) ||
+            [](attributes::UvSetId id) {
+                return id == 0U || id > std::numeric_limits<std::uint32_t>::max();
+            }) ||
         std::adjacent_find(additional_uv_set_ids.begin(),
             additional_uv_set_ids.end()) != additional_uv_set_ids.end()) {
         return core::Result<void>::failure(validation(
-            "additional render-mesh UV-set identities must be nonzero, unique, and sorted"));
+            "additional render-mesh UV-set identities must be nonzero, unique, sorted, and fit 32 bits"));
     }
 
     const bool has_uvs = vertices.front().uv.has_value();
@@ -524,7 +526,7 @@ core::Result<std::vector<std::uint8_t>> RenderMeshArtifact::serialize() const {
     append_u32(output, static_cast<std::uint32_t>(submeshes.size()));
     append_u32(output, static_cast<std::uint32_t>(additional_uv_set_ids.size()));
     for (const auto uv_set : additional_uv_set_ids)
-        append_u32(output, uv_set);
+        append_u32(output, static_cast<std::uint32_t>(uv_set));
     for (const RenderMeshVertex& vertex : vertices) {
         append_u64(output, vertex.source_vertex.value);
         append_f64(output, vertex.position.x);
@@ -955,12 +957,12 @@ core::Result<RenderMeshArtifact> compile_render_mesh_artifact(
             additional_uv_set_ids.end()) != additional_uv_set_ids.end() ||
         std::any_of(additional_uv_set_ids.begin(), additional_uv_set_ids.end(),
             [&](attributes::UvSetId id) {
-                return id == 0U ||
+                return id == 0U || id > std::numeric_limits<std::uint32_t>::max() ||
                     (options.uv_set.has_value() && id == *options.uv_set) ||
                     (options.uv1_set.has_value() && id == *options.uv1_set);
             })) {
         return core::Result<RenderMeshArtifact>::failure(invalid(
-            "additional UV sets must be bounded, distinct, and nonzero"));
+            "additional UV sets must be bounded, distinct, nonzero, and fit 32-bit artifact identities"));
     }
     if (options.material_slot_layer.has_value() &&
         !safe_layer_id(options.material_slot_layer.value())) {
