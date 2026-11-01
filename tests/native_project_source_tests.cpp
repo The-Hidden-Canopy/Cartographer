@@ -1,7 +1,10 @@
 #include <carto/native_source/project_mesh_source.hpp>
 #include <carto/native_source/project_sweep_source.hpp>
+#include <carto/project/transaction.hpp>
 
+#include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -36,28 +39,69 @@ template<class F> auto read_only(const project::ProjectDocument& document, F cal
     return result;
 }
 
-// These are synthetic owner-created fixtures, not imported or observed data.
-// Producer calls below are read-only: they grant no user/AI mutation authority.
+class TempDirectory {
+public:
+    TempDirectory() : path_(std::filesystem::temp_directory_path() /
+        ("cartographer-native-source-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()))) {
+        check(std::filesystem::create_directory(path_), "create a new owned fixture directory");
+    }
+    ~TempDirectory() {
+        std::error_code ignored;
+        if (path_.lexically_normal().parent_path() ==
+            std::filesystem::temp_directory_path().lexically_normal())
+            std::filesystem::remove_all(path_, ignored);
+    }
+    const std::filesystem::path& path() const { return path_; }
+private:
+    std::filesystem::path path_;
+};
+
+// Synthetic fixture mutations use the real journaled owner boundary.
+// Producer calls are read-only and grant no user/AI mutation authority.
 struct Fixture {
+    TempDirectory directory;
+    journal::Journal journal;
     project::ProjectDocument document;
     std::uint64_t asset = 7U;
     scene::ObjectId first{11U};
     scene::ObjectId second{12U};
 
     explicit Fixture(geometry::EditableMesh mesh, bool visible = true,
-                     bool scaled = false, bool parent_second = false) {
-        okay(document.insert_mesh(asset, std::move(mesh)));
+                     bool scaled = false, bool parent_second = false)
+        : journal(directory.path() / "fixture.events") {
         auto first_transform = core::Transform::identity();
         first_transform.translation = {2.0, 3.0, 4.0};
         if (scaled) first_transform.scale.x = 2.0;
-        okay(document.insert_object({first, "Synthetic selected instance", first_transform,
-            std::nullopt, asset, visible, false}));
         auto second_transform = core::Transform::identity();
         second_transform.translation = {20.0, 30.0, 40.0};
-        okay(document.insert_object({second, "Synthetic shared instance", second_transform,
-            parent_second ? std::optional<scene::ObjectId>{first} : std::nullopt,
-            asset, true, false}));
+        change([&](auto& transaction) {
+            okay(transaction.insert_mesh(asset, std::move(mesh)));
+            okay(transaction.insert_object({first, "Synthetic selected instance", first_transform,
+                std::nullopt, asset, visible, false}));
+            okay(transaction.insert_object({second, "Synthetic shared instance", second_transform,
+                parent_second ? std::optional<scene::ObjectId>{first} : std::nullopt,
+                asset, true, false}));
+        }, "native.source.fixture.create");
         okay(document.validate());
+    }
+    template<class F> void change(F edits, const std::string& operation) {
+        const auto count = take(journal.read_all()).size();
+        auto transaction = take(project::ProjectTransaction::begin(
+            document, journal, "native-source-test-fixture"));
+        edits(transaction);
+        const auto receipt = take(transaction.commit(operation));
+        const auto events = take(journal.read_all());
+        check(events.size() == count + 1U && events.back().event_type == operation &&
+              events.back().revision_before == receipt.revision_before &&
+              events.back().revision_after == receipt.revision_after,
+              "fixture mutation must retain its exact journal event and revisions");
+        okay(journal.verify());
+    }
+    void advance_mesh_revision() {
+        change([&](auto& transaction) {
+            okay(transaction.replace_mesh(asset, document.meshes().at(asset)));
+        }, "native.source.fixture.mesh-revision");
     }
     geometry::FaceId face() const { return document.meshes().at(asset).faces_sorted().front().id; }
     render::RenderScene viewport() const {
@@ -100,7 +144,9 @@ void selected_instance_and_persistence() {
           "render bytes and editable mesh retain their own digest domains");
     check(first.physical_mesh_candidate.valid() && !first.render_asset_binding_verified(),
           "even an open triangle is a source candidate, not physical or display admission");
-    take(fixture.document.create_object("Unrelated synthetic object"));
+    fixture.change([](auto& transaction) {
+        take(transaction.create_object("Unrelated synthetic object"));
+    }, "native.source.fixture.unrelated-object");
     const auto unrelated = take(native_source::derive_project_mesh_source(fixture.document, fixture.first));
     check(unrelated.source_digest == first.source_digest,
           "unrelated project/scene revisions must not create a circular source hash");
@@ -167,7 +213,7 @@ void viewport_requires_exact_current_structure() {
     reject_mesh_tamper(fixture, [](auto& m) { m.triangle_edges.front()[0] = geometry::EdgeId{777U}; }, "altered edge identity refuses");
     reject_mesh_tamper(fixture, [](auto& m) { m.bounds.maximum.x += 0.125; }, "altered bounds refuse");
     reject_mesh_tamper(fixture, [](auto& m) { m.source_revision = core::Revision{999U}; }, "altered compiled revision refuses");
-    okay(fixture.document.replace_mesh(fixture.asset, fixture.document.meshes().at(fixture.asset)));
+    fixture.advance_mesh_revision();
     check(!read_only(fixture.document, [&] {
         return native_source::verify_project_viewport_face(
             fixture.document, viewport, fixture.first, fixture.face());
@@ -223,8 +269,10 @@ void sweep_measure_and_exact_project_correspondence() {
     check(std::abs(take(geometry::measure_straight_sweep(source, reversed)).source_model_volume - 24.0) < 1e-12,
           "reversed axis preserves positive source-model volume");
     Fixture fixture(take(geometry::build_sweep_mesh(source, path)).mesh);
-    okay(fixture.document.set_curve_path(path));
-    okay(fixture.document.set_sweep_source(source));
+    fixture.change([&](auto& transaction) {
+        okay(transaction.set_curve_path(path));
+        okay(transaction.set_sweep_source(source));
+    }, "native.source.fixture.sweep-source");
     const auto product = take(read_only(fixture.document, [&] {
         return native_source::derive_project_straight_sweep(
             fixture.document, fixture.first, source.source_identity);
@@ -244,7 +292,7 @@ void sweep_measure_and_exact_project_correspondence() {
     const auto restored = take(native_source::derive_project_straight_sweep(reopened, fixture.first, source.source_identity));
     check(restored.operation_identity == product.operation_identity,
           "save/reopen retains this exact current source/mesh correspondence without proving historical origin");
-    okay(fixture.document.replace_mesh(fixture.asset, fixture.document.meshes().at(fixture.asset)));
+    fixture.advance_mesh_revision();
     check(!read_only(fixture.document, [&] {
         return native_source::derive_project_straight_sweep(
             fixture.document, fixture.first, source.source_identity);
