@@ -162,6 +162,55 @@ core::Result<Frame> transport_frame(const Frame& previous, core::Vec3d tangent) 
 
 } // namespace
 
+core::Result<StraightSweepMeasure> measure_straight_sweep(
+    const SweepSource& source, const CurvePath& centerline) {
+    using Result = core::Result<StraightSweepMeasure>;
+    if (auto valid = source.validate(); !valid) return Result::failure(valid.error());
+    if (auto valid = centerline.validate(); !valid) return Result::failure(valid.error());
+    if (source.centerline_identity != centerline.source_identity ||
+        source.centerline_revision != centerline.source_revision) {
+        return Result::failure(core::Diagnostic(core::ErrorCode::stale_data,
+            "straight sweep measure requires the exact authored centerline"));
+    }
+    if (centerline.segments.size() != 1U || source.cap_policy != SweepCapPolicy::both ||
+        source.inner_profile_scale != 0.0 || source.start_scale != source.end_scale) {
+        return Result::failure(core::Diagnostic(core::ErrorCode::unsupported,
+            "straight sweep measure supports one filled, capped, constant-scale segment"));
+    }
+    const auto& s = centerline.segments.front();
+    const double coordinates[3][4] = {{s.p0.x, s.p1.x, s.p2.x, s.p3.x},
+        {s.p0.y, s.p1.y, s.p2.y, s.p3.y}, {s.p0.z, s.p1.z, s.p2.z, s.p3.z}};
+    int axis = -1;
+    for (int i = 0; i < 3; ++i) {
+        const auto& c = coordinates[i];
+        if (c[0] == c[1] && c[1] == c[2] && c[2] == c[3]) continue;
+        if (axis != -1 || !((c[0] < c[1] && c[1] < c[2] && c[2] < c[3]) ||
+            (c[0] > c[1] && c[1] > c[2] && c[2] > c[3]))) {
+            return Result::failure(core::Diagnostic(core::ErrorCode::unsupported,
+                "straight sweep measure requires a monotone axis-aligned path"));
+        }
+        axis = i;
+    }
+    if (axis == -1) return Result::failure(validation("straight sweep path has zero length"));
+    core::Vec3d tangent{};
+    const double direction = coordinates[axis][3] > coordinates[axis][0] ? 1.0 : -1.0;
+    if (axis == 0) tangent.x = direction;
+    else if (axis == 1) tangent.y = direction;
+    else tangent.z = direction;
+    if (auto frame = initial_frame(tangent, source.reference_up); !frame)
+        return Result::failure(frame.error());
+    const double area = 0.5 * polygon_area_twice(source.profile) *
+        source.start_scale * source.start_scale;
+    const double length = std::abs(coordinates[axis][3] - coordinates[axis][0]);
+    const double volume = area * length;
+    if (!std::isfinite(area) || !std::isfinite(length) || !std::isfinite(volume) ||
+        area <= 0.0 || length <= 0.0 || volume <= 0.0) {
+        return Result::failure(validation("straight sweep source measure is non-finite or degenerate"));
+    }
+    return Result::success({source.source_identity, source.source_revision,
+        centerline.source_identity, centerline.source_revision, area, length, volume, std::nullopt});
+}
+
 core::Result<void> SweepSource::validate() const {
     if (!valid_identity(source_identity) || source_revision.value() == 0U ||
         !valid_identity(centerline_identity) || centerline_revision.value() == 0U) {

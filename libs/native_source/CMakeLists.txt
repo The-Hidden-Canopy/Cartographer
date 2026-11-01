@@ -1,4 +1,4 @@
-add_library(carto_native_source STATIC src/project_mesh_source.cpp)
+add_library(carto_native_source STATIC src/project_mesh_source.cpp src/project_sweep_source.cpp)
 target_include_directories(carto_native_source PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)

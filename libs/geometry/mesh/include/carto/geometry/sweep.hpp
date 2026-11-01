@@ -69,6 +69,25 @@ struct SweptMeshProduct final {
     core::Revision owner_scene_revision;
 };
 
+// Source-model measure for a single axis-aligned, monotone straight segment,
+// a constant-scale filled profile and both caps. This uses the authored profile
+// and path, not mesh integration or physical material evidence. Values are
+// binary64 calculations in the source's length units; no numerical error bound
+// is certified by this result.
+struct StraightSweepMeasure final {
+    std::string source_identity;
+    core::Revision source_revision;
+    std::string centerline_identity;
+    core::Revision centerline_revision;
+    double cross_section_area = 0.0;
+    double length = 0.0;
+    double source_model_volume = 0.0;
+    std::optional<double> volume_absolute_numeric_error_bound;
+};
+
+[[nodiscard]] core::Result<StraightSweepMeasure> measure_straight_sweep(
+    const SweepSource& source, const CurvePath& centerline);
+
 // Generates only from the exact source/path pair in the source's local frame.
 // Output topology IDs are allocated by EditableMesh and the returned product
 // preserves its inputs' identities, revisions, and optional scene owner. The
