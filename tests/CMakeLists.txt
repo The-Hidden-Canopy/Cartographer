@@ -1965,6 +1965,11 @@ set(CARTO_TEST_TEMP_ROOT "${CMAKE_CURRENT_BINARY_DIR}/.ctest-tmp" CACHE PATH
 if(NOT IS_ABSOLUTE "${CARTO_TEST_TEMP_ROOT}")
     message(FATAL_ERROR "CARTO_TEST_TEMP_ROOT must be an absolute writable scratch path")
 endif()
+add_executable(cartographer_native_presentation_tests native_presentation_tests.cpp)
+carto_target(cartographer_native_presentation_tests)
+add_test(NAME cartographer_native_presentation_tests COMMAND cartographer_native_presentation_tests)
+set_tests_properties(cartographer_native_presentation_tests PROPERTIES TIMEOUT 30)
+
 get_property(CARTO_REGISTERED_TESTS DIRECTORY PROPERTY TESTS)
 set(CARTO_TEST_TEMP_INDEX 0)
 foreach(CARTO_TEST_NAME IN LISTS CARTO_REGISTERED_TESTS)

@@ -29,6 +29,7 @@
 #include "studio_viewshed.hpp"
 #include "studio_viewport_capture.hpp"
 #include "uv_inspector.hpp"
+#include "native_presentation.hpp"
 
 // Dear ImGui intentionally keeps the Win32 message handler declaration behind
 // a disabled block in its public backend header to avoid pulling in windows.h.
@@ -85,6 +86,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 #include <future>
 #include <iomanip>
 #include <initializer_list>
+#include <iostream>
 #include <limits>
 #include <map>
 #include <memory>
@@ -539,38 +541,64 @@ public:
             source_reimport_thumbnail_textures_[slot], retired_rgba8_textures_));
     }
 
-    void render(ImDrawData* draw_data) {
-        if (resize_pending_) {
+    // False means deferred rendering or pending recreation. Return to Win32
+    // without resetting/reusing synchronization objects on an early wait.
+    bool render(ImDrawData* draw_data) {
+        destroy_retired_rgba8_textures();
+        if (client_width() == 0 || client_height() == 0) return false;
+        if (resize_pending_ && !presentation_.has_acquired_image()) {
+            for (auto& frame : frame_contexts_) {
+                if (wait_fence(frame.fence, "resize frame fence") ==
+                    carto::studio::PresentationResult::deferred) return false;
+            }
             recreate_swapchain();
         }
-        if (client_width() == 0 || client_height() == 0) {
-            destroy_retired_rgba8_textures();
-            return;
-        }
+        struct Driver {
+            VulkanShell& shell;
+            ImDrawData* draw;
+            carto::studio::PresentationResult wait_frame(std::size_t slot, std::uint64_t) {
+                return shell.wait_fence(shell.frame_contexts_.at(slot).fence, "frame fence");
+            }
+            carto::studio::AcquiredImage acquire(std::size_t slot, std::uint64_t budget) {
+                std::uint32_t image = 0;
+                const auto result = vkAcquireNextImageKHR(shell.device_, shell.swapchain_, budget,
+                    shell.frame_contexts_.at(slot).image_available, VK_NULL_HANDLE, &image);
+                return {shell.presentation_result(result, "vkAcquireNextImageKHR"), image};
+            }
+            carto::studio::PresentationResult wait_image(std::size_t slot, std::uint32_t image, std::uint64_t) {
+                const auto fence = shell.image_fences_.at(image);
+                if (fence == VK_NULL_HANDLE || fence == shell.frame_contexts_.at(slot).fence)
+                    return carto::studio::PresentationResult::ready;
+                return shell.wait_fence(fence, "swapchain image fence");
+            }
+            void submit(std::size_t slot, std::uint32_t image) { shell.submit_frame(slot, image, draw); }
+            carto::studio::PresentationResult present(std::uint32_t image) { return shell.present_frame(image); }
+        } driver{*this, draw_data};
+        const auto progress = presentation_.step(driver, images_.size());
+        if (progress == carto::studio::FrameProgress::recreate) resize_pending_ = true;
+        return progress == carto::studio::FrameProgress::presented;
+    }
 
-        FrameContext& frame = frame_contexts_.at(current_frame_);
-        check_vk(vkWaitForFences(device_, 1, &frame.fence, VK_TRUE, UINT64_MAX),
-                 "vkWaitForFences frame context");
+private:
+    static carto::studio::PresentationResult presentation_result(VkResult result, const char* operation) {
+        using Result = carto::studio::PresentationResult;
+        if (result == VK_TIMEOUT || result == VK_NOT_READY) return Result::deferred;
+        if (result == VK_ERROR_OUT_OF_DATE_KHR) return Result::out_of_date;
+        if (result == VK_SUBOPTIMAL_KHR) return Result::suboptimal;
+        check_vk(result, operation);
+        return Result::ready;
+    }
 
-        std::uint32_t image_index = 0;
-        const VkResult acquired = vkAcquireNextImageKHR(
-            device_, swapchain_, UINT64_MAX, frame.image_available, VK_NULL_HANDLE, &image_index);
-        if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
-            resize_pending_ = true;
-            destroy_retired_rgba8_textures();
-            return;
-        }
-        if (acquired == VK_SUBOPTIMAL_KHR) resize_pending_ = true;
-        check_vk(acquired, "vkAcquireNextImageKHR");
-        if (image_fences_.at(image_index) != VK_NULL_HANDLE &&
-            image_fences_.at(image_index) != frame.fence) {
-            check_vk(vkWaitForFences(
-                         device_, 1, &image_fences_.at(image_index), VK_TRUE, UINT64_MAX),
-                     "vkWaitForFences swapchain image");
-        }
-        image_fences_.at(image_index) = frame.fence;
-        check_vk(vkResetFences(device_, 1, &frame.fence), "vkResetFences");
+    carto::studio::PresentationResult wait_fence(VkFence fence, const char* operation) {
+        const auto result = vkWaitForFences(device_, 1, &fence, VK_TRUE,
+            carto::studio::PresentationSequence::wait_budget_ns);
+        if (result == VK_TIMEOUT) return carto::studio::PresentationResult::deferred;
+        check_vk(result, operation);
+        return carto::studio::PresentationResult::ready;
+    }
 
+    void submit_frame(std::size_t slot, std::uint32_t image_index, ImDrawData* draw_data) {
+        FrameContext& frame = frame_contexts_.at(slot);
         check_vk(vkResetCommandBuffer(frame.command_buffer, 0), "vkResetCommandBuffer");
         VkCommandBufferBeginInfo begin{};
         begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -604,28 +632,27 @@ public:
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &frame.command_buffer;
         submit.signalSemaphoreCount = 1;
-        submit.pSignalSemaphores = &frame.render_finished;
+        submit.pSignalSemaphores = &present_finished_.at(image_index);
+        // No early reset on timeout, minimized surface or out-of-date acquire.
+        check_vk(vkResetFences(device_, 1, &frame.fence), "vkResetFences");
         check_vk(vkQueueSubmit(queue_, 1, &submit, frame.fence), "vkQueueSubmit");
+        image_fences_.at(image_index) = frame.fence;
+        frame.frame_id = next_frame_id_++;
+        frame.submitted = true;
+    }
 
+    carto::studio::PresentationResult present_frame(std::uint32_t image_index) {
         VkPresentInfoKHR present{};
         present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         present.waitSemaphoreCount = 1;
-        present.pWaitSemaphores = &frame.render_finished;
+        // Reacquiring this image proves its previous presentation consumed
+        // this semaphore. A frame submission fence alone does not prove that.
+        present.pWaitSemaphores = &present_finished_.at(image_index);
         present.swapchainCount = 1;
         present.pSwapchains = &swapchain_;
         present.pImageIndices = &image_index;
         const VkResult presented = vkQueuePresentKHR(queue_, &present);
-        if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) {
-            resize_pending_ = true;
-        } else {
-            check_vk(presented, "vkQueuePresentKHR");
-        }
-        // Instrument controls can replace textures after ImGui draw data has
-        // captured their descriptors. Keep retired images alive until this
-        // frame has been submitted and presented.
-        destroy_retired_rgba8_textures();
-        frame.frame_id = next_frame_id_++;
-        current_frame_ = (current_frame_ + 1U) % frame_contexts_.size();
+        return presentation_result(presented, "vkQueuePresentKHR");
     }
 
 private:
@@ -633,8 +660,8 @@ private:
         VkCommandBuffer command_buffer = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
         VkSemaphore image_available = VK_NULL_HANDLE;
-        VkSemaphore render_finished = VK_NULL_HANDLE;
         std::uint64_t frame_id = 0U;
+        bool submitted = false;
     };
 
     struct Rgba8Texture {
@@ -645,6 +672,11 @@ private:
         VkDeviceMemory memory = VK_NULL_HANDLE;
         VkImageView view = VK_NULL_HANDLE;
         VkDescriptorSet descriptor = VK_NULL_HANDLE;
+    };
+
+    struct RetiredTexture {
+        Rgba8Texture texture;
+        std::uint64_t last_possible_frame;
     };
 
     template <typename Descriptor>
@@ -698,10 +730,14 @@ private:
 
     [[nodiscard]] bool retire_rgba8_texture(
         std::optional<Rgba8Texture>& current,
-        std::vector<Rgba8Texture>& retired) noexcept {
+        std::vector<RetiredTexture>& retired) noexcept {
         if (!current.has_value()) return true;
         try {
-            retired.emplace_back(std::move(*current));
+            // Platform-window submissions follow the main frame. The next
+            // main frame's fence covers those submissions on the same queue.
+            // Reserve before moving so allocation failure preserves live data.
+            retired.reserve(retired.size() + 1U);
+            retired.push_back({std::move(*current), next_frame_id_ + 1U});
         } catch (...) {
             // Leave the live handle owned and usable if retirement storage
             // cannot grow; never destroy a resource still referenced by draw data.
@@ -713,7 +749,7 @@ private:
 
     [[nodiscard]] bool publish_rgba8_texture(
         std::optional<Rgba8Texture>& current,
-        std::vector<Rgba8Texture>& retired,
+        std::vector<RetiredTexture>& retired,
         std::optional<Rgba8Texture>& candidate) noexcept {
         if (!candidate.has_value() || !retire_rgba8_texture(current, retired)) {
             return false;
@@ -723,15 +759,19 @@ private:
         return true;
     }
 
-    void destroy_retired_rgba8_textures() noexcept {
+    void destroy_retired_rgba8_textures(bool device_idle = false) noexcept {
         if (retired_rgba8_textures_.empty()) return;
-        if (device_ != VK_NULL_HANDLE) {
-            static_cast<void>(vkDeviceWaitIdle(device_));
+        for (auto& frame : frame_contexts_) {
+            if (frame.submitted && (device_idle || vkGetFenceStatus(device_, frame.fence) == VK_SUCCESS)) {
+                if (!completed_frame_ || frame.frame_id > *completed_frame_) completed_frame_ = frame.frame_id;
+                frame.submitted = false;
+            }
         }
-        for (auto& texture : retired_rgba8_textures_) {
-            destroy_rgba8_texture(texture);
-        }
-        retired_rgba8_textures_.clear();
+        std::erase_if(retired_rgba8_textures_, [&](RetiredTexture& retired) {
+            if (!device_idle && (!completed_frame_ || *completed_frame_ < retired.last_possible_frame)) return false;
+            destroy_rgba8_texture(retired.texture);
+            return true;
+        });
     }
 
     [[nodiscard]] bool create_rgba8_texture(
@@ -980,7 +1020,10 @@ private:
         return true;
     }
 
-    static constexpr std::size_t kFrameContextCount = 3U;
+    // ImGui rotates its upload buffers by InitInfo.ImageCount. Surface
+    // admission guarantees at least two images; never queue more main frames
+    // than that ring can retain, including on two-image surfaces.
+    static constexpr std::size_t kFrameContextCount = 2U;
 
     enum class PresentPolicy {
         performance,
@@ -1036,10 +1079,36 @@ private:
     }
 
     void create_instance() {
-        const std::array<const char*, 2> extensions{
+        std::vector<const char*> extensions{
             VK_KHR_SURFACE_EXTENSION_NAME,
             VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
         };
+        const char* validation = std::getenv("CARTOGRAPHER_VULKAN_VALIDATION");
+        const bool validate = validation != nullptr && std::string_view(validation) == "require";
+        const char* layer = "VK_LAYER_KHRONOS_validation";
+        VkDebugUtilsMessengerCreateInfoEXT debug{};
+        debug.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+        debug.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                                VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+        debug.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                            VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                            VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+        debug.pfnUserCallback = [](VkDebugUtilsMessageSeverityFlagBitsEXT,
+            VkDebugUtilsMessageTypeFlagsEXT, const VkDebugUtilsMessengerCallbackDataEXT* data, void*) -> VkBool32 {
+            std::clog << "cartographer: Vulkan validation: " << data->pMessage << '\n';
+            OutputDebugStringA(data->pMessage);
+            return VK_FALSE;
+        };
+        if (validate) {
+            std::uint32_t count = 0;
+            check_vk(vkEnumerateInstanceLayerProperties(&count, nullptr), "enumerate Vulkan layers");
+            std::vector<VkLayerProperties> layers(count);
+            check_vk(vkEnumerateInstanceLayerProperties(&count, layers.data()), "enumerate Vulkan layers");
+            if (std::none_of(layers.begin(), layers.end(), [layer](const auto& value) {
+                    return std::string_view(value.layerName) == layer;
+                })) throw std::runtime_error("required Vulkan validation layer is unavailable");
+            extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        }
         VkApplicationInfo app{};
         app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         app.pApplicationName = "Cartographer";
@@ -1052,15 +1121,29 @@ private:
         info.pApplicationInfo = &app;
         info.enabledExtensionCount = static_cast<std::uint32_t>(extensions.size());
         info.ppEnabledExtensionNames = extensions.data();
+        info.enabledLayerCount = validate ? 1U : 0U;
+        info.ppEnabledLayerNames = validate ? &layer : nullptr;
+        info.pNext = validate ? &debug : nullptr;
         check_vk(vkCreateInstance(&info, nullptr, &instance_), "vkCreateInstance");
+        if (validate) {
+            const auto create = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
+                vkGetInstanceProcAddr(instance_, "vkCreateDebugUtilsMessengerEXT"));
+            if (create == nullptr) throw std::runtime_error("required Vulkan debug messenger is unavailable");
+            check_vk(create(instance_, &debug, nullptr, &debug_messenger_), "create Vulkan debug messenger");
+        }
     }
 
     void choose_device() {
+        using carto::studio::AdapterClass;
+        using carto::studio::PresentationAdapter;
         std::uint32_t count = 0;
         check_vk(vkEnumeratePhysicalDevices(instance_, &count, nullptr), "vkEnumeratePhysicalDevices");
         if (count == 0U) throw std::runtime_error("Vulkan reported no physical devices");
         std::vector<VkPhysicalDevice> devices(count);
         check_vk(vkEnumeratePhysicalDevices(instance_, &count, devices.data()), "vkEnumeratePhysicalDevices");
+        struct Candidate { VkPhysicalDevice device; std::uint32_t queue; };
+        std::vector<Candidate> candidates;
+        std::vector<PresentationAdapter> descriptions;
         for (VkPhysicalDevice device : devices) {
             std::uint32_t extension_count = 0U;
             check_vk(vkEnumerateDeviceExtensionProperties(
@@ -1085,13 +1168,49 @@ private:
                 check_vk(vkGetPhysicalDeviceSurfaceSupportKHR(device, index, surface_, &present),
                          "vkGetPhysicalDeviceSurfaceSupportKHR");
                 if ((queues[index].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0U && present == VK_TRUE) {
-                    physical_device_ = device;
-                    queue_family_ = index;
-                    return;
+                    std::uint32_t format_count = 0, mode_count = 0;
+                    check_vk(vkGetPhysicalDeviceSurfaceFormatsKHR(device, surface_, &format_count, nullptr),
+                             "adapter surface formats");
+                    check_vk(vkGetPhysicalDeviceSurfacePresentModesKHR(device, surface_, &mode_count, nullptr),
+                             "adapter surface modes");
+                    if (format_count == 0 || mode_count == 0) break;
+                    VkPhysicalDeviceProperties properties{};
+                    vkGetPhysicalDeviceProperties(device, &properties);
+                    AdapterClass kind = AdapterClass::other;
+                    switch (properties.deviceType) {
+                    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: kind = AdapterClass::discrete_gpu; break;
+                    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: kind = AdapterClass::integrated_gpu; break;
+                    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: kind = AdapterClass::virtual_gpu; break;
+                    case VK_PHYSICAL_DEVICE_TYPE_CPU: kind = AdapterClass::cpu; break;
+                    default: break;
+                    }
+                    VkPhysicalDeviceMemoryProperties memory{};
+                    vkGetPhysicalDeviceMemoryProperties(device, &memory);
+                    std::uint64_t local_bytes = 0;
+                    for (std::uint32_t heap = 0; heap < memory.memoryHeapCount; ++heap)
+                        if ((memory.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0)
+                            local_bytes = std::max(local_bytes, memory.memoryHeaps[heap].size);
+                    candidates.push_back({device, index});
+                    descriptions.push_back({properties.deviceName, kind,
+                        properties.vendorID, properties.deviceID, local_bytes});
+                    std::clog << "cartographer: compatible Vulkan adapter '" << properties.deviceName
+                              << "' vendor=" << properties.vendorID << " device=" << properties.deviceID
+                              << " driver=" << properties.driverVersion << " queue=" << index << '\n';
+                    break;
                 }
             }
         }
-        throw std::runtime_error("no Vulkan device exposes a graphics/present queue");
+        const char* requested = std::getenv("CARTOGRAPHER_VULKAN_ADAPTER");
+        const auto selected = carto::studio::select_presentation_adapter(descriptions,
+            requested == nullptr ? std::string_view{} : std::string_view(requested));
+        physical_device_ = candidates[selected].device;
+        queue_family_ = candidates[selected].queue;
+        std::ostringstream diagnostic;
+        diagnostic << "cartographer: selected Vulkan adapter '" << descriptions[selected].name
+                   << "' policy=" << (requested != nullptr && *requested != '\0' ? "explicit-name" : "prefer-discrete")
+                   << " queue=" << queue_family_ << '\n';
+        std::clog << diagnostic.str();
+        OutputDebugStringA(diagnostic.str().c_str());
     }
 
     void create_device() {
@@ -1171,8 +1290,6 @@ private:
             frame.command_buffer = command_buffers[index];
             check_vk(vkCreateSemaphore(device_, &semaphore, nullptr, &frame.image_available),
                      "vkCreateSemaphore image_available");
-            check_vk(vkCreateSemaphore(device_, &semaphore, nullptr, &frame.render_finished),
-                     "vkCreateSemaphore render_finished");
             check_vk(vkCreateFence(device_, &fence, nullptr, &frame.fence),
                      "vkCreateFence frame context");
         }
@@ -1289,10 +1406,18 @@ private:
         check_vk(vkGetSwapchainImagesKHR(device_, swapchain_, &actual_count, nullptr), "vkGetSwapchainImagesKHR");
         images_.resize(actual_count);
         check_vk(vkGetSwapchainImagesKHR(device_, swapchain_, &actual_count, images_.data()), "vkGetSwapchainImagesKHR");
+        std::clog << "cartographer: swapchain images=" << actual_count
+                  << " frames=" << kFrameContextCount << " present_mode=" << swapchain_present_mode_
+                  << " extent=" << swapchain_width_ << 'x' << swapchain_height_ << '\n';
         image_views_.resize(images_.size());
         framebuffers_.resize(images_.size());
         image_fences_.assign(images_.size(), VK_NULL_HANDLE);
+        present_finished_.assign(images_.size(), VK_NULL_HANDLE);
         for (std::size_t index = 0; index < images_.size(); ++index) {
+            VkSemaphoreCreateInfo semaphore{};
+            semaphore.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+            check_vk(vkCreateSemaphore(device_, &semaphore, nullptr, &present_finished_[index]),
+                     "vkCreateSemaphore present image");
             VkImageViewCreateInfo view{};
             view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
             view.image = images_[index];
@@ -1320,6 +1445,9 @@ private:
     void recreate_swapchain() {
         if (client_width() == 0 || client_height() == 0) return;
         check_vk(vkDeviceWaitIdle(device_), "vkDeviceWaitIdle resize");
+        for (VkSemaphore semaphore : present_finished_)
+            if (semaphore != VK_NULL_HANDLE) vkDestroySemaphore(device_, semaphore, nullptr);
+        present_finished_.clear();
         for (VkFramebuffer framebuffer : framebuffers_) vkDestroyFramebuffer(device_, framebuffer, nullptr);
         for (VkImageView view : image_views_) vkDestroyImageView(device_, view, nullptr);
         framebuffers_.clear();
@@ -1350,21 +1478,21 @@ public:
                         texture.reset();
                     }
                 }
-                destroy_retired_rgba8_textures();
+                destroy_retired_rgba8_textures(true);
                 ImGui_ImplVulkan_Shutdown();
                 imgui_initialized_ = false;
             }
             for (VkFramebuffer framebuffer : framebuffers_) vkDestroyFramebuffer(device_, framebuffer, nullptr);
             for (VkImageView view : image_views_) vkDestroyImageView(device_, view, nullptr);
+            for (VkSemaphore semaphore : present_finished_)
+                if (semaphore != VK_NULL_HANDLE) vkDestroySemaphore(device_, semaphore, nullptr);
+            present_finished_.clear();
             if (swapchain_ != VK_NULL_HANDLE) vkDestroySwapchainKHR(device_, swapchain_, nullptr);
             if (descriptor_pool_ != VK_NULL_HANDLE) vkDestroyDescriptorPool(device_, descriptor_pool_, nullptr);
             for (auto& frame : frame_contexts_) {
                 if (frame.fence != VK_NULL_HANDLE) vkDestroyFence(device_, frame.fence, nullptr);
                 if (frame.image_available != VK_NULL_HANDLE) {
                     vkDestroySemaphore(device_, frame.image_available, nullptr);
-                }
-                if (frame.render_finished != VK_NULL_HANDLE) {
-                    vkDestroySemaphore(device_, frame.render_finished, nullptr);
                 }
             }
             if (command_pool_ != VK_NULL_HANDLE) vkDestroyCommandPool(device_, command_pool_, nullptr);
@@ -1376,6 +1504,12 @@ public:
             vkDestroySurfaceKHR(instance_, surface_, nullptr);
             surface_ = VK_NULL_HANDLE;
         }
+        if (debug_messenger_ != VK_NULL_HANDLE && instance_ != VK_NULL_HANDLE) {
+            const auto destroy = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
+                vkGetInstanceProcAddr(instance_, "vkDestroyDebugUtilsMessengerEXT"));
+            if (destroy != nullptr) destroy(instance_, debug_messenger_, nullptr);
+            debug_messenger_ = VK_NULL_HANDLE;
+        }
         if (instance_ != VK_NULL_HANDLE) vkDestroyInstance(instance_, nullptr);
         instance_ = VK_NULL_HANDLE;
         frame_contexts_.clear();
@@ -1385,6 +1519,7 @@ public:
 private:
     HWND window_ = nullptr;
     VkInstance instance_ = VK_NULL_HANDLE;
+    VkDebugUtilsMessengerEXT debug_messenger_ = VK_NULL_HANDLE;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
@@ -1407,12 +1542,14 @@ private:
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
     std::vector<FrameContext> frame_contexts_;
     std::vector<VkFence> image_fences_;
+    std::vector<VkSemaphore> present_finished_;
     std::optional<Rgba8Texture> reference_image_texture_;
     std::optional<Rgba8Texture> scene_capture_texture_;
     std::array<std::optional<Rgba8Texture>, 2U>
         source_reimport_thumbnail_textures_;
-    std::vector<Rgba8Texture> retired_rgba8_textures_;
-    std::size_t current_frame_ = 0U;
+    std::vector<RetiredTexture> retired_rgba8_textures_;
+    std::optional<std::uint64_t> completed_frame_;
+    carto::studio::PresentationSequence presentation_{kFrameContextCount};
     std::uint64_t next_frame_id_ = 0U;
     PresentPolicy present_policy_ = present_policy_from_environment();
     bool imgui_initialized_ = false;
@@ -29281,8 +29418,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
         if (g_state->work_surface_camera_panning) g_state->finish_work_surface_camera_pan();
         g_state->native_capture_window = nullptr;
     }
-    if (ImGui::GetCurrentContext() != nullptr &&
-        ImGui_ImplWin32_WndProcHandler(window, message, w_param, l_param)) return 1;
+    // Lifecycle messages belong to the shell even while ImGui captures input.
     if (message == WM_SIZE && g_state != nullptr && w_param != SIZE_MINIMIZED) {
         g_state->renderer.request_resize();
     }
@@ -29290,7 +29426,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l
         g_state->request_close();
         return 0;
     }
-    if (message == WM_DESTROY) return 0;
+    if (message == WM_DESTROY) { PostQuitMessage(0); return 0; }
+    if (ImGui::GetCurrentContext() != nullptr &&
+        ImGui_ImplWin32_WndProcHandler(window, message, w_param, l_param)) return 1;
     return DefWindowProcW(window, message, w_param, l_param);
 }
 
@@ -29378,11 +29516,19 @@ int run(HINSTANCE instance, int show_command) {
         ImGui::NewFrame();
         state.draw();
         ImGui::Render();
-        state.renderer.render(ImGui::GetDrawData());
+        // An accepted clean-project close posts WM_QUIT during draw(). Do not
+        // enter another driver call before handling that accepted close.
+        if (PeekMessageW(&message, nullptr, WM_QUIT, WM_QUIT, PM_NOREMOVE)) break;
+        const bool presented = state.renderer.render(ImGui::GetDrawData());
         if ((imgui_io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0) {
             ImGui::UpdatePlatformWindows();
             carto::studio::DockingWorkspace::recover_offscreen_platform_windows();
             ImGui::RenderPlatformWindowsDefault();
+        }
+        if (!presented) {
+            // Finite GPU waits must not become a tight CPU loop. Wake as soon
+            // as resize, input, activation or close messages are available.
+            MsgWaitForMultipleObjectsEx(0, nullptr, 8, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         }
     }
 

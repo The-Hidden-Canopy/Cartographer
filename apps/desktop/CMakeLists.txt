@@ -16,6 +16,7 @@ target_link_libraries(carto_imgui PUBLIC Vulkan::Vulkan user32 gdi32 shell32 dwm
 
 add_executable(cartographer_desktop WIN32
     main.cpp
+    native_presentation.hpp
     bake_workflow.hpp
     branding.hpp
     reference_image_decoder.cpp
