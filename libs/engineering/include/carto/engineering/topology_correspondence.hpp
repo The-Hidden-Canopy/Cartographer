@@ -63,7 +63,8 @@ struct TopologyReimportReport {
 
 // This comparison is read-only: callers retain the previous authoring
 // document and block publication whenever source or topology correspondence
-// changed, leaving human reconciliation as a separate action.
+// changed, including added identities, leaving human reconciliation as a
+// separate action.
 [[nodiscard]] core::Result<TopologyReimportReport> compare_topology_reimport(
     const TopologyCorrespondenceMap& previous,
     const TopologyCorrespondenceMap& incoming);

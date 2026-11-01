@@ -214,6 +214,7 @@ core::Result<TopologyReimportReport> compare_topology_reimport(
     report.ambiguous_display_mesh_assets.assign(
         ambiguous_assets.begin(), ambiguous_assets.end());
     report.publication_blocked = report.source_changed ||
+        !report.added_identities.empty() ||
         !report.removed_identities.empty() ||
         !report.changed_correspondence_identities.empty() ||
         !report.ambiguous_display_mesh_assets.empty();
