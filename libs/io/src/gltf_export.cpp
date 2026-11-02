@@ -13,6 +13,7 @@
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <locale>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -182,7 +183,67 @@ struct MeshRecord {
     std::size_t triangles = 0U;
     std::size_t index_bytes = 0U;
     std::optional<std::vector<std::pair<std::uint64_t, std::uint32_t>>> material_regions;
+    std::optional<std::size_t> material_index;
+    std::optional<std::uint32_t> material_region;
 };
+
+// The first appearance-preserving profile is deliberately limited to
+// texture-free, opaque base-color/metallic/roughness factors. Refuse rather
+// than silently flatten authored graph, variant, texture or lighting semantics.
+core::Result<void> validate_constant_gltf_material(const render::MaterialAsset& asset) {
+    const auto& material = asset.definition;
+    if (material.base_color_factor.x > 1.0 || material.base_color_factor.y > 1.0 ||
+        material.base_color_factor.z > 1.0 || material.alpha_mode != render::AlphaMode::opaque ||
+        material.base_color || material.metallic_roughness || material.normal ||
+        material.occlusion || material.emissive || material.normal_scale != 1.0 ||
+        material.occlusion_strength != 1.0 || material.dielectric_f0 != 0.04 ||
+        material.clearcoat != 0.0 || material.clearcoat_roughness != 0.1 ||
+        material.emissive_factor.x != 0.0 || material.emissive_factor.y != 0.0 ||
+        material.emissive_factor.z != 0.0) {
+        return core::Result<void>::failure(validation(
+            "glTF material catalog contains a material outside the texture-free opaque PBR profile"));
+    }
+    return core::Result<void>::success();
+}
+
+struct UniformGltfMaterial {
+    std::size_t index;
+    std::uint32_t region;
+};
+
+core::Result<UniformGltfMaterial> uniform_gltf_material(
+    const geometry::EditableMesh& mesh, std::uint64_t mesh_id,
+    const project::MaterialCatalog& catalog,
+    const std::map<render::MaterialId, std::size_t>& material_indices) {
+    const auto* generic = mesh.attributes().find("cartographer.material_slot");
+    const auto* condition = mesh.attributes().find("condition.material_region");
+    if ((generic == nullptr) == (condition == nullptr))
+        return core::Result<UniformGltfMaterial>::failure(validation(
+            "glTF material catalog requires exactly one authored face-region layer per mesh"));
+    const auto* layer = generic != nullptr ? generic : condition;
+    if (layer->descriptor.domain != attributes::AttributeDomain::face ||
+        layer->descriptor.type != attributes::AttributeType::uint32 ||
+        layer->values.size() != mesh.faces_sorted().size() || layer->values.empty())
+        return core::Result<UniformGltfMaterial>::failure(validation(
+            "glTF material catalog requires a complete face-domain uint32 region layer"));
+    std::optional<std::uint32_t> region;
+    for (const auto& value : layer->values) {
+        const auto* id = std::get_if<std::uint32_t>(&value);
+        if (id == nullptr || *id == 0U || (region && *region != *id))
+            return core::Result<UniformGltfMaterial>::failure(validation(
+                "glTF material catalog requires one nonzero material region per mesh"));
+        region = *id;
+    }
+    const auto assignment = catalog.assignments().find({mesh_id, *region});
+    if (assignment == catalog.assignments().end() || assignment->second.variant.has_value())
+        return core::Result<UniformGltfMaterial>::failure(validation(
+            "glTF material catalog requires an explicit non-variant region assignment"));
+    const auto material = material_indices.find(assignment->second.material);
+    if (material == material_indices.end())
+        return core::Result<UniformGltfMaterial>::failure(validation(
+            "glTF material region refers to an unavailable material"));
+    return core::Result<UniformGltfMaterial>::success({material->second, *region});
+}
 
 struct NodeRecord {
     scene::ObjectId id;
@@ -335,9 +396,23 @@ static core::Result<GltfExportReport> export_interchange(
         return core::Result<GltfExportReport>::failure(
             validation("glTF export requires at least one mesh asset"));
     }
-    if (!document.material_catalog().empty()) {
-        return core::Result<GltfExportReport>::failure(validation(
-            "glTF export cannot preserve the authored material catalog or texture sources"));
+    const auto& catalog = document.material_catalog();
+    const bool export_materials = !catalog.empty();
+    std::map<render::MaterialId, std::size_t> material_indices;
+    std::map<std::uint64_t, UniformGltfMaterial> mesh_material_indices;
+    if (export_materials) {
+        if (catalog.materials().empty() || catalog.materials().size() > 32U ||
+            catalog.assignments().empty() || !catalog.textures().empty() ||
+            !catalog.samplers().empty() || !catalog.variants().empty() ||
+            !catalog.material_graphs().empty() || !catalog.material_graph_bindings().empty())
+            return core::Result<GltfExportReport>::failure(validation(
+                "glTF export cannot preserve this material catalog: the supported profile requires 1..32 assigned, texture-free opaque materials without graphs or variants"));
+        for (const auto& [id, material] : catalog.materials()) {
+            if (auto result = validate_constant_gltf_material(material); !result)
+                return core::Result<GltfExportReport>::failure(result.error().with_context(
+                    "material " + std::to_string(id)));
+            material_indices.emplace(id, material_indices.size());
+        }
     }
     if (!document.kinematic_graphs().empty() || !document.pose_libraries().empty() ||
         !document.rig_module_templates().empty() || !document.garment_assets().empty() ||
@@ -356,7 +431,7 @@ static core::Result<GltfExportReport> export_interchange(
                     "glTF export cannot preserve authored color layers on mesh " + std::to_string(mesh_id)));
             }
         }
-        if (mesh.attributes().find("cartographer.material_slot") != nullptr) {
+        if (!export_materials && mesh.attributes().find("cartographer.material_slot") != nullptr) {
             return core::Result<GltfExportReport>::failure(validation(
                 "glTF export cannot preserve authored material slots on mesh " + std::to_string(mesh_id)));
         }
@@ -365,6 +440,12 @@ static core::Result<GltfExportReport> export_interchange(
             (!uv_sets.descriptors().empty() && uv_sets.active_for_render() == nullptr)) {
             return core::Result<GltfExportReport>::failure(validation(
                 "glTF export cannot preserve all authored UV sets on mesh " + std::to_string(mesh_id)));
+        }
+        if (export_materials) {
+            auto material = uniform_gltf_material(mesh, mesh_id, catalog, material_indices);
+            if (!material) return core::Result<GltfExportReport>::failure(
+                material.error().with_context("mesh asset " + std::to_string(mesh_id)));
+            mesh_material_indices.emplace(mesh_id, material.value());
         }
     }
 
@@ -608,6 +689,8 @@ static core::Result<GltfExportReport> export_interchange(
             render_indices.size() / 3U,
             index_bytes,
             material_regions.value(),
+            export_materials ? std::optional<std::size_t>{mesh_material_indices.at(mesh_id).index} : std::nullopt,
+            export_materials ? std::optional<std::uint32_t>{mesh_material_indices.at(mesh_id).region} : std::nullopt,
         });
         report.vertices += render_positions.size();
         report.triangles += render_indices.size() / 3U;
@@ -615,7 +698,10 @@ static core::Result<GltfExportReport> export_interchange(
     }
 
     if (any_missing_uv) {
-        if (any_active_uv) {
+        if (export_materials) {
+            report.warnings.push_back(
+                "Some meshes have no active render UV set; texture-free material factors remain assigned");
+        } else if (any_active_uv) {
             report.warnings.push_back(
                 "Some Cartographer meshes have no active render UV set; those meshes use the default material path");
         } else {
@@ -628,13 +714,15 @@ static core::Result<GltfExportReport> export_interchange(
         report.warnings.push_back(
             "Some UV-bearing Cartographer meshes do not produce a valid tangent frame; those meshes use the default tangent path");
     }
-    if (any_material_regions) {
+    if (any_material_regions && !export_materials) {
         report.warnings.push_back(
             "Cartographer glTF export preserves condition.material_region face identity in mesh extras; visual material realization remains consumer-owned");
-    } else if (any_active_uv) {
+    } else if (any_active_uv && !export_materials) {
         report.warnings.push_back(
             "Cartographer glTF export does not include material channels; consumers must use their default material path");
     }
+    if (export_materials) report.warnings.push_back(
+        "Texture-free opaque PBR factors are exported; native and downstream lighting or back-face shading may differ");
     report.warnings.push_back("float64 authoring positions and normals are narrowed to glTF float32");
 
     std::map<scene::ObjectId, std::size_t> node_indices;
@@ -691,7 +779,27 @@ static core::Result<GltfExportReport> export_interchange(
         first = false;
         json << index;
     }
-    json << "]}],\n  \"nodes\":[\n";
+    json << "]}],\n";
+    if (export_materials) {
+        json << "  \"materials\":[\n";
+        std::size_t material_index = 0;
+        for (const auto& [id, material] : catalog.materials()) {
+            const auto& pbr = material.definition;
+            std::ostringstream factors;
+            factors.imbue(std::locale::classic());
+            factors << std::setprecision(std::numeric_limits<double>::max_digits10)
+                << "{\"name\":\"" << json_escape(material.name) << "\","
+                << "\"doubleSided\":true,\"alphaMode\":\"OPAQUE\","
+                << "\"pbrMetallicRoughness\":{\"baseColorFactor\":["
+                << pbr.base_color_factor.x << ',' << pbr.base_color_factor.y << ','
+                << pbr.base_color_factor.z << ',' << pbr.base_color_factor.w << "],"
+                << "\"metallicFactor\":" << pbr.metallic << ",\"roughnessFactor\":" << pbr.roughness
+                << "},\"extras\":{\"cartographer_material_id\":" << id << "}}";
+            json << "    " << factors.str() << (++material_index == catalog.materials().size() ? "\n" : ",\n");
+        }
+        json << "  ],\n";
+    }
+    json << "  \"nodes\":[\n";
     for (std::size_t index = 0U; index < nodes.size(); ++index) {
         const auto& node = nodes[index];
         json << "    {\"name\":\"" << json_escape(node.name) << "\"";
@@ -730,8 +838,12 @@ static core::Result<GltfExportReport> export_interchange(
             json << ",\"TANGENT\":" << *mesh.tangent_accessor;
         }
         json << "},\"indices\":" << mesh.index_accessor << ",\"mode\":"
-             << kGlTriangles << ",\"extras\":{\"cartographer_mesh_id\":"
+             << kGlTriangles;
+        if (mesh.material_index.has_value()) json << ",\"material\":" << *mesh.material_index;
+        json << ",\"extras\":{\"cartographer_mesh_id\":"
              << mesh.source_id;
+        if (mesh.material_region.has_value())
+            json << ",\"cartographer_material_region\":" << *mesh.material_region;
         if (mesh.material_regions.has_value()) {
             json << ",\"condition_material_region\":{\"layer\":\"condition.material_region\","
                     "\"domain\":\"face\",\"faces\":[";

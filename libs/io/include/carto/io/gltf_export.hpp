@@ -43,9 +43,14 @@ struct GltfExportReport {
 // as the authoring viewport, without mutating the project.
 // The CONDITION face-domain `condition.material_region` layer is preserved in
 // mesh extras as stable face/region identity; final material realization remains
-// consumer-owned and is reported explicitly. Authored material catalogs,
-// material slots, authored tangent/color layers, multiple/inactive UV sets,
-// and rig/deformation records are refused until this profile can preserve them.
+// consumer-owned and is reported explicitly. Authored tangent/color layers,
+// multiple/inactive UV sets, and rig/deformation records are refused until this
+// profile can preserve them. Material catalogs and slots are accepted only for
+// 1..32 explicitly assigned, texture-free opaque
+// base-color/metallic/roughness materials when each mesh uses one nonzero
+// region. glTF primitives carry their material; lighting and back-face shading
+// are not claimed identical. Textures, graphs, variants, non-default lighting
+// controls and multiple regions per mesh continue to fail closed.
 [[nodiscard]] core::Result<GltfExportReport> export_gltf(
     const project::ProjectDocument& document,
     const std::filesystem::path& path);
