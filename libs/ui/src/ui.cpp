@@ -3746,6 +3746,44 @@ core::Result<application::DispatchReceipt> UiController::commit_mesh_cleanup(
     return result;
 }
 
+core::Result<application::DispatchReceipt> UiController::adopt_control_workspace(
+    const application::AdoptControlWorkspaceRequest& request) {
+    auto result = application::HumanApplicationAccess::adopt_control_workspace(session_, request);
+    if (result) record_operation(result.value(), OperationCategory::committed_command);
+    else record_ui_problem(result.error().with_context("control workspace adoption"));
+    return result;
+}
+
+core::Result<application::AcceptedAutorigView> UiController::accepted_autorig(
+    std::string_view identity, std::uint64_t generation, core::Revision revision) const {
+    return session_.accepted_autorig(identity, generation, revision);
+}
+
+core::Result<application::ControlWorkspaceView> UiController::control_workspace_source(
+    std::uint64_t generation, core::Revision revision) const {
+    return session_.control_workspace_source(generation, revision);
+}
+
+core::Result<application::ControlWorkspacePoseView> UiController::evaluate_control_workspace_pose(
+    std::string_view rig, character::CharacterId character, character::RationalTime tick,
+    std::uint64_t generation, core::Revision revision) const {
+    return session_.evaluate_control_workspace_pose(rig, character, tick, generation, revision);
+}
+
+core::Result<application::IkFkKeyReview> UiController::review_ik_fk_key(
+    std::string_view rig, character::CharacterId character, character::RationalTime tick,
+    std::uint64_t generation, core::Revision revision) const {
+    return session_.review_ik_fk_key(rig, character, tick, generation, revision);
+}
+
+core::Result<application::DispatchReceipt> UiController::accept_ik_fk_key(
+    application::IkFkKeyReview& review, std::string justification) {
+    auto result = application::HumanApplicationAccess::accept_ik_fk_key(session_, review, std::move(justification));
+    if (result) record_operation(result.value(), OperationCategory::committed_command);
+    else record_ui_problem(result.error().with_context("IK/FK key review commit"));
+    return result;
+}
+
 core::Result<ai::Proposal> UiController::propose_ai(std::string_view intent) {
     const auto authoring = session_.authoring_context();
     if (!authoring) {

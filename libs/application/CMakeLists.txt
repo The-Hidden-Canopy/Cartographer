@@ -1,5 +1,6 @@
 add_library(carto_application STATIC
     src/application.cpp
+    src/ik_fk_key_admission.cpp
     src/gltf_scene_import.cpp
 )
 
@@ -22,6 +23,7 @@ target_link_libraries(carto_application
         carto_production
         carto_render
         carto_terrain
+        carto_workspace
     PRIVATE
         carto_mesh_attributes
         carto_io

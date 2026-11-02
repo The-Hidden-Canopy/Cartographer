@@ -100,7 +100,7 @@ void project_save_reopen_and_lineage_are_governed() {
         "active sweep binding passes full project validation");
 
     const std::string encoded = document.serialize();
-    require(encoded.starts_with("CARTOGRAPHER_PROJECT 38\n"),
+    require(encoded.starts_with("CARTOGRAPHER_PROJECT 39\n"),
         "project schema 38 preserves current source-authoring format compatibility");
     const auto reopened = project::ProjectDocument::deserialize(encoded);
     require(reopened && reopened.value().sweep_sources().size() == 1U &&
@@ -322,6 +322,8 @@ void stale_bindings_and_schema_migrations_fail_closed() {
     // remove future tables up to the outer project's final terminator.
     const auto end_v22 = legacy_v22.rfind("END\n");
     legacy_v22.erase(biological_v22, end_v22 - biological_v22);
+    if (const auto control_workspace = legacy_v22.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
+        legacy_v22.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
     legacy_v22.replace(0U, current_header.size(),
         "CARTOGRAPHER_PROJECT 22\n");
     const auto migrated_v22 = project::ProjectDocument::deserialize(legacy_v22);
@@ -343,6 +345,8 @@ void stale_bindings_and_schema_migrations_fail_closed() {
     const auto biological_v21 = legacy_v21.find("BIOLOGICAL_AUTHORING_SOURCES ");
     const auto end_v21 = legacy_v21.rfind("END\n");
     legacy_v21.erase(biological_v21, end_v21 - biological_v21);
+    if (const auto control_workspace = legacy_v21.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
+        legacy_v21.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
     legacy_v21.replace(0U, current_header.size(),
         "CARTOGRAPHER_PROJECT 21\n");
     const auto migrated = project::ProjectDocument::deserialize(legacy_v21);

@@ -222,6 +222,19 @@ struct SerializedAcceptedAutorig {
     [[nodiscard]] bool operator==(const SerializedAcceptedAutorig&) const noexcept = default;
 };
 
+// Project-owned workspace snapshot; only the human application boundary may
+// install or replace it after validating its workspace and rig bindings.
+struct SerializedControlWorkspace {
+    core::Revision revision{1U};
+    std::string source_namespace;
+    std::string rig_identity;
+    core::Revision rig_revision;
+    assets::Sha256Digest rig_digest;
+    std::string bytes;
+    assets::Sha256Digest digest;
+    assets::Sha256Digest envelope_digest;
+};
+
 // An unadmitted authored-intent draft. Bytes contain caller assertions, not
 // an authoritative motion channel, current pose, or execution evidence.
 struct SerializedUnadmittedModeKeyDraft {
@@ -347,7 +360,7 @@ struct RoadSurfaceInstanceReceipt {
 
 class ProjectDocument {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 38;
+    static constexpr std::uint32_t kSchemaVersion = 39;
     static constexpr std::uint32_t kMinimumReadableSchemaVersion = 1;
     static constexpr std::string_view kMagic = "CARTOGRAPHER_PROJECT";
     static constexpr std::string_view kAuthoringFormat = "cartographer.authoring";
@@ -475,6 +488,8 @@ public:
     // Internally validated accepted rig bundles; historical review assertions are not authenticated.
     [[nodiscard]] const std::map<std::string, SerializedAcceptedAutorig>&
     accepted_autorigs() const noexcept { return accepted_autorigs_; }
+    [[nodiscard]] const std::optional<SerializedControlWorkspace>&
+    control_workspace() const noexcept { return control_workspace_; }
     // Historical, unadmitted drafts; cold read conveys no currentness or authority.
     [[nodiscard]] const std::map<std::string, SerializedUnadmittedModeKeyDraft>&
     unadmitted_mode_key_drafts() const noexcept { return unadmitted_mode_key_drafts_; }
@@ -708,6 +723,10 @@ private:
         std::string checked_rig_identity,
         core::Revision checked_rig_revision, assets::Sha256Digest checked_rig_digest,
         std::string bytes, assets::Sha256Digest digest);
+    [[nodiscard]] core::Result<core::Revision> set_control_workspace(
+        core::Revision expected_revision, std::string source_namespace, std::string rig_identity,
+        core::Revision rig_revision, assets::Sha256Digest rig_digest,
+        std::string bytes, assets::Sha256Digest digest);
     // Appends one digest-bound weight-edit receipt. The receipt bytes must
     // decode through the weights codec and bind their input/output binding
     // digests; receipts are historical and never revised in place.
@@ -811,6 +830,7 @@ private:
     std::map<std::string, SerializedKinematicGraph> kinematic_graphs_;
     std::map<std::string, SerializedAcceptedAutorig> accepted_autorigs_;
     std::map<std::string, SerializedUnadmittedModeKeyDraft> unadmitted_mode_key_drafts_;
+    std::optional<SerializedControlWorkspace> control_workspace_;
     std::vector<SerializedWeightEditReceipt> weight_edit_receipts_;
     std::vector<SerializedCurveEditReceipt> curve_edit_receipts_;
     assets::ProjectAssetRegistry source_asset_registry_;

@@ -154,8 +154,10 @@ int main() {
     const auto mislabeled_v36_drafts = mislabeled_v36.find("UNADMITTED_MODE_KEY_DRAFTS 0\n");
     require(mislabeled_v36_drafts != std::string::npos, "fixture has the v38 draft table");
     mislabeled_v36.erase(mislabeled_v36_drafts, std::string("UNADMITTED_MODE_KEY_DRAFTS 0\n").size());
-    require(mislabeled_v36.starts_with("CARTOGRAPHER_PROJECT 38\n"), "current v38 header");
-    mislabeled_v36.replace(0U, std::string("CARTOGRAPHER_PROJECT 38\n").size(),
+    require(mislabeled_v36.starts_with("CARTOGRAPHER_PROJECT 39\n"), "current v38 header");
+    if (const auto control_workspace = mislabeled_v36.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
+        mislabeled_v36.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
+    mislabeled_v36.replace(0U, std::string("CARTOGRAPHER_PROJECT 39\n").size(),
                            "CARTOGRAPHER_PROJECT 36\n");
     require(!project::ProjectDocument::deserialize(mislabeled_v36),
         "v36 refuses a v2 accepted-autorig bundle");

@@ -1186,7 +1186,7 @@ core::Result<AcceptedAutorigView> ApplicationSession::accepted_autorig(
     if (!bundle) return Result::failure(bundle.error());
     if (auto ready = project::validate_accepted_autorig_current(document_, bundle.value()); !ready)
         return Result::failure(ready.error());
-    return Result::success({found->second.revision, std::move(bundle.value())});
+    return Result::success({found->second.revision, std::move(bundle.value()), found->second.digest});
 }
 
 core::Result<HistoricalAutorigView> ApplicationSession::historical_autorig(

@@ -170,7 +170,7 @@ void generated_botanical_import_receipt_is_persistent_and_schema_gated() {
         "generation receipt mutation receives a revisioned project journal entry");
 
     const std::string encoded = document.serialize();
-    require(encoded.starts_with("CARTOGRAPHER_PROJECT 38\n"),
+    require(encoded.starts_with("CARTOGRAPHER_PROJECT 39\n"),
         "generation receipts are marked with the current project schema");
     const auto reopened = project::ProjectDocument::deserialize(encoded);
     require(reopened && reopened.value().source_asset_registry().records().at(
@@ -224,7 +224,9 @@ void generated_botanical_import_receipt_is_persistent_and_schema_gated() {
             "schema 26 fixture removes a later character record table");
         mislabeled_v26.erase(record, table.size());
     }
-    mislabeled_v26.replace(0U, std::string("CARTOGRAPHER_PROJECT 38\n").size(),
+    if (const auto control_workspace = mislabeled_v26.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
+        mislabeled_v26.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
+    mislabeled_v26.replace(0U, std::string("CARTOGRAPHER_PROJECT 39\n").size(),
         "CARTOGRAPHER_PROJECT 26\n");
     require(!project::ProjectDocument::deserialize(mislabeled_v26),
         "schema 26 refuses a v2 generation receipt instead of silently ignoring it");
@@ -310,6 +312,8 @@ void schema_twenty_migrates_to_an_empty_registry() {
         std::to_string(project::ProjectDocument::kSchemaVersion) + "\n";
     const auto header = schema_twenty.find(current_header);
     require(header == 0U, "fixture begins with current project schema header");
+    if (const auto control_workspace = schema_twenty.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
+        schema_twenty.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
     schema_twenty.replace(header, current_header.size(), "CARTOGRAPHER_PROJECT 20\n");
     const auto sweep_sources = schema_twenty.find("SWEEP_SOURCES 0\n");
     require(sweep_sources != std::string::npos,

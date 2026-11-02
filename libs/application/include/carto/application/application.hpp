@@ -25,6 +25,8 @@
 #include <carto/geometry/sign.hpp>
 #include <carto/journal/journal.hpp>
 #include <carto/pose/ik_fk_mode_key_record.hpp>
+#include <carto/pose/ik_control_frame.hpp>
+#include <carto/workspace/store.hpp>
 #include <carto/project/accepted_autorig.hpp>
 #include <carto/project/project.hpp>
 #include <carto/project/material_catalog.hpp>
@@ -1876,6 +1878,67 @@ struct ConfigureAutorigIkFkRequest {
     std::vector<pose::IkFkAuthoring> configurations;
 };
 
+// Explicit adoption copies a detached workspace into the project's single
+// authoring history. It never writes the detached workspace or its journal.
+struct AdoptControlWorkspaceRequest {
+    std::uint64_t expected_project_generation = 0U;
+    core::Revision expected_project_revision;
+    std::string rig_identity;
+    core::Revision expected_rig_revision;
+    assets::Sha256Digest expected_rig_digest;
+    std::string workspace_bytes;
+    std::string justification;
+};
+
+// Historical source remains inspectable after a rig edit; its stored rig
+// pins do not establish currentness until the evaluator checks them.
+struct ControlWorkspaceView {
+    core::Revision revision;
+    assets::Sha256Digest digest;
+    std::string source_namespace;
+    std::string rig_identity;
+    core::Revision rig_revision;
+    assets::Sha256Digest rig_digest;
+    workspace::CharacterSourceStore source;
+};
+
+// CPU evaluation of authored control tracks; not observation or execution.
+struct ControlWorkspacePoseView {
+    pose::IkFkMode mode;
+    pose::FkPose pose;
+    assets::Sha256Digest workspace_digest;
+};
+
+class IkFkKeyReview final {
+public:
+    IkFkKeyReview(const IkFkKeyReview&) = delete;
+    IkFkKeyReview& operator=(const IkFkKeyReview&) = delete;
+    IkFkKeyReview(IkFkKeyReview&&) noexcept = default;
+    IkFkKeyReview& operator=(IkFkKeyReview&&) noexcept = default;
+    [[nodiscard]] bool active() const noexcept { return active_ != nullptr; }
+    void cancel() noexcept { active_.reset(); }
+    [[nodiscard]] const assets::Sha256Digest& proposal_digest() const { return proposal_digest_; }
+    [[nodiscard]] const pose::FkToIkControlFrameProposal& proposal() const { return proposal_; }
+    [[nodiscard]] character::RationalTime tick() const { return tick_; }
+private:
+    friend class ApplicationSession;
+    IkFkKeyReview() = default;
+    std::unique_ptr<bool> active_ = std::make_unique<bool>(true);
+    std::weak_ptr<const std::uint8_t> session_identity_;
+    std::uint64_t generation_ = 0U;
+    core::Revision project_revision_;
+    core::Revision workspace_revision_;
+    assets::Sha256Digest workspace_digest_;
+    std::string rig_identity_;
+    core::Revision rig_revision_;
+    assets::Sha256Digest rig_digest_;
+    character::CharacterId character_;
+    character::RationalTime tick_;
+    assets::Sha256Digest proposal_digest_;
+    std::string result_workspace_;
+    pose::FkToIkControlFrameProposal proposal_;
+};
+
 // Stores only an unadmitted raw curve draft. The selected layer is not a
 // complete layer snapshot or a CAS on evaluated/current mode. The record does
 // not retain the matched pose or certify human approval of a particular match.
@@ -1937,6 +2000,7 @@ struct ClearHistoricalAutorigIkFkRequest {
 struct AcceptedAutorigView {
     core::Revision record_revision;
     project::AcceptedAutorigBundle bundle;
+    assets::Sha256Digest record_digest;
 };
 
 // Historical source snapshot only: freshness is not evaluated and this is
@@ -1952,6 +2016,10 @@ struct HistoricalAutorigView {
 // be used as a public raw AI mutation route.
 class HumanApplicationAccess final {
 public:
+    [[nodiscard]] static core::Result<DispatchReceipt> adopt_control_workspace(
+        ApplicationSession& session, const AdoptControlWorkspaceRequest& request);
+    [[nodiscard]] static core::Result<DispatchReceipt> accept_ik_fk_key(
+        ApplicationSession& session, IkFkKeyReview& review, std::string justification);
     [[nodiscard]] static core::Result<DispatchReceipt> commit_autorig(
         ApplicationSession& session, const AcceptAutorigRequest& request);
     [[nodiscard]] static core::Result<DispatchReceipt> configure_autorig_ik_fk(
@@ -2142,6 +2210,18 @@ public:
     [[nodiscard]] core::Result<AcceptedAutorigView> accepted_autorig(
         std::string_view identity, std::uint64_t expected_project_generation,
         core::Revision expected_project_revision) const;
+    // Reviews a supported rest-pose FK-to-IK key against the project-owned
+    // workspace. The review is session-bound and has not changed source.
+    [[nodiscard]] core::Result<IkFkKeyReview> review_ik_fk_key(
+        std::string_view rig_identity, character::CharacterId character,
+        character::RationalTime tick, std::uint64_t expected_generation,
+        core::Revision expected_project_revision) const;
+    [[nodiscard]] core::Result<ControlWorkspaceView> control_workspace_source(
+        std::uint64_t expected_generation, core::Revision expected_project_revision) const;
+    [[nodiscard]] core::Result<ControlWorkspacePoseView> evaluate_control_workspace_pose(
+        std::string_view rig_identity, character::CharacterId character,
+        character::RationalTime tick, std::uint64_t expected_generation,
+        core::Revision expected_project_revision) const;
     // Historical inspection only: internal integrity is checked, but this is
     // not a current/evaluable rig or evidence that source geometry is fresh.
     [[nodiscard]] core::Result<HistoricalAutorigView> historical_autorig(
@@ -2208,6 +2288,12 @@ private:
     friend class ::carto::agent::AgentTask;
     friend class ::carto::agent::SceneQuery;
     friend class HumanApplicationAccess;
+    [[nodiscard]] core::Result<DispatchReceipt> adopt_control_workspace(
+        HumanActionAdmission admission, const AdoptControlWorkspaceRequest& request);
+    [[nodiscard]] core::Result<DispatchReceipt> accept_ik_fk_key(
+        HumanActionAdmission admission, IkFkKeyReview& review, std::string justification);
+    std::shared_ptr<const std::uint8_t> ik_fk_review_identity_ =
+        std::make_shared<const std::uint8_t>(0U);
     [[nodiscard]] core::Result<DispatchReceipt> commit_autorig(
         HumanActionAdmission admission, const AcceptAutorigRequest& request);
     [[nodiscard]] core::Result<DispatchReceipt> configure_autorig_ik_fk(

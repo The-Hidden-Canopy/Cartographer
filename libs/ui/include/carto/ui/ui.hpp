@@ -1092,6 +1092,20 @@ public:
     [[nodiscard]] core::Result<application::DispatchReceipt> commit_mesh_cleanup(
         application::MeshCleanupReview& review,
         std::string justification);
+    [[nodiscard]] core::Result<application::DispatchReceipt> adopt_control_workspace(
+        const application::AdoptControlWorkspaceRequest& request);
+    [[nodiscard]] core::Result<application::AcceptedAutorigView> accepted_autorig(
+        std::string_view identity, std::uint64_t generation, core::Revision revision) const;
+    [[nodiscard]] core::Result<application::ControlWorkspaceView> control_workspace_source(
+        std::uint64_t generation, core::Revision revision) const;
+    [[nodiscard]] core::Result<application::ControlWorkspacePoseView> evaluate_control_workspace_pose(
+        std::string_view rig, character::CharacterId character, character::RationalTime tick,
+        std::uint64_t generation, core::Revision revision) const;
+    [[nodiscard]] core::Result<application::IkFkKeyReview> review_ik_fk_key(
+        std::string_view rig, character::CharacterId character, character::RationalTime tick,
+        std::uint64_t generation, core::Revision revision) const;
+    [[nodiscard]] core::Result<application::DispatchReceipt> accept_ik_fk_key(
+        application::IkFkKeyReview& review, std::string justification);
     // Native AI proposals carry their copied context so a stale selection or
     // project revision cannot be reused. Safe native operations may be
     // auto-applied by policy; the host still uses the typed preview boundary.

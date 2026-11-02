@@ -690,8 +690,10 @@ void prefab_socket_connections_are_revision_bound_persisted_and_undoable() {
     const auto mislabeled_schema33_drafts = mislabeled_schema33.find("UNADMITTED_MODE_KEY_DRAFTS 0\n");
     REQUIRE(mislabeled_schema33_drafts != std::string::npos);
     mislabeled_schema33.erase(mislabeled_schema33_drafts, std::string("UNADMITTED_MODE_KEY_DRAFTS 0\n").size());
+    if (const auto control_workspace = mislabeled_schema33.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
+        mislabeled_schema33.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
     mislabeled_schema33.replace(0U,
-        std::string("CARTOGRAPHER_PROJECT 38\n").size(), "CARTOGRAPHER_PROJECT 33\n");
+        std::string("CARTOGRAPHER_PROJECT 39\n").size(), "CARTOGRAPHER_PROJECT 33\n");
     const std::string accepted_table = "ACCEPTED_AUTORIGS 0\n";
     const auto accepted_pos = mislabeled_schema33.find(accepted_table);
     REQUIRE(accepted_pos != std::string::npos);

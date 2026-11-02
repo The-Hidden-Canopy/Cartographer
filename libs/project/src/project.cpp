@@ -203,6 +203,17 @@ constexpr std::uint64_t kMaxAcceptedAutorigBytes = 64ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaxUnadmittedModeKeyDrafts = 512U;
 constexpr std::uint64_t kMaxUnadmittedModeKeyDraftAggregateBytes = 64ULL * 1024ULL * 1024ULL;
 
+assets::Sha256Digest control_workspace_envelope_digest(const SerializedControlWorkspace& entry) {
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << "CARTO_CONTROL_WORKSPACE_ENVELOPE_1\n" << entry.revision.value() << '\n'
+        << std::quoted(entry.source_namespace) << ' ' << std::quoted(entry.rig_identity) << ' '
+        << entry.rig_revision.value() << ' ' << entry.rig_digest.hex() << '\n' << entry.digest.hex() << '\n';
+    const auto bytes = out.str();
+    return assets::sha256(std::span<const std::uint8_t>{
+        reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()});
+}
+
 assets::Sha256Digest mode_key_draft_envelope_digest(
     std::string_view identity, const SerializedUnadmittedModeKeyDraft& entry) {
     // Each field is length-delimited; the checksum is integrity evidence only.
@@ -4305,6 +4316,36 @@ core::Result<core::Revision> ProjectDocument::set_pose_library(
     return core::Result<core::Revision>::success(next_revision);
 }
 
+core::Result<core::Revision> ProjectDocument::set_control_workspace(
+    core::Revision expected_revision, std::string source_namespace, std::string rig_identity,
+    core::Revision rig_revision, assets::Sha256Digest rig_digest,
+    std::string bytes, assets::Sha256Digest digest) {
+    using Result = core::Result<core::Revision>;
+    if (revision_.exhausted()) return Result::failure(exhausted_revision());
+    if (bytes.empty() || bytes.size() > 16U * 1024U * 1024U || digest.is_zero())
+        return Result::failure(invalid("control workspace payload exceeds its bound"));
+    if (auto checked = bind_opaque_record(bytes, digest, "control workspace"); !checked)
+        return Result::failure(checked.error());
+    const auto current = control_workspace_ ? control_workspace_->revision : core::Revision{};
+    if (current != expected_revision || current.exhausted() || current.next().exhausted())
+        return Result::failure(Diagnostic(ErrorCode::stale_data, "control workspace revision changed"));
+    const auto rig = accepted_autorigs_.find(rig_identity);
+    if (source_namespace != source_namespace_ || !valid_source_namespace(source_namespace) ||
+        !valid_kinematic_graph_identity(rig_identity) || rig == accepted_autorigs_.end() ||
+        rig_revision != rig->second.revision || rig_digest != rig->second.digest ||
+        (control_workspace_ && (control_workspace_->source_namespace != source_namespace ||
+            control_workspace_->rig_identity != rig_identity || control_workspace_->rig_revision != rig_revision ||
+            control_workspace_->rig_digest != rig_digest)))
+        return Result::failure(Diagnostic(ErrorCode::stale_data, "control workspace project or rig binding changed"));
+    const auto next = current.next();
+    SerializedControlWorkspace entry{next, std::move(source_namespace), std::move(rig_identity),
+        rig_revision, rig_digest, std::move(bytes), digest, {}};
+    entry.envelope_digest = control_workspace_envelope_digest(entry);
+    control_workspace_ = std::move(entry);
+    bump_revision();
+    return Result::success(next);
+}
+
 core::Result<core::Revision> ProjectDocument::insert_unadmitted_mode_key_draft(
     std::string identity, core::Revision expected_revision,
     std::string checked_project_namespace, core::Revision checked_project_revision,
@@ -5182,6 +5223,18 @@ core::Result<void> ProjectDocument::validate() const {
         if (!record || record.value().serialize() != entry.bytes)
             return core::Result<void>::failure(parse_error("invalid unadmitted mode-key draft"));
     }
+    if (control_workspace_) {
+        const auto& entry = *control_workspace_;
+        if (entry.revision.value() == 0U || entry.revision.exhausted() ||
+            !valid_source_namespace(entry.source_namespace) || entry.source_namespace != source_namespace_ ||
+            !valid_kinematic_graph_identity(entry.rig_identity) ||
+            entry.rig_revision.value() == 0U || entry.rig_revision.exhausted() || entry.rig_digest.is_zero() || entry.bytes.empty() ||
+            entry.bytes.size() > 16U * 1024U * 1024U || entry.digest.is_zero() ||
+            entry.envelope_digest.is_zero() || entry.envelope_digest != control_workspace_envelope_digest(entry))
+            return core::Result<void>::failure(parse_error("invalid control workspace snapshot"));
+        if (auto checked = bind_opaque_record(entry.bytes, entry.digest, "control workspace"); !checked)
+            return core::Result<void>::failure(checked.error());
+    }
     if (weight_edit_receipts_.size() > kMaxSerializedWeightEditReceipts) {
         return core::Result<void>::failure(parse_error(
             "project contains too many weight edit receipts"));
@@ -5879,6 +5932,7 @@ void ProjectDocument::swap(ProjectDocument& other) noexcept {
     kinematic_graphs_.swap(other.kinematic_graphs_);
     accepted_autorigs_.swap(other.accepted_autorigs_);
     unadmitted_mode_key_drafts_.swap(other.unadmitted_mode_key_drafts_);
+    control_workspace_.swap(other.control_workspace_);
     weight_edit_receipts_.swap(other.weight_edit_receipts_);
     curve_edit_receipts_.swap(other.curve_edit_receipts_);
     std::swap(source_asset_registry_, other.source_asset_registry_);
@@ -6196,6 +6250,13 @@ std::string ProjectDocument::serialize() const {
                << std::quoted(entry.checked_rig_identity) << ' ' << entry.checked_rig_revision.value() << ' '
                << entry.checked_rig_digest.hex() << ' ' << entry.envelope_digest.hex() << ' '
                << std::quoted(entry.bytes) << '\n';
+    output << "CONTROL_WORKSPACE " << (control_workspace_ ? 1 : 0) << '\n';
+    if (control_workspace_)
+        output << "CONTROL_WORKSPACE_SNAPSHOT " << control_workspace_->revision.value() << ' '
+               << std::quoted(control_workspace_->source_namespace) << ' ' << std::quoted(control_workspace_->rig_identity) << ' '
+               << control_workspace_->rig_revision.value() << ' ' << control_workspace_->rig_digest.hex() << ' '
+               << control_workspace_->digest.hex() << ' ' << control_workspace_->envelope_digest.hex() << ' '
+               << std::quoted(control_workspace_->bytes) << '\n';
     output << "END\n";
     return output.str();
 }
@@ -8764,6 +8825,44 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
     }
     if (version.value() >= 38U && !mode_key_drafts_seen)
         return core::Result<ProjectDocument>::failure(parse_error("project schema v38 is missing unadmitted mode-key drafts"));
+    bool control_workspace_seen = false;
+    if (terminal_record == "CONTROL_WORKSPACE") {
+        if (version.value() < 39U)
+            return core::Result<ProjectDocument>::failure(parse_error("control workspace requires schema v39"));
+        control_workspace_seen = true;
+        const auto count = read_uint(input, "control workspace count");
+        if (!count || count.value() > 1U)
+            return core::Result<ProjectDocument>::failure(parse_error("invalid control workspace count"));
+        if (count.value()) {
+            if (auto line = require_line(input, "CONTROL_WORKSPACE_SNAPSHOT"); !line)
+                return core::Result<ProjectDocument>::failure(line.error());
+            const auto revision = read_uint(input, "control workspace revision");
+            std::string source_namespace, rig_identity, rig_hex, hex, envelope_hex, bytes;
+            if (!revision || revision.value() == 0U || !(input >> std::quoted(source_namespace) >> std::quoted(rig_identity)))
+                return core::Result<ProjectDocument>::failure(parse_error("invalid control workspace binding"));
+            const auto rig_revision = read_uint(input, "control workspace rig revision");
+            if (!rig_revision || !(input >> rig_hex >> hex >> envelope_hex >> std::quoted(bytes)) ||
+                bytes.empty() || bytes.size() > 16U * 1024U * 1024U)
+                return core::Result<ProjectDocument>::failure(parse_error("invalid control workspace record"));
+            auto digest = assets::Sha256Digest::from_hex(hex);
+            auto rig_digest = assets::Sha256Digest::from_hex(rig_hex);
+            auto envelope = assets::Sha256Digest::from_hex(envelope_hex);
+            if (!digest || digest.value().is_zero() || !rig_digest || rig_digest.value().is_zero() ||
+                !envelope || envelope.value().is_zero() ||
+                !bind_opaque_record(bytes, digest.value(), "control workspace"))
+                return core::Result<ProjectDocument>::failure(parse_error("invalid control workspace digest"));
+            SerializedControlWorkspace entry{core::Revision{revision.value()}, std::move(source_namespace),
+                std::move(rig_identity), core::Revision{rig_revision.value()}, rig_digest.value(),
+                std::move(bytes), digest.value(), envelope.value()};
+            if (entry.envelope_digest != control_workspace_envelope_digest(entry))
+                return core::Result<ProjectDocument>::failure(parse_error("invalid control workspace envelope"));
+            document.control_workspace_ = std::move(entry);
+        }
+        if (!(input >> terminal_record))
+            return core::Result<ProjectDocument>::failure(parse_error("project is missing END"));
+    }
+    if (version.value() >= 39U && !control_workspace_seen)
+        return core::Result<ProjectDocument>::failure(parse_error("project schema v39 is missing control workspace"));
     if (terminal_record != "END") {
         return core::Result<ProjectDocument>::failure(
             parse_error("project is missing its END record"));
