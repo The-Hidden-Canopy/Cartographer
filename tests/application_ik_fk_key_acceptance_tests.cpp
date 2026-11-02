@@ -45,7 +45,7 @@ int main() {
     geometry::EditableMesh mesh;
     auto root = mesh.add_vertex({0, 0, 0});
     auto mid = mesh.add_vertex({0, 1, 0});
-    auto child = mesh.add_vertex({0, 2, 0});
+    auto child = mesh.add_vertex({0.35, 2, 0});
     auto side = mesh.add_vertex({1, 0, 0});
     require(root && mid && child && side && mesh.add_face({root.value(), mid.value(), side.value()}) &&
         mesh.add_face({mid.value(), child.value(), side.value()}), "mesh fixture");
@@ -60,7 +60,7 @@ int main() {
     request.expected_project_generation = snapshot.project_generation;
     request.expected_project_revision = snapshot.project_revision;
     request.identity = "body";
-    request.analysis = {{mesh_id, hash("caller source")}, mesh.revision(), character::AutorigAxis::x, 0, 1e-7, {}, {}};
+    request.analysis = {{mesh_id, hash("caller source")}, mesh.revision(), character::AutorigAxis::z, 0, 1e-7, {}, {}};
     const auto analysis = character::analyze_autorig_features(mesh, request.analysis);
     require(static_cast<bool>(analysis), "analyze source");
     character::AutorigConstraintSet constraints{request.analysis.source, mesh.revision(), analysis.value().analysis_digest,
@@ -88,6 +88,11 @@ int main() {
         node.node_class = kinematic::NodeClass::skinned; node.semantic_type = joint.semantic_role;
         request.nodes.push_back(node);
     }
+    auto mismatched_nodes = request.nodes;
+    mismatched_nodes.back().local_rest.translation.x += 0.1;
+    require(!character::prepare_accepted_autorig_graph(
+        mesh, request.analysis, request.candidates, request.acceptance, mismatched_nodes),
+        "rest graph must reconstruct the reviewed source anchors");
     auto graph = character::prepare_accepted_autorig_graph(
         mesh, request.analysis, request.candidates, request.acceptance, request.nodes);
     if (!graph) std::cerr << "DIAGNOSTIC graph: " << graph.error().message << "\n";

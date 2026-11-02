@@ -293,6 +293,10 @@ void references_and_final_contact_evidence() {
     turn.rotation = {0, 0, std::sqrt(3.0) / 2.0, 0.5};
     composed.blend_targets[{2}] = turn; composed.blend_weights[{2}] = 1;
     composed.blend_targets[{3}] = turn; composed.blend_weights[{3}] = 1;
+    require(!pose::evaluate_constraints(shortest_rotation, graph, composed),
+        "mixed constraints without declared arbitration refuse before reporting a residual");
+    rule(shortest_rotation, character::ConstraintType::orient, character::ConstraintType::fk_blend,
+         character::ArbitrationRule::sequential);
     const auto shortest = pose::evaluate_constraints(shortest_rotation, graph, composed);
     if (!shortest) std::cerr << "DIAGNOSTIC shortest: " << shortest.error().message << "\n";
     else std::cerr << "DIAGNOSTIC shortest residual=" << shortest.value().outcomes.at({1}).residual << "\n";

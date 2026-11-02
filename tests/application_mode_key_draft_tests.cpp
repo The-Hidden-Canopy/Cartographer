@@ -239,6 +239,8 @@ int main() {
     std::error_code file_error;
     std::filesystem::rename(journal_path, journal_backup, file_error);
     require(!file_error && std::filesystem::create_directory(journal_path), "block journal");
+    const auto prior_journal = journal::Journal(journal_backup).read_all();
+    require(static_cast<bool>(prior_journal), "read preserved journal before refusal");
     const auto before_blocked = session.snapshot();
     const auto blocked = store(draft);
     const auto after_blocked = session.snapshot();
@@ -246,11 +248,17 @@ int main() {
         << " before_revision=" << before_blocked.project_revision.value() << " after_revision=" << after_blocked.project_revision.value()
         << " before_undo=" << before_blocked.undo_count << " after_undo=" << after_blocked.undo_count
         << " before_redo=" << before_blocked.redo_count << " after_redo=" << after_blocked.redo_count << " draft_present=" << static_cast<bool>(read()) << "\n";
-    require(!blocked && blocked.error().message.find("rolled back") != std::string::npos &&
+    require(!blocked && blocked.error().code == core::ErrorCode::io_error &&
         before_blocked.project_revision == after_blocked.project_revision &&
         before_blocked.undo_count == after_blocked.undo_count &&
         before_blocked.redo_count == after_blocked.redo_count && !read(),
-        "journal append failure rolls back draft and history");
+        "journal preflight or append failure preserves draft and history");
+    const auto preserved_journal = journal::Journal(journal_backup).read_all();
+    require(preserved_journal && preserved_journal.value().size() == prior_journal.value().size() &&
+        journal::Journal(journal_backup).verify(), "prior journal remains complete and verified");
+    for (std::size_t i = 0; i < prior_journal.value().size(); ++i)
+        require(prior_journal.value()[i].payload == preserved_journal.value()[i].payload,
+            "journal refusal preserves every prior domain payload");
     require(std::filesystem::remove(journal_path), "remove blocked journal");
     std::filesystem::rename(journal_backup, journal_path, file_error);
     require(!file_error, "restore journal");
