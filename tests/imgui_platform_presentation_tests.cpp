@@ -23,7 +23,8 @@ struct Trace {
     std::map<VkSemaphore,std::uint32_t> submitted;
     std::size_t next=0;
     int acquisitions=0, waits=0, submissions=0, presents=0, records=0, violations=0, idle_calls=0, swapchain_creations=0;
-    VkResult acquire_result=VK_SUCCESS;
+    VkResult acquire_result=VK_SUCCESS, present_result=VK_SUCCESS;
+    VkFence defer_specific_fence=VK_NULL_HANDLE;
     bool defer_fence_once=false,creating=false;
     std::uint32_t allocated_commands=0,image_count=3;
     std::uint64_t acquire_budget=0,wait_budget=0;
@@ -38,8 +39,9 @@ VKAPI_ATTR VkResult VKAPI_CALL acquire(VkDevice,VkSwapchainKHR,std::uint64_t bud
     if(trace->acquired.at(*image))++trace->violations;
     trace->acquired.at(*image)=true;return VK_SUCCESS;
 }
-VKAPI_ATTR VkResult VKAPI_CALL wait(VkDevice,std::uint32_t,const VkFence*,VkBool32,std::uint64_t budget) {
+VKAPI_ATTR VkResult VKAPI_CALL wait(VkDevice,std::uint32_t,const VkFence* fences,VkBool32,std::uint64_t budget) {
     ++trace->waits;trace->wait_budget=budget;
+    if(trace->defer_specific_fence!=VK_NULL_HANDLE && *fences==trace->defer_specific_fence){trace->defer_specific_fence=VK_NULL_HANDLE;return VK_TIMEOUT;}
     if(trace->defer_fence_once){trace->defer_fence_once=false;return VK_TIMEOUT;}
     return VK_SUCCESS;
 }
@@ -63,7 +65,10 @@ VKAPI_ATTR VkResult VKAPI_CALL submit(VkQueue,std::uint32_t,const VkSubmitInfo* 
 VKAPI_ATTR VkResult VKAPI_CALL present(VkQueue,const VkPresentInfoKHR* p){
     ++trace->presents;const auto image=*p->pImageIndices;const auto semaphore=*p->pWaitSemaphores;
     if(!trace->acquired.at(image)||!trace->submitted.contains(semaphore)||trace->submitted[semaphore]!=image)++trace->violations;
-    trace->acquired.at(image)=false;trace->pending_present[semaphore]=image;return VK_SUCCESS;
+    const auto result=trace->present_result;
+    const bool enqueued=result==VK_SUCCESS||result==VK_SUBOPTIMAL_KHR||result==VK_ERROR_OUT_OF_DATE_KHR||result==VK_ERROR_SURFACE_LOST_KHR;
+    if(enqueued){trace->acquired.at(image)=false;trace->pending_present[semaphore]=image;}
+    return result;
 }
 VKAPI_ATTR void VKAPI_CALL bind_pipeline(VkCommandBuffer,VkPipelineBindPoint,VkPipeline){}
 VKAPI_ATTR void VKAPI_CALL set_viewport(VkCommandBuffer,std::uint32_t,std::uint32_t,const VkViewport*){}
@@ -72,7 +77,7 @@ VKAPI_ATTR void VKAPI_CALL push(VkCommandBuffer,VkPipelineLayout,VkShaderStageFl
 VKAPI_ATTR void VKAPI_CALL bind_sets(VkCommandBuffer,VkPipelineBindPoint,VkPipelineLayout,std::uint32_t,std::uint32_t,const VkDescriptorSet*,std::uint32_t,const std::uint32_t*){}
 VKAPI_ATTR VkResult VKAPI_CALL idle(VkDevice){++trace->idle_calls;return VK_SUCCESS;}
 VKAPI_ATTR VkResult VKAPI_CALL capabilities(VkPhysicalDevice,VkSurfaceKHR,VkSurfaceCapabilitiesKHR* p){
-    *p={};p->minImageCount=2;p->maxImageCount=3;p->currentExtent={16,16};p->supportedTransforms=VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;p->currentTransform=VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;p->supportedCompositeAlpha=VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;return VK_SUCCESS;
+    *p={};p->minImageCount=2;p->maxImageCount=3;p->currentExtent={16,16};p->minImageExtent={1,1};p->maxImageExtent={4096,4096};p->supportedTransforms=VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;p->currentTransform=VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;p->supportedCompositeAlpha=VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;return VK_SUCCESS;
 }
 VKAPI_ATTR VkResult VKAPI_CALL create_swap(VkDevice,const VkSwapchainCreateInfoKHR*,const VkAllocationCallbacks*,VkSwapchainKHR* p){++trace->swapchain_creations;*p=handle<VkSwapchainKHR>(600);return VK_SUCCESS;}
 VKAPI_ATTR VkResult VKAPI_CALL images(VkDevice,VkSwapchainKHR,std::uint32_t* count,VkImage* p){*count=trace->image_count;if(p)for(std::uint32_t i=0;i<*count;++i)p[i]=handle<VkImage>(700+i);return VK_SUCCESS;}
@@ -93,6 +98,13 @@ VKAPI_ATTR void VKAPI_CALL destroy_framebuffer(VkDevice,VkFramebuffer,const VkAl
 VKAPI_ATTR void VKAPI_CALL destroy_semaphore(VkDevice,VkSemaphore,const VkAllocationCallbacks*){}
 VKAPI_ATTR void VKAPI_CALL destroy_pass(VkDevice,VkRenderPass,const VkAllocationCallbacks*){}
 VKAPI_ATTR void VKAPI_CALL destroy_swap(VkDevice,VkSwapchainKHR,const VkAllocationCallbacks*){}
+VKAPI_ATTR VkResult VKAPI_CALL surface_formats(VkPhysicalDevice,VkSurfaceKHR,std::uint32_t* count,VkSurfaceFormatKHR* formats){
+    *count=1;if(formats)*formats={VK_FORMAT_B8G8R8A8_UNORM,VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};return VK_SUCCESS;
+}
+VKAPI_ATTR VkResult VKAPI_CALL create_pipelines(VkDevice,VkPipelineCache,std::uint32_t count,const VkGraphicsPipelineCreateInfo*,const VkAllocationCallbacks*,VkPipeline* pipelines){
+    for(std::uint32_t i=0;i<count;++i)pipelines[i]=handle<VkPipeline>(1600+i);return VK_SUCCESS;
+}
+VKAPI_ATTR void VKAPI_CALL destroy_pipeline(VkDevice,VkPipeline,const VkAllocationCallbacks*){}
 struct Fixture {
     Trace log;
     ImGui_ImplVulkan_Data backend;
@@ -105,7 +117,10 @@ struct Fixture {
         backend.VulkanInitInfo.ImageCount=2;backend.VulkanInitInfo.MinImageCount=2;
         backend.VulkanInitInfo.PhysicalDevice=handle<VkPhysicalDevice>(2);
         backend.VulkanInitInfo.Device=handle<VkDevice>(3);
+        backend.ShaderModuleVert=handle<VkShaderModule>(1400);backend.ShaderModuleFrag=handle<VkShaderModule>(1401);
         auto& f=backend.Functions;
+        f.pfn_vkGetPhysicalDeviceSurfaceFormatsKHR=surface_formats;
+        f.pfn_vkCreateGraphicsPipelines=create_pipelines;f.pfn_vkDestroyPipeline=destroy_pipeline;
         f.pfn_vkAcquireNextImageKHR=acquire;f.pfn_vkWaitForFences=wait;
         f.pfn_vkResetCommandPool=reset_pool;f.pfn_vkBeginCommandBuffer=begin;
         f.pfn_vkCmdBeginRenderPass=begin_pass;f.pfn_vkCmdEndRenderPass=end_pass;
@@ -125,9 +140,9 @@ struct Fixture {
         f.pfn_vkDestroySwapchainKHR=destroy_swap;
         data.WindowOwned=true;auto& w=data.Window;
         w.Surface=handle<VkSurfaceKHR>(1);w.SurfaceFormat={VK_FORMAT_B8G8R8A8_UNORM,VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};w.PresentMode=VK_PRESENT_MODE_FIFO_KHR;
-        w.ImageCount=3;w.SemaphoreCount=4;w.Frames.resize(3);w.FrameSemaphores.resize(4);
-        for(std::uint32_t i=0;i<3;++i){w.Frames[i]={};w.Frames[i].Framebuffer=handle<VkFramebuffer>(100+i);w.Frames[i].CommandBuffer=handle<VkCommandBuffer>(200+i);}
-        for(std::uint32_t i=0;i<4;++i){w.FrameSemaphores[i]={};w.FrameSemaphores[i].ImageAcquiredSemaphore=handle<VkSemaphore>(300+i);w.FrameSemaphores[i].RenderCompleteSemaphore=handle<VkSemaphore>(400+i);}
+        w.UseDiscardedImageContents=true;w.ImageCount=3;w.SemaphoreCount=4;w.Frames.resize(3);w.FrameSemaphores.resize(4);
+        for(std::uint32_t i=0;i<3;++i){w.Frames[i]={};w.Frames[i].Fence=handle<VkFence>(500+i);w.Frames[i].PresentFence=handle<VkFence>(800+i);w.Frames[i].Framebuffer=handle<VkFramebuffer>(100+i);w.Frames[i].CommandBuffer=handle<VkCommandBuffer>(200+i);}
+        for(std::uint32_t i=0;i<4;++i){w.FrameSemaphores[i]={};w.FrameSemaphores[i].AcquireFence=handle<VkFence>(600+i);w.FrameSemaphores[i].ImageAcquiredSemaphore=handle<VkSemaphore>(300+i);w.FrameSemaphores[i].RenderCompleteSemaphore=handle<VkSemaphore>(400+i);}
         viewport.RendererUserData=&data;viewport.DrawData=&draw;viewport.Size=ImVec2(16,16);draw.OwnerViewport=&viewport;
         draw.DisplaySize=ImVec2(0,0);draw.FramebufferScale=ImVec2(1,1);
     }
@@ -203,6 +218,23 @@ void failed_acquire(){
     Fixture f;f.log.acquire_result=VK_ERROR_SURFACE_LOST_KHR;f.frame();
     require(f.log.records==0&&f.log.submissions==0&&f.log.presents==0,"failed platform acquisition reached recording/submission/presentation");
 }
+void present_fence_deferral(){
+    Fixture f;f.data.Window.UseSwapchainMaintenance1=true;f.log.images={0,0};
+    f.frame();require(f.data.Window.Frames[0].PresentCycle.Pending,"present fence was not retained after enqueue");
+    f.log.defer_specific_fence=f.data.Window.Frames[0].PresentFence;f.frame();
+    require(f.log.acquisitions==2&&f.log.submissions==1&&f.log.presents==1&&f.data.AcquireCycle.Acquired,
+        "pending present fence reused image resources or discarded acquisition");
+    f.frame();require(f.log.acquisitions==2&&f.log.submissions==2&&f.log.presents==2&&f.log.violations==0,
+        "present-fence deferral did not resume the same acquired image");
+}
+void non_enqueued_present_retry(){
+    Fixture f;f.data.Window.UseSwapchainMaintenance1=true;f.log.present_result=VK_ERROR_OUT_OF_HOST_MEMORY;
+    f.frame();require(f.data.AcquireCycle.MayPresent()&&!f.data.Window.Frames[0].PresentCycle.Pending,
+        "non-enqueued present discarded submission or retained an unqueued present fence");
+    f.log.present_result=VK_SUCCESS;f.frame();
+    require(f.log.acquisitions==1&&f.log.submissions==1&&f.log.presents==2&&f.log.violations==0&&!f.data.AcquireCycle.Acquired,
+        "non-enqueued present retry reacquired, resubmitted or lost its binary wait");
+}
 void upload_ring(){
     Fixture f;f.draw.DisplaySize=ImVec2(16,16);
     f.log.images={2,0,2,1,0,1};
@@ -211,8 +243,9 @@ void upload_ring(){
 }
 }
 int main(){
+    std::cout<<std::unitbuf;
     int failed=0;
-    for(auto [name,test]:std::vector<std::pair<const char*,void(*)()>>{{"shrinking swapchain",shrinking_swapchain},{"creation ownership",creation_ownership},{"irregular image ownership",irregular_images},{"acquire timeout",acquire_timeout},{"deferred image fence",deferred_image_fence},{"resize during deferred acquire",resize_during_deferred_acquire},{"minimized without acquire",minimized_without_acquire},{"minimize during deferred acquire",minimize_during_deferred_acquire},{"failed acquisition",failed_acquire},{"per-image upload ring",upload_ring}}){
+    for(auto [name,test]:std::vector<std::pair<const char*,void(*)()>>{{"shrinking swapchain",shrinking_swapchain},{"creation ownership",creation_ownership},{"irregular image ownership",irregular_images},{"acquire timeout",acquire_timeout},{"deferred image fence",deferred_image_fence},{"resize during deferred acquire",resize_during_deferred_acquire},{"minimized without acquire",minimized_without_acquire},{"minimize during deferred acquire",minimize_during_deferred_acquire},{"failed acquisition",failed_acquire},{"per-image upload ring",upload_ring},{"present-fence deferral",present_fence_deferral},{"non-enqueued present retry",non_enqueued_present_retry}}){
         try{test();std::cout<<"PASS "<<name<<'\n';}catch(const std::exception& e){++failed;std::cerr<<"FAIL "<<name<<": "<<e.what()<<'\n';}
     }
     return failed?1:0;
