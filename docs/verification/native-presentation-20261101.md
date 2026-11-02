@@ -156,3 +156,43 @@ pressure targets remain registered before per-test temporary directories.
 Earlier receipts remain revision-specific; this merge still needs fresh CPU,
 desktop/D3D12 compilation and bounded native validation. Legacy device-idle,
 driver calls, maintenance1 support and performance limits remain explicit.
+
+
+## Combined validation completed on 2026-11-02
+
+The preceding pending and failed observations remain historical evidence.
+Runtime source at `3ec3997` passed 18 combined CPU suites, including all 12
+actual bundled-backend fixture cases, and the D3D12-enabled desktop build.
+The selected-HEAD public source/history and ignore-policy audit passed.
+The three bake cook-key calls use explicit owned platform-profile strings;
+the initial D3D12 compile failure remains separate from the passing rerun.
+
+Actual Windows observations with required Khronos validation established:
+
+- An empty-project viewport detached into a separate native window, resized,
+  and remained alive until normal main-window close. The process exited 0
+  with no Vulkan validation diagnostics.
+- An owned authored-scene copy loaded in plan and perspective views and
+  survived a maximize transition. Saving and a separate cold-process reopen
+  preserved the visible project revision and scene. Cold close exited 0
+  with no Vulkan validation diagnostics. Original project files were preserved.
+- Default automatic adapter selection chose the discrete adapter, enabled
+  maintenance1 present fences, rendered the initial workspace and closed
+  normally with no Vulkan validation diagnostics. Required-retirement mode
+  was independently observed on the same compatible adapter.
+- The actual offscreen D3D12 overlay/admission/pixel-capture CTest passed.
+
+Two earlier owned deadline expirations are retained as incomplete attempts,
+not native acceptance or product-crash diagnoses. The launcher binding and
+file-dialog walkthrough consumed their bounded budgets.
+
+The saved-scene pixel preview refused an authored source without the required
+complete material-region layer. This refusal is preserved: no material input
+was invented. Scalar material export/import tests establish factors and
+bindings, not visual or physical equivalence across viewers.
+
+These bounded observations do not establish reboot causality, general host
+stability, performance, device-loss recovery, legacy-retirement behavior on
+unsupported adapters, dirty close, repeated texture replacement or every
+multi-monitor configuration. Driver calls and legacy device-idle/font paths
+retain their documented limits.
