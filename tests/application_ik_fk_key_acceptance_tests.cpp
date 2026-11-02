@@ -5,6 +5,7 @@
 #include <carto/ui/ui.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -37,6 +38,10 @@ character::AutorigConstraintProvenance human(std::string id) {
 }
 
 int main() {
+    const std::array<std::string, 14> invalid_reasons{
+        "\xc2\xa0", "\xe3\x80\x80", " \xc2\xa0 ", std::string(1, '\xff'),
+        "\xe2\x80\x83", "\xc2\x85", "\xc0\xaf", "\xed\xa0\x80",
+        "\xf4\x90\x80\x80", "\xe3\x80", "\xe3x", "\x80", "text\n", "\x7f"};
     const auto path = std::filesystem::temp_directory_path() /
         ("carto-app-autorig-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::filesystem::create_directories(path);
@@ -201,6 +206,22 @@ int main() {
     adopt.rig_identity = "body"; adopt.expected_rig_revision = configured.value().record_revision;
     adopt.expected_rig_digest = rig_digest; adopt.workspace_bytes = detached_bytes;
     adopt.justification = "adopt this control workspace into project history";
+    const auto before_adoption_reason = session.snapshot();
+    const auto adoption_journal_path = std::filesystem::path(project_path.string() + ".journal");
+    const auto adoption_journal_before = journal::Journal(adoption_journal_path).read_all();
+    require(static_cast<bool>(adoption_journal_before), "read journal before adoption reason pressure");
+    for (const auto& reason : invalid_reasons) {
+        auto invalid_reason_adopt = adopt;
+        invalid_reason_adopt.justification = reason;
+        require(!application::HumanApplicationAccess::adopt_control_workspace(session, invalid_reason_adopt),
+            "Unicode blank or malformed reason must not authorize workspace adoption");
+        const auto after_adoption_reason = session.snapshot();
+        const auto adoption_journal_after = journal::Journal(adoption_journal_path).read_all();
+        require(after_adoption_reason.project_revision == before_adoption_reason.project_revision &&
+            after_adoption_reason.undo_count == before_adoption_reason.undo_count && adoption_journal_after &&
+            adoption_journal_after.value().size() == adoption_journal_before.value().size(),
+            "invalid adoption reason preserves project, history and durable journal");
+    }
     auto stale_adopt = adopt; stale_adopt.expected_rig_digest = hash("different rig");
     require(!application::HumanApplicationAccess::adopt_control_workspace(session, stale_adopt), "stale rig refused");
     auto wrong_frame_store = detached;
@@ -267,6 +288,19 @@ int main() {
         "review cannot cross sessions");
     require(!application::HumanApplicationAccess::accept_ik_fk_key(session, reviewed.value(), " "), "reason required");
     const auto journal_path = std::filesystem::path(project_path.string() + ".journal");
+    const auto before_reason = session.snapshot();
+    const auto reason_journal_before = journal::Journal(journal_path).read_all();
+    require(static_cast<bool>(reason_journal_before), "read journal before reason pressure");
+    for (const auto& reason : invalid_reasons) {
+        require(!application::HumanApplicationAccess::accept_ik_fk_key(session, reviewed.value(), reason) &&
+            reviewed.value().active(), "Unicode blank or malformed reason must not authorize keys");
+        const auto after_reason = session.snapshot();
+        const auto reason_journal_after = journal::Journal(journal_path).read_all();
+        require(after_reason.project_revision == before_reason.project_revision &&
+            after_reason.undo_count == before_reason.undo_count && reason_journal_after &&
+            reason_journal_after.value().size() == reason_journal_before.value().size(),
+            "invalid reason preserves project, history, review and durable journal");
+    }
     const auto journal_backup = path / "saved-journal";
     std::error_code file_error;
     std::filesystem::rename(journal_path, journal_backup, file_error);
@@ -282,7 +316,7 @@ int main() {
     require(std::filesystem::remove(journal_path), "remove blocked journal");
     std::filesystem::rename(journal_backup, journal_path, file_error);
     require(!file_error, "restore journal");
-    require(static_cast<bool>(ui.accept_ik_fk_key(reviewed.value(), "accept matched key")),
+    require(static_cast<bool>(ui.accept_ik_fk_key(reviewed.value(), "確認済み café 🌿")),
         "accept exact reviewed keys");
     require(!reviewed.value().active() && !application::HumanApplicationAccess::accept_ik_fk_key(session, reviewed.value(), "reuse"),
         "review is consumed exactly once");

@@ -4,6 +4,7 @@
 #include <carto/pose/ik_fk_mode_key_record.hpp>
 
 #include <chrono>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -150,7 +151,7 @@ int main() {
     draft.expected_rig_record_digest = rig_digest;
     draft.draft_identity = "mode-draft-1";
     draft.acknowledge_unadmitted_assertions = true;
-    draft.justification = "review this asserted future mode key";
+    draft.justification = "未承認の草案を確認 café 🌿";
     draft.channel.id = {7}; draft.channel.channel_name = "mode-reference";
     draft.channel.target = {temporal::TargetBindingKind::skinned_mesh, "character.body"};
     draft.channel.duration = 10; draft.channel.scalar_keyframes = {{0, 0}};
@@ -211,14 +212,30 @@ int main() {
     const auto assert_refused = [&](const application::StoreUnadmittedModeKeyDraftRequest& input,
                                     const char* message) {
         const auto before = session.snapshot();
+        const auto journal_before = journal::Journal(std::filesystem::path(project_path.string() + ".journal")).read_all();
+        require(static_cast<bool>(journal_before), "read journal before refused draft");
         require(!store(input), message);
         const auto after = session.snapshot();
         require(before.project_revision == after.project_revision && before.undo_count == after.undo_count &&
             before.redo_count == after.redo_count && !read(), "refusal leaves project, history and draft unchanged");
+        const auto journal_after = journal::Journal(std::filesystem::path(project_path.string() + ".journal")).read_all();
+        require(journal_after && journal_after.value().size() == journal_before.value().size(),
+            "refused draft creates no durable domain record");
+        for (std::size_t i = 0; i < journal_before.value().size(); ++i)
+            require(journal_before.value()[i].payload == journal_after.value()[i].payload,
+                "refused draft preserves prior durable domain payloads");
     };
     auto bad = draft; bad.acknowledge_unadmitted_assertions = false;
     assert_refused(bad, "unadmitted assertion acknowledgment required");
     bad = draft; bad.justification = "   "; assert_refused(bad, "blank rationale refused");
+    const std::array<std::string, 14> invalid_reasons{
+        "\xc2\xa0", "\xe3\x80\x80", " \xc2\xa0 ", std::string(1, '\xff'),
+        "\xe2\x80\x83", "\xc2\x85", "\xc0\xaf", "\xed\xa0\x80",
+        "\xf4\x90\x80\x80", "\xe3\x80", "\xe3x", "\x80", "text\n", "\x7f"};
+    for (const auto& reason : invalid_reasons) {
+        bad = draft; bad.justification = reason;
+        assert_refused(bad, "Unicode blank or malformed draft rationale refused");
+    }
     bad = draft; bad.justification = std::string(5000, 'x'); assert_refused(bad, "unbounded rationale refused");
     bad = draft; ++bad.expected_project_generation; assert_refused(bad, "stale generation refused");
     bad = draft; bad.expected_source_namespace = "other-project"; assert_refused(bad, "wrong project namespace refused");
