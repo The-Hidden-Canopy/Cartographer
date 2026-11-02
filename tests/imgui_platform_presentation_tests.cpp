@@ -126,7 +126,7 @@ struct Fixture {
 void creation_ownership(){
     Fixture f;f.log.creating=true;ImGui_ImplVulkanH_Window window;
     window.Surface=handle<VkSurfaceKHR>(1);window.SurfaceFormat={VK_FORMAT_B8G8R8A8_UNORM,VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};window.PresentMode=VK_PRESENT_MODE_FIFO_KHR;
-    ImGui_ImplVulkanH_CreateOrResizeWindow(VK_NULL_HANDLE,VK_NULL_HANDLE,VK_NULL_HANDLE,&window,0,nullptr,16,16,2,VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    ImGui_ImplVulkanH_CreateOrResizeWindow(VK_NULL_HANDLE,handle<VkPhysicalDevice>(2),handle<VkDevice>(3),&window,0,nullptr,16,16,2,VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     require(window.ImageCount==3,"platform swapchain happy-path setup did not complete");
     require(f.log.violations==0&&f.log.submissions==0,"platform creation transitioned or submitted never-acquired swapchain images");
 }
