@@ -65,6 +65,7 @@ VKAPI_ATTR VkResult VKAPI_CALL present(VkQueue,const VkPresentInfoKHR* p){
 }
 VKAPI_ATTR void VKAPI_CALL bind_pipeline(VkCommandBuffer,VkPipelineBindPoint,VkPipeline){}
 VKAPI_ATTR void VKAPI_CALL set_viewport(VkCommandBuffer,std::uint32_t,std::uint32_t,const VkViewport*){}
+VKAPI_ATTR void VKAPI_CALL set_scissor(VkCommandBuffer,std::uint32_t,std::uint32_t,const VkRect2D*){}
 VKAPI_ATTR void VKAPI_CALL push(VkCommandBuffer,VkPipelineLayout,VkShaderStageFlags,std::uint32_t,std::uint32_t,const void*){}
 VKAPI_ATTR void VKAPI_CALL bind_sets(VkCommandBuffer,VkPipelineBindPoint,VkPipelineLayout,std::uint32_t,std::uint32_t,const VkDescriptorSet*,std::uint32_t,const std::uint32_t*){}
 struct Fixture {
@@ -84,7 +85,7 @@ struct Fixture {
         f.pfn_vkEndCommandBuffer=end;f.pfn_vkResetFences=reset_fences;
         f.pfn_vkQueueSubmit=submit;f.pfn_vkQueuePresentKHR=present;
         f.pfn_vkCmdBindPipeline=bind_pipeline;f.pfn_vkCmdSetViewport=set_viewport;
-        f.pfn_vkCmdPushConstants=push;f.pfn_vkCmdBindDescriptorSets=bind_sets;
+        f.pfn_vkCmdPushConstants=push;f.pfn_vkCmdBindDescriptorSets=bind_sets;f.pfn_vkCmdSetScissor=set_scissor;
         data.WindowOwned=true;auto& w=data.Window;
         w.ImageCount=3;w.SemaphoreCount=4;w.Frames.resize(3);w.FrameSemaphores.resize(4);
         for(std::uint32_t i=0;i<3;++i){w.Frames[i]={};w.Frames[i].Framebuffer=handle<VkFramebuffer>(100+i);w.Frames[i].CommandBuffer=handle<VkCommandBuffer>(200+i);}
