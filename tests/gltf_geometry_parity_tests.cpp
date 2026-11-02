@@ -1,4 +1,5 @@
 #include <array>
+#include <locale>
 #include <bit>
 #include <carto/core/json.hpp>
 #include <carto/editor/command_bus.hpp>
@@ -435,6 +436,34 @@ void constant_material_export_roundtrip(const std::filesystem::path& root) {
                             "cartographer_material_id")) == 71U,
           "primitive uses the sorted material's actual glTF index");
 }
+class CommaGroupedNumbers final : public std::numpunct<char> {
+    char do_decimal_point() const override { return ','; }
+    char do_thousands_sep() const override { return '_'; }
+    std::string do_grouping() const override { return "\3"; }
+};
+
+void material_export_locale_pressure(const std::filesystem::path& root) {
+    auto scene = make_scene(material_mesh(), root);
+    set_export_catalog(scene, scalar_catalog(scene.mesh), root / "material.log");
+    const auto before_source = scene.doc.serialize();
+    static_cast<void>(exported(scene, root, "locale"));
+    const auto gltf = root / "locale.gltf", glb = root / "locale.glb";
+    const auto before_gltf = read(gltf), before_glb = read(glb);
+    struct RestoreLocale {
+        std::locale previous;
+        ~RestoreLocale() { std::locale::global(previous); }
+    };
+    {
+        RestoreLocale restore;
+        std::locale::global(std::locale(restore.previous, new CommaGroupedNumbers));
+        static_cast<void>(take(io::export_gltf(scene.doc, gltf)));
+        static_cast<void>(take(io::export_glb(scene.doc, glb)));
+    }
+    check(read(gltf) == before_gltf && read(glb) == before_glb,
+          "glTF/GLB bytes must preserve transforms and material factors under comma/grouped numeric locale");
+    check(scene.doc.serialize() == before_source, "locale export does not mutate source");
+}
+
 } // namespace
 int main(int argc, char** argv) {
     try {
@@ -462,6 +491,9 @@ int main(int argc, char** argv) {
         const auto scalar_root = root / "constant-material";
         std::filesystem::create_directory(scalar_root);
         constant_material_export_roundtrip(scalar_root);
+        const auto locale_root = root / "locale-pressure";
+        std::filesystem::create_directory(locale_root);
+        material_export_locale_pressure(locale_root);
         auto mesh = fixture();
         auto s = make_scene(mesh, root);
         auto p = exported(s, root, "baseline");
