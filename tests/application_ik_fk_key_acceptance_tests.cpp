@@ -351,6 +351,14 @@ int main() {
     revised_config.expected_project_generation = opened_snapshot.project_generation;
     revised_config.expected_project_revision = opened_snapshot.project_revision;
     revised_config.configurations.front().max_position_jump *= 2.0;
+    require(!application::HumanApplicationAccess::configure_autorig_ik_fk(reopened, revised_config) &&
+        reopened.snapshot().project_revision == opened_snapshot.project_revision &&
+        reopened.snapshot().undo_count == opened_snapshot.undo_count,
+        "stale copied rig revision refuses without changing history");
+    const auto current_rig = reopened.accepted_autorig("body",
+        opened_snapshot.project_generation, opened_snapshot.project_revision);
+    require(static_cast<bool>(current_rig), "read current reopened rig revision");
+    revised_config.expected_record_revision = current_rig.value().record_revision;
     require(static_cast<bool>(application::HumanApplicationAccess::configure_autorig_ik_fk(reopened, revised_config)),
         "revise configured rig without deleting workspace");
     auto changed_rig = reopened.snapshot();

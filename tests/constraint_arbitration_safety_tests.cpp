@@ -295,7 +295,7 @@ void references_and_final_contact_evidence() {
     composed.blend_targets[{3}] = turn; composed.blend_weights[{3}] = 1;
     require(!pose::evaluate_constraints(shortest_rotation, graph, composed),
         "mixed constraints without declared arbitration refuse before reporting a residual");
-    rule(shortest_rotation, character::ConstraintType::orient, character::ConstraintType::fk_blend,
+    rule(shortest_rotation, character::ConstraintType::fk_blend, character::ConstraintType::orient,
          character::ArbitrationRule::sequential);
     const auto shortest = pose::evaluate_constraints(shortest_rotation, graph, composed);
     if (!shortest) std::cerr << "DIAGNOSTIC shortest: " << shortest.error().message << "\n";
