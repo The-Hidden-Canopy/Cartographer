@@ -1,7 +1,10 @@
+#include <array>
 #include <bit>
 #include <carto/core/json.hpp>
 #include <carto/editor/command_bus.hpp>
 #include <carto/io/gltf_export.hpp>
+#include <carto/io/gltf_material_import.hpp>
+#include <carto/io/gltf_scene_import.hpp>
 #include <carto/mesh_attributes/provenance.hpp>
 #include <carto/production/render_mesh.hpp>
 #include <carto/project/transaction.hpp>
@@ -313,6 +316,125 @@ void add_material(Scene &s, const std::filesystem::path &root) {
     okay(tx.set_material_catalog(std::move(catalog)));
     static_cast<void>(take(tx.commit()));
 }
+
+void set_export_catalog(Scene& scene, project::MaterialCatalog catalog,
+                        const std::filesystem::path& journal_path) {
+    journal::Journal journal(journal_path);
+    const auto before = scene.doc.serialize();
+    static_cast<void>(take(journal.append(
+        {{}, scene.doc.revision(), "export.material.fixture-base",
+         {reinterpret_cast<const std::uint8_t*>(before.data()), before.size()}, std::nullopt})));
+    auto tx = take(project::ProjectTransaction::begin(scene.doc, journal, "export.material.fixture"));
+    okay(tx.set_material_catalog(std::move(catalog)));
+    static_cast<void>(take(tx.commit()));
+}
+
+project::MaterialCatalog scalar_catalog(std::uint64_t mesh, bool two_regions = false,
+                                        double red = 0.25) {
+    project::MaterialCatalog catalog;
+    render::MaterialAsset material;
+    material.id = 71; material.name = "Copper \"fixture\""; material.revision = core::Revision{1};
+    material.definition.base_color_factor = {red, 0.5, 0.75, 1.0};
+    material.definition.metallic = 0.8; material.definition.roughness = 0.27;
+    okay(catalog.insert_material(std::move(material)));
+    okay(catalog.insert_assignment({{mesh, 7U}, 71U, std::nullopt}));
+    if (two_regions) okay(catalog.insert_assignment({{mesh, 8U}, 71U, std::nullopt}));
+    return catalog;
+}
+
+geometry::EditableMesh material_mesh(bool two_regions = false) {
+    auto mesh = fixture();
+    auto attrs = mesh.attributes();
+    okay(attrs.add_layer({{"cartographer.material_slot", attributes::AttributeDomain::face,
+                           attributes::AttributeType::uint32},
+                          {std::uint32_t{7}, std::uint32_t{two_regions ? 8U : 7U}}}));
+    okay(mesh.set_attribute_payload(std::move(attrs), mesh.uv_sets()));
+    return mesh;
+}
+
+void constant_material_export_roundtrip(const std::filesystem::path& root) {
+    auto edited_mesh = material_mesh();
+    auto scene = make_scene(edited_mesh, root);
+    set_export_catalog(scene, scalar_catalog(scene.mesh), root / "material.log");
+    const auto source_before = scene.doc.serialize();
+    const auto payload = exported(scene, root, "material-before");
+    const auto primitive = payload.primitive();
+    check(number(member(primitive, "material")) == 0U, "primitive binds authored material");
+    check(number(member(member(primitive, "extras"), "cartographer_material_region")) == 7U,
+          "primitive records its source material region");
+    const auto material = array(member(payload.json, "materials")).at(0);
+    check(member(material, "doubleSided") == "true", "export preserves double-sided viewport contract");
+    check(number(member(member(material, "extras"), "cartographer_material_id")) == 71U,
+          "material records its source identity");
+    const auto pbr = member(material, "pbrMetallicRoughness");
+    const auto color = array(member(pbr, "baseColorFactor"));
+    near(std::stod(std::string(color[0])), 0.25, "exported red factor");
+    near(std::stod(std::string(color[1])), 0.5, "exported green factor");
+    near(std::stod(std::string(color[2])), 0.75, "exported blue factor");
+    near(std::stod(std::string(member(pbr, "metallicFactor"))), 0.8, "exported metallic");
+    near(std::stod(std::string(member(pbr, "roughnessFactor"))), 0.27, "exported roughness");
+    check(!payload.attribute("TEXCOORD_0").empty(), "material export retains authored UVs");
+    for (const auto ext : {".gltf", ".glb"}) {
+        const auto bytes = read(root / (std::string("material-before") + ext));
+        const auto imported = take(io::import_gltf_materials({
+            reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()}));
+        check(imported.catalog.materials().size() == 1U && imported.encoded_images.empty(),
+              "actual glTF material importer admits the emitted texture-free material");
+        const auto imported_scene = take(io::import_gltf_scene({
+            reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()}));
+        check(imported_scene.meshes.size() == 1U && imported_scene.meshes[0].faces_sorted().size() == 2U &&
+                  imported_scene.meshes[0].uv_sets().active_for_render() != nullptr &&
+                  imported_scene.materials.catalog.assignments().contains({1U, 1U}),
+              "actual scene importer retains faces, active UVs and remapped material assignment");
+        const auto* imported_slots = imported_scene.meshes[0].attributes().find("cartographer.material_slot");
+        check(imported_slots != nullptr && imported_slots->values.size() == 2U &&
+                  std::get<std::uint32_t>(imported_slots->values[0]) == 1U &&
+                  std::get<std::uint32_t>(imported_slots->values[1]) == 1U,
+              "scene importer attaches material to both faces");
+        const auto& value = imported.catalog.materials().begin()->second.definition;
+        near(value.base_color_factor.x, 0.25, "material importer sees authored factor");
+        near(value.metallic, 0.8, "material importer sees metallic factor");
+        near(value.roughness, 0.27, "material importer sees roughness factor");
+    }
+    check(scene.doc.serialize() == source_before, "material export leaves source unchanged");
+    const auto saved = root / "material-source.carto";
+    static_cast<void>(take(scene.doc.save_atomic(saved)));
+    Scene reopened{take(project::ProjectDocument::load(saved)), scene.mesh};
+    const auto after = exported(reopened, root, "material-reopened");
+    check(after.bytes == payload.bytes, "material source save/reopen preserves geometry and UV bytes");
+    check(member(after.primitive(), "material") == member(payload.primitive(), "material") &&
+          member(array(member(after.json, "materials")).at(0), "pbrMetallicRoughness") == pbr,
+          "material source save/reopen preserves the exported assignment and factors");
+
+    // Existing mesh command undo/redo must not detach the material binding.
+    editor::CommandBus bus;
+    okay(bus.execute(std::make_unique<editor::SetVertexPositionCommand>(
+        edited_mesh, geometry::VertexId{1}, core::Vec3d{0, 0, 0}, core::Vec3d{0, 0, .1})));
+    replace(scene, edited_mesh, root, 21);
+    check(number(member(exported(scene, root, "material-edited").primitive(), "material")) == 0U,
+          "mesh edit retains assigned material");
+    okay(bus.undo()); replace(scene, edited_mesh, root, 22);
+    const auto undone = exported(scene, root, "material-undo");
+    check(undone.bytes == payload.bytes && number(member(undone.primitive(), "material")) == 0U,
+          "mesh undo retains material and restores source geometry bytes");
+    okay(bus.redo()); replace(scene, edited_mesh, root, 23);
+    check(number(member(exported(scene, root, "material-redo").primitive(), "material")) == 0U,
+          "mesh redo retains assigned material");
+
+    const auto ordering_root = root / "material-ordering";
+    std::filesystem::create_directory(ordering_root);
+    auto ordered = make_scene(material_mesh(), ordering_root);
+    auto catalog = scalar_catalog(ordered.mesh);
+    render::MaterialAsset unused;
+    unused.id = 4U; unused.name = "Earlier unassigned material"; unused.revision = core::Revision{1U};
+    okay(catalog.insert_material(std::move(unused)));
+    set_export_catalog(ordered, std::move(catalog), ordering_root / "material.log");
+    const auto ordered_payload = exported(ordered, ordering_root, "ordered");
+    check(number(member(ordered_payload.primitive(), "material")) == 1U &&
+              number(member(member(array(member(ordered_payload.json, "materials")).at(1), "extras"),
+                            "cartographer_material_id")) == 71U,
+          "primitive uses the sorted material's actual glTF index");
+}
 } // namespace
 int main(int argc, char** argv) {
     try {
@@ -337,6 +459,9 @@ int main(int argc, char** argv) {
              std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         check(!std::filesystem::exists(root), "fixture directory must be new; prior artifacts are preserved");
         std::filesystem::create_directories(root);
+        const auto scalar_root = root / "constant-material";
+        std::filesystem::create_directory(scalar_root);
+        constant_material_export_roundtrip(scalar_root);
         auto mesh = fixture();
         auto s = make_scene(mesh, root);
         auto p = exported(s, root, "baseline");
@@ -449,6 +574,48 @@ int main(int argc, char** argv) {
         check(!material_export && material_export.error().message.find("material catalog") != std::string::npos &&
                   read(good) == before,
               "authored material loss is refused without replacing prior glTF");
+        const auto multi_root = root / "multi-region-material";
+        std::filesystem::create_directory(multi_root);
+        auto multi = make_scene(material_mesh(true), multi_root);
+        set_export_catalog(multi, scalar_catalog(multi.mesh, true), multi_root / "material.log");
+        const auto multi_source = multi.doc.serialize();
+        const auto multi_gltf = io::export_gltf(multi.doc, good);
+        check(!multi_gltf && multi_gltf.error().message.find("one nonzero material region") != std::string::npos &&
+                  read(good) == before && multi.doc.serialize() == multi_source,
+              "multi-region material refuses without changing source or replacing glTF");
+        const auto multi_glb = io::export_glb(multi.doc, good_glb);
+        check(!multi_glb && read(good_glb) == glb_before && multi.doc.serialize() == multi_source,
+              "multi-region material refuses without replacing GLB");
+        const auto hdr_root = root / "out-of-range-material";
+        std::filesystem::create_directory(hdr_root);
+        auto hdr = make_scene(material_mesh(), hdr_root);
+        set_export_catalog(hdr, scalar_catalog(hdr.mesh, false, 1.25), hdr_root / "material.log");
+        const auto hdr_source = hdr.doc.serialize();
+        check(!io::export_gltf(hdr.doc, good) && read(good) == before && hdr.doc.serialize() == hdr_source,
+              "glTF-out-of-range base color refuses without clamping or mutation");
+        const auto texture_root = root / "textured-material";
+        std::filesystem::create_directory(texture_root);
+        auto textured = make_scene(material_mesh(), texture_root);
+        auto textured_catalog = scalar_catalog(textured.mesh);
+        const std::array<std::uint8_t, 3U> fixture_digest_bytes{1U, 2U, 3U};
+        okay(textured_catalog.insert_texture(project::TextureSourceRecord{
+            .id = 501U, .name = "Texture identity fixture", .relative_locator = "textures/fixture.png",
+            .content_digest = assets::sha256(fixture_digest_bytes),
+            .format = assets::TextureSourceFormat::png, .width = 1U, .height = 1U,
+            .provenance = "synthetic identity only", .revision = core::Revision{1U}}));
+        okay(textured_catalog.insert_sampler(project::SamplerIntent{
+            .id = 31U, .name = "Fixture sampler", .revision = core::Revision{1U}}));
+        auto textured_material = textured_catalog.materials().at(71U);
+        textured_material.revision = core::Revision{2U};
+        textured_material.definition.base_color.asset = 501U;
+        textured_material.definition.base_color.sampler = 31U;
+        textured_material.definition.base_color.uv_set = 7U;
+        okay(textured_catalog.replace_material(std::move(textured_material)));
+        set_export_catalog(textured, std::move(textured_catalog), texture_root / "material.log");
+        const auto texture_source_before = textured.doc.serialize();
+        const auto texture_result = io::export_gltf(textured.doc, good);
+        check(!texture_result && read(good) == before && textured.doc.serialize() == texture_source_before,
+              "textured material is refused without fake pixels, source mutation or file replacement");
         auto slotted = fixture();
         auto slot_attributes = slotted.attributes();
         okay(slot_attributes.add_layer({{"cartographer.material_slot", attributes::AttributeDomain::face,
