@@ -767,6 +767,7 @@ static core::Result<GltfExportReport> export_interchange(
     }
 
     std::ostringstream json;
+    json.imbue(std::locale::classic());
     json << "{\n"
          << "  \"asset\":{\"version\":\"2.0\",\"generator\":\"Cartographer "
          << CARTOGRAPHER_VERSION << "\"},\n"
