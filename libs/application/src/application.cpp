@@ -1,3 +1,4 @@
+#include "authoring_justification.hpp"
 #include <carto/application/application.hpp>
 #include <carto/editor/viewport_interaction.hpp>
 #include <carto/project/recovery.hpp>
@@ -1070,11 +1071,7 @@ core::Result<DispatchReceipt> ApplicationSession::configure_autorig_ik_fk(
 core::Result<DispatchReceipt> ApplicationSession::store_unadmitted_mode_key_draft(
     HumanActionAdmission, const StoreUnadmittedModeKeyDraftRequest& request) {
     if (active_source_ != OperationSource::human || !request.acknowledge_unadmitted_assertions ||
-        request.justification.empty() || request.justification.size() > 512U ||
-        request.justification.find_first_not_of(' ') == std::string::npos ||
-        std::any_of(request.justification.begin(), request.justification.end(), [](unsigned char value) {
-            return value < 0x20U || value == 0x7fU;
-        }))
+        !detail::justification_valid(request.justification))
         return failure(invalid_state("unadmitted mode-key draft requires human acknowledgement and justification"));
     if (!journal_.has_value())
         return failure(invalid_state("unadmitted mode-key draft requires a saved project with a durable journal"));

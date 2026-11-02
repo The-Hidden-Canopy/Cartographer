@@ -1,3 +1,4 @@
+#include "authoring_justification.hpp"
 #include <carto/application/application.hpp>
 #include <carto/character/rig_record.hpp>
 #include <carto/workspace/commands.hpp>
@@ -17,11 +18,6 @@ core::Diagnostic invalid(std::string message) {
 }
 core::Diagnostic stale(std::string message) {
     return {core::ErrorCode::stale_data, std::move(message)};
-}
-bool justification_valid(const std::string& value) {
-    return !value.empty() && value.size() <= 512U &&
-        value.find_first_not_of(' ') != std::string::npos &&
-        std::none_of(value.begin(), value.end(), [](unsigned char c) { return c < 0x20U || c == 0x7fU; });
 }
 std::string hex_text(std::string_view text) {
     constexpr char digits[] = "0123456789abcdef";
@@ -273,7 +269,7 @@ core::Result<DispatchReceipt> HumanApplicationAccess::accept_ik_fk_key(
 core::Result<DispatchReceipt> ApplicationSession::adopt_control_workspace(
     HumanActionAdmission, const AdoptControlWorkspaceRequest& request) {
     if (std::locale() != std::locale::classic() || active_source_ != OperationSource::human ||
-        !justification_valid(request.justification) || !journal_)
+        !detail::justification_valid(request.justification) || !journal_)
         return core::Result<DispatchReceipt>::failure(invalid("workspace adoption requires a saved project and explicit human justification"));
     if (document_.control_workspace())
         return core::Result<DispatchReceipt>::failure(stale("project already owns a control workspace"));
@@ -381,7 +377,7 @@ core::Result<DispatchReceipt> ApplicationSession::accept_ik_fk_key(
     HumanActionAdmission, IkFkKeyReview& review, std::string justification) {
     const auto session = review.session_identity_.lock();
     if (std::locale() != std::locale::classic() || !review.active() || !session || session != ik_fk_review_identity_ ||
-        active_source_ != OperationSource::human || !journal_ || !justification_valid(justification))
+        active_source_ != OperationSource::human || !journal_ || !detail::justification_valid(justification))
         return core::Result<DispatchReceipt>::failure(invalid("key acceptance requires an active same-session human review and saved journal"));
     if (review.generation_ != project_generation_ || review.project_revision_ != document_.revision() ||
         !document_.control_workspace() || document_.control_workspace()->revision != review.workspace_revision_ ||
