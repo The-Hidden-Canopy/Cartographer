@@ -90,10 +90,17 @@ existing compatibility path and does not claim to close it. A supported
 platform-window ownership need separate native verification before claiming
 fully certified resize/shutdown resource retirement.
 
-## Coordinator follow-up boundaries
+## Coordinator follow-up at b9385b8
 
-An additional CPU counterexample refuses an empty swapchain image set before any driver acquisition, submission or presentation. The original helper reached acquisition before its invalid-index check; the added precondition repairs that actual RED failure.
+An additional CPU counterexample refuses an empty swapchain image set before
+any driver acquisition, submission or presentation. The original helper
+reached acquisition before its invalid-index check; the precondition repairs
+that failure.
 
-The main ImGui upload ring is now fixed to the two fenced main frame slots, avoiding the pinned backend assertion when a surface changes its image count. A changed main surface format rebuilds the backend main pipeline with the new render pass after existing retirement waits. This preserves the internal source/asset and project codec contracts. Actual format-change coverage requires a suitable native surface; ordinary same-format resize does not prove it.
+The main ImGui upload ring is fixed to the two fenced main frame slots, and a
+changed main surface format rebuilds the backend main pipeline after retirement
+waits. Actual format-change coverage requires a suitable native surface.
 
-These changes do not implement presentation-fence maintenance1 retirement or replace the bundled platform-window renderer. Device-idle shutdown/retirement, platform-window teardown, low-level driver blocking and repeated Release performance remain separate acceptance gates. Passing CPU tests or a sampled main-window walkthrough must not be described as complete retirement correctness.
+These are the coordinator's b9385b8 boundaries; subsequent local source also
+proposes maintenance1 presentation fences and platform-window retirement.
+Those later changes have not yet passed compilation or native validation.

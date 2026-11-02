@@ -30,6 +30,7 @@
 #include "studio_viewport_capture.hpp"
 #include "uv_inspector.hpp"
 #include "native_presentation.hpp"
+#include "native_upload_lifetime.hpp"
 
 // Dear ImGui intentionally keeps the Win32 message handler declaration behind
 // a disabled block in its public backend header to avoid pulling in windows.h.
@@ -69,7 +70,6 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 #include <carto/runtime_api/client.hpp>
 #include <carto/terrain/terrain_tile.hpp>
 #include <carto/ui/ui.hpp>
-#include <carto/vulkan/runtime.hpp>
 
 #include <algorithm>
 #include <array>
@@ -349,7 +349,15 @@ int create_imgui_vulkan_surface(
 
 class VulkanShell final {
 public:
-    ~VulkanShell() { shutdown(); }
+    enum class TextureUploadResult { ready, pending, failed };
+    ~VulkanShell() noexcept {
+        try { shutdown(); }
+        catch (const std::exception& error) {
+            // Explicit shutdown throws before the ImGui context is destroyed.
+            // Exception unwinding must preserve unretired work, not terminate.
+            std::clog << "cartographer: GPU cleanup retained: " << error.what() << '\n';
+        }
+    }
 
     void initialize(HWND window) {
         window_ = window;
@@ -371,11 +379,12 @@ public:
         init_info.QueueFamily = queue_family_;
         init_info.Queue = queue_;
         init_info.DescriptorPool = descriptor_pool_;
-        // The main upload ring follows the two fenced frame slots, not WSI's
-        // independently changing image count. Keep ImGui's minimum stable:
-        // this pinned backend asserts on SetMinImageCount changes.
+        // Backend upload rings count queued main frames, not WSI images.
+        // Detached surfaces query/clamp their own image count independently.
         init_info.MinImageCount = static_cast<std::uint32_t>(kFrameContextCount);
         init_info.ImageCount = static_cast<std::uint32_t>(kFrameContextCount);
+        init_info.CheckVkResultFn = [](VkResult result) { check_vk(result, "ImGui Vulkan backend"); };
+        init_info.UseSwapchainMaintenance1 = present_retirement_enabled_;
         init_info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
         init_info.PipelineInfoMain.RenderPass = render_pass_;
         if (!ImGui_ImplVulkan_Init(&init_info)) {
@@ -386,7 +395,7 @@ public:
 
     void request_resize() noexcept { resize_pending_ = true; }
 
-    [[nodiscard]] bool set_reference_image_texture(
+    [[nodiscard]] TextureUploadResult set_reference_image_texture(
         const carto::assets::DecodedRgba8Texture& decoded,
         std::string& diagnostic) {
         carto::assets::TextureSourceLimits texture_limits;
@@ -398,35 +407,36 @@ public:
             diagnostic = valid
                 ? "reference viewport texture requires digest-bound decoded PNG, JPEG, or TGA pixels"
                 : valid.error().message;
-            return false;
+            return TextureUploadResult::failed;
         }
         if (!imgui_initialized_ || device_ == VK_NULL_HANDLE ||
             command_pool_ == VK_NULL_HANDLE || queue_ == VK_NULL_HANDLE) {
             diagnostic = "Vulkan renderer is unavailable for reference image upload";
-            return false;
+            return TextureUploadResult::failed;
         }
         const std::string digest = decoded.admission.source.digest.hex();
         if (reference_image_texture_.has_value() &&
             reference_image_texture_->digest == digest &&
             reference_image_texture_->width == decoded.admission.width &&
             reference_image_texture_->height == decoded.admission.height) {
-            return true;
+            cancel_upload("reference image");
+            diagnostic.clear();
+            return TextureUploadResult::ready;
         }
         std::optional<Rgba8Texture> candidate;
-        if (!create_rgba8_texture(decoded.admission.width, decoded.admission.height,
-                decoded.pixels, digest, candidate, "reference image", diagnostic)) {
-            return false;
-        }
+        const auto upload_result = create_rgba8_texture(decoded.admission.width, decoded.admission.height,
+                decoded.pixels, digest, candidate, "reference image", diagnostic);
+        if (upload_result != TextureUploadResult::ready) return upload_result;
         if (!publish_rgba8_texture(reference_image_texture_,
                 retired_rgba8_textures_, candidate)) {
             if (candidate.has_value()) destroy_rgba8_texture(*candidate);
             diagnostic = "Unable to retain the prior reference texture through frame presentation";
-            return false;
+            return TextureUploadResult::failed;
         }
-        return true;
+        return TextureUploadResult::ready;
     }
 
-    [[nodiscard]] bool set_scene_capture_texture(
+    [[nodiscard]] TextureUploadResult set_scene_capture_texture(
         std::uint32_t width, std::uint32_t height,
         std::span<const std::uint8_t> pixels,
         const carto::assets::Sha256Digest& pixel_digest,
@@ -435,32 +445,33 @@ public:
         if (width == 0U || height == 0U || pixel_count > 16'777'216ULL ||
             pixel_count * 4ULL != pixels.size() || pixel_digest.is_zero()) {
             diagnostic = "rendered scene capture has invalid RGBA8 pixels or identity";
-            return false;
+            return TextureUploadResult::failed;
         }
         if (!imgui_initialized_ || device_ == VK_NULL_HANDLE ||
             command_pool_ == VK_NULL_HANDLE || queue_ == VK_NULL_HANDLE) {
             diagnostic = "Vulkan renderer is unavailable for scene capture upload";
-            return false;
+            return TextureUploadResult::failed;
         }
         const std::string digest = pixel_digest.hex();
         if (scene_capture_texture_.has_value() &&
             scene_capture_texture_->digest == digest &&
             scene_capture_texture_->width == width &&
             scene_capture_texture_->height == height) {
-            return true;
+            cancel_upload("scene capture");
+            diagnostic.clear();
+            return TextureUploadResult::ready;
         }
         std::optional<Rgba8Texture> candidate;
-        if (!create_rgba8_texture(width, height, pixels, digest, candidate,
-                "scene capture", diagnostic)) {
-            return false;
-        }
+        const auto upload_result = create_rgba8_texture(width, height, pixels, digest, candidate,
+                "scene capture", diagnostic);
+        if (upload_result != TextureUploadResult::ready) return upload_result;
         if (!publish_rgba8_texture(scene_capture_texture_,
                 retired_rgba8_textures_, candidate)) {
             if (candidate.has_value()) destroy_rgba8_texture(*candidate);
             diagnostic = "Unable to retain the prior scene texture through frame presentation";
-            return false;
+            return TextureUploadResult::failed;
         }
-        return true;
+        return TextureUploadResult::ready;
     }
 
     [[nodiscard]] ImTextureID reference_image_texture_id() const noexcept {
@@ -479,7 +490,7 @@ public:
         return to_imgui_texture_id(scene_capture_texture_->descriptor);
     }
 
-    [[nodiscard]] bool set_source_reimport_thumbnail_texture(
+    [[nodiscard]] TextureUploadResult set_source_reimport_thumbnail_texture(
         std::size_t slot, const carto::studio::MeshThumbnailRaster& raster,
         std::string& diagnostic) {
         const std::uint64_t pixel_count =
@@ -489,30 +500,31 @@ public:
             pixel_count > 65'536ULL || pixel_count * 4ULL != raster.rgba8.size() ||
             raster.pixel_digest.is_zero()) {
             diagnostic = "source reimport thumbnail has invalid bounded RGBA8 pixels";
-            return false;
+            return TextureUploadResult::failed;
         }
         if (!imgui_initialized_ || device_ == VK_NULL_HANDLE ||
             command_pool_ == VK_NULL_HANDLE || queue_ == VK_NULL_HANDLE) {
             diagnostic = "Vulkan renderer is unavailable for source reimport thumbnail upload";
-            return false;
+            return TextureUploadResult::failed;
         }
         auto& texture = source_reimport_thumbnail_textures_[slot];
         const std::string digest = raster.pixel_digest.hex();
         if (texture.has_value() && texture->digest == digest &&
             texture->width == raster.width && texture->height == raster.height) {
-            return true;
+            cancel_upload(slot == 0U ? "source reimport thumbnail 0" : "source reimport thumbnail 1");
+            diagnostic.clear();
+            return TextureUploadResult::ready;
         }
         std::optional<Rgba8Texture> candidate;
-        if (!create_rgba8_texture(raster.width, raster.height, raster.rgba8,
-                digest, candidate, "source reimport thumbnail", diagnostic)) {
-            return false;
-        }
+        const auto upload_result = create_rgba8_texture(raster.width, raster.height, raster.rgba8,
+                digest, candidate, "source reimport thumbnail " + std::to_string(slot), diagnostic);
+        if (upload_result != TextureUploadResult::ready) return upload_result;
         if (!publish_rgba8_texture(texture, retired_rgba8_textures_, candidate)) {
             if (candidate.has_value()) destroy_rgba8_texture(*candidate);
             diagnostic = "Unable to retain the prior source thumbnail through frame presentation";
-            return false;
+            return TextureUploadResult::failed;
         }
-        return true;
+        return TextureUploadResult::ready;
     }
 
     [[nodiscard]] ImTextureID source_reimport_thumbnail_texture_id(
@@ -527,12 +539,14 @@ public:
     }
 
     void clear_reference_image_texture() noexcept {
+        cancel_upload("reference image");
         if (!reference_image_texture_.has_value()) return;
         static_cast<void>(retire_rgba8_texture(
             reference_image_texture_, retired_rgba8_textures_));
     }
 
-    void clear_scene_capture_texture() noexcept {
+    void clear_scene_capture_texture(bool cancel_pending = true) noexcept {
+        if (cancel_pending) cancel_upload("scene capture");
         if (!scene_capture_texture_.has_value()) return;
         static_cast<void>(retire_rgba8_texture(
             scene_capture_texture_, retired_rgba8_textures_));
@@ -540,6 +554,8 @@ public:
 
     void clear_source_reimport_thumbnail_texture(std::size_t slot) noexcept {
         if (slot >= source_reimport_thumbnail_textures_.size()) return;
+        // Avoid allocation in this noexcept clear path.
+        cancel_upload(slot == 0U ? "source reimport thumbnail 0" : "source reimport thumbnail 1");
         static_cast<void>(retire_rgba8_texture(
             source_reimport_thumbnail_textures_[slot], retired_rgba8_textures_));
     }
@@ -547,32 +563,49 @@ public:
     // False means deferred rendering or pending recreation. Return to Win32
     // without resetting/reusing synchronization objects on an early wait.
     bool render(ImDrawData* draw_data) {
+        poll_uploads();
         destroy_retired_rgba8_textures();
         if (client_width() == 0 || client_height() == 0) return false;
         if (resize_pending_ && !presentation_.has_acquired_image()) {
             for (auto& frame : frame_contexts_) {
                 if (wait_fence(frame.fence, "resize frame fence") ==
                     carto::studio::PresentationResult::deferred) return false;
+                if (frame.acquire_pending && wait_fence(frame.acquire_fence, "resize acquisition fence") ==
+                    carto::studio::PresentationResult::deferred) return false;
             }
+            for (std::size_t image = 0; image < present_retirement_.size(); ++image)
+                if (wait_present(image) == carto::studio::PresentationResult::deferred) return false;
             recreate_swapchain();
         }
         struct Driver {
             VulkanShell& shell;
             ImDrawData* draw;
             carto::studio::PresentationResult wait_frame(std::size_t slot, std::uint64_t) {
-                return shell.wait_fence(shell.frame_contexts_.at(slot).fence, "frame fence");
+                auto& frame = shell.frame_contexts_.at(slot);
+                if (shell.wait_fence(frame.fence, "frame fence") == carto::studio::PresentationResult::deferred)
+                    return carto::studio::PresentationResult::deferred;
+                if (frame.acquire_pending) {
+                    if (shell.wait_fence(frame.acquire_fence, "acquisition completion fence") ==
+                        carto::studio::PresentationResult::deferred) return carto::studio::PresentationResult::deferred;
+                    frame.acquire_pending = false;
+                }
+                return carto::studio::PresentationResult::ready;
             }
             carto::studio::AcquiredImage acquire(std::size_t slot, std::uint64_t budget) {
                 std::uint32_t image = 0;
+                auto& frame = shell.frame_contexts_.at(slot);
+                check_vk(vkResetFences(shell.device_, 1, &frame.acquire_fence), "reset acquisition fence");
                 const auto result = vkAcquireNextImageKHR(shell.device_, shell.swapchain_, budget,
-                    shell.frame_contexts_.at(slot).image_available, VK_NULL_HANDLE, &image);
+                    frame.image_available, frame.acquire_fence, &image);
+                frame.acquire_pending = result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR;
                 return {shell.presentation_result(result, "vkAcquireNextImageKHR"), image};
             }
             carto::studio::PresentationResult wait_image(std::size_t slot, std::uint32_t image, std::uint64_t) {
                 const auto fence = shell.image_fences_.at(image);
-                if (fence == VK_NULL_HANDLE || fence == shell.frame_contexts_.at(slot).fence)
-                    return carto::studio::PresentationResult::ready;
-                return shell.wait_fence(fence, "swapchain image fence");
+                if (fence != VK_NULL_HANDLE && fence != shell.frame_contexts_.at(slot).fence &&
+                    shell.wait_fence(fence, "swapchain image fence") == carto::studio::PresentationResult::deferred)
+                    return carto::studio::PresentationResult::deferred;
+                return shell.wait_present(image);
             }
             void submit(std::size_t slot, std::uint32_t image) { shell.submit_frame(slot, image, draw); }
             carto::studio::PresentationResult present(std::uint32_t image) { return shell.present_frame(image); }
@@ -598,6 +631,15 @@ private:
         if (result == VK_TIMEOUT) return carto::studio::PresentationResult::deferred;
         check_vk(result, operation);
         return carto::studio::PresentationResult::ready;
+    }
+
+    carto::studio::PresentationResult wait_present(std::size_t image) {
+        if (!present_retirement_enabled_) return carto::studio::PresentationResult::ready;
+        auto& retirement = present_retirement_.at(image);
+        if (!retirement.cycle.Pending) return carto::studio::PresentationResult::ready;
+        const auto result = wait_fence(retirement.fence, "presentation retirement fence");
+        if (result == carto::studio::PresentationResult::ready) retirement.cycle.ObserveSignal();
+        return result;
     }
 
     void submit_frame(std::size_t slot, std::uint32_t image_index, ImDrawData* draw_data) {
@@ -654,7 +696,28 @@ private:
         present.swapchainCount = 1;
         present.pSwapchains = &swapchain_;
         present.pImageIndices = &image_index;
+#ifdef VK_EXT_swapchain_maintenance1
+        VkSwapchainPresentFenceInfoEXT retirement_info{};
+        if (present_retirement_enabled_) {
+            auto& retirement = present_retirement_.at(image_index);
+            if (!retirement.cycle.Begin()) throw std::runtime_error("presentation fence is still owned");
+            const auto reset = vkResetFences(device_, 1, &retirement.fence);
+            if (reset != VK_SUCCESS) {
+                retirement.cycle.Finish(false);
+                check_vk(reset, "reset presentation fence");
+            }
+            retirement_info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT;
+            retirement_info.swapchainCount = 1;
+            retirement_info.pFences = &retirement.fence;
+            present.pNext = &retirement_info;
+        }
+#endif
         const VkResult presented = vkQueuePresentKHR(queue_, &present);
+        if (present_retirement_enabled_) {
+            const bool enqueued = presented == VK_SUCCESS || presented == VK_SUBOPTIMAL_KHR ||
+                presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_ERROR_SURFACE_LOST_KHR;
+            present_retirement_.at(image_index).cycle.Finish(enqueued);
+        }
         return presentation_result(presented, "vkQueuePresentKHR");
     }
 
@@ -663,8 +726,15 @@ private:
         VkCommandBuffer command_buffer = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
         VkSemaphore image_available = VK_NULL_HANDLE;
+        VkFence acquire_fence = VK_NULL_HANDLE;
+        bool acquire_pending = false;
         std::uint64_t frame_id = 0U;
         bool submitted = false;
+    };
+
+    struct PresentRetirement {
+        VkFence fence = VK_NULL_HANDLE;
+        ImGui_ImplVulkanLifetime::PresentFenceCycle cycle;
     };
 
     struct Rgba8Texture {
@@ -681,6 +751,70 @@ private:
         Rgba8Texture texture;
         std::uint64_t last_possible_frame;
     };
+
+    struct PendingUpload {
+        Rgba8Texture texture;
+        VkBuffer staging_buffer = VK_NULL_HANDLE;
+        VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+        VkCommandBuffer command = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        carto::studio::TextureUploadTicket ticket;
+        explicit PendingUpload(carto::studio::TextureUploadIdentity key) : ticket(std::move(key)) {}
+    };
+
+    bool release_upload_submission(PendingUpload& upload, bool retirement_confirmed = false) noexcept {
+        if (!retirement_confirmed && !upload.ticket.may_release_submission()) return false;
+        if (upload.command != VK_NULL_HANDLE)
+            vkFreeCommandBuffers(device_, command_pool_, 1U, &upload.command);
+        if (upload.staging_buffer != VK_NULL_HANDLE) vkDestroyBuffer(device_, upload.staging_buffer, nullptr);
+        if (upload.staging_memory != VK_NULL_HANDLE) vkFreeMemory(device_, upload.staging_memory, nullptr);
+        if (upload.fence != VK_NULL_HANDLE) vkDestroyFence(device_, upload.fence, nullptr);
+        upload.command = VK_NULL_HANDLE;
+        upload.staging_buffer = VK_NULL_HANDLE;
+        upload.staging_memory = VK_NULL_HANDLE;
+        upload.fence = VK_NULL_HANDLE;
+        return true;
+    }
+
+    void poll_uploads() noexcept {
+        for (auto& upload : pending_uploads_) {
+            if (upload.fence != VK_NULL_HANDLE && vkGetFenceStatus(device_, upload.fence) == VK_SUCCESS) {
+                upload.ticket.observe_completion();
+                release_upload_submission(upload);
+            }
+        }
+        std::erase_if(pending_uploads_, [&](PendingUpload& upload) {
+            if (!upload.ticket.cancelled() || !upload.ticket.may_release_submission()) return false;
+            destroy_rgba8_texture(upload.texture);
+            return true;
+        });
+    }
+
+    void cancel_upload(std::string_view role) noexcept {
+        carto::studio::cancel_uploads_for_role(pending_uploads_, role);
+    }
+
+    TextureUploadResult consume_upload(std::size_t index,
+        const carto::studio::TextureUploadIdentity& key,
+        std::optional<Rgba8Texture>& destination, std::string& diagnostic) {
+        auto& upload = pending_uploads_.at(index);
+        if (!upload.ticket.may_publish(key)) {
+            diagnostic = "The requested texture upload is pending.";
+            return TextureUploadResult::pending;
+        }
+        upload.texture.descriptor = ImGui_ImplVulkan_AddTexture(
+            upload.texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        if (upload.texture.descriptor == VK_NULL_HANDLE) {
+            destroy_rgba8_texture(upload.texture);
+            pending_uploads_.erase(pending_uploads_.begin() + static_cast<std::ptrdiff_t>(index));
+            diagnostic = "Dear ImGui could not bind the completed texture upload.";
+            return TextureUploadResult::failed;
+        }
+        destination.emplace(std::move(upload.texture));
+        pending_uploads_.erase(pending_uploads_.begin() + static_cast<std::ptrdiff_t>(index));
+        diagnostic.clear();
+        return TextureUploadResult::ready;
+    }
 
     template <typename Descriptor>
     [[nodiscard]] static ImTextureID to_imgui_texture_id(
@@ -777,7 +911,7 @@ private:
         });
     }
 
-    [[nodiscard]] bool create_rgba8_texture(
+    [[nodiscard]] TextureUploadResult create_rgba8_texture(
         std::uint32_t width,
         std::uint32_t height,
         std::span<const std::uint8_t> pixels,
@@ -788,7 +922,7 @@ private:
         if (destination.has_value()) {
             diagnostic = "RGBA8 " + std::string(label) +
                 " upload destination must be empty until publication";
-            return false;
+            return TextureUploadResult::failed;
         }
         VkPhysicalDeviceProperties device_properties{};
         vkGetPhysicalDeviceProperties(physical_device_, &device_properties);
@@ -796,7 +930,7 @@ private:
             height > device_properties.limits.maxImageDimension2D) {
             diagnostic = "RGBA8 " + std::string(label) +
                 " exceeds this Vulkan device's 2D texture limit";
-            return false;
+            return TextureUploadResult::failed;
         }
         VkFormatProperties format_properties{};
         vkGetPhysicalDeviceFormatProperties(
@@ -807,13 +941,29 @@ private:
             required_format_features) {
             diagnostic = "Vulkan device cannot sample an RGBA8 " + std::string(label) +
                 " texture";
-            return false;
+            return TextureUploadResult::failed;
         }
-        if (vkDeviceWaitIdle(device_) != VK_SUCCESS) {
-            diagnostic = "Vulkan device did not become idle before RGBA8 " +
-                std::string(label) + " upload";
-            return false;
+        const carto::studio::TextureUploadIdentity key{std::string(label), digest, width, height};
+        poll_uploads();
+        for (auto& upload : pending_uploads_)
+            if (upload.ticket.identity().role == key.role && !(upload.ticket.identity() == key))
+                upload.ticket.cancel();
+        poll_uploads();
+        for (std::size_t index = 0; index < pending_uploads_.size(); ++index)
+            if (!pending_uploads_[index].ticket.cancelled() && pending_uploads_[index].ticket.identity() == key)
+                return consume_upload(index, key, destination, diagnostic);
+        constexpr std::size_t maximum_pending_uploads = 4;
+        if (pending_uploads_.size() >= maximum_pending_uploads)
+            carto::studio::reclaim_completed_upload(pending_uploads_, [&](PendingUpload& upload) {
+                destroy_rgba8_texture(upload.texture);
+            });
+        if (pending_uploads_.size() >= maximum_pending_uploads) {
+            diagnostic = "Texture upload queue is busy; no preview was replaced.";
+            return TextureUploadResult::pending;
         }
+        // All host allocations needed to retain accepted work happen first.
+        pending_uploads_.reserve(maximum_pending_uploads);
+        PendingUpload pending(key);
 
         Rgba8Texture candidate;
         candidate.digest = digest;
@@ -822,7 +972,12 @@ private:
         VkBuffer staging_buffer = VK_NULL_HANDLE;
         VkDeviceMemory staging_memory = VK_NULL_HANDLE;
         VkCommandBuffer upload_command = VK_NULL_HANDLE;
+        VkFence upload_fence = VK_NULL_HANDLE;
         const auto cleanup_staging = [&]() {
+            if (upload_fence != VK_NULL_HANDLE) {
+                vkDestroyFence(device_, upload_fence, nullptr);
+                upload_fence = VK_NULL_HANDLE;
+            }
             if (upload_command != VK_NULL_HANDLE && command_pool_ != VK_NULL_HANDLE) {
                 vkFreeCommandBuffers(device_, command_pool_, 1U, &upload_command);
                 upload_command = VK_NULL_HANDLE;
@@ -840,7 +995,7 @@ private:
             cleanup_staging();
             destroy_rgba8_texture(candidate);
             diagnostic = std::move(reason);
-            return false;
+            return TextureUploadResult::failed;
         };
 
         const VkDeviceSize upload_size = static_cast<VkDeviceSize>(pixels.size());
@@ -1008,19 +1163,34 @@ private:
         upload_submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         upload_submit.commandBufferCount = 1U;
         upload_submit.pCommandBuffers = &upload_command;
-        if (vkQueueSubmit(queue_, 1U, &upload_submit, VK_NULL_HANDLE) != VK_SUCCESS ||
-            vkQueueWaitIdle(queue_) != VK_SUCCESS) {
-            return fail("Vulkan texture upload failed for RGBA8 " + std::string(label));
+        VkFenceCreateInfo fence_info{};
+        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (vkCreateFence(device_, &fence_info, nullptr, &upload_fence) != VK_SUCCESS)
+            return fail("Vulkan upload fence allocation failed for " + std::string(label));
+        if (vkQueueSubmit(queue_, 1U, &upload_submit, upload_fence) != VK_SUCCESS)
+            return fail("Vulkan texture upload submission failed for " + std::string(label));
+
+        pending.texture = std::move(candidate);
+        pending.staging_buffer = staging_buffer;
+        pending.staging_memory = staging_memory;
+        pending.command = upload_command;
+        pending.fence = upload_fence;
+        pending.ticket.mark_submitted();
+        pending_uploads_.push_back(std::move(pending));
+        // From here, even a timeout or device error cannot free in-flight
+        // commands/staging. The pending owner survives until fence completion
+        // or the explicit device shutdown boundary.
+        const auto index = pending_uploads_.size() - 1;
+        const auto waited = vkWaitForFences(device_, 1, &pending_uploads_[index].fence,
+            VK_TRUE, carto::studio::PresentationSequence::wait_budget_ns);
+        if (waited == VK_SUCCESS) {
+            pending_uploads_[index].ticket.observe_completion();
+            release_upload_submission(pending_uploads_[index]);
+        } else if (waited != VK_TIMEOUT) {
+            diagnostic = "Texture upload completion failed; pending GPU resources remain owned.";
+            return TextureUploadResult::failed;
         }
-        cleanup_staging();
-        candidate.descriptor = ImGui_ImplVulkan_AddTexture(
-            candidate.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        if (candidate.descriptor == VK_NULL_HANDLE) {
-            return fail("Dear ImGui could not bind the RGBA8 " + std::string(label) + " texture");
-        }
-        destination.emplace(std::move(candidate));
-        diagnostic.clear();
-        return true;
+        return consume_upload(index, key, destination, diagnostic);
     }
 
     // ImGui rotates its upload buffers by InitInfo.ImageCount. Surface
@@ -1086,6 +1256,29 @@ private:
             VK_KHR_SURFACE_EXTENSION_NAME,
             VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
         };
+        if (const char* policy = std::getenv("CARTOGRAPHER_VULKAN_PRESENT_RETIREMENT"))
+            present_retirement_policy_ = policy;
+        if (present_retirement_policy_ != "auto" && present_retirement_policy_ != "require" &&
+            present_retirement_policy_ != "legacy")
+            throw std::runtime_error("CARTOGRAPHER_VULKAN_PRESENT_RETIREMENT must be auto, require or legacy");
+#if defined(VK_EXT_swapchain_maintenance1) && defined(VK_EXT_surface_maintenance1)
+        std::uint32_t extension_count = 0;
+        check_vk(vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, nullptr), "enumerate instance extensions");
+        std::vector<VkExtensionProperties> available_extensions(extension_count);
+        check_vk(vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, available_extensions.data()), "enumerate instance extensions");
+        const auto has_extension = [&available_extensions](std::string_view name) {
+            return std::any_of(available_extensions.begin(), available_extensions.end(), [name](const auto& extension) {
+                return name == extension.extensionName;
+            });
+        };
+        present_retirement_instance_ = present_retirement_policy_ != "legacy" &&
+            has_extension(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) &&
+            has_extension(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
+        if (present_retirement_instance_) {
+            extensions.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+            extensions.push_back(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
+        }
+#endif
         const char* validation = std::getenv("CARTOGRAPHER_VULKAN_VALIDATION");
         const bool validate = validation != nullptr && std::string_view(validation) == "require";
         const char* layer = "VK_LAYER_KHRONOS_validation";
@@ -1223,13 +1416,41 @@ private:
         queue_info.queueFamilyIndex = queue_family_;
         queue_info.queueCount = 1;
         queue_info.pQueuePriorities = &priority;
-        const std::array<const char*, 1> extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+        std::vector<const char*> extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+#ifdef VK_EXT_swapchain_maintenance1
+        VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT maintenance{};
+        maintenance.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT;
+        if (present_retirement_instance_) {
+            std::uint32_t count = 0;
+            check_vk(vkEnumerateDeviceExtensionProperties(physical_device_, nullptr, &count, nullptr), "enumerate device extensions");
+            std::vector<VkExtensionProperties> available(count);
+            check_vk(vkEnumerateDeviceExtensionProperties(physical_device_, nullptr, &count, available.data()), "enumerate device extensions");
+            if (std::any_of(available.begin(), available.end(), [](const auto& extension) {
+                    return std::string_view(extension.extensionName) == VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME;
+                })) {
+                VkPhysicalDeviceFeatures2 features{};
+                features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+                features.pNext = &maintenance;
+                vkGetPhysicalDeviceFeatures2(physical_device_, &features);
+                present_retirement_enabled_ = maintenance.swapchainMaintenance1 == VK_TRUE;
+            }
+        }
+        if (present_retirement_enabled_) extensions.push_back(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
+#endif
+        if (present_retirement_policy_ == "require" && !present_retirement_enabled_)
+            throw std::runtime_error("required Vulkan swapchain-maintenance1 presentation retirement is unavailable");
+        std::clog << "cartographer: presentation retirement="
+                  << (present_retirement_enabled_ ? "maintenance1 present fences" :
+                      "legacy compatibility; presentation teardown is not certified") << '\n';
         VkDeviceCreateInfo info{};
         info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         info.queueCreateInfoCount = 1;
         info.pQueueCreateInfos = &queue_info;
         info.enabledExtensionCount = static_cast<std::uint32_t>(extensions.size());
         info.ppEnabledExtensionNames = extensions.data();
+#ifdef VK_EXT_swapchain_maintenance1
+        info.pNext = present_retirement_enabled_ ? &maintenance : nullptr;
+#endif
         check_vk(vkCreateDevice(physical_device_, &info, nullptr, &device_), "vkCreateDevice");
         vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
     }
@@ -1295,6 +1516,10 @@ private:
                      "vkCreateSemaphore image_available");
             check_vk(vkCreateFence(device_, &fence, nullptr, &frame.fence),
                      "vkCreateFence frame context");
+            VkFenceCreateInfo acquire_fence{};
+            acquire_fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            check_vk(vkCreateFence(device_, &acquire_fence, nullptr, &frame.acquire_fence),
+                     "vkCreateFence acquisition");
         }
     }
 
@@ -1387,12 +1612,6 @@ private:
                 render_pass_ = VK_NULL_HANDLE;
             }
             create_render_pass();
-            if (imgui_initialized_) {
-                ImGui_ImplVulkan_PipelineInfo pipeline{};
-                pipeline.RenderPass = render_pass_;
-                pipeline.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
-                ImGui_ImplVulkan_CreateMainPipeline(&pipeline);
-            }
         }
 
         VkSwapchainCreateInfoKHR info{};
@@ -1422,7 +1641,13 @@ private:
         framebuffers_.resize(images_.size());
         image_fences_.assign(images_.size(), VK_NULL_HANDLE);
         present_finished_.assign(images_.size(), VK_NULL_HANDLE);
+        present_retirement_.resize(images_.size());
         for (std::size_t index = 0; index < images_.size(); ++index) {
+            if (present_retirement_enabled_) {
+                VkFenceCreateInfo fence{};
+                fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+                check_vk(vkCreateFence(device_, &fence, nullptr, &present_retirement_[index].fence), "create presentation fence");
+            }
             VkSemaphoreCreateInfo semaphore{};
             semaphore.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
             check_vk(vkCreateSemaphore(device_, &semaphore, nullptr, &present_finished_[index]),
@@ -1453,7 +1678,12 @@ private:
 
     void recreate_swapchain() {
         if (client_width() == 0 || client_height() == 0) return;
-        check_vk(vkDeviceWaitIdle(device_), "vkDeviceWaitIdle resize");
+        // Maintenance1 callers already observed every main render/present
+        // fence. Pending uploads and detached windows own separate resources.
+        if (!present_retirement_enabled_) check_vk(vkDeviceWaitIdle(device_), "vkDeviceWaitIdle legacy resize");
+        for (auto& retirement : present_retirement_)
+            if (retirement.fence != VK_NULL_HANDLE) vkDestroyFence(device_, retirement.fence, nullptr);
+        present_retirement_.clear();
         for (VkSemaphore semaphore : present_finished_)
             if (semaphore != VK_NULL_HANDLE) vkDestroySemaphore(device_, semaphore, nullptr);
         present_finished_.clear();
@@ -1464,14 +1694,66 @@ private:
         images_.clear();
         vkDestroySwapchainKHR(device_, swapchain_, nullptr);
         swapchain_ = VK_NULL_HANDLE;
+        const VkFormat previous_pipeline_format = render_pass_format_;
         create_swapchain();
-        ImGui_ImplVulkan_SetMinImageCount(static_cast<std::uint32_t>(kFrameContextCount));
+        if (imgui_initialized_ && previous_pipeline_format != render_pass_format_) {
+            ImGui_ImplVulkan_PipelineInfo pipeline{};
+            pipeline.RenderPass = render_pass_;
+            pipeline.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+            ImGui_ImplVulkan_CreateMainPipeline(&pipeline);
+        }
+        // SetMinImageCount is unsupported by this multi-viewport backend and
+        // destroys every viewport's buffers. Its stable two-frame ring already
+        // fits our main in-flight budget; WSI image count is separate.
     }
 
 public:
-    void shutdown() noexcept {
+    // No new submissions are allowed after entering this close phase. Polling
+    // keeps the host responsive and covers acquired-but-not-submitted images.
+    bool prepare_shutdown() {
+        if (device_ == VK_NULL_HANDLE || device_lost_) return true;
+        const auto completed = [this](VkFence fence) {
+            if (device_lost_) return true;
+            if (fence == VK_NULL_HANDLE) return true;
+            const auto status = vkGetFenceStatus(device_, fence);
+            if (status == VK_ERROR_DEVICE_LOST) { device_lost_ = true; return true; }
+            if (status == VK_NOT_READY) return false;
+            check_vk(status, "poll shutdown ownership");
+            return true;
+        };
+        for (auto& frame : frame_contexts_) {
+            if (!completed(frame.fence)) return false;
+            if (frame.acquire_pending && !completed(frame.acquire_fence)) return false;
+        }
+        for (auto& upload : pending_uploads_)
+            if (!completed(upload.fence)) return false;
+        for (auto& retirement : present_retirement_)
+            if (retirement.cycle.Pending) {
+                if (!completed(retirement.fence)) return false;
+                retirement.cycle.ObserveSignal();
+            }
+        if (imgui_initialized_ && !device_lost_) {
+            const auto status = ImGui_ImplVulkan_PollPlatformWindowRetirement();
+            if (status == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+            else if (status == VK_NOT_READY || status == VK_TIMEOUT) return false;
+            else check_vk(status, "poll platform window shutdown ownership");
+        }
+        return true;
+    }
+
+    void shutdown() {
         if (device_ != VK_NULL_HANDLE) {
-            vkDeviceWaitIdle(device_);
+            if (!prepare_shutdown()) throw std::runtime_error("GPU shutdown retirement is pending; resources retained");
+            if (!present_retirement_enabled_ && !device_lost_) {
+                const auto idle = vkDeviceWaitIdle(device_); // Uncertified legacy compatibility.
+                if (idle == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+                else check_vk(idle, "legacy GPU shutdown retirement is unconfirmed");
+            }
+            for (auto& upload : pending_uploads_) {
+                release_upload_submission(upload, true);
+                destroy_rgba8_texture(upload.texture);
+            }
+            pending_uploads_.clear();
             if (imgui_initialized_) {
                 if (reference_image_texture_.has_value()) {
                     destroy_rgba8_texture(*reference_image_texture_);
@@ -1496,10 +1778,14 @@ public:
             for (VkSemaphore semaphore : present_finished_)
                 if (semaphore != VK_NULL_HANDLE) vkDestroySemaphore(device_, semaphore, nullptr);
             present_finished_.clear();
+            for (auto& retirement : present_retirement_)
+                if (retirement.fence != VK_NULL_HANDLE) vkDestroyFence(device_, retirement.fence, nullptr);
+            present_retirement_.clear();
             if (swapchain_ != VK_NULL_HANDLE) vkDestroySwapchainKHR(device_, swapchain_, nullptr);
             if (descriptor_pool_ != VK_NULL_HANDLE) vkDestroyDescriptorPool(device_, descriptor_pool_, nullptr);
             for (auto& frame : frame_contexts_) {
                 if (frame.fence != VK_NULL_HANDLE) vkDestroyFence(device_, frame.fence, nullptr);
+                if (frame.acquire_fence != VK_NULL_HANDLE) vkDestroyFence(device_, frame.acquire_fence, nullptr);
                 if (frame.image_available != VK_NULL_HANDLE) {
                     vkDestroySemaphore(device_, frame.image_available, nullptr);
                 }
@@ -1552,17 +1838,23 @@ private:
     std::vector<FrameContext> frame_contexts_;
     std::vector<VkFence> image_fences_;
     std::vector<VkSemaphore> present_finished_;
+    std::vector<PresentRetirement> present_retirement_;
     std::optional<Rgba8Texture> reference_image_texture_;
     std::optional<Rgba8Texture> scene_capture_texture_;
     std::array<std::optional<Rgba8Texture>, 2U>
         source_reimport_thumbnail_textures_;
     std::vector<RetiredTexture> retired_rgba8_textures_;
+    std::vector<PendingUpload> pending_uploads_;
     std::optional<std::uint64_t> completed_frame_;
     carto::studio::PresentationSequence presentation_{kFrameContextCount};
     std::uint64_t next_frame_id_ = 0U;
     PresentPolicy present_policy_ = present_policy_from_environment();
     bool imgui_initialized_ = false;
     bool resize_pending_ = false;
+    std::string present_retirement_policy_ = "auto";
+    bool present_retirement_instance_ = false;
+    bool present_retirement_enabled_ = false;
+    bool device_lost_ = false;
 };
 
 struct DesktopState;
@@ -10049,10 +10341,15 @@ struct DesktopState {
                     renderer.clear_reference_image_texture();
                 } else {
                     std::string upload_diagnostic;
-                    if (renderer.set_reference_image_texture(
-                            *reference_image_preview, upload_diagnostic)) {
+                    const auto upload = renderer.set_reference_image_texture(
+                        *reference_image_preview, upload_diagnostic);
+                    if (upload == VulkanShell::TextureUploadResult::ready) {
                         viewport_reference_plane = &plane->second;
                         viewport_reference_plane_corners = plane_corners.value();
+                    } else if (upload == VulkanShell::TextureUploadResult::pending) {
+                        // Retry this exact source-bound preview next draw.
+                        action_feedback = std::move(upload_diagnostic);
+                        action_feedback_error = false;
                     } else {
                         reference_image_viewport_enabled = false;
                         reference_image_viewport_identity.clear();
@@ -13905,7 +14202,7 @@ struct DesktopState {
             return;
         }
 
-        renderer.clear_scene_capture_texture();
+        renderer.clear_scene_capture_texture(false);
         scene_capture_preview.reset();
         scene_capture_feedback.clear();
         scene_capture_feedback_error = false;
@@ -14263,9 +14560,15 @@ struct DesktopState {
                 return;
             }
             std::string upload_diagnostic;
-            if (!renderer.set_scene_capture_texture(image.value().width,
+            const auto upload = renderer.set_scene_capture_texture(image.value().width,
                     image.value().height, image.value().srgb_rgba,
-                    image.value().pixel_digest, upload_diagnostic)) {
+                    image.value().pixel_digest, upload_diagnostic);
+            if (upload == VulkanShell::TextureUploadResult::pending) {
+                scene_capture_feedback = "Preview upload is pending. Retry Capture to publish the current source-bound preview.";
+                scene_capture_feedback_error = false;
+                return;
+            }
+            if (upload != VulkanShell::TextureUploadResult::ready) {
                 fail("Rendered scene could not be shown in the viewport: " +
                     upload_diagnostic);
                 return;
@@ -15128,6 +15431,8 @@ struct DesktopState {
                         std::string candidate_thumbnail_diagnostic;
                         bool current_thumbnail_ready = false;
                         bool candidate_thumbnail_ready = false;
+                        bool current_thumbnail_pending = false;
+                        bool candidate_thumbnail_pending = false;
                         if (thumbnail_controls_active) {
                             current_thumbnail_ready =
                                 renderer.source_reimport_thumbnail_texture_id(0U) !=
@@ -15142,9 +15447,10 @@ struct DesktopState {
                                 source_reimport_current_raster_cache.raster_for(
                                     current_projection, shared_frame);
                             if (current_raster.has_value()) {
-                                current_thumbnail_ready =
-                                    renderer.set_source_reimport_thumbnail_texture(
-                                        0U, *current_raster, current_thumbnail_diagnostic);
+                                const auto upload = renderer.set_source_reimport_thumbnail_texture(
+                                    0U, *current_raster, current_thumbnail_diagnostic);
+                                current_thumbnail_ready = upload == VulkanShell::TextureUploadResult::ready;
+                                current_thumbnail_pending = upload == VulkanShell::TextureUploadResult::pending;
                             } else {
                                 current_thumbnail_diagnostic =
                                     "Depth-correct thumbnail exceeds its safe geometry or raster budget.";
@@ -15153,17 +15459,18 @@ struct DesktopState {
                                 source_reimport_candidate_raster_cache.raster_for(
                                     candidate_projection, shared_frame);
                             if (candidate_raster.has_value()) {
-                                candidate_thumbnail_ready =
-                                    renderer.set_source_reimport_thumbnail_texture(
-                                        1U, *candidate_raster, candidate_thumbnail_diagnostic);
+                                const auto upload = renderer.set_source_reimport_thumbnail_texture(
+                                    1U, *candidate_raster, candidate_thumbnail_diagnostic);
+                                candidate_thumbnail_ready = upload == VulkanShell::TextureUploadResult::ready;
+                                candidate_thumbnail_pending = upload == VulkanShell::TextureUploadResult::pending;
                             } else {
                                 candidate_thumbnail_diagnostic =
                                     "Depth-correct thumbnail exceeds its safe geometry or raster budget.";
                             }
-                            if (!current_thumbnail_ready) {
+                            if (!current_thumbnail_ready && !current_thumbnail_pending) {
                                 renderer.clear_source_reimport_thumbnail_texture(0U);
                             }
-                            if (!candidate_thumbnail_ready) {
+                            if (!candidate_thumbnail_ready && !candidate_thumbnail_pending) {
                                 renderer.clear_source_reimport_thumbnail_texture(1U);
                             }
                         }
@@ -29476,14 +29783,9 @@ int run(HINSTANCE instance, int show_command) {
     g_state = &state;
     state.window = create_window(instance, show_command);
     state.load_preferences();
-    const auto runtime = carto::vulkan::Runtime::probe();
-    if (!runtime) {
-        MessageBoxW(state.window, wide(runtime.error().message).c_str(),
-                    L"Cartographer Vulkan unavailable", MB_OK | MB_ICONERROR);
-        DestroyWindow(state.window);
-        g_state = nullptr;
-        return 2;
-    }
+    // The headless renderer has a separate, stricter device profile. Its
+    // result is not used by this desktop. Admit the actual window's graphics
+    // and presentation queue in VulkanShell::initialize instead.
     state.load_market_library();
     state.load_workbench_preferences();
     ImGui::CreateContext();
@@ -29544,10 +29846,24 @@ int run(HINSTANCE instance, int show_command) {
     state.save_preferences();
     state.save_workbench_preferences();
     state.save_docking_layout();
-    // Platform windows own extra swapchains; destroy them before the main
-    // Vulkan shell shuts down.
-    ImGui::DestroyPlatformWindows();
     state.renderer_ready = false;
+    // Stop submitting, then keep pumping Win32 while finite retirement polls
+    // complete. Do not silently destroy an acquired image or a pending present
+    // when the driver cannot confirm retirement within this close budget.
+    const ULONGLONG shutdown_deadline = GetTickCount64() + 5000;
+    while (!state.renderer.prepare_shutdown()) {
+        if (GetTickCount64() >= shutdown_deadline)
+            throw std::runtime_error("GPU close retirement exceeded 5 seconds; resources retained for process cleanup");
+        MSG pending{};
+        while (PeekMessage(&pending, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&pending);
+            DispatchMessage(&pending);
+        }
+        MsgWaitForMultipleObjectsEx(0, nullptr, 8, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+    }
+    // Platform windows own extra swapchains and surfaces. Their work is now
+    // retired before the native windows, backend, and main Vulkan device.
+    ImGui::DestroyPlatformWindows();
     state.renderer.shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
@@ -29561,6 +29877,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show_command) {
     try {
         return run(instance, show_command);
     } catch (const std::exception& error) {
+        std::cerr << "cartographer: desktop startup or runtime error: " << error.what() << std::endl;
+        OutputDebugStringA(error.what());
         MessageBoxW(nullptr, wide(error.what()).c_str(), L"Cartographer desktop error", MB_OK | MB_ICONERROR);
         return 1;
     }

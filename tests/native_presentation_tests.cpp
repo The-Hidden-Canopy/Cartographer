@@ -38,8 +38,6 @@ int main() {
         require(select_presentation_adapter(memory_rank) == 1);
         refuses([&] { select_presentation_adapter(std::span<const PresentationAdapter>{}); });
 
-        // Invalid swapchain state must be refused before the driver can
-        // acquire an image or signal a semaphore with no valid image set.
         PresentationSequence empty_images;
         Driver invalid_surface;
         refuses([&] { empty_images.step(invalid_surface, 0); });

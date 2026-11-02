@@ -109,6 +109,8 @@ struct ImGui_ImplVulkan_PipelineInfo
 // - About dynamic rendering:
 //   - When using dynamic rendering, set UseDynamicRendering=true + fill PipelineInfoMain.PipelineRenderingCreateInfo structure.
 //   - PipelineRenderingCreateInfo may describe multiple color attachments: we render to the first one and leave the others untouched. This requires the 'independentBlend' device feature.
+#include "imgui_impl_vulkan_lifetime.h"
+
 struct ImGui_ImplVulkan_InitInfo
 {
     uint32_t                        ApiVersion;                 // Fill with API version of Instance, e.g. VK_API_VERSION_1_3 or your value of VkApplicationInfo::apiVersion. May be lower than header version (VK_HEADER_VERSION_COMPLETE)
@@ -145,11 +147,17 @@ struct ImGui_ImplVulkan_InitInfo
     // - Shader inputs/outputs need to match ours. Code/data pointed to by the structure needs to survive for whole during of backend usage.
     VkShaderModuleCreateInfo        CustomShaderVertCreateInfo;
     VkShaderModuleCreateInfo        CustomShaderFragCreateInfo;
+    // Local Cartographer integration: caller must enable the extension and
+    // swapchainMaintenance1 device feature before setting this option.
+    bool                            UseSwapchainMaintenance1;
 };
 
 // Follow "Getting Started" link and check examples/ folder to learn about using backends!
 IMGUI_IMPL_API bool             ImGui_ImplVulkan_Init(ImGui_ImplVulkan_InitInfo* info);
 IMGUI_IMPL_API void             ImGui_ImplVulkan_Shutdown();
+// Local integration: poll owned viewport work before destroying OS windows.
+// Does not free resources; VK_NOT_READY/VK_TIMEOUT allow the host to pump input.
+IMGUI_IMPL_API VkResult         ImGui_ImplVulkan_PollPlatformWindowRetirement();
 IMGUI_IMPL_API void             ImGui_ImplVulkan_NewFrame();
 IMGUI_IMPL_API void             ImGui_ImplVulkan_RenderDrawData(ImDrawData* draw_data, VkCommandBuffer command_buffer, VkPipeline pipeline = VK_NULL_HANDLE);
 IMGUI_IMPL_API void             ImGui_ImplVulkan_SetMinImageCount(uint32_t min_image_count); // To override MinImageCount after initialization (e.g. if swap chain is recreated)
@@ -211,8 +219,8 @@ struct ImGui_ImplVulkanH_Frame;
 struct ImGui_ImplVulkanH_Window;
 
 // Helpers
-IMGUI_IMPL_API void                 ImGui_ImplVulkanH_CreateOrResizeWindow(VkInstance instance, VkPhysicalDevice physical_device, VkDevice device, ImGui_ImplVulkanH_Window* wd, uint32_t queue_family, const VkAllocationCallbacks* allocator, int w, int h, uint32_t min_image_count, VkImageUsageFlags image_usage);
-IMGUI_IMPL_API void                 ImGui_ImplVulkanH_DestroyWindow(VkInstance instance, VkDevice device, ImGui_ImplVulkanH_Window* wd, const VkAllocationCallbacks* allocator);
+IMGUI_IMPL_API bool                 ImGui_ImplVulkanH_CreateOrResizeWindow(VkInstance instance, VkPhysicalDevice physical_device, VkDevice device, ImGui_ImplVulkanH_Window* wd, uint32_t queue_family, const VkAllocationCallbacks* allocator, int w, int h, uint32_t min_image_count, VkImageUsageFlags image_usage);
+IMGUI_IMPL_API bool                 ImGui_ImplVulkanH_DestroyWindow(VkInstance instance, VkDevice device, ImGui_ImplVulkanH_Window* wd, const VkAllocationCallbacks* allocator);
 IMGUI_IMPL_API VkSurfaceFormatKHR   ImGui_ImplVulkanH_SelectSurfaceFormat(VkPhysicalDevice physical_device, VkSurfaceKHR surface, const VkFormat* request_formats, int request_formats_count, VkColorSpaceKHR request_color_space);
 IMGUI_IMPL_API VkPresentModeKHR     ImGui_ImplVulkanH_SelectPresentMode(VkPhysicalDevice physical_device, VkSurfaceKHR surface, const VkPresentModeKHR* request_modes, int request_modes_count);
 IMGUI_IMPL_API VkPhysicalDevice     ImGui_ImplVulkanH_SelectPhysicalDevice(VkInstance instance);
@@ -228,6 +236,8 @@ struct ImGui_ImplVulkanH_Frame
     VkCommandPool       CommandPool;
     VkCommandBuffer     CommandBuffer;
     VkFence             Fence;
+    VkFence             PresentFence;
+    ImGui_ImplVulkanLifetime::PresentFenceCycle PresentCycle;
     VkImage             Backbuffer;
     VkImageView         BackbufferView;
     VkFramebuffer       Framebuffer;
@@ -237,6 +247,9 @@ struct ImGui_ImplVulkanH_FrameSemaphores
 {
     VkSemaphore         ImageAcquiredSemaphore;
     VkSemaphore         RenderCompleteSemaphore;
+    VkFence             AcquireFence;
+    VkFence             ConsumedByFence;
+    bool                AcquirePending;
 };
 
 // Helper structure to hold the data needed by one rendering context into one OS window
@@ -245,6 +258,8 @@ struct ImGui_ImplVulkanH_Window
 {
     // Input
     bool                    UseDynamicRendering;
+    bool                    UseSwapchainMaintenance1;
+    bool                    UseDiscardedImageContents; // Transition only after acquisition; no bootstrap submit.
     VkSurfaceKHR            Surface;            // Surface created and destroyed by caller.
     VkSurfaceFormatKHR      SurfaceFormat;
     VkPresentModeKHR        PresentMode;
