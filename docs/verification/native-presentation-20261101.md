@@ -97,3 +97,9 @@ An additional CPU counterexample refuses an empty swapchain image set before any
 The main ImGui upload ring is now fixed to the two fenced main frame slots, avoiding the pinned backend assertion when a surface changes its image count. A changed main surface format rebuilds the backend main pipeline with the new render pass after existing retirement waits. This preserves the internal source/asset and project codec contracts. Actual format-change coverage requires a suitable native surface; ordinary same-format resize does not prove it.
 
 These changes do not implement presentation-fence maintenance1 retirement or replace the bundled platform-window renderer. Device-idle shutdown/retirement, platform-window teardown, low-level driver blocking and repeated Release performance remain separate acceptance gates. Passing CPU tests or a sampled main-window walkthrough must not be described as complete retirement correctness.
+
+## Native teardown counterexample
+
+The b9385b8 native Room08/UV inspection exited normally but emitted two VUID-vkDestroyBuffer-buffer-00922 reports. A zero process exit was therefore not native acceptance. The bundled ImGui DestroyPlatformWindows callback destroys the main viewport upload buffers as well as secondary viewports. It was called before VulkanShell shutdown reached its device-idle wait. Moving that call inside the existing initialized-renderer shutdown path, immediately after that wait, preserves the backend and waits before those buffers are freed.
+
+Required replay: required-validation native Room08 load, UV inspection and normal Close; retain full stderr and require no validation diagnostic in addition to exit0. This ordering repair does not implement maintenance1 presentation fences, change queue policy, remove the existing shutdown idle wait, or prove untested driver/secondary-window retirement cases.

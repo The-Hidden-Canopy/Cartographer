@@ -1473,6 +1473,9 @@ public:
         if (device_ != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(device_);
             if (imgui_initialized_) {
+                // This callback also frees the main viewport's upload buffers.
+                // Quiesce their submitted commands before destroying any viewport.
+                ImGui::DestroyPlatformWindows();
                 if (reference_image_texture_.has_value()) {
                     destroy_rgba8_texture(*reference_image_texture_);
                     reference_image_texture_.reset();
@@ -29544,9 +29547,6 @@ int run(HINSTANCE instance, int show_command) {
     state.save_preferences();
     state.save_workbench_preferences();
     state.save_docking_layout();
-    // Platform windows own extra swapchains; destroy them before the main
-    // Vulkan shell shuts down.
-    ImGui::DestroyPlatformWindows();
     state.renderer_ready = false;
     state.renderer.shutdown();
     ImGui_ImplWin32_Shutdown();
