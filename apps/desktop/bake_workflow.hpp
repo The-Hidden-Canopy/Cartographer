@@ -2171,7 +2171,7 @@ inline core::Result<CpuTextureTileBakeResult> bake_tangent_normal_tiles_d3d12(
         },
         [](const production::BakeRecipe& tile_recipe, std::string_view profile) {
             return production::bake_production_cook_key(
-                tile_recipe, production::BakeNormalSpace::tangent, profile);
+                tile_recipe, production::BakeNormalSpace::tangent, std::string{profile});
         },
         [](production::ProductionArtifactStore& store,
             production::ProductionArtifactReceipt receipt,
@@ -2286,7 +2286,7 @@ inline core::Result<CpuTextureTileBakeResult> bake_ambient_occlusion_tiles_d3d12
         },
         [](const production::AmbientOcclusionRecipe& tile_recipe,
             std::string_view profile) {
-            return production::bake_ambient_occlusion_cook_key(tile_recipe, profile);
+            return production::bake_ambient_occlusion_cook_key(tile_recipe, std::string{profile});
         },
         [](production::ProductionArtifactStore& store,
             production::ProductionArtifactReceipt receipt,
@@ -2397,7 +2397,7 @@ inline core::Result<CpuTextureTileBakeResult> bake_bent_normal_tiles_d3d12(
         },
         [](const production::AmbientOcclusionRecipe& tile_recipe,
             std::string_view profile) {
-            return production::bake_bent_normal_cook_key(tile_recipe, profile);
+            return production::bake_bent_normal_cook_key(tile_recipe, std::string{profile});
         },
         [](production::ProductionArtifactStore& store,
             production::ProductionArtifactReceipt receipt,
