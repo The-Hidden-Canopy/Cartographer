@@ -22,7 +22,7 @@ struct Trace {
     std::map<VkSemaphore,std::uint32_t> pending_present;
     std::map<VkSemaphore,std::uint32_t> submitted;
     std::size_t next=0;
-    int acquisitions=0, waits=0, submissions=0, presents=0, records=0, violations=0;
+    int acquisitions=0, waits=0, submissions=0, presents=0, records=0, violations=0, idle_calls=0, swapchain_creations=0;
     VkResult acquire_result=VK_SUCCESS;
     bool defer_fence_once=false,creating=false;
     std::uint32_t allocated_commands=0,image_count=3;
@@ -70,11 +70,11 @@ VKAPI_ATTR void VKAPI_CALL set_viewport(VkCommandBuffer,std::uint32_t,std::uint3
 VKAPI_ATTR void VKAPI_CALL set_scissor(VkCommandBuffer,std::uint32_t,std::uint32_t,const VkRect2D*){}
 VKAPI_ATTR void VKAPI_CALL push(VkCommandBuffer,VkPipelineLayout,VkShaderStageFlags,std::uint32_t,std::uint32_t,const void*){}
 VKAPI_ATTR void VKAPI_CALL bind_sets(VkCommandBuffer,VkPipelineBindPoint,VkPipelineLayout,std::uint32_t,std::uint32_t,const VkDescriptorSet*,std::uint32_t,const std::uint32_t*){}
-VKAPI_ATTR VkResult VKAPI_CALL idle(VkDevice){return VK_SUCCESS;}
+VKAPI_ATTR VkResult VKAPI_CALL idle(VkDevice){++trace->idle_calls;return VK_SUCCESS;}
 VKAPI_ATTR VkResult VKAPI_CALL capabilities(VkPhysicalDevice,VkSurfaceKHR,VkSurfaceCapabilitiesKHR* p){
     *p={};p->minImageCount=2;p->maxImageCount=3;p->currentExtent={16,16};p->supportedTransforms=VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;p->currentTransform=VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;p->supportedCompositeAlpha=VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;return VK_SUCCESS;
 }
-VKAPI_ATTR VkResult VKAPI_CALL create_swap(VkDevice,const VkSwapchainCreateInfoKHR*,const VkAllocationCallbacks*,VkSwapchainKHR* p){*p=handle<VkSwapchainKHR>(600);return VK_SUCCESS;}
+VKAPI_ATTR VkResult VKAPI_CALL create_swap(VkDevice,const VkSwapchainCreateInfoKHR*,const VkAllocationCallbacks*,VkSwapchainKHR* p){++trace->swapchain_creations;*p=handle<VkSwapchainKHR>(600);return VK_SUCCESS;}
 VKAPI_ATTR VkResult VKAPI_CALL images(VkDevice,VkSwapchainKHR,std::uint32_t* count,VkImage* p){*count=trace->image_count;if(p)for(std::uint32_t i=0;i<*count;++i)p[i]=handle<VkImage>(700+i);return VK_SUCCESS;}
 VKAPI_ATTR VkResult VKAPI_CALL create_pass(VkDevice,const VkRenderPassCreateInfo*,const VkAllocationCallbacks*,VkRenderPass* p){*p=handle<VkRenderPass>(800);return VK_SUCCESS;}
 VKAPI_ATTR VkResult VKAPI_CALL create_view(VkDevice,const VkImageViewCreateInfo*,const VkAllocationCallbacks*,VkImageView* p){*p=handle<VkImageView>(900);return VK_SUCCESS;}
@@ -102,7 +102,9 @@ struct Fixture {
     Fixture(){
         ImGui::CreateContext();trace=&log;g_FunctionsLoaded=true;
         ImGui::GetIO().BackendRendererUserData=&backend;
-        backend.VulkanInitInfo.ImageCount=2;
+        backend.VulkanInitInfo.ImageCount=2;backend.VulkanInitInfo.MinImageCount=2;
+        backend.VulkanInitInfo.PhysicalDevice=handle<VkPhysicalDevice>(2);
+        backend.VulkanInitInfo.Device=handle<VkDevice>(3);
         auto& f=backend.Functions;
         f.pfn_vkAcquireNextImageKHR=acquire;f.pfn_vkWaitForFences=wait;
         f.pfn_vkResetCommandPool=reset_pool;f.pfn_vkBeginCommandBuffer=begin;
@@ -122,10 +124,11 @@ struct Fixture {
         f.pfn_vkDestroySemaphore=destroy_semaphore;f.pfn_vkDestroyRenderPass=destroy_pass;
         f.pfn_vkDestroySwapchainKHR=destroy_swap;
         data.WindowOwned=true;auto& w=data.Window;
+        w.Surface=handle<VkSurfaceKHR>(1);w.SurfaceFormat={VK_FORMAT_B8G8R8A8_UNORM,VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};w.PresentMode=VK_PRESENT_MODE_FIFO_KHR;
         w.ImageCount=3;w.SemaphoreCount=4;w.Frames.resize(3);w.FrameSemaphores.resize(4);
         for(std::uint32_t i=0;i<3;++i){w.Frames[i]={};w.Frames[i].Framebuffer=handle<VkFramebuffer>(100+i);w.Frames[i].CommandBuffer=handle<VkCommandBuffer>(200+i);}
         for(std::uint32_t i=0;i<4;++i){w.FrameSemaphores[i]={};w.FrameSemaphores[i].ImageAcquiredSemaphore=handle<VkSemaphore>(300+i);w.FrameSemaphores[i].RenderCompleteSemaphore=handle<VkSemaphore>(400+i);}
-        viewport.RendererUserData=&data;viewport.DrawData=&draw;draw.OwnerViewport=&viewport;
+        viewport.RendererUserData=&data;viewport.DrawData=&draw;viewport.Size=ImVec2(16,16);draw.OwnerViewport=&viewport;
         draw.DisplaySize=ImVec2(0,0);draw.FramebufferScale=ImVec2(1,1);
     }
     ~Fixture(){viewport.RendererUserData=nullptr;viewport.DrawData=nullptr;ImGui::GetIO().BackendRendererUserData=nullptr;ImGui::DestroyContext();trace=nullptr;}
@@ -164,6 +167,38 @@ void deferred_image_fence(){
     require(f.log.wait_budget<=2'000'000,"platform fence exceeded finite event-loop budget");
     f.frame();require(f.log.acquisitions==1&&f.log.submissions==1&&f.log.presents==1&&f.log.violations==0,"deferred platform frame lost or reacquired its owned image");
 }
+void resize_during_deferred_acquire(){
+    Fixture f;f.data.Window.Surface=handle<VkSurfaceKHR>(1);f.log.defer_fence_once=true;f.frame();
+    require(f.data.FrameAcquired && f.log.acquisitions==1,"fixture did not retain a successful acquire");
+    ImGui_ImplVulkan_SetWindowSize(&f.viewport,ImVec2(32,32));
+    require(f.data.FrameAcquired && f.data.SwapChainNeedRebuild,"resize discarded the retained acquire");
+    require(f.log.idle_calls==0 && f.log.swapchain_creations==0,"resize callback recreated an owned swapchain");
+    f.frame();
+    require(f.log.acquisitions==1 && f.log.submissions==1 && f.log.presents==1 && f.log.violations==0,
+        "resized viewport failed to consume its original acquire exactly once");
+    require(f.data.SwapChainNeedRebuild,"deferred resize was lost after presentation");
+}
+void minimized_without_acquire(){
+    Fixture f;f.viewport.Size=ImVec2(0,0);
+    ImGui_ImplVulkan_SetWindowSize(&f.viewport,ImVec2(0,0));
+    f.frame();
+    require(f.log.acquisitions==0 && f.log.idle_calls==0 && f.log.swapchain_creations==0,
+        "minimized viewport recreated or acquired a zero-sized swapchain");
+    require(f.data.SwapChainNeedRebuild,"minimized resize was not retained for restoration");
+    f.viewport.Size=ImVec2(16,16);f.frame();
+    require(f.log.idle_calls==1 && f.log.swapchain_creations==1 && !f.data.SwapChainNeedRebuild,
+        "restored viewport did not perform its deferred recreation");
+}
+void minimize_during_deferred_acquire(){
+    Fixture f;f.log.defer_fence_once=true;f.frame();
+    f.viewport.Size=ImVec2(0,0);ImGui_ImplVulkan_SetWindowSize(&f.viewport,ImVec2(0,0));
+    f.frame();
+    require(f.log.acquisitions==1 && f.log.submissions==1 && f.log.presents==1 && f.log.violations==0,
+        "minimized retained acquire was not consumed exactly once");
+    f.frame();
+    require(f.log.acquisitions==1 && f.log.swapchain_creations==0 && f.data.SwapChainNeedRebuild,
+        "minimized viewport reacquired or discarded its deferred recreation");
+}
 void failed_acquire(){
     Fixture f;f.log.acquire_result=VK_ERROR_SURFACE_LOST_KHR;f.frame();
     require(f.log.records==0&&f.log.submissions==0&&f.log.presents==0,"failed platform acquisition reached recording/submission/presentation");
@@ -177,7 +212,7 @@ void upload_ring(){
 }
 int main(){
     int failed=0;
-    for(auto [name,test]:std::vector<std::pair<const char*,void(*)()>>{{"shrinking swapchain",shrinking_swapchain},{"creation ownership",creation_ownership},{"irregular image ownership",irregular_images},{"acquire timeout",acquire_timeout},{"deferred image fence",deferred_image_fence},{"failed acquisition",failed_acquire},{"per-image upload ring",upload_ring}}){
+    for(auto [name,test]:std::vector<std::pair<const char*,void(*)()>>{{"shrinking swapchain",shrinking_swapchain},{"creation ownership",creation_ownership},{"irregular image ownership",irregular_images},{"acquire timeout",acquire_timeout},{"deferred image fence",deferred_image_fence},{"resize during deferred acquire",resize_during_deferred_acquire},{"minimized without acquire",minimized_without_acquire},{"minimize during deferred acquire",minimize_during_deferred_acquire},{"failed acquisition",failed_acquire},{"per-image upload ring",upload_ring}}){
         try{test();std::cout<<"PASS "<<name<<'\n';}catch(const std::exception& e){++failed;std::cerr<<"FAIL "<<name<<": "<<e.what()<<'\n';}
     }
     return failed?1:0;
