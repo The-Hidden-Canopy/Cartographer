@@ -124,6 +124,7 @@
 #include "imgui.h"
 #ifndef IMGUI_DISABLE
 #include "imgui_impl_vulkan.h"
+#include "imgui_impl_vulkan_lifetime.h"
 #include <stdio.h>
 #ifndef IM_MAX
 #define IM_MAX(A, B)    (((A) >= (B)) ? (A) : (B))
@@ -153,7 +154,8 @@ void ImGui_ImplVulkan_DestroyWindowRenderBuffers(VkDevice device, ImGui_ImplVulk
 void ImGui_ImplVulkanH_DestroyFrame(VkDevice device, ImGui_ImplVulkanH_Frame* fd, const VkAllocationCallbacks* allocator);
 void ImGui_ImplVulkanH_DestroyFrameSemaphores(VkDevice device, ImGui_ImplVulkanH_FrameSemaphores* fsd, const VkAllocationCallbacks* allocator);
 void ImGui_ImplVulkanH_DestroyAllViewportsRenderBuffers(VkDevice device, const VkAllocationCallbacks* allocator);
-void ImGui_ImplVulkanH_CreateWindowSwapChain(VkPhysicalDevice physical_device, VkDevice device, ImGui_ImplVulkanH_Window* wd, const VkAllocationCallbacks* allocator, int w, int h, uint32_t min_image_count, VkImageUsageFlags image_usage);
+static void ImGui_ImplVulkan_CollectRetiredViewports();
+bool ImGui_ImplVulkanH_CreateWindowSwapChain(VkPhysicalDevice physical_device, VkDevice device, ImGui_ImplVulkanH_Window* wd, const VkAllocationCallbacks* allocator, int w, int h, uint32_t min_image_count, VkImageUsageFlags image_usage);
 void ImGui_ImplVulkanH_CreateWindowCommandBuffers(VkPhysicalDevice physical_device, VkDevice device, ImGui_ImplVulkanH_Window* wd, uint32_t queue_family, const VkAllocationCallbacks* allocator);
 
 // Vulkan prototypes for use with custom loaders
@@ -310,9 +312,9 @@ struct ImGui_ImplVulkan_ViewportData
 {
     ImGui_ImplVulkanH_Window                Window;                 // Used by secondary viewports only
     ImGui_ImplVulkan_WindowRenderBuffers    RenderBuffers;          // Used by all viewports
+    ImGui_ImplVulkanLifetime::AcquireCycle AcquireCycle;
+    VkPipeline                            WindowPipeline = VK_NULL_HANDLE;
     bool                                    WindowOwned;
-    bool                                    FrameAcquired = false;
-    bool                                    FrameReady = false;
     bool                                    SwapChainNeedRebuild;   // Flag when viewport swapchain resized in the middle of processing a frame
     bool                                    SwapChainSuboptimal;    // Flag when VK_SUBOPTIMAL_KHR was returned.
 
@@ -337,6 +339,7 @@ struct ImGui_ImplVulkan_Data
     VkShaderModule              ShaderModuleFrag;
     VkDescriptorPool            DescriptorPool;
     ImVector<VkFormat>          PipelineRenderingCreateInfoColorAttachmentFormats; // Deep copy of format array
+    ImVector<ImGui_ImplVulkan_ViewportData*> RetiredViewports; // Owns closed windows until GPU retirement.
 
     // Texture management
     VkSampler                   SamplerLinear;
@@ -647,12 +650,9 @@ void ImGui_ImplVulkan_RenderDrawData(ImDrawData* draw_data, VkCommandBuffer comm
     ImGui_ImplVulkan_ViewportData* viewport_renderer_data = (ImGui_ImplVulkan_ViewportData*)draw_data->OwnerViewport->RendererUserData;
     IM_ASSERT(viewport_renderer_data != nullptr);
     ImGui_ImplVulkan_WindowRenderBuffers* wrb = &viewport_renderer_data->RenderBuffers;
-    // Platform uploads share the acquired image's fence. The application-owned
-    // main viewport keeps its separately fenced upload ring.
     const uint32_t upload_count = viewport_renderer_data->WindowOwned
         ? viewport_renderer_data->Window.ImageCount : v->ImageCount;
     if (wrb->FrameRenderBuffers.Size != 0 && wrb->Count != upload_count)
-        // Platform swapchain recreation has already waited for device idle.
         ImGui_ImplVulkan_DestroyWindowRenderBuffers(v->Device, wrb, v->Allocator);
     if (wrb->FrameRenderBuffers.Size == 0)
     {
@@ -662,8 +662,9 @@ void ImGui_ImplVulkan_RenderDrawData(ImDrawData* draw_data, VkCommandBuffer comm
         memset((void*)wrb->FrameRenderBuffers.Data, 0, wrb->FrameRenderBuffers.size_in_bytes());
     }
     IM_ASSERT(wrb->Count == upload_count && upload_count > 0);
-    wrb->Index = viewport_renderer_data->WindowOwned
-        ? viewport_renderer_data->Window.FrameIndex : (wrb->Index + 1) % wrb->Count;
+    // Owned windows wait the acquired image's fence. Their upload buffer must
+    // have the same owner, rather than an unrelated global frame-ring index.
+    wrb->Index = viewport_renderer_data->WindowOwned ? viewport_renderer_data->Window.FrameIndex : (wrb->Index + 1) % wrb->Count;
     ImGui_ImplVulkan_FrameRenderBuffers* rb = &wrb->FrameRenderBuffers[wrb->Index];
 
     if (draw_data->TotalVtxCount > 0)
@@ -1433,6 +1434,9 @@ bool    ImGui_ImplVulkan_LoadFunctions(uint32_t api_version, PFN_vkVoidFunction(
 bool    ImGui_ImplVulkan_Init(ImGui_ImplVulkan_InitInfo* info)
 {
     IM_ASSERT(g_FunctionsLoaded && "Need to call ImGui_ImplVulkan_LoadFunctions() if IMGUI_IMPL_VULKAN_NO_PROTOTYPES or VK_NO_PROTOTYPES are set!");
+#ifndef VK_EXT_swapchain_maintenance1
+    if (info->UseSwapchainMaintenance1) return false;
+#endif
 
     if (info->ApiVersion == 0)
         info->ApiVersion = ImGui_ImplVulkan_GetDefaultApiVersion();
@@ -1508,6 +1512,12 @@ void ImGui_ImplVulkan_Shutdown()
     IM_ASSERT(bd != nullptr && "No renderer backend to shutdown, or already shutdown?");
     ImGuiIO& io = ImGui::GetIO();
     ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
+    const VkResult retirement = ImGui_ImplVulkan_PollPlatformWindowRetirement();
+    if (retirement != VK_SUCCESS && retirement != VK_ERROR_DEVICE_LOST)
+    {
+        check_vk_result(retirement);
+        return; // Shared textures/pipelines still belong to these submissions.
+    }
 
     // First destroy objects in all viewports
     ImGui_ImplVulkan_DestroyDeviceObjects();
@@ -1520,6 +1530,12 @@ void ImGui_ImplVulkan_Shutdown()
 
     // Clean up windows
     ImGui_ImplVulkan_ShutdownMultiViewportSupport();
+    ImGui_ImplVulkan_CollectRetiredViewports();
+    if (!bd->RetiredViewports.empty())
+    {
+        check_vk_result(VK_NOT_READY);
+        return; // Never discard owners of a still-live platform submission.
+    }
 
     io.BackendRendererName = nullptr;
     io.BackendRendererUserData = nullptr;
@@ -1532,7 +1548,7 @@ void ImGui_ImplVulkan_NewFrame()
 {
     ImGui_ImplVulkan_Data* bd = ImGui_ImplVulkan_GetBackendData();
     IM_ASSERT(bd != nullptr && "Context or backend not initialized! Did you call ImGui_ImplVulkan_Init()?");
-    IM_UNUSED(bd);
+    ImGui_ImplVulkan_CollectRetiredViewports();
 }
 
 void ImGui_ImplVulkan_SetMinImageCount(uint32_t min_image_count)
@@ -1784,6 +1800,13 @@ void ImGui_ImplVulkanH_CreateWindowCommandBuffers(VkPhysicalDevice physical_devi
             err = vkCreateFence(device, &info, allocator, &fd->Fence);
             check_vk_result(err);
         }
+        if (wd->UseSwapchainMaintenance1)
+        {
+            VkFenceCreateInfo info = {};
+            info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            err = vkCreateFence(device, &info, allocator, &fd->PresentFence);
+            check_vk_result(err);
+        }
     }
 
     for (uint32_t i = 0; i < wd->SemaphoreCount; i++)
@@ -1795,6 +1818,10 @@ void ImGui_ImplVulkanH_CreateWindowCommandBuffers(VkPhysicalDevice physical_devi
             err = vkCreateSemaphore(device, &info, allocator, &fsd->ImageAcquiredSemaphore);
             check_vk_result(err);
             err = vkCreateSemaphore(device, &info, allocator, &fsd->RenderCompleteSemaphore);
+            check_vk_result(err);
+            VkFenceCreateInfo fence_info = {};
+            fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            err = vkCreateFence(device, &fence_info, allocator, &fsd->AcquireFence);
             check_vk_result(err);
         }
     }
@@ -1812,14 +1839,84 @@ int ImGui_ImplVulkanH_GetMinImageCountFromPresentMode(VkPresentModeKHR present_m
     return 1;
 }
 
-// Also destroy old swap chain and in-flight frames data, if any.
-void ImGui_ImplVulkanH_CreateWindowSwapChain(VkPhysicalDevice physical_device, VkDevice device, ImGui_ImplVulkanH_Window* wd, const VkAllocationCallbacks* allocator, int w, int h, uint32_t min_image_count, VkImageUsageFlags image_usage)
+// Return a finite status without freeing any window-owned resource. Rendering
+// fences do not cover the presentation engine's references to wait semaphores.
+static VkResult ImGui_ImplVulkanH_WaitWindowRetirement(VkDevice device, ImGui_ImplVulkanH_Window* wd, uint64_t timeout = 2000000)
+{
+    for (uint32_t i = 0; i < wd->ImageCount; ++i)
+    {
+        ImGui_ImplVulkanH_Frame* fd = &wd->Frames[i];
+        if (fd->Fence != VK_NULL_HANDLE)
+        {
+            const VkResult err = vkWaitForFences(device, 1, &fd->Fence, VK_TRUE, timeout);
+            if (err != VK_SUCCESS) return err;
+        }
+        if (fd->PresentCycle.Pending)
+        {
+            const VkResult err = vkWaitForFences(device, 1, &fd->PresentFence, VK_TRUE, timeout);
+            if (err != VK_SUCCESS) return err;
+            fd->PresentCycle.ObserveSignal();
+        }
+        if (!fd->PresentCycle.MayRetire()) return VK_NOT_READY;
+    }
+    for (uint32_t i = 0; i < wd->SemaphoreCount; ++i)
+    {
+        ImGui_ImplVulkanH_FrameSemaphores* fsd = &wd->FrameSemaphores[i];
+        if (!fsd->AcquirePending) continue;
+        const VkResult err = vkWaitForFences(device, 1, &fsd->AcquireFence, VK_TRUE, timeout);
+        if (err != VK_SUCCESS) return err;
+        fsd->AcquirePending = false;
+    }
+    return VK_SUCCESS;
+}
+
+VkResult ImGui_ImplVulkan_PollPlatformWindowRetirement()
+{
+    ImGui_ImplVulkan_Data* bd = ImGui_ImplVulkan_GetBackendData();
+    if (!bd) return VK_SUCCESS;
+    ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
+    for (int n = 0; n < platform_io.Viewports.Size; ++n)
+    {
+        ImGui_ImplVulkan_ViewportData* vd = (ImGui_ImplVulkan_ViewportData*)platform_io.Viewports[n]->RendererUserData;
+        if (!vd || !vd->WindowOwned) continue;
+        const VkResult err = ImGui_ImplVulkanH_WaitWindowRetirement(bd->VulkanInitInfo.Device, &vd->Window, 0);
+        if (err != VK_SUCCESS) return err;
+    }
+    for (ImGui_ImplVulkan_ViewportData* vd : bd->RetiredViewports)
+    {
+        const VkResult err = ImGui_ImplVulkanH_WaitWindowRetirement(bd->VulkanInitInfo.Device, &vd->Window, 0);
+        if (err != VK_SUCCESS) return err;
+    }
+    return VK_SUCCESS;
+}
+
+// Also destroy old swap chain and in-flight frames data, if any. A deferred
+// retirement leaves the old chain and every handle intact for a later retry.
+bool ImGui_ImplVulkanH_CreateWindowSwapChain(VkPhysicalDevice physical_device, VkDevice device, ImGui_ImplVulkanH_Window* wd, const VkAllocationCallbacks* allocator, int w, int h, uint32_t min_image_count, VkImageUsageFlags image_usage)
 {
     VkResult err;
+    if (wd->UseSwapchainMaintenance1)
+        err = ImGui_ImplVulkanH_WaitWindowRetirement(device, wd);
+    else
+        err = vkDeviceWaitIdle(device); // Explicit, uncertified legacy path.
+    if (err == VK_SUCCESS && !wd->UseSwapchainMaintenance1)
+        err = ImGui_ImplVulkanH_WaitWindowRetirement(device, wd);
+    if (err == VK_TIMEOUT || err == VK_NOT_READY) return false;
+    check_vk_result(err);
+    if (err != VK_SUCCESS) return false;
+    // Query before tearing down the old chain: minimized surfaces may report
+    // zero extent even while the viewport's last requested size is nonzero.
+    VkSurfaceCapabilitiesKHR cap = {};
+    err = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, wd->Surface, &cap);
+    check_vk_result(err);
+    if (err != VK_SUCCESS) return false;
+    ImGui_ImplVulkanLifetime::SurfaceExtent chosen_extent = {};
+    if (!ImGui_ImplVulkanLifetime::SelectSurfaceExtent(w, h,
+        {cap.currentExtent.width, cap.currentExtent.height},
+        {cap.minImageExtent.width, cap.minImageExtent.height},
+        {cap.maxImageExtent.width, cap.maxImageExtent.height}, chosen_extent)) return false;
     VkSwapchainKHR old_swapchain = wd->Swapchain;
     wd->Swapchain = VK_NULL_HANDLE;
-    err = vkDeviceWaitIdle(device);
-    check_vk_result(err);
 
     // We don't use ImGui_ImplVulkanH_DestroyWindow() because we want to preserve the old swapchain to create the new one.
     // Destroy old Framebuffer
@@ -1830,8 +1927,10 @@ void ImGui_ImplVulkanH_CreateWindowSwapChain(VkPhysicalDevice physical_device, V
     wd->Frames.clear();
     wd->FrameSemaphores.clear();
     wd->ImageCount = 0;
+    wd->SemaphoreCount = 0;
     if (wd->RenderPass)
         vkDestroyRenderPass(device, wd->RenderPass, allocator);
+    wd->RenderPass = VK_NULL_HANDLE;
 
     // If min image count was not specified, request different count of images dependent on selected present mode
     if (min_image_count == 0)
@@ -1839,10 +1938,6 @@ void ImGui_ImplVulkanH_CreateWindowSwapChain(VkPhysicalDevice physical_device, V
 
     // Create Swapchain
     {
-        VkSurfaceCapabilitiesKHR cap;
-        err = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, wd->Surface, &cap);
-        check_vk_result(err);
-
         VkSwapchainCreateInfoKHR info = {};
         info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
         info.surface = wd->Surface;
@@ -1866,29 +1961,49 @@ void ImGui_ImplVulkanH_CreateWindowSwapChain(VkPhysicalDevice physical_device, V
             info.minImageCount = cap.minImageCount;
         else if (cap.maxImageCount != 0 && info.minImageCount > cap.maxImageCount)
             info.minImageCount = cap.maxImageCount;
-        if (cap.currentExtent.width == 0xffffffff)
-        {
-            info.imageExtent.width = wd->Width = w;
-            info.imageExtent.height = wd->Height = h;
-        }
-        else
-        {
-            info.imageExtent.width = wd->Width = cap.currentExtent.width;
-            info.imageExtent.height = wd->Height = cap.currentExtent.height;
-        }
+        info.imageExtent.width = chosen_extent.Width;
+        info.imageExtent.height = chosen_extent.Height;
+        wd->Width = (int)chosen_extent.Width;
+        wd->Height = (int)chosen_extent.Height;
         err = vkCreateSwapchainKHR(device, &info, allocator, &wd->Swapchain);
-        check_vk_result(err);
+        if (err != VK_SUCCESS)
+        {
+            // The output handle is not usable after a failed create.
+            wd->Swapchain = VK_NULL_HANDLE;
+            if (old_swapchain) vkDestroySwapchainKHR(device, old_swapchain, allocator);
+            old_swapchain = VK_NULL_HANDLE;
+            check_vk_result(err);
+            return false;
+        }
         err = vkGetSwapchainImagesKHR(device, wd->Swapchain, &wd->ImageCount, nullptr);
-        check_vk_result(err);
-        VkImage backbuffers[16] = {};
-        IM_ASSERT(wd->ImageCount >= min_image_count);
-        IM_ASSERT(wd->ImageCount < IM_COUNTOF(backbuffers));
-        err = vkGetSwapchainImagesKHR(device, wd->Swapchain, &wd->ImageCount, backbuffers);
-        check_vk_result(err);
+        if (err != VK_SUCCESS || wd->ImageCount == 0 || wd->ImageCount >= 0x7fffffffU)
+        {
+            vkDestroySwapchainKHR(device, wd->Swapchain, allocator);
+            wd->Swapchain = VK_NULL_HANDLE;
+            if (old_swapchain) vkDestroySwapchainKHR(device, old_swapchain, allocator);
+            old_swapchain = VK_NULL_HANDLE;
+            wd->ImageCount = 0;
+            check_vk_result(err == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : err);
+            return false;
+        }
+        ImVector<VkImage> backbuffers;
+        backbuffers.resize((int)wd->ImageCount);
+        err = vkGetSwapchainImagesKHR(device, wd->Swapchain, &wd->ImageCount, backbuffers.Data);
+        if (err != VK_SUCCESS || wd->ImageCount < info.minImageCount)
+        {
+            vkDestroySwapchainKHR(device, wd->Swapchain, allocator);
+            wd->Swapchain = VK_NULL_HANDLE;
+            if (old_swapchain) vkDestroySwapchainKHR(device, old_swapchain, allocator);
+            old_swapchain = VK_NULL_HANDLE;
+            wd->ImageCount = 0;
+            check_vk_result(err == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : err);
+            return false;
+        }
 
         wd->SemaphoreCount = wd->ImageCount + 1;
-        wd->FrameIndex = wd->SemaphoreIndex = 0; // New image/semaphore arrays own new cursors.
-        wd->Frames.resize(wd->ImageCount);
+        wd->FrameIndex = 0;
+    wd->SemaphoreIndex = 0;
+    wd->Frames.resize(wd->ImageCount);
         wd->FrameSemaphores.resize(wd->SemaphoreCount);
         memset(wd->Frames.Data, 0, wd->Frames.size_in_bytes());
         memset(wd->FrameSemaphores.Data, 0, wd->FrameSemaphores.size_in_bytes());
@@ -1975,28 +2090,37 @@ void ImGui_ImplVulkanH_CreateWindowSwapChain(VkPhysicalDevice physical_device, V
             check_vk_result(err);
         }
     }
+    return true;
 }
 
 // Create or resize window
 // - 2025/09/26: v1.92.4 added a trailing 'VkImageUsageFlags image_usage' parameter which is usually VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT.
-void ImGui_ImplVulkanH_CreateOrResizeWindow(VkInstance instance, VkPhysicalDevice physical_device, VkDevice device, ImGui_ImplVulkanH_Window* wd, uint32_t queue_family, const VkAllocationCallbacks* allocator, int width, int height, uint32_t min_image_count, VkImageUsageFlags image_usage)
+bool ImGui_ImplVulkanH_CreateOrResizeWindow(VkInstance instance, VkPhysicalDevice physical_device, VkDevice device, ImGui_ImplVulkanH_Window* wd, uint32_t queue_family, const VkAllocationCallbacks* allocator, int width, int height, uint32_t min_image_count, VkImageUsageFlags image_usage)
 {
-    IM_ASSERT(g_FunctionsLoaded && "Need to call ImGui_ImplVulkan_LoadFunctions() if IMGUI_IMPL_VULKAN_NO_PROTOTYPES or VK_NO_PROTOTYPES are set!");
+    IM_ASSERT(g_FunctionsLoaded && "Vulkan callbacks must be loaded");
     IM_ASSERT(wd->Surface != VK_NULL_HANDLE);
     IM_UNUSED(instance);
-
-    ImGui_ImplVulkanH_CreateWindowSwapChain(physical_device, device, wd, allocator, width, height, min_image_count, image_usage);
+    if (!ImGui_ImplVulkanH_CreateWindowSwapChain(physical_device, device, wd, allocator, width, height, min_image_count, image_usage))
+        return false;
     ImGui_ImplVulkanH_CreateWindowCommandBuffers(physical_device, device, wd, queue_family, allocator);
-
-    // First-use layout transitions belong to rendering after acquisition.
-
+    // Never submit transitions for images not acquired from WSI. Cartographer
+    // clears/discards, and transitions only its acquired image during rendering.
+    return true;
 }
 
-void ImGui_ImplVulkanH_DestroyWindow(VkInstance instance, VkDevice device, ImGui_ImplVulkanH_Window* wd, const VkAllocationCallbacks* allocator)
+bool ImGui_ImplVulkanH_DestroyWindow(VkInstance instance, VkDevice device, ImGui_ImplVulkanH_Window* wd, const VkAllocationCallbacks* allocator)
 {
     IM_UNUSED(instance);
-    vkDeviceWaitIdle(device); // FIXME: We could wait on the Queue if we had the queue in wd-> (otherwise VulkanH functions can't use globals)
-    //vkQueueWaitIdle(bd->Queue);
+    VkResult err = wd->UseSwapchainMaintenance1 ? ImGui_ImplVulkanH_WaitWindowRetirement(device, wd) : vkDeviceWaitIdle(device);
+    // Losing the device permits host cleanup. All other uncertain boundaries
+    // retain ownership, including a signalled-but-unconsumed acquisition.
+    if (err == VK_SUCCESS && !wd->UseSwapchainMaintenance1)
+        err = ImGui_ImplVulkanH_WaitWindowRetirement(device, wd);
+    if (err != VK_SUCCESS && err != VK_ERROR_DEVICE_LOST)
+    {
+        check_vk_result(err);
+        return false;
+    }
 
     for (uint32_t i = 0; i < wd->ImageCount; i++)
         ImGui_ImplVulkanH_DestroyFrame(device, &wd->Frames[i], allocator);
@@ -2011,25 +2135,33 @@ void ImGui_ImplVulkanH_DestroyWindow(VkInstance instance, VkDevice device, ImGui
     wd->Width = wd->Height = 0;
     wd->FrameIndex = wd->ImageCount = wd->SemaphoreCount = wd->SemaphoreIndex = 0;
     //vkDestroySurfaceKHR(instance, wd->Surface, allocator); // v1.92.6 (~2026-01-16): because wd->Surface is user provided we don't attempt to destroy it ourself.
+    return true;
 }
 
 void ImGui_ImplVulkanH_DestroyFrame(VkDevice device, ImGui_ImplVulkanH_Frame* fd, const VkAllocationCallbacks* allocator)
 {
     vkDestroyFence(device, fd->Fence, allocator);
-    vkFreeCommandBuffers(device, fd->CommandPool, 1, &fd->CommandBuffer);
-    vkDestroyCommandPool(device, fd->CommandPool, allocator);
+    vkDestroyFence(device, fd->PresentFence, allocator);
+    fd->PresentFence = VK_NULL_HANDLE;
+    fd->PresentCycle = {};
+    if (fd->CommandPool != VK_NULL_HANDLE && fd->CommandBuffer != VK_NULL_HANDLE)
+        vkFreeCommandBuffers(device, fd->CommandPool, 1, &fd->CommandBuffer);
+    if (fd->CommandPool != VK_NULL_HANDLE) vkDestroyCommandPool(device, fd->CommandPool, allocator);
     fd->Fence = VK_NULL_HANDLE;
     fd->CommandBuffer = VK_NULL_HANDLE;
     fd->CommandPool = VK_NULL_HANDLE;
 
-    vkDestroyImageView(device, fd->BackbufferView, allocator);
     vkDestroyFramebuffer(device, fd->Framebuffer, allocator);
+    vkDestroyImageView(device, fd->BackbufferView, allocator);
 }
 
 void ImGui_ImplVulkanH_DestroyFrameSemaphores(VkDevice device, ImGui_ImplVulkanH_FrameSemaphores* fsd, const VkAllocationCallbacks* allocator)
 {
     vkDestroySemaphore(device, fsd->ImageAcquiredSemaphore, allocator);
     vkDestroySemaphore(device, fsd->RenderCompleteSemaphore, allocator);
+    vkDestroyFence(device, fsd->AcquireFence, allocator);
+    fsd->AcquireFence = fsd->ConsumedByFence = VK_NULL_HANDLE;
+    fsd->AcquirePending = false;
     fsd->ImageAcquiredSemaphore = fsd->RenderCompleteSemaphore = VK_NULL_HANDLE;
 }
 
@@ -2052,6 +2184,30 @@ ImGui_ImplVulkanH_Window* ImGui_ImplVulkanH_GetWindowDataFromViewport(ImGuiViewp
 // This is an _advanced_ and _optional_ feature, allowing the backend to create and handle multiple viewports simultaneously.
 // If you are new to dear imgui or creating a new binding for dear imgui, it is recommended that you completely ignore this section first..
 //--------------------------------------------------------------------------------------------------------
+
+static void ImGui_ImplVulkan_CreateOwnedWindowPipeline(ImGui_ImplVulkan_ViewportData* vd)
+{
+    ImGui_ImplVulkan_Data* bd = ImGui_ImplVulkan_GetBackendData();
+    ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
+    // Work on a value copy: a throwing result callback cannot leave shared
+    // settings pointing into this function's stack during exception cleanup.
+    ImGui_ImplVulkan_PipelineInfo info = v->PipelineInfoForViewports;
+    info.RenderPass = vd->Window.RenderPass;
+#ifdef IMGUI_IMPL_VULKAN_HAS_DYNAMIC_RENDERING
+    const VkFormat format = vd->Window.SurfaceFormat.format;
+    if (vd->Window.UseDynamicRendering)
+    {
+        info.PipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+        info.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
+        info.PipelineRenderingCreateInfo.pColorAttachmentFormats = &format;
+    }
+#endif
+    const VkPipeline pipeline = ImGui_ImplVulkan_CreatePipeline(v->Device, v->Allocator, VK_NULL_HANDLE, &info);
+    // Caller has retired this window's previous submissions before rebuild.
+    if (vd->WindowPipeline != VK_NULL_HANDLE)
+        vkDestroyPipeline(v->Device, vd->WindowPipeline, v->Allocator);
+    vd->WindowPipeline = pipeline;
+}
 
 static void ImGui_ImplVulkan_CreateWindow(ImGuiViewport* viewport)
 {
@@ -2105,28 +2261,37 @@ static void ImGui_ImplVulkan_CreateWindow(ImGuiViewport* viewport)
 
     // Create SwapChain, RenderPass, Framebuffer, etc.
     wd->UseDynamicRendering = v->UseDynamicRendering;
+    wd->UseSwapchainMaintenance1 = v->UseSwapchainMaintenance1;
+    wd->UseDiscardedImageContents = true;
+    wd->AttachmentDesc.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     wd->AttachmentDesc.loadOp = (viewport->Flags & ImGuiViewportFlags_NoRendererClear) ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_CLEAR;
-    ImGui_ImplVulkanH_CreateOrResizeWindow(v->Instance, v->PhysicalDevice, v->Device, wd, v->QueueFamily, v->Allocator, (int)viewport->Size.x, (int)viewport->Size.y, v->MinImageCount, pipeline_info->SwapChainImageUsage);
     vd->WindowOwned = true;
-
-    // Create pipeline (shared by all secondary viewports)
-    if (bd->PipelineForViewports == VK_NULL_HANDLE)
+    if (!ImGui_ImplVulkanH_CreateOrResizeWindow(v->Instance, v->PhysicalDevice, v->Device, wd, v->QueueFamily, v->Allocator, (int)viewport->Size.x, (int)viewport->Size.y, v->MinImageCount, pipeline_info->SwapChainImageUsage))
     {
-#ifdef IMGUI_IMPL_VULKAN_HAS_DYNAMIC_RENDERING
-        if (wd->UseDynamicRendering)
-        {
-            pipeline_info->PipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-            pipeline_info->PipelineRenderingCreateInfo.colorAttachmentCount = 1;
-            bd->PipelineRenderingCreateInfoColorAttachmentFormats.resize(1);
-            bd->PipelineRenderingCreateInfoColorAttachmentFormats[0] = wd->SurfaceFormat.format;
-            pipeline_info->PipelineRenderingCreateInfo.pColorAttachmentFormats = bd->PipelineRenderingCreateInfoColorAttachmentFormats.Data;
-        }
-        else
-        {
-            pipeline_info->RenderPass = wd->RenderPass;
-        }
-#endif
-        bd->PipelineForViewports = ImGui_ImplVulkan_CreatePipeline(v->Device, v->Allocator, VK_NULL_HANDLE, &v->PipelineInfoForViewports);
+        vd->SwapChainNeedRebuild = true;
+        return;
+    }
+
+    // Different platform surfaces need not have compatible attachment formats.
+    ImGui_ImplVulkan_CreateOwnedWindowPipeline(vd);
+}
+
+static void ImGui_ImplVulkan_CollectRetiredViewports()
+{
+    ImGui_ImplVulkan_Data* bd = ImGui_ImplVulkan_GetBackendData();
+    ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
+    for (int n = 0; n < bd->RetiredViewports.Size; )
+    {
+        ImGui_ImplVulkan_ViewportData* vd = bd->RetiredViewports[n];
+        const VkResult status = ImGui_ImplVulkanH_WaitWindowRetirement(v->Device, &vd->Window, 0);
+        if (status == VK_NOT_READY || status == VK_TIMEOUT) { ++n; continue; }
+        if (status != VK_SUCCESS && status != VK_ERROR_DEVICE_LOST) { check_vk_result(status); ++n; continue; }
+        if (!ImGui_ImplVulkanH_DestroyWindow(v->Instance, v->Device, &vd->Window, v->Allocator)) { ++n; continue; }
+        vkDestroySurfaceKHR(v->Instance, vd->Window.Surface, v->Allocator);
+        ImGui_ImplVulkan_DestroyWindowRenderBuffers(v->Device, &vd->RenderBuffers, v->Allocator);
+        if (vd->WindowPipeline != VK_NULL_HANDLE) vkDestroyPipeline(v->Device, vd->WindowPipeline, v->Allocator);
+        IM_DELETE(vd);
+        bd->RetiredViewports.erase(bd->RetiredViewports.begin() + n);
     }
 }
 
@@ -2139,10 +2304,17 @@ static void ImGui_ImplVulkan_DestroyWindow(ImGuiViewport* viewport)
         ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
         if (vd->WindowOwned)
         {
-            ImGui_ImplVulkanH_DestroyWindow(v->Instance, v->Device, &vd->Window, v->Allocator);
-            vkDestroySurfaceKHR(v->Instance, vd->Window.Surface, v->Allocator);
+            // The native window can close now; its Vulkan surface, acquisition
+            // signals, buffers, pipeline and swapchain remain explicitly owned.
+            // NewFrame/Shutdown collect only after rendering and presentation.
+            bd->RetiredViewports.push_back(vd);
+            viewport->RendererUserData = nullptr;
+            ImGui_ImplVulkan_CollectRetiredViewports();
+            return;
         }
         ImGui_ImplVulkan_DestroyWindowRenderBuffers(v->Device, &vd->RenderBuffers, v->Allocator);
+        if (vd->WindowPipeline != VK_NULL_HANDLE)
+            vkDestroyPipeline(v->Device, vd->WindowPipeline, v->Allocator);
         IM_DELETE(vd);
     }
     viewport->RendererUserData = nullptr;
@@ -2150,14 +2322,15 @@ static void ImGui_ImplVulkan_DestroyWindow(ImGuiViewport* viewport)
 
 static void ImGui_ImplVulkan_SetWindowSize(ImGuiViewport* viewport, ImVec2 size)
 {
+    ImGui_ImplVulkan_Data* bd = ImGui_ImplVulkan_GetBackendData();
     ImGui_ImplVulkan_ViewportData* vd = (ImGui_ImplVulkan_ViewportData*)viewport->RendererUserData;
     if (vd == nullptr) // This is nullptr for the main viewport (which is left to the user/app to handle)
         return;
+    ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
     ImGui_ImplVulkanH_Window* wd = &vd->Window;
     wd->AttachmentDesc.loadOp = (viewport->Flags & ImGuiViewportFlags_NoRendererClear) ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_CLEAR;
-    // A previously acquired image and its binary semaphore remain owned when
-    // the render fence times out. Let RenderWindow consume that acquisition
-    // before recreating the swapchain, including across minimize/restore.
+    // Do not retire a swapchain in a Win32 resize callback while an acquired
+    // image/semaphore is held across a deferred render wait.
     IM_UNUSED(size);
     vd->SwapChainNeedRebuild = true;
 }
@@ -2172,25 +2345,52 @@ static void ImGui_ImplVulkan_RenderWindow(ImGuiViewport* viewport, void*)
     ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
     VkResult err;
 
-    vd->FrameReady = false;
-    // With no retained acquisition, wait for a nonzero surface before any
-    // recreation or acquire. A retained acquisition still needs consumption.
-    if (!vd->FrameAcquired && (viewport->Size.x <= 0.0f || viewport->Size.y <= 0.0f))
+    if (vd->AcquireCycle.Submitted) return; // Swap must consume this submit first.
+    if (!vd->AcquireCycle.Acquired && (viewport->Size.x <= 0 || viewport->Size.y <= 0))
         return;
-    if (!vd->FrameAcquired && (vd->SwapChainNeedRebuild || vd->SwapChainSuboptimal))
+    if ((vd->SwapChainNeedRebuild || vd->SwapChainSuboptimal) && !vd->AcquireCycle.Acquired)
     {
-        ImGui_ImplVulkanH_CreateOrResizeWindow(v->Instance, v->PhysicalDevice, v->Device, wd, v->QueueFamily, v->Allocator, (int)viewport->Size.x, (int)viewport->Size.y, v->MinImageCount, v->PipelineInfoForViewports.SwapChainImageUsage);
+        const VkResult ready = ImGui_ImplVulkanH_WaitWindowRetirement(v->Device, wd);
+        if (ready == VK_TIMEOUT || ready == VK_NOT_READY) return;
+        check_vk_result(ready);
+        if (ready != VK_SUCCESS) return;
+        const VkFormat formats[] = { wd->SurfaceFormat.format, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM };
+        wd->SurfaceFormat = ImGui_ImplVulkanH_SelectSurfaceFormat(v->PhysicalDevice, wd->Surface, formats, IM_COUNTOF(formats), wd->SurfaceFormat.colorSpace);
+        if (!ImGui_ImplVulkanH_CreateOrResizeWindow(v->Instance, v->PhysicalDevice, v->Device, wd, v->QueueFamily, v->Allocator, (int)viewport->Size.x, (int)viewport->Size.y, v->MinImageCount, v->PipelineInfoForViewports.SwapChainImageUsage)) return;
+        ImGui_ImplVulkan_DestroyWindowRenderBuffers(v->Device, &vd->RenderBuffers, v->Allocator);
+        ImGui_ImplVulkan_CreateOwnedWindowPipeline(vd);
         vd->SwapChainNeedRebuild = vd->SwapChainSuboptimal = false;
     }
 
     ImGui_ImplVulkanH_Frame* fd = nullptr;
     ImGui_ImplVulkanH_FrameSemaphores* fsd = &wd->FrameSemaphores[wd->SemaphoreIndex];
     {
-        if (!vd->FrameAcquired)
         {
-            err = vkAcquireNextImageKHR(v->Device, wd->Swapchain, 8000000, fsd->ImageAcquiredSemaphore, VK_NULL_HANDLE, &wd->FrameIndex);
-            if (err == VK_TIMEOUT || err == VK_NOT_READY)
-                return;
+            if (!vd->AcquireCycle.Acquired)
+            {
+            // The acquisition ring and image ring are different. Explicitly
+            // observe the prior signal AND its submit wait before reusing it.
+            if (fsd->ConsumedByFence != VK_NULL_HANDLE)
+            {
+                err = vkWaitForFences(v->Device, 1, &fsd->ConsumedByFence, VK_TRUE, 2000000);
+                if (err == VK_TIMEOUT) return;
+                check_vk_result(err);
+                if (err != VK_SUCCESS) return;
+                fsd->ConsumedByFence = VK_NULL_HANDLE;
+            }
+            if (fsd->AcquirePending)
+            {
+                err = vkWaitForFences(v->Device, 1, &fsd->AcquireFence, VK_TRUE, 2000000);
+                if (err == VK_TIMEOUT) return;
+                check_vk_result(err);
+                if (err != VK_SUCCESS) return;
+                fsd->AcquirePending = false;
+            }
+            err = vkResetFences(v->Device, 1, &fsd->AcquireFence);
+            check_vk_result(err);
+            if (err != VK_SUCCESS) return;
+            err = vkAcquireNextImageKHR(v->Device, wd->Swapchain, 8000000, fsd->ImageAcquiredSemaphore, fsd->AcquireFence, &wd->FrameIndex);
+            if (err == VK_TIMEOUT || err == VK_NOT_READY) return;
             if (err == VK_ERROR_OUT_OF_DATE_KHR)
             {
                 vd->SwapChainNeedRebuild = true; // Since we are not going to swap this frame anyway, it's ok that recreation happens on next frame.
@@ -2198,21 +2398,30 @@ static void ImGui_ImplVulkan_RenderWindow(ImGuiViewport* viewport, void*)
             }
             if (err == VK_SUBOPTIMAL_KHR)
                 vd->SwapChainSuboptimal = true;
-            else if (err != VK_SUCCESS)
-            {
+            else
                 check_vk_result(err);
+            if (err != VK_SUCCESS && err != VK_SUBOPTIMAL_KHR) return;
+            fsd->AcquirePending = true;
+            if (!vd->AcquireCycle.Admit(wd->FrameIndex, wd->ImageCount))
+            {
+                check_vk_result(VK_ERROR_INITIALIZATION_FAILED);
                 return;
             }
-            vd->FrameAcquired = true;
+            }
+            wd->FrameIndex = vd->AcquireCycle.Image;
+            fd = &wd->Frames[wd->FrameIndex];
         }
-        fd = &wd->Frames[wd->FrameIndex];
         err = vkWaitForFences(v->Device, 1, &fd->Fence, VK_TRUE, 2000000);
-        if (err == VK_TIMEOUT || err == VK_NOT_READY)
-            return; // Retain this image and acquisition semaphore until retry.
-        if (err != VK_SUCCESS)
+        if (err == VK_TIMEOUT) return; // Keep the successful acquire owned.
+        check_vk_result(err);
+        if (err != VK_SUCCESS) return;
+        if (fd->PresentCycle.Pending)
         {
+            err = vkWaitForFences(v->Device, 1, &fd->PresentFence, VK_TRUE, 2000000);
+            if (err == VK_TIMEOUT) return;
             check_vk_result(err);
-            return;
+            if (err != VK_SUCCESS) return;
+            fd->PresentCycle.ObserveSignal();
         }
         {
             err = vkResetCommandPool(v->Device, fd->CommandPool, 0);
@@ -2234,8 +2443,9 @@ static void ImGui_ImplVulkan_RenderWindow(ImGuiViewport* viewport, void*)
             VkImageMemoryBarrier barrier = {};
             barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; // Contents are cleared/discarded after acquire.
             barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barrier.image = fd->Backbuffer;
             barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             barrier.subresourceRange.levelCount = 1;
@@ -2277,7 +2487,7 @@ static void ImGui_ImplVulkan_RenderWindow(ImGuiViewport* viewport, void*)
         }
     }
 
-    ImGui_ImplVulkan_RenderDrawData(viewport->DrawData, fd->CommandBuffer, bd->PipelineForViewports);
+    ImGui_ImplVulkan_RenderDrawData(viewport->DrawData, fd->CommandBuffer, vd->WindowPipeline);
 
     {
 #ifdef IMGUI_IMPL_VULKAN_HAS_DYNAMIC_RENDERING
@@ -2291,6 +2501,7 @@ static void ImGui_ImplVulkan_RenderWindow(ImGuiViewport* viewport, void*)
             barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
             barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barrier.image = fd->Backbuffer;
             barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             barrier.subresourceRange.levelCount = 1;
@@ -2320,7 +2531,9 @@ static void ImGui_ImplVulkan_RenderWindow(ImGuiViewport* viewport, void*)
             check_vk_result(err);
             err = vkQueueSubmit(v->Queue, 1, &info, fd->Fence);
             check_vk_result(err);
-            vd->FrameReady = (err == VK_SUCCESS);
+            if (err != VK_SUCCESS) return;
+            fsd->ConsumedByFence = fd->Fence;
+            if (!vd->AcquireCycle.MarkSubmitted()) check_vk_result(VK_ERROR_INITIALIZATION_FAILED);
         }
     }
 }
@@ -2334,18 +2547,13 @@ static void ImGui_ImplVulkan_SwapBuffers(ImGuiViewport* viewport, void*)
     ImGui_ImplVulkanH_Window* wd = &vd->Window;
     ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
 
-    if (!vd->FrameReady)
-        return; // No successful submission owns a presentable image yet.
-    // Even if a resize arrived, this successful submit must be presented so
-    // its binary wait is consumed before the old swapchain is retired.
-    vd->FrameReady = vd->FrameAcquired = false;
+    if (!vd->AcquireCycle.MayPresent())
+        return;
 
     VkResult err;
     uint32_t present_index = wd->FrameIndex;
 
-    // Reacquiring the same image, rather than rotating frame order, permits
-    // reuse of the semaphore consumed by that image's previous presentation.
-    ImGui_ImplVulkanH_FrameSemaphores* fsd = &wd->FrameSemaphores[wd->FrameIndex];
+    ImGui_ImplVulkanH_FrameSemaphores* fsd = &wd->FrameSemaphores[present_index];
     VkPresentInfoKHR info = {};
     info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     info.waitSemaphoreCount = 1;
@@ -2353,7 +2561,30 @@ static void ImGui_ImplVulkan_SwapBuffers(ImGuiViewport* viewport, void*)
     info.swapchainCount = 1;
     info.pSwapchains = &wd->Swapchain;
     info.pImageIndices = &present_index;
+#ifdef VK_EXT_swapchain_maintenance1
+    VkSwapchainPresentFenceInfoEXT retirement_info = {};
+    ImGui_ImplVulkanH_Frame* fd = &wd->Frames[present_index];
+    if (wd->UseSwapchainMaintenance1)
+    {
+        if (!fd->PresentCycle.Begin()) { check_vk_result(VK_ERROR_INITIALIZATION_FAILED); return; }
+        err = vkResetFences(v->Device, 1, &fd->PresentFence);
+        if (err != VK_SUCCESS) { fd->PresentCycle.Finish(false); check_vk_result(err); return; }
+        retirement_info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT;
+        retirement_info.swapchainCount = 1;
+        retirement_info.pFences = &fd->PresentFence;
+        info.pNext = &retirement_info;
+    }
+#endif
     err = vkQueuePresentKHR(v->Queue, &info);
+    // Out-of-date/surface-lost presents are still enqueued. Do not retry the
+    // same binary wait or retain a released acquired image after that result.
+    const bool enqueued = err == VK_SUCCESS || err == VK_SUBOPTIMAL_KHR || err == VK_ERROR_OUT_OF_DATE_KHR || err == VK_ERROR_SURFACE_LOST_KHR;
+    if (wd->UseSwapchainMaintenance1) wd->Frames[present_index].PresentCycle.Finish(enqueued);
+    if (enqueued)
+    {
+        vd->AcquireCycle.Presented();
+        wd->SemaphoreIndex = (wd->SemaphoreIndex + 1) % wd->SemaphoreCount;
+    }
     if (err == VK_ERROR_OUT_OF_DATE_KHR)
     {
         vd->SwapChainNeedRebuild = true;
@@ -2363,7 +2594,6 @@ static void ImGui_ImplVulkan_SwapBuffers(ImGuiViewport* viewport, void*)
         vd->SwapChainSuboptimal = true;
     else
         check_vk_result(err);
-    wd->SemaphoreIndex = (wd->SemaphoreIndex + 1) % wd->SemaphoreCount; // Now we can use the next set of semaphores
 }
 
 void ImGui_ImplVulkan_InitMultiViewportSupport()

@@ -1997,6 +1997,16 @@ carto_target(cartographer_visual_baseline_tests)
 add_test(NAME cartographer_visual_baseline_tests COMMAND cartographer_visual_baseline_tests)
 set_tests_properties(cartographer_visual_baseline_tests PROPERTIES TIMEOUT 30)
 
+add_executable(cartographer_native_lifetime_followon_tests native_lifetime_followon_tests.cpp)
+carto_target(cartographer_native_lifetime_followon_tests)
+add_test(NAME cartographer_native_lifetime_followon_tests COMMAND cartographer_native_lifetime_followon_tests)
+set_tests_properties(cartographer_native_lifetime_followon_tests PROPERTIES TIMEOUT 30)
+
+add_test(NAME cartographer_desktop_admission_boundary
+    COMMAND ${CMAKE_COMMAND} "-DCARTO_SOURCE_ROOT=${PROJECT_SOURCE_DIR}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/desktop_admission_boundary.cmake")
+set_tests_properties(cartographer_desktop_admission_boundary PROPERTIES TIMEOUT 30)
+
 get_property(CARTO_REGISTERED_TESTS DIRECTORY PROPERTY TESTS)
 set(CARTO_TEST_TEMP_INDEX 0)
 foreach(CARTO_TEST_NAME IN LISTS CARTO_REGISTERED_TESTS)

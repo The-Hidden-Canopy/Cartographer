@@ -93,13 +93,18 @@ existing compatibility path and does not claim to close it. A supported
 platform-window ownership need separate native verification before claiming
 fully certified resize/shutdown resource retirement.
 
-## Coordinator follow-up boundaries
+## Coordinator follow-up at b9385b8
 
-An additional CPU counterexample refuses an empty swapchain image set before any driver acquisition, submission or presentation. The original helper reached acquisition before its invalid-index check; the added precondition repairs that actual RED failure.
+An additional CPU counterexample refuses an empty swapchain image set before
+any driver acquisition, submission or presentation. The original helper
+reached acquisition before its invalid-index check; the precondition repairs
+that failure.
 
-The main ImGui upload ring is now fixed to the two fenced main frame slots, avoiding the pinned backend assertion when a surface changes its image count. A changed main surface format rebuilds the backend main pipeline with the new render pass after existing retirement waits. This preserves the internal source/asset and project codec contracts. Actual format-change coverage requires a suitable native surface; ordinary same-format resize does not prove it.
+The main ImGui upload ring is fixed to the two fenced main frame slots, and a
+changed main surface format rebuilds the backend main pipeline after retirement
+waits. Actual format-change coverage requires a suitable native surface.
 
-These changes do not implement presentation-fence maintenance1 retirement or replace the bundled platform-window renderer. Device-idle shutdown/retirement, platform-window teardown, low-level driver blocking and repeated Release performance remain separate acceptance gates. Passing CPU tests or a sampled main-window walkthrough must not be described as complete retirement correctness.
+At the earlier b9385b8/2f8ac2c checkpoints, these changes did not implement presentation-fence maintenance1 retirement or replace the bundled platform-window renderer. Device-idle shutdown/retirement, platform-window teardown, low-level driver blocking and repeated Release performance remain separate acceptance gates. Passing CPU tests or a sampled main-window walkthrough must not be described as complete retirement correctness.
 
 ## Native teardown counterexample
 
@@ -133,3 +138,21 @@ but **not compiled or run**; the prior seven CPU cases belong to 2f8ac2c.
 Device-idle retirement and true presentation-engine lifetime proof, the
 host-stability hold, live resize, close/reopen and native performance remain
 separate open gates.
+
+These are the coordinator's b9385b8 boundaries; subsequent local source also
+proposes maintenance1 presentation fences and platform-window retirement.
+Those later changes have not yet passed compilation or native validation.
+
+
+## Combined lifetime/material reconciliation — validation pending
+
+The current combined source includes the reviewed22565ca lifetime/startup
+proposal plus the tested9ac9768 material/locale and earlierbe91967 resize work.
+The complete AcquireCycle backend replaces the older two-boolean state. The
+coordinator preserves no unacquired bootstrap transitions, acquired-image
+upload ownership, cursor reset on image-count shrink, and consumption of a
+retained acquisition across minimize. Both lifetime and actual-backend CPU
+pressure targets remain registered before per-test temporary directories.
+Earlier receipts remain revision-specific; this merge still needs fresh CPU,
+desktop/D3D12 compilation and bounded native validation. Legacy device-idle,
+driver calls, maintenance1 support and performance limits remain explicit.

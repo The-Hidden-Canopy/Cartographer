@@ -71,6 +71,8 @@ public:
 
     template<class Driver>
     FrameProgress step(Driver& driver, std::size_t image_count) {
+        // Reconciled with Sol's b9385b8: never signal an acquisition semaphore
+        // when the current swapchain contains no usable images.
         if (image_count == 0) throw std::runtime_error("presentation requires a swapchain image");
         if (!acquired_) {
             if (driver.wait_frame(current_, wait_budget_ns) == PresentationResult::deferred)

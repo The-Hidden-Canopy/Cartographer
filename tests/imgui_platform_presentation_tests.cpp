@@ -169,9 +169,9 @@ void deferred_image_fence(){
 }
 void resize_during_deferred_acquire(){
     Fixture f;f.data.Window.Surface=handle<VkSurfaceKHR>(1);f.log.defer_fence_once=true;f.frame();
-    require(f.data.FrameAcquired && f.log.acquisitions==1,"fixture did not retain a successful acquire");
+    require(f.data.AcquireCycle.Acquired && f.log.acquisitions==1,"fixture did not retain a successful acquire");
     ImGui_ImplVulkan_SetWindowSize(&f.viewport,ImVec2(32,32));
-    require(f.data.FrameAcquired && f.data.SwapChainNeedRebuild,"resize discarded the retained acquire");
+    require(f.data.AcquireCycle.Acquired && f.data.SwapChainNeedRebuild,"resize discarded the retained acquire");
     require(f.log.idle_calls==0 && f.log.swapchain_creations==0,"resize callback recreated an owned swapchain");
     f.frame();
     require(f.log.acquisitions==1 && f.log.submissions==1 && f.log.presents==1 && f.log.violations==0,
