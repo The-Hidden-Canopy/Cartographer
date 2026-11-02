@@ -92,7 +92,7 @@ struct Fixture {
         viewport.RendererUserData=&data;viewport.DrawData=&draw;draw.OwnerViewport=&viewport;
         draw.DisplaySize=ImVec2(0,0);draw.FramebufferScale=ImVec2(1,1);
     }
-    ~Fixture(){ImGui::GetIO().BackendRendererUserData=nullptr;ImGui::DestroyContext();trace=nullptr;}
+    ~Fixture(){viewport.RendererUserData=nullptr;viewport.DrawData=nullptr;ImGui::GetIO().BackendRendererUserData=nullptr;ImGui::DestroyContext();trace=nullptr;}
     void frame(){ImGui_ImplVulkan_RenderWindow(&viewport,nullptr);ImGui_ImplVulkan_SwapBuffers(&viewport,nullptr);}
 };
 void irregular_images(){
