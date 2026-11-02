@@ -1970,6 +1970,24 @@ carto_target(cartographer_native_presentation_tests)
 add_test(NAME cartographer_native_presentation_tests COMMAND cartographer_native_presentation_tests)
 set_tests_properties(cartographer_native_presentation_tests PROPERTIES TIMEOUT 30)
 
+# Exercise the bundled Vulkan callbacks with injected function pointers only.
+# These CPU tests create no Vulkan instance/device and link no Vulkan loader.
+if(TARGET carto_imgui)
+    add_executable(cartographer_imgui_platform_presentation_tests
+        imgui_platform_presentation_tests.cpp
+        ${CARTO_IMGUI_ROOT}/imgui.cpp
+        ${CARTO_IMGUI_ROOT}/imgui_draw.cpp
+        ${CARTO_IMGUI_ROOT}/imgui_tables.cpp
+        ${CARTO_IMGUI_ROOT}/imgui_widgets.cpp)
+    target_compile_features(cartographer_imgui_platform_presentation_tests PRIVATE cxx_std_20)
+    target_include_directories(cartographer_imgui_platform_presentation_tests PRIVATE
+        ${CARTO_IMGUI_ROOT} ${Vulkan_INCLUDE_DIRS})
+    target_link_libraries(cartographer_imgui_platform_presentation_tests PRIVATE user32 gdi32)
+    add_test(NAME cartographer_imgui_platform_presentation_tests
+        COMMAND cartographer_imgui_platform_presentation_tests)
+    set_tests_properties(cartographer_imgui_platform_presentation_tests PROPERTIES TIMEOUT 20)
+endif()
+
 get_property(CARTO_REGISTERED_TESTS DIRECTORY PROPERTY TESTS)
 set(CARTO_TEST_TEMP_INDEX 0)
 foreach(CARTO_TEST_NAME IN LISTS CARTO_REGISTERED_TESTS)
