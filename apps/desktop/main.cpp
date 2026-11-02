@@ -370,6 +370,9 @@ public:
         init_info.Device = device_;
         init_info.QueueFamily = queue_family_;
         init_info.Queue = queue_;
+        init_info.CheckVkResultFn = [](VkResult result) {
+            check_vk(result, "ImGui Vulkan backend");
+        };
         init_info.DescriptorPool = descriptor_pool_;
         // The main upload ring follows the two fenced frame slots, not WSI's
         // independently changing image count. Keep ImGui's minimum stable:

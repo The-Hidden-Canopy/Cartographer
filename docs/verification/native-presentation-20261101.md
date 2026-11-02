@@ -103,3 +103,13 @@ These changes do not implement presentation-fence maintenance1 retirement or rep
 The b9385b8 native Room08/UV inspection exited normally but emitted two VUID-vkDestroyBuffer-buffer-00922 reports. A zero process exit was therefore not native acceptance. The bundled ImGui DestroyPlatformWindows callback destroys the main viewport upload buffers as well as secondary viewports. It was called before VulkanShell shutdown reached its device-idle wait. Moving that call inside the existing initialized-renderer shutdown path, immediately after that wait, preserves the backend and waits before those buffers are freed.
 
 Required replay: required-validation native Room08 load, UV inspection and normal Close; retain full stderr and require no validation diagnostic in addition to exit0. This ordering repair does not implement maintenance1 presentation fences, change queue policy, remove the existing shutdown idle wait, or prove untested driver/secondary-window retirement cases.
+
+## Detached-window native counterexample and local backend repair
+
+The 2ae19bc explicit-adapter resize/detach run emitted acquired-image and presentation-semaphore reuse diagnostics. It did not produce a terminal receipt; a subsequent unclean host reboot is recorded separately, without claiming causality. Native GPU execution is held. Main-window UV authoring acceptance at2ae19bc remains distinct from this failed platform-window acceptance.
+
+CPU tests include the actual bundled Vulkan backend implementation and inject every exercised Vulkan callback; they create no Vulkan instance/device or native window and link no Vulkan loader. Six baseline cases fail: creation transitions on never-acquired images, irregular-image presentation semaphore reuse, acquisition timeout, deferred image-fence ownership, failed acquisition, and a platform upload ring not bound to its acquired-image fence. Fixture failures are retained separately from the completed baseline.
+
+The local backend patch removes the invalid creation-time transition submission, uses per-image presentation completion semaphores and upload buffers, yields on finite acquisition/fence timeouts while retaining an acquired image, and presents only after successful submission. The application now surfaces unexpected backend Vulkan results instead of silently continuing. No execution/domain authority or project format path changes. Upstream attribution and license remain.
+
+This repair still requires a bounded native detached-window replay after host stability review. CPU success is not GPU acceptance or proof of reboot causality. Maintenance1 presentation retirement, platform format changes, repeated texture replacement, Release performance, dirty close and invalid-adapter native cases remain separate gates.

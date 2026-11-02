@@ -311,6 +311,8 @@ struct ImGui_ImplVulkan_ViewportData
     ImGui_ImplVulkanH_Window                Window;                 // Used by secondary viewports only
     ImGui_ImplVulkan_WindowRenderBuffers    RenderBuffers;          // Used by all viewports
     bool                                    WindowOwned;
+    bool                                    FrameAcquired = false;
+    bool                                    FrameReady = false;
     bool                                    SwapChainNeedRebuild;   // Flag when viewport swapchain resized in the middle of processing a frame
     bool                                    SwapChainSuboptimal;    // Flag when VK_SUBOPTIMAL_KHR was returned.
 
@@ -645,15 +647,23 @@ void ImGui_ImplVulkan_RenderDrawData(ImDrawData* draw_data, VkCommandBuffer comm
     ImGui_ImplVulkan_ViewportData* viewport_renderer_data = (ImGui_ImplVulkan_ViewportData*)draw_data->OwnerViewport->RendererUserData;
     IM_ASSERT(viewport_renderer_data != nullptr);
     ImGui_ImplVulkan_WindowRenderBuffers* wrb = &viewport_renderer_data->RenderBuffers;
+    // Platform uploads share the acquired image's fence. The application-owned
+    // main viewport keeps its separately fenced upload ring.
+    const uint32_t upload_count = viewport_renderer_data->WindowOwned
+        ? viewport_renderer_data->Window.ImageCount : v->ImageCount;
+    if (wrb->FrameRenderBuffers.Size != 0 && wrb->Count != upload_count)
+        // Platform swapchain recreation has already waited for device idle.
+        ImGui_ImplVulkan_DestroyWindowRenderBuffers(v->Device, wrb, v->Allocator);
     if (wrb->FrameRenderBuffers.Size == 0)
     {
         wrb->Index = 0;
-        wrb->Count = v->ImageCount;
+        wrb->Count = upload_count;
         wrb->FrameRenderBuffers.resize(wrb->Count);
         memset((void*)wrb->FrameRenderBuffers.Data, 0, wrb->FrameRenderBuffers.size_in_bytes());
     }
-    IM_ASSERT(wrb->Count == v->ImageCount);
-    wrb->Index = (wrb->Index + 1) % wrb->Count;
+    IM_ASSERT(wrb->Count == upload_count && upload_count > 0);
+    wrb->Index = viewport_renderer_data->WindowOwned
+        ? viewport_renderer_data->Window.FrameIndex : (wrb->Index + 1) % wrb->Count;
     ImGui_ImplVulkan_FrameRenderBuffers* rb = &wrb->FrameRenderBuffers[wrb->Index];
 
     if (draw_data->TotalVtxCount > 0)
@@ -1977,80 +1987,8 @@ void ImGui_ImplVulkanH_CreateOrResizeWindow(VkInstance instance, VkPhysicalDevic
     ImGui_ImplVulkanH_CreateWindowSwapChain(physical_device, device, wd, allocator, width, height, min_image_count, image_usage);
     ImGui_ImplVulkanH_CreateWindowCommandBuffers(physical_device, device, wd, queue_family, allocator);
 
-    // FIXME: to submit the command buffer, we need a queue. In the examples folder, the ImGui_ImplVulkanH_CreateOrResizeWindow function is called
-    // before the ImGui_ImplVulkan_Init function, so we don't have access to the queue yet. Here we have the queue_family that we can use to grab
-    // a queue from the device and submit the command buffer. It would be better to have access to the queue as suggested in the FIXME below.
-    VkCommandPool command_pool;
-    VkCommandPoolCreateInfo pool_info = {};
-    pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    pool_info.queueFamilyIndex = queue_family;
-    VkResult err = vkCreateCommandPool(device, &pool_info, allocator, &command_pool);
-    check_vk_result(err);
+    // First-use layout transitions belong to rendering after acquisition.
 
-    VkFenceCreateInfo fence_info = {};
-    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    VkFence fence;
-    err = vkCreateFence(device, &fence_info, allocator, &fence);
-    check_vk_result(err);
-
-    VkCommandBufferAllocateInfo alloc_info = {};
-    alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    alloc_info.commandPool = command_pool;
-    alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    alloc_info.commandBufferCount = 1;
-    VkCommandBuffer command_buffer;
-    err = vkAllocateCommandBuffers(device, &alloc_info, &command_buffer);
-    check_vk_result(err);
-
-    VkCommandBufferBeginInfo begin_info = {};
-    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    err = vkBeginCommandBuffer(command_buffer, &begin_info);
-    check_vk_result(err);
-
-    // Transition the images to the correct layout for rendering
-    for (uint32_t i = 0; i < wd->ImageCount; i++)
-    {
-        VkImageMemoryBarrier barrier = {};
-        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        barrier.image = wd->Frames[i].Backbuffer;
-        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        barrier.subresourceRange.levelCount = 1;
-        barrier.subresourceRange.layerCount = 1;
-        vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-    }
-
-    err = vkEndCommandBuffer(command_buffer);
-    check_vk_result(err);
-    VkSubmitInfo submit_info = {};
-    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit_info.commandBufferCount = 1;
-    submit_info.pCommandBuffers = &command_buffer;
-
-    VkQueue queue;
-    vkGetDeviceQueue(device, queue_family, 0, &queue);
-    err = vkQueueSubmit(queue, 1, &submit_info, fence);
-    check_vk_result(err);
-    err = vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
-    check_vk_result(err);
-    err = vkResetFences(device, 1, &fence);
-    check_vk_result(err);
-
-    err = vkResetCommandPool(device, command_pool, 0);
-    check_vk_result(err);
-
-    // Destroy command buffer and fence and command pool
-    vkFreeCommandBuffers(device, command_pool, 1, &command_buffer);
-    vkDestroyCommandPool(device, command_pool, allocator);
-    vkDestroyFence(device, fence, allocator);
-    command_pool = VK_NULL_HANDLE;
-    command_buffer = VK_NULL_HANDLE;
-    fence = VK_NULL_HANDLE;
-    queue = VK_NULL_HANDLE;
 }
 
 void ImGui_ImplVulkanH_DestroyWindow(VkInstance instance, VkDevice device, ImGui_ImplVulkanH_Window* wd, const VkAllocationCallbacks* allocator)
@@ -2219,6 +2157,7 @@ static void ImGui_ImplVulkan_SetWindowSize(ImGuiViewport* viewport, ImVec2 size)
     ImGui_ImplVulkanH_Window* wd = &vd->Window;
     wd->AttachmentDesc.loadOp = (viewport->Flags & ImGuiViewportFlags_NoRendererClear) ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_CLEAR;
     ImGui_ImplVulkanH_CreateOrResizeWindow(v->Instance, v->PhysicalDevice, v->Device, &vd->Window, v->QueueFamily, v->Allocator, (int)size.x, (int)size.y, v->MinImageCount, v->PipelineInfoForViewports.SwapChainImageUsage);
+    vd->FrameAcquired = vd->FrameReady = false;
 }
 
 static void ImGui_ImplVulkan_RenderWindow(ImGuiViewport* viewport, void*)
@@ -2231,7 +2170,8 @@ static void ImGui_ImplVulkan_RenderWindow(ImGuiViewport* viewport, void*)
     ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
     VkResult err;
 
-    if (vd->SwapChainNeedRebuild || vd->SwapChainSuboptimal)
+    vd->FrameReady = false;
+    if (!vd->FrameAcquired && (vd->SwapChainNeedRebuild || vd->SwapChainSuboptimal))
     {
         ImGui_ImplVulkanH_CreateOrResizeWindow(v->Instance, v->PhysicalDevice, v->Device, wd, v->QueueFamily, v->Allocator, (int)viewport->Size.x, (int)viewport->Size.y, v->MinImageCount, v->PipelineInfoForViewports.SwapChainImageUsage);
         vd->SwapChainNeedRebuild = vd->SwapChainSuboptimal = false;
@@ -2240,8 +2180,11 @@ static void ImGui_ImplVulkan_RenderWindow(ImGuiViewport* viewport, void*)
     ImGui_ImplVulkanH_Frame* fd = nullptr;
     ImGui_ImplVulkanH_FrameSemaphores* fsd = &wd->FrameSemaphores[wd->SemaphoreIndex];
     {
+        if (!vd->FrameAcquired)
         {
-            err = vkAcquireNextImageKHR(v->Device, wd->Swapchain, UINT64_MAX, fsd->ImageAcquiredSemaphore, VK_NULL_HANDLE, &wd->FrameIndex);
+            err = vkAcquireNextImageKHR(v->Device, wd->Swapchain, 8000000, fsd->ImageAcquiredSemaphore, VK_NULL_HANDLE, &wd->FrameIndex);
+            if (err == VK_TIMEOUT || err == VK_NOT_READY)
+                return;
             if (err == VK_ERROR_OUT_OF_DATE_KHR)
             {
                 vd->SwapChainNeedRebuild = true; // Since we are not going to swap this frame anyway, it's ok that recreation happens on next frame.
@@ -2249,16 +2192,21 @@ static void ImGui_ImplVulkan_RenderWindow(ImGuiViewport* viewport, void*)
             }
             if (err == VK_SUBOPTIMAL_KHR)
                 vd->SwapChainSuboptimal = true;
-            else
+            else if (err != VK_SUCCESS)
+            {
                 check_vk_result(err);
-            fd = &wd->Frames[wd->FrameIndex];
+                return;
+            }
+            vd->FrameAcquired = true;
         }
-        for (;;)
+        fd = &wd->Frames[wd->FrameIndex];
+        err = vkWaitForFences(v->Device, 1, &fd->Fence, VK_TRUE, 2000000);
+        if (err == VK_TIMEOUT || err == VK_NOT_READY)
+            return; // Retain this image and acquisition semaphore until retry.
+        if (err != VK_SUCCESS)
         {
-            err = vkWaitForFences(v->Device, 1, &fd->Fence, VK_TRUE, 100);
-            if (err == VK_SUCCESS) break;
-            if (err == VK_TIMEOUT) continue;
             check_vk_result(err);
+            return;
         }
         {
             err = vkResetCommandPool(v->Device, fd->CommandPool, 0);
@@ -2280,7 +2228,7 @@ static void ImGui_ImplVulkan_RenderWindow(ImGuiViewport* viewport, void*)
             VkImageMemoryBarrier barrier = {};
             barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-            barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             barrier.image = fd->Backbuffer;
             barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -2358,7 +2306,7 @@ static void ImGui_ImplVulkan_RenderWindow(ImGuiViewport* viewport, void*)
             info.commandBufferCount = 1;
             info.pCommandBuffers = &fd->CommandBuffer;
             info.signalSemaphoreCount = 1;
-            info.pSignalSemaphores = &fsd->RenderCompleteSemaphore;
+            info.pSignalSemaphores = &wd->FrameSemaphores[wd->FrameIndex].RenderCompleteSemaphore;
 
             err = vkEndCommandBuffer(fd->CommandBuffer);
             check_vk_result(err);
@@ -2366,6 +2314,7 @@ static void ImGui_ImplVulkan_RenderWindow(ImGuiViewport* viewport, void*)
             check_vk_result(err);
             err = vkQueueSubmit(v->Queue, 1, &info, fd->Fence);
             check_vk_result(err);
+            vd->FrameReady = (err == VK_SUCCESS);
         }
     }
 }
@@ -2379,13 +2328,16 @@ static void ImGui_ImplVulkan_SwapBuffers(ImGuiViewport* viewport, void*)
     ImGui_ImplVulkanH_Window* wd = &vd->Window;
     ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
 
-    if (vd->SwapChainNeedRebuild) // Frame data became invalid in the middle of rendering
-        return;
+    if (!vd->FrameReady || vd->SwapChainNeedRebuild)
+        return; // No successful submission owns a presentable image yet.
+    vd->FrameReady = vd->FrameAcquired = false;
 
     VkResult err;
     uint32_t present_index = wd->FrameIndex;
 
-    ImGui_ImplVulkanH_FrameSemaphores* fsd = &wd->FrameSemaphores[wd->SemaphoreIndex];
+    // Reacquiring the same image, rather than rotating frame order, permits
+    // reuse of the semaphore consumed by that image's previous presentation.
+    ImGui_ImplVulkanH_FrameSemaphores* fsd = &wd->FrameSemaphores[wd->FrameIndex];
     VkPresentInfoKHR info = {};
     info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     info.waitSemaphoreCount = 1;

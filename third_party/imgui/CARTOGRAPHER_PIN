@@ -4,3 +4,5 @@ Upstream branch: docking
 Upstream commit: d88f238d1d363ef387382b2e29ad12cf96f826ac
 License: MIT (see LICENSE.txt)
 Reason: the desktop workbench requires docking and native multi-viewport tear-off windows.
+
+Local Cartographer patch: platform-window acquisition/submission ownership, finite waits, per-image presentation semaphores and uploads, and removal of never-acquired image transitions. Upstream revision/license retained; see docs/verification/native-presentation-20261101.md and tests/imgui_platform_presentation_tests.cpp.
