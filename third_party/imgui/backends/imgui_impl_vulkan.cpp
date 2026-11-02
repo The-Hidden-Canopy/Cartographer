@@ -1887,6 +1887,7 @@ void ImGui_ImplVulkanH_CreateWindowSwapChain(VkPhysicalDevice physical_device, V
         check_vk_result(err);
 
         wd->SemaphoreCount = wd->ImageCount + 1;
+        wd->FrameIndex = wd->SemaphoreIndex = 0; // New image/semaphore arrays own new cursors.
         wd->Frames.resize(wd->ImageCount);
         wd->FrameSemaphores.resize(wd->SemaphoreCount);
         memset(wd->Frames.Data, 0, wd->Frames.size_in_bytes());
