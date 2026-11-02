@@ -1,10 +1,13 @@
 # Native desktop presentation repair candidate
 
-This candidate changes the native shell only. Project schemas, source authoring,
-history, import admission and saved content are unchanged. Source review and
-whitespace validation are complete; no compiler, CPU regression or native GPU
-execution has been performed for this candidate. A passing build is not visual
-acceptance and a successful exit is not a successful authoring workflow.
+This candidate changes native presentation and its bundled renderer integration.
+Project schemas, authoring authority, import admission and codecs are unchanged.
+This note preserves the initial design and subsequent counterexamples below.
+CPU tests and compilation now have recorded results; the earlier main-window
+Room08/UV workflow passed, while detached-window validation exposed additional
+ownership failures. The revised platform renderer has CPU proof and still
+requires native acceptance after host-stability review. A build or exit0 alone
+does not prove a successful authoring workflow or a repaired host crash.
 
 ## Changes and evidence
 
@@ -78,8 +81,8 @@ and ImGui's platform-window backend. Finite acquire/fence budgets cannot bound
 those APIs. The candidate does not claim to repair a persistent GPU deadlock,
 device-loss recovery, or all native stalls. Those paths require native traces;
 moving all renderer ownership to a dedicated thread would be a separate design
-change. Surface-format changes still use the existing backend pipeline path
-and require native acceptance. General performance, full-suite, other GPU and
+change. Main surface-format rebinding is described in the coordinator follow-up;
+native changed-format acceptance remains open. General performance, full-suite, other GPU and
 installed-product acceptance remain open. Rollback is the scoped candidate
 diff; do not reset canonical work or downgrade any saved project.
 
