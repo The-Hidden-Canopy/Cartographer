@@ -25,7 +25,7 @@ struct Trace {
     int acquisitions=0, waits=0, submissions=0, presents=0, records=0, violations=0;
     VkResult acquire_result=VK_SUCCESS;
     bool defer_fence_once=false,creating=false;
-    std::uint32_t allocated_commands=0;
+    std::uint32_t allocated_commands=0,image_count=3;
     std::uint64_t acquire_budget=0,wait_budget=0;
 };
 Trace* trace=nullptr;
@@ -75,7 +75,7 @@ VKAPI_ATTR VkResult VKAPI_CALL capabilities(VkPhysicalDevice,VkSurfaceKHR,VkSurf
     *p={};p->minImageCount=2;p->maxImageCount=3;p->currentExtent={16,16};p->supportedTransforms=VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;p->currentTransform=VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;p->supportedCompositeAlpha=VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;return VK_SUCCESS;
 }
 VKAPI_ATTR VkResult VKAPI_CALL create_swap(VkDevice,const VkSwapchainCreateInfoKHR*,const VkAllocationCallbacks*,VkSwapchainKHR* p){*p=handle<VkSwapchainKHR>(600);return VK_SUCCESS;}
-VKAPI_ATTR VkResult VKAPI_CALL images(VkDevice,VkSwapchainKHR,std::uint32_t* count,VkImage* p){*count=3;if(p)for(std::uint32_t i=0;i<3;++i)p[i]=handle<VkImage>(700+i);return VK_SUCCESS;}
+VKAPI_ATTR VkResult VKAPI_CALL images(VkDevice,VkSwapchainKHR,std::uint32_t* count,VkImage* p){*count=trace->image_count;if(p)for(std::uint32_t i=0;i<*count;++i)p[i]=handle<VkImage>(700+i);return VK_SUCCESS;}
 VKAPI_ATTR VkResult VKAPI_CALL create_pass(VkDevice,const VkRenderPassCreateInfo*,const VkAllocationCallbacks*,VkRenderPass* p){*p=handle<VkRenderPass>(800);return VK_SUCCESS;}
 VKAPI_ATTR VkResult VKAPI_CALL create_view(VkDevice,const VkImageViewCreateInfo*,const VkAllocationCallbacks*,VkImageView* p){*p=handle<VkImageView>(900);return VK_SUCCESS;}
 VKAPI_ATTR VkResult VKAPI_CALL create_framebuffer(VkDevice,const VkFramebufferCreateInfo*,const VkAllocationCallbacks*,VkFramebuffer* p){*p=handle<VkFramebuffer>(100);return VK_SUCCESS;}
@@ -88,6 +88,11 @@ VKAPI_ATTR void VKAPI_CALL barriers(VkCommandBuffer,VkPipelineStageFlags,VkPipel
 VKAPI_ATTR void VKAPI_CALL free_commands(VkDevice,VkCommandPool,std::uint32_t,const VkCommandBuffer*){}
 VKAPI_ATTR void VKAPI_CALL destroy_pool(VkDevice,VkCommandPool,const VkAllocationCallbacks*){}
 VKAPI_ATTR void VKAPI_CALL destroy_fence(VkDevice,VkFence,const VkAllocationCallbacks*){}
+VKAPI_ATTR void VKAPI_CALL destroy_view(VkDevice,VkImageView,const VkAllocationCallbacks*){}
+VKAPI_ATTR void VKAPI_CALL destroy_framebuffer(VkDevice,VkFramebuffer,const VkAllocationCallbacks*){}
+VKAPI_ATTR void VKAPI_CALL destroy_semaphore(VkDevice,VkSemaphore,const VkAllocationCallbacks*){}
+VKAPI_ATTR void VKAPI_CALL destroy_pass(VkDevice,VkRenderPass,const VkAllocationCallbacks*){}
+VKAPI_ATTR void VKAPI_CALL destroy_swap(VkDevice,VkSwapchainKHR,const VkAllocationCallbacks*){}
 struct Fixture {
     Trace log;
     ImGui_ImplVulkan_Data backend;
@@ -113,6 +118,9 @@ struct Fixture {
         f.pfn_vkCreateFence=create_fence;f.pfn_vkCreateSemaphore=create_semaphore;f.pfn_vkGetDeviceQueue=queue;
         f.pfn_vkCmdPipelineBarrier=barriers;f.pfn_vkFreeCommandBuffers=free_commands;
         f.pfn_vkDestroyCommandPool=destroy_pool;f.pfn_vkDestroyFence=destroy_fence;
+        f.pfn_vkDestroyImageView=destroy_view;f.pfn_vkDestroyFramebuffer=destroy_framebuffer;
+        f.pfn_vkDestroySemaphore=destroy_semaphore;f.pfn_vkDestroyRenderPass=destroy_pass;
+        f.pfn_vkDestroySwapchainKHR=destroy_swap;
         data.WindowOwned=true;auto& w=data.Window;
         w.ImageCount=3;w.SemaphoreCount=4;w.Frames.resize(3);w.FrameSemaphores.resize(4);
         for(std::uint32_t i=0;i<3;++i){w.Frames[i]={};w.Frames[i].Framebuffer=handle<VkFramebuffer>(100+i);w.Frames[i].CommandBuffer=handle<VkCommandBuffer>(200+i);}
@@ -129,6 +137,15 @@ void creation_ownership(){
     ImGui_ImplVulkanH_CreateOrResizeWindow(VK_NULL_HANDLE,handle<VkPhysicalDevice>(2),handle<VkDevice>(3),&window,0,nullptr,16,16,2,VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     require(window.ImageCount==3,"platform swapchain happy-path setup did not complete");
     require(f.log.violations==0&&f.log.submissions==0,"platform creation transitioned or submitted never-acquired swapchain images");
+}
+void shrinking_swapchain(){
+    Fixture f;f.log.creating=true;ImGui_ImplVulkanH_Window window;
+    window.Surface=handle<VkSurfaceKHR>(1);window.SurfaceFormat={VK_FORMAT_B8G8R8A8_UNORM,VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};window.PresentMode=VK_PRESENT_MODE_FIFO_KHR;
+    const auto recreate=[&]{ImGui_ImplVulkanH_CreateOrResizeWindow(VK_NULL_HANDLE,handle<VkPhysicalDevice>(2),handle<VkDevice>(3),&window,0,nullptr,16,16,2,VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);};
+    recreate();window.FrameIndex=2;window.SemaphoreIndex=3;f.log.image_count=2;recreate();
+    require(window.ImageCount==2&&window.SemaphoreCount==3,"mocked 3-to-2 swapchain recreation did not complete");
+    require(window.FrameIndex==0&&window.SemaphoreIndex==0,"platform swapchain retained stale image/semaphore cursors after shrinking");
+    require(f.log.violations==0&&f.log.submissions==0,"platform recreation accessed unacquired images");
 }
 void irregular_images(){
     Fixture f;for(std::size_t i=0;i<f.log.images.size();++i)f.frame();
@@ -160,7 +177,7 @@ void upload_ring(){
 }
 int main(){
     int failed=0;
-    for(auto [name,test]:std::vector<std::pair<const char*,void(*)()>>{{"creation ownership",creation_ownership},{"irregular image ownership",irregular_images},{"acquire timeout",acquire_timeout},{"deferred image fence",deferred_image_fence},{"failed acquisition",failed_acquire},{"per-image upload ring",upload_ring}}){
+    for(auto [name,test]:std::vector<std::pair<const char*,void(*)()>>{{"shrinking swapchain",shrinking_swapchain},{"creation ownership",creation_ownership},{"irregular image ownership",irregular_images},{"acquire timeout",acquire_timeout},{"deferred image fence",deferred_image_fence},{"failed acquisition",failed_acquire},{"per-image upload ring",upload_ring}}){
         try{test();std::cout<<"PASS "<<name<<'\n';}catch(const std::exception& e){++failed;std::cerr<<"FAIL "<<name<<": "<<e.what()<<'\n';}
     }
     return failed?1:0;
