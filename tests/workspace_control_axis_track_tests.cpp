@@ -1,6 +1,7 @@
 #include <carto/workspace/store.hpp>
 
 #include <cstdlib>
+#include <chrono>
 #include <iostream>
 #include <span>
 #include <string>
@@ -62,6 +63,9 @@ workspace::ControlAxisTrack track() {
 }
 
 int main() {
+    const auto diagnostic_start = std::chrono::steady_clock::now();
+    const auto elapsed = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - diagnostic_start).count(); };
+    std::cerr << "DIAGNOSTIC axis-track start\n";
     workspace::CharacterSourceStore store;
     auto bundle = fixture();
     bundle.control_axis_tracks.push_back(track());
@@ -144,10 +148,13 @@ int main() {
         item.curve_digest = item.curve.canonical_digest().value();
         large.control_axis_tracks.push_back(std::move(item));
     }
+    std::cerr << "DIAGNOSTIC large fixture ready seconds=" << elapsed() << "\n";
     require(static_cast<bool>(large.validate()), "large bundle is individually bounded");
+    std::cerr << "DIAGNOSTIC large fixture validated seconds=" << elapsed() << "\n";
     workspace::CharacterSourceStore bounded;
     bool refused = false;
     for (std::uint64_t id = 1; id <= 12; ++id) {
+        std::cerr << "DIAGNOSTIC aggregate insert=" << id << " seconds=" << elapsed() << "\n";
         large.definition.id = character::CharacterId{id};
         const auto before = bounded.size();
         const auto before_digest = bounded.canonical_digest().value();
@@ -158,6 +165,7 @@ int main() {
             break;
         }
     }
+    std::cerr << "DIAGNOSTIC aggregate refused=" << refused << " characters=" << bounded.size() << " seconds=" << elapsed() << "\n";
     require(refused && bounded.serialize().size() <= workspace::CharacterSourceStore::kMaxSerializedBytes &&
         static_cast<bool>(workspace::CharacterSourceStore::deserialize(bounded.serialize())),
         "combined escaped store size is bounded and remains readable");

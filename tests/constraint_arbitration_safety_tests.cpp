@@ -294,6 +294,8 @@ void references_and_final_contact_evidence() {
     composed.blend_targets[{2}] = turn; composed.blend_weights[{2}] = 1;
     composed.blend_targets[{3}] = turn; composed.blend_weights[{3}] = 1;
     const auto shortest = pose::evaluate_constraints(shortest_rotation, graph, composed);
+    if (!shortest) std::cerr << "DIAGNOSTIC shortest: " << shortest.error().message << "\n";
+    else std::cerr << "DIAGNOSTIC shortest residual=" << shortest.value().outcomes.at({1}).residual << "\n";
     require(shortest && near(shortest.value().outcomes.at({1}).residual, 2 * std::acos(-1.0) / 3) &&
         !shortest.value().outcomes.at({1}).converged,
         "final 240-degree composition reports its shortest 120-degree residual");

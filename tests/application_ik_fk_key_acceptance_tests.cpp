@@ -90,6 +90,7 @@ int main() {
     }
     auto graph = character::prepare_accepted_autorig_graph(
         mesh, request.analysis, request.candidates, request.acceptance, request.nodes);
+    if (!graph) std::cerr << "DIAGNOSTIC graph: " << graph.error().message << "\n";
     require(static_cast<bool>(graph), "prepare graph");
     request.rig.id = character::RigId{7};
     request.rig.kinematic_graph_digest = graph.value().graph_digest;

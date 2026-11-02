@@ -242,6 +242,10 @@ int main() {
     const auto before_blocked = session.snapshot();
     const auto blocked = store(draft);
     const auto after_blocked = session.snapshot();
+    std::cerr << "DIAGNOSTIC blocked=" << static_cast<bool>(blocked) << " message=" << (blocked ? "success" : blocked.error().message)
+        << " before_revision=" << before_blocked.project_revision.value() << " after_revision=" << after_blocked.project_revision.value()
+        << " before_undo=" << before_blocked.undo_count << " after_undo=" << after_blocked.undo_count
+        << " before_redo=" << before_blocked.redo_count << " after_redo=" << after_blocked.redo_count << " draft_present=" << static_cast<bool>(read()) << "\n";
     require(!blocked && blocked.error().message.find("rolled back") != std::string::npos &&
         before_blocked.project_revision == after_blocked.project_revision &&
         before_blocked.undo_count == after_blocked.undo_count &&
