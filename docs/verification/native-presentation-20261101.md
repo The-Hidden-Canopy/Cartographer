@@ -118,3 +118,18 @@ The local backend patch removes the invalid creation-time transition submission,
 This repair still requires a bounded native detached-window replay after host stability review. CPU success is not GPU acceptance or proof of reboot causality. Maintenance1 presentation retirement, platform format changes, repeated texture replacement, Release performance, dirty close and invalid-adapter native cases remain separate gates.
 
 A seventh actual-helper CPU counterexample recreated a three-image swapchain as two images and exposed a stale acquisition semaphore cursor outside the new array. Resetting both image/semaphore cursors when the arrays are recreated repairs this additional RED; the prior six cases remain required. This is CPU ownership coverage, not a claim of a native surface image-count change.
+
+## Retained acquisition during platform resize — source follow-on
+
+The platform resize callback previously recreated its swapchain and cleared
+the acquired-image state immediately, even when a finite image-fence wait had
+deferred an already successful acquire. The source follow-on marks recreation
+pending instead. A successful outstanding submission is still presented when
+resize is pending, and a minimized viewport with no retained image waits for a
+nonzero size before recreating or acquiring. The actual-backend injected Vulkan
+fixture now includes resize during a deferred acquire, minimize during a
+deferred acquire, and minimize/restore without one. These new cases are authored
+but **not compiled or run**; the prior seven CPU cases belong to 2f8ac2c.
+Device-idle retirement and true presentation-engine lifetime proof, the
+host-stability hold, live resize, close/reopen and native performance remain
+separate open gates.

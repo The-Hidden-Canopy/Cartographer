@@ -2150,15 +2150,16 @@ static void ImGui_ImplVulkan_DestroyWindow(ImGuiViewport* viewport)
 
 static void ImGui_ImplVulkan_SetWindowSize(ImGuiViewport* viewport, ImVec2 size)
 {
-    ImGui_ImplVulkan_Data* bd = ImGui_ImplVulkan_GetBackendData();
     ImGui_ImplVulkan_ViewportData* vd = (ImGui_ImplVulkan_ViewportData*)viewport->RendererUserData;
     if (vd == nullptr) // This is nullptr for the main viewport (which is left to the user/app to handle)
         return;
-    ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
     ImGui_ImplVulkanH_Window* wd = &vd->Window;
     wd->AttachmentDesc.loadOp = (viewport->Flags & ImGuiViewportFlags_NoRendererClear) ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_CLEAR;
-    ImGui_ImplVulkanH_CreateOrResizeWindow(v->Instance, v->PhysicalDevice, v->Device, &vd->Window, v->QueueFamily, v->Allocator, (int)size.x, (int)size.y, v->MinImageCount, v->PipelineInfoForViewports.SwapChainImageUsage);
-    vd->FrameAcquired = vd->FrameReady = false;
+    // A previously acquired image and its binary semaphore remain owned when
+    // the render fence times out. Let RenderWindow consume that acquisition
+    // before recreating the swapchain, including across minimize/restore.
+    IM_UNUSED(size);
+    vd->SwapChainNeedRebuild = true;
 }
 
 static void ImGui_ImplVulkan_RenderWindow(ImGuiViewport* viewport, void*)
@@ -2172,6 +2173,10 @@ static void ImGui_ImplVulkan_RenderWindow(ImGuiViewport* viewport, void*)
     VkResult err;
 
     vd->FrameReady = false;
+    // With no retained acquisition, wait for a nonzero surface before any
+    // recreation or acquire. A retained acquisition still needs consumption.
+    if (!vd->FrameAcquired && (viewport->Size.x <= 0.0f || viewport->Size.y <= 0.0f))
+        return;
     if (!vd->FrameAcquired && (vd->SwapChainNeedRebuild || vd->SwapChainSuboptimal))
     {
         ImGui_ImplVulkanH_CreateOrResizeWindow(v->Instance, v->PhysicalDevice, v->Device, wd, v->QueueFamily, v->Allocator, (int)viewport->Size.x, (int)viewport->Size.y, v->MinImageCount, v->PipelineInfoForViewports.SwapChainImageUsage);
@@ -2329,8 +2334,10 @@ static void ImGui_ImplVulkan_SwapBuffers(ImGuiViewport* viewport, void*)
     ImGui_ImplVulkanH_Window* wd = &vd->Window;
     ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
 
-    if (!vd->FrameReady || vd->SwapChainNeedRebuild)
+    if (!vd->FrameReady)
         return; // No successful submission owns a presentable image yet.
+    // Even if a resize arrived, this successful submit must be presented so
+    // its binary wait is consumed before the old swapchain is retired.
     vd->FrameReady = vd->FrameAcquired = false;
 
     VkResult err;

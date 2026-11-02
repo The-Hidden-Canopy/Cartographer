@@ -984,6 +984,7 @@ if(CARTO_ENABLE_D3D12)
     target_link_libraries(cartographer_web_geometry_overlay_d3d12_tests
         PRIVATE
             carto_d3d12
+            carto_render
             carto_device
             carto_device_ir
             carto_gpu
@@ -1987,6 +1988,14 @@ if(TARGET carto_imgui)
         COMMAND cartographer_imgui_platform_presentation_tests)
     set_tests_properties(cartographer_imgui_platform_presentation_tests PROPERTIES TIMEOUT 20)
 endif()
+
+add_executable(cartographer_visual_baseline_tests visual_baseline_tests.cpp)
+target_link_libraries(cartographer_visual_baseline_tests PRIVATE carto_render)
+target_compile_definitions(cartographer_visual_baseline_tests
+    PRIVATE CARTO_VISUAL_BASELINE_DIR="${CMAKE_CURRENT_LIST_DIR}/visual_baselines")
+carto_target(cartographer_visual_baseline_tests)
+add_test(NAME cartographer_visual_baseline_tests COMMAND cartographer_visual_baseline_tests)
+set_tests_properties(cartographer_visual_baseline_tests PROPERTIES TIMEOUT 30)
 
 get_property(CARTO_REGISTERED_TESTS DIRECTORY PROPERTY TESTS)
 set(CARTO_TEST_TEMP_INDEX 0)

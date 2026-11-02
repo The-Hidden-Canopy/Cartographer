@@ -4,6 +4,7 @@
 #include <carto/web_geometry/compiler.hpp>
 #include <carto/web_geometry/overlay.hpp>
 #include <carto/web_geometry/package.hpp>
+#include <carto/render/visual_baseline.hpp>
 
 #include <algorithm>
 #include <array>
@@ -16,6 +17,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -40,45 +42,33 @@ constexpr std::uint32_t kCaptureHeight = 96U;
 constexpr std::uint8_t kMaxChannelDelta = 1U;
 constexpr std::size_t kMaxChangedPixels = 24U;
 
-std::string baseline_metadata(const carto::device::DeviceIdentity& identity) {
+carto::render::visual::BaselineSpec baseline_spec(const carto::device::DeviceIdentity& identity) {
     REQUIRE(identity.backend == carto::device::BackendKind::d3d12);
-    std::ostringstream output;
-    output << "format=carto-visual-baseline-v1\n"
-           << "fixture=web-geometry-overlay-clusters\n"
-           << "backend=d3d12\n"
-           << "adapter_name=" << identity.adapter_name << '\n'
-           << "vendor_id=" << identity.vendor_id << '\n'
-           << "device_id=" << identity.device_id << '\n'
-           << "feature_level=" << identity.feature_level << '\n'
-           << "driver_label=" << identity.driver << '\n'
-           << "dimensions=" << kCaptureWidth << 'x' << kCaptureHeight << '\n'
-           << "pixel_encoding=rgb8-channel-round-nearest\n"
-           << "max_channel_delta=" << static_cast<unsigned>(kMaxChannelDelta) << '\n'
-           << "max_changed_pixels=" << kMaxChangedPixels << '\n';
-    return output.str();
+    return {"web-geometry-overlay-clusters", "d3d12", identity.adapter_name,
+        identity.vendor_id, identity.device_id, identity.feature_level, identity.driver,
+        kCaptureWidth, kCaptureHeight, kMaxChannelDelta, kMaxChangedPixels};
+}
+
+std::string baseline_metadata(const carto::device::DeviceIdentity& identity) {
+    return carto::render::visual::metadata_v1(baseline_spec(identity));
 }
 
 bool baseline_platform_matches(
     std::string_view metadata,
     const carto::device::DeviceIdentity& identity) {
-    return metadata == baseline_metadata(identity);
+    return carto::render::visual::metadata_matches_v1(metadata, baseline_metadata(identity));
 }
 
 std::size_t changed_pixel_count(
     std::span<const std::uint8_t> actual,
     std::span<const std::uint8_t> expected) {
     REQUIRE(actual.size() == expected.size() && actual.size() % 3U == 0U);
-    std::size_t changed_pixels = 0U;
-    for (std::size_t pixel = 0U; pixel < actual.size(); pixel += 3U) {
-        bool changed = false;
-        for (std::size_t channel = 0U; channel < 3U; ++channel) {
-            const int delta = std::abs(static_cast<int>(actual[pixel + channel]) -
-                                       static_cast<int>(expected[pixel + channel]));
-            changed = changed || delta > kMaxChannelDelta;
-        }
-        if (changed) ++changed_pixels;
-    }
-    return changed_pixels;
+    REQUIRE(actual.size() / 3U <= std::numeric_limits<std::uint32_t>::max());
+    const auto diff = carto::render::visual::compare_rgb8(actual, expected,
+        static_cast<std::uint32_t>(actual.size() / 3U), 1U,
+        kMaxChannelDelta, actual.size() / 3U);
+    REQUIRE(diff.has_value());
+    return diff->changed_pixels;
 }
 
 void baseline_comparison_rejects_platform_and_pixel_drift() {
@@ -235,12 +225,11 @@ std::size_t compare_with_baseline(
     REQUIRE(metadata.good());
     const std::string actual_metadata{
         std::istreambuf_iterator<char>{metadata}, std::istreambuf_iterator<char>{}};
-    REQUIRE(baseline_platform_matches(actual_metadata, identity));
     const auto expected = read_baseline_image();
-    REQUIRE(expected.size() == actual.size());
-    const std::size_t changed_pixels = changed_pixel_count(actual, expected);
-    REQUIRE(changed_pixels <= kMaxChangedPixels);
-    return changed_pixels;
+    const auto result = carto::render::visual::compare_baseline(baseline_spec(identity),
+        actual_metadata, actual, expected, static_cast<std::size_t>(kCaptureWidth) * kCaptureHeight);
+    REQUIRE(result.status == carto::render::visual::ComparisonStatus::match);
+    return result.pixels.changed_pixels;
 }
 
 template <typename T>
