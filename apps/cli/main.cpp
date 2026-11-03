@@ -7699,7 +7699,7 @@ template <typename Schedule, typename BaseRecipe, typename ArtifactFor,
     typename PublishArtifact, typename ReadArtifact, typename ValidateArtifact>
 int publish_d3d12_tile_schedule(
     const std::filesystem::path& project_path,
-    const project::ProjectDocument& original_document,
+    const carto::project::ProjectDocument& original_document,
     std::uint64_t source_asset,
     std::uint64_t target_asset,
     const BaseRecipe& base_recipe,
@@ -8453,7 +8453,7 @@ int bake_tangent_normal_map_tiles_d3d12(char** argv) {
         },
         [](const production::BakeRecipe& recipe, std::string_view profile) {
             return production::bake_production_cook_key(
-                recipe, production::BakeNormalSpace::tangent, profile);
+                recipe, production::BakeNormalSpace::tangent, std::string(profile));
         },
         [](production::ProductionArtifactStore& store,
             production::ProductionArtifactReceipt receipt,
@@ -8474,7 +8474,7 @@ int bake_tangent_normal_map_tiles_d3d12(char** argv) {
             std::string_view profile) {
             return production::read_normal_map(
                 store, recipe, production::BakeNormalSpace::tangent,
-                current_source, current_target, policy, profile);
+                current_source, current_target, policy, std::string(profile));
         },
         [](const production::BakeRecipe& recipe,
             const geometry::EditableMesh& current_source,
@@ -8593,7 +8593,7 @@ int bake_ambient_occlusion_tiles_d3d12(char** argv) {
         },
         [](const production::AmbientOcclusionRecipe& recipe,
             std::string_view profile) {
-            return production::bake_ambient_occlusion_cook_key(recipe, profile);
+            return production::bake_ambient_occlusion_cook_key(recipe, std::string(profile));
         },
         [](production::ProductionArtifactStore& store,
             production::ProductionArtifactReceipt receipt,
@@ -8613,7 +8613,7 @@ int bake_ambient_occlusion_tiles_d3d12(char** argv) {
             const production::AdmissionPolicy& policy,
             std::string_view profile) {
             return production::read_ambient_occlusion_map(
-                store, recipe, current_source, current_target, policy, profile);
+                store, recipe, current_source, current_target, policy, std::string(profile));
         },
         [](const production::AmbientOcclusionRecipe& recipe,
             const geometry::EditableMesh& current_source,
@@ -8734,7 +8734,7 @@ int bake_bent_normal_tiles_d3d12(char** argv) {
         },
         [](const production::AmbientOcclusionRecipe& recipe,
             std::string_view profile) {
-            return production::bake_bent_normal_cook_key(recipe, profile);
+            return production::bake_bent_normal_cook_key(recipe, std::string(profile));
         },
         [](production::ProductionArtifactStore& store,
             production::ProductionArtifactReceipt receipt,
@@ -8754,7 +8754,7 @@ int bake_bent_normal_tiles_d3d12(char** argv) {
             const production::AdmissionPolicy& policy,
             std::string_view profile) {
             return production::read_bent_normal_map(
-                store, recipe, current_source, current_target, policy, profile);
+                store, recipe, current_source, current_target, policy, std::string(profile));
         },
         [](const production::AmbientOcclusionRecipe& recipe,
             const geometry::EditableMesh& current_source,
