@@ -538,6 +538,10 @@ void material_export_locale_pressure(const std::filesystem::path& root) {
     static_cast<void>(exported(scene, root, "locale"));
     const auto gltf = root / "locale.gltf", glb = root / "locale.glb";
     const auto before_gltf = read(gltf), before_glb = read(glb);
+    const auto before_catalog = scene.doc.material_catalog().serialize();
+    std::string during_source, during_catalog;
+    bool project_decoded = false, catalog_decoded = false;
+
     struct RestoreLocale {
         std::locale previous;
         ~RestoreLocale() { std::locale::global(previous); }
@@ -545,9 +549,25 @@ void material_export_locale_pressure(const std::filesystem::path& root) {
     {
         RestoreLocale restore;
         std::locale::global(std::locale(restore.previous, new CommaGroupedNumbers));
+        during_source = scene.doc.serialize();
+        during_catalog = scene.doc.material_catalog().serialize();
+        project_decoded = static_cast<bool>(project::ProjectDocument::deserialize(before_source));
+        catalog_decoded = static_cast<bool>(project::MaterialCatalog::deserialize(before_catalog));
+
         static_cast<void>(take(io::export_gltf(scene.doc, gltf)));
         static_cast<void>(take(io::export_glb(scene.doc, glb)));
     }
+    { std::ofstream out(root / "canonical-before.carto", std::ios::binary); out << before_source; }
+    { std::ofstream out(root / "canonical-during.carto", std::ios::binary); out << during_source; }
+    { std::ofstream out(root / "catalog-before.carto-material", std::ios::binary); out << before_catalog; }
+    { std::ofstream out(root / "catalog-during.carto-material", std::ios::binary); out << during_catalog; }
+    std::cerr << "CANONICAL_LOCALE project_equal=" << (during_source == before_source)
+              << " catalog_equal=" << (during_catalog == before_catalog)
+              << " project_decode=" << project_decoded << " catalog_decode=" << catalog_decoded << '\n';
+    check(during_source == before_source && during_catalog == before_catalog,
+          "canonical project and material bytes must not depend on numeric locale");
+    check(project_decoded && catalog_decoded,
+          "canonical project and material bytes must decode under non-default numeric locale");
     check(read(gltf) == before_gltf && read(glb) == before_glb,
           "glTF/GLB bytes must preserve transforms and material factors under comma/grouped numeric locale");
     check(scene.doc.serialize() == before_source, "locale export does not mutate source");
