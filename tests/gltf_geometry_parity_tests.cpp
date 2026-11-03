@@ -343,14 +343,103 @@ project::MaterialCatalog scalar_catalog(std::uint64_t mesh, bool two_regions = f
     return catalog;
 }
 
-geometry::EditableMesh material_mesh(bool two_regions = false) {
+geometry::EditableMesh material_mesh(bool two_regions = false, bool condition = false, bool reverse = false) {
     auto mesh = fixture();
     auto attrs = mesh.attributes();
-    okay(attrs.add_layer({{"cartographer.material_slot", attributes::AttributeDomain::face,
-                           attributes::AttributeType::uint32},
-                          {std::uint32_t{7}, std::uint32_t{two_regions ? 8U : 7U}}}));
+    okay(attrs.add_layer({{condition ? "condition.material_region" : "cartographer.material_slot",
+                           attributes::AttributeDomain::face, attributes::AttributeType::uint32},
+                          {std::uint32_t{reverse && two_regions ? 8U : 7U},
+                           std::uint32_t{two_regions && !reverse ? 8U : 7U}}}));
     okay(mesh.set_attribute_payload(std::move(attrs), mesh.uv_sets()));
     return mesh;
+}
+
+
+Scene region_limit_scene(const std::filesystem::path& root, std::size_t count) {
+    geometry::EditableMesh mesh;
+    std::vector<geometry::Vertex> vertices;
+    std::vector<geometry::Face> faces;
+    auto layer = *material_mesh().attributes().find("cartographer.material_slot");
+    layer.values.clear();
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::uint64_t v = i * 3U + 1U;
+        const double x = static_cast<double>(i * 2U);
+        vertices.push_back({{v}, {x, 0, 0}});
+        vertices.push_back({{v + 1U}, {x + 1, 0, 0}});
+        vertices.push_back({{v + 2U}, {x, 1, 0}});
+        faces.push_back({{i + 1U}, {{v}, {v + 1U}, {v + 2U}}});
+        layer.values.push_back(static_cast<std::uint32_t>(1000U + i));
+    }
+    okay(mesh.insert_bulk(std::move(vertices), std::move(faces)));
+    attributes::AttributeSet attrs({{attributes::AttributeDomain::face, count}});
+    okay(attrs.add_layer(std::move(layer)));
+    okay(mesh.set_attribute_payload(std::move(attrs), {}));
+    auto scene = make_scene(mesh, root);
+    project::MaterialCatalog catalog;
+    render::MaterialAsset material;
+    material.id = 71U; material.name = "Shared bounded material";
+    material.revision = core::Revision{1U};
+    okay(catalog.insert_material(std::move(material)));
+    for (std::size_t i = 0; i < count; ++i)
+        okay(catalog.insert_assignment({{scene.mesh, static_cast<std::uint32_t>(1000U + i)},
+                                        71U, std::nullopt}));
+    set_export_catalog(scene, std::move(catalog), root / "materials.log");
+    return scene;
+}
+
+void region_limit_pressure(const std::filesystem::path& root) {
+    const auto accepted_root = root / "accepted";
+    std::filesystem::create_directory(accepted_root);
+    auto accepted = region_limit_scene(accepted_root, 128U);
+    const auto payload = exported(accepted, accepted_root, "limit");
+    const auto primitives = array(member(array(member(payload.json, "meshes")).at(0), "primitives"));
+    check(primitives.size() == 128U, "128 assigned regions remain distinct even with one material");
+    for (std::size_t i = 0; i < primitives.size(); ++i) {
+        const auto extras = member(primitives[i], "extras");
+        const auto faces = array(member(extras, "cartographer_triangle_faces"));
+        check(number(member(primitives[i], "material")) == 0U &&
+                  number(member(extras, "cartographer_material_region")) == 1000U + i &&
+                  faces.size() == 1U && number(faces[0]) == i + 1U,
+              "region limit preserves exact material, region and source-face correspondence");
+    }
+    const auto rejected_root = root / "rejected";
+    std::filesystem::create_directory(rejected_root);
+    auto rejected = region_limit_scene(rejected_root, 129U);
+    const auto before_source = rejected.doc.serialize();
+    for (const auto ext : {".gltf", ".glb"}) {
+        const auto target = accepted_root / (std::string("limit") + ext);
+        const auto before = read(target);
+        const auto result = std::string_view(ext) == ".gltf" ?
+            io::export_gltf(rejected.doc, target) : io::export_glb(rejected.doc, target);
+        check(!result && result.error().message.find("128-region") != std::string::npos &&
+                  read(target) == before && rejected.doc.serialize() == before_source,
+              "129 regions refuse for the bound and preserve prior output and source");
+    }
+}
+
+void polygon_region_export(const std::filesystem::path& root) {
+    geometry::EditableMesh mesh;
+    okay(mesh.insert_bulk({{{1}, {0, 0, 0}}, {{2}, {1, 0, 0}}, {{3}, {1, 1, 0}},
+                           {{4}, {0, 1, 0}}, {{5}, {2, 0, 0}}},
+                          {{{1}, {{1}, {2}, {3}, {4}}}, {{2}, {{2}, {5}, {3}}}}));
+    attributes::AttributeSet attrs({{attributes::AttributeDomain::face, 2}});
+    okay(attrs.add_layer({{"condition.material_region", attributes::AttributeDomain::face,
+                           attributes::AttributeType::uint32},
+                          {std::uint32_t{8U}, std::uint32_t{7U}}}));
+    okay(mesh.set_attribute_payload(std::move(attrs), {}));
+    auto scene = make_scene(mesh, root);
+    set_export_catalog(scene, scalar_catalog(scene.mesh, true), root / "material.log");
+    const auto payload = exported(scene, root, "polygon");
+    const auto primitives = array(member(array(member(payload.json, "meshes")).at(0), "primitives"));
+    check(primitives.size() == 2U, "same material on different regions remains partitioned");
+    const auto first_faces = array(member(member(primitives[0], "extras"), "cartographer_triangle_faces"));
+    const auto second_faces = array(member(member(primitives[1], "extras"), "cartographer_triangle_faces"));
+    check(first_faces.size() == 1U && number(first_faces[0]) == 2U && second_faces.size() == 2U &&
+              number(second_faces[0]) == 1U && number(second_faces[1]) == 1U,
+          "triangulation records the actual source face for each output triangle");
+    check(payload.accessor(number(member(primitives[0], "indices"))).size() == 3U &&
+              payload.accessor(number(member(primitives[1], "indices"))).size() == 6U,
+          "region index accessors cover each source triangle exactly once");
 }
 
 void constant_material_export_roundtrip(const std::filesystem::path& root) {
@@ -494,6 +583,12 @@ int main(int argc, char** argv) {
         const auto locale_root = root / "locale-pressure";
         std::filesystem::create_directory(locale_root);
         material_export_locale_pressure(locale_root);
+        const auto polygon_root = root / "polygon-regions";
+        std::filesystem::create_directory(polygon_root);
+        polygon_region_export(polygon_root);
+        const auto limit_root = root / "region-limit";
+        std::filesystem::create_directory(limit_root);
+        region_limit_pressure(limit_root);
         auto mesh = fixture();
         auto s = make_scene(mesh, root);
         auto p = exported(s, root, "baseline");
@@ -608,16 +703,82 @@ int main(int argc, char** argv) {
               "authored material loss is refused without replacing prior glTF");
         const auto multi_root = root / "multi-region-material";
         std::filesystem::create_directory(multi_root);
-        auto multi = make_scene(material_mesh(true), multi_root);
-        set_export_catalog(multi, scalar_catalog(multi.mesh, true), multi_root / "material.log");
+        auto multi = make_scene(material_mesh(true, true, true), multi_root);
+        auto multi_catalog = scalar_catalog(multi.mesh);
+        render::MaterialAsset second;
+        second.id = 72U; second.name = "Second region"; second.revision = core::Revision{1U};
+        second.definition.base_color_factor = {0.1, 0.2, 0.3, 1.0};
+        okay(multi_catalog.insert_material(std::move(second)));
+        okay(multi_catalog.insert_assignment({{multi.mesh, 8U}, 72U, std::nullopt}));
+        set_export_catalog(multi, std::move(multi_catalog), multi_root / "material.log");
         const auto multi_source = multi.doc.serialize();
-        const auto multi_gltf = io::export_gltf(multi.doc, good);
-        check(!multi_gltf && multi_gltf.error().message.find("one nonzero material region") != std::string::npos &&
-                  read(good) == before && multi.doc.serialize() == multi_source,
-              "multi-region material refuses without changing source or replacing glTF");
-        const auto multi_glb = io::export_glb(multi.doc, good_glb);
-        check(!multi_glb && read(good_glb) == glb_before && multi.doc.serialize() == multi_source,
-              "multi-region material refuses without replacing GLB");
+        const auto multi_payload = exported(multi, multi_root, "multi");
+        const Payload multi_binary(multi_root / "multi.glb");
+        const auto primitives = array(member(array(member(multi_payload.json, "meshes")).at(0), "primitives"));
+        const auto binary_primitives = array(member(array(member(multi_binary.json, "meshes")).at(0), "primitives"));
+        check(primitives.size() == 2U && binary_primitives.size() == 2U,
+              "both containers preserve two material regions as primitives");
+        for (std::size_t i = 0; i < primitives.size(); ++i) {
+            const auto extras = member(primitives[i], "extras");
+            const auto binary_extras = member(binary_primitives[i], "extras");
+            check(number(member(primitives[i], "material")) == i &&
+                      number(member(extras, "cartographer_material_region")) == i + 7U &&
+                      take(core::json::decode_string(member(extras, "cartographer_material_region_layer"))) ==
+                          "condition.material_region" &&
+                      number(member(extras, "cartographer_mesh_revision")) ==
+                          multi.doc.meshes().at(multi.mesh).revision().value() &&
+                      number(array(member(extras, "cartographer_triangle_faces")).at(0)) == 2U - i,
+                  "primitive retains its material, region and producer triangle-face identity");
+            check(member(primitives[i], "material") == member(binary_primitives[i], "material") &&
+                      extras == binary_extras &&
+                      multi_payload.accessor(number(member(primitives[i], "indices"))) ==
+                          multi_binary.accessor(number(member(binary_primitives[i], "indices"))),
+                  "GLB and glTF agree on every region and its indices");
+        }
+        check(array(member(member(member(primitives[0], "extras"), "condition_material_region"), "faces")).size() == 2U,
+              "first primitive retains the legacy CONDITION full face table");
+        const auto profile = member(member(multi_payload.json, "extras"), "cartographer");
+        check(number(member(profile, "material_regions_version")) == 1U &&
+                  take(core::json::decode_string(member(profile, "canonical_project_sha256"))) ==
+                  assets::sha256({reinterpret_cast<const std::uint8_t*>(multi_source.data()),
+                                  multi_source.size()}).hex(),
+              "export binds canonical source serialization digest");
+        check(number(member(profile, "project_schema")) == multi.doc.schema_version() &&
+                  number(member(profile, "project_revision")) == multi.doc.revision().value(),
+              "identity metadata describes the actual canonical serialization schema and revision");
+        for (const auto ext : {".gltf", ".glb"}) {
+            const auto bytes = read(multi_root / (std::string("multi") + ext));
+            const auto imported = take(io::import_gltf_scene({
+                reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()}));
+            check(imported.meshes.size() == 1U && imported.meshes[0].faces_sorted().size() == 2U &&
+                      imported.meshes[0].uv_sets().active_for_render() != nullptr &&
+                      imported.materials.catalog.assignments().contains({1U, 1U}) &&
+                      imported.materials.catalog.assignments().contains({1U, 2U}),
+                  "scene import preserves both remapped assignments and active UVs");
+            const auto* slots = imported.meshes[0].attributes().find("cartographer.material_slot");
+            check(slots != nullptr && slots->values.size() == 2U &&
+                      std::get<std::uint32_t>(slots->values[0]) == 1U &&
+                      std::get<std::uint32_t>(slots->values[1]) == 2U,
+                  "imported faces keep their distinct material assignments");
+        }
+        check(multi.doc.serialize() == multi_source, "multi-region export leaves source unchanged");
+        const auto saved_multi = multi_root / "multi-source.carto";
+        static_cast<void>(take(multi.doc.save_atomic(saved_multi)));
+        Scene reopened_multi{take(project::ProjectDocument::load(saved_multi)), multi.mesh};
+        const auto multi_reopened = exported(reopened_multi, multi_root, "multi-reopened");
+        check(multi_reopened.bytes == multi_payload.bytes && multi_reopened.json == multi_payload.json,
+              "multi-region project save/reopen retains derived data and metadata");
+        const auto partial_root = root / "partially-unassigned-material";
+        std::filesystem::create_directory(partial_root);
+        auto partial = make_scene(material_mesh(true), partial_root);
+        set_export_catalog(partial, scalar_catalog(partial.mesh), partial_root / "material.log");
+        const auto partial_source = partial.doc.serialize();
+        const auto partial_gltf = io::export_gltf(partial.doc, good);
+        check(!partial_gltf && read(good) == before && partial.doc.serialize() == partial_source,
+              "unassigned face region refuses without changing source or replacing glTF");
+        const auto partial_glb = io::export_glb(partial.doc, good_glb);
+        check(!partial_glb && read(good_glb) == glb_before && partial.doc.serialize() == partial_source,
+              "unassigned face region refuses without replacing GLB");
         const auto hdr_root = root / "out-of-range-material";
         std::filesystem::create_directory(hdr_root);
         auto hdr = make_scene(material_mesh(), hdr_root);
@@ -648,6 +809,9 @@ int main(int argc, char** argv) {
         const auto texture_result = io::export_gltf(textured.doc, good);
         check(!texture_result && read(good) == before && textured.doc.serialize() == texture_source_before,
               "textured material is refused without fake pixels, source mutation or file replacement");
+        check(!io::export_glb(textured.doc, good_glb) && read(good_glb) == glb_before &&
+                  textured.doc.serialize() == texture_source_before,
+              "textured GLB is refused without replacing the existing artifact");
         auto slotted = fixture();
         auto slot_attributes = slotted.attributes();
         okay(slot_attributes.add_layer({{"cartographer.material_slot", attributes::AttributeDomain::face,
