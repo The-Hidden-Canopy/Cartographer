@@ -1,4 +1,6 @@
 #include <carto/project/accepted_autorig.hpp>
+#include <carto/io/gltf_export.hpp>
+#include <fstream>
 #include <carto/project/transaction.hpp>
 #include <chrono>
 #include <algorithm>
@@ -75,6 +77,15 @@ int main() {
     weights::WeightTransferOptions opts; opts.output_layer_id = RigLayerId{2};
     opts.output_mesh_asset = 51; opts.output_mesh_digest = request.source.content_digest;
     const auto before = doc.serialize();
+    const auto gltf_path = path / "prior.gltf";
+    const auto glb_path = path / "prior.glb";
+    require(io::export_gltf(doc, gltf_path) && io::export_glb(doc, glb_path),
+            "pre-rig geometry can export through both actual writers");
+    const auto bytes_at = [](const std::filesystem::path& file) {
+        std::ifstream input(file, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(input), {});
+    };
+    const auto prior_gltf = bytes_at(gltf_path), prior_glb = bytes_at(glb_path);
     auto prepared_bundle = project::prepare_accepted_autorig_bundle(doc, request, set,
         acceptance.value(), nodes, rig, limits, source, layer, correspondence, {}, opts);
     require(static_cast<bool>(prepared_bundle) && doc.serialize() == before,
@@ -86,6 +97,25 @@ int main() {
     require(doc.accepted_autorigs().empty(), "staging leaves published document unchanged");
     require(static_cast<bool>(tx.value().commit("accept.autorig")), "journal commit");
     const auto entry = doc.accepted_autorigs().at("body");
+
+    require(doc.kinematic_graphs().empty() && !doc.accepted_autorigs().empty(),
+            "accepted bundle is independent of legacy kinematic graph records");
+    const auto source_before_export = doc.serialize();
+    const auto events_before_export = journal.read_all();
+    require(static_cast<bool>(events_before_export), "read journal before export refusal");
+    const auto refused_gltf = io::export_gltf(doc, gltf_path);
+    const auto refused_glb = io::export_glb(doc, glb_path);
+    require(!refused_gltf && !refused_glb,
+            "accepted autorig cannot silently flatten through the scalar glTF profile");
+    require(refused_gltf.error().message.find("rig") != std::string::npos &&
+            refused_glb.error().message.find("rig") != std::string::npos &&
+            bytes_at(gltf_path) == prior_gltf && bytes_at(glb_path) == prior_glb &&
+            doc.serialize() == source_before_export,
+            "rig refusal preserves both prior complete outputs and authoritative source");
+    const auto events_after_export = journal.read_all();
+    require(events_after_export && events_after_export.value().size() == events_before_export.value().size(),
+            "refused derived export cannot append a project domain event");
+
     require(entry.bytes == prepared_bundle.value(), "transaction uses the same prepared bundle");
     auto decoded = project::decode_accepted_autorig_bundle(entry.bytes);
     require(decoded && decoded.value().weights.output.binding.influences.size() == 3 &&
