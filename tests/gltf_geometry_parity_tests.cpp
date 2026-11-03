@@ -227,7 +227,8 @@ Scene make_scene(const geometry::EditableMesh &mesh, const std::filesystem::path
 void near(double a, double b, const char *message) {
     check(std::isfinite(a) && std::abs(a - b) < 2e-6, message);
 }
-Payload exported(const Scene &s, const std::filesystem::path &root, std::string name) {
+Payload exported(const Scene &s, const std::filesystem::path &root, std::string name,
+                 double expected_scale_x = -2.0) {
     const auto before = s.doc.serialize();
     const auto gltf = root / (name + ".gltf"), glb = root / (name + ".glb");
     auto a = take(io::export_gltf(s.doc, gltf));
@@ -251,7 +252,7 @@ Payload exported(const Scene &s, const std::filesystem::path &root, std::string 
         norm += std::stod(std::string(v)) * std::stod(std::string(v));
     near(norm, 1, "glTF quaternion normalized to authored rotation semantics");
     auto scale = array(member(node, "scale"));
-    near(std::stod(std::string(scale[0])), -2, "mirrored scale preserved");
+    near(std::stod(std::string(scale[0])), expected_scale_x, "authored scale sign preserved");
     near(std::stod(std::string(scale[1])), 3, "nonuniform scale preserved");
     return p;
 }
@@ -794,7 +795,7 @@ int main(int argc, char** argv) {
         check(positive_material.mesh == multi.mesh, "independent authored fixture uses matching local mesh keys");
         set_export_catalog(positive_material, multi.doc.material_catalog(), positive_material_root / "material.log");
         const auto positive_material_source = positive_material.doc.serialize();
-        const auto positive_material_payload = exported(positive_material, positive_material_root, "positive");
+        const auto positive_material_payload = exported(positive_material, positive_material_root, "positive", 2.0);
         check(array(member(array(member(positive_material_payload.json, "meshes")).at(0), "primitives")).size() == 2U,
               "separately authored positive-scale scene preserves both material regions");
         const auto positive_material_path = positive_material_root / "positive-source.carto";
