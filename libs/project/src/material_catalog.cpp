@@ -5,6 +5,7 @@
 #include <cmath>
 #include <filesystem>
 #include <iomanip>
+#include <locale>
 #include <limits>
 #include <span>
 #include <sstream>
@@ -891,6 +892,7 @@ core::Result<void> MaterialCatalog::validate() const {
 
 std::string MaterialCatalog::serialize() const {
     std::ostringstream output;
+    output.imbue(std::locale::classic());
     output << std::setprecision(std::numeric_limits<double>::max_digits10);
     output << kMagic << ' ' << kSchemaVersion << '\n';
     output << "TEXTURES " << textures_.size() << '\n';
@@ -988,6 +990,7 @@ core::Result<MaterialCatalog> MaterialCatalog::deserialize(std::string_view text
             "material catalog exceeds its serialized size limit"));
     }
     std::istringstream input{std::string(text)};
+    input.imbue(std::locale::classic());
     std::uint32_t version = 0U;
     if (!require_token(input, kMagic) || !read_unsigned(input, version)) {
         return core::Result<MaterialCatalog>::failure(parse_error(

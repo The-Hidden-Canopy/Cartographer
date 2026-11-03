@@ -5943,6 +5943,7 @@ void ProjectDocument::swap(ProjectDocument& other) noexcept {
 
 std::string ProjectDocument::serialize() const {
     std::ostringstream output;
+    output.imbue(std::locale::classic());
     output << kMagic << ' ' << kSchemaVersion << '\n';
     output << "AUTHORING " << std::quoted(std::string(kAuthoringFormat)) << ' '
            << std::quoted(std::string(kAuthoringUnits)) << ' '
@@ -6267,6 +6268,7 @@ core::Result<ProjectDocument> ProjectDocument::deserialize(std::string_view text
             "project text exceeds the Cartographer v1 size limit of 128 MiB"));
     }
     std::istringstream input{std::string(text)};
+    input.imbue(std::locale::classic());
     std::string magic;
     if (!(input >> magic) || magic != kMagic) {
         return core::Result<ProjectDocument>::failure(
