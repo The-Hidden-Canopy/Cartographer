@@ -788,6 +788,19 @@ int main(int argc, char** argv) {
         const auto multi_reopened = exported(reopened_multi, multi_root, "multi-reopened");
         check(multi_reopened.bytes == multi_payload.bytes && multi_reopened.json == multi_payload.json,
               "multi-region project save/reopen retains derived data and metadata");
+        const auto positive_material_root = root / "positive-material-regions";
+        std::filesystem::create_directory(positive_material_root);
+        auto positive_material = make_scene(material_mesh(true, true, true), positive_material_root, false);
+        check(positive_material.mesh == multi.mesh, "independent authored fixture uses matching local mesh keys");
+        set_export_catalog(positive_material, multi.doc.material_catalog(), positive_material_root / "material.log");
+        const auto positive_material_source = positive_material.doc.serialize();
+        const auto positive_material_payload = exported(positive_material, positive_material_root, "positive");
+        check(array(member(array(member(positive_material_payload.json, "meshes")).at(0), "primitives")).size() == 2U,
+              "separately authored positive-scale scene preserves both material regions");
+        const auto positive_material_path = positive_material_root / "positive-source.carto";
+        static_cast<void>(take(positive_material.doc.save_atomic(positive_material_path)));
+        check(take(project::ProjectDocument::load(positive_material_path)).serialize() == positive_material_source,
+              "positive-scale material fixture preserves source across save/reopen");
         const auto partial_root = root / "partially-unassigned-material";
         std::filesystem::create_directory(partial_root);
         auto partial = make_scene(material_mesh(true), partial_root);
