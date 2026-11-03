@@ -171,20 +171,27 @@ struct Accessor {
     bool has_bounds = false;
 };
 
+struct PrimitiveRecord {
+    std::size_t index_accessor = 0U;
+    std::optional<std::size_t> material_index;
+    std::optional<std::uint32_t> material_region;
+    std::string region_layer;
+    std::vector<geometry::FaceId> triangle_faces;
+};
+
 struct MeshRecord {
     std::uint64_t source_id = 0U;
+    std::uint64_t source_mesh_revision = 0U;
     std::string name;
     std::size_t position_accessor = 0U;
     std::size_t normal_accessor = 0U;
     std::optional<std::size_t> uv_accessor;
     std::optional<std::size_t> tangent_accessor;
-    std::size_t index_accessor = 0U;
+    std::vector<PrimitiveRecord> primitives;
     std::size_t vertices = 0U;
     std::size_t triangles = 0U;
     std::size_t index_bytes = 0U;
     std::optional<std::vector<std::pair<std::uint64_t, std::uint32_t>>> material_regions;
-    std::optional<std::size_t> material_index;
-    std::optional<std::uint32_t> material_region;
 };
 
 // The first appearance-preserving profile is deliberately limited to
@@ -206,43 +213,45 @@ core::Result<void> validate_constant_gltf_material(const render::MaterialAsset& 
     return core::Result<void>::success();
 }
 
-struct UniformGltfMaterial {
-    std::size_t index;
-    std::uint32_t region;
+struct GltfMaterialRegions {
+    std::string layer;
+    std::map<std::uint32_t, std::size_t> material_by_region;
 };
 
-core::Result<UniformGltfMaterial> uniform_gltf_material(
+core::Result<GltfMaterialRegions> gltf_material_regions(
     const geometry::EditableMesh& mesh, std::uint64_t mesh_id,
     const project::MaterialCatalog& catalog,
     const std::map<render::MaterialId, std::size_t>& material_indices) {
     const auto* generic = mesh.attributes().find("cartographer.material_slot");
     const auto* condition = mesh.attributes().find("condition.material_region");
     if ((generic == nullptr) == (condition == nullptr))
-        return core::Result<UniformGltfMaterial>::failure(validation(
+        return core::Result<GltfMaterialRegions>::failure(validation(
             "glTF material catalog requires exactly one authored face-region layer per mesh"));
     const auto* layer = generic != nullptr ? generic : condition;
     if (layer->descriptor.domain != attributes::AttributeDomain::face ||
         layer->descriptor.type != attributes::AttributeType::uint32 ||
         layer->values.size() != mesh.faces_sorted().size() || layer->values.empty())
-        return core::Result<UniformGltfMaterial>::failure(validation(
+        return core::Result<GltfMaterialRegions>::failure(validation(
             "glTF material catalog requires a complete face-domain uint32 region layer"));
-    std::optional<std::uint32_t> region;
+    GltfMaterialRegions result{generic != nullptr ? "cartographer.material_slot" :
+                                                    "condition.material_region", {}};
     for (const auto& value : layer->values) {
-        const auto* id = std::get_if<std::uint32_t>(&value);
-        if (id == nullptr || *id == 0U || (region && *region != *id))
-            return core::Result<UniformGltfMaterial>::failure(validation(
-                "glTF material catalog requires one nonzero material region per mesh"));
-        region = *id;
+        const auto* region = std::get_if<std::uint32_t>(&value);
+        if (region == nullptr || *region == 0U)
+            return core::Result<GltfMaterialRegions>::failure(validation(
+                "glTF material catalog requires a nonzero assigned region on every face"));
+        if (result.material_by_region.contains(*region)) continue;
+        const auto assignment = catalog.assignments().find({mesh_id, *region});
+        if (assignment == catalog.assignments().end() || assignment->second.variant.has_value())
+            return core::Result<GltfMaterialRegions>::failure(validation(
+                "glTF material catalog requires an explicit non-variant region assignment"));
+        const auto material = material_indices.find(assignment->second.material);
+        if (material == material_indices.end())
+            return core::Result<GltfMaterialRegions>::failure(validation(
+                "glTF material region refers to an unavailable material"));
+        result.material_by_region.emplace(*region, material->second);
     }
-    const auto assignment = catalog.assignments().find({mesh_id, *region});
-    if (assignment == catalog.assignments().end() || assignment->second.variant.has_value())
-        return core::Result<UniformGltfMaterial>::failure(validation(
-            "glTF material catalog requires an explicit non-variant region assignment"));
-    const auto material = material_indices.find(assignment->second.material);
-    if (material == material_indices.end())
-        return core::Result<UniformGltfMaterial>::failure(validation(
-            "glTF material region refers to an unavailable material"));
-    return core::Result<UniformGltfMaterial>::success({material->second, *region});
+    return core::Result<GltfMaterialRegions>::success(std::move(result));
 }
 
 struct NodeRecord {
@@ -399,7 +408,7 @@ static core::Result<GltfExportReport> export_interchange(
     const auto& catalog = document.material_catalog();
     const bool export_materials = !catalog.empty();
     std::map<render::MaterialId, std::size_t> material_indices;
-    std::map<std::uint64_t, UniformGltfMaterial> mesh_material_indices;
+    std::map<std::uint64_t, GltfMaterialRegions> mesh_material_indices;
     if (export_materials) {
         if (catalog.materials().empty() || catalog.materials().size() > 32U ||
             catalog.assignments().empty() || !catalog.textures().empty() ||
@@ -414,7 +423,8 @@ static core::Result<GltfExportReport> export_interchange(
             material_indices.emplace(id, material_indices.size());
         }
     }
-    if (!document.kinematic_graphs().empty() || !document.pose_libraries().empty() ||
+    if (!document.accepted_autorigs().empty() || !document.unadmitted_mode_key_drafts().empty() ||
+        !document.kinematic_graphs().empty() || !document.pose_libraries().empty() ||
         !document.rig_module_templates().empty() || !document.garment_assets().empty() ||
         !document.sculpt_stacks().empty()) {
         return core::Result<GltfExportReport>::failure(validation(
@@ -442,7 +452,7 @@ static core::Result<GltfExportReport> export_interchange(
                 "glTF export cannot preserve all authored UV sets on mesh " + std::to_string(mesh_id)));
         }
         if (export_materials) {
-            auto material = uniform_gltf_material(mesh, mesh_id, catalog, material_indices);
+            auto material = gltf_material_regions(mesh, mesh_id, catalog, material_indices);
             if (!material) return core::Result<GltfExportReport>::failure(
                 material.error().with_context("mesh asset " + std::to_string(mesh_id)));
             mesh_material_indices.emplace(mesh_id, material.value());
@@ -480,6 +490,7 @@ static core::Result<GltfExportReport> export_interchange(
         if (active_uv)
             options.uv_set = active_uv->id;
         options.generate_tangents = has_uv;
+        if (export_materials) options.material_slot_layer = mesh_material_indices.at(mesh_id).layer;
         auto artifact = production::compile_render_mesh_artifact(source_identity, mesh, options);
         if (!artifact && has_uv) {
             // Preserve the existing explicit missing-tangent fallback only if
@@ -493,6 +504,9 @@ static core::Result<GltfExportReport> export_interchange(
             return core::Result<GltfExportReport>::failure(
                 artifact.error().with_context("mesh asset " + std::to_string(mesh_id)));
         const auto &source = artifact.value();
+        if (export_materials && source.submeshes.size() > 128U)
+            return core::Result<GltfExportReport>::failure(validation(
+                "glTF material export exceeds the 128-region scene-import limit"));
         const auto material_regions = condition_material_regions(mesh);
         if (!material_regions) {
             return core::Result<GltfExportReport>::failure(
@@ -660,18 +674,30 @@ static core::Result<GltfExportReport> export_interchange(
         if (use_uint16) append_vector(buffer, indices_16);
         else append_vector(buffer, indices_32);
         const std::size_t index_bytes = use_uint16 ? sizeof(std::uint16_t) : sizeof(std::uint32_t);
-        views.push_back({index_offset, render_indices.size() * index_bytes, kGlElementArrayBuffer});
-        const std::size_t index_view = views.size() - 1U;
-        accessors.push_back({
-            index_view,
-            use_uint16 ? kGlUnsignedShort : kGlUnsignedInt,
-            render_indices.size(),
-            "SCALAR",
-            {},
-            {},
-            false,
-        });
-        const std::size_t index_accessor = accessors.size() - 1U;
+        std::vector<PrimitiveRecord> primitives;
+        primitives.reserve(source.submeshes.size());
+        for (const auto& submesh : source.submeshes) {
+            views.push_back({index_offset + static_cast<std::size_t>(submesh.first_index) * index_bytes,
+                             static_cast<std::size_t>(submesh.index_count) * index_bytes,
+                             kGlElementArrayBuffer});
+            accessors.push_back({views.size() - 1U,
+                                 use_uint16 ? kGlUnsignedShort : kGlUnsignedInt,
+                                 submesh.index_count, "SCALAR", {}, {}, false});
+            PrimitiveRecord primitive;
+            primitive.index_accessor = accessors.size() - 1U;
+            if (export_materials) {
+                if (!submesh.material_slot ||
+                    !mesh_material_indices.at(mesh_id).material_by_region.contains(*submesh.material_slot))
+                    return core::Result<GltfExportReport>::failure(validation(
+                        "glTF compiled submesh has no explicit material assignment"));
+                primitive.material_region = *submesh.material_slot;
+                primitive.region_layer = mesh_material_indices.at(mesh_id).layer;
+                primitive.material_index = mesh_material_indices.at(mesh_id).material_by_region.at(*submesh.material_slot);
+                const auto first = source.triangle_faces.begin() + submesh.first_index / 3U;
+                primitive.triangle_faces.assign(first, first + submesh.index_count / 3U);
+            }
+            primitives.push_back(std::move(primitive));
+        }
 
         if (buffer.size() > kMaxExportBufferBytes) {
             return core::Result<GltfExportReport>::failure(
@@ -679,18 +705,17 @@ static core::Result<GltfExportReport> export_interchange(
         }
         meshes.push_back({
             mesh_id,
+            mesh.revision().value(),
             "cartographer-mesh-" + std::to_string(mesh_id),
             position_accessor,
             normal_accessor,
             uv_accessor,
             tangent_accessor,
-            index_accessor,
+            std::move(primitives),
             render_positions.size(),
             render_indices.size() / 3U,
             index_bytes,
             material_regions.value(),
-            export_materials ? std::optional<std::size_t>{mesh_material_indices.at(mesh_id).index} : std::nullopt,
-            export_materials ? std::optional<std::uint32_t>{mesh_material_indices.at(mesh_id).region} : std::nullopt,
         });
         report.vertices += render_positions.size();
         report.triangles += render_indices.size() / 3U;
@@ -829,35 +854,45 @@ static core::Result<GltfExportReport> export_interchange(
     json << "  ],\n  \"meshes\":[\n";
     for (std::size_t index = 0U; index < meshes.size(); ++index) {
         const auto& mesh = meshes[index];
-        json << "    {\"name\":\"" << json_escape(mesh.name) << "\",\"primitives\":[{"
-             << "\"attributes\":{\"POSITION\":" << mesh.position_accessor
-             << ",\"NORMAL\":" << mesh.normal_accessor;
-        if (mesh.uv_accessor.has_value()) {
-            json << ",\"TEXCOORD_0\":" << *mesh.uv_accessor;
-        }
-        if (mesh.tangent_accessor.has_value()) {
-            json << ",\"TANGENT\":" << *mesh.tangent_accessor;
-        }
-        json << "},\"indices\":" << mesh.index_accessor << ",\"mode\":"
-             << kGlTriangles;
-        if (mesh.material_index.has_value()) json << ",\"material\":" << *mesh.material_index;
-        json << ",\"extras\":{\"cartographer_mesh_id\":"
-             << mesh.source_id;
-        if (mesh.material_region.has_value())
-            json << ",\"cartographer_material_region\":" << *mesh.material_region;
-        if (mesh.material_regions.has_value()) {
-            json << ",\"condition_material_region\":{\"layer\":\"condition.material_region\","
-                    "\"domain\":\"face\",\"faces\":[";
-            for (std::size_t region_index = 0U;
-                 region_index < mesh.material_regions->size(); ++region_index) {
-                if (region_index != 0U) json << ',';
-                const auto [face_id, region_id] = (*mesh.material_regions)[region_index];
-                json << "{\"id\":" << face_id << ",\"region\":" << region_id << '}';
+        json << "    {\"name\":\"" << json_escape(mesh.name) << "\",\"primitives\":[";
+        for (std::size_t primitive_index = 0U; primitive_index < mesh.primitives.size(); ++primitive_index) {
+            const auto& primitive = mesh.primitives[primitive_index];
+            if (primitive_index != 0U) json << ',';
+            json << "{\"attributes\":{\"POSITION\":" << mesh.position_accessor
+                 << ",\"NORMAL\":" << mesh.normal_accessor;
+            if (mesh.uv_accessor.has_value()) json << ",\"TEXCOORD_0\":" << *mesh.uv_accessor;
+            if (mesh.tangent_accessor.has_value()) json << ",\"TANGENT\":" << *mesh.tangent_accessor;
+            json << "},\"indices\":" << primitive.index_accessor << ",\"mode\":" << kGlTriangles;
+            if (primitive.material_index.has_value()) json << ",\"material\":" << *primitive.material_index;
+            json << ",\"extras\":{\"cartographer_mesh_id\":" << mesh.source_id;
+            if (primitive.material_region.has_value()) {
+                json << ",\"cartographer_material_region\":" << *primitive.material_region
+                     << ",\"cartographer_material_region_layer\":\"" << json_escape(primitive.region_layer) << "\""
+                     << ",\"cartographer_mesh_revision\":" << mesh.source_mesh_revision
+                     << ",\"cartographer_triangle_faces\":[";
+                for (std::size_t face_index = 0U; face_index < primitive.triangle_faces.size(); ++face_index) {
+                    if (face_index != 0U) json << ',';
+                    json << primitive.triangle_faces[face_index].value;
+                }
+                json << ']';
             }
-            json << "]}";
+            // Retain the legacy whole-mesh CONDITION face table once, on the first primitive.
+            if (primitive_index == 0U && mesh.material_regions.has_value()) {
+                json << ",\"condition_material_region\":{\"layer\":\"condition.material_region\","
+                        "\"domain\":\"face\",\"faces\":[";
+                for (std::size_t region_index = 0U;
+                     region_index < mesh.material_regions->size(); ++region_index) {
+                    if (region_index != 0U) json << ',';
+                    const auto [face_id, region_id] = (*mesh.material_regions)[region_index];
+                    json << "{\"id\":" << face_id << ",\"region\":" << region_id << '}';
+                }
+                json << "]}";
+            }
+            json << "}}";
         }
-        json << "}}]}" << (index + 1U == meshes.size() ? "\n" : ",\n");
+        json << "]}" << (index + 1U == meshes.size() ? "\n" : ",\n");
     }
+
     json << "  ],\n  \"accessors\":[\n";
     for (std::size_t index = 0U; index < accessors.size(); ++index) {
         const auto& accessor = accessors[index];
@@ -888,8 +923,11 @@ static core::Result<GltfExportReport> export_interchange(
          << "  \"extras\":{\"cartographer\":{\"profile\":\"cartographer-gltf\","
          << "\"profile_version\":" << GltfExportReport::kProfileVersion
          << ",\"project_schema\":" << document.schema_version()
-         << ",\"project_revision\":" << document.revision().value()
-         << ",\"project_name\":\"" << json_escape(document.name()) << "\"}}\n"
+         << ",\"project_revision\":" << document.revision().value();
+    if (export_materials)
+        json << ",\"material_regions_version\":1,\"canonical_project_sha256\":\""
+             << source_identity.content_digest.hex() << "\"";
+    json << ",\"project_name\":\"" << json_escape(document.name()) << "\"}}\n"
          << "}\n";
     const std::string text = json.str();
     if (text.size() > kMaxExportJsonBytes) {
