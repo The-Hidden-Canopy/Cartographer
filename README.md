@@ -165,15 +165,18 @@ checkout.
   indexed mesh into an RGBA16F/D32 target, and verifies bounded readback when run
   with an explicit Vulkan SDK. The acceptance seam requires Vulkan 1.1, binds
   the compiled mesh to an expected source revision, selects the physical device
-  by UUID, and has an opt-in 8192x8192 execution check. The desktop shell now has a
-  product-shaped drafting workbench with a fixed work surface, Tool Rack,
-  Instrument Bay, movable/resizable instruments, an Operation Ledger,
-  project/revision state, diagnostics, settings, explicit unavailable-state
-  language, and validated local persistence for rack visibility and instrument
-  geometry. A local Debug build and responsive native-window launch have been
-  exercised against pinned Vulkan SDK/ImGui prerequisites; native click-through,
-  pixel, DPI, resize, OS-level tear-out, and broad GPU compatibility remain
-  separate acceptance gates.
+  by UUID, and has an opt-in 8192x8192 execution check. The desktop shell has a
+  viewport-centered workbench with the existing ImGui dock tree, movable,
+  resizable and detachable instruments, native OS multi-viewports, focus mode,
+  and Studio/Scene/Review arrangements. Each arrangement retains its customized
+  layout locally, independently of project truth; View > Work surface restores a
+  closed viewport without discarding the scene, selection, or camera. Named
+  perspective/plan/front/right views, monochrome, and CPU projected depth and
+  topology views reuse the existing cameras and scene; they are not a GPU
+  depth-readback claim. Populated native detach/resize/save/reopen acceptance is
+  recorded in [the viewport workspace ledger](docs/verification/viewport-workspace/EVIDENCE_LEDGER.md).
+  Multi-monitor recovery, DPI combinations, authored-camera GPU preview, and
+  broad GPU compatibility remain separate acceptance gates.
 - `cartographer_cli` can create/validate a sample project and import/export
   OBJ, PLY, STL, and the public glTF profile without a login or network
   connection.
@@ -182,7 +185,8 @@ checkout.
 
 The following are contracts and roadmap items, not runtime-accepted capability
 in this checkout: production Vulkan PBR/render-graph/submission-lifetime/
-presentation lifecycle, native workspace docking/tab stacks, broader edge-edit tools, bevel tools,
+presentation lifecycle, disconnected-monitor recovery and arbitrary device/DPI combinations,
+broader edge-edit tools, bevel tools,
 modifiers, UVs, full texture decoding/residency, node graphs, curves/NURBS, sculpting, CAD
 sketches/constraints, B-Rep/booleans, BIM objects, animation, rigging, physics,
 plugins, Python bindings, full glTF/STEP/IFC interchange, and large-scene

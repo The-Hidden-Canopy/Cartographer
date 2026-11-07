@@ -1248,6 +1248,22 @@ carto_target(cartographer_desktop_viewshed_tests)
 add_test(NAME cartographer_desktop_viewshed_tests
     COMMAND cartographer_desktop_viewshed_tests)
 
+add_executable(cartographer_desktop_viewport_view_tests
+    desktop_viewport_view_tests.cpp
+)
+target_include_directories(cartographer_desktop_viewport_view_tests
+    PRIVATE ${PROJECT_SOURCE_DIR}/apps/desktop
+)
+target_link_libraries(cartographer_desktop_viewport_view_tests
+    PRIVATE
+        carto_core
+        carto_editor
+        carto_geometry
+)
+carto_target(cartographer_desktop_viewport_view_tests)
+add_test(NAME cartographer_desktop_viewport_view_tests
+    COMMAND cartographer_desktop_viewport_view_tests)
+
 add_executable(cartographer_desktop_sweep_source_tests
     desktop_sweep_source_tests.cpp
 )

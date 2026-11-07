@@ -27,6 +27,7 @@
 #include "studio_draft.hpp"
 #include "studio_sweep_source.hpp"
 #include "studio_viewshed.hpp"
+#include "studio_view_settings.hpp"
 #include "studio_viewport_capture.hpp"
 #include "uv_inspector.hpp"
 #include "native_presentation.hpp"
@@ -2640,6 +2641,19 @@ enum class StandardMeshExport {
     return path;
 }
 
+// Arrangement selection and viewport view settings persist beside the dock
+// layout in their own bounded, atomically replaced file. Keeping the marker
+// outside every per-arrangement INI avoids a bootstrap loop when deciding
+// which arrangement layout to load.
+[[nodiscard]] std::optional<std::filesystem::path> viewport_workspace_preference_path(
+    bool create_parent) {
+    const auto workspace_path = user_preference_path(create_parent);
+    if (!workspace_path.has_value()) return std::nullopt;
+    auto path = *workspace_path;
+    path.replace_filename(L"workspace-viewport.prefs");
+    return path;
+}
+
 [[nodiscard]] std::optional<std::filesystem::path> market_library_path(bool create_parent) {
     const auto workspace_path = user_preference_path(create_parent);
     if (!workspace_path.has_value()) return std::nullopt;
@@ -3462,6 +3476,23 @@ struct DesktopState {
     std::optional<std::uint64_t> selected_operation_id;
     std::unique_ptr<carto::production::PreparationJob> preparation_job;
     carto::studio::DockingWorkspace dock_workspace;
+    // The artist-selected arrangement marker. It may differ from
+    // dock_workspace.arrangement() after a startup restore (the workspace only
+    // tracks the arrangement it built itself); the marker drives which
+    // per-arrangement INI is loaded and saved.
+    carto::studio::WorkspaceArrangement active_arrangement{
+        carto::studio::WorkspaceArrangement::studio};
+    // Current viewport view settings. `view` is the single source of truth for
+    // the named view; pose retention keeps one captured pose per view kind so
+    // switching views never resets scene, selection, or the other cameras.
+    // The default is set in the constructor to the plan view the studio has
+    // always started in, so users without a prefs file see unchanged behavior.
+    carto::studio::ViewportViewSettings viewport_view;
+    std::array<std::optional<carto::studio::ViewportViewPose>,
+        static_cast<std::size_t>(carto::studio::ViewportViewKind::right_zy) + 1U>
+        viewport_view_poses;
+    bool viewport_view_restore_pending = false;
+    bool viewport_projected_geometry_last_frame = false;
     HWND native_event_window = nullptr;
     HWND native_capture_window = nullptr;
 
@@ -3474,6 +3505,7 @@ struct DesktopState {
         workbench.scene = true;
         workbench.inspector = true;
         workbench.assets = true;
+        viewport_view.view = carto::studio::ViewportViewKind::top_plan_xz;
     }
 
     void load_fonts() {
@@ -3598,39 +3630,40 @@ struct DesktopState {
     // Dock topology, floating positions, and OS-window relationships are local
     // presentation preferences stored beside workbench.prefs, never project
     // state. Writes are bounded and replace the file atomically.
-    void load_docking_layout() {
-        const auto base = workbench_preference_path(false);
-        if (!base.has_value()) return;
-        const auto path = base->parent_path() / "workspace-docking.ini";
+    // Bounded atomic read of one arrangement layout file. Reports
+    // missing/present/rejected without side effects for a missing file; a
+    // rejected file marks the workspace so its corrupt bytes are never
+    // overwritten by a later save, and a present file clears any previous
+    // rejection (the artist moved to a healthy layout).
+    [[nodiscard]] carto::studio::DockingWorkspace::LayoutPresence load_docking_layout_file(
+        const std::filesystem::path& path) {
+        using LayoutPresence = carto::studio::DockingWorkspace::LayoutPresence;
         std::error_code error;
         const bool exists = std::filesystem::exists(path, error);
         const auto presence = carto::studio::DockingWorkspace::classify_layout_presence(
             exists, error);
-        if (presence == carto::studio::DockingWorkspace::LayoutPresence::rejected) {
+        if (presence == LayoutPresence::rejected) {
             dock_workspace.note_saved_layout_rejected();
             action_feedback = "Docking layout was rejected: file status could not be read.";
             action_feedback_error = true;
-            return;
+            return LayoutPresence::rejected;
         }
-        if (presence == carto::studio::DockingWorkspace::LayoutPresence::missing) {
-            workbench.scene = true;
-            workbench.inspector = true;
-            workbench.assets = true;
-            return;
+        if (presence == LayoutPresence::missing) {
+            return LayoutPresence::missing;
         }
         const auto size = std::filesystem::file_size(path, error);
         if (error || size > 1048576U) {
             dock_workspace.note_saved_layout_rejected();
             action_feedback = "Docking layout was rejected: unreadable or oversized.";
             action_feedback_error = true;
-            return;
+            return LayoutPresence::rejected;
         }
         std::ifstream input(path, std::ios::binary);
         if (!input) {
             dock_workspace.note_saved_layout_rejected();
             action_feedback = "Docking layout was rejected: file could not be opened.";
             action_feedback_error = true;
-            return;
+            return LayoutPresence::rejected;
         }
         std::string settings((std::istreambuf_iterator<char>(input)),
                              std::istreambuf_iterator<char>());
@@ -3640,17 +3673,49 @@ struct DesktopState {
                 ? "Docking layout was rejected: read failed."
                 : "Docking layout was rejected: file is empty.";
             action_feedback_error = true;
-            return;
+            return LayoutPresence::rejected;
         }
         ImGui::LoadIniSettingsFromMemory(settings.data(), settings.size());
         dock_workspace.note_saved_layout_loaded();
+        return LayoutPresence::present;
     }
 
-    void save_docking_layout() {
+    [[nodiscard]] std::optional<std::filesystem::path> docking_layout_path(
+        carto::studio::WorkspaceArrangement arrangement,
+        bool create_parent) const {
+        const auto base = workbench_preference_path(create_parent);
+        if (!base.has_value()) return std::nullopt;
+        return carto::studio::DockingWorkspace::arrangement_layout_path(
+            base->parent_path(), arrangement);
+    }
+
+    void load_docking_layout() {
+        using LayoutPresence = carto::studio::DockingWorkspace::LayoutPresence;
+        const auto path = docking_layout_path(active_arrangement, false);
+        const auto presence = path.has_value()
+            ? load_docking_layout_file(*path)
+            : LayoutPresence::missing;
+        if (presence == LayoutPresence::present) return;
+        if (presence == LayoutPresence::rejected) {
+            // Rebuild this arrangement's defaults but keep the rejection
+            // guard, so the corrupt file on disk is preserved until the
+            // artist explicitly resets the workspace.
+            dock_workspace.request_arrangement_defaults(active_arrangement);
+            return;
+        }
+        if (active_arrangement != carto::studio::WorkspaceArrangement::studio) {
+            // No saved layout for the persisted arrangement yet: let the
+            // workspace build that arrangement's authored topology.
+            dock_workspace.request_arrangement(active_arrangement);
+            return;
+        }
+        workbench.scene = true;
+        workbench.inspector = true;
+        workbench.assets = true;
+    }
+
+    void save_docking_layout_to(const std::filesystem::path& path) {
         if (!dock_workspace.layout_save_allowed()) return;
-        const auto base = workbench_preference_path(true);
-        if (!base.has_value()) return;
-        const auto path = base->parent_path() / "workspace-docking.ini";
         static std::atomic<std::uint64_t> write_sequence{0U};
         const auto temporary = carto::studio::DockingWorkspace::layout_temporary_path(
             path, GetCurrentProcessId(),
@@ -3686,6 +3751,166 @@ struct DesktopState {
             std::filesystem::remove(temporary, ignored);
             action_feedback = "Docking layout could not be saved atomically.";
             action_feedback_error = true;
+        }
+    }
+
+    void save_docking_layout() {
+        const auto path = docking_layout_path(active_arrangement, true);
+        if (path.has_value()) save_docking_layout_to(*path);
+    }
+
+    // Flushes the current dock tree to the current arrangement's file (skipped
+    // while a rejected file is guarded), then moves to the target arrangement.
+    // A saved healthy layout for the target replaces the live tree, preserving
+    // that arrangement's customization and clearing any previous rejection. A
+    // missing target file establishes its authored defaults with saving
+    // allowed; a rejected target file rebuilds defaults too, but the rejection
+    // guard is preserved so its corrupt bytes are never overwritten. Focus
+    // mode survives every path. Re-selecting the active arrangement is a no-op
+    // so customization is never reset.
+    void switch_workspace_arrangement(carto::studio::WorkspaceArrangement target) {
+        using LayoutPresence = carto::studio::DockingWorkspace::LayoutPresence;
+        if (target == active_arrangement) return;
+        if (const auto current = docking_layout_path(active_arrangement, true);
+            current.has_value()) {
+            save_docking_layout_to(*current);
+        }
+        active_arrangement = target;
+        const auto path = docking_layout_path(target, false);
+        const auto presence = path.has_value()
+            ? load_docking_layout_file(*path)
+            : LayoutPresence::missing;
+        if (presence == LayoutPresence::present) return;
+        if (presence == LayoutPresence::rejected) {
+            dock_workspace.request_arrangement_defaults(target);
+            return;
+        }
+        if (dock_workspace.arrangement() != target) {
+            dock_workspace.request_arrangement(target);
+        } else {
+            // The workspace already reports this arrangement (startup restore
+            // leaves the internal arrangement untouched) but no saved layout
+            // was restored; rebuild its authored defaults without touching
+            // focus mode or a pending rejection.
+            dock_workspace.request_arrangement_defaults(target);
+        }
+    }
+
+    // Bounded, atomically replaced local preferences holding the selected
+    // arrangement marker plus the current viewport view settings (kind, color
+    // and spatial mode, and the current view's retained camera pose). The
+    // view-settings payload reuses the studio codec verbatim; malformed or
+    // oversized content falls back to defaults without touching the dock INIs.
+    void load_viewport_workspace_preferences() {
+        const auto path = viewport_workspace_preference_path(false);
+        if (!path.has_value()) return;
+        std::error_code error;
+        const auto size = std::filesystem::file_size(*path, error);
+        if (error || size == 0U || size > 16384U) return;
+        std::ifstream input(*path, std::ios::binary);
+        if (!input) return;
+        std::string text((std::istreambuf_iterator<char>(input)),
+                         std::istreambuf_iterator<char>());
+        if (input.bad() || text.empty()) return;
+
+        // Parse the header into temporaries: a malformed line anywhere in the
+        // header must not partially change the active arrangement. The marker
+        // commits only once the whole header validated.
+        carto::studio::WorkspaceArrangement parsed_arrangement = active_arrangement;
+        std::string payload;
+        bool payload_ready = false;
+        std::size_t cursor = 0U;
+        while (cursor < text.size()) {
+            const std::size_t newline = text.find('\n', cursor);
+            const std::size_t end = newline == std::string::npos ? text.size() : newline;
+            const std::string_view line(text.data() + cursor, end - cursor);
+            cursor = newline == std::string::npos ? text.size() : end + 1U;
+            if (!payload_ready) {
+                if (line == "view_settings:") {
+                    payload_ready = true;
+                    active_arrangement = parsed_arrangement;
+                    continue;
+                }
+                const std::size_t separator = line.find('=');
+                if (separator == std::string_view::npos || separator == 0U) return;
+                const std::string_view key = line.substr(0U, separator);
+                const std::string_view value = line.substr(separator + 1U);
+                if (key == "version") {
+                    if (value != "1") return;
+                } else if (key == "arrangement") {
+                    const auto classified =
+                        carto::studio::DockingWorkspace::classify_arrangement(value);
+                    if (!classified.has_value()) return;
+                    parsed_arrangement = *classified;
+                } else {
+                    return;
+                }
+                continue;
+            }
+            if (!payload.empty()) payload += '\n';
+            payload.append(line.data(), line.size());
+        }
+        if (!payload_ready) {
+            // Header-only file: still a valid header, so the marker commits.
+            active_arrangement = parsed_arrangement;
+            return;
+        }
+        if (!payload.empty()) {
+            bool used_defaults = false;
+            viewport_view = carto::studio::viewport_view_settings_or_default(
+                payload, used_defaults);
+            if (used_defaults) {
+                action_feedback = "Viewport view settings were reset to defaults.";
+                action_feedback_error = false;
+            }
+            perspective_camera_active =
+                viewport_view.view != carto::studio::ViewportViewKind::top_plan_xz;
+            if (!viewport_view.pose.empty()) {
+                viewport_view_poses[viewport_view_kind_index(viewport_view.view)] =
+                    viewport_view.pose;
+            }
+            viewport_view_restore_pending = true;
+        }
+    }
+
+    void save_viewport_workspace_preferences() {
+        const auto path = viewport_workspace_preference_path(true);
+        if (!path.has_value()) return;
+        // Refresh the retained pose for the current view before encoding.
+        const auto captured = carto::studio::capture_viewport_view_pose(
+            viewport_view.view, perspective_camera, work_surface_camera);
+        if (captured) viewport_view.pose = captured.value();
+        const auto encoded = carto::studio::encode_viewport_view_settings(viewport_view);
+        std::string text;
+        text += "version=1\narrangement=";
+        text += carto::studio::DockingWorkspace::arrangement_name(active_arrangement);
+        text += "\nview_settings:\n";
+        text += encoded;
+
+        static std::atomic<std::uint64_t> prefs_write_sequence{0U};
+        const auto temporary = carto::studio::DockingWorkspace::layout_temporary_path(
+            *path, GetCurrentProcessId(),
+            prefs_write_sequence.fetch_add(1U, std::memory_order_relaxed));
+        {
+            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+            if (!output) {
+                std::error_code ignored;
+                std::filesystem::remove(temporary, ignored);
+                return;
+            }
+            output.write(text.data(), static_cast<std::streamsize>(text.size()));
+            output.flush();
+            output.close();
+            if (!output) {
+                std::error_code ignored;
+                std::filesystem::remove(temporary, ignored);
+                return;
+            }
+        }
+        if (!MoveFileExW(temporary.c_str(), path->c_str(),
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            std::error_code ignored;
+            std::filesystem::remove(temporary, ignored);
         }
     }
 
@@ -7372,6 +7597,7 @@ struct DesktopState {
 
         const bool request_orbit = perspective_camera_active &&
             perspective_camera_orbit_tool_active &&
+            carto::studio::view_kind_allows_orbit(viewport_view.view) &&
             event.button == carto::ui::NativePointerButton::primary;
         bool empty_surface = false;
         if (event.button == carto::ui::NativePointerButton::primary) {
@@ -7495,6 +7721,103 @@ struct DesktopState {
         work_surface_camera_pan_button = ImGuiMouseButton_Middle;
         work_surface_camera_pan_viewport_height = 0.0F;
         release_native_capture();
+    }
+
+    // --- Named viewport views (presentation only) ---------------------------
+    // The four named views reuse the two existing camera objects: the plan
+    // view renders through WorkSurfaceCamera, the others through EditorCamera
+    // (perspective for 3D, bounded orthographic presets for Front/Right).
+    // Switching captures the outgoing pose and restores the incoming one, so
+    // scene, selection, materials, lighting, and the other views are never
+    // reset. See studio_view_settings.hpp for the retention contract.
+    [[nodiscard]] static std::size_t viewport_view_kind_index(
+        carto::studio::ViewportViewKind kind) noexcept {
+        return static_cast<std::size_t>(kind);
+    }
+
+    void capture_current_viewport_pose() {
+        const auto captured = carto::studio::capture_viewport_view_pose(
+            viewport_view.view, perspective_camera, work_surface_camera);
+        if (captured) {
+            viewport_view_poses[viewport_view_kind_index(viewport_view.view)] =
+                std::move(captured).value();
+        }
+    }
+
+    void set_viewport_view_kind(carto::studio::ViewportViewKind kind) {
+        if (kind == viewport_view.view) return;
+        capture_current_viewport_pose();
+        viewport_view.view = kind;
+        finish_work_surface_camera_pan();
+        perspective_camera_orbit_tool_active = false;
+        const auto& pose = viewport_view_poses[viewport_view_kind_index(kind)];
+        switch (kind) {
+        case carto::studio::ViewportViewKind::top_plan_xz:
+            perspective_camera_active = false;
+            // The plan pose restores through the live viewport extent, so the
+            // restore is deferred to the next draw_viewport.
+            work_surface_camera_framed = pose.has_value();
+            break;
+        case carto::studio::ViewportViewKind::perspective_3d:
+            perspective_camera_active = true;
+            if (pose.has_value()) {
+                const auto applied = carto::studio::apply_viewport_view_pose(
+                    kind, *pose, perspective_camera, work_surface_camera, {});
+                perspective_camera_framed = applied.has_value();
+            } else {
+                perspective_camera_framed = false;
+            }
+            if (!perspective_camera_framed) {
+                perspective_camera.set_projection(
+                    carto::editor::EditorProjection::perspective);
+                static_cast<void>(perspective_camera.set_orientation(0.0, -1.35));
+            }
+            break;
+        case carto::studio::ViewportViewKind::front_xy:
+        case carto::studio::ViewportViewKind::right_zy:
+            perspective_camera_active = true;
+            if (pose.has_value()) {
+                const auto applied = carto::studio::apply_viewport_view_pose(
+                    kind, *pose, perspective_camera, work_surface_camera, {});
+                perspective_camera_framed = applied.has_value();
+            } else {
+                perspective_camera_framed = false;
+            }
+            if (!perspective_camera_framed) {
+                // Fixed orthographic preset; leaving the camera unframed lets
+                // the existing auto-frame fit the scene in the new projection.
+                perspective_camera.set_projection(
+                    carto::editor::EditorProjection::orthographic);
+                static_cast<void>(
+                    carto::studio::apply_orthographic_view_orientation(
+                        kind, perspective_camera));
+            }
+            break;
+        }
+        if (pose.has_value() && kind == carto::studio::ViewportViewKind::top_plan_xz) {
+            // Editor poses were applied above; the plan pose needs the live
+            // viewport extent and is restored in the next draw_viewport.
+            viewport_view_restore_pending = true;
+        }
+    }
+
+    // Applies a retained pose once the live viewport extent is known. Plan
+    // poses require the extent; editor poses ignore it but apply through the
+    // same path so framing state is marked consistently.
+    void restore_pending_viewport_pose(const carto::core::Vec2d& viewport_extent) {
+        viewport_view_restore_pending = false;
+        const auto& pose = viewport_view_poses[viewport_view_kind_index(viewport_view.view)];
+        if (!pose.has_value()) return;
+        const auto applied = carto::studio::apply_viewport_view_pose(
+            viewport_view.view, *pose, perspective_camera, work_surface_camera,
+            viewport_extent);
+        if (applied) {
+            if (viewport_view.view == carto::studio::ViewportViewKind::top_plan_xz) {
+                work_surface_camera_framed = true;
+            } else {
+                perspective_camera_framed = true;
+            }
+        }
     }
 
     void finish_native_workbench_instrument_drag() {
@@ -9480,11 +9803,11 @@ struct DesktopState {
         if (io.WantTextInput) return;
         if (ImGui::IsKeyPressed(ImGuiKey_F11, false) ||
             (io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_V, false))) {
-            dock_workspace.toggle_focus();
+            toggle_viewport_focus();
         }
         const bool exit_focus = dock_workspace.focus_mode() &&
             ImGui::IsKeyPressed(ImGuiKey_Escape, false);
-        if (exit_focus) dock_workspace.toggle_focus();
+        if (exit_focus) toggle_viewport_focus();
         // The Win32 procedure of the main window never sees keys typed into
         // a torn-out OS window, so native shortcuts route from ImGui input.
         const std::uint8_t native_modifiers = static_cast<std::uint8_t>(
@@ -9729,9 +10052,34 @@ struct DesktopState {
             instrument_item("Transform instrument", carto::ui::WorkbenchInstrument::transform);
             instrument_item("Extrude instrument", carto::ui::WorkbenchInstrument::extrude);
             ImGui::Separator();
+            if (ImGui::BeginMenu("Workspace arrangement")) {
+                for (std::size_t index = 0U;
+                     index < carto::studio::DockingWorkspace::kArrangementCount;
+                     ++index) {
+                    const auto arrangement =
+                        static_cast<carto::studio::WorkspaceArrangement>(index);
+                    const bool active = arrangement == active_arrangement;
+                    if (ImGui::MenuItem(
+                            carto::studio::DockingWorkspace::arrangement_name(
+                                arrangement).data(),
+                            nullptr, active)) {
+                        switch_workspace_arrangement(arrangement);
+                    }
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "Studio keeps the legacy proportions and layout file. Scene and "
+                        "Review enlarge the viewport; each arrangement saves its own "
+                        "layout beside the legacy one. Project data is never touched.");
+                }
+                ImGui::TextDisabled(
+                    "Each arrangement keeps its own saved layout; re-selecting the active one is a no-op.");
+                ImGui::EndMenu();
+            }
+            ImGui::Separator();
             if (ImGui::MenuItem("Viewport focus / restore", "F11",
                     dock_workspace.focus_mode())) {
-                dock_workspace.toggle_focus();
+                toggle_viewport_focus();
             }
             if (ImGui::MenuItem("Reset workspace layout")) {
                 reset_workbench_layout();
@@ -9739,6 +10087,9 @@ struct DesktopState {
                 workbench.assets = true;
                 workbench.inspector = true;
                 dock_workspace.request_reset();
+                if (dock_workspace.arrangement() != active_arrangement) {
+                    dock_workspace.request_arrangement(active_arrangement);
+                }
             }
             ImGui::TextDisabled("Panels move and resize independently. Close to hide; reopen here.");
             ImGui::EndMenu();
@@ -10373,7 +10724,7 @@ struct DesktopState {
                     ? "Speculative after · human ghost correction"
                     : "Speculative after · review only")
                                    : "Task base · review only")
-            : (perspective_camera_active ? "Project · perspective view" : "Project · plan view"));
+            : carto::studio::view_kind_label(viewport_view.view).data());
         ImGui::SameLine();
         const bool frame_button_pressed = ImGui::SmallButton("Frame all");
         const ImGuiIO& frame_shortcut_io = ImGui::GetIO();
@@ -10388,25 +10739,20 @@ struct DesktopState {
             frame_shortcut_io.WantCaptureKeyboard,
             ImGui::IsKeyPressed(ImGuiKey_Home, false));
         ImGui::SameLine();
-        bool camera_mode_changed = false;
-        if (ImGui::SmallButton(perspective_camera_active ? "Plan view" : "Perspective")) {
-            perspective_camera_active = !perspective_camera_active;
-            perspective_camera_orbit_tool_active = false;
-            finish_work_surface_camera_pan();
-            if (perspective_camera_active) {
-                static_cast<void>(perspective_camera.set_orientation(0.0, -1.35));
-                perspective_camera_framed = false;
-            } else {
-                work_surface_camera_framed = false;
-            }
-            camera_mode_changed = true;
+        int selected_view_kind = static_cast<int>(viewport_view.view);
+        if (ImGui::Combo("##ViewportViewKind", &selected_view_kind,
+                carto::studio::kViewportViewKindMenuItems)) {
+            const auto kind = carto::studio::viewport_view_kind_from_menu_index(
+                static_cast<std::size_t>(selected_view_kind));
+            if (kind.has_value()) set_viewport_view_kind(*kind);
         }
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(
-                "Perspective scene view. Empty-space placement resolves on the ground plane.");
+                "Named views reuse the existing plan and editor cameras. Front and Right are "
+                "bounded orthographic CPU projections; they never claim GPU readback.");
         }
         const bool request_camera_frame =
-            frame_button_pressed || frame_hotkey_pressed || camera_mode_changed;
+            frame_button_pressed || frame_hotkey_pressed;
         ImGui::SameLine();
         if (work_surface_pan_tool_active) {
             ImGui::PushStyleColor(ImGuiCol_Button, color(snapshot.colors.panel_selected));
@@ -10422,20 +10768,36 @@ struct DesktopState {
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Pan view captures primary drag; middle/right-drag pans. Wheel zooms or dollies.");
         }
+        const bool orbit_allowed =
+            carto::studio::view_kind_allows_orbit(viewport_view.view);
         if (perspective_camera_active) {
             ImGui::SameLine();
-            if (perspective_camera_orbit_tool_active) {
-                ImGui::PushStyleColor(ImGuiCol_Button, color(snapshot.colors.panel_selected));
-                ImGui::PushStyleColor(ImGuiCol_Text, color(snapshot.colors.accent_primary));
+            if (!orbit_allowed) {
+                // Fixed orthographic presets cannot rotate; make that explicit
+                // instead of silently accepting an orbit that would corrupt
+                // the bounded 2D projection.
+                ImGui::BeginDisabled();
+                ImGui::SmallButton("Orbit view");
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "Front and Right are fixed orthographic views and cannot orbit. "
+                        "Switch to 3D Perspective to orbit.");
+                }
+            } else {
+                if (perspective_camera_orbit_tool_active) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, color(snapshot.colors.panel_selected));
+                    ImGui::PushStyleColor(ImGuiCol_Text, color(snapshot.colors.accent_primary));
+                }
+                if (ImGui::SmallButton(perspective_camera_orbit_tool_active
+                        ? "Orbit view ON" : "Orbit view")) {
+                    perspective_camera_orbit_tool_active = !perspective_camera_orbit_tool_active;
+                    if (perspective_camera_orbit_tool_active) work_surface_pan_tool_active = false;
+                    finish_work_surface_camera_pan();
+                }
+                if (perspective_camera_orbit_tool_active) ImGui::PopStyleColor(2);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Primary drag orbits while Orbit view is on.");
             }
-            if (ImGui::SmallButton(perspective_camera_orbit_tool_active
-                    ? "Orbit view ON" : "Orbit view")) {
-                perspective_camera_orbit_tool_active = !perspective_camera_orbit_tool_active;
-                if (perspective_camera_orbit_tool_active) work_surface_pan_tool_active = false;
-                finish_work_surface_camera_pan();
-            }
-            if (perspective_camera_orbit_tool_active) ImGui::PopStyleColor(2);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Primary drag orbits while Orbit view is on.");
         }
         ImGui::SameLine();
         if (perspective_camera_active) {
@@ -10476,6 +10838,44 @@ struct DesktopState {
                     "Pan View or middle-drag · select an object, then drag the labeled X/Z Move handles · Ctrl grid · Shift geometry snap");
             }
         }
+        if (ImGui::CollapsingHeader("Display & shading")) {
+            const bool geometry_visible = viewport_projected_geometry_last_frame;
+            int selected_spatial = static_cast<int>(viewport_view.spatial);
+            if (ImGui::Combo("Spatial", &selected_spatial,
+                    carto::studio::kViewportSpatialModeMenuItems)) {
+                const auto mode = carto::studio::viewport_spatial_mode_from_menu_index(
+                    static_cast<std::size_t>(selected_spatial));
+                if (mode.has_value()) viewport_view.spatial = *mode;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Shaded draws the scene with material fills. Structure and Depth are "
+                    "CPU re-projections of the same displayed geometry; the studio does "
+                    "not perform GPU depth or texture readback.");
+            }
+            int selected_color = static_cast<int>(viewport_view.color);
+            if (ImGui::Combo("Color", &selected_color,
+                    carto::studio::kViewportColorModeMenuItems)) {
+                const auto mode = carto::studio::viewport_color_mode_from_menu_index(
+                    static_cast<std::size_t>(selected_color));
+                if (mode.has_value()) viewport_view.color = *mode;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Black & white applies a Rec. 709 luma to neutral display colors. "
+                    "Selection and diagnostic accents stay semantic.");
+            }
+            const auto capability = carto::studio::viewport_spatial_capability(
+                viewport_view.spatial, geometry_visible);
+            ImGui::TextDisabled("%s",
+                carto::studio::spatial_capability_label(capability).data());
+            if (viewport_view.view == carto::studio::ViewportViewKind::front_xy ||
+                viewport_view.view == carto::studio::ViewportViewKind::right_zy) {
+                ImGui::TextDisabled(
+                    "Orthographic named views render on the CPU painter; the GPU scene "
+                    "preview binds authored or perspective cameras only.");
+            }
+        }
         if (rendered_error.has_value()) {
             ImGui::TextColored(
                 color(snapshot.colors.semantic_error),
@@ -10498,6 +10898,10 @@ struct DesktopState {
         native_viewport_hits.screen_origin = origin;
         native_viewport_hits.extent = extent;
         native_viewport_hits.valid = extent.x > 0.0F && extent.y > 0.0F;
+        if (viewport_view_restore_pending && native_viewport_hits.valid) {
+            restore_pending_viewport_pose(
+                {static_cast<double>(extent.x), static_cast<double>(extent.y)});
+        }
         const bool ghost_edit_available = showing_agent_after && agent_ghost_edit_mode &&
             snapshot.agent_task.has_value() &&
             snapshot.project_revision == snapshot.agent_task->base_revision &&
@@ -10513,6 +10917,18 @@ struct DesktopState {
         const auto rgba = [](carto::ui::UiColor token, float alpha) {
             token.alpha *= alpha;
             return ImGui::ColorConvertFloat4ToU32(color(token));
+        };
+        // Neutral display colors pass through the view's color mode (Rec. 709
+        // luma in black & white); semantic accents keep their meaning.
+        const auto display_color = [&](carto::ui::UiColor token, float alpha) -> ImU32 {
+            const auto mapped = carto::studio::map_viewport_color(
+                {token.red, token.green, token.blue}, viewport_view.color);
+            if (!mapped) return rgba(token, alpha);
+            return ImGui::ColorConvertFloat4ToU32(ImVec4(
+                static_cast<float>(mapped.value().x),
+                static_cast<float>(mapped.value().y),
+                static_cast<float>(mapped.value().z),
+                token.alpha * alpha));
         };
         draw->AddRectFilled(origin, origin + extent, rgba(snapshot.colors.canvas_0, 1.0F));
         auto instances = rendered_scene.instances();
@@ -11929,6 +12345,21 @@ struct DesktopState {
                     return first.fan_index < second.fan_index;
                 });
         }
+        // Spatial display modes reuse the same projected triangles: Structure
+        // drops fills to show topology only; Depth shades fills by normalized
+        // view depth (a CPU painter ramp, not a GPU depth buffer). Near/far
+        // bounds come from the displayed geometry itself.
+        viewport_projected_geometry_last_frame = !projected_triangles.empty();
+        const bool structure_view =
+            viewport_view.spatial == carto::studio::ViewportSpatialMode::structure;
+        double depth_near = std::numeric_limits<double>::infinity();
+        double depth_far = -std::numeric_limits<double>::infinity();
+        if (viewport_view.spatial == carto::studio::ViewportSpatialMode::depth) {
+            for (const auto& projected_triangle : projected_triangles) {
+                depth_near = std::min(depth_near, projected_triangle.average_depth);
+                depth_far = std::max(depth_far, projected_triangle.average_depth);
+            }
+        }
         for (const auto& projected_triangle : projected_triangles) {
             const auto& projected_mesh = projected_meshes[projected_triangle.mesh_index];
             const auto& instance = *projected_mesh.instance;
@@ -11973,11 +12404,37 @@ struct DesktopState {
             const bool face_selected = snapshot.selection.mode == carto::editor::SelectionMode::face &&
                 std::find(snapshot.selection.faces.begin(), snapshot.selection.faces.end(),
                           instance.mesh->triangle_faces[index / 3U]) != snapshot.selection.faces.end();
-            const ImU32 fill = face_selected ? rgba(snapshot.colors.semantic_warning, 0.52F)
-                                              : (highlighted ? rgba(snapshot.colors.accent_primary, 0.30F)
-                                                             : rgba(snapshot.colors.panel_hover, 0.18F));
-            draw->AddTriangleFilled(a, b, c, fill);
-            draw->AddTriangle(a, b, c, rgba(snapshot.colors.border_soft, 0.82F), 1.0F);
+            ImU32 fill = face_selected ? rgba(snapshot.colors.semantic_warning, 0.52F)
+                                        : (highlighted ? rgba(snapshot.colors.accent_primary, 0.30F)
+                                                       : display_color(snapshot.colors.panel_hover, 0.18F));
+            if (viewport_view.spatial == carto::studio::ViewportSpatialMode::depth &&
+                depth_far > depth_near) {
+                const auto amount = carto::studio::normalize_viewport_depth(
+                    projected_triangle.average_depth, depth_near, depth_far);
+                if (amount) {
+                    const ImVec4 near_color = color(snapshot.colors.accent_secondary);
+                    // Far depth settles into the blue-black canvas identity.
+                    constexpr float far_rgb[3] = {0.03F, 0.05F, 0.09F};
+                    const float u = static_cast<float>(amount.value());
+                    const auto ramp = carto::studio::map_viewport_color({
+                        near_color.x + (far_rgb[0] - near_color.x) * u,
+                        near_color.y + (far_rgb[1] - near_color.y) * u,
+                        near_color.z + (far_rgb[2] - near_color.z) * u},
+                        viewport_view.color);
+                    if (ramp) {
+                        fill = ImGui::ColorConvertFloat4ToU32(ImVec4(
+                            static_cast<float>(ramp.value().x),
+                            static_cast<float>(ramp.value().y),
+                            static_cast<float>(ramp.value().z),
+                            face_selected ? 0.62F : (highlighted ? 0.42F : 0.30F)));
+                    }
+                }
+            }
+            if (!structure_view) {
+                draw->AddTriangleFilled(a, b, c, fill);
+                draw->AddTriangle(a, b, c,
+                    display_color(snapshot.colors.border_soft, 0.82F), 1.0F);
+            }
             faces.push_back({instance.object, instance.mesh->triangle_faces[index / 3U], {a, b, c}});
             if (perspective_camera_active ||
                 (sculpt_target.has_value() &&
@@ -12023,7 +12480,7 @@ struct DesktopState {
                               *triangle_edges[edge_index]) != snapshot.selection.edges.end();
                 draw->AddLine(first, second,
                               selected ? rgba(snapshot.colors.semantic_warning, 1.0F)
-                                       : rgba(snapshot.colors.text_secondary, 0.88F),
+                                       : display_color(snapshot.colors.text_secondary, 0.88F),
                               selected ? 3.0F : 1.0F);
                 edges.push_back({instance.object, *triangle_edges[edge_index],
                     {static_cast<double>(first.x), static_cast<double>(first.y)},
@@ -29237,6 +29694,48 @@ struct DesktopState {
         ImGui::End();
     }
 
+    // The single persisted flag behind View > Work surface. The docked
+    // Viewport binds its close button to this flag, so the existing
+    // preference contract covers close/restore with no second preference.
+    [[nodiscard]] bool& work_surface_pane_visible() noexcept {
+        return workbench.persisted.panes.at(
+            static_cast<std::size_t>(carto::ui::WorkbenchPane::work_surface)).visible;
+    }
+
+    // Focus mode promises a usable work surface: entering it restores a
+    // hidden viewport. Only the persisted pane flag flips; project, selection,
+    // cameras, and view state are untouched.
+    void toggle_viewport_focus() {
+        if (!dock_workspace.focus_mode()) work_surface_pane_visible() = true;
+        dock_workspace.toggle_focus();
+    }
+
+    // Shown while the work-surface pane is hidden so the workspace always has
+    // an explicit restore path. Restoring sets the same persisted flag as
+    // View > Work surface; this card is presentation only and never docks.
+    void draw_viewport_hidden_restore(const UiSnapshot& snapshot) {
+        const ImGuiViewport* primary = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(
+            ImVec2(primary->WorkPos.x + primary->WorkSize.x * 0.5F,
+                   primary->WorkPos.y + primary->WorkSize.y * 0.5F),
+            ImGuiCond_Appearing, ImVec2(0.5F, 0.5F));
+        ImGui::SetNextWindowSize(ImVec2(340.0F, 0.0F), ImGuiCond_Appearing);
+        const auto flags = ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoFocusOnAppearing;
+        if (ImGui::Begin("Viewport hidden##restore", nullptr, flags)) {
+            heading_text_colored(snapshot.colors.accent_secondary, "Viewport hidden");
+            ImGui::TextWrapped(
+                "%s", "The work surface is closed. Project, selection, cameras, and "
+                "view state are unchanged.");
+            if (ImGui::Button("Restore viewport", ImVec2(-1.0F, 0.0F))) {
+                work_surface_pane_visible() = true;
+            }
+            ImGui::TextDisabled("View > Work surface toggles the same persisted setting.");
+        }
+        ImGui::End();
+    }
+
     void draw_workspace_surface(const UiSnapshot& snapshot) {
         const ImGuiViewport* primary = ImGui::GetMainViewport();
         const auto chrome_metrics = carto::studio::studio_chrome_metrics(
@@ -29260,20 +29759,30 @@ struct DesktopState {
             ImGui::End();
             return;
         }
-        if (ImGui::Begin("Viewport", nullptr, ImGuiWindowFlags_NoScrollbar)) {
-            if (workbench.persisted.panes.at(
-                    static_cast<std::size_t>(carto::ui::WorkbenchPane::toolbar)).visible) {
-                draw_toolbar(snapshot);
+        // The docked Viewport is bound to the persisted work-surface pane
+        // flag: its tab close (or closing its torn-out native OS window) hides
+        // it, and View > Work surface / the restore card brings it back to the
+        // same dock node. Skipping the window entirely keeps hits unset.
+        if (work_surface_pane_visible()) {
+            if (ImGui::Begin("Viewport", &work_surface_pane_visible(),
+                    ImGuiWindowFlags_NoScrollbar)) {
+                if (workbench.persisted.panes.at(
+                        static_cast<std::size_t>(carto::ui::WorkbenchPane::toolbar)).visible) {
+                    draw_toolbar(snapshot);
+                }
+                workbench_origin = ImGui::GetWindowPos();
+                workbench_extent = ImGui::GetWindowSize();
+                workbench_bounds_valid = true;
+                draw_viewport(snapshot, ImVec2(0.0F, 0.0F));
+                route_viewport_mouse_frame();
+            } else {
+                native_viewport_hits.reset();
             }
-            workbench_origin = ImGui::GetWindowPos();
-            workbench_extent = ImGui::GetWindowSize();
-            workbench_bounds_valid = true;
-            draw_viewport(snapshot, ImVec2(0.0F, 0.0F));
-            route_viewport_mouse_frame();
+            ImGui::End();
         } else {
             native_viewport_hits.reset();
+            draw_viewport_hidden_restore(snapshot);
         }
-        ImGui::End();
         // Every pane can dock, tab, float, or tear out to its own OS window.
         draw_dock_pane(carto::ui::WorkbenchPane::navigation, "Navigation",
             [&] { draw_navigation_rail(snapshot); });
@@ -29794,6 +30303,10 @@ int run(HINSTANCE instance, int show_command) {
     // and presentation queue in VulkanShell::initialize instead.
     state.load_market_library();
     state.load_workbench_preferences();
+    // Arrangement selection and viewport view settings are local presentation
+    // preferences; they load before the dock layout so the right per-
+    // arrangement INI is chosen.
+    state.load_viewport_workspace_preferences();
     ImGui::CreateContext();
     // UI preferences are owned by UiController; do not let Dear ImGui create
     // an unmanaged imgui.ini beside the executable or in the checkout. The
@@ -29851,6 +30364,7 @@ int run(HINSTANCE instance, int show_command) {
 
     state.save_preferences();
     state.save_workbench_preferences();
+    state.save_viewport_workspace_preferences();
     state.save_docking_layout();
     state.renderer_ready = false;
     // Stop submitting, then keep pumping Win32 while finite retirement polls

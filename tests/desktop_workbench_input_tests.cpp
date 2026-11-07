@@ -504,6 +504,421 @@ void require_docking_mouse_snap() {
     ImGui::SetCurrentContext(previous_context);
 }
 
+struct ArrangementGeometry {
+    ImGuiID root = 0U;
+    ImGuiID viewport_node = 0U;
+    ImGuiID scene_node = 0U;
+    ImGuiID inspector_node = 0U;
+    ImGuiID assets_node = 0U;
+    ImVec2 viewport_pos{};
+    ImVec2 scene_pos{};
+    ImVec2 inspector_pos{};
+    ImVec2 assets_pos{};
+    float viewport_share = 0.0F;
+    bool viewport_central = false;
+};
+
+ArrangementGeometry draw_arrangement_frame(carto::studio::DockingWorkspace& workspace) {
+    ImGui::NewFrame();
+    workspace.begin_root();
+    ImGuiWindow* host = ImGui::FindWindowByName(
+        "Cartographer Studio Dock Host##host");
+    ArrangementGeometry geometry;
+    geometry.root = host == nullptr ? 0U : host->GetID("CartographerStudioDockV1");
+    for (const char* name : {"Viewport", "Scene", "Inspector", "Assets", "History"}) {
+        if (ImGui::Begin(name)) ImGui::TextUnformatted("Arrangement probe");
+        ImGui::End();
+    }
+    ImGui::Render();
+
+    const ImGuiDockNode* const root = ImGui::DockBuilderGetNode(geometry.root);
+    const ImGuiWindow* const viewport = ImGui::FindWindowByName("Viewport");
+    const ImGuiWindow* const scene = ImGui::FindWindowByName("Scene");
+    const ImGuiWindow* const inspector = ImGui::FindWindowByName("Inspector");
+    const ImGuiWindow* const assets = ImGui::FindWindowByName("Assets");
+    const ImGuiWindow* const history = ImGui::FindWindowByName("History");
+    require(root != nullptr && viewport != nullptr && scene != nullptr &&
+            inspector != nullptr && assets != nullptr && history != nullptr &&
+            viewport->DockNode != nullptr && scene->DockNode != nullptr &&
+            inspector->DockNode != nullptr && assets->DockNode != nullptr &&
+            history->DockNode != nullptr,
+        "every arrangement probe panel must stay assigned to the shared dock tree");
+    geometry.viewport_node = viewport->DockNode->ID;
+    geometry.scene_node = scene->DockNode->ID;
+    geometry.inspector_node = inspector->DockNode->ID;
+    geometry.assets_node = assets->DockNode->ID;
+    geometry.viewport_pos = viewport->DockNode->Pos;
+    geometry.scene_pos = scene->DockNode->Pos;
+    geometry.inspector_pos = inspector->DockNode->Pos;
+    geometry.assets_pos = assets->DockNode->Pos;
+    geometry.viewport_central = viewport->DockNode->IsCentralNode();
+    const float root_area = root->Size.x * root->Size.y;
+    require(root_area > 0.0F && std::isfinite(root_area),
+        "the shared dock root must have a measurable surface");
+    geometry.viewport_share =
+        viewport->DockNode->Size.x * viewport->DockNode->Size.y / root_area;
+    require(history->DockNode == assets->DockNode,
+        "Assets and History must remain tabbed together in every arrangement");
+    return geometry;
+}
+
+void require_workspace_arrangement_switching() {
+    ImGuiContext* const previous_context = ImGui::GetCurrentContext();
+    ImGuiContext* const context = ImGui::CreateContext();
+    require(context != nullptr,
+        "a separate ImGui context must be available for arrangement acceptance");
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(1280.0F, 800.0F);
+    io.DeltaTime = 1.0F / 60.0F;
+    io.IniFilename = nullptr;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    require(io.Fonts->Build(), "the arrangement test font atlas must build");
+
+    using Arrangement = carto::studio::WorkspaceArrangement;
+    carto::studio::DockingWorkspace workspace;
+    require(workspace.arrangement() == Arrangement::studio,
+        "the default arrangement must remain Studio for saved-layout compatibility");
+    static_cast<void>(draw_arrangement_frame(workspace));
+    const ArrangementGeometry studio = draw_arrangement_frame(workspace);
+    require(studio.viewport_central,
+        "Studio must keep the viewport in the central dock node");
+    require(studio.inspector_node != studio.scene_node &&
+            studio.scene_pos.x < studio.viewport_pos.x &&
+            studio.inspector_pos.x > studio.viewport_pos.x &&
+            studio.assets_pos.y > studio.viewport_pos.y,
+        "Studio must keep Scene left, Inspector right, and Assets/History below");
+
+    workspace.request_arrangement(Arrangement::scene);
+    require(workspace.arrangement() == Arrangement::scene,
+        "request_arrangement must record the artist's selection");
+    static_cast<void>(draw_arrangement_frame(workspace));
+    const ArrangementGeometry scene = draw_arrangement_frame(workspace);
+    require(scene.viewport_central &&
+            scene.scene_pos.x < scene.viewport_pos.x &&
+            scene.inspector_pos.x > scene.viewport_pos.x &&
+            scene.inspector_node != scene.scene_node,
+        "Scene must keep the same panel topology with Scene left and Inspector right");
+    require(scene.viewport_share > studio.viewport_share + 0.05F,
+        "Scene must give the viewport a substantially larger share than Studio");
+
+    workspace.request_arrangement(Arrangement::review);
+    require(workspace.focus_mode() == false,
+        "arrangement switching must not enter focus mode by itself");
+    static_cast<void>(draw_arrangement_frame(workspace));
+    const ArrangementGeometry review = draw_arrangement_frame(workspace);
+    require(review.viewport_central,
+        "Review must keep the viewport in the central dock node");
+    require(review.inspector_node == review.scene_node &&
+            review.assets_node == review.scene_node &&
+            review.scene_pos.x < review.viewport_pos.x,
+        "Review must fold Scene, Inspector, and ledger tabs into one left tab group");
+    require(review.viewport_share > scene.viewport_share + 0.05F,
+        "Review must give the viewport a substantially larger share than Scene");
+
+    // Re-selecting the active arrangement must be a no-op so customization
+    // within the current arrangement is never reset by re-selection.
+    const ArrangementGeometry customized = review;
+    workspace.request_arrangement(Arrangement::review);
+    const ArrangementGeometry reselected = draw_arrangement_frame(workspace);
+    require(reselected.scene_node == customized.scene_node &&
+            reselected.inspector_node == customized.inspector_node &&
+            reselected.viewport_node == customized.viewport_node,
+        "re-selecting the active arrangement must not rebuild the dock tree");
+
+    // An explicit switch away and back may rebuild to that arrangement's
+    // authored defaults, discarding in-arrangement customization.
+    workspace.request_arrangement(Arrangement::scene);
+    static_cast<void>(draw_arrangement_frame(workspace));
+    static_cast<void>(draw_arrangement_frame(workspace));
+    workspace.request_arrangement(Arrangement::review);
+    static_cast<void>(draw_arrangement_frame(workspace));
+    const ArrangementGeometry restored_review = draw_arrangement_frame(workspace);
+    require(restored_review.inspector_node == restored_review.scene_node &&
+            restored_review.scene_node != 0U,
+        "switching back to Review must rebuild its authored tab-fold topology");
+
+    // Arrangement switching must survive focus mode: the topology stays alive
+    // underneath and is rebuilt when the chrome returns.
+    workspace.toggle_focus();
+    workspace.request_arrangement(Arrangement::scene);
+    require(workspace.focus_mode(),
+        "an arrangement request must not clear focus mode");
+    static_cast<void>(draw_arrangement_frame(workspace));
+    require(workspace.focus_mode(),
+        "arrangement frames must remain in focus mode until the artist exits it");
+    workspace.toggle_focus();
+    static_cast<void>(draw_arrangement_frame(workspace));
+    const ArrangementGeometry focused_scene = draw_arrangement_frame(workspace);
+    require(!workspace.focus_mode() && focused_scene.viewport_central &&
+            focused_scene.inspector_pos.x > focused_scene.viewport_pos.x,
+        "the arrangement requested during focus mode must be applied when chrome returns");
+
+    ImGui::DestroyContext(context);
+    ImGui::SetCurrentContext(previous_context);
+}
+
+void require_arrangement_layout_path_mapping() {
+    using Arrangement = carto::studio::WorkspaceArrangement;
+    const std::filesystem::path directory =
+        std::filesystem::path("prefs") / "desktop-test";
+    const auto studio_path =
+        carto::studio::DockingWorkspace::arrangement_layout_path(
+            directory, Arrangement::studio);
+    require(studio_path == directory / "workspace-docking.ini",
+        "Studio must keep the exact legacy docking INI path for compatibility");
+    require(studio_path.filename() ==
+            std::filesystem::path(carto::studio::DockingWorkspace::kLegacyLayoutFileName),
+        "Studio must resolve to the legacy layout file name");
+
+    const auto scene_path =
+        carto::studio::DockingWorkspace::arrangement_layout_path(
+            directory, Arrangement::scene);
+    const auto review_path =
+        carto::studio::DockingWorkspace::arrangement_layout_path(
+            directory, Arrangement::review);
+    require(scene_path != studio_path && review_path != studio_path &&
+            scene_path != review_path,
+        "each arrangement must persist to its own bounded file");
+    require(scene_path.parent_path() == directory &&
+            review_path.parent_path() == directory,
+        "per-arrangement layout files must stay beside the legacy Studio file");
+    require(scene_path.filename().string().size() <= 40U &&
+            review_path.filename().string().size() <= 40U,
+        "per-arrangement layout file names must remain bounded");
+
+    const auto scene_temporary =
+        carto::studio::DockingWorkspace::layout_temporary_path(scene_path, 4100U, 0U);
+    require(scene_temporary.parent_path() == directory,
+        "arrangement temp writes must remain beside the destination file");
+
+    require(carto::studio::DockingWorkspace::classify_arrangement("Studio") ==
+                Arrangement::studio &&
+            carto::studio::DockingWorkspace::classify_arrangement("Scene") ==
+                Arrangement::scene &&
+            carto::studio::DockingWorkspace::classify_arrangement("Review") ==
+                Arrangement::review,
+        "arrangement labels must classify to their persisted layouts");
+    require(!carto::studio::DockingWorkspace::classify_arrangement("scene").has_value() &&
+            !carto::studio::DockingWorkspace::classify_arrangement("").has_value() &&
+            !carto::studio::DockingWorkspace::classify_arrangement("Studio ").has_value(),
+        "unknown arrangement labels must be rejected instead of mapping to a layout");
+    for (std::size_t index = 0U;
+         index < carto::studio::DockingWorkspace::kArrangementCount; ++index) {
+        const auto arrangement = static_cast<Arrangement>(index);
+        require(carto::studio::DockingWorkspace::arrangement_name(arrangement).size() > 0U,
+            "every arrangement must expose a non-empty artist-facing label");
+    }
+}
+
+void require_arrangement_layout_restart() {
+    ImGuiContext* previous_context = ImGui::GetCurrentContext();
+    ImGuiContext* context = ImGui::CreateContext();
+    require(context != nullptr,
+        "a separate ImGui context must be available for arrangement persistence");
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(1280.0F, 800.0F);
+    io.DeltaTime = 1.0F / 60.0F;
+    io.IniFilename = nullptr;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    require(io.Fonts->Build(),
+        "the arrangement persistence font atlas must build");
+
+    // Artist works in the Scene arrangement and customizes it by folding the
+    // Inspector into the Scene node; the customized topology is persisted.
+    using Arrangement = carto::studio::WorkspaceArrangement;
+    carto::studio::DockingWorkspace workspace;
+    workspace.request_arrangement(Arrangement::scene);
+    static_cast<void>(draw_arrangement_frame(workspace));
+    const ArrangementGeometry scene = draw_arrangement_frame(workspace);
+    ImGui::DockBuilderDockWindow("Inspector", scene.scene_node);
+    ImGui::DockBuilderFinish(scene.root);
+    const ArrangementGeometry customized = draw_arrangement_frame(workspace);
+    require(customized.inspector_node == customized.scene_node,
+        "the customized Scene arrangement must tab Inspector with Scene");
+    std::size_t persisted_size = 0U;
+    const char* persisted_data = ImGui::SaveIniSettingsToMemory(&persisted_size);
+    require(persisted_data != nullptr && persisted_size > 0U,
+        "a customized arrangement must produce restart settings");
+    const std::string persisted_settings(persisted_data, persisted_size);
+
+    // Fresh session: the workspace still defaults to Studio, and the saved
+    // Scene-arrangement customization is loaded. Startup must not overwrite
+    // the artist's saved topology with any arrangement's authored defaults.
+    ImGui::DestroyContext(context);
+    context = ImGui::CreateContext();
+    require(context != nullptr,
+        "a fresh ImGui context must be available for arrangement restart");
+    ImGuiIO& restored_io = ImGui::GetIO();
+    restored_io.DisplaySize = ImVec2(1280.0F, 800.0F);
+    restored_io.DeltaTime = 1.0F / 60.0F;
+    restored_io.IniFilename = nullptr;
+    restored_io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    require(restored_io.Fonts->Build(),
+        "the arrangement restart font atlas must build");
+    ImGui::LoadIniSettingsFromMemory(
+        persisted_settings.data(), persisted_settings.size());
+    carto::studio::DockingWorkspace restored;
+    restored.note_saved_layout_loaded();
+    static_cast<void>(draw_arrangement_frame(restored));
+    const ArrangementGeometry restarted = draw_arrangement_frame(restored);
+    require(restarted.inspector_node == restarted.scene_node &&
+            restarted.scene_pos.x < restarted.viewport_pos.x,
+        "startup must restore the saved Scene-arrangement customization instead of Studio defaults");
+    require(restarted.viewport_share > 0.4F,
+        "the restored arrangement must keep a viewport-dominant surface");
+    const ArrangementGeometry kept = restarted;
+    static_cast<void>(draw_arrangement_frame(restored));
+    const ArrangementGeometry kept_again = draw_arrangement_frame(restored);
+    require(kept_again.scene_node == kept.scene_node &&
+            kept_again.inspector_node == kept.inspector_node,
+        "frames after a loaded arrangement must not rebuild the saved topology");
+
+    ImGui::DestroyContext(context);
+    ImGui::SetCurrentContext(previous_context);
+}
+
+void require_arrangement_fallback_preserves_guard_state() {
+    ImGuiContext* const previous_context = ImGui::GetCurrentContext();
+    ImGuiContext* const context = ImGui::CreateContext();
+    require(context != nullptr,
+        "a separate ImGui context must be available for arrangement fallback acceptance");
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(1280.0F, 800.0F);
+    io.DeltaTime = 1.0F / 60.0F;
+    io.IniFilename = nullptr;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    require(io.Fonts->Build(),
+        "the arrangement fallback font atlas must build");
+
+    using Arrangement = carto::studio::WorkspaceArrangement;
+    carto::studio::DockingWorkspace workspace;
+    workspace.toggle_focus();
+    static_cast<void>(draw_arrangement_frame(workspace));
+    static_cast<void>(draw_arrangement_frame(workspace));
+
+    // Simulate the app rejecting a corrupt layout file for the current
+    // arrangement. The corrupt-file guard must survive a defaults fallback:
+    // shutdown saves would otherwise silently overwrite the rejected bytes.
+    workspace.note_saved_layout_rejected();
+    require(!workspace.layout_save_allowed(),
+        "a rejected layout must block saves before the fallback");
+    workspace.request_arrangement_defaults(Arrangement::scene);
+    require(workspace.arrangement() == Arrangement::scene,
+        "the fallback must record the arrangement it rebuilds");
+    require(workspace.focus_mode(),
+        "the arrangement defaults fallback must preserve focus mode");
+    require(!workspace.layout_save_allowed(),
+        "the arrangement defaults fallback must preserve a pending rejection so the corrupt file is not overwritten");
+    static_cast<void>(draw_arrangement_frame(workspace));
+    require(workspace.focus_mode(),
+        "fallback frames must remain in focus mode until the artist exits it");
+    // Geometry assertions need the chrome back: while focus mode is active the
+    // dockspace runs KeepAliveOnly and marks no central node.
+    workspace.toggle_focus();
+    const ArrangementGeometry rebuilt = draw_arrangement_frame(workspace);
+    require(rebuilt.viewport_central &&
+            rebuilt.scene_pos.x < rebuilt.viewport_pos.x &&
+            rebuilt.inspector_pos.x > rebuilt.viewport_pos.x,
+        "the fallback must rebuild the Scene arrangement's authored topology");
+
+    // The explicit Reset workspace layout action keeps its deliberate
+    // semantics: it clears focus and the rejection guard, making saves
+    // allowed again (the artist has chosen to discard the corrupt file).
+    workspace.toggle_focus();
+    workspace.request_reset();
+    require(!workspace.focus_mode() && workspace.layout_save_allowed(),
+        "an explicit reset must clear focus and the rejection guard");
+
+    ImGui::DestroyContext(context);
+    ImGui::SetCurrentContext(previous_context);
+}
+
+void require_arrangement_switch_clears_rejection_for_healthy_target() {
+    // Switching away from a rejected arrangement to one with no usable saved
+    // layout must clear the stale rejection: the new arrangement has no
+    // corrupt file to preserve, and blocking saves would prevent it from ever
+    // persisting. This is the request_arrangement normal branch the app uses
+    // for missing target layouts.
+    carto::studio::DockingWorkspace workspace;
+    workspace.note_saved_layout_rejected();
+    require(!workspace.layout_save_allowed(),
+        "a rejected layout must block saves before switching");
+    workspace.request_arrangement(carto::studio::WorkspaceArrangement::review);
+    require(workspace.arrangement() == carto::studio::WorkspaceArrangement::review,
+        "switching must record the target arrangement");
+    require(workspace.layout_save_allowed(),
+        "switching to a layout with no corrupt file must clear the stale rejection so the target can be saved");
+}
+
+// Mirrors the shell's Viewport binding: p_open is the persisted work-surface
+// pane flag. Closing (tab or native OS window) hides the window without
+// touching the dock tree, and restoring re-docks it to the same node.
+void require_viewport_close_restore_keeps_dock_identity() {
+    ImGuiContext* const previous_context = ImGui::GetCurrentContext();
+    ImGuiContext* const context = ImGui::CreateContext();
+    require(context != nullptr,
+        "a separate ImGui context must be available for viewport close/restore acceptance");
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(1280.0F, 800.0F);
+    io.DeltaTime = 1.0F / 60.0F;
+    io.IniFilename = nullptr;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    require(io.Fonts->Build(),
+        "the viewport close/restore font atlas must build");
+
+    carto::studio::DockingWorkspace workspace;
+    bool work_surface_visible = true;
+    const ImGuiWindow* viewport = nullptr;
+    const ImGuiWindow* scene = nullptr;
+    const auto frame = [&]() {
+        ImGui::NewFrame();
+        workspace.begin_root();
+        viewport = nullptr;
+        if (work_surface_visible) {
+            if (ImGui::Begin("Viewport", &work_surface_visible,
+                    ImGuiWindowFlags_NoScrollbar)) {
+                ImGui::TextUnformatted("Viewport probe");
+            }
+            ImGui::End();
+            viewport = ImGui::FindWindowByName("Viewport");
+        }
+        if (ImGui::Begin("Scene")) ImGui::TextUnformatted("Scene probe");
+        ImGui::End();
+        scene = ImGui::FindWindowByName("Scene");
+        ImGui::Render();
+    };
+    frame();
+    frame();
+    require(viewport != nullptr && viewport->DockNode != nullptr,
+        "the viewport must dock into the shared tree");
+    require(scene != nullptr && scene->DockNode != nullptr,
+        "the scene probe must dock into the shared tree");
+    const ImGuiID viewport_node = viewport->DockNode->ID;
+    const ImGuiID scene_node = scene->DockNode->ID;
+
+    // Closing the tab (or the torn-out native window) drives p_open false,
+    // exactly as the shell's bound Begin reports it.
+    work_surface_visible = false;
+    frame();
+    require(viewport == nullptr,
+        "a hidden work surface must not draw the viewport window");
+    require(scene != nullptr && scene->DockNode != nullptr &&
+            scene->DockNode->ID == scene_node,
+        "hiding the viewport must leave the rest of the dock tree intact");
+
+    // Restore through the same persisted flag View > Work surface toggles.
+    work_surface_visible = true;
+    frame();
+    frame();
+    const ImGuiWindow* restored = ImGui::FindWindowByName("Viewport");
+    require(restored != nullptr && restored->DockNode != nullptr &&
+            restored->DockNode->ID == viewport_node,
+        "restoring the work surface must re-dock Viewport to its previous node");
+
+    ImGui::DestroyContext(context);
+    ImGui::SetCurrentContext(previous_context);
+}
+
 } // namespace
 
 int main() {
@@ -798,6 +1213,12 @@ int main() {
     require_docking_layout_load_fail_closed();
     require_docking_capture_loss_is_distinguished();
     require_docking_mouse_snap();
+    require_workspace_arrangement_switching();
+    require_arrangement_layout_path_mapping();
+    require_arrangement_layout_restart();
+    require_arrangement_fallback_preserves_guard_state();
+    require_arrangement_switch_clears_rejection_for_healthy_target();
+    require_viewport_close_restore_keeps_dock_identity();
 
     ImGui::DestroyContext(context);
 
