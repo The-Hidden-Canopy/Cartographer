@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -22,8 +23,58 @@
 
 namespace carto::studio {
 
+// Named workspace arrangements share the same dock root identity and the same
+// panel windows as the legacy Studio layout; only split topology and
+// proportions differ. Studio keeps the exact legacy proportions (Scene 17%,
+// Inspector 22%, bottom 21%) and the legacy persisted file so existing users
+// keep their saved layout untouched; Scene and Review give the viewport a
+// substantially larger share for viewport-first authoring.
+enum class WorkspaceArrangement : std::uint8_t { studio, scene, review };
 
 class DockingWorkspace final {
+public:
+    static constexpr std::size_t kArrangementCount = 3U;
+    // The legacy Studio persisted layout file; its name and location must not
+    // change so previously saved workspaces keep loading.
+    static constexpr std::string_view kLegacyLayoutFileName = "workspace-docking.ini";
+
+    [[nodiscard]] static constexpr std::string_view arrangement_name(
+        WorkspaceArrangement arrangement) noexcept {
+        switch (arrangement) {
+        case WorkspaceArrangement::scene: return "Scene";
+        case WorkspaceArrangement::review: return "Review";
+        case WorkspaceArrangement::studio: default: return "Studio";
+        }
+    }
+
+    // Bounded input mapping from a user-visible arrangement label. Names that
+    // do not exactly match a known arrangement are rejected.
+    [[nodiscard]] static constexpr std::optional<WorkspaceArrangement>
+    classify_arrangement(std::string_view name) noexcept {
+        for (std::size_t index = 0U; index < kArrangementCount; ++index) {
+            const auto arrangement = static_cast<WorkspaceArrangement>(index);
+            if (arrangement_name(arrangement) == name) return arrangement;
+        }
+        return std::nullopt;
+    }
+
+    // Maps an arrangement to its bounded persisted INI file beside the legacy
+    // Studio file. Studio resolves to the exact legacy path for compatibility;
+    // every other arrangement gets its own sibling file so an artist can
+    // customize and later return to each arrangement independently.
+    [[nodiscard]] static std::filesystem::path arrangement_layout_path(
+        const std::filesystem::path& directory,
+        WorkspaceArrangement arrangement) {
+        switch (arrangement) {
+        case WorkspaceArrangement::scene:
+            return directory / "workspace-docking-scene.ini";
+        case WorkspaceArrangement::review:
+            return directory / "workspace-docking-review.ini";
+        case WorkspaceArrangement::studio: default:
+            return directory / std::string(kLegacyLayoutFileName);
+        }
+    }
+
 public:
     enum class LayoutPresence : std::uint8_t { missing, present, rejected };
     enum class NativeCaptureState : std::uint8_t { none, owned, lost };
@@ -66,6 +117,35 @@ public:
         loaded_existing_layout_ = false;
         layout_load_rejected_ = false;
         focus_mode_ = false;
+    }
+    [[nodiscard]] WorkspaceArrangement arrangement() const noexcept { return arrangement_; }
+    // An explicit arrangement switch rebuilds the dock tree to that
+    // arrangement's proportions on the next frame. Re-selecting the active
+    // arrangement is a no-op so artist customization within the current
+    // arrangement is never reset by re-selection. A switch never clears focus
+    // mode and never touches project/scene/camera authority. Loading a saved
+    // layout keeps the saved topology: startup only builds an arrangement when
+    // no usable layout was restored.
+    void request_arrangement(WorkspaceArrangement arrangement) noexcept {
+        if (arrangement_ == arrangement) return;
+        arrangement_ = arrangement;
+        rebuild_ = true;
+        loaded_existing_layout_ = false;
+        layout_load_rejected_ = false;
+    }
+    // Rebuilds the given arrangement's authored defaults on the next frame
+    // without clearing focus mode or a pending layout-load rejection. Unlike
+    // request_arrangement() this entry fires even when the arrangement is
+    // already selected, and unlike request_reset() it is not an explicit
+    // artist reset: the corrupt-file guard (layout_save_allowed) and focus
+    // state are preserved so a rejected layout file is never overwritten as a
+    // side effect. The app uses this when the target arrangement has no usable
+    // saved layout — its file is missing (first use, save allowed) or rejected
+    // (preserved on disk until the artist explicitly resets the workspace).
+    void request_arrangement_defaults(WorkspaceArrangement arrangement) noexcept {
+        arrangement_ = arrangement;
+        rebuild_ = true;
+        loaded_existing_layout_ = false;
     }
     void toggle_focus() noexcept { focus_mode_ = !focus_mode_; }
     [[nodiscard]] bool focus_mode() const noexcept { return focus_mode_; }
@@ -238,22 +318,60 @@ private:
         ImGui::DockBuilderRemoveNode(root);
         ImGui::DockBuilderAddNode(root, ImGuiDockNodeFlags_DockSpace);
         ImGui::DockBuilderSetNodeSize(root, extent);
+        switch (arrangement_) {
+        case WorkspaceArrangement::scene:
+            build_arrangement(root, 0.13F, 0.18F, 0.14F);
+            break;
+        case WorkspaceArrangement::review:
+            // Review folds Scene, Inspector, Assets, and History into one tab
+            // column on the left so the viewport takes the whole remaining
+            // ~86% of the surface. There is no right node and no bottom node.
+            build_arrangement(root, 0.14F, 0.0F, 0.0F, true);
+            break;
+        case WorkspaceArrangement::studio: default:
+            // Legacy compatibility baseline: Scene 17%, Inspector 22%,
+            // Assets/History 21% below; the viewport keeps ~51% of the surface.
+            build_arrangement(root, 0.17F, 0.22F, 0.21F);
+            break;
+        }
+        ImGui::DockBuilderFinish(root);
+    }
+
+    // Same panels, same root identity, same tear-off paths for every
+    // arrangement; only the splits differ. When fold_inspector_left is set the
+    // Inspector is tabbed with Scene instead of receiving its own right node,
+    // and bottom_fraction is applied to the remaining center column.
+    static void build_arrangement(ImGuiID root, float left_fraction,
+                                  float right_fraction, float bottom_fraction,
+                                  bool fold_inspector_left = false) {
         ImGuiID center = root;
-        const ImGuiID left = ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, 0.17F, nullptr, &center);
-        const ImGuiID right = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.22F, nullptr, &center);
-        const ImGuiID bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.21F, nullptr, &center);
+        const ImGuiID left = ImGui::DockBuilderSplitNode(
+            center, ImGuiDir_Left, left_fraction, nullptr, &center);
+        ImGuiID right = 0U;
+        if (!fold_inspector_left) {
+            right = ImGui::DockBuilderSplitNode(
+                center, ImGuiDir_Right, right_fraction, nullptr, &center);
+        }
+        if (bottom_fraction > 0.0F) {
+            const ImGuiID bottom = ImGui::DockBuilderSplitNode(
+                center, ImGuiDir_Down, bottom_fraction, nullptr, &center);
+            ImGui::DockBuilderDockWindow("Assets", bottom);
+            ImGui::DockBuilderDockWindow("History", bottom);
+        } else {
+            ImGui::DockBuilderDockWindow("Assets", left);
+            ImGui::DockBuilderDockWindow("History", left);
+        }
         ImGui::DockBuilderDockWindow("Viewport", center);
         ImGui::DockBuilderDockWindow("Scene", left);
-        ImGui::DockBuilderDockWindow("Inspector", right);
-        ImGui::DockBuilderDockWindow("Assets", bottom);
-        ImGui::DockBuilderDockWindow("History", bottom);
-        ImGui::DockBuilderFinish(root);
+        ImGui::DockBuilderDockWindow("Inspector",
+            fold_inspector_left || right == 0U ? left : right);
     }
     bool initialized_{false};
     bool loaded_existing_layout_{false};
     bool layout_load_rejected_{false};
     bool rebuild_{false};
     bool focus_mode_{false};
+    WorkspaceArrangement arrangement_{WorkspaceArrangement::studio};
 };
 
 } // namespace carto::studio

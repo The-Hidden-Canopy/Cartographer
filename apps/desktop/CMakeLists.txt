@@ -30,6 +30,7 @@ add_executable(cartographer_desktop WIN32
     studio_browser.hpp
     studio_scene_camera.hpp
     studio_viewshed.hpp
+    studio_view_settings.hpp
     studio_viewport_capture.hpp
     studio_sweep_source.hpp
     uv_inspector.hpp

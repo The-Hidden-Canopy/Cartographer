@@ -172,11 +172,34 @@ bounded UI preferences. The Workspace surface is a drafting workbench hosted
 beneath its fixed header. Every workbench pane and instrument is a dockable
 ImGui window: panes can be split, tabbed, hidden, resized, moved freely, or
 dragged beyond the main window to become native OS windows, then docked back
-into the workspace. The header is outside the dockspace. The pinned Dear ImGui
+into the workspace. The docked Viewport window is bound to the persisted
+work-surface pane flag: closing its tab — or its torn-out native OS window —
+hides it without touching project, selection, cameras, view state, or the dock
+tree, and it restores to the same dock node through View > Work surface or the
+in-workspace "Viewport hidden / Restore viewport" card. Entering focus mode
+(F11) restores a hidden work surface so the workspace stays usable afterwards. The header is outside the dockspace. The pinned Dear ImGui
 docking branch supplies Win32 and Vulkan multi-viewport support. Dock layout is
-persisted in `%LOCALAPPDATA%/Cartographer/workspace-layout.ini`; validated pane
+persisted per arrangement in bounded, atomically replaced INI files under
+`%LOCALAPPDATA%/Cartographer/`: the legacy `workspace-docking.ini` remains the
+Studio arrangement's file so existing users keep their saved layout untouched,
+while Scene and Review persist to sibling files beside it. The selected
+arrangement marker and the viewport view settings live in a separate bounded
+atomic `workspace-viewport.prefs`; validated pane
 visibility, geometry, and Ledger collapse preferences remain in
-`workbench.prefs`. Both files are local UI state and never enter project truth.
+`workbench.prefs`. All of these are local UI state and never enter project
+truth. Three named arrangements share one dock root and panel set: Studio keeps
+the legacy proportions (Scene 17%, Inspector 22%, bottom 21%), Scene narrows the
+side and bottom rails for a substantially larger viewport, and Review folds the
+panel columns into one left tab group so the viewport takes the remaining
+surface. Switching flushes the outgoing arrangement's layout, loads the target's
+saved layout when one exists, and otherwise rebuilds that arrangement's authored
+topology; re-selecting the active arrangement is a no-op. Switching never
+changes project, scene, selection, or camera state and never clears focus mode.
+A rejected (corrupt or unreadable) arrangement layout is never overwritten by
+shutdown saves: the shell rebuilds that arrangement's authored defaults and
+keeps the rejection guard until the artist explicitly resets the workspace;
+switching to a healthy or not-yet-created arrangement clears the stale guard so
+that arrangement can persist.
 The Measure bay is connected to the public surface-fidelity compiler as a
 Surface Fidelity instrument: it compiles an explicit triangle-budget preview
 from the selected viewport instance, displays the appearance-conservation
@@ -196,15 +219,39 @@ Ledger receipts are selectable and expose the retained operation id, action,
 revision interval, and document-change flag. Parameter reopening is explicitly
 disabled until the application receipt contract carries an editable parameter
 payload; the shell does not infer or fabricate one.
+The viewport itself binds named views and display modes as presentation-only
+controls. The 3D Perspective view renders through the existing bounded
+`EditorCamera`; Top (Plan X/Z) renders through the existing
+`WorkSurfaceCamera`; Front (X/Y) and Right (Z/Y) render through the same
+`EditorCamera` with bounded orthographic orientation presets, so no separate
+renderer mode exists. Each view retains its own camera pose: switching views
+captures the outgoing pose and restores the incoming one, and the current
+view's pose persists across restarts through the bounded view-settings codec in
+`workspace-viewport.prefs`. Scene, selection, materials, and lighting are never
+reset by a view change. The fixed orthographic presets cannot be rotated: the
+Orbit control is disabled in Front and Right with an explicit tooltip, and the
+pointer path refuses orbit input for fixed views, so a bounded 2D projection is
+never silently changed. Shaded draws the scene with its existing material
+fills; Structure drops fills to show real mesh topology edges; Depth shades
+fills by normalized view depth of the displayed geometry. Structure and Depth
+are CPU painter re-projections and are labeled as such — the studio performs no
+GPU depth or texture readback, and the capability line under the display
+controls states this explicitly. Full color and a Rec. 709 monochrome transform
+are the two color modes; selection and diagnostic accents stay semantic. The
+GPU scene preview binds authored or perspective viewport cameras only, so the
+display controls carry an explicit note that orthographic named views render on
+the CPU painter.
 Unavailable capabilities remain explicit placeholder instruments. Preference
 read/write failures are surfaced rather than silently discarded. The shell
 remains behind the existing Vulkan SDK and pinned Dear ImGui prerequisites. A
 local Debug build and responsive native-window launch have been exercised
 against those prerequisites; native message routing is source- and contract-
-verified. Docking and viewport-tear-out code is now integrated against the
-pinned docking branch; interactive click-through, secondary-monitor placement,
-pixel, DPI, and resize acceptance remain pending. Broad GPU compatibility and
-downstream runtime admission are separate gates.
+verified. Docking and viewport-tear-out are integrated against the pinned
+docking branch. Populated native view switching, detach/dock, resize, focus,
+and dirty-save/reopen are recorded in the
+[viewport workspace ledger](../verification/viewport-workspace/EVIDENCE_LEDGER.md).
+Secondary-monitor recovery, arbitrary DPI combinations, authored-camera GPU
+preview, and broad GPU compatibility remain separate acceptance gates.
 
 ## Evidence
 
@@ -232,6 +279,19 @@ evaluate the private sculpt runtime. See the
 [wiring repair ledger](../verification/frontend-backend-wiring.md) for executed
 checks and platform-specific gaps.
 
+`tests/desktop_workbench_input_tests.cpp` covers the named dock arrangements
+(viewport centrality and share, focus-mode interaction, per-arrangement layout
+paths, re-selection no-op, and restart restore of a customized arrangement),
+and `tests/desktop_viewport_view_tests.cpp` covers the named-view axes,
+orthographic presets, per-view pose capture/restore, monochrome luma mapping,
+depth normalization, structure-edge collection, capability labels, and the
+bounded view-settings codec. These are model and contract tests; the
+[viewport workspace ledger](../verification/viewport-workspace/EVIDENCE_LEDGER.md)
+separately records visible-window populated-scene, view-switching,
+detach/dock, resize, focus, per-arrangement restoration, and dirty-save/reopen
+acceptance. Multi-monitor recovery, arbitrary DPI combinations, and
+authored-camera GPU preview remain separate gates.
+
 ## Deliberate non-claims
 
 The Model workspace routes a bounded human viewport stroke on one selected
@@ -250,5 +310,5 @@ normal snapping, broader persistent edge authoring/traversal, general-purpose
 3D manipulators, numeric rotation/scale, full direct-modeling interaction,
 CAD/BUILD/material/animation subsystems, and model-backed AI planning remain
 roadmap work. Docking and native viewport tear-out are implemented in the
-shell; native visual, click-through, DPI, and broad GPU acceptance remain
-pending.
+shell; multi-monitor recovery, arbitrary DPI combinations, and broad GPU
+acceptance remain pending.
