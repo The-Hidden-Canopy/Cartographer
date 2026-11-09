@@ -22,6 +22,8 @@
 #include "reference_image_projection.hpp"
 #include "studio_browser.hpp"
 #include "studio_chrome.hpp"
+#include "studio_file_picker.hpp"
+#include "studio_native_chrome.hpp"
 #include "studio_scene_camera.hpp"
 #include "studio_style.hpp"
 #include "studio_draft.hpp"
@@ -2456,6 +2458,9 @@ enum class StandardMeshExport {
     stl,
 };
 
+// A presentation snapshot, updated by the existing theme authority each frame.
+carto::studio::FilePickerTheme file_picker_theme = carto::studio::FilePickerTheme::dark;
+
 [[nodiscard]] std::optional<std::filesystem::path> choose_file(
     bool save, FileDialogKind kind = FileDialogKind::project) {
     wchar_t path[MAX_PATH]{};
@@ -2613,6 +2618,11 @@ enum class StandardMeshExport {
     dialog.Flags = OFN_PATHMUSTEXIST | (save
         ? ((kind == FileDialogKind::agent_checkpoint || kind == FileDialogKind::agent_demonstration) ? 0U : OFN_OVERWRITEPROMPT)
         : OFN_FILEMUSTEXIST);
+    dialog.hwndOwner = GetActiveWindow();
+    const auto result = carto::studio::choose_studio_file(
+        dialog.hwndOwner, dialog, file_picker_theme, save);
+    if (result.outcome == carto::studio::FilePickerOutcome::selected) return result.path;
+    if (result.outcome == carto::studio::FilePickerOutcome::cancelled) return std::nullopt;
     const BOOL selected = save ? GetSaveFileNameW(&dialog) : GetOpenFileNameW(&dialog);
     if (!selected) return std::nullopt;
     return std::filesystem::path(path);
@@ -2831,6 +2841,7 @@ struct DesktopState {
     std::optional<carto::core::Vec2d> workbench_native_release_position;
     bool renderer_ready = false;
     std::optional<carto::ui::Theme> applied_window_theme;
+    std::optional<bool> applied_system_high_contrast;
     ImFont* body_font = nullptr;
     ImFont* heading_font = nullptr;
     ImFont* mono_font = nullptr;
@@ -8796,23 +8807,20 @@ struct DesktopState {
 
     void apply_theme(const UiSnapshot& snapshot) {
         carto::studio::apply_studio_style(snapshot);
+        file_picker_theme = snapshot.theme == carto::ui::Theme::light
+            ? carto::studio::FilePickerTheme::light
+            : snapshot.theme == carto::ui::Theme::high_contrast
+                ? carto::studio::FilePickerTheme::high_contrast
+                : carto::studio::FilePickerTheme::dark;
     }
 
     void apply_window_chrome(const UiSnapshot& snapshot) {
-        if (window == nullptr || applied_window_theme == snapshot.theme) return;
-        const BOOL dark_mode = snapshot.theme != carto::ui::Theme::light ? TRUE : FALSE;
-        const COLORREF caption = dark_mode == TRUE ? RGB(7, 11, 18) : RGB(244, 246, 249);
-        const COLORREF text = dark_mode == TRUE ? RGB(230, 236, 250) : RGB(20, 26, 36);
-        // These attributes are supported by current Windows 10/11 builds. The
-        // calls are intentionally best-effort so older systems keep the native
-        // title bar instead of making startup fail.
-        static_cast<void>(DwmSetWindowAttribute(
-            window, static_cast<DWMWINDOWATTRIBUTE>(20), &dark_mode, sizeof(dark_mode)));
-        static_cast<void>(DwmSetWindowAttribute(
-            window, static_cast<DWMWINDOWATTRIBUTE>(35), &caption, sizeof(caption)));
-        static_cast<void>(DwmSetWindowAttribute(
-            window, static_cast<DWMWINDOWATTRIBUTE>(36), &text, sizeof(text)));
+        const bool high_contrast = carto::studio::system_high_contrast_enabled();
+        if (window == nullptr || (applied_window_theme == snapshot.theme &&
+            applied_system_high_contrast == high_contrast)) return;
+        carto::studio::apply_native_caption(window, high_contrast);
         applied_window_theme = snapshot.theme;
+        applied_system_high_contrast = high_contrast;
     }
 
     [[nodiscard]] ImVec4 status_color(const UiSnapshot& snapshot) const noexcept {
@@ -30212,6 +30220,21 @@ struct DesktopState {
     }
 };
 
+void apply_detached_window_chrome(bool high_contrast) {
+    auto& platform = ImGui::GetPlatformIO();
+    const ImGuiViewport* main = ImGui::GetMainViewport();
+    constexpr wchar_t marker[] = L"Cartographer.DarkCaption.V1";
+    const HANDLE marker_value = reinterpret_cast<HANDLE>(static_cast<INT_PTR>(high_contrast ? 2 : 1));
+    for (int index = 0; index < platform.Viewports.Size; ++index) {
+        const ImGuiViewport* viewport = platform.Viewports[index];
+        if (viewport == nullptr || viewport == main || viewport->PlatformHandle == nullptr) continue;
+        HWND native_window = static_cast<HWND>(viewport->PlatformHandle);
+        if (GetPropW(native_window, marker) == marker_value) continue;
+        carto::studio::apply_native_caption(native_window, high_contrast);
+        static_cast<void>(SetPropW(native_window, marker, marker_value));
+    }
+}
+
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l_param) {
     if (message == WM_GETMINMAXINFO) {
         auto* limits = reinterpret_cast<MINMAXINFO*>(l_param);
@@ -30353,6 +30376,7 @@ int run(HINSTANCE instance, int show_command) {
         if ((imgui_io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0) {
             ImGui::UpdatePlatformWindows();
             carto::studio::DockingWorkspace::recover_offscreen_platform_windows();
+            apply_detached_window_chrome(state.applied_system_high_contrast.value_or(false));
             ImGui::RenderPlatformWindowsDefault();
         }
         if (!presented) {

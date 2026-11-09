@@ -1244,6 +1244,13 @@ target_link_libraries(cartographer_ui_tests
 carto_target(cartographer_ui_tests)
 add_test(NAME cartographer_ui_tests COMMAND cartographer_ui_tests)
 
+add_executable(cartographer_desktop_file_picker_rules_tests desktop_file_picker_rules_tests.cpp)
+if(WIN32)
+    target_link_libraries(cartographer_desktop_file_picker_rules_tests PRIVATE shlwapi)
+endif()
+carto_target(cartographer_desktop_file_picker_rules_tests)
+add_test(NAME cartographer_desktop_file_picker_rules_tests COMMAND cartographer_desktop_file_picker_rules_tests)
+
 add_executable(cartographer_desktop_viewshed_tests desktop_viewshed_tests.cpp)
 target_include_directories(cartographer_desktop_viewshed_tests
     PRIVATE ${PROJECT_SOURCE_DIR}/apps/desktop

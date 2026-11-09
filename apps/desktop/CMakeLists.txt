@@ -27,6 +27,11 @@ add_executable(cartographer_desktop WIN32
     studio_style.hpp
     studio_draft.hpp
     studio_chrome.hpp
+    studio_file_picker.cpp
+    studio_file_picker.hpp
+    studio_file_picker_rules.hpp
+    studio_file_picker_paths.hpp
+    studio_native_chrome.hpp
     studio_browser.hpp
     studio_scene_camera.hpp
     studio_viewshed.hpp
@@ -49,6 +54,7 @@ target_link_libraries(cartographer_desktop
         user32
         gdi32
         shell32
+        shlwapi
         dwmapi
         winmm
         windowscodecs

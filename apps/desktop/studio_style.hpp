@@ -38,14 +38,14 @@ inline void apply_studio_style(const ui::UiSnapshot& snapshot) noexcept {
     style.FrameRounding = 4.0F;
     style.GrabRounding = 3.0F;
     style.ScrollbarRounding = 6.0F;
-    style.TabRounding = 4.0F;
+    style.TabRounding = 8.0F;
     style.WindowBorderSize = 1.0F;
     style.ChildBorderSize = 1.0F;
     style.PopupBorderSize = 1.0F;
     style.FrameBorderSize = 1.0F;
     style.TabBorderSize = 0.0F;
-    style.TabBarBorderSize = 1.0F;
-    style.TabBarOverlineSize = 2.0F;
+    style.TabBarBorderSize = 0.0F;
+    style.TabBarOverlineSize = 3.0F;
     style.WindowTitleAlign = {0.0F, 0.5F};
     style.ButtonTextAlign = {0.5F, 0.5F};
     style.SelectableTextAlign = {0.0F, 0.5F};
