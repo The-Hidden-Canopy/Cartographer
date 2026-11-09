@@ -302,3 +302,18 @@ The prior viewport change did not modify these eight test sources, their library
 sources, or their target definitions. This supports a pre-existing/environmental
 explanation, but no independently rebuilt c10d668 baseline was run and a full
 post-fix regression run remains outstanding.
+
+Native follow-up: the modified desktop translation unit was rebuilt with
+llvm-mingw and linked into a separate executable with the unchanged final-build
+libraries. With isolated copied preferences on the single available display,
+the app launched, the Inspector tab was torn out into a native window, and a
+graceful close saved that layout. Reopening with its stored viewport position
+changed to `(715,-100)` showed an accessible title strip and saved a corrected
+position. The prior final executable, run with the same isolated input, also
+showed an accessible title and saved a corrected position. This visible test
+therefore verifies basic launch, tear-out, and restoration but does not isolate
+the recovery patch's effect; the targeted platform-callback test does that.
+No populated-scene GPU preview, real monitor disconnect, multi-monitor, or DPI
+combination was exercised in this follow-up. The CMake-generated MinGW fixture
+link command was checked to include `--stack,16777216`; the separately linked
+fixture with that option passed.
