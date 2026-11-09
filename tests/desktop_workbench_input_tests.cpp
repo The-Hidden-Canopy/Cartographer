@@ -259,6 +259,30 @@ void require_docking_monitor_recovery() {
             kept_visible.y == sufficiently_visible.y,
         "a detached viewport with a useful visible strip must keep its placement");
 
+    const ImVec2 hidden_title{100.0F, -100.0F};
+    const ImVec2 recovered_title =
+        carto::studio::DockingWorkspace::recover_window_position(
+            hidden_title, window_size, monitors, 2);
+    require(recovered_title.x == 100.0F && recovered_title.y == 0.0F,
+        "a visible body must not leave the title bar above every monitor");
+
+    const ImVec2 oversized_hidden_title =
+        carto::studio::DockingWorkspace::recover_window_position(
+            hidden_title, ImVec2(2200.0F, 1400.0F), monitors, 2);
+    require(oversized_hidden_title.y == 0.0F,
+        "an oversized window must also recover its top drag strip");
+
+    ImGuiPlatformMonitor stacked_monitors[2]{};
+    stacked_monitors[0] = monitors[0];
+    stacked_monitors[1].WorkPos = {0.0F, -1024.0F};
+    stacked_monitors[1].WorkSize = {1280.0F, 1024.0F};
+    const ImVec2 spanning{100.0F, -100.0F};
+    const ImVec2 kept_spanning =
+        carto::studio::DockingWorkspace::recover_window_position(
+            spanning, window_size, stacked_monitors, 2);
+    require(kept_spanning.x == spanning.x && kept_spanning.y == spanning.y,
+        "a drag strip on another connected monitor must retain its placement");
+
     const ImVec2 barely_visible{1876.0F, 1400.0F};
     const ImVec2 recovered =
         carto::studio::DockingWorkspace::recover_window_position(
@@ -343,6 +367,17 @@ void require_live_docking_monitor_recovery() {
             recovered_platform_position.x == offscreen.Pos.x &&
             recovered_platform_position.y == offscreen.Pos.y,
         "recovery must update only the detached OS window through its platform callback");
+
+    visible.Pos = {20.0F, -100.0F};
+    recovered_platform_position_calls = 0;
+    carto::studio::DockingWorkspace::recover_offscreen_platform_windows();
+    require(visible.Pos.x == 20.0F && visible.Pos.y == 0.0F &&
+            recovered_platform_position_calls == 1 &&
+            recovered_platform_viewport == &visible,
+        "a visible window body must not hide its platform title bar offscreen");
+    carto::studio::DockingWorkspace::recover_offscreen_platform_windows();
+    require(recovered_platform_position_calls == 1,
+        "a recovered platform window must not be moved again every frame");
 
     io.ConfigFlags = original_flags;
     platform.Platform_SetWindowPos = nullptr;

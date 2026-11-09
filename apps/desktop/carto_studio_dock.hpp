@@ -151,9 +151,10 @@ public:
     [[nodiscard]] bool focus_mode() const noexcept { return focus_mode_; }
 
     // Keep detached windows recoverable when a monitor disappears. A window
-    // already showing a useful portion on any connected work area is left
-    // untouched; otherwise clamp it to the nearest current monitor, retaining
-    // at least a small draggable strip. This changes presentation only.
+    // with a useful portion of its top drag strip on a connected work area is
+    // left untouched; otherwise clamp it to the nearest monitor. Seeing only
+    // the window body is insufficient when its title bar is above all screens.
+    // This changes presentation only.
     [[nodiscard]] static ImVec2 recover_window_position(
         ImVec2 position,
         ImVec2 size,
@@ -194,10 +195,11 @@ public:
 
             const float overlap_x = std::max(0.0F,
                 std::min(right, area_right) - std::max(position.x, area_position.x));
-            const float overlap_y = std::max(0.0F,
-                std::min(bottom, area_bottom) - std::max(position.y, area_position.y));
             const float visible_x = std::min({minimum_visible_width, size.x, area_size.x});
             const float visible_y = std::min({minimum_visible_height, size.y, area_size.y});
+            const float overlap_y = std::max(0.0F,
+                std::min(position.y + visible_y, area_bottom) -
+                std::max(position.y, area_position.y));
             if (overlap_x >= visible_x && overlap_y >= visible_y) return position;
 
             const double dx = center_x < area_position.x
@@ -225,9 +227,7 @@ public:
         const float maximum_x = size.x <= monitor.WorkSize.x
             ? monitor.WorkPos.x + monitor.WorkSize.x - size.x
             : monitor.WorkPos.x + monitor.WorkSize.x - visible_x;
-        const float minimum_y = size.y <= monitor.WorkSize.y
-            ? monitor.WorkPos.y
-            : monitor.WorkPos.y - size.y + visible_y;
+        const float minimum_y = monitor.WorkPos.y;
         const float maximum_y = size.y <= monitor.WorkSize.y
             ? monitor.WorkPos.y + monitor.WorkSize.y - size.y
             : monitor.WorkPos.y + monitor.WorkSize.y - visible_y;
