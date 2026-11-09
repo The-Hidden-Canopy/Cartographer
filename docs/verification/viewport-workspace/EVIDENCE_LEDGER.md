@@ -273,3 +273,32 @@ ctest --test-dir <build-root>/viewport-build --rerun-failed --output-on-failure
   `0xc0000409`). Their implementation files are outside this change; a clean
   baseline run was not used to attribute them to this candidate or to assert
   that they are pre-existing defects.
+
+## Follow-up 2026-11-09: recovery and Windows test triage
+
+Local main integrated the detached-window top-drag-strip recovery after the
+viewport commit. Focused workbench input tests passed using the modified test
+object linked against the prior final build's libraries; coverage includes a
+hidden top strip, oversized windows, stacked monitors, the platform callback,
+and no repeated movement. This is headless coverage, not a multi-monitor or
+visible-window acceptance claim. Windows with a visible strip may remain partly
+offscreen by design.
+
+The eight previously failed broad suites were rerun from copies of the prior
+`viewport-build` executables with a task-local `TEMP`/`TMP` and fixture output.
+Seven passed: prepared scene, prepared publication, preparation operation,
+preparation job, verification failure injection, verification corrupt artifact,
+and character production. The publication and operation suites each skipped a
+link-dependent case because Windows denied link creation. Their earlier failure
+cause has not been established; this rerun does not retroactively prove why
+they failed.
+
+The condition-authoring UI fixture exited with Windows stack overflow
+`0xc00000fd` and its PE stack reserve was 1 MiB. The same copied executable
+passed after raising only its stack reserve to 16 MiB; a separate executable
+linked from the prior build's object and libraries with `--stack,16777216` also
+passed. The test target now requests a 16 MiB Windows stack (MSVC or MinGW).
+The prior viewport change did not modify these eight test sources, their library
+sources, or their target definitions. This supports a pre-existing/environmental
+explanation, but no independently rebuilt c10d668 baseline was run and a full
+post-fix regression run remains outstanding.

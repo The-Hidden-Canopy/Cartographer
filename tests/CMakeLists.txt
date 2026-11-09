@@ -284,6 +284,13 @@ target_link_libraries(cartographer_condition_authoring_ui_fixture_tests
         carto_ui
 )
 carto_target(cartographer_condition_authoring_ui_fixture_tests)
+# This integration fixture keeps several large authored-scene snapshots alive
+# in one run. Windows' default 1 MiB stack can overflow before it completes.
+if(MSVC)
+    target_link_options(cartographer_condition_authoring_ui_fixture_tests PRIVATE /STACK:16777216)
+elseif(MINGW)
+    target_link_options(cartographer_condition_authoring_ui_fixture_tests PRIVATE -Wl,--stack,16777216)
+endif()
 add_test(
     NAME cartographer_condition_authoring_ui_fixture_tests
     COMMAND cartographer_condition_authoring_ui_fixture_tests
