@@ -917,7 +917,7 @@ core::Result<void> ToolRegistry::register_builtin_tools() {
         return result;
     }
     if (auto result = register_tool(
-        {"mesh.remove-face", "Delete selected face",
+        {"mesh.remove-face", "Delete selected faces",
          ToolKernelKind::editable_mesh_delete_face},
         [](const ToolContext& context, const ToolArguments& arguments)
             -> core::Result<std::unique_ptr<EditorCommand>> {

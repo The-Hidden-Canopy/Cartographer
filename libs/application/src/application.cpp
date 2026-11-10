@@ -1,6 +1,7 @@
 #include "authoring_justification.hpp"
 #include <carto/production/material_binding.hpp>
 #include <carto/application/application.hpp>
+#include <carto/core/filesystem.hpp>
 #include <carto/editor/viewport_interaction.hpp>
 #include <carto/project/recovery.hpp>
 #include <carto/production/lightmap_uv.hpp>
@@ -3044,13 +3045,19 @@ core::Result<void> ApplicationSession::verify_source_asset_blob(
         ? std::filesystem::current_path(error) : project_path_->parent_path();
     if (error) return core::Result<void>::failure(core::Diagnostic(
         core::ErrorCode::io_error, "unable to resolve the saved project directory"));
-    const auto project_root = std::filesystem::weakly_canonical(requested_root, error);
+    const auto native_requested_root = core::native_io_path(requested_root, error);
+    if (error) return core::Result<void>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the saved project directory"));
+    const auto project_root = std::filesystem::weakly_canonical(native_requested_root, error);
     if (error || project_root.empty()) return core::Result<void>::failure(core::Diagnostic(
         core::ErrorCode::io_error, "unable to resolve the saved project directory"));
 
     assets::BlobStore store(project_root / ".carto-assets" / "source-blobs");
     const auto expected_path = store.path_for(record->second.source_digest);
-    const auto stored_path = std::filesystem::canonical(expected_path, error);
+    const auto native_expected_path = core::native_io_path(expected_path, error);
+    if (error) return core::Result<void>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the project-local source blob path"));
+    const auto stored_path = std::filesystem::canonical(native_expected_path, error);
     if (error) return core::Result<void>::failure(core::Diagnostic(
         core::ErrorCode::not_found, "project-local source blob is missing"));
     const auto relative_path = stored_path.lexically_relative(project_root);
@@ -3065,7 +3072,10 @@ core::Result<void> ApplicationSession::verify_source_asset_blob(
             "source blob locator is not the recorded project-local content-addressed path"));
     }
     constexpr std::uintmax_t kMaxVerifiedSourceBlobBytes = 256ULL * 1024ULL * 1024ULL;
-    const auto size = std::filesystem::file_size(stored_path, error);
+    const auto native_stored_path = core::native_io_path(stored_path, error);
+    if (error) return core::Result<void>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the project-local source blob path"));
+    const auto size = std::filesystem::file_size(native_stored_path, error);
     if (error || size > kMaxVerifiedSourceBlobBytes) {
         return core::Result<void>::failure(core::Diagnostic(
             core::ErrorCode::unsupported,

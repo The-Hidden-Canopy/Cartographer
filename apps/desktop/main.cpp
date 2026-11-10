@@ -19348,11 +19348,16 @@ struct DesktopState {
             static_cast<void>(dispatch(carto::application::CreatePlaneAction{"Plane", 2.0, 2.0}));
         }
         if (ImGui::Button("Transform Instrument", ImVec2(-1, 30))) workbench.transform = true;
+        std::size_t selected_face_count = snapshot.selection.component_groups.empty()
+            ? snapshot.selection.faces.size() : 0U;
+        for (const auto& group : snapshot.selection.component_groups)
+            selected_face_count += group.faces.size();
         const bool face_available = snapshot.selection.mode == carto::editor::SelectionMode::face &&
-            !snapshot.selection.faces.empty();
+            selected_face_count > 0U;
         const bool edge_available = snapshot.selection.mode == carto::editor::SelectionMode::edge &&
             !snapshot.selection.edges.empty();
         if (face_available) {
+            ImGui::BeginDisabled(snapshot.selection.faces.empty());
             if (ImGui::Button("Extrude Instrument", ImVec2(-1, 30))) workbench.extrude = true;
             if (ImGui::Button("Inset Selected Face", ImVec2(-1, 30))) {
                 carto::editor::ToolArguments arguments;
@@ -19360,12 +19365,15 @@ struct DesktopState {
                 static_cast<void>(dispatch(carto::application::InvokeToolAction{
                     "mesh.inset-face", arguments}));
             }
-            if (ImGui::Button("Delete Selected Face", ImVec2(-1, 30))) {
+            ImGui::EndDisabled();
+            ImGui::BeginDisabled(selected_face_count > carto::editor::kMaxSelectedFacesPerDeletion);
+            if (ImGui::Button(selected_face_count == 1U ? "Delete Selected Face" : "Delete Selected Faces", ImVec2(-1, 30))) {
                 carto::editor::ToolArguments arguments;
                 arguments.remove_orphaned_vertices = true;
                 static_cast<void>(dispatch(carto::application::InvokeToolAction{
                     "mesh.remove-face", arguments}));
             }
+            ImGui::EndDisabled();
         } else if (edge_available) {
             if (ImGui::Button("Split Selected Edge", ImVec2(-1, 30))) {
                 carto::editor::ToolArguments arguments;
@@ -20102,10 +20110,11 @@ struct DesktopState {
                 ImGui::TextDisabled("Select one mesh object to scan for nearby vertices.");
             }
         } else if (snapshot.selection.mode == carto::editor::SelectionMode::face) {
-            const std::size_t count = snapshot.selection.faces.size();
+            const auto face_groups = snapshot.selection.component_groups;
+            std::size_t count = face_groups.empty() ? snapshot.selection.faces.size() : 0U;
+            for (const auto& group : face_groups) count += group.faces.size();
             ImGui::Text("Face selection · %zu", count);
             const bool one_face = count == 1U;
-            const auto face_groups = snapshot.selection.component_groups;
             const bool one_object_face = snapshot.workspace_kind == carto::ui::Workspace::model &&
                 one_face && face_groups.size() == 1U && face_groups.front().faces.size() == 1U;
             ImGui::BeginDisabled(!one_object_face && !mesh_knife_mode_active);
@@ -20148,15 +20157,19 @@ struct DesktopState {
                 static_cast<void>(dispatch(carto::application::InvokeToolAction{
                     "mesh.poke-face", {}}));
             }
+            ImGui::EndDisabled();
+            ImGui::BeginDisabled(count == 0U || count > carto::editor::kMaxSelectedFacesPerDeletion);
             ImGui::Checkbox("Remove orphaned vertices", &remove_orphaned_vertices);
-            if (ImGui::Button("Delete face", ImVec2(-1, 30))) {
+            if (ImGui::Button(count == 1U ? "Delete face" : "Delete selected faces", ImVec2(-1, 30))) {
                 carto::editor::ToolArguments arguments;
                 arguments.remove_orphaned_vertices = remove_orphaned_vertices;
                 static_cast<void>(dispatch(carto::application::InvokeToolAction{
                     "mesh.remove-face", arguments}));
             }
             ImGui::EndDisabled();
-            const bool two_faces = count == 2U;
+            if (count > carto::editor::kMaxSelectedFacesPerDeletion)
+                ImGui::TextDisabled("Select at most 256 faces for one deletion.");
+            const bool two_faces = count == 2U && face_groups.size() <= 1U;
             ImGui::BeginDisabled(!two_faces);
             if (ImGui::Button("Triangles to quad", ImVec2(-1, 30))) {
                 static_cast<void>(dispatch(carto::application::InvokeToolAction{
@@ -20164,7 +20177,7 @@ struct DesktopState {
             }
             ImGui::EndDisabled();
             if (!one_face && !two_faces) {
-                ImGui::TextDisabled("Select one face, or two adjacent triangles.");
+                ImGui::TextDisabled("Other face tools require one face or two adjacent triangles.");
             }
         } else if (snapshot.selection.mode == carto::editor::SelectionMode::edge) {
             const std::size_t count = snapshot.selection.edges.size();

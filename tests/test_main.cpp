@@ -2375,7 +2375,14 @@ void gltf_export_is_deterministic_bounded_and_feature_honest() {
     REQUIRE(first.value().vertices == 8U && first.value().triangles == 12U);
     REQUIRE(first.value().index_bytes == 72U);
     REQUIRE(!first.value().used_uint32_indices);
-    REQUIRE(first.value().warnings.size() == 3U);
+    const auto has_warning = [&](std::string_view fragment) {
+        return std::any_of(first.value().warnings.begin(), first.value().warnings.end(),
+            [&](const auto& warning) { return warning.find(fragment) != std::string::npos; });
+    };
+    REQUIRE(has_warning("clearcoat roughness or zero-emission strength"));
+    REQUIRE(has_warning("without an active render UV set"));
+    REQUIRE(has_warning("back-face normal reversal"));
+    REQUIRE(has_warning("narrowed to glTF float32"));
     REQUIRE(carto::io::export_gltf(document.value(), second_path));
 
     std::ifstream first_input(first_path, std::ios::binary);

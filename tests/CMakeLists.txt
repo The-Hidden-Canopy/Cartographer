@@ -65,6 +65,13 @@ add_executable(cartographer_application_tests
     application_tests.cpp
 )
 
+add_executable(cartographer_editor_multi_face_deletion_tests
+    editor_multi_face_deletion_tests.cpp)
+target_link_libraries(cartographer_editor_multi_face_deletion_tests PRIVATE carto_application carto_journal)
+carto_target(cartographer_editor_multi_face_deletion_tests)
+add_test(NAME cartographer_editor_multi_face_deletion_tests
+    COMMAND cartographer_editor_multi_face_deletion_tests)
+
 add_executable(cartographer_native_scene_import_tests
     application_native_import_sprint_tests.cpp
 )

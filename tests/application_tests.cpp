@@ -21,6 +21,7 @@
 #include <carto/geometry/primitives.hpp>
 #include <carto/assets/blob_store.hpp>
 #include <carto/assets/source_registry.hpp>
+#include <carto/core/filesystem.hpp>
 #include <carto/journal/journal.hpp>
 #include <carto/editor/viewport_interaction.hpp>
 #include <carto/mesh_attributes/provenance.hpp>
@@ -11276,6 +11277,7 @@ void application_reviews_authored_source_metadata_through_human_history() {
         carto::application::ApplySourceReimportPlanAction{imported_plan.value()}));
 
     const auto base = session.snapshot();
+    REQUIRE(blob_store.verify(source.source_digest));
     REQUIRE(session.verify_source_asset_blob(source.identity, source.source_generation,
         base.project_generation, base.project_revision));
     REQUIRE(!session.verify_source_asset_blob(source.identity, source.source_generation,
@@ -11356,8 +11358,12 @@ void application_reviews_authored_source_metadata_through_human_history() {
     REQUIRE((after.source_assets.front().source_generation == carto::core::Revision{2U} &&
         after.source_assets.front().authored_tags ==
             std::vector<std::string>{"canopy", "exterior"}));
+    std::error_code blob_path_error;
+    const auto native_blob_path = carto::core::native_io_path(
+        blob_store.path_for(source.source_digest), blob_path_error);
+    REQUIRE(!blob_path_error);
     {
-        std::ofstream corrupted(blob_store.path_for(source.source_digest),
+        std::ofstream corrupted(native_blob_path,
             std::ios::binary | std::ios::trunc);
         REQUIRE(static_cast<bool>(corrupted));
         corrupted << "tampered source bytes";
@@ -11373,7 +11379,7 @@ void application_reviews_authored_source_metadata_through_human_history() {
             corrupt_blob_inventory.value().corrupt.end());
     std::error_code remove_blob_error;
     REQUIRE(std::filesystem::remove(
-        blob_store.path_for(source.source_digest), remove_blob_error));
+        native_blob_path, remove_blob_error));
     REQUIRE(!remove_blob_error);
     const auto missing_blob_inventory = session.inspect_source_blob_store(
         after.project_generation, after.project_revision);

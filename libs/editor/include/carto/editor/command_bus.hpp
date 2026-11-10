@@ -15,6 +15,8 @@
 
 namespace carto::editor {
 
+inline constexpr std::size_t kMaxSelectedFacesPerDeletion = 256U;
+
 // A project-bound command may mutate a ProjectDocument only when it carries
 // this admission token. ApplicationSession creates the token for an
 // application-dispatched command; low-level callers cannot manufacture one.
@@ -838,7 +840,8 @@ private:
     const SelectionState* selection_;
     geometry::EditableMesh* mesh_;
     bool remove_orphaned_vertices_;
-    CommandCheckpointPtr<DeleteFaceCommand> delegate_;
+    std::optional<geometry::EditableMesh> before_;
+    std::optional<geometry::EditableMesh> after_;
 };
 
 class DeleteProjectSelectedFaceCommand final : public CheckpointableEditorCommand<DeleteProjectSelectedFaceCommand> {
@@ -864,7 +867,7 @@ private:
         geometry::EditableMesh before;
         geometry::EditableMesh after;
         geometry::TopologyEditReceipt receipt;
-        geometry::FaceDeletionPatch patch;
+        std::vector<geometry::FaceDeletionPatch> patches;
         core::Revision current_mesh_revision;
     };
 

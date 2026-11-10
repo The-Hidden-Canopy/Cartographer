@@ -2851,7 +2851,7 @@ core::Result<void> DeleteSelectedFaceCommand::execute() {
             core::ErrorCode::invalid_state,
             "selected-face deletion command has incomplete context"));
     }
-    if (!delegate_) {
+    if (!before_.has_value()) {
         if (selection_->mode() != SelectionMode::face) {
             return core::Result<void>::failure(core::Diagnostic(
                 core::ErrorCode::invalid_argument,
@@ -2864,31 +2864,40 @@ core::Result<void> DeleteSelectedFaceCommand::execute() {
         if (faces.empty()) {
             return core::Result<void>::failure(core::Diagnostic(
                 core::ErrorCode::invalid_state,
-                "selected-face deletion requires one selected face"));
+                "selected-face deletion requires at least one selected face"));
         }
-        if (faces.size() != 1U) {
+        if (faces.size() > kMaxSelectedFacesPerDeletion) {
             return core::Result<void>::failure(core::Diagnostic(
                 core::ErrorCode::unsupported,
-                "multi-face deletion is not implemented in this tool boundary"));
+                "selected-face deletion exceeds the 256-face batch limit"));
         }
-        delegate_ = std::make_unique<DeleteFaceCommand>(
-            *mesh_, faces.front(), remove_orphaned_vertices_);
-        auto result = delegate_->execute();
-        if (!result) {
-            delegate_.reset();
+        geometry::EditableMesh candidate = *mesh_;
+        for (const geometry::FaceId face : faces) {
+            auto deleted = candidate.delete_face(face, remove_orphaned_vertices_);
+            if (!deleted) return core::Result<void>::failure(deleted.error());
         }
-        return result;
+        if (auto result = candidate.validate(); !result) return result;
+        const geometry::EditableMesh before = *mesh_;
+        if (auto result = mesh_->restore_from(candidate); !result) return result;
+        before_ = before;
+        after_ = *mesh_;
+        return core::Result<void>::success();
     }
-    return delegate_->execute();
+    if (!after_.has_value()) {
+        return core::Result<void>::failure(core::Diagnostic(
+            core::ErrorCode::invalid_state,
+            "selected-face deletion has incomplete history state"));
+    }
+    return mesh_->restore_from(*after_);
 }
 
 core::Result<void> DeleteSelectedFaceCommand::undo() {
-    if (!delegate_) {
+    if (!mesh_ || !before_.has_value() || !after_.has_value()) {
         return core::Result<void>::failure(core::Diagnostic(
             core::ErrorCode::invalid_state,
             "selected-face deletion has no completed operation to undo"));
     }
-    return delegate_->undo();
+    return mesh_->restore_from(*before_);
 }
 
 DeleteProjectSelectedFaceCommand::DeleteProjectSelectedFaceCommand(
@@ -2908,9 +2917,8 @@ core::Result<void> DeleteProjectSelectedFaceCommand::execute() {
     }
     if (!edits_.empty()) {
         project::ProjectDocument candidate = *document_;
-        std::vector<core::Revision> revisions;
-        revisions.reserve(edits_.size());
-        for (const auto& edit : edits_) {
+        auto staged_edits = edits_;
+        for (auto& edit : staged_edits) {
             const auto mesh = candidate.meshes().find(edit.mesh_asset);
             if (mesh == candidate.meshes().end() ||
                 mesh->second.revision() != edit.current_mesh_revision) {
@@ -2918,23 +2926,34 @@ core::Result<void> DeleteProjectSelectedFaceCommand::execute() {
                     core::ErrorCode::stale_data,
                     "project face deletion redo no longer matches its source mesh"));
             }
-            auto patch = edit.patch;
-            patch.expected_revision = edit.current_mesh_revision;
-            auto result = candidate.apply_face_deletion_patch(edit.mesh_asset, patch);
-            if (!result) {
-                return core::Result<void>::failure(result.error());
+            if (edit.patches.empty()) {
+                return core::Result<void>::failure(core::Diagnostic(
+                    core::ErrorCode::invalid_state,
+                    "project face deletion redo has no saved face patches"));
             }
-            revisions.push_back(result.value());
+            for (auto& patch : edit.patches) {
+                const auto revision_before = edit.current_mesh_revision;
+                patch.expected_revision = revision_before;
+                auto result = candidate.apply_face_deletion_patch(edit.mesh_asset, patch);
+                if (!result) return core::Result<void>::failure(result.error());
+                const auto& receipts = candidate.topology_receipts();
+                if (receipts.empty() || receipts.back().mesh_asset != edit.mesh_asset ||
+                    receipts.back().receipt.revision_before != revision_before ||
+                    receipts.back().receipt.revision_after != result.value()) {
+                    return core::Result<void>::failure(core::Diagnostic(
+                        core::ErrorCode::invalid_state,
+                        "persistent face deletion redo did not retain its topology receipt"));
+                }
+                edit.current_mesh_revision = result.value();
+                edit.after = candidate.meshes().at(edit.mesh_asset);
+                edit.receipt = receipts.back().receipt;
+            }
         }
         if (auto result = candidate.validate(); !result) {
             return result;
         }
         document_->swap(candidate);
-        for (std::size_t index = 0U; index < edits_.size(); ++index) {
-            edits_[index].current_mesh_revision = revisions[index];
-            edits_[index].patch.expected_revision = revisions[index];
-            edits_[index].after = document_->meshes().at(edits_[index].mesh_asset);
-        }
+        edits_ = std::move(staged_edits);
         return core::Result<void>::success();
     }
     if (selection_->mode() != SelectionMode::face) {
@@ -2950,6 +2969,7 @@ core::Result<void> DeleteProjectSelectedFaceCommand::execute() {
     }
     std::map<scene::ObjectId, const geometry::EditableMesh*> owner_meshes;
     std::map<std::uint64_t, scene::ObjectId> asset_owners;
+    std::size_t selected_face_count = 0U;
     for (const auto& group : groups) {
         const auto* object = document_->scene().find(group.object);
         if (!object) {
@@ -2969,14 +2989,17 @@ core::Result<void> DeleteProjectSelectedFaceCommand::execute() {
                 core::ErrorCode::stale_data,
                 "selected face owner references a missing mesh asset"));
         }
-        if (group.faces.size() != 1U) {
+        if (group.faces.empty()) {
             return core::Result<void>::failure(core::Diagnostic(
-                group.faces.empty() ? core::ErrorCode::invalid_state
-                                    : core::ErrorCode::unsupported,
-                group.faces.empty()
-                    ? "project face deletion requires one selected face per object"
-                    : "multi-face project deletion is not implemented"));
+                core::ErrorCode::invalid_state,
+                "project face deletion requires at least one selected face per object"));
         }
+        if (group.faces.size() > kMaxSelectedFacesPerDeletion - selected_face_count) {
+            return core::Result<void>::failure(core::Diagnostic(
+                core::ErrorCode::unsupported,
+                "project face deletion exceeds the 256-face batch limit"));
+        }
+        selected_face_count += group.faces.size();
         if (!asset_owners.emplace(mesh_asset, group.object).second) {
             return core::Result<void>::failure(core::Diagnostic(
                 core::ErrorCode::unsupported,
@@ -3020,29 +3043,34 @@ core::Result<void> DeleteProjectSelectedFaceCommand::execute() {
                 "selected face owner references a missing mesh asset"));
         }
         geometry::EditableMesh before = mesh->second;
-        const geometry::FaceDeletionPatch patch{
-            before.revision(), group.faces.front(), remove_orphaned_vertices_};
-        auto replaced = candidate.apply_face_deletion_patch(mesh_asset, patch);
-        if (!replaced) {
-            return core::Result<void>::failure(replaced.error());
-        }
-        const auto applied_mesh = candidate.meshes().find(mesh_asset);
-        const auto& receipts = candidate.topology_receipts();
-        if (applied_mesh == candidate.meshes().end() || receipts.empty() ||
-            receipts.back().mesh_asset != mesh_asset ||
-            receipts.back().receipt.revision_before != before.revision() ||
-            receipts.back().receipt.revision_after != replaced.value()) {
-            return core::Result<void>::failure(core::Diagnostic(
-                core::ErrorCode::invalid_state,
-                "persistent face deletion did not retain its topology receipt"));
+        std::vector<geometry::FaceDeletionPatch> patches;
+        patches.reserve(group.faces.size());
+        core::Revision current_mesh_revision = before.revision();
+        geometry::TopologyEditReceipt last_receipt;
+        for (const geometry::FaceId face : group.faces) {
+            const geometry::FaceDeletionPatch patch{
+                current_mesh_revision, face, remove_orphaned_vertices_};
+            auto replaced = candidate.apply_face_deletion_patch(mesh_asset, patch);
+            if (!replaced) return core::Result<void>::failure(replaced.error());
+            const auto& receipts = candidate.topology_receipts();
+            if (receipts.empty() || receipts.back().mesh_asset != mesh_asset ||
+                receipts.back().receipt.revision_before != current_mesh_revision ||
+                receipts.back().receipt.revision_after != replaced.value()) {
+                return core::Result<void>::failure(core::Diagnostic(
+                    core::ErrorCode::invalid_state,
+                    "persistent face deletion did not retain its topology receipt"));
+            }
+            patches.push_back(patch);
+            current_mesh_revision = replaced.value();
+            last_receipt = receipts.back().receipt;
         }
         staged_edits.push_back(AppliedMeshEdit{
             mesh_asset,
             std::move(before),
-            applied_mesh->second,
-            receipts.back().receipt,
-            patch,
-            replaced.value(),
+            candidate.meshes().at(mesh_asset),
+            std::move(last_receipt),
+            std::move(patches),
+            current_mesh_revision,
         });
     }
     if (auto result = candidate.validate(); !result) {
