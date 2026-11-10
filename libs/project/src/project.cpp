@@ -1,4 +1,5 @@
 #include <carto/project/project.hpp>
+#include <carto/core/filesystem.hpp>
 #include "accepted_autorig_internal.hpp"
 #include <carto/project/accepted_autorig.hpp>
 #include <carto/character/rig_record.hpp>
@@ -9095,12 +9096,17 @@ core::Result<SaveReceipt> ProjectDocument::save_atomic_unlocked(
     const auto parent = path.parent_path();
     if (!parent.empty()) {
         std::error_code parent_error;
-        const bool parent_exists = std::filesystem::exists(parent, parent_error);
+        const auto native_parent = core::native_io_path(parent, parent_error);
+        if (parent_error) {
+            return core::Result<SaveReceipt>::failure(
+                Diagnostic(ErrorCode::io_error, "unable to resolve project save parent directory"));
+        }
+        const bool parent_exists = std::filesystem::exists(native_parent, parent_error);
         if (parent_error) {
             return core::Result<SaveReceipt>::failure(
                 Diagnostic(ErrorCode::io_error, "unable to inspect project save parent directory"));
         }
-        if (!parent_exists || !std::filesystem::is_directory(parent, parent_error) || parent_error) {
+        if (!parent_exists || !std::filesystem::is_directory(native_parent, parent_error) || parent_error) {
             return core::Result<SaveReceipt>::failure(
                 Diagnostic(ErrorCode::io_error, "project save parent directory does not exist"));
         }
@@ -9112,7 +9118,13 @@ core::Result<SaveReceipt> ProjectDocument::save_atomic_unlocked(
             result.error().with_context("serialized project failed pre-commit validation"));
     }
 
-    const auto temporary = temporary_path(path);
+    std::error_code path_error;
+    const auto temporary = core::native_io_path(temporary_path(path), path_error);
+    if (path_error) return core::Result<SaveReceipt>::failure(
+        Diagnostic(ErrorCode::io_error, "unable to resolve project temporary file"));
+    const auto native_target = core::native_io_path(path, path_error);
+    if (path_error) return core::Result<SaveReceipt>::failure(
+        Diagnostic(ErrorCode::io_error, "unable to resolve project save path"));
     std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
     if (!output) {
         return core::Result<SaveReceipt>::failure(
@@ -9135,7 +9147,7 @@ core::Result<SaveReceipt> ProjectDocument::save_atomic_unlocked(
             Diagnostic(ErrorCode::io_error, "failed while closing project temporary file"));
     }
 
-    auto replacement = atomic_replace(temporary, path);
+    auto replacement = atomic_replace(temporary, native_target);
     if (!replacement) {
         std::error_code ignored;
         std::filesystem::remove(temporary, ignored);

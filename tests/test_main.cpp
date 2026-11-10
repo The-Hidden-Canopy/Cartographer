@@ -1852,6 +1852,33 @@ void project_save_failure_does_not_replace_existing_file_and_paths_are_bounded()
     REQUIRE(!carto::project::ProjectDocument::deserialize(invalid_flag));
 }
 
+void project_saves_when_temporary_name_crosses_windows_path_limit() {
+    TempDirectory temp;
+    constexpr std::size_t target_length = 235U;
+    auto parent = temp.path();
+    if (parent.native().size() < 160U) {
+        parent /= std::string(160U - parent.native().size() - 1U, 'd');
+        REQUIRE(std::filesystem::create_directory(parent));
+    }
+    const auto prefix_length = parent.native().size() + 1U;
+    if (prefix_length + 8U >= target_length) {
+        std::cout << "SKIP: project test temporary root is too long for this boundary case\n";
+        return;
+    }
+    const auto filename_length = target_length - prefix_length;
+    const auto path = parent / (std::string(filename_length - 6U, 'p') + ".carto");
+    REQUIRE(path.native().size() == target_length);
+    auto document = carto::project::ProjectDocument::create("Long temporary project path");
+    REQUIRE(document);
+    REQUIRE(carto::project::testing::access(document.value()).create_object("Original"));
+    REQUIRE(document.value().save_atomic(path));
+    REQUIRE(carto::project::testing::access(document.value()).create_object("Edited"));
+    REQUIRE(document.value().save_atomic(path));
+    const auto reopened = carto::project::ProjectDocument::load(path);
+    REQUIRE(reopened);
+    REQUIRE(reopened.value().scene().objects_sorted().size() == 2U);
+}
+
 void project_persists_topology_receipts_and_rejects_stale_lineage() {
     auto document = carto::project::ProjectDocument::create("Receipt Ledger");
     REQUIRE(document);
@@ -2592,6 +2619,7 @@ int main() {
         {"duplicate mesh instance command shares assets", duplicate_mesh_instance_command_shares_asset_and_preserves_history},
         {"project round trip and future version rejection", project_round_trips_authoritative_state_and_rejects_future_versions},
         {"project save failure and path bounds", project_save_failure_does_not_replace_existing_file_and_paths_are_bounded},
+        {"project save with long temporary path", project_saves_when_temporary_name_crosses_windows_path_limit},
         {"project persists topology receipts and rejects stale lineage", project_persists_topology_receipts_and_rejects_stale_lineage},
         {"project persists internal edge dissolve receipt", project_persists_internal_edge_dissolve_receipt},
         {"OBJ interchange reports feature loss", obj_interchange_reports_feature_loss_and_round_trips_geometry},
