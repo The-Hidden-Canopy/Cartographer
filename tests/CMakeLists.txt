@@ -2220,7 +2220,9 @@ set_tests_properties(cartographer_native_presentation_tests PROPERTIES TIMEOUT 3
 
 # Exercise the bundled Vulkan callbacks with injected function pointers only.
 # These CPU tests create no Vulkan instance/device and link no Vulkan loader.
-if(TARGET carto_imgui)
+# The Vulkan backend supplies the required SDK headers. A D3D12-only desktop
+# must remain buildable without an unrelated Vulkan SDK.
+if(TARGET carto_imgui AND CARTO_ENABLE_VULKAN)
     add_executable(cartographer_imgui_platform_presentation_tests
         imgui_platform_presentation_tests.cpp
         ${CARTO_IMGUI_ROOT}/imgui.cpp
