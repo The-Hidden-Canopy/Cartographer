@@ -3547,7 +3547,6 @@ core::Result<void> BevelProjectSelectedEdgeCommand::execute() {
             core::ErrorCode::invalid_argument,
             "project edge bevel requires object-bound edge selections"));
     }
-    constexpr std::size_t kMaxProjectEdgeBevelSelection = 64U;
     std::map<scene::ObjectId, const geometry::EditableMesh*> owner_meshes;
     std::map<std::uint64_t, scene::ObjectId> asset_owners;
     std::size_t selected_edge_count = 0U;
@@ -3574,7 +3573,7 @@ core::Result<void> BevelProjectSelectedEdgeCommand::execute() {
                 core::ErrorCode::invalid_state,
                 "project edge bevel requires at least one selected edge per object"));
         }
-        if (group.edges.size() > kMaxProjectEdgeBevelSelection - selected_edge_count) {
+        if (group.edges.size() > kMaxSelectedEdgesPerBevel - selected_edge_count) {
             return core::Result<void>::failure(core::Diagnostic(
                 core::ErrorCode::invalid_argument,
                 "project edge bevel selection exceeds the 64-edge command limit"));

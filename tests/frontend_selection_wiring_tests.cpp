@@ -12,6 +12,7 @@
 #endif
 
 #include "project_document_access.hpp"
+#include "../apps/desktop/studio_edge_tools.hpp"
 #include <carto/ui/ui.hpp>
 #include <carto/journal/journal.hpp>
 
@@ -300,6 +301,100 @@ void batch_availability_matches_refusal_for_ineligible_authored_sources() {
     }
 }
 
+void multi_edge_tool_controls_match_authoring_commands() {
+    using namespace carto;
+    Fixture fixture;
+    geometry::EditableMesh mesh;
+    const auto a = mesh.add_vertex({0.0, 0.0, 0.0});
+    const auto b = mesh.add_vertex({1.0, 0.0, 0.0});
+    const auto c = mesh.add_vertex({1.0, 1.0, 0.0});
+    const auto d = mesh.add_vertex({0.0, 1.0, 0.0});
+    const auto center = mesh.add_vertex({0.5, 0.5, 0.0});
+    REQUIRE(a && b && c && d && center);
+    REQUIRE(mesh.add_face({a.value(), b.value(), center.value()}));
+    REQUIRE(mesh.add_face({b.value(), c.value(), center.value()}));
+    REQUIRE(mesh.add_face({c.value(), d.value(), center.value()}));
+    REQUIRE(mesh.add_face({d.value(), a.value(), center.value()}));
+    const auto topology = mesh.topology();
+    REQUIRE(topology);
+    std::vector<geometry::EdgeId> internal_edges;
+    for (const auto& edge : topology.value().edges)
+        if (edge.second_half_edge) internal_edges.push_back(edge.id);
+    REQUIRE(internal_edges.size() >= 2U);
+    REQUIRE(fixture.ui.dispatch(application::CreateMeshObjectAction{"Fan", std::move(mesh)}));
+    const auto before_selection = fixture.session.snapshot();
+    const auto object = before_selection.objects.back().object;
+    REQUIRE(object.mesh_asset.has_value());
+    REQUIRE(fixture.ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::edge}));
+    REQUIRE(fixture.ui.dispatch(application::SelectEdgeAction{object.id, internal_edges[0]}));
+    auto availability = studio::edge_tool_availability(fixture.session.snapshot().selection);
+    REQUIRE(availability.selected_edges == 1U && availability.split && availability.bevel && availability.dissolve);
+    REQUIRE(fixture.ui.dispatch(application::SelectEdgeAction{
+        object.id, internal_edges[1], editor::SelectionOperation::add}));
+    availability = studio::edge_tool_availability(fixture.session.snapshot().selection);
+    REQUIRE(availability.selected_edges == 2U && !availability.split && availability.bevel && availability.dissolve);
+    const auto source_mesh = fixture.session.document_.meshes().at(*object.mesh_asset);
+    const auto result = fixture.ui.dispatch(application::InvokeToolAction{"mesh.dissolve-edge", {}});
+    REQUIRE(result && result.value().affected.edges.size() == 2U);
+    REQUIRE(fixture.session.document_.meshes().at(*object.mesh_asset).face_count() == 2U);
+    REQUIRE(fixture.session.document_.mesh_patches().back().replay(source_mesh));
+    REQUIRE(fixture.ui.dispatch(application::UndoAction{}));
+    REQUIRE(fixture.session.document_.meshes().at(*object.mesh_asset).face_count() == 4U);
+    REQUIRE(fixture.ui.dispatch(application::RedoAction{}));
+    REQUIRE(fixture.session.document_.meshes().at(*object.mesh_asset).face_count() == 2U);
+    REQUIRE(fixture.ui.dispatch(application::SaveProjectAction{}));
+    application::ApplicationSession reopened;
+    REQUIRE(application::testing::dispatch(reopened, application::OpenProjectAction{fixture.path}));
+    REQUIRE(reopened.document_.meshes().at(*object.mesh_asset).face_count() == 2U);
+
+    Fixture multiple;
+    REQUIRE(multiple.ui.dispatch(application::CreateMeshObjectAction{"Second Quad", quad()}));
+    const auto objects = multiple.session.snapshot().objects;
+    REQUIRE(objects.size() == 2U);
+    const auto first = objects[0].object;
+    const auto second = objects[1].object;
+    REQUIRE(first.mesh_asset && second.mesh_asset);
+    const auto first_topology = multiple.session.document_.meshes().at(*first.mesh_asset).topology();
+    const auto second_topology = multiple.session.document_.meshes().at(*second.mesh_asset).topology();
+    REQUIRE(first_topology && second_topology);
+    REQUIRE(multiple.ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::edge}));
+    REQUIRE(multiple.ui.dispatch(application::SelectEdgeAction{first.id, first_topology.value().edges.front().id}));
+    REQUIRE(multiple.ui.dispatch(application::SelectEdgeAction{
+        second.id, second_topology.value().edges.front().id, editor::SelectionOperation::add}));
+    availability = studio::edge_tool_availability(multiple.session.snapshot().selection);
+    REQUIRE(availability.selected_edges == 2U && availability.split);
+    editor::ToolArguments split_arguments;
+    split_arguments.factor = 0.5;
+    const auto split = multiple.ui.dispatch(application::InvokeToolAction{"mesh.split-edge", split_arguments});
+    REQUIRE(split && split.value().affected.objects.size() == 2U && split.value().affected.edges.size() == 2U);
+    REQUIRE(multiple.session.document_.meshes().at(*first.mesh_asset).vertex_count() == 5U);
+    REQUIRE(multiple.session.document_.meshes().at(*second.mesh_asset).vertex_count() == 5U);
+    REQUIRE(multiple.ui.dispatch(application::UndoAction{}));
+    REQUIRE(multiple.session.document_.meshes().at(*first.mesh_asset).vertex_count() == 4U);
+    REQUIRE(multiple.session.document_.meshes().at(*second.mesh_asset).vertex_count() == 4U);
+    REQUIRE(multiple.ui.dispatch(application::RedoAction{}));
+    REQUIRE(multiple.session.document_.meshes().at(*first.mesh_asset).vertex_count() == 5U);
+    REQUIRE(multiple.session.document_.meshes().at(*second.mesh_asset).vertex_count() == 5U);
+
+    application::SelectionView selection;
+    selection.mode = editor::SelectionMode::edge;
+    selection.component_groups.resize(2U);
+    selection.component_groups[0].edges = {geometry::EdgeId{1U}};
+    selection.component_groups[1].edges = {geometry::EdgeId{2U}};
+    availability = studio::edge_tool_availability(selection);
+    REQUIRE(availability.selected_edges == 2U && availability.split && availability.bevel && availability.dissolve);
+    selection.component_groups[1].edges.clear();
+    availability = studio::edge_tool_availability(selection);
+    REQUIRE(!availability.split && !availability.bevel && !availability.dissolve);
+    selection.component_groups.resize(1U);
+    selection.component_groups[0].edges.resize(editor::kMaxSelectedEdgesPerBevel + 1U);
+    availability = studio::edge_tool_availability(selection);
+    REQUIRE(!availability.split && !availability.bevel && availability.dissolve);
+    selection.mode = editor::SelectionMode::face;
+    availability = studio::edge_tool_availability(selection);
+    REQUIRE(availability.selected_edges == 0U && !availability.split && !availability.bevel && !availability.dissolve);
+}
+
 } // namespace
 
 int main() {
@@ -308,6 +403,7 @@ int main() {
         shared_shortest_path_keeps_backend_ties_and_refuses_bad_context();
         shared_batch_duplicate_is_bounded_journaled_and_undoable();
         batch_availability_matches_refusal_for_ineligible_authored_sources();
+        multi_edge_tool_controls_match_authoring_commands();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return EXIT_FAILURE;

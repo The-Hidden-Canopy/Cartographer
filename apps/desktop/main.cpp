@@ -36,6 +36,7 @@
 #include "studio_style.hpp"
 #include "studio_draft.hpp"
 #include "studio_environment_import.hpp"
+#include "studio_edge_tools.hpp"
 #include "studio_material_draft.hpp"
 #include "studio_material_graph_draft.hpp"
 #include "studio_sweep_source.hpp"
@@ -15837,7 +15838,11 @@ struct DesktopState {
         if (snapshot.selection.mode == carto::editor::SelectionMode::edge &&
             !snapshot.selection.edges.empty()) {
             ImGui::Separator();
-            ImGui::Text("Edge %llu", static_cast<unsigned long long>(snapshot.selection.edges.front().value));
+            if (snapshot.selection.edges.size() == 1U)
+                ImGui::Text("Edge %llu", static_cast<unsigned long long>(snapshot.selection.edges.front().value));
+            else
+                ImGui::Text("Edges selected: %zu", snapshot.selection.edges.size());
+            ImGui::BeginDisabled(!carto::studio::edge_tool_availability(snapshot.selection).split);
             ImGui::InputDouble("Factor", &edge_split_factor);
             if (ImGui::Button("Split Edge")) {
                 carto::editor::ToolArguments arguments;
@@ -15845,6 +15850,7 @@ struct DesktopState {
                 static_cast<void>(dispatch(carto::application::InvokeToolAction{
                     "mesh.split-edge", arguments}));
             }
+            ImGui::EndDisabled();
         }
         if (snapshot.selection.mode == carto::editor::SelectionMode::face && !snapshot.selection.faces.empty()) {
             ImGui::Separator();
@@ -19354,8 +19360,8 @@ struct DesktopState {
             selected_face_count += group.faces.size();
         const bool face_available = snapshot.selection.mode == carto::editor::SelectionMode::face &&
             selected_face_count > 0U;
-        const bool edge_available = snapshot.selection.mode == carto::editor::SelectionMode::edge &&
-            !snapshot.selection.edges.empty();
+        const auto edge_tools = carto::studio::edge_tool_availability(snapshot.selection);
+        const bool edge_available = edge_tools.selected_edges > 0U;
         if (face_available) {
             ImGui::BeginDisabled(snapshot.selection.faces.empty());
             if (ImGui::Button("Extrude Instrument", ImVec2(-1, 30))) workbench.extrude = true;
@@ -19375,12 +19381,15 @@ struct DesktopState {
             }
             ImGui::EndDisabled();
         } else if (edge_available) {
-            if (ImGui::Button("Split Selected Edge", ImVec2(-1, 30))) {
+            ImGui::BeginDisabled(!edge_tools.split);
+            if (ImGui::Button(edge_tools.selected_edges == 1U ? "Split Selected Edge" : "Split Selected Edges", ImVec2(-1, 30))) {
                 carto::editor::ToolArguments arguments;
                 arguments.factor = edge_split_factor;
                 static_cast<void>(dispatch(carto::application::InvokeToolAction{
                     "mesh.split-edge", arguments}));
             }
+            ImGui::EndDisabled();
+            if (!edge_tools.split) ImGui::TextDisabled("Split needs one selected edge per object.");
         } else {
             ImGui::BeginDisabled();
             ImGui::Button("Extrude requires a selected face", ImVec2(-1, 30));
@@ -20180,23 +20189,27 @@ struct DesktopState {
                 ImGui::TextDisabled("Other face tools require one face or two adjacent triangles.");
             }
         } else if (snapshot.selection.mode == carto::editor::SelectionMode::edge) {
-            const std::size_t count = snapshot.selection.edges.size();
+            const auto edge_tools = carto::studio::edge_tool_availability(snapshot.selection);
+            const std::size_t count = edge_tools.selected_edges;
             ImGui::Text("Edge selection · %zu", count);
-            const bool available = count == 1U;
-            ImGui::BeginDisabled(!available);
+            ImGui::BeginDisabled(!edge_tools.split);
             edge_split_factor = std::clamp(edge_split_factor, 0.001, 0.999);
             ImGui::InputDouble("Split factor", &edge_split_factor, 0.05, 0.1, "%.3f");
-            if (ImGui::Button("Split edge", ImVec2(-1, 30))) {
+            if (ImGui::Button(count == 1U ? "Split edge" : "Split edges", ImVec2(-1, 30))) {
                 carto::editor::ToolArguments arguments;
                 arguments.factor = edge_split_factor;
                 static_cast<void>(dispatch(carto::application::InvokeToolAction{
                     "mesh.split-edge", arguments}));
             }
+            ImGui::EndDisabled();
+            if (count > 0U && !edge_tools.split)
+                ImGui::TextDisabled("Split needs one selected edge per object.");
+            ImGui::BeginDisabled(!edge_tools.bevel);
             bevel_width = std::max(bevel_width, 0.0001);
             bevel_segments = std::max(bevel_segments, 1);
             ImGui::InputDouble("Bevel width", &bevel_width, 0.01, 0.1, "%.4f");
             ImGui::InputInt("Segments", &bevel_segments);
-            if (ImGui::Button("Bevel edge", ImVec2(-1, 30))) {
+            if (ImGui::Button(count == 1U ? "Bevel edge" : "Bevel edges", ImVec2(-1, 30))) {
                 carto::editor::ToolArguments arguments;
                 arguments.distance = bevel_width;
                 arguments.segments = static_cast<std::uint32_t>(
@@ -20204,11 +20217,18 @@ struct DesktopState {
                 static_cast<void>(dispatch(carto::application::InvokeToolAction{
                     "mesh.bevel-edge", arguments}));
             }
-            if (ImGui::Button("Dissolve edge", ImVec2(-1, 30))) {
+            ImGui::EndDisabled();
+            if (count > carto::editor::kMaxSelectedEdgesPerBevel)
+                ImGui::TextDisabled("Bevel supports at most %zu selected edges.",
+                    carto::editor::kMaxSelectedEdgesPerBevel);
+            ImGui::BeginDisabled(!edge_tools.dissolve);
+            if (ImGui::Button(count == 1U ? "Dissolve edge" : "Dissolve edges", ImVec2(-1, 30))) {
                 static_cast<void>(dispatch(carto::application::InvokeToolAction{
                     "mesh.dissolve-edge", {}}));
             }
             ImGui::EndDisabled();
+            if (count > 0U && !edge_tools.dissolve)
+                ImGui::TextDisabled("The dissolve selection exceeds the per-object edge limit.");
             const bool one_owner_edge_selection = count > 0U &&
                 snapshot.selection.component_groups.size() == 1U &&
                 snapshot.selection.component_groups.front().edges.size() == count;
@@ -20261,8 +20281,8 @@ struct DesktopState {
                 }
             }
             ImGui::EndDisabled();
-            if (!available && !one_loop_seed_per_object) {
-                ImGui::TextDisabled("Select one edge, or one loop-cut seed per object.");
+            if (count == 0U) {
+                ImGui::TextDisabled("Select edges to edit.");
             }
             if (mesh_loop_cut_seed_pick_active) {
                 ImGui::TextDisabled(

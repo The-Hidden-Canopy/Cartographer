@@ -5060,7 +5060,8 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
             affected.objects.push_back(*authoring.value().component_object);
         }
         const auto selected_component_groups = selection_.component_groups();
-        const bool affects_grouped_edges = action.tool_id == "mesh.dissolve-edge" ||
+        const bool affects_grouped_edges = action.tool_id == "mesh.split-edge" ||
+            action.tool_id == "mesh.dissolve-edge" ||
             action.tool_id == "mesh.bevel-edge" || action.tool_id == "mesh.loop-cut" ||
             action.tool_id == "mesh.set-edge-sharp";
         const bool affects_grouped_vertices = action.tool_id == "mesh.bevel-vertex" ||
