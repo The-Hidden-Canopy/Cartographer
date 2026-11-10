@@ -1,3 +1,4 @@
+#include "project_schema_test_support.hpp"
 #include <carto/project/project.hpp>
 
 #include <cstdlib>
@@ -15,7 +16,7 @@ int main() {
     using carto::project::ProjectDocument;
     const auto current = ProjectDocument{}.serialize();
     const std::string table = "UNADMITTED_MODE_KEY_DRAFTS 0\n";
-    require(current.starts_with("CARTOGRAPHER_PROJECT 39\n") &&
+    require(current.starts_with(carto::test_support::current_project_header()) &&
         current.find(table) != std::string::npos, "v38 writes an explicit empty table");
     const auto empty = ProjectDocument::deserialize(current);
     require(empty && empty.value().unadmitted_mode_key_drafts().empty(), "v38 empty round trip");
@@ -23,16 +24,18 @@ int main() {
     missing.erase(missing.find(table), table.size());
     require(!ProjectDocument::deserialize(missing), "v38 missing mandatory table refused");
     auto v37 = missing;
+    carto::test_support::erase_schema40_tables(v37);
     if (const auto control_workspace = v37.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
         v37.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
-    v37.replace(0, std::string("CARTOGRAPHER_PROJECT 39\n").size(), "CARTOGRAPHER_PROJECT 37\n");
+    v37.replace(0, carto::test_support::current_project_header().size(), "CARTOGRAPHER_PROJECT 37\n");
     const auto migrated = ProjectDocument::deserialize(v37);
     require(migrated && migrated.value().unadmitted_mode_key_drafts().empty() &&
-        migrated.value().serialize().starts_with("CARTOGRAPHER_PROJECT 39\n"), "v37 migrates with no drafts");
+        migrated.value().serialize().starts_with(carto::test_support::current_project_header()), "v37 migrates with no drafts");
     auto mislabeled = current;
+    carto::test_support::erase_schema40_tables(mislabeled);
     if (const auto control_workspace = mislabeled.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
         mislabeled.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
-    mislabeled.replace(0, std::string("CARTOGRAPHER_PROJECT 39\n").size(), "CARTOGRAPHER_PROJECT 37\n");
+    mislabeled.replace(0, carto::test_support::current_project_header().size(), "CARTOGRAPHER_PROJECT 37\n");
     require(!ProjectDocument::deserialize(mislabeled), "v37 cannot carry v38 table");
     auto over = current;
     over.replace(over.find(table), table.size(), "UNADMITTED_MODE_KEY_DRAFTS 513\n");

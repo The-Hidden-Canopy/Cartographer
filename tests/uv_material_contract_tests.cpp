@@ -534,7 +534,10 @@ void gltf_export_emits_active_corner_uvs_and_splits_seams() {
     REQUIRE(exported);
     REQUIRE(exported.value().vertices == 6U);
     REQUIRE(exported.value().triangles == 2U);
-    REQUIRE(exported.value().warnings.size() == 2U);
+    REQUIRE(exported.value().warnings.size() == 3U);
+    REQUIRE(exported.value().warnings[0].find("Inactive clearcoat roughness") != std::string::npos);
+    REQUIRE(exported.value().warnings[1].find("face culling") != std::string::npos);
+    REQUIRE(exported.value().warnings[2].find("float32") != std::string::npos);
 
     std::ifstream input(path, std::ios::binary);
     REQUIRE(input);
@@ -563,9 +566,12 @@ void gltf_export_preserves_condition_material_regions_in_extras() {
     std::filesystem::remove(path, ignored);
     const auto exported = carto::io::export_gltf(document.value(), path);
     REQUIRE(exported);
-    REQUIRE(exported.value().warnings.size() == 3U);
-    REQUIRE(exported.value().warnings.front().find("condition.material_region") !=
+    REQUIRE(exported.value().warnings.size() == 4U);
+    REQUIRE(exported.value().warnings[0].find("Inactive clearcoat roughness") != std::string::npos);
+    REQUIRE(exported.value().warnings[1].find("condition.material_region") !=
             std::string::npos);
+    REQUIRE(exported.value().warnings[2].find("face culling") != std::string::npos);
+    REQUIRE(exported.value().warnings[3].find("float32") != std::string::npos);
 
     std::ifstream input(path, std::ios::binary);
     REQUIRE(input);

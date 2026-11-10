@@ -1,3 +1,4 @@
+#include "project_schema_test_support.hpp"
 #include "application_access.hpp"
 #include "gltf_test_payload.hpp"
 #include <carto/character/rig_module.hpp>
@@ -84,9 +85,12 @@ int main(){try {
     const auto c_tip=take(source(s).scene().world_transform({8}));
     check(std::abs(c_tip.translation.y-2.5)<1e-9&&c_tip.scale.x==1&&c_tip.scale.y==1,"same deep rig retargets to a second asset without copying the first target's mesh scales");
     auto legacy=project::ProjectDocument{}.serialize();const auto table=legacy.find("RIG_TEMPLATE_BINDINGS 0\n");legacy.erase(table,std::string("RIG_TEMPLATE_BINDINGS 0\n").size());
-    check(!project::ProjectDocument::deserialize(legacy),"schema34 requires rig binding table");
+    check(!project::ProjectDocument::deserialize(legacy),"current schema requires rig binding table");
     const auto aging=legacy.find("AGING_LAYERS 0\n");legacy.erase(aging,std::string("AGING_LAYERS 0\n").size());
-    legacy.replace(0,std::string("CARTOGRAPHER_PROJECT 35").size(),"CARTOGRAPHER_PROJECT 33");
+    for (const auto empty_table : {"KINEMATIC_GRAPHS 0\n", "ACCEPTED_AUTORIGS 0\n",
+            "UNADMITTED_MODE_KEY_DRAFTS 0\n", "CONTROL_WORKSPACE 0\n"})
+        carto::test_support::erase_empty_project_table(legacy, empty_table);
+    legacy.replace(0,carto::test_support::current_project_header().size(),"CARTOGRAPHER_PROJECT 33\n");
     check(take(project::ProjectDocument::deserialize(legacy)).rig_template_bindings().empty(),"schema33 migrates with no invented bindings");
     std::cout<<"PASS two-asset rig reuse, explicit correspondence/license, rigid rest retarget, incompatible refusal, undo/reopen and v33 migration\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

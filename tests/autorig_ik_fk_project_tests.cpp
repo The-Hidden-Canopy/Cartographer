@@ -1,3 +1,4 @@
+#include "project_schema_test_support.hpp"
 #include <carto/character/rig_record.hpp>
 #include <carto/project/accepted_autorig.hpp>
 #include <carto/project/transaction.hpp>
@@ -151,13 +152,14 @@ int main() {
         decoded.value().weights.output.binding.serialize() == old.value().weights.output.binding.serialize(),
         "v2 retains authored configuration and full transferred binding");
     auto mislabeled_v36 = document.serialize();
+    carto::test_support::erase_schema40_tables(mislabeled_v36);
     const auto mislabeled_v36_drafts = mislabeled_v36.find("UNADMITTED_MODE_KEY_DRAFTS 0\n");
     require(mislabeled_v36_drafts != std::string::npos, "fixture has the v38 draft table");
     mislabeled_v36.erase(mislabeled_v36_drafts, std::string("UNADMITTED_MODE_KEY_DRAFTS 0\n").size());
-    require(mislabeled_v36.starts_with("CARTOGRAPHER_PROJECT 39\n"), "current v38 header");
+    require(mislabeled_v36.starts_with(carto::test_support::current_project_header()), "current project header");
     if (const auto control_workspace = mislabeled_v36.find("CONTROL_WORKSPACE 0\n"); control_workspace != std::string::npos)
         mislabeled_v36.erase(control_workspace, std::string("CONTROL_WORKSPACE 0\n").size());
-    mislabeled_v36.replace(0U, std::string("CARTOGRAPHER_PROJECT 39\n").size(),
+    mislabeled_v36.replace(0U, carto::test_support::current_project_header().size(),
                            "CARTOGRAPHER_PROJECT 36\n");
     require(!project::ProjectDocument::deserialize(mislabeled_v36),
         "v36 refuses a v2 accepted-autorig bundle");
