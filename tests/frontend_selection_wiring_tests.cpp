@@ -13,7 +13,9 @@
 
 #include "project_document_access.hpp"
 #include "../apps/desktop/studio_edge_tools.hpp"
+#include "../apps/desktop/studio_face_tools.hpp"
 #include <carto/ui/ui.hpp>
+#include <carto/geometry/primitives.hpp>
 #include <carto/journal/journal.hpp>
 
 #include <algorithm>
@@ -395,6 +397,114 @@ void multi_edge_tool_controls_match_authoring_commands() {
     REQUIRE(availability.selected_edges == 0U && !availability.split && !availability.bevel && !availability.dissolve);
 }
 
+void multi_face_tool_controls_match_authoring_commands() {
+    using namespace carto;
+    Fixture multiple;
+    REQUIRE(multiple.ui.dispatch(application::CreateMeshObjectAction{"Second Quad", quad()}));
+    const auto objects = multiple.session.snapshot().objects;
+    REQUIRE(objects.size() == 2U);
+    const auto first = objects[0].object;
+    const auto second = objects[1].object;
+    REQUIRE(first.mesh_asset && second.mesh_asset);
+    const auto first_face = multiple.session.document_.meshes().at(*first.mesh_asset).faces_sorted().front().id;
+    const auto second_face = multiple.session.document_.meshes().at(*second.mesh_asset).faces_sorted().front().id;
+    REQUIRE(multiple.ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::face}));
+    REQUIRE(multiple.ui.dispatch(application::SelectFaceAction{first.id, first_face}));
+    REQUIRE(multiple.ui.dispatch(application::SelectFaceAction{
+        second.id, second_face, editor::SelectionOperation::add}));
+    auto availability = studio::face_tool_availability(multiple.session.snapshot().selection);
+    REQUIRE(availability.selected_faces == 2U && availability.selected_objects == 2U);
+    REQUIRE(availability.individual && availability.remove && !availability.single && !availability.triangle_pair);
+    editor::ToolArguments extrusion;
+    extrusion.distance = 0.25;
+    const auto extruded = multiple.ui.dispatch(application::InvokeToolAction{"mesh.extrude-face", extrusion});
+    REQUIRE(extruded && extruded.value().affected.objects.size() == 2U && extruded.value().affected.faces.size() == 2U);
+    REQUIRE(multiple.session.document_.meshes().at(*first.mesh_asset).face_count() == 5U);
+    REQUIRE(multiple.session.document_.meshes().at(*second.mesh_asset).face_count() == 5U);
+    REQUIRE(multiple.ui.dispatch(application::UndoAction{}));
+    REQUIRE(multiple.session.document_.meshes().at(*first.mesh_asset).face_count() == 1U);
+    REQUIRE(multiple.session.document_.meshes().at(*second.mesh_asset).face_count() == 1U);
+    REQUIRE(multiple.ui.dispatch(application::RedoAction{}));
+    REQUIRE(multiple.ui.dispatch(application::SaveProjectAction{}));
+    application::ApplicationSession reopened;
+    REQUIRE(application::testing::dispatch(reopened, application::OpenProjectAction{multiple.path}));
+    REQUIRE(reopened.document_.meshes().at(*first.mesh_asset).face_count() == 5U);
+    REQUIRE(reopened.document_.meshes().at(*second.mesh_asset).face_count() == 5U);
+
+    Fixture same_owner;
+    auto box = geometry::make_box({1.0, 1.0, 1.0});
+    REQUIRE(box);
+    const auto faces = box.value().faces_sorted();
+    REQUIRE(same_owner.ui.dispatch(application::CreateMeshObjectAction{"Box", std::move(box.value())}));
+    const auto box_object = same_owner.session.snapshot().objects.back().object;
+    REQUIRE(box_object.mesh_asset);
+    REQUIRE(same_owner.ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::face}));
+    REQUIRE(same_owner.ui.dispatch(application::SelectFaceAction{box_object.id, faces[0].id}));
+    REQUIRE(same_owner.ui.dispatch(application::SelectFaceAction{
+        box_object.id, faces[1].id, editor::SelectionOperation::add}));
+    availability = studio::face_tool_availability(same_owner.session.snapshot().selection);
+    REQUIRE(availability.selected_faces == 2U && availability.selected_objects == 1U);
+    REQUIRE(availability.individual && availability.remove && availability.triangle_pair);
+    REQUIRE(same_owner.ui.dispatch(application::InvokeToolAction{"mesh.poke-face", {}}));
+    REQUIRE(same_owner.session.document_.meshes().at(*box_object.mesh_asset).face_count() == 12U);
+    REQUIRE(same_owner.ui.dispatch(application::UndoAction{}));
+    REQUIRE(same_owner.session.document_.meshes().at(*box_object.mesh_asset).face_count() == 6U);
+    REQUIRE(same_owner.ui.dispatch(application::RedoAction{}));
+    REQUIRE(same_owner.session.document_.meshes().at(*box_object.mesh_asset).face_count() == 12U);
+    REQUIRE(same_owner.ui.dispatch(application::UndoAction{}));
+    REQUIRE(same_owner.ui.dispatch(application::SelectFaceAction{box_object.id, faces[0].id}));
+    REQUIRE(same_owner.ui.dispatch(application::SelectFaceAction{
+        box_object.id, faces[1].id, editor::SelectionOperation::add}));
+    editor::ToolArguments inset_arguments;
+    inset_arguments.distance = 0.1;
+    const auto inset = same_owner.ui.dispatch(application::InvokeToolAction{"mesh.inset-face", inset_arguments});
+    REQUIRE(inset && inset.value().affected.faces.size() == 2U);
+    REQUIRE(same_owner.session.document_.meshes().at(*box_object.mesh_asset).face_count() == 14U);
+    REQUIRE(same_owner.ui.dispatch(application::UndoAction{}));
+    REQUIRE(same_owner.session.document_.meshes().at(*box_object.mesh_asset).face_count() == 6U);
+    REQUIRE(same_owner.ui.dispatch(application::RedoAction{}));
+    REQUIRE(same_owner.ui.dispatch(application::SaveProjectAction{}));
+    application::ApplicationSession inset_reopened;
+    REQUIRE(application::testing::dispatch(inset_reopened, application::OpenProjectAction{same_owner.path}));
+    REQUIRE(inset_reopened.document_.meshes().at(*box_object.mesh_asset).face_count() == 14U);
+
+    Fixture deletion;
+    REQUIRE(deletion.ui.dispatch(application::CreateMeshObjectAction{"Second Quad", quad()}));
+    const auto delete_objects = deletion.session.snapshot().objects;
+    const auto delete_first = delete_objects[0].object;
+    const auto delete_second = delete_objects[1].object;
+    REQUIRE(delete_first.mesh_asset && delete_second.mesh_asset);
+    REQUIRE(deletion.ui.dispatch(application::SetSelectionModeAction{editor::SelectionMode::face}));
+    REQUIRE(deletion.ui.dispatch(application::SelectFaceAction{delete_first.id,
+        deletion.session.document_.meshes().at(*delete_first.mesh_asset).faces_sorted().front().id}));
+    REQUIRE(deletion.ui.dispatch(application::SelectFaceAction{delete_second.id,
+        deletion.session.document_.meshes().at(*delete_second.mesh_asset).faces_sorted().front().id,
+        editor::SelectionOperation::add}));
+    const auto deleted = deletion.ui.dispatch(application::InvokeToolAction{"mesh.remove-face", {}});
+    REQUIRE(deleted && deleted.value().affected.objects.size() == 2U && deleted.value().affected.faces.size() == 2U);
+    REQUIRE(deletion.ui.dispatch(application::UndoAction{}));
+    REQUIRE(deletion.session.document_.meshes().at(*delete_first.mesh_asset).face_count() == 1U);
+    REQUIRE(deletion.session.document_.meshes().at(*delete_second.mesh_asset).face_count() == 1U);
+
+    application::SelectionView selection;
+    selection.mode = editor::SelectionMode::face;
+    selection.component_groups.resize(1U);
+    selection.component_groups[0].faces.resize(studio::kMaxInteractiveFaceBatch + 1U);
+    availability = studio::face_tool_availability(selection);
+    REQUIRE(availability.selected_faces == studio::kMaxInteractiveFaceBatch + 1U);
+    REQUIRE(!availability.individual && !availability.remove && !availability.single && !availability.triangle_pair);
+    selection.component_groups[0].faces.clear();
+    availability = studio::face_tool_availability(selection);
+    REQUIRE(availability.selected_faces == 0U && !availability.individual && !availability.remove);
+    selection.component_groups[0].faces = {geometry::FaceId{1U}};
+    selection.component_groups.resize(2U);
+    availability = studio::face_tool_availability(selection);
+    REQUIRE(!availability.individual && !availability.remove);
+    selection.mode = editor::SelectionMode::edge;
+    availability = studio::face_tool_availability(selection);
+    REQUIRE(availability.selected_faces == 0U && !availability.individual && !availability.remove);
+}
+
 } // namespace
 
 int main() {
@@ -404,6 +514,7 @@ int main() {
         shared_batch_duplicate_is_bounded_journaled_and_undoable();
         batch_availability_matches_refusal_for_ineligible_authored_sources();
         multi_edge_tool_controls_match_authoring_commands();
+        multi_face_tool_controls_match_authoring_commands();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return EXIT_FAILURE;

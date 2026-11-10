@@ -5069,7 +5069,8 @@ core::Result<DispatchReceipt> ApplicationSession::invoke_tool(const InvokeToolAc
             action.tool_id == "mesh.slide-vertex" ||
             action.tool_id == "mesh.merge-vertices" ||
             action.tool_id == "mesh.merge-by-distance";
-        const bool affects_grouped_faces = action.tool_id == "mesh.poke-face" ||
+        const bool affects_grouped_faces = action.tool_id == "mesh.remove-face" ||
+            action.tool_id == "mesh.poke-face" ||
             action.tool_id == "mesh.inset-face" ||
             action.tool_id == "mesh.extrude-face" ||
             action.tool_id == "mesh.set-face-normal" ||
