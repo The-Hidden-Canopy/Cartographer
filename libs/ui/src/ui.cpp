@@ -1162,7 +1162,10 @@ core::Result<StagedMeshSource> persist_managed_source_blob(
         ? std::filesystem::current_path(error) : project_path.parent_path();
     if (error) return core::Result<StagedMeshSource>::failure(io_error(
         "unable to resolve the saved project directory"));
-    const auto project_root = std::filesystem::weakly_canonical(requested_root, error);
+    const auto native_root = core::native_io_path(requested_root, error);
+    if (error) return core::Result<StagedMeshSource>::failure(io_error(
+        "unable to resolve the saved project directory"));
+    const auto project_root = std::filesystem::weakly_canonical(native_root, error);
     if (error || project_root.empty()) {
         return core::Result<StagedMeshSource>::failure(io_error(
             "unable to resolve the saved project directory"));
@@ -1177,7 +1180,10 @@ core::Result<StagedMeshSource> persist_managed_source_blob(
             project_root, destination.parent_path()); !checked) {
         return core::Result<StagedMeshSource>::failure(checked.error());
     }
-    const auto destination_status = std::filesystem::symlink_status(destination, error);
+    const auto native_destination = core::native_io_path(destination, error);
+    if (error) return core::Result<StagedMeshSource>::failure(io_error(
+        "unable to resolve managed " + std::string(source_description) + " destination"));
+    const auto destination_status = std::filesystem::symlink_status(native_destination, error);
     if (error && error != std::errc::no_such_file_or_directory) {
         return core::Result<StagedMeshSource>::failure(io_error(
             "unable to inspect managed " + std::string(source_description) + " destination"));
@@ -1193,7 +1199,7 @@ core::Result<StagedMeshSource> persist_managed_source_blob(
             ? validation(std::string(source_description) + " digest changed during persistence")
             : stored.error());
     }
-    const auto canonical_destination = std::filesystem::canonical(destination, error);
+    const auto canonical_destination = std::filesystem::canonical(native_destination, error);
     if (error || !is_within_directory(project_root, canonical_destination)) {
         return core::Result<StagedMeshSource>::failure(validation(
             std::string(source_description) + " resolved outside the saved project directory"));
@@ -1235,7 +1241,10 @@ core::Result<std::string> persist_texture_source_blob(
         : project_path.parent_path();
     if (error) return core::Result<std::string>::failure(io_error(
         "unable to resolve the saved project directory"));
-    const auto project_root = std::filesystem::weakly_canonical(requested_root, error);
+    const auto native_root = core::native_io_path(requested_root, error);
+    if (error) return core::Result<std::string>::failure(io_error(
+        "unable to resolve the saved project directory"));
+    const auto project_root = std::filesystem::weakly_canonical(native_root, error);
     if (error || project_root.empty()) return core::Result<std::string>::failure(io_error(
         "unable to resolve the saved project directory"));
 
@@ -1247,7 +1256,10 @@ core::Result<std::string> persist_texture_source_blob(
             project_root, destination.parent_path()); !checked) {
         return core::Result<std::string>::failure(checked.error());
     }
-    const auto destination_status = std::filesystem::symlink_status(destination, error);
+    const auto native_destination = core::native_io_path(destination, error);
+    if (error) return core::Result<std::string>::failure(io_error(
+        "unable to resolve managed material texture source"));
+    const auto destination_status = std::filesystem::symlink_status(native_destination, error);
     if (error && error != std::errc::no_such_file_or_directory) {
         return core::Result<std::string>::failure(io_error(
             "unable to inspect managed material texture source"));
@@ -1263,7 +1275,7 @@ core::Result<std::string> persist_texture_source_blob(
         return core::Result<std::string>::failure(validation(
             "managed material texture digest changed during persistence"));
     }
-    const auto canonical_destination = std::filesystem::canonical(destination, error);
+    const auto canonical_destination = std::filesystem::canonical(native_destination, error);
     if (error || canonical_destination.lexically_normal() != destination.lexically_normal() ||
         !is_within_directory(project_root, canonical_destination)) {
         return core::Result<std::string>::failure(validation(

@@ -1,5 +1,6 @@
 #include <carto/project/presentation_catalog.hpp>
 #include <carto/assets/texture_source.hpp>
+#include <carto/core/filesystem.hpp>
 
 #include <algorithm>
 #include <charconv>
@@ -412,10 +413,16 @@ core::Result<std::vector<std::uint8_t>> read_reference_image_source_bytes(
 
     assets::TextureSourceLimits limits;
     std::error_code error;
-    const auto project_root = std::filesystem::weakly_canonical(
-        requested_project_root, error);
-    if (error || project_root.empty() ||
-        !std::filesystem::is_directory(project_root, error) || error) {
+    const auto native_requested_root = core::native_io_path(requested_project_root, error);
+    if (error) return core::Result<std::vector<std::uint8_t>>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "reference-image project root is unavailable"));
+    const auto project_root = std::filesystem::weakly_canonical(native_requested_root, error);
+    if (error || project_root.empty()) {
+        return core::Result<std::vector<std::uint8_t>>::failure(core::Diagnostic(
+            core::ErrorCode::io_error, "reference-image project root is unavailable"));
+    }
+    const auto native_project_root = core::native_io_path(project_root, error);
+    if (error || !std::filesystem::is_directory(native_project_root, error) || error) {
         return core::Result<std::vector<std::uint8_t>>::failure(core::Diagnostic(
             core::ErrorCode::io_error,
             "reference-image project root is unavailable"));
@@ -434,7 +441,10 @@ core::Result<std::vector<std::uint8_t>> read_reference_image_source_bytes(
             core::ErrorCode::validation_failed,
             "reference-image locator is not its project-local content-addressed blob"));
     }
-    const auto stored_path = std::filesystem::canonical(expected_path, error);
+    const auto native_expected_path = core::native_io_path(expected_path, error);
+    if (error) return core::Result<std::vector<std::uint8_t>>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the reference-image source path"));
+    const auto stored_path = std::filesystem::canonical(native_expected_path, error);
     if (error) {
         return core::Result<std::vector<std::uint8_t>>::failure(core::Diagnostic(
             core::ErrorCode::not_found,
@@ -450,7 +460,10 @@ core::Result<std::vector<std::uint8_t>> read_reference_image_source_bytes(
             core::ErrorCode::validation_failed,
             "reference-image source path resolves outside its project-local blob"));
     }
-    const auto size = std::filesystem::file_size(stored_path, error);
+    const auto native_stored_path = core::native_io_path(stored_path, error);
+    if (error) return core::Result<std::vector<std::uint8_t>>::failure(core::Diagnostic(
+        core::ErrorCode::io_error, "unable to resolve the reference-image source path"));
+    const auto size = std::filesystem::file_size(native_stored_path, error);
     if (error || size == 0U || size > limits.max_source_bytes) {
         return core::Result<std::vector<std::uint8_t>>::failure(core::Diagnostic(
             core::ErrorCode::validation_failed,

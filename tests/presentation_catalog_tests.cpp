@@ -1,4 +1,5 @@
 #include <carto/journal/journal.hpp>
+#include <carto/core/filesystem.hpp>
 #include <carto/project/presentation_catalog.hpp>
 #include <carto/project/project.hpp>
 #include <carto/project/transaction.hpp>
@@ -44,7 +45,8 @@ public:
     }
     ~TempDirectory() {
         std::error_code ignored;
-        std::filesystem::remove_all(path_, ignored);
+        const auto native = core::native_io_path(path_, ignored);
+        if (!ignored) std::filesystem::remove_all(native, ignored);
     }
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
 private:
@@ -609,7 +611,9 @@ void reference_image_source_reads_only_verified_project_blobs() {
 
     const auto blob_path = store.path_for(stored.value().digest);
     std::error_code error;
-    std::filesystem::remove(blob_path, error);
+    const auto native_blob_path = core::native_io_path(blob_path, error);
+    require(!error, "blob fixture path can be resolved");
+    std::filesystem::remove(native_blob_path, error);
     require(!error, "blob fixture can be removed before corruption case");
     const auto missing_bytes = project::read_reference_image_source_bytes(
         temp.path(), plane, registry);
@@ -617,7 +621,7 @@ void reference_image_source_reads_only_verified_project_blobs() {
             missing_bytes.error().code == core::ErrorCode::not_found,
         "missing project-local bytes remain missing with no fallback");
     {
-        std::ofstream corrupted(blob_path, std::ios::binary | std::ios::trunc);
+        std::ofstream corrupted(native_blob_path, std::ios::binary | std::ios::trunc);
         corrupted.write("not-an-image", 12);
         require(static_cast<bool>(corrupted), "corrupt blob fixture is written");
     }
@@ -634,9 +638,9 @@ void reference_image_source_reads_only_verified_project_blobs() {
             static_cast<std::streamsize>(bytes.size()));
         require(static_cast<bool>(image), "outside image fixture is written");
     }
-    std::filesystem::remove(blob_path, error);
+    std::filesystem::remove(native_blob_path, error);
     require(!error, "corrupt in-project blob is removed before symlink case");
-    std::filesystem::create_symlink(outside_image, blob_path, error);
+    std::filesystem::create_symlink(outside_image, native_blob_path, error);
     if (!error) {
         const auto escaped = project::read_reference_image_source_bytes(
             temp.path(), plane, registry);

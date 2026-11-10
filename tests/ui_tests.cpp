@@ -1,5 +1,6 @@
 #include <carto/ui/ui.hpp>
 #include <carto/assets/blob_store.hpp>
+#include <carto/core/filesystem.hpp>
 #include <carto/journal/journal.hpp>
 #include <carto/attributes/set.hpp>
 #include <carto/connection/graph.hpp>
@@ -172,7 +173,8 @@ public:
 
     ~TempDirectory() {
         std::error_code ignored;
-        std::filesystem::remove_all(path_, ignored);
+        const auto native = carto::core::native_io_path(path_, ignored);
+        if (!ignored) std::filesystem::remove_all(native, ignored);
     }
 
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
@@ -180,6 +182,16 @@ public:
 private:
     std::filesystem::path path_;
 };
+
+std::filesystem::path long_texture_source_directory(const std::filesystem::path& root) {
+    const auto path = root / std::string(160U, 'x') / std::string(80U, 'y');
+    std::error_code error;
+    const auto native = carto::core::native_io_path(path, error);
+    REQUIRE(!error);
+    REQUIRE(carto::core::create_directories(native, error));
+    REQUIRE(!error);
+    return path;
+}
 
 std::vector<std::uint8_t> runtime_bytes(std::string_view value) {
     return {value.begin(), value.end()};
@@ -773,7 +785,11 @@ void ui_imports_and_binds_private_pathless_material_texture_sources() {
     const auto project_root = temp.path() / "p";
     std::filesystem::create_directories(project_root);
     const auto project_path = project_root / "texture-workflow.carto";
-    const auto source_path = temp.path() / "workstation-private-donor-identity.tga";
+    const auto source_path = long_texture_source_directory(temp.path()) /
+        "workstation-private-donor-identity.tga";
+#ifdef _WIN32
+    REQUIRE(source_path.native().size() > 260U);
+#endif
     const std::string private_tga_image_id = "PRIVATE-DONOR-IDENTITY";
     std::vector<std::uint8_t> tga(18U, 0U);
     tga[0U] = static_cast<std::uint8_t>(private_tga_image_id.size());
@@ -784,7 +800,10 @@ void ui_imports_and_binds_private_pathless_material_texture_sources() {
     tga.insert(tga.end(), private_tga_image_id.begin(), private_tga_image_id.end());
     tga.insert(tga.end(), {0U, 0U, 255U, 0U, 255U, 0U});
     {
-        std::ofstream source(source_path, std::ios::binary | std::ios::trunc);
+        std::error_code error;
+        const auto native_source = carto::core::native_io_path(source_path, error);
+        REQUIRE(!error);
+        std::ofstream source(native_source, std::ios::binary | std::ios::trunc);
         REQUIRE(static_cast<bool>(source));
         source.write(reinterpret_cast<const char*>(tga.data()),
                      static_cast<std::streamsize>(tga.size()));
@@ -1054,7 +1073,11 @@ void ui_reimports_material_texture_source_without_retargeting_bindings() {
     const auto project_path = project_root / "texture-reimport.carto";
     const auto first_path = temp.path() / "first-workstation-texture.tga";
     const auto other_path = temp.path() / "other-registered-texture.tga";
-    const auto replacement_path = temp.path() / "replacement-workstation-texture.tga";
+    const auto replacement_path = long_texture_source_directory(temp.path()) /
+        "replacement-workstation-texture.tga";
+#ifdef _WIN32
+    REQUIRE(replacement_path.native().size() > 260U);
+#endif
     const auto make_tga = [](std::uint8_t marker) {
         std::vector<std::uint8_t> bytes(18U, 0U);
         bytes[2U] = 2U;
@@ -1069,7 +1092,10 @@ void ui_reimports_material_texture_source_without_retargeting_bindings() {
     const auto replacement_bytes = make_tga(192U);
     const auto write_file = [](const std::filesystem::path& path,
                                const std::vector<std::uint8_t>& bytes) {
-        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        std::error_code error;
+        const auto native_path = carto::core::native_io_path(path, error);
+        REQUIRE(!error);
+        std::ofstream output(native_path, std::ios::binary | std::ios::trunc);
         REQUIRE(static_cast<bool>(output));
         output.write(reinterpret_cast<const char*>(bytes.data()),
                      static_cast<std::streamsize>(bytes.size()));
@@ -3549,7 +3575,10 @@ void ui_rejects_tampered_source_blob_without_fallback_or_project_mutation() {
     const auto source_view = ui.snapshot().source_assets.front();
     const auto blob_path = project_path.parent_path() / source_view.relative_source_path;
     {
-        std::ofstream corrupt(blob_path, std::ios::binary | std::ios::trunc);
+        std::error_code error;
+        const auto native_blob_path = carto::core::native_io_path(blob_path, error);
+        REQUIRE(!error);
+        std::ofstream corrupt(native_blob_path, std::ios::binary | std::ios::trunc);
         REQUIRE(static_cast<bool>(corrupt));
         corrupt << "tampered bytes";
     }

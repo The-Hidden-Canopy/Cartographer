@@ -743,7 +743,11 @@ core::Result<assets::TextureSourceAdmission> inspect_project_texture_blob(
     if (error) return core::Result<assets::TextureSourceAdmission>::failure(
         core::Diagnostic(core::ErrorCode::io_error,
             "unable to resolve the saved project directory"));
-    const auto project_root = std::filesystem::weakly_canonical(requested_root, error);
+    const auto native_root = core::native_io_path(requested_root, error);
+    if (error) return core::Result<assets::TextureSourceAdmission>::failure(
+        core::Diagnostic(core::ErrorCode::io_error,
+            "unable to resolve the saved project directory"));
+    const auto project_root = std::filesystem::weakly_canonical(native_root, error);
     if (error || project_root.empty()) {
         return core::Result<assets::TextureSourceAdmission>::failure(
             core::Diagnostic(core::ErrorCode::io_error,
@@ -754,7 +758,11 @@ core::Result<assets::TextureSourceAdmission> inspect_project_texture_blob(
         project_root / ".carto-assets" / "source-blobs",
         assets::BlobStoreLimits{texture_limits.max_source_bytes, 256U});
     const auto expected_path = store.path_for(digest);
-    const auto stored_path = std::filesystem::canonical(expected_path, error);
+    const auto native_expected = core::native_io_path(expected_path, error);
+    if (error) return core::Result<assets::TextureSourceAdmission>::failure(
+        core::Diagnostic(core::ErrorCode::io_error,
+            "unable to resolve the material texture blob path"));
+    const auto stored_path = std::filesystem::canonical(native_expected, error);
     if (error) return core::Result<assets::TextureSourceAdmission>::failure(
         core::Diagnostic(core::ErrorCode::not_found,
             "material texture source bytes are missing from the project asset store"));
@@ -770,7 +778,11 @@ core::Result<assets::TextureSourceAdmission> inspect_project_texture_blob(
             core::Diagnostic(core::ErrorCode::validation_failed,
                 "material texture blob is not at its project-local content-addressed path"));
     }
-    const auto size = std::filesystem::file_size(stored_path, error);
+    const auto native_stored = core::native_io_path(stored_path, error);
+    if (error) return core::Result<assets::TextureSourceAdmission>::failure(
+        core::Diagnostic(core::ErrorCode::io_error,
+            "unable to resolve the material texture blob path"));
+    const auto size = std::filesystem::file_size(native_stored, error);
     if (error || size > texture_limits.max_source_bytes) {
         return core::Result<assets::TextureSourceAdmission>::failure(
             core::Diagnostic(core::ErrorCode::validation_failed,
@@ -3338,7 +3350,13 @@ ApplicationSession::read_reference_image_source_bytes(std::string_view identity)
             core::ErrorCode::io_error,
             "unable to resolve the current project directory for reference-image decoding"));
     }
-    const auto project_root = std::filesystem::weakly_canonical(requested_root, error);
+    const auto native_root = core::native_io_path(requested_root, error);
+    if (error) {
+        return core::Result<std::vector<std::uint8_t>>::failure(core::Diagnostic(
+            core::ErrorCode::io_error,
+            "unable to resolve the current project directory for reference-image decoding"));
+    }
+    const auto project_root = std::filesystem::weakly_canonical(native_root, error);
     if (error || project_root.empty()) {
         return core::Result<std::vector<std::uint8_t>>::failure(core::Diagnostic(
             core::ErrorCode::io_error,
